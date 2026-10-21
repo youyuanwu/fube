@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ClusterManifest Name="${CLUSTER_NAME}" Version="1"
+                 xmlns="http://schemas.microsoft.com/2011/01/fabric">
+  <NodeTypes>
+    <NodeType Name="LinuxNodeType">
+      <Endpoints>
+        <ClientConnectionEndpoint Port="19000" />
+        <LeaseDriverEndpoint Port="19001" />
+        <ClusterConnectionEndpoint Port="19002" />
+        <ServiceConnectionEndpoint Port="19006" />
+        <HttpGatewayEndpoint Port="19080" Protocol="http" />
+        <ApplicationEndpoints StartPort="22001" EndPort="23000" />
+      </Endpoints>
+    </NodeType>
+  </NodeTypes>
+  <Infrastructure>
+    <Linux IsScaleMin="false">
+      <NodeList>
+        <Node NodeName="n0" IPAddressOrFQDN="${N0_IP}" NodeTypeRef="LinuxNodeType"
+              IsSeedNode="true" FaultDomain="fd:/host0/c0" UpgradeDomain="UD0" />
+        <Node NodeName="n1" IPAddressOrFQDN="${N1_IP}" NodeTypeRef="LinuxNodeType"
+              IsSeedNode="true" FaultDomain="fd:/host0/c1" UpgradeDomain="UD1" />
+        <Node NodeName="n2" IPAddressOrFQDN="${N2_IP}" NodeTypeRef="LinuxNodeType"
+              IsSeedNode="true" FaultDomain="fd:/host0/c2" UpgradeDomain="UD2" />
+      </NodeList>
+    </Linux>
+  </Infrastructure>
+  <FabricSettings>
+    <Section Name="Trace/Console">
+      <Parameter Name="Level" Value="3" />
+    </Section>
+    <Section Name="Trace/Etw">
+      <Parameter Name="Level" Value="4" />
+    </Section>
+    <Section Name="Federation">
+      <Parameter Name="NodeIdGeneratorVersion" Value="V3" />
+    </Section>
+    <Section Name="ClusterManager">
+      <Parameter Name="TargetReplicaSetSize" Value="3" />
+      <Parameter Name="MinReplicaSetSize" Value="2" />
+    </Section>
+    <Section Name="FailoverManager">
+      <Parameter Name="ExpectedClusterSize" Value="3" />
+      <Parameter Name="TargetReplicaSetSize" Value="3" />
+      <Parameter Name="MinReplicaSetSize" Value="2" />
+    </Section>
+    <Section Name="ImageStoreService">
+      <Parameter Name="TargetReplicaSetSize" Value="3" />
+      <Parameter Name="MinReplicaSetSize" Value="2" />
+    </Section>
+    <Section Name="NamingService">
+      <Parameter Name="PartitionCount" Value="1" />
+      <Parameter Name="TargetReplicaSetSize" Value="3" />
+      <Parameter Name="MinReplicaSetSize" Value="2" />
+    </Section>
+    <Section Name="Hosting">
+      <Parameter Name="RunAsPolicyEnabled" Value="True" />
+      <Parameter Name="EndpointProviderEnabled" Value="True" />
+      <Parameter Name="FirewallPolicyEnabled" Value="False" />
+      <Parameter Name="SkipDockerProcessManagement" Value="True" />
+      <Parameter Name="DisableContainers" Value="True" />
+    </Section>
+    <Section Name="HttpGateway">
+      <Parameter Name="IsEnabled" Value="True" />
+      <Parameter Name="VersionCheck" Value="True" />
+    </Section>
+    <Section Name="FileStoreService">
+      <Parameter Name="PrimaryAccountType" Value="LocalUser" />
+      <Parameter Name="PrimaryAccountNTLMPasswordSecret" Value="${FSS_PRIMARY_SECRET}" />
+      <Parameter Name="SecondaryAccountType" Value="LocalUser" />
+      <Parameter Name="SecondaryAccountNTLMPasswordSecret" Value="${FSS_SECONDARY_SECRET}" />
+    </Section>
+    <Section Name="Management">
+      <Parameter Name="ImageStoreConnectionString" Value="fabric:ImageStore" />
+      <Parameter Name="EnableSelfReconfiguringServices" Value="True" />
+    </Section>
+    <Section Name="PerformanceCounterLocalStore">
+      <Parameter Name="IsEnabled" Value="False" />
+    </Section>
+    <Section Name="Security">
+      <Parameter Name="ClusterCredentialType" Value="None" />
+      <Parameter Name="ServerAuthCredentialType" Value="None" />
+    </Section>
+    <Section Name="Setup">
+      <Parameter Name="SkipFirewallConfiguration" Value="True" />
+      <Parameter Name="ContainerDnsSetup" Value="Disallow" />
+    </Section>
+  </FabricSettings>
+</ClusterManifest>
