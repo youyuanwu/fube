@@ -1,7 +1,8 @@
 # Rust FabricClient POC
 
 **Status:** experimental native clear-TCP subset. Gateway ping, NameExists,
-typed GetNodeList, single-node GetNodeHealth, and native CreateName/DeleteName
+typed GetNodeList, single-node GetNodeHealth, native CreateName/DeleteName,
+and application/application-scoped service lists
 have been demonstrated against the repository's Ubuntu onebox running
 Service Fabric **11.8.121.4**. This is not a complete FabricClient replacement
 and does not support TLS or authentication.
@@ -11,7 +12,7 @@ and does not support TLS or authentication.
 `mssf-transport` implements bounded Fabric serialization, clear frames and CRCs,
 ordered native headers, client-only ListenInstance establishment, and
 continuously driven, bounded concurrent Tokio request/reply I/O. `mssf-client`
-adds native gateway ping, NameExists, typed node-list pages, node health and
+adds native gateway ping, NameExists, typed node/application/service pages, node health and
 single-name creation/deletion, with owned results and explicit errors.
 
 Neither package calls the native Service Fabric client or COM libraries.
@@ -25,6 +26,8 @@ Neither uses HTTP to execute client operations. "Clear TCP" still carries the
 | CreateName / DeleteName | Send the same direct URI object, with explicit-delete header `0x8033` for deletion. Require actor 5 / `NameOperationReply` and zero body bytes. Unique owned lifecycle independently observed absent → present → absent; native duplicate/missing errors followed by healthy same-connection reuse qualified live. |
 | GetNodeList | Sends the external `GetNodeList` string query to NamingGateway using `QueryRequest`; decodes all 21 source-defined node fields, nested deactivation data and explicit paging. Five-node membership/overlapping fields independently checked through management; binary ports checked against the onebox manifest. |
 | GetNodeHealth | Sends external `GetNodeHealth` via NamingGateway; validates the HM single-item envelope, aggregate, full events and Event evaluations. Independently injected Warning, false/true/inherited policy, event masks, unknown-node error and healthy same-connection reuse qualified live. |
+| GetApplicationList | Native external query with owned application identity/type/version/status/health/parameters/definition; two unique nonempty applications, exact/type/definition filters, parameter exclusion and explicit native continuation qualified live. |
+| GetServiceList | Public Rust method sends external **GetApplicationServiceList** for an ordinary application. Owned kind/type/manifest/status/health/persistence/group results; stateless and volatile stateful guest services, filters and real native continuation qualified live. |
 | Native faults/errors | Retains native signed error codes and available diagnostics. Malformed GetNodeList continuation produced live `E_INVALIDARG` (-2147024809) or `FMFailoverUnitNotFound` (-2147017462); the same connection remained usable. Other fault forms have offline model-peer coverage. |
 | Concurrent operations | Mixed ping, NameExists, node-list and node-health queries on clones sharing one connection; real onebox coverage. Deterministic cancellation/late-reply safety remains model-covered. |
 | Idle disconnect | Real native ping through a test-owned proxy, followed by proxy cutoff; closure detected without another operation. |
@@ -347,6 +350,120 @@ The result is Item=1, wrapper tag NodeHealth=16, empty list then mandatory item,
 no paging; events and Event evaluations are flattened field scopes, not a
 public C API pointer layout or safety-check-style derived scope.
 
+### Native application and service pages
+
+```rust,no_run
+use std::{num::NonZeroU64, time::Duration};
+use mssf_client::{
+    ApplicationListFilter, ApplicationQueryDescription, FabricClient,
+    ServiceListFilter, ServiceQueryDescription,
+};
+
+# async fn workloads(client: &FabricClient) -> mssf_client::Result<()> {
+let mut applications = ApplicationQueryDescription {
+    filter: ApplicationListFilter::TypeName("MyApplicationType".into()),
+    max_results: NonZeroU64::new(1),
+    ..Default::default()
+};
+let page = client.get_application_list(&applications).await?;
+for application in page.applications {
+    println!("{} {} {:?}", application.name, application.type_version, application.health_state);
+}
+// Caller decides whether/when to issue another operation with this opaque token.
+applications.continuation_token = page.continuation_token;
+
+let mut services = ServiceQueryDescription::new("fabric:/MyApplication");
+services.filter = ServiceListFilter::TypeName("MyServiceType".into());
+let page = client.get_service_list_with_timeout(&services, Duration::from_secs(5)).await?;
+for service in page.services {
+    println!("{} {:?} {:?}", service.name, service.kind, service.status);
+}
+println!("continuation={:?}", page.continuation_token);
+# Ok(())
+# }
+```
+
+`get_application_list` / `get_service_list` use the connection's configured
+default operation timeout. Both have `_with_timeout` variants with one deadline
+from preparation through admission, write waiting and driver decode. Neither
+automatically pages, retries, reconnects or replays. Native errors stay
+`Error::Remote { code, message }` and permit same-connection reuse; malformed
+successful results retire the shared stream before pending callers can reuse it.
+
+| Description | Selector and independent controls |
+|---|---|
+| `ApplicationQueryDescription` | `ApplicationListFilter::All` (default), `Name`, `TypeName`, or `DefinitionKind`; exactly one. Independent `exclude_application_parameters` (default false), continuation and count. |
+| `ApplicationDefinitionKindFilter` | DEFAULT=0, ALL=65535; bits SERVICE_FABRIC_APPLICATION_DESCRIPTION=1, COMPOSE=2, MESH_APPLICATION_DESCRIPTION=4, combinable with `\|`. `from_bits` rejects unnamed bits. These are **not** result discriminants. |
+| `ServiceQueryDescription::new(application)` | Required ordinary application scope; `ServiceListFilter::All` (default), exact `Name` or exact `TypeName`. Independent continuation and count. |
+
+Type selectors are nonempty and case-sensitive; names are exact, not prefixes.
+Conflicting selectors are unrepresentable. Selected empty type/name is an error,
+not a silent default. Application/service status, health, version and service
+kind are not available filters. Ad-hoc/root and exact `fabric:/System` service
+scopes use other native routes and are **explicitly rejected** by this API.
+Names in requests **and returned URI objects** use the narrow 4096-byte naming
+subset below; URI components and segment vectors must agree. This does not
+implement the full native URI grammar.
+
+Empty optional continuation is omitted; nonempty tokens are opaque bounded
+strings, not node IDs. `max_results` is optional positive `NonZeroU64` at most
+`i64::MAX`, the native query-map range, not the COM facade's 32-bit count.
+Each call returns one native page. Both message-size and count limits can page;
+exactly count rows need not imply a continuation. The count is applied to native
+subqueries; a divergent CM/FM **service union can exceed it**. Pages and
+entity/health observations are not snapshots. No continuation means paging
+ended, not that every aggregation source answered or health was available.
+
+`ApplicationListPage.applications` contains owned `Application` records:
+name, type_name/type_version, `ApplicationStatus`, `HealthState`, a sorted owned
+parameter map and `ApplicationDefinitionKind`. Parameter exclusion yields an
+empty map, indistinguishable from an actually empty map without request context.
+Application statuses are Invalid/Ready/Upgrading/Creating/Deleting/Failed.
+Definition results are ServiceFabricApplicationDescription/Compose/
+MeshApplicationDescription/Invalid (0/1/2/65535); missing optional definition
+defaults to Invalid. Deprecated upgrade fields are structurally consumed but
+not exposed; nonempty values are an explicitly unsupported result profile.
+
+`ServiceListPage.services` contains owned `Service` records: name, type_name,
+manifest_version, `ServiceKind`, `HealthState`, `ServiceStatus`, is_service_group.
+Manifest version is not application type version and may be empty.
+`ServiceKind::Stateful { has_persisted_state }` distinguishes persistence from
+kind; `Stateless` cannot report persisted state. Service statuses are
+Unknown/Active/Upgrading/Deleting/Creating/Failed; absent optional status/group
+defaults to Unknown/false. Named health Unknown is valid and does not mean Ok.
+Unlike the existing node/health scalar policy, unnamed scalar values in these
+new lists fail explicitly; existing APIs retain their behavior. Missing optional
+suffixes require a legitimate scope end; truncation/wrong metadata is an error.
+
+Application exact-name misses and service misses **within a valid application**
+can be empty successful pages. A nonexistent application for service listing
+returns a native error (live observed ApplicationNotFound -2147017763), never an
+invented empty page.
+
+CLI commands print exactly one owned page, including continuation:
+
+```sh
+cargo run -p mssf-client --example onebox -- \
+  --clear 127.0.0.1:19000 application-list --type MyApplicationType \
+  --exclude-parameters true --max-results 1 --timeout-seconds 5
+cargo run -p mssf-client --example onebox -- \
+  --clear 127.0.0.1:19000 service-list fabric:/MyApplication \
+  --type MyServiceType --max-results 1
+```
+
+Both accept `--name` instead of `--type` and `--continuation-token TOKEN`.
+Application listing additionally accepts `--definition-kind U32` instead of
+name/type. No management writes are added to the production client/example.
+
+Native layouts are independently source-derived, not copied from node results:
+[ApplicationQueryResult](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/ApplicationQueryResult.h#L54-L63),
+[ServiceQueryResult](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/ServiceQueryResult.h#L76).
+Both use a List result, dynamic wrapper tags 4/2, a null single-item pointer,
+native scalar query error and optional untyped paging object. Record names are
+ten-field URI objects, not strings; service records are not the C API kind/value
+union. Native aggregate reply constructors allow absent actor/action headers;
+present headers are validated.
+
 ## 4. Supported inputs and bounds
 
 Naming input is literal lowercase `fabric:/` followed by nonempty ASCII
@@ -367,6 +484,7 @@ native NamingUri parser.
 | Object nesting | 32 |
 | String | 32,768 UTF-16 code units |
 | Byte-array/object-array/type-information count | 4,096 |
+| Application/service rows, parameter pairs, URI segments | 4,096 each (the row bound is independent of requested count) |
 | Admitted operations, including unconsumed results | 32 |
 | Queued output frames, including cancelled commands awaiting disposal | 32 |
 | Started write / partial incoming frame | 30 seconds; request expiry ends local waiting, not started frame completion |
@@ -433,6 +551,9 @@ export MSSF_HEALTH_OWNER="poc-unique-task-id"
 export MSSF_NAME_CONFIG="$PWD/build/poc-native/name-config.json"
 export MSSF_NAME_REPORT="$PWD/build/poc-native/name-report.json"
 export MSSF_NAME_OWNER="poc-unique-task-id"
+export MSSF_LIST_CONFIG="$PWD/build/poc-native/list-config.json"
+export MSSF_LIST_REPORT="$PWD/build/poc-native/list-report.json"
+export MSSF_LIST_OWNER="poc-unique-task-id"
 cargo nextest archive --locked -p mssf-transport -p mssf-client \
   --archive-file build/poc-native/native-client-tests.tar.zst
 export MSSF_TEST_ARCHIVE_SHA256="$(sha256sum build/poc-native/native-client-tests.tar.zst | cut -d ' ' -f 1)"
@@ -621,6 +742,52 @@ property operations, nonempty-name deletion, implicit-ancestor promotion,
 arbitrary runtime versions, TLS, retry/reconnect or remote completion after a
 real transport failure.
 
+### Owned nonempty application/service qualification
+
+The list scenario provisions one unique type/version and **two** unique
+applications, each with a stateless and volatile stateful implicit-host guest
+service. Its test-only HTTP upload includes inert package contents and native
+`_.dir` commit markers bottom-up. It provisions synchronously, creates the
+applications, and waits for independently observed Ready/Active/Ok before native
+assertions. This qualifies stateful **kind**, not durability or replication of
+application data; persisted-state=true remains source/model-covered only.
+
+The four-slot private `MSSF_LIST_CONFIG` journal binds owner, canonical UUID,
+archive SHA, exact upload root, type/version 1.0 and both application identities.
+All initial absences must be observed before any mutation; exact application
+lookup uses 204 NoContent for no match. Collisions are not adopted. Pending is
+durably recorded before upload, provision, create and cleanup mutations.
+Unexpected/ambiguous outcomes remain Pending: even observed absence cannot
+release them. Destroy only the exact-owned disposable allocation to resolve
+such uncertainty. No prefix scan, shared-resource cleanup or automatic mutation
+retry occurs.
+
+Native checks require both applications and four services, compare identity,
+type/version, status/health, parameters, kind/persistence and group information
+with independent management observations, exercise exact/type/definition
+selection and parameter exclusion, require **real continuations** at count 1
+for applications and services, and follow them in distinct calls. Mixed
+application/service/node/ping operations and reuse following missing-application
+native error also run on one shared connection. These are not empty-list-only
+compatibility claims.
+
+Cleanup deletes only the journal's exact applications, waits for absence,
+unprovisions its exact type/version, then deletes its upload root. A success
+report is written only after cleanup. Preparation failures, assertion panics
+and cleanup errors use the same cleanup-before-report harness; Pending entries
+block success. File sync and rename run on every platform; only directory fsync
+is gated to Unix. A hard kill can skip in-process cleanup, so always-run exact
+allocation teardown remains essential.
+
+The **11.8.121.4** archived group now has four live scenarios and passes all four.
+The application/service delivery also passes 148 offline tests plus four CLI
+parser tests. Offline evidence covers strict suffixes, hostile bounds, enums,
+malformed successes, native errors, out-of-order mixed queries, deadlines,
+ownership collisions, ambiguous mutation retention and cleanup dependency order.
+Live coverage does not establish Compose/Mesh applications, service groups,
+persisted stateful data, upgrade/deletion transitions, partial aggregation,
+byte-size paging, divergent unions, other runtime versions or full URI grammar.
+
 ### Build once, run the archive on onebox
 
 The Linux Rust job compiles the selected packages' test binaries, including
@@ -652,6 +819,9 @@ export MSSF_HEALTH_OWNER="poc-unique-task-id"
 export MSSF_NAME_CONFIG="$PWD/build/poc-native/name-config.json"
 export MSSF_NAME_REPORT="$PWD/build/poc-native/name-report.json"
 export MSSF_NAME_OWNER="poc-unique-task-id"
+export MSSF_LIST_CONFIG="$PWD/build/poc-native/list-config.json"
+export MSSF_LIST_REPORT="$PWD/build/poc-native/list-report.json"
+export MSSF_LIST_OWNER="poc-unique-task-id"
 # MSSF_TEST_CONFIG / MSSF_TEST_REPORT must also be set, as above.
 cargo-nextest nextest run --archive-file "$archive" --workspace-remap "$PWD" \
   --run-ignored all -E 'group(onebox)' --no-tests fail
@@ -659,7 +829,7 @@ cargo-nextest nextest run --archive-file "$archive" --workspace-remap "$PWD" \
 
 These commands extract and execute prebuilt tests without rebuilding them.
 `--workspace-remap` handles a different checkout path. Empty selections fail
-rather than silently reporting success. Only the three sanitized native success
+rather than silently reporting success. Only the four sanitized native success
 reports and compiled test archive are uploaded, never the private configurations,
 raw runtime logs, or credentials.
 Every host or compiler-free consumer leg uses this single group command;

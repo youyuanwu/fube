@@ -9,23 +9,8 @@ use crate::{Error, GatewayDescription, Result};
 pub(crate) const DELETE_NAME_HEADER: u16 = 0x8033;
 
 pub(crate) fn encode_name(name: &str) -> Result<Vec<u8>> {
-    if name.len() > 4096 {
-        return Err(Error::InvalidInput("naming URI exceeds 4096 bytes"));
-    }
-    let suffix = name
-        .strip_prefix("fabric:/")
-        .ok_or(Error::InvalidInput("naming URI must start with fabric:/"))?;
-    let segments: Vec<_> = suffix.split('/').collect();
-    if segments.iter().any(|segment| {
-        segment.is_empty()
-            || !segment
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    }) {
-        return Err(Error::InvalidInput(
-            "naming URI requires nonempty ASCII alphanumeric, underscore or hyphen segments",
-        ));
-    }
+    validate_name(name)?;
+    let segments: Vec<_> = name["fabric:/".len()..].split('/').collect();
     let mut encoder = Encoder::new();
     encoder.object(|encoder| {
         encoder.i64(1);
@@ -44,6 +29,26 @@ pub(crate) fn encode_name(name: &str) -> Result<Vec<u8>> {
         Ok(())
     })?;
     Ok(encoder.finish())
+}
+
+pub(crate) fn validate_name(name: &str) -> Result<()> {
+    if name.len() > 4096 {
+        return Err(Error::InvalidInput("naming URI exceeds 4096 bytes"));
+    }
+    let suffix = name
+        .strip_prefix("fabric:/")
+        .ok_or(Error::InvalidInput("naming URI must start with fabric:/"))?;
+    if suffix.split('/').any(|segment| {
+        segment.is_empty()
+            || !segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    }) {
+        return Err(Error::InvalidInput(
+            "naming URI requires nonempty ASCII alphanumeric, underscore or hyphen segments",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn check_failure(message: &Message) -> Result<()> {

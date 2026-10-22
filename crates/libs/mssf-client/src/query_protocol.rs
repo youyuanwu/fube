@@ -30,13 +30,26 @@ pub(crate) fn decode<T>(
     body: &[u8],
     payload: impl FnOnce(&mut Decoder<'_>, &[u8]) -> Result<T>,
 ) -> Result<QueryResult<T>> {
+    decode_with_paging_policy(body, payload, false)
+}
+
+pub(crate) fn decode_with_paging_policy<T>(
+    body: &[u8],
+    payload: impl FnOnce(&mut Decoder<'_>, &[u8]) -> Result<T>,
+    strict_paging: bool,
+) -> Result<QueryResult<T>> {
     let mut decoder = Decoder::new(body);
     let (kind, payload, error, paging) = decoder.object(|decoder| {
         Ok((
             decoder.i64()?,
             decoder.pointer(payload)?,
             decoder.i64()?,
-            decoder.pointer(|decoder, _| decoder.string())?,
+            decoder.pointer(|decoder, tag| {
+                if strict_paging && !tag.is_empty() {
+                    return Err(Error::Protocol("unexpected paging status type"));
+                }
+                decoder.string()
+            })?,
         ))
     })?;
     decoder.finish()?;

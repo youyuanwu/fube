@@ -4,14 +4,19 @@
 //! Connections support bounded concurrency, have no automatic reconnect, and must only be
 //! used with an explicitly selected unsecured development gateway.
 
+mod applications;
 mod health;
 mod health_protocol;
+mod list_protocol;
 mod node_protocol;
 mod nodes;
 mod protocol;
 mod query_protocol;
+mod services;
+pub use applications::*;
 pub use health::*;
 pub use nodes::*;
+pub use services::*;
 
 use std::{net::SocketAddr, time::Duration};
 
@@ -175,6 +180,57 @@ impl FabricClient {
         let body = health_protocol::encode_query(query)?;
         self.request("QueryRequest", body, deadline, |reply| {
             health_protocol::decode_reply(&reply)
+        })
+        .await
+    }
+
+    /// Get one application page using the configured default deadline.
+    /// Filters are mutually exclusive; parameters are included by default.
+    pub async fn get_application_list(
+        &self,
+        query: &ApplicationQueryDescription,
+    ) -> Result<ApplicationListPage> {
+        self.get_application_list_with_timeout(query, self.timeout)
+            .await
+    }
+
+    /// Get one native application page with an explicit whole-operation timeout.
+    /// No retries or automatic traversal. Malformed successes retire the stream;
+    /// normal native errors remain operation-local.
+    pub async fn get_application_list_with_timeout(
+        &self,
+        query: &ApplicationQueryDescription,
+        timeout: Duration,
+    ) -> Result<ApplicationListPage> {
+        let deadline = deadline_after(timeout)?;
+        let body = list_protocol::encode_application(query)?;
+        self.request("QueryRequest", body, deadline, |reply| {
+            list_protocol::decode_applications(&reply)
+        })
+        .await
+    }
+
+    /// Get one ordinary application-scoped service page with the default timeout.
+    /// Ad-hoc/root and System profiles are explicitly unsupported.
+    pub async fn get_service_list(
+        &self,
+        query: &ServiceQueryDescription,
+    ) -> Result<ServiceListPage> {
+        self.get_service_list_with_timeout(query, self.timeout)
+            .await
+    }
+
+    /// Get one service page with an explicit whole-operation timeout.
+    /// Count is a native per-subquery limit, not a strict CM/FM union cap.
+    pub async fn get_service_list_with_timeout(
+        &self,
+        query: &ServiceQueryDescription,
+        timeout: Duration,
+    ) -> Result<ServiceListPage> {
+        let deadline = deadline_after(timeout)?;
+        let body = list_protocol::encode_service(query)?;
+        self.request("QueryRequest", body, deadline, |reply| {
+            list_protocol::decode_services(&reply)
         })
         .await
     }

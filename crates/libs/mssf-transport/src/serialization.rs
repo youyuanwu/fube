@@ -308,6 +308,16 @@ impl<'a> Decoder<'a> {
         self.expect(SCOPE_BEGIN)
     }
 
+    /// Whether the current object scope ends at this position, without consuming
+    /// it. Only a valid delimiter denotes an absent optional trailing field;
+    /// missing bytes and truncated values still fail decoding.
+    pub fn is_scope_end(&self) -> Result<bool> {
+        if self.depth == 0 {
+            return Err(Error::Protocol("scope requires an object"));
+        }
+        Ok(self.peek()? == SCOPE_END)
+    }
+
     /// Read a nullable native object pointer, exposing nonnull type information.
     /// The callback is not invoked for a null pointer.
     pub fn pointer<T>(
@@ -627,6 +637,37 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_end_probe_does_not_consume_or_forgive_truncated_values() {
+        assert!(Decoder::new(&[]).is_scope_end().is_err());
+        let mut e = Encoder::new();
+        e.object(|e| e.string("value")).unwrap();
+        let bytes = e.finish();
+        let mut d = Decoder::new(&bytes);
+        d.object(|d| {
+            assert!(!d.is_scope_end()?);
+            assert_eq!(d.string()?, "value");
+            assert!(d.is_scope_end()?);
+            assert!(d.is_scope_end()?);
+            Ok(())
+        })
+        .unwrap();
+        d.finish().unwrap();
+        let mut truncated = bytes.clone();
+        // Keep the outer extent valid, but shorten the string payload so the
+        // delimiter becomes part of the field rather than an absent suffix.
+        truncated.drain(14..22);
+        let extent = (truncated.len() - 1) as u32;
+        truncated[1..5].copy_from_slice(&extent.to_le_bytes());
+        let mut d = Decoder::new(&truncated);
+        assert!(d
+            .object(|d| {
+                assert!(!d.is_scope_end()?);
+                d.string()
+            })
+            .is_err());
+    }
 
     #[test]
     fn pointers_arrays_type_info_and_derived_scopes_are_bounded() {
