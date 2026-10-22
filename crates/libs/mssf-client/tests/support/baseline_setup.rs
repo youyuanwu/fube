@@ -1,18 +1,18 @@
 //! Test-only HTTP preparation; actual client operations use native TCP.
 
-use std::{error::Error, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
-use reqwest::{redirect::Policy, Client, Response, StatusCode};
+use openapi_service_fabric::models::NameDescription;
+use reqwest::{Response, StatusCode};
 use serde::Deserialize;
 
-use super::support;
+use super::{rest, support};
 use support::ObservedNode;
 
-const MANAGEMENT: &str = "http://127.0.0.1:19080";
 const EXISTING: &str = "fabric:/native-client-ci-existing";
 const ABSENT: &str = "fabric:/native-client-ci-absent";
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+type Result<T> = rest::Result<T>;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -58,15 +58,15 @@ pub async fn prepare() -> Result<()> {
     if config_path.exists() {
         std::fs::remove_file(&config_path)?;
     }
-    let client = Client::builder()
-        .no_proxy()
-        .redirect(Policy::none())
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    let config = rest::configuration(Duration::from_secs(30))?;
+    let client = &config.client;
+    let management = &config.base_path;
 
+    // Keep raw status-only calls: SDK unit responses discard the status and
+    // accept redirects, whereas fixture prerequisites require explicit success.
     let created = client
-        .post(format!("{MANAGEMENT}/Names/$/Create?api-version=6.0"))
-        .json(&serde_json::json!({"Name": EXISTING}))
+        .post(format!("{management}/Names/$/Create?api-version=6.0"))
+        .json(&NameDescription::new(EXISTING.into()))
         .send()
         .await?;
     // Re-running independent observation before each archive execution leg is
@@ -78,14 +78,14 @@ pub async fn prepare() -> Result<()> {
     successful(
         client
             .get(format!(
-                "{MANAGEMENT}/Names/native-client-ci-existing?api-version=6.0"
+                "{management}/Names/native-client-ci-existing?api-version=6.0"
             ))
             .send()
             .await?,
     )?;
     let absent = client
         .get(format!(
-            "{MANAGEMENT}/Names/native-client-ci-absent?api-version=6.0"
+            "{management}/Names/native-client-ci-absent?api-version=6.0"
         ))
         .send()
         .await?;
@@ -101,11 +101,9 @@ pub async fn prepare() -> Result<()> {
     let mut token = String::new();
     let mut seen = std::collections::HashSet::new();
     for _ in 0..128 {
-        let mut request = client.get(format!("{MANAGEMENT}/Nodes?api-version=6.3"));
-        if !token.is_empty() {
-            request = request.query(&[("ContinuationToken", &token)]);
-        }
-        let page: Nodes = successful(request.send().await?)?.json().await?;
+        let page: Nodes = serde_json::from_value(
+            rest::nodes(&config, (!token.is_empty()).then_some(token.as_str())).await?,
+        )?;
         items.extend(page.items);
         if items.len() > 4096 {
             return Err("management membership exceeds test observation bound".into());
@@ -160,4 +158,42 @@ fn fixture_outputs_require_explicit_absolute_paths() {
         .join(uuid::Uuid::new_v4().to_string())
         .join("config.json");
     assert!(absolute_output(missing_parent.to_str().unwrap()).is_err());
+}
+
+#[tokio::test]
+async fn generated_node_query_preserves_tokens_and_required_observation_fields() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = rest::configuration(Duration::from_secs(5)).unwrap();
+    config.base_path = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(stream.read_u8().await.unwrap());
+            assert!(headers.len() < 16384);
+        }
+        assert!(String::from_utf8(headers).unwrap().starts_with(
+            "GET /Nodes?api-version=6.3&ContinuationToken=next+%2F%3F%26 HTTP/1.1\r\n"
+        ));
+        let body =
+            br#"{"Items":[{"Name":"N0010","NodeStatus":"Up"}],"ContinuationToken":"opaque /?&"}"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        stream.write_all(body).await.unwrap();
+    });
+    let page = rest::nodes(&config, Some("next /?&")).await.unwrap();
+    assert_eq!(page["ContinuationToken"], "opaque /?&");
+    assert_eq!(page["Items"][0]["Name"], "N0010");
+    assert_eq!(page["Items"][0]["NodeStatus"], "Up");
+    assert!(serde_json::from_value::<Nodes>(page).is_err());
+    server.await.unwrap();
 }

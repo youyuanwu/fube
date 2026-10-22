@@ -19,6 +19,8 @@ use oracle::*;
 
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/rest.rs"]
+mod rest;
 #[path = "support/health_setup.rs"]
 mod setup;
 

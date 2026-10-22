@@ -6,7 +6,6 @@ use std::{error::Error, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
-pub const MANAGEMENT: &str = "http://127.0.0.1:19080";
 pub const MAX_AGE_MS: u64 = 120_000;
 pub const MISSING_CODE: i64 = -2147017705; // Pinned FABRIC_E_HEALTH_ENTITY_NOT_FOUND.
 

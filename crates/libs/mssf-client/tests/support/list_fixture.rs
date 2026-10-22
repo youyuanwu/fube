@@ -6,13 +6,22 @@ use std::{
     time::Duration,
 };
 
-use reqwest::{redirect::Policy, Client, Method, StatusCode};
+use openapi_service_fabric::{
+    apis::{
+        application_api, application_type_api, configuration::Configuration, image_store_api,
+        Error as ApiError,
+    },
+    models::{
+        ApplicationDescription, ApplicationParameter, UnprovisionApplicationTypeDescriptionInfo,
+    },
+};
+use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
-const MANAGEMENT: &str = "http://127.0.0.1:19080";
+use super::rest;
 
 pub fn output(variable: &str) -> Result<PathBuf> {
     let path = PathBuf::from(std::env::var(variable)?);
@@ -153,26 +162,37 @@ impl Journal {
 }
 
 pub struct Http {
-    client: Client,
-    base: String,
+    config: Configuration,
+}
+
+fn optional_resource<T: Serialize, E: std::fmt::Debug + Send + Sync + 'static>(
+    result: std::result::Result<T, ApiError<E>>,
+) -> Result<Option<Value>> {
+    match result {
+        Ok(value) => Ok(Some(serde_json::to_value(value)?)),
+        Err(ApiError::ResponseError(response)) if response.status == StatusCode::NOT_FOUND => {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 impl Http {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            client: Client::builder()
-                .no_proxy()
-                .redirect(Policy::none())
-                .timeout(Duration::from_secs(120))
-                .build()?,
-            base: MANAGEMENT.into(),
+            config: rest::configuration(Duration::from_secs(120))?,
         })
     }
 
-    pub async fn get(&self, path: &str) -> Result<Value> {
+    pub async fn nodes(&self) -> Result<Value> {
+        rest::nodes(&self.config, None).await
+    }
+
+    async fn get(&self, path: &str) -> Result<Value> {
         Ok(self
+            .config
             .client
-            .get(format!("{}{path}", self.base))
+            .get(format!("{}{path}", self.config.base_path))
             .send()
             .await?
             .error_for_status()?
@@ -180,13 +200,17 @@ impl Http {
             .await?)
     }
 
-    async fn mutation(&self, method: Method, path: &str, value: Value) -> Result<()> {
-        let response = self
+    // SDK unit responses discard status, accepting even redirects. Retain the
+    // strict success boundary before settling an owned mutation.
+    async fn mutation(&self, method: Method, path: &str, value: Option<Value>) -> Result<()> {
+        let mut request = self
+            .config
             .client
-            .request(method, format!("{}{path}", self.base))
-            .json(&value)
-            .send()
-            .await?;
+            .request(method, format!("{}{path}", self.config.base_path));
+        if let Some(value) = value {
+            request = request.json(&value);
+        }
+        let response = request.send().await?;
         if !response.status().is_success() {
             let status = response.status();
             let details: Value = response.json().await?;
@@ -206,29 +230,54 @@ impl Http {
     }
 
     pub async fn exists(&self, journal: &Journal, index: usize) -> Result<bool> {
-        let path = match index {
-            0 => format!("/ImageStore/{}?api-version=6.0", journal.upload),
-            1 => format!("/ApplicationTypes/{}?api-version=6.0", journal.type_name),
-            2 | 3 => format!(
-                "/Applications/{}?api-version=6.0",
-                app_id(&journal.applications[index - 2])
-            ),
+        let value = match index {
+            0 => optional_resource(
+                image_store_api::get_image_store_content(
+                    &self.config,
+                    "6.0",
+                    &journal.upload,
+                    None,
+                )
+                .await,
+            )?,
+            1 => optional_resource(
+                application_type_api::get_application_type_info_list_by_name(
+                    &self.config,
+                    "6.0",
+                    &journal.type_name,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await,
+            )?,
+            2 | 3 => {
+                // SDK 0.1.1 tries to deserialize the documented empty 204.
+                let response = self
+                    .config
+                    .client
+                    .get(format!(
+                        "{}/Applications/{}?api-version=6.0",
+                        self.config.base_path,
+                        app_id(&journal.applications[index - 2])
+                    ))
+                    .send()
+                    .await?;
+                if matches!(
+                    response.status(),
+                    StatusCode::NOT_FOUND | StatusCode::NO_CONTENT
+                ) {
+                    return Ok(false);
+                }
+                Some(response.error_for_status()?.json::<Value>().await?)
+            }
             _ => return Err("invalid workload resource index".into()),
         };
-        let response = self
-            .client
-            .get(format!("{}{path}", self.base))
-            .send()
-            .await?;
-        if response.status() == StatusCode::NOT_FOUND {
+        let Some(value) = value else {
             return Ok(false);
-        }
-        // ApplicationsHandler's exact-name query returns NoContent, not a
-        // JSON error or empty object, when its successful list is empty.
-        if index >= 2 && response.status() == StatusCode::NO_CONTENT {
-            return Ok(false);
-        }
-        let value: Value = response.error_for_status()?.json().await?;
+        };
         match index {
             0 => Ok(!value["StoreFiles"]
                 .as_array()
@@ -271,11 +320,13 @@ impl Http {
     pub async fn prepare(&self, journal: &mut Journal, path: &Path) -> Result<()> {
         self.confirm_absent(journal, path).await?;
         journal.record(path, 0, Stage::Pending)?;
+        // The Swagger/SDK upload operation has no body parameter.
         for (relative, contents) in manifests(&journal.type_name) {
-            self.client
+            self.config
+                .client
                 .put(format!(
                     "{}/ImageStore/{}/{}?api-version=6.0",
-                    self.base, journal.upload, relative
+                    self.config.base_path, journal.upload, relative
                 ))
                 .header("Content-Type", "application/octet-stream")
                 .body(contents)
@@ -288,15 +339,29 @@ impl Http {
         self.mutation(
             Method::POST,
             "/ApplicationTypes/$/Provision?api-version=6.0",
-            json!({"ApplicationTypeBuildPath": journal.upload, "Async": false}),
+            // API 6.0 uses the legacy untagged shape. The SDK's newer
+            // polymorphic provision model also loses the required build path.
+            Some(json!({"ApplicationTypeBuildPath": journal.upload, "Async": false})),
         )
         .await?;
         journal.record(path, 1, Stage::Settled)?;
         for index in 0..2 {
             journal.record(path, index + 2, Stage::Pending)?;
-            self.mutation(Method::POST, "/Applications/$/Create?api-version=6.0",
-                json!({"Name": journal.applications[index], "TypeName": journal.type_name,
-                    "TypeVersion": "1.0", "ParameterList": [{"Key": "Evidence", "Value": "owned-list-value"}]})).await?;
+            let mut description = ApplicationDescription::new(
+                journal.applications[index].clone(),
+                journal.type_name.clone(),
+                "1.0".into(),
+            );
+            description.parameter_list = Some(vec![ApplicationParameter::new(
+                "Evidence".into(),
+                "owned-list-value".into(),
+            )]);
+            self.mutation(
+                Method::POST,
+                "/Applications/$/Create?api-version=6.0",
+                Some(serde_json::to_value(description)?),
+            )
+            .await?;
             journal.record(path, index + 2, Stage::Settled)?;
         }
         Ok(())
@@ -305,15 +370,22 @@ impl Http {
     pub async fn applications(&self, journal: &Journal) -> Result<Vec<Value>> {
         let mut result = Vec::new();
         for name in &journal.applications {
-            result.push(
-                self.get(&format!("/Applications/{}?api-version=6.3", app_id(name)))
-                    .await?,
-            );
+            result.push(serde_json::to_value(
+                application_api::get_application_info(
+                    &self.config,
+                    "6.3",
+                    app_id(name),
+                    None,
+                    None,
+                )
+                .await?,
+            )?);
         }
         Ok(result)
     }
 
     pub async fn services(&self, name: &str) -> Result<Vec<Value>> {
+        // SDK 0.1.1 has incorrect ServiceKind tags and loses HasPersistedState.
         let value = self
             .get(&format!(
                 "/Applications/{}/$/GetServices?api-version=6.3",
@@ -374,7 +446,7 @@ impl Http {
             0 => (
                 Method::DELETE,
                 format!("/ImageStore/{}?api-version=6.0", journal.upload),
-                Value::Null,
+                None,
             ),
             1 => (
                 Method::POST,
@@ -382,7 +454,12 @@ impl Http {
                     "/ApplicationTypes/{}/$/Unprovision?api-version=6.0",
                     journal.type_name
                 ),
-                json!({"ApplicationTypeVersion": "1.0", "Async": false}),
+                Some(serde_json::to_value(
+                    UnprovisionApplicationTypeDescriptionInfo {
+                        r#async: Some(false),
+                        ..UnprovisionApplicationTypeDescriptionInfo::new("1.0".into())
+                    },
+                )?),
             ),
             2 | 3 => (
                 Method::POST,
@@ -390,7 +467,7 @@ impl Http {
                     "/Applications/{}/$/Delete?api-version=6.0",
                     app_id(&journal.applications[index - 2])
                 ),
-                Value::Null,
+                None,
             ),
             _ => return Err("invalid cleanup slot".into()),
         };
@@ -493,6 +570,16 @@ mod tests {
                     .unwrap_or(0);
                 let mut body = vec![0; length];
                 stream.read_exact(&mut body).await.unwrap();
+                if expected.starts_with("DELETE ") || expected.contains("/$/Delete?api-version=6.0")
+                {
+                    assert!(body.is_empty(), "bodyless cleanup must not send JSON null");
+                }
+                if expected.contains("/$/Unprovision?api-version=6.0") {
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&body).unwrap(),
+                        json!({"ApplicationTypeVersion": "1.0", "Async": false})
+                    );
+                }
                 let bytes = if status == StatusCode::NO_CONTENT {
                     Vec::new()
                 } else {
@@ -506,13 +593,11 @@ mod tests {
         });
         (
             Http {
-                base,
-                client: Client::builder()
-                    .no_proxy()
-                    .redirect(Policy::none())
-                    .timeout(Duration::from_secs(5))
-                    .build()
-                    .unwrap(),
+                config: {
+                    let mut config = rest::configuration(Duration::from_secs(5)).unwrap();
+                    config.base_path = base;
+                    config
+                },
             },
             server,
         )
@@ -685,7 +770,12 @@ mod tests {
 
     #[tokio::test]
     async fn partial_preparation_cleans_only_settled_upload_and_preserves_uncertainty() {
-        for failed_delete in [false, true] {
+        for status in [
+            StatusCode::OK,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::FOUND,
+        ] {
+            let failed_delete = status != StatusCode::OK;
             let dir = Directory::new();
             let path = dir.0.join("journal.json");
             let mut j = Journal::new("offline-owner".into(), "d".repeat(64)).unwrap();
@@ -695,11 +785,7 @@ mod tests {
             }
             let mut script = vec![(
                 request(&j, 0, "DELETE", true),
-                if failed_delete {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                } else {
-                    StatusCode::OK
-                },
+                status,
                 json!({"Error": {"Code": "OwnedTestError", "Message": "uncertain delete"}}),
             )];
             if !failed_delete {
@@ -726,6 +812,73 @@ mod tests {
             assert_eq!(loaded.stages[1..], [Stage::Reserved; 3]);
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn sdk_errors_and_malformed_observations_never_authorize_ownership() {
+        for (index, status, value) in [
+            (0, StatusCode::OK, json!({"StoreFiles": "not-an-array"})),
+            (
+                0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"Error": {"Code": "OwnedTestError", "Message": "failed observation"}}),
+            ),
+            (1, StatusCode::OK, json!({"Items": "not-an-array"})),
+        ] {
+            let dir = Directory::new();
+            let path = dir.0.join("journal.json");
+            let mut journal = Journal::new("offline-owner".into(), "e".repeat(64)).unwrap();
+            journal.reserve(&path).unwrap();
+            let mut script = Vec::new();
+            if index == 1 {
+                script.push((
+                    request(&journal, 0, "GET", false),
+                    StatusCode::NOT_FOUND,
+                    Value::Null,
+                ));
+            }
+            script.push((request(&journal, index, "GET", false), status, value));
+            let (http, server) = scripted_http(script).await;
+            assert!(http.confirm_absent(&mut journal, &path).await.is_err());
+            assert_eq!(journal.stages, [Stage::Reserved; 4]);
+            assert_eq!(Journal::load(&path, "offline-owner").unwrap(), journal);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_application_reads_preserve_parameters_and_errors() {
+        let journal = Journal::new("offline-owner".into(), "f".repeat(64)).unwrap();
+        let mut script = Vec::new();
+        for name in &journal.applications {
+            script.push((
+                format!("GET /Applications/{}?api-version=6.3", app_id(name)),
+                StatusCode::OK,
+                json!({"Name": name, "Status": "Ready", "HealthState": "Ok",
+                    "Parameters": [{"Key": "Evidence", "Value": "owned-list-value"}]}),
+            ));
+        }
+        let (http, server) = scripted_http(script).await;
+        let applications = http.applications(&journal).await.unwrap();
+        for (app, name) in applications.iter().zip(&journal.applications) {
+            assert_eq!(app["Name"], *name);
+            assert_eq!(app["Status"], "Ready");
+            assert_eq!(app["Parameters"][0]["Value"], "owned-list-value");
+        }
+        server.await.unwrap();
+
+        let (http, server) = scripted_http(vec![(
+            format!(
+                "GET /Applications/{}?api-version=6.3",
+                app_id(&journal.applications[0])
+            ),
+            StatusCode::NO_CONTENT,
+            Value::Null,
+        )])
+        .await;
+        // A readiness read must fail on absence, not retry through a raw fallback.
+        assert!(http.applications(&journal).await.is_err());
+        server.await.unwrap();
     }
 
     #[test]

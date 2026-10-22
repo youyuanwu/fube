@@ -6,14 +6,14 @@ use std::{
     time::Duration,
 };
 
-use reqwest::{redirect::Policy, Client, StatusCode};
+use openapi_service_fabric::apis::configuration::Configuration;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 pub const DUPLICATE: i64 = -2147017792;
 pub const MISSING: i64 = -2147017791;
-const MANAGEMENT: &str = "http://127.0.0.1:19080";
 
 pub fn output(variable: &str) -> Result<PathBuf> {
     let path = PathBuf::from(std::env::var(variable)?);
@@ -151,29 +151,15 @@ pub trait NameManagement {
     async fn delete(&self, name: &str) -> Result<()>;
 }
 
-pub struct Http(Client, String);
+pub struct Http(Configuration);
 
 impl Http {
     pub fn new() -> Result<Self> {
-        Ok(Self(
-            Client::builder()
-                .no_proxy()
-                .redirect(Policy::none())
-                .timeout(Duration::from_secs(10))
-                .build()?,
-            MANAGEMENT.into(),
-        ))
+        Ok(Self(super::rest::configuration(Duration::from_secs(10))?))
     }
 
     pub async fn runtime(&self) -> Result<String> {
-        let nodes: serde_json::Value = self
-            .0
-            .get(format!("{}/Nodes?api-version=6.3", self.1))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let nodes = super::rest::nodes(&self.0, None).await?;
         let items = nodes["Items"]
             .as_array()
             .ok_or("missing independent nodes")?;
@@ -188,14 +174,16 @@ impl Http {
 
     fn name_url(&self, name: &str) -> String {
         // Journal validation guarantees one literal ASCII segment (no URL escaping).
-        format!("{}/Names/{}", self.1, &name["fabric:/".len()..])
+        format!("{}/Names/{}", self.0.base_path, &name["fabric:/".len()..])
     }
 }
 
 impl NameManagement for Http {
     async fn exists(&self, name: &str) -> Result<bool> {
+        // The SDK's unit response loses the exact 200/404 existence contract.
         let response = self
             .0
+            .client
             .get(format!("{}?api-version=6.0", self.name_url(name)))
             .send()
             .await?;
@@ -211,6 +199,7 @@ impl NameManagement for Http {
     async fn delete(&self, name: &str) -> Result<()> {
         let response = self
             .0
+            .client
             .delete(format!("{}?api-version=6.0", self.name_url(name)))
             .send()
             .await?;
@@ -361,7 +350,8 @@ mod tests {
                     .unwrap();
             }
         });
-        let http = Http(Http::new().unwrap().0, format!("http://{endpoint}"));
+        let mut http = Http::new().unwrap();
+        http.0.base_path = format!("http://{endpoint}");
         assert!(!http.exists("fabric:/native-names-owned").await.unwrap());
         assert!(http.exists("fabric:/native-names-owned").await.unwrap());
         http.delete("fabric:/native-names-owned").await.unwrap();

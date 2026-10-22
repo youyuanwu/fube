@@ -9,6 +9,8 @@ mod oracle;
 use oracle::*;
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/rest.rs"]
+mod rest;
 
 async fn mutate(
     client: &FabricClient,

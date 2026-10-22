@@ -27,6 +27,8 @@ const OBSERVATION_MAX_AGE_MS: u64 = 120_000;
 mod support;
 use support::ObservedNode;
 
+#[path = "support/rest.rs"]
+mod rest;
 #[path = "support/baseline_setup.rs"]
 mod setup;
 

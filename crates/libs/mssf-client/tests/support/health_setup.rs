@@ -1,32 +1,32 @@
 //! Independent HTTP-only preparation and owned-report restoration helpers.
 use std::time::Duration;
 
-use reqwest::{redirect::Policy, Client};
-use serde_json::json;
+use openapi_service_fabric::{
+    apis::{configuration::Configuration, node_api},
+    models::{ClusterHealthPolicy, HealthInformation, HealthState},
+};
 
-use super::oracle::*;
-
-fn management() -> Result<Client> {
-    Ok(Client::builder()
-        .no_proxy()
-        .redirect(Policy::none())
-        .timeout(Duration::from_secs(10))
-        .build()?)
-}
+use super::{oracle::*, rest};
 
 async fn observe(
-    client: &Client,
+    config: &Configuration,
     node: &str,
     policy: Option<bool>,
     filter: Option<u32>,
 ) -> Result<ObservedHealth> {
-    let url = format!("{MANAGEMENT}/Nodes/{node}/$/GetHealth?api-version=6.3");
+    let url = format!(
+        "{}/Nodes/{node}/$/GetHealth?api-version=6.3",
+        config.base_path
+    );
+    // Keep the raw health response: SDK 0.1.1 loses Event subtype fields and
+    // uses the wrong discriminator; its i32 filter also cannot express u32 masks.
     let mut request = if let Some(value) = policy {
-        client
-            .post(url)
-            .json(&json!({"ConsiderWarningAsError": value}))
+        config.client.post(url).json(&ClusterHealthPolicy {
+            consider_warning_as_error: Some(value),
+            ..Default::default()
+        })
     } else {
-        client.get(url)
+        config.client.get(url)
     };
     if let Some(value) = filter {
         request = request.query(&[("EventsHealthStateFilter", value)]);
@@ -35,33 +35,33 @@ async fn observe(
 }
 
 async fn submit(
-    client: &Client,
+    client: &Configuration,
     config: &Config,
-    state: &str,
+    state: HealthState,
     sequence: i64,
     ttl_ms: i64,
 ) -> Result<()> {
-    client
-        .post(format!(
-            "{MANAGEMENT}/Nodes/{}/$/ReportHealth?api-version=6.3&Immediate=true",
-            config.target
-        ))
-        .json(&json!({
-            "SourceId": config.source, "Property": config.property,
-            "HealthState": state, "TimeToLiveInMilliSeconds": ttl_ms.to_string(),
-            "Description": config.description, "SequenceNumber": sequence.to_string(),
-            "RemoveWhenExpired": true,
-        }))
-        .send()
-        .await?
-        .error_for_status()?;
+    let ttl = Duration::from_millis(ttl_ms.try_into()?);
+    let information = HealthInformation {
+        time_to_live_in_milli_seconds: Some(format!(
+            "PT{}.{:03}S",
+            ttl.as_secs(),
+            ttl.subsec_millis()
+        )),
+        description: Some(config.description.clone()),
+        sequence_number: Some(sequence.to_string()),
+        remove_when_expired: Some(true),
+        ..HealthInformation::new(config.source.clone(), config.property.clone(), state)
+    };
+    node_api::report_node_health(client, "6.3", &config.target, information, Some(true), None)
+        .await?;
     Ok(())
 }
 
-async fn restore(client: &Client, config: &Config) -> Result<()> {
+async fn restore(client: &Configuration, config: &Config) -> Result<()> {
     config.validate()?;
     // Supersede only this task's report. Short finite TTL removes even the Ok report.
-    submit(client, config, "Ok", config.sequence + 1, 1_000).await?;
+    submit(client, config, HealthState::Ok, config.sequence + 1, 1_000).await?;
     for _ in 0..60 {
         let health = observe(client, &config.target, Some(false), None).await?;
         let owned = health
@@ -69,13 +69,7 @@ async fn restore(client: &Client, config: &Config) -> Result<()> {
             .iter()
             .any(|e| e.source_id == config.source && e.property == config.property);
         if health.aggregated_health_state == "Ok" && !owned {
-            let nodes: serde_json::Value = client
-                .get(format!("{MANAGEMENT}/Nodes?api-version=6.3"))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
+            let nodes = rest::nodes(client, None).await?;
             let items = nodes["Items"]
                 .as_array()
                 .ok_or("missing management node list during restoration")?;
@@ -107,7 +101,7 @@ pub async fn prepare() -> Result<()> {
     {
         return Err("MSSF_HEALTH_OWNER must be a unique task-owned ASCII identifier".into());
     }
-    let client = management()?;
+    let client = rest::configuration(Duration::from_secs(10))?;
     if path.exists() {
         let previous: Config = serde_json::from_slice(&std::fs::read(&path)?)?;
         if previous.owner != owner {
@@ -116,13 +110,7 @@ pub async fn prepare() -> Result<()> {
         restore(&client, &previous).await?;
         remove_stale(&path)?;
     }
-    let nodes: serde_json::Value = client
-        .get(format!("{MANAGEMENT}/Nodes?api-version=6.3"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let nodes = rest::nodes(&client, None).await?;
     let items = nodes["Items"]
         .as_array()
         .ok_or("missing management node list")?;
@@ -164,7 +152,14 @@ pub async fn prepare() -> Result<()> {
     if healthy.aggregated_health_state != "Ok" || !healthy.unhealthy_evaluations.is_empty() {
         return Err("healthy node prerequisite failed".into());
     }
-    submit(&client, &config, "Warning", config.sequence, config.ttl_ms).await?;
+    submit(
+        &client,
+        &config,
+        HealthState::Warning,
+        config.sequence,
+        config.ttl_ms,
+    )
+    .await?;
     let mut converged = false;
     for _ in 0..60 {
         let false_health = observe(&client, &config.target, Some(false), None).await?;
@@ -215,9 +210,10 @@ pub async fn prepare() -> Result<()> {
         });
     }
     let missing = client
+        .client
         .get(format!(
-            "{MANAGEMENT}/Nodes/{}/$/GetHealth?api-version=6.3",
-            config.missing
+            "{}/Nodes/{}/$/GetHealth?api-version=6.3",
+            client.base_path, config.missing
         ))
         .send()
         .await?;
@@ -244,7 +240,7 @@ pub async fn restore_owned() -> Result<()> {
     if config.owner != std::env::var("MSSF_HEALTH_OWNER")? {
         return Err("health restoration owner mismatch".into());
     }
-    restore(&management()?, &config).await
+    restore(&rest::configuration(Duration::from_secs(10))?, &config).await
 }
 
 #[test]
@@ -263,4 +259,75 @@ fn health_time_oracles_use_exact_ticks_and_reject_overflow() {
     assert!(fresh(1, 120_001));
     assert!(!fresh(1, 120_002));
     assert!(!fresh(10, 9));
+}
+
+#[tokio::test]
+async fn generated_health_submission_preserves_owned_report_and_iso_ttl() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = rest::configuration(Duration::from_secs(5)).unwrap();
+    client.base_path = format!("http://{}", listener.local_addr().unwrap());
+    let config = Config {
+        profile: "clear".into(),
+        gateway: "127.0.0.1:19000".into(),
+        runtime_version: "test".into(),
+        archive_sha256: "a".repeat(64),
+        owner: "offline-owner".into(),
+        source: "NativeHealth-offline-owner".into(),
+        property: "owned-report".into(),
+        target: "N0020".into(),
+        healthy: "N0010".into(),
+        missing: "missing-owned-report".into(),
+        sequence: 42,
+        ttl_ms: 1_800_000,
+        description: "Disposable native node health qualification warning".into(),
+        report_path: std::env::temp_dir().join("unused-health-report.json"),
+        observed_at_unix_ms: 0,
+        missing_http_code: String::new(),
+        snapshots: Vec::new(),
+    };
+    let server = tokio::spawn(async move {
+        for (state, sequence, ttl) in [("Warning", "42", "PT1800.000S"), ("Ok", "43", "PT1.000S")] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(stream.read_u8().await.unwrap());
+                assert!(headers.len() < 16384);
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            assert!(headers.starts_with(
+                "POST /Nodes/N0020/$/ReportHealth?api-version=6.3&Immediate=true HTTP/1.1\r\n"
+            ));
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({
+                    "SourceId": "NativeHealth-offline-owner", "Property": "owned-report",
+                    "HealthState": state, "SequenceNumber": sequence,
+                    "TimeToLiveInMilliSeconds": ttl, "RemoveWhenExpired": true,
+                    "Description": "Disposable native node health qualification warning",
+                })
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        }
+    });
+    submit(&client, &config, HealthState::Warning, 42, 1_800_000)
+        .await
+        .unwrap();
+    submit(&client, &config, HealthState::Ok, 43, 1_000)
+        .await
+        .unwrap();
+    server.await.unwrap();
 }

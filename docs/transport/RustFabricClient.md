@@ -537,7 +537,7 @@ are helper functions, not tests with ordering dependencies. Select the group
 once; no individual test-name selectors or manual preparation are needed.
 
 On a fresh disposable local onebox, provide absolute private output paths and
-a unique fixture owner. The baseline helper uses test-only `reqwest` HTTP
+a unique fixture owner. The baseline helper uses test-only REST
 calls to prepare synthetic names and independently observe healthy five-node
 membership. Health restores its own report; names journals its own unique entry:
 
@@ -567,9 +567,22 @@ automatically refreshes its observations before native assertions. The baseline'
 read-test prerequisite accepts HTTP conflict followed by an independent existence
 check; unexpected HTTP results fail. Node observation timestamps
 must be no more than 120 seconds old and not future-dated at native test start.
-Proxy use and redirects are disabled. No additional CI job is needed.
-`reqwest` has JSON support only, with default/TLS features disabled, and is a
-dev-dependency rather than a production client dependency.
+Proxy use, redirects, and automatic request retries are disabled. No additional
+CI job is needed. `openapi-service-fabric` 0.1.1 and `reqwest` 0.13 are
+dev-dependencies with default/TLS features disabled, not production client
+dependencies. The generated client handles node observations, successful
+application reads, image-store/application-type observations, and health report
+submission. Existing strict required-field checks and evidence schemas remain
+in place; generated optional response fields are not defaulted into success.
+
+Some HTTP calls deliberately remain handwritten until the SDK/specification gaps
+are fixed: binary uploads (no body parameter), legacy API 6.0 provisioning,
+service and health reads (incorrect polymorphic tags/missing subtype fields),
+and application absence (documented empty 204). Exact-status name operations and
+owned mutations also retain raw response checks: generated unit-returning methods
+discard successful status codes and accept redirects. These are explicit
+test-only paths, never automatic fallbacks from failed SDK calls. Health reports
+use documented ISO-8601 TTL strings, and bodyless cleanup calls omit JSON bodies.
 
 The baseline helper writes a private JSON file with the following fields;
 the native assertions consume this independent observation, not their own

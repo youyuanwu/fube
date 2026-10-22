@@ -8,6 +8,8 @@ mod oracle;
 use oracle::{output, owner, Http, Journal, Result};
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/rest.rs"]
+mod rest;
 
 fn compare_application(app: &Application, observed: &Value) {
     assert_eq!(app.name, observed["Name"]);
@@ -63,7 +65,7 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
         Err(e) => return Err(e.into()),
     }
     let http = Http::new()?;
-    let nodes = http.get("/Nodes?api-version=6.3").await?;
+    let nodes = http.nodes().await?;
     let nodes = nodes["Items"]
         .as_array()
         .ok_or("missing independent node list")?;

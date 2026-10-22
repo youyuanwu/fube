@@ -11,5 +11,6 @@ uuid.workspace = true
 [dev-dependencies]
 time.workspace = true
 reqwest.workspace = true
+openapi-service-fabric.workspace = true
 serde.workspace = true
 serde_json.workspace = true
