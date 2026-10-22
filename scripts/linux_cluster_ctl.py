@@ -14,7 +14,7 @@ import sys
 import time
 import uuid
 
-from linux_cluster import check_subnet, generate
+from linux_cluster import SHUTDOWN_TIMEOUT, check_subnet, generate
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -145,6 +145,9 @@ def definition(state, directory, generator=generate, gateway_service="n0"):
     for service in compose["services"].values():
         service["labels"] = label
         service["pull_policy"] = "never"
+        if "stop_grace_period" in service:
+            # Older allocations keep the grace period of their frozen image/inputs.
+            service["stop_grace_period"] = f"{state.get('shutdown_timeout', 45)}s"
     # Older allocations retain their frozen, unpublished gateway configuration.
     if state.get("publish_gateway", False):
         compose["services"][gateway_service]["ports"] = ["127.0.0.1:19080:19080"]
@@ -201,6 +204,7 @@ class Cluster:
                 or state.get("project") != self.project \
                 or state.get("phase") not in PHASES \
                 or not isinstance(state.get("publish_gateway", False), bool) \
+                or state.get("shutdown_timeout", 45) not in (45, SHUTDOWN_TIMEOUT) \
                 or not re.fullmatch(r"[0-9a-f]{32}", state.get("owner", "")):
             raise ValueError("Invalid cluster identity/state")
         if state["phase"] == "destroyed":
@@ -217,7 +221,7 @@ class Cluster:
                 or json.loads((self.directory / "compose.json").read_text()) != expected:
             raise ValueError("Generated inputs changed; refusing lifecycle mutation")
 
-    def compose(self, *arguments, timeout=120):
+    def compose(self, *arguments, timeout=SHUTDOWN_TIMEOUT + 30):
         return run(
             ["docker", "compose", "--project-name", self.project, "--file",
              self.directory / "compose.json", "--profile", "admin", *arguments],
@@ -346,6 +350,7 @@ class Cluster:
             "owner": uuid.uuid4().hex, "image": image_id, "subnet": str(check_subnet(subnet, [])),
             "runtime_version": RUNTIME, "manifest_version": "1", "phase": "allocating",
             "baseline": "not-started", "publish_gateway": True,
+            "shutdown_timeout": SHUTDOWN_TIMEOUT,
         }
         _, nodes = self.definition(self.state, self.directory)
         self.state["nodes"] = nodes
@@ -497,7 +502,7 @@ class Cluster:
         self.compose("up", "-d", "--no-build", "--pull", "never", *self.services)
         if restart_nodes:
             self.event("explicit-node-restart", nodes=list(restart_nodes))
-            self.compose("restart", "--timeout", "45", *restart_nodes)
+            self.compose("restart", "--timeout", str(self.state.get("shutdown_timeout", 45)), *restart_nodes)
         self.event("startup")
         with self.tools():
             self.wait(False, stable=0)
@@ -538,14 +543,14 @@ class Cluster:
         if self.state["phase"] == "destroying":
             raise ValueError("Destroy is incomplete; repeat destroy, not down")
         self.resources(require_volumes=self.state["phase"] != "allocating")
-        self.compose("stop", "--timeout", "45")
+        self.compose("stop", "--timeout", str(self.state.get("shutdown_timeout", 45)))
         containers, _, _ = self.resources(require_volumes=self.state["phase"] != "allocating")
         exits = {
             container["Config"]["Labels"]["com.docker.compose.service"]: container["State"]["ExitCode"]
             for container in containers
             if container["Config"]["Labels"]["com.docker.compose.service"] in self.services
         }
-        self.compose("down", "--timeout", "45")
+        self.compose("down", "--timeout", str(self.state.get("shutdown_timeout", 45)))
         # Preserve allocating so up can finish an interrupted initial allocation.
         if self.state["phase"] != "allocating":
             self.save(phase="down")
@@ -563,7 +568,7 @@ class Cluster:
             _, volumes, _ = self.resources(require_volumes=False)
             retained_image = self.image_tag_id()
             self.save(phase="destroying")
-            self.compose("down", "--timeout", "45")
+            self.compose("down", "--timeout", str(self.state.get("shutdown_timeout", 45)))
             for volume in volumes:
                 run(["docker", "volume", "rm", volume["Name"]])
             if retained_image:

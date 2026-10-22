@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ENTRYPOINT = Path(__file__).resolve().parents[1] / "docker/linux-cluster/node-entrypoint.py"
@@ -168,10 +168,11 @@ class LinuxNodeEntrypointTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.node.expected_identity({**environment, field: value})
 
-    def wrapper(self, command, auxiliary=None):
+    def wrapper(self, command, auxiliary=None, shutdown_timeout=90):
         source = (
             "import runpy,subprocess,sys;"
             f"entry=runpy.run_path({str(ENTRYPOINT)!r});"
+            f"entry['supervise'].__globals__['HOST_SHUTDOWN_TIMEOUT']={shutdown_timeout!r};"
             f"aux=[subprocess.Popen({auxiliary!r})] if {auxiliary is not None!r} else [];"
             f"sys.exit(entry['supervise']({command!r},aux))"
         )
@@ -190,6 +191,112 @@ class LinuxNodeEntrypointTests(unittest.TestCase):
         process.send_signal(signal.SIGTERM)
         stdout, stderr = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 0, (stdout, stderr))
+
+    def test_supervisor_waits_for_delayed_graceful_shutdown(self):
+        command = [sys.executable, "-u", "-c", """
+import signal
+import time
+
+stopping = False
+def stop(number, _frame):
+    global stopping
+    print("signal", number, flush=True)
+    stopping = True
+
+signal.signal(signal.SIGTERM, stop)
+print("ready", flush=True)
+while not stopping:
+    time.sleep(0.01)
+time.sleep(0.2)
+print("stopped", flush=True)
+"""]
+        process = self.wrapper(command)
+        self.assertEqual(process.stdout.readline().strip(), "ready")
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, (stdout, stderr))
+        self.assertEqual(stdout.splitlines(), [f"signal {signal.SIGTERM.value}", "stopped"])
+
+    def test_supervisor_fails_when_host_ignores_stop_signal(self):
+        command = [sys.executable, "-u", "-c",
+                   "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                   "print('ready',flush=True);time.sleep(60)"]
+        process = self.wrapper(command, shutdown_timeout=0.1)
+        self.assertEqual(process.stdout.readline().strip(), "ready")
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 1, (stdout, stderr))
+        self.assertIn("FabricHost", stderr)
+        self.assertIn("sending SIGKILL", stderr)
+
+    def test_supervisor_sends_only_the_first_requested_signal(self):
+        for number in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(number=number):
+                host = Mock()
+                host.poll.return_value = None
+                handlers = {}
+
+                def install(number, handler):
+                    handlers[number] = handler
+
+                def request(_seconds):
+                    handlers[number](number, None)
+                    handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+                with patch.object(self.node.subprocess, "Popen", return_value=host), \
+                        patch.object(self.node.signal, "signal", side_effect=install), \
+                        patch.object(self.node.time, "sleep", side_effect=request):
+                    self.assertEqual(self.node.supervise(["FabricHost"], []), 0)
+                host.send_signal.assert_called_once_with(number)
+                host.terminate.assert_not_called()
+                host.wait.assert_called_once_with(timeout=self.node.HOST_SHUTDOWN_TIMEOUT)
+                host.kill.assert_not_called()
+
+    def test_supervisor_reports_a_host_shutdown_timeout(self):
+        host = Mock()
+        host.poll.return_value = None
+        host.wait.side_effect = [subprocess.TimeoutExpired("FabricHost", 90), 0]
+        handlers = {}
+
+        def install(number, handler):
+            handlers[number] = handler
+
+        def request(_seconds):
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+        with patch.object(self.node.subprocess, "Popen", return_value=host), \
+                patch.object(self.node.signal, "signal", side_effect=install), \
+                patch.object(self.node.time, "sleep", side_effect=request), \
+                patch("sys.stderr") as stderr:
+            self.assertEqual(self.node.supervise(["FabricHost"], []), 1)
+        host.kill.assert_called_once()
+        self.assertEqual(host.wait.call_count, 2)
+        self.assertIn("FabricHost", stderr.write.call_args_list[0].args[0])
+
+    def test_shutdown_budget_fits_inside_both_compose_grace_periods(self):
+        from linux_cluster import SHUTDOWN_TIMEOUT, generate
+        from onebox_ctl import generate as generate_onebox
+
+        self.assertGreater(
+            SHUTDOWN_TIMEOUT, self.node.HOST_SHUTDOWN_TIMEOUT + self.node.AUXILIARY_SHUTDOWN_TIMEOUT
+        )
+        for generator in (generate, generate_onebox):
+            compose, _, _ = generator("test", "172.30.80.0/24", "image", "image", TEMPLATE)
+            for service in compose["services"].values():
+                if "stop_grace_period" in service:
+                    self.assertEqual(service["stop_grace_period"], f"{SHUTDOWN_TIMEOUT}s")
+
+    def test_auxiliary_shutdown_remains_bounded_and_reports_forced_termination(self):
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("lttng-sessiond", 30), 0]
+        with patch("sys.stderr") as stderr:
+            self.assertFalse(self.node.stop_process(process, name="LTTng session daemon"))
+        process.send_signal.assert_called_once_with(signal.SIGTERM)
+        process.kill.assert_called_once()
+        self.assertEqual(process.wait.call_args_list[0].kwargs,
+                         {"timeout": self.node.AUXILIARY_SHUTDOWN_TIMEOUT})
+        self.assertIn("LTTng session daemon", stderr.write.call_args_list[0].args[0])
 
     def test_unexpected_host_or_auxiliary_exit_is_a_failure(self):
         for command, auxiliary in [

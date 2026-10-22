@@ -43,6 +43,7 @@ class OneboxTests(unittest.TestCase):
             "image": "sha256:" + "b" * 64, "subnet": onebox.DEFAULT_SUBNET,
             "runtime_version": ctl.RUNTIME, "manifest_version": "1",
             "phase": "ready", "baseline": "complete", "publish_gateway": True,
+            "shutdown_timeout": ctl.SHUTDOWN_TIMEOUT,
         }
         state = self.cluster.state
         _, _, self.xml = onebox.generate(
@@ -67,6 +68,7 @@ class OneboxTests(unittest.TestCase):
             "127.0.0.1:19080:19080", "127.0.0.1:19000:19000",
         ])
         self.assertEqual(service["image"], self.cluster.state["image"])
+        self.assertEqual(service["stop_grace_period"], f"{ctl.SHUTDOWN_TIMEOUT}s")
         self.assertEqual(service["environment"]["SF_LAYOUT"], "onebox")
         self.assertNotIn("HOME", service["environment"])
         self.assertEqual(service["labels"][ctl.OWNER_LABEL], "a" * 32)
@@ -99,6 +101,19 @@ class OneboxTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "inputs changed"):
             self.cluster.load()
 
+    def test_legacy_onebox_retains_frozen_shutdown_grace_period(self):
+        del self.cluster.state["shutdown_timeout"]
+        compose = json.loads((self.directory / "compose.json").read_text())
+        compose["services"]["onebox"]["stop_grace_period"] = "45s"
+        ctl.write_json(self.directory / "compose.json", compose)
+        self.cluster.save()
+        self.cluster.load()
+        with patch.object(self.cluster, "resources", return_value=([], [], [])), \
+                patch.object(self.cluster, "compose") as execute:
+            self.cluster.down()
+        self.assertEqual([call.args for call in execute.call_args_list],
+                         [("stop", "--timeout", "45"), ("down", "--timeout", "45")])
+
     def test_credentials_are_generated_once_and_retained(self):
         state = self.cluster.state
         _, _, second = onebox.generate(
@@ -127,7 +142,7 @@ class OneboxTests(unittest.TestCase):
         helper.assert_called_once_with(self.cluster.state["nodes"][0], ctl.READ_VOLUME, readonly=True)
         self.assertEqual([call.args for call in compose.call_args_list], [
             ("up", "-d", "--no-build", "--pull", "never", "onebox"),
-            ("restart", "--timeout", "45", "onebox"),
+            ("restart", "--timeout", str(ctl.SHUTDOWN_TIMEOUT), "onebox"),
         ])
         wait.assert_called_once_with(False, stable=0)
         self.assertEqual(self.cluster.state["baseline"], "not-started")

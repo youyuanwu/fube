@@ -12,6 +12,7 @@ import sys
 
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "docker/linux-cluster/ClusterManifest.template.xml"
+SHUTDOWN_TIMEOUT = 150
 
 
 def check_subnet(subnet, occupied):
@@ -61,7 +62,7 @@ def generate(project, subnet, image_id, pinned_image, manifest_path):
             "image": pinned_image,
             "hostname": name,
             "privileged": True,
-            "stop_grace_period": "45s",
+            "stop_grace_period": f"{SHUTDOWN_TIMEOUT}s",
             "environment": {
                 "SF_" + key.upper(): value
                 for key, value in identity.items()

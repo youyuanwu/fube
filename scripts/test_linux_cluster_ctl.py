@@ -54,6 +54,7 @@ class LifecycleTests(unittest.TestCase):
             "image": "sha256:" + "b" * 64, "subnet": "172.29.99.0/24",
             "runtime_version": ctl.RUNTIME, "manifest_version": "1",
             "phase": "ready", "baseline": "complete", "publish_gateway": True,
+            "shutdown_timeout": ctl.SHUTDOWN_TIMEOUT,
         }
         compose, nodes = ctl.definition(self.cluster.state, self.directory)
         self.cluster.state["nodes"] = nodes
@@ -72,6 +73,7 @@ class LifecycleTests(unittest.TestCase):
             service = compose["services"][node["node_name"]]
             self.assertEqual(service["image"], self.cluster.state["image"])
             self.assertEqual(service["labels"], {ctl.OWNER_LABEL: "a" * 32})
+            self.assertEqual(service["stop_grace_period"], f"{ctl.SHUTDOWN_TIMEOUT}s")
             self.assertNotIn("profiles", service)
             self.assertNotIn("network_mode", service)
             if node["node_name"] == "n0":
@@ -83,6 +85,30 @@ class LifecycleTests(unittest.TestCase):
         self.assertNotIn("ports", tools)
         self.assertEqual(tools["environment"]["HOME"], "/tmp/sfctl-home")
         self.assertTrue(tools["volumes"][0]["read_only"])
+
+    def test_legacy_allocation_retains_frozen_shutdown_grace_period(self):
+        del self.cluster.state["shutdown_timeout"]
+        compose = json.loads((self.directory / "compose.json").read_text())
+        for name in ctl.NODES:
+            compose["services"][name]["stop_grace_period"] = "45s"
+        ctl.write_json(self.directory / "compose.json", compose)
+        self.cluster.save()
+        self.cluster.load()
+        with patch.object(self.cluster, "resources", return_value=([], [], [])), \
+                patch.object(self.cluster, "compose") as execute:
+            self.cluster.down()
+        self.assertEqual([call.args for call in execute.call_args_list],
+                         [("stop", "--timeout", "45"), ("down", "--timeout", "45")])
+        with patch.object(self.cluster, "resources", return_value=([], [], [])), \
+                patch.object(self.cluster, "image_tag_id", return_value=""), \
+                patch.object(self.cluster, "compose") as execute:
+            self.cluster.destroy("test")
+        execute.assert_called_once_with("down", "--timeout", "45")
+
+    def test_compose_command_deadline_exceeds_container_shutdown_deadline(self):
+        with patch.object(ctl, "run") as run:
+            self.cluster.compose("stop", "--timeout", str(ctl.SHUTDOWN_TIMEOUT))
+        self.assertGreater(run.call_args.kwargs["timeout"], ctl.SHUTDOWN_TIMEOUT)
 
     def test_legacy_allocation_retains_unpublished_gateway(self):
         del self.cluster.state["publish_gateway"]
@@ -174,7 +200,8 @@ class LifecycleTests(unittest.TestCase):
                 result = self.cluster.down()
             self.assertTrue(result["data_preserved"])
             self.assertEqual([call.args for call in compose.call_args_list],
-                             [("stop", "--timeout", "45"), ("down", "--timeout", "45")])
+                             [("stop", "--timeout", str(ctl.SHUTDOWN_TIMEOUT)),
+                              ("down", "--timeout", str(ctl.SHUTDOWN_TIMEOUT))])
             self.assertEqual(self.cluster.state["phase"], "allocating" if phase == "allocating" else "down")
 
     def test_failed_shutdown_is_reported_after_preserving_data(self):
@@ -201,7 +228,7 @@ class LifecycleTests(unittest.TestCase):
                 patch.object(self.cluster, "compose") as compose, patch.object(ctl, "run") as run:
             result = self.cluster.destroy("test")
         self.assertTrue(result["data_deleted"])
-        compose.assert_called_once_with("down", "--timeout", "45")
+        compose.assert_called_once_with("down", "--timeout", str(ctl.SHUTDOWN_TIMEOUT))
         self.assertEqual([call.args[0] for call in run.call_args_list],
                          [["docker", "volume", "rm", volume["Name"]] for volume in volumes])
         self.assertFalse((self.directory / "ClusterManifest.xml").exists())
@@ -231,6 +258,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertNotEqual(self.cluster.state["manifest_sha256"], original["manifest_sha256"])
         self.assertEqual(self.cluster.state["baseline"], "not-started")
         self.assertIs(self.cluster.state["publish_gateway"], True)
+        self.assertEqual(self.cluster.state["shutdown_timeout"], ctl.SHUTDOWN_TIMEOUT)
         compose = json.loads((self.directory / "compose.json").read_text())
         self.assertEqual(compose["services"]["n0"]["ports"], ["127.0.0.1:19080:19080"])
 
@@ -332,7 +360,8 @@ class LifecycleTests(unittest.TestCase):
                             for call in helper.call_args_list))
         self.assertEqual(compose.call_args_list[0].args,
                          ("up", "-d", "--no-build", "--pull", "never", *ctl.NODES))
-        self.assertEqual(compose.call_args_list[1].args, ("restart", "--timeout", "45", "n2"))
+        self.assertEqual(compose.call_args_list[1].args,
+                         ("restart", "--timeout", str(ctl.SHUTDOWN_TIMEOUT), "n2"))
         self.assertEqual(wait.call_args_list[0].args, (False,))
         self.assertEqual(wait.call_args_list[1].args, (True,))
 

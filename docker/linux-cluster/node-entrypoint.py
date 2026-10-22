@@ -27,6 +27,8 @@ IDENTITY_FIELDS = (
     "volume_name",
 )
 ONEBOX_NODES = ("N0010", "N0020", "N0030", "N0040", "N0050")
+HOST_SHUTDOWN_TIMEOUT = 90
+AUXILIARY_SHUTDOWN_TIMEOUT = 30
 
 
 def expected_identity(environ):
@@ -187,13 +189,15 @@ def prepare_deployment(root, identity, record):
     save_identity(root, record)
 
 
-def stop_process(process, timeout=20):
+def stop_process(process, timeout=AUXILIARY_SHUTDOWN_TIMEOUT, *,
+                 name="process", stop_signal=signal.SIGTERM):
     if process.poll() is None:
-        process.terminate()
+        process.send_signal(stop_signal)
         try:
             process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            print(f"ERROR: process {process.pid} exceeded shutdown deadline; sending SIGKILL",
+            print(f"ERROR: {name} (pid {process.pid}) exceeded {timeout}s shutdown deadline; "
+                  "sending SIGKILL",
                   file=sys.stderr, flush=True)
             process.kill()
             process.wait()
@@ -203,27 +207,27 @@ def stop_process(process, timeout=20):
 
 def supervise(command, auxiliaries):
     requested = []
-    host = subprocess.Popen(command)
     previous = {}
 
     def request_stop(number, _frame):
-        requested.append(number)
-        if host.poll() is None:
-            host.send_signal(number)
+        if not requested:
+            requested.append(number)
 
     for number in (signal.SIGTERM, signal.SIGINT):
         previous[number] = signal.signal(number, request_stop)
     try:
+        host = subprocess.Popen(command)
         while host.poll() is None and not requested:
             failed = [process for process in auxiliaries if process.poll() is not None]
             if failed:
                 print(f"ERROR: required auxiliary process {failed[0].pid} exited",
                       file=sys.stderr, flush=True)
-                stop_process(host)
+                stop_process(host, HOST_SHUTDOWN_TIMEOUT, name="FabricHost")
                 return 1
             time.sleep(0.1)
         if requested:
-            if not stop_process(host):
+            if not stop_process(host, HOST_SHUTDOWN_TIMEOUT, name="FabricHost",
+                                stop_signal=requested[0]):
                 return 1
             return 0
         print(f"ERROR: FabricHost exited unexpectedly: {host.returncode}",
@@ -254,7 +258,7 @@ def start_tracing(root):
         run(["lttng", "start"])
         return daemon
     except (OSError, RuntimeError, subprocess.SubprocessError):
-        stop_process(daemon)
+        stop_process(daemon, name="LTTng session daemon")
         raise
 
 
@@ -282,7 +286,7 @@ def main():
             print(f"Starting node {identity['node_name']}; SSH is disabled", flush=True)
             return supervise([str(BIN / "FabricHost"), "-c", "-skipfabricsetup"], [tracing])
         finally:
-            if not stop_process(tracing):
+            if not stop_process(tracing, name="LTTng session daemon"):
                 raise RuntimeError("LTTng session daemon required forced termination")
 
 

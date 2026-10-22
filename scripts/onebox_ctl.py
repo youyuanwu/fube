@@ -6,7 +6,7 @@ from string import Template
 import sys
 
 import linux_cluster_ctl as ctl
-from linux_cluster import check_subnet
+from linux_cluster import SHUTDOWN_TIMEOUT, check_subnet
 
 
 STATE_ROOT = ctl.REPO / "build/oneboxes"
@@ -34,7 +34,7 @@ def generate(project, subnet, image_id, pinned_image, manifest_path):
         "name": project,
         "services": {"onebox": {
             "image": pinned_image, "hostname": "onebox", "privileged": True,
-            "stop_grace_period": "45s",
+            "stop_grace_period": f"{SHUTDOWN_TIMEOUT}s",
             "environment": {
                 "SF_" + key.upper(): value for key, value in identity.items() if key != "phase"
             },
