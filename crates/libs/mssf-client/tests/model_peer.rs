@@ -21,6 +21,9 @@ const REMOTE_CODE: i64 = -2147017794;
 #[path = "support/health_model.rs"]
 mod health_queries;
 
+#[path = "support/name_model.rs"]
+mod name_writes;
+
 fn body(fields: impl FnOnce(&mut Encoder) -> mssf_transport::Result<()>) -> Vec<u8> {
     let mut encoder = Encoder::new();
     encoder.object(fields).unwrap();

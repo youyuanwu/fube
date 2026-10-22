@@ -202,7 +202,7 @@ jobs:
     - name: Check fresh cluster health
       run: python3 "$CLUSTER_CTL" status "$CLUSTER_NAME" > "$RUNNER_TEMP/linux-cluster-status-created.json"
 
-    - name: Exercise real native ping, NameExists, node list and health
+    - name: Exercise real native reads, health and owned name writes
       id: native_client
       if: matrix.topology == 'onebox'
       run: |
@@ -217,6 +217,9 @@ jobs:
         MSSF_HEALTH_CONFIG: ${{ runner.temp }}/native-health-config.json
         MSSF_HEALTH_REPORT: ${{ runner.temp }}/native-health-report.json
         MSSF_HEALTH_OWNER: ci-${{ github.run_id }}-${{ github.run_attempt }}
+        MSSF_NAME_CONFIG: ${{ runner.temp }}/native-name-config.json
+        MSSF_NAME_REPORT: ${{ runner.temp }}/native-name-report.json
+        MSSF_NAME_OWNER: ci-${{ github.run_id }}-${{ github.run_attempt }}
 
     - name: Upload successful native client evidence
       if: matrix.topology == 'onebox' && steps.native_client.outcome == 'success'
@@ -226,6 +229,7 @@ jobs:
         path: |
           ${{ runner.temp }}/native-client-report.json
           ${{ runner.temp }}/native-health-report.json
+          ${{ runner.temp }}/native-name-report.json
         if-no-files-found: error
         retention-days: 7
 

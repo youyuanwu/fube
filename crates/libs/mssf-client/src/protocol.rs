@@ -5,6 +5,9 @@ use mssf_transport::{
 
 use crate::{Error, GatewayDescription, Result};
 
+// ClientServerTransport::DeleteNameHeader: public deletion is explicit.
+pub(crate) const DELETE_NAME_HEADER: u16 = 0x8033;
+
 pub(crate) fn encode_name(name: &str) -> Result<Vec<u8>> {
     if name.len() > 4096 {
         return Err(Error::InvalidInput("naming URI exceeds 4096 bytes"));
@@ -157,6 +160,14 @@ pub(crate) fn decode_name_exists(message: &Message) -> Result<bool> {
     })?;
     decoder.finish()?;
     Ok(exists)
+}
+
+pub(crate) fn decode_name_write(message: &Message) -> Result<()> {
+    check_reply(message, &["NameOperationReply"])?;
+    if !message.body.is_empty() {
+        return Err(Error::Protocol("name write success body must be empty"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

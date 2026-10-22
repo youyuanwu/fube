@@ -6,13 +6,15 @@ use mssf_client::{
 };
 
 const USAGE: &str =
-    "usage: onebox --clear IP:port ping|node-list [--timeout-seconds N]\n       onebox --clear IP:port name-exists fabric:/name [--timeout-seconds N]\n       onebox --clear IP:port node-health NODE [--events-filter U32] [--warning-as-error true|false] [--timeout-seconds N]";
+    "usage: onebox --clear IP:port ping|node-list [--timeout-seconds N]\n       onebox --clear IP:port name-exists|create-name|delete-name fabric:/name [--timeout-seconds N]\n       onebox --clear IP:port node-health NODE [--events-filter U32] [--warning-as-error true|false] [--timeout-seconds N]";
 
 #[derive(Debug)]
 enum Operation {
     Ping,
     NodeList,
     NameExists(String),
+    CreateName(String),
+    DeleteName(String),
     NodeHealth(NodeHealthQueryDescription),
 }
 
@@ -41,6 +43,8 @@ fn arguments(mut args: Vec<String>) -> Result<(SocketAddr, Operation, Duration)>
         "ping" if args.len() == 3 => Operation::Ping,
         "node-list" if args.len() == 3 => Operation::NodeList,
         "name-exists" if args.len() == 4 => Operation::NameExists(args[3].clone()),
+        "create-name" if args.len() == 4 => Operation::CreateName(args[3].clone()),
+        "delete-name" if args.len() == 4 => Operation::DeleteName(args[3].clone()),
         "node-health" if args.len() >= 4 => {
             let mut query = NodeHealthQueryDescription::new(&args[3]);
             let (options, remainder) = args[4..].as_chunks::<2>();
@@ -100,6 +104,15 @@ async fn run() -> Result<()> {
         Operation::NameExists(name) => {
             println!("name={name} exists={}", client.name_exists(&name).await?);
         }
+        Operation::CreateName(name) => {
+            // Sent writes can execute despite timeout/cancel/disconnect. Never replay.
+            client.create_name_with_timeout(&name, timeout).await?;
+            println!("created name={name}");
+        }
+        Operation::DeleteName(name) => {
+            client.delete_name_with_timeout(&name, timeout).await?;
+            println!("deleted name={name}");
+        }
     }
     client.close().await
 }
@@ -148,9 +161,28 @@ mod tests {
             "node-health N0020 --events-filter 0 --events-filter 1",
             "node-health N0020 --warning-as-error true --warning-as-error false",
             "ping --timeout-seconds 1 --timeout-seconds 2",
+            "create-name",
+            "delete-name",
+            "create-name fabric:/owned extra",
+            "delete-name fabric:/owned --recursive",
+            "create-name fabric:/owned --timeout-seconds 0",
+            "delete-name fabric:/owned --timeout-seconds NaN",
+            "create-name fabric:/owned --timeout-seconds 1 --timeout-seconds 2",
         ] {
             assert!(parse(input).is_err(), "{input}");
         }
+    }
+
+    #[test]
+    fn name_writes_preserve_explicit_name_and_timeout() {
+        let (endpoint, operation, timeout) =
+            parse("create-name fabric:/owned --timeout-seconds 0.5").unwrap();
+        assert_eq!(endpoint, "127.0.0.1:19000".parse().unwrap());
+        assert!(matches!(operation, Operation::CreateName(name) if name == "fabric:/owned"));
+        assert_eq!(timeout, Duration::from_millis(500));
+        let (_, operation, timeout) = parse("delete-name fabric:/owned").unwrap();
+        assert!(matches!(operation, Operation::DeleteName(name) if name == "fabric:/owned"));
+        assert_eq!(timeout, DEFAULT_TIMEOUT);
     }
 }
 

@@ -83,6 +83,57 @@ impl FabricClient {
         .await
     }
 
+    /// Explicitly create a naming entry using the default timeout.
+    ///
+    /// Uses the same supported URI profile as [`Self::name_exists`]. Native
+    /// creation may create implicit ancestors or promote an implicit entry;
+    /// an already explicitly created entry returns a native error.
+    ///
+    /// No retry or replay occurs. After sending, timeout, cancellation or
+    /// disconnection can leave the write outcome unknown: stopping local
+    /// waiting does not prove that the name was not created.
+    pub async fn create_name(&self, name: &str) -> Result<()> {
+        self.create_name_with_timeout(name, self.timeout).await
+    }
+
+    /// Create a name with one deadline covering preparation through decode.
+    ///
+    /// See [`Self::create_name`] for native semantics and post-send uncertainty.
+    pub async fn create_name_with_timeout(&self, name: &str, timeout: Duration) -> Result<()> {
+        let deadline = deadline_after(timeout)?;
+        let body = protocol::encode_name(name)?;
+        self.request("CreateNameRequest", body, deadline, |reply| {
+            protocol::decode_name_write(&reply)
+        })
+        .await
+    }
+
+    /// Explicitly delete one naming entry using the default timeout.
+    ///
+    /// Uses the same URI profile as [`Self::name_exists`]. This is not recursive:
+    /// native missing-name and nonempty-name failures remain errors. The service
+    /// may also remove empty implicit ancestors.
+    ///
+    /// No retry or replay occurs. After sending, timeout, cancellation or
+    /// disconnection can leave the write outcome unknown; none proves that
+    /// deletion did not execute. Native errors are not converted to success.
+    pub async fn delete_name(&self, name: &str) -> Result<()> {
+        self.delete_name_with_timeout(name, self.timeout).await
+    }
+
+    /// Delete a name with one deadline covering preparation through decode.
+    ///
+    /// See [`Self::delete_name`] for native semantics and post-send uncertainty.
+    pub async fn delete_name_with_timeout(&self, name: &str, timeout: Duration) -> Result<()> {
+        let deadline = deadline_after(timeout)?;
+        let body = protocol::encode_name(name)?;
+        let headers = vec![Header::boolean(protocol::DELETE_NAME_HEADER, true)?];
+        self.request_with_headers("DeleteNameRequest", headers, body, deadline, |reply| {
+            protocol::decode_name_write(&reply)
+        })
+        .await
+    }
+
     /// Get one native node page. Inspect `continuation_token` even without an
     /// explicit page limit: the server can also page by message size.
     ///
@@ -150,10 +201,20 @@ impl FabricClient {
         deadline: Instant,
         decode: fn(mssf_transport::message::Message) -> Result<T>,
     ) -> Result<T> {
-        let headers = vec![
-            Header::activity(Uuid::new_v4().to_bytes_le())?,
-            Header::version(1, 1)?,
-        ];
+        self.request_with_headers(action, Vec::new(), body, deadline, decode)
+            .await
+    }
+
+    async fn request_with_headers<T: Send + 'static>(
+        &self,
+        action: &str,
+        mut headers: Vec<Header>,
+        body: Vec<u8>,
+        deadline: Instant,
+        decode: fn(mssf_transport::message::Message) -> Result<T>,
+    ) -> Result<T> {
+        headers.push(Header::activity(Uuid::new_v4().to_bytes_le())?);
+        headers.push(Header::version(1, 1)?);
         self.connection
             .request_decoded(action, 5, headers, body, deadline, decode)
             .await

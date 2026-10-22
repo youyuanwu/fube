@@ -1,7 +1,7 @@
 # Rust FabricClient POC
 
 **Status:** experimental native clear-TCP subset. Gateway ping, NameExists,
-typed GetNodeList and single-node GetNodeHealth
+typed GetNodeList, single-node GetNodeHealth, and native CreateName/DeleteName
 have been demonstrated against the repository's Ubuntu onebox running
 Service Fabric **11.8.121.4**. This is not a complete FabricClient replacement
 and does not support TLS or authentication.
@@ -11,8 +11,8 @@ and does not support TLS or authentication.
 `mssf-transport` implements bounded Fabric serialization, clear frames and CRCs,
 ordered native headers, client-only ListenInstance establishment, and
 continuously driven, bounded concurrent Tokio request/reply I/O. `mssf-client`
-adds native gateway ping, NameExists, typed node-list pages and node health, with
-owned results and explicit errors.
+adds native gateway ping, NameExists, typed node-list pages, node health and
+single-name creation/deletion, with owned results and explicit errors.
 
 Neither package calls the native Service Fabric client or COM libraries.
 Neither uses HTTP to execute client operations. "Clear TCP" still carries the
@@ -22,6 +22,7 @@ Neither uses HTTP to execute client operations. "Clear TCP" still carries the
 |---|---|
 | Gateway ping | Sends PingRequest with an empty body and decodes gateway address, node ID, node instance, and node name. Full identity compared with independent onebox observations. |
 | NameExists | Sends a parsed ten-field native URI object; independently established existing/absent names returned true/false on the same connection. |
+| CreateName / DeleteName | Send the same direct URI object, with explicit-delete header `0x8033` for deletion. Require actor 5 / `NameOperationReply` and zero body bytes. Unique owned lifecycle independently observed absent → present → absent; native duplicate/missing errors followed by healthy same-connection reuse qualified live. |
 | GetNodeList | Sends the external `GetNodeList` string query to NamingGateway using `QueryRequest`; decodes all 21 source-defined node fields, nested deactivation data and explicit paging. Five-node membership/overlapping fields independently checked through management; binary ports checked against the onebox manifest. |
 | GetNodeHealth | Sends external `GetNodeHealth` via NamingGateway; validates the HM single-item envelope, aggregate, full events and Event evaluations. Independently injected Warning, false/true/inherited policy, event masks, unknown-node error and healthy same-connection reuse qualified live. |
 | Native faults/errors | Retains native signed error codes and available diagnostics. Malformed GetNodeList continuation produced live `E_INVALIDARG` (-2147024809) or `FMFailoverUnitNotFound` (-2147017462); the same connection remained usable. Other fault forms have offline model-peer coverage. |
@@ -86,6 +87,29 @@ Port **19000** is native TCP; **19080** is HTTP management, not a fallback.
 The `--clear` flag is mandatory. Endpoints are IP socket addresses, including
 bracketed IPv6, not DNS names or URLs.
 
+To exercise native writes instead of management preparation, use a fresh name
+that belongs only to you on your disposable allocation:
+
+```sh
+owned_name="fabric:/rust-poc-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+cargo run -p mssf-client --example onebox -- \
+  --clear 127.0.0.1:19000 name-exists "$owned_name"
+# Proceed only after confirming absence; never adopt an existing name.
+cargo run -p mssf-client --example onebox -- \
+  --clear 127.0.0.1:19000 create-name "$owned_name" --timeout-seconds 5
+cargo run -p mssf-client --example onebox -- \
+  --clear 127.0.0.1:19000 name-exists "$owned_name"
+cargo run -p mssf-client --example onebox -- \
+  --clear 127.0.0.1:19000 delete-name "$owned_name" --timeout-seconds 5
+```
+
+These separate CLI calls are not an ownership journal or automatic cleanup
+tool. **After send, timeout, cancellation or disconnect can leave a write's
+outcome unknown**, even if the name currently appears absent. Do not blindly
+retry or claim nonexecution. Keep ownership until the write is conclusively
+settled or your exact disposable allocation is destroyed. The automated
+qualification below journals ownership before writes and uses one shared client.
+
 The default connection/per-operation timeout is 30 seconds. Override it with
 `--timeout-seconds 5`; only finite positive durations of at least 100 ns that
 fit native TimeSpan and the monotonic clock are accepted. Errors use a nonzero
@@ -119,6 +143,41 @@ The handle is **cloneable**; operations take `&self` and share one connection.
 Admission allows 32 operations, including completed results not yet delivered
 to their awaiting futures. Excess callers wait within their original deadlines.
 There is no automatic reconnect, retry, or replay.
+
+`create_name(&str)` and `delete_name(&str)` return owned `Result<()>`.
+`create_name_with_timeout(&str, Duration)` and
+`delete_name_with_timeout(&str, Duration)` supply one deadline calculated
+**before URI preparation**, through admission and reply decoding. The default
+variants use the connection's configured timeout. All four reuse the existing
+bounded URI encoder and shared driver; the supported URI grammar is unchanged.
+For example, with a unique caller-owned name on a disposable cluster:
+
+```rust,no_run
+# async fn write(client: &mssf_client::FabricClient, owned_name: &str) -> mssf_client::Result<()> {
+client.create_name_with_timeout(owned_name, std::time::Duration::from_secs(5)).await?;
+client.delete_name(owned_name).await?;
+# Ok(())
+# }
+```
+
+Creation can create implicit ancestors or promote an implicit name. Creating
+an already **explicitly created** name returns native `FABRIC_E_NAME_ALREADY_EXISTS`
+(-2147017792), not an idempotent success. Deleting an absent name returns
+`FABRIC_E_NAME_DOES_NOT_EXIST` (-2147017791). Deletion is not recursive and can
+reject a nonempty name; the service may remove empty implicit ancestors.
+Native codes and available diagnostics remain `Error::Remote`, operation-local
+when the stream is healthy. Write success has an empty body, unlike NameExists
+despite their shared reply action.
+
+Writes are never automatically retried or replayed. A timeout, cancellation or
+disconnect after sending **does not establish that the write failed to execute**:
+replication may commit after local waiting stops. Dropping the future or closing
+the connection does not roll back a sent write.
+
+Implementation: [write facade](../../crates/libs/mssf-client/src/lib.rs#L85-L136)
+and [empty-success decoder](../../crates/libs/mssf-client/src/protocol.rs#L165-L171).
+Native contract: [public request construction](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/client/FabricClientImpl.cpp#L6881-L6976)
+and [gateway create reply](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/EntreeService.CreateNameAsyncOperation.cpp#L24-L49).
 
 Each operation has one local monotonic deadline covering encoding, sending,
 control dispatch, receiving, and result decoding. Replies match both message
@@ -353,16 +412,16 @@ to pass against the real onebox.
 
 Tests that need onebox are named `onebox_*` and assigned to the shared
 **`onebox` nextest group** in `.config/nextest.toml`. They remain `#[ignore]`
-for ordinary Cargo runs. The group permits only one test at a time; either
+for ordinary Cargo runs. The group permits only one test at a time; any
 scenario may run first. Each test prepares its own fresh independent
 observations and completes its cleanup before returning. Setup and restoration
 are helper functions, not tests with ordering dependencies. Select the group
 once; no individual test-name selectors or manual preparation are needed.
 
 On a fresh disposable local onebox, provide absolute private output paths and
-a unique health-report owner. The baseline helper uses test-only `reqwest` HTTP
+a unique fixture owner. The baseline helper uses test-only `reqwest` HTTP
 calls to prepare synthetic names and independently observe healthy five-node
-membership. The health scenario prepares and restores its own report:
+membership. Health restores its own report; names journals its own unique entry:
 
 ```sh
 mkdir -p build/poc-native
@@ -371,6 +430,9 @@ export MSSF_TEST_REPORT="$PWD/build/poc-native/report.json"
 export MSSF_HEALTH_CONFIG="$PWD/build/poc-native/health-config.json"
 export MSSF_HEALTH_REPORT="$PWD/build/poc-native/health-report.json"
 export MSSF_HEALTH_OWNER="poc-unique-task-id"
+export MSSF_NAME_CONFIG="$PWD/build/poc-native/name-config.json"
+export MSSF_NAME_REPORT="$PWD/build/poc-native/name-report.json"
+export MSSF_NAME_OWNER="poc-unique-task-id"
 cargo nextest archive --locked -p mssf-transport -p mssf-client \
   --archive-file build/poc-native/native-client-tests.tar.zst
 export MSSF_TEST_ARCHIVE_SHA256="$(sha256sum build/poc-native/native-client-tests.tar.zst | cut -d ' ' -f 1)"
@@ -380,9 +442,9 @@ cargo nextest run --archive-file build/poc-native/native-client-tests.tar.zst \
 
 Preparation uses the published local HTTP gateway at `127.0.0.1:19080` and records
 the first native gateway at `127.0.0.1:19000` / N0010. Every execution leg
-automatically refreshes its observations before native assertions. Creating
-the naming fixture is idempotent (HTTP conflict is followed by an independent
-existence check); unexpected HTTP results fail. Node observation timestamps
+automatically refreshes its observations before native assertions. The baseline's
+read-test prerequisite accepts HTTP conflict followed by an independent existence
+check; unexpected HTTP results fail. Node observation timestamps
 must be no more than 120 seconds old and not future-dated at native test start.
 Proxy use and redirects are disabled. No additional CI job is needed.
 `reqwest` has JSON support only, with default/TLS features disabled, and is a
@@ -416,8 +478,8 @@ Use **absolute paths** for all configuration/report outputs; integration tests
 run from the package directory. Profiles are generated inside each scenario,
 not reused as an externally ordered prerequisite.
 
-Each test fails on missing/wrong configuration, inaccessible native
-gateway, identity mismatch, or unmet naming prerequisites. It writes a result
+Tests fail on missing/wrong configuration, inaccessible native gateways or unmet
+prerequisites. The baseline scenario writes a result
 only after node field/filter/paging/error assertions, sequential ping/true/false,
 32 initially Pending overlapping mixed operations on clones (14 ping, 6 existing
 names, 6 absent names, 6 node queries),
@@ -513,6 +575,52 @@ Error, expired nonremoved reports, synthetic HM conditions, future evaluation
 kinds and other runtimes are not live-qualified. Their source/model coverage
 must not be described as native interoperability.
 
+### Owned native name-management qualification
+
+The name scenario is self-contained and does not use HTTP to create the name
+being qualified. It persists a UUID-based, owner-specific, single-segment name
+before observation; it confirms initial absence independently with HTTP and
+records that proof **before any native mutation**. An existing candidate is
+never adopted or deleted. Existing journals are never overwritten, including
+same-owner unresolved writes.
+
+On one shared native client it confirms initial absence, creates the name,
+checks HTTP/native presence, requires duplicate-create error -2147017792 and
+healthy reuse, deletes the name, checks HTTP/native absence, then requires
+missing-delete error -2147017791 and healthy reuse/ping. Management HTTP is only
+an independent observation and owned-cleanup oracle: GET `/Names/NAME` uses
+200/empty 404 statuses; cleanup uses DELETE `/Names/NAME`, API version 6.0.
+It is never a production fallback.
+
+The private `MSSF_NAME_CONFIG` journal contains the exact owner, canonical UUID,
+derived name, archive SHA256 and stage. Pending is persisted before each write.
+Only a conclusive success or the specifically expected duplicate/missing
+rejection settles it. Timeout, cancellation, disconnect or unexpected failure
+retains ownership. Cleanup can best-effort delete only that pre-owned name but
+**cannot release an uncertain write merely because it observes absence**:
+a delayed create can still commit. Such cleanup reports uncertainty and retains
+the journal until proven completion or verified exact-allocation destruction.
+Preparation/native errors and assertion panics pass through the shared
+cleanup-before-report wrapper. A hard kill/external cancellation can bypass
+in-process cleanup; exact-allocation always-run teardown remains essential.
+
+`MSSF_NAME_REPORT` is written only after settled owned cleanup succeeds. It
+records independent lifecycle observations, native results/error codes,
+same-client reuse, runtime and archive identity. Keep journals private/ignored;
+after exact destruction, remove private profiles and extracted consumers.
+Never use these fixtures on a shared cluster.
+
+The native-name archive qualified on **11.8.121.4**, five logical nodes in one
+Ubuntu container, with **119 offline tests and all three live group scenarios**.
+Offline tests cover exact requests, malformed-success retirement, concurrent
+reordering, peer-observed cancellation/timeouts without replay, partial setup,
+collision/foreign-owner refusal, errors/panics, cleanup failure and
+absence-then-late-create ownership retention. They do not establish runtime
+compatibility on their own. This live lifecycle does not qualify recursive or
+property operations, nonempty-name deletion, implicit-ancestor promotion,
+arbitrary runtime versions, TLS, retry/reconnect or remote completion after a
+real transport failure.
+
 ### Build once, run the archive on onebox
 
 The Linux Rust job compiles the selected packages' test binaries, including
@@ -541,6 +649,9 @@ export MSSF_TEST_ARCHIVE_SHA256="$(sha256sum "$archive" | cut -d ' ' -f 1)"
 export MSSF_HEALTH_CONFIG="$PWD/build/poc-native/health-config.json"
 export MSSF_HEALTH_REPORT="$PWD/build/poc-native/health-report.json"
 export MSSF_HEALTH_OWNER="poc-unique-task-id"
+export MSSF_NAME_CONFIG="$PWD/build/poc-native/name-config.json"
+export MSSF_NAME_REPORT="$PWD/build/poc-native/name-report.json"
+export MSSF_NAME_OWNER="poc-unique-task-id"
 # MSSF_TEST_CONFIG / MSSF_TEST_REPORT must also be set, as above.
 cargo-nextest nextest run --archive-file "$archive" --workspace-remap "$PWD" \
   --run-ignored all -E 'group(onebox)' --no-tests fail
@@ -548,15 +659,17 @@ cargo-nextest nextest run --archive-file "$archive" --workspace-remap "$PWD" \
 
 These commands extract and execute prebuilt tests without rebuilding them.
 `--workspace-remap` handles a different checkout path. Empty selections fail
-rather than silently reporting success. Only the sanitized native success
-report and compiled test archive are uploaded, never the private configuration,
+rather than silently reporting success. Only the three sanitized native success
+reports and compiled test archive are uploaded, never the private configurations,
 raw runtime logs, or credentials.
 Every host or compiler-free consumer leg uses this single group command;
 each test automatically repeats its independent preparation and restoration.
-The same archive has been exercised offline,
-on the native host, and in an Ubuntu 24.04 container with standalone nextest and
-no cargo/rustc in PATH. Compiler-free execution used host networking for the
-loopback gateways, read-only source and a private writable evidence directory.
+The native-name archive was exercised offline and on the real onebox through
+the standalone host consumer, without compilation during either consumer leg.
+Earlier read/health archives also ran in an Ubuntu 24.04 consumer container with
+standalone nextest and no cargo/rustc in PATH, using host networking for loopback
+gateways, read-only source and a private writable evidence directory. That
+historical container-consumer result is not a new native-name qualification.
 No compiler/SDK installation or separate CI infrastructure is required.
 
 ## 6. Deliberate exclusions
