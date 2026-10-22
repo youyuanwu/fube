@@ -9,8 +9,8 @@ and does not support TLS or authentication.
 
 `mssf-transport` implements bounded Fabric serialization, clear frames and CRCs,
 ordered native headers, client-only ListenInstance establishment, and
-sequential Tokio request/reply I/O. `mssf-client` adds native gateway ping and
-NameExists, with owned results and explicit errors.
+continuously driven, bounded concurrent Tokio request/reply I/O. `mssf-client`
+adds native gateway ping and NameExists, with owned results and explicit errors.
 
 Neither package calls the native Service Fabric client or COM libraries.
 Neither uses HTTP to execute client operations. "Clear TCP" still carries the
@@ -21,7 +21,9 @@ Neither uses HTTP to execute client operations. "Clear TCP" still carries the
 | Gateway ping | Sends PingRequest with an empty body and decodes gateway address, node ID, node instance, and node name. Full identity compared with independent onebox observations. |
 | NameExists | Sends a parsed ten-field native URI object; independently established existing/absent names returned true/false on the same connection. |
 | Native faults/errors | Retains native signed error codes and available diagnostics; offline model-peer coverage only, not live error-path qualification. |
-| Stream lifecycle | Bounded deadlines, fragmentation, partial writes, correlation, cancellation, and close; offline model-peer coverage. |
+| Concurrent operations | Mixed ping and NameExists on clones sharing one connection; real onebox coverage. |
+| Idle disconnect | Real native ping through a test-owned proxy, followed by proxy cutoff; closure detected without another operation. |
+| Controls and stream lifecycle | Idle ListenInstance, deadlines, fragmentation, backpressure, correlation, cancellation, and close/drop; offline model-peer coverage. |
 
 The client advertises protocol **1.1**. The demonstrated gateway replies with
 protocol **1.2**. Coverage is qualified only for the observed runtime,
@@ -85,31 +87,64 @@ use mssf_client::{FabricClient, DEFAULT_TIMEOUT};
 
 # async fn example() -> mssf_client::Result<()> {
 let endpoint = "127.0.0.1:19000".parse().expect("IP socket endpoint");
-let mut client = FabricClient::connect_clear(endpoint, DEFAULT_TIMEOUT).await?;
-let gateway = client.ping().await?;
-let exists = client.name_exists("fabric:/app/service").await?;
+let client = FabricClient::connect_clear(endpoint, DEFAULT_TIMEOUT).await?;
+let clone = client.clone();
+let (gateway, exists) = tokio::try_join!(
+    client.ping(),
+    clone.name_exists("fabric:/app/service"),
+)?;
 client.close().await?;
 # Ok(())
 # }
 ```
 
-The handle is mutable and **single-flight**. Sequential operations reuse one
-connection; there is no cloneable concurrent multiplexer, automatic reconnect,
-retry, or replay.
+The handle is **cloneable**; operations take `&self` and share one connection.
+Admission allows 32 operations, including completed results not yet delivered
+to their awaiting futures. Excess callers wait within their original deadlines.
+There is no automatic reconnect, retry, or replay.
 
 Each operation has one local monotonic deadline covering encoding, sending,
 control dispatch, receiving, and result decoding. Replies match both message
-GUID and index. Unrelated, duplicate, late, and push replies cannot complete
-another operation. More than 1,024 interleaved controls/unrelated messages
-terminates that exchange.
+GUID and index. Unknown, duplicate, and late replies cannot complete another
+operation; their bodies are discarded and a saturating diagnostic count is
+retained. More than 1,024 consecutive unmatched replies retires the connection.
 
-The in-flight future owns the socket. Cancellation, timeout, or transport/
-envelope failure closes it rather than leaving a partially written frame on
-a reusable stream. Malformed success data also closes it. An ordinary complete
-native failure remains an error but does not itself poison the stream.
-Invalid local naming input is rejected without sending.
-`close()` is explicit and idempotent; dropping the handle releases the socket.
-There is no client-owned background task.
+One background driver per connection supervises independent persistent receive,
+write, and deadline processing. It continues receiving while idle and while
+output is blocked. Supported ListenInstance controls update a peer snapshot.
+Transport controls are handled before reverse traffic and ordinary correlation;
+unsupported reverse requests fail explicitly and receive no acknowledgment.
+
+Cancellation or a reply-wait timeout removes that caller's pending entry without
+closing an otherwise healthy connection. Cancelled/expired queued frames are
+discarded before writing. A started frame is finished independently of the
+caller, or the entire connection closes: its suffix is never removed from a
+reusable stream. Started writes have an independent 30-second local progress
+limit: a cancelled/expired caller's deadline cannot truncate that frame or
+prematurely fail its neighbors. Partial incoming frames must complete
+within 30 seconds of their first byte; an idle connection has no inactivity
+timeout. A stalled partial read/write, I/O failure, or malformed frame closes
+the connection and resolves pending callers.
+
+Successful operation bodies are decoded on the driver before result delivery.
+Malformed success closes the shared connection, even if its waiter has not been
+polled again. An ordinary complete native operation failure preserves its error
+code without itself poisoning the stream. Cancellation/timeout does not imply
+that remote execution was cancelled. Invalid naming input sends nothing.
+
+`is_closed()` observes terminal state, including idle failures;
+`terminal_error()` returns the first terminal cause. Later operations surface
+that cause rather than reconnecting. `close()` is shared and idempotent, resolves
+pending callers and waits for driver exit. Cancelling its wait does not cancel
+shutdown. Dropping one clone leaves others usable; dropping the final handle
+signals shutdown without an asynchronous join. Use `close()` when release must
+be observed before continuing.
+
+`ScheduleClose` conservatively retires immediately, preserving a readable native
+fault code; native delayed security-session draining is not implemented.
+`Reconnect`, authorization/security controls, and unknown control actions are
+unsupported in this clear-only profile and terminate explicitly. This is not
+qualification of native secure-session recovery or service notifications.
 
 ## 4. Supported inputs and bounds
 
@@ -131,6 +166,19 @@ native NamingUri parser.
 | Object nesting | 32 |
 | String | 32,768 UTF-16 code units |
 | Byte-array/collection count helper | 4,096 |
+| Admitted operations, including unconsumed results | 32 |
+| Queued output frames, including cancelled commands awaiting disposal | 32 |
+| Started write / partial incoming frame | 30 seconds; request expiry ends local waiting, not started frame completion |
+
+The queue is a count bound, not an aggregate memory limit of one frame: 32
+maximum-sized queued frames can occupy 128 MiB. Memory also includes active
+encoding and frame copies, one active writer, one incoming frame and decoded
+results. Admission and queue capacity are acquired before transport frame
+encoding, and admission follows each result through delivery. Facade-prepared
+URI bodies and activity/version headers already exist before admission; waiting
+calls can own these bounded buffers. Cancelled commands retain no admission but
+remain within the queue bound until discarded. Returned values and caller-created
+input buffers remain the caller's responsibility.
 
 The decoder skips unknown/deleted header records by their bounded record
 lengths. Effective common headers use the last visible occurrence; first
@@ -218,9 +266,12 @@ MSSF_TEST_CONFIG="$PWD/build/poc-native-config.json" \
 
 The selected test fails on missing/wrong configuration, inaccessible native
 gateway, identity mismatch, or unmet naming prerequisites. It writes a result
-only after ping, true/false naming results on the same connection, and explicit
-close pass. Runtime metadata comes from the independent preparation; the ping
-body does not advertise the server's code version.
+only after sequential ping/true/false, 32 overlapping mixed operations on clones,
+clone-drop survival, explicit close and a test-owned proxy idle-disconnect case
+pass. The proxy first proves a real native ping, then cuts the TCP connection;
+no new application operation is used to detect the failure. It does not restart
+onebox or qualify native failover/control emission. Runtime metadata comes from
+independent preparation; ping does not advertise the server's code version.
 
 ### Build once, run the archive on onebox
 
@@ -261,7 +312,7 @@ raw runtime logs, or credentials.
 
 No TLS/rustls, authentication, HTTP operation fallback, Windows-specific
 integration, native client wrapper, full URI/API coverage, service resolution,
-notifications, production failover, or concurrent request handling is provided.
+notifications, automatic recovery/replay, or production failover is provided.
 The onebox is privileged and unsecured: keep it local with loopback-only
 published endpoints. Do not use this profile on a production or shared cluster.
 

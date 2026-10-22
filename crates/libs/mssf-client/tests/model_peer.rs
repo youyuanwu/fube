@@ -9,6 +9,7 @@ use mssf_transport::{
     serialization::{Decoder, Encoder},
 };
 use tokio::{
+    io::AsyncReadExt,
     net::{TcpListener, TcpStream},
     task::JoinHandle,
 };
@@ -181,8 +182,9 @@ async fn sequential_ping_and_naming_use_native_headers_and_keep_bool_independent
             };
             write_message(&mut stream, &response).await.unwrap();
         }
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let mut client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
         .await
         .unwrap();
     assert_eq!(
@@ -224,7 +226,7 @@ async fn malformed_naming_success_never_returns_absent_and_closes() {
         }),
     ];
     for bytes in incomplete {
-        let (mut client, server) =
+        let (client, server) =
             single_reply(move |request| reply(request, "NameOperationReply", bytes)).await;
         assert!(matches!(
             client.name_exists("fabric:/a").await,
@@ -271,7 +273,7 @@ async fn malformed_ping_success_requires_every_identity_field() {
         }),
     ];
     for bytes in incomplete {
-        let (mut client, server) = single_reply(move |request| {
+        let (client, server) = single_reply(move |request| {
             let mut response = reply(request, "PingRequest", bytes);
             response.headers.push(Header::version(1, 1).unwrap());
             response
@@ -286,7 +288,7 @@ async fn malformed_ping_success_requires_every_identity_field() {
 #[tokio::test]
 async fn empty_gateway_identity_is_not_a_success() {
     for (address, node_name) in [("", "N0010"), ("10.0.0.2:19000", "")] {
-        let (mut client, server) = single_reply(move |request| {
+        let (client, server) = single_reply(move |request| {
             let bytes = body(|encoder| {
                 encoder.object(|encoder| {
                     encoder.string(address)?;
@@ -318,7 +320,7 @@ async fn ping_requires_compatible_version_action_and_actor() {
         Some((0, 2)),
         Some((1, -1)),
     ] {
-        let (mut client, server) = single_reply(move |request| {
+        let (client, server) = single_reply(move |request| {
             let mut response = reply(request, "PingRequest", ping_body());
             if let Some((major, minor)) = version {
                 response
@@ -337,7 +339,7 @@ async fn ping_requires_compatible_version_action_and_actor() {
         (1, "PingRequest"),
         (0, "PingRequest"),
     ] {
-        let (mut client, server) = single_reply(move |request| {
+        let (client, server) = single_reply(move |request| {
             let mut response = reply(request, action, ping_body());
             response.headers.push(Header::actor(actor).unwrap());
             response.headers.push(Header::version(1, 1).unwrap());
@@ -353,7 +355,7 @@ async fn ping_requires_compatible_version_action_and_actor() {
 #[tokio::test]
 async fn naming_rejects_wrong_success_action_or_actor() {
     for (actor, action) in [(5, "NameExistsReply"), (2, "NameOperationReply")] {
-        let (mut client, server) = single_reply(move |request| {
+        let (client, server) = single_reply(move |request| {
             let mut response = reply(request, action, naming_body(false, 0));
             response.headers.push(Header::actor(actor).unwrap());
             response
@@ -417,7 +419,7 @@ async fn transport_fault_preserves_error_with_optional_malformed_details() {
         ),
     ];
     for (has_body, bytes, expected_code, diagnostic) in details {
-        let (mut client, server) = single_reply(move |request| {
+        let (client, server) = single_reply(move |request| {
             let mut response = reply(request, "", bytes);
             response.headers.push(
                 Header::object(FAULT, |encoder| {
@@ -467,7 +469,7 @@ async fn operation_failure_is_not_reject_fault_and_retains_readable_code() {
             "diagnostic",
         ),
     ] {
-        let (mut client, server) =
+        let (client, server) =
             single_reply(move |request| reply(request, "ClientOperationFailure", bytes)).await;
         match client.ping().await {
             Err(Error::Remote { code, message }) => {
@@ -486,7 +488,7 @@ async fn operation_failure_is_not_reject_fault_and_retains_readable_code() {
             encoder.string("not a native failure")
         }),
     ] {
-        let (mut client, server) =
+        let (client, server) =
             single_reply(move |request| reply(request, "ClientOperationFailure", bytes)).await;
         assert!(matches!(
             client.name_exists("fabric:/a").await,
@@ -520,8 +522,9 @@ async fn input_error_does_not_send_and_native_error_does_not_poison_complete_str
             };
             write_message(&mut stream, &response).await.unwrap();
         }
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let mut client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
         .await
         .unwrap();
     assert!(matches!(

@@ -1,7 +1,7 @@
 //! Experimental pure Rust, clear-TCP FabricClient subset.
 //!
 //! This package does not use the native Service Fabric client library.
-//! Connections are sequential, have no automatic reconnect, and must only be
+//! Connections support bounded concurrency, have no automatic reconnect, and must only be
 //! used with an explicitly selected unsecured development gateway.
 
 mod protocol;
@@ -29,7 +29,10 @@ pub struct GatewayDescription {
     pub node_name: String,
 }
 
-/// A mutable, single-flight client for the native clear-TCP development profile.
+/// Cloneable client for the native clear-TCP development profile.
+///
+/// Clones share one continuously driven connection and its terminal state.
+#[derive(Clone)]
 pub struct FabricClient {
     connection: Connection,
     timeout: Duration,
@@ -50,10 +53,12 @@ impl FabricClient {
     }
 
     /// Discover the native gateway's full node identity.
-    pub async fn ping(&mut self) -> Result<GatewayDescription> {
+    pub async fn ping(&self) -> Result<GatewayDescription> {
         let deadline = deadline_after(self.timeout)?;
-        let reply = self.request("PingRequest", Vec::new(), deadline).await?;
-        self.complete(protocol::decode_ping(&reply), deadline)
+        self.request("PingRequest", Vec::new(), deadline, |reply| {
+            protocol::decode_ping(&reply)
+        })
+        .await
     }
 
     /// Test naming-store existence, independently of user-service state.
@@ -62,15 +67,18 @@ impl FabricClient {
     /// `[A-Za-z0-9_-]+` segments separated by single slashes, at most 4096 bytes.
     /// Root, authority, escapes, query, fragment, whitespace, Unicode, and
     /// trailing or repeated slashes are rejected rather than normalized.
-    pub async fn name_exists(&mut self, name: &str) -> Result<bool> {
+    pub async fn name_exists(&self, name: &str) -> Result<bool> {
         let deadline = deadline_after(self.timeout)?;
         let body = protocol::encode_name(name)?;
-        let reply = self.request("NameExistsRequest", body, deadline).await?;
-        self.complete(protocol::decode_name_exists(&reply), deadline)
+        self.request("NameExistsRequest", body, deadline, |reply| {
+            protocol::decode_name_exists(&reply)
+        })
+        .await
     }
 
-    /// Release the connection. No background tasks are owned by the client.
-    pub async fn close(&mut self) -> Result<()> {
+    /// Close the shared connection and wait for the background driver to exit.
+    /// Dropping one clone does not close the other handles.
+    pub async fn close(&self) -> Result<()> {
         self.connection.close().await
     }
 
@@ -78,29 +86,24 @@ impl FabricClient {
         self.connection.is_closed()
     }
 
-    async fn request(
-        &mut self,
+    /// The first terminal connection cause, including failures detected idle.
+    pub fn terminal_error(&self) -> Option<Error> {
+        self.connection.terminal_error()
+    }
+
+    async fn request<T: Send + 'static>(
+        &self,
         action: &str,
         body: Vec<u8>,
         deadline: Instant,
-    ) -> Result<mssf_transport::message::Message> {
+        decode: fn(mssf_transport::message::Message) -> Result<T>,
+    ) -> Result<T> {
         let headers = vec![
             Header::activity(Uuid::new_v4().to_bytes_le())?,
             Header::version(1, 1)?,
         ];
         self.connection
-            .request(action, 5, headers, body, deadline)
+            .request_decoded(action, 5, headers, body, deadline, decode)
             .await
-    }
-
-    fn complete<T>(&mut self, result: Result<T>, deadline: Instant) -> Result<T> {
-        if Instant::now() >= deadline {
-            self.connection.abort();
-            return Err(Error::Timeout);
-        }
-        if matches!(&result, Err(Error::Protocol(_))) {
-            self.connection.abort();
-        }
-        result
     }
 }

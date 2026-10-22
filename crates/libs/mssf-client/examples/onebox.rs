@@ -37,7 +37,7 @@ fn arguments() -> Result<(SocketAddr, String, Option<String>, Duration)> {
 
 async fn run() -> Result<()> {
     let (endpoint, operation, name, timeout) = arguments()?;
-    let mut client = FabricClient::connect_clear(endpoint, timeout).await?;
+    let client = FabricClient::connect_clear(endpoint, timeout).await?;
     if operation == "ping" {
         let gateway = client.ping().await?;
         println!(

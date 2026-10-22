@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 tokio.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

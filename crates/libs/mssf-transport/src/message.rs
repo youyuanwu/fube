@@ -17,7 +17,7 @@ pub const CLIENT_VERSION: u16 = 0x8025;
 pub const UNCORRELATED_REPLY: u16 = 0x803e;
 pub const MAX_HEADER_COUNT: usize = 4096;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct MessageId {
     /// Native GUID field order, not a UUID's network byte order.
     pub guid: [u8; 16],
