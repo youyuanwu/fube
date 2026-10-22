@@ -202,34 +202,30 @@ jobs:
     - name: Check fresh cluster health
       run: python3 "$CLUSTER_CTL" status "$CLUSTER_NAME" > "$RUNNER_TEMP/linux-cluster-status-created.json"
 
-    - name: Prepare onebox test data and expected results
-      if: matrix.topology == 'onebox'
-      run: |
-        cargo-nextest nextest run \
-          --archive-file "$RUNNER_TEMP/native-client-tests/native-client-tests.tar.zst" \
-          --workspace-remap "$GITHUB_WORKSPACE" \
-          --run-ignored all -E 'group(onebox) & test(=onebox_prepare_fixtures)' --no-tests fail
-      env:
-        MSSF_TEST_CONFIG: ${{ runner.temp }}/native-client-config.json
-        MSSF_TEST_REPORT: ${{ runner.temp }}/native-client-report.json
-
-    - name: Exercise real native ping, NameExists and node list
+    - name: Exercise real native ping, NameExists, node list and health
       id: native_client
       if: matrix.topology == 'onebox'
       run: |
+        export MSSF_TEST_ARCHIVE_SHA256="$(sha256sum "$RUNNER_TEMP/native-client-tests/native-client-tests.tar.zst" | cut -d ' ' -f 1)"
         cargo-nextest nextest run \
           --archive-file "$RUNNER_TEMP/native-client-tests/native-client-tests.tar.zst" \
           --workspace-remap "$GITHUB_WORKSPACE" \
-          --run-ignored all -E 'group(onebox) & not test(=onebox_prepare_fixtures)' --no-tests fail
+          --run-ignored all -E 'group(onebox)' --no-tests fail
       env:
         MSSF_TEST_CONFIG: ${{ runner.temp }}/native-client-config.json
+        MSSF_TEST_REPORT: ${{ runner.temp }}/native-client-report.json
+        MSSF_HEALTH_CONFIG: ${{ runner.temp }}/native-health-config.json
+        MSSF_HEALTH_REPORT: ${{ runner.temp }}/native-health-report.json
+        MSSF_HEALTH_OWNER: ci-${{ github.run_id }}-${{ github.run_attempt }}
 
     - name: Upload successful native client evidence
       if: matrix.topology == 'onebox' && steps.native_client.outcome == 'success'
       uses: actions/upload-artifact@v4
       with:
         name: native-client-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/native-client-report.json
+        path: |
+          ${{ runner.temp }}/native-client-report.json
+          ${{ runner.temp }}/native-health-report.json
         if-no-files-found: error
         retention-days: 7
 

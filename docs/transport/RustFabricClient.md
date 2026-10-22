@@ -1,7 +1,7 @@
 # Rust FabricClient POC
 
-**Status:** experimental native clear-TCP subset. Gateway ping, NameExists and
-typed GetNodeList
+**Status:** experimental native clear-TCP subset. Gateway ping, NameExists,
+typed GetNodeList and single-node GetNodeHealth
 have been demonstrated against the repository's Ubuntu onebox running
 Service Fabric **11.8.121.4**. This is not a complete FabricClient replacement
 and does not support TLS or authentication.
@@ -11,7 +11,7 @@ and does not support TLS or authentication.
 `mssf-transport` implements bounded Fabric serialization, clear frames and CRCs,
 ordered native headers, client-only ListenInstance establishment, and
 continuously driven, bounded concurrent Tokio request/reply I/O. `mssf-client`
-adds native gateway ping, NameExists and a typed node-list page operation, with
+adds native gateway ping, NameExists, typed node-list pages and node health, with
 owned results and explicit errors.
 
 Neither package calls the native Service Fabric client or COM libraries.
@@ -23,8 +23,9 @@ Neither uses HTTP to execute client operations. "Clear TCP" still carries the
 | Gateway ping | Sends PingRequest with an empty body and decodes gateway address, node ID, node instance, and node name. Full identity compared with independent onebox observations. |
 | NameExists | Sends a parsed ten-field native URI object; independently established existing/absent names returned true/false on the same connection. |
 | GetNodeList | Sends the external `GetNodeList` string query to NamingGateway using `QueryRequest`; decodes all 21 source-defined node fields, nested deactivation data and explicit paging. Five-node membership/overlapping fields independently checked through management; binary ports checked against the onebox manifest. |
+| GetNodeHealth | Sends external `GetNodeHealth` via NamingGateway; validates the HM single-item envelope, aggregate, full events and Event evaluations. Independently injected Warning, false/true/inherited policy, event masks, unknown-node error and healthy same-connection reuse qualified live. |
 | Native faults/errors | Retains native signed error codes and available diagnostics. Malformed GetNodeList continuation produced live `E_INVALIDARG` (-2147024809) or `FMFailoverUnitNotFound` (-2147017462); the same connection remained usable. Other fault forms have offline model-peer coverage. |
-| Concurrent operations | Mixed ping, NameExists and node queries on clones sharing one connection; real onebox coverage. |
+| Concurrent operations | Mixed ping, NameExists, node-list and node-health queries on clones sharing one connection; real onebox coverage. Deterministic cancellation/late-reply safety remains model-covered. |
 | Idle disconnect | Real native ping through a test-owned proxy, followed by proxy cutoff; closure detected without another operation. |
 | Controls and stream lifecycle | Idle ListenInstance, deadlines, fragmentation, backpressure, correlation, cancellation, and close/drop; offline model-peer coverage. |
 
@@ -33,6 +34,8 @@ protocol **1.2** for ping. The observed GetNodeList aggregate success has no
 actor, action or client-version header; correlation and typed body validation
 remain mandatory. Coverage is qualified only for the observed runtime,
 clear-TCP profile, and these operations, not all Service Fabric releases.
+GetNodeHealth instead returns actor **HM (16)** and action
+**OperationSuccessAction**; it is not the bare list-aggregation reply.
 
 ## 2. Run against a disposable onebox
 
@@ -49,6 +52,10 @@ cargo run -p mssf-client --example onebox -- \
 
 cargo run -p mssf-client --example onebox -- \
   --clear 127.0.0.1:19000 node-list
+
+cargo run -p mssf-client --example onebox -- \
+  --clear 127.0.0.1:19000 node-health N0020 \
+  --events-filter 8 --warning-as-error true
 ```
 
 The example prints the gateway's advertised address and full node identity.
@@ -208,6 +215,79 @@ numbers are retained, not silently coerced. Unsupported polymorphic wrapper/
 safety-check tags or malformed field structure fail explicitly and retire the
 stream. Nonempty deactivation/safety variants have source/model coverage only.
 
+### Native node health
+
+```rust,no_run
+use mssf_client::{
+    FabricClient, HealthEventsFilter, NodeHealthPolicy, NodeHealthQueryDescription,
+};
+
+# async fn health(client: &FabricClient) -> mssf_client::Result<()> {
+let mut query = NodeHealthQueryDescription::new("N0020");
+query.events_filter = Some(HealthEventsFilter::ERROR);
+query.health_policy = Some(NodeHealthPolicy { consider_warning_as_error: true });
+let health = client.get_node_health(&query).await?;
+println!("{:?}", health.aggregated_health_state);
+for evaluation in health.unhealthy_evaluations {
+    println!("{evaluation:?}");
+}
+# Ok(())
+# }
+```
+
+`get_node_health_with_timeout` uses one deadline from preparation through driver
+decode, like node-list. `NodeHealth` owns its node name, event vector, aggregate
+`HealthState` and unhealthy evaluations. This is **actual detail health**, not
+`Node.health_state` from GetNodeList. Unhealthy aggregate is successful data;
+unknown node returns native `FABRIC_E_HEALTH_ENTITY_NOT_FOUND`
+(-2147017705 / 0x80071c17), not an empty healthy result.
+
+The node name is required, case-preserving, 1..=4096 UTF-16 units without NUL.
+It is not a naming URI/prefix; HM performs native identity resolution. Empty
+names are rejected locally, unlike node-list's optional empty-name omission.
+
+| Request option | Supported semantics |
+|---|---|
+| `health_policy: None` | Omit ClusterHealthPolicy; inherit native effective cluster policy. |
+| `Some(NodeHealthPolicy::default())` | Explicit warning-as-error **false**, overriding cluster policy. |
+| `consider_warning_as_error: true` | Treat reported Warning as evaluated Error. Only this node-relevant override is exposed, not cluster aggregate thresholds/application maps. |
+| `events_filter: None` | Omit EventsFilter; all otherwise eligible events. |
+| `Some(DEFAULT)` / `Some(ALL)` | Explicit masks 0 / 65535; select all. |
+| `Some(NONE)` | Exact mask 1; no events, **without** suppressing aggregate/evaluations. |
+| `OK`, `WARNING`, `ERROR` | Bits 2, 4, 8, combinable with `\|`. Selection uses **evaluated** state; ERROR under policy true can return reported Warning. |
+| `from_bits(u32)` | Sent unchanged. Other bits do not match; exact special-value equality matters: NONE \| ERROR = 9 selects Error, not none. |
+
+No raw JSON/arguments, node-ID selector, paging, health-statistics, child filters
+or full cluster-health policy API is exposed. Policy/filter arguments are JSON
+**strings within the native binary query map**, not an HTTP request.
+See the public types in
+[`health.rs`](../../crates/libs/mssf-client/src/health.rs).
+
+Each `HealthEvent` includes source/property, signed TTL ticks, reported state,
+description, signed sequence, source/modified timestamps, expiry/removal flags,
+and all three transition timestamps. TTL is signed 100ns duration ticks
+(`i64::MAX` means infinite); dates reuse `NodeTimestamp`'s signed 1601 epoch
+ticks, with zero preserved as native default. No timestamp is synthesized.
+Scalar health values retain unknown numbers as `Unrecognized(i64)`.
+
+Supported `HealthEvaluation::Event` includes description, the complete unhealthy
+event, applied warning-as-error flag and evaluated aggregate. The pinned
+single-node detail path generates Event evaluations, including synthetic HM
+reports; it may return a representative explanation, not every unhealthy event.
+Other general health evaluation kinds/recursive child trees are **not**
+implemented: unknown structural tags, tag/kind disagreement, mandatory nulls
+and malformed success retire the shared stream explicitly.
+
+The exact source pin remains
+`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`, separate from deployed runtime
+**11.8.121.4**. Native serialization definitions:
+[NodeHealth](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/NodeHealth.h#L38),
+[HealthEvent](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/HealthEvent.h#L66),
+[EventHealthEvaluation](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/EventHealthEvaluation.h#L48).
+The result is Item=1, wrapper tag NodeHealth=16, empty list then mandatory item,
+no paging; events and Event evaluations are flattened field scopes, not a
+public C API pointer layout or safety-check-style derived scope.
+
 ## 4. Supported inputs and bounds
 
 Naming input is literal lowercase `fabric:/` followed by nonempty ASCII
@@ -268,32 +348,39 @@ cargo doc --locked -p mssf-transport -p mssf-client --no-deps
 exercise parser bounds, malformed input, internal round trips, and connection
 lifecycle behavior; they do not establish native protocol correctness.
 There are no committed golden packet hex files or normalized capture snapshots.
-Native compatibility claims require the live setup and native-client targets
-below to pass against the real onebox.
+Native compatibility claims require the self-contained live scenarios below
+to pass against the real onebox.
 
 Tests that need onebox are named `onebox_*` and assigned to the shared
 **`onebox` nextest group** in `.config/nextest.toml`. They remain `#[ignore]`
-for ordinary Cargo runs. The group permits only one test at a time, but
-serialization does not guarantee setup order: run preparation first, then
-the remaining group tests.
+for ordinary Cargo runs. The group permits only one test at a time; either
+scenario may run first. Each test prepares its own fresh independent
+observations and completes its cleanup before returning. Setup and restoration
+are helper functions, not tests with ordering dependencies. Select the group
+once; no individual test-name selectors or manual preparation are needed.
 
-On a fresh disposable local onebox, the Rust `onebox_setup` helper uses
-test-only `reqwest` HTTP calls to prepare synthetic names and independently
-observe full healthy five-logical-node membership and typed field expectations:
+On a fresh disposable local onebox, provide absolute private output paths and
+a unique health-report owner. The baseline helper uses test-only `reqwest` HTTP
+calls to prepare synthetic names and independently observe healthy five-node
+membership. The health scenario prepares and restores its own report:
 
 ```sh
 mkdir -p build/poc-native
 export MSSF_TEST_CONFIG="$PWD/build/poc-native/config.json"
 export MSSF_TEST_REPORT="$PWD/build/poc-native/report.json"
-cargo nextest run --locked -p mssf-client --run-ignored all \
-  -E 'group(onebox) & test(=onebox_prepare_fixtures)' --no-tests fail
-cargo nextest run --locked -p mssf-client --run-ignored all \
-  -E 'group(onebox) & not test(=onebox_prepare_fixtures)' --no-tests fail
+export MSSF_HEALTH_CONFIG="$PWD/build/poc-native/health-config.json"
+export MSSF_HEALTH_REPORT="$PWD/build/poc-native/health-report.json"
+export MSSF_HEALTH_OWNER="poc-unique-task-id"
+cargo nextest archive --locked -p mssf-transport -p mssf-client \
+  --archive-file build/poc-native/native-client-tests.tar.zst
+export MSSF_TEST_ARCHIVE_SHA256="$(sha256sum build/poc-native/native-client-tests.tar.zst | cut -d ' ' -f 1)"
+cargo nextest run --archive-file build/poc-native/native-client-tests.tar.zst \
+  --run-ignored all -E 'group(onebox)' --no-tests fail
 ```
 
-Setup uses the published local HTTP gateway at `127.0.0.1:19080` and records
-the first native gateway at `127.0.0.1:19000` / N0010. Run setup once on a fresh
-disposable onebox, then repeat it before every native execution leg. Creating
+Preparation uses the published local HTTP gateway at `127.0.0.1:19080` and records
+the first native gateway at `127.0.0.1:19000` / N0010. Every execution leg
+automatically refreshes its observations before native assertions. Creating
 the naming fixture is idempotent (HTTP conflict is followed by an independent
 existence check); unexpected HTTP results fail. Node observation timestamps
 must be no more than 120 seconds old and not future-dated at native test start.
@@ -301,8 +388,9 @@ Proxy use and redirects are disabled. No additional CI job is needed.
 `reqwest` has JSON support only, with default/TLS features disabled, and is a
 dev-dependency rather than a production client dependency.
 
-For a separately prepared environment, the native `onebox_clear` target still
-accepts a private JSON file with the following fields:
+The baseline helper writes a private JSON file with the following fields;
+the native assertions consume this independent observation, not their own
+query results:
 
 | Field | Meaning |
 |---|---|
@@ -324,17 +412,11 @@ independently using `GET /Names/NAME?api-version=6.0`; absent is HTTP 404.
 HTTP is fixture preparation/observation only. Native results are obtained
 exclusively through the Rust native connection.
 
-Use **absolute paths** for both the configuration file and report. Integration
-tests run from the package directory. With an independently prepared profile,
-run only the native cases, not preparation:
+Use **absolute paths** for all configuration/report outputs; integration tests
+run from the package directory. Profiles are generated inside each scenario,
+not reused as an externally ordered prerequisite.
 
-```sh
-MSSF_TEST_CONFIG="$PWD/build/poc-native-config.json" \
-  cargo nextest run --locked -p mssf-client --run-ignored all \
-    -E 'group(onebox) & not test(=onebox_prepare_fixtures)' --no-tests fail
-```
-
-The selected test fails on missing/wrong configuration, inaccessible native
+Each test fails on missing/wrong configuration, inaccessible native
 gateway, identity mismatch, or unmet naming prerequisites. It writes a result
 only after node field/filter/paging/error assertions, sequential ping/true/false,
 32 initially Pending overlapping mixed operations on clones (14 ping, 6 existing
@@ -373,6 +455,64 @@ versions or multi-host behavior. Those bounds are not erased by terminal
 paging. Synthetic model peers test nested/unknown/malformed safety behavior,
 not native compatibility.
 
+### Independent unhealthy node-health qualification
+
+The health test uses independent management preparation helpers before its
+native assertions:
+POST `/Nodes/N0020/$/ReportHealth?api-version=6.3&Immediate=true` and
+GET/POST `/Nodes/N0020/$/GetHealth?api-version=6.3`.
+HTTP event selection uses `EventsHealthStateFilter`, not the native map name.
+No production query uses HTTP.
+
+Preparation owns a unique non-System source/property, positive sequence,
+30-minute TTL and remove-on-expiration. It persists ownership **before**
+submission and polls independent false/true policy observations up to 60 times
+with one-second spacing and ten-second per-HTTP-call timeout. Submission is not
+ingestion. A genuine matching Warning Event explanation and false=Warning /
+true=Error aggregates must converge before any native health assertion.
+Omitted policy is observed separately, not assumed to equal false.
+
+Private `MSSF_HEALTH_CONFIG` records clear endpoint/runtime, owner/source/
+property/sequence/TTL, report path, archive SHA256, independent unknown-node
+HTTP code, and 17 snapshots with node/policy/mask and start/end times. Snapshots
+cover healthy, inherited/false/true, omitted/default/all/NONE/OK/WARNING/ERROR,
+combined, NONE|ERROR and raw high-bit masks. The assertion phase uses only
+native TCP to compare full event/evaluation data and independently recorded
+membership. Report identity/state/sequence/TTL/flags/descriptions are exact;
+event order is not significant. Snapshot age is at most 120 seconds, never
+future-dated. Source/transition times match HTTP's millisecond rendering
+(<10,000 ticks); only LastModified may advance from its independent value up
+to the native query end +1ms. This is an actual observation window, not a blanket
+120-second timestamp tolerance.
+
+The sanitized success report retains independent snapshots and native raw
+signed ticks/sequence as decimal strings, full Event explanations, native
+observation windows and archive hash. It also records unknown-node
+HealthEntityNotFound followed by healthy same-connection reuse, 32 mixed
+ping/list/health operations, and reuse after a first-polled health future is
+dropped. That live cancellation does not prove wire emission on fast loopback;
+model tests deterministically cover cancelled/timed-out late malformed replies.
+
+The health test always awaits owned restoration after preparation/native
+errors or assertion panics. It supersedes only its report with higher-sequence
+Ok/one-second TTL, then independently polls until the report is gone and both
+detailed health and node-list health are Ok. This permits the baseline test to
+run before or after it. Primary and restoration failures remain visible, and
+success evidence is written only after restoration succeeds. Ownership mismatch
+fails instead of adopting someone else's profile. A rerun removes stale success
+evidence, restores its prior owned report, then replaces the profile.
+
+Keep all profiles/reports ignored. Always destroy only your disposable
+allocation by exact name, including after a killed test process: in-process
+restoration cannot run after a hard kill. CI retains its always-run allocation
+teardown. Never use these write fixtures on a shared cluster.
+
+Live coverage is one five-logical-node, single-physical-container runtime.
+Nonempty Warning and warning-as-error Error are qualified; separately reported
+Error, expired nonremoved reports, synthetic HM conditions, future evaluation
+kinds and other runtimes are not live-qualified. Their source/model coverage
+must not be described as native interoperability.
+
 ### Build once, run the archive on onebox
 
 The Linux Rust job compiles the selected packages' test binaries, including
@@ -391,15 +531,19 @@ archive. No additional job is created. Both runners use Ubuntu 24.04 and the
 same pinned nextest version.
 
 On the target, check out the same source revision and provide the absolute
-private profile/report paths as above. Rust and Cargo are not required to
+private output paths as above. Rust and Cargo are not required to
 execute the archive; use the standalone runner:
 
 ```sh
 archive=/absolute/path/native-client-tests.tar.zst
+set -e
+export MSSF_TEST_ARCHIVE_SHA256="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+export MSSF_HEALTH_CONFIG="$PWD/build/poc-native/health-config.json"
+export MSSF_HEALTH_REPORT="$PWD/build/poc-native/health-report.json"
+export MSSF_HEALTH_OWNER="poc-unique-task-id"
+# MSSF_TEST_CONFIG / MSSF_TEST_REPORT must also be set, as above.
 cargo-nextest nextest run --archive-file "$archive" --workspace-remap "$PWD" \
-  --run-ignored all -E 'group(onebox) & test(=onebox_prepare_fixtures)' --no-tests fail
-cargo-nextest nextest run --archive-file "$archive" --workspace-remap "$PWD" \
-  --run-ignored all -E 'group(onebox) & not test(=onebox_prepare_fixtures)' --no-tests fail
+  --run-ignored all -E 'group(onebox)' --no-tests fail
 ```
 
 These commands extract and execute prebuilt tests without rebuilding them.
@@ -407,6 +551,13 @@ These commands extract and execute prebuilt tests without rebuilding them.
 rather than silently reporting success. Only the sanitized native success
 report and compiled test archive are uploaded, never the private configuration,
 raw runtime logs, or credentials.
+Every host or compiler-free consumer leg uses this single group command;
+each test automatically repeats its independent preparation and restoration.
+The same archive has been exercised offline,
+on the native host, and in an Ubuntu 24.04 container with standalone nextest and
+no cargo/rustc in PATH. Compiler-free execution used host networking for the
+loopback gateways, read-only source and a private writable evidence directory.
+No compiler/SDK installation or separate CI infrastructure is required.
 
 ## 6. Deliberate exclusions
 

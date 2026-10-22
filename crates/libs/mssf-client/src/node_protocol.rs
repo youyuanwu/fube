@@ -1,6 +1,6 @@
 use mssf_transport::{
     message::{Message, ACTION, ACTOR},
-    serialization::{Decoder, Encoder},
+    serialization::Decoder,
 };
 
 use crate::{nodes::*, Error, Result};
@@ -31,17 +31,7 @@ pub(crate) fn encode_query(query: &NodeQueryDescription) -> Result<Vec<u8>> {
             Cow::Owned(query.status_filter.bits().to_string()),
         ));
     }
-    let mut encoder = Encoder::new();
-    encoder.object(|encoder| {
-        encoder.object(|encoder| {
-            encoder.object_array(&args, |encoder, (key, value)| {
-                encoder.object(|encoder| encoder.string(key))?;
-                encoder.string(value)
-            })
-        })?;
-        encoder.string("GetNodeList")
-    })?;
-    Ok(encoder.finish())
+    crate::query_protocol::encode("GetNodeList", &args)
 }
 
 pub(crate) fn decode_reply(message: &Message) -> Result<NodeListPage> {
@@ -55,37 +45,25 @@ pub(crate) fn decode_reply(message: &Message) -> Result<NodeListPage> {
     if message.headers.iter().any(|h| h.id == ACTION) && properties.action != "QueryReply" {
         return Err(Error::Protocol("unexpected query reply action"));
     }
-    let mut decoder = Decoder::new(&message.body);
-    let (kind, nodes, error, token) = decoder.object(|decoder| {
-        let kind = decoder.i64()?;
-        let nodes = decoder.pointer(|decoder, tag| {
-            if tag != 1i32.to_le_bytes() {
-                return Err(Error::Protocol("query wrapper is not the native Node type"));
-            }
-            let nodes = decoder.object_array(decode_node)?;
-            if decoder.pointer(|_, _| Ok(()))?.is_some() {
-                return Err(Error::Protocol("node list has a single-item payload"));
-            }
-            Ok(nodes)
-        })?;
-        let error = decoder.i64()?;
-        let token = decoder.pointer(|decoder, _| decoder.string())?;
-        Ok((kind, nodes, error, token))
+    let result = crate::query_protocol::decode(&message.body, |decoder, tag| {
+        if tag != 1i32.to_le_bytes() {
+            return Err(Error::Protocol("query wrapper is not the native Node type"));
+        }
+        let nodes = decoder.object_array(decode_node)?;
+        if decoder.pointer(|_, _| Ok(()))?.is_some() {
+            return Err(Error::Protocol("node list has a single-item payload"));
+        }
+        Ok(nodes)
     })?;
-    decoder.finish()?;
-    if error != 0 {
-        return Err(Error::Remote {
-            code: error,
-            message: String::new(),
-        });
-    }
-    if kind != 2 {
+    if result.kind != 2 {
         return Err(Error::Protocol("query result is not a List"));
     }
-    let nodes = nodes.ok_or(Error::Protocol("node list has no typed wrapper"))?;
+    let nodes = result
+        .payload
+        .ok_or(Error::Protocol("node list has no typed wrapper"))?;
     Ok(NodeListPage {
         nodes,
-        continuation_token: token.filter(|token| !token.is_empty()),
+        continuation_token: result.paging.filter(|token| !token.is_empty()),
     })
 }
 

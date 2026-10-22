@@ -27,6 +27,9 @@ const OBSERVATION_MAX_AGE_MS: u64 = 120_000;
 mod support;
 use support::ObservedNode;
 
+#[path = "support/baseline_setup.rs"]
+mod setup;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -108,7 +111,7 @@ fn assert_fresh(config: &Config) {
     assert!(
         now.checked_sub(config.observed_at_unix_ms)
             .is_some_and(|age| age <= OBSERVATION_MAX_AGE_MS),
-        "independent observations expired or are future-dated; rerun explicit setup"
+        "independent observations expired or are future-dated; rerun the onebox baseline test"
     );
 }
 
@@ -522,8 +525,11 @@ async fn assert_idle_proxy_disconnect(
 /// Mixed operations are initially polled together on the current-thread runtime,
 /// proving overlapping lifetimes before yielding to the connection driver.
 #[tokio::test]
-#[ignore = "requires an independently prepared clear onebox and MSSF_TEST_CONFIG"]
+#[ignore = "prepares its own fixtures on a disposable clear onebox; requires MSSF_TEST_CONFIG and MSSF_TEST_REPORT"]
 async fn onebox_ping_name_exists_and_node_list() {
+    setup::prepare()
+        .await
+        .expect("independently prepare fresh baseline fixtures");
     let path = PathBuf::from(
         std::env::var_os("MSSF_TEST_CONFIG")
             .expect("MSSF_TEST_CONFIG must point to the private JSON fixture configuration"),

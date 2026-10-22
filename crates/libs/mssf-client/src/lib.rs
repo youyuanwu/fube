@@ -4,9 +4,13 @@
 //! Connections support bounded concurrency, have no automatic reconnect, and must only be
 //! used with an explicitly selected unsecured development gateway.
 
+mod health;
+mod health_protocol;
 mod node_protocol;
 mod nodes;
 mod protocol;
+mod query_protocol;
+pub use health::*;
 pub use nodes::*;
 
 use std::{net::SocketAddr, time::Duration};
@@ -98,6 +102,28 @@ impl FabricClient {
         let body = node_protocol::encode_query(query)?;
         self.request("QueryRequest", body, deadline, |reply| {
             node_protocol::decode_reply(&reply)
+        })
+        .await
+    }
+
+    /// Query actual single-node health, events and unhealthy explanations.
+    /// This is not GetNodeList's summary. No paging or automatic retries occur.
+    pub async fn get_node_health(&self, query: &NodeHealthQueryDescription) -> Result<NodeHealth> {
+        self.get_node_health_with_timeout(query, self.timeout).await
+    }
+
+    /// Query node health with one deadline covering preparation through decode.
+    /// Native errors are operation-local; malformed successful responses retire
+    /// the shared connection. See [`NodeHealthQueryDescription`] for defaults.
+    pub async fn get_node_health_with_timeout(
+        &self,
+        query: &NodeHealthQueryDescription,
+        timeout: Duration,
+    ) -> Result<NodeHealth> {
+        let deadline = deadline_after(timeout)?;
+        let body = health_protocol::encode_query(query)?;
+        self.request("QueryRequest", body, deadline, |reply| {
+            health_protocol::decode_reply(&reply)
         })
         .await
     }

@@ -18,6 +18,9 @@ const TIMEOUT_DURATION: Duration = Duration::from_secs(3);
 const NODE_ID: u128 = 0x0123456789abcdef_fedcba9876543210;
 const REMOTE_CODE: i64 = -2147017794;
 
+#[path = "support/health_model.rs"]
+mod health_queries;
+
 fn body(fields: impl FnOnce(&mut Encoder) -> mssf_transport::Result<()>) -> Vec<u8> {
     let mut encoder = Encoder::new();
     encoder.object(fields).unwrap();
