@@ -10,6 +10,9 @@ const SCOPE_BEGIN: u8 = 0x1f;
 const SCOPE_END: u8 = 0x2f;
 const OBJECT_END: u8 = 0x3f;
 const EMPTY: u8 = 0x40;
+const POINTER: u8 = 0x01;
+const OBJECT_ARRAY: u8 = 0x80;
+const UINT16: u8 = 0x06;
 const INT32: u8 = 0x07;
 const UINT32: u8 = 0x08;
 const INT64: u8 = 0x09;
@@ -37,12 +40,29 @@ impl Encoder {
     }
 
     pub fn object(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        self.typed_object(&[], f)
+    }
+
+    /// Encode an object with optional raw native polymorphic type information.
+    pub fn typed_object(
+        &mut self,
+        type_info: &[u8],
+        f: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
         if self.depth >= MAX_DEPTH {
             return Err(Error::InvalidInput("object nesting limit exceeded"));
+        }
+        if type_info.len() > MAX_COLLECTION_COUNT {
+            return Err(Error::InvalidInput("type-information limit exceeded"));
         }
         let start = self.bytes.len();
         // Marker, little-endian size, flags, and three deterministic pad bytes.
         self.bytes.extend_from_slice(&[0; 9]);
+        if !type_info.is_empty() {
+            self.bytes[start + 5] = 1;
+            self.write_unsigned_payload(type_info.len() as u64);
+            self.bytes.extend_from_slice(type_info);
+        }
         self.bytes.push(SCOPE_BEGIN);
         self.depth += 1;
         let result = f(self);
@@ -59,6 +79,64 @@ impl Encoder {
         }
         self.bytes[start + 1..start + 5].copy_from_slice(&(size as u32).to_le_bytes());
         Ok(())
+    }
+
+    /// End the current base scope and begin a derived scope.
+    pub fn next_scope(&mut self) -> Result<()> {
+        if self.depth == 0 {
+            return Err(Error::InvalidInput("scope requires an object"));
+        }
+        self.bytes.extend_from_slice(&[SCOPE_END, SCOPE_BEGIN]);
+        Ok(())
+    }
+
+    /// A nullable object pointer; `None` emits the native empty-pointer marker.
+    pub fn pointer(
+        &mut self,
+        type_info: Option<&[u8]>,
+        f: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        let start = self.bytes.len();
+        if let Some(type_info) = type_info {
+            self.bytes.push(POINTER);
+            if let Err(error) = self.typed_object(type_info, f) {
+                self.bytes.truncate(start);
+                return Err(error);
+            }
+        } else {
+            self.bytes.push(POINTER | EMPTY);
+        }
+        Ok(())
+    }
+
+    /// Serializable objects, not pointers or a scalar count followed by fields.
+    pub fn object_array<T>(
+        &mut self,
+        values: &[T],
+        mut f: impl FnMut(&mut Self, &T) -> Result<()>,
+    ) -> Result<()> {
+        if values.len() > MAX_COLLECTION_COUNT {
+            return Err(Error::InvalidInput("object-array count limit exceeded"));
+        }
+        let start = self.bytes.len();
+        if values.is_empty() {
+            self.bytes.push(OBJECT_ARRAY | EMPTY);
+        } else {
+            self.bytes.push(OBJECT_ARRAY);
+            self.write_unsigned_payload(values.len() as u64);
+            for value in values {
+                if let Err(error) = self.object(|encoder| f(encoder, value)) {
+                    self.bytes.truncate(start);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode a native compressed UInt16, including its scalar metadata.
+    pub fn u16(&mut self, value: u16) {
+        self.unsigned(UINT16, u64::from(value));
     }
 
     pub fn i32(&mut self, value: i32) {
@@ -92,6 +170,11 @@ impl Encoder {
     }
 
     pub fn string(&mut self, value: &str) -> Result<()> {
+        // At most three UTF-8 bytes per UTF-16 code unit. Reject oversized
+        // caller buffers before scanning them; encoding work stays bounded too.
+        if value.len() > MAX_STRING_UNITS * 3 {
+            return Err(Error::InvalidInput("string code-unit limit exceeded"));
+        }
         let count = value.encode_utf16().count();
         if count > MAX_STRING_UNITS {
             return Err(Error::InvalidInput("string code-unit limit exceeded"));
@@ -200,12 +283,73 @@ impl<'a> Decoder<'a> {
     }
 
     pub fn object<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.typed_object(|decoder, _| f(decoder))
+    }
+
+    /// Read an object while exposing its bounded raw native type information.
+    pub fn typed_object<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &'a [u8]) -> Result<T>,
+    ) -> Result<T> {
         let outer_limit = self.limit;
         let outer_depth = self.depth;
         let result = self.read_object(f);
         self.limit = outer_limit;
         self.depth = outer_depth;
         result
+    }
+
+    /// Consume remaining supported base fields, then enter the derived scope.
+    pub fn next_scope(&mut self) -> Result<()> {
+        if self.depth == 0 {
+            return Err(Error::Protocol("scope requires an object"));
+        }
+        self.finish_scope()?;
+        self.expect(SCOPE_BEGIN)
+    }
+
+    /// Read a nullable native object pointer, exposing nonnull type information.
+    /// The callback is not invoked for a null pointer.
+    pub fn pointer<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &'a [u8]) -> Result<T>,
+    ) -> Result<Option<T>> {
+        match self.byte()? {
+            metadata if metadata == POINTER | EMPTY => Ok(None),
+            POINTER => self.typed_object(f).map(Some),
+            _ => Err(Error::Protocol("expected object pointer metadata")),
+        }
+    }
+
+    /// Read complete serializable objects using the callback for each first scope.
+    /// Validate the count and minimum enclosing extent before allocating values.
+    pub fn object_array<T>(&mut self, mut f: impl FnMut(&mut Self) -> Result<T>) -> Result<Vec<T>> {
+        let count = self.object_array_count()?;
+        let mut values = Vec::new();
+        for _ in 0..count {
+            values.push(self.object(&mut f)?);
+        }
+        Ok(values)
+    }
+
+    fn object_array_count(&mut self) -> Result<usize> {
+        match self.byte()? {
+            metadata if metadata == OBJECT_ARRAY | EMPTY => Ok(0),
+            OBJECT_ARRAY => {
+                let count = self.count(MAX_COLLECTION_COUNT)?;
+                // Even a fieldless object occupies marker + header + delimiters.
+                if count > (self.limit - self.position) / 12 {
+                    return Err(Error::Protocol("object-array exceeds enclosing extent"));
+                }
+                Ok(count)
+            }
+            _ => Err(Error::Protocol("expected object-array metadata")),
+        }
+    }
+
+    /// Read a native compressed UInt16, rejecting wrong metadata and overflow.
+    pub fn u16(&mut self) -> Result<u16> {
+        self.unsigned(UINT16, 16).map(|value| value as u16)
     }
 
     pub fn i32(&mut self) -> Result<i32> {
@@ -257,7 +401,7 @@ impl<'a> Decoder<'a> {
         Ok(self.byte_array_bytes()?.to_vec())
     }
 
-    fn read_object<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+    fn read_object<T>(&mut self, f: impl FnOnce(&mut Self, &'a [u8]) -> Result<T>) -> Result<T> {
         if self.depth >= MAX_DEPTH {
             return Err(Error::Protocol("object nesting limit exceeded"));
         }
@@ -280,15 +424,17 @@ impl<'a> Decoder<'a> {
         }
         self.limit = end;
         self.depth += 1;
-        if flags == 1 {
+        let type_info = if flags == 1 {
             let count = self.count(MAX_COLLECTION_COUNT)?;
             if count == 0 {
                 return Err(Error::Protocol("empty object type information"));
             }
-            self.take(count)?;
-        }
+            self.take(count)?
+        } else {
+            &[]
+        };
         self.expect(SCOPE_BEGIN)?;
-        let value = f(self)?;
+        let value = f(self, type_info)?;
         self.finish_scope()?;
         while self.peek()? == SCOPE_BEGIN {
             self.byte()?;
@@ -321,6 +467,15 @@ impl<'a> Decoder<'a> {
     fn skip_value(&mut self) -> Result<()> {
         match self.peek()? {
             OBJECT => self.object(|_| Ok(())),
+            POINTER | 0x41 => self.pointer(|_, _| Ok(())).map(|_| ()),
+            OBJECT_ARRAY | 0xc0 => {
+                let count = self.object_array_count()?;
+                for _ in 0..count {
+                    self.object(|_| Ok(()))?;
+                }
+                Ok(())
+            }
+            UINT16 | 0x46 => self.u16().map(|_| ()),
             INT32 | 0x47 => self.i32().map(|_| ()),
             UINT32 | 0x48 => self.u32().map(|_| ()),
             INT64 | 0x49 => self.i64().map(|_| ()),
@@ -472,6 +627,79 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointers_arrays_type_info_and_derived_scopes_are_bounded() {
+        let mut encoder = Encoder::new();
+        encoder
+            .object(|encoder| {
+                encoder.pointer(None, |_| panic!("null pointer callback"))?;
+                encoder.pointer(Some(&[0x1f, 0x2f, 0x3f]), |encoder| {
+                    encoder.u16(u16::MAX);
+                    encoder.next_scope()?;
+                    encoder.object_array(&[0u16, 127, 128, 32768], |encoder, value| {
+                        encoder.u16(*value);
+                        Ok(())
+                    })
+                })
+            })
+            .unwrap();
+        let bytes = encoder.finish();
+        let mut decoder = Decoder::new(&bytes);
+        decoder
+            .object(|decoder| {
+                assert_eq!(decoder.pointer(|_, _| Ok(1))?, None);
+                assert_eq!(
+                    decoder.pointer(|decoder, tag| {
+                        assert_eq!(tag, [0x1f, 0x2f, 0x3f]);
+                        assert_eq!(decoder.u16()?, u16::MAX);
+                        decoder.next_scope()?;
+                        decoder.object_array(Decoder::u16)
+                    })?,
+                    Some(vec![0, 127, 128, 32768])
+                );
+                Ok(())
+            })
+            .unwrap();
+        decoder.finish().unwrap();
+        let mut decoder = Decoder::new(&bytes);
+        decoder.object(|_| Ok(())).unwrap(); // bounded typed skip, including derived scope
+        decoder.finish().unwrap();
+        for length in 0..bytes.len() {
+            assert!(Decoder::new(&bytes[..length]).object(|_| Ok(())).is_err());
+        }
+        for count in [1, MAX_COLLECTION_COUNT as u64 + 1, u32::MAX as u64] {
+            let array = counted(OBJECT_ARRAY, count, &[]);
+            assert!(Decoder::new(&array).object_array(|_| Ok(())).is_err());
+            assert!(Decoder::new(&object_bytes(&array))
+                .object(|_| Ok(()))
+                .is_err());
+        }
+        for bytes in [
+            &[POINTER][..],
+            &[POINTER, 0x41],
+            &[UINT16],
+            &[UINT16, 0x84, 0x80, 0], // 65536 overflow
+            &[UINT16, 0x80, 0x80, 0x80, 0],
+        ] {
+            assert!(Decoder::new(&object_bytes(bytes))
+                .object(|_| Ok(()))
+                .is_err());
+        }
+        assert!(Decoder::new(&[]).next_scope().is_err());
+        assert!(Encoder::new().next_scope().is_err());
+        let mut encoder = Encoder::new();
+        encoder.u16(42);
+        assert!(encoder
+            .pointer(Some(&[]), |_| Err(Error::InvalidInput("model failure")))
+            .is_err());
+        assert_eq!(Decoder::new(&encoder.finish()).u16().unwrap(), 42);
+        let mut encoder = Encoder::new();
+        assert!(encoder
+            .object_array(&vec![0; MAX_COLLECTION_COUNT + 1], |_, _| Ok(()))
+            .is_err());
+        assert!(encoder.finish().is_empty());
+    }
 
     fn encode(f: impl FnOnce(&mut Encoder)) -> Vec<u8> {
         let mut encoder = Encoder::new();

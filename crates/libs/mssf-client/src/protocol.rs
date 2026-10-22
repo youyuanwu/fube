@@ -43,7 +43,7 @@ pub(crate) fn encode_name(name: &str) -> Result<Vec<u8>> {
     Ok(encoder.finish())
 }
 
-fn check_reply(message: &Message, actions: &[&str]) -> Result<()> {
+pub(crate) fn check_failure(message: &Message) -> Result<()> {
     let properties = message.properties()?;
     if let Some(fault) = properties.fault.filter(|fault| fault.code != 0) {
         let mut code = fault.code;
@@ -90,6 +90,12 @@ fn check_reply(message: &Message, actions: &[&str]) -> Result<()> {
             )),
         };
     }
+    Ok(())
+}
+
+fn check_reply(message: &Message, actions: &[&str]) -> Result<()> {
+    check_failure(message)?;
+    let properties = message.properties()?;
     if properties.actor != 5 {
         return Err(Error::Protocol("operation reply is not from NamingGateway"));
     }

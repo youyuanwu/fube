@@ -1,6 +1,7 @@
 # Rust FabricClient POC
 
-**Status:** experimental native clear-TCP subset. Gateway ping and NameExists
+**Status:** experimental native clear-TCP subset. Gateway ping, NameExists and
+typed GetNodeList
 have been demonstrated against the repository's Ubuntu onebox running
 Service Fabric **11.8.121.4**. This is not a complete FabricClient replacement
 and does not support TLS or authentication.
@@ -10,7 +11,8 @@ and does not support TLS or authentication.
 `mssf-transport` implements bounded Fabric serialization, clear frames and CRCs,
 ordered native headers, client-only ListenInstance establishment, and
 continuously driven, bounded concurrent Tokio request/reply I/O. `mssf-client`
-adds native gateway ping and NameExists, with owned results and explicit errors.
+adds native gateway ping, NameExists and a typed node-list page operation, with
+owned results and explicit errors.
 
 Neither package calls the native Service Fabric client or COM libraries.
 Neither uses HTTP to execute client operations. "Clear TCP" still carries the
@@ -20,13 +22,16 @@ Neither uses HTTP to execute client operations. "Clear TCP" still carries the
 |---|---|
 | Gateway ping | Sends PingRequest with an empty body and decodes gateway address, node ID, node instance, and node name. Full identity compared with independent onebox observations. |
 | NameExists | Sends a parsed ten-field native URI object; independently established existing/absent names returned true/false on the same connection. |
-| Native faults/errors | Retains native signed error codes and available diagnostics; offline model-peer coverage only, not live error-path qualification. |
-| Concurrent operations | Mixed ping and NameExists on clones sharing one connection; real onebox coverage. |
+| GetNodeList | Sends the external `GetNodeList` string query to NamingGateway using `QueryRequest`; decodes all 21 source-defined node fields, nested deactivation data and explicit paging. Five-node membership/overlapping fields independently checked through management; binary ports checked against the onebox manifest. |
+| Native faults/errors | Retains native signed error codes and available diagnostics. Malformed GetNodeList continuation produced live `E_INVALIDARG` (-2147024809) or `FMFailoverUnitNotFound` (-2147017462); the same connection remained usable. Other fault forms have offline model-peer coverage. |
+| Concurrent operations | Mixed ping, NameExists and node queries on clones sharing one connection; real onebox coverage. |
 | Idle disconnect | Real native ping through a test-owned proxy, followed by proxy cutoff; closure detected without another operation. |
 | Controls and stream lifecycle | Idle ListenInstance, deadlines, fragmentation, backpressure, correlation, cancellation, and close/drop; offline model-peer coverage. |
 
 The client advertises protocol **1.1**. The demonstrated gateway replies with
-protocol **1.2**. Coverage is qualified only for the observed runtime,
+protocol **1.2** for ping. The observed GetNodeList aggregate success has no
+actor, action or client-version header; correlation and typed body validation
+remain mandatory. Coverage is qualified only for the observed runtime,
 clear-TCP profile, and these operations, not all Service Fabric releases.
 
 ## 2. Run against a disposable onebox
@@ -41,9 +46,14 @@ just onebox create poc
 
 cargo run -p mssf-client --example onebox -- \
   --clear 127.0.0.1:19000 ping
+
+cargo run -p mssf-client --example onebox -- \
+  --clear 127.0.0.1:19000 node-list
 ```
 
 The example prints the gateway's advertised address and full node identity.
+`node-list` prints one page and its continuation token, not an implicit complete
+cluster inventory.
 The advertised address can be the container's private address rather than the
 loopback endpoint used to dial it.
 
@@ -146,6 +156,58 @@ fault code; native delayed security-session draining is not implemented.
 unsupported in this clear-only profile and terminate explicitly. This is not
 qualification of native secure-session recovery or service notifications.
 
+### Native node pages
+
+```rust,no_run
+use std::num::NonZeroU64;
+use mssf_client::{FabricClient, NodeQueryDescription, NodeStatusFilter};
+
+# async fn pages(client: &FabricClient) -> mssf_client::Result<()> {
+let mut query = NodeQueryDescription {
+    status_filter: NodeStatusFilter::UP | NodeStatusFilter::DOWN,
+    max_results: NonZeroU64::new(2),
+    ..Default::default()
+};
+loop {
+    let page = client.get_node_list(&query).await?;
+    for node in page.nodes {
+        println!("{} {} {:?}", node.name, node.id, node.status);
+    }
+    query.continuation_token = page.continuation_token;
+    if query.continuation_token.is_none() {
+        break;
+    }
+}
+# Ok(())
+# }
+```
+
+The operation returns an owned `NodeListPage`; callers choose traversal and
+overall budgets. `get_node_list_with_timeout` supplies a per-request timeout,
+not a whole-traversal deadline. Nodes can change between pages; native
+aggregation is best-effort when individual subqueries fail. **No continuation
+means paging ended, not proof that every aggregation source answered.**
+
+`node_name` is an exact, case-preserving filter, not a prefix or naming URI.
+Empty name/token values are omitted like the native facade. Default status
+filter `0` excludes Unknown/Removed, not all non-Up states; `ALL = 0xffff`
+bypasses status matching. Other masks combine distinct status **bits**, not
+`NodeStatus` discriminants. `from_bits` preserves any UInt32 native mask.
+`max_results` is optional `NonZeroU64`, rejected locally above `i64::MAX`.
+No limit still allows server byte-size paging: always inspect continuation.
+A final page with exactly the requested count can have no token.
+
+The result includes identity, address, node type, versions, status/health,
+seed/domains, instance, native ports, uptime/downtime, up/down timestamps,
+stopped flag and deactivation tasks/safety checks. `NodeId` is high/low UInt64,
+not a UUID; its display matches native hexadecimal numeric formatting.
+`NodeTimestamp` preserves signed native 100-nanosecond ticks since 1601 UTC;
+zero means native default. Durations remain signed native seconds.
+Scalar enums distinguish named `Unknown` from `Unrecognized(i64)`; unrecognized
+numbers are retained, not silently coerced. Unsupported polymorphic wrapper/
+safety-check tags or malformed field structure fail explicitly and retire the
+stream. Nonempty deactivation/safety variants have source/model coverage only.
+
 ## 4. Supported inputs and bounds
 
 Naming input is literal lowercase `fabric:/` followed by nonempty ASCII
@@ -165,7 +227,7 @@ native NamingUri parser.
 | Object extent, excluding its leading marker | 4 MiB, additionally constrained by the containing frame |
 | Object nesting | 32 |
 | String | 32,768 UTF-16 code units |
-| Byte-array/collection count helper | 4,096 |
+| Byte-array/object-array/type-information count | 4,096 |
 | Admitted operations, including unconsumed results | 32 |
 | Queued output frames, including cancelled commands awaiting disposal | 32 |
 | Started write / partial incoming frame | 30 seconds; request expiry ends local waiting, not started frame completion |
@@ -175,7 +237,7 @@ maximum-sized queued frames can occupy 128 MiB. Memory also includes active
 encoding and frame copies, one active writer, one incoming frame and decoded
 results. Admission and queue capacity are acquired before transport frame
 encoding, and admission follows each result through delivery. Facade-prepared
-URI bodies and activity/version headers already exist before admission; waiting
+URI/query bodies and activity/version headers already exist before admission; waiting
 calls can own these bounded buffers. Cancelled commands retain no admission but
 remain within the queue bound until discarded. Returned values and caller-created
 input buffers remain the caller's responsibility.
@@ -183,7 +245,9 @@ input buffers remain the caller's responsibility.
 The decoder skips unknown/deleted header records by their bounded record
 lengths. Effective common headers use the last visible occurrence; first
 typed version lookup remains first-match. Supported appended values/scopes
-are typed-skipped, not found by searching for delimiter bytes.
+are typed-skipped, not found by searching for delimiter bytes. The bounded codec
+supports nullable object pointers, typed objects, object arrays, UInt16 and
+base/derived scopes needed by node results.
 Unsupported trailing metadata, no-copy extensions, or object flags fail
 explicitly. General native forward compatibility is not claimed.
 
@@ -215,7 +279,7 @@ the remaining group tests.
 
 On a fresh disposable local onebox, the Rust `onebox_setup` helper uses
 test-only `reqwest` HTTP calls to prepare synthetic names and independently
-observe gateway identity:
+observe full healthy five-logical-node membership and typed field expectations:
 
 ```sh
 mkdir -p build/poc-native
@@ -229,8 +293,11 @@ cargo nextest run --locked -p mssf-client --run-ignored all \
 
 Setup uses the published local HTTP gateway at `127.0.0.1:19080` and records
 the first native gateway at `127.0.0.1:19000` / N0010. Run setup once on a fresh
-disposable onebox; an existing fixture name or unexpected HTTP result is an
-error. Proxy use and redirects are disabled. No additional CI job is needed.
+disposable onebox, then repeat it before every native execution leg. Creating
+the naming fixture is idempotent (HTTP conflict is followed by an independent
+existence check); unexpected HTTP results fail. Node observation timestamps
+must be no more than 120 seconds old and not future-dated at native test start.
+Proxy use and redirects are disabled. No additional CI job is needed.
 `reqwest` has JSON support only, with default/TLS features disabled, and is a
 dev-dependency rather than a production client dependency.
 
@@ -246,10 +313,13 @@ accepts a private JSON file with the following fields:
 | `expected_node_name` | Gateway node name, e.g. `"N0010"` for the published first gateway. |
 | `expected_node_id` | Canonical lowercase hexadecimal native node ID. |
 | `expected_node_instance` | Numeric native node instance. |
+| `observed_at_unix_ms` | Independent observation start time; maximum age 120 seconds. |
+| `expected_nodes` | Five unique healthy node observations in management JSON shape: identity, address/type/versions, status/health/seed/domains, durations/timestamps, deactivation and stopped state. |
 | `report_path` | Absolute path for a sanitized JSON result, in an existing private directory. |
 
-Use HTTP `GET /Nodes?api-version=6.0` for independent node/version observations
-(`CodeVersion`, `Name`, `Id.Id`, and numeric `InstanceId`). Verify fixture state
+Use HTTP `GET /Nodes?api-version=6.3`, following continuation, for independent
+node/version/field observations. `InstanceId` and durations are decimal strings.
+Verify fixture state
 independently using `GET /Names/NAME?api-version=6.0`; absent is HTTP 404.
 HTTP is fixture preparation/observation only. Native results are obtained
 exclusively through the Rust native connection.
@@ -266,12 +336,42 @@ MSSF_TEST_CONFIG="$PWD/build/poc-native-config.json" \
 
 The selected test fails on missing/wrong configuration, inaccessible native
 gateway, identity mismatch, or unmet naming prerequisites. It writes a result
-only after sequential ping/true/false, 32 overlapping mixed operations on clones,
+only after node field/filter/paging/error assertions, sequential ping/true/false,
+32 initially Pending overlapping mixed operations on clones (14 ping, 6 existing
+names, 6 absent names, 6 node queries),
 clone-drop survival, explicit close and a test-owned proxy idle-disconnect case
 pass. The proxy first proves a real native ping, then cuts the TCP connection;
 no new application operation is used to detect the failure. It does not restart
 onebox or qualify native failover/control emission. Runtime metadata comes from
 independent preparation; ping does not advertise the server's code version.
+
+On the qualified healthy five-logical-node, single-host **11.8.121.4** profile,
+page limits 1 and 2 yielded lengths **[1,1,1,1,1]** and **[2,2,1]**, with four
+and two server-issued continuations. Their strictly NodeId-ordered unique unions
+matched management membership. Exact-name hits, case/prefix/nonexistent misses,
+default/All/Up/Down masks, empty input omission, full terminal pages and valid
+continuation after the final independent ID were checked. Stable fields match
+exactly; duration observations allow at most 120 seconds of sequential skew,
+timestamps match management's millisecond precision (<10,000 ticks), and
+deactivation/health must match the stable healthy prerequisite.
+Reports retain independent management observations **and** native durations,
+raw timestamp ticks and native observation start/end times, not just pass flags.
+
+Malformed-token errors are runtime-dependent even on this healthy profile:
+independent HTTP probes also returned both E_INVALIDARG (400) and
+FMFailoverUnitNotFound (500). The native parallel-query handler returns the
+last error when every subquery fails
+([pinned source](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/query/QueryMessageHandler.cpp#L212-L225)).
+The qualification test accepts these two specifically observed native codes,
+records the actual code/diagnostic, and requires healthy queries before/after.
+The client neither normalizes this variability nor retries it.
+
+This does **not** qualify non-Up transitions, populated safety/deactivation
+states, partial aggregation failures, byte-size-limited paging, membership
+changes during traversal, unknown numeric values on a real runtime, other
+versions or multi-host behavior. Those bounds are not erased by terminal
+paging. Synthetic model peers test nested/unknown/malformed safety behavior,
+not native compatibility.
 
 ### Build once, run the archive on onebox
 

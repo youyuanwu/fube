@@ -3,7 +3,8 @@
 **Status:** proposed; all implementation phases are pending.
 
 An initial [clear-TCP Rust POC](../RustFabricClient.md) now demonstrates native
-gateway ping and NameExists against Ubuntu onebox runtime 11.8.121.4. It is a
+gateway ping, NameExists and typed GetNodeList pages against Ubuntu onebox runtime
+11.8.121.4. It is a
 deliberately narrower implementation, now with a continuously driven, bounded
 concurrent client, restricted naming inputs, and no TLS or automatic recovery. The production
 phases below remain pending; partial POC work does not satisfy their full gates.

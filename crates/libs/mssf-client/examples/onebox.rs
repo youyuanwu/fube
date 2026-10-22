@@ -1,9 +1,9 @@
 use std::{net::SocketAddr, time::Duration};
 
-use mssf_client::{Error, FabricClient, Result, DEFAULT_TIMEOUT};
+use mssf_client::{Error, FabricClient, NodeQueryDescription, Result, DEFAULT_TIMEOUT};
 
 const USAGE: &str =
-    "usage: onebox --clear IP:port ping [--timeout-seconds N]\n       onebox --clear IP:port name-exists fabric:/name [--timeout-seconds N]";
+    "usage: onebox --clear IP:port ping|node-list [--timeout-seconds N]\n       onebox --clear IP:port name-exists fabric:/name [--timeout-seconds N]";
 
 fn arguments() -> Result<(SocketAddr, String, Option<String>, Duration)> {
     let mut args: Vec<_> = std::env::args().skip(1).collect();
@@ -28,7 +28,7 @@ fn arguments() -> Result<(SocketAddr, String, Option<String>, Duration)> {
         .parse()
         .map_err(|_| Error::InvalidInput("clear endpoint must be an IP:port socket address"))?;
     let name = match args[2].as_str() {
-        "ping" if args.len() == 3 => None,
+        "ping" | "node-list" if args.len() == 3 => None,
         "name-exists" if args.len() == 4 => Some(args[3].clone()),
         _ => return Err(Error::InvalidInput(USAGE)),
     };
@@ -44,6 +44,15 @@ async fn run() -> Result<()> {
             "gateway={} node_name={} node_id={:x} node_instance={}",
             gateway.address, gateway.node_name, gateway.node_id, gateway.node_instance
         );
+    } else if operation == "node-list" {
+        // Explicit single page: never imply this is the complete membership.
+        let page = client
+            .get_node_list(&NodeQueryDescription::default())
+            .await?;
+        for node in page.nodes {
+            println!("{node:?}");
+        }
+        println!("continuation_token={:?}", page.continuation_token);
     } else {
         let name = name.as_deref().unwrap();
         println!("name={name} exists={}", client.name_exists(name).await?);

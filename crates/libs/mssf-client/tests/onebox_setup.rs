@@ -5,6 +5,9 @@ use std::{error::Error, path::PathBuf, time::Duration};
 use reqwest::{redirect::Policy, Client, Response, StatusCode};
 use serde::Deserialize;
 
+mod support;
+use support::ObservedNode;
+
 const MANAGEMENT: &str = "http://127.0.0.1:19080";
 const EXISTING: &str = "fabric:/native-client-ci-existing";
 const ABSENT: &str = "fabric:/native-client-ci-absent";
@@ -14,22 +17,8 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct Nodes {
-    items: Vec<Node>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct Node {
-    name: String,
-    code_version: String,
-    id: NodeId,
-    instance_id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct NodeId {
-    id: String,
+    items: Vec<ObservedNode>,
+    continuation_token: String,
 }
 
 fn absolute_output(value: &str) -> Result<PathBuf> {
@@ -64,19 +53,26 @@ async fn onebox_prepare_fixtures() -> Result<()> {
     if config_path == report_path {
         return Err("configuration and report paths must differ".into());
     }
+    if report_path.exists() {
+        std::fs::remove_file(&report_path)?;
+    }
     let client = Client::builder()
         .no_proxy()
         .redirect(Policy::none())
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    successful(
-        client
-            .post(format!("{MANAGEMENT}/Names/$/Create?api-version=6.0"))
-            .json(&serde_json::json!({"Name": EXISTING}))
-            .send()
-            .await?,
-    )?;
+    let created = client
+        .post(format!("{MANAGEMENT}/Names/$/Create?api-version=6.0"))
+        .json(&serde_json::json!({"Name": EXISTING}))
+        .send()
+        .await?;
+    // Re-running independent observation before each archive execution leg is
+    // required for freshness. Accept only success or an already-existing name;
+    // the following GET independently confirms the naming prerequisite.
+    if created.status() != StatusCode::CONFLICT {
+        successful(created)?;
+    }
     successful(
         client
             .get(format!(
@@ -98,17 +94,36 @@ async fn onebox_prepare_fixtures() -> Result<()> {
         )
         .into());
     }
-    let nodes: Nodes = successful(
-        client
-            .get(format!("{MANAGEMENT}/Nodes?api-version=6.0"))
-            .send()
-            .await?,
-    )?
-    .json()
-    .await?;
-    let node = nodes
-        .items
-        .into_iter()
+    let observed_at_unix_ms = support::unix_millis();
+    let mut items = Vec::new();
+    let mut token = String::new();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..128 {
+        let mut request = client.get(format!("{MANAGEMENT}/Nodes?api-version=6.3"));
+        if !token.is_empty() {
+            request = request.query(&[("ContinuationToken", &token)]);
+        }
+        let page: Nodes = successful(request.send().await?)?.json().await?;
+        items.extend(page.items);
+        if items.len() > 4096 {
+            return Err("management membership exceeds test observation bound".into());
+        }
+        token = page.continuation_token;
+        if token.is_empty() {
+            break;
+        }
+        if !seen.insert(token.clone()) {
+            return Err("management continuation repeated".into());
+        }
+    }
+    if !token.is_empty() {
+        return Err("management paging exceeded test bound".into());
+    }
+    if items.len() != 5 || items.iter().any(|node| node.node_status != "Up") {
+        return Err("qualification requires the healthy five-logical-node onebox profile".into());
+    }
+    let node = items
+        .iter()
         .find(|node| node.name == "N0010")
         .ok_or("management response is missing gateway node N0010")?;
     let config = serde_json::json!({
@@ -120,6 +135,8 @@ async fn onebox_prepare_fixtures() -> Result<()> {
         "expected_node_name": node.name,
         "expected_node_id": node.id.id,
         "expected_node_instance": node.instance_id.parse::<u64>()?,
+        "observed_at_unix_ms": observed_at_unix_ms,
+        "expected_nodes": items,
         "report_path": report_path,
     });
     std::fs::write(config_path, serde_json::to_vec_pretty(&config)?)?;

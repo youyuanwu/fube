@@ -213,7 +213,7 @@ jobs:
         MSSF_TEST_CONFIG: ${{ runner.temp }}/native-client-config.json
         MSSF_TEST_REPORT: ${{ runner.temp }}/native-client-report.json
 
-    - name: Exercise real native ping and NameExists
+    - name: Exercise real native ping, NameExists and node list
       id: native_client
       if: matrix.topology == 'onebox'
       run: |

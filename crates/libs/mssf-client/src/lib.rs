@@ -4,7 +4,10 @@
 //! Connections support bounded concurrency, have no automatic reconnect, and must only be
 //! used with an explicitly selected unsecured development gateway.
 
+mod node_protocol;
+mod nodes;
 mod protocol;
+pub use nodes::*;
 
 use std::{net::SocketAddr, time::Duration};
 
@@ -72,6 +75,29 @@ impl FabricClient {
         let body = protocol::encode_name(name)?;
         self.request("NameExistsRequest", body, deadline, |reply| {
             protocol::decode_name_exists(&reply)
+        })
+        .await
+    }
+
+    /// Get one native node page. Inspect `continuation_token` even without an
+    /// explicit page limit: the server can also page by message size.
+    ///
+    /// This is best-effort native aggregation, not a membership snapshot.
+    pub async fn get_node_list(&self, query: &NodeQueryDescription) -> Result<NodeListPage> {
+        self.get_node_list_with_timeout(query, self.timeout).await
+    }
+
+    /// Get one page using one deadline covering encoding, admission and reply.
+    /// No automatic paging, retry, reconnect or replay occurs.
+    pub async fn get_node_list_with_timeout(
+        &self,
+        query: &NodeQueryDescription,
+        timeout: Duration,
+    ) -> Result<NodeListPage> {
+        let deadline = deadline_after(timeout)?;
+        let body = node_protocol::encode_query(query)?;
+        self.request("QueryRequest", body, deadline, |reply| {
+            node_protocol::decode_reply(&reply)
         })
         .await
     }
