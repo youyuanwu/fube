@@ -508,6 +508,92 @@ base/derived scopes needed by node results.
 Unsupported trailing metadata, no-copy extensions, or object flags fail
 explicitly. General native forward compatibility is not claimed.
 
+### 4.1 Native Serde payloads
+
+`mssf_transport::serialization::serde` provides `to_vec` / `from_slice` over
+the existing bounded native codec, not a JSON, bincode or postcard encoding.
+Compatible ordered wire DTOs can use ordinary Serde derives:
+
+```rust
+use mssf_transport::serialization::serde::{from_slice, to_vec, Guid};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct ListenWire {
+    address: String,
+    instance: u64,
+    nonce: Guid,
+}
+
+let value = ListenWire {
+    address: "node".into(), instance: 7, nonce: Guid([0; 16]),
+};
+let bytes = to_vec(&value).unwrap();
+assert_eq!(from_slice::<ListenWire>(&bytes).unwrap(), value);
+```
+
+| Mapping | Native behavior |
+|---|---|
+| bool, u16, i32/u32, i64/u64, str/String | Existing typed metadata, compressed integers and strict little-endian UTF-16. |
+| Named struct / multi-field tuple struct | One ordered native object. Fields follow declaration order; field names/renames do not appear on the wire. |
+| Newtype struct | Transparent; `struct Wrapper(T)` does **not** add an object. Use a named one-field struct when an object wrapper is required. |
+| `Guid([u8; 16])` | Native GUID metadata and Windows field-order bytes, e.g. `Uuid::to_bytes_le()`, not UUID network order or byte-array metadata. |
+| `ByteArray<T>` | Native byte-array metadata; encode Vec/slice/array bytes, decode `ByteArray<Vec<u8>>`. |
+| `ObjectArray<T>` | Native object-array metadata even when empty; encode a Vec/slice of struct-shaped elements, decode `ObjectArray<Vec<Row>>`. |
+| `to_fields` / `from_fields` | Fixed ordered struct fields inside an already-open codec object, without introducing or closing an object/scope. |
+
+Scalar roots are native scalar fragments; struct roots include object framing.
+`from_slice` requires complete root consumption. Decoding uses owned strings
+and bytes, not borrowed UTF-8 views of native UTF-16. Existing limits above
+apply; 4 MiB is a **per-object** extent limit, not an aggregate limit on a
+standalone root object array. Transport frames retain their separate limit.
+`collect_str` formats through a bounded sink that checks UTF-16 units before
+buffering each chunk, then uses the same native string encoder.
+
+Generic Vec/array/tuple/map, Option, enums, unit, floats, chars and other integer
+widths are unsupported unless used through an explicit native adapter.
+Ordinary enum indices are not native signed-64-bit codes: wire DTOs use i64
+with operation-specific conversion. Empty container kind is never inferred
+from the sequence length or first element.
+
+Pointers, type information, recognized polymorphic kinds, base/derived scopes
+and compatibility suffixes remain explicit `Encoder`/`Decoder` operations.
+Bridge their compatible ordered bodies with `to_fields` / `from_fields`;
+validate tags/kinds and use `is_scope_end()` for genuinely absent suffixes.
+An Option/default is not a substitute for pointer metadata or an absent
+trailing field. `from_fields` leaves following fields available and does not
+finish the enclosing object. Encoder errors roll back the failed bridge's
+bytes; decoder errors do not rewind input.
+
+Only fixed positional schemas are wire-preserving. Do not apply flatten,
+skip/skip_serializing_if, default or enum-tagging attributes to native DTOs.
+The backend rejects observable unsupported calls, but cannot detect every
+attribute or custom serializer that hides a positional shape change.
+Serialization custom errors are bounded static `InvalidInput` diagnostics;
+deserialization custom errors are `Protocol`, retaining malformed-success
+connection retirement. Codec errors retain their existing categories.
+Supported unknown trailing values/scopes are skipped, not retained for
+lossless re-emission.
+
+Production adoption includes listen-instance controls and common header
+writers, shared query-request DTOs, ping/NameExists replies, health/event
+fields and application/service scalar blocks/parameter pairs. Header record
+framing/duplicate rules and public client models are unchanged. Query argument
+order remains the supplied slice order; QueryAddress is not added to the body.
+Naming URI's inline string-vector, query-result pointer/tag policy, node-list
+structural polymorphism, strict list conversions/deprecated fields/suffix
+defaults, and failure-detail fallbacks remain explicit manual boundaries.
+
+See the [backend contract and compiling example][native-serde],
+[transport payloads][serde-messages], [query DTOs][serde-query],
+[health conversion][serde-health] and [list conversion][serde-lists].
+
+[native-serde]: ../../crates/libs/mssf-transport/src/serialization/serde.rs#L1-L198
+[serde-messages]: ../../crates/libs/mssf-transport/src/message.rs#L12-L123
+[serde-query]: ../../crates/libs/mssf-client/src/query_protocol.rs#L13-L39
+[serde-health]: ../../crates/libs/mssf-client/src/health_protocol.rs#L71-L151
+[serde-lists]: ../../crates/libs/mssf-client/src/list_protocol.rs#L195-L312
+
 ## 5. Offline and native qualification
 
 Use nextest 0.9.146, pinned in CI. The repository requires at least 0.9.133 for
@@ -527,6 +613,17 @@ lifecycle behavior; they do not establish native protocol correctness.
 There are no committed golden packet hex files or normalized capture snapshots.
 Native compatibility claims require the self-contained live scenarios below
 to pass against the real onebox.
+
+The native Serde migration was qualified with independent old/manual-versus-new
+encoded-byte comparisons for every migrated encoder family, malformed and
+missing-versus-truncated suffix regressions, exact/over-bound adapter tests,
+and all four live scenarios below on SF **11.8.121.4**. The qualification used
+a uniquely owned unpublished onebox and a nonroot Ubuntu24.04 archive consumer
+sharing only that runtime's network namespace, with read-only checkout/root
+and private writable evidence. All four passed; owned fixture cleanup and
+independent allocation/container/volume/network/private-tag removal were
+verified. This does not extend compatibility to untested native schemas or
+make test-only REST preparation part of the production client.
 
 Tests that need onebox are named `onebox_*` and assigned to the shared
 **`onebox` nextest group** in `.config/nextest.toml`. They remain `#[ignore]`

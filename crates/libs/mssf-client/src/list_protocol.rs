@@ -4,8 +4,9 @@ use std::{borrow::Cow, collections::BTreeMap, num::NonZeroU64};
 
 use mssf_transport::{
     message::{Message, ACTION, ACTOR},
-    serialization::{Decoder, MAX_COLLECTION_COUNT},
+    serialization::{serde::from_fields, Decoder, MAX_COLLECTION_COUNT},
 };
+use serde::Deserialize;
 
 use crate::{applications::*, services::*, Error, HealthState, Result};
 
@@ -146,8 +147,8 @@ pub(crate) fn decode_services(message: &Message) -> Result<ServiceListPage> {
     })
 }
 
-fn health(decoder: &mut Decoder<'_>) -> Result<HealthState> {
-    match HealthState::from_raw(decoder.i64()?) {
+fn health(raw: i64) -> Result<HealthState> {
+    match HealthState::from_raw(raw) {
         HealthState::Unrecognized(_) => Err(Error::Protocol("unsupported list health state")),
         state => Ok(state),
     }
@@ -192,9 +193,11 @@ fn name(decoder: &mut Decoder<'_>) -> Result<String> {
 }
 
 fn parameters(decoder: &mut Decoder<'_>) -> Result<BTreeMap<String, String>> {
-    let pairs = decoder.object_array(|decoder| Ok((decoder.string()?, decoder.string()?)))?;
+    #[derive(Deserialize)]
+    struct Pair(String, String);
+    let pairs = decoder.object_array(from_fields::<Pair>)?;
     let mut values = BTreeMap::new();
-    for (key, value) in pairs {
+    for Pair(key, value) in pairs {
         if values.insert(key, value).is_some() {
             return Err(Error::Protocol("duplicate application parameter"));
         }
@@ -203,10 +206,16 @@ fn parameters(decoder: &mut Decoder<'_>) -> Result<BTreeMap<String, String>> {
 }
 
 fn application(decoder: &mut Decoder<'_>) -> Result<Application> {
+    #[derive(Deserialize)]
+    struct Fields {
+        type_name: String,
+        type_version: String,
+        status: i64,
+        health: i64,
+    }
     let name = name(decoder)?;
-    let type_name = decoder.string()?;
-    let type_version = decoder.string()?;
-    let status = match decoder.i64()? {
+    let fields: Fields = from_fields(decoder)?;
+    let status = match fields.status {
         0 => ApplicationStatus::Invalid,
         1 => ApplicationStatus::Ready,
         2 => ApplicationStatus::Upgrading,
@@ -215,7 +224,7 @@ fn application(decoder: &mut Decoder<'_>) -> Result<Application> {
         5 => ApplicationStatus::Failed,
         _ => return Err(Error::Protocol("unsupported application status")),
     };
-    let health_state = health(decoder)?;
+    let health_state = health(fields.health)?;
     let parameters = parameters(decoder)?;
     if !decoder.is_scope_end()? && !decoder.string()?.is_empty() {
         return Err(Error::Protocol(
@@ -240,8 +249,8 @@ fn application(decoder: &mut Decoder<'_>) -> Result<Application> {
     };
     Ok(Application {
         name,
-        type_name,
-        type_version,
+        type_name: fields.type_name,
+        type_version: fields.type_version,
         status,
         health_state,
         parameters,
@@ -250,19 +259,24 @@ fn application(decoder: &mut Decoder<'_>) -> Result<Application> {
 }
 
 fn service(decoder: &mut Decoder<'_>) -> Result<Service> {
+    #[derive(Deserialize)]
+    struct Fields {
+        type_name: String,
+        manifest_version: String,
+        persisted: bool,
+        health: i64,
+    }
     let raw_kind = decoder.i64()?;
     let name = name(decoder)?;
-    let type_name = decoder.string()?;
-    let manifest_version = decoder.string()?;
-    let persisted = decoder.boolean()?;
-    let kind = match (raw_kind, persisted) {
+    let fields: Fields = from_fields(decoder)?;
+    let kind = match (raw_kind, fields.persisted) {
         (1, false) => ServiceKind::Stateless,
         (2, has_persisted_state) => ServiceKind::Stateful {
             has_persisted_state,
         },
         _ => return Err(Error::Protocol("unsupported service kind/persistence")),
     };
-    let health_state = health(decoder)?;
+    let health_state = health(fields.health)?;
     let status = if decoder.is_scope_end()? {
         ServiceStatus::Unknown
     } else {
@@ -283,8 +297,8 @@ fn service(decoder: &mut Decoder<'_>) -> Result<Service> {
     };
     Ok(Service {
         name,
-        type_name,
-        manifest_version,
+        type_name: fields.type_name,
+        manifest_version: fields.manifest_version,
         kind,
         health_state,
         status,

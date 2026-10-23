@@ -1,7 +1,9 @@
+use mssf_transport::serialization::serde::{from_slice, ByteArray};
 use mssf_transport::{
     message::Message,
     serialization::{Decoder, Encoder},
 };
+use serde::Deserialize;
 
 use crate::{Error, GatewayDescription, Result};
 
@@ -124,46 +126,40 @@ pub(crate) fn decode_ping(message: &Message) -> Result<GatewayDescription> {
             ))
         }
     }
-    let mut decoder = Decoder::new(&message.body);
-    let gateway = decoder.object(|decoder| {
-        decoder.object(|decoder| {
-            let address = decoder.string()?;
-            let (node_id, node_instance) = decoder.object(|decoder| {
-                let bytes = decoder.byte_array()?;
-                if bytes.len() != 16 {
-                    return Err(Error::Protocol("node ID must contain exactly 16 bytes"));
-                }
-                let high = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-                let low = u64::from_le_bytes(bytes[8..].try_into().unwrap());
-                Ok(((u128::from(high) << 64) | u128::from(low), decoder.u64()?))
-            })?;
-            let node_name = decoder.string()?;
-            if address.is_empty() || node_name.is_empty() {
-                return Err(Error::Protocol(
-                    "gateway address and node name must be nonempty",
-                ));
-            }
-            Ok(GatewayDescription {
-                address,
-                node_id,
-                node_instance,
-                node_name,
-            })
-        })
-    })?;
-    decoder.finish()?;
-    Ok(gateway)
+    #[derive(Deserialize)]
+    struct NodeInstance(ByteArray, u64);
+    #[derive(Deserialize)]
+    struct Gateway(String, NodeInstance, String);
+    #[derive(Deserialize)]
+    struct Reply {
+        gateway: Gateway,
+    }
+    let Reply {
+        gateway: Gateway(address, NodeInstance(ByteArray(bytes), node_instance), node_name),
+    } = from_slice(&message.body)?;
+    if bytes.len() != 16 {
+        return Err(Error::Protocol("node ID must contain exactly 16 bytes"));
+    }
+    let high = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let low = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+    if address.is_empty() || node_name.is_empty() {
+        return Err(Error::Protocol(
+            "gateway address and node name must be nonempty",
+        ));
+    }
+    Ok(GatewayDescription {
+        address,
+        node_id: (u128::from(high) << 64) | u128::from(low),
+        node_instance,
+        node_name,
+    })
 }
 
 pub(crate) fn decode_name_exists(message: &Message) -> Result<bool> {
     check_reply(message, &["NameOperationReply"])?;
-    let mut decoder = Decoder::new(&message.body);
-    let exists = decoder.object(|decoder| {
-        let exists = decoder.boolean()?;
-        let _user_service_state = decoder.i64()?;
-        Ok(exists)
-    })?;
-    decoder.finish()?;
+    #[derive(Deserialize)]
+    struct Reply(bool, i64);
+    let Reply(exists, _user_service_state) = from_slice(&message.body)?;
     Ok(exists)
 }
 

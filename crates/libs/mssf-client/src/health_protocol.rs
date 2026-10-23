@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 
+use mssf_transport::serialization::serde::{from_fields, ObjectArray};
 use mssf_transport::{message::Message, serialization::Decoder};
+use serde::Deserialize;
 
 use crate::{health::*, Error, HealthState, NodeTimestamp, Result};
 
@@ -67,10 +69,24 @@ pub(crate) fn decode_reply(message: &Message) -> Result<NodeHealth> {
 }
 
 fn decode_health(decoder: &mut Decoder<'_>) -> Result<NodeHealth> {
+    #[derive(Deserialize)]
+    struct Prefix {
+        node_name: String,
+        health_events: ObjectArray<Vec<EventWire>>,
+        aggregated_health_state: i64,
+    }
+    #[derive(Deserialize)]
+    struct Evaluation {
+        description: String,
+        unhealthy_event: EventWire,
+        consider_warning_as_error: bool,
+        aggregated_health_state: i64,
+    }
+    let prefix: Prefix = from_fields(decoder)?;
     Ok(NodeHealth {
-        node_name: decoder.string()?,
-        health_events: decoder.object_array(decode_event)?,
-        aggregated_health_state: HealthState::from_raw(decoder.i64()?),
+        node_name: prefix.node_name,
+        health_events: prefix.health_events.0.into_iter().map(Into::into).collect(),
+        aggregated_health_state: HealthState::from_raw(prefix.aggregated_health_state),
         unhealthy_evaluations: decoder.object_array(|decoder| {
             decoder
                 .pointer(|decoder, tag| {
@@ -82,11 +98,14 @@ fn decode_health(decoder: &mut Decoder<'_>) -> Result<NodeHealth> {
                     if decoder.i64()? != 1 {
                         return Err(Error::Protocol("health evaluation tag and kind disagree"));
                     }
+                    let wire: Evaluation = from_fields(decoder)?;
                     Ok(HealthEvaluation::Event(EventHealthEvaluation {
-                        description: decoder.string()?,
-                        unhealthy_event: decoder.object(decode_event)?,
-                        consider_warning_as_error: decoder.boolean()?,
-                        aggregated_health_state: HealthState::from_raw(decoder.i64()?),
+                        description: wire.description,
+                        unhealthy_event: wire.unhealthy_event.into(),
+                        consider_warning_as_error: wire.consider_warning_as_error,
+                        aggregated_health_state: HealthState::from_raw(
+                            wire.aggregated_health_state,
+                        ),
                     }))
                 })?
                 .ok_or(Error::Protocol("null health evaluation"))
@@ -94,20 +113,39 @@ fn decode_health(decoder: &mut Decoder<'_>) -> Result<NodeHealth> {
     })
 }
 
-fn decode_event(decoder: &mut Decoder<'_>) -> Result<HealthEvent> {
-    Ok(HealthEvent {
-        source_id: decoder.string()?,
-        property: decoder.string()?,
-        time_to_live_ticks: decoder.i64()?,
-        health_state: HealthState::from_raw(decoder.i64()?),
-        description: decoder.string()?,
-        sequence_number: decoder.i64()?,
-        source_utc_timestamp: NodeTimestamp(decoder.i64()?),
-        last_modified_utc_timestamp: NodeTimestamp(decoder.i64()?),
-        is_expired: decoder.boolean()?,
-        remove_when_expired: decoder.boolean()?,
-        last_ok_transition_at: NodeTimestamp(decoder.i64()?),
-        last_warning_transition_at: NodeTimestamp(decoder.i64()?),
-        last_error_transition_at: NodeTimestamp(decoder.i64()?),
-    })
+#[derive(Deserialize)]
+struct EventWire {
+    source_id: String,
+    property: String,
+    time_to_live_ticks: i64,
+    health_state: i64,
+    description: String,
+    sequence_number: i64,
+    source_utc_timestamp: i64,
+    last_modified_utc_timestamp: i64,
+    is_expired: bool,
+    remove_when_expired: bool,
+    last_ok_transition_at: i64,
+    last_warning_transition_at: i64,
+    last_error_transition_at: i64,
+}
+
+impl From<EventWire> for HealthEvent {
+    fn from(wire: EventWire) -> Self {
+        Self {
+            source_id: wire.source_id,
+            property: wire.property,
+            time_to_live_ticks: wire.time_to_live_ticks,
+            health_state: HealthState::from_raw(wire.health_state),
+            description: wire.description,
+            sequence_number: wire.sequence_number,
+            source_utc_timestamp: NodeTimestamp(wire.source_utc_timestamp),
+            last_modified_utc_timestamp: NodeTimestamp(wire.last_modified_utc_timestamp),
+            is_expired: wire.is_expired,
+            remove_when_expired: wire.remove_when_expired,
+            last_ok_transition_at: NodeTimestamp(wire.last_ok_transition_at),
+            last_warning_transition_at: NodeTimestamp(wire.last_warning_transition_at),
+            last_error_transition_at: NodeTimestamp(wire.last_error_transition_at),
+        }
+    }
 }

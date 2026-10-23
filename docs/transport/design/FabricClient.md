@@ -206,10 +206,12 @@ the byte-level encoding and representative schemas. Keep frame parsing, raw
 header-record boundaries, and TLS handling outside the object serializer;
 operation/header schemas call the same serialization primitives.
 
-Implement explicit `FabricEncode`/`FabricDecode` traits, backed by bounded
-read/write cursors and small helpers matching `FABRIC_FIELDS_*` scopes. Keep
-field order visible in each schema. Any later derive macro must express Fabric
-scope and compatibility semantics rather than infer them from Rust layout.
+The implementation uses bounded `serialization::{Encoder, Decoder}` cursors
+and explicit scope helpers. `serialization::serde` now adds ordered DTO derives
+over those same primitives, alongside manual schemas where native boundaries
+or validation demand them. `FabricEncode`/`FabricDecode` were an initial design
+direction, not implemented traits. Keep native field order and compatibility
+semantics visible rather than infer them from Rust layout.
 
 ### 5.1 Required representations
 
@@ -245,18 +247,20 @@ data, nested objects, and null/optional values. An unknown field is not
 permission to scan for the next marker byte; strings and binary data can
 contain the same bytes as markers.
 
-Preserve raw unknown header records and object extension data when a value will
-be re-emitted. Read-only results may skip unknown extensions according to the
-native rules. Unknown required polymorphic result types return a typed
-unsupported-schema error, retaining a bounded diagnostic representation, rather
-than an empty result.
+Raw unknown header records are preserved. Read-only object results may skip
+supported trailing values/scopes according to the bounded native rules; the
+current manual and Serde decoders do not retain arbitrary object extension
+data for lossless re-emission. Unknown required polymorphic result kinds fail
+explicitly with Protocol errors, never an empty/default success. Lossless
+object-extension storage remains outside the delivered subset.
 
 Internally represent wire strings as UTF-16 code units where exact preservation
 is needed. Conversion to a public Rust `String` is fallible; never use lossy
 conversion for identifiers or request fields.
 
 Use checked arithmetic for lengths, counts, integer decompression, nesting,
-and allocations. Reject truncated scopes, overlong integers, overflow, object
+and allocations. Reject truncated scopes, integer groups beyond the supported
+width, overflow, object
 sizes outside their parent, unsupported required flags, and inconsistent array
 metadata. Parsing must make progress or fail without panicking.
 
@@ -269,18 +273,19 @@ bincode, postcard, or JSON does **not** produce the native Fabric encoding.
 | Approach | Decision |
 |---|---|
 | Stock Serde derives with an existing general-purpose format | Not wire-compatible; do not use for native messages. |
-| Serde derives with a custom Fabric `Serializer`/`Deserializer` | Possible, but still requires the native codec, explicit wire adapters, and schema rules. Not the initial implementation. |
-| Dedicated `FabricEncode`/`FabricDecode` implementations | Initial path; makes field order, scope boundaries, and compatibility behavior explicit. |
+| Serde derives with the custom Fabric `Serializer`/`Deserializer` | Delivered for documented ordered DTOs; reuses the native codec with explicit adapters and field bridges. |
+| Manual Encoder/Decoder schema operations | Retained for native distinctions and operation validation not captured by ordinary derives; shares the same primitive authority. |
 
-A custom Serde backend could handle primitive metadata, compressed integers,
-UTF-16 output, object lengths, and ordinary single-scope structs. It would not
-remove the need to specify native distinctions absent from a generic Rust
-model:
+The delivered backend handles existing supported primitive metadata, compressed
+integers, UTF-16, object extents and ordered single-scope structs. It does not
+remove native distinctions absent from a generic Rust model:
 
 - **Container kind:** an empty native string vector is `48`, an empty byte
   array is `c4`, and an empty object array is `c0`. A generic
   `serialize_seq(Some(0))` call does not identify the element type or native
-  helper. Explicit container wrappers/adapters must select the representation.
+  helper. `ByteArray` and `ObjectArray` select their metadata even when empty.
+  Generic sequences and native string-vectors are not inferred; NamingUri's
+  count followed by inline strings remains explicit.
 - **Native value types:** GUID layout, TimeSpan ticks, and explicit signed
   64-bit enum codes need wire-specific conversions. Ordinary derived enum
   variant indices are not native numeric codes.
@@ -291,29 +296,48 @@ model:
   and polymorphic type information need explicit decoder/storage behavior.
   Ordinary derives do not automatically preserve that native information.
 
-If a Serde adapter is added later, use the same codec primitives and explicit
-wire types rather than maintain a second encoding implementation. Support only
-documented mappings; do not silently apply field omission, flattening, or enum
-tagging attributes to a positional native schema. Serde remains suitable for
-configuration or application-facing JSON independently of native wire support.
+`to_vec`/`from_slice` encode/decode native values; struct roots include an object,
+scalar roots do not, and complete root consumption is checked.
+`to_fields`/`from_fields` bridge ordered DTO fields inside an existing native
+scope without adding another object. Newtype structs are transparent; use a
+named one-field struct for an actual nested wrapper. The shared codec enforces
+existing string/count/depth/object bounds; 4 MiB remains per object, not a new
+aggregate cap on standalone root object arrays.
 
-### 5.4 Derive and implementation sequence
+Supported ordinary widths are u16, i32/u32, i64/u64, bool and strings. GUID uses
+explicit native-order `Guid`; native enum/timestamp/tick scalars use i64 wire
+fields and conversion. Generic tuples/sequences/maps/Option/enums/unit/floats/
+chars/other integer widths fail explicitly. Pointer/type/scope selection and
+real-delimiter suffix defaults remain codec responsibilities, not generic
+Option/enum inference.
 
-First handwrite the bootstrap headers, transport controls, ping, and NameExists
-schemas against the bounded codec. Check internal behavior with offline tests
-and qualify encoding/decoding through real onebox exchanges as described in
-section 13 before generalizing schema generation. Neither static packet
-snapshots nor a C++ fixture build is a compatibility prerequisite.
+Fixed-order wire DTOs must not use positional omission, flattening, defaults or
+enum tagging. Unsupported backend calls fail, but attributes/custom serializers
+hidden from the backend cannot universally be detected; wire stability depends
+on the documented schema contract and independent byte/native tests. Static
+Serde custom errors preserve InvalidInput for encode and Protocol for decode.
+Existing accepted redundant integer groups within width and counted-zero
+strings/bytes remain accepted; canonical-shortest input is not newly required.
 
-Then, if repetition warrants it, add a Fabric-specific derive macro that
-generates ordered field operations, declared scope boundaries, inline versus
-nested groups, and explicit trailing-field defaults. Keep specialized value,
-container, polymorphic, and unknown-data handling in reviewed codec helpers.
-The derive must use declared wire semantics, not Rust struct memory layout.
+### 5.4 Adoption and qualification
 
-A future derive macro or Serde adapter must pass the same live onebox cases
-and malformed-input checks as handwritten schemas, with no wire-format change.
-Neither is a prerequisite for the first compatible client.
+Initial handwritten schemas established bootstrap, header, ping and operation
+compatibility. The Serde adoption now covers listen controls/common header
+writers, query requests, ping/NameExists replies, health/event bodies and
+application/service ordered scalar blocks/parameter pairs. MessageId remains
+inline and Activity nested; query argument order is preserved and QueryAddress
+is not added as a body field. Query-result tags/pointers, NamingUri,
+structural node/health polymorphism, list validation/deprecated/suffix policies,
+and failure-detail fallbacks retain deliberate manual handling.
+
+Independent old/new encoded-byte comparisons, malformed/suffix/bound tests and
+the same four live onebox scenarios passed for this migration on SF11.8.121.4.
+Qualification used an owned unpublished runtime and nonroot network-namespace
+archive consumer; exact fixture and runtime cleanup were verified. This is
+evidence for the exercised subset, not every native schema. No C++ fixture
+build, committed capture files, generic derive macro or general-purpose format
+is required. See the [public mapping contract](../RustFabricClient.md#41-native-serde-payloads)
+and its source links for supported adapters, integration and limitations.
 
 ## 6. Frames, headers, and messages
 

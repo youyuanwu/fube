@@ -1,5 +1,7 @@
 use crate::{Error, Result};
 
+pub mod serde;
+
 pub const MAX_STRING_UNITS: usize = 32_768;
 pub const MAX_COLLECTION_COUNT: usize = 4_096;
 pub const MAX_DEPTH: usize = 32;
@@ -49,6 +51,17 @@ impl Encoder {
         type_info: &[u8],
         f: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
+        let start = self.begin_object(type_info)?;
+        let result = f(self);
+        if let Err(error) = result {
+            self.bytes.truncate(start);
+            self.depth -= 1;
+            return Err(error);
+        }
+        self.end_object(start)
+    }
+
+    fn begin_object(&mut self, type_info: &[u8]) -> Result<usize> {
         if self.depth >= MAX_DEPTH {
             return Err(Error::InvalidInput("object nesting limit exceeded"));
         }
@@ -65,12 +78,11 @@ impl Encoder {
         }
         self.bytes.push(SCOPE_BEGIN);
         self.depth += 1;
-        let result = f(self);
+        Ok(start)
+    }
+
+    fn end_object(&mut self, start: usize) -> Result<()> {
         self.depth -= 1;
-        if let Err(error) = result {
-            self.bytes.truncate(start);
-            return Err(error);
-        }
         self.bytes.extend_from_slice(&[SCOPE_END, OBJECT_END]);
         let size = self.bytes.len() - start - 1;
         if size > MAX_OBJECT_SIZE {
@@ -115,21 +127,26 @@ impl Encoder {
         values: &[T],
         mut f: impl FnMut(&mut Self, &T) -> Result<()>,
     ) -> Result<()> {
-        if values.len() > MAX_COLLECTION_COUNT {
+        let start = self.bytes.len();
+        self.object_array_header(values.len())?;
+        for value in values {
+            if let Err(error) = self.object(|encoder| f(encoder, value)) {
+                self.bytes.truncate(start);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn object_array_header(&mut self, count: usize) -> Result<()> {
+        if count > MAX_COLLECTION_COUNT {
             return Err(Error::InvalidInput("object-array count limit exceeded"));
         }
-        let start = self.bytes.len();
-        if values.is_empty() {
+        if count == 0 {
             self.bytes.push(OBJECT_ARRAY | EMPTY);
         } else {
             self.bytes.push(OBJECT_ARRAY);
-            self.write_unsigned_payload(values.len() as u64);
-            for value in values {
-                if let Err(error) = self.object(|encoder| f(encoder, value)) {
-                    self.bytes.truncate(start);
-                    return Err(error);
-                }
-            }
+            self.write_unsigned_payload(count as u64);
         }
         Ok(())
     }

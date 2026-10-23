@@ -61,6 +61,18 @@ impl From<io::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl serde::ser::Error for Error {
+    fn custom<T: fmt::Display>(_: T) -> Self {
+        Self::InvalidInput("invalid native Serde value")
+    }
+}
+
+impl serde::de::Error for Error {
+    fn custom<T: fmt::Display>(_: T) -> Self {
+        Self::Protocol("invalid native Serde value")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

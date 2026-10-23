@@ -1,8 +1,27 @@
 use crate::{
     frame::{Frame, FIXED_HEADER_SIZE, MAX_FRAME_SIZE, MAX_HEADER_SIZE},
-    serialization::{Decoder, Encoder},
+    serialization::{
+        serde::{from_slice, to_fields, to_vec, Guid},
+        Decoder, Encoder,
+    },
     Error, Result,
 };
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize)]
+struct Scalar<T> {
+    value: T,
+}
+#[derive(Serialize)]
+struct Fields2<A, B>(A, B);
+#[derive(Serialize)]
+struct IdWire(Guid, u32);
+#[derive(Serialize, Deserialize)]
+struct ListenWire<T> {
+    address: T,
+    instance: u64,
+    nonce: Guid,
+}
 
 pub const ACTOR: u16 = 0x8001;
 pub const ACTION: u16 = 0x8002;
@@ -56,14 +75,11 @@ impl Header {
     }
 
     pub fn actor(actor: i64) -> Result<Self> {
-        Self::object(ACTOR, |encoder| {
-            encoder.i64(actor);
-            Ok(())
-        })
+        Self::serialized(ACTOR, &Scalar { value: actor })
     }
 
     pub fn action(action: &str) -> Result<Self> {
-        Self::object(ACTION, |encoder| encoder.string(action))
+        Self::serialized(ACTION, &Scalar { value: action })
     }
 
     pub fn message_id(id: MessageId) -> Result<Self> {
@@ -75,42 +91,32 @@ impl Header {
     }
 
     fn id_header(kind: u16, id: MessageId) -> Result<Self> {
-        Self::object(kind, |encoder| {
-            id.encode(encoder);
-            Ok(())
-        })
+        Self::serialized(kind, &IdWire(Guid(id.guid), id.index))
     }
 
     pub fn boolean(kind: u16, value: bool) -> Result<Self> {
-        Self::object(kind, |encoder| {
-            encoder.boolean(value);
-            Ok(())
-        })
+        Self::serialized(kind, &Scalar { value })
     }
 
     pub fn timeout(ticks: i64) -> Result<Self> {
-        Self::object(TIMEOUT, |encoder| {
-            encoder.i64(ticks);
-            Ok(())
-        })
+        Self::serialized(TIMEOUT, &Scalar { value: ticks })
     }
 
     pub fn activity(guid: [u8; 16]) -> Result<Self> {
-        Self::object(ACTIVITY, |encoder| {
-            encoder.object(|encoder| {
-                encoder.guid(&guid);
-                encoder.u64(0);
-                Ok(())
-            })
-        })
+        Self::serialized(
+            ACTIVITY,
+            &Scalar {
+                value: Fields2(Guid(guid), 0u64),
+            },
+        )
     }
 
     pub fn version(major: i64, minor: i64) -> Result<Self> {
-        Self::object(CLIENT_VERSION, |encoder| {
-            encoder.i64(major);
-            encoder.i64(minor);
-            Ok(())
-        })
+        Self::serialized(CLIENT_VERSION, &Fields2(major, minor))
+    }
+
+    fn serialized<T: Serialize>(id: u16, value: &T) -> Result<Self> {
+        Self::object(id, |encoder| to_fields(encoder, value))
     }
 
     pub fn read<T>(&self, fields: impl FnOnce(&mut Decoder<'_>) -> Result<T>) -> Result<T> {
@@ -265,33 +271,106 @@ pub struct ListenInstance {
 
 impl ListenInstance {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut encoder = Encoder::new();
-        encoder.object(|encoder| {
-            encoder.string(&self.address)?;
-            encoder.u64(self.instance);
-            encoder.guid(&self.nonce);
-            Ok(())
-        })?;
-        Ok(encoder.finish())
+        to_vec(&ListenWire {
+            address: self.address.as_str(),
+            instance: self.instance,
+            nonce: Guid(self.nonce),
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut decoder = Decoder::new(bytes);
-        let instance = decoder.object(|decoder| {
-            Ok(Self {
-                address: decoder.string()?,
-                instance: decoder.u64()?,
-                nonce: decoder.guid()?,
-            })
-        })?;
-        decoder.finish()?;
-        Ok(instance)
+        let wire: ListenWire<String> = from_slice(bytes)?;
+        Ok(Self {
+            address: wire.address,
+            instance: wire.instance,
+            nonce: wire.nonce.0,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrated_payloads_match_independent_pre_serde_schemas() {
+        fn compare(header: Header, fields: impl FnOnce(&mut Encoder) -> Result<()>) {
+            assert_eq!(header, Header::object(header.id, fields).unwrap());
+        }
+        for guid in [[0; 16], std::array::from_fn(|i| (i + 1) as u8)] {
+            for index in [0, u32::MAX] {
+                let id = MessageId { guid, index };
+                compare(Header::message_id(id).unwrap(), |e| {
+                    e.guid(&guid);
+                    e.u32(index);
+                    Ok(())
+                });
+                compare(Header::relates_to(id).unwrap(), |e| {
+                    e.guid(&guid);
+                    e.u32(index);
+                    Ok(())
+                });
+            }
+            compare(Header::activity(guid).unwrap(), |e| {
+                e.object(|e| {
+                    e.guid(&guid);
+                    e.u64(0);
+                    Ok(())
+                })
+            });
+            for address in ["", "node🦀é"] {
+                for instance in [0, u64::MAX] {
+                    let value = ListenInstance {
+                        address: address.into(),
+                        instance,
+                        nonce: guid,
+                    };
+                    let mut old = Encoder::new();
+                    old.object(|e| {
+                        e.string(address)?;
+                        e.u64(instance);
+                        e.guid(&guid);
+                        Ok(())
+                    })
+                    .unwrap();
+                    let bytes = value.encode().unwrap();
+                    assert_eq!(bytes, old.finish());
+                    assert_eq!(ListenInstance::decode(&bytes).unwrap(), value);
+                }
+            }
+        }
+        for value in [0, -1, i64::MIN, i64::MAX] {
+            compare(Header::actor(value).unwrap(), |e| {
+                e.i64(value);
+                Ok(())
+            });
+            compare(Header::timeout(value).unwrap(), |e| {
+                e.i64(value);
+                Ok(())
+            });
+            compare(Header::version(value, 1).unwrap(), |e| {
+                e.i64(value);
+                e.i64(1);
+                Ok(())
+            });
+        }
+        for value in ["", "Action🦀é"] {
+            compare(Header::action(value).unwrap(), |e| e.string(value));
+        }
+        for kind in [EXPECTS_REPLY, HIGH_PRIORITY, UNCORRELATED_REPLY, 0x8033] {
+            for value in [false, true] {
+                compare(Header::boolean(kind, value).unwrap(), |e| {
+                    e.boolean(value);
+                    Ok(())
+                });
+            }
+        }
+        // The header-record size bound still applies after successful native string encoding.
+        assert!(matches!(
+            Header::action(&"a".repeat(32768)),
+            Err(Error::Protocol(_))
+        ));
+    }
 
     #[test]
     fn listen_control_round_trip_preserves_fields() {

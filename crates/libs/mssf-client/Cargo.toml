@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 mssf-transport.workspace = true
+serde.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
@@ -12,5 +13,4 @@ uuid.workspace = true
 time.workspace = true
 reqwest.workspace = true
 openapi-service-fabric.workspace = true
-serde.workspace = true
 serde_json.workspace = true
