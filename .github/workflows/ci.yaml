@@ -30,6 +30,9 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check
 
+    - name: Check production-only native-client libraries
+      run: cargo check --locked -p mssf-transport -p mssf-client --lib
+
     - name: Install pinned nextest
       uses: taiki-e/install-action@v2
       with:

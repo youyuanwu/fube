@@ -748,6 +748,7 @@ fn evidence_retains_native_timing_values_without_precision_loss() {
         is_seed_node: true,
         upgrade_domain: "UD0".into(),
         fault_domain: "fd:/n".into(),
+        id_copy: NodeId { high: 1, low: 2 },
         instance_id: 42,
         cluster_connection_port: 19002,
         deactivation: NodeDeactivation {

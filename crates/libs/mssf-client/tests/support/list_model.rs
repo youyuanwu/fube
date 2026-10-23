@@ -26,6 +26,7 @@ struct Shape {
     path: &'static str,
     duplicate: bool,
     upgrade: bool,
+    upgrade_parameters: bool,
     paging_tag: bool,
     wrong_metadata: bool,
     error: i64,
@@ -50,6 +51,7 @@ impl Shape {
             path: "/Model/App",
             duplicate: false,
             upgrade: false,
+            upgrade_parameters: false,
             paging_tag: false,
             wrong_metadata: false,
             error: 0,
@@ -120,7 +122,15 @@ fn record(e: &mut Encoder, s: &Shape) -> mssf_transport::Result<()> {
             e.string(if s.upgrade { "unsupported" } else { "" })?;
         }
         if s.suffix >= 2 {
-            e.object_array::<()>(&[], |_, _| Ok(()))?;
+            let pairs: &[(&str, &str)] = if s.upgrade_parameters {
+                &[("upgrade", "value")]
+            } else {
+                &[]
+            };
+            e.object_array(pairs, |e, (key, value)| {
+                e.string(key)?;
+                e.string(value)
+            })?;
         }
         if s.suffix >= 3 {
             e.i64(s.definition);
@@ -247,6 +257,8 @@ async fn application_selectors_exclusion_and_native_paging_are_explicit() {
         assert_eq!(app.status, ApplicationStatus::Ready);
         assert_eq!(app.health_state, HealthState::Warning);
         assert_eq!(app.parameters.get("p").map(String::as_str), Some("v"));
+        assert!(app.upgrade_type_version.is_empty());
+        assert!(app.upgrade_parameters.is_empty());
         assert_eq!(
             app.definition_kind,
             ApplicationDefinitionKind::ServiceFabricApplicationDescription
@@ -363,6 +375,8 @@ async fn optional_record_suffixes_use_only_native_defaults() {
                         ApplicationDefinitionKind::Invalid
                     }
                 );
+                assert!(page.items[0].upgrade_type_version.is_empty());
+                assert!(page.items[0].upgrade_parameters.is_empty());
             }
             server.await.unwrap();
         }
@@ -545,6 +559,10 @@ async fn malformed_list_successes_retire_shared_stream() {
                 upgrade: true,
                 ..base.clone()
             });
+            shapes.push(Shape {
+                upgrade_parameters: true,
+                ..base.clone()
+            });
         }
         for s in shapes {
             let (client, server) =
@@ -718,6 +736,14 @@ async fn semantic_list_validation_precedes_embedded_query_errors() {
         },
         Shape {
             duplicate: true,
+            ..Shape::application()
+        },
+        Shape {
+            upgrade: true,
+            ..Shape::application()
+        },
+        Shape {
+            upgrade_parameters: true,
             ..Shape::application()
         },
         Shape {

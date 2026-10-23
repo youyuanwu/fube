@@ -74,27 +74,37 @@ crate::native::strict_enum!(ApplicationStatus {
 });
 
 /// Native result definition kind. Missing optional suffix defaults to Invalid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ApplicationDefinitionKind {
     ServiceFabricApplicationDescription,
     Compose,
     MeshApplicationDescription,
+    #[default]
     Invalid,
 }
 crate::native::strict_enum!(ApplicationDefinitionKind {
     ServiceFabricApplicationDescription = 0, Compose = 1, MeshApplicationDescription = 2, Invalid = 65535,
 });
 
-/// An owned aggregate observation. Health may be Unknown when unavailable.
-/// Deprecated upgrade fields are not exposed; nonempty values are unsupported.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An owned aggregate observation in native field order.
+/// Health may be Unknown when unavailable. Missing trailing fields use native
+/// defaults; application-list replies require deprecated upgrade fields to be empty.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Application {
     pub name: NamingUri,
     pub type_name: String,
     pub type_version: String,
     pub status: ApplicationStatus,
     pub health_state: HealthState,
+    #[serde(deserialize_with = "crate::native::string_map::deserialize")]
     pub parameters: BTreeMap<String, String>,
+    /// Deprecated native upgrade version, empty in the supported query profile.
+    #[serde(deserialize_with = "crate::native::trailing_default::deserialize")]
+    pub upgrade_type_version: String,
+    /// Deprecated native upgrade parameters, empty in the supported query profile.
+    #[serde(deserialize_with = "crate::native::string_map::deserialize_trailing")]
+    pub upgrade_parameters: BTreeMap<String, String>,
+    #[serde(deserialize_with = "crate::native::trailing_default::deserialize")]
     pub definition_kind: ApplicationDefinitionKind,
 }
 

@@ -1,10 +1,8 @@
 //! Source-derived list aggregate envelopes and positional record layouts.
 
-use std::collections::BTreeMap;
-
 use mssf_transport::{
     message::Message,
-    serialization::serde::{NumericEnum, ObjectArray, Trailing},
+    serialization::serde::{NumericEnum, Trailing},
 };
 use serde::{Deserialize, Serialize};
 
@@ -110,11 +108,7 @@ impl Query for ServiceQueryDescription {
 }
 
 pub(crate) fn decode_applications(message: &Message) -> Result<ApplicationListPage> {
-    crate::query_protocol::decode_list::<ApplicationWire, _, 4>(
-        message,
-        true,
-        ApplicationWire::into_application,
-    )
+    crate::query_protocol::decode_list::<Application, _, 4>(message, true, validate_application)
 }
 
 pub(crate) fn decode_services(message: &Message) -> Result<ServiceListPage> {
@@ -139,68 +133,19 @@ enum ServiceKindWire {
     Stateful,
 }
 
-#[derive(Deserialize)]
-struct ParameterPair(String, String);
-fn parameters(pairs: ObjectArray<Vec<ParameterPair>>) -> Result<BTreeMap<String, String>> {
-    let mut values = BTreeMap::new();
-    for ParameterPair(key, value) in pairs.0 {
-        if values.insert(key, value).is_some() {
-            return Err(Error::Protocol("duplicate application parameter"));
-        }
+fn validate_application(application: Application) -> Result<Application> {
+    validate_list_health(application.health_state)?;
+    if !application.upgrade_type_version.is_empty() {
+        return Err(Error::Protocol(
+            "nonempty deprecated application upgrade version",
+        ));
     }
-    Ok(values)
-}
-
-#[derive(Deserialize)]
-struct ApplicationWire {
-    name: NamingUri,
-    type_name: String,
-    type_version: String,
-    status: ApplicationStatus,
-    health: HealthState,
-    parameters: ObjectArray<Vec<ParameterPair>>,
-    deprecated_version: Trailing<String>,
-    deprecated_parameters: Trailing<ObjectArray<Vec<ParameterPair>>>,
-    definition_kind: Trailing<ApplicationDefinitionKind>,
-}
-impl ApplicationWire {
-    fn into_application(self) -> Result<Application> {
-        let name = self.name;
-        let status = self.status;
-        let health_state = validate_list_health(self.health)?;
-        let parameters = parameters(self.parameters)?;
-        if self
-            .deprecated_version
-            .0
-            .is_some_and(|value| !value.is_empty())
-        {
-            return Err(Error::Protocol(
-                "nonempty deprecated application upgrade version",
-            ));
-        }
-        if self
-            .deprecated_parameters
-            .0
-            .is_some_and(|value| !value.0.is_empty())
-        {
-            return Err(Error::Protocol(
-                "nonempty deprecated application upgrade parameters",
-            ));
-        }
-        let definition_kind = self
-            .definition_kind
-            .0
-            .unwrap_or(ApplicationDefinitionKind::Invalid);
-        Ok(Application {
-            name,
-            type_name: self.type_name,
-            type_version: self.type_version,
-            status,
-            health_state,
-            parameters,
-            definition_kind,
-        })
+    if !application.upgrade_parameters.is_empty() {
+        return Err(Error::Protocol(
+            "nonempty deprecated application upgrade parameters",
+        ));
     }
+    Ok(application)
 }
 
 #[derive(Deserialize)]
@@ -244,7 +189,7 @@ mod tests {
     use mssf_transport::serialization::{serde::from_fields, Decoder, Encoder};
 
     fn application(decoder: &mut Decoder<'_>) -> Result<Application> {
-        from_fields::<ApplicationWire>(decoder)?.into_application()
+        validate_application(from_fields::<Application>(decoder)?)
     }
     fn service(decoder: &mut Decoder<'_>) -> Result<Service> {
         from_fields::<ServiceWire>(decoder)?.into_service()

@@ -322,7 +322,8 @@ Generic tuples/sequences/maps/Option/enums/unit/floats/
 chars/other integer widths fail explicitly unless wrapped by a documented
 adapter. Pointer/type/scope selection and real-delimiter suffix absence use
 the same codec through explicit adapters, not generic Option/enum inference.
-Domain defaults and validation belong in conversion code.
+Domain defaults and validation belong in model field adapters or query
+validation, not in the generic Serde backend.
 
 Fixed-order wire DTOs must not use positional omission, flattening, defaults or
 Serde enum-representation attributes. Canonical numeric variant renames select
@@ -345,9 +346,18 @@ inline and Activity nested; query argument order is preserved and QueryAddress
 is not added as a body field. Safety checks and health evaluations share derived
 enum dispatch, including tag/kind agreement checks. Fixed query-wrapper and
 empty naming URI tags no longer need custom deserialization callbacks.
-Application/service suffixes use explicit Trailing
-fields. Aligned health/event/evaluation/deactivation models deserialize directly
+Application suffixes use explicit Trailing-based field adapters; service
+suffixes still use Trailing fields. Aligned application/node/health/event/evaluation/deactivation/safety models deserialize directly
 using shared field adapters rather than a parallel set of wire records.
+`Node` preserves both native ID fields, with agreement checked after deserialization.
+`SafetyCheck` preserves all native variants and their explicit discriminants.
+Partition variants share a `PartitionSafetyCheck` payload, whose field adapter
+decodes the derived-scope GUID directly into a UUID.
+Tasks preserve the nested `NodeDeactivationTaskId { id, task_type }` identity;
+both task and identity derive deserialization without a flattening conversion.
+`Application` retains all nine native fields, including deprecated upgrade
+fields. Its two string maps decode from bounded pair arrays with duplicate-key
+rejection; trailing adapters apply native defaults only at a real scope end.
 `NamingUri` is a checked semantic type with a private native component schema,
 not an arbitrary String. Naming query fields and application/service result
 names use it; string naming-call convenience remains supported. JSON query
@@ -355,9 +365,8 @@ shapes are unchanged, with invalid names rejected on construction/deserializatio
 Strict scalar status/definition enums map their numeric codes directly; shared
 `HealthState` retains unknown codes, with list-specific rejection after decoding.
 URI redundancy is checked by semantic construction above the generic backend;
-node-ID agreement, duplicate parameters and cross-field checks remain validated
-record conversions. Helpers remain for actual layout differences (duplicate
-fields, nested task IDs, native safety variants, suffixes and service kind).
+node-ID agreement, duplicate parameters and cross-field checks remain record-level
+validation. Service helpers remain for suffixes and kind/persistence consolidation.
 Query payload
 validation still precedes embedded remote errors. Paging tag strictness remains
 operation-specific, and partial operation-failure diagnostics retain deliberate

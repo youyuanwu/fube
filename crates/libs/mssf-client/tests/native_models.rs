@@ -4,6 +4,7 @@ use mssf_transport::serialization::{
     Encoder, MAX_COLLECTION_COUNT,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 fn uri_fields(e: &mut Encoder, case: usize) -> Result<()> {
     e.i64(if case == 1 { 0 } else { 1 });
@@ -197,6 +198,122 @@ fn strict_scalar_models_map_explicit_codes_without_duplicate_wire_enums() {
     ]);
 }
 
+fn application_fields(
+    e: &mut Encoder,
+    parameters: &[(String, String)],
+    suffix: usize,
+) -> Result<()> {
+    e.object(|e| uri_fields(e, 0))?;
+    e.string("Type")?;
+    e.string("1")?;
+    e.i64(2);
+    e.i64(-99);
+    e.object_array(parameters, |e, (key, value)| {
+        e.string(key)?;
+        e.string(value)
+    })?;
+    if suffix >= 1 {
+        e.string("legacy")?;
+    }
+    if suffix >= 2 {
+        e.object_array(&[("old", "value")], |e, (key, value)| {
+            e.string(key)?;
+            e.string(value)
+        })?;
+    }
+    if suffix >= 3 {
+        e.i64(1);
+    }
+    Ok(())
+}
+
+#[test]
+fn applications_deserialize_native_maps_and_all_trailing_defaults_directly() {
+    let parameters = vec![("z".into(), "last".into()), ("a".into(), "first".into())];
+    for suffix in 0..=3 {
+        let mut e = Encoder::new();
+        e.object(|e| application_fields(e, &parameters, suffix))
+            .unwrap();
+        let application: Application = from_slice(&e.finish()).unwrap();
+        assert_eq!(
+            application,
+            Application {
+                name: "fabric:/App/Child".parse().unwrap(),
+                type_name: "Type".into(),
+                type_version: "1".into(),
+                status: ApplicationStatus::Upgrading,
+                health_state: HealthState::Unrecognized(-99),
+                parameters: parameters.iter().cloned().collect(),
+                upgrade_type_version: if suffix >= 1 {
+                    "legacy".into()
+                } else {
+                    String::new()
+                },
+                upgrade_parameters: if suffix >= 2 {
+                    BTreeMap::from([("old".into(), "value".into())])
+                } else {
+                    BTreeMap::new()
+                },
+                definition_kind: if suffix == 3 {
+                    ApplicationDefinitionKind::Compose
+                } else {
+                    ApplicationDefinitionKind::Invalid
+                },
+            }
+        );
+        let json = serde_json::json!({
+            "name": "fabric:/App/Child",
+            "type_name": "Type",
+            "type_version": "1",
+            "status": 2,
+            "health_state": -99,
+            "parameters": {"z": "last", "a": "first"},
+            "upgrade_type_version": application.upgrade_type_version,
+            "upgrade_parameters": application.upgrade_parameters,
+            "definition_kind": application.definition_kind
+        });
+        assert_eq!(
+            serde_json::from_value::<Application>(json).unwrap(),
+            application
+        );
+    }
+}
+
+#[test]
+fn application_maps_reject_duplicate_keys_and_retain_collection_bounds() {
+    let duplicate: Vec<(String, String)> = vec![("key".into(), "value".into()); 2];
+    for upgrade in [false, true] {
+        let mut e = Encoder::new();
+        e.object(|e| {
+            if upgrade {
+                application_fields(e, &[], 1)?;
+                e.object_array(&duplicate, |e, (key, value)| {
+                    e.string(key)?;
+                    e.string(value)
+                })
+            } else {
+                application_fields(e, &duplicate, 0)
+            }
+        })
+        .unwrap();
+        assert!(matches!(
+            from_slice::<Application>(&e.finish()),
+            Err(Error::Protocol(_))
+        ));
+    }
+    let parameters: Vec<(String, String)> = (0..MAX_COLLECTION_COUNT)
+        .map(|index| (index.to_string(), "value".into()))
+        .collect();
+    let mut e = Encoder::new();
+    e.object(|e| application_fields(e, &parameters, 0)).unwrap();
+    let application: Application = from_slice(&e.finish()).unwrap();
+    assert_eq!(application.parameters.len(), MAX_COLLECTION_COUNT);
+    assert_eq!(
+        application.parameters,
+        parameters.into_iter().collect::<BTreeMap<_, _>>()
+    );
+}
+
 fn event() -> HealthEvent {
     HealthEvent {
         source_id: "source".into(),
@@ -312,6 +429,56 @@ fn direct_health_collection_mappings_retain_bounds_and_required_pointers() {
 }
 
 #[test]
+fn task_and_identity_models_deserialize_directly_with_native_nesting() {
+    let id = NodeDeactivationTaskId {
+        id: "task".into(),
+        task_type: NodeDeactivationTaskType::Client,
+    };
+    let id_fields = |e: &mut Encoder| {
+        e.string("task")?;
+        e.i64(3);
+        Ok(())
+    };
+    let mut e = Encoder::new();
+    e.object(id_fields).unwrap();
+    assert_eq!(
+        from_slice::<NodeDeactivationTaskId>(&e.finish()).unwrap(),
+        id
+    );
+    let task = NodeDeactivationTask {
+        id,
+        intent: NodeDeactivationIntent::Restart,
+    };
+    let mut e = Encoder::new();
+    e.object(|e| {
+        e.object(id_fields)?;
+        e.i64(2);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        from_slice::<NodeDeactivationTask>(&e.finish()).unwrap(),
+        task
+    );
+    assert_eq!(
+        serde_json::from_value::<NodeDeactivationTask>(serde_json::json!({
+            "id": {"id": "task", "task_type": 3},
+            "intent": 2
+        }))
+        .unwrap(),
+        task
+    );
+    assert!(
+        serde_json::from_value::<NodeDeactivationTask>(serde_json::json!({
+            "id": "task",
+            "task_type": 3,
+            "intent": 2
+        }))
+        .is_err()
+    );
+}
+
+#[test]
 fn deactivation_models_decode_nested_task_ids_without_a_parallel_record_layer() {
     let mut e = Encoder::new();
     e.object(|e| {
@@ -340,8 +507,10 @@ fn deactivation_models_decode_nested_task_ids_without_a_parallel_record_layer() 
             effective_intent: NodeDeactivationIntent::Restart,
             status: NodeDeactivationStatus::SafetyCheckInProgress,
             tasks: vec![NodeDeactivationTask {
-                id: "task".into(),
-                task_type: NodeDeactivationTaskType::Client,
+                id: NodeDeactivationTaskId {
+                    id: "task".into(),
+                    task_type: NodeDeactivationTaskType::Client,
+                },
                 intent: NodeDeactivationIntent::Restart,
             }],
             pending_safety_checks: vec![SafetyCheck::EnsureSeedNodeQuorum],

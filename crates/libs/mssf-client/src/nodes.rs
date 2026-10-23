@@ -176,7 +176,7 @@ pub type NodeListPage = QueryPage<Node>;
 ///
 /// Aggregation can include CM-only records with native default/unknown values;
 /// this type does not infer missing observations from other fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Node {
     pub name: String,
     pub id: NodeId,
@@ -190,6 +190,8 @@ pub struct Node {
     pub is_seed_node: bool,
     pub upgrade_domain: String,
     pub fault_domain: String,
+    /// Repeated native ID; node-list replies require this to equal `id`.
+    pub id_copy: NodeId,
     pub instance_id: u64,
     pub cluster_connection_port: u32,
     pub deactivation: NodeDeactivation,
@@ -208,26 +210,66 @@ pub struct NodeDeactivation {
     pub status: NodeDeactivationStatus,
     #[serde(deserialize_with = "crate::native::object_array::deserialize")]
     pub tasks: Vec<NodeDeactivationTask>,
-    #[serde(deserialize_with = "crate::node_protocol::deserialize_safety_checks")]
+    #[serde(deserialize_with = "crate::native::tagged_pointer_slots::deserialize")]
     pub pending_safety_checks: Vec<SafetyCheck>,
 }
 
-/// An owned deactivation task, flattening the native task-ID object.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An owned deactivation task, preserving the native nested identity.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NodeDeactivationTask {
-    pub id: String,
-    pub task_type: NodeDeactivationTaskType,
+    pub id: NodeDeactivationTaskId,
     pub intent: NodeDeactivationIntent,
 }
 
-/// Known polymorphic safety check, with a partition ID only for partition kinds.
-/// Partition IDs use UUID semantics, not numeric NodeId semantics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Native deactivation task identity and its owning subsystem.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NodeDeactivationTaskId {
+    pub id: String,
+    pub task_type: NodeDeactivationTaskType,
+}
+
+/// Native safety-check variants, with explicit numeric Serde discriminants.
+/// Native decoding uses `NativeEnum` and rejects unknown or disagreeing tags.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub enum SafetyCheck {
+    #[serde(rename = "0")]
     Invalid,
+    #[serde(rename = "1")]
     EnsureSeedNodeQuorum,
-    Partition {
-        kind: SafetyCheckKind,
-        partition_id: uuid::Uuid,
-    },
+    #[serde(rename = "2")]
+    EnsurePartitionQuorum(PartitionSafetyCheck),
+    #[serde(rename = "3")]
+    WaitForPrimaryPlacement(PartitionSafetyCheck),
+    #[serde(rename = "4")]
+    WaitForPrimarySwap(PartitionSafetyCheck),
+    #[serde(rename = "5")]
+    WaitForReconfiguration(PartitionSafetyCheck),
+    #[serde(rename = "6")]
+    WaitForInBuildReplica(PartitionSafetyCheck),
+    #[serde(rename = "7")]
+    EnsureAvailability(PartitionSafetyCheck),
+}
+
+impl SafetyCheck {
+    /// Return the native kind implied by this variant.
+    pub fn kind(&self) -> SafetyCheckKind {
+        match self {
+            Self::Invalid => SafetyCheckKind::Invalid,
+            Self::EnsureSeedNodeQuorum => SafetyCheckKind::EnsureSeedNodeQuorum,
+            Self::EnsurePartitionQuorum(_) => SafetyCheckKind::EnsurePartitionQuorum,
+            Self::WaitForPrimaryPlacement(_) => SafetyCheckKind::WaitForPrimaryPlacement,
+            Self::WaitForPrimarySwap(_) => SafetyCheckKind::WaitForPrimarySwap,
+            Self::WaitForReconfiguration(_) => SafetyCheckKind::WaitForReconfiguration,
+            Self::WaitForInBuildReplica(_) => SafetyCheckKind::WaitForInBuildReplica,
+            Self::EnsureAvailability(_) => SafetyCheckKind::EnsureAvailability,
+        }
+    }
+}
+
+/// Shared derived-scope payload for partition safety checks.
+/// Partition IDs use UUID semantics, not numeric NodeId semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PartitionSafetyCheck {
+    #[serde(deserialize_with = "crate::native::derived_guid::deserialize")]
+    pub partition_id: uuid::Uuid,
 }

@@ -473,8 +473,10 @@ empty map, indistinguishable from an actually empty map without request context.
 Application statuses are Invalid/Ready/Upgrading/Creating/Deleting/Failed.
 Definition results are ServiceFabricApplicationDescription/Compose/
 MeshApplicationDescription/Invalid (0/1/2/65535); missing optional definition
-defaults to Invalid. Deprecated upgrade fields are structurally consumed but
-not exposed; nonempty values are an explicitly unsupported result profile.
+defaults to Invalid. The native deprecated fields `upgrade_type_version` and
+`upgrade_parameters` are exposed in native field order, defaulting to an empty
+string/map when their suffixes are absent. Nonempty values remain an explicitly
+unsupported application-list result profile.
 
 `ServiceListPage.items` contains owned `Service` records: name, type_name,
 manifest_version, `ServiceKind`, `HealthState`, `ServiceStatus`, is_service_group.
@@ -707,8 +709,9 @@ empty tag. The supplied deserializer still handles the ordinary struct fields.
 `Inline` and `Derived` require an open object. `Trailing` is only for positional
 suffixes: once one suffix is omitted, all following fields in that scope must
 also be omitted. `Trailing<Pointer<T>>` distinguishes an absent suffix from a
-present null pointer. Defaults are applied by conversion code after decoding,
-never by catching malformed input. `Derived` skips supported unread base fields
+present null pointer. Defaults are applied by model field adapters or conversion
+code only after decoding genuine suffix absence, never by catching malformed
+input. `Derived` skips supported unread base fields
 using the codec before entering the next scope.
 
 `to_fields` / `from_fields` remain escape hatches for partial schemas and policies
@@ -738,19 +741,34 @@ using CountedStrings.
 Header record framing/duplicate rules and query argument order are unchanged;
 QueryAddress is not added to the body.
 
-Aligned public models deserialize directly: `NodeHealth`, `HealthEvent`,
-`EventHealthEvaluation`, `HealthEvaluation` and `NodeDeactivation` no longer
-have parallel wire records. Shared field adapters select object arrays and
+Aligned public models deserialize directly: `Node`, `NodeHealth`, `HealthEvent`,
+`EventHealthEvaluation`, `HealthEvaluation`, `NodeDeactivation`,
+`NodeDeactivationTask`, `NodeDeactivationTaskId`, `SafetyCheck` and `Application` no longer
+need parallel wire records. Shared field adapters select object arrays and
 required tagged-pointer slots without exposing wrappers in model fields.
 `NodeTimestamp` transparently maps signed i64 ticks; `NodeId` maps an exactly
 16-byte numeric byte array (high then low little-endian words), not a GUID.
 Health models also serialize using the same native mapping.
+`Node` retains both native `id` and `id_copy` fields; node-list validation checks
+their agreement after deserialization.
+`SafetyCheck` exposes all eight native variants with explicit codes, rather than
+collapsing partition variants into `Partition { kind, partition_id }`.
+The six partition variants share `PartitionSafetyCheck { partition_id }`; a
+field adapter enters the native derived scope and decodes GUID bytes into a UUID.
+`SafetyCheck::kind()` returns the discriminant implied by the variant.
+`NodeDeactivationTask` preserves the nested native identity as
+`id: NodeDeactivationTaskId { id, task_type }`, followed by `intent`.
+Callers access the task string through `task.id.id` and its subsystem through
+`task.id.task_type`; neither model needs a custom deserializer.
+`Application` matches the native nine-field record, including the deprecated
+upgrade fields. Both native `std::map` fields remain `BTreeMap` values, decoded
+from bounded string-pair object arrays with duplicate-key rejection. Explicit
+trailing-field adapters apply native empty-string/map and Invalid defaults;
+health and deprecated-field restrictions remain query-level validation.
 
-Structural helpers remain only where the public/native shapes differ: node
-records carry a duplicate ID, task IDs are nested, safety checks collapse six
-native variants into one public partition variant, and application/service
-records have deprecated fields, versioned suffixes and kind/persistence
-consolidation. `NamingUri` owns its genuinely different component representation.
+Structural helpers remain only where the public/native shapes differ:
+service records have versioned suffixes and kind/persistence consolidation.
+`NamingUri` owns its genuinely different component representation.
 No generalized derive framework or changed default Vec/Option mapping is needed.
 
 Validation is above the generic Serde backend. That backend enforces bounds,

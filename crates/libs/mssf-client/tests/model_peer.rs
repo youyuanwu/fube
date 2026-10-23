@@ -570,9 +570,9 @@ mod node_queries {
     use super::*;
     use mssf_client::{
         HealthState, Node, NodeDeactivation, NodeDeactivationIntent, NodeDeactivationStatus,
-        NodeDeactivationTask, NodeDeactivationTaskType, NodeId, NodeListPage, NodeQueryDescription,
-        NodeQueryParameters, NodeStatus, NodeStatusFilter, NodeTimestamp, Paging, SafetyCheck,
-        SafetyCheckKind,
+        NodeDeactivationTask, NodeDeactivationTaskId, NodeDeactivationTaskType, NodeId,
+        NodeListPage, NodeQueryDescription, NodeQueryParameters, NodeStatus, NodeStatusFilter,
+        NodeTimestamp, Paging, PartitionSafetyCheck, SafetyCheck,
     };
     use std::{
         future::{poll_fn, Future},
@@ -813,6 +813,10 @@ mod node_queries {
             is_seed_node: true,
             upgrade_domain: "UD-02".into(),
             fault_domain: "fd:/rack/02".into(),
+            id_copy: NodeId {
+                high: 0x0123456789abcdef,
+                low: 0xfedcba9876543210,
+            },
             instance_id: 0xfedcba9876543210,
             cluster_connection_port: 19002,
             deactivation: NodeDeactivation {
@@ -820,48 +824,48 @@ mod node_queries {
                 status: NodeDeactivationStatus::SafetyCheckInProgress,
                 tasks: vec![
                     NodeDeactivationTask {
-                        id: "infra:01".into(),
-                        task_type: NodeDeactivationTaskType::Infrastructure,
+                        id: NodeDeactivationTaskId {
+                            id: "infra:01".into(),
+                            task_type: NodeDeactivationTaskType::Infrastructure,
+                        },
                         intent: NodeDeactivationIntent::Pause,
                     },
                     NodeDeactivationTask {
-                        id: "repair:02".into(),
-                        task_type: NodeDeactivationTaskType::Repair,
+                        id: NodeDeactivationTaskId {
+                            id: "repair:02".into(),
+                            task_type: NodeDeactivationTaskType::Repair,
+                        },
                         intent: NodeDeactivationIntent::Restart,
                     },
                     NodeDeactivationTask {
-                        id: "client:03".into(),
-                        task_type: NodeDeactivationTaskType::Client,
+                        id: NodeDeactivationTaskId {
+                            id: "client:03".into(),
+                            task_type: NodeDeactivationTaskType::Client,
+                        },
                         intent: NodeDeactivationIntent::RemoveData,
                     },
                 ],
                 pending_safety_checks: vec![
                     SafetyCheck::Invalid,
                     SafetyCheck::EnsureSeedNodeQuorum,
-                    SafetyCheck::Partition {
-                        kind: SafetyCheckKind::EnsurePartitionQuorum,
+                    SafetyCheck::EnsurePartitionQuorum(PartitionSafetyCheck {
                         partition_id: partition_id(2),
-                    },
-                    SafetyCheck::Partition {
-                        kind: SafetyCheckKind::WaitForPrimaryPlacement,
+                    }),
+                    SafetyCheck::WaitForPrimaryPlacement(PartitionSafetyCheck {
                         partition_id: partition_id(3),
-                    },
-                    SafetyCheck::Partition {
-                        kind: SafetyCheckKind::WaitForPrimarySwap,
+                    }),
+                    SafetyCheck::WaitForPrimarySwap(PartitionSafetyCheck {
                         partition_id: partition_id(4),
-                    },
-                    SafetyCheck::Partition {
-                        kind: SafetyCheckKind::WaitForReconfiguration,
+                    }),
+                    SafetyCheck::WaitForReconfiguration(PartitionSafetyCheck {
                         partition_id: partition_id(5),
-                    },
-                    SafetyCheck::Partition {
-                        kind: SafetyCheckKind::WaitForInBuildReplica,
+                    }),
+                    SafetyCheck::WaitForInBuildReplica(PartitionSafetyCheck {
                         partition_id: partition_id(6),
-                    },
-                    SafetyCheck::Partition {
-                        kind: SafetyCheckKind::EnsureAvailability,
+                    }),
+                    SafetyCheck::EnsureAvailability(PartitionSafetyCheck {
                         partition_id: partition_id(7),
-                    },
+                    }),
                 ],
             },
             is_stopped: true,
@@ -869,6 +873,53 @@ mod node_queries {
             up_at: NodeTimestamp(133_700_000_000_000_001),
             down_at: NodeTimestamp(133_699_999_830_000_001),
             http_gateway_port: 65535,
+        }
+    }
+
+    #[test]
+    fn node_deserializes_directly_and_retains_both_native_ids() {
+        for shape in [NodeShape::Complete, NodeShape::DisagreeingIdCopies] {
+            let bytes = body(|encoder| encode_node(encoder, &shape));
+            let node: Node = mssf_transport::serialization::serde::from_slice(&bytes).unwrap();
+            let mut expected = expected_node();
+            if matches!(shape, NodeShape::DisagreeingIdCopies) {
+                expected.id_copy.low ^= 1 << 56;
+            }
+            assert_eq!(node, expected);
+        }
+    }
+
+    #[test]
+    fn safety_checks_deserialize_directly_with_native_codes_and_guid_order() {
+        use mssf_transport::serialization::serde::{from_slice, NativeEnum, Pointer};
+
+        for (kind, expected) in expected_node()
+            .deactivation
+            .pending_safety_checks
+            .into_iter()
+            .enumerate()
+        {
+            let kind = kind as i64;
+            assert_eq!(expected.kind().as_raw(), kind);
+            let mut encoder = Encoder::new();
+            encode_safety(&mut encoder, kind, NodeShape::Complete).unwrap();
+            let Pointer(Some(NativeEnum(check))) =
+                from_slice::<Pointer<NativeEnum<SafetyCheck>>>(&encoder.finish()).unwrap()
+            else {
+                panic!("missing safety check");
+            };
+            assert_eq!(check, expected);
+            let json = if kind < 2 {
+                serde_json::json!(kind.to_string())
+            } else {
+                serde_json::json!({
+                    (kind.to_string()): {"partition_id": partition_id(kind)}
+                })
+            };
+            assert_eq!(
+                serde_json::from_value::<SafetyCheck>(json).unwrap(),
+                expected
+            );
         }
     }
 
@@ -1039,7 +1090,7 @@ mod node_queries {
         expected.deactivation.effective_intent = NodeDeactivationIntent::Unrecognized(-7001);
         expected.deactivation.status = NodeDeactivationStatus::Unrecognized(7_654_321);
         for task in &mut expected.deactivation.tasks {
-            task.task_type = NodeDeactivationTaskType::Unrecognized(-5003);
+            task.id.task_type = NodeDeactivationTaskType::Unrecognized(-5003);
             task.intent = NodeDeactivationIntent::Unrecognized(i64::MAX - 1);
         }
         let page = client

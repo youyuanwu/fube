@@ -20,6 +20,70 @@ pub(crate) mod object_array {
     }
 }
 
+pub(crate) mod trailing_default {
+    use super::*;
+    use mssf_transport::serialization::serde::Trailing;
+
+    pub fn deserialize<'de, T: Deserialize<'de> + Default, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<T, D::Error> {
+        if deserializer.is_human_readable() {
+            return T::deserialize(deserializer);
+        }
+        Trailing::<T>::deserialize(deserializer).map(|Trailing(value)| value.unwrap_or_default())
+    }
+}
+
+pub(crate) mod string_map {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<String, String>, D::Error> {
+        if deserializer.is_human_readable() {
+            return BTreeMap::deserialize(deserializer);
+        }
+        #[derive(Deserialize)]
+        struct Pair(String, String);
+        let ObjectArray(pairs) = ObjectArray::<Vec<Pair>>::deserialize(deserializer)?;
+        let mut values = BTreeMap::new();
+        for Pair(key, value) in pairs {
+            if values.insert(key, value).is_some() {
+                return Err(serde::de::Error::custom("duplicate native string-map key"));
+            }
+        }
+        Ok(values)
+    }
+
+    pub fn deserialize_trailing<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<String, String>, D::Error> {
+        #[derive(Default, Deserialize)]
+        struct Map(#[serde(deserialize_with = "deserialize")] BTreeMap<String, String>);
+        super::trailing_default::deserialize::<Map, D>(deserializer).map(|Map(values)| values)
+    }
+}
+
+pub(crate) mod derived_guid {
+    use super::*;
+    use mssf_transport::serialization::serde::{Derived, Guid};
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<uuid::Uuid, D::Error> {
+        if deserializer.is_human_readable() {
+            return uuid::Uuid::deserialize(deserializer);
+        }
+        #[derive(Deserialize)]
+        struct Fields {
+            id: Guid,
+        }
+        let Derived(fields) = Derived::<Fields>::deserialize(deserializer)?;
+        Ok(uuid::Uuid::from_bytes_le(fields.id.0))
+    }
+}
+
 pub(crate) mod tagged_pointer_slots {
     use super::*;
     use serde::ser::SerializeSeq;
