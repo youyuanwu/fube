@@ -225,25 +225,68 @@ fault code; native delayed security-session draining is not implemented.
 unsupported in this clear-only profile and terminate explicitly. This is not
 qualification of native secure-session recovery or service notifications.
 
+### Query parameters, paging, and serialization
+
+List requests compose `PagedQuery<P> { parameters, paging }`; node, application,
+and service description names are aliases for this wrapper with their respective
+parameter types. `Paging` shares `continuation_token` and `max_results` across these lists.
+Unpaged health uses `QueryDescription<NodeHealthQueryParameters>` instead, so it
+has no meaningless paging controls. Every list returns `QueryPage<T> { items,
+continuation_token }`, with operation-specific page names retained as aliases.
+Tokens remain opaque strings; request controls and response metadata are distinct.
+
+Descriptions, parameter structs, selectors, health policy, and `Paging` support
+Serde serialization/deserialization for application configuration, including
+`serde_json::to_string` / `from_str`. Deserialization is not operation validation:
+URI profiles, filter validity, count range and native limits are checked before
+sending. A JSON round trip does not itself qualify a value for the native wire.
+
+Internally, a `Query` trait binds the native query name, parameter encoder, paging
+placement, output and reply decoder. One executor starts the deadline before
+preparation and supplies the typed decoder to the connection driver. A dedicated
+Serde argument serializer turns named wire-projection fields into native string
+arguments. It omits `None`, retains explicit false/zero/empty strings unless the
+operation's projection omits them, formats integers numerically, and rejects
+duplicate keys, unsupported nested shapes and native bounds violations. It is
+non-human-readable, so Serde-enabled bitflags emit numeric masks, not flag names.
+
+This is separate from the positional Fabric Serde backend, which serializes the
+binary request envelope. Health's embedded JSON uses explicit numeric-mask DTOs.
+List replies share envelope/page decoding but keep their native wrapper IDs and
+paging-tag policies; health keeps its distinct unpaged item envelope. Native
+pointers, polymorphism and versioned record suffixes remain explicit.
+
+**API migration:** move operation fields into `.parameters`, request token/count
+into `.paging`, and use `.items` instead of `.nodes`, `.applications` or
+`.services` on returned pages. Wrap service/health parameters with the corresponding
+description's `new(parameters)` constructor. Named client methods are unchanged.
+
 ### Native node pages
 
 ```rust,no_run
 use std::num::NonZeroU64;
-use mssf_client::{FabricClient, NodeQueryDescription, NodeStatusFilter};
+use mssf_client::{
+    FabricClient, NodeQueryDescription, NodeQueryParameters, NodeStatusFilter, Paging,
+};
 
 # async fn pages(client: &FabricClient) -> mssf_client::Result<()> {
 let mut query = NodeQueryDescription {
-    status_filter: NodeStatusFilter::UP | NodeStatusFilter::DOWN,
-    max_results: NonZeroU64::new(2),
-    ..Default::default()
+    parameters: NodeQueryParameters {
+        status_filter: NodeStatusFilter::UP | NodeStatusFilter::DOWN,
+        ..Default::default()
+    },
+    paging: Paging {
+        max_results: NonZeroU64::new(2),
+        ..Default::default()
+    },
 };
 loop {
     let page = client.get_node_list(&query).await?;
-    for node in page.nodes {
+    for node in page.items {
         println!("{} {} {:?}", node.name, node.id, node.status);
     }
-    query.continuation_token = page.continuation_token;
-    if query.continuation_token.is_none() {
+    query.paging.continuation_token = page.continuation_token;
+    if query.paging.continuation_token.is_none() {
         break;
     }
 }
@@ -282,12 +325,13 @@ stream. Nonempty deactivation/safety variants have source/model coverage only.
 ```rust,no_run
 use mssf_client::{
     FabricClient, HealthEventsFilter, NodeHealthPolicy, NodeHealthQueryDescription,
+    NodeHealthQueryParameters,
 };
 
 # async fn health(client: &FabricClient) -> mssf_client::Result<()> {
-let mut query = NodeHealthQueryDescription::new("N0020");
-query.events_filter = Some(HealthEventsFilter::ERROR);
-query.health_policy = Some(NodeHealthPolicy { consider_warning_as_error: true });
+let mut query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("N0020"));
+query.parameters.events_filter = Some(HealthEventsFilter::ERROR);
+query.parameters.health_policy = Some(NodeHealthPolicy { consider_warning_as_error: true });
 let health = client.get_node_health(&query).await?;
 println!("{:?}", health.aggregated_health_state);
 for evaluation in health.unhealthy_evaluations {
@@ -355,27 +399,32 @@ public C API pointer layout or safety-check-style derived scope.
 ```rust,no_run
 use std::{num::NonZeroU64, time::Duration};
 use mssf_client::{
-    ApplicationListFilter, ApplicationQueryDescription, FabricClient,
-    ServiceListFilter, ServiceQueryDescription,
+    ApplicationListFilter, ApplicationQueryDescription, ApplicationQueryParameters, FabricClient,
+    Paging, ServiceListFilter, ServiceQueryDescription, ServiceQueryParameters,
 };
 
 # async fn workloads(client: &FabricClient) -> mssf_client::Result<()> {
 let mut applications = ApplicationQueryDescription {
-    filter: ApplicationListFilter::TypeName("MyApplicationType".into()),
-    max_results: NonZeroU64::new(1),
-    ..Default::default()
+    parameters: ApplicationQueryParameters {
+        filter: ApplicationListFilter::TypeName("MyApplicationType".into()),
+        ..Default::default()
+    },
+    paging: Paging {
+        max_results: NonZeroU64::new(1),
+        ..Default::default()
+    },
 };
 let page = client.get_application_list(&applications).await?;
-for application in page.applications {
+for application in page.items {
     println!("{} {} {:?}", application.name, application.type_version, application.health_state);
 }
 // Caller decides whether/when to issue another operation with this opaque token.
-applications.continuation_token = page.continuation_token;
+applications.paging.continuation_token = page.continuation_token;
 
-let mut services = ServiceQueryDescription::new("fabric:/MyApplication");
-services.filter = ServiceListFilter::TypeName("MyServiceType".into());
+let mut services = ServiceQueryDescription::new(ServiceQueryParameters::new("fabric:/MyApplication"));
+services.parameters.filter = ServiceListFilter::TypeName("MyServiceType".into());
 let page = client.get_service_list_with_timeout(&services, Duration::from_secs(5)).await?;
-for service in page.services {
+for service in page.items {
     println!("{} {:?} {:?}", service.name, service.kind, service.status);
 }
 println!("continuation={:?}", page.continuation_token);
@@ -392,9 +441,10 @@ successful results retire the shared stream before pending callers can reuse it.
 
 | Description | Selector and independent controls |
 |---|---|
-| `ApplicationQueryDescription` | `ApplicationListFilter::All` (default), `Name`, `TypeName`, or `DefinitionKind`; exactly one. Independent `exclude_application_parameters` (default false), continuation and count. |
+| `ApplicationQueryParameters` | `ApplicationListFilter::All` (default), `Name`, `TypeName`, or `DefinitionKind`; exactly one. Independent `exclude_application_parameters` (default false). |
 | `ApplicationDefinitionKindFilter` | DEFAULT=0, ALL=65535; bits SERVICE_FABRIC_APPLICATION_DESCRIPTION=1, COMPOSE=2, MESH_APPLICATION_DESCRIPTION=4, combinable with `\|`. `try_from_bits` rejects unnamed bits except exact ALL. These are **not** result discriminants. |
-| `ServiceQueryDescription::new(application)` | Required ordinary application scope; `ServiceListFilter::All` (default), exact `Name` or exact `TypeName`. Independent continuation and count. |
+| `ServiceQueryParameters::new(application)` | Required ordinary application scope; `ServiceListFilter::All` (default), exact `Name` or exact `TypeName`. |
+| `PagedQuery<P>::paging` | Shared `Paging` controls: opaque continuation token and positive count. |
 
 Type selectors are nonempty and case-sensitive; names are exact, not prefixes.
 Conflicting selectors are unrepresentable. Selected empty type/name is an error,
@@ -414,7 +464,7 @@ subqueries; a divergent CM/FM **service union can exceed it**. Pages and
 entity/health observations are not snapshots. No continuation means paging
 ended, not that every aggregation source answered or health was available.
 
-`ApplicationListPage.applications` contains owned `Application` records:
+`ApplicationListPage.items` contains owned `Application` records:
 name, type_name/type_version, `ApplicationStatus`, `HealthState`, a sorted owned
 parameter map and `ApplicationDefinitionKind`. Parameter exclusion yields an
 empty map, indistinguishable from an actually empty map without request context.
@@ -424,7 +474,7 @@ MeshApplicationDescription/Invalid (0/1/2/65535); missing optional definition
 defaults to Invalid. Deprecated upgrade fields are structurally consumed but
 not exposed; nonempty values are an explicitly unsupported result profile.
 
-`ServiceListPage.services` contains owned `Service` records: name, type_name,
+`ServiceListPage.items` contains owned `Service` records: name, type_name,
 manifest_version, `ServiceKind`, `HealthState`, `ServiceStatus`, is_service_group.
 Manifest version is not application type version and may be empty.
 `ServiceKind::Stateful { has_persisted_state }` distinguishes persistence from

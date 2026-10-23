@@ -571,7 +571,8 @@ mod node_queries {
     use mssf_client::{
         HealthState, Node, NodeDeactivation, NodeDeactivationIntent, NodeDeactivationStatus,
         NodeDeactivationTask, NodeDeactivationTaskType, NodeId, NodeListPage, NodeQueryDescription,
-        NodeStatus, NodeStatusFilter, NodeTimestamp, SafetyCheck, SafetyCheckKind,
+        NodeQueryParameters, NodeStatus, NodeStatusFilter, NodeTimestamp, Paging, SafetyCheck,
+        SafetyCheckKind,
     };
     use std::{
         future::{poll_fn, Future},
@@ -877,18 +878,27 @@ mod node_queries {
             (NodeQueryDescription::default(), vec![]),
             (
                 NodeQueryDescription {
-                    node_name: Some(String::new()),
-                    continuation_token: Some(String::new()),
-                    ..Default::default()
+                    parameters: NodeQueryParameters {
+                        node_name: Some(String::new()),
+                        ..Default::default()
+                    },
+                    paging: Paging {
+                        continuation_token: Some(String::new()),
+                        ..Default::default()
+                    },
                 },
                 vec![],
             ),
             (
                 NodeQueryDescription {
-                    node_name: Some("MiXeD_Node-02".into()),
-                    status_filter: NodeStatusFilter::UP | NodeStatusFilter::DISABLING,
-                    continuation_token: Some(" opaque+/= token ".into()),
-                    max_results: NonZeroU64::new(2),
+                    parameters: NodeQueryParameters {
+                        node_name: Some("MiXeD_Node-02".into()),
+                        status_filter: NodeStatusFilter::UP | NodeStatusFilter::DISABLING,
+                    },
+                    paging: Paging {
+                        continuation_token: Some(" opaque+/= token ".into()),
+                        max_results: NonZeroU64::new(2),
+                    },
                 },
                 vec![
                     ("ContinuationToken", " opaque+/= token "),
@@ -898,17 +908,22 @@ mod node_queries {
                 ],
             ),
             (
-                NodeQueryDescription {
+                NodeQueryDescription::new(NodeQueryParameters {
                     node_name: Some("ExactNode".into()),
                     ..Default::default()
-                },
+                }),
                 vec![("NodeName", "ExactNode")],
             ),
             (
                 NodeQueryDescription {
-                    max_results: NonZeroU64::new(i64::MAX as u64),
-                    status_filter: NodeStatusFilter::ALL,
-                    ..Default::default()
+                    parameters: NodeQueryParameters {
+                        status_filter: NodeStatusFilter::ALL,
+                        ..Default::default()
+                    },
+                    paging: Paging {
+                        max_results: NonZeroU64::new(i64::MAX as u64),
+                        ..Default::default()
+                    },
                 },
                 vec![
                     ("MaxResults", "9223372036854775807"),
@@ -916,17 +931,17 @@ mod node_queries {
                 ],
             ),
             (
-                NodeQueryDescription {
+                NodeQueryDescription::new(NodeQueryParameters {
                     status_filter: NodeStatusFilter::from_bits_retain(u32::MAX),
                     ..Default::default()
-                },
+                }),
                 vec![("NodeStatusFilter", "4294967295")],
             ),
             (
-                NodeQueryDescription {
+                NodeQueryDescription::new(NodeQueryParameters {
                     status_filter: NodeStatusFilter::DOWN,
                     ..Default::default()
-                },
+                }),
                 vec![("NodeStatusFilter", "2")],
             ),
         ];
@@ -959,7 +974,7 @@ mod node_queries {
             assert_eq!(
                 client.get_node_list(&query).await.unwrap(),
                 NodeListPage {
-                    nodes: vec![],
+                    items: vec![],
                     continuation_token: None,
                 }
             );
@@ -984,7 +999,7 @@ mod node_queries {
                 .await
                 .unwrap(),
             NodeListPage {
-                nodes: vec![expected_node()],
+                items: vec![expected_node()],
                 continuation_token: Some("opaque-next".into()),
             }
         );
@@ -1010,9 +1025,9 @@ mod node_queries {
             .get_node_list(&NodeQueryDescription::default())
             .await
             .unwrap();
-        assert_eq!(page.nodes, vec![expected]);
-        assert_eq!(page.nodes[0].status.as_raw(), i64::MIN);
-        assert_eq!(page.nodes[0].health_state.as_raw(), i64::MAX);
+        assert_eq!(page.items, vec![expected]);
+        assert_eq!(page.items[0].status.as_raw(), i64::MIN);
+        assert_eq!(page.items[0].health_state.as_raw(), i64::MAX);
         server.await.unwrap();
     }
 
@@ -1046,17 +1061,20 @@ mod node_queries {
             .await
             .unwrap();
         let mut query = NodeQueryDescription {
-            max_results: NonZeroU64::new(1),
+            paging: Paging {
+                max_results: NonZeroU64::new(1),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let first = client.get_node_list(&query).await.unwrap();
-        assert_eq!(first.nodes, vec![expected_node()]);
+        assert_eq!(first.items, vec![expected_node()]);
         assert_eq!(first.continuation_token.as_deref(), Some("server-token"));
-        query.continuation_token = first.continuation_token;
+        query.paging.continuation_token = first.continuation_token;
         let terminal = client.get_node_list(&query).await.unwrap();
-        assert_eq!(terminal.nodes.len(), 1);
+        assert_eq!(terminal.items.len(), 1);
         assert_eq!(terminal.continuation_token, None);
-        query.continuation_token = None;
+        query.paging.continuation_token = None;
         assert_eq!(
             client
                 .get_node_list(&query)
@@ -1087,7 +1105,10 @@ mod node_queries {
             .unwrap();
         for limit in [i64::MAX as u64 + 1, u64::MAX] {
             let query = NodeQueryDescription {
-                max_results: NonZeroU64::new(limit),
+                paging: Paging {
+                    max_results: NonZeroU64::new(limit),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             assert!(matches!(
@@ -1097,12 +1118,15 @@ mod node_queries {
             assert!(!client.is_closed());
         }
         for query in [
-            NodeQueryDescription {
+            NodeQueryDescription::new(NodeQueryParameters {
                 node_name: Some("x".repeat(100_000)),
                 ..Default::default()
-            },
+            }),
             NodeQueryDescription {
-                continuation_token: Some("x".repeat(100_000)),
+                paging: Paging {
+                    continuation_token: Some("x".repeat(100_000)),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         ] {
@@ -1125,7 +1149,7 @@ mod node_queries {
             .get_node_list(&NodeQueryDescription::default())
             .await
             .unwrap()
-            .nodes
+            .items
             .is_empty());
         client.close().await.unwrap();
         server.await.unwrap();
@@ -1322,7 +1346,7 @@ mod node_queries {
                 .get_node_list(&NodeQueryDescription::default())
                 .await
                 .unwrap()
-                .nodes
+                .items
                 .is_empty());
             server.await.unwrap();
         }
@@ -1431,7 +1455,7 @@ mod node_queries {
             .get_node_list(&NodeQueryDescription::default())
             .await
             .unwrap()
-            .nodes
+            .items
             .is_empty());
         client.close().await.unwrap();
         server.await.unwrap();
@@ -1537,14 +1561,14 @@ mod node_queries {
             client.clone(),
             client.clone(),
         );
-        let a = NodeQueryDescription {
+        let a = NodeQueryDescription::new(NodeQueryParameters {
             node_name: Some("A".into()),
             ..Default::default()
-        };
-        let b = NodeQueryDescription {
+        });
+        let b = NodeQueryDescription::new(NodeQueryParameters {
             node_name: Some("B".into()),
             ..Default::default()
-        };
+        });
         let (a_page, b_page, exists, gateway) = tokio::join!(
             a_client.get_node_list(&a),
             b_client.get_node_list(&b),
@@ -1554,14 +1578,14 @@ mod node_queries {
         assert_eq!(
             a_page.unwrap(),
             NodeListPage {
-                nodes: vec![expected_node()],
+                items: vec![expected_node()],
                 continuation_token: Some("A-next".into()),
             }
         );
         assert_eq!(
             b_page.unwrap(),
             NodeListPage {
-                nodes: vec![],
+                items: vec![],
                 continuation_token: None,
             }
         );
@@ -1651,7 +1675,7 @@ mod node_queries {
                     .await
                     .unwrap(),
                 NodeListPage {
-                    nodes: vec![expected_node()],
+                    items: vec![expected_node()],
                     continuation_token: None,
                 }
             );

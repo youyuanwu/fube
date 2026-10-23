@@ -1,10 +1,10 @@
 //! Owned application list data for the explicitly supported native query profile.
 
-use std::{collections::BTreeMap, num::NonZeroU64};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, HealthState, Result};
+use crate::{Error, HealthState, PagedQuery, QueryPage, Result};
 
 bitflags::bitflags! {
     /// Native definition-kind selection bits, distinct from result enum numbers.
@@ -40,7 +40,7 @@ impl ApplicationDefinitionKindFilter {
 }
 
 /// Exactly one native application selector; combinations are not supported.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApplicationListFilter {
     #[default]
     All,
@@ -49,15 +49,15 @@ pub enum ApplicationListFilter {
     DefinitionKind(ApplicationDefinitionKindFilter),
 }
 
-/// One native page request. Empty continuation means absent. Parameters are
-/// included by default; count is positive and must fit a signed native Int64.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ApplicationQueryDescription {
+/// Native application selectors. Application parameters are included by default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationQueryParameters {
     pub filter: ApplicationListFilter,
     pub exclude_application_parameters: bool,
-    pub continuation_token: Option<String>,
-    pub max_results: Option<NonZeroU64>,
 }
+
+/// One application-list request with separate parameters and paging.
+pub type ApplicationQueryDescription = PagedQuery<ApplicationQueryParameters>;
 
 /// Native application deployment status, not its health.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,8 +94,4 @@ pub struct Application {
 
 /// One native page, not an atomic snapshot. Inspect the opaque continuation even
 /// without a count limit; native byte limits can also produce a next page.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApplicationListPage {
-    pub applications: Vec<Application>,
-    pub continuation_token: Option<String>,
-}
+pub type ApplicationListPage = QueryPage<Application>;

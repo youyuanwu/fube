@@ -8,8 +8,8 @@ use std::{
 
 use mssf_client::{
     FabricClient, GatewayDescription, HealthState, Node, NodeDeactivationIntent,
-    NodeDeactivationStatus, NodeListPage, NodeQueryDescription, NodeStatus, NodeStatusFilter,
-    DEFAULT_TIMEOUT,
+    NodeDeactivationStatus, NodeListPage, NodeQueryDescription, NodeQueryParameters, NodeStatus,
+    NodeStatusFilter, Paging, DEFAULT_TIMEOUT,
 };
 use serde::Deserialize;
 use tokio::{
@@ -188,12 +188,12 @@ fn assert_membership(page: &NodeListPage, config: &Config) {
         page.continuation_token.is_none(),
         "small healthy membership fits one unspecified-size page"
     );
-    let names: std::collections::BTreeSet<_> = page.nodes.iter().map(|n| &n.name).collect();
+    let names: std::collections::BTreeSet<_> = page.items.iter().map(|n| &n.name).collect();
     let expected: std::collections::BTreeSet<_> =
         config.expected_nodes.iter().map(|n| &n.name).collect();
     assert_eq!(names, expected);
-    assert_eq!(page.nodes.len(), expected.len(), "no duplicate members");
-    for node in &page.nodes {
+    assert_eq!(page.items.len(), expected.len(), "no duplicate members");
+    for node in &page.items {
         let expected = config
             .expected_nodes
             .iter()
@@ -234,29 +234,34 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
     ] {
         assert_membership(
             &client
-                .get_node_list(&NodeQueryDescription {
+                .get_node_list(&NodeQueryDescription::new(NodeQueryParameters {
                     status_filter: filter,
                     ..Default::default()
-                })
+                }))
                 .await
                 .expect("native status selection"),
             config,
         );
     }
     let empty = client
-        .get_node_list(&NodeQueryDescription {
+        .get_node_list(&NodeQueryDescription::new(NodeQueryParameters {
             status_filter: NodeStatusFilter::DOWN,
             ..Default::default()
-        })
+        }))
         .await
         .expect("native nonmatching status selection");
-    assert!(empty.nodes.is_empty() && empty.continuation_token.is_none());
+    assert!(empty.items.is_empty() && empty.continuation_token.is_none());
     assert_membership(
         &client
             .get_node_list(&NodeQueryDescription {
-                node_name: Some(String::new()),
-                continuation_token: Some(String::new()),
-                ..Default::default()
+                parameters: NodeQueryParameters {
+                    node_name: Some(String::new()),
+                    ..Default::default()
+                },
+                paging: Paging {
+                    continuation_token: Some(String::new()),
+                    ..Default::default()
+                },
             })
             .await
             .expect("native empty omission semantics"),
@@ -265,29 +270,33 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
     for expected in &config.expected_nodes {
         let page = client
             .get_node_list(&NodeQueryDescription {
-                node_name: Some(expected.name.clone()),
-                status_filter: NodeStatusFilter::UP,
-                max_results: std::num::NonZeroU64::new(1),
-                ..Default::default()
+                parameters: NodeQueryParameters {
+                    node_name: Some(expected.name.clone()),
+                    status_filter: NodeStatusFilter::UP,
+                },
+                paging: Paging {
+                    max_results: std::num::NonZeroU64::new(1),
+                    ..Default::default()
+                },
             })
             .await
             .expect("native exact-name hit and full terminal page");
-        assert_eq!(page.nodes.len(), 1);
+        assert_eq!(page.items.len(), 1);
         assert!(
             page.continuation_token.is_none(),
             "full terminal page needs no token"
         );
-        assert_independent_node(&page.nodes[0], expected);
+        assert_independent_node(&page.items[0], expected);
     }
     for absent in ["native-client-no-such-node", "n0010", "N00"] {
         let page = client
-            .get_node_list(&NodeQueryDescription {
+            .get_node_list(&NodeQueryDescription::new(NodeQueryParameters {
                 node_name: Some(absent.into()),
                 ..Default::default()
-            })
+            }))
             .await
             .expect("native exact-name miss");
-        assert!(page.nodes.is_empty() && page.continuation_token.is_none());
+        assert!(page.items.is_empty() && page.continuation_token.is_none());
     }
     let mut chains = Vec::new();
     for page_size in [1, 2] {
@@ -298,16 +307,18 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
         for _ in 0..16 {
             let page = client
                 .get_node_list(&NodeQueryDescription {
-                    continuation_token: token.take(),
-                    max_results: std::num::NonZeroU64::new(page_size),
+                    paging: Paging {
+                        continuation_token: token.take(),
+                        max_results: std::num::NonZeroU64::new(page_size),
+                    },
                     ..Default::default()
                 })
                 .await
                 .expect("native server continuation chain");
-            assert!(!page.nodes.is_empty());
-            assert!(page.nodes.len() <= page_size as usize);
-            page_lengths.push(page.nodes.len());
-            all.extend(page.nodes);
+            assert!(!page.items.is_empty());
+            assert!(page.items.len() <= page_size as usize);
+            page_lengths.push(page.items.len());
+            all.extend(page.items);
             token = page.continuation_token;
             if let Some(token) = &token {
                 assert!(seen.insert(token.clone()), "continuation must progress");
@@ -326,7 +337,7 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
         );
         assert_membership(
             &NodeListPage {
-                nodes: all,
+                items: all,
                 continuation_token: None,
             },
             config,
@@ -341,16 +352,21 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
         .unwrap();
     let exhausted = client
         .get_node_list(&NodeQueryDescription {
-            continuation_token: Some(format!("{final_id:x}")),
-            max_results: std::num::NonZeroU64::new(1),
+            paging: Paging {
+                continuation_token: Some(format!("{final_id:x}")),
+                max_results: std::num::NonZeroU64::new(1),
+            },
             ..Default::default()
         })
         .await
         .expect("valid boundary continuation strictly after final independent ID");
-    assert!(exhausted.nodes.is_empty() && exhausted.continuation_token.is_none());
+    assert!(exhausted.items.is_empty() && exhausted.continuation_token.is_none());
     let invalid = client
         .get_node_list(&NodeQueryDescription {
-            continuation_token: Some("this-is-not-a-node-id".into()),
+            paging: Paging {
+                continuation_token: Some("this-is-not-a-node-id".into()),
+                ..Default::default()
+            },
             ..Default::default()
         })
         .await
@@ -416,11 +432,11 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
     });
     probe.close().await.unwrap();
     serde_json::json!({
-        "native_node_count": baseline.nodes.len(), "independent_nodes": config.expected_nodes,
+        "native_node_count": baseline.items.len(), "independent_nodes": config.expected_nodes,
         "observation_unix_ms": config.observed_at_unix_ms,
         "native_observation_start_unix_ms": native_observation_start_unix_ms,
         "native_observation_end_unix_ms": native_observation_end_unix_ms,
-        "native_timings": native_timing_evidence(&baseline.nodes),
+        "native_timings": native_timing_evidence(&baseline.items),
         "typed_stable_fields_match": true, "timing_tolerance_seconds": 120,
         "timestamp_precision_tolerance_ticks": 10000,
         "binary_ports_match_onebox_manifest": true,

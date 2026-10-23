@@ -1,11 +1,10 @@
 //! Owned ordinary application-scoped service list data.
 
-use std::num::NonZeroU64;
-
-use crate::HealthState;
+use crate::{HealthState, PagedQuery, QueryPage};
+use serde::{Deserialize, Serialize};
 
 /// Exactly one service selector; matching type names are case-sensitive.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServiceListFilter {
     #[default]
     All,
@@ -13,26 +12,25 @@ pub enum ServiceListFilter {
     TypeName(String),
 }
 
-/// One page scoped to an ordinary application. Root/ad-hoc and fabric:/System
+/// Selectors scoped to an ordinary application. Root/ad-hoc and fabric:/System
 /// are rejected; neither denotes all services. No status/kind/health filter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServiceQueryDescription {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceQueryParameters {
     pub application_name: String,
     pub filter: ServiceListFilter,
-    pub continuation_token: Option<String>,
-    pub max_results: Option<NonZeroU64>,
 }
 
-impl ServiceQueryDescription {
+impl ServiceQueryParameters {
     pub fn new(application_name: impl Into<String>) -> Self {
         Self {
             application_name: application_name.into(),
             filter: ServiceListFilter::All,
-            continuation_token: None,
-            max_results: None,
         }
     }
 }
+
+/// One ordinary application-scoped service request with independent paging.
+pub type ServiceQueryDescription = PagedQuery<ServiceQueryParameters>;
 
 /// Kind and persistence are inseparable; stateless cannot claim persisted state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,8 +65,4 @@ pub struct Service {
 
 /// Native count limits apply to subqueries; a divergent CM/FM union can exceed
 /// the requested count. There is no automatic paging or snapshot guarantee.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServiceListPage {
-    pub services: Vec<Service>,
-    pub continuation_token: Option<String>,
-}
+pub type ServiceListPage = QueryPage<Service>;

@@ -1,70 +1,40 @@
-use mssf_transport::{
-    message::{Message, ACTION, ACTOR},
-    serialization::Decoder,
+use mssf_transport::{message::Message, serialization::Decoder};
+use serde::Serialize;
+
+use crate::{
+    nodes::*, query_arguments::QueryArguments, query_protocol::Query, Error, Paging, Result,
 };
 
-use crate::{nodes::*, Error, Result};
+impl Query for NodeQueryDescription {
+    type Output = NodeListPage;
+    const NAME: &'static str = "GetNodeList";
+    const PAGING_FIRST: bool = true;
 
-pub(crate) fn encode_query(query: &NodeQueryDescription) -> Result<Vec<u8>> {
-    let mut args: Vec<(&str, Cow<'_, str>)> = Vec::new();
-    if let Some(token) = query
-        .continuation_token
-        .as_deref()
-        .filter(|s| !s.is_empty())
-    {
-        args.push(("ContinuationToken", Cow::Borrowed(token)));
-    }
-    if let Some(max) = query.max_results {
-        if max.get() > i64::MAX as u64 {
-            return Err(Error::InvalidInput(
-                "MaxResults exceeds native signed range",
-            ));
+    fn encode_parameters(&self, arguments: &mut QueryArguments) -> Result<()> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Fields<'a> {
+            node_name: Option<&'a str>,
+            node_status_filter: Option<NodeStatusFilter>,
         }
-        args.push(("MaxResults", Cow::Owned(max.to_string())));
+        arguments.append(&Fields {
+            node_name: self
+                .parameters
+                .node_name
+                .as_deref()
+                .filter(|s| !s.is_empty()),
+            node_status_filter: (self.parameters.status_filter != NodeStatusFilter::DEFAULT)
+                .then_some(self.parameters.status_filter),
+        })
     }
-    if let Some(name) = query.node_name.as_deref().filter(|s| !s.is_empty()) {
-        args.push(("NodeName", Cow::Borrowed(name)));
-    }
-    if query.status_filter != NodeStatusFilter::DEFAULT {
-        args.push((
-            "NodeStatusFilter",
-            Cow::Owned(query.status_filter.bits().to_string()),
-        ));
-    }
-    crate::query_protocol::encode("GetNodeList", &args)
-}
 
-pub(crate) fn decode_reply(message: &Message) -> Result<NodeListPage> {
-    crate::protocol::check_failure(message)?;
-    let properties = message.properties()?;
-    // The native aggregate constructs a bare Message(QueryResult), unlike the
-    // generic QueryReply factory. Absent headers are not actor/action defaults.
-    if message.headers.iter().any(|h| h.id == ACTOR) && properties.actor != 5 {
-        return Err(Error::Protocol("query reply is not from NamingGateway"));
+    fn paging(&self) -> Option<&Paging> {
+        Some(&self.paging)
     }
-    if message.headers.iter().any(|h| h.id == ACTION) && properties.action != "QueryReply" {
-        return Err(Error::Protocol("unexpected query reply action"));
+
+    fn decode_reply(message: &Message) -> Result<NodeListPage> {
+        crate::query_protocol::decode_list(message, 1, false, decode_node)
     }
-    let result = crate::query_protocol::decode(&message.body, |decoder, tag| {
-        if tag != 1i32.to_le_bytes() {
-            return Err(Error::Protocol("query wrapper is not the native Node type"));
-        }
-        let nodes = decoder.object_array(decode_node)?;
-        if decoder.pointer(|_, _| Ok(()))?.is_some() {
-            return Err(Error::Protocol("node list has a single-item payload"));
-        }
-        Ok(nodes)
-    })?;
-    if result.kind != 2 {
-        return Err(Error::Protocol("query result is not a List"));
-    }
-    let nodes = result
-        .payload
-        .ok_or(Error::Protocol("node list has no typed wrapper"))?;
-    Ok(NodeListPage {
-        nodes,
-        continuation_token: result.paging.filter(|token| !token.is_empty()),
-    })
 }
 
 fn decode_id(decoder: &mut Decoder<'_>) -> Result<NodeId> {
@@ -167,4 +137,3 @@ fn decode_node(decoder: &mut Decoder<'_>) -> Result<Node> {
         http_gateway_port: decoder.u16()?,
     })
 }
-use std::borrow::Cow;

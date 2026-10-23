@@ -3,7 +3,8 @@ use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
 use mssf_client::{
     ApplicationDefinitionKindFilter, ApplicationListFilter, ApplicationQueryDescription, Error,
     FabricClient, HealthEventsFilter, NodeHealthPolicy, NodeHealthQueryDescription,
-    NodeQueryDescription, Result, ServiceListFilter, ServiceQueryDescription, DEFAULT_TIMEOUT,
+    NodeHealthQueryParameters, NodeQueryDescription, Result, ServiceListFilter,
+    ServiceQueryDescription, ServiceQueryParameters, DEFAULT_TIMEOUT,
 };
 
 const USAGE: &str =
@@ -32,7 +33,7 @@ fn list_arguments(args: &[String], application: Option<&str>) -> Result<Operatio
     for [key, value] in pairs {
         match key.as_str() {
             "--name" | "--type" | "--definition-kind" if !selected => {
-                query.filter = match key.as_str() {
+                query.parameters.filter = match key.as_str() {
                     "--name" => ApplicationListFilter::Name(value.clone()),
                     "--type" => ApplicationListFilter::TypeName(value.clone()),
                     _ if application.is_none() => ApplicationListFilter::DefinitionKind(
@@ -45,36 +46,35 @@ fn list_arguments(args: &[String], application: Option<&str>) -> Result<Operatio
                 selected = true;
             }
             "--exclude-parameters" if application.is_none() && !exclude_set => {
-                query.exclude_application_parameters = value
+                query.parameters.exclude_application_parameters = value
                     .parse()
                     .map_err(|_| Error::InvalidInput("exclude-parameters must be true or false"))?;
                 exclude_set = true;
             }
-            "--continuation-token" if query.continuation_token.is_none() => {
-                query.continuation_token = Some(value.clone());
+            "--continuation-token" if query.paging.continuation_token.is_none() => {
+                query.paging.continuation_token = Some(value.clone());
             }
-            "--max-results" if query.max_results.is_none() => {
+            "--max-results" if query.paging.max_results.is_none() => {
                 let count = value
                     .parse::<u64>()
                     .ok()
                     .and_then(NonZeroU64::new)
                     .filter(|v| v.get() <= i64::MAX as u64)
                     .ok_or(Error::InvalidInput("max-results must be 1..i64::MAX"))?;
-                query.max_results = Some(count);
+                query.paging.max_results = Some(count);
             }
             _ => return Err(Error::InvalidInput(USAGE)),
         }
     }
     if let Some(application) = application {
-        let mut service = ServiceQueryDescription::new(application);
-        service.filter = match query.filter {
+        let mut service = ServiceQueryDescription::new(ServiceQueryParameters::new(application));
+        service.parameters.filter = match query.parameters.filter {
             ApplicationListFilter::All => ServiceListFilter::All,
             ApplicationListFilter::Name(value) => ServiceListFilter::Name(value),
             ApplicationListFilter::TypeName(value) => ServiceListFilter::TypeName(value),
             ApplicationListFilter::DefinitionKind(_) => return Err(Error::InvalidInput(USAGE)),
         };
-        service.max_results = query.max_results;
-        service.continuation_token = query.continuation_token;
+        service.paging = query.paging;
         Ok(Operation::ServiceList(service))
     } else {
         Ok(Operation::ApplicationList(query))
@@ -111,19 +111,23 @@ fn arguments(mut args: Vec<String>) -> Result<(SocketAddr, Operation, Duration)>
         "create-name" if args.len() == 4 => Operation::CreateName(args[3].clone()),
         "delete-name" if args.len() == 4 => Operation::DeleteName(args[3].clone()),
         "node-health" if args.len() >= 4 => {
-            let mut query = NodeHealthQueryDescription::new(&args[3]);
+            let mut query =
+                NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(&args[3]));
             let (options, remainder) = args[4..].as_chunks::<2>();
             for pair in options {
                 match pair[0].as_str() {
-                    "--events-filter" if query.events_filter.is_none() => {
-                        query.events_filter = Some(HealthEventsFilter::from_bits_retain(
-                            pair[1].parse().map_err(|_| {
-                                Error::InvalidInput("events filter must be a decimal UInt32 mask")
-                            })?,
-                        ));
+                    "--events-filter" if query.parameters.events_filter.is_none() => {
+                        query.parameters.events_filter =
+                            Some(HealthEventsFilter::from_bits_retain(
+                                pair[1].parse().map_err(|_| {
+                                    Error::InvalidInput(
+                                        "events filter must be a decimal UInt32 mask",
+                                    )
+                                })?,
+                            ));
                     }
-                    "--warning-as-error" if query.health_policy.is_none() => {
-                        query.health_policy = Some(NodeHealthPolicy {
+                    "--warning-as-error" if query.parameters.health_policy.is_none() => {
+                        query.parameters.health_policy = Some(NodeHealthPolicy {
                             consider_warning_as_error: pair[1].parse().map_err(|_| {
                                 Error::InvalidInput("warning-as-error must be true or false")
                             })?,
@@ -158,7 +162,7 @@ async fn run() -> Result<()> {
             let page = client
                 .get_node_list(&NodeQueryDescription::default())
                 .await?;
-            for node in page.nodes {
+            for node in page.items {
                 println!("{node:?}");
             }
             println!("continuation_token={:?}", page.continuation_token);
@@ -215,17 +219,23 @@ mod tests {
         let (_, Operation::NodeHealth(query), _) = parse("node-health N0020").unwrap() else {
             panic!()
         };
-        assert_eq!(query.node_name, "N0020");
-        assert_eq!(query.health_policy, None);
-        assert_eq!(query.events_filter, None);
+        assert_eq!(query.parameters.node_name, "N0020");
+        assert_eq!(query.parameters.health_policy, None);
+        assert_eq!(query.parameters.events_filter, None);
         let (_, Operation::NodeHealth(query), timeout) = parse(
             "node-health N0020 --warning-as-error false --events-filter 0 --timeout-seconds 5",
         )
         .unwrap() else {
             panic!()
         };
-        assert_eq!(query.health_policy, Some(NodeHealthPolicy::default()));
-        assert_eq!(query.events_filter, Some(HealthEventsFilter::DEFAULT));
+        assert_eq!(
+            query.parameters.health_policy,
+            Some(NodeHealthPolicy::default())
+        );
+        assert_eq!(
+            query.parameters.events_filter,
+            Some(HealthEventsFilter::DEFAULT)
+        );
         assert_eq!(timeout, Duration::from_secs(5));
     }
 
@@ -270,20 +280,20 @@ mod tests {
     fn list_options_preserve_explicit_filters_and_one_page_controls() {
         let (_, Operation::ApplicationList(query), _) = parse("application-list --type MyType --exclude-parameters true --max-results 1 --continuation-token opaque").unwrap() else { panic!() };
         assert_eq!(
-            query.filter,
+            query.parameters.filter,
             ApplicationListFilter::TypeName("MyType".into())
         );
-        assert!(query.exclude_application_parameters);
-        assert_eq!(query.max_results, NonZeroU64::new(1));
-        assert_eq!(query.continuation_token.as_deref(), Some("opaque"));
+        assert!(query.parameters.exclude_application_parameters);
+        assert_eq!(query.paging.max_results, NonZeroU64::new(1));
+        assert_eq!(query.paging.continuation_token.as_deref(), Some("opaque"));
         let (_, Operation::ServiceList(query), _) =
             parse("service-list fabric:/App --name fabric:/App/Svc").unwrap()
         else {
             panic!()
         };
-        assert_eq!(query.application_name, "fabric:/App");
+        assert_eq!(query.parameters.application_name, "fabric:/App");
         assert_eq!(
-            query.filter,
+            query.parameters.filter,
             ServiceListFilter::Name("fabric:/App/Svc".into())
         );
         for input in [

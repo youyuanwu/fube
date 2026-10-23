@@ -82,27 +82,28 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     let client =
         FabricClient::connect_clear("127.0.0.1:19000".parse()?, Duration::from_secs(30)).await?;
     let mut app_query = ApplicationQueryDescription {
-        filter: ApplicationListFilter::TypeName(journal.type_name.clone()),
-        max_results: NonZeroU64::new(1),
-        ..Default::default()
+        parameters: ApplicationQueryParameters {
+            filter: ApplicationListFilter::TypeName(journal.type_name.clone()),
+            ..Default::default()
+        },
+        paging: Paging {
+            max_results: NonZeroU64::new(1),
+            ..Default::default()
+        },
     };
     let first = client.get_application_list(&app_query).await?;
-    assert_eq!(first.applications.len(), 1);
+    assert_eq!(first.items.len(), 1);
     assert!(
         first.continuation_token.is_some(),
         "two owned apps must force a real native token"
     );
-    app_query.continuation_token = first.continuation_token.clone();
+    app_query.paging.continuation_token = first.continuation_token.clone();
     let second = client
         .get_application_list_with_timeout(&app_query, Duration::from_secs(30))
         .await?;
-    assert_eq!(second.applications.len(), 1);
+    assert_eq!(second.items.len(), 1);
     assert!(second.continuation_token.is_none());
-    let combined: Vec<_> = first
-        .applications
-        .into_iter()
-        .chain(second.applications)
-        .collect();
+    let combined: Vec<_> = first.items.into_iter().chain(second.items).collect();
     assert_eq!(
         combined.iter().map(|a| &a.name).collect::<BTreeSet<_>>(),
         journal.applications.iter().collect()
@@ -116,55 +117,49 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
                 .unwrap(),
         );
     }
-    app_query.continuation_token = None;
-    app_query.max_results = None;
-    app_query.exclude_application_parameters = true;
+    app_query.paging.continuation_token = None;
+    app_query.paging.max_results = None;
+    app_query.parameters.exclude_application_parameters = true;
     let excluded = client.get_application_list(&app_query).await?;
-    assert_eq!(excluded.applications.len(), 2);
-    assert!(excluded
-        .applications
-        .iter()
-        .all(|a| a.parameters.is_empty()));
-    app_query.filter = ApplicationListFilter::Name(journal.applications[0].clone());
+    assert_eq!(excluded.items.len(), 2);
+    assert!(excluded.items.iter().all(|a| a.parameters.is_empty()));
+    app_query.parameters.filter = ApplicationListFilter::Name(journal.applications[0].clone());
     assert_eq!(
-        client
-            .get_application_list(&app_query)
-            .await?
-            .applications
-            .len(),
+        client.get_application_list(&app_query).await?.items.len(),
         1
     );
-    app_query.filter = ApplicationListFilter::Name(format!("{}-absent", journal.applications[0]));
+    app_query.parameters.filter =
+        ApplicationListFilter::Name(format!("{}-absent", journal.applications[0]));
     assert!(client
         .get_application_list(&app_query)
         .await?
-        .applications
+        .items
         .is_empty());
-    app_query.filter = ApplicationListFilter::DefinitionKind(
+    app_query.parameters.filter = ApplicationListFilter::DefinitionKind(
         ApplicationDefinitionKindFilter::SERVICE_FABRIC_APPLICATION_DESCRIPTION,
     );
     let definitions = client.get_application_list(&app_query).await?;
     assert!(journal
         .applications
         .iter()
-        .all(|name| definitions.applications.iter().any(|a| &a.name == name)));
+        .all(|name| definitions.items.iter().any(|a| &a.name == name)));
 
     let mut service_observations = Vec::new();
     let mut native_services = Vec::new();
     for name in &journal.applications {
         let observed = http.services(name).await?;
-        let mut query = ServiceQueryDescription::new(name);
-        query.max_results = NonZeroU64::new(1);
+        let mut query = ServiceQueryDescription::new(ServiceQueryParameters::new(name));
+        query.paging.max_results = NonZeroU64::new(1);
         let first = client.get_service_list(&query).await?;
-        assert_eq!(first.services.len(), 1);
+        assert_eq!(first.items.len(), 1);
         assert!(first.continuation_token.is_some());
-        query.continuation_token = first.continuation_token.clone();
+        query.paging.continuation_token = first.continuation_token.clone();
         let second = client
             .get_service_list_with_timeout(&query, Duration::from_secs(30))
             .await?;
-        assert_eq!(second.services.len(), 1);
+        assert_eq!(second.items.len(), 1);
         assert!(second.continuation_token.is_none());
-        let services: Vec<_> = first.services.into_iter().chain(second.services).collect();
+        let services: Vec<_> = first.items.into_iter().chain(second.items).collect();
         assert_eq!(
             services
                 .iter()
@@ -190,21 +185,22 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
                 "is_service_group": service.is_service_group,
             }));
         }
-        query.continuation_token = None;
-        query.max_results = None;
-        query.filter = ServiceListFilter::TypeName("ListStateful".into());
-        assert_eq!(client.get_service_list(&query).await?.services.len(), 1);
-        query.filter = ServiceListFilter::Name(format!("{name}/Stateless"));
-        assert_eq!(client.get_service_list(&query).await?.services.len(), 1);
-        query.filter = ServiceListFilter::Name(format!("{name}/Absent"));
-        assert!(client.get_service_list(&query).await?.services.is_empty());
+        query.paging.continuation_token = None;
+        query.paging.max_results = None;
+        query.parameters.filter = ServiceListFilter::TypeName("ListStateful".into());
+        assert_eq!(client.get_service_list(&query).await?.items.len(), 1);
+        query.parameters.filter = ServiceListFilter::Name(format!("{name}/Stateless"));
+        assert_eq!(client.get_service_list(&query).await?.items.len(), 1);
+        query.parameters.filter = ServiceListFilter::Name(format!("{name}/Absent"));
+        assert!(client.get_service_list(&query).await?.items.is_empty());
         service_observations.extend(observed);
     }
-    let app_query = ApplicationQueryDescription {
+    let app_query = ApplicationQueryDescription::new(ApplicationQueryParameters {
         filter: ApplicationListFilter::TypeName(journal.type_name.clone()),
         ..Default::default()
-    };
-    let service_query = ServiceQueryDescription::new(&journal.applications[0]);
+    });
+    let service_query =
+        ServiceQueryDescription::new(ServiceQueryParameters::new(&journal.applications[0]));
     let node_query = NodeQueryDescription::default();
     let (a, s, n, p) = tokio::join!(
         client.get_application_list(&app_query),
@@ -212,14 +208,13 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
         client.get_node_list(&node_query),
         client.ping()
     );
-    assert_eq!(a?.applications.len(), 2);
-    assert_eq!(s?.services.len(), 2);
-    assert_eq!(n?.nodes.len(), 5);
+    assert_eq!(a?.items.len(), 2);
+    assert_eq!(s?.items.len(), 2);
+    assert_eq!(n?.items.len(), 5);
     p?;
     let missing = client
-        .get_service_list(&ServiceQueryDescription::new(format!(
-            "{}-absent",
-            journal.applications[0]
+        .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
+            format!("{}-absent", journal.applications[0]),
         )))
         .await;
     let code = match missing {
@@ -230,11 +225,7 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     };
     assert!(!client.is_closed());
     assert_eq!(
-        client
-            .get_application_list(&app_query)
-            .await?
-            .applications
-            .len(),
+        client.get_application_list(&app_query).await?.items.len(),
         2
     );
     client.ping().await?;

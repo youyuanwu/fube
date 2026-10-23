@@ -1,8 +1,8 @@
 //! Owned native node query data. Scalar enum numbers are never silently coerced.
 
-use std::num::NonZeroU64;
-
 use serde::{Deserialize, Serialize};
+
+use crate::{PagedQuery, QueryPage};
 
 /// The numeric native node ID, not a GUID. Ordering is high word, then low word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -118,28 +118,19 @@ bitflags::bitflags! {
     }
 }
 
-/// One native GetNodeList request. Empty name/token are omitted like the native
+/// Native GetNodeList parameters. Empty names are omitted like the native
 /// facade. Node name is exact and case-preserving, not a prefix or naming URI.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NodeQueryDescription {
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeQueryParameters {
     pub node_name: Option<String>,
     pub status_filter: NodeStatusFilter,
-    /// Opaque server continuation. No snapshot is promised across requests.
-    pub continuation_token: Option<String>,
-    /// Positive native page limit, at most i64::MAX; larger values are rejected
-    /// locally. None leaves count unspecified (the server can still byte-page).
-    pub max_results: Option<NonZeroU64>,
 }
 
-/// An explicit server page, never an automatically collected cluster snapshot.
-///
-/// None means paging ended, not proof that every native aggregation subquery
-/// succeeded: GetNodeList can return best-effort data after partial failures.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeListPage {
-    pub nodes: Vec<Node>,
-    pub continuation_token: Option<String>,
-}
+/// One native node-list request with separate parameters and paging.
+pub type NodeQueryDescription = PagedQuery<NodeQueryParameters>;
+
+/// An explicit, best-effort node page, not a cluster membership snapshot.
+pub type NodeListPage = QueryPage<Node>;
 
 /// Owned native node record, including deactivation and raw timing fields.
 ///

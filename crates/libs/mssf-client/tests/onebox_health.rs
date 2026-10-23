@@ -8,7 +8,8 @@ use std::{
 
 use mssf_client::{
     Error, FabricClient, HealthEvaluation, HealthEvent, HealthEventsFilter, HealthState,
-    NodeHealth, NodeHealthPolicy, NodeHealthQueryDescription, NodeQueryDescription,
+    NodeHealth, NodeHealthPolicy, NodeHealthQueryDescription, NodeHealthQueryParameters,
+    NodeQueryDescription,
 };
 use serde_json::{json, Value};
 use tokio::task::JoinSet;
@@ -263,13 +264,16 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
             fresh(snapshot.start_ms, now_ms()),
             "rerun preparation, observations expired"
         );
-        let mut query = NodeHealthQueryDescription::new(snapshot.node_name.clone());
-        query.health_policy = snapshot
-            .policy
-            .map(|consider_warning_as_error| NodeHealthPolicy {
-                consider_warning_as_error,
-            });
-        query.events_filter = snapshot.filter.map(HealthEventsFilter::from_bits_retain);
+        let mut query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(
+            snapshot.node_name.clone(),
+        ));
+        query.parameters.health_policy =
+            snapshot
+                .policy
+                .map(|consider_warning_as_error| NodeHealthPolicy {
+                    consider_warning_as_error,
+                });
+        query.parameters.events_filter = snapshot.filter.map(HealthEventsFilter::from_bits_retain);
         let start_ms = now_ms();
         let health = client.get_node_health(&query).await?;
         let end_ms = now_ms();
@@ -280,7 +284,9 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
         );
     }
     let error = client
-        .get_node_health(&NodeHealthQueryDescription::new(&config.missing))
+        .get_node_health(&NodeHealthQueryDescription::new(
+            NodeHealthQueryParameters::new(&config.missing),
+        ))
         .await
         .unwrap_err();
     assert!(
@@ -294,7 +300,8 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
         "{error:?}"
     );
     assert!(!client.is_closed());
-    let healthy_query = NodeHealthQueryDescription::new(&config.healthy);
+    let healthy_query =
+        NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(&config.healthy));
     let reused = client
         .get_node_health_with_timeout(&healthy_query, Duration::from_secs(5))
         .await?;
@@ -319,7 +326,9 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
                 assert!(!client.ping().await.unwrap().node_name.is_empty());
             } else if index % 3 == 1 {
                 let health = client
-                    .get_node_health(&NodeHealthQueryDescription::new(node))
+                    .get_node_health(&NodeHealthQueryDescription::new(
+                        NodeHealthQueryParameters::new(node),
+                    ))
                     .await
                     .unwrap();
                 assert_eq!(health.aggregated_health_state, HealthState::Ok);
@@ -329,7 +338,7 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
                         .get_node_list(&NodeQueryDescription::default())
                         .await
                         .unwrap()
-                        .nodes
+                        .items
                         .len(),
                     5
                 );

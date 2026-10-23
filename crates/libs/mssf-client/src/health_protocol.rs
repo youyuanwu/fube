@@ -1,41 +1,74 @@
-use std::borrow::Cow;
-
 use mssf_transport::serialization::serde::{from_fields, ObjectArray};
 use mssf_transport::{message::Message, serialization::Decoder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::{health::*, Error, HealthState, NodeTimestamp, Result};
+use crate::{
+    health::*, query_arguments::QueryArguments, query_protocol::Query, Error, HealthState,
+    NodeTimestamp, Result,
+};
 
-pub(crate) fn encode_query(query: &NodeHealthQueryDescription) -> Result<Vec<u8>> {
-    // Bound caller work before UTF-16 scanning, not just before wire allocation.
-    let name = &query.node_name;
-    if name.is_empty()
-        || name.len() > 4096 * 3
-        || name.contains('\0')
-        || name.encode_utf16().count() > 4096
-    {
-        return Err(Error::InvalidInput(
-            "node health name must be 1..=4096 UTF-16 units without NUL",
-        ));
+impl Query for NodeHealthQueryDescription {
+    type Output = NodeHealth;
+    const NAME: &'static str = "GetNodeHealth";
+
+    fn encode_parameters(&self, arguments: &mut QueryArguments) -> Result<()> {
+        let query = &self.parameters;
+        // Bound caller work before UTF-16 scanning, not just before wire allocation.
+        let name = &query.node_name;
+        if name.is_empty()
+            || name.len() > 4096 * 3
+            || name.contains('\0')
+            || name.encode_utf16().count() > 4096
+        {
+            return Err(Error::InvalidInput(
+                "node health name must be 1..=4096 UTF-16 units without NUL",
+            ));
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Policy {
+            consider_warning_as_error: bool,
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Filter {
+            health_state_filter: u32,
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Fields<'a> {
+            cluster_health_policy: Option<String>,
+            events_filter: Option<String>,
+            node_name: &'a str,
+        }
+        fn json(value: &impl Serialize) -> Result<String> {
+            serde_json::to_string(value)
+                .map_err(|_| Error::InvalidInput("failed to serialize query JSON argument"))
+        }
+        arguments.append(&Fields {
+            cluster_health_policy: query
+                .health_policy
+                .map(|policy| {
+                    json(&Policy {
+                        consider_warning_as_error: policy.consider_warning_as_error,
+                    })
+                })
+                .transpose()?,
+            events_filter: query
+                .events_filter
+                .map(|filter| {
+                    json(&Filter {
+                        health_state_filter: filter.bits(),
+                    })
+                })
+                .transpose()?,
+            node_name: name,
+        })
     }
-    let mut args = Vec::with_capacity(3);
-    if let Some(policy) = query.health_policy {
-        args.push((
-            "ClusterHealthPolicy",
-            Cow::Owned(format!(
-                "{{\"ConsiderWarningAsError\":{}}}",
-                policy.consider_warning_as_error
-            )),
-        ));
+
+    fn decode_reply(message: &Message) -> Result<NodeHealth> {
+        decode_reply(message)
     }
-    if let Some(filter) = query.events_filter {
-        args.push((
-            "EventsFilter",
-            Cow::Owned(format!("{{\"HealthStateFilter\":{}}}", filter.bits())),
-        ));
-    }
-    args.push(("NodeName", Cow::Borrowed(name.as_str())));
-    crate::query_protocol::encode("GetNodeHealth", &args)
 }
 
 pub(crate) fn decode_reply(message: &Message) -> Result<NodeHealth> {

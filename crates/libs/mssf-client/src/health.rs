@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{HealthState, NodeTimestamp};
+use crate::{HealthState, NodeTimestamp, QueryDescription};
 
 bitflags::bitflags! {
     /// Native event filter over **evaluated**, not reported, event health.
@@ -33,14 +33,14 @@ bitflags::bitflags! {
 /// An explicit default/false overrides the cluster policy; omitting the policy
 /// in [`NodeHealthQueryDescription`] inherits the native effective cluster policy.
 /// Cluster percentage/application thresholds do not govern this node query.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeHealthPolicy {
     pub consider_warning_as_error: bool,
 }
 
-/// One GetNodeHealth request; no paging, child filters or statistics.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeHealthQueryDescription {
+/// GetNodeHealth parameters; no paging, child filters or statistics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeHealthQueryParameters {
     /// Required, case-preserving name: 1..=4096 UTF-16 units, without NUL.
     /// Native HM resolves node identity; this is not a naming URI or prefix.
     pub node_name: String,
@@ -50,7 +50,7 @@ pub struct NodeHealthQueryDescription {
     pub health_policy: Option<NodeHealthPolicy>,
 }
 
-impl NodeHealthQueryDescription {
+impl NodeHealthQueryParameters {
     pub fn new(node_name: impl Into<String>) -> Self {
         Self {
             node_name: node_name.into(),
@@ -59,6 +59,9 @@ impl NodeHealthQueryDescription {
         }
     }
 }
+
+/// One unpaged node-health request.
+pub type NodeHealthQueryDescription = QueryDescription<NodeHealthQueryParameters>;
 
 /// Owned detail health. An unhealthy aggregate is successful query data.
 #[derive(Debug, Clone, PartialEq, Eq)]

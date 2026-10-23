@@ -11,11 +11,14 @@ mod list_protocol;
 mod node_protocol;
 mod nodes;
 mod protocol;
+mod query;
+mod query_arguments;
 mod query_protocol;
 mod services;
 pub use applications::*;
 pub use health::*;
 pub use nodes::*;
+pub use query::*;
 pub use services::*;
 
 use std::{net::SocketAddr, time::Duration};
@@ -154,12 +157,7 @@ impl FabricClient {
         query: &NodeQueryDescription,
         timeout: Duration,
     ) -> Result<NodeListPage> {
-        let deadline = deadline_after(timeout)?;
-        let body = node_protocol::encode_query(query)?;
-        self.request("QueryRequest", body, deadline, |reply| {
-            node_protocol::decode_reply(&reply)
-        })
-        .await
+        self.query(query, timeout).await
     }
 
     /// Query actual single-node health, events and unhealthy explanations.
@@ -176,12 +174,7 @@ impl FabricClient {
         query: &NodeHealthQueryDescription,
         timeout: Duration,
     ) -> Result<NodeHealth> {
-        let deadline = deadline_after(timeout)?;
-        let body = health_protocol::encode_query(query)?;
-        self.request("QueryRequest", body, deadline, |reply| {
-            health_protocol::decode_reply(&reply)
-        })
-        .await
+        self.query(query, timeout).await
     }
 
     /// Get one application page using the configured default deadline.
@@ -202,12 +195,7 @@ impl FabricClient {
         query: &ApplicationQueryDescription,
         timeout: Duration,
     ) -> Result<ApplicationListPage> {
-        let deadline = deadline_after(timeout)?;
-        let body = list_protocol::encode_application(query)?;
-        self.request("QueryRequest", body, deadline, |reply| {
-            list_protocol::decode_applications(&reply)
-        })
-        .await
+        self.query(query, timeout).await
     }
 
     /// Get one ordinary application-scoped service page with the default timeout.
@@ -227,12 +215,7 @@ impl FabricClient {
         query: &ServiceQueryDescription,
         timeout: Duration,
     ) -> Result<ServiceListPage> {
-        let deadline = deadline_after(timeout)?;
-        let body = list_protocol::encode_service(query)?;
-        self.request("QueryRequest", body, deadline, |reply| {
-            list_protocol::decode_services(&reply)
-        })
-        .await
+        self.query(query, timeout).await
     }
 
     /// Close the shared connection and wait for the background driver to exit.
@@ -248,6 +231,19 @@ impl FabricClient {
     /// The first terminal connection cause, including failures detected idle.
     pub fn terminal_error(&self) -> Option<Error> {
         self.connection.terminal_error()
+    }
+
+    async fn query<Q: query_protocol::Query>(
+        &self,
+        query: &Q,
+        timeout: Duration,
+    ) -> Result<Q::Output> {
+        let deadline = deadline_after(timeout)?;
+        let body = query_protocol::encode_query(query)?;
+        self.request("QueryRequest", body, deadline, |reply| {
+            Q::decode_reply(&reply)
+        })
+        .await
     }
 
     async fn request<T: Send + 'static>(

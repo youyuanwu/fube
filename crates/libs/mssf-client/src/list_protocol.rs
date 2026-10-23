@@ -1,151 +1,123 @@
 //! Source-derived list aggregate envelopes and positional record layouts.
 
-use std::{borrow::Cow, collections::BTreeMap, num::NonZeroU64};
+use std::collections::BTreeMap;
 
 use mssf_transport::{
-    message::{Message, ACTION, ACTOR},
+    message::Message,
     serialization::{serde::from_fields, Decoder, MAX_COLLECTION_COUNT},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::{applications::*, services::*, Error, HealthState, Result};
+use crate::{
+    applications::*, query_arguments::QueryArguments, query_protocol::Query, services::*, Error,
+    HealthState, Paging, Result,
+};
 
-fn paging<'a>(
-    args: &mut Vec<(&'static str, Cow<'a, str>)>,
-    token: &'a Option<String>,
-    max: Option<NonZeroU64>,
-) -> Result<()> {
-    if let Some(token) = token.as_deref().filter(|s| !s.is_empty()) {
-        args.push(("ContinuationToken", Cow::Borrowed(token)));
-    }
-    if let Some(max) = max {
-        if max.get() > i64::MAX as u64 {
-            return Err(Error::InvalidInput(
-                "MaxResults exceeds native signed range",
-            ));
-        }
-        args.push(("MaxResults", Cow::Owned(max.to_string())));
-    }
-    Ok(())
-}
-
-fn type_selector<'a>(
-    args: &mut Vec<(&'static str, Cow<'a, str>)>,
-    key: &'static str,
-    value: &'a str,
-) -> Result<()> {
+fn type_selector(value: &str) -> Result<&str> {
     if value.is_empty() {
         return Err(Error::InvalidInput("selected type name must not be empty"));
     }
-    args.push((key, Cow::Borrowed(value)));
-    Ok(())
+    Ok(value)
 }
 
-pub(crate) fn encode_application(query: &ApplicationQueryDescription) -> Result<Vec<u8>> {
-    let mut args = Vec::new();
-    match &query.filter {
-        ApplicationListFilter::All => {}
-        ApplicationListFilter::Name(name) => {
-            crate::protocol::validate_name(name)?;
-            args.push(("ApplicationName", Cow::Borrowed(name.as_str())));
+impl Query for ApplicationQueryDescription {
+    type Output = ApplicationListPage;
+    const NAME: &'static str = "GetApplicationList";
+
+    fn encode_parameters(&self, arguments: &mut QueryArguments) -> Result<()> {
+        #[derive(Default, Serialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Fields<'a> {
+            application_name: Option<&'a str>,
+            application_type_name: Option<&'a str>,
+            application_definition_kind_filter: Option<ApplicationDefinitionKindFilter>,
+            exclude_application_parameters: Option<bool>,
         }
-        ApplicationListFilter::TypeName(name) => {
-            type_selector(&mut args, "ApplicationTypeName", name)?
-        }
-        ApplicationListFilter::DefinitionKind(filter) => {
-            let filter = ApplicationDefinitionKindFilter::try_from_bits(filter.bits())?;
-            if filter.bits() != 0 {
-                args.push((
-                    "ApplicationDefinitionKindFilter",
-                    Cow::Owned(filter.bits().to_string()),
-                ));
+        let mut fields = Fields {
+            exclude_application_parameters: self
+                .parameters
+                .exclude_application_parameters
+                .then_some(true),
+            ..Default::default()
+        };
+        match &self.parameters.filter {
+            ApplicationListFilter::All => {}
+            ApplicationListFilter::Name(name) => {
+                crate::protocol::validate_name(name)?;
+                fields.application_name = Some(name);
+            }
+            ApplicationListFilter::TypeName(name) => {
+                fields.application_type_name = Some(type_selector(name)?);
+            }
+            ApplicationListFilter::DefinitionKind(filter) => {
+                let filter = ApplicationDefinitionKindFilter::try_from_bits(filter.bits())?;
+                fields.application_definition_kind_filter = (filter.bits() != 0).then_some(filter);
             }
         }
+        arguments.append(&fields)
     }
-    if query.exclude_application_parameters {
-        args.push(("ExcludeApplicationParameters", Cow::Borrowed("true")));
+
+    fn paging(&self) -> Option<&Paging> {
+        Some(&self.paging)
     }
-    paging(&mut args, &query.continuation_token, query.max_results)?;
-    crate::query_protocol::encode("GetApplicationList", &args)
+
+    fn decode_reply(message: &Message) -> Result<ApplicationListPage> {
+        decode_applications(message)
+    }
 }
 
-pub(crate) fn encode_service(query: &ServiceQueryDescription) -> Result<Vec<u8>> {
-    crate::protocol::validate_name(&query.application_name)?;
-    if query.application_name == "fabric:/System" {
-        return Err(Error::InvalidInput(
-            "System service-list profile is unsupported",
-        ));
-    }
-    let mut args = vec![(
-        "ApplicationName",
-        Cow::Borrowed(query.application_name.as_str()),
-    )];
-    match &query.filter {
-        ServiceListFilter::All => {}
-        ServiceListFilter::Name(name) => {
-            crate::protocol::validate_name(name)?;
-            args.push(("ServiceName", Cow::Borrowed(name.as_str())));
-        }
-        ServiceListFilter::TypeName(name) => type_selector(&mut args, "ServiceTypeName", name)?,
-    }
-    paging(&mut args, &query.continuation_token, query.max_results)?;
-    crate::query_protocol::encode("GetApplicationServiceList", &args)
-}
+impl Query for ServiceQueryDescription {
+    type Output = ServiceListPage;
+    const NAME: &'static str = "GetApplicationServiceList";
 
-fn decode_list<T>(
-    message: &Message,
-    wrapper: i32,
-    record: fn(&mut Decoder<'_>) -> Result<T>,
-) -> Result<(Vec<T>, Option<String>)> {
-    crate::protocol::check_failure(message)?;
-    let properties = message.properties()?;
-    // Both native aggregates construct bare Message(QueryResult). Validate
-    // actor/action if present; absence is not a fabricated default header.
-    if message.headers.iter().any(|h| h.id == ACTOR) && properties.actor != 5 {
-        return Err(Error::Protocol("list reply is not from NamingGateway"));
-    }
-    if message.headers.iter().any(|h| h.id == ACTION) && properties.action != "QueryReply" {
-        return Err(Error::Protocol("unexpected list reply action"));
-    }
-    let result = crate::query_protocol::decode_with_paging_policy(
-        &message.body,
-        |decoder, tag| {
-            if tag != wrapper.to_le_bytes() {
-                return Err(Error::Protocol("unexpected native list wrapper type"));
+    fn encode_parameters(&self, arguments: &mut QueryArguments) -> Result<()> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Fields<'a> {
+            application_name: &'a str,
+            service_name: Option<&'a str>,
+            service_type_name: Option<&'a str>,
+        }
+        let parameters = &self.parameters;
+        crate::protocol::validate_name(&parameters.application_name)?;
+        if parameters.application_name == "fabric:/System" {
+            return Err(Error::InvalidInput(
+                "System service-list profile is unsupported",
+            ));
+        }
+        let mut fields = Fields {
+            application_name: &parameters.application_name,
+            service_name: None,
+            service_type_name: None,
+        };
+        match &parameters.filter {
+            ServiceListFilter::All => {}
+            ServiceListFilter::Name(name) => {
+                crate::protocol::validate_name(name)?;
+                fields.service_name = Some(name);
             }
-            let rows = decoder.object_array(record)?;
-            if decoder.pointer(|_, _| Ok(()))?.is_some() {
-                return Err(Error::Protocol("list has a single-item payload"));
+            ServiceListFilter::TypeName(name) => {
+                fields.service_type_name = Some(type_selector(name)?);
             }
-            Ok(rows)
-        },
-        true,
-    )?;
-    if result.kind != 2 {
-        return Err(Error::Protocol("query result is not a List"));
+        }
+        arguments.append(&fields)
     }
-    Ok((
-        result
-            .payload
-            .ok_or(Error::Protocol("list has no typed wrapper"))?,
-        result.paging.filter(|s| !s.is_empty()),
-    ))
+
+    fn paging(&self) -> Option<&Paging> {
+        Some(&self.paging)
+    }
+
+    fn decode_reply(message: &Message) -> Result<ServiceListPage> {
+        decode_services(message)
+    }
 }
 
 pub(crate) fn decode_applications(message: &Message) -> Result<ApplicationListPage> {
-    let (applications, continuation_token) = decode_list(message, 4, application)?;
-    Ok(ApplicationListPage {
-        applications,
-        continuation_token,
-    })
+    crate::query_protocol::decode_list(message, 4, true, application)
 }
 
 pub(crate) fn decode_services(message: &Message) -> Result<ServiceListPage> {
-    let (services, continuation_token) = decode_list(message, 2, service)?;
-    Ok(ServiceListPage {
-        services,
-        continuation_token,
-    })
+    crate::query_protocol::decode_list(message, 2, true, service)
 }
 
 fn health(raw: i64) -> Result<HealthState> {

@@ -2,8 +2,9 @@
 use super::*;
 use mssf_client::{
     ApplicationDefinitionKind, ApplicationDefinitionKindFilter as Definitions,
-    ApplicationListFilter, ApplicationQueryDescription, ApplicationStatus, HealthState,
-    ServiceKind, ServiceListFilter, ServiceQueryDescription, ServiceStatus,
+    ApplicationListFilter, ApplicationQueryDescription, ApplicationQueryParameters,
+    ApplicationStatus, HealthState, Paging, ServiceKind, ServiceListFilter,
+    ServiceQueryDescription, ServiceQueryParameters, ServiceStatus,
 };
 use std::{collections::BTreeMap, num::NonZeroU64};
 
@@ -222,10 +223,14 @@ async fn application_selectors_exclusion_and_native_paging_are_explicit() {
         let page = client
             .get_application_list_with_timeout(
                 &ApplicationQueryDescription {
-                    filter,
-                    exclude_application_parameters: true,
-                    continuation_token: Some("opaque:not-a-node-id".into()),
-                    max_results: NonZeroU64::new(i64::MAX as u64),
+                    parameters: ApplicationQueryParameters {
+                        filter,
+                        exclude_application_parameters: true,
+                    },
+                    paging: Paging {
+                        continuation_token: Some("opaque:not-a-node-id".into()),
+                        max_results: NonZeroU64::new(i64::MAX as u64),
+                    },
                 },
                 TIMEOUT_DURATION,
             )
@@ -235,7 +240,7 @@ async fn application_selectors_exclusion_and_native_paging_are_explicit() {
             page.continuation_token.as_deref(),
             Some("fabric:/Model/App")
         );
-        let app = &page.applications[0];
+        let app = &page.items[0];
         assert_eq!(app.name, "fabric:/Model/App");
         assert_eq!(app.type_name, "ModelType");
         assert_eq!(app.type_version, "1.2");
@@ -288,11 +293,11 @@ async fn service_selectors_route_to_application_service_list_and_both_kinds_deco
             )
         })
         .await;
-        let mut query = ServiceQueryDescription::new("fabric:/Model");
-        query.filter = filter;
-        query.continuation_token = Some(String::new());
+        let mut query = ServiceQueryDescription::new(ServiceQueryParameters::new("fabric:/Model"));
+        query.parameters.filter = filter;
+        query.paging.continuation_token = Some(String::new());
         let page = client.get_service_list(&query).await.unwrap();
-        let service = &page.services[0];
+        let service = &page.items[0];
         assert_eq!(
             service.kind,
             if kind == 1 {
@@ -328,18 +333,20 @@ async fn optional_record_suffixes_use_only_native_defaults() {
                 single_reply(move |r| aggregate(r, list_body(&s, Some("")))).await;
             if service {
                 let page = client
-                    .get_service_list(&ServiceQueryDescription::new("fabric:/Model"))
+                    .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
+                        "fabric:/Model",
+                    )))
                     .await
                     .unwrap();
                 assert_eq!(
-                    page.services[0].status,
+                    page.items[0].status,
                     if suffix == 0 {
                         ServiceStatus::Unknown
                     } else {
                         ServiceStatus::Active
                     }
                 );
-                assert_eq!(page.services[0].is_service_group, suffix == 2);
+                assert_eq!(page.items[0].is_service_group, suffix == 2);
                 assert!(page.continuation_token.is_none());
             } else {
                 let page = client
@@ -347,7 +354,7 @@ async fn optional_record_suffixes_use_only_native_defaults() {
                     .await
                     .unwrap();
                 assert_eq!(
-                    page.applications[0].definition_kind,
+                    page.items[0].definition_kind,
                     if suffix == 3 {
                         ApplicationDefinitionKind::ServiceFabricApplicationDescription
                     } else {
@@ -378,7 +385,9 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
                     single_reply(move |r| aggregate(r, list_body(&s, None))).await;
                 if service {
                     let page = client
-                        .get_service_list(&ServiceQueryDescription::new("fabric:/Model"))
+                        .get_service_list(&ServiceQueryDescription::new(
+                            ServiceQueryParameters::new("fabric:/Model"),
+                        ))
                         .await
                         .unwrap();
                     let expected = [
@@ -389,8 +398,8 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
                         ServiceStatus::Creating,
                         ServiceStatus::Failed,
                     ];
-                    assert_eq!(page.services[0].status, expected[status as usize]);
-                    assert_eq!(page.services[0].health_state.as_raw(), health);
+                    assert_eq!(page.items[0].status, expected[status as usize]);
+                    assert_eq!(page.items[0].health_state.as_raw(), health);
                 } else {
                     let page = client
                         .get_application_list(&ApplicationQueryDescription::default())
@@ -404,8 +413,8 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
                         ApplicationStatus::Deleting,
                         ApplicationStatus::Failed,
                     ];
-                    assert_eq!(page.applications[0].status, expected[status as usize]);
-                    assert_eq!(page.applications[0].health_state.as_raw(), health);
+                    assert_eq!(page.items[0].status, expected[status as usize]);
+                    assert_eq!(page.items[0].health_state.as_raw(), health);
                 }
                 server.await.unwrap();
             }
@@ -438,7 +447,7 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
                 .get_application_list(&ApplicationQueryDescription::default())
                 .await
                 .unwrap()
-                .applications[0]
+                .items[0]
                 .definition_kind,
             expected
         );
@@ -540,7 +549,9 @@ async fn malformed_list_successes_retire_shared_stream() {
                 single_reply(move |r| aggregate(r, list_body(&s, Some("token")))).await;
             let outcome = if service {
                 client
-                    .get_service_list(&ServiceQueryDescription::new("fabric:/Model"))
+                    .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
+                        "fabric:/Model",
+                    )))
                     .await
                     .map(|_| ())
             } else {
@@ -571,7 +582,9 @@ async fn truncated_and_wrong_metadata_are_not_missing_optional_suffixes() {
             let (client, server) = single_reply(move |r| aggregate(r, bytes)).await;
             let outcome = if service {
                 client
-                    .get_service_list(&ServiceQueryDescription::new("fabric:/Model"))
+                    .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
+                        "fabric:/Model",
+                    )))
                     .await
                     .map(|_| ())
             } else {
@@ -611,10 +624,12 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
     ] {
         assert!(matches!(
             client
-                .get_application_list(&ApplicationQueryDescription {
-                    filter,
-                    ..Default::default()
-                })
+                .get_application_list(&ApplicationQueryDescription::new(
+                    ApplicationQueryParameters {
+                        filter,
+                        ..Default::default()
+                    }
+                ))
                 .await,
             Err(Error::InvalidInput(_))
         ));
@@ -629,35 +644,43 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
     ] {
         assert!(matches!(
             client
-                .get_service_list(&ServiceQueryDescription::new(application))
+                .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
+                    application
+                )))
                 .await,
             Err(Error::InvalidInput(_))
         ));
     }
-    let mut service = ServiceQueryDescription::new("fabric:/Model");
-    service.filter = ServiceListFilter::TypeName(String::new());
+    let mut service = ServiceQueryDescription::new(ServiceQueryParameters::new("fabric:/Model"));
+    service.parameters.filter = ServiceListFilter::TypeName(String::new());
     assert!(matches!(
         client.get_service_list(&service).await,
         Err(Error::InvalidInput(_))
     ));
-    service.filter = ServiceListFilter::Name("fabric:/bad//name".into());
+    service.parameters.filter = ServiceListFilter::Name("fabric:/bad//name".into());
     assert!(matches!(
         client.get_service_list(&service).await,
         Err(Error::InvalidInput(_))
     ));
-    service.filter = ServiceListFilter::All;
-    service.max_results = NonZeroU64::new(u64::MAX);
+    service.parameters.filter = ServiceListFilter::All;
+    service.paging.max_results = NonZeroU64::new(u64::MAX);
     assert!(matches!(
         client.get_service_list(&service).await,
         Err(Error::InvalidInput(_))
     ));
     for q in [
         ApplicationQueryDescription {
-            max_results: NonZeroU64::new(u64::MAX),
+            paging: Paging {
+                max_results: NonZeroU64::new(u64::MAX),
+                ..Default::default()
+            },
             ..Default::default()
         },
         ApplicationQueryDescription {
-            continuation_token: Some("x".repeat(32769)),
+            paging: Paging {
+                continuation_token: Some("x".repeat(32769)),
+                ..Default::default()
+            },
             ..Default::default()
         },
     ] {
@@ -676,7 +699,7 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
         assert!(matches!(
             client
                 .get_service_list_with_timeout(
-                    &ServiceQueryDescription::new("fabric:/Model"),
+                    &ServiceQueryDescription::new(ServiceQueryParameters::new("fabric:/Model")),
                     timeout
                 )
                 .await,
@@ -736,7 +759,9 @@ async fn native_list_errors_are_local_and_allow_mixed_reuse() {
     assert!(!client.is_closed());
     assert!(matches!(
         client
-            .get_service_list(&ServiceQueryDescription::new("fabric:/Model"))
+            .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
+                "fabric:/Model"
+            )))
             .await,
         Err(Error::Remote {
             code: REMOTE_CODE,
@@ -748,7 +773,9 @@ async fn native_list_errors_are_local_and_allow_mixed_reuse() {
         .await
         .unwrap();
     client
-        .get_service_list(&ServiceQueryDescription::new("fabric:/Model"))
+        .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
+            "fabric:/Model",
+        )))
         .await
         .unwrap();
     client.ping().await.unwrap();
@@ -796,15 +823,15 @@ async fn mixed_lists_ping_and_name_complete_out_of_order_on_one_stream() {
         .await
         .unwrap();
     let apps = ApplicationQueryDescription::default();
-    let services = ServiceQueryDescription::new("fabric:/Model");
+    let services = ServiceQueryDescription::new(ServiceQueryParameters::new("fabric:/Model"));
     let (a, s, p, n) = tokio::join!(
         client.get_application_list(&apps),
         client.get_service_list(&services),
         client.ping(),
         client.name_exists("fabric:/Model")
     );
-    assert_eq!(a.unwrap().applications.len(), 1);
-    assert_eq!(s.unwrap().services.len(), 1);
+    assert_eq!(a.unwrap().items.len(), 1);
+    assert_eq!(s.unwrap().items.len(), 1);
     p.unwrap();
     assert!(n.unwrap());
     client.ping().await.unwrap();
@@ -849,8 +876,10 @@ async fn malformed_list_is_terminal_before_pending_waiter_repoll() {
     tokio::task::yield_now().await;
     let c = client.clone();
     let second = tokio::spawn(async move {
-        c.get_service_list(&ServiceQueryDescription::new("fabric:/Model"))
-            .await
+        c.get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
+            "fabric:/Model",
+        )))
+        .await
     });
     received.await.unwrap();
     tokio::time::timeout(TIMEOUT_DURATION, async {
@@ -907,13 +936,13 @@ async fn explicit_service_paging_stops_at_empty_terminal_page_without_hidden_req
     let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
         .await
         .unwrap();
-    let mut query = ServiceQueryDescription::new("fabric:/Model");
-    query.max_results = NonZeroU64::new(1);
+    let mut query = ServiceQueryDescription::new(ServiceQueryParameters::new("fabric:/Model"));
+    query.paging.max_results = NonZeroU64::new(1);
     let first = client.get_service_list(&query).await.unwrap();
     assert_eq!(first.continuation_token.as_deref(), Some("opaque"));
-    query.continuation_token = first.continuation_token;
+    query.paging.continuation_token = first.continuation_token;
     let terminal = client.get_service_list(&query).await.unwrap();
-    assert!(terminal.services.is_empty());
+    assert!(terminal.items.is_empty());
     assert!(terminal.continuation_token.is_none());
     client.ping().await.unwrap();
     server.await.unwrap();
@@ -940,7 +969,9 @@ async fn present_aggregate_headers_are_validated_for_each_list() {
             .await;
             let result = if service {
                 client
-                    .get_service_list(&ServiceQueryDescription::new("fabric:/Model"))
+                    .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
+                        "fabric:/Model",
+                    )))
                     .await
                     .map(|_| ())
             } else {
@@ -991,7 +1022,9 @@ async fn timed_out_list_ignores_late_malformed_reply_and_preserves_reuse() {
         Err(Error::Timeout)
     ));
     client
-        .get_service_list(&ServiceQueryDescription::new("fabric:/Model"))
+        .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
+            "fabric:/Model",
+        )))
         .await
         .unwrap();
     client.ping().await.unwrap();
