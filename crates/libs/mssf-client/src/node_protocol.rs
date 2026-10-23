@@ -1,6 +1,6 @@
 use mssf_transport::{
     message::Message,
-    serialization::serde::{ByteArray, Derived, Guid, NativeEnum, ObjectArray, Pointer},
+    serialization::serde::{Derived, Guid},
 };
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +43,7 @@ impl Query for NodeQueryDescription {
 #[derive(Deserialize)]
 struct NodeWire {
     name: String,
-    id: ByteArray,
+    id: NodeId,
     ip_address_or_fqdn: String,
     node_type: String,
     code_version: String,
@@ -54,21 +54,21 @@ struct NodeWire {
     is_seed_node: bool,
     upgrade_domain: String,
     fault_domain: String,
-    id_copy: ByteArray,
+    id_copy: NodeId,
     instance_id: u64,
     cluster_connection_port: u32,
-    deactivation: DeactivationWire,
+    deactivation: NodeDeactivation,
     is_stopped: bool,
     down_time_seconds: i64,
-    up_at: i64,
-    down_at: i64,
+    up_at: NodeTimestamp,
+    down_at: NodeTimestamp,
     http_gateway_port: u16,
 }
 
 impl NodeWire {
     fn into_node(self) -> Result<Node> {
-        let id = crate::protocol::decode_node_id(self.id)?;
-        if crate::protocol::decode_node_id(self.id_copy)? != id {
+        let id = self.id;
+        if self.id_copy != id {
             return Err(Error::Protocol("node ID copies disagree"));
         }
         Ok(Node {
@@ -86,11 +86,11 @@ impl NodeWire {
             fault_domain: self.fault_domain,
             instance_id: self.instance_id,
             cluster_connection_port: self.cluster_connection_port,
-            deactivation: self.deactivation.into_deactivation()?,
+            deactivation: self.deactivation,
             is_stopped: self.is_stopped,
             down_time_seconds: self.down_time_seconds,
-            up_at: NodeTimestamp(self.up_at),
-            down_at: NodeTimestamp(self.down_at),
+            up_at: self.up_at,
+            down_at: self.down_at,
             http_gateway_port: self.http_gateway_port,
         })
     }
@@ -98,52 +98,26 @@ impl NodeWire {
 
 #[derive(Deserialize)]
 struct TaskId(String, NodeDeactivationTaskType);
-#[derive(Deserialize)]
-struct TaskWire(TaskId, NodeDeactivationIntent);
-#[derive(Deserialize)]
-struct SafetySlot {
-    value: Pointer<NativeEnum<SafetyWire>>,
-}
-#[derive(Deserialize)]
-struct DeactivationWire {
-    effective_intent: NodeDeactivationIntent,
-    status: NodeDeactivationStatus,
-    tasks: ObjectArray<Vec<TaskWire>>,
-    pending_safety_checks: ObjectArray<Vec<SafetySlot>>,
-}
-impl DeactivationWire {
-    fn into_deactivation(self) -> Result<NodeDeactivation> {
-        Ok(NodeDeactivation {
-            effective_intent: self.effective_intent,
-            status: self.status,
-            tasks: self
-                .tasks
-                .0
-                .into_iter()
-                .map(
-                    |TaskWire(TaskId(id, task_type), intent)| NodeDeactivationTask {
-                        id,
-                        task_type,
-                        intent,
-                    },
-                )
-                .collect(),
-            pending_safety_checks: self
-                .pending_safety_checks
-                .0
-                .into_iter()
-                .map(
-                    |SafetySlot {
-                         value: Pointer(value),
-                     }| {
-                        value
-                            .map(|NativeEnum(value)| value.into())
-                            .ok_or(Error::Protocol("null pending safety check"))
-                    },
-                )
-                .collect::<Result<_>>()?,
+impl<'de> Deserialize<'de> for NodeDeactivationTask {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields(TaskId, NodeDeactivationIntent);
+        let Fields(TaskId(id, task_type), intent) = Fields::deserialize(deserializer)?;
+        Ok(Self {
+            id,
+            task_type,
+            intent,
         })
     }
+}
+
+pub(crate) fn deserialize_safety_checks<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<SafetyCheck>, D::Error> {
+    crate::native::tagged_pointer_slots::deserialize::<SafetyWire, D>(deserializer)
+        .map(|checks| checks.into_iter().map(Into::into).collect())
 }
 
 #[derive(Deserialize)]

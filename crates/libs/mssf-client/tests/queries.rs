@@ -67,7 +67,7 @@ fn descriptions_and_parameters_support_json_without_becoming_native_wire_dtos() 
     json_round_trip(&paging);
     for filter in [
         ApplicationListFilter::All,
-        ApplicationListFilter::Name("fabric:/App".into()),
+        ApplicationListFilter::Name("fabric:/App".parse().unwrap()),
         ApplicationListFilter::TypeName("ExactType".into()),
         ApplicationListFilter::DefinitionKind(ApplicationDefinitionKindFilter::ALL),
     ] {
@@ -83,12 +83,12 @@ fn descriptions_and_parameters_support_json_without_becoming_native_wire_dtos() 
     }
     for filter in [
         ServiceListFilter::All,
-        ServiceListFilter::Name("fabric:/App/Service".into()),
+        ServiceListFilter::Name("fabric:/App/Service".parse().unwrap()),
         ServiceListFilter::TypeName("ExactType".into()),
     ] {
         let query = ServiceQueryDescription {
             parameters: ServiceQueryParameters {
-                application_name: "fabric:/App".into(),
+                application_name: "fabric:/App".parse().unwrap(),
                 filter,
             },
             paging: paging.clone(),

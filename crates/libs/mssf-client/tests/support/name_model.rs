@@ -103,9 +103,10 @@ async fn exact_native_write_requests_all_entry_points_and_empty_replies() {
     let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
         .await
         .unwrap();
-    client.create_name("fabric:/App_1/Name-2").await.unwrap();
+    let name: mssf_client::NamingUri = "fabric:/App_1/Name-2".parse().unwrap();
+    client.create_name(&name).await.unwrap();
     write(&client, false, TIMEOUT_DURATION).await.unwrap();
-    client.delete_name("fabric:/App_1/Name-2").await.unwrap();
+    client.delete_name(&name).await.unwrap();
     write(&client, true, TIMEOUT_DURATION).await.unwrap();
     client.close().await.unwrap();
     server.await.unwrap();

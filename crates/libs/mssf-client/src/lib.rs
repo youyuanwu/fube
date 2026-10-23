@@ -8,6 +8,8 @@ mod applications;
 mod health;
 mod health_protocol;
 mod list_protocol;
+mod naming_uri;
+mod native;
 mod node_protocol;
 mod nodes;
 mod protocol;
@@ -17,6 +19,7 @@ mod query_protocol;
 mod services;
 pub use applications::*;
 pub use health::*;
+pub use naming_uri::NamingUri;
 pub use nodes::*;
 pub use query::*;
 pub use services::*;
@@ -82,9 +85,10 @@ impl FabricClient {
     /// `[A-Za-z0-9_-]+` segments separated by single slashes, at most 4096 bytes.
     /// Root, authority, escapes, query, fragment, whitespace, Unicode, and
     /// trailing or repeated slashes are rejected rather than normalized.
-    pub async fn name_exists(&self, name: &str) -> Result<bool> {
+    /// Accepts a [`NamingUri`] or a string checked before sending.
+    pub async fn name_exists(&self, name: impl AsRef<str>) -> Result<bool> {
         let deadline = deadline_after(self.timeout)?;
-        let body = protocol::encode_name(name)?;
+        let body = protocol::encode_name(name.as_ref())?;
         self.request("NameExistsRequest", body, deadline, |reply| {
             protocol::decode_name_exists(&reply)
         })
@@ -100,16 +104,20 @@ impl FabricClient {
     /// No retry or replay occurs. After sending, timeout, cancellation or
     /// disconnection can leave the write outcome unknown: stopping local
     /// waiting does not prove that the name was not created.
-    pub async fn create_name(&self, name: &str) -> Result<()> {
+    pub async fn create_name(&self, name: impl AsRef<str>) -> Result<()> {
         self.create_name_with_timeout(name, self.timeout).await
     }
 
     /// Create a name with one deadline covering preparation through decode.
     ///
     /// See [`Self::create_name`] for native semantics and post-send uncertainty.
-    pub async fn create_name_with_timeout(&self, name: &str, timeout: Duration) -> Result<()> {
+    pub async fn create_name_with_timeout(
+        &self,
+        name: impl AsRef<str>,
+        timeout: Duration,
+    ) -> Result<()> {
         let deadline = deadline_after(timeout)?;
-        let body = protocol::encode_name(name)?;
+        let body = protocol::encode_name(name.as_ref())?;
         self.request("CreateNameRequest", body, deadline, |reply| {
             protocol::decode_name_write(&reply)
         })
@@ -125,16 +133,20 @@ impl FabricClient {
     /// No retry or replay occurs. After sending, timeout, cancellation or
     /// disconnection can leave the write outcome unknown; none proves that
     /// deletion did not execute. Native errors are not converted to success.
-    pub async fn delete_name(&self, name: &str) -> Result<()> {
+    pub async fn delete_name(&self, name: impl AsRef<str>) -> Result<()> {
         self.delete_name_with_timeout(name, self.timeout).await
     }
 
     /// Delete a name with one deadline covering preparation through decode.
     ///
     /// See [`Self::delete_name`] for native semantics and post-send uncertainty.
-    pub async fn delete_name_with_timeout(&self, name: &str, timeout: Duration) -> Result<()> {
+    pub async fn delete_name_with_timeout(
+        &self,
+        name: impl AsRef<str>,
+        timeout: Duration,
+    ) -> Result<()> {
         let deadline = deadline_after(timeout)?;
-        let body = protocol::encode_name(name)?;
+        let body = protocol::encode_name(name.as_ref())?;
         let headers = vec![Header::boolean(protocol::DELETE_NAME_HEADER, true)?];
         self.request_with_headers("DeleteNameRequest", headers, body, deadline, |reply| {
             protocol::decode_name_write(&reply)

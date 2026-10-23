@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, HealthState, PagedQuery, QueryPage, Result};
+use crate::{Error, HealthState, NamingUri, PagedQuery, QueryPage, Result};
 
 bitflags::bitflags! {
     /// Native definition-kind selection bits, distinct from result enum numbers.
@@ -44,7 +44,7 @@ impl ApplicationDefinitionKindFilter {
 pub enum ApplicationListFilter {
     #[default]
     All,
-    Name(String),
+    Name(NamingUri),
     TypeName(String),
     DefinitionKind(ApplicationDefinitionKindFilter),
 }
@@ -69,6 +69,9 @@ pub enum ApplicationStatus {
     Deleting,
     Failed,
 }
+crate::native::strict_enum!(ApplicationStatus {
+    Invalid = 0, Ready = 1, Upgrading = 2, Creating = 3, Deleting = 4, Failed = 5,
+});
 
 /// Native result definition kind. Missing optional suffix defaults to Invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,12 +81,15 @@ pub enum ApplicationDefinitionKind {
     MeshApplicationDescription,
     Invalid,
 }
+crate::native::strict_enum!(ApplicationDefinitionKind {
+    ServiceFabricApplicationDescription = 0, Compose = 1, MeshApplicationDescription = 2, Invalid = 65535,
+});
 
 /// An owned aggregate observation. Health may be Unknown when unavailable.
 /// Deprecated upgrade fields are not exposed; nonempty values are unsupported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Application {
-    pub name: String,
+    pub name: NamingUri,
     pub type_name: String,
     pub type_version: String,
     pub status: ApplicationStatus,

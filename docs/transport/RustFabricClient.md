@@ -237,9 +237,11 @@ Tokens remain opaque strings; request controls and response metadata are distinc
 
 Descriptions, parameter structs, selectors, health policy, and `Paging` support
 Serde serialization/deserialization for application configuration, including
-`serde_json::to_string` / `from_str`. Deserialization is not operation validation:
-URI profiles, filter validity, count range and native limits are checked before
-sending. A JSON round trip does not itself qualify a value for the native wire.
+`serde_json::to_string` / `from_str`. Naming selectors and service application
+scope use checked `NamingUri` values, including during JSON deserialization.
+Other operation validation (filter validity, count range and native limits)
+still happens before sending. A JSON round trip does not itself qualify a value
+for the native wire.
 
 Internally, a `Query` trait binds the native query name, parameter encoder, paging
 placement, output and reply decoder. One executor starts the deadline before
@@ -525,6 +527,20 @@ segments, other punctuation, and trailing/repeated slashes are unsupported
 and return an explicit input error. This is a deliberate subset, not a full
 native NamingUri parser.
 
+`NamingUri` is a distinct checked value, constructed with
+`"fabric:/App".parse::<NamingUri>()?` or `NamingUri::parse("fabric:/App")?`.
+`as_str`, `AsRef<str>`, `Display` and `into_string` provide string access.
+JSON represents it as a string, while native Serde represents the complete
+structured URI object. Application/service result `name` fields,
+`ApplicationListFilter::Name`, `ServiceListFilter::Name` and
+`ServiceQueryParameters::application_name` now use this type rather than
+`String`. Construct service parameters with
+`ServiceQueryParameters::new("fabric:/App".parse()?)`.
+These field/constructor changes require callers to parse their names explicitly;
+JSON query shapes are unchanged, but invalid names are rejected earlier.
+Naming methods accept `impl AsRef<str>`, so both existing string calls and
+`client.name_exists(&name)` with a `NamingUri` are supported.
+
 | Resource | Limit |
 |---|---:|
 | Entire frame | 4 MiB |
@@ -668,8 +684,10 @@ DTO. A partition safety-check payload uses a `Derived<PartitionFields>` field
 to enter its derived scope. Encoding uses the same mapping in reverse.
 
 `NumericEnum<T>` instead maps derived unit variants to signed i64 scalar codes.
-It is used for strict application/service status, definition, health and service
-kind wire enums. Unknown codes are errors. Node scalar enums (`NodeStatus`,
+It is used for the structural service-kind helper; unknown codes are errors.
+Application status, definition kind and service status implement their explicit
+signed-i64 mappings directly and reject unknown codes without parallel wire
+enums. Node scalar enums (`NodeStatus`,
 `HealthState`, deactivation/task enums and `SafetyCheckKind`) implement Serde
 through the shared numeric-enum macro: both native and JSON formats use their
 signed i64 codes, including `Unrecognized(i64)`. This preserves the deliberate
@@ -715,13 +733,33 @@ query requests/results, ping/NameExists replies, complete node/deactivation/task
 and node-health records, application/service records, naming URI bodies and
 complete optional fault details. Safety checks and health evaluations use
 derived enums through shared native dispatch. Query wrappers use FixedTag;
-naming URI encode/decode share an Untagged schema using CountedStrings.
+naming URI encode/decode share the type's private Untagged component schema
+using CountedStrings.
 Header record framing/duplicate rules and query argument order are unchanged;
 QueryAddress is not added to the body.
 
-Wire DTO conversion still enforces duplicate node IDs/parameter keys, naming URI
-profile/segment agreement, strict list enums, deprecated fields and service
-kind/persistence consistency. Node paging retains its permissive type-info
+Aligned public models deserialize directly: `NodeHealth`, `HealthEvent`,
+`EventHealthEvaluation`, `HealthEvaluation` and `NodeDeactivation` no longer
+have parallel wire records. Shared field adapters select object arrays and
+required tagged-pointer slots without exposing wrappers in model fields.
+`NodeTimestamp` transparently maps signed i64 ticks; `NodeId` maps an exactly
+16-byte numeric byte array (high then low little-endian words), not a GUID.
+Health models also serialize using the same native mapping.
+
+Structural helpers remain only where the public/native shapes differ: node
+records carry a duplicate ID, task IDs are nested, safety checks collapse six
+native variants into one public partition variant, and application/service
+records have deprecated fields, versioned suffixes and kind/persistence
+consolidation. `NamingUri` owns its genuinely different component representation.
+No generalized derive framework or changed default Vec/Option mapping is needed.
+
+Validation is above the generic Serde backend. That backend enforces bounds,
+framing, metadata and tags; checked semantic types validate after their component
+decode, before returning a valid typed value. Record/operation validation still
+enforces duplicate node IDs/parameter keys, list health restrictions, deprecated
+fields and service kind/persistence consistency. In particular `HealthState`
+retains unknown codes structurally, then list validation rejects them; node and
+health results continue retaining them. Node paging retains its permissive type-info
 policy; application/service paging requires an empty tag. Payload validation
 precedes reporting an embedded query error so malformed records still retire
 the connection. Actor/action, Item/List invariants and connection policy remain
@@ -768,6 +806,11 @@ and private writable evidence. All four passed; owned fixture cleanup and
 independent allocation/container/volume/network/private-tag removal were
 verified. This does not extend compatibility to untested native schemas or
 make test-only REST preparation part of the production client.
+
+The later shared-adapter and direct-model expansions were checked with offline
+byte comparisons, malformed-input regressions and independent model peers.
+Their live onebox consumers compile, but these expansions have not received a
+fresh live-runtime qualification.
 
 Tests that need onebox are named `onebox_*` and assigned to the shared
 **`onebox` nextest group** in `.config/nextest.toml`. They remain `#[ignore]`

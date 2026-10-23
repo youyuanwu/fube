@@ -1,14 +1,42 @@
 //! Owned native node query data. Scalar enum numbers are never silently coerced.
 
+use mssf_transport::serialization::serde::ByteArray;
 use serde::{Deserialize, Serialize};
 
 use crate::{PagedQuery, QueryPage};
 
 /// The numeric native node ID, not a GUID. Ordering is high word, then low word.
+/// Native Serde uses a 16-byte array of little-endian words; JSON uses those bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId {
     pub high: u64,
     pub low: u64,
+}
+
+impl Serialize for NodeId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&self.high.to_le_bytes());
+        bytes[8..].copy_from_slice(&self.low.to_le_bytes());
+        ByteArray(bytes).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes = if deserializer.is_human_readable() {
+            Vec::<u8>::deserialize(deserializer)?
+        } else {
+            ByteArray::deserialize(deserializer)?.0
+        };
+        let bytes: [u8; 16] = bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("node ID must contain exactly 16 bytes"))?;
+        Ok(Self {
+            high: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            low: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+        })
+    }
 }
 
 impl std::fmt::Display for NodeId {
@@ -23,7 +51,8 @@ impl std::fmt::Display for NodeId {
 
 /// Native DateTime: signed 100-nanosecond ticks since 1601-01-01 UTC.
 /// Zero is the native default, not an inferred observation time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct NodeTimestamp(pub i64);
 
 macro_rules! native_enum {
@@ -172,11 +201,14 @@ pub struct Node {
 }
 
 /// Native effective deactivation state with its tasks and pending safety checks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Native deserialization preserves the nested task-ID and safety-check layouts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NodeDeactivation {
     pub effective_intent: NodeDeactivationIntent,
     pub status: NodeDeactivationStatus,
+    #[serde(deserialize_with = "crate::native::object_array::deserialize")]
     pub tasks: Vec<NodeDeactivationTask>,
+    #[serde(deserialize_with = "crate::node_protocol::deserialize_safety_checks")]
     pub pending_safety_checks: Vec<SafetyCheck>,
 }
 

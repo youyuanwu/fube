@@ -1,11 +1,8 @@
 use mssf_transport::message::Message;
-use mssf_transport::serialization::serde::{FixedTag, NativeEnum, ObjectArray, Pointer};
+use mssf_transport::serialization::serde::{FixedTag, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    health::*, query_arguments::QueryArguments, query_protocol::Query, Error, HealthState,
-    NodeTimestamp, Result,
-};
+use crate::{health::*, query_arguments::QueryArguments, query_protocol::Query, Error, Result};
 
 impl Query for NodeHealthQueryDescription {
     type Output = NodeHealth;
@@ -80,17 +77,12 @@ pub(crate) fn decode_reply(message: &Message) -> Result<NodeHealth> {
     #[derive(Deserialize)]
     struct ItemWire {
         _list: ObjectArray<Vec<ForbiddenListItem>>,
-        item: Pointer<HealthWire>,
+        item: Pointer<NodeHealth>,
     }
     let result = crate::query_protocol::decode::<FixedTag<ItemWire, 16>, _>(
         &message.body,
         false,
-        |FixedTag(wire)| {
-            wire.item
-                .0
-                .ok_or(Error::Protocol("null node health item"))?
-                .into_health()
-        },
+        |FixedTag(wire)| wire.item.0.ok_or(Error::Protocol("null node health item")),
     )?;
     if result.kind != 1 || result.paging.is_some() {
         return Err(Error::Protocol("node health result is not an unpaged Item"));
@@ -104,98 +96,5 @@ struct ForbiddenListItem;
 impl<'de> Deserialize<'de> for ForbiddenListItem {
     fn deserialize<D: serde::Deserializer<'de>>(_: D) -> std::result::Result<Self, D::Error> {
         Err(serde::de::Error::custom("node health item contains a list"))
-    }
-}
-#[derive(Deserialize)]
-struct EvaluationSlot {
-    value: Pointer<NativeEnum<EvaluationWire>>,
-}
-#[derive(Deserialize)]
-struct HealthWire {
-    node_name: String,
-    health_events: ObjectArray<Vec<EventWire>>,
-    aggregated_health_state: HealthState,
-    unhealthy_evaluations: ObjectArray<Vec<EvaluationSlot>>,
-}
-impl HealthWire {
-    fn into_health(self) -> Result<NodeHealth> {
-        Ok(NodeHealth {
-            node_name: self.node_name,
-            health_events: self.health_events.0.into_iter().map(Into::into).collect(),
-            aggregated_health_state: self.aggregated_health_state,
-            unhealthy_evaluations: self
-                .unhealthy_evaluations
-                .0
-                .into_iter()
-                .map(
-                    |EvaluationSlot {
-                         value: Pointer(value),
-                     }| {
-                        value
-                            .map(|NativeEnum(value)| value.into())
-                            .ok_or(Error::Protocol("null health evaluation"))
-                    },
-                )
-                .collect::<Result<_>>()?,
-        })
-    }
-}
-#[derive(Deserialize)]
-enum EvaluationWire {
-    #[serde(rename = "1")]
-    Event(EventEvaluationWire),
-}
-#[derive(Deserialize)]
-struct EventEvaluationWire {
-    description: String,
-    unhealthy_event: EventWire,
-    consider_warning_as_error: bool,
-    aggregated_health_state: HealthState,
-}
-impl From<EvaluationWire> for HealthEvaluation {
-    fn from(EvaluationWire::Event(wire): EvaluationWire) -> Self {
-        Self::Event(EventHealthEvaluation {
-            description: wire.description,
-            unhealthy_event: wire.unhealthy_event.into(),
-            consider_warning_as_error: wire.consider_warning_as_error,
-            aggregated_health_state: wire.aggregated_health_state,
-        })
-    }
-}
-
-#[derive(Deserialize)]
-struct EventWire {
-    source_id: String,
-    property: String,
-    time_to_live_ticks: i64,
-    health_state: HealthState,
-    description: String,
-    sequence_number: i64,
-    source_utc_timestamp: i64,
-    last_modified_utc_timestamp: i64,
-    is_expired: bool,
-    remove_when_expired: bool,
-    last_ok_transition_at: i64,
-    last_warning_transition_at: i64,
-    last_error_transition_at: i64,
-}
-
-impl From<EventWire> for HealthEvent {
-    fn from(wire: EventWire) -> Self {
-        Self {
-            source_id: wire.source_id,
-            property: wire.property,
-            time_to_live_ticks: wire.time_to_live_ticks,
-            health_state: wire.health_state,
-            description: wire.description,
-            sequence_number: wire.sequence_number,
-            source_utc_timestamp: NodeTimestamp(wire.source_utc_timestamp),
-            last_modified_utc_timestamp: NodeTimestamp(wire.last_modified_utc_timestamp),
-            is_expired: wire.is_expired,
-            remove_when_expired: wire.remove_when_expired,
-            last_ok_transition_at: NodeTimestamp(wire.last_ok_transition_at),
-            last_warning_transition_at: NodeTimestamp(wire.last_warning_transition_at),
-            last_error_transition_at: NodeTimestamp(wire.last_error_transition_at),
-        }
     }
 }

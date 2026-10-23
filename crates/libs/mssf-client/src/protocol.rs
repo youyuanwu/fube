@@ -1,103 +1,14 @@
-use mssf_transport::serialization::serde::{
-    from_fields, from_slice, to_vec, ByteArray, CountedStrings, Untagged,
-};
+use mssf_transport::serialization::serde::{from_fields, from_slice, to_vec};
 use mssf_transport::{message::Message, serialization::Decoder};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::{Error, GatewayDescription, NodeId, Result};
+use crate::{Error, GatewayDescription, NamingUri, NodeId, Result};
 
 // ClientServerTransport::DeleteNameHeader: public deletion is explicit.
 pub(crate) const DELETE_NAME_HEADER: u16 = 0x8033;
 
 pub(crate) fn encode_name(name: &str) -> Result<Vec<u8>> {
-    validate_name(name)?;
-    to_vec(&Untagged(NamingUriWire {
-        uri_type: 1,
-        scheme: "fabric".into(),
-        authority: String::new(),
-        host_type: 0,
-        host: String::new(),
-        port: -1,
-        path: name["fabric:".len()..].into(),
-        query: String::new(),
-        fragment: String::new(),
-        segments: CountedStrings(
-            name["fabric:/".len()..]
-                .split('/')
-                .map(str::to_owned)
-                .collect(),
-        ),
-    }))
-}
-
-#[derive(Serialize, Deserialize)]
-pub(crate) struct NamingUriWire {
-    uri_type: i64,
-    scheme: String,
-    authority: String,
-    host_type: i64,
-    host: String,
-    port: i32,
-    path: String,
-    query: String,
-    fragment: String,
-    segments: CountedStrings<Vec<String>>,
-}
-impl NamingUriWire {
-    pub(crate) fn into_name(self) -> Result<String> {
-        if self.uri_type != 1
-            || self.scheme != "fabric"
-            || !self.authority.is_empty()
-            || self.host_type != 0
-            || !self.host.is_empty()
-            || self.port != -1
-        {
-            return Err(Error::Protocol("unsupported native naming URI profile"));
-        }
-        if !self.query.is_empty() || !self.fragment.is_empty() {
-            return Err(Error::Protocol("naming URI has query or fragment"));
-        }
-        let value = format!("fabric:{}", self.path);
-        validate_name(&value)
-            .map_err(|_| Error::Protocol("unsupported native naming URI value"))?;
-        if !self.path[1..]
-            .split('/')
-            .eq(self.segments.0.iter().map(String::as_str))
-        {
-            return Err(Error::Protocol("naming URI segments disagree with path"));
-        }
-        Ok(value)
-    }
-}
-
-pub(crate) fn decode_node_id(ByteArray(bytes): ByteArray) -> Result<NodeId> {
-    let bytes: [u8; 16] = bytes
-        .try_into()
-        .map_err(|_| Error::Protocol("node ID must contain exactly 16 bytes"))?;
-    Ok(NodeId {
-        high: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-        low: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
-    })
-}
-
-pub(crate) fn validate_name(name: &str) -> Result<()> {
-    if name.len() > 4096 {
-        return Err(Error::InvalidInput("naming URI exceeds 4096 bytes"));
-    }
-    let suffix = name
-        .strip_prefix("fabric:/")
-        .ok_or(Error::InvalidInput("naming URI must start with fabric:/"))?;
-    if suffix.split('/').any(|segment| {
-        segment.is_empty()
-            || !segment
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    }) {
-        return Err(Error::InvalidInput(
-            "naming URI requires nonempty ASCII alphanumeric, underscore or hyphen segments",
-        ));
-    }
-    Ok(())
+    to_vec(&NamingUri::parse(name)?)
 }
 
 pub(crate) fn check_failure(message: &Message) -> Result<()> {
@@ -186,7 +97,7 @@ pub(crate) fn decode_ping(message: &Message) -> Result<GatewayDescription> {
         }
     }
     #[derive(Deserialize)]
-    struct NodeInstance(ByteArray, u64);
+    struct NodeInstance(NodeId, u64);
     #[derive(Deserialize)]
     struct Gateway(String, NodeInstance, String);
     #[derive(Deserialize)]
@@ -194,9 +105,8 @@ pub(crate) fn decode_ping(message: &Message) -> Result<GatewayDescription> {
         gateway: Gateway,
     }
     let Reply {
-        gateway: Gateway(address, NodeInstance(ByteArray(bytes), node_instance), node_name),
+        gateway: Gateway(address, NodeInstance(NodeId { high, low }, node_instance), node_name),
     } = from_slice(&message.body)?;
-    let NodeId { high, low } = decode_node_id(ByteArray(bytes))?;
     if address.is_empty() || node_name.is_empty() {
         return Err(Error::Protocol(
             "gateway address and node name must be nonempty",
@@ -260,14 +170,7 @@ mod tests {
                 .unwrap();
             let bytes = encode_name(name).unwrap();
             assert_eq!(bytes, encoder.finish());
-            assert_eq!(
-                from_slice::<Untagged<NamingUriWire>>(&bytes)
-                    .unwrap()
-                    .0
-                    .into_name()
-                    .unwrap(),
-                name
-            );
+            assert_eq!(from_slice::<NamingUri>(&bytes).unwrap().as_str(), name);
         }
     }
 

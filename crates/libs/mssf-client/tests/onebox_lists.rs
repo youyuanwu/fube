@@ -12,7 +12,7 @@ mod fixture;
 mod rest;
 
 fn compare_application(app: &Application, observed: &Value) {
-    assert_eq!(app.name, observed["Name"]);
+    assert_eq!(app.name.as_str(), observed["Name"]);
     assert_eq!(app.type_name, observed["TypeName"]);
     assert_eq!(app.type_version, observed["TypeVersion"]);
     assert_eq!(format!("{:?}", app.status), observed["Status"]);
@@ -33,7 +33,7 @@ fn compare_application(app: &Application, observed: &Value) {
 }
 
 fn compare_service(service: &Service, observed: &Value) {
-    assert_eq!(service.name, observed["Name"]);
+    assert_eq!(service.name.as_str(), observed["Name"]);
     assert_eq!(service.type_name, observed["TypeName"]);
     assert_eq!(service.manifest_version, observed["ManifestVersion"]);
     assert_eq!(format!("{:?}", service.status), observed["ServiceStatus"]);
@@ -105,15 +105,18 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     assert!(second.continuation_token.is_none());
     let combined: Vec<_> = first.items.into_iter().chain(second.items).collect();
     assert_eq!(
-        combined.iter().map(|a| &a.name).collect::<BTreeSet<_>>(),
-        journal.applications.iter().collect()
+        combined
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<BTreeSet<_>>(),
+        journal.applications.iter().map(String::as_str).collect()
     );
     for app in &combined {
         compare_application(
             app,
             observed_apps
                 .iter()
-                .find(|a| a["Name"] == app.name)
+                .find(|a| a["Name"] == app.name.as_str())
                 .unwrap(),
         );
     }
@@ -123,13 +126,13 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     let excluded = client.get_application_list(&app_query).await?;
     assert_eq!(excluded.items.len(), 2);
     assert!(excluded.items.iter().all(|a| a.parameters.is_empty()));
-    app_query.parameters.filter = ApplicationListFilter::Name(journal.applications[0].clone());
+    app_query.parameters.filter = ApplicationListFilter::Name(journal.applications[0].parse()?);
     assert_eq!(
         client.get_application_list(&app_query).await?.items.len(),
         1
     );
     app_query.parameters.filter =
-        ApplicationListFilter::Name(format!("{}-absent", journal.applications[0]));
+        ApplicationListFilter::Name(format!("{}-absent", journal.applications[0]).parse()?);
     assert!(client
         .get_application_list(&app_query)
         .await?
@@ -142,13 +145,13 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     assert!(journal
         .applications
         .iter()
-        .all(|name| definitions.items.iter().any(|a| &a.name == name)));
+        .all(|name| definitions.items.iter().any(|a| a.name.as_str() == name)));
 
     let mut service_observations = Vec::new();
     let mut native_services = Vec::new();
     for name in &journal.applications {
         let observed = http.services(name).await?;
-        let mut query = ServiceQueryDescription::new(ServiceQueryParameters::new(name));
+        let mut query = ServiceQueryDescription::new(ServiceQueryParameters::new(name.parse()?));
         query.paging.max_results = NonZeroU64::new(1);
         let first = client.get_service_list(&query).await?;
         assert_eq!(first.items.len(), 1);
@@ -176,7 +179,10 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
         for service in &services {
             compare_service(
                 service,
-                observed.iter().find(|s| s["Name"] == service.name).unwrap(),
+                observed
+                    .iter()
+                    .find(|s| s["Name"] == service.name.as_str())
+                    .unwrap(),
             );
             native_services.push(json!({
                 "name": service.name, "type_name": service.type_name,
@@ -189,9 +195,9 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
         query.paging.max_results = None;
         query.parameters.filter = ServiceListFilter::TypeName("ListStateful".into());
         assert_eq!(client.get_service_list(&query).await?.items.len(), 1);
-        query.parameters.filter = ServiceListFilter::Name(format!("{name}/Stateless"));
+        query.parameters.filter = ServiceListFilter::Name(format!("{name}/Stateless").parse()?);
         assert_eq!(client.get_service_list(&query).await?.items.len(), 1);
-        query.parameters.filter = ServiceListFilter::Name(format!("{name}/Absent"));
+        query.parameters.filter = ServiceListFilter::Name(format!("{name}/Absent").parse()?);
         assert!(client.get_service_list(&query).await?.items.is_empty());
         service_observations.extend(observed);
     }
@@ -199,8 +205,9 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
         filter: ApplicationListFilter::TypeName(journal.type_name.clone()),
         ..Default::default()
     });
-    let service_query =
-        ServiceQueryDescription::new(ServiceQueryParameters::new(&journal.applications[0]));
+    let service_query = ServiceQueryDescription::new(ServiceQueryParameters::new(
+        journal.applications[0].parse()?,
+    ));
     let node_query = NodeQueryDescription::default();
     let (a, s, n, p) = tokio::join!(
         client.get_application_list(&app_query),
@@ -214,7 +221,7 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     p?;
     let missing = client
         .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
-            format!("{}-absent", journal.applications[0]),
+            format!("{}-absent", journal.applications[0]).parse()?,
         )))
         .await;
     let code = match missing {

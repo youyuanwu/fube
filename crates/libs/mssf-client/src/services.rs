@@ -1,6 +1,6 @@
 //! Owned ordinary application-scoped service list data.
 
-use crate::{HealthState, PagedQuery, QueryPage};
+use crate::{HealthState, NamingUri, PagedQuery, QueryPage};
 use serde::{Deserialize, Serialize};
 
 /// Exactly one service selector; matching type names are case-sensitive.
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum ServiceListFilter {
     #[default]
     All,
-    Name(String),
+    Name(NamingUri),
     TypeName(String),
 }
 
@@ -16,14 +16,14 @@ pub enum ServiceListFilter {
 /// are rejected; neither denotes all services. No status/kind/health filter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceQueryParameters {
-    pub application_name: String,
+    pub application_name: NamingUri,
     pub filter: ServiceListFilter,
 }
 
 impl ServiceQueryParameters {
-    pub fn new(application_name: impl Into<String>) -> Self {
+    pub fn new(application_name: NamingUri) -> Self {
         Self {
-            application_name: application_name.into(),
+            application_name,
             filter: ServiceListFilter::All,
         }
     }
@@ -49,12 +49,15 @@ pub enum ServiceStatus {
     Creating,
     Failed,
 }
+crate::native::strict_enum!(ServiceStatus {
+    Unknown = 0, Active = 1, Upgrading = 2, Deleting = 3, Creating = 4, Failed = 5,
+});
 
 /// An aggregate observation, not a readiness guarantee. Manifest version can be
 /// empty and is not the application type version. Unknown health is legitimate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Service {
-    pub name: String,
+    pub name: NamingUri,
     pub type_name: String,
     pub manifest_version: String,
     pub kind: ServiceKind,

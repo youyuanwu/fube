@@ -64,17 +64,19 @@ impl NodeHealthQueryParameters {
 pub type NodeHealthQueryDescription = QueryDescription<NodeHealthQueryParameters>;
 
 /// Owned detail health. An unhealthy aggregate is successful query data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeHealth {
     pub node_name: String,
+    #[serde(with = "crate::native::object_array")]
     pub health_events: Vec<HealthEvent>,
     pub aggregated_health_state: HealthState,
     /// Native representative explanations, not necessarily every unhealthy event.
+    #[serde(with = "crate::native::tagged_pointer_slots")]
     pub unhealthy_evaluations: Vec<HealthEvaluation>,
 }
 
 /// Full flattened native health event, including reported state and raw times.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthEvent {
     pub source_id: String,
     pub property: String,
@@ -98,14 +100,15 @@ pub struct HealthEvent {
 /// Every reachable node-detail explanation is Event, including synthetic HM
 /// reports. Unsupported structural tags fail the operation and retire the
 /// connection rather than being silently discarded or guessed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum HealthEvaluation {
+    #[serde(rename = "1")]
     Event(EventHealthEvaluation),
 }
 
 /// Why an event made the node unhealthy, with the original full event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventHealthEvaluation {
     pub description: String,
     pub unhealthy_event: HealthEvent,

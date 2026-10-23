@@ -262,7 +262,7 @@ mod tests {
         for (filter, argument) in [
             (ApplicationListFilter::All, None),
             (
-                ApplicationListFilter::Name("fabric:/App".into()),
+                ApplicationListFilter::Name("fabric:/App".parse().unwrap()),
                 Some(("ApplicationName", "fabric:/App")),
             ),
             (
@@ -307,7 +307,7 @@ mod tests {
         for (filter, argument) in [
             (ServiceListFilter::All, None),
             (
-                ServiceListFilter::Name("fabric:/App/Service".into()),
+                ServiceListFilter::Name("fabric:/App/Service".parse().unwrap()),
                 Some(("ServiceName", "fabric:/App/Service")),
             ),
             (
@@ -317,7 +317,7 @@ mod tests {
         ] {
             let query = ServiceQueryDescription {
                 parameters: ServiceQueryParameters {
-                    application_name: "fabric:/App".into(),
+                    application_name: "fabric:/App".parse().unwrap(),
                     filter,
                 },
                 paging: paging(),
@@ -406,7 +406,7 @@ mod tests {
         }
         check(NodeQueryParameters::default());
         check(ApplicationQueryParameters::default());
-        check(ServiceQueryParameters::new("fabric:/App"));
+        check(ServiceQueryParameters::new("fabric:/App".parse().unwrap()));
     }
 
     #[test]

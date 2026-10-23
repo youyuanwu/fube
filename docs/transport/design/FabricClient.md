@@ -316,7 +316,9 @@ aggregate cap on standalone root object arrays.
 
 Supported ordinary widths are u16, i32/u32, i64/u64, bool and strings. GUID uses
 explicit native-order `Guid`; native enum/timestamp/tick scalars use i64 wire
-fields and conversion. Generic tuples/sequences/maps/Option/enums/unit/floats/
+fields. Semantic `NodeTimestamp` maps transparently to signed ticks; numeric
+`NodeId` maps directly to its 16-byte array rather than GUID metadata.
+Generic tuples/sequences/maps/Option/enums/unit/floats/
 chars/other integer widths fail explicitly unless wrapped by a documented
 adapter. Pointer/type/scope selection and real-delimiter suffix absence use
 the same codec through explicit adapters, not generic Option/enum inference.
@@ -344,8 +346,19 @@ is not added as a body field. Safety checks and health evaluations share derived
 enum dispatch, including tag/kind agreement checks. Fixed query-wrapper and
 empty naming URI tags no longer need custom deserialization callbacks.
 Application/service suffixes use explicit Trailing
-fields. URI redundancy, node-ID agreement, duplicate parameters, enum and
-cross-field checks remain validated wire-to-model conversions. Query payload
+fields. Aligned health/event/evaluation/deactivation models deserialize directly
+using shared field adapters rather than a parallel set of wire records.
+`NamingUri` is a checked semantic type with a private native component schema,
+not an arbitrary String. Naming query fields and application/service result
+names use it; string naming-call convenience remains supported. JSON query
+shapes are unchanged, with invalid names rejected on construction/deserialization.
+Strict scalar status/definition enums map their numeric codes directly; shared
+`HealthState` retains unknown codes, with list-specific rejection after decoding.
+URI redundancy is checked by semantic construction above the generic backend;
+node-ID agreement, duplicate parameters and cross-field checks remain validated
+record conversions. Helpers remain for actual layout differences (duplicate
+fields, nested task IDs, native safety variants, suffixes and service kind).
+Query payload
 validation still precedes embedded remote errors. Paging tag strictness remains
 operation-specific, and partial operation-failure diagnostics retain deliberate
 incremental handling so malformed text cannot erase a nonzero error code.
@@ -358,8 +371,8 @@ evidence for the exercised subset, not every native schema. No C++ fixture
 build, committed capture files, generic derive macro or general-purpose format
 is required. See the [public mapping contract](../RustFabricClient.md#41-native-serde-payloads)
 and its source links for supported adapters, integration and limitations.
-The later shared-adapter expansion adds offline differential/malformed tests
-and reruns independent model-peer scenarios; it does not constitute a fresh
+The later shared-adapter and direct-model expansions add offline differential/malformed tests
+and rerun independent model-peer scenarios; they do not constitute a fresh
 live onebox qualification.
 
 ## 6. Frames, headers, and messages

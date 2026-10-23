@@ -2,7 +2,7 @@ use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
 
 use mssf_client::{
     ApplicationDefinitionKindFilter, ApplicationListFilter, ApplicationQueryDescription, Error,
-    FabricClient, HealthEventsFilter, NodeHealthPolicy, NodeHealthQueryDescription,
+    FabricClient, HealthEventsFilter, NamingUri, NodeHealthPolicy, NodeHealthQueryDescription,
     NodeHealthQueryParameters, NodeQueryDescription, Result, ServiceListFilter,
     ServiceQueryDescription, ServiceQueryParameters, DEFAULT_TIMEOUT,
 };
@@ -14,9 +14,9 @@ const USAGE: &str =
 enum Operation {
     Ping,
     NodeList,
-    NameExists(String),
-    CreateName(String),
-    DeleteName(String),
+    NameExists(NamingUri),
+    CreateName(NamingUri),
+    DeleteName(NamingUri),
     NodeHealth(NodeHealthQueryDescription),
     ApplicationList(ApplicationQueryDescription),
     ServiceList(ServiceQueryDescription),
@@ -34,7 +34,7 @@ fn list_arguments(args: &[String], application: Option<&str>) -> Result<Operatio
         match key.as_str() {
             "--name" | "--type" | "--definition-kind" if !selected => {
                 query.parameters.filter = match key.as_str() {
-                    "--name" => ApplicationListFilter::Name(value.clone()),
+                    "--name" => ApplicationListFilter::Name(value.parse()?),
                     "--type" => ApplicationListFilter::TypeName(value.clone()),
                     _ if application.is_none() => ApplicationListFilter::DefinitionKind(
                         ApplicationDefinitionKindFilter::try_from_bits(value.parse().map_err(
@@ -67,7 +67,8 @@ fn list_arguments(args: &[String], application: Option<&str>) -> Result<Operatio
         }
     }
     if let Some(application) = application {
-        let mut service = ServiceQueryDescription::new(ServiceQueryParameters::new(application));
+        let mut service =
+            ServiceQueryDescription::new(ServiceQueryParameters::new(application.parse()?));
         service.parameters.filter = match query.parameters.filter {
             ApplicationListFilter::All => ServiceListFilter::All,
             ApplicationListFilter::Name(value) => ServiceListFilter::Name(value),
@@ -107,9 +108,9 @@ fn arguments(mut args: Vec<String>) -> Result<(SocketAddr, Operation, Duration)>
         "node-list" if args.len() == 3 => Operation::NodeList,
         "application-list" => list_arguments(&args[3..], None)?,
         "service-list" if args.len() >= 4 => list_arguments(&args[4..], Some(&args[3]))?,
-        "name-exists" if args.len() == 4 => Operation::NameExists(args[3].clone()),
-        "create-name" if args.len() == 4 => Operation::CreateName(args[3].clone()),
-        "delete-name" if args.len() == 4 => Operation::DeleteName(args[3].clone()),
+        "name-exists" if args.len() == 4 => Operation::NameExists(args[3].parse()?),
+        "create-name" if args.len() == 4 => Operation::CreateName(args[3].parse()?),
+        "delete-name" if args.len() == 4 => Operation::DeleteName(args[3].parse()?),
         "node-health" if args.len() >= 4 => {
             let mut query =
                 NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(&args[3]));
@@ -259,6 +260,9 @@ mod tests {
             "create-name fabric:/owned --timeout-seconds 0",
             "delete-name fabric:/owned --timeout-seconds NaN",
             "create-name fabric:/owned --timeout-seconds 1 --timeout-seconds 2",
+            "name-exists fabric:/",
+            "create-name fabric:/bad//name",
+            "delete-name fabric:/bad/",
         ] {
             assert!(parse(input).is_err(), "{input}");
         }
@@ -269,10 +273,14 @@ mod tests {
         let (endpoint, operation, timeout) =
             parse("create-name fabric:/owned --timeout-seconds 0.5").unwrap();
         assert_eq!(endpoint, "127.0.0.1:19000".parse().unwrap());
-        assert!(matches!(operation, Operation::CreateName(name) if name == "fabric:/owned"));
+        assert!(
+            matches!(operation, Operation::CreateName(name) if name.as_str() == "fabric:/owned")
+        );
         assert_eq!(timeout, Duration::from_millis(500));
         let (_, operation, timeout) = parse("delete-name fabric:/owned").unwrap();
-        assert!(matches!(operation, Operation::DeleteName(name) if name == "fabric:/owned"));
+        assert!(
+            matches!(operation, Operation::DeleteName(name) if name.as_str() == "fabric:/owned")
+        );
         assert_eq!(timeout, DEFAULT_TIMEOUT);
     }
 
@@ -291,10 +299,10 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(query.parameters.application_name, "fabric:/App");
+        assert_eq!(query.parameters.application_name.as_str(), "fabric:/App");
         assert_eq!(
             query.parameters.filter,
-            ServiceListFilter::Name("fabric:/App/Svc".into())
+            ServiceListFilter::Name("fabric:/App/Svc".parse().unwrap())
         );
         for input in [
             "service-list",
