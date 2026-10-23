@@ -3,11 +3,11 @@
 use mssf_transport::{
     message::{Message, ACTION, ACTOR},
     serialization::{
-        serde::{to_vec, ObjectArray},
-        Decoder, MAX_COLLECTION_COUNT,
+        serde::{from_slice, to_vec, FixedTag, NativeType, ObjectArray, Pointer, Typed},
+        MAX_COLLECTION_COUNT,
     },
 };
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{query_arguments::QueryArguments, Error, Paging, QueryPage, Result};
 
@@ -90,11 +90,10 @@ fn encode(name: &str, args: &[(String, String)]) -> Result<Vec<u8>> {
     ))
 }
 
-pub(crate) fn decode_list<T>(
+pub(crate) fn decode_list<W: DeserializeOwned, T, const TAG: i32>(
     message: &Message,
-    wrapper: i32,
     strict_paging: bool,
-    record: fn(&mut Decoder<'_>) -> Result<T>,
+    record: fn(W) -> Result<T>,
 ) -> Result<QueryPage<T>> {
     crate::protocol::check_failure(message)?;
     let properties = message.properties()?;
@@ -105,20 +104,24 @@ pub(crate) fn decode_list<T>(
     if message.headers.iter().any(|h| h.id == ACTION) && properties.action != "QueryReply" {
         return Err(Error::Protocol("unexpected list reply action"));
     }
-    let result = decode_with_paging_policy(
-        &message.body,
-        |decoder, tag| {
-            if tag != wrapper.to_le_bytes() {
-                return Err(Error::Protocol("unexpected native list wrapper type"));
-            }
-            let items = decoder.object_array(record)?;
-            if decoder.pointer(|_, _| Ok(()))?.is_some() {
+    #[derive(Deserialize)]
+    struct Empty {}
+    #[derive(Deserialize)]
+    struct ListWire<W> {
+        items: ObjectArray<Vec<W>>,
+        item: Pointer<Empty>,
+    }
+    let result =
+        decode::<FixedTag<ListWire<W>, TAG>, _>(&message.body, strict_paging, |FixedTag(wire)| {
+            if wire.item.0.is_some() {
                 return Err(Error::Protocol("list has a single-item payload"));
             }
-            Ok(items)
-        },
-        strict_paging,
-    )?;
+            wire.items
+                .0
+                .into_iter()
+                .map(record)
+                .collect::<Result<Vec<_>>>()
+        })?;
     if result.kind != 2 {
         return Err(Error::Protocol("query result is not a List"));
     }
@@ -136,42 +139,63 @@ pub(crate) struct QueryResult<T> {
     pub paging: Option<String>,
 }
 
-pub(crate) fn decode<T>(
-    body: &[u8],
-    payload: impl FnOnce(&mut Decoder<'_>, &[u8]) -> Result<T>,
-) -> Result<QueryResult<T>> {
-    decode_with_paging_policy(body, payload, false)
+struct PagingStatus {
+    type_info: Vec<u8>,
+    token: String,
 }
-
-pub(crate) fn decode_with_paging_policy<T>(
+impl NativeType for PagingStatus {
+    fn type_info(&self) -> mssf_transport::Result<&[u8]> {
+        Ok(&self.type_info)
+    }
+    fn deserialize_fields<'de, D: serde::Deserializer<'de>>(
+        tag: &[u8],
+        d: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            token: String,
+        }
+        let fields = Fields::deserialize(d)?;
+        Ok(Self {
+            type_info: tag.to_vec(),
+            token: fields.token,
+        })
+    }
+}
+pub(crate) fn decode<T: DeserializeOwned, U>(
     body: &[u8],
-    payload: impl FnOnce(&mut Decoder<'_>, &[u8]) -> Result<T>,
     strict_paging: bool,
-) -> Result<QueryResult<T>> {
-    let mut decoder = Decoder::new(body);
-    let (kind, payload, error, paging) = decoder.object(|decoder| {
-        Ok((
-            decoder.i64()?,
-            decoder.pointer(payload)?,
-            decoder.i64()?,
-            decoder.pointer(|decoder, tag| {
-                if strict_paging && !tag.is_empty() {
-                    return Err(Error::Protocol("unexpected paging status type"));
-                }
-
-                decoder.string()
-            })?,
-        ))
-    })?;
-    decoder.finish()?;
-    if error != 0 {
+    validate: impl FnOnce(T) -> Result<U>,
+) -> Result<QueryResult<U>> {
+    #[derive(Deserialize)]
+    struct Wire<T> {
+        kind: i64,
+        payload: Pointer<T>,
+        error: i64,
+        paging: Pointer<Typed<PagingStatus>>,
+    }
+    let wire: Wire<T> = from_slice(body)?;
+    // A native query error must not hide a malformed payload and allow reuse
+    // of a connection that previously failed protocol validation.
+    let payload = wire.payload.0.map(validate).transpose()?;
+    let paging = wire
+        .paging
+        .0
+        .map(|Typed(status)| {
+            if strict_paging && !status.type_info.is_empty() {
+                return Err(Error::Protocol("unexpected paging status type"));
+            }
+            Ok(status.token)
+        })
+        .transpose()?;
+    if wire.error != 0 {
         return Err(Error::Remote {
-            code: error,
+            code: wire.error,
             message: String::new(),
         });
     }
     Ok(QueryResult {
-        kind,
+        kind: wire.kind,
         payload,
         paging,
     })

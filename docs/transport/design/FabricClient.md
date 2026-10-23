@@ -274,7 +274,7 @@ bincode, postcard, or JSON does **not** produce the native Fabric encoding.
 |---|---|
 | Stock Serde derives with an existing general-purpose format | Not wire-compatible; do not use for native messages. |
 | Serde derives with the custom Fabric `Serializer`/`Deserializer` | Delivered for documented ordered DTOs; reuses the native codec with explicit adapters and field bridges. |
-| Manual Encoder/Decoder schema operations | Retained for native distinctions and operation validation not captured by ordinary derives; shares the same primitive authority. |
+| Manual Encoder/Decoder schema operations | Retained as an incremental escape hatch; native distinctions use explicit Serde adapters over the same primitive authority. |
 
 The delivered backend handles existing supported primitive metadata, compressed
 integers, UTF-16, object extents and ordered single-scope structs. It does not
@@ -284,17 +284,27 @@ remove native distinctions absent from a generic Rust model:
   array is `c4`, and an empty object array is `c0`. A generic
   `serialize_seq(Some(0))` call does not identify the element type or native
   helper. `ByteArray` and `ObjectArray` select their metadata even when empty.
-  Generic sequences and native string-vectors are not inferred; NamingUri's
-  count followed by inline strings remains explicit.
+  Generic sequences and native string-vectors are not inferred;
+  `CountedStrings` explicitly represents NamingUri's UInt32 count followed by
+  inline strings, including its zero-count form.
 - **Native value types:** GUID layout, TimeSpan ticks, and explicit signed
   64-bit enum codes need wire-specific conversions. Ordinary derived enum
-  variant indices are not native numeric codes.
+  variant indices are not native numeric codes. `NativeEnum` selects a native
+  i32 type tag and matching i64 kind from explicit variant renames, then uses
+  Serde EnumAccess/VariantAccess for the derived payload. `NumericEnum` separately
+  handles strict i64 scalar unit enums; unknown-retaining node enums share
+  signed numeric Serialize/Deserialize implementations.
 - **Scope and nesting:** inline MessageId fields differ from a nested ActivityId
   object. Native base/derived scopes are not automatically equivalent to
-  Serde struct nesting or `flatten`.
+  Serde struct nesting or `flatten`. `Inline` and `Derived` represent these
+  distinctions without adding incorrect nested objects.
 - **Version preservation:** absent trailing fields, raw unknown scope data,
   and polymorphic type information need explicit decoder/storage behavior.
   Ordinary derives do not automatically preserve that native information.
+  `Trailing` distinguishes true scope-end absence from malformed present data;
+  `Pointer` distinguishes null metadata from absence. `FixedTag`/`Untagged`
+  automatically validate fixed object tags before deriving the fields;
+  `Typed`/`NativeType` remain an escape hatch for exceptional raw tag policies.
 
 `to_vec`/`from_slice` encode/decode native values; struct roots include an object,
 scalar roots do not, and complete root consumption is checked.
@@ -307,12 +317,15 @@ aggregate cap on standalone root object arrays.
 Supported ordinary widths are u16, i32/u32, i64/u64, bool and strings. GUID uses
 explicit native-order `Guid`; native enum/timestamp/tick scalars use i64 wire
 fields and conversion. Generic tuples/sequences/maps/Option/enums/unit/floats/
-chars/other integer widths fail explicitly. Pointer/type/scope selection and
-real-delimiter suffix defaults remain codec responsibilities, not generic
-Option/enum inference.
+chars/other integer widths fail explicitly unless wrapped by a documented
+adapter. Pointer/type/scope selection and real-delimiter suffix absence use
+the same codec through explicit adapters, not generic Option/enum inference.
+Domain defaults and validation belong in conversion code.
 
 Fixed-order wire DTOs must not use positional omission, flattening, defaults or
-enum tagging. Unsupported backend calls fail, but attributes/custom serializers
+Serde enum-representation attributes. Canonical numeric variant renames select
+codes explicitly for the native enum adapters, never via ordinal/discriminant
+inference. Unsupported backend calls fail, but attributes/custom serializers
 hidden from the backend cannot universally be detected; wire stability depends
 on the documented schema contract and independent byte/native tests. Static
 Serde custom errors preserve InvalidInput for encode and Protocol for decode.
@@ -323,21 +336,31 @@ strings/bytes remain accepted; canonical-shortest input is not newly required.
 
 Initial handwritten schemas established bootstrap, header, ping and operation
 compatibility. The Serde adoption now covers listen controls/common header
-writers, query requests, ping/NameExists replies, health/event bodies and
-application/service ordered scalar blocks/parameter pairs. MessageId remains
+writers, query requests/results, ping/NameExists replies, complete node and
+health wire bodies, naming URIs, application/service records and optional
+fault details. MessageId remains
 inline and Activity nested; query argument order is preserved and QueryAddress
-is not added as a body field. Query-result tags/pointers, NamingUri,
-structural node/health polymorphism, list validation/deprecated/suffix policies,
-and failure-detail fallbacks retain deliberate manual handling.
+is not added as a body field. Safety checks and health evaluations share derived
+enum dispatch, including tag/kind agreement checks. Fixed query-wrapper and
+empty naming URI tags no longer need custom deserialization callbacks.
+Application/service suffixes use explicit Trailing
+fields. URI redundancy, node-ID agreement, duplicate parameters, enum and
+cross-field checks remain validated wire-to-model conversions. Query payload
+validation still precedes embedded remote errors. Paging tag strictness remains
+operation-specific, and partial operation-failure diagnostics retain deliberate
+incremental handling so malformed text cannot erase a nonzero error code.
 
 Independent old/new encoded-byte comparisons, malformed/suffix/bound tests and
-the same four live onebox scenarios passed for this migration on SF11.8.121.4.
+the same four live onebox scenarios passed for the initial Serde migration on SF11.8.121.4.
 Qualification used an owned unpublished runtime and nonroot network-namespace
 archive consumer; exact fixture and runtime cleanup were verified. This is
 evidence for the exercised subset, not every native schema. No C++ fixture
 build, committed capture files, generic derive macro or general-purpose format
 is required. See the [public mapping contract](../RustFabricClient.md#41-native-serde-payloads)
 and its source links for supported adapters, integration and limitations.
+The later shared-adapter expansion adds offline differential/malformed tests
+and reruns independent model-peer scenarios; it does not constitute a fresh
+live onebox qualification.
 
 ## 6. Frames, headers, and messages
 

@@ -9,6 +9,47 @@ fn json_round_trip<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug
 }
 
 #[test]
+fn scalar_node_enums_use_signed_numeric_serde_and_retain_unknown_values() {
+    use mssf_transport::serialization::{
+        serde::{from_slice, to_vec},
+        Encoder,
+    };
+    fn check<T>(as_raw: fn(T) -> i64)
+    where
+        T: Serialize + DeserializeOwned + Copy + PartialEq + std::fmt::Debug,
+    {
+        for raw in [i64::MIN, -99, 0, 1, 7, 65535, i64::MAX] {
+            let json = raw.to_string();
+            let value: T = serde_json::from_str(&json).unwrap();
+            assert_eq!(as_raw(value), raw);
+            assert_eq!(serde_json::to_string(&value).unwrap(), json);
+            let mut e = Encoder::new();
+            e.i64(raw);
+            let bytes = e.finish();
+            assert_eq!(to_vec(&value).unwrap(), bytes);
+            assert_eq!(from_slice::<T>(&bytes).unwrap(), value);
+        }
+    }
+    check(NodeStatus::as_raw);
+    check(HealthState::as_raw);
+    check(NodeDeactivationIntent::as_raw);
+    check(NodeDeactivationStatus::as_raw);
+    check(NodeDeactivationTaskType::as_raw);
+    check(SafetyCheckKind::as_raw);
+    assert_eq!(
+        serde_json::from_str::<HealthState>("1").unwrap(),
+        HealthState::Ok
+    );
+    assert_eq!(
+        serde_json::from_str::<HealthState>("-99").unwrap(),
+        HealthState::Unrecognized(-99)
+    );
+    assert!(serde_json::from_str::<HealthState>(r#""Ok""#).is_err());
+    assert!(serde_json::from_str::<HealthState>("1.5").is_err());
+    assert!(serde_json::from_str::<HealthState>("18446744073709551615").is_err());
+}
+
+#[test]
 fn descriptions_and_parameters_support_json_without_becoming_native_wire_dtos() {
     let paging = Paging {
         continuation_token: Some(" opaque+/\0\u{1f980} ".into()),

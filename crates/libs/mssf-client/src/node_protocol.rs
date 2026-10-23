@@ -1,5 +1,8 @@
-use mssf_transport::{message::Message, serialization::Decoder};
-use serde::Serialize;
+use mssf_transport::{
+    message::Message,
+    serialization::serde::{ByteArray, Derived, Guid, NativeEnum, ObjectArray, Pointer},
+};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     nodes::*, query_arguments::QueryArguments, query_protocol::Query, Error, Paging, Result,
@@ -33,107 +36,170 @@ impl Query for NodeQueryDescription {
     }
 
     fn decode_reply(message: &Message) -> Result<NodeListPage> {
-        crate::query_protocol::decode_list(message, 1, false, decode_node)
+        crate::query_protocol::decode_list::<NodeWire, _, 1>(message, false, NodeWire::into_node)
     }
 }
 
-fn decode_id(decoder: &mut Decoder<'_>) -> Result<NodeId> {
-    let bytes = decoder.byte_array()?;
-    let bytes: [u8; 16] = bytes
-        .try_into()
-        .map_err(|_| Error::Protocol("node ID must contain exactly 16 bytes"))?;
-    Ok(NodeId {
-        high: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-        low: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
-    })
+#[derive(Deserialize)]
+struct NodeWire {
+    name: String,
+    id: ByteArray,
+    ip_address_or_fqdn: String,
+    node_type: String,
+    code_version: String,
+    config_version: String,
+    status: NodeStatus,
+    up_time_seconds: i64,
+    health_state: HealthState,
+    is_seed_node: bool,
+    upgrade_domain: String,
+    fault_domain: String,
+    id_copy: ByteArray,
+    instance_id: u64,
+    cluster_connection_port: u32,
+    deactivation: DeactivationWire,
+    is_stopped: bool,
+    down_time_seconds: i64,
+    up_at: i64,
+    down_at: i64,
+    http_gateway_port: u16,
 }
 
-fn decode_node(decoder: &mut Decoder<'_>) -> Result<Node> {
-    let name = decoder.string()?;
-    let id = decode_id(decoder)?;
-    let ip_address_or_fqdn = decoder.string()?;
-    let node_type = decoder.string()?;
-    let code_version = decoder.string()?;
-    let config_version = decoder.string()?;
-    let status = NodeStatus::from_raw(decoder.i64()?);
-    let up_time_seconds = decoder.i64()?;
-    let health_state = HealthState::from_raw(decoder.i64()?);
-    let is_seed_node = decoder.boolean()?;
-    let upgrade_domain = decoder.string()?;
-    let fault_domain = decoder.string()?;
-    if decode_id(decoder)? != id {
-        return Err(Error::Protocol("node ID copies disagree"));
-    }
-    let instance_id = decoder.u64()?;
-    let cluster_connection_port = decoder.u32()?;
-    let deactivation = decoder.object(|decoder| {
-        let effective_intent = NodeDeactivationIntent::from_raw(decoder.i64()?);
-        let status = NodeDeactivationStatus::from_raw(decoder.i64()?);
-        let tasks = decoder.object_array(|decoder| {
-            let (id, task_type) = decoder.object(|decoder| {
-                Ok((
-                    decoder.string()?,
-                    NodeDeactivationTaskType::from_raw(decoder.i64()?),
-                ))
-            })?;
-            Ok(NodeDeactivationTask {
-                id,
-                task_type,
-                intent: NodeDeactivationIntent::from_raw(decoder.i64()?),
-            })
-        })?;
-        let pending_safety_checks = decoder.object_array(|decoder| {
-            decoder
-                .pointer(|decoder, tag| {
-                    let kind = decoder.i64()?;
-                    let raw: i32 = kind
-                        .try_into()
-                        .map_err(|_| Error::Protocol("safety-check kind out of range"))?;
-                    if tag != raw.to_le_bytes() {
-                        return Err(Error::Protocol("safety-check tag and kind disagree"));
-                    }
-                    match kind {
-                        0 => Ok(SafetyCheck::Invalid),
-                        1 => Ok(SafetyCheck::EnsureSeedNodeQuorum),
-                        2..=7 => {
-                            decoder.next_scope()?;
-                            Ok(SafetyCheck::Partition {
-                                kind: SafetyCheckKind::from_raw(kind),
-                                partition_id: uuid::Uuid::from_bytes_le(decoder.guid()?),
-                            })
-                        }
-                        _ => Err(Error::Protocol("unsupported safety-check dynamic kind")),
-                    }
-                })?
-                .ok_or(Error::Protocol("null pending safety check"))
-        })?;
-        Ok(NodeDeactivation {
-            effective_intent,
-            status,
-            tasks,
-            pending_safety_checks,
+impl NodeWire {
+    fn into_node(self) -> Result<Node> {
+        let id = crate::protocol::decode_node_id(self.id)?;
+        if crate::protocol::decode_node_id(self.id_copy)? != id {
+            return Err(Error::Protocol("node ID copies disagree"));
+        }
+        Ok(Node {
+            name: self.name,
+            id,
+            ip_address_or_fqdn: self.ip_address_or_fqdn,
+            node_type: self.node_type,
+            code_version: self.code_version,
+            config_version: self.config_version,
+            status: self.status,
+            up_time_seconds: self.up_time_seconds,
+            health_state: self.health_state,
+            is_seed_node: self.is_seed_node,
+            upgrade_domain: self.upgrade_domain,
+            fault_domain: self.fault_domain,
+            instance_id: self.instance_id,
+            cluster_connection_port: self.cluster_connection_port,
+            deactivation: self.deactivation.into_deactivation()?,
+            is_stopped: self.is_stopped,
+            down_time_seconds: self.down_time_seconds,
+            up_at: NodeTimestamp(self.up_at),
+            down_at: NodeTimestamp(self.down_at),
+            http_gateway_port: self.http_gateway_port,
         })
-    })?;
-    Ok(Node {
-        name,
-        id,
-        ip_address_or_fqdn,
-        node_type,
-        code_version,
-        config_version,
-        status,
-        up_time_seconds,
-        health_state,
-        is_seed_node,
-        upgrade_domain,
-        fault_domain,
-        instance_id,
-        cluster_connection_port,
-        deactivation,
-        is_stopped: decoder.boolean()?,
-        down_time_seconds: decoder.i64()?,
-        up_at: NodeTimestamp(decoder.i64()?),
-        down_at: NodeTimestamp(decoder.i64()?),
-        http_gateway_port: decoder.u16()?,
-    })
+    }
+}
+
+#[derive(Deserialize)]
+struct TaskId(String, NodeDeactivationTaskType);
+#[derive(Deserialize)]
+struct TaskWire(TaskId, NodeDeactivationIntent);
+#[derive(Deserialize)]
+struct SafetySlot {
+    value: Pointer<NativeEnum<SafetyWire>>,
+}
+#[derive(Deserialize)]
+struct DeactivationWire {
+    effective_intent: NodeDeactivationIntent,
+    status: NodeDeactivationStatus,
+    tasks: ObjectArray<Vec<TaskWire>>,
+    pending_safety_checks: ObjectArray<Vec<SafetySlot>>,
+}
+impl DeactivationWire {
+    fn into_deactivation(self) -> Result<NodeDeactivation> {
+        Ok(NodeDeactivation {
+            effective_intent: self.effective_intent,
+            status: self.status,
+            tasks: self
+                .tasks
+                .0
+                .into_iter()
+                .map(
+                    |TaskWire(TaskId(id, task_type), intent)| NodeDeactivationTask {
+                        id,
+                        task_type,
+                        intent,
+                    },
+                )
+                .collect(),
+            pending_safety_checks: self
+                .pending_safety_checks
+                .0
+                .into_iter()
+                .map(
+                    |SafetySlot {
+                         value: Pointer(value),
+                     }| {
+                        value
+                            .map(|NativeEnum(value)| value.into())
+                            .ok_or(Error::Protocol("null pending safety check"))
+                    },
+                )
+                .collect::<Result<_>>()?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+enum SafetyWire {
+    #[serde(rename = "0")]
+    Invalid,
+    #[serde(rename = "1")]
+    EnsureSeedNodeQuorum,
+    #[serde(rename = "2")]
+    EnsurePartitionQuorum(PartitionWire),
+    #[serde(rename = "3")]
+    WaitForPrimaryPlacement(PartitionWire),
+    #[serde(rename = "4")]
+    WaitForPrimarySwap(PartitionWire),
+    #[serde(rename = "5")]
+    WaitForReconfiguration(PartitionWire),
+    #[serde(rename = "6")]
+    WaitForInBuildReplica(PartitionWire),
+    #[serde(rename = "7")]
+    EnsureAvailability(PartitionWire),
+}
+#[derive(Deserialize)]
+struct PartitionWire {
+    partition: Derived<PartitionId>,
+}
+#[derive(Deserialize)]
+struct PartitionId {
+    id: Guid,
+}
+impl From<SafetyWire> for SafetyCheck {
+    fn from(value: SafetyWire) -> Self {
+        let partition = |kind, wire: PartitionWire| Self::Partition {
+            kind,
+            partition_id: uuid::Uuid::from_bytes_le(wire.partition.0.id.0),
+        };
+        match value {
+            SafetyWire::Invalid => Self::Invalid,
+            SafetyWire::EnsureSeedNodeQuorum => Self::EnsureSeedNodeQuorum,
+            SafetyWire::EnsurePartitionQuorum(wire) => {
+                partition(SafetyCheckKind::EnsurePartitionQuorum, wire)
+            }
+            SafetyWire::WaitForPrimaryPlacement(wire) => {
+                partition(SafetyCheckKind::WaitForPrimaryPlacement, wire)
+            }
+            SafetyWire::WaitForPrimarySwap(wire) => {
+                partition(SafetyCheckKind::WaitForPrimarySwap, wire)
+            }
+            SafetyWire::WaitForReconfiguration(wire) => {
+                partition(SafetyCheckKind::WaitForReconfiguration, wire)
+            }
+            SafetyWire::WaitForInBuildReplica(wire) => {
+                partition(SafetyCheckKind::WaitForInBuildReplica, wire)
+            }
+            SafetyWire::EnsureAvailability(wire) => {
+                partition(SafetyCheckKind::EnsureAvailability, wire)
+            }
+        }
+    }
 }

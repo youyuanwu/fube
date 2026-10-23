@@ -873,6 +873,27 @@ mod node_queries {
     }
 
     #[tokio::test]
+    async fn embedded_error_cannot_hide_invalid_record_or_required_pointer() {
+        for shape in [NodeShape::DisagreeingIdCopies, NodeShape::NullSafetyCheck] {
+            let (client, server) = single_reply(move |request| {
+                node_reply(
+                    request,
+                    query_result(2, Some(&1i32.to_le_bytes()), REMOTE_CODE, None, |encoder| {
+                        encode_wrapper(encoder, &[shape])
+                    }),
+                )
+            })
+            .await;
+            assert!(matches!(
+                client.get_node_list(&NodeQueryDescription::default()).await,
+                Err(Error::Protocol(_))
+            ));
+            assert!(client.is_closed());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn arguments_use_nested_sorted_map_exact_name_and_native_omission_rules() {
         let cases = [
             (NodeQueryDescription::default(), vec![]),

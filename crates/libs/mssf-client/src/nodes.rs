@@ -29,6 +29,7 @@ pub struct NodeTimestamp(pub i64);
 macro_rules! native_enum {
     ($(#[$meta:meta])* $name:ident { $($variant:ident = $value:expr),* $(,)? }) => {
         $(#[$meta])*
+        /// Serde uses the signed i64 code in native and JSON formats, retaining unknown values.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         #[non_exhaustive]
         pub enum $name {
@@ -49,6 +50,16 @@ macro_rules! native_enum {
                     $(Self::$variant => $value,)*
                     Self::Unrecognized(other) => other,
                 }
+            }
+        }
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+                serializer.serialize_i64(self.as_raw())
+            }
+        }
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+                i64::deserialize(deserializer).map(Self::from_raw)
             }
         }
     };

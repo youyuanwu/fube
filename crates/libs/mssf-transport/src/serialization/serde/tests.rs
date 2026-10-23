@@ -3,6 +3,8 @@ use crate::serialization::{MAX_COLLECTION_COUNT, MAX_DEPTH, MAX_STRING_UNITS};
 use ::serde::ser::SerializeStruct;
 use std::{cell::Cell, fmt::Write};
 
+mod enums;
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct Row {
     text: String,
@@ -137,7 +139,7 @@ fn bitflags_unsupported_width_fails_explicitly() {
     assert!(matches!(from_slice::<Flags>(&[1]), Err(Error::Protocol(_))));
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct Pair(u32, String);
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct Newtype(Pair);
@@ -616,4 +618,440 @@ fn missing_truncated_wrong_metadata_and_supported_unknown_tails() {
         from_slice::<ByteArray>(&[0x84, 0x00]).unwrap(),
         ByteArray(vec![])
     );
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct BaseFields {
+    kind: i64,
+    fields: Inline<Pair>,
+}
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct DerivedFields {
+    base: Inline<BaseFields>,
+    extra: Derived<Row>,
+}
+#[derive(Debug, PartialEq)]
+enum Dynamic {
+    Base(BaseFields),
+    Derived(DerivedFields),
+}
+impl Serialize for Dynamic {
+    fn serialize<S: ::serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Base(fields) => fields.serialize(s),
+            Self::Derived(fields) => fields.serialize(s),
+        }
+    }
+}
+impl NativeType for Dynamic {
+    fn type_info(&self) -> Result<&[u8]> {
+        Ok(match self {
+            Self::Base(_) => &[1, 0, 0, 0],
+            Self::Derived(_) => &[2, 0, 0, 0],
+        })
+    }
+    fn deserialize_fields<'de, D: ::serde::Deserializer<'de>>(
+        tag: &[u8],
+        d: D,
+    ) -> std::result::Result<Self, D::Error> {
+        match tag {
+            [1, 0, 0, 0] => {
+                let value = BaseFields::deserialize(d)?;
+                if value.kind != 1 {
+                    return Err(::serde::de::Error::custom("tag/kind mismatch"));
+                }
+                Ok(Self::Base(value))
+            }
+            [2, 0, 0, 0] => {
+                let value = DerivedFields::deserialize(d)?;
+                if value.base.0.kind != 2 {
+                    return Err(::serde::de::Error::custom("tag/kind mismatch"));
+                }
+                Ok(Self::Derived(value))
+            }
+            _ => Err(::serde::de::Error::custom("unknown dynamic type")),
+        }
+    }
+}
+fn dynamic(derived: bool) -> Dynamic {
+    let base = BaseFields {
+        kind: if derived { 2 } else { 1 },
+        fields: Inline(Pair(7, "base".into())),
+    };
+    if derived {
+        Dynamic::Derived(DerivedFields {
+            base: Inline(base),
+            extra: Derived(row()),
+        })
+    } else {
+        Dynamic::Base(base)
+    }
+}
+fn write_dynamic(e: &mut Encoder, derived: bool) -> Result<()> {
+    e.i64(if derived { 2 } else { 1 });
+    e.u32(7);
+    e.string("base")?;
+    if derived {
+        e.next_scope()?;
+        write_row(e, &row())?;
+    }
+    Ok(())
+}
+
+#[test]
+fn native_adapters_match_manual_pointer_tags_scopes_and_counted_strings() {
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct Slot {
+        value: Pointer<Typed<Dynamic>>,
+    }
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct Payload {
+        prefix: Inline<Pair>,
+        pointers: ObjectArray<Vec<Slot>>,
+        strings: CountedStrings<Vec<String>>,
+        suffix: Trailing<bool>,
+    }
+    let value = Payload {
+        prefix: Inline(Pair(5, "inline".into())),
+        pointers: ObjectArray(vec![
+            Slot {
+                value: Pointer(None),
+            },
+            Slot {
+                value: Pointer(Some(Typed(dynamic(false)))),
+            },
+            Slot {
+                value: Pointer(Some(Typed(dynamic(true)))),
+            },
+        ]),
+        strings: CountedStrings(vec!["a".into(), "".into(), "b".into()]),
+        suffix: Trailing(Some(true)),
+    };
+    let mut e = Encoder::new();
+    e.object(|e| {
+        e.u32(5);
+        e.string("inline")?;
+        e.object_array(&[0, 1, 2], |e, kind| {
+            if *kind == 0 {
+                e.pointer(None, |_| unreachable!())
+            } else {
+                e.pointer(Some(&i32::to_le_bytes(*kind)), |e| {
+                    write_dynamic(e, *kind == 2)
+                })
+            }
+        })?;
+        e.u32(3);
+        e.string("a")?;
+        e.string("")?;
+        e.string("b")?;
+        e.boolean(true);
+        Ok(())
+    })
+    .unwrap();
+    let bytes = to_vec(&value).unwrap();
+    assert_eq!(bytes, e.finish());
+    assert_eq!(from_slice::<Payload>(&bytes).unwrap(), value);
+    for end in 0..bytes.len() {
+        assert!(from_slice::<Payload>(&bytes[..end]).is_err());
+    }
+    for derived in [false, true] {
+        let value = Typed(dynamic(derived));
+        let mut e = Encoder::new();
+        e.typed_object(value.0.type_info().unwrap(), |e| write_dynamic(e, derived))
+            .unwrap();
+        assert_eq!(to_vec(&value).unwrap(), e.finish());
+        assert_eq!(
+            from_slice::<Typed<Dynamic>>(&to_vec(&value).unwrap()).unwrap(),
+            value
+        );
+    }
+    let array = ObjectArray(vec![Typed(dynamic(false)), Typed(dynamic(true))]);
+    assert_eq!(
+        from_slice::<ObjectArray<Vec<Typed<Dynamic>>>>(&to_vec(&array).unwrap()).unwrap(),
+        array
+    );
+}
+
+#[test]
+fn typed_dispatch_rejects_unknown_tags_mismatched_kinds_and_missing_derived_scope() {
+    for (tag, kind, derived) in [(1i32, 2i64, false), (3, 3, false), (2, 2, false)] {
+        let mut e = Encoder::new();
+        e.pointer(Some(&tag.to_le_bytes()), |e| {
+            e.i64(kind);
+            e.u32(7);
+            e.string("base")?;
+            if derived {
+                e.next_scope()?;
+                write_row(e, &row())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(from_slice::<Pointer<Typed<Dynamic>>>(&e.finish()).is_err());
+    }
+    let mut e = Encoder::new();
+    e.pointer(Some(&[1, 0, 0]), |e| write_dynamic(e, false))
+        .unwrap();
+    assert!(from_slice::<Pointer<Typed<Dynamic>>>(&e.finish()).is_err());
+    let mut e = Encoder::new();
+    e.pointer(Some(&[1, 0, 0, 0]), |e| {
+        e.u32(1);
+        e.string("plain")
+    })
+    .unwrap();
+    assert!(from_slice::<Pointer<Pair>>(&e.finish()).is_err());
+    assert_eq!(from_slice::<Pointer<Pair>>(&[0x41]).unwrap(), Pointer(None));
+}
+
+#[test]
+fn trailing_fields_distinguish_absence_null_and_invalid_present_data() {
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct Versioned {
+        first: u32,
+        text: Trailing<String>,
+        pointer: Trailing<Pointer<Empty>>,
+    }
+    for value in [
+        Versioned {
+            first: 1,
+            text: Trailing(None),
+            pointer: Trailing(None),
+        },
+        Versioned {
+            first: 1,
+            text: Trailing(Some("".into())),
+            pointer: Trailing(None),
+        },
+        Versioned {
+            first: 1,
+            text: Trailing(Some("present".into())),
+            pointer: Trailing(Some(Pointer(None))),
+        },
+        Versioned {
+            first: 1,
+            text: Trailing(Some("present".into())),
+            pointer: Trailing(Some(Pointer(Some(Empty {})))),
+        },
+    ] {
+        let bytes = to_vec(&value).unwrap();
+        assert_eq!(from_slice::<Versioned>(&bytes).unwrap(), value);
+        for end in 0..bytes.len() {
+            assert!(from_slice::<Versioned>(&bytes[..end]).is_err());
+        }
+    }
+    let mut e = Encoder::new();
+    e.object(|e| {
+        e.u32(1);
+        e.boolean(true);
+        Ok(())
+    })
+    .unwrap();
+    assert!(from_slice::<Versioned>(&e.finish()).is_err());
+    let mut e = Encoder::new();
+    e.object(|e| {
+        e.u32(1);
+        e.string("present")?;
+        e.boolean(true);
+        Ok(())
+    })
+    .unwrap();
+    assert!(from_slice::<Versioned>(&e.finish()).is_err());
+    assert!(to_vec(&Inline(Pair(1, "".into()))).is_err());
+    assert!(to_vec(&Derived(row())).is_err());
+    assert!(to_vec(&Trailing(Some(1u32))).is_err());
+    assert!(from_slice::<Inline<Pair>>(&[]).is_err());
+    assert!(from_slice::<Derived<Row>>(&[]).is_err());
+    assert!(from_slice::<Trailing<u32>>(&[]).is_err());
+}
+
+#[test]
+fn counted_strings_enforce_scalar_kind_counts_and_extent() {
+    for count in [0, MAX_COLLECTION_COUNT] {
+        let value = CountedStrings(vec!["".to_string(); count]);
+        assert_eq!(
+            from_slice::<CountedStrings<Vec<String>>>(&to_vec(&value).unwrap()).unwrap(),
+            value
+        );
+    }
+    assert!(to_vec(&CountedStrings(vec![""; MAX_COLLECTION_COUNT + 1])).is_err());
+    assert!(to_vec(&CountedStrings(vec![1u32])).is_err());
+    let mut e = Encoder::new();
+    e.u32((MAX_COLLECTION_COUNT + 1) as u32);
+    assert!(from_slice::<CountedStrings<Vec<String>>>(&e.finish()).is_err());
+    let mut e = Encoder::new();
+    e.u32(2);
+    e.string("").unwrap();
+    assert!(from_slice::<CountedStrings<Vec<String>>>(&e.finish()).is_err());
+    let mut e = Encoder::new();
+    e.u32(1);
+    e.boolean(true);
+    assert!(from_slice::<CountedStrings<Vec<String>>>(&e.finish()).is_err());
+    let bytes = to_vec(&CountedStrings(vec![""])).unwrap();
+    assert!(from_slice::<CountedStrings<Vec<u32>>>(&bytes).is_err());
+}
+
+#[test]
+fn adapter_failures_roll_back_and_preserve_depth_limits() {
+    #[derive(Serialize)]
+    struct BadDerived {
+        first: u32,
+        bad: Derived<ByteArray>,
+    }
+    let mut e = Encoder::new();
+    e.object(|e| {
+        assert!(to_fields(
+            e,
+            &BadDerived {
+                first: 1,
+                bad: Derived(ByteArray(vec![0]))
+            }
+        )
+        .is_err());
+        assert!(to_fields(e, &Pointer(Some(1u32))).is_err());
+        assert!(to_fields(e, &CountedStrings(vec![1u32])).is_err());
+        to_fields(e, &Pair(2, "after".into()))
+    })
+    .unwrap();
+    assert_eq!(
+        from_slice::<Pair>(&e.finish()).unwrap(),
+        Pair(2, "after".into())
+    );
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct NestedPointer {
+        next: Pointer<Box<NestedPointer>>,
+    }
+    let mut value = NestedPointer {
+        next: Pointer(None),
+    };
+    for _ in 1..MAX_DEPTH {
+        value = NestedPointer {
+            next: Pointer(Some(Box::new(value))),
+        };
+    }
+    let bytes = to_vec(&value).unwrap();
+    assert_eq!(from_slice::<NestedPointer>(&bytes).unwrap(), value);
+    value = NestedPointer {
+        next: Pointer(Some(Box::new(value))),
+    };
+    assert!(to_vec(&value).is_err());
+}
+
+#[derive(Debug, PartialEq)]
+struct OpaqueTagged {
+    tag: Vec<u8>,
+    fields: Pair,
+}
+impl Serialize for OpaqueTagged {
+    fn serialize<S: ::serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        self.fields.serialize(s)
+    }
+}
+impl NativeType for OpaqueTagged {
+    fn type_info(&self) -> Result<&[u8]> {
+        Ok(&self.tag)
+    }
+    fn deserialize_fields<'de, D: ::serde::Deserializer<'de>>(
+        tag: &[u8],
+        d: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(Self {
+            tag: tag.to_vec(),
+            fields: Pair::deserialize(d)?,
+        })
+    }
+}
+
+#[test]
+fn typed_adapters_enforce_raw_tag_bounds_and_rollback_nested_pointer_failures() {
+    for len in [0, MAX_COLLECTION_COUNT] {
+        let value = Typed(OpaqueTagged {
+            tag: vec![0x1f; len],
+            fields: Pair(1, "ok".into()),
+        });
+        let bytes = to_vec(&value).unwrap();
+        assert_eq!(from_slice::<Typed<OpaqueTagged>>(&bytes).unwrap(), value);
+        if len == MAX_COLLECTION_COUNT {
+            let mut oversized = bytes;
+            assert_eq!(&oversized[9..11], &[0xa0, 0x00]);
+            oversized[10] = 1;
+            assert!(from_slice::<Typed<OpaqueTagged>>(&oversized).is_err());
+        }
+    }
+    #[derive(Serialize)]
+    struct Fields {
+        first: u32,
+        value: Pointer<Typed<OpaqueTagged>>,
+    }
+    for (tag, text) in [
+        (vec![0; MAX_COLLECTION_COUNT + 1], "ok".into()),
+        (vec![1], "x".repeat(MAX_STRING_UNITS + 1)),
+    ] {
+        let mut e = Encoder::new();
+        e.object(|e| {
+            assert!(to_fields(
+                e,
+                &Fields {
+                    first: 1,
+                    value: Pointer(Some(Typed(OpaqueTagged {
+                        tag,
+                        fields: Pair(1, text)
+                    }))),
+                }
+            )
+            .is_err());
+            to_fields(e, &Pair(2, "after".into()))
+        })
+        .unwrap();
+        assert_eq!(
+            from_slice::<Pair>(&e.finish()).unwrap(),
+            Pair(2, "after".into())
+        );
+    }
+}
+
+#[test]
+fn derived_adapter_skips_supported_unknown_base_fields_before_entering_next_scope() {
+    let mut e = Encoder::new();
+    e.typed_object(&2i32.to_le_bytes(), |e| {
+        e.i64(2);
+        e.u32(7);
+        e.string("base")?;
+        e.boolean(true);
+        e.next_scope()?;
+        write_row(e, &row())
+    })
+    .unwrap();
+    assert_eq!(
+        from_slice::<Typed<Dynamic>>(&e.finish()).unwrap(),
+        Typed(dynamic(true))
+    );
+}
+
+impl NativeType for Fill {
+    fn type_info(&self) -> Result<&[u8]> {
+        Ok(&[1, 0, 0, 0])
+    }
+    fn deserialize_fields<'de, D: ::serde::Deserializer<'de>>(
+        tag: &[u8],
+        d: D,
+    ) -> std::result::Result<Self, D::Error> {
+        if tag != 1i32.to_le_bytes() {
+            return Err(::serde::de::Error::custom("invalid fill tag"));
+        }
+        Empty::deserialize(d)?;
+        Ok(Fill(0))
+    }
+}
+
+#[test]
+fn pointer_and_typed_object_extents_allow_the_exact_native_limit() {
+    let exact = to_vec(&Pointer(Some(Fill(MAX_OBJECT_SIZE - 11)))).unwrap();
+    assert_eq!(exact.len(), MAX_OBJECT_SIZE + 2);
+    from_slice::<Pointer<Empty>>(&exact).unwrap();
+    assert!(to_vec(&Pointer(Some(Fill(MAX_OBJECT_SIZE - 10)))).is_err());
+    let exact = to_vec(&Pointer(Some(Typed(Fill(MAX_OBJECT_SIZE - 16))))).unwrap();
+    assert_eq!(exact.len(), MAX_OBJECT_SIZE + 2);
+    from_slice::<Pointer<Typed<Fill>>>(&exact).unwrap();
+    assert!(to_vec(&Pointer(Some(Typed(Fill(MAX_OBJECT_SIZE - 15))))).is_err());
 }
