@@ -1,40 +1,41 @@
 //! Owned application list data for the explicitly supported native query profile.
 
-use std::{collections::BTreeMap, num::NonZeroU64, ops::BitOr};
+use std::{collections::BTreeMap, num::NonZeroU64};
+
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, HealthState, Result};
 
-/// Native definition-kind selection bits, distinct from result enum numbers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ApplicationDefinitionKindFilter(u32);
+bitflags::bitflags! {
+    /// Native definition-kind selection bits, distinct from result enum numbers.
+    ///
+    /// Use [`Self::try_from_bits`] for the supported query profile: combinations
+    /// of bits 1/2/4 or exact ALL (65535). The generated `from_bits` only checks
+    /// the bitflags mask, which includes every low bit because ALL is a sentinel.
+    /// Queries revalidate masks from all constructors, operators and Serde.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(transparent)]
+    pub struct ApplicationDefinitionKindFilter: u32 {
+        const DEFAULT = 0;
+        const ALL = 65535;
+        const SERVICE_FABRIC_APPLICATION_DESCRIPTION = 1;
+        const COMPOSE = 2;
+        const MESH_APPLICATION_DESCRIPTION = 4;
+    }
+}
 
 impl ApplicationDefinitionKindFilter {
-    pub const DEFAULT: Self = Self(0);
-    pub const ALL: Self = Self(65535);
-    pub const SERVICE_FABRIC_APPLICATION_DESCRIPTION: Self = Self(1);
-    pub const COMPOSE: Self = Self(2);
-    pub const MESH_APPLICATION_DESCRIPTION: Self = Self(4);
-
     /// Reject unnamed bits rather than accepting native's ignored-bit behavior.
-    pub fn from_bits(bits: u32) -> Result<Self> {
-        if bits != 65535 && bits & !7 != 0 {
+    pub fn try_from_bits(bits: u32) -> Result<Self> {
+        let kinds = Self::SERVICE_FABRIC_APPLICATION_DESCRIPTION
+            | Self::COMPOSE
+            | Self::MESH_APPLICATION_DESCRIPTION;
+        if bits != Self::ALL.bits() && bits & !kinds.bits() != 0 {
             return Err(Error::InvalidInput(
                 "unsupported application definition filter bits",
             ));
         }
-        Ok(Self(bits))
-    }
-
-    pub fn bits(self) -> u32 {
-        self.0
-    }
-}
-
-impl BitOr for ApplicationDefinitionKindFilter {
-    type Output = Self;
-
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
+        Ok(Self::from_bits_retain(bits))
     }
 }
 

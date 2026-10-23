@@ -94,6 +94,9 @@ name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "bumpalo"
@@ -650,6 +653,7 @@ dependencies = [
 name = "mssf-client"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "mssf-transport",
  "openapi-service-fabric",
  "reqwest",
@@ -730,6 +734,7 @@ dependencies = [
 name = "mssf-transport"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "serde",
  "tokio",
  "uuid",

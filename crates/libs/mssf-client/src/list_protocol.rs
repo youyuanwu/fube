@@ -53,6 +53,7 @@ pub(crate) fn encode_application(query: &ApplicationQueryDescription) -> Result<
             type_selector(&mut args, "ApplicationTypeName", name)?
         }
         ApplicationListFilter::DefinitionKind(filter) => {
+            let filter = ApplicationDefinitionKindFilter::try_from_bits(filter.bits())?;
             if filter.bits() != 0 {
                 args.push((
                     "ApplicationDefinitionKindFilter",

@@ -3,6 +3,9 @@
 //! Structs (including tuple structs) are ordered native objects. Supported scalars
 //! are bool, u16/i32/u32/i64/u64 and UTF-16 strings. Newtypes are transparent.
 //! Use [`Guid`], [`ByteArray`] and [`ObjectArray`] for native-specific metadata.
+//! `bitflags` types with Serde enabled use their underlying integer directly
+//! when its width is supported. Unknown bits are retained; validate domain rules
+//! separately. Both encoding and decoding are non-human-readable.
 //! Generic sequences, tuples, maps, Option, enums, unit, floats, chars and other
 //! integer widths are unsupported. Owned decoding is supported; strings/bytes
 //! are not borrowed from the UTF-16/native input.

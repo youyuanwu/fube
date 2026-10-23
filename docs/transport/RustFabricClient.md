@@ -261,7 +261,7 @@ means paging ended, not proof that every aggregation source answered.**
 Empty name/token values are omitted like the native facade. Default status
 filter `0` excludes Unknown/Removed, not all non-Up states; `ALL = 0xffff`
 bypasses status matching. Other masks combine distinct status **bits**, not
-`NodeStatus` discriminants. `from_bits` preserves any UInt32 native mask.
+`NodeStatus` discriminants. `from_bits_retain` preserves any UInt32 native mask.
 `max_results` is optional `NonZeroU64`, rejected locally above `i64::MAX`.
 No limit still allows server byte-size paging: always inspect continuation.
 A final page with exactly the requested count can have no token.
@@ -317,7 +317,7 @@ names are rejected locally, unlike node-list's optional empty-name omission.
 | `Some(DEFAULT)` / `Some(ALL)` | Explicit masks 0 / 65535; select all. |
 | `Some(NONE)` | Exact mask 1; no events, **without** suppressing aggregate/evaluations. |
 | `OK`, `WARNING`, `ERROR` | Bits 2, 4, 8, combinable with `\|`. Selection uses **evaluated** state; ERROR under policy true can return reported Warning. |
-| `from_bits(u32)` | Sent unchanged. Other bits do not match; exact special-value equality matters: NONE \| ERROR = 9 selects Error, not none. |
+| `from_bits_retain(u32)` | Sent unchanged. Other bits do not match; exact special-value equality matters: NONE \| ERROR = 9 selects Error, not none. |
 
 No raw JSON/arguments, node-ID selector, paging, health-statistics, child filters
 or full cluster-health policy API is exposed. Policy/filter arguments are JSON
@@ -393,7 +393,7 @@ successful results retire the shared stream before pending callers can reuse it.
 | Description | Selector and independent controls |
 |---|---|
 | `ApplicationQueryDescription` | `ApplicationListFilter::All` (default), `Name`, `TypeName`, or `DefinitionKind`; exactly one. Independent `exclude_application_parameters` (default false), continuation and count. |
-| `ApplicationDefinitionKindFilter` | DEFAULT=0, ALL=65535; bits SERVICE_FABRIC_APPLICATION_DESCRIPTION=1, COMPOSE=2, MESH_APPLICATION_DESCRIPTION=4, combinable with `\|`. `from_bits` rejects unnamed bits. These are **not** result discriminants. |
+| `ApplicationDefinitionKindFilter` | DEFAULT=0, ALL=65535; bits SERVICE_FABRIC_APPLICATION_DESCRIPTION=1, COMPOSE=2, MESH_APPLICATION_DESCRIPTION=4, combinable with `\|`. `try_from_bits` rejects unnamed bits except exact ALL. These are **not** result discriminants. |
 | `ServiceQueryDescription::new(application)` | Required ordinary application scope; `ServiceListFilter::All` (default), exact `Name` or exact `TypeName`. Independent continuation and count. |
 
 Type selectors are nonempty and case-sensitive; names are exact, not prefixes.
@@ -541,6 +541,7 @@ assert_eq!(from_slice::<ListenWire>(&bytes).unwrap(), value);
 | `ByteArray<T>` | Native byte-array metadata; encode Vec/slice/array bytes, decode `ByteArray<Vec<u8>>`. |
 | `ObjectArray<T>` | Native object-array metadata even when empty; encode a Vec/slice of struct-shaped elements, decode `ObjectArray<Vec<Row>>`. |
 | `to_fields` / `from_fields` | Fixed ordered struct fields inside an already-open codec object, without introducing or closing an object/scope. |
+| `bitflags` with Serde derives | Underlying supported integer, without an object wrapper or flag-name string; unknown bits survive decoding. Match the native field's width and signedness. |
 
 Scalar roots are native scalar fragments; struct roots include object framing.
 `from_slice` requires complete root consumption. Decoding uses owned strings
@@ -549,6 +550,28 @@ apply; 4 MiB is a **per-object** extent limit, not an aggregate limit on a
 standalone root object array. Transport frames retain their separate limit.
 `collect_str` formats through a bounded sink that checks UTF-16 units before
 buffering each chunk, then uses the same native string encoder.
+
+`NodeStatusFilter`, `HealthEventsFilter` and `ApplicationDefinitionKindFilter`
+are Serde-enabled `bitflags` types backed by u32. They support standard bitwise
+operators and methods such as `contains`, `insert` and `remove`. Node/health raw
+constructors now use `from_bits_retain`, replacing the previous infallible
+`from_bits`. Their unnamed all-bits mask preserves arbitrary UInt32 values
+through bitwise operations. Use the native `ALL = 65535` constant when requesting
+its special behavior: bitflags' `all()` is `u32::MAX` for those two types.
+`HealthEventsFilter::NONE = 1` is not an empty bitset.
+
+For application definition filters, use `try_from_bits` (the replacement for the
+previous Result-returning `from_bits`) to check combinations of bits 1/2/4 or
+exact ALL. The generated bitflags `from_bits` returns Option and is not that
+domain validator: ALL makes every low bit known to bitflags. Query encoding
+rechecks the strict rule even for values created through Serde, raw constructors
+or operators. Invalid masks fail locally before sending a request.
+
+Enable the `bitflags` crate's `serde` feature and derive Serialize/Deserialize
+on additional flag types. The backend's non-human-readable mode makes them use
+integer masks directly. Human-readable Serde formats such as JSON instead use flag-name
+strings; query-map filters still explicitly encode numeric decimal values,
+including numeric `HealthStateFilter` inside the EventsFilter JSON string.
 
 Generic Vec/array/tuple/map, Option, enums, unit, floats, chars and other integer
 widths are unsupported unless used through an explicit native adapter.
@@ -578,7 +601,7 @@ lossless re-emission.
 Production adoption includes listen-instance controls and common header
 writers, shared query-request DTOs, ping/NameExists replies, health/event
 fields and application/service scalar blocks/parameter pairs. Header record
-framing/duplicate rules and public client models are unchanged. Query argument
+framing/duplicate rules are unchanged. Query argument
 order remains the supplied slice order; QueryAddress is not added to the body.
 Naming URI's inline string-vector, query-result pointer/tag policy, node-list
 structural polymorphism, strict list conversions/deprecated fields/suffix

@@ -1,41 +1,30 @@
 //! Owned native single-node health data, not node-list summary health.
 
-use std::ops::BitOr;
+use serde::{Deserialize, Serialize};
 
 use crate::{HealthState, NodeTimestamp};
 
-/// Native event filter over **evaluated**, not reported, event health.
-///
-/// Exact DEFAULT (0) and ALL (65535) select all; exact NONE (1) selects none.
-/// Otherwise bits OK/WARNING/ERROR are ORed; other bits are sent unchanged.
-/// For example NONE | ERROR selects Error. With warning-as-error enabled an
-/// ERROR filter can return events whose reported state is Warning.
-/// Filtering never reduces aggregate/evaluation computation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct HealthEventsFilter(u32);
-
-impl HealthEventsFilter {
-    pub const DEFAULT: Self = Self(0);
-    pub const NONE: Self = Self(1);
-    pub const OK: Self = Self(2);
-    pub const WARNING: Self = Self(4);
-    pub const ERROR: Self = Self(8);
-    pub const ALL: Self = Self(0xffff);
-
-    /// Retain the native UInt32 mask, including unnamed bits.
-    pub const fn from_bits(bits: u32) -> Self {
-        Self(bits)
-    }
-
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-}
-
-impl BitOr for HealthEventsFilter {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
+bitflags::bitflags! {
+    /// Native event filter over **evaluated**, not reported, event health.
+    ///
+    /// Exact DEFAULT (0) and ALL (65535) select all; exact NONE (1) selects none.
+    /// Otherwise bits OK/WARNING/ERROR are ORed; other bits are sent unchanged.
+    /// For example NONE | ERROR selects Error. With warning-as-error enabled an
+    /// ERROR filter can return events whose reported state is Warning.
+    /// Filtering never reduces aggregate/evaluation computation.
+    ///
+    /// Use `from_bits_retain` for raw UInt32 masks. Every bit is retained by
+    /// bitwise operations; native `ALL` differs from bitflags' `all()`.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(transparent)]
+    pub struct HealthEventsFilter: u32 {
+        const DEFAULT = 0;
+        const NONE = 1;
+        const OK = 2;
+        const WARNING = 4;
+        const ERROR = 8;
+        const ALL = 0xffff;
+        const _ = !0;
     }
 }
 

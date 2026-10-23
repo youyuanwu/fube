@@ -1,6 +1,8 @@
 //! Owned native node query data. Scalar enum numbers are never silently coerced.
 
-use std::{num::NonZeroU64, ops::BitOr};
+use std::num::NonZeroU64;
+
+use serde::{Deserialize, Serialize};
 
 /// The numeric native node ID, not a GUID. Ordering is high word, then low word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -92,39 +94,27 @@ native_enum!(
     }
 );
 
-/// Native filter bits, distinct from `NodeStatus` discriminants.
-///
-/// DEFAULT excludes Unknown/Removed, not all non-Up states. ALL bypasses status
-/// matching. Other masks combine individual bits; raw bits are sent unchanged.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct NodeStatusFilter(u32);
-
-impl NodeStatusFilter {
-    pub const DEFAULT: Self = Self(0);
-    pub const ALL: Self = Self(0xffff);
-    pub const UP: Self = Self(1);
-    pub const DOWN: Self = Self(2);
-    pub const ENABLING: Self = Self(4);
-    pub const DISABLING: Self = Self(8);
-    pub const DISABLED: Self = Self(16);
-    pub const UNKNOWN: Self = Self(32);
-    pub const REMOVED: Self = Self(64);
-
-    /// Native accepts UInt32 masks, including unnamed bits.
-    pub const fn from_bits(bits: u32) -> Self {
-        Self(bits)
-    }
-
-    /// Return the unchanged native filter bitmask.
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-}
-
-impl BitOr for NodeStatusFilter {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
+bitflags::bitflags! {
+    /// Native filter bits, distinct from `NodeStatus` discriminants.
+    ///
+    /// DEFAULT excludes Unknown/Removed, not all non-Up states. ALL bypasses status
+    /// matching. Other masks combine individual bits; raw bits are sent unchanged.
+    ///
+    /// Use `from_bits_retain` for raw UInt32 masks. Every bit is retained by
+    /// bitwise operations; native `ALL` differs from bitflags' `all()`.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(transparent)]
+    pub struct NodeStatusFilter: u32 {
+        const DEFAULT = 0;
+        const ALL = 0xffff;
+        const UP = 1;
+        const DOWN = 2;
+        const ENABLING = 4;
+        const DISABLING = 8;
+        const DISABLED = 16;
+        const UNKNOWN = 32;
+        const REMOVED = 64;
+        const _ = !0;
     }
 }
 

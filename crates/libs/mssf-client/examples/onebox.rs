@@ -36,7 +36,7 @@ fn list_arguments(args: &[String], application: Option<&str>) -> Result<Operatio
                     "--name" => ApplicationListFilter::Name(value.clone()),
                     "--type" => ApplicationListFilter::TypeName(value.clone()),
                     _ if application.is_none() => ApplicationListFilter::DefinitionKind(
-                        ApplicationDefinitionKindFilter::from_bits(value.parse().map_err(
+                        ApplicationDefinitionKindFilter::try_from_bits(value.parse().map_err(
                             |_| Error::InvalidInput("definition filter must be UInt32"),
                         )?)?,
                     ),
@@ -116,7 +116,7 @@ fn arguments(mut args: Vec<String>) -> Result<(SocketAddr, Operation, Duration)>
             for pair in options {
                 match pair[0].as_str() {
                     "--events-filter" if query.events_filter.is_none() => {
-                        query.events_filter = Some(HealthEventsFilter::from_bits(
+                        query.events_filter = Some(HealthEventsFilter::from_bits_retain(
                             pair[1].parse().map_err(|_| {
                                 Error::InvalidInput("events filter must be a decimal UInt32 mask")
                             })?,

@@ -183,7 +183,7 @@ async fn health_options_encode_sorted_json_and_preserve_omission_false_and_raw_b
             None,
             Some(HealthEventsFilter::ERROR | HealthEventsFilter::NONE),
         ),
-        (None, Some(HealthEventsFilter::from_bits(u32::MAX))),
+        (None, Some(HealthEventsFilter::from_bits_retain(u32::MAX))),
     ];
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();

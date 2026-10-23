@@ -917,7 +917,7 @@ mod node_queries {
             ),
             (
                 NodeQueryDescription {
-                    status_filter: NodeStatusFilter::from_bits(u32::MAX),
+                    status_filter: NodeStatusFilter::from_bits_retain(u32::MAX),
                     ..Default::default()
                 },
                 vec![("NodeStatusFilter", "4294967295")],

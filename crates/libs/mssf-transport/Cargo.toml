@@ -9,4 +9,5 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+bitflags.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

@@ -77,6 +77,66 @@ fn derived_bytes_match_independent_native_schema() {
     }
 }
 
+macro_rules! bitflags_case {
+    ($test:ident, $bits:ty, $method:ident) => {
+        #[test]
+        fn $test() {
+            bitflags::bitflags! {
+                #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+                #[serde(transparent)]
+                struct Flags: $bits {
+                    const A = 1;
+                    const B = 2;
+                }
+            }
+            #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+            struct Payload {
+                flags: Flags,
+                tail: bool,
+            }
+            for bits in [0, 1, 3, 8, <$bits>::MIN, <$bits>::MAX] {
+                let flags = Flags::from_bits_retain(bits);
+                let bytes = to_vec(&flags).unwrap();
+                let mut native = Encoder::new();
+                native.$method(bits);
+                assert_eq!(bytes, native.finish());
+                assert_eq!(from_slice::<Flags>(&bytes).unwrap().bits(), bits);
+
+                let payload = Payload { flags, tail: true };
+                let bytes = to_vec(&payload).unwrap();
+                let mut native = Encoder::new();
+                native
+                    .object(|e| {
+                        e.$method(bits);
+                        e.boolean(true);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(bytes, native.finish());
+                assert_eq!(from_slice::<Payload>(&bytes).unwrap(), payload);
+            }
+        }
+    };
+}
+
+bitflags_case!(bitflags_u16_preserves_native_bits, u16, u16);
+bitflags_case!(bitflags_u32_preserves_native_bits, u32, u32);
+bitflags_case!(bitflags_u64_preserves_native_bits, u64, u64);
+bitflags_case!(bitflags_i32_preserves_native_bits, i32, i32);
+bitflags_case!(bitflags_i64_preserves_native_bits, i64, i64);
+
+#[test]
+fn bitflags_unsupported_width_fails_explicitly() {
+    bitflags::bitflags! {
+        #[derive(Serialize, Deserialize)]
+        struct Flags: u8 {
+            const A = 1;
+        }
+    }
+    assert!(matches!(to_vec(&Flags::A), Err(Error::InvalidInput(_))));
+    assert!(matches!(from_slice::<Flags>(&[1]), Err(Error::Protocol(_))));
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct Pair(u32, String);
 #[derive(Debug, Serialize, Deserialize, PartialEq)]

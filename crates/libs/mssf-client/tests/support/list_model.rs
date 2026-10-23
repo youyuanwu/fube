@@ -594,12 +594,20 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
         ping_response(r)
     })
     .await;
-    assert!(Definitions::from_bits(8).is_err());
+    assert!(Definitions::try_from_bits(8).is_err());
     for filter in [
         ApplicationListFilter::Name("fabric:".into()),
         ApplicationListFilter::Name("fabric:/bad/".into()),
         ApplicationListFilter::TypeName(String::new()),
         ApplicationListFilter::TypeName("x".repeat(32769)),
+        ApplicationListFilter::DefinitionKind(Definitions::from_bits(8).unwrap()),
+        ApplicationListFilter::DefinitionKind(Definitions::from_bits_retain(u32::MAX)),
+        ApplicationListFilter::DefinitionKind(Definitions::ALL & !Definitions::COMPOSE),
+        ApplicationListFilter::DefinitionKind({
+            let mut encoder = Encoder::new();
+            encoder.u32(8);
+            mssf_transport::serialization::serde::from_slice(&encoder.finish()).unwrap()
+        }),
     ] {
         assert!(matches!(
             client
