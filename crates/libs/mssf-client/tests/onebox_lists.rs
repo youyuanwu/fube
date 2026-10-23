@@ -43,12 +43,14 @@ fn compare_service(service: &Service, observed: &Value) {
     );
     assert_eq!(service.is_service_group, observed["IsServiceGroup"]);
     match service.kind {
-        ServiceKind::Stateless => assert_eq!(observed["ServiceKind"], "Stateless"),
-        ServiceKind::Stateful {
-            has_persisted_state,
-        } => {
+        ServiceKind::Invalid => panic!("invalid service kind in a validated query result"),
+        ServiceKind::Stateless => {
+            assert_eq!(observed["ServiceKind"], "Stateless");
+            assert!(!service.has_persisted_state);
+        }
+        ServiceKind::Stateful => {
             assert_eq!(observed["ServiceKind"], "Stateful");
-            assert_eq!(has_persisted_state, observed["HasPersistedState"]);
+            assert_eq!(service.has_persisted_state, observed["HasPersistedState"]);
         }
     }
 }
@@ -172,10 +174,9 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
             2
         );
         assert!(services.iter().any(|s| s.kind == ServiceKind::Stateless));
-        assert!(services.iter().any(|s| s.kind
-            == ServiceKind::Stateful {
-                has_persisted_state: false
-            }));
+        assert!(services
+            .iter()
+            .any(|s| s.kind == ServiceKind::Stateful && !s.has_persisted_state));
         for service in &services {
             compare_service(
                 service,
@@ -187,6 +188,7 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
             native_services.push(json!({
                 "name": service.name, "type_name": service.type_name,
                 "manifest_version": service.manifest_version, "kind": format!("{:?}", service.kind),
+                "has_persisted_state": service.has_persisted_state,
                 "status": format!("{:?}", service.status), "health_state": format!("{:?}", service.health_state),
                 "is_service_group": service.is_service_group,
             }));

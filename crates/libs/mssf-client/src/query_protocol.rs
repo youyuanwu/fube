@@ -107,21 +107,25 @@ pub(crate) fn decode_list<W: DeserializeOwned, T, const TAG: i32>(
     #[derive(Deserialize)]
     struct Empty {}
     #[derive(Deserialize)]
-    struct ListWire<W> {
+    struct ListPayload<W> {
         items: ObjectArray<Vec<W>>,
         item: Pointer<Empty>,
     }
-    let result =
-        decode::<FixedTag<ListWire<W>, TAG>, _>(&message.body, strict_paging, |FixedTag(wire)| {
-            if wire.item.0.is_some() {
+    let result = decode::<FixedTag<ListPayload<W>, TAG>, _>(
+        &message.body,
+        strict_paging,
+        |FixedTag(payload)| {
+            if payload.item.0.is_some() {
                 return Err(Error::Protocol("list has a single-item payload"));
             }
-            wire.items
+            payload
+                .items
                 .0
                 .into_iter()
                 .map(record)
                 .collect::<Result<Vec<_>>>()
-        })?;
+        },
+    )?;
     if result.kind != 2 {
         return Err(Error::Protocol("query result is not a List"));
     }
@@ -168,17 +172,17 @@ pub(crate) fn decode<T: DeserializeOwned, U>(
     validate: impl FnOnce(T) -> Result<U>,
 ) -> Result<QueryResult<U>> {
     #[derive(Deserialize)]
-    struct Wire<T> {
+    struct QueryResultEnvelope<T> {
         kind: i64,
         payload: Pointer<T>,
         error: i64,
         paging: Pointer<Typed<PagingStatus>>,
     }
-    let wire: Wire<T> = from_slice(body)?;
+    let envelope: QueryResultEnvelope<T> = from_slice(body)?;
     // A native query error must not hide a malformed payload and allow reuse
     // of a connection that previously failed protocol validation.
-    let payload = wire.payload.0.map(validate).transpose()?;
-    let paging = wire
+    let payload = envelope.payload.0.map(validate).transpose()?;
+    let paging = envelope
         .paging
         .0
         .map(|Typed(status)| {
@@ -188,14 +192,14 @@ pub(crate) fn decode<T: DeserializeOwned, U>(
             Ok(status.token)
         })
         .transpose()?;
-    if wire.error != 0 {
+    if envelope.error != 0 {
         return Err(Error::Remote {
-            code: wire.error,
+            code: envelope.error,
             message: String::new(),
         });
     }
     Ok(QueryResult {
-        kind: wire.kind,
+        kind: envelope.kind,
         payload,
         paging,
     })

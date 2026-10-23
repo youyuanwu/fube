@@ -29,6 +29,7 @@ struct Shape {
     upgrade_parameters: bool,
     paging_tag: bool,
     wrong_metadata: bool,
+    wrong_suffix: Option<usize>,
     error: i64,
 }
 
@@ -54,6 +55,7 @@ impl Shape {
             upgrade_parameters: false,
             paging_tag: false,
             wrong_metadata: false,
+            wrong_suffix: None,
             error: 0,
         }
     }
@@ -103,10 +105,18 @@ fn record(e: &mut Encoder, s: &Shape) -> mssf_transport::Result<()> {
     }
     if s.service {
         if s.suffix >= 1 {
-            e.i64(s.status);
+            if s.wrong_suffix == Some(0) {
+                e.string("not a status")?;
+            } else {
+                e.i64(s.status);
+            }
         }
         if s.suffix >= 2 {
-            e.boolean(true);
+            if s.wrong_suffix == Some(1) {
+                e.string("not a group flag")?;
+            } else {
+                e.boolean(true);
+            }
         }
     } else {
         let pairs = if s.duplicate {
@@ -269,19 +279,21 @@ async fn application_selectors_exclusion_and_native_paging_are_explicit() {
 
 #[tokio::test]
 async fn service_selectors_route_to_application_service_list_and_both_kinds_decode() {
-    for (filter, key, value, kind) in [
-        (ServiceListFilter::All, None, "", 1),
+    for (filter, key, value, kind, persisted) in [
+        (ServiceListFilter::All, None, "", 1, false),
         (
             ServiceListFilter::Name("fabric:/Model/App".parse().unwrap()),
             Some("ServiceName"),
             "fabric:/Model/App",
             2,
+            true,
         ),
         (
             ServiceListFilter::TypeName("ExactType".into()),
             Some("ServiceTypeName"),
             "ExactType",
             2,
+            false,
         ),
     ] {
         let (client, server) = single_reply(move |request| {
@@ -297,7 +309,7 @@ async fn service_selectors_route_to_application_service_list_and_both_kinds_deco
                 list_body(
                     &Shape {
                         kind,
-                        persisted: kind == 2,
+                        persisted,
                         ..Shape::service()
                     },
                     None,
@@ -317,11 +329,10 @@ async fn service_selectors_route_to_application_service_list_and_both_kinds_deco
             if kind == 1 {
                 ServiceKind::Stateless
             } else {
-                ServiceKind::Stateful {
-                    has_persisted_state: true,
-                }
+                ServiceKind::Stateful
             }
         );
+        assert_eq!(service.has_persisted_state, persisted);
         assert_eq!(service.status, ServiceStatus::Active);
         assert_eq!(service.health_state, HealthState::Warning);
         assert_eq!(service.manifest_version, "1.2");
@@ -546,6 +557,12 @@ async fn malformed_list_successes_retire_shared_stream() {
                 persisted: true,
                 ..base.clone()
             });
+            for position in 0..=1 {
+                shapes.push(Shape {
+                    wrong_suffix: Some(position),
+                    ..base.clone()
+                });
+            }
         } else {
             shapes.push(Shape {
                 definition: 3,
@@ -752,6 +769,26 @@ async fn semantic_list_validation_precedes_embedded_query_errors() {
         },
         Shape {
             health: -99,
+            ..Shape::service()
+        },
+        Shape {
+            kind: 0,
+            ..Shape::service()
+        },
+        Shape {
+            kind: 7,
+            ..Shape::service()
+        },
+        Shape {
+            status: 99,
+            ..Shape::service()
+        },
+        Shape {
+            wrong_suffix: Some(0),
+            ..Shape::service()
+        },
+        Shape {
+            wrong_suffix: Some(1),
             ..Shape::service()
         },
         Shape {

@@ -172,6 +172,114 @@ fn tuple_struct_newtype_and_explicit_empty_kinds() {
     assert!(from_slice::<ObjectArray<Vec<u32>>>(&e.finish()).is_err());
 }
 
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct GuidField(#[serde(with = "guid")] [u8; 16]);
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct GuidRecord {
+    before: u32,
+    #[serde(with = "guid")]
+    guid: [u8; 16],
+    after: bool,
+}
+
+#[test]
+fn guid_field_adapter_preserves_native_metadata_bytes_and_inline_framing() {
+    for value in [
+        [0; 16],
+        [
+            0x78, 0x56, 0x34, 0x12, 0xbc, 0x9a, 0xf0, 0xde, 0x1f, 0x2f, 0x3f, 0x00, 0x80, 0xff,
+            0x01, 0x02,
+        ],
+    ] {
+        let field = GuidField(value);
+        let bytes = to_vec(&field).unwrap();
+        assert_eq!(bytes, to_vec(&Guid(value)).unwrap());
+        if value == [0; 16] {
+            assert_eq!(bytes, [0x4c]);
+        } else {
+            assert_eq!(bytes[0], 0x0c);
+            assert_eq!(&bytes[1..], value);
+        }
+        assert_eq!(from_slice::<GuidField>(&bytes).unwrap(), field);
+        let record = GuidRecord {
+            before: u32::MAX,
+            guid: value,
+            after: true,
+        };
+        let mut native = Encoder::new();
+        native
+            .object(|e| {
+                e.u32(record.before);
+                e.guid(&value);
+                e.boolean(record.after);
+                Ok(())
+            })
+            .unwrap();
+        let bytes = to_vec(&record).unwrap();
+        assert_eq!(bytes, native.finish());
+        assert_eq!(from_slice::<GuidRecord>(&bytes).unwrap(), record);
+        let mut inline = Encoder::new();
+        inline.object(|e| to_fields(e, &record)).unwrap();
+        assert_eq!(inline.finish(), bytes);
+        let mut decoder = Decoder::new(&bytes);
+        assert_eq!(decoder.object(from_fields::<GuidRecord>).unwrap(), record);
+        decoder.finish().unwrap();
+    }
+}
+
+#[test]
+fn guid_field_adapter_rejects_wrong_native_metadata_and_lengths() {
+    for bytes in [
+        to_vec(&ByteArray([1; 16])).unwrap(),
+        to_vec(&ByteArray(Vec::<u8>::new())).unwrap(),
+        to_vec(&1u32).unwrap(),
+        to_vec(&true).unwrap(),
+        vec![0x8c],
+        vec![0xcc],
+    ] {
+        assert!(matches!(
+            from_slice::<GuidField>(&bytes),
+            Err(Error::Protocol(_))
+        ));
+    }
+    for length in 0..16 {
+        let mut bytes = vec![0x0c];
+        bytes.extend(std::iter::repeat_n(1, length));
+        assert!(from_slice::<GuidField>(&bytes).is_err());
+    }
+    for mut bytes in [vec![0x4c], to_vec(&Guid([1; 16])).unwrap()] {
+        bytes.push(1);
+        assert!(from_slice::<GuidField>(&bytes).is_err());
+    }
+    let mut native = Encoder::new();
+    native
+        .object(|e| {
+            e.u32(1);
+            e.byte_array(&[1; 16])?;
+            e.boolean(true);
+            Ok(())
+        })
+        .unwrap();
+    assert!(from_slice::<GuidRecord>(&native.finish()).is_err());
+}
+
+#[test]
+fn guid_field_adapter_reads_human_readable_raw_arrays() {
+    use ::serde::de::value::{Error, SeqDeserializer};
+
+    let value = std::array::from_fn(|i| i as u8);
+    let input = SeqDeserializer::<_, Error>::new(value.into_iter());
+    assert_eq!(guid::deserialize(input).unwrap(), value);
+    for length in [0, 15, 17] {
+        let input = SeqDeserializer::<_, Error>::new(vec![1u8; length].into_iter());
+        assert!(guid::deserialize(input).is_err());
+    }
+    let input = SeqDeserializer::<_, Error>::new(vec![256u16; 16].into_iter());
+    assert!(guid::deserialize(input).is_err());
+}
+
 #[test]
 fn field_bridges_preserve_pointer_tags_scopes_and_continuation() {
     let mut e = Encoder::new();

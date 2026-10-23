@@ -75,14 +75,19 @@ pub(crate) fn decode_reply(message: &Message) -> Result<NodeHealth> {
         return Err(Error::Protocol("unexpected node health success envelope"));
     }
     #[derive(Deserialize)]
-    struct ItemWire {
+    struct ItemPayload {
         _list: ObjectArray<Vec<ForbiddenListItem>>,
         item: Pointer<NodeHealth>,
     }
-    let result = crate::query_protocol::decode::<FixedTag<ItemWire, 16>, _>(
+    let result = crate::query_protocol::decode::<FixedTag<ItemPayload, 16>, _>(
         &message.body,
         false,
-        |FixedTag(wire)| wire.item.0.ok_or(Error::Protocol("null node health item")),
+        |FixedTag(payload)| {
+            payload
+                .item
+                .0
+                .ok_or(Error::Protocol("null node health item"))
+        },
     )?;
     if result.kind != 1 || result.paging.is_some() {
         return Err(Error::Protocol("node health result is not an unpaged Item"));

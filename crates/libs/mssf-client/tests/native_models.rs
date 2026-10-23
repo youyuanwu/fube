@@ -1,4 +1,5 @@
 use mssf_client::*;
+use mssf_transport::message::{ListenInstance, MessageId};
 use mssf_transport::serialization::{
     serde::{from_slice, to_vec, ByteArray, ObjectArray, Pointer},
     Encoder, MAX_COLLECTION_COUNT,
@@ -189,6 +190,11 @@ fn strict_scalar_models_map_explicit_codes_without_duplicate_wire_enums() {
         (ApplicationDefinitionKind::Invalid, 65535),
     ]);
     check(&[
+        (ServiceKind::Invalid, 0),
+        (ServiceKind::Stateless, 1),
+        (ServiceKind::Stateful, 2),
+    ]);
+    check(&[
         (ServiceStatus::Unknown, 0),
         (ServiceStatus::Active, 1),
         (ServiceStatus::Upgrading, 2),
@@ -196,6 +202,206 @@ fn strict_scalar_models_map_explicit_codes_without_duplicate_wire_enums() {
         (ServiceStatus::Creating, 4),
         (ServiceStatus::Failed, 5),
     ]);
+}
+
+fn service_fields(
+    e: &mut Encoder,
+    kind: i64,
+    persisted: bool,
+    health: i64,
+    suffix: usize,
+) -> Result<()> {
+    e.i64(kind);
+    e.object(|e| uri_fields(e, 0))?;
+    e.string("ServiceType")?;
+    e.string("1.2")?;
+    e.boolean(persisted);
+    e.i64(health);
+    if suffix >= 1 {
+        e.i64(2);
+    }
+    if suffix >= 2 {
+        e.boolean(true);
+    }
+    Ok(())
+}
+
+#[test]
+fn services_deserialize_direct_native_and_json_fields_without_query_policy() {
+    assert_eq!(ServiceStatus::default(), ServiceStatus::Unknown);
+    for (kind, expected_kind) in [
+        (0, ServiceKind::Invalid),
+        (1, ServiceKind::Stateless),
+        (2, ServiceKind::Stateful),
+    ] {
+        for persisted in [false, true] {
+            for suffix in 0..=2 {
+                let mut e = Encoder::new();
+                e.object(|e| service_fields(e, kind, persisted, -99, suffix))
+                    .unwrap();
+                let service: Service = from_slice(&e.finish()).unwrap();
+                assert_eq!(
+                    service,
+                    Service {
+                        kind: expected_kind,
+                        name: "fabric:/App/Child".parse().unwrap(),
+                        type_name: "ServiceType".into(),
+                        manifest_version: "1.2".into(),
+                        has_persisted_state: persisted,
+                        health_state: HealthState::Unrecognized(-99),
+                        status: if suffix == 0 {
+                            ServiceStatus::Unknown
+                        } else {
+                            ServiceStatus::Upgrading
+                        },
+                        is_service_group: suffix == 2,
+                    }
+                );
+                let json = serde_json::json!({
+                    "kind": kind,
+                    "name": "fabric:/App/Child",
+                    "type_name": "ServiceType",
+                    "manifest_version": "1.2",
+                    "has_persisted_state": persisted,
+                    "health_state": -99,
+                    "status": if suffix == 0 { 0 } else { 2 },
+                    "is_service_group": suffix == 2,
+                });
+                assert_eq!(serde_json::from_value::<Service>(json).unwrap(), service);
+            }
+        }
+    }
+}
+
+#[test]
+fn services_reject_unknown_native_kind_status_and_malformed_present_suffixes() {
+    for kind in [-1, 3, 99, i64::MAX] {
+        let mut e = Encoder::new();
+        e.object(|e| service_fields(e, kind, false, 1, 2)).unwrap();
+        assert!(matches!(
+            from_slice::<Service>(&e.finish()),
+            Err(Error::Protocol(_))
+        ));
+    }
+    for status in [-1, 6, 99, i64::MAX] {
+        let mut e = Encoder::new();
+        e.object(|e| {
+            service_fields(e, 1, false, 1, 0)?;
+            e.i64(status);
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            from_slice::<Service>(&e.finish()),
+            Err(Error::Protocol(_))
+        ));
+    }
+    for suffix in 0..=1 {
+        let mut e = Encoder::new();
+        e.object(|e| {
+            service_fields(e, 1, false, 1, suffix)?;
+            e.string("malformed present status/group")
+        })
+        .unwrap();
+        assert!(matches!(
+            from_slice::<Service>(&e.finish()),
+            Err(Error::Protocol(_))
+        ));
+    }
+    let mut e = Encoder::new();
+    e.object(|e| service_fields(e, 1, false, 1, 1)).unwrap();
+    let mut bytes = e.finish();
+    // Preserve the object extent and delimiters, but advertise an unterminated
+    // compressed status payload instead of treating its presence as absence.
+    let status_payload = bytes.len() - 3;
+    assert_eq!(bytes[status_payload], 2);
+    bytes[status_payload] = 0x80;
+    assert!(matches!(
+        from_slice::<Service>(&bytes),
+        Err(Error::Protocol(_))
+    ));
+}
+
+#[test]
+fn service_json_requires_numeric_scalars_and_rejects_malformed_present_suffixes() {
+    let base = serde_json::json!({
+        "kind": 2,
+        "name": "fabric:/App/Child",
+        "type_name": "ServiceType",
+        "manifest_version": "1.2",
+        "has_persisted_state": true,
+        "health_state": 1,
+        "status": 2,
+        "is_service_group": true,
+    });
+    for (field, malformed) in [
+        ("kind", serde_json::json!(-1)),
+        ("kind", serde_json::json!(3)),
+        ("kind", serde_json::json!("Stateful")),
+        (
+            "kind",
+            serde_json::json!({"Stateful": {"has_persisted_state": true}}),
+        ),
+        ("status", serde_json::json!(6)),
+        ("status", serde_json::json!("Unknown")),
+        ("status", serde_json::Value::Null),
+        ("is_service_group", serde_json::json!(0)),
+        ("is_service_group", serde_json::json!("false")),
+        ("is_service_group", serde_json::Value::Null),
+        ("has_persisted_state", serde_json::json!("true")),
+        ("name", serde_json::json!("fabric:/bad/")),
+    ] {
+        let mut json = base.clone();
+        json[field] = malformed;
+        assert!(serde_json::from_value::<Service>(json).is_err(), "{field}");
+    }
+    for field in ["kind", "has_persisted_state", "status", "is_service_group"] {
+        let mut json = base.clone();
+        json.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<Service>(json).is_err(), "{field}");
+    }
+}
+
+#[test]
+fn transport_records_keep_raw_native_order_guid_arrays_in_json() {
+    for guid in [[0; 16], std::array::from_fn(|i| (i + 1) as u8)] {
+        for index in [0, u32::MAX] {
+            let id = MessageId { guid, index };
+            let json = serde_json::json!({ "guid": guid, "index": index });
+            assert_eq!(serde_json::to_value(id).unwrap(), json);
+            assert_eq!(serde_json::from_value::<MessageId>(json).unwrap(), id);
+        }
+        for address in ["", "node🦀é"] {
+            let instance = ListenInstance {
+                address: address.into(),
+                instance: u64::MAX,
+                nonce: guid,
+            };
+            let json = serde_json::json!({
+                "address": address, "instance": u64::MAX, "nonce": guid,
+            });
+            assert_eq!(serde_json::to_value(&instance).unwrap(), json);
+            assert_eq!(
+                serde_json::from_value::<ListenInstance>(json).unwrap(),
+                instance
+            );
+        }
+    }
+    for guid in [
+        serde_json::json!(vec![0u8; 15]),
+        serde_json::json!(vec![0u8; 17]),
+        serde_json::json!(vec![256u16; 16]),
+        serde_json::json!("00000000-0000-0000-0000-000000000000"),
+    ] {
+        assert!(serde_json::from_value::<MessageId>(
+            serde_json::json!({ "guid": guid, "index": 0 })
+        )
+        .is_err());
+        assert!(serde_json::from_value::<ListenInstance>(serde_json::json!({
+            "address": "", "instance": 0, "nonce": guid,
+        }))
+        .is_err());
+    }
 }
 
 fn application_fields(

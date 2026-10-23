@@ -14,14 +14,6 @@ struct Scalar<T> {
 }
 #[derive(Serialize)]
 struct Fields2<A, B>(A, B);
-#[derive(Serialize)]
-struct IdWire(Guid, u32);
-#[derive(Serialize, Deserialize)]
-struct ListenWire<T> {
-    address: T,
-    instance: u64,
-    nonce: Guid,
-}
 
 pub const ACTOR: u16 = 0x8001;
 pub const ACTION: u16 = 0x8002;
@@ -36,9 +28,10 @@ pub const CLIENT_VERSION: u16 = 0x8025;
 pub const UNCORRELATED_REPLY: u16 = 0x803e;
 pub const MAX_HEADER_COUNT: usize = 4096;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageId {
     /// Native GUID field order, not a UUID's network byte order.
+    #[serde(with = "crate::serialization::serde::guid")]
     pub guid: [u8; 16],
     pub index: u32,
 }
@@ -91,7 +84,7 @@ impl Header {
     }
 
     fn id_header(kind: u16, id: MessageId) -> Result<Self> {
-        Self::serialized(kind, &IdWire(Guid(id.guid), id.index))
+        Self::serialized(kind, &id)
     }
 
     pub fn boolean(kind: u16, value: bool) -> Result<Self> {
@@ -262,29 +255,21 @@ impl Message {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenInstance {
     pub address: String,
     pub instance: u64,
+    #[serde(with = "crate::serialization::serde::guid")]
     pub nonce: [u8; 16],
 }
 
 impl ListenInstance {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        to_vec(&ListenWire {
-            address: self.address.as_str(),
-            instance: self.instance,
-            nonce: Guid(self.nonce),
-        })
+        to_vec(self)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let wire: ListenWire<String> = from_slice(bytes)?;
-        Ok(Self {
-            address: wire.address,
-            instance: wire.instance,
-            nonce: wire.nonce.0,
-        })
+        from_slice(bytes)
     }
 }
 
@@ -354,7 +339,8 @@ mod tests {
                 Ok(())
             });
         }
-        for value in ["", "Action🦀é"] {
+        let largest_action = "a".repeat(32759);
+        for value in ["", "Action🦀é", largest_action.as_str()] {
             compare(Header::action(value).unwrap(), |e| e.string(value));
         }
         for kind in [EXPECTS_REPLY, HIGH_PRIORITY, UNCORRELATED_REPLY, 0x8033] {
@@ -366,10 +352,98 @@ mod tests {
             }
         }
         // The header-record size bound still applies after successful native string encoding.
-        assert!(matches!(
-            Header::action(&"a".repeat(32768)),
-            Err(Error::Protocol(_))
-        ));
+        for length in [32760, 32768] {
+            assert!(matches!(
+                Header::action(&"a".repeat(length)),
+                Err(Error::Protocol(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn public_records_serialize_directly_with_native_object_framing() {
+        for guid in [[0; 16], std::array::from_fn(|i| (i + 1) as u8)] {
+            for index in [0, u32::MAX] {
+                let id = MessageId { guid, index };
+                let bytes = to_vec(&id).unwrap();
+                let mut native = Encoder::new();
+                native
+                    .object(|e| {
+                        id.encode(e);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(bytes, native.finish());
+                assert_eq!(from_slice::<MessageId>(&bytes).unwrap(), id);
+                assert_eq!(Header::message_id(id).unwrap().value, bytes);
+                assert_eq!(Header::relates_to(id).unwrap().value, bytes);
+
+                let mut inline = Encoder::new();
+                id.encode(&mut inline);
+                let inline = inline.finish();
+                let mut decoder = Decoder::new(&inline);
+                assert_eq!(MessageId::decode(&mut decoder).unwrap(), id);
+                decoder.finish().unwrap();
+                for end in 0..bytes.len() {
+                    assert!(from_slice::<MessageId>(&bytes[..end]).is_err());
+                }
+                let mut extra = bytes;
+                extra.push(0);
+                assert!(from_slice::<MessageId>(&extra).is_err());
+            }
+            for address in ["", "node🦀é"] {
+                for instance in [0, u64::MAX] {
+                    let value = ListenInstance {
+                        address: address.into(),
+                        instance,
+                        nonce: guid,
+                    };
+                    let bytes = to_vec(&value).unwrap();
+                    assert_eq!(bytes, value.encode().unwrap());
+                    assert_eq!(from_slice::<ListenInstance>(&bytes).unwrap(), value);
+                    assert_eq!(ListenInstance::decode(&bytes).unwrap(), value);
+                    for end in 0..bytes.len() {
+                        assert!(from_slice::<ListenInstance>(&bytes[..end]).is_err());
+                    }
+                    let mut extra = bytes;
+                    extra.push(0);
+                    assert!(from_slice::<ListenInstance>(&extra).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn header_record_and_area_bounds_are_exact() {
+        let mut message = Message {
+            headers: vec![Header {
+                id: 0x7ffe,
+                value: vec![0xff; MAX_HEADER_SIZE - 4],
+            }],
+            body: vec![],
+        };
+        let frame = message.to_frame().unwrap();
+        assert_eq!(frame.headers.len(), MAX_HEADER_SIZE);
+        assert_eq!(Message::from_frame(frame.clone()).unwrap(), message);
+        let mut oversized = frame;
+        oversized.headers.push(0);
+        assert!(Message::from_frame(oversized).is_err());
+        message.headers[0].value.push(0);
+        assert!(message.to_frame().is_err());
+        for size in [0, u16::MAX as usize, u16::MAX as usize + 1] {
+            message.headers[0].value = vec![0xff; size];
+            assert!(message.to_frame().is_err());
+        }
+        message.headers = vec![
+            Header {
+                id: 0x7ffe,
+                value: vec![0xff],
+            };
+            MAX_HEADER_COUNT
+        ];
+        assert!(message.to_frame().is_ok());
+        message.headers.push(message.headers[0].clone());
+        assert!(message.to_frame().is_err());
     }
 
     #[test]

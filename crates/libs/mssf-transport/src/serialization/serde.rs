@@ -65,7 +65,7 @@ use std::fmt;
 
 mod adapters;
 pub use adapters::{
-    CountedStrings, Derived, FixedTag, Inline, NativeEnum, NativeType, NumericEnum, Pointer,
+    guid, CountedStrings, Derived, FixedTag, Inline, NativeEnum, NativeType, NumericEnum, Pointer,
     Trailing, Typed, Untagged,
 };
 

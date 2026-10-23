@@ -2,6 +2,36 @@ use super::*;
 use ::serde::{de::DeserializeSeed, ser::SerializeTupleStruct};
 use std::marker::PhantomData;
 
+/// Serde field adapter for `[u8; 16]` GUIDs in native Windows byte order.
+///
+/// Use `#[serde(with = "mssf_transport::serialization::serde::guid")]`.
+/// Native encoding uses [`Guid`] metadata; human-readable formats use arrays.
+pub mod guid {
+    use super::Guid;
+    use ::serde::{Deserialize, Serialize};
+
+    pub fn serialize<S: ::serde::Serializer>(
+        value: &[u8; 16],
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            value.serialize(serializer)
+        } else {
+            Guid(*value).serialize(serializer)
+        }
+    }
+
+    pub fn deserialize<'de, D: ::serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<[u8; 16], D::Error> {
+        if deserializer.is_human_readable() {
+            <[u8; 16]>::deserialize(deserializer)
+        } else {
+            Guid::deserialize(deserializer).map(|value| value.0)
+        }
+    }
+}
+
 macro_rules! field_adapter {
     ($name:ident, $marker:ident, $doc:literal) => {
         #[doc = $doc]

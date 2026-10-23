@@ -346,8 +346,8 @@ inline and Activity nested; query argument order is preserved and QueryAddress
 is not added as a body field. Safety checks and health evaluations share derived
 enum dispatch, including tag/kind agreement checks. Fixed query-wrapper and
 empty naming URI tags no longer need custom deserialization callbacks.
-Application suffixes use explicit Trailing-based field adapters; service
-suffixes still use Trailing fields. Aligned application/node/health/event/evaluation/deactivation/safety models deserialize directly
+Application and service suffixes use explicit Trailing-based field adapters.
+Aligned application/service/node/health/event/evaluation/deactivation/safety models deserialize directly
 using shared field adapters rather than a parallel set of wire records.
 `Node` preserves both native ID fields, with agreement checked after deserialization.
 `SafetyCheck` preserves all native variants and their explicit discriminants.
@@ -358,6 +358,11 @@ both task and identity derive deserialization without a flattening conversion.
 `Application` retains all nine native fields, including deprecated upgrade
 fields. Its two string maps decode from bounded pair arrays with duplicate-key
 rejection; trailing adapters apply native defaults only at a real scope end.
+`Service` retains all eight native fields, including a scalar `ServiceKind`
+followed later by the separate `has_persisted_state` flag. Query validation,
+not structural deserialization, rejects Invalid kind and stateless persistence.
+`MessageId` and `ListenInstance` derive Serde directly with a shared GUID field
+adapter on their existing raw-byte fields; no parallel transport records remain.
 `NamingUri` is a checked semantic type with a private native component schema,
 not an arbitrary String. Naming query fields and application/service result
 names use it; string naming-call convenience remains supported. JSON query
@@ -366,8 +371,9 @@ Strict scalar status/definition enums map their numeric codes directly; shared
 `HealthState` retains unknown codes, with list-specific rejection after decoding.
 URI redundancy is checked by semantic construction above the generic backend;
 node-ID agreement, duplicate parameters and cross-field checks remain record-level
-validation. Service helpers remain for suffixes and kind/persistence consolidation.
-Query payload
+validation. Native `QueryResultEnvelope`, `ListPayload` and `ItemPayload`
+helpers retain protocol framing distinct from domain records, including both
+native list/item slots and their required empty/null checks. Query payload
 validation still precedes embedded remote errors. Paging tag strictness remains
 operation-specific, and partial operation-failure diagnostics retain deliberate
 incremental handling so malformed text cannot erase a nonzero error code.

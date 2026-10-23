@@ -1,14 +1,11 @@
 //! Source-derived list aggregate envelopes and positional record layouts.
 
-use mssf_transport::{
-    message::Message,
-    serialization::serde::{NumericEnum, Trailing},
-};
-use serde::{Deserialize, Serialize};
+use mssf_transport::message::Message;
+use serde::Serialize;
 
 use crate::{
     applications::*, query_arguments::QueryArguments, query_protocol::Query, services::*, Error,
-    HealthState, NamingUri, Paging, Result,
+    HealthState, Paging, Result,
 };
 
 fn type_selector(value: &str) -> Result<&str> {
@@ -112,11 +109,7 @@ pub(crate) fn decode_applications(message: &Message) -> Result<ApplicationListPa
 }
 
 pub(crate) fn decode_services(message: &Message) -> Result<ServiceListPage> {
-    crate::query_protocol::decode_list::<ServiceWire, _, 2>(
-        message,
-        true,
-        ServiceWire::into_service,
-    )
+    crate::query_protocol::decode_list::<Service, _, 2>(message, true, validate_service)
 }
 
 fn validate_list_health(value: HealthState) -> Result<HealthState> {
@@ -124,13 +117,6 @@ fn validate_list_health(value: HealthState) -> Result<HealthState> {
         return Err(Error::Protocol("unsupported list health state"));
     }
     Ok(value)
-}
-#[derive(Deserialize)]
-enum ServiceKindWire {
-    #[serde(rename = "1")]
-    Stateless,
-    #[serde(rename = "2")]
-    Stateful,
 }
 
 fn validate_application(application: Application) -> Result<Application> {
@@ -148,39 +134,14 @@ fn validate_application(application: Application) -> Result<Application> {
     Ok(application)
 }
 
-#[derive(Deserialize)]
-struct ServiceWire {
-    kind: NumericEnum<ServiceKindWire>,
-    name: NamingUri,
-    type_name: String,
-    manifest_version: String,
-    persisted: bool,
-    health: HealthState,
-    status: Trailing<ServiceStatus>,
-    is_service_group: Trailing<bool>,
-}
-impl ServiceWire {
-    fn into_service(self) -> Result<Service> {
-        let name = self.name;
-        let kind = match (self.kind.0, self.persisted) {
-            (ServiceKindWire::Stateless, false) => ServiceKind::Stateless,
-            (ServiceKindWire::Stateful, has_persisted_state) => ServiceKind::Stateful {
-                has_persisted_state,
-            },
-            _ => return Err(Error::Protocol("unsupported service kind/persistence")),
-        };
-        let health_state = validate_list_health(self.health)?;
-        let status = self.status.0.unwrap_or(ServiceStatus::Unknown);
-        Ok(Service {
-            name,
-            type_name: self.type_name,
-            manifest_version: self.manifest_version,
-            kind,
-            health_state,
-            status,
-            is_service_group: self.is_service_group.0.unwrap_or(false),
-        })
+fn validate_service(service: Service) -> Result<Service> {
+    if service.kind == ServiceKind::Invalid
+        || (service.kind == ServiceKind::Stateless && service.has_persisted_state)
+    {
+        return Err(Error::Protocol("unsupported service kind/persistence"));
     }
+    validate_list_health(service.health_state)?;
+    Ok(service)
 }
 
 #[cfg(test)]
@@ -192,7 +153,7 @@ mod tests {
         validate_application(from_fields::<Application>(decoder)?)
     }
     fn service(decoder: &mut Decoder<'_>) -> Result<Service> {
-        from_fields::<ServiceWire>(decoder)?.into_service()
+        validate_service(from_fields::<Service>(decoder)?)
     }
 
     fn application_base(e: &mut Encoder) -> Result<()> {

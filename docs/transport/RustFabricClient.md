@@ -478,11 +478,14 @@ defaults to Invalid. The native deprecated fields `upgrade_type_version` and
 string/map when their suffixes are absent. Nonempty values remain an explicitly
 unsupported application-list result profile.
 
-`ServiceListPage.items` contains owned `Service` records: name, type_name,
-manifest_version, `ServiceKind`, `HealthState`, `ServiceStatus`, is_service_group.
+`ServiceListPage.items` contains owned `Service` records in native field order:
+`ServiceKind`, name, type_name, manifest_version, has_persisted_state,
+`HealthState`, `ServiceStatus`, is_service_group.
 Manifest version is not application type version and may be empty.
-`ServiceKind::Stateful { has_persisted_state }` distinguishes persistence from
-kind; `Stateless` cannot report persisted state. Service statuses are
+`ServiceKind` is a scalar enum: Invalid/Stateless/Stateful (0/1/2); persistence
+is the separate `service.has_persisted_state` field. Deserialization retains
+the native fields independently; service-list validation rejects Invalid kind
+and stateless records claiming persisted state. Service statuses are
 Unknown/Active/Upgrading/Deleting/Creating/Failed; absent optional status/group
 defaults to Unknown/false. Named health Unknown is valid and does not mean Ok.
 Unlike the existing node/health scalar policy, unnamed scalar values in these
@@ -580,24 +583,20 @@ explicitly. General native forward compatibility is not claimed.
 
 `mssf_transport::serialization::serde` provides `to_vec` / `from_slice` over
 the existing bounded native codec, not a JSON, bincode or postcard encoding.
-Compatible ordered wire DTOs can use ordinary Serde derives:
+Ordered native-shaped models use ordinary Serde derives and explicit field
+adapters without parallel wire records:
 
 ```rust
-use mssf_transport::serialization::serde::{from_slice, to_vec, Guid};
-use serde::{Deserialize, Serialize};
+use mssf_transport::{
+    message::ListenInstance,
+    serialization::serde::{from_slice, to_vec},
+};
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-struct ListenWire {
-    address: String,
-    instance: u64,
-    nonce: Guid,
-}
-
-let value = ListenWire {
-    address: "node".into(), instance: 7, nonce: Guid([0; 16]),
+let value = ListenInstance {
+    address: "node".into(), instance: 7, nonce: [0; 16],
 };
 let bytes = to_vec(&value).unwrap();
-assert_eq!(from_slice::<ListenWire>(&bytes).unwrap(), value);
+assert_eq!(from_slice::<ListenInstance>(&bytes).unwrap(), value);
 ```
 
 | Mapping | Native behavior |
@@ -606,6 +605,7 @@ assert_eq!(from_slice::<ListenWire>(&bytes).unwrap(), value);
 | Named struct / multi-field tuple struct | One ordered native object. Fields follow declaration order; field names/renames do not appear on the wire. |
 | Newtype struct | Transparent; `struct Wrapper(T)` does **not** add an object. Use a named one-field struct when an object wrapper is required. |
 | `Guid([u8; 16])` | Native GUID metadata and Windows field-order bytes, e.g. `Uuid::to_bytes_le()`, not UUID network order or byte-array metadata. |
+| `#[serde(with = "mssf_transport::serialization::serde::guid")]` | The same explicit GUID mapping on an existing `[u8; 16]` field, without a parallel record or changing its public type. |
 | `ByteArray<T>` | Native byte-array metadata; encode Vec/slice/array bytes, decode `ByteArray<Vec<u8>>`. |
 | `ObjectArray<T>` | Native object-array metadata even when empty; encode a Vec/slice of struct-shaped elements, decode `ObjectArray<Vec<Row>>`. |
 | `CountedStrings<T>` | Native UInt32 count followed by inline strings, including an explicit zero count. Encode Vec/slice strings; decode `CountedStrings<Vec<String>>`. Not string-array or object-array metadata. |
@@ -669,7 +669,7 @@ objects, derive an enum with explicit native codes:
 
 ```rust
 #[derive(serde::Serialize, serde::Deserialize)]
-enum EvaluationWire {
+enum Evaluation {
     #[serde(rename = "1")]
     Event { description: String },
     #[serde(rename = "0")]
@@ -677,7 +677,7 @@ enum EvaluationWire {
 }
 ```
 
-Wrap it in `NativeEnum<EvaluationWire>`. The backend implements Serde
+Wrap it in `NativeEnum<Evaluation>`. The backend implements Serde
 `EnumAccess`/`VariantAccess`: it reads the raw four-byte i32 tag, verifies the
 matching i64 body kind, selects the derived variant and deserializes its fields
 inline. Unit, struct and tuple variants are supported; a newtype variant must
@@ -686,10 +686,10 @@ DTO. A partition safety-check payload uses a `Derived<PartitionFields>` field
 to enter its derived scope. Encoding uses the same mapping in reverse.
 
 `NumericEnum<T>` instead maps derived unit variants to signed i64 scalar codes.
-It is used for the structural service-kind helper; unknown codes are errors.
-Application status, definition kind and service status implement their explicit
-signed-i64 mappings directly and reject unknown codes without parallel wire
-enums. Node scalar enums (`NodeStatus`,
+It remains available for derived unit enums; unknown codes are errors.
+Application status, definition kind, service kind and service status implement
+their explicit signed-i64 mappings directly and reject unknown codes without
+parallel wire enums. Node scalar enums (`NodeStatus`,
 `HealthState`, deactivation/task enums and `SafetyCheckKind`) implement Serde
 through the shared numeric-enum macro: both native and JSON formats use their
 signed i64 codes, including `Unrecognized(i64)`. This preserves the deliberate
@@ -743,9 +743,10 @@ QueryAddress is not added to the body.
 
 Aligned public models deserialize directly: `Node`, `NodeHealth`, `HealthEvent`,
 `EventHealthEvaluation`, `HealthEvaluation`, `NodeDeactivation`,
-`NodeDeactivationTask`, `NodeDeactivationTaskId`, `SafetyCheck` and `Application` no longer
-need parallel wire records. Shared field adapters select object arrays and
-required tagged-pointer slots without exposing wrappers in model fields.
+`NodeDeactivationTask`, `NodeDeactivationTaskId`, `SafetyCheck`, `Application`
+and `Service` no longer need parallel wire records. Shared field adapters select
+object arrays and required tagged-pointer slots without exposing wrappers in
+model fields.
 `NodeTimestamp` transparently maps signed i64 ticks; `NodeId` maps an exactly
 16-byte numeric byte array (high then low little-endian words), not a GUID.
 Health models also serialize using the same native mapping.
@@ -766,8 +767,21 @@ from bounded string-pair object arrays with duplicate-key rejection. Explicit
 trailing-field adapters apply native empty-string/map and Invalid defaults;
 health and deprecated-field restrictions remain query-level validation.
 
-Structural helpers remain only where the public/native shapes differ:
-service records have versioned suffixes and kind/persistence consolidation.
+`Service` matches the native eight-field record rather than consolidating kind
+and persistence. Migrate `ServiceKind::Stateful { has_persisted_state }` to
+`ServiceKind::Stateful` plus `service.has_persisted_state`. Explicit suffix
+adapters default missing status/group fields to Unknown/false; query validation
+checks kind/persistence consistency after structural deserialization.
+`MessageId` and `ListenInstance` also derive Serde directly, using the shared
+GUID field adapter without changing their public field types. Header IDs remain
+inline fields in the existing header object; listen controls retain their
+ordinary object framing.
+
+Structural helpers remain where native envelopes differ from public results:
+`QueryResultEnvelope` carries the result kind, payload pointer, native error
+code and paging pointer. `ListPayload`/`ItemPayload` preserve both native list
+and single-item slots and their operation-specific requirements. These are not
+duplicate domain records.
 `NamingUri` owns its genuinely different component representation.
 No generalized derive framework or changed default Vec/Option mapping is needed.
 
@@ -786,7 +800,7 @@ decoding so a readable nonzero native error survives a malformed diagnostic.
 
 See the [backend contract and compiling example][native-serde],
 [transport payloads][serde-messages], [query DTOs][serde-query],
-[health conversion][serde-health] and [list conversion][serde-lists].
+[health envelopes][serde-health] and [list validation][serde-lists].
 
 [native-serde]: ../../crates/libs/mssf-transport/src/serialization/serde.rs
 [serde-messages]: ../../crates/libs/mssf-transport/src/message.rs#L12-L123

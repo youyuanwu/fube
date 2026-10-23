@@ -32,16 +32,21 @@ impl ServiceQueryParameters {
 /// One ordinary application-scoped service request with independent paging.
 pub type ServiceQueryDescription = PagedQuery<ServiceQueryParameters>;
 
-/// Kind and persistence are inseparable; stateless cannot claim persisted state.
+/// Native scalar kind; persistence is a separate service field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceKind {
+    Invalid,
     Stateless,
-    Stateful { has_persisted_state: bool },
+    Stateful,
 }
+crate::native::strict_enum!(ServiceKind {
+    Invalid = 0, Stateless = 1, Stateful = 2,
+});
 
 /// Native service lifecycle status. A missing optional suffix is Unknown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ServiceStatus {
+    #[default]
     Unknown,
     Active,
     Upgrading,
@@ -55,14 +60,17 @@ crate::native::strict_enum!(ServiceStatus {
 
 /// An aggregate observation, not a readiness guarantee. Manifest version can be
 /// empty and is not the application type version. Unknown health is legitimate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Service {
+    pub kind: ServiceKind,
     pub name: NamingUri,
     pub type_name: String,
     pub manifest_version: String,
-    pub kind: ServiceKind,
+    pub has_persisted_state: bool,
     pub health_state: HealthState,
+    #[serde(deserialize_with = "crate::native::trailing_default::deserialize")]
     pub status: ServiceStatus,
+    #[serde(deserialize_with = "crate::native::trailing_default::deserialize")]
     pub is_service_group: bool,
 }
 
