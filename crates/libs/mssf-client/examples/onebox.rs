@@ -154,7 +154,7 @@ async fn run() -> Result<()> {
     let client = FabricClient::connect_clear(endpoint, timeout).await?;
     match operation {
         Operation::Ping => {
-            let gateway = client.ping().await?;
+            let gateway = client.ping(None).await?;
             println!(
                 "gateway={} node_name={} node_id={:x} node_instance={}",
                 gateway.address, gateway.node_name, gateway.node_id, gateway.node_instance
@@ -163,7 +163,7 @@ async fn run() -> Result<()> {
         Operation::NodeList => {
             // Explicit single page: never imply this is the complete membership.
             let page = client
-                .get_node_list(&NodeQueryDescription::default())
+                .get_node_list(&NodeQueryDescription::default(), None)
                 .await?;
             for node in page.items {
                 println!("{node:?}");
@@ -171,34 +171,33 @@ async fn run() -> Result<()> {
             println!("continuation_token={:?}", page.continuation_token);
         }
         Operation::NodeHealth(query) => {
-            println!("{:#?}", client.get_node_health(&query).await?);
+            println!("{:#?}", client.get_node_health(&query, None).await?);
         }
         Operation::ApplicationList(query) => {
             println!(
                 "{:#?}",
-                client
-                    .get_application_list_with_timeout(&query, timeout)
-                    .await?
+                client.get_application_list(&query, Some(timeout)).await?
             );
         }
         Operation::ServiceList(query) => {
             println!(
                 "{:#?}",
-                client
-                    .get_service_list_with_timeout(&query, timeout)
-                    .await?
+                client.get_service_list(&query, Some(timeout)).await?
             );
         }
         Operation::NameExists(name) => {
-            println!("name={name} exists={}", client.name_exists(&name).await?);
+            println!(
+                "name={name} exists={}",
+                client.name_exists(&name, None).await?
+            );
         }
         Operation::CreateName(name) => {
             // Sent writes can execute despite timeout/cancel/disconnect. Never replay.
-            client.create_name_with_timeout(&name, timeout).await?;
+            client.create_name(&name, Some(timeout)).await?;
             println!("created name={name}");
         }
         Operation::DeleteName(name) => {
-            client.delete_name_with_timeout(&name, timeout).await?;
+            client.delete_name(&name, Some(timeout)).await?;
             println!("deleted name={name}");
         }
     }

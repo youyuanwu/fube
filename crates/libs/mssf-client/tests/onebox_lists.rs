@@ -97,7 +97,7 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
             ..Default::default()
         },
     };
-    let first = client.get_application_list(&app_query).await?;
+    let first = client.get_application_list(&app_query, None).await?;
     assert_eq!(first.items.len(), 1);
     assert!(
         first.continuation_token.is_some(),
@@ -105,7 +105,7 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     );
     app_query.paging.continuation_token = first.continuation_token.clone();
     let second = client
-        .get_application_list_with_timeout(&app_query, Duration::from_secs(30))
+        .get_application_list(&app_query, Some(Duration::from_secs(30)))
         .await?;
     assert_eq!(second.items.len(), 1);
     assert!(second.continuation_token.is_none());
@@ -129,25 +129,29 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     app_query.paging.continuation_token = None;
     app_query.paging.max_results = None;
     app_query.parameters.exclude_application_parameters = true;
-    let excluded = client.get_application_list(&app_query).await?;
+    let excluded = client.get_application_list(&app_query, None).await?;
     assert_eq!(excluded.items.len(), 2);
     assert!(excluded.items.iter().all(|a| a.parameters.is_empty()));
     app_query.parameters.filter = ApplicationListFilter::Name(journal.applications[0].parse()?);
     assert_eq!(
-        client.get_application_list(&app_query).await?.items.len(),
+        client
+            .get_application_list(&app_query, None)
+            .await?
+            .items
+            .len(),
         1
     );
     app_query.parameters.filter =
         ApplicationListFilter::Name(format!("{}-absent", journal.applications[0]).parse()?);
     assert!(client
-        .get_application_list(&app_query)
+        .get_application_list(&app_query, None)
         .await?
         .items
         .is_empty());
     app_query.parameters.filter = ApplicationListFilter::DefinitionKind(
         ApplicationDefinitionKindFilter::SERVICE_FABRIC_APPLICATION_DESCRIPTION,
     );
-    let definitions = client.get_application_list(&app_query).await?;
+    let definitions = client.get_application_list(&app_query, None).await?;
     assert!(journal
         .applications
         .iter()
@@ -159,12 +163,12 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
         let observed = http.services(name).await?;
         let mut query = ServiceQueryDescription::new(ServiceQueryParameters::new(name.parse()?));
         query.paging.max_results = NonZeroU64::new(1);
-        let first = client.get_service_list(&query).await?;
+        let first = client.get_service_list(&query, None).await?;
         assert_eq!(first.items.len(), 1);
         assert!(first.continuation_token.is_some());
         query.paging.continuation_token = first.continuation_token.clone();
         let second = client
-            .get_service_list_with_timeout(&query, Duration::from_secs(30))
+            .get_service_list(&query, Some(Duration::from_secs(30)))
             .await?;
         assert_eq!(second.items.len(), 1);
         assert!(second.continuation_token.is_none());
@@ -200,11 +204,15 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
         query.paging.continuation_token = None;
         query.paging.max_results = None;
         query.parameters.filter = ServiceListFilter::TypeName("ListStateful".into());
-        assert_eq!(client.get_service_list(&query).await?.items.len(), 1);
+        assert_eq!(client.get_service_list(&query, None).await?.items.len(), 1);
         query.parameters.filter = ServiceListFilter::Name(format!("{name}/Stateless").parse()?);
-        assert_eq!(client.get_service_list(&query).await?.items.len(), 1);
+        assert_eq!(client.get_service_list(&query, None).await?.items.len(), 1);
         query.parameters.filter = ServiceListFilter::Name(format!("{name}/Absent").parse()?);
-        assert!(client.get_service_list(&query).await?.items.is_empty());
+        assert!(client
+            .get_service_list(&query, None)
+            .await?
+            .items
+            .is_empty());
         service_observations.extend(observed);
     }
     let app_query = ApplicationQueryDescription::new(ApplicationQueryParameters {
@@ -216,19 +224,22 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     ));
     let node_query = NodeQueryDescription::default();
     let (a, s, n, p) = tokio::join!(
-        client.get_application_list(&app_query),
-        client.get_service_list(&service_query),
-        client.get_node_list(&node_query),
-        client.ping()
+        client.get_application_list(&app_query, None),
+        client.get_service_list(&service_query, None),
+        client.get_node_list(&node_query, None),
+        client.ping(None)
     );
     assert_eq!(a?.items.len(), 2);
     assert_eq!(s?.items.len(), 2);
     assert_eq!(n?.items.len(), 5);
     p?;
     let missing = client
-        .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
-            format!("{}-absent", journal.applications[0]).parse()?,
-        )))
+        .get_service_list(
+            &ServiceQueryDescription::new(ServiceQueryParameters::new(
+                format!("{}-absent", journal.applications[0]).parse()?,
+            )),
+            None,
+        )
         .await;
     let code = match missing {
         Err(Error::Remote { code, .. }) => code,
@@ -238,10 +249,14 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     };
     assert!(!client.is_closed());
     assert_eq!(
-        client.get_application_list(&app_query).await?.items.len(),
+        client
+            .get_application_list(&app_query, None)
+            .await?
+            .items
+            .len(),
         2
     );
-    client.ping().await?;
+    client.ping(None).await?;
     let topology = topology::observe(&client, &http, &journal).await?;
     let deployment = deployment::observe(&client, &http, &journal).await?;
     client.close().await?;

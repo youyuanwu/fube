@@ -22,10 +22,10 @@ async fn mutate(
     journal.record(path, Stage::Pending)?;
     let outcome = if delete {
         client
-            .delete_name_with_timeout(&journal.name, Duration::from_secs(30))
+            .delete_name(&journal.name, Some(Duration::from_secs(30)))
             .await
     } else {
-        client.create_name(&journal.name).await
+        client.create_name(&journal.name, None).await
     };
     settle(journal, path, outcome, expected_error)
 }
@@ -76,20 +76,20 @@ async fn lifecycle() -> Result<Value> {
     confirm_absent(&mut journal, &path, &http).await?;
     let client =
         FabricClient::connect_clear("127.0.0.1:19000".parse()?, Duration::from_secs(30)).await?;
-    assert!(!client.name_exists(&journal.name).await?);
+    assert!(!client.name_exists(&journal.name, None).await?);
     mutate(&client, &mut journal, &path, false, None).await?;
     assert!(http.exists(&journal.name).await?);
-    assert!(client.name_exists(&journal.name).await?);
+    assert!(client.name_exists(&journal.name, None).await?);
     let duplicate = mutate(&client, &mut journal, &path, false, Some(DUPLICATE)).await?;
     assert!(!client.is_closed());
-    assert!(client.name_exists(&journal.name).await?);
+    assert!(client.name_exists(&journal.name, None).await?);
     mutate(&client, &mut journal, &path, true, None).await?;
     assert!(!http.exists(&journal.name).await?);
-    assert!(!client.name_exists(&journal.name).await?);
+    assert!(!client.name_exists(&journal.name, None).await?);
     let missing = mutate(&client, &mut journal, &path, true, Some(MISSING)).await?;
     assert!(!client.is_closed());
-    assert!(!client.name_exists(&journal.name).await?);
-    client.ping().await?;
+    assert!(!client.name_exists(&journal.name, None).await?);
+    client.ping(None).await?;
     client.close().await?;
     Ok(json!({
         "profile": "clear",

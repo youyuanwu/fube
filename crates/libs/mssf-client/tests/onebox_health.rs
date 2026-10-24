@@ -277,7 +277,7 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
             .filter
             .map(|bits| HealthEventsFilter::from_bits_retain(bits).into());
         let start_ms = now_ms();
-        let health = client.get_node_health(&query).await?;
+        let health = client.get_node_health(&query, None).await?;
         let end_ms = now_ms();
         assert_health(&health, snapshot, end_ms);
         evidence.push(
@@ -286,9 +286,10 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
         );
     }
     let error = client
-        .get_node_health(&NodeHealthQueryDescription::new(
-            NodeHealthQueryParameters::new(&config.missing),
-        ))
+        .get_node_health(
+            &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(&config.missing)),
+            None,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -305,13 +306,13 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
     let healthy_query =
         NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(&config.healthy));
     let reused = client
-        .get_node_health_with_timeout(&healthy_query, Duration::from_secs(5))
+        .get_node_health(&healthy_query, Some(Duration::from_secs(5)))
         .await?;
     assert_health(&reused, &config.snapshots[0], now_ms());
     // Poll once then cancel, without claiming that a fast loopback necessarily
     // transmitted the request. Model tests establish deterministic late-reply safety.
     {
-        let pending = client.get_node_health(&healthy_query);
+        let pending = client.get_node_health(&healthy_query, None);
         tokio::pin!(pending);
         poll_fn(|cx| {
             let _ = pending.as_mut().poll(cx);
@@ -325,19 +326,20 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
         let node = config.healthy.clone();
         operations.spawn(async move {
             if index % 3 == 0 {
-                assert!(!client.ping().await.unwrap().node_name.is_empty());
+                assert!(!client.ping(None).await.unwrap().node_name.is_empty());
             } else if index % 3 == 1 {
                 let health = client
-                    .get_node_health(&NodeHealthQueryDescription::new(
-                        NodeHealthQueryParameters::new(node),
-                    ))
+                    .get_node_health(
+                        &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(node)),
+                        None,
+                    )
                     .await
                     .unwrap();
                 assert_eq!(health.aggregated_health_state, HealthState::Ok);
             } else {
                 assert_eq!(
                     client
-                        .get_node_list(&NodeQueryDescription::default())
+                        .get_node_list(&NodeQueryDescription::default(), None)
                         .await
                         .unwrap()
                         .items
@@ -350,7 +352,7 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
     while let Some(result) = operations.join_next().await {
         result?;
     }
-    let final_health = client.get_node_health(&healthy_query).await?;
+    let final_health = client.get_node_health(&healthy_query, None).await?;
     assert_health(&final_health, &config.snapshots[0], now_ms());
     assert!(!client.is_closed());
     client.close().await?;

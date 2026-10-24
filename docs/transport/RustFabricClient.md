@@ -145,8 +145,8 @@ let endpoint = "127.0.0.1:19000".parse().expect("IP socket endpoint");
 let client = FabricClient::connect_clear(endpoint, DEFAULT_TIMEOUT).await?;
 let clone = client.clone();
 let (gateway, exists) = tokio::try_join!(
-    client.ping(),
-    clone.name_exists("fabric:/app/service"),
+    client.ping(None),
+    clone.name_exists("fabric:/app/service", None),
 )?;
 client.close().await?;
 # Ok(())
@@ -158,18 +158,22 @@ Admission allows 32 operations, including completed results not yet delivered
 to their awaiting futures. Excess callers wait within their original deadlines.
 There is no automatic reconnect, retry, or replay.
 
-`create_name(&str)` and `delete_name(&str)` return owned `Result<()>`.
-`create_name_with_timeout(&str, Duration)` and
-`delete_name_with_timeout(&str, Duration)` supply one deadline calculated
-**before URI preparation**, through admission and reply decoding. The default
-variants use the connection's configured timeout. All four reuse the existing
-bounded URI encoder and shared driver; the supported URI grammar is unchanged.
+Every remote operation takes a final `timeout: Option<Duration>` argument.
+`None` uses the default configured by `connect_clear`; `Some(duration)` overrides
+it for that call, including `ping` and `name_exists`. `None` does **not** mean
+infinite. Explicit durations must satisfy the same finite positive bounds as
+the configured default. There are no separate `_with_timeout` methods.
+
+`create_name(name, timeout)` and `delete_name(name, timeout)` return owned
+`Result<()>` and use one deadline calculated **before URI preparation**, through
+admission and reply decoding. Both reuse the existing bounded URI encoder and
+shared driver; the supported URI grammar is unchanged.
 For example, with a unique caller-owned name on a disposable cluster:
 
 ```rust,no_run
 # async fn write(client: &mssf_client::FabricClient, owned_name: &str) -> mssf_client::Result<()> {
-client.create_name_with_timeout(owned_name, std::time::Duration::from_secs(5)).await?;
-client.delete_name(owned_name).await?;
+client.create_name(owned_name, Some(std::time::Duration::from_secs(5))).await?;
+client.delete_name(owned_name, None).await?;
 # Ok(())
 # }
 ```
@@ -353,7 +357,7 @@ let mut query = NodeQueryDescription {
     },
 };
 loop {
-    let page = client.get_node_list(&query).await?;
+    let page = client.get_node_list(&query, None).await?;
     for node in page.items {
         println!("{} {} {:?}", node.name, node.id, node.status);
     }
@@ -367,8 +371,8 @@ loop {
 ```
 
 The operation returns an owned `NodeListPage`; callers choose traversal and
-overall budgets. `get_node_list_with_timeout` supplies a per-request timeout,
-not a whole-traversal deadline. Nodes can change between pages; native
+overall budgets. `get_node_list(&query, Some(duration))` supplies a per-request
+timeout, not a whole-traversal deadline. Nodes can change between pages; native
 aggregation is best-effort when individual subqueries fail. **No continuation
 means paging ended, not proof that every aggregation source answered.**
 
@@ -404,7 +408,7 @@ use mssf_client::{
 let mut query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("N0020"));
 query.parameters.events_filter = Some(HealthEventsFilter::ERROR.into());
 query.parameters.health_policy = Some(NodeHealthPolicy { consider_warning_as_error: true });
-let health = client.get_node_health(&query).await?;
+let health = client.get_node_health(&query, None).await?;
 println!("{:?}", health.aggregated_health_state);
 for evaluation in health.unhealthy_evaluations {
     println!("{evaluation:?}");
@@ -413,7 +417,7 @@ for evaluation in health.unhealthy_evaluations {
 # }
 ```
 
-`get_node_health_with_timeout` uses one deadline from preparation through driver
+`get_node_health` uses one deadline from preparation through driver
 decode, like node-list. `NodeHealth` owns its node name, event vector, aggregate
 `HealthState` and unhealthy evaluations. This is **actual detail health**, not
 `Node.health_state` from GetNodeList. Unhealthy aggregate is successful data;
@@ -486,7 +490,7 @@ let mut applications = ApplicationQueryDescription {
         ..Default::default()
     },
 };
-let page = client.get_application_list(&applications).await?;
+let page = client.get_application_list(&applications, None).await?;
 for application in page.items {
     println!("{} {} {:?}", application.name, application.type_version, application.health_state);
 }
@@ -495,7 +499,7 @@ applications.paging.continuation_token = page.continuation_token;
 
 let mut services = ServiceQueryDescription::new(ServiceQueryParameters::new("fabric:/MyApplication"));
 services.parameters.filter = ServiceListFilter::TypeName("MyServiceType".into());
-let page = client.get_service_list_with_timeout(&services, Duration::from_secs(5)).await?;
+let page = client.get_service_list(&services, Some(Duration::from_secs(5))).await?;
 for service in page.items {
     println!("{} {:?} {:?}", service.name, service.kind, service.status);
 }
@@ -505,8 +509,9 @@ println!("continuation={:?}", page.continuation_token);
 ```
 
 `get_application_list` / `get_service_list` use the connection's configured
-default operation timeout. Both have `_with_timeout` variants with one deadline
-from preparation through admission, write waiting and driver decode. Neither
+default operation timeout when passed `None`, or an override with `Some(duration)`.
+Both use one deadline from preparation through admission, write waiting and
+driver decode. Neither
 automatically pages, retries, reconnects or replays. Native errors stay
 `Error::Remote { code, message }` and permit same-connection reuse; malformed
 successful results retire the shared stream before pending callers can reuse it.
@@ -602,7 +607,7 @@ Three additional list APIs extend discovery beyond applications and services:
 | `get_deployed_application_list` | Applications deployed on one selected node, not the cluster-wide application inventory. |
 
 Each accepts a `PagedQuery`-based description and returns one owned `QueryPage`.
-The corresponding `_with_timeout` variant uses one whole-operation deadline,
+The optional timeout uses one whole-operation deadline,
 including parameter validation and decoding. Continuations are opaque and must
 be followed explicitly; observations across pages and families are not a
 snapshot. Native errors remain operation-local, while malformed replies retire
@@ -621,19 +626,19 @@ use mssf_client::{
 let mut partitions = PartitionQueryDescription::new(PartitionQueryParameters::new(
     "fabric:/MyApplication/MyService".parse()?,
 ));
-let page = client.get_partition_list(&partitions).await?;
+let page = client.get_partition_list(&partitions, None).await?;
 for partition in page.items {
     println!("{} {:?}", partition.partition_information.id, partition.kind);
     let replicas = ReplicaQueryDescription::new(ReplicaQueryParameters::new(
         partition.partition_information.id,
     ));
-    println!("{:?}", client.get_replica_list(&replicas).await?.items);
+    println!("{:?}", client.get_replica_list(&replicas, None).await?.items);
 }
 partitions.paging.continuation_token = page.continuation_token;
 
 let replicas = ReplicaQueryDescription::new(ReplicaQueryParameters::new(partition_id));
 let page = client
-    .get_replica_list_with_timeout(&replicas, Duration::from_secs(5))
+    .get_replica_list(&replicas, Some(Duration::from_secs(5)))
     .await?;
 println!("{:?}", page.items);
 
@@ -641,7 +646,7 @@ let mut deployments = DeployedApplicationQueryDescription::new(
     DeployedApplicationQueryParameters::new("N0010"),
 );
 deployments.parameters.include_health_state = true;
-let page = client.get_deployed_application_list(&deployments).await?;
+let page = client.get_deployed_application_list(&deployments, None).await?;
 println!("{:?}", page.items);
 # Ok(())
 # }
@@ -726,7 +731,7 @@ distinct from the cluster-wide service list and partition-scoped replica list.
 Each takes a `QueryDescription`-based request and returns `Vec<Record>`, not a
 `QueryPage`. The native facade/specifications expose **no paging controls** for
 these queries: there is no `paging`, `MaxResults` or continuation token to set.
-Each also has a `_with_timeout` variant, with the same whole-operation
+Each takes an optional timeout, with the same whole-operation
 deadline, native-error reuse and malformed-response retirement behavior as the
 other queries. There are no retries, reconnects or automatic replay.
 Unpaged description JSON rejects unknown outer fields, including `paging`,
@@ -747,7 +752,7 @@ let application = "fabric:/MyApplication".parse()?;
 let packages = DeployedServicePackageQueryDescription::new(
     DeployedServicePackageQueryParameters::new("N0010", application),
 );
-for package in client.get_deployed_service_package_list(&packages).await? {
+for package in client.get_deployed_service_package_list(&packages, None).await? {
     println!("{} {}", package.service_manifest_name, package.service_manifest_version);
 }
 let mut code = DeployedCodePackageQueryDescription::new(
@@ -755,7 +760,7 @@ let mut code = DeployedCodePackageQueryDescription::new(
 );
 code.parameters.service_manifest_name = Some("MyServiceManifest".into());
 code.parameters.code_package_name = Some("Code".into());
-println!("{:?}", client.get_deployed_code_package_list(&code).await?);
+println!("{:?}", client.get_deployed_code_package_list(&code, None).await?);
 
 let mut replicas = DeployedReplicaQueryDescription::new(
     DeployedReplicaQueryParameters::new("N0010", "fabric:/MyApplication".parse()?),
@@ -763,9 +768,9 @@ let mut replicas = DeployedReplicaQueryDescription::new(
 replicas.parameters.partition_id = Some(uuid::Uuid::parse_str(
     "00112233-4455-6677-8899-aabbccddeeff",
 ).expect("partition UUID"));
-let deployed = client.get_deployed_replica_list_with_timeout(
-    &replicas, Duration::from_secs(5),
-).await?;
+let deployed = client
+    .get_deployed_replica_list(&replicas, Some(Duration::from_secs(5)))
+    .await?;
 println!("{deployed:?}");
 # Ok(())
 # }
@@ -847,7 +852,7 @@ These field/constructor changes require callers to parse their names explicitly;
 Names remain strings in query JSON, with invalid names rejected earlier; the
 query-field JSON migration is described above.
 Naming methods accept `impl AsRef<str>`, so both existing string calls and
-`client.name_exists(&name)` with a `NamingUri` are supported.
+`client.name_exists(&name, None)` with a `NamingUri` are supported.
 
 | Resource | Limit |
 |---|---:|

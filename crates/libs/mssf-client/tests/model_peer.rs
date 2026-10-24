@@ -200,7 +200,7 @@ async fn sequential_ping_and_naming_use_native_headers_and_keep_bool_independent
         .await
         .unwrap();
     assert_eq!(
-        client.ping().await.unwrap(),
+        client.ping(None).await.unwrap(),
         GatewayDescription {
             address: "10.0.0.2:19000".into(),
             node_id: NODE_ID,
@@ -210,7 +210,10 @@ async fn sequential_ping_and_naming_use_native_headers_and_keep_bool_independent
     );
     for expected in [true, false, true, false] {
         assert_eq!(
-            client.name_exists("fabric:/App_1/Service-2").await.unwrap(),
+            client
+                .name_exists("fabric:/App_1/Service-2", None)
+                .await
+                .unwrap(),
             expected
         );
         assert!(!client.is_closed());
@@ -218,8 +221,205 @@ async fn sequential_ping_and_naming_use_native_headers_and_keep_bool_independent
     client.close().await.unwrap();
     assert!(client.is_closed());
     client.close().await.unwrap();
-    assert!(matches!(client.ping().await, Err(Error::Closed)));
+    assert!(matches!(client.ping(None).await, Err(Error::Closed)));
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn all_operations_select_optional_timeout_and_reject_invalid_overrides_without_sending() {
+    use mssf_client::{
+        DeployedApplicationQueryDescription, DeployedApplicationQueryParameters,
+        DeployedCodePackageQueryDescription, DeployedCodePackageQueryParameters,
+        DeployedReplicaQueryDescription, DeployedReplicaQueryParameters,
+        DeployedServicePackageQueryDescription, DeployedServicePackageQueryParameters,
+        NodeHealthQueryDescription, NodeHealthQueryParameters, PartitionQueryDescription,
+        PartitionQueryParameters, ReplicaQueryDescription, ReplicaQueryParameters,
+        ServiceQueryDescription, ServiceQueryParameters,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut stream = establish(listener).await;
+        for budget in [
+            TIMEOUT_DURATION,
+            Duration::from_secs(1),
+            Duration::from_secs(6),
+        ] {
+            for _ in 0..14 {
+                let request = read_message(&mut stream).await.unwrap();
+                let ticks = request
+                    .headers
+                    .iter()
+                    .find(|header| header.id == TIMEOUT)
+                    .unwrap()
+                    .read(|decoder| decoder.i64())
+                    .unwrap();
+                let lower = (budget - Duration::from_secs(1)).as_nanos() as i64 / 100;
+                let upper = budget.as_nanos() as i64 / 100;
+                assert!(
+                    ticks > lower && ticks <= upper,
+                    "{ticks}: budget {budget:?}"
+                );
+                let mut response = reply(&request, "ClientOperationFailure", vec![]);
+                response.headers.push(
+                    Header::object(FAULT, |encoder| {
+                        encoder.i64(REMOTE_CODE);
+                        encoder.boolean(false);
+                        Ok(())
+                    })
+                    .unwrap(),
+                );
+                write_message(&mut stream, &response).await.unwrap();
+            }
+        }
+        let request = read_message(&mut stream).await.unwrap();
+        assert_eq!(request.properties().unwrap().action, "PingRequest");
+        let mut response = reply(&request, "PingRequest", ping_body());
+        response.headers.push(Header::version(1, 1).unwrap());
+        write_message(&mut stream, &response).await.unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    });
+    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+        .await
+        .unwrap();
+    for (timeout, valid) in [
+        (None, true),
+        (Some(Duration::from_secs(1)), true),
+        (Some(Duration::from_secs(6)), true),
+        (Some(Duration::ZERO), false),
+        (Some(Duration::from_nanos(99)), false),
+        (Some(Duration::MAX), false),
+    ] {
+        macro_rules! check {
+            ($method:ident $(, $argument:expr)?) => {
+                let result = client.$method($($argument,)? timeout).await;
+                if valid {
+                    assert!(matches!(
+                        result,
+                        Err(Error::Remote { code: REMOTE_CODE, .. })
+                    ), "{}: {result:?}", stringify!($method));
+                } else {
+                    assert!(matches!(result, Err(Error::InvalidInput(_))),
+                        "{}: {result:?}", stringify!($method));
+                }
+                assert!(!client.is_closed());
+            };
+        }
+        check!(ping);
+        check!(name_exists, "fabric:/Model");
+        check!(create_name, "fabric:/Model");
+        check!(delete_name, "fabric:/Model");
+        check!(get_node_list, &Default::default());
+        check!(
+            get_node_health,
+            &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("N0010"))
+        );
+        check!(get_application_list, &Default::default());
+        check!(
+            get_service_list,
+            &ServiceQueryDescription::new(ServiceQueryParameters::new(
+                "fabric:/Model".parse().unwrap()
+            ))
+        );
+        check!(
+            get_partition_list,
+            &PartitionQueryDescription::new(PartitionQueryParameters::new(
+                "fabric:/Model/Service".parse().unwrap()
+            ))
+        );
+        check!(
+            get_replica_list,
+            &ReplicaQueryDescription::new(ReplicaQueryParameters::new(
+                uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap()
+            ))
+        );
+        check!(
+            get_deployed_application_list,
+            &DeployedApplicationQueryDescription::new(DeployedApplicationQueryParameters::new(
+                "N0010"
+            ))
+        );
+        check!(
+            get_deployed_service_package_list,
+            &DeployedServicePackageQueryDescription::new(
+                DeployedServicePackageQueryParameters::new(
+                    "N0010",
+                    "fabric:/Model".parse().unwrap()
+                )
+            )
+        );
+        check!(
+            get_deployed_code_package_list,
+            &DeployedCodePackageQueryDescription::new(DeployedCodePackageQueryParameters::new(
+                "N0010",
+                "fabric:/Model".parse().unwrap()
+            ))
+        );
+        check!(
+            get_deployed_replica_list,
+            &DeployedReplicaQueryDescription::new(DeployedReplicaQueryParameters::new(
+                "N0010",
+                "fabric:/Model".parse().unwrap()
+            ))
+        );
+    }
+    client.ping(None).await.unwrap();
+    client.close().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn ping_and_name_exists_timeout_overrides_expire_without_retiring_connection() {
+    for ping in [true, false] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut stream = establish(listener).await;
+            let expired = read_message(&mut stream).await.unwrap();
+            assert_eq!(
+                expired.properties().unwrap().action,
+                if ping {
+                    "PingRequest"
+                } else {
+                    "NameExistsRequest"
+                }
+            );
+            release_rx.await.unwrap();
+            write_message(&mut stream, &reply(&expired, "late-reply", vec![]))
+                .await
+                .unwrap();
+            let request = read_message(&mut stream).await.unwrap();
+            assert_eq!(request.properties().unwrap().action, "PingRequest");
+            let mut response = reply(&request, "PingRequest", ping_body());
+            response.headers.push(Header::version(1, 1).unwrap());
+            write_message(&mut stream, &response).await.unwrap();
+            assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+        });
+        let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            let timeout = Some(Duration::from_millis(250));
+            if ping {
+                client.ping(timeout).await.map(|_| ())
+            } else {
+                client
+                    .name_exists("fabric:/Model", timeout)
+                    .await
+                    .map(|_| ())
+            }
+        })
+        .await
+        .expect("override must expire before the configured three-second default");
+        assert!(matches!(result, Err(Error::Timeout)));
+        assert!(!client.is_closed());
+        release_tx.send(()).unwrap();
+        client.ping(None).await.unwrap();
+        client.close().await.unwrap();
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -241,7 +441,7 @@ async fn malformed_naming_success_never_returns_absent_and_closes() {
         let (client, server) =
             single_reply(move |request| reply(request, "NameOperationReply", bytes)).await;
         assert!(matches!(
-            client.name_exists("fabric:/a").await,
+            client.name_exists("fabric:/a", None).await,
             Err(Error::Protocol(_))
         ));
         assert!(client.is_closed());
@@ -291,7 +491,7 @@ async fn malformed_ping_success_requires_every_identity_field() {
             response
         })
         .await;
-        assert!(matches!(client.ping().await, Err(Error::Protocol(_))));
+        assert!(matches!(client.ping(None).await, Err(Error::Protocol(_))));
         assert!(client.is_closed());
         server.await.unwrap();
     }
@@ -317,7 +517,7 @@ async fn empty_gateway_identity_is_not_a_success() {
             response
         })
         .await;
-        assert!(matches!(client.ping().await, Err(Error::Protocol(_))));
+        assert!(matches!(client.ping(None).await, Err(Error::Protocol(_))));
         assert!(client.is_closed());
         server.await.unwrap();
     }
@@ -342,7 +542,7 @@ async fn ping_requires_compatible_version_action_and_actor() {
             response
         })
         .await;
-        assert!(matches!(client.ping().await, Err(Error::Protocol(_))));
+        assert!(matches!(client.ping(None).await, Err(Error::Protocol(_))));
         assert!(client.is_closed());
         server.await.unwrap();
     }
@@ -358,7 +558,7 @@ async fn ping_requires_compatible_version_action_and_actor() {
             response
         })
         .await;
-        assert!(matches!(client.ping().await, Err(Error::Protocol(_))));
+        assert!(matches!(client.ping(None).await, Err(Error::Protocol(_))));
         assert!(client.is_closed());
         server.await.unwrap();
     }
@@ -374,7 +574,7 @@ async fn naming_rejects_wrong_success_action_or_actor() {
         })
         .await;
         assert!(matches!(
-            client.name_exists("fabric:/a").await,
+            client.name_exists("fabric:/a", None).await,
             Err(Error::Protocol(_))
         ));
         assert!(client.is_closed());
@@ -444,7 +644,7 @@ async fn transport_fault_preserves_error_with_optional_malformed_details() {
             response
         })
         .await;
-        match client.name_exists("fabric:/a").await {
+        match client.name_exists("fabric:/a", None).await {
             Err(Error::Remote { code, message }) => {
                 assert_eq!(code, expected_code);
                 assert!(message.contains(diagnostic), "{message}");
@@ -483,7 +683,7 @@ async fn operation_failure_is_not_reject_fault_and_retains_readable_code() {
     ] {
         let (client, server) =
             single_reply(move |request| reply(request, "ClientOperationFailure", bytes)).await;
-        match client.ping().await {
+        match client.ping(None).await {
             Err(Error::Remote { code, message }) => {
                 assert_eq!(code, REMOTE_CODE);
                 assert!(message.contains(expected_diagnostic));
@@ -503,7 +703,7 @@ async fn operation_failure_is_not_reject_fault_and_retains_readable_code() {
         let (client, server) =
             single_reply(move |request| reply(request, "ClientOperationFailure", bytes)).await;
         assert!(matches!(
-            client.name_exists("fabric:/a").await,
+            client.name_exists("fabric:/a", None).await,
             Err(Error::Protocol(_))
         ));
         assert!(client.is_closed());
@@ -540,19 +740,19 @@ async fn input_error_does_not_send_and_native_error_does_not_poison_complete_str
         .await
         .unwrap();
     assert!(matches!(
-        client.name_exists("fabric:/invalid?").await,
+        client.name_exists("fabric:/invalid?", None).await,
         Err(Error::InvalidInput(_))
     ));
     assert!(!client.is_closed());
     assert!(matches!(
-        client.name_exists("fabric:/a").await,
+        client.name_exists("fabric:/a", None).await,
         Err(Error::Remote {
             code: REMOTE_CODE,
             ..
         })
     ));
     assert!(!client.is_closed());
-    assert!(!client.name_exists("fabric:/a").await.unwrap());
+    assert!(!client.name_exists("fabric:/a", None).await.unwrap());
     client.close().await.unwrap();
     assert!(client.is_closed());
     server.await.unwrap();
@@ -939,7 +1139,9 @@ mod node_queries {
             })
             .await;
             assert!(matches!(
-                client.get_node_list(&NodeQueryDescription::default()).await,
+                client
+                    .get_node_list(&NodeQueryDescription::default(), None)
+                    .await,
                 Err(Error::Protocol(_))
             ));
             assert!(client.is_closed());
@@ -1047,7 +1249,7 @@ mod node_queries {
             .unwrap();
         for (query, _) in cases {
             assert_eq!(
-                client.get_node_list(&query).await.unwrap(),
+                client.get_node_list(&query, None).await.unwrap(),
                 NodeListPage {
                     items: vec![],
                     continuation_token: None,
@@ -1070,7 +1272,7 @@ mod node_queries {
         .await;
         assert_eq!(
             client
-                .get_node_list(&NodeQueryDescription::default())
+                .get_node_list(&NodeQueryDescription::default(), None)
                 .await
                 .unwrap(),
             NodeListPage {
@@ -1097,7 +1299,7 @@ mod node_queries {
             task.intent = NodeDeactivationIntent::Unrecognized(i64::MAX - 1);
         }
         let page = client
-            .get_node_list(&NodeQueryDescription::default())
+            .get_node_list(&NodeQueryDescription::default(), None)
             .await
             .unwrap();
         assert_eq!(page.items, vec![expected]);
@@ -1142,17 +1344,17 @@ mod node_queries {
             },
             ..Default::default()
         };
-        let first = client.get_node_list(&query).await.unwrap();
+        let first = client.get_node_list(&query, None).await.unwrap();
         assert_eq!(first.items, vec![expected_node()]);
         assert_eq!(first.continuation_token.as_deref(), Some("server-token"));
         query.paging.continuation_token = first.continuation_token;
-        let terminal = client.get_node_list(&query).await.unwrap();
+        let terminal = client.get_node_list(&query, None).await.unwrap();
         assert_eq!(terminal.items.len(), 1);
         assert_eq!(terminal.continuation_token, None);
         query.paging.continuation_token = None;
         assert_eq!(
             client
-                .get_node_list(&query)
+                .get_node_list(&query, None)
                 .await
                 .unwrap()
                 .continuation_token,
@@ -1187,7 +1389,7 @@ mod node_queries {
                 ..Default::default()
             };
             assert!(matches!(
-                client.get_node_list(&query).await,
+                client.get_node_list(&query, None).await,
                 Err(Error::InvalidInput(_))
             ));
             assert!(!client.is_closed());
@@ -1206,7 +1408,7 @@ mod node_queries {
             },
         ] {
             assert!(matches!(
-                client.get_node_list(&query).await,
+                client.get_node_list(&query, None).await,
                 Err(Error::InvalidInput(_))
             ));
             assert!(!client.is_closed());
@@ -1214,14 +1416,14 @@ mod node_queries {
         for timeout in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
             assert!(matches!(
                 client
-                    .get_node_list_with_timeout(&NodeQueryDescription::default(), timeout)
+                    .get_node_list(&NodeQueryDescription::default(), Some(timeout))
                     .await,
                 Err(Error::InvalidInput(_))
             ));
             assert!(!client.is_closed());
         }
         assert!(client
-            .get_node_list(&NodeQueryDescription::default())
+            .get_node_list(&NodeQueryDescription::default(), None)
             .await
             .unwrap()
             .items
@@ -1233,7 +1435,9 @@ mod node_queries {
     async fn assert_malformed_success(bytes: Vec<u8>, label: &str) {
         let (client, server) = single_reply(move |request| node_reply(request, bytes)).await;
         let clone = client.clone();
-        let result = client.get_node_list(&NodeQueryDescription::default()).await;
+        let result = client
+            .get_node_list(&NodeQueryDescription::default(), None)
+            .await;
         assert!(
             matches!(result, Err(Error::Protocol(_))),
             "{label}: {result:?}"
@@ -1241,7 +1445,7 @@ mod node_queries {
         assert!(client.is_closed(), "{label}");
         assert!(clone.is_closed(), "{label}");
         assert!(
-            matches!(clone.ping().await, Err(Error::Protocol(_))),
+            matches!(clone.ping(None).await, Err(Error::Protocol(_))),
             "{label}"
         );
         assert!(
@@ -1418,7 +1622,7 @@ mod node_queries {
             })
             .await;
             assert!(client
-                .get_node_list(&NodeQueryDescription::default())
+                .get_node_list(&NodeQueryDescription::default(), None)
                 .await
                 .unwrap()
                 .items
@@ -1436,7 +1640,9 @@ mod node_queries {
             })
             .await;
             assert!(matches!(
-                client.get_node_list(&NodeQueryDescription::default()).await,
+                client
+                    .get_node_list(&NodeQueryDescription::default(), None)
+                    .await,
                 Err(Error::Protocol(_))
             ));
             assert!(client.is_closed());
@@ -1515,7 +1721,10 @@ mod node_queries {
         .into_iter()
         .enumerate()
         {
-            match client.get_node_list(&NodeQueryDescription::default()).await {
+            match client
+                .get_node_list(&NodeQueryDescription::default(), None)
+                .await
+            {
                 Err(Error::Remote { code, message }) => {
                     assert_eq!(code, REMOTE_CODE - index as i64);
                     assert_eq!(message, diagnostic);
@@ -1523,11 +1732,11 @@ mod node_queries {
                 result => panic!("fault {index} became {result:?}"),
             }
             assert!(!client.is_closed());
-            assert_eq!(client.ping().await.unwrap().node_id, NODE_ID);
+            assert_eq!(client.ping(None).await.unwrap().node_id, NODE_ID);
             assert!(!client.is_closed());
         }
         assert!(client
-            .get_node_list(&NodeQueryDescription::default())
+            .get_node_list(&NodeQueryDescription::default(), None)
             .await
             .unwrap()
             .items
@@ -1562,8 +1771,8 @@ mod node_queries {
             .unwrap();
         let clone = client.clone();
         let query = NodeQueryDescription::default();
-        let nodes = client.get_node_list(&query);
-        let neighbor = clone.name_exists("fabric:/neighbor");
+        let nodes = client.get_node_list(&query, None);
+        let neighbor = clone.name_exists("fabric:/neighbor", None);
         tokio::pin!(nodes, neighbor);
         poll_fn(|cx| {
             assert!(nodes.as_mut().poll(cx).is_pending());
@@ -1581,7 +1790,7 @@ mod node_queries {
         assert!(matches!(nodes.await, Err(Error::Protocol(_))));
         assert!(matches!(neighbor.await, Err(Error::Protocol(_))));
         assert!(clone.is_closed());
-        assert!(matches!(clone.ping().await, Err(Error::Protocol(_))));
+        assert!(matches!(clone.ping(None).await, Err(Error::Protocol(_))));
         client.close().await.unwrap();
         server.await.unwrap();
     }
@@ -1645,10 +1854,10 @@ mod node_queries {
             ..Default::default()
         });
         let (a_page, b_page, exists, gateway) = tokio::join!(
-            a_client.get_node_list(&a),
-            b_client.get_node_list(&b),
-            name_client.name_exists("fabric:/App"),
-            ping_client.ping(),
+            a_client.get_node_list(&a, None),
+            b_client.get_node_list(&b, None),
+            name_client.name_exists("fabric:/App", None),
+            ping_client.ping(None),
         );
         assert_eq!(
             a_page.unwrap(),
@@ -1667,7 +1876,7 @@ mod node_queries {
         assert!(exists.unwrap());
         assert_eq!(gateway.unwrap().node_id, NODE_ID);
         assert!(!client.is_closed());
-        assert_eq!(client.ping().await.unwrap().node_id, NODE_ID);
+        assert_eq!(client.ping(None).await.unwrap().node_id, NODE_ID);
         client.close().await.unwrap();
         server.await.unwrap();
     }
@@ -1717,19 +1926,21 @@ mod node_queries {
             let query_client = client.clone();
             let nodes = tokio::spawn(async move {
                 query_client
-                    .get_node_list_with_timeout(
+                    .get_node_list(
                         &NodeQueryDescription::default(),
-                        if cancel {
+                        Some(if cancel {
                             TIMEOUT_DURATION
                         } else {
                             Duration::from_millis(250)
-                        },
+                        }),
                     )
                     .await
             });
             let name_client = client.clone();
             let neighbor =
-                tokio::spawn(async move { name_client.name_exists("fabric:/neighbor").await });
+                tokio::spawn(
+                    async move { name_client.name_exists("fabric:/neighbor", None).await },
+                );
             tokio::time::timeout(TIMEOUT_DURATION, observed_rx)
                 .await
                 .unwrap()
@@ -1746,7 +1957,7 @@ mod node_queries {
             assert!(!client.is_closed());
             assert_eq!(
                 client
-                    .get_node_list(&NodeQueryDescription::default())
+                    .get_node_list(&NodeQueryDescription::default(), None)
                     .await
                     .unwrap(),
                 NodeListPage {

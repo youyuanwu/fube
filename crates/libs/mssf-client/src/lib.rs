@@ -62,6 +62,22 @@ pub struct GatewayDescription {
 /// Cloneable client for the native clear-TCP development profile.
 ///
 /// Clones share one continuously driven connection and its terminal state.
+/// Every remote operation accepts an optional whole-operation timeout:
+/// `None` uses the timeout configured by [`Self::connect_clear`], while
+/// `Some(duration)` overrides it for that call. `None` is not an infinite timeout.
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use mssf_client::{FabricClient, DEFAULT_TIMEOUT};
+///
+/// # async fn example() -> mssf_client::Result<()> {
+/// let client = FabricClient::connect_clear("127.0.0.1:19000".parse().unwrap(), DEFAULT_TIMEOUT).await?;
+/// let gateway = client.ping(None).await?;
+/// let exists = client.name_exists("fabric:/MyApplication", Some(Duration::from_secs(5))).await?;
+/// client.close().await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct FabricClient {
     connection: Connection,
@@ -71,8 +87,8 @@ pub struct FabricClient {
 impl FabricClient {
     /// Connect explicitly without TLS or authentication.
     ///
-    /// `timeout` also bounds each subsequent operation. There is no insecure
-    /// fallback, automatic reconnect, or replay.
+    /// `timeout` also supplies the default for subsequent operations that pass
+    /// `None`. There is no insecure fallback, automatic reconnect, or replay.
     pub async fn connect_clear(endpoint: SocketAddr, timeout: Duration) -> Result<Self> {
         let deadline = deadline_after(timeout)?;
         let connection = Connection::connect_clear(endpoint, deadline).await?;
@@ -83,8 +99,8 @@ impl FabricClient {
     }
 
     /// Discover the native gateway's full node identity.
-    pub async fn ping(&self) -> Result<GatewayDescription> {
-        let deadline = deadline_after(self.timeout)?;
+    pub async fn ping(&self, timeout: Option<Duration>) -> Result<GatewayDescription> {
+        let deadline = self.deadline(timeout)?;
         self.request("PingRequest", Vec::new(), deadline, |reply| {
             protocol::decode_ping(&reply)
         })
@@ -98,8 +114,12 @@ impl FabricClient {
     /// Root, authority, escapes, query, fragment, whitespace, Unicode, and
     /// trailing or repeated slashes are rejected rather than normalized.
     /// Accepts a [`NamingUri`] or a string checked before sending.
-    pub async fn name_exists(&self, name: impl AsRef<str>) -> Result<bool> {
-        let deadline = deadline_after(self.timeout)?;
+    pub async fn name_exists(
+        &self,
+        name: impl AsRef<str>,
+        timeout: Option<Duration>,
+    ) -> Result<bool> {
+        let deadline = self.deadline(timeout)?;
         let body = protocol::encode_name(name.as_ref())?;
         self.request("NameExistsRequest", body, deadline, |reply| {
             protocol::decode_name_exists(&reply)
@@ -107,7 +127,7 @@ impl FabricClient {
         .await
     }
 
-    /// Explicitly create a naming entry using the default timeout.
+    /// Explicitly create a naming entry with one deadline from preparation through decode.
     ///
     /// Uses the same supported URI profile as [`Self::name_exists`]. Native
     /// creation may create implicit ancestors or promote an implicit entry;
@@ -116,19 +136,12 @@ impl FabricClient {
     /// No retry or replay occurs. After sending, timeout, cancellation or
     /// disconnection can leave the write outcome unknown: stopping local
     /// waiting does not prove that the name was not created.
-    pub async fn create_name(&self, name: impl AsRef<str>) -> Result<()> {
-        self.create_name_with_timeout(name, self.timeout).await
-    }
-
-    /// Create a name with one deadline covering preparation through decode.
-    ///
-    /// See [`Self::create_name`] for native semantics and post-send uncertainty.
-    pub async fn create_name_with_timeout(
+    pub async fn create_name(
         &self,
         name: impl AsRef<str>,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<()> {
-        let deadline = deadline_after(timeout)?;
+        let deadline = self.deadline(timeout)?;
         let body = protocol::encode_name(name.as_ref())?;
         self.request("CreateNameRequest", body, deadline, |reply| {
             protocol::decode_name_write(&reply)
@@ -136,7 +149,7 @@ impl FabricClient {
         .await
     }
 
-    /// Explicitly delete one naming entry using the default timeout.
+    /// Explicitly delete one naming entry with one deadline from preparation through decode.
     ///
     /// Uses the same URI profile as [`Self::name_exists`]. This is not recursive:
     /// native missing-name and nonempty-name failures remain errors. The service
@@ -145,19 +158,12 @@ impl FabricClient {
     /// No retry or replay occurs. After sending, timeout, cancellation or
     /// disconnection can leave the write outcome unknown; none proves that
     /// deletion did not execute. Native errors are not converted to success.
-    pub async fn delete_name(&self, name: impl AsRef<str>) -> Result<()> {
-        self.delete_name_with_timeout(name, self.timeout).await
-    }
-
-    /// Delete a name with one deadline covering preparation through decode.
-    ///
-    /// See [`Self::delete_name`] for native semantics and post-send uncertainty.
-    pub async fn delete_name_with_timeout(
+    pub async fn delete_name(
         &self,
         name: impl AsRef<str>,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<()> {
-        let deadline = deadline_after(timeout)?;
+        let deadline = self.deadline(timeout)?;
         let body = protocol::encode_name(name.as_ref())?;
         let headers = vec![Header::boolean(protocol::DELETE_NAME_HEADER, true)?];
         self.request_with_headers("DeleteNameRequest", headers, body, deadline, |reply| {
@@ -170,16 +176,11 @@ impl FabricClient {
     /// explicit page limit: the server can also page by message size.
     ///
     /// This is best-effort native aggregation, not a membership snapshot.
-    pub async fn get_node_list(&self, query: &NodeQueryDescription) -> Result<NodeListPage> {
-        self.get_node_list_with_timeout(query, self.timeout).await
-    }
-
-    /// Get one page using one deadline covering encoding, admission and reply.
     /// No automatic paging, retry, reconnect or replay occurs.
-    pub async fn get_node_list_with_timeout(
+    pub async fn get_node_list(
         &self,
         query: &NodeQueryDescription,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<NodeListPage> {
         self.query(&query.parameters, Some(&query.paging), timeout)
             .await
@@ -187,103 +188,67 @@ impl FabricClient {
 
     /// Query actual single-node health, events and unhealthy explanations.
     /// This is not GetNodeList's summary. No paging or automatic retries occur.
-    pub async fn get_node_health(&self, query: &NodeHealthQueryDescription) -> Result<NodeHealth> {
-        self.get_node_health_with_timeout(query, self.timeout).await
-    }
-
-    /// Query node health with one deadline covering preparation through decode.
+    ///
     /// Native errors are operation-local; malformed successful responses retire
     /// the shared connection. See [`NodeHealthQueryDescription`] for defaults.
-    pub async fn get_node_health_with_timeout(
+    pub async fn get_node_health(
         &self,
         query: &NodeHealthQueryDescription,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<NodeHealth> {
         self.query(&query.parameters, None, timeout).await
     }
 
-    /// Get one application page using the configured default deadline.
+    /// Get one native application page with one whole-operation deadline.
     /// Filters are mutually exclusive; parameters are included by default.
+    ///
+    /// No retries or automatic traversal. Malformed successes retire the stream;
+    /// normal native errors remain operation-local.
     pub async fn get_application_list(
         &self,
         query: &ApplicationQueryDescription,
-    ) -> Result<ApplicationListPage> {
-        self.get_application_list_with_timeout(query, self.timeout)
-            .await
-    }
-
-    /// Get one native application page with an explicit whole-operation timeout.
-    /// No retries or automatic traversal. Malformed successes retire the stream;
-    /// normal native errors remain operation-local.
-    pub async fn get_application_list_with_timeout(
-        &self,
-        query: &ApplicationQueryDescription,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<ApplicationListPage> {
         self.query(&query.parameters, Some(&query.paging), timeout)
             .await
     }
 
-    /// Get one ordinary application-scoped service page with the default timeout.
+    /// Get one ordinary application-scoped service page with one whole-operation deadline.
     /// Ad-hoc/root and System profiles are explicitly unsupported.
+    ///
+    /// Count is a native per-subquery limit, not a strict CM/FM union cap.
     pub async fn get_service_list(
         &self,
         query: &ServiceQueryDescription,
-    ) -> Result<ServiceListPage> {
-        self.get_service_list_with_timeout(query, self.timeout)
-            .await
-    }
-
-    /// Get one service page with an explicit whole-operation timeout.
-    /// Count is a native per-subquery limit, not a strict CM/FM union cap.
-    pub async fn get_service_list_with_timeout(
-        &self,
-        query: &ServiceQueryDescription,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<ServiceListPage> {
         self.query(&query.parameters, Some(&query.paging), timeout)
             .await
     }
 
-    /// Get one partition page for a service using the default timeout.
+    /// Get one partition page for a service with one whole-operation deadline.
     /// Results describe observed partition state, not service endpoint resolution.
+    ///
+    /// Native partition paging supports continuation tokens, not MaxResults.
+    /// No automatic paging, retries, reconnect or replay occurs.
     pub async fn get_partition_list(
         &self,
         query: &PartitionQueryDescription,
-    ) -> Result<PartitionListPage> {
-        self.get_partition_list_with_timeout(query, self.timeout)
-            .await
-    }
-
-    /// Get one partition page with an explicit whole-operation timeout.
-    /// Native partition paging supports continuation tokens, not MaxResults.
-    /// No automatic paging, retries, reconnect or replay occurs.
-    pub async fn get_partition_list_with_timeout(
-        &self,
-        query: &PartitionQueryDescription,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<PartitionListPage> {
         self.query(&query.parameters, Some(&query.paging), timeout)
             .await
     }
 
     /// Get one replica or stateless instance page for a partition.
-    /// Uses the default timeout; callers inspect and follow continuation tokens.
+    /// Callers inspect and follow continuation tokens within their own overall budget.
+    ///
+    /// Native replica paging supports continuation tokens, not MaxResults.
+    /// No automatic paging, retries, reconnect or replay occurs.
     pub async fn get_replica_list(
         &self,
         query: &ReplicaQueryDescription,
-    ) -> Result<ReplicaListPage> {
-        self.get_replica_list_with_timeout(query, self.timeout)
-            .await
-    }
-
-    /// Get one replica/instance page with an explicit whole-operation timeout.
-    /// Native replica paging supports continuation tokens, not MaxResults.
-    /// No automatic paging, retries, reconnect or replay occurs.
-    pub async fn get_replica_list_with_timeout(
-        &self,
-        query: &ReplicaQueryDescription,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<ReplicaListPage> {
         self.query(&query.parameters, Some(&query.paging), timeout)
             .await
@@ -291,20 +256,12 @@ impl FabricClient {
 
     /// Get one deployed application page on a selected node.
     /// This is node-local deployment state, not the cluster-wide application list.
+    ///
+    /// No automatic paging, retries, reconnect or replay occurs.
     pub async fn get_deployed_application_list(
         &self,
         query: &DeployedApplicationQueryDescription,
-    ) -> Result<DeployedApplicationListPage> {
-        self.get_deployed_application_list_with_timeout(query, self.timeout)
-            .await
-    }
-
-    /// Get one deployment page with an explicit whole-operation timeout.
-    /// No automatic paging, retries, reconnect or replay occurs.
-    pub async fn get_deployed_application_list_with_timeout(
-        &self,
-        query: &DeployedApplicationQueryDescription,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DeployedApplicationListPage> {
         self.query(&query.parameters, Some(&query.paging), timeout)
             .await
@@ -312,60 +269,36 @@ impl FabricClient {
 
     /// List service packages deployed for one application on a selected node.
     /// This native query is unpaged and does not provide a cluster snapshot.
+    ///
+    /// No automatic retries, reconnect or replay occurs.
     pub async fn get_deployed_service_package_list(
         &self,
         query: &DeployedServicePackageQueryDescription,
-    ) -> Result<Vec<DeployedServicePackage>> {
-        self.get_deployed_service_package_list_with_timeout(query, self.timeout)
-            .await
-    }
-
-    /// List deployed service packages with an explicit whole-operation timeout.
-    /// No automatic retries, reconnect or replay occurs.
-    pub async fn get_deployed_service_package_list_with_timeout(
-        &self,
-        query: &DeployedServicePackageQueryDescription,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Vec<DeployedServicePackage>> {
         self.query(&query.parameters, None, timeout).await
     }
 
     /// List code packages deployed for one application on a selected node.
     /// Includes setup/main entry points, statistics and host details; no paging.
+    ///
+    /// Native errors remain operation-local; malformed successes retire the stream.
     pub async fn get_deployed_code_package_list(
         &self,
         query: &DeployedCodePackageQueryDescription,
-    ) -> Result<Vec<DeployedCodePackage>> {
-        self.get_deployed_code_package_list_with_timeout(query, self.timeout)
-            .await
-    }
-
-    /// List deployed code packages with an explicit whole-operation timeout.
-    /// Native errors remain operation-local; malformed successes retire the stream.
-    pub async fn get_deployed_code_package_list_with_timeout(
-        &self,
-        query: &DeployedCodePackageQueryDescription,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Vec<DeployedCodePackage>> {
         self.query(&query.parameters, None, timeout).await
     }
 
     /// List replicas or stateless instances deployed on one node for an application.
     /// Includes activation, host and reconfiguration details; not endpoint resolution.
+    ///
+    /// No paging, automatic retries, reconnect or replay occurs.
     pub async fn get_deployed_replica_list(
         &self,
         query: &DeployedReplicaQueryDescription,
-    ) -> Result<Vec<DeployedReplica>> {
-        self.get_deployed_replica_list_with_timeout(query, self.timeout)
-            .await
-    }
-
-    /// List deployed replicas with an explicit whole-operation timeout.
-    /// No paging, automatic retries, reconnect or replay occurs.
-    pub async fn get_deployed_replica_list_with_timeout(
-        &self,
-        query: &DeployedReplicaQueryDescription,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Vec<DeployedReplica>> {
         self.query(&query.parameters, None, timeout).await
     }
@@ -385,13 +318,17 @@ impl FabricClient {
         self.connection.terminal_error()
     }
 
+    fn deadline(&self, timeout: Option<Duration>) -> Result<Instant> {
+        deadline_after(timeout.unwrap_or(self.timeout))
+    }
+
     async fn query<Q: query_protocol::Query>(
         &self,
         parameters: &Q,
         paging: Option<&Paging>,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Q::Output> {
-        let deadline = deadline_after(timeout)?;
+        let deadline = self.deadline(timeout)?;
         let body = query_protocol::encode_query(parameters, paging)?;
         self.request("QueryRequest", body, deadline, |reply| {
             query_protocol::decode_reply::<Q>(&reply)

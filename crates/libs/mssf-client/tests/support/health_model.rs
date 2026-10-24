@@ -217,7 +217,7 @@ async fn health_options_encode_sorted_json_and_preserve_omission_false_and_raw_b
             consider_warning_as_error: value,
         });
         query.parameters.events_filter = filter.map(Into::into);
-        let value = client.get_node_health(&query).await.unwrap();
+        let value = client.get_node_health(&query, None).await.unwrap();
         assert_eq!(value.node_name, query.parameters.node_name);
         assert!(value.health_events.is_empty());
         assert!(value.unhealthy_evaluations.is_empty());
@@ -247,9 +247,10 @@ async fn health_complete_owned_data_and_unknown_scalars_retain_native_values() {
         let (client, server) =
             single_reply(move |request| health_reply(request, result(shape, 0))).await;
         let value = client
-            .get_node_health(&NodeHealthQueryDescription::new(
-                NodeHealthQueryParameters::new("Node_Å😀"),
-            ))
+            .get_node_health(
+                &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("Node_Å😀")),
+                None,
+            )
             .await
             .unwrap();
         server.await.unwrap();
@@ -296,14 +297,15 @@ async fn malformed(bytes: Vec<u8>) {
     let clone = client.clone();
     assert!(matches!(
         client
-            .get_node_health(&NodeHealthQueryDescription::new(
-                NodeHealthQueryParameters::new("n")
-            ))
+            .get_node_health(
+                &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n")),
+                None
+            )
             .await,
         Err(Error::Protocol(_))
     ));
     assert!(client.is_closed());
-    assert!(matches!(clone.ping().await, Err(Error::Protocol(_))));
+    assert!(matches!(clone.ping(None).await, Err(Error::Protocol(_))));
     server.await.unwrap();
 }
 
@@ -368,9 +370,10 @@ async fn health_success_requires_hm_envelope() {
         .await;
         assert!(matches!(
             client
-                .get_node_health(&NodeHealthQueryDescription::new(
-                    NodeHealthQueryParameters::new("n")
-                ))
+                .get_node_health(
+                    &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n")),
+                    None
+                )
                 .await,
             Err(Error::Protocol(_))
         ));
@@ -416,7 +419,7 @@ async fn health_native_failures_are_local_and_healthy_queries_reuse_the_connecti
     let query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n"));
     for _ in 0..3 {
         assert!(matches!(
-            client.get_node_health(&query).await,
+            client.get_node_health(&query, None).await,
             Err(Error::Remote {
                 code: REMOTE_CODE,
                 ..
@@ -424,7 +427,7 @@ async fn health_native_failures_are_local_and_healthy_queries_reuse_the_connecti
         ));
         assert!(!client.is_closed());
         assert!(client
-            .get_node_health(&query)
+            .get_node_health(&query, None)
             .await
             .unwrap()
             .health_events
@@ -457,9 +460,10 @@ async fn health_local_invalid_names_and_timeouts_send_nothing() {
     ] {
         assert!(matches!(
             client
-                .get_node_health(&NodeHealthQueryDescription::new(
-                    NodeHealthQueryParameters::new(name)
-                ))
+                .get_node_health(
+                    &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(name)),
+                    None
+                )
                 .await,
             Err(Error::InvalidInput(_))
         ));
@@ -467,15 +471,15 @@ async fn health_local_invalid_names_and_timeouts_send_nothing() {
     for timeout in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
         assert!(matches!(
             client
-                .get_node_health_with_timeout(
+                .get_node_health(
                     &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n")),
-                    timeout
+                    Some(timeout)
                 )
                 .await,
             Err(Error::InvalidInput(_))
         ));
     }
-    client.ping().await.unwrap();
+    client.ping(None).await.unwrap();
     client.close().await.unwrap();
     server.await.unwrap();
 }
@@ -505,8 +509,8 @@ async fn health_malformed_success_retires_before_repoll_and_fails_pending_neighb
         .await
         .unwrap();
     let query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n"));
-    let health = client.get_node_health(&query);
-    let neighbor = client.name_exists("fabric:/neighbor");
+    let health = client.get_node_health(&query, None);
+    let neighbor = client.name_exists("fabric:/neighbor", None);
     tokio::pin!(health, neighbor);
     poll_fn(|cx| {
         assert!(health.as_mut().poll(cx).is_pending());
@@ -564,9 +568,10 @@ async fn health_reordered_mixed_operations_and_late_cancelled_malformed_replies(
     let clone = client.clone();
     let pending = tokio::spawn(async move {
         clone
-            .get_node_health(&NodeHealthQueryDescription::new(
-                NodeHealthQueryParameters::new("cancelled"),
-            ))
+            .get_node_health(
+                &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("cancelled")),
+                None,
+            )
             .await
     });
     ready.await.unwrap();
@@ -575,15 +580,15 @@ async fn health_reordered_mixed_operations_and_late_cancelled_malformed_replies(
     release.send(()).unwrap();
     assert!(matches!(
         client
-            .get_node_health_with_timeout(
+            .get_node_health(
                 &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("timed")),
-                Duration::from_millis(30)
+                Some(Duration::from_millis(30))
             )
             .await,
         Err(Error::Timeout)
     ));
     let query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n"));
-    let (health, ping) = tokio::join!(client.get_node_health(&query), client.ping());
+    let (health, ping) = tokio::join!(client.get_node_health(&query, None), client.ping(None));
     assert_eq!(health.unwrap().health_events.len(), 1);
     assert_eq!(ping.unwrap().node_id, NODE_ID);
     assert!(!client.is_closed());

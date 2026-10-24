@@ -122,7 +122,7 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
             assert_eq!(observed.len(), expected_count);
             let mut query =
                 PartitionQueryDescription::new(PartitionQueryParameters::new(name.parse()?));
-            let first = client.get_partition_list(&query).await?;
+            let first = client.get_partition_list(&query, None).await?;
             let mut partitions = first.items;
             let mut continuation = first.continuation_token;
             let mut seen_tokens = BTreeSet::new();
@@ -134,7 +134,7 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
                 assert!(seen_tokens.len() <= expected_count);
                 query.paging.continuation_token = Some(token);
                 let page = client
-                    .get_partition_list_with_timeout(&query, Duration::from_secs(30))
+                    .get_partition_list(&query, Some(Duration::from_secs(30)))
                     .await?;
                 partitions.extend(page.items);
                 continuation = page.continuation_token;
@@ -168,7 +168,7 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
                 compare_partition(partition, observed);
                 query.parameters.partition_id = Some(partition.partition_information.id);
                 query.paging = Paging::default();
-                let selected = client.get_partition_list(&query).await?;
+                let selected = client.get_partition_list(&query, None).await?;
                 assert_eq!(selected.items.len(), 1);
                 assert_eq!(
                     selected.items[0].partition_information.id,
@@ -192,7 +192,7 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
                 let mut native = Vec::new();
                 loop {
                     let page = client
-                        .get_replica_list_with_timeout(&query, Duration::from_secs(30))
+                        .get_replica_list(&query, Some(Duration::from_secs(30)))
                         .await?;
                     assert!(!page.items.is_empty());
                     native.extend(page.items);
@@ -222,13 +222,13 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
                     );
                     query.parameters.replica_or_instance_id = Some(replica_id(replica));
                     query.paging = Paging::default();
-                    let selected = client.get_replica_list(&query).await?;
+                    let selected = client.get_replica_list(&query, None).await?;
                     assert_eq!(selected.items.len(), 1);
                     assert_eq!(replica_id(&selected.items[0]), replica_id(replica));
                 }
                 query.parameters.replica_or_instance_id = None;
                 query.parameters.status_filter = ReplicaStatusFilter::READY;
-                let ready = client.get_replica_list(&query).await?;
+                let ready = client.get_replica_list(&query, None).await?;
                 assert_eq!(
                     ready.items.iter().map(replica_id).collect::<BTreeSet<_>>(),
                     native
@@ -262,7 +262,7 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
         let mut seen_tokens = BTreeSet::new();
         let mut deployments = Vec::new();
         loop {
-            let page = client.get_deployed_application_list(&query).await?;
+            let page = client.get_deployed_application_list(&query, None).await?;
             assert!(page.items.len() <= 1);
             deployments.extend(page.items);
             let Some(token) = page.continuation_token else {
@@ -305,7 +305,7 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
             query.parameters.include_health_state = false;
             query.paging = Paging::default();
             let selected = client
-                .get_deployed_application_list_with_timeout(&query, Duration::from_secs(30))
+                .get_deployed_application_list(&query, Some(Duration::from_secs(30)))
                 .await?;
             assert_eq!(selected.items.len(), 1);
             assert_eq!(selected.items[0].name, app.name);
@@ -319,25 +319,28 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
     );
     let missing_partition =
         ReplicaQueryDescription::new(ReplicaQueryParameters::new(uuid::Uuid::nil()));
-    let missing_replica_code = match client.get_replica_list(&missing_partition).await {
+    let missing_replica_code = match client.get_replica_list(&missing_partition, None).await {
         Err(Error::Remote { code, .. }) => code,
         other => {
             return Err(format!("missing partition must return a native error: {other:?}").into())
         }
     };
     assert!(!client.is_closed());
-    client.ping().await?;
+    client.ping(None).await?;
     let absent_node = format!("missing-{}", journal.owner);
     assert!(!nodes.iter().any(|node| node["Name"] == absent_node));
     let missing_node = DeployedApplicationQueryDescription::new(
         DeployedApplicationQueryParameters::new(absent_node),
     );
-    let missing_node_code = match client.get_deployed_application_list(&missing_node).await {
+    let missing_node_code = match client
+        .get_deployed_application_list(&missing_node, None)
+        .await
+    {
         Err(Error::Remote { code, .. }) => code,
         other => return Err(format!("missing node must return a native error: {other:?}").into()),
     };
     assert!(!client.is_closed());
-    client.ping().await?;
+    client.ping(None).await?;
     Ok(json!({
         "partition_count": partition_count,
         "replica_instance_count": replica_count,

@@ -52,40 +52,22 @@ impl QueryKind {
                 let query = PartitionQueryDescription::new(PartitionQueryParameters::new(
                     "fabric:/Model/Service".parse().unwrap(),
                 ));
-                match timeout {
-                    Some(timeout) => client
-                        .get_partition_list_with_timeout(&query, timeout)
-                        .await
-                        .map(|_| ()),
-                    None => client.get_partition_list(&query).await.map(|_| ()),
-                }
+                client.get_partition_list(&query, timeout).await.map(|_| ())
             }
             Self::Replicas => {
                 let query = ReplicaQueryDescription::new(ReplicaQueryParameters::new(
                     uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap(),
                 ));
-                match timeout {
-                    Some(timeout) => client
-                        .get_replica_list_with_timeout(&query, timeout)
-                        .await
-                        .map(|_| ()),
-                    None => client.get_replica_list(&query).await.map(|_| ()),
-                }
+                client.get_replica_list(&query, timeout).await.map(|_| ())
             }
             Self::Deployments => {
                 let query = DeployedApplicationQueryDescription::new(
                     DeployedApplicationQueryParameters::new("N0010"),
                 );
-                match timeout {
-                    Some(timeout) => client
-                        .get_deployed_application_list_with_timeout(&query, timeout)
-                        .await
-                        .map(|_| ()),
-                    None => client
-                        .get_deployed_application_list(&query)
-                        .await
-                        .map(|_| ()),
-                }
+                client
+                    .get_deployed_application_list(&query, timeout)
+                    .await
+                    .map(|_| ())
             }
             Self::ServicePackages => {
                 let query = DeployedServicePackageQueryDescription::new(
@@ -94,16 +76,10 @@ impl QueryKind {
                         "fabric:/Model".parse().unwrap(),
                     ),
                 );
-                match timeout {
-                    Some(timeout) => client
-                        .get_deployed_service_package_list_with_timeout(&query, timeout)
-                        .await
-                        .map(|_| ()),
-                    None => client
-                        .get_deployed_service_package_list(&query)
-                        .await
-                        .map(|_| ()),
-                }
+                client
+                    .get_deployed_service_package_list(&query, timeout)
+                    .await
+                    .map(|_| ())
             }
             Self::CodePackages => {
                 let query = DeployedCodePackageQueryDescription::new(
@@ -112,28 +88,19 @@ impl QueryKind {
                         "fabric:/Model".parse().unwrap(),
                     ),
                 );
-                match timeout {
-                    Some(timeout) => client
-                        .get_deployed_code_package_list_with_timeout(&query, timeout)
-                        .await
-                        .map(|_| ()),
-                    None => client
-                        .get_deployed_code_package_list(&query)
-                        .await
-                        .map(|_| ()),
-                }
+                client
+                    .get_deployed_code_package_list(&query, timeout)
+                    .await
+                    .map(|_| ())
             }
             Self::DeployedReplicas => {
                 let query = DeployedReplicaQueryDescription::new(
                     DeployedReplicaQueryParameters::new("N0010", "fabric:/Model".parse().unwrap()),
                 );
-                match timeout {
-                    Some(timeout) => client
-                        .get_deployed_replica_list_with_timeout(&query, timeout)
-                        .await
-                        .map(|_| ()),
-                    None => client.get_deployed_replica_list(&query).await.map(|_| ()),
-                }
+                client
+                    .get_deployed_replica_list(&query, timeout)
+                    .await
+                    .map(|_| ())
             }
         }
     }
@@ -242,7 +209,7 @@ async fn unpaged_deployment_continuations_retire_connection_even_with_native_err
                     Err(Error::Protocol(_))
                 ));
                 assert!(client.is_closed());
-                assert!(client.ping().await.is_err());
+                assert!(client.ping(None).await.is_err());
                 server.await.unwrap();
             }
         }
@@ -281,7 +248,7 @@ async fn native_errors_from_each_new_query_leave_shared_connection_usable() {
             })
         ));
         assert!(!client.is_closed());
-        client.ping().await.unwrap();
+        client.ping(None).await.unwrap();
     }
     client.close().await.unwrap();
     server.await.unwrap();
@@ -297,7 +264,7 @@ async fn malformed_new_query_successes_retire_the_shared_connection() {
             Err(Error::Protocol(_))
         ));
         assert!(client.is_closed());
-        assert!(client.ping().await.is_err());
+        assert!(client.ping(None).await.is_err());
         server.await.unwrap();
     }
 }
@@ -344,7 +311,7 @@ async fn partition_field_adapters_reject_bad_tags_and_guid_metadata_before_nativ
                 Err(Error::Protocol(_))
             ));
             assert!(client.is_closed());
-            assert!(client.ping().await.is_err());
+            assert!(client.ping(None).await.is_err());
             server.await.unwrap();
         }
     }
@@ -384,11 +351,11 @@ async fn invalid_new_query_options_send_nothing_and_preserve_connection() {
             ReplicaQueryDescription::new(ReplicaQueryParameters::new(uuid::Uuid::nil()));
         replicas.paging = partitions.paging.clone();
         assert!(matches!(
-            client.get_partition_list(&partitions).await,
+            client.get_partition_list(&partitions, None).await,
             Err(Error::InvalidInput("query does not support MaxResults"))
         ));
         assert!(matches!(
-            client.get_replica_list(&replicas).await,
+            client.get_replica_list(&replicas, None).await,
             Err(Error::InvalidInput("query does not support MaxResults"))
         ));
         assert!(!client.is_closed());
@@ -397,38 +364,51 @@ async fn invalid_new_query_options_send_nothing_and_preserve_connection() {
         let query =
             DeployedApplicationQueryDescription::new(DeployedApplicationQueryParameters::new(node));
         assert!(matches!(
-            client.get_deployed_application_list(&query).await,
+            client.get_deployed_application_list(&query, None).await,
             Err(Error::InvalidInput(_))
         ));
         assert!(!client.is_closed());
         let application = "fabric:/Model".parse().unwrap();
         assert!(matches!(
             client
-                .get_deployed_service_package_list(&DeployedServicePackageQueryDescription::new(
-                    DeployedServicePackageQueryParameters::new(node, application),
-                ))
+                .get_deployed_service_package_list(
+                    &DeployedServicePackageQueryDescription::new(
+                        DeployedServicePackageQueryParameters::new(node, application),
+                    ),
+                    None
+                )
                 .await,
             Err(Error::InvalidInput(_))
         ));
         assert!(matches!(
             client
-                .get_deployed_code_package_list(&DeployedCodePackageQueryDescription::new(
-                    DeployedCodePackageQueryParameters::new(node, "fabric:/Model".parse().unwrap()),
-                ))
+                .get_deployed_code_package_list(
+                    &DeployedCodePackageQueryDescription::new(
+                        DeployedCodePackageQueryParameters::new(
+                            node,
+                            "fabric:/Model".parse().unwrap()
+                        ),
+                    ),
+                    None
+                )
                 .await,
             Err(Error::InvalidInput(_))
         ));
         assert!(matches!(
             client
-                .get_deployed_replica_list(&DeployedReplicaQueryDescription::new(
-                    DeployedReplicaQueryParameters::new(node, "fabric:/Model".parse().unwrap()),
-                ))
+                .get_deployed_replica_list(
+                    &DeployedReplicaQueryDescription::new(DeployedReplicaQueryParameters::new(
+                        node,
+                        "fabric:/Model".parse().unwrap()
+                    ),),
+                    None
+                )
                 .await,
             Err(Error::InvalidInput(_))
         ));
         assert!(!client.is_closed());
     }
-    client.ping().await.unwrap();
+    client.ping(None).await.unwrap();
     client.close().await.unwrap();
     server.await.unwrap();
 }

@@ -161,11 +161,18 @@ client.connect().await?;
 let name = NamingUri::parse("fabric:/app/service")?;
 let exists = client
     .naming()
-    .name_exists(&name, RequestOptions::with_timeout(Duration::from_secs(30)))
+    .name_exists(&name, Some(Duration::from_secs(30)))
     .await?;
 
 client.close().await?;
 ```
+
+Each remote operation has one method with a final `Option<Duration>` timeout:
+`None` selects the configured default, not infinity; `Some(duration)` overrides
+it for that call. There are no separate `_with_timeout` variants. The current
+clear-TCP facade follows this contract without the illustrative builder or
+subclient grouping above. Cancellation remains composable by dropping the
+operation future, including through `tokio::select!`.
 
 Credential material is supplied explicitly as certificate chains and private
 keys in supported encodings. Separate the TCP endpoint from the expected TLS

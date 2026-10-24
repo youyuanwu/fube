@@ -196,7 +196,9 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
             let mut query = DeployedServicePackageQueryDescription::new(
                 DeployedServicePackageQueryParameters::new(node_name, application.parse()?),
             );
-            let packages = client.get_deployed_service_package_list(&query).await?;
+            let packages = client
+                .get_deployed_service_package_list(&query, None)
+                .await?;
             assert_eq!(packages.len(), observed.len());
             let native_ids: BTreeSet<_> = packages
                 .iter()
@@ -233,14 +235,14 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
                 query.parameters.service_manifest_name =
                     Some(package.service_manifest_name.clone());
                 let selected = client
-                    .get_deployed_service_package_list_with_timeout(&query, Duration::from_secs(30))
+                    .get_deployed_service_package_list(&query, Some(Duration::from_secs(30)))
                     .await?;
                 assert_eq!(selected.len(), 1);
                 assert_eq!(selected[0], *package);
             }
             query.parameters.service_manifest_name = Some("AbsentManifest".into());
             assert!(client
-                .get_deployed_service_package_list(&query)
+                .get_deployed_service_package_list(&query, None)
                 .await?
                 .is_empty());
             let observed_code = http.deployed_code_packages(node_name, application).await?;
@@ -255,9 +257,9 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
                 DeployedReplicaQueryParameters::new(node_name, application.parse()?),
             );
             let (code, replicas, _) = tokio::try_join!(
-                client.get_deployed_code_package_list(&code_query),
-                client.get_deployed_replica_list(&replica_query),
-                client.ping(),
+                client.get_deployed_code_package_list(&code_query, None),
+                client.get_deployed_replica_list(&replica_query, None),
+                client.ping(None),
             )?;
             assert_eq!(code.len(), observed_code.len());
             let native_ids: BTreeSet<_> = code
@@ -303,17 +305,14 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
                     Some(package.service_manifest_name.clone());
                 code_query.parameters.code_package_name = Some(package.name.clone());
                 let selected = client
-                    .get_deployed_code_package_list_with_timeout(
-                        &code_query,
-                        Duration::from_secs(30),
-                    )
+                    .get_deployed_code_package_list(&code_query, Some(Duration::from_secs(30)))
                     .await?;
                 assert_eq!(selected.len(), 1);
                 assert_eq!(selected[0], *package);
             }
             code_query.parameters.code_package_name = Some("AbsentCodePackage".into());
             assert!(client
-                .get_deployed_code_package_list(&code_query)
+                .get_deployed_code_package_list(&code_query, None)
                 .await?
                 .is_empty());
             let observed_replicas = http.deployed_replicas(node_name, application).await?;
@@ -344,14 +343,14 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
                     Some(replica.service_manifest_name.clone());
                 replica_query.parameters.partition_id = Some(replica.partition_id);
                 let selected = client
-                    .get_deployed_replica_list_with_timeout(&replica_query, Duration::from_secs(30))
+                    .get_deployed_replica_list(&replica_query, Some(Duration::from_secs(30)))
                     .await?;
                 assert_eq!(selected.len(), 1);
                 assert_eq!(selected[0], *replica);
             }
             replica_query.parameters.partition_id = Some(uuid::Uuid::new_v4());
             assert!(client
-                .get_deployed_replica_list(&replica_query)
+                .get_deployed_replica_list(&replica_query, None)
                 .await?
                 .is_empty());
             service_package_count += packages.len();
@@ -377,27 +376,32 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
     let application = journal.applications[0].parse()?;
     for result in [
         client
-            .get_deployed_service_package_list(&DeployedServicePackageQueryDescription::new(
-                DeployedServicePackageQueryParameters::new(&missing_node, application),
-            ))
+            .get_deployed_service_package_list(
+                &DeployedServicePackageQueryDescription::new(
+                    DeployedServicePackageQueryParameters::new(&missing_node, application),
+                ),
+                None,
+            )
             .await
             .map(|_| ()),
         client
-            .get_deployed_code_package_list(&DeployedCodePackageQueryDescription::new(
-                DeployedCodePackageQueryParameters::new(
+            .get_deployed_code_package_list(
+                &DeployedCodePackageQueryDescription::new(DeployedCodePackageQueryParameters::new(
                     &missing_node,
                     journal.applications[0].parse()?,
-                ),
-            ))
+                )),
+                None,
+            )
             .await
             .map(|_| ()),
         client
-            .get_deployed_replica_list(&DeployedReplicaQueryDescription::new(
-                DeployedReplicaQueryParameters::new(
+            .get_deployed_replica_list(
+                &DeployedReplicaQueryDescription::new(DeployedReplicaQueryParameters::new(
                     &missing_node,
                     journal.applications[0].parse()?,
-                ),
-            ))
+                )),
+                None,
+            )
             .await
             .map(|_| ()),
     ] {
@@ -410,7 +414,7 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
             }
         }
         assert!(!client.is_closed());
-        client.ping().await?;
+        client.ping(None).await?;
     }
     Ok(json!({
         "service_package_count": service_package_count,

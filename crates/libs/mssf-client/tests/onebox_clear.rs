@@ -222,7 +222,7 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
     assert_fresh(config);
     let native_observation_start_unix_ms = support::unix_millis();
     let baseline = client
-        .get_node_list(&NodeQueryDescription::default())
+        .get_node_list(&NodeQueryDescription::default(), None)
         .await
         .expect("native GetNodeList");
     let native_observation_end_unix_ms = support::unix_millis();
@@ -234,51 +234,63 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
     ] {
         assert_membership(
             &client
-                .get_node_list(&NodeQueryDescription::new(NodeQueryParameters {
-                    status_filter: filter,
-                    ..Default::default()
-                }))
+                .get_node_list(
+                    &NodeQueryDescription::new(NodeQueryParameters {
+                        status_filter: filter,
+                        ..Default::default()
+                    }),
+                    None,
+                )
                 .await
                 .expect("native status selection"),
             config,
         );
     }
     let empty = client
-        .get_node_list(&NodeQueryDescription::new(NodeQueryParameters {
-            status_filter: NodeStatusFilter::DOWN,
-            ..Default::default()
-        }))
+        .get_node_list(
+            &NodeQueryDescription::new(NodeQueryParameters {
+                status_filter: NodeStatusFilter::DOWN,
+                ..Default::default()
+            }),
+            None,
+        )
         .await
         .expect("native nonmatching status selection");
     assert!(empty.items.is_empty() && empty.continuation_token.is_none());
     assert_membership(
         &client
-            .get_node_list(&NodeQueryDescription {
-                parameters: NodeQueryParameters {
-                    node_name: Some(String::new()),
-                    ..Default::default()
+            .get_node_list(
+                &NodeQueryDescription {
+                    parameters: NodeQueryParameters {
+                        node_name: Some(String::new()),
+                        ..Default::default()
+                    },
+                    paging: Paging {
+                        continuation_token: Some(String::new()),
+                        ..Default::default()
+                    },
                 },
-                paging: Paging {
-                    continuation_token: Some(String::new()),
-                    ..Default::default()
-                },
-            })
+                None,
+            )
             .await
             .expect("native empty omission semantics"),
         config,
     );
     for expected in &config.expected_nodes {
         let page = client
-            .get_node_list(&NodeQueryDescription {
-                parameters: NodeQueryParameters {
-                    node_name: Some(expected.name.clone()),
-                    status_filter: NodeStatusFilter::UP,
+            .get_node_list(
+                &NodeQueryDescription {
+                    parameters: NodeQueryParameters {
+                        node_name: Some(expected.name.clone()),
+                        status_filter: NodeStatusFilter::UP,
+                    },
+                    paging: Paging {
+                        max_results: std::num::NonZeroU64::new(1),
+                        ..Default::default()
+                    },
                 },
-                paging: Paging {
-                    max_results: std::num::NonZeroU64::new(1),
-                    ..Default::default()
-                },
-            })
+                None,
+            )
             .await
             .expect("native exact-name hit and full terminal page");
         assert_eq!(page.items.len(), 1);
@@ -290,10 +302,13 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
     }
     for absent in ["native-client-no-such-node", "n0010", "N00"] {
         let page = client
-            .get_node_list(&NodeQueryDescription::new(NodeQueryParameters {
-                node_name: Some(absent.into()),
-                ..Default::default()
-            }))
+            .get_node_list(
+                &NodeQueryDescription::new(NodeQueryParameters {
+                    node_name: Some(absent.into()),
+                    ..Default::default()
+                }),
+                None,
+            )
             .await
             .expect("native exact-name miss");
         assert!(page.items.is_empty() && page.continuation_token.is_none());
@@ -306,13 +321,16 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
         let mut page_lengths = Vec::new();
         for _ in 0..16 {
             let page = client
-                .get_node_list(&NodeQueryDescription {
-                    paging: Paging {
-                        continuation_token: token.take(),
-                        max_results: std::num::NonZeroU64::new(page_size),
+                .get_node_list(
+                    &NodeQueryDescription {
+                        paging: Paging {
+                            continuation_token: token.take(),
+                            max_results: std::num::NonZeroU64::new(page_size),
+                        },
+                        ..Default::default()
                     },
-                    ..Default::default()
-                })
+                    None,
+                )
                 .await
                 .expect("native server continuation chain");
             assert!(!page.items.is_empty());
@@ -351,24 +369,30 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
         .max()
         .unwrap();
     let exhausted = client
-        .get_node_list(&NodeQueryDescription {
-            paging: Paging {
-                continuation_token: Some(format!("{final_id:x}")),
-                max_results: std::num::NonZeroU64::new(1),
+        .get_node_list(
+            &NodeQueryDescription {
+                paging: Paging {
+                    continuation_token: Some(format!("{final_id:x}")),
+                    max_results: std::num::NonZeroU64::new(1),
+                },
+                ..Default::default()
             },
-            ..Default::default()
-        })
+            None,
+        )
         .await
         .expect("valid boundary continuation strictly after final independent ID");
     assert!(exhausted.items.is_empty() && exhausted.continuation_token.is_none());
     let invalid = client
-        .get_node_list(&NodeQueryDescription {
-            paging: Paging {
-                continuation_token: Some("this-is-not-a-node-id".into()),
+        .get_node_list(
+            &NodeQueryDescription {
+                paging: Paging {
+                    continuation_token: Some("this-is-not-a-node-id".into()),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        })
+            None,
+        )
         .await
         .expect_err("malformed continuation must be a native error, not empty success");
     let mssf_client::Error::Remote { code, message } = invalid else {
@@ -388,7 +412,7 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
     );
     assert_membership(
         &client
-            .get_node_list(&NodeQueryDescription::default())
+            .get_node_list(&NodeQueryDescription::default(), None)
             .await
             .expect("reuse after native error"),
         config,
@@ -502,7 +526,7 @@ async fn assert_idle_proxy_disconnect(
     .await
     .expect("bound native connection through proxy")
     .expect("connect through test-owned proxy");
-    let gateway = timeout(DEFAULT_TIMEOUT + SHUTDOWN_TIMEOUT, client.ping())
+    let gateway = timeout(DEFAULT_TIMEOUT + SHUTDOWN_TIMEOUT, client.ping(None))
         .await
         .expect("bound real native ping through proxy")
         .expect("real native ping through proxy");
@@ -565,14 +589,14 @@ async fn onebox_ping_name_exists_and_node_list() {
     let client = FabricClient::connect_clear(endpoint, DEFAULT_TIMEOUT)
         .await
         .expect("connect explicitly to native clear gateway");
-    let gateway = client.ping().await.expect("native correlated ping");
+    let gateway = client.ping(None).await.expect("native correlated ping");
     assert_independent_gateway(&gateway, &config, node_id);
     assert!(client
-        .name_exists(&config.existing_name)
+        .name_exists(&config.existing_name, None)
         .await
         .expect("existing native name"));
     assert!(!client
-        .name_exists(&config.absent_name)
+        .name_exists(&config.absent_name, None)
         .await
         .expect("absent native name"));
     let node_evidence = assert_node_queries(&client, &config).await;
@@ -584,17 +608,17 @@ async fn onebox_ping_name_exists_and_node_list() {
         let expected_config = config.clone();
         pending_operations.push(Box::pin(async move {
             match index % 5 {
-                0 | 1 => Some(handle.ping().await.expect("concurrent native ping")),
+                0 | 1 => Some(handle.ping(None).await.expect("concurrent native ping")),
                 2 => {
                     assert!(handle
-                        .name_exists(&existing_name)
+                        .name_exists(&existing_name, None)
                         .await
                         .expect("concurrent existing native name"));
                     None
                 }
                 3 => {
                     assert!(!handle
-                        .name_exists(&absent_name)
+                        .name_exists(&absent_name, None)
                         .await
                         .expect("concurrent absent native name"));
                     None
@@ -602,7 +626,7 @@ async fn onebox_ping_name_exists_and_node_list() {
                 _ => {
                     assert_membership(
                         &handle
-                            .get_node_list(&NodeQueryDescription::default())
+                            .get_node_list(&NodeQueryDescription::default(), None)
                             .await
                             .expect("concurrent native node list"),
                         &expected_config,
@@ -655,7 +679,7 @@ async fn onebox_ping_name_exists_and_node_list() {
     );
     assert!(client.terminal_error().is_none());
     let after_clone_drop = client
-        .ping()
+        .ping(None)
         .await
         .expect("original native connection survives all operation clones being dropped");
     assert_independent_gateway(&after_clone_drop, &config, node_id);

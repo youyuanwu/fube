@@ -72,11 +72,11 @@ fn check_request(request: &Message, delete: bool) {
 async fn write(client: &FabricClient, delete: bool, timeout: Duration) -> mssf_client::Result<()> {
     if delete {
         client
-            .delete_name_with_timeout("fabric:/App_1/Name-2", timeout)
+            .delete_name("fabric:/App_1/Name-2", Some(timeout))
             .await
     } else {
         client
-            .create_name_with_timeout("fabric:/App_1/Name-2", timeout)
+            .create_name("fabric:/App_1/Name-2", Some(timeout))
             .await
     }
 }
@@ -104,9 +104,9 @@ async fn exact_native_write_requests_all_entry_points_and_empty_replies() {
         .await
         .unwrap();
     let name: mssf_client::NamingUri = "fabric:/App_1/Name-2".parse().unwrap();
-    client.create_name(&name).await.unwrap();
+    client.create_name(&name, None).await.unwrap();
     write(&client, false, TIMEOUT_DURATION).await.unwrap();
-    client.delete_name(&name).await.unwrap();
+    client.delete_name(&name, None).await.unwrap();
     write(&client, true, TIMEOUT_DURATION).await.unwrap();
     client.close().await.unwrap();
     server.await.unwrap();
@@ -184,11 +184,11 @@ async fn invalid_uri_and_budget_never_send_writes_and_keep_connection() {
         format!("fabric:/{}", "a".repeat(4089)),
     ] {
         assert!(matches!(
-            client.create_name(&name).await,
+            client.create_name(&name, None).await,
             Err(Error::InvalidInput(_))
         ));
         assert!(matches!(
-            client.delete_name(&name).await,
+            client.delete_name(&name, None).await,
             Err(Error::InvalidInput(_))
         ));
     }
@@ -200,7 +200,7 @@ async fn invalid_uri_and_budget_never_send_writes_and_keep_connection() {
             ));
         }
     }
-    assert!(!client.name_exists("fabric:/neighbor").await.unwrap());
+    assert!(!client.name_exists("fabric:/neighbor", None).await.unwrap());
     client.close().await.unwrap();
     server.await.unwrap();
 }
@@ -254,8 +254,8 @@ async fn malformed_write_retires_without_waiter_repoll_and_fails_neighbor() {
     let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
         .await
         .unwrap();
-    let mutation = client.delete_name("fabric:/App_1/Name-2");
-    let neighbor = client.name_exists("fabric:/neighbor");
+    let mutation = client.delete_name("fabric:/App_1/Name-2", None);
+    let neighbor = client.name_exists("fabric:/neighbor", None);
     tokio::pin!(mutation, neighbor);
     poll_fn(|cx| {
         assert!(mutation.as_mut().poll(cx).is_pending());
@@ -306,9 +306,9 @@ async fn reordered_concurrent_writes_and_read_share_one_driver() {
         .await
         .unwrap();
     let (create, delete, exists) = tokio::join!(
-        client.create_name("fabric:/App_1/Name-2"),
-        client.delete_name("fabric:/App_1/Name-2"),
-        client.name_exists("fabric:/neighbor"),
+        client.create_name("fabric:/App_1/Name-2", None),
+        client.delete_name("fabric:/App_1/Name-2", None),
+        client.name_exists("fabric:/neighbor", None),
     );
     create.unwrap();
     delete.unwrap();
@@ -375,7 +375,7 @@ async fn peer_observed_cancel_and_timeout_never_replay_writes_or_decode_late_rep
                 assert!(matches!(pending.await.unwrap(), Err(Error::Timeout)));
             }
             release.send(()).unwrap();
-            assert!(client.name_exists("fabric:/neighbor").await.unwrap());
+            assert!(client.name_exists("fabric:/neighbor", None).await.unwrap());
             assert!(!client.is_closed());
             client.close().await.unwrap();
             server.await.unwrap();

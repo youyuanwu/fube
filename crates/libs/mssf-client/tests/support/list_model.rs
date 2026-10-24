@@ -241,7 +241,7 @@ async fn application_selectors_exclusion_and_native_paging_are_explicit() {
         })
         .await;
         let page = client
-            .get_application_list_with_timeout(
+            .get_application_list(
                 &ApplicationQueryDescription {
                     parameters: ApplicationQueryParameters {
                         filter,
@@ -252,7 +252,7 @@ async fn application_selectors_exclusion_and_native_paging_are_explicit() {
                         max_results: NonZeroU64::new(i64::MAX as u64),
                     },
                 },
-                TIMEOUT_DURATION,
+                Some(TIMEOUT_DURATION),
             )
             .await
             .unwrap();
@@ -322,7 +322,7 @@ async fn service_selectors_route_to_application_service_list_and_both_kinds_deco
         ));
         query.parameters.filter = filter;
         query.paging.continuation_token = Some(String::new());
-        let page = client.get_service_list(&query).await.unwrap();
+        let page = client.get_service_list(&query, None).await.unwrap();
         let service = &page.items[0];
         assert_eq!(
             service.kind,
@@ -358,9 +358,12 @@ async fn optional_record_suffixes_use_only_native_defaults() {
                 single_reply(move |r| aggregate(r, list_body(&s, Some("")))).await;
             if service {
                 let page = client
-                    .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
-                        "fabric:/Model".parse().unwrap(),
-                    )))
+                    .get_service_list(
+                        &ServiceQueryDescription::new(ServiceQueryParameters::new(
+                            "fabric:/Model".parse().unwrap(),
+                        )),
+                        None,
+                    )
                     .await
                     .unwrap();
                 assert_eq!(
@@ -375,7 +378,7 @@ async fn optional_record_suffixes_use_only_native_defaults() {
                 assert!(page.continuation_token.is_none());
             } else {
                 let page = client
-                    .get_application_list(&ApplicationQueryDescription::default())
+                    .get_application_list(&ApplicationQueryDescription::default(), None)
                     .await
                     .unwrap();
                 assert_eq!(
@@ -412,9 +415,12 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
                     single_reply(move |r| aggregate(r, list_body(&s, None))).await;
                 if service {
                     let page = client
-                        .get_service_list(&ServiceQueryDescription::new(
-                            ServiceQueryParameters::new("fabric:/Model".parse().unwrap()),
-                        ))
+                        .get_service_list(
+                            &ServiceQueryDescription::new(ServiceQueryParameters::new(
+                                "fabric:/Model".parse().unwrap(),
+                            )),
+                            None,
+                        )
                         .await
                         .unwrap();
                     let expected = [
@@ -429,7 +435,7 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
                     assert_eq!(page.items[0].health_state.as_raw(), health);
                 } else {
                     let page = client
-                        .get_application_list(&ApplicationQueryDescription::default())
+                        .get_application_list(&ApplicationQueryDescription::default(), None)
                         .await
                         .unwrap();
                     let expected = [
@@ -471,7 +477,7 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
         .await;
         assert_eq!(
             client
-                .get_application_list(&ApplicationQueryDescription::default())
+                .get_application_list(&ApplicationQueryDescription::default(), None)
                 .await
                 .unwrap()
                 .items[0]
@@ -586,20 +592,23 @@ async fn malformed_list_successes_retire_shared_stream() {
                 single_reply(move |r| aggregate(r, list_body(&s, Some("token")))).await;
             let outcome = if service {
                 client
-                    .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
-                        "fabric:/Model".parse().unwrap(),
-                    )))
+                    .get_service_list(
+                        &ServiceQueryDescription::new(ServiceQueryParameters::new(
+                            "fabric:/Model".parse().unwrap(),
+                        )),
+                        None,
+                    )
                     .await
                     .map(|_| ())
             } else {
                 client
-                    .get_application_list(&ApplicationQueryDescription::default())
+                    .get_application_list(&ApplicationQueryDescription::default(), None)
                     .await
                     .map(|_| ())
             };
             assert!(matches!(outcome, Err(Error::Protocol(_))), "{outcome:?}");
             assert!(client.is_closed());
-            assert!(client.ping().await.is_err());
+            assert!(client.ping(None).await.is_err());
             server.await.unwrap();
         }
     }
@@ -619,14 +628,17 @@ async fn truncated_and_wrong_metadata_are_not_missing_optional_suffixes() {
             let (client, server) = single_reply(move |r| aggregate(r, bytes)).await;
             let outcome = if service {
                 client
-                    .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
-                        "fabric:/Model".parse().unwrap(),
-                    )))
+                    .get_service_list(
+                        &ServiceQueryDescription::new(ServiceQueryParameters::new(
+                            "fabric:/Model".parse().unwrap(),
+                        )),
+                        None,
+                    )
                     .await
                     .map(|_| ())
             } else {
                 client
-                    .get_application_list(&ApplicationQueryDescription::default())
+                    .get_application_list(&ApplicationQueryDescription::default(), None)
                     .await
                     .map(|_| ())
             };
@@ -659,12 +671,13 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
     ] {
         assert!(matches!(
             client
-                .get_application_list(&ApplicationQueryDescription::new(
-                    ApplicationQueryParameters {
+                .get_application_list(
+                    &ApplicationQueryDescription::new(ApplicationQueryParameters {
                         filter,
                         ..Default::default()
-                    }
-                ))
+                    }),
+                    None
+                )
                 .await,
             Err(Error::InvalidInput(_))
         ));
@@ -679,13 +692,13 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
         "fabric:/System".parse().unwrap(),
     ));
     assert!(matches!(
-        client.get_service_list(&service).await,
+        client.get_service_list(&service, None).await,
         Err(Error::InvalidInput(_))
     ));
     service.parameters.application_name = "fabric:/Model".parse().unwrap();
     service.parameters.filter = ServiceListFilter::TypeName(String::new());
     assert!(matches!(
-        client.get_service_list(&service).await,
+        client.get_service_list(&service, None).await,
         Err(Error::InvalidInput(_))
     ));
     for name in ["fabric:", "fabric:/bad/", "fabric:/bad//name"] {
@@ -697,7 +710,7 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
     service.parameters.filter = ServiceListFilter::All;
     service.paging.max_results = NonZeroU64::new(u64::MAX);
     assert!(matches!(
-        client.get_service_list(&service).await,
+        client.get_service_list(&service, None).await,
         Err(Error::InvalidInput(_))
     ));
     for q in [
@@ -717,30 +730,30 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
         },
     ] {
         assert!(matches!(
-            client.get_application_list(&q).await,
+            client.get_application_list(&q, None).await,
             Err(Error::InvalidInput(_))
         ));
     }
     for timeout in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
         assert!(matches!(
             client
-                .get_application_list_with_timeout(&Default::default(), timeout)
+                .get_application_list(&Default::default(), Some(timeout))
                 .await,
             Err(Error::InvalidInput(_))
         ));
         assert!(matches!(
             client
-                .get_service_list_with_timeout(
+                .get_service_list(
                     &ServiceQueryDescription::new(ServiceQueryParameters::new(
                         "fabric:/Model".parse().unwrap()
                     )),
-                    timeout
+                    Some(timeout)
                 )
                 .await,
             Err(Error::InvalidInput(_))
         ));
     }
-    client.ping().await.unwrap();
+    client.ping(None).await.unwrap();
     server.await.unwrap();
 }
 
@@ -816,14 +829,17 @@ async fn semantic_list_validation_precedes_embedded_query_errors() {
         .await;
         let result = if service {
             client
-                .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
-                    "fabric:/Model".parse().unwrap(),
-                )))
+                .get_service_list(
+                    &ServiceQueryDescription::new(ServiceQueryParameters::new(
+                        "fabric:/Model".parse().unwrap(),
+                    )),
+                    None,
+                )
                 .await
                 .map(|_| ())
         } else {
             client
-                .get_application_list(&Default::default())
+                .get_application_list(&Default::default(), None)
                 .await
                 .map(|_| ())
         };
@@ -875,7 +891,7 @@ async fn native_list_errors_are_local_and_allow_mixed_reuse() {
         .await
         .unwrap();
     assert!(matches!(
-        client.get_application_list(&Default::default()).await,
+        client.get_application_list(&Default::default(), None).await,
         Err(Error::Remote {
             code: REMOTE_CODE,
             ..
@@ -884,9 +900,12 @@ async fn native_list_errors_are_local_and_allow_mixed_reuse() {
     assert!(!client.is_closed());
     assert!(matches!(
         client
-            .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
-                "fabric:/Model".parse().unwrap()
-            )))
+            .get_service_list(
+                &ServiceQueryDescription::new(ServiceQueryParameters::new(
+                    "fabric:/Model".parse().unwrap()
+                )),
+                None
+            )
             .await,
         Err(Error::Remote {
             code: REMOTE_CODE,
@@ -894,16 +913,19 @@ async fn native_list_errors_are_local_and_allow_mixed_reuse() {
         })
     ));
     client
-        .get_application_list(&Default::default())
+        .get_application_list(&Default::default(), None)
         .await
         .unwrap();
     client
-        .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
-            "fabric:/Model".parse().unwrap(),
-        )))
+        .get_service_list(
+            &ServiceQueryDescription::new(ServiceQueryParameters::new(
+                "fabric:/Model".parse().unwrap(),
+            )),
+            None,
+        )
         .await
         .unwrap();
-    client.ping().await.unwrap();
+    client.ping(None).await.unwrap();
     server.await.unwrap();
 }
 
@@ -952,16 +974,16 @@ async fn mixed_lists_ping_and_name_complete_out_of_order_on_one_stream() {
         "fabric:/Model".parse().unwrap(),
     ));
     let (a, s, p, n) = tokio::join!(
-        client.get_application_list(&apps),
-        client.get_service_list(&services),
-        client.ping(),
-        client.name_exists("fabric:/Model")
+        client.get_application_list(&apps, None),
+        client.get_service_list(&services, None),
+        client.ping(None),
+        client.name_exists("fabric:/Model", None)
     );
     assert_eq!(a.unwrap().items.len(), 1);
     assert_eq!(s.unwrap().items.len(), 1);
     p.unwrap();
     assert!(n.unwrap());
-    client.ping().await.unwrap();
+    client.ping(None).await.unwrap();
     server.await.unwrap();
 }
 
@@ -999,13 +1021,17 @@ async fn malformed_list_is_terminal_before_pending_waiter_repoll() {
         .await
         .unwrap();
     let c = client.clone();
-    let first = tokio::spawn(async move { c.get_application_list(&Default::default()).await });
+    let first =
+        tokio::spawn(async move { c.get_application_list(&Default::default(), None).await });
     tokio::task::yield_now().await;
     let c = client.clone();
     let second = tokio::spawn(async move {
-        c.get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
-            "fabric:/Model".parse().unwrap(),
-        )))
+        c.get_service_list(
+            &ServiceQueryDescription::new(ServiceQueryParameters::new(
+                "fabric:/Model".parse().unwrap(),
+            )),
+            None,
+        )
         .await
     });
     received.await.unwrap();
@@ -1018,7 +1044,7 @@ async fn malformed_list_is_terminal_before_pending_waiter_repoll() {
     .unwrap();
     assert!(matches!(first.await.unwrap(), Err(Error::Protocol(_))));
     assert!(matches!(second.await.unwrap(), Err(Error::Protocol(_))));
-    assert!(client.ping().await.is_err());
+    assert!(client.ping(None).await.is_err());
     server.await.unwrap();
 }
 
@@ -1067,13 +1093,13 @@ async fn explicit_service_paging_stops_at_empty_terminal_page_without_hidden_req
         "fabric:/Model".parse().unwrap(),
     ));
     query.paging.max_results = NonZeroU64::new(1);
-    let first = client.get_service_list(&query).await.unwrap();
+    let first = client.get_service_list(&query, None).await.unwrap();
     assert_eq!(first.continuation_token.as_deref(), Some("opaque"));
     query.paging.continuation_token = first.continuation_token;
-    let terminal = client.get_service_list(&query).await.unwrap();
+    let terminal = client.get_service_list(&query, None).await.unwrap();
     assert!(terminal.items.is_empty());
     assert!(terminal.continuation_token.is_none());
-    client.ping().await.unwrap();
+    client.ping(None).await.unwrap();
     server.await.unwrap();
 }
 
@@ -1098,14 +1124,17 @@ async fn present_aggregate_headers_are_validated_for_each_list() {
             .await;
             let result = if service {
                 client
-                    .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
-                        "fabric:/Model".parse().unwrap(),
-                    )))
+                    .get_service_list(
+                        &ServiceQueryDescription::new(ServiceQueryParameters::new(
+                            "fabric:/Model".parse().unwrap(),
+                        )),
+                        None,
+                    )
                     .await
                     .map(|_| ())
             } else {
                 client
-                    .get_application_list(&Default::default())
+                    .get_application_list(&Default::default(), None)
                     .await
                     .map(|_| ())
             };
@@ -1146,16 +1175,19 @@ async fn timed_out_list_ignores_late_malformed_reply_and_preserves_reuse() {
         .unwrap();
     assert!(matches!(
         client
-            .get_application_list_with_timeout(&Default::default(), Duration::from_millis(75))
+            .get_application_list(&Default::default(), Some(Duration::from_millis(75)))
             .await,
         Err(Error::Timeout)
     ));
     client
-        .get_service_list(&ServiceQueryDescription::new(ServiceQueryParameters::new(
-            "fabric:/Model".parse().unwrap(),
-        )))
+        .get_service_list(
+            &ServiceQueryDescription::new(ServiceQueryParameters::new(
+                "fabric:/Model".parse().unwrap(),
+            )),
+            None,
+        )
         .await
         .unwrap();
-    client.ping().await.unwrap();
+    client.ping(None).await.unwrap();
     server.await.unwrap();
 }
