@@ -279,9 +279,12 @@ Replies select shared `ListReply<Record, TAG, STRICT_PAGING>` or
 operation. A shared `decode_reply<Q>` function selects the profile and record
 validator; `Query` has no decoding method. Records use ordinary `Deserialize`
 derives and native field adapters; an optional `validate_record` hook enforces
-domain restrictions. For example,
-service queries declare `ListReply<Service, 2>` and node health declares
-`ItemReply<NodeHealth, 16, 16>`. Lists allow absent actor/action headers but check
+domain restrictions. Native payload type IDs are centralized as named `i32`
+constants in `query_protocol::result_tags`, matching `QueryResultHelpersEnum.h`.
+For example, service queries declare `ListReply<Service, { result_tags::SERVICE }>`
+and node health declares `ItemReply<NodeHealth, { result_tags::NODE_HEALTH }, 16>`
+(the final argument is the actor ID, not a payload tag).
+Lists allow absent actor/action headers but check
 them when present; items require their declared actor and `OperationSuccessAction`.
 The shared decoder validates both native list/item slots, required pointers,
 result kind and paging. Node lists retain permissive paging tags, application/

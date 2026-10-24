@@ -13,6 +13,17 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{query_arguments::QueryArguments, Error, Paging, QueryPage, Result};
 
+/// Native payload type IDs from ServiceModel/QueryResultHelpersEnum.h.
+pub(crate) mod result_tags {
+    pub(crate) const NODE: i32 = 1;
+    pub(crate) const SERVICE: i32 = 2;
+    pub(crate) const APPLICATION: i32 = 4;
+    pub(crate) const PARTITION: i32 = 5;
+    pub(crate) const REPLICA: i32 = 6;
+    pub(crate) const DEPLOYED_APPLICATION: i32 = 10;
+    pub(crate) const NODE_HEALTH: i32 = 16;
+}
+
 pub(crate) trait Query: Serialize {
     type Output: Send + 'static;
     type Reply: Reply<Output = Self::Output>;
@@ -253,6 +264,64 @@ mod tests {
     use crate::*;
     use mssf_transport::{message::Header, serialization::Encoder};
     use std::num::NonZeroU64;
+
+    #[test]
+    fn result_tags_match_native_wire_ids() {
+        assert_eq!(
+            [
+                result_tags::NODE,
+                result_tags::SERVICE,
+                result_tags::APPLICATION,
+                result_tags::PARTITION,
+                result_tags::REPLICA,
+                result_tags::DEPLOYED_APPLICATION,
+                result_tags::NODE_HEALTH,
+            ],
+            [1, 2, 4, 5, 6, 10, 16]
+        );
+    }
+
+    #[test]
+    fn node_queries_accept_names_at_utf16_boundaries() {
+        for name in [
+            " Node_Ab ".to_owned(),
+            "x".repeat(4096),
+            "\u{754c}".repeat(4096),
+            "\u{1f600}".repeat(2048),
+            "\u{1f600}".repeat(2047) + "ab",
+        ] {
+            encode_query(&NodeHealthQueryParameters::new(&name), None).unwrap();
+            encode_query(&DeployedApplicationQueryParameters::new(&name), None).unwrap();
+        }
+    }
+
+    #[test]
+    fn node_queries_reject_invalid_names_with_existing_errors() {
+        for name in [
+            String::new(),
+            "\0node".to_owned(),
+            "no\0de".to_owned(),
+            "node\0".to_owned(),
+            "x".repeat(4097),
+            "\u{754c}".repeat(4097),
+            "\u{1f600}".repeat(2049),
+            "\u{1f600}".repeat(2047) + "abc",
+            "x".repeat(100_000),
+        ] {
+            assert!(matches!(
+                encode_query(&NodeHealthQueryParameters::new(&name), None),
+                Err(Error::InvalidInput(
+                    "node health name must be 1..=4096 UTF-16 units without NUL"
+                ))
+            ));
+            assert!(matches!(
+                encode_query(&DeployedApplicationQueryParameters::new(&name), None),
+                Err(Error::InvalidInput(
+                    "deployed application node name must be 1..=4096 UTF-16 units without NUL"
+                ))
+            ));
+        }
+    }
 
     #[derive(Debug, PartialEq, Deserialize)]
     struct ReplyRecord {

@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    query_protocol::{ListReply, Query},
+    query_arguments::validate_node_name,
+    query_protocol::{result_tags, ListReply, Query},
     Error, HealthState, NamingUri, PagedQuery, QueryPage, Result,
 };
 
@@ -87,21 +88,14 @@ pub type DeployedApplicationListPage = QueryPage<DeployedApplication>;
 
 impl Query for DeployedApplicationQueryParameters {
     type Output = DeployedApplicationListPage;
-    type Reply = ListReply<DeployedApplication, 10>;
+    type Reply = ListReply<DeployedApplication, { result_tags::DEPLOYED_APPLICATION }>;
     const NAME: &'static str = "GetApplicationPagedListDeployedOnNode";
 
     fn validate_parameters(&self) -> Result<()> {
-        let name = &self.node_name;
-        if name.is_empty()
-            || name.len() > 4096 * 3
-            || name.contains('\0')
-            || name.encode_utf16().count() > 4096
-        {
-            return Err(Error::InvalidInput(
-                "deployed application node name must be 1..=4096 UTF-16 units without NUL",
-            ));
-        }
-        Ok(())
+        validate_node_name(
+            &self.node_name,
+            "deployed application node name must be 1..=4096 UTF-16 units without NUL",
+        )
     }
 
     fn validate_record(record: DeployedApplication) -> Result<DeployedApplication> {

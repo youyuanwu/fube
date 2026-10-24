@@ -31,6 +31,19 @@ pub(crate) fn is_none_or_zero(id: &Option<i64>) -> bool {
     id.is_none_or(|id| id == 0)
 }
 
+pub(crate) fn validate_node_name(name: &str, error_message: &'static str) -> Result<()> {
+    const MAX_NODE_NAME_UNITS: usize = 4096;
+    // Bound caller work before scanning UTF-8 or counting UTF-16 units.
+    if name.is_empty()
+        || name.len() > MAX_NODE_NAME_UNITS * 3
+        || name.contains('\0')
+        || name.encode_utf16().count() > MAX_NODE_NAME_UNITS
+    {
+        return Err(Error::InvalidInput(error_message));
+    }
+    Ok(())
+}
+
 pub(crate) mod json {
     use super::*;
 

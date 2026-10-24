@@ -2,7 +2,7 @@
 
 use crate::{
     applications::*,
-    query_protocol::{ListReply, Query},
+    query_protocol::{result_tags, ListReply, Query},
     services::*,
     Error, HealthState, Result,
 };
@@ -16,7 +16,7 @@ fn validate_type_selector(value: &str) -> Result<()> {
 
 impl Query for ApplicationQueryParameters {
     type Output = ApplicationListPage;
-    type Reply = ListReply<Application, 4>;
+    type Reply = ListReply<Application, { result_tags::APPLICATION }>;
     const NAME: &'static str = "GetApplicationList";
 
     fn validate_parameters(&self) -> Result<()> {
@@ -50,7 +50,7 @@ impl Query for ApplicationQueryParameters {
 
 impl Query for ServiceQueryParameters {
     type Output = ServiceListPage;
-    type Reply = ListReply<Service, 2>;
+    type Reply = ListReply<Service, { result_tags::SERVICE }>;
     const NAME: &'static str = "GetApplicationServiceList";
 
     fn validate_parameters(&self) -> Result<()> {

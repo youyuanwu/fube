@@ -1,7 +1,7 @@
 //! Owned service partition list records and native query parameters.
 
 use crate::{
-    query_protocol::{ListReply, Query},
+    query_protocol::{result_tags, ListReply, Query},
     Error, HealthState, NamingUri, PagedQuery, QueryPage, Result, ServiceKind,
 };
 use serde::{Deserialize, Serialize};
@@ -103,7 +103,7 @@ pub struct Partition {
 
 impl Query for PartitionQueryParameters {
     type Output = PartitionListPage;
-    type Reply = ListReply<Partition, 5>;
+    type Reply = ListReply<Partition, { result_tags::PARTITION }>;
     const NAME: &'static str = "GetServicePartitionList";
     const SUPPORTS_MAX_RESULTS: bool = false;
 

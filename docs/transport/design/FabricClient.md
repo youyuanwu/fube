@@ -388,6 +388,8 @@ helpers retain protocol framing distinct from domain records, including both
 native list/item slots and their required empty/null checks. Operations declare
 shared `ListReply<Record, TAG, STRICT_PAGING>` or `ItemReply<Record, TAG, ACTOR>`
 profiles with optional record-validation hooks, not handwritten reply decoders.
+Payload tags use shared `query_protocol::result_tags` constants matching the
+native `QueryResultHelpersEnum.h` IDs, rather than literals in query declarations.
 Partition, replica/instance and node-local deployed-application lists follow the
 same pattern: parameter-owned query declarations, source-ordered native records
 and shared list envelopes. Partition-key and replica-kind differences belong to

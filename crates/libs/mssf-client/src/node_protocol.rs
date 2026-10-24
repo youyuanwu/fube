@@ -1,12 +1,12 @@
 use crate::{
     nodes::*,
-    query_protocol::{ListReply, Query},
+    query_protocol::{result_tags, ListReply, Query},
     Error, Result,
 };
 
 impl Query for NodeQueryParameters {
     type Output = NodeListPage;
-    type Reply = ListReply<Node, 1, false>;
+    type Reply = ListReply<Node, { result_tags::NODE }, false>;
     const NAME: &'static str = "GetNodeList";
     const PAGING_FIRST: bool = true;
 

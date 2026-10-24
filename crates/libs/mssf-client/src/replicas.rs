@@ -1,7 +1,7 @@
 //! Owned stateful replicas and stateless instances from the native list query.
 
 use crate::{
-    query_protocol::{ListReply, Query},
+    query_protocol::{result_tags, ListReply, Query},
     Error, HealthState, PagedQuery, QueryPage, Result, ServiceKind,
 };
 use serde::{Deserialize, Serialize};
@@ -107,7 +107,7 @@ pub struct Replica {
 
 impl Query for ReplicaQueryParameters {
     type Output = ReplicaListPage;
-    type Reply = ListReply<Replica, 6>;
+    type Reply = ListReply<Replica, { result_tags::REPLICA }>;
     const NAME: &'static str = "GetServicePartitionReplicaList";
     const SUPPORTS_MAX_RESULTS: bool = false;
 
