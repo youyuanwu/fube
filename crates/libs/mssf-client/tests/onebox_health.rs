@@ -273,7 +273,9 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
                 .map(|consider_warning_as_error| NodeHealthPolicy {
                     consider_warning_as_error,
                 });
-        query.parameters.events_filter = snapshot.filter.map(HealthEventsFilter::from_bits_retain);
+        query.parameters.events_filter = snapshot
+            .filter
+            .map(|bits| HealthEventsFilter::from_bits_retain(bits).into());
         let start_ms = now_ms();
         let health = client.get_node_health(&query).await?;
         let end_ms = now_ms();

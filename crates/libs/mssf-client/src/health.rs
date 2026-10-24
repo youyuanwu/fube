@@ -34,20 +34,49 @@ bitflags::bitflags! {
 /// in [`NodeHealthQueryDescription`] inherits the native effective cluster policy.
 /// Cluster percentage/application thresholds do not govern this node query.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct NodeHealthPolicy {
     pub consider_warning_as_error: bool,
 }
 
-/// GetNodeHealth parameters; no paging, child filters or statistics.
+/// Native JSON event-filter object; its mask is numeric, including DEFAULT (0).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct HealthEventsQueryFilter {
+    #[serde(with = "crate::query_arguments::flags")]
+    pub health_state_filter: HealthEventsFilter,
+}
+
+impl From<HealthEventsFilter> for HealthEventsQueryFilter {
+    fn from(health_state_filter: HealthEventsFilter) -> Self {
+        Self {
+            health_state_filter,
+        }
+    }
+}
+
+/// GetNodeHealth parameters in native argument order; no paging or child filters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct NodeHealthQueryParameters {
+    /// None inherits cluster policy, unlike Some(default()).
+    #[serde(
+        rename = "ClusterHealthPolicy",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::query_arguments::json"
+    )]
+    pub health_policy: Option<NodeHealthPolicy>,
+    /// None omits the argument; an explicit DEFAULT mask also selects all events.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::query_arguments::json"
+    )]
+    pub events_filter: Option<HealthEventsQueryFilter>,
     /// Required, case-preserving name: 1..=4096 UTF-16 units, without NUL.
     /// Native HM resolves node identity; this is not a naming URI or prefix.
     pub node_name: String,
-    /// None omits the argument; explicit DEFAULT also selects all events.
-    pub events_filter: Option<HealthEventsFilter>,
-    /// None inherits cluster policy, unlike Some(default()).
-    pub health_policy: Option<NodeHealthPolicy>,
 }
 
 impl NodeHealthQueryParameters {

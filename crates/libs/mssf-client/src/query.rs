@@ -1,5 +1,9 @@
 //! Shared request composition and explicit, single-page query results.
 //!
+//! Parameter/paging JSON uses native argument names and numeric flag masks.
+//! Selectors are flattened and declared defaults are omitted; the outer
+//! `parameters`/`paging` fields stay separate from the native request envelope.
+//!
 //! ```
 //! use mssf_client::{
 //!     NodeQueryDescription, NodeQueryParameters, NodeStatusFilter, Paging,
@@ -12,6 +16,13 @@
 //!     paging: Paging { max_results: std::num::NonZeroU64::new(2), ..Default::default() },
 //! };
 //! let json = serde_json::to_string(&query).unwrap();
+//! assert_eq!(
+//!     serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+//!     serde_json::json!({
+//!         "parameters": { "NodeStatusFilter": 1 },
+//!         "paging": { "MaxResults": 2 },
+//!     }),
+//! );
 //! assert_eq!(serde_json::from_str::<NodeQueryDescription>(&json).unwrap(), query);
 //! ```
 
@@ -52,11 +63,17 @@ impl<P> PagedQuery<P> {
 
 /// Shared request paging, not response metadata or an automatic page iterator.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct Paging {
     /// Opaque server continuation. Empty strings are omitted like absent tokens.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::query_arguments::is_none_or_empty"
+    )]
     pub continuation_token: Option<String>,
     /// Positive limit at most i64::MAX, checked before sending. None leaves the
     /// count unspecified; the native server can still page by message size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_results: Option<NonZeroU64>,
 }
 

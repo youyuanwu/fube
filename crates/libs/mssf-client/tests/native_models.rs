@@ -50,11 +50,11 @@ fn naming_uri_has_distinct_native_mapping_and_checked_string_json() {
     );
     assert_eq!(
         serde_json::to_value(ApplicationListFilter::Name(uri.clone())).unwrap(),
-        serde_json::json!({"Name": "fabric:/App/Child"})
+        serde_json::json!({"ApplicationName": "fabric:/App/Child"})
     );
     assert_eq!(
         serde_json::to_value(ServiceQueryParameters::new(uri)).unwrap(),
-        serde_json::json!({"application_name": "fabric:/App/Child", "filter": "All"})
+        serde_json::json!({"ApplicationName": "fabric:/App/Child"})
     );
     for invalid in [
         "fabric:/",
@@ -71,10 +71,13 @@ fn naming_uri_has_distinct_native_mapping_and_checked_string_json() {
     assert!(NamingUri::parse(&format!("fabric:/{}", "a".repeat(4088))).is_ok());
     assert!(NamingUri::parse(&format!("fabric:/{}", "a".repeat(4089))).is_err());
     assert!(serde_json::from_str::<ServiceQueryParameters>(
-        r#"{"application_name":"fabric:/bad/","filter":"All"}"#
+        r#"{"ApplicationName":"fabric:/bad/"}"#
     )
     .is_err());
-    assert!(serde_json::from_str::<ApplicationListFilter>(r#"{"Name":"fabric:/bad/"}"#).is_err());
+    assert!(
+        serde_json::from_str::<ApplicationListFilter>(r#"{"ApplicationName":"fabric:/bad/"}"#)
+            .is_err()
+    );
 }
 
 #[test]

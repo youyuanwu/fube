@@ -161,8 +161,20 @@ bitflags::bitflags! {
 /// Native GetNodeList parameters. Empty names are omitted like the native
 /// facade. Node name is exact and case-preserving, not a prefix or naming URI.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeQueryParameters {
+    #[serde(
+        rename = "NodeName",
+        default,
+        skip_serializing_if = "crate::query_arguments::is_none_or_empty"
+    )]
     pub node_name: Option<String>,
+    #[serde(
+        rename = "NodeStatusFilter",
+        default,
+        skip_serializing_if = "crate::query_arguments::is_default",
+        with = "crate::query_arguments::flags"
+    )]
     pub status_filter: NodeStatusFilter,
 }
 

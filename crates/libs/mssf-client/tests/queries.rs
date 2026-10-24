@@ -105,11 +105,131 @@ fn descriptions_and_parameters_support_json_without_becoming_native_wire_dtos() 
             let query = NodeHealthQueryDescription::new(NodeHealthQueryParameters {
                 node_name: "Exact_Node".into(),
                 health_policy: policy,
-                events_filter,
+                events_filter: events_filter.map(Into::into),
             });
             json_round_trip(&query);
             json_round_trip(&query.parameters);
         }
+    }
+}
+
+#[test]
+fn default_query_json_uses_native_names_and_preserves_explicit_health_options() {
+    assert_eq!(
+        serde_json::to_value(NodeQueryParameters::default()).unwrap(),
+        serde_json::json!({})
+    );
+    assert_eq!(
+        serde_json::to_value(ApplicationQueryParameters::default()).unwrap(),
+        serde_json::json!({})
+    );
+    assert_eq!(
+        serde_json::to_value(Paging::default()).unwrap(),
+        serde_json::json!({})
+    );
+    assert_eq!(
+        serde_json::from_str::<NodeQueryParameters>("{}").unwrap(),
+        NodeQueryParameters::default()
+    );
+    assert_eq!(
+        serde_json::from_str::<ApplicationQueryParameters>("{}").unwrap(),
+        ApplicationQueryParameters::default()
+    );
+    let parameters = NodeHealthQueryParameters {
+        health_policy: Some(NodeHealthPolicy::default()),
+        events_filter: Some(HealthEventsFilter::DEFAULT.into()),
+        node_name: "Node".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(&parameters).unwrap(),
+        serde_json::json!({
+            "ClusterHealthPolicy": { "ConsiderWarningAsError": false },
+            "EventsFilter": { "HealthStateFilter": 0 },
+            "NodeName": "Node",
+        })
+    );
+    json_round_trip(&parameters);
+    for value in [serde_json::json!(0), serde_json::Value::Null] {
+        let parameters = serde_json::from_value::<ApplicationQueryParameters>(
+            serde_json::json!({ "ApplicationDefinitionKindFilter": value }),
+        )
+        .unwrap();
+        assert_eq!(
+            parameters.filter,
+            ApplicationListFilter::DefinitionKind(ApplicationDefinitionKindFilter::DEFAULT)
+        );
+        assert_eq!(
+            serde_json::to_value(&parameters).unwrap(),
+            serde_json::json!({ "ApplicationDefinitionKindFilter": null })
+        );
+        json_round_trip(&parameters);
+    }
+}
+
+#[test]
+fn flattened_selectors_reject_conflicts_duplicates_unknowns_and_malformed_values() {
+    for json in [
+        r#"{"ApplicationName":"fabric:/App","ApplicationTypeName":"Type"}"#,
+        r#"{"ApplicationName":"fabric:/App","ApplicationName":"fabric:/Other"}"#,
+        r#"{"ApplicationName":null}"#,
+        r#"{"ApplicationTypeName":1}"#,
+        r#"{"ApplicationDefinitionKindFilter":"COMPOSE"}"#,
+        r#"{"Unknown":null}"#,
+        r#"{"filter":"All"}"#,
+        r#"{"ApplicationName":"fabric:/bad/"}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<ApplicationQueryParameters>(json).is_err(),
+            "{json}"
+        );
+    }
+    for json in [
+        r#"{"ApplicationName":"fabric:/App","ServiceName":"fabric:/App/S","ServiceTypeName":"Type"}"#,
+        r#"{"ApplicationName":"fabric:/App","ServiceName":"fabric:/App/S","ServiceName":"fabric:/App/T"}"#,
+        r#"{"ApplicationName":"fabric:/App","ServiceName":null}"#,
+        r#"{"ApplicationName":"fabric:/App","Unknown":"value"}"#,
+        r#"{"ApplicationName":"fabric:/App","filter":"All"}"#,
+        r#"{"ServiceName":"fabric:/App/S"}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<ServiceQueryParameters>(json).is_err(),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn old_or_malformed_query_json_cannot_silently_become_unfiltered_queries() {
+    for json in [
+        r#"{"node_name":"Node","status_filter":"UP"}"#,
+        r#"{"NodeStatusFilter":"UP"}"#,
+        r#"{"NodeStatusFilter":-1}"#,
+        r#"{"NodeStatusFilter":4294967296}"#,
+        r#"{"NodeName":"Node","Unknown":true}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<NodeQueryParameters>(json).is_err(),
+            "{json}"
+        );
+    }
+    for json in [
+        r#"{"continuation_token":"next","max_results":10}"#,
+        r#"{"MaxResults":0}"#,
+        r#"{"Unknown":"value"}"#,
+    ] {
+        assert!(serde_json::from_str::<Paging>(json).is_err(), "{json}");
+    }
+    for json in [
+        r#"{"node_name":"Node"}"#,
+        r#"{"NodeName":"Node","EventsFilter":0}"#,
+        r#"{"NodeName":"Node","EventsFilter":{"HealthStateFilter":"ERROR"}}"#,
+        r#"{"NodeName":"Node","ClusterHealthPolicy":{"consider_warning_as_error":false}}"#,
+        r#"{"NodeName":"Node","ClusterHealthPolicy":{"ConsiderWarningAsError":false,"Unknown":0}}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<NodeHealthQueryParameters>(json).is_err(),
+            "{json}"
+        );
     }
 }
 
@@ -136,8 +256,8 @@ fn page_and_request_paging_are_separate_and_unpaged_queries_have_no_paging() {
     let health = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("Exact_Node"));
     let json = serde_json::to_value(health).unwrap();
     assert!(json.get("paging").is_none());
-    assert_eq!(json["parameters"]["node_name"], "Exact_Node");
+    assert_eq!(json["parameters"]["NodeName"], "Exact_Node");
     assert!(
-        serde_json::from_str::<Paging>(r#"{"continuation_token":null,"max_results":0}"#).is_err()
+        serde_json::from_str::<Paging>(r#"{"ContinuationToken":null,"MaxResults":0}"#).is_err()
     );
 }

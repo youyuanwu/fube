@@ -365,8 +365,14 @@ not structural deserialization, rejects Invalid kind and stateless persistence.
 adapter on their existing raw-byte fields; no parallel transport records remain.
 `NamingUri` is a checked semantic type with a private native component schema,
 not an arbitrary String. Naming query fields and application/service result
-names use it; string naming-call convenience remains supported. JSON query
-shapes are unchanged, with invalid names rejected on construction/deserialization.
+names use it; string naming-call convenience remains supported. Names remain
+JSON strings, with invalid names rejected on construction/deserialization.
+Request structs directly declare native query names, flattened selectors,
+omissions, numeric masks and embedded JSON through stock Serde attributes and
+reusable field adapters. A shared string-keyed struct/map encoder consumes their
+ordinary derives without a parallel serialization trait or custom derive crate.
+Configuration JSON now follows those declared native names and masks; legacy
+shapes and malformed/conflicting selectors fail explicitly.
 Strict scalar status/definition enums map their numeric codes directly; shared
 `HealthState` retains unknown codes, with list-specific rejection after decoding.
 URI redundancy is checked by semantic construction above the generic backend;

@@ -1,6 +1,6 @@
 use mssf_transport::message::Message;
 use mssf_transport::serialization::serde::{FixedTag, ObjectArray, Pointer};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{health::*, query_arguments::QueryArguments, query_protocol::Query, Error, Result};
 
@@ -21,46 +21,7 @@ impl Query for NodeHealthQueryDescription {
                 "node health name must be 1..=4096 UTF-16 units without NUL",
             ));
         }
-        #[derive(Serialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Policy {
-            consider_warning_as_error: bool,
-        }
-        #[derive(Serialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Filter {
-            health_state_filter: u32,
-        }
-        #[derive(Serialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Fields<'a> {
-            cluster_health_policy: Option<String>,
-            events_filter: Option<String>,
-            node_name: &'a str,
-        }
-        fn json(value: &impl Serialize) -> Result<String> {
-            serde_json::to_string(value)
-                .map_err(|_| Error::InvalidInput("failed to serialize query JSON argument"))
-        }
-        arguments.append(&Fields {
-            cluster_health_policy: query
-                .health_policy
-                .map(|policy| {
-                    json(&Policy {
-                        consider_warning_as_error: policy.consider_warning_as_error,
-                    })
-                })
-                .transpose()?,
-            events_filter: query
-                .events_filter
-                .map(|filter| {
-                    json(&Filter {
-                        health_state_filter: filter.bits(),
-                    })
-                })
-                .transpose()?,
-            node_name: name,
-        })
+        arguments.append(query)
     }
 
     fn decode_reply(message: &Message) -> Result<NodeHealth> {

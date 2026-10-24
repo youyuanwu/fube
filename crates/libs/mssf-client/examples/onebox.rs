@@ -118,14 +118,16 @@ fn arguments(mut args: Vec<String>) -> Result<(SocketAddr, Operation, Duration)>
             for pair in options {
                 match pair[0].as_str() {
                     "--events-filter" if query.parameters.events_filter.is_none() => {
-                        query.parameters.events_filter =
-                            Some(HealthEventsFilter::from_bits_retain(
-                                pair[1].parse().map_err(|_| {
+                        query.parameters.events_filter = Some(
+                            HealthEventsFilter::from_bits_retain(pair[1].parse().map_err(
+                                |_| {
                                     Error::InvalidInput(
                                         "events filter must be a decimal UInt32 mask",
                                     )
-                                })?,
-                            ));
+                                },
+                            )?)
+                            .into(),
+                        );
                     }
                     "--warning-as-error" if query.parameters.health_policy.is_none() => {
                         query.parameters.health_policy = Some(NodeHealthPolicy {
@@ -235,7 +237,7 @@ mod tests {
         );
         assert_eq!(
             query.parameters.events_filter,
-            Some(HealthEventsFilter::DEFAULT)
+            Some(HealthEventsFilter::DEFAULT.into())
         );
         assert_eq!(timeout, Duration::from_secs(5));
     }

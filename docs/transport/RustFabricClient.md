@@ -246,14 +246,24 @@ for the native wire.
 Internally, a `Query` trait binds the native query name, parameter encoder, paging
 placement, output and reply decoder. One executor starts the deadline before
 preparation and supplies the typed decoder to the connection driver. A dedicated
-Serde argument serializer turns named wire-projection fields into native string
-arguments. It omits `None`, retains explicit false/zero/empty strings unless the
-operation's projection omits them, formats integers numerically, and rejects
-duplicate keys, unsupported nested shapes and native bounds violations. It is
-non-human-readable, so Serde-enabled bitflags emit numeric masks, not flag names.
+Serde argument serializer consumes the parameter types and `Paging` directly.
+Ordinary `rename`, `flatten`, `skip_serializing_if` and reusable `with` field
+adapters declare native names, selector fields, numeric masks, omissions and
+field order on those structs. No parallel projection structs, serialization
+trait, per-request serialization wrapper or additional derive-macro crate is
+needed. The encoder
+accepts flat string-keyed structs/maps, formats scalar values as native string
+arguments, and rejects duplicates, unsupported nested shapes and bounds
+violations. Values use their ordinary human-readable representation, so checked
+`NamingUri` values serialize as strings without a query-specific handler.
 
 This is separate from the positional Fabric Serde backend, which serializes the
-binary request envelope. Health's embedded JSON uses explicit numeric-mask DTOs.
+binary request envelope. Health fields select the reusable `json` field adapter:
+the normal nested object becomes JSON text only when encoding a query argument.
+Ordinary nested objects remain unsupported; JSON output is bounded after
+escaping. `NodeHealthPolicy` and `HealthEventsQueryFilter` declare the native
+property names, and the reusable `flags` adapter selects numeric masks. Missing
+policy/filter remains distinct from explicit false/zero.
 List replies share envelope/page decoding but keep their native wrapper IDs and
 paging-tag policies; health keeps its distinct unpaged item envelope. Native
 pointers, polymorphism and versioned record suffixes remain explicit.
@@ -262,6 +272,33 @@ pointers, polymorphism and versioned record suffixes remain explicit.
 into `.paging`, and use `.items` instead of `.nodes`, `.applications` or
 `.services` on returned pages. Wrap service/health parameters with the corresponding
 description's `new(parameters)` constructor. Named client methods are unchanged.
+
+**Query JSON migration:** parameter and paging JSON now uses the native argument
+names and numeric masks rather than snake_case fields and flag-name strings.
+Selector enums flatten into keys such as `ApplicationName`, `ApplicationTypeName`
+or `ServiceTypeName`; a missing selector means All. For example, application
+parameters can be `{"ApplicationTypeName":"MyType","ExcludeApplicationParameters":true}`.
+Paging uses `ContinuationToken`/`MaxResults`; the outer description still uses
+`parameters`/`paging`. Optional/default values are omitted where declared, so
+empty names/tokens canonicalize to absence. Conflicting, duplicate, unknown or
+malformed selectors and unknown parameter fields fail instead of silently
+becoming an unfiltered query. Explicit application definition DEFAULT (0) can be
+read as 0 or null, serializes as null, and omits the native argument.
+
+Health parameter JSON keeps nested objects, not JSON strings:
+
+```json
+{
+  "ClusterHealthPolicy": { "ConsiderWarningAsError": false },
+  "EventsFilter": { "HealthStateFilter": 0 },
+  "NodeName": "N0020"
+}
+```
+
+`events_filter` now holds `HealthEventsQueryFilter { health_state_filter }`.
+Rust callers can use `Some(HealthEventsFilter::ERROR.into())`; flag operations
+remain on `HealthEventsFilter`. Existing JSON configurations must be migrated;
+the emitted native request bytes, validation and CLI arguments are unchanged.
 
 ### Native node pages
 
@@ -332,7 +369,7 @@ use mssf_client::{
 
 # async fn health(client: &FabricClient) -> mssf_client::Result<()> {
 let mut query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("N0020"));
-query.parameters.events_filter = Some(HealthEventsFilter::ERROR);
+query.parameters.events_filter = Some(HealthEventsFilter::ERROR.into());
 query.parameters.health_policy = Some(NodeHealthPolicy { consider_warning_as_error: true });
 let health = client.get_node_health(&query).await?;
 println!("{:?}", health.aggregated_health_state);
@@ -360,8 +397,8 @@ names are rejected locally, unlike node-list's optional empty-name omission.
 | `Some(NodeHealthPolicy::default())` | Explicit warning-as-error **false**, overriding cluster policy. |
 | `consider_warning_as_error: true` | Treat reported Warning as evaluated Error. Only this node-relevant override is exposed, not cluster aggregate thresholds/application maps. |
 | `events_filter: None` | Omit EventsFilter; all otherwise eligible events. |
-| `Some(DEFAULT)` / `Some(ALL)` | Explicit masks 0 / 65535; select all. |
-| `Some(NONE)` | Exact mask 1; no events, **without** suppressing aggregate/evaluations. |
+| `Some(DEFAULT.into())` / `Some(ALL.into())` | Explicit masks 0 / 65535; select all. |
+| `Some(NONE.into())` | Exact mask 1; no events, **without** suppressing aggregate/evaluations. |
 | `OK`, `WARNING`, `ERROR` | Bits 2, 4, 8, combinable with `\|`. Selection uses **evaluated** state; ERROR under policy true can return reported Warning. |
 | `from_bits_retain(u32)` | Sent unchanged. Other bits do not match; exact special-value equality matters: NONE \| ERROR = 9 selects Error, not none. |
 
@@ -542,7 +579,8 @@ structured URI object. Application/service result `name` fields,
 `String`. Construct service parameters with
 `ServiceQueryParameters::new("fabric:/App".parse()?)`.
 These field/constructor changes require callers to parse their names explicitly;
-JSON query shapes are unchanged, but invalid names are rejected earlier.
+Names remain strings in query JSON, with invalid names rejected earlier; the
+query-field JSON migration is described above.
 Naming methods accept `impl AsRef<str>`, so both existing string calls and
 `client.name_exists(&name)` with a `NamingUri` are supported.
 
@@ -647,9 +685,10 @@ or operators. Invalid masks fail locally before sending a request.
 
 Enable the `bitflags` crate's `serde` feature and derive Serialize/Deserialize
 on additional flag types. The backend's non-human-readable mode makes them use
-integer masks directly. Human-readable Serde formats such as JSON instead use flag-name
-strings; query-map filters still explicitly encode numeric decimal values,
-including numeric `HealthStateFilter` inside the EventsFilter JSON string.
+integer masks directly. Standalone flags in human-readable formats use flag-name
+strings. Query parameter fields instead select a numeric flag adapter in both
+configuration JSON and native query maps, including `HealthStateFilter` inside
+the EventsFilter JSON string.
 
 Generic Vec/array/tuple/map, Option, enums, unit, floats, chars and other integer
 widths are unsupported unless used through an explicit native adapter.

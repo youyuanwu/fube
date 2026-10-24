@@ -1,18 +1,17 @@
 //! Source-derived list aggregate envelopes and positional record layouts.
 
 use mssf_transport::message::Message;
-use serde::Serialize;
 
 use crate::{
     applications::*, query_arguments::QueryArguments, query_protocol::Query, services::*, Error,
     HealthState, Paging, Result,
 };
 
-fn type_selector(value: &str) -> Result<&str> {
+fn validate_type_selector(value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(Error::InvalidInput("selected type name must not be empty"));
     }
-    Ok(value)
+    Ok(())
 }
 
 impl Query for ApplicationQueryDescription {
@@ -20,35 +19,16 @@ impl Query for ApplicationQueryDescription {
     const NAME: &'static str = "GetApplicationList";
 
     fn encode_parameters(&self, arguments: &mut QueryArguments) -> Result<()> {
-        #[derive(Default, Serialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Fields<'a> {
-            application_name: Option<&'a str>,
-            application_type_name: Option<&'a str>,
-            application_definition_kind_filter: Option<ApplicationDefinitionKindFilter>,
-            exclude_application_parameters: Option<bool>,
-        }
-        let mut fields = Fields {
-            exclude_application_parameters: self
-                .parameters
-                .exclude_application_parameters
-                .then_some(true),
-            ..Default::default()
-        };
         match &self.parameters.filter {
-            ApplicationListFilter::All => {}
-            ApplicationListFilter::Name(name) => {
-                fields.application_name = Some(name.as_str());
-            }
             ApplicationListFilter::TypeName(name) => {
-                fields.application_type_name = Some(type_selector(name)?);
+                validate_type_selector(name)?;
             }
             ApplicationListFilter::DefinitionKind(filter) => {
-                let filter = ApplicationDefinitionKindFilter::try_from_bits(filter.bits())?;
-                fields.application_definition_kind_filter = (filter.bits() != 0).then_some(filter);
+                ApplicationDefinitionKindFilter::try_from_bits(filter.bits())?;
             }
+            _ => {}
         }
-        arguments.append(&fields)
+        arguments.append(&self.parameters)
     }
 
     fn paging(&self) -> Option<&Paging> {
@@ -65,34 +45,16 @@ impl Query for ServiceQueryDescription {
     const NAME: &'static str = "GetApplicationServiceList";
 
     fn encode_parameters(&self, arguments: &mut QueryArguments) -> Result<()> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Fields<'a> {
-            application_name: &'a str,
-            service_name: Option<&'a str>,
-            service_type_name: Option<&'a str>,
-        }
         let parameters = &self.parameters;
         if parameters.application_name.as_str() == "fabric:/System" {
             return Err(Error::InvalidInput(
                 "System service-list profile is unsupported",
             ));
         }
-        let mut fields = Fields {
-            application_name: parameters.application_name.as_str(),
-            service_name: None,
-            service_type_name: None,
-        };
-        match &parameters.filter {
-            ServiceListFilter::All => {}
-            ServiceListFilter::Name(name) => {
-                fields.service_name = Some(name.as_str());
-            }
-            ServiceListFilter::TypeName(name) => {
-                fields.service_type_name = Some(type_selector(name)?);
-            }
+        if let ServiceListFilter::TypeName(name) = &parameters.filter {
+            validate_type_selector(name)?;
         }
-        arguments.append(&fields)
+        arguments.append(parameters)
     }
 
     fn paging(&self) -> Option<&Paging> {

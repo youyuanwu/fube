@@ -216,7 +216,7 @@ async fn health_options_encode_sorted_json_and_preserve_omission_false_and_raw_b
         query.parameters.health_policy = policy.map(|value| NodeHealthPolicy {
             consider_warning_as_error: value,
         });
-        query.parameters.events_filter = filter;
+        query.parameters.events_filter = filter.map(Into::into);
         let value = client.get_node_health(&query).await.unwrap();
         assert_eq!(value.node_name, query.parameters.node_name);
         assert!(value.health_events.is_empty());

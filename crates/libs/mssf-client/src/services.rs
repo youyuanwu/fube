@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 pub enum ServiceListFilter {
     #[default]
     All,
+    #[serde(rename = "ServiceName")]
     Name(NamingUri),
+    #[serde(rename = "ServiceTypeName")]
     TypeName(String),
 }
 
@@ -16,7 +18,13 @@ pub enum ServiceListFilter {
 /// are rejected; neither denotes all services. No status/kind/health filter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceQueryParameters {
+    #[serde(rename = "ApplicationName")]
     pub application_name: NamingUri,
+    #[serde(
+        flatten,
+        skip_serializing_if = "crate::query_arguments::is_default",
+        deserialize_with = "crate::query_arguments::deserialize_selector"
+    )]
     pub filter: ServiceListFilter,
 }
 

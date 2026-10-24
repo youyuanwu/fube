@@ -36,12 +36,6 @@ pub(crate) fn encode_query<Q: Query>(query: &Q) -> Result<Vec<u8>> {
 }
 
 fn append_paging(arguments: &mut QueryArguments, paging: Option<&Paging>) -> Result<()> {
-    #[derive(Serialize)]
-    #[serde(rename_all = "PascalCase")]
-    struct Fields<'a> {
-        continuation_token: Option<&'a str>,
-        max_results: Option<u64>,
-    }
     let Some(paging) = paging else {
         return Ok(());
     };
@@ -53,13 +47,7 @@ fn append_paging(arguments: &mut QueryArguments, paging: Option<&Paging>) -> Res
             "MaxResults exceeds native signed range",
         ));
     }
-    arguments.append(&Fields {
-        continuation_token: paging
-            .continuation_token
-            .as_deref()
-            .filter(|s| !s.is_empty()),
-        max_results: paging.max_results.map(|max| max.get()),
-    })
+    arguments.append(paging)
 }
 
 fn encode(name: &str, args: &[(String, String)]) -> Result<Vec<u8>> {
@@ -235,8 +223,84 @@ mod tests {
     }
 
     #[test]
+    fn declarations_define_native_named_json_and_round_trips() {
+        fn check<Q>(query: Q, expected: serde_json::Value)
+        where
+            Q: Query + Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+        {
+            assert_eq!(serde_json::to_value(&query).unwrap(), expected);
+            encode_query(&query).unwrap();
+            assert_eq!(serde_json::to_value(&query).unwrap(), expected);
+            assert_eq!(serde_json::from_value::<Q>(expected).unwrap(), query);
+        }
+        check(
+            NodeQueryDescription {
+                parameters: NodeQueryParameters {
+                    node_name: Some("Node".into()),
+                    status_filter: NodeStatusFilter::UP,
+                },
+                paging: Paging {
+                    continuation_token: Some("next".into()),
+                    max_results: NonZeroU64::new(3),
+                },
+            },
+            serde_json::json!({
+                "parameters": { "NodeName": "Node", "NodeStatusFilter": 1 },
+                "paging": { "ContinuationToken": "next", "MaxResults": 3 },
+            }),
+        );
+        check(
+            ApplicationQueryDescription::new(ApplicationQueryParameters {
+                filter: ApplicationListFilter::DefinitionKind(
+                    ApplicationDefinitionKindFilter::COMPOSE,
+                ),
+                exclude_application_parameters: false,
+            }),
+            serde_json::json!({
+                "parameters": { "ApplicationDefinitionKindFilter": 2 },
+                "paging": {},
+            }),
+        );
+        check(
+            ServiceQueryDescription::new(ServiceQueryParameters {
+                application_name: "fabric:/App".parse().unwrap(),
+                filter: ServiceListFilter::TypeName("Type".into()),
+            }),
+            serde_json::json!({
+                "parameters": {
+                    "ApplicationName": "fabric:/App", "ServiceTypeName": "Type",
+                },
+                "paging": {},
+            }),
+        );
+        check(
+            NodeHealthQueryDescription::new(NodeHealthQueryParameters {
+                node_name: "Node".into(),
+                events_filter: Some(HealthEventsFilter::ERROR.into()),
+                health_policy: Some(NodeHealthPolicy {
+                    consider_warning_as_error: false,
+                }),
+            }),
+            serde_json::json!({
+                "parameters": {
+                    "NodeName": "Node", "EventsFilter": { "HealthStateFilter": 8 },
+                    "ClusterHealthPolicy": { "ConsiderWarningAsError": false },
+                },
+            }),
+        );
+    }
+
+    #[test]
     fn node_parameters_and_shared_paging_match_the_previous_wire_layout() {
         assert_native_bytes(&NodeQueryDescription::default(), "GetNodeList", &[]);
+        assert_native_bytes(
+            &NodeQueryDescription::new(NodeQueryParameters {
+                node_name: Some(String::new()),
+                ..Default::default()
+            }),
+            "GetNodeList",
+            &[],
+        );
         let query = NodeQueryDescription {
             parameters: NodeQueryParameters {
                 node_name: Some("Exact_Node".into()),
@@ -366,7 +430,7 @@ mod tests {
                 health_policy: Some(NodeHealthPolicy {
                     consider_warning_as_error: policy,
                 }),
-                events_filter: Some(filter),
+                events_filter: Some(filter.into()),
             });
             assert_native_bytes(
                 &query,
@@ -385,6 +449,30 @@ mod tests {
                 ],
             );
         }
+        assert_native_bytes(
+            &NodeHealthQueryDescription::new(NodeHealthQueryParameters {
+                node_name: "Node".into(),
+                health_policy: Some(NodeHealthPolicy::default()),
+                events_filter: None,
+            }),
+            "GetNodeHealth",
+            &[
+                ("ClusterHealthPolicy", r#"{"ConsiderWarningAsError":false}"#),
+                ("NodeName", "Node"),
+            ],
+        );
+        assert_native_bytes(
+            &NodeHealthQueryDescription::new(NodeHealthQueryParameters {
+                node_name: "Node".into(),
+                health_policy: None,
+                events_filter: Some(HealthEventsFilter::DEFAULT.into()),
+            }),
+            "GetNodeHealth",
+            &[
+                ("EventsFilter", r#"{"HealthStateFilter":0}"#),
+                ("NodeName", "Node"),
+            ],
+        );
     }
 
     #[test]

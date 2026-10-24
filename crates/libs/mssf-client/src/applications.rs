@@ -44,15 +44,30 @@ impl ApplicationDefinitionKindFilter {
 pub enum ApplicationListFilter {
     #[default]
     All,
+    #[serde(rename = "ApplicationName")]
     Name(NamingUri),
+    #[serde(rename = "ApplicationTypeName")]
     TypeName(String),
-    DefinitionKind(ApplicationDefinitionKindFilter),
+    #[serde(rename = "ApplicationDefinitionKindFilter")]
+    DefinitionKind(
+        #[serde(with = "crate::query_arguments::flags_or_none")] ApplicationDefinitionKindFilter,
+    ),
 }
 
 /// Native application selectors. Application parameters are included by default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicationQueryParameters {
+    #[serde(
+        flatten,
+        skip_serializing_if = "crate::query_arguments::is_default",
+        deserialize_with = "crate::query_arguments::deserialize_selector"
+    )]
     pub filter: ApplicationListFilter,
+    #[serde(
+        rename = "ExcludeApplicationParameters",
+        default,
+        skip_serializing_if = "crate::query_arguments::is_default"
+    )]
     pub exclude_application_parameters: bool,
 }
 
