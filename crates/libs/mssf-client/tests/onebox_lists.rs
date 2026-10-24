@@ -6,6 +6,8 @@ use std::{collections::BTreeSet, num::NonZeroU64, time::Duration};
 #[path = "support/list_fixture.rs"]
 mod oracle;
 use oracle::{output, owner, Http, Journal, Result};
+#[path = "support/deployment_oracle.rs"]
+mod deployment;
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/rest.rs"]
@@ -241,6 +243,7 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     );
     client.ping().await?;
     let topology = topology::observe(&client, &http, &journal).await?;
+    let deployment = deployment::observe(&client, &http, &journal).await?;
     client.close().await?;
     Ok(json!({
         "runtime_version": runtime, "archive_sha256": journal.archive_sha256,
@@ -258,6 +261,7 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
         })).collect::<Vec<_>>(),
         "native_services": native_services,
         "topology": topology,
+        "deployment_inspection": deployment,
         "qualification_limit": "volatile implicit-host stateful kind; not persisted application data replication"
     }))
 }

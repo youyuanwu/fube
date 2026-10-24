@@ -6,6 +6,9 @@
 
 mod applications;
 mod deployed_applications;
+mod deployed_code_packages;
+mod deployed_replicas;
+mod deployed_service_packages;
 mod health;
 mod health_protocol;
 mod list_protocol;
@@ -22,6 +25,9 @@ mod replicas;
 mod services;
 pub use applications::*;
 pub use deployed_applications::*;
+pub use deployed_code_packages::*;
+pub use deployed_replicas::*;
+pub use deployed_service_packages::*;
 pub use health::*;
 pub use naming_uri::NamingUri;
 pub use nodes::*;
@@ -302,6 +308,66 @@ impl FabricClient {
     ) -> Result<DeployedApplicationListPage> {
         self.query(&query.parameters, Some(&query.paging), timeout)
             .await
+    }
+
+    /// List service packages deployed for one application on a selected node.
+    /// This native query is unpaged and does not provide a cluster snapshot.
+    pub async fn get_deployed_service_package_list(
+        &self,
+        query: &DeployedServicePackageQueryDescription,
+    ) -> Result<Vec<DeployedServicePackage>> {
+        self.get_deployed_service_package_list_with_timeout(query, self.timeout)
+            .await
+    }
+
+    /// List deployed service packages with an explicit whole-operation timeout.
+    /// No automatic retries, reconnect or replay occurs.
+    pub async fn get_deployed_service_package_list_with_timeout(
+        &self,
+        query: &DeployedServicePackageQueryDescription,
+        timeout: Duration,
+    ) -> Result<Vec<DeployedServicePackage>> {
+        self.query(&query.parameters, None, timeout).await
+    }
+
+    /// List code packages deployed for one application on a selected node.
+    /// Includes setup/main entry points, statistics and host details; no paging.
+    pub async fn get_deployed_code_package_list(
+        &self,
+        query: &DeployedCodePackageQueryDescription,
+    ) -> Result<Vec<DeployedCodePackage>> {
+        self.get_deployed_code_package_list_with_timeout(query, self.timeout)
+            .await
+    }
+
+    /// List deployed code packages with an explicit whole-operation timeout.
+    /// Native errors remain operation-local; malformed successes retire the stream.
+    pub async fn get_deployed_code_package_list_with_timeout(
+        &self,
+        query: &DeployedCodePackageQueryDescription,
+        timeout: Duration,
+    ) -> Result<Vec<DeployedCodePackage>> {
+        self.query(&query.parameters, None, timeout).await
+    }
+
+    /// List replicas or stateless instances deployed on one node for an application.
+    /// Includes activation, host and reconfiguration details; not endpoint resolution.
+    pub async fn get_deployed_replica_list(
+        &self,
+        query: &DeployedReplicaQueryDescription,
+    ) -> Result<Vec<DeployedReplica>> {
+        self.get_deployed_replica_list_with_timeout(query, self.timeout)
+            .await
+    }
+
+    /// List deployed replicas with an explicit whole-operation timeout.
+    /// No paging, automatic retries, reconnect or replay occurs.
+    pub async fn get_deployed_replica_list_with_timeout(
+        &self,
+        query: &DeployedReplicaQueryDescription,
+        timeout: Duration,
+    ) -> Result<Vec<DeployedReplica>> {
+        self.query(&query.parameters, None, timeout).await
     }
 
     /// Close the shared connection and wait for the background driver to exit.

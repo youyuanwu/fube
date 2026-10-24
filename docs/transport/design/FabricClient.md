@@ -388,6 +388,10 @@ helpers retain protocol framing distinct from domain records, including both
 native list/item slots and their required empty/null checks. Operations declare
 shared `ListReply<Record, TAG, STRICT_PAGING>` or `ItemReply<Record, TAG, ACTOR>`
 profiles with optional record-validation hooks, not handwritten reply decoders.
+`UnpagedListReply<Record, TAG, ACTOR>` reuses list framing and validation, returns a
+`Vec<Record>`, and rejects any unexpected paging status before embedded errors.
+The actor check defaults to NamingGateway (5); deployed replicas instead select
+RS (13), matching the native RA query's `RSMessage::GetQueryReply` response.
 Payload tags use shared `query_protocol::result_tags` constants matching the
 native `QueryResultHelpersEnum.h` IDs, rather than literals in query declarations.
 Partition, replica/instance and node-local deployed-application lists follow the
@@ -399,6 +403,18 @@ Ordinary model derives select shared field adapters for untagged nested objects,
 UUID mapping and model-owned trailing defaults, rather than model-specific
 deserializers or remote derives. `HealthState` defaults to Unknown in the domain
 model; the generic trailing adapter does not know about health types.
+Node-local service-package, code-package and deployed-replica queries use
+`QueryDescription` without paging and require node/application selectors.
+Complete code-package records include both entry points and statistics; deployed
+replicas include nullable activation IDs, host process IDs and reconfiguration
+information. They reuse deployment/service/replica scalar enums and the same
+deadline/connection lifecycle rather than introducing deployment-specific
+transport workflows or interpreting inventory as endpoint resolution.
+The shared unpaged description rejects unsupported outer JSON fields, including
+paging controls, instead of silently ignoring them. Generic field adapters map
+nullable native string-pointer wrappers and untagged trailing objects, preserving
+null/empty distinctions and native constructor defaults without model-specific
+deserializers.
 A shared `decode_reply<Q>` function dispatches to the profile and validator
 outside the `Query` trait, symmetric with the shared request encoder.
 The shared schemas use `EmptyObjectArray` for the forbidden item-result list
@@ -421,6 +437,12 @@ and its source links for supported adapters, integration and limitations.
 The later shared-adapter and direct-model expansions add offline differential/malformed tests
 and rerun independent model-peer scenarios; they do not constitute a fresh
 live onebox qualification.
+The node-local deployment inspection expansion was separately qualified live on
+SF11.8.121.4 against two owned applications: ten service packages, ten ExeHost
+code packages and 22 deployed replicas/instances matched independent REST
+observations. This covers shared activation, no setup execution and stable
+stateful reconfiguration observations, not exclusive activation, container hosts
+or reconfiguration transitions.
 
 ## 6. Frames, headers, and messages
 

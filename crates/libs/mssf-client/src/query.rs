@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 
 /// Parameters for an unpaged query. Unlike [`PagedQuery`], this has no paging.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryDescription<P> {
     pub parameters: P,
 }

@@ -2,6 +2,9 @@
 use super::*;
 use mssf_client::{
     DeployedApplicationQueryDescription, DeployedApplicationQueryParameters,
+    DeployedCodePackageQueryDescription, DeployedCodePackageQueryParameters,
+    DeployedReplicaQueryDescription, DeployedReplicaQueryParameters,
+    DeployedServicePackageQueryDescription, DeployedServicePackageQueryParameters,
     PartitionQueryDescription, PartitionQueryParameters, ReplicaQueryDescription,
     ReplicaQueryParameters,
 };
@@ -13,10 +16,31 @@ enum QueryKind {
     Partitions,
     Replicas,
     Deployments,
+    ServicePackages,
+    CodePackages,
+    DeployedReplicas,
 }
 
 impl QueryKind {
-    const ALL: [Self; 3] = [Self::Partitions, Self::Replicas, Self::Deployments];
+    const ALL: [Self; 6] = [
+        Self::Partitions,
+        Self::Replicas,
+        Self::Deployments,
+        Self::ServicePackages,
+        Self::CodePackages,
+        Self::DeployedReplicas,
+    ];
+
+    fn tag(self) -> i32 {
+        match self {
+            Self::Partitions => 5,
+            Self::Replicas => 6,
+            Self::Deployments => 10,
+            Self::ServicePackages => 11,
+            Self::CodePackages => 14,
+            Self::DeployedReplicas => 12,
+        }
+    }
 
     async fn call(
         self,
@@ -63,11 +87,108 @@ impl QueryKind {
                         .map(|_| ()),
                 }
             }
+            Self::ServicePackages => {
+                let query = DeployedServicePackageQueryDescription::new(
+                    DeployedServicePackageQueryParameters::new(
+                        "N0010",
+                        "fabric:/Model".parse().unwrap(),
+                    ),
+                );
+                match timeout {
+                    Some(timeout) => client
+                        .get_deployed_service_package_list_with_timeout(&query, timeout)
+                        .await
+                        .map(|_| ()),
+                    None => client
+                        .get_deployed_service_package_list(&query)
+                        .await
+                        .map(|_| ()),
+                }
+            }
+            Self::CodePackages => {
+                let query = DeployedCodePackageQueryDescription::new(
+                    DeployedCodePackageQueryParameters::new(
+                        "N0010",
+                        "fabric:/Model".parse().unwrap(),
+                    ),
+                );
+                match timeout {
+                    Some(timeout) => client
+                        .get_deployed_code_package_list_with_timeout(&query, timeout)
+                        .await
+                        .map(|_| ()),
+                    None => client
+                        .get_deployed_code_package_list(&query)
+                        .await
+                        .map(|_| ()),
+                }
+            }
+            Self::DeployedReplicas => {
+                let query = DeployedReplicaQueryDescription::new(
+                    DeployedReplicaQueryParameters::new("N0010", "fabric:/Model".parse().unwrap()),
+                );
+                match timeout {
+                    Some(timeout) => client
+                        .get_deployed_replica_list_with_timeout(&query, timeout)
+                        .await
+                        .map(|_| ()),
+                    None => client.get_deployed_replica_list(&query).await.map(|_| ()),
+                }
+            }
         }
     }
 }
 
-fn native_error(request: &Message) -> Message {
+#[tokio::test]
+async fn empty_list_successes_support_default_and_explicit_timeouts() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut stream = establish(listener).await;
+        for kind in QueryKind::ALL {
+            for _ in 0..2 {
+                let request = read_message(&mut stream).await.unwrap();
+                assert_eq!(request.properties().unwrap().action, "QueryRequest");
+                let bytes = body(|e| {
+                    e.i64(2);
+                    e.pointer(Some(&kind.tag().to_le_bytes()), |e| {
+                        e.object_array::<()>(&[], |_, _| Ok(()))?;
+                        e.pointer(None, |_| Ok(()))
+                    })?;
+                    e.i64(0);
+                    e.pointer(None, |_| Ok(()))
+                });
+                write_message(&mut stream, &query_reply(kind, &request, bytes))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    });
+    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+        .await
+        .unwrap();
+    for kind in QueryKind::ALL {
+        kind.call(&client, None).await.unwrap();
+        kind.call(&client, Some(TIMEOUT_DURATION)).await.unwrap();
+    }
+    client.close().await.unwrap();
+    server.await.unwrap();
+}
+
+fn query_reply(kind: QueryKind, request: &Message, bytes: Vec<u8>) -> Message {
+    let mut response = reply(request, "QueryReply", bytes);
+    match kind {
+        QueryKind::DeployedReplicas => response.headers[0] = Header::actor(13).unwrap(),
+        QueryKind::ServicePackages | QueryKind::CodePackages => {
+            response.headers = vec![Header::relates_to(request.properties().unwrap().id).unwrap()];
+        }
+        _ => {}
+    }
+    response
+}
+
+fn native_error(kind: QueryKind, request: &Message) -> Message {
     #[derive(Serialize)]
     struct QueryError {
         kind: i64,
@@ -75,9 +196,9 @@ fn native_error(request: &Message) -> Message {
         error: i64,
         paging: Pointer<EmptyObjectArray>,
     }
-    reply(
+    query_reply(
+        kind,
         request,
-        "QueryReply",
         mssf_transport::serialization::serde::to_vec(&QueryError {
             kind: 0,
             payload: Pointer(None),
@@ -95,15 +216,49 @@ fn ping_reply(request: &Message) -> Message {
 }
 
 #[tokio::test]
+async fn unpaged_deployment_continuations_retire_connection_even_with_native_error() {
+    for kind in [
+        QueryKind::ServicePackages,
+        QueryKind::CodePackages,
+        QueryKind::DeployedReplicas,
+    ] {
+        for token in ["", "unexpected-next"] {
+            for error in [0, REMOTE_CODE] {
+                let (client, server) = single_reply(move |request| {
+                    let bytes = body(|e| {
+                        e.i64(2);
+                        e.pointer(Some(&kind.tag().to_le_bytes()), |e| {
+                            e.object_array::<()>(&[], |_, _| Ok(()))?;
+                            e.pointer(None, |_| Ok(()))
+                        })?;
+                        e.i64(error);
+                        e.pointer(Some(&[]), |e| e.string(token))
+                    });
+                    query_reply(kind, request, bytes)
+                })
+                .await;
+                assert!(matches!(
+                    kind.call(&client, None).await,
+                    Err(Error::Protocol(_))
+                ));
+                assert!(client.is_closed());
+                assert!(client.ping().await.is_err());
+                server.await.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn native_errors_from_each_new_query_leave_shared_connection_usable() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let mut stream = establish(listener).await;
-        for _ in QueryKind::ALL {
+        for kind in QueryKind::ALL {
             let request = read_message(&mut stream).await.unwrap();
             assert_eq!(request.properties().unwrap().action, "QueryRequest");
-            write_message(&mut stream, &native_error(&request))
+            write_message(&mut stream, &native_error(kind, &request))
                 .await
                 .unwrap();
             let request = read_message(&mut stream).await.unwrap();
@@ -243,6 +398,32 @@ async fn invalid_new_query_options_send_nothing_and_preserve_connection() {
             DeployedApplicationQueryDescription::new(DeployedApplicationQueryParameters::new(node));
         assert!(matches!(
             client.get_deployed_application_list(&query).await,
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(!client.is_closed());
+        let application = "fabric:/Model".parse().unwrap();
+        assert!(matches!(
+            client
+                .get_deployed_service_package_list(&DeployedServicePackageQueryDescription::new(
+                    DeployedServicePackageQueryParameters::new(node, application),
+                ))
+                .await,
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            client
+                .get_deployed_code_package_list(&DeployedCodePackageQueryDescription::new(
+                    DeployedCodePackageQueryParameters::new(node, "fabric:/Model".parse().unwrap()),
+                ))
+                .await,
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            client
+                .get_deployed_replica_list(&DeployedReplicaQueryDescription::new(
+                    DeployedReplicaQueryParameters::new(node, "fabric:/Model".parse().unwrap()),
+                ))
+                .await,
             Err(Error::InvalidInput(_))
         ));
         assert!(!client.is_closed());

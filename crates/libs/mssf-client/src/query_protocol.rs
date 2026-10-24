@@ -21,6 +21,9 @@ pub(crate) mod result_tags {
     pub(crate) const PARTITION: i32 = 5;
     pub(crate) const REPLICA: i32 = 6;
     pub(crate) const DEPLOYED_APPLICATION: i32 = 10;
+    pub(crate) const DEPLOYED_SERVICE_PACKAGE: i32 = 11;
+    pub(crate) const DEPLOYED_REPLICA: i32 = 12;
+    pub(crate) const DEPLOYED_CODE_PACKAGE: i32 = 14;
     pub(crate) const NODE_HEALTH: i32 = 16;
 }
 
@@ -124,40 +127,72 @@ impl<T: DeserializeOwned + Send + 'static, const TAG: i32, const STRICT_PAGING: 
     type Output = QueryPage<T>;
 
     fn decode(message: &Message, validate: fn(T) -> Result<T>) -> Result<Self::Output> {
-        crate::protocol::check_failure(message)?;
-        let properties = message.properties()?;
-        // Native list aggregates can omit actor/action; validate them if present.
-        if message.headers.iter().any(|h| h.id == ACTOR) && properties.actor != 5 {
-            return Err(Error::Protocol("list reply is not from NamingGateway"));
-        }
-        if message.headers.iter().any(|h| h.id == ACTION) && properties.action != "QueryReply" {
-            return Err(Error::Protocol("unexpected list reply action"));
-        }
-        let result = decode::<FixedTag<ListPayload<T>, TAG>, _>(
-            &message.body,
-            STRICT_PAGING,
-            |FixedTag(payload)| {
-                if payload.item.0.is_some() {
-                    return Err(Error::Protocol("list has a single-item payload"));
-                }
-                payload
-                    .items
-                    .0
-                    .into_iter()
-                    .map(validate)
-                    .collect::<Result<Vec<_>>>()
-            },
-        )?;
-        if result.kind != 2 {
-            return Err(Error::Protocol("query result is not a List"));
-        }
-        Ok(QueryPage {
-            items: result
-                .payload
-                .ok_or(Error::Protocol("list has no typed wrapper"))?,
-            continuation_token: result.paging.filter(|s| !s.is_empty()),
-        })
+        decode_list::<T, TAG, STRICT_PAGING, 5>(message, validate, true)
     }
+}
+
+/// Native node-local lists that have no paging request or continuation contract.
+pub(crate) struct UnpagedListReply<T, const TAG: i32, const ACTOR_ID: i64 = 5>(PhantomData<T>);
+
+impl<T: DeserializeOwned + Send + 'static, const TAG: i32, const ACTOR_ID: i64> Reply
+    for UnpagedListReply<T, TAG, ACTOR_ID>
+{
+    type Record = T;
+    type Output = Vec<T>;
+
+    fn decode(message: &Message, validate: fn(T) -> Result<T>) -> Result<Vec<T>> {
+        decode_list::<T, TAG, true, ACTOR_ID>(message, validate, false).map(|page| page.items)
+    }
+}
+
+fn decode_list<
+    T: DeserializeOwned,
+    const TAG: i32,
+    const STRICT_PAGING: bool,
+    const ACTOR_ID: i64,
+>(
+    message: &Message,
+    validate: fn(T) -> Result<T>,
+    allow_paging: bool,
+) -> Result<QueryPage<T>> {
+    crate::protocol::check_failure(message)?;
+    let properties = message.properties()?;
+    // Native list aggregates can omit actor/action; validate them if present.
+    if message.headers.iter().any(|h| h.id == ACTOR) && properties.actor != ACTOR_ID {
+        return Err(Error::Protocol(if ACTOR_ID == 5 {
+            "list reply is not from NamingGateway"
+        } else {
+            "unexpected unpaged list reply actor"
+        }));
+    }
+    if message.headers.iter().any(|h| h.id == ACTION) && properties.action != "QueryReply" {
+        return Err(Error::Protocol("unexpected list reply action"));
+    }
+    let result = decode::<FixedTag<ListPayload<T>, TAG>, _>(
+        &message.body,
+        STRICT_PAGING,
+        allow_paging,
+        |FixedTag(payload)| {
+            if payload.item.0.is_some() {
+                return Err(Error::Protocol("list has a single-item payload"));
+            }
+            payload
+                .items
+                .0
+                .into_iter()
+                .map(validate)
+                .collect::<Result<Vec<_>>>()
+        },
+    )?;
+    if result.kind != 2 {
+        return Err(Error::Protocol("query result is not a List"));
+    }
+    Ok(QueryPage {
+        items: result
+            .payload
+            .ok_or(Error::Protocol("list has no typed wrapper"))?,
+        continuation_token: result.paging.filter(|s| !s.is_empty()),
+    })
 }
 
 /// Unpaged item with a fixed payload tag and required actor/OperationSuccessAction.
@@ -181,6 +216,7 @@ impl<T: DeserializeOwned + Send + 'static, const TAG: i32, const ACTOR_ID: i64> 
         let result = decode::<FixedTag<ItemPayload<T>, TAG>, _>(
             &message.body,
             false,
+            true,
             |FixedTag(payload)| validate(payload.item.0.ok_or(Error::Protocol("null query item"))?),
         )?;
         if result.kind != 1 || result.paging.is_some() {
@@ -229,12 +265,16 @@ struct QueryResult<T> {
 fn decode<T: DeserializeOwned, U>(
     body: &[u8],
     strict_paging: bool,
+    allow_paging: bool,
     validate: impl FnOnce(T) -> Result<U>,
 ) -> Result<QueryResult<U>> {
     let envelope: QueryResultEnvelope<T> = from_slice(body)?;
     // A native query error must not hide a malformed payload and allow reuse
     // of a connection that previously failed protocol validation.
     let payload = envelope.payload.0.map(validate).transpose()?;
+    if !allow_paging && envelope.paging.0.is_some() {
+        return Err(Error::Protocol("unpaged list has paging status"));
+    }
     let paging = envelope
         .paging
         .0
@@ -275,9 +315,12 @@ mod tests {
                 result_tags::PARTITION,
                 result_tags::REPLICA,
                 result_tags::DEPLOYED_APPLICATION,
+                result_tags::DEPLOYED_SERVICE_PACKAGE,
+                result_tags::DEPLOYED_REPLICA,
+                result_tags::DEPLOYED_CODE_PACKAGE,
                 result_tags::NODE_HEALTH,
             ],
-            [1, 2, 4, 5, 6, 10, 16]
+            [1, 2, 4, 5, 6, 10, 11, 12, 14, 16]
         );
     }
 
@@ -351,6 +394,19 @@ mod tests {
         type Output = ReplyRecord;
         type Reply = ItemReply<ReplyRecord, 37, 99>;
         const NAME: &'static str = "DeclaredItem";
+    }
+
+    #[derive(Serialize)]
+    struct DeclaredUnpagedListQuery {}
+
+    impl Query for DeclaredUnpagedListQuery {
+        type Output = Vec<ReplyRecord>;
+        type Reply = UnpagedListReply<ReplyRecord, 23>;
+        const NAME: &'static str = "DeclaredUnpagedList";
+
+        fn validate_record(record: ReplyRecord) -> Result<ReplyRecord> {
+            DeclaredListQuery::validate_record(record)
+        }
     }
 
     #[test]
@@ -439,6 +495,75 @@ mod tests {
             Header::action("OperationSuccessAction").unwrap(),
         ];
         message
+    }
+
+    #[test]
+    fn unpaged_lists_validate_headers_slots_and_any_paging_before_remote_errors() {
+        for values in [&[][..], &["first", "second"][..]] {
+            let records = decode_reply::<DeclaredUnpagedListQuery>(&reply_fixture(
+                2,
+                Some(23),
+                values,
+                None,
+                0,
+                None,
+            ))
+            .unwrap();
+            assert_eq!(
+                records,
+                values
+                    .iter()
+                    .map(|value| ReplyRecord {
+                        value: (*value).into()
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+        for error in [0, -123] {
+            for message in [
+                reply_fixture(2, Some(24), &[], None, error, None),
+                reply_fixture(2, Some(23), &["invalid"], None, error, None),
+                reply_fixture(2, Some(23), &[], Some("unexpected"), error, None),
+                reply_fixture(2, Some(23), &[], None, error, Some((&[], ""))),
+                reply_fixture(2, Some(23), &[], None, error, Some((&[], "next"))),
+                reply_fixture(2, Some(23), &[], None, error, Some((b"typed", ""))),
+            ] {
+                assert!(matches!(
+                    decode_reply::<DeclaredUnpagedListQuery>(&message),
+                    Err(Error::Protocol(_))
+                ));
+            }
+        }
+        for message in [
+            reply_fixture(1, Some(23), &[], None, 0, None),
+            reply_fixture(2, None, &[], None, 0, None),
+        ] {
+            assert!(matches!(
+                decode_reply::<DeclaredUnpagedListQuery>(&message),
+                Err(Error::Protocol(_))
+            ));
+        }
+        for tag in [None, Some(23)] {
+            assert!(matches!(
+                decode_reply::<DeclaredUnpagedListQuery>(&reply_fixture(
+                    0,
+                    tag,
+                    &[],
+                    None,
+                    -123,
+                    None
+                )),
+                Err(Error::Remote { code: -123, .. })
+            ));
+        }
+        for header in [Header::actor(99).unwrap(), Header::action("wrong").unwrap()] {
+            let mut message = reply_fixture(2, Some(23), &[], None, 0, None);
+            message.headers.push(header);
+            assert!(matches!(
+                decode_reply::<DeclaredUnpagedListQuery>(&message),
+                Err(Error::Protocol(_))
+            ));
+        }
     }
 
     #[test]

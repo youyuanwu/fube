@@ -433,6 +433,51 @@ impl Http {
         unpaged_items(value, "deployed applications")
     }
 
+    async fn deployed_list(
+        &self,
+        node_name: &str,
+        application_name: &str,
+        operation: &str,
+    ) -> Result<Vec<Value>> {
+        let application_id = app_id(application_name).replace('/', "~");
+        let value = self
+            .get(&format!(
+            "/Nodes/{node_name}/$/GetApplications/{application_id}/$/{operation}?api-version=6.3"
+        ))
+            .await?;
+        Ok(value
+            .as_array()
+            .ok_or_else(|| format!("missing independent unpaged {operation} array"))?
+            .clone())
+    }
+
+    pub async fn deployed_service_packages(
+        &self,
+        node_name: &str,
+        application_name: &str,
+    ) -> Result<Vec<Value>> {
+        self.deployed_list(node_name, application_name, "GetServicePackages")
+            .await
+    }
+
+    pub async fn deployed_code_packages(
+        &self,
+        node_name: &str,
+        application_name: &str,
+    ) -> Result<Vec<Value>> {
+        self.deployed_list(node_name, application_name, "GetCodePackages")
+            .await
+    }
+
+    pub async fn deployed_replicas(
+        &self,
+        node_name: &str,
+        application_name: &str,
+    ) -> Result<Vec<Value>> {
+        self.deployed_list(node_name, application_name, "GetReplicas")
+            .await
+    }
+
     pub async fn wait_ready(&self, journal: &Journal) -> Result<()> {
         for _ in 0..120 {
             let apps = self.applications(journal).await?;
@@ -725,6 +770,67 @@ mod tests {
             http.deployed_applications("N0010").await.unwrap(),
             vec![deployed]
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn independent_deployment_routes_require_unpaged_arrays_and_preserve_details() {
+        let packages = json!([{
+            "Name": "Manifest", "Version": "1.0",
+            "Status": "Active", "ServicePackageActivationId": ""
+        }]);
+        let code = json!([{
+            "Name": "Guest", "HostType": "ExeHost",
+            "MainEntryPoint": {
+                "ProcessId": "18446744073709551615",
+                "Statistics": {"LastExitCode": -1}
+            }
+        }]);
+        let replicas = json!([{
+            "ServiceKind": "Stateful", "ReplicaId": "9223372036854775807",
+            "HostProcessId": "-1",
+            "ReconfigurationInformation": {"ReconfigurationType": "SwapPrimary"}
+        }]);
+        let (http, server) = scripted_http(vec![
+            (
+                "GET /Nodes/N0010/$/GetApplications/Owned~Nested/$/GetServicePackages?api-version=6.3".into(),
+                StatusCode::OK, packages.clone(),
+            ),
+            (
+                "GET /Nodes/N0010/$/GetApplications/Owned~Nested/$/GetCodePackages?api-version=6.3".into(),
+                StatusCode::OK, code.clone(),
+            ),
+            (
+                "GET /Nodes/N0010/$/GetApplications/Owned~Nested/$/GetReplicas?api-version=6.3".into(),
+                StatusCode::OK, replicas.clone(),
+            ),
+            (
+                "GET /Nodes/N0010/$/GetApplications/Owned/$/GetReplicas?api-version=6.3".into(),
+                StatusCode::OK, json!({"Items": [], "ContinuationToken": "next"}),
+            ),
+        ]).await;
+        assert_eq!(
+            http.deployed_service_packages("N0010", "fabric:/Owned/Nested")
+                .await
+                .unwrap(),
+            packages.as_array().unwrap().clone()
+        );
+        assert_eq!(
+            http.deployed_code_packages("N0010", "fabric:/Owned/Nested")
+                .await
+                .unwrap(),
+            code.as_array().unwrap().clone()
+        );
+        assert_eq!(
+            http.deployed_replicas("N0010", "fabric:/Owned/Nested")
+                .await
+                .unwrap(),
+            replicas.as_array().unwrap().clone()
+        );
+        assert!(http
+            .deployed_replicas("N0010", "fabric:/Owned")
+            .await
+            .is_err());
         server.await.unwrap();
     }
 

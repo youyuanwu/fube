@@ -15,6 +15,44 @@ pub(crate) mod untagged {
         }
         Untagged::<T>::deserialize(deserializer).map(|Untagged(value)| value)
     }
+
+    pub fn deserialize_trailing<'de, T: Deserialize<'de> + Default, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<T, D::Error> {
+        #[derive(Default, Deserialize)]
+        #[serde(bound(deserialize = "T: Deserialize<'de>"))]
+        struct Value<T>(#[serde(deserialize_with = "deserialize")] T);
+
+        super::trailing_default::deserialize::<Value<T>, D>(deserializer).map(|Value(value)| value)
+    }
+}
+
+pub(crate) mod string_pointer {
+    use super::*;
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        if deserializer.is_human_readable() {
+            return Option::<String>::deserialize(deserializer);
+        }
+        #[derive(Deserialize)]
+        struct Value {
+            value: String,
+        }
+
+        Pointer::<Value>::deserialize(deserializer)
+            .map(|pointer| pointer.0.map(|value| value.value))
+    }
+
+    pub fn deserialize_trailing<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        #[derive(Default, Deserialize)]
+        struct Value(#[serde(deserialize_with = "deserialize")] Option<String>);
+
+        super::trailing_default::deserialize::<Value, D>(deserializer).map(|Value(value)| value)
+    }
 }
 
 pub(crate) mod guid {

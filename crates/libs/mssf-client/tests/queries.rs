@@ -419,3 +419,33 @@ fn page_and_request_paging_are_separate_and_unpaged_queries_have_no_paging() {
         serde_json::from_str::<Paging>(r#"{"ContinuationToken":null,"MaxResults":0}"#).is_err()
     );
 }
+
+#[test]
+fn unpaged_descriptions_reject_unsupported_outer_paging_instead_of_ignoring_it() {
+    fn check<T: Serialize + DeserializeOwned>(query: T) {
+        let original = serde_json::to_value(query).unwrap();
+        for (key, value) in [
+            ("paging", serde_json::json!({"ContinuationToken": "next"})),
+            ("MaxResults", serde_json::json!(1)),
+            ("ContinuationToken", serde_json::json!("next")),
+            ("parameters_typo", serde_json::json!({})),
+        ] {
+            let mut invalid = original.clone();
+            invalid[key] = value;
+            assert!(serde_json::from_value::<T>(invalid).is_err());
+        }
+        serde_json::from_value::<T>(original).unwrap();
+    }
+    check(NodeHealthQueryDescription::new(
+        NodeHealthQueryParameters::new("Node_1"),
+    ));
+    check(DeployedServicePackageQueryDescription::new(
+        DeployedServicePackageQueryParameters::new("Node_1", "fabric:/App".parse().unwrap()),
+    ));
+    check(DeployedCodePackageQueryDescription::new(
+        DeployedCodePackageQueryParameters::new("Node_1", "fabric:/App".parse().unwrap()),
+    ));
+    check(DeployedReplicaQueryDescription::new(
+        DeployedReplicaQueryParameters::new("Node_1", "fabric:/App".parse().unwrap()),
+    ));
+}
