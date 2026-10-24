@@ -58,7 +58,7 @@ jobs:
         RUSTDOCFLAGS: -D warnings
 
     - name: Upload native-client test archive
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: native-client-tests
         path: ${{ runner.temp }}/native-client-tests.tar.zst
@@ -163,11 +163,11 @@ jobs:
       run:
         shell: bash
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
       with:
         persist-credentials: false
 
-    - uses: actions/setup-python@v6
+    - uses: actions/setup-python@v7
       with:
         python-version: "3.12"
 
@@ -180,7 +180,7 @@ jobs:
 
     - name: Download native-client test archive
       if: matrix.topology == 'onebox'
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: native-client-tests
         path: ${{ runner.temp }}/native-client-tests
@@ -229,7 +229,7 @@ jobs:
 
     - name: Upload successful native client evidence
       if: matrix.topology == 'onebox' && steps.native_client.outcome == 'success'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: native-client-${{ github.run_id }}-${{ github.run_attempt }}
         path: |
@@ -271,7 +271,7 @@ jobs:
     - name: Upload lifecycle diagnostics
       if: always()
       timeout-minutes: 2
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: linux-${{ matrix.topology }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/linux-cluster-diagnostics/diagnostics.json
