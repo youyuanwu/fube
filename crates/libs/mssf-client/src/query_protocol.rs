@@ -1,9 +1,11 @@
-//! Bounded external query framing; payload and success policy stay operation-specific.
+//! Declarative external query framing with shared list/item reply profiles.
+
+use std::marker::PhantomData;
 
 use mssf_transport::{
     message::{Message, ACTION, ACTOR},
     serialization::{
-        serde::{from_slice, to_vec, FixedTag, NativeType, ObjectArray, Pointer, Typed},
+        serde::{from_slice, to_vec, EmptyObjectArray, FixedTag, ObjectArray, Pointer, RawTagged},
         MAX_COLLECTION_COUNT,
     },
 };
@@ -11,26 +13,34 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{query_arguments::QueryArguments, Error, Paging, QueryPage, Result};
 
-pub(crate) trait Query {
+pub(crate) trait Query: Serialize {
     type Output: Send + 'static;
+    type Reply: Reply<Output = Self::Output>;
     const NAME: &'static str;
     const PAGING_FIRST: bool = false;
 
-    fn encode_parameters(&self, arguments: &mut QueryArguments) -> Result<()>;
-    fn decode_reply(message: &Message) -> Result<Self::Output>;
-    fn paging(&self) -> Option<&Paging> {
-        None
+    fn validate_parameters(&self) -> Result<()> {
+        Ok(())
+    }
+    fn validate_record(
+        record: <Self::Reply as Reply>::Record,
+    ) -> Result<<Self::Reply as Reply>::Record> {
+        Ok(record)
+    }
+    fn decode_reply(message: &Message) -> Result<Self::Output> {
+        Self::Reply::decode(message, Self::validate_record)
     }
 }
 
-pub(crate) fn encode_query<Q: Query>(query: &Q) -> Result<Vec<u8>> {
+pub(crate) fn encode_query<Q: Query>(query: &Q, paging: Option<&Paging>) -> Result<Vec<u8>> {
     let mut arguments = QueryArguments::default();
     if Q::PAGING_FIRST {
-        append_paging(&mut arguments, query.paging())?;
+        append_paging(&mut arguments, paging)?;
     }
-    query.encode_parameters(&mut arguments)?;
+    query.validate_parameters()?;
+    arguments.append(query)?;
     if !Q::PAGING_FIRST {
-        append_paging(&mut arguments, query.paging())?;
+        append_paging(&mut arguments, paging)?;
     }
     encode(Q::NAME, &arguments.values)
 }
@@ -78,94 +88,133 @@ fn encode(name: &str, args: &[(String, String)]) -> Result<Vec<u8>> {
     ))
 }
 
-pub(crate) fn decode_list<W: DeserializeOwned, T, const TAG: i32>(
-    message: &Message,
-    strict_paging: bool,
-    record: fn(W) -> Result<T>,
-) -> Result<QueryPage<T>> {
-    crate::protocol::check_failure(message)?;
-    let properties = message.properties()?;
-    // Native list aggregates can omit actor/action; validate them if present.
-    if message.headers.iter().any(|h| h.id == ACTOR) && properties.actor != 5 {
-        return Err(Error::Protocol("list reply is not from NamingGateway"));
-    }
-    if message.headers.iter().any(|h| h.id == ACTION) && properties.action != "QueryReply" {
-        return Err(Error::Protocol("unexpected list reply action"));
-    }
-    #[derive(Deserialize)]
-    struct Empty {}
-    #[derive(Deserialize)]
-    struct ListPayload<W> {
-        items: ObjectArray<Vec<W>>,
-        item: Pointer<Empty>,
-    }
-    let result = decode::<FixedTag<ListPayload<W>, TAG>, _>(
-        &message.body,
-        strict_paging,
-        |FixedTag(payload)| {
-            if payload.item.0.is_some() {
-                return Err(Error::Protocol("list has a single-item payload"));
-            }
-            payload
-                .items
-                .0
-                .into_iter()
-                .map(record)
-                .collect::<Result<Vec<_>>>()
-        },
-    )?;
-    if result.kind != 2 {
-        return Err(Error::Protocol("query result is not a List"));
-    }
-    Ok(QueryPage {
-        items: result
-            .payload
-            .ok_or(Error::Protocol("list has no typed wrapper"))?,
-        continuation_token: result.paging.filter(|s| !s.is_empty()),
-    })
+pub(crate) trait Reply {
+    type Record: DeserializeOwned;
+    type Output: Send + 'static;
+
+    fn decode(
+        message: &Message,
+        validate: fn(Self::Record) -> Result<Self::Record>,
+    ) -> Result<Self::Output>;
 }
 
-pub(crate) struct QueryResult<T> {
-    pub kind: i64,
-    pub payload: Option<T>,
-    pub paging: Option<String>,
-}
+/// NamingGateway list aggregate with optional, checked actor/action headers.
+pub(crate) struct ListReply<T, const TAG: i32, const STRICT_PAGING: bool = true>(PhantomData<T>);
 
-struct PagingStatus {
-    type_info: Vec<u8>,
-    token: String,
-}
-impl NativeType for PagingStatus {
-    fn type_info(&self) -> mssf_transport::Result<&[u8]> {
-        Ok(&self.type_info)
-    }
-    fn deserialize_fields<'de, D: serde::Deserializer<'de>>(
-        tag: &[u8],
-        d: D,
-    ) -> std::result::Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct Fields {
-            token: String,
+impl<T: DeserializeOwned + Send + 'static, const TAG: i32, const STRICT_PAGING: bool> Reply
+    for ListReply<T, TAG, STRICT_PAGING>
+{
+    type Record = T;
+    type Output = QueryPage<T>;
+
+    fn decode(message: &Message, validate: fn(T) -> Result<T>) -> Result<Self::Output> {
+        crate::protocol::check_failure(message)?;
+        let properties = message.properties()?;
+        // Native list aggregates can omit actor/action; validate them if present.
+        if message.headers.iter().any(|h| h.id == ACTOR) && properties.actor != 5 {
+            return Err(Error::Protocol("list reply is not from NamingGateway"));
         }
-        let fields = Fields::deserialize(d)?;
-        Ok(Self {
-            type_info: tag.to_vec(),
-            token: fields.token,
+        if message.headers.iter().any(|h| h.id == ACTION) && properties.action != "QueryReply" {
+            return Err(Error::Protocol("unexpected list reply action"));
+        }
+        let result = decode::<FixedTag<ListPayload<T>, TAG>, _>(
+            &message.body,
+            STRICT_PAGING,
+            |FixedTag(payload)| {
+                if payload.item.0.is_some() {
+                    return Err(Error::Protocol("list has a single-item payload"));
+                }
+                payload
+                    .items
+                    .0
+                    .into_iter()
+                    .map(validate)
+                    .collect::<Result<Vec<_>>>()
+            },
+        )?;
+        if result.kind != 2 {
+            return Err(Error::Protocol("query result is not a List"));
+        }
+        Ok(QueryPage {
+            items: result
+                .payload
+                .ok_or(Error::Protocol("list has no typed wrapper"))?,
+            continuation_token: result.paging.filter(|s| !s.is_empty()),
         })
     }
 }
-pub(crate) fn decode<T: DeserializeOwned, U>(
+
+/// Unpaged item with a fixed payload tag and required actor/OperationSuccessAction.
+pub(crate) struct ItemReply<T, const TAG: i32, const ACTOR_ID: i64>(PhantomData<T>);
+
+impl<T: DeserializeOwned + Send + 'static, const TAG: i32, const ACTOR_ID: i64> Reply
+    for ItemReply<T, TAG, ACTOR_ID>
+{
+    type Record = T;
+    type Output = T;
+
+    fn decode(message: &Message, validate: fn(T) -> Result<T>) -> Result<T> {
+        crate::protocol::check_failure(message)?;
+        let properties = message.properties()?;
+        if !message.headers.iter().any(|header| header.id == ACTOR)
+            || properties.actor != ACTOR_ID
+            || properties.action != "OperationSuccessAction"
+        {
+            return Err(Error::Protocol("unexpected item success envelope"));
+        }
+        let result = decode::<FixedTag<ItemPayload<T>, TAG>, _>(
+            &message.body,
+            false,
+            |FixedTag(payload)| validate(payload.item.0.ok_or(Error::Protocol("null query item"))?),
+        )?;
+        if result.kind != 1 || result.paging.is_some() {
+            return Err(Error::Protocol("query result is not an unpaged Item"));
+        }
+        result
+            .payload
+            .ok_or(Error::Protocol("item has no typed wrapper"))
+    }
+}
+
+#[derive(Deserialize)]
+struct Empty {}
+
+#[derive(Deserialize)]
+struct ListPayload<T> {
+    items: ObjectArray<Vec<T>>,
+    item: Pointer<Empty>,
+}
+
+#[derive(Deserialize)]
+struct ItemPayload<T> {
+    _list: EmptyObjectArray,
+    item: Pointer<T>,
+}
+
+#[derive(Deserialize)]
+struct PagingStatus {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct QueryResultEnvelope<T> {
+    kind: i64,
+    payload: Pointer<T>,
+    error: i64,
+    paging: Pointer<RawTagged<PagingStatus>>,
+}
+
+struct QueryResult<T> {
+    kind: i64,
+    payload: Option<T>,
+    paging: Option<String>,
+}
+
+fn decode<T: DeserializeOwned, U>(
     body: &[u8],
     strict_paging: bool,
     validate: impl FnOnce(T) -> Result<U>,
 ) -> Result<QueryResult<U>> {
-    #[derive(Deserialize)]
-    struct QueryResultEnvelope<T> {
-        kind: i64,
-        payload: Pointer<T>,
-        error: i64,
-        paging: Pointer<Typed<PagingStatus>>,
-    }
     let envelope: QueryResultEnvelope<T> = from_slice(body)?;
     // A native query error must not hide a malformed payload and allow reuse
     // of a connection that previously failed protocol validation.
@@ -173,11 +222,11 @@ pub(crate) fn decode<T: DeserializeOwned, U>(
     let paging = envelope
         .paging
         .0
-        .map(|Typed(status)| {
+        .map(|status| {
             if strict_paging && !status.type_info.is_empty() {
                 return Err(Error::Protocol("unexpected paging status type"));
             }
-            Ok(status.token)
+            Ok(status.value.token)
         })
         .transpose()?;
     if envelope.error != 0 {
@@ -197,10 +246,319 @@ pub(crate) fn decode<T: DeserializeOwned, U>(
 mod tests {
     use super::*;
     use crate::*;
-    use mssf_transport::serialization::Encoder;
+    use mssf_transport::{message::Header, serialization::Encoder};
     use std::num::NonZeroU64;
 
-    fn assert_native_bytes(query: &impl Query, name: &str, arguments: &[(&str, &str)]) {
+    #[derive(Debug, PartialEq, Deserialize)]
+    struct ReplyRecord {
+        value: String,
+    }
+
+    #[derive(Serialize)]
+    struct DeclaredListQuery {}
+
+    impl Query for DeclaredListQuery {
+        type Output = QueryPage<ReplyRecord>;
+        type Reply = ListReply<ReplyRecord, 23>;
+        const NAME: &'static str = "DeclaredList";
+
+        fn validate_record(record: ReplyRecord) -> Result<ReplyRecord> {
+            if record.value == "invalid" {
+                return Err(Error::Protocol("invalid fixture record"));
+            }
+            Ok(record)
+        }
+    }
+
+    #[derive(Serialize)]
+    struct DeclaredItemQuery {}
+
+    impl Query for DeclaredItemQuery {
+        type Output = ReplyRecord;
+        type Reply = ItemReply<ReplyRecord, 37, 99>;
+        const NAME: &'static str = "DeclaredItem";
+    }
+
+    #[test]
+    fn shared_encoder_validates_before_serializing_only_the_parameter_struct() {
+        use serde::ser::SerializeStruct;
+        use std::cell::Cell;
+
+        struct Parameters {
+            serializations: Cell<usize>,
+            invalid: bool,
+        }
+        impl Serialize for Parameters {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                self.serializations.set(self.serializations.get() + 1);
+                let mut fields = serializer.serialize_struct("Parameters", 1)?;
+                fields.serialize_field("Argument", "value")?;
+                fields.end()
+            }
+        }
+
+        impl Query for Parameters {
+            type Output = QueryPage<ReplyRecord>;
+            type Reply = ListReply<ReplyRecord, 23>;
+            const NAME: &'static str = "CheckedQuery";
+
+            fn validate_parameters(&self) -> Result<()> {
+                if self.invalid {
+                    return Err(Error::InvalidInput("invalid fixture parameters"));
+                }
+                Ok(())
+            }
+        }
+
+        let mut query = QueryDescription::new(Parameters {
+            serializations: Cell::new(0),
+            invalid: true,
+        });
+        assert!(matches!(
+            encode_query(&query.parameters, None),
+            Err(Error::InvalidInput("invalid fixture parameters"))
+        ));
+        assert_eq!(query.parameters.serializations.get(), 0);
+        query.parameters.invalid = false;
+        assert_native_bytes(
+            &query.parameters,
+            None,
+            "CheckedQuery",
+            &[("Argument", "value")],
+        );
+        assert_eq!(query.parameters.serializations.get(), 1);
+    }
+
+    fn reply_fixture(
+        kind: i64,
+        tag: Option<i32>,
+        values: &[&str],
+        item: Option<&str>,
+        error: i64,
+        paging: Option<(&[u8], &str)>,
+    ) -> Message {
+        let mut encoder = Encoder::new();
+        encoder
+            .object(|e| {
+                e.i64(kind);
+                let tag = tag.map(i32::to_le_bytes);
+                e.pointer(tag.as_ref().map(|tag| tag.as_slice()), |e| {
+                    e.object_array(values, |e, value| e.string(value))?;
+                    e.pointer(item.map(|_| &[][..]), |e| e.string(item.unwrap()))
+                })?;
+                e.i64(error);
+                e.pointer(paging.map(|(tag, _)| tag), |e| e.string(paging.unwrap().1))
+            })
+            .unwrap();
+        Message {
+            headers: Vec::new(),
+            body: encoder.finish(),
+        }
+    }
+
+    fn item_envelope(mut message: Message) -> Message {
+        message.headers = vec![
+            Header::actor(99).unwrap(),
+            Header::action("OperationSuccessAction").unwrap(),
+        ];
+        message
+    }
+
+    #[test]
+    fn new_reply_schemas_need_only_derived_records_and_profile_declarations() {
+        assert_native_bytes(&DeclaredListQuery {}, None, "DeclaredList", &[]);
+        assert_native_bytes(&DeclaredItemQuery {}, None, "DeclaredItem", &[]);
+        let page = DeclaredListQuery::decode_reply(&reply_fixture(
+            2,
+            Some(23),
+            &["first", "second"],
+            None,
+            0,
+            Some((&[], "opaque-next")),
+        ))
+        .unwrap();
+        assert_eq!(
+            page.items,
+            ["first", "second"].map(|value| ReplyRecord {
+                value: value.into()
+            })
+        );
+        assert_eq!(page.continuation_token.as_deref(), Some("opaque-next"));
+        let item = DeclaredItemQuery::decode_reply(&item_envelope(reply_fixture(
+            1,
+            Some(37),
+            &[],
+            Some("only"),
+            0,
+            None,
+        )))
+        .unwrap();
+        assert_eq!(item.value, "only");
+    }
+
+    #[test]
+    fn reply_profiles_preserve_optional_list_and_required_item_headers() {
+        for headers in [
+            vec![],
+            vec![Header::actor(5).unwrap()],
+            vec![Header::action("QueryReply").unwrap()],
+            vec![
+                Header::actor(5).unwrap(),
+                Header::action("QueryReply").unwrap(),
+            ],
+        ] {
+            let mut message = reply_fixture(2, Some(23), &[], None, 0, None);
+            message.headers = headers;
+            DeclaredListQuery::decode_reply(&message).unwrap();
+        }
+        for header in [Header::actor(0).unwrap(), Header::action("wrong").unwrap()] {
+            let mut message = reply_fixture(2, Some(23), &[], None, 0, None);
+            message.headers.push(header);
+            assert!(matches!(
+                DeclaredListQuery::decode_reply(&message),
+                Err(Error::Protocol(_))
+            ));
+        }
+        for headers in [
+            vec![],
+            vec![Header::actor(99).unwrap()],
+            vec![Header::action("OperationSuccessAction").unwrap()],
+            vec![
+                Header::actor(37).unwrap(),
+                Header::action("OperationSuccessAction").unwrap(),
+            ],
+            vec![Header::actor(99).unwrap(), Header::action("wrong").unwrap()],
+        ] {
+            let mut message = reply_fixture(1, Some(37), &[], Some("only"), 0, None);
+            message.headers = headers;
+            assert!(matches!(
+                DeclaredItemQuery::decode_reply(&message),
+                Err(Error::Protocol(_))
+            ));
+        }
+        let mut message = reply_fixture(1, Some(37), &[], Some("only"), 0, None);
+        message.headers = vec![Header::action("OperationSuccessAction").unwrap()];
+        assert!(matches!(
+            ItemReply::<ReplyRecord, 37, 0>::decode(&message, Ok),
+            Err(Error::Protocol(_))
+        ));
+        message.headers.push(Header::actor(0).unwrap());
+        ItemReply::<ReplyRecord, 37, 0>::decode(&message, Ok).unwrap();
+    }
+
+    #[test]
+    fn reply_profiles_reject_wrong_kinds_tags_slots_and_item_paging() {
+        for message in [
+            reply_fixture(1, Some(23), &[], None, 0, None),
+            reply_fixture(2, None, &[], None, 0, None),
+            reply_fixture(2, Some(24), &[], None, 0, None),
+            reply_fixture(2, Some(23), &[], Some("unexpected"), 0, None),
+        ] {
+            assert!(matches!(
+                DeclaredListQuery::decode_reply(&message),
+                Err(Error::Protocol(_))
+            ));
+        }
+        for message in [
+            reply_fixture(2, Some(37), &[], Some("only"), 0, None),
+            reply_fixture(1, None, &[], None, 0, None),
+            reply_fixture(1, Some(38), &[], Some("only"), 0, None),
+            reply_fixture(1, Some(37), &["unexpected"], Some("only"), 0, None),
+            reply_fixture(1, Some(37), &[], None, 0, None),
+            reply_fixture(1, Some(37), &[], Some("only"), 0, Some((&[], ""))),
+            reply_fixture(1, Some(37), &[], Some("only"), 0, Some((b"typed", ""))),
+        ] {
+            assert!(matches!(
+                DeclaredItemQuery::decode_reply(&item_envelope(message)),
+                Err(Error::Protocol(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn shared_reply_validation_precedes_embedded_errors_without_rejecting_null_error_payloads() {
+        const REMOTE: i64 = -123;
+        for message in [
+            reply_fixture(2, Some(23), &["invalid"], None, REMOTE, None),
+            reply_fixture(2, Some(23), &[], Some("unexpected"), REMOTE, None),
+            reply_fixture(2, Some(23), &[], None, REMOTE, Some((b"typed", ""))),
+        ] {
+            assert!(matches!(
+                DeclaredListQuery::decode_reply(&message),
+                Err(Error::Protocol(_))
+            ));
+        }
+        for message in [
+            reply_fixture(1, Some(37), &[], Some("invalid"), REMOTE, None),
+            reply_fixture(1, Some(37), &[], None, REMOTE, None),
+            reply_fixture(1, Some(37), &["unexpected"], Some("only"), REMOTE, None),
+        ] {
+            assert!(matches!(
+                ItemReply::<ReplyRecord, 37, 99>::decode(
+                    &item_envelope(message),
+                    DeclaredListQuery::validate_record,
+                ),
+                Err(Error::Protocol(_))
+            ));
+        }
+        for tag in [None, Some(23)] {
+            let message = reply_fixture(0, tag, &[], None, REMOTE, None);
+            assert!(matches!(
+                DeclaredListQuery::decode_reply(&message),
+                Err(Error::Remote { code: REMOTE, .. })
+            ));
+        }
+        for tag in [None, Some(37)] {
+            let message = item_envelope(reply_fixture(
+                0,
+                tag,
+                &[],
+                Some("only"),
+                REMOTE,
+                Some((b"typed", "")),
+            ));
+            assert!(matches!(
+                DeclaredItemQuery::decode_reply(&message),
+                Err(Error::Remote { code: REMOTE, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn shared_reply_profiles_reject_truncation_and_trailing_bytes() {
+        let mut list = reply_fixture(2, Some(23), &["first"], None, 0, Some((&[], "next")));
+        let mut item = item_envelope(reply_fixture(1, Some(37), &[], Some("only"), 0, None));
+        for end in 0..list.body.len() {
+            let mut truncated = list.clone();
+            truncated.body.truncate(end);
+            assert!(matches!(
+                DeclaredListQuery::decode_reply(&truncated),
+                Err(Error::Protocol(_))
+            ));
+        }
+        for end in 0..item.body.len() {
+            let mut truncated = item.clone();
+            truncated.body.truncate(end);
+            assert!(matches!(
+                DeclaredItemQuery::decode_reply(&truncated),
+                Err(Error::Protocol(_))
+            ));
+        }
+        list.body.push(0);
+        item.body.push(0);
+        assert!(DeclaredListQuery::decode_reply(&list).is_err());
+        assert!(DeclaredItemQuery::decode_reply(&item).is_err());
+    }
+
+    fn assert_native_bytes(
+        query: &impl Query,
+        paging: Option<&Paging>,
+        name: &str,
+        arguments: &[(&str, &str)],
+    ) {
         let mut old = Encoder::new();
         old.object(|e| {
             e.object(|e| {
@@ -212,7 +570,7 @@ mod tests {
             e.string(name)
         })
         .unwrap();
-        assert_eq!(encode_query(query).unwrap(), old.finish());
+        assert_eq!(encode_query(query, paging).unwrap(), old.finish());
     }
 
     fn paging() -> Paging {
@@ -226,10 +584,8 @@ mod tests {
     fn declarations_define_native_named_json_and_round_trips() {
         fn check<Q>(query: Q, expected: serde_json::Value)
         where
-            Q: Query + Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+            Q: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
         {
-            assert_eq!(serde_json::to_value(&query).unwrap(), expected);
-            encode_query(&query).unwrap();
             assert_eq!(serde_json::to_value(&query).unwrap(), expected);
             assert_eq!(serde_json::from_value::<Q>(expected).unwrap(), query);
         }
@@ -292,12 +648,13 @@ mod tests {
 
     #[test]
     fn node_parameters_and_shared_paging_match_the_previous_wire_layout() {
-        assert_native_bytes(&NodeQueryDescription::default(), "GetNodeList", &[]);
+        assert_native_bytes(&NodeQueryParameters::default(), None, "GetNodeList", &[]);
         assert_native_bytes(
-            &NodeQueryDescription::new(NodeQueryParameters {
+            &NodeQueryParameters {
                 node_name: Some(String::new()),
                 ..Default::default()
-            }),
+            },
+            None,
             "GetNodeList",
             &[],
         );
@@ -309,7 +666,8 @@ mod tests {
             paging: paging(),
         };
         assert_native_bytes(
-            &query,
+            &query.parameters,
+            Some(&query.paging),
             "GetNodeList",
             &[
                 ("ContinuationToken", " opaque+/\u{1f980} "),
@@ -323,7 +681,8 @@ mod tests {
     #[test]
     fn every_application_selector_preserves_order_numeric_flags_and_omission() {
         assert_native_bytes(
-            &ApplicationQueryDescription::default(),
+            &ApplicationQueryParameters::default(),
+            None,
             "GetApplicationList",
             &[],
         );
@@ -366,7 +725,12 @@ mod tests {
                 ("ContinuationToken", " opaque+/\u{1f980} "),
                 ("MaxResults", "9223372036854775807"),
             ]);
-            assert_native_bytes(&query, "GetApplicationList", &expected);
+            assert_native_bytes(
+                &query.parameters,
+                Some(&query.paging),
+                "GetApplicationList",
+                &expected,
+            );
         }
     }
 
@@ -396,14 +760,20 @@ mod tests {
                 ("ContinuationToken", " opaque+/\u{1f980} "),
                 ("MaxResults", "9223372036854775807"),
             ]);
-            assert_native_bytes(&query, "GetApplicationServiceList", &expected);
+            assert_native_bytes(
+                &query.parameters,
+                Some(&query.paging),
+                "GetApplicationServiceList",
+                &expected,
+            );
         }
     }
 
     #[test]
     fn health_json_stays_embedded_numeric_and_distinguishes_absent_from_false() {
         assert_native_bytes(
-            &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("Node")),
+            &NodeHealthQueryParameters::new("Node"),
+            None,
             "GetNodeHealth",
             &[("NodeName", "Node")],
         );
@@ -425,15 +795,16 @@ mod tests {
                 r#"{"HealthStateFilter":4294967295}"#,
             ),
         ] {
-            let query = NodeHealthQueryDescription::new(NodeHealthQueryParameters {
+            let query = NodeHealthQueryParameters {
                 node_name: "Node".into(),
                 health_policy: Some(NodeHealthPolicy {
                     consider_warning_as_error: policy,
                 }),
                 events_filter: Some(filter.into()),
-            });
+            };
             assert_native_bytes(
                 &query,
+                None,
                 "GetNodeHealth",
                 &[
                     (
@@ -450,11 +821,12 @@ mod tests {
             );
         }
         assert_native_bytes(
-            &NodeHealthQueryDescription::new(NodeHealthQueryParameters {
+            &NodeHealthQueryParameters {
                 node_name: "Node".into(),
                 health_policy: Some(NodeHealthPolicy::default()),
                 events_filter: None,
-            }),
+            },
+            None,
             "GetNodeHealth",
             &[
                 ("ClusterHealthPolicy", r#"{"ConsiderWarningAsError":false}"#),
@@ -462,11 +834,12 @@ mod tests {
             ],
         );
         assert_native_bytes(
-            &NodeHealthQueryDescription::new(NodeHealthQueryParameters {
+            &NodeHealthQueryParameters {
                 node_name: "Node".into(),
                 health_policy: None,
                 events_filter: Some(HealthEventsFilter::DEFAULT.into()),
-            }),
+            },
+            None,
             "GetNodeHealth",
             &[
                 ("EventsFilter", r#"{"HealthStateFilter":0}"#),
@@ -477,24 +850,30 @@ mod tests {
 
     #[test]
     fn all_list_operations_share_signed_limits_and_bounded_opaque_tokens() {
-        fn check<P>(parameters: P)
-        where
-            PagedQuery<P>: Query,
-        {
+        fn check<P: Query>(parameters: P) {
             let mut query = PagedQuery::new(parameters);
-            let baseline = encode_query(&query).unwrap();
+            let baseline = encode_query(&query.parameters, Some(&query.paging)).unwrap();
             query.paging.continuation_token = Some(String::new());
-            assert_eq!(encode_query(&query).unwrap(), baseline);
+            assert_eq!(
+                encode_query(&query.parameters, Some(&query.paging)).unwrap(),
+                baseline
+            );
             for limit in [i64::MAX as u64 + 1, u64::MAX] {
                 query.paging.max_results = NonZeroU64::new(limit);
-                assert!(matches!(encode_query(&query), Err(Error::InvalidInput(_))));
+                assert!(matches!(
+                    encode_query(&query.parameters, Some(&query.paging)),
+                    Err(Error::InvalidInput(_))
+                ));
             }
             query.paging.max_results = NonZeroU64::new(i64::MAX as u64);
             let token = "\u{1f980}".repeat(16_384);
             query.paging.continuation_token = Some(token.clone());
-            assert!(encode_query(&query).is_ok());
+            assert!(encode_query(&query.parameters, Some(&query.paging)).is_ok());
             query.paging.continuation_token = Some(token + "x");
-            assert!(matches!(encode_query(&query), Err(Error::InvalidInput(_))));
+            assert!(matches!(
+                encode_query(&query.parameters, Some(&query.paging)),
+                Err(Error::InvalidInput(_))
+            ));
         }
         check(NodeQueryParameters::default());
         check(ApplicationQueryParameters::default());
@@ -524,11 +903,11 @@ mod tests {
         for token in ["opaque-next", ""] {
             let expected = (!token.is_empty()).then(|| token.to_owned());
             for tag in [b"".as_slice(), b"typed".as_slice()] {
-                let nodes = NodeQueryDescription::decode_reply(&reply(1, tag, token)).unwrap();
+                let nodes = NodeQueryParameters::decode_reply(&reply(1, tag, token)).unwrap();
                 assert!(nodes.items.is_empty());
                 assert_eq!(nodes.continuation_token, expected);
-                let apps = ApplicationQueryDescription::decode_reply(&reply(4, tag, token));
-                let services = ServiceQueryDescription::decode_reply(&reply(2, tag, token));
+                let apps = ApplicationQueryParameters::decode_reply(&reply(4, tag, token));
+                let services = ServiceQueryParameters::decode_reply(&reply(2, tag, token));
                 if tag.is_empty() {
                     assert_eq!(apps.unwrap().continuation_token, expected);
                     assert_eq!(services.unwrap().continuation_token, expected);
@@ -551,7 +930,10 @@ mod tests {
             });
             let query: ApplicationQueryDescription =
                 serde_json::from_str(&serde_json::to_string(&query).unwrap()).unwrap();
-            assert!(matches!(encode_query(&query), Err(Error::InvalidInput(_))));
+            assert!(matches!(
+                encode_query(&query.parameters, Some(&query.paging)),
+                Err(Error::InvalidInput(_))
+            ));
         }
     }
 

@@ -1,10 +1,10 @@
 //! Source-derived list aggregate envelopes and positional record layouts.
 
-use mssf_transport::message::Message;
-
 use crate::{
-    applications::*, query_arguments::QueryArguments, query_protocol::Query, services::*, Error,
-    HealthState, Paging, Result,
+    applications::*,
+    query_protocol::{ListReply, Query},
+    services::*,
+    Error, HealthState, Result,
 };
 
 fn validate_type_selector(value: &str) -> Result<()> {
@@ -14,12 +14,13 @@ fn validate_type_selector(value: &str) -> Result<()> {
     Ok(())
 }
 
-impl Query for ApplicationQueryDescription {
+impl Query for ApplicationQueryParameters {
     type Output = ApplicationListPage;
+    type Reply = ListReply<Application, 4>;
     const NAME: &'static str = "GetApplicationList";
 
-    fn encode_parameters(&self, arguments: &mut QueryArguments) -> Result<()> {
-        match &self.parameters.filter {
+    fn validate_parameters(&self) -> Result<()> {
+        match &self.filter {
             ApplicationListFilter::TypeName(name) => {
                 validate_type_selector(name)?;
             }
@@ -28,50 +29,51 @@ impl Query for ApplicationQueryDescription {
             }
             _ => {}
         }
-        arguments.append(&self.parameters)
+        Ok(())
     }
 
-    fn paging(&self) -> Option<&Paging> {
-        Some(&self.paging)
-    }
-
-    fn decode_reply(message: &Message) -> Result<ApplicationListPage> {
-        decode_applications(message)
+    fn validate_record(application: Application) -> Result<Application> {
+        validate_list_health(application.health_state)?;
+        if !application.upgrade_type_version.is_empty() {
+            return Err(Error::Protocol(
+                "nonempty deprecated application upgrade version",
+            ));
+        }
+        if !application.upgrade_parameters.is_empty() {
+            return Err(Error::Protocol(
+                "nonempty deprecated application upgrade parameters",
+            ));
+        }
+        Ok(application)
     }
 }
 
-impl Query for ServiceQueryDescription {
+impl Query for ServiceQueryParameters {
     type Output = ServiceListPage;
+    type Reply = ListReply<Service, 2>;
     const NAME: &'static str = "GetApplicationServiceList";
 
-    fn encode_parameters(&self, arguments: &mut QueryArguments) -> Result<()> {
-        let parameters = &self.parameters;
-        if parameters.application_name.as_str() == "fabric:/System" {
+    fn validate_parameters(&self) -> Result<()> {
+        if self.application_name.as_str() == "fabric:/System" {
             return Err(Error::InvalidInput(
                 "System service-list profile is unsupported",
             ));
         }
-        if let ServiceListFilter::TypeName(name) = &parameters.filter {
+        if let ServiceListFilter::TypeName(name) = &self.filter {
             validate_type_selector(name)?;
         }
-        arguments.append(parameters)
+        Ok(())
     }
 
-    fn paging(&self) -> Option<&Paging> {
-        Some(&self.paging)
+    fn validate_record(service: Service) -> Result<Service> {
+        if service.kind == ServiceKind::Invalid
+            || (service.kind == ServiceKind::Stateless && service.has_persisted_state)
+        {
+            return Err(Error::Protocol("unsupported service kind/persistence"));
+        }
+        validate_list_health(service.health_state)?;
+        Ok(service)
     }
-
-    fn decode_reply(message: &Message) -> Result<ServiceListPage> {
-        decode_services(message)
-    }
-}
-
-pub(crate) fn decode_applications(message: &Message) -> Result<ApplicationListPage> {
-    crate::query_protocol::decode_list::<Application, _, 4>(message, true, validate_application)
-}
-
-pub(crate) fn decode_services(message: &Message) -> Result<ServiceListPage> {
-    crate::query_protocol::decode_list::<Service, _, 2>(message, true, validate_service)
 }
 
 fn validate_list_health(value: HealthState) -> Result<HealthState> {
@@ -81,41 +83,16 @@ fn validate_list_health(value: HealthState) -> Result<HealthState> {
     Ok(value)
 }
 
-fn validate_application(application: Application) -> Result<Application> {
-    validate_list_health(application.health_state)?;
-    if !application.upgrade_type_version.is_empty() {
-        return Err(Error::Protocol(
-            "nonempty deprecated application upgrade version",
-        ));
-    }
-    if !application.upgrade_parameters.is_empty() {
-        return Err(Error::Protocol(
-            "nonempty deprecated application upgrade parameters",
-        ));
-    }
-    Ok(application)
-}
-
-fn validate_service(service: Service) -> Result<Service> {
-    if service.kind == ServiceKind::Invalid
-        || (service.kind == ServiceKind::Stateless && service.has_persisted_state)
-    {
-        return Err(Error::Protocol("unsupported service kind/persistence"));
-    }
-    validate_list_health(service.health_state)?;
-    Ok(service)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use mssf_transport::serialization::{serde::from_fields, Decoder, Encoder};
 
     fn application(decoder: &mut Decoder<'_>) -> Result<Application> {
-        validate_application(from_fields::<Application>(decoder)?)
+        ApplicationQueryParameters::validate_record(from_fields::<Application>(decoder)?)
     }
     fn service(decoder: &mut Decoder<'_>) -> Result<Service> {
-        validate_service(from_fields::<Service>(decoder)?)
+        ServiceQueryParameters::validate_record(from_fields::<Service>(decoder)?)
     }
 
     fn application_base(e: &mut Encoder) -> Result<()> {

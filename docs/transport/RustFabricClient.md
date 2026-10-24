@@ -243,10 +243,14 @@ Other operation validation (filter validity, count range and native limits)
 still happens before sending. A JSON round trip does not itself qualify a value
 for the native wire.
 
-Internally, a `Query` trait binds the native query name, parameter encoder, paging
-placement, output and reply decoder. One executor starts the deadline before
-preparation and supplies the typed decoder to the connection driver. A dedicated
-Serde argument serializer consumes the parameter types and `Paging` directly.
+Internally, parameter structs implement `Query: Serialize`, binding the native
+query name, optional `validate_parameters` hook, paging placement, output and
+declarative reply profile. Request wrappers retain their public composition;
+the executor receives parameters and optional paging separately, without trait
+accessors for either. It starts the deadline before preparation and supplies the
+typed decoder to the connection driver. The shared encoder validates and
+serializes parameters directly; operations no longer implement parameter encoding.
+A dedicated Serde argument serializer consumes the parameter types and `Paging`.
 Ordinary `rename`, `flatten`, `skip_serializing_if` and reusable `with` field
 adapters declare native names, selector fields, numeric masks, omissions and
 field order on those structs. No parallel projection structs, serialization
@@ -264,8 +268,16 @@ Ordinary nested objects remain unsupported; JSON output is bounded after
 escaping. `NodeHealthPolicy` and `HealthEventsQueryFilter` declare the native
 property names, and the reusable `flags` adapter selects numeric masks. Missing
 policy/filter remains distinct from explicit false/zero.
-List replies share envelope/page decoding but keep their native wrapper IDs and
-paging-tag policies; health keeps its distinct unpaged item envelope. Native
+Replies select shared `ListReply<Record, TAG, STRICT_PAGING>` or
+`ItemReply<Record, TAG, ACTOR>` profiles rather than implementing a decoder per
+operation. Records use ordinary `Deserialize` derives and native field adapters;
+an optional `validate_record` hook enforces domain restrictions. For example,
+service queries declare `ListReply<Service, 2>` and node health declares
+`ItemReply<NodeHealth, 16, 16>`. Lists allow absent actor/action headers but check
+them when present; items require their declared actor and `OperationSuccessAction`.
+The shared decoder validates both native list/item slots, required pointers,
+result kind and paging. Node lists retain permissive paging tags, application/
+service lists require empty tags, and successful items cannot be paged. Native
 pointers, polymorphism and versioned record suffixes remain explicit.
 
 **API migration:** move operation fields into `.parameters`, request token/count
@@ -646,13 +658,15 @@ assert_eq!(from_slice::<ListenInstance>(&bytes).unwrap(), value);
 | `#[serde(with = "mssf_transport::serialization::serde::guid")]` | The same explicit GUID mapping on an existing `[u8; 16]` field, without a parallel record or changing its public type. |
 | `ByteArray<T>` | Native byte-array metadata; encode Vec/slice/array bytes, decode `ByteArray<Vec<u8>>`. |
 | `ObjectArray<T>` | Native object-array metadata even when empty; encode a Vec/slice of struct-shaped elements, decode `ObjectArray<Vec<Row>>`. |
+| `EmptyObjectArray` | A required object-array slot that must have zero elements; rejects nonempty arrays and wrong metadata. |
 | `CountedStrings<T>` | Native UInt32 count followed by inline strings, including an explicit zero count. Encode Vec/slice strings; decode `CountedStrings<Vec<String>>`. Not string-array or object-array metadata. |
 | `Pointer<T>` | Explicit nullable native object pointer. `None` writes the empty-pointer marker; a plain struct target requires empty type information. |
 | `FixedTag<T, TAG>` | Automatically validate a fixed i32 type tag, then derive-deserialize the struct fields. The tag is not an extra body field. |
 | `Untagged<T>` | Automatically require empty type information for a struct-shaped object. |
+| `RawTagged<T>` | Retain bounded raw type information separately from ordinary derived fields; the caller must validate the tag according to its operation profile. |
 | `NativeEnum<T>` | Derived polymorphic enum: explicit i32 variant codes select the object tag, the matching i64 body kind and inline variant fields. |
 | `NumericEnum<T>` | Strict derived unit enum encoded as a single signed i64 code, without object framing. |
-| `Typed<T>` / `NativeType` | Escape hatch for exceptional raw-tag policies, not required for fixed schemas or derived polymorphic enums. Supports roots, nested objects, object-array elements and pointer targets. |
+| `Typed<T>` / `NativeType` | Escape hatch for exceptional tag-dependent schemas, not required for fixed schemas, raw-tag retention or derived polymorphic enums. Supports roots, nested objects, object-array elements and pointer targets. |
 | `Inline<T>` | Struct fields in the current object scope without a nested object. |
 | `Derived<T>` | Advance to the next native scope, then read/write the struct's fields inline. |
 | `Trailing<T>` | A positional suffix: `None` is genuine absence at the current scope end, not a null pointer. Present malformed data remains an error. |
@@ -818,9 +832,11 @@ ordinary object framing.
 
 Structural helpers remain where native envelopes differ from public results:
 `QueryResultEnvelope` carries the result kind, payload pointer, native error
-code and paging pointer. `ListPayload`/`ItemPayload` preserve both native list
-and single-item slots and their operation-specific requirements. These are not
-duplicate domain records.
+code and paging pointer. Shared derived `ListPayload`/`ItemPayload` schemas
+preserve both native list and single-item slots and their profile-specific
+requirements. `EmptyObjectArray` rejects populated item-result list slots;
+`RawTagged<PagingStatus>` retains paging tags without a custom paging deserializer.
+These are not duplicate domain records.
 `NamingUri` owns its genuinely different component representation.
 No generalized derive framework or changed default Vec/Option mapping is needed.
 
@@ -839,7 +855,7 @@ decoding so a readable nonzero native error survives a malformed diagnostic.
 
 See the [backend contract and compiling example][native-serde],
 [transport payloads][serde-messages], [query DTOs][serde-query],
-[health envelopes][serde-health] and [list validation][serde-lists].
+[health reply declaration][serde-health] and [list validation][serde-lists].
 
 [native-serde]: ../../crates/libs/mssf-transport/src/serialization/serde.rs
 [serde-messages]: ../../crates/libs/mssf-transport/src/message.rs#L12-L123

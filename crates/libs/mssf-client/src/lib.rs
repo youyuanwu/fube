@@ -169,7 +169,8 @@ impl FabricClient {
         query: &NodeQueryDescription,
         timeout: Duration,
     ) -> Result<NodeListPage> {
-        self.query(query, timeout).await
+        self.query(&query.parameters, Some(&query.paging), timeout)
+            .await
     }
 
     /// Query actual single-node health, events and unhealthy explanations.
@@ -186,7 +187,7 @@ impl FabricClient {
         query: &NodeHealthQueryDescription,
         timeout: Duration,
     ) -> Result<NodeHealth> {
-        self.query(query, timeout).await
+        self.query(&query.parameters, None, timeout).await
     }
 
     /// Get one application page using the configured default deadline.
@@ -207,7 +208,8 @@ impl FabricClient {
         query: &ApplicationQueryDescription,
         timeout: Duration,
     ) -> Result<ApplicationListPage> {
-        self.query(query, timeout).await
+        self.query(&query.parameters, Some(&query.paging), timeout)
+            .await
     }
 
     /// Get one ordinary application-scoped service page with the default timeout.
@@ -227,7 +229,8 @@ impl FabricClient {
         query: &ServiceQueryDescription,
         timeout: Duration,
     ) -> Result<ServiceListPage> {
-        self.query(query, timeout).await
+        self.query(&query.parameters, Some(&query.paging), timeout)
+            .await
     }
 
     /// Close the shared connection and wait for the background driver to exit.
@@ -247,11 +250,12 @@ impl FabricClient {
 
     async fn query<Q: query_protocol::Query>(
         &self,
-        query: &Q,
+        parameters: &Q,
+        paging: Option<&Paging>,
         timeout: Duration,
     ) -> Result<Q::Output> {
         let deadline = deadline_after(timeout)?;
-        let body = query_protocol::encode_query(query)?;
+        let body = query_protocol::encode_query(parameters, paging)?;
         self.request("QueryRequest", body, deadline, |reply| {
             Q::decode_reply(&reply)
         })

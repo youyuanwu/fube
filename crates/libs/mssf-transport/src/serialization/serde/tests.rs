@@ -1071,6 +1071,145 @@ impl NativeType for OpaqueTagged {
 }
 
 #[test]
+fn raw_tagged_derived_fields_match_native_bytes_and_retain_bounded_tags() {
+    for tag in [
+        vec![],
+        vec![7],
+        16i32.to_le_bytes().to_vec(),
+        vec![0x1f; MAX_COLLECTION_COUNT],
+    ] {
+        let value = RawTagged {
+            type_info: tag,
+            value: Pair(7, "raw tag".into()),
+        };
+        let mut native = Encoder::new();
+        native
+            .typed_object(&value.type_info, |e| {
+                e.u32(7);
+                e.string("raw tag")
+            })
+            .unwrap();
+        let bytes = to_vec(&value).unwrap();
+        assert_eq!(bytes, native.finish());
+        assert_eq!(from_slice::<RawTagged<Pair>>(&bytes).unwrap(), value);
+        for end in [0, 1, 9, bytes.len() - 1] {
+            assert!(from_slice::<RawTagged<Pair>>(&bytes[..end]).is_err());
+        }
+        if value.type_info.len() == MAX_COLLECTION_COUNT {
+            let mut oversized = bytes;
+            assert_eq!(&oversized[9..11], &[0xa0, 0x00]);
+            oversized[10] = 1;
+            assert!(from_slice::<RawTagged<Pair>>(&oversized).is_err());
+        }
+    }
+}
+
+#[test]
+fn raw_tagged_pointers_arrays_and_fields_preserve_object_boundaries() {
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Fields {
+        first: u32,
+        pointer: Pointer<RawTagged<Pair>>,
+        array: ObjectArray<Vec<RawTagged<Pair>>>,
+        tail: bool,
+    }
+    for present in [false, true] {
+        let tagged = || RawTagged {
+            type_info: vec![1, 2, 3],
+            value: Pair(8, "nested".into()),
+        };
+        let value = Fields {
+            first: 7,
+            pointer: Pointer(present.then(tagged)),
+            array: ObjectArray(vec![tagged()]),
+            tail: true,
+        };
+        let mut native = Encoder::new();
+        native
+            .object(|e| {
+                e.u32(7);
+                e.pointer(present.then_some(&[1, 2, 3][..]), |e| {
+                    e.u32(8);
+                    e.string("nested")
+                })?;
+                e.object_array_header(1)?;
+                e.typed_object(&[1, 2, 3], |e| {
+                    e.u32(8);
+                    e.string("nested")
+                })?;
+                e.boolean(true);
+                Ok(())
+            })
+            .unwrap();
+        let bytes = to_vec(&value).unwrap();
+        assert_eq!(bytes, native.finish());
+        assert_eq!(from_slice::<Fields>(&bytes).unwrap(), value);
+    }
+    let invalid = RawTagged {
+        type_info: vec![0; MAX_COLLECTION_COUNT + 1],
+        value: Pair(8, "invalid".into()),
+    };
+    assert!(to_vec(&invalid).is_err());
+    let invalid = Fields {
+        first: 7,
+        pointer: Pointer(Some(invalid)),
+        array: ObjectArray(vec![]),
+        tail: true,
+    };
+    let mut native = Encoder::new();
+    native
+        .object(|e| {
+            assert!(to_fields(e, &invalid).is_err());
+            to_fields(e, &Pair(9, "after".into()))
+        })
+        .unwrap();
+    assert_eq!(
+        from_slice::<Pair>(&native.finish()).unwrap(),
+        Pair(9, "after".into())
+    );
+}
+
+#[test]
+fn empty_object_array_requires_the_exact_empty_array_field() {
+    assert_eq!(to_vec(&EmptyObjectArray).unwrap(), [0xc0]);
+    assert_eq!(
+        from_slice::<EmptyObjectArray>(&[0xc0]).unwrap(),
+        EmptyObjectArray
+    );
+    for bytes in [
+        vec![],
+        to_vec(&ByteArray(Vec::<u8>::new())).unwrap(),
+        to_vec(&false).unwrap(),
+        to_vec(&ObjectArray(vec![Empty {}])).unwrap(),
+    ] {
+        assert!(from_slice::<EmptyObjectArray>(&bytes).is_err());
+    }
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Fields {
+        first: u32,
+        empty: EmptyObjectArray,
+        tail: bool,
+    }
+    let fields = Fields {
+        first: 7,
+        empty: EmptyObjectArray,
+        tail: true,
+    };
+    let mut native = Encoder::new();
+    native
+        .object(|e| {
+            e.u32(7);
+            e.object_array::<()>(&[], |_, _| unreachable!())?;
+            e.boolean(true);
+            Ok(())
+        })
+        .unwrap();
+    let bytes = to_vec(&fields).unwrap();
+    assert_eq!(bytes, native.finish());
+    assert_eq!(from_slice::<Fields>(&bytes).unwrap(), fields);
+}
+
+#[test]
 fn typed_adapters_enforce_raw_tag_bounds_and_rollback_nested_pointer_failures() {
     for len in [0, MAX_COLLECTION_COUNT] {
         let value = Typed(OpaqueTagged {

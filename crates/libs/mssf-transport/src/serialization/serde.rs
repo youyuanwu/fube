@@ -14,6 +14,8 @@
 //! [`Pointer`], [`Typed`]/[`NativeType`], [`Inline`], [`Derived`] and [`Trailing`].
 //! [`CountedStrings`] handles UInt32-counted string sequences.
 //! [`FixedTag`] and [`Untagged`] automatically validate struct tags.
+//! [`RawTagged`] retains bounded raw type information for caller validation;
+//! [`EmptyObjectArray`] declares an array slot that must be empty.
 //! [`NativeEnum`] uses explicitly renamed i32 variant codes for polymorphic
 //! objects and checks their matching i64 body kinds. [`NumericEnum`] is separate:
 //! a strict i64 scalar mapping for derived unit enums. Variant ordinals and Rust
@@ -65,8 +67,8 @@ use std::fmt;
 
 mod adapters;
 pub use adapters::{
-    guid, CountedStrings, Derived, FixedTag, Inline, NativeEnum, NativeType, NumericEnum, Pointer,
-    Trailing, Typed, Untagged,
+    guid, CountedStrings, Derived, EmptyObjectArray, FixedTag, Inline, NativeEnum, NativeType,
+    NumericEnum, Pointer, RawTagged, Trailing, Typed, Untagged,
 };
 
 const GUID_ADAPTER: &str = "$fabric::Guid";

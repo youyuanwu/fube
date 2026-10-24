@@ -182,10 +182,84 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Untagged<T> {
     }
 }
 
+/// A struct-shaped native object with raw type information retained separately.
+///
+/// Unlike [`FixedTag`] or [`Untagged`], this accepts any bounded type information.
+/// The caller must validate it according to the operation's compatibility policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawTagged<T> {
+    pub type_info: Vec<u8>,
+    pub value: T,
+}
+
+impl<T: Serialize> Serialize for RawTagged<T> {
+    fn serialize<S: ::serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_newtype_struct(
+            TYPED_ADAPTER,
+            &TypeFields {
+                type_info: &self.type_info,
+                value: &self.value,
+            },
+        )
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for RawTagged<T> {
+    fn deserialize<D: ::serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+            type Value = RawTagged<T>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("raw native type information and fields")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let ByteArray(type_info) = a
+                    .next_element()?
+                    .ok_or_else(|| ::serde::de::Error::custom("missing native type information"))?;
+                let value = a
+                    .next_element()?
+                    .ok_or_else(|| ::serde::de::Error::custom("missing native object fields"))?;
+                Ok(RawTagged { type_info, value })
+            }
+        }
+        d.deserialize_newtype_struct(TYPED_ADAPTER, V(PhantomData))
+    }
+}
+
+/// A required native object-array field whose count must be zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmptyObjectArray;
+
+#[derive(Serialize)]
+struct ForbiddenObject {}
+
+impl<'de> Deserialize<'de> for ForbiddenObject {
+    fn deserialize<D: ::serde::Deserializer<'de>>(_: D) -> std::result::Result<Self, D::Error> {
+        Err(::serde::de::Error::custom(
+            "expected an empty native object array",
+        ))
+    }
+}
+
+impl Serialize for EmptyObjectArray {
+    fn serialize<S: ::serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        ObjectArray(&[] as &[ForbiddenObject]).serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for EmptyObjectArray {
+    fn deserialize<D: ::serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        ObjectArray::<Vec<ForbiddenObject>>::deserialize(d).map(|_| Self)
+    }
+}
+
 /// A nullable native object pointer. This never represents an absent field.
 ///
 /// Plain struct targets require empty type information. Use `Pointer<Typed<T>>`
-/// or the automatic `FixedTag`, `Untagged` and `NativeEnum` adapters for tags.
+/// or the `FixedTag`, `Untagged`, `RawTagged` and `NativeEnum` adapters for tags.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pointer<T>(pub Option<T>);
 
@@ -235,7 +309,8 @@ optional_adapter!(Trailing, TRAILING_ADAPTER);
 /// Native tagged-object dispatch, independent of Serde enum variant ordinals.
 ///
 /// This is an escape hatch for exceptional layouts/raw tag policies. Prefer
-/// [`FixedTag`], [`Untagged`] or [`NativeEnum`] for automatically derived schemas.
+/// [`FixedTag`], [`Untagged`] or [`NativeEnum`] for automatically derived schemas;
+/// use [`RawTagged`] when only raw type-information retention is needed.
 ///
 /// `deserialize_fields` receives the bounded raw tag before reading any fields.
 /// Select the supported schema, deserialize its fields with `D`, and enforce

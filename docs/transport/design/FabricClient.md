@@ -371,6 +371,11 @@ Request structs directly declare native query names, flattened selectors,
 omissions, numeric masks and embedded JSON through stock Serde attributes and
 reusable field adapters. A shared string-keyed struct/map encoder consumes their
 ordinary derives without a parallel serialization trait or custom derive crate.
+Parameter structs implement `Query: Serialize` with an optional
+`validate_parameters` hook; serialization stays in the shared encoder rather
+than per-operation methods. Public request wrappers stay unchanged, while the
+executor receives parameters and optional paging separately, without trait
+accessors for either.
 Configuration JSON now follows those declared native names and masks; legacy
 shapes and malformed/conflicting selectors fail explicitly.
 Strict scalar status/definition enums map their numeric codes directly; shared
@@ -379,10 +384,17 @@ URI redundancy is checked by semantic construction above the generic backend;
 node-ID agreement, duplicate parameters and cross-field checks remain record-level
 validation. Native `QueryResultEnvelope`, `ListPayload` and `ItemPayload`
 helpers retain protocol framing distinct from domain records, including both
-native list/item slots and their required empty/null checks. Query payload
-validation still precedes embedded remote errors. Paging tag strictness remains
-operation-specific, and partial operation-failure diagnostics retain deliberate
-incremental handling so malformed text cannot erase a nonzero error code.
+native list/item slots and their required empty/null checks. Operations declare
+shared `ListReply<Record, TAG, STRICT_PAGING>` or `ItemReply<Record, TAG, ACTOR>`
+profiles with optional record-validation hooks, not handwritten reply decoders.
+The shared schemas use `EmptyObjectArray` for the forbidden item-result list
+slot and `RawTagged<PagingStatus>` to retain bounded paging metadata without a
+custom `NativeType` implementation. Query payload validation still precedes
+embedded remote errors. List headers remain optional but checked when present;
+items require the declared actor and `OperationSuccessAction`. Paging tag
+strictness remains operation-specific, successful items remain unpaged, and
+partial operation-failure diagnostics retain deliberate incremental handling
+so malformed text cannot erase a nonzero error code.
 
 Independent old/new encoded-byte comparisons, malformed/suffix/bound tests and
 the same four live onebox scenarios passed for the initial Serde migration on SF11.8.121.4.
