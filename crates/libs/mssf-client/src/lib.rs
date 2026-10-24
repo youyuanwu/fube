@@ -257,7 +257,7 @@ impl FabricClient {
         let deadline = deadline_after(timeout)?;
         let body = query_protocol::encode_query(parameters, paging)?;
         self.request("QueryRequest", body, deadline, |reply| {
-            Q::decode_reply(&reply)
+            query_protocol::decode_reply::<Q>(&reply)
         })
         .await
     }

@@ -387,6 +387,8 @@ helpers retain protocol framing distinct from domain records, including both
 native list/item slots and their required empty/null checks. Operations declare
 shared `ListReply<Record, TAG, STRICT_PAGING>` or `ItemReply<Record, TAG, ACTOR>`
 profiles with optional record-validation hooks, not handwritten reply decoders.
+A shared `decode_reply<Q>` function dispatches to the profile and validator
+outside the `Query` trait, symmetric with the shared request encoder.
 The shared schemas use `EmptyObjectArray` for the forbidden item-result list
 slot and `RawTagged<PagingStatus>` to retain bounded paging metadata without a
 custom `NativeType` implementation. Query payload validation still precedes

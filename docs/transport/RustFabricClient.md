@@ -270,8 +270,10 @@ property names, and the reusable `flags` adapter selects numeric masks. Missing
 policy/filter remains distinct from explicit false/zero.
 Replies select shared `ListReply<Record, TAG, STRICT_PAGING>` or
 `ItemReply<Record, TAG, ACTOR>` profiles rather than implementing a decoder per
-operation. Records use ordinary `Deserialize` derives and native field adapters;
-an optional `validate_record` hook enforces domain restrictions. For example,
+operation. A shared `decode_reply<Q>` function selects the profile and record
+validator; `Query` has no decoding method. Records use ordinary `Deserialize`
+derives and native field adapters; an optional `validate_record` hook enforces
+domain restrictions. For example,
 service queries declare `ListReply<Service, 2>` and node health declares
 `ItemReply<NodeHealth, 16, 16>`. Lists allow absent actor/action headers but check
 them when present; items require their declared actor and `OperationSuccessAction`.

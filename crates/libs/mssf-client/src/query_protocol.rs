@@ -27,9 +27,6 @@ pub(crate) trait Query: Serialize {
     ) -> Result<<Self::Reply as Reply>::Record> {
         Ok(record)
     }
-    fn decode_reply(message: &Message) -> Result<Self::Output> {
-        Self::Reply::decode(message, Self::validate_record)
-    }
 }
 
 pub(crate) fn encode_query<Q: Query>(query: &Q, paging: Option<&Paging>) -> Result<Vec<u8>> {
@@ -43,6 +40,10 @@ pub(crate) fn encode_query<Q: Query>(query: &Q, paging: Option<&Paging>) -> Resu
         append_paging(&mut arguments, paging)?;
     }
     encode(Q::NAME, &arguments.values)
+}
+
+pub(crate) fn decode_reply<Q: Query>(message: &Message) -> Result<Q::Output> {
+    Q::Reply::decode(message, Q::validate_record)
 }
 
 fn append_paging(arguments: &mut QueryArguments, paging: Option<&Paging>) -> Result<()> {
@@ -371,7 +372,7 @@ mod tests {
     fn new_reply_schemas_need_only_derived_records_and_profile_declarations() {
         assert_native_bytes(&DeclaredListQuery {}, None, "DeclaredList", &[]);
         assert_native_bytes(&DeclaredItemQuery {}, None, "DeclaredItem", &[]);
-        let page = DeclaredListQuery::decode_reply(&reply_fixture(
+        let page = decode_reply::<DeclaredListQuery>(&reply_fixture(
             2,
             Some(23),
             &["first", "second"],
@@ -387,7 +388,7 @@ mod tests {
             })
         );
         assert_eq!(page.continuation_token.as_deref(), Some("opaque-next"));
-        let item = DeclaredItemQuery::decode_reply(&item_envelope(reply_fixture(
+        let item = decode_reply::<DeclaredItemQuery>(&item_envelope(reply_fixture(
             1,
             Some(37),
             &[],
@@ -412,13 +413,13 @@ mod tests {
         ] {
             let mut message = reply_fixture(2, Some(23), &[], None, 0, None);
             message.headers = headers;
-            DeclaredListQuery::decode_reply(&message).unwrap();
+            decode_reply::<DeclaredListQuery>(&message).unwrap();
         }
         for header in [Header::actor(0).unwrap(), Header::action("wrong").unwrap()] {
             let mut message = reply_fixture(2, Some(23), &[], None, 0, None);
             message.headers.push(header);
             assert!(matches!(
-                DeclaredListQuery::decode_reply(&message),
+                decode_reply::<DeclaredListQuery>(&message),
                 Err(Error::Protocol(_))
             ));
         }
@@ -435,7 +436,7 @@ mod tests {
             let mut message = reply_fixture(1, Some(37), &[], Some("only"), 0, None);
             message.headers = headers;
             assert!(matches!(
-                DeclaredItemQuery::decode_reply(&message),
+                decode_reply::<DeclaredItemQuery>(&message),
                 Err(Error::Protocol(_))
             ));
         }
@@ -458,7 +459,7 @@ mod tests {
             reply_fixture(2, Some(23), &[], Some("unexpected"), 0, None),
         ] {
             assert!(matches!(
-                DeclaredListQuery::decode_reply(&message),
+                decode_reply::<DeclaredListQuery>(&message),
                 Err(Error::Protocol(_))
             ));
         }
@@ -472,7 +473,7 @@ mod tests {
             reply_fixture(1, Some(37), &[], Some("only"), 0, Some((b"typed", ""))),
         ] {
             assert!(matches!(
-                DeclaredItemQuery::decode_reply(&item_envelope(message)),
+                decode_reply::<DeclaredItemQuery>(&item_envelope(message)),
                 Err(Error::Protocol(_))
             ));
         }
@@ -487,7 +488,7 @@ mod tests {
             reply_fixture(2, Some(23), &[], None, REMOTE, Some((b"typed", ""))),
         ] {
             assert!(matches!(
-                DeclaredListQuery::decode_reply(&message),
+                decode_reply::<DeclaredListQuery>(&message),
                 Err(Error::Protocol(_))
             ));
         }
@@ -507,7 +508,7 @@ mod tests {
         for tag in [None, Some(23)] {
             let message = reply_fixture(0, tag, &[], None, REMOTE, None);
             assert!(matches!(
-                DeclaredListQuery::decode_reply(&message),
+                decode_reply::<DeclaredListQuery>(&message),
                 Err(Error::Remote { code: REMOTE, .. })
             ));
         }
@@ -521,7 +522,7 @@ mod tests {
                 Some((b"typed", "")),
             ));
             assert!(matches!(
-                DeclaredItemQuery::decode_reply(&message),
+                decode_reply::<DeclaredItemQuery>(&message),
                 Err(Error::Remote { code: REMOTE, .. })
             ));
         }
@@ -535,7 +536,7 @@ mod tests {
             let mut truncated = list.clone();
             truncated.body.truncate(end);
             assert!(matches!(
-                DeclaredListQuery::decode_reply(&truncated),
+                decode_reply::<DeclaredListQuery>(&truncated),
                 Err(Error::Protocol(_))
             ));
         }
@@ -543,14 +544,14 @@ mod tests {
             let mut truncated = item.clone();
             truncated.body.truncate(end);
             assert!(matches!(
-                DeclaredItemQuery::decode_reply(&truncated),
+                decode_reply::<DeclaredItemQuery>(&truncated),
                 Err(Error::Protocol(_))
             ));
         }
         list.body.push(0);
         item.body.push(0);
-        assert!(DeclaredListQuery::decode_reply(&list).is_err());
-        assert!(DeclaredItemQuery::decode_reply(&item).is_err());
+        assert!(decode_reply::<DeclaredListQuery>(&list).is_err());
+        assert!(decode_reply::<DeclaredItemQuery>(&item).is_err());
     }
 
     fn assert_native_bytes(
@@ -903,11 +904,11 @@ mod tests {
         for token in ["opaque-next", ""] {
             let expected = (!token.is_empty()).then(|| token.to_owned());
             for tag in [b"".as_slice(), b"typed".as_slice()] {
-                let nodes = NodeQueryParameters::decode_reply(&reply(1, tag, token)).unwrap();
+                let nodes = decode_reply::<NodeQueryParameters>(&reply(1, tag, token)).unwrap();
                 assert!(nodes.items.is_empty());
                 assert_eq!(nodes.continuation_token, expected);
-                let apps = ApplicationQueryParameters::decode_reply(&reply(4, tag, token));
-                let services = ServiceQueryParameters::decode_reply(&reply(2, tag, token));
+                let apps = decode_reply::<ApplicationQueryParameters>(&reply(4, tag, token));
+                let services = decode_reply::<ServiceQueryParameters>(&reply(2, tag, token));
                 if tag.is_empty() {
                     assert_eq!(apps.unwrap().continuation_token, expected);
                     assert_eq!(services.unwrap().continuation_token, expected);
