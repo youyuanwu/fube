@@ -10,6 +10,8 @@ use oracle::{output, owner, Http, Journal, Result};
 mod fixture;
 #[path = "support/rest.rs"]
 mod rest;
+#[path = "support/topology_oracle.rs"]
+mod topology;
 
 fn compare_application(app: &Application, observed: &Value) {
     assert_eq!(app.name.as_str(), observed["Name"]);
@@ -238,6 +240,7 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
         2
     );
     client.ping().await?;
+    let topology = topology::observe(&client, &http, &journal).await?;
     client.close().await?;
     Ok(json!({
         "runtime_version": runtime, "archive_sha256": journal.archive_sha256,
@@ -254,6 +257,7 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
             "parameters": app.parameters, "definition_kind": format!("{:?}", app.definition_kind),
         })).collect::<Vec<_>>(),
         "native_services": native_services,
+        "topology": topology,
         "qualification_limit": "volatile implicit-host stateful kind; not persisted application data replication"
     }))
 }

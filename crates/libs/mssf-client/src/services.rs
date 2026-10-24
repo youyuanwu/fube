@@ -40,31 +40,29 @@ impl ServiceQueryParameters {
 /// One ordinary application-scoped service request with independent paging.
 pub type ServiceQueryDescription = PagedQuery<ServiceQueryParameters>;
 
-/// Native scalar kind; persistence is a separate service field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServiceKind {
-    Invalid,
-    Stateless,
-    Stateful,
+crate::native::strict_enum! {
+    /// Native scalar kind; persistence is a separate service field.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ServiceKind {
+        Invalid = 0,
+        Stateless = 1,
+        Stateful = 2,
+    }
 }
-crate::native::strict_enum!(ServiceKind {
-    Invalid = 0, Stateless = 1, Stateful = 2,
-});
 
-/// Native service lifecycle status. A missing optional suffix is Unknown.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ServiceStatus {
-    #[default]
-    Unknown,
-    Active,
-    Upgrading,
-    Deleting,
-    Creating,
-    Failed,
+crate::native::strict_enum! {
+    /// Native service lifecycle status. A missing optional suffix is Unknown.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub enum ServiceStatus {
+        #[default]
+        Unknown = 0,
+        Active = 1,
+        Upgrading = 2,
+        Deleting = 3,
+        Creating = 4,
+        Failed = 5,
+    }
 }
-crate::native::strict_enum!(ServiceStatus {
-    Unknown = 0, Active = 1, Upgrading = 2, Deleting = 3, Creating = 4, Failed = 5,
-});
 
 /// An aggregate observation, not a readiness guarantee. Manifest version can be
 /// empty and is not the application type version. Unknown health is legitimate.

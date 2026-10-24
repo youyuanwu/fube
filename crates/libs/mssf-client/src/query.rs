@@ -73,6 +73,7 @@ pub struct Paging {
     pub continuation_token: Option<String>,
     /// Positive limit at most i64::MAX, checked before sending. None leaves the
     /// count unspecified; the native server can still page by message size.
+    /// Partition and replica queries do not support count limits and require None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_results: Option<NonZeroU64>,
 }

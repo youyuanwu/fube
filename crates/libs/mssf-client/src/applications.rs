@@ -74,32 +74,30 @@ pub struct ApplicationQueryParameters {
 /// One application-list request with separate parameters and paging.
 pub type ApplicationQueryDescription = PagedQuery<ApplicationQueryParameters>;
 
-/// Native application deployment status, not its health.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApplicationStatus {
-    Invalid,
-    Ready,
-    Upgrading,
-    Creating,
-    Deleting,
-    Failed,
+crate::native::strict_enum! {
+    /// Native application deployment status, not its health.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ApplicationStatus {
+        Invalid = 0,
+        Ready = 1,
+        Upgrading = 2,
+        Creating = 3,
+        Deleting = 4,
+        Failed = 5,
+    }
 }
-crate::native::strict_enum!(ApplicationStatus {
-    Invalid = 0, Ready = 1, Upgrading = 2, Creating = 3, Deleting = 4, Failed = 5,
-});
 
-/// Native result definition kind. Missing optional suffix defaults to Invalid.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ApplicationDefinitionKind {
-    ServiceFabricApplicationDescription,
-    Compose,
-    MeshApplicationDescription,
-    #[default]
-    Invalid,
+crate::native::strict_enum! {
+    /// Native result definition kind. Missing optional suffix defaults to Invalid.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub enum ApplicationDefinitionKind {
+        ServiceFabricApplicationDescription = 0,
+        Compose = 1,
+        MeshApplicationDescription = 2,
+        #[default]
+        Invalid = 65535,
+    }
 }
-crate::native::strict_enum!(ApplicationDefinitionKind {
-    ServiceFabricApplicationDescription = 0, Compose = 1, MeshApplicationDescription = 2, Invalid = 65535,
-});
 
 /// An owned aggregate observation in native field order.
 /// Health may be Unknown when unavailable. Missing trailing fields use native

@@ -56,13 +56,13 @@ impl std::fmt::Display for NodeId {
 pub struct NodeTimestamp(pub i64);
 
 macro_rules! native_enum {
-    ($(#[$meta:meta])* $name:ident { $($variant:ident = $value:expr),* $(,)? }) => {
+    ($(#[$meta:meta])* $name:ident { $($(#[$variant_meta:meta])* $variant:ident = $value:expr),* $(,)? }) => {
         $(#[$meta])*
         /// Serde uses the signed i64 code in native and JSON formats, retaining unknown values.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         #[non_exhaustive]
         pub enum $name {
-            $($variant,)*
+            $($(#[$variant_meta])* $variant,)*
             /// A numeric value not named by the profiled native source.
             Unrecognized(i64),
         }
@@ -103,8 +103,12 @@ native_enum!(
 );
 native_enum!(
     /// Native health assessment; `Unknown` is a named value, not a fallback.
+    /// The default is Unknown; deserialization still preserves explicit codes.
+    #[derive(Default)]
     HealthState {
-        Invalid = 0, Ok = 1, Warning = 2, Error = 3, Unknown = 65535,
+        Invalid = 0, Ok = 1, Warning = 2, Error = 3,
+        #[default]
+        Unknown = 65535,
     }
 );
 native_enum!(

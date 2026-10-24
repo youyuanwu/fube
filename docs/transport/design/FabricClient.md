@@ -378,7 +378,8 @@ executor receives parameters and optional paging separately, without trait
 accessors for either.
 Configuration JSON now follows those declared native names and masks; legacy
 shapes and malformed/conflicting selectors fail explicitly.
-Strict scalar status/definition enums map their numeric codes directly; shared
+Strict scalar status/definition enums generate their type and numeric Serde
+mappings from one declaration rather than repeating the variant list; shared
 `HealthState` retains unknown codes, with list-specific rejection after decoding.
 URI redundancy is checked by semantic construction above the generic backend;
 node-ID agreement, duplicate parameters and cross-field checks remain record-level
@@ -387,6 +388,15 @@ helpers retain protocol framing distinct from domain records, including both
 native list/item slots and their required empty/null checks. Operations declare
 shared `ListReply<Record, TAG, STRICT_PAGING>` or `ItemReply<Record, TAG, ACTOR>`
 profiles with optional record-validation hooks, not handwritten reply decoders.
+Partition, replica/instance and node-local deployed-application lists follow the
+same pattern: parameter-owned query declarations, source-ordered native records
+and shared list envelopes. Partition-key and replica-kind differences belong to
+their domain models, not additional transport workflows. Query pages remain
+explicit and do not provide service endpoint resolution or a cluster snapshot.
+Ordinary model derives select shared field adapters for untagged nested objects,
+UUID mapping and model-owned trailing defaults, rather than model-specific
+deserializers or remote derives. `HealthState` defaults to Unknown in the domain
+model; the generic trailing adapter does not know about health types.
 A shared `decode_reply<Q>` function dispatches to the profile and validator
 outside the `Query` trait, symmetric with the shared request encoder.
 The shared schemas use `EmptyObjectArray` for the forbidden item-result list

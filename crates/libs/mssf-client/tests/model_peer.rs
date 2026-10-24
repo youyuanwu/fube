@@ -27,6 +27,9 @@ mod name_writes;
 #[path = "support/list_model.rs"]
 mod workload_lists;
 
+#[path = "support/topology_model.rs"]
+mod topology_lists;
+
 fn body(fields: impl FnOnce(&mut Encoder) -> mssf_transport::Result<()>) -> Vec<u8> {
     let mut encoder = Encoder::new();
     encoder.object(fields).unwrap();

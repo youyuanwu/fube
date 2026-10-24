@@ -23,6 +23,14 @@ pub(crate) fn is_none_or_empty<T: AsRef<str>>(value: &Option<T>) -> bool {
     value.as_ref().is_none_or(|value| value.as_ref().is_empty())
 }
 
+pub(crate) fn is_none_or_nil(id: &Option<uuid::Uuid>) -> bool {
+    id.is_none_or(|id| id.is_nil())
+}
+
+pub(crate) fn is_none_or_zero(id: &Option<i64>) -> bool {
+    id.is_none_or(|id| id == 0)
+}
+
 pub(crate) mod json {
     use super::*;
 

@@ -50,6 +50,164 @@ fn scalar_node_enums_use_signed_numeric_serde_and_retain_unknown_values() {
 }
 
 #[test]
+fn strict_scalar_enums_preserve_numeric_json_and_native_contracts() {
+    use mssf_transport::serialization::{
+        serde::{from_slice, to_vec},
+        Encoder,
+    };
+
+    fn check<T>(cases: &[(T, i64)], invalid: &[i64])
+    where
+        T: Serialize + DeserializeOwned + Copy + PartialEq + std::fmt::Debug,
+    {
+        for (value, raw) in cases {
+            let json = raw.to_string();
+            assert_eq!(serde_json::to_string(value).unwrap(), json);
+            assert_eq!(serde_json::from_str::<T>(&json).unwrap(), *value);
+            let mut encoder = Encoder::new();
+            encoder.i64(*raw);
+            let bytes = encoder.finish();
+            assert_eq!(to_vec(value).unwrap(), bytes);
+            assert_eq!(from_slice::<T>(&bytes).unwrap(), *value);
+        }
+        for raw in [i64::MIN, -1, i64::MAX]
+            .into_iter()
+            .chain(invalid.iter().copied())
+        {
+            assert!(serde_json::from_str::<T>(&raw.to_string()).is_err());
+            let mut encoder = Encoder::new();
+            encoder.i64(raw);
+            assert!(from_slice::<T>(&encoder.finish()).is_err());
+        }
+        for json in ["null", "\"Ready\"", "1.5", "18446744073709551615"] {
+            assert!(serde_json::from_str::<T>(json).is_err());
+        }
+    }
+
+    check(
+        &[
+            (ApplicationStatus::Invalid, 0),
+            (ApplicationStatus::Ready, 1),
+            (ApplicationStatus::Upgrading, 2),
+            (ApplicationStatus::Creating, 3),
+            (ApplicationStatus::Deleting, 4),
+            (ApplicationStatus::Failed, 5),
+        ],
+        &[6, 65535],
+    );
+    check(
+        &[
+            (
+                ApplicationDefinitionKind::ServiceFabricApplicationDescription,
+                0,
+            ),
+            (ApplicationDefinitionKind::Compose, 1),
+            (ApplicationDefinitionKind::MeshApplicationDescription, 2),
+            (ApplicationDefinitionKind::Invalid, 65535),
+        ],
+        &[3, 4],
+    );
+    check(
+        &[
+            (ServiceKind::Invalid, 0),
+            (ServiceKind::Stateless, 1),
+            (ServiceKind::Stateful, 2),
+        ],
+        &[3, 65535],
+    );
+    check(
+        &[
+            (ServiceStatus::Unknown, 0),
+            (ServiceStatus::Active, 1),
+            (ServiceStatus::Upgrading, 2),
+            (ServiceStatus::Deleting, 3),
+            (ServiceStatus::Creating, 4),
+            (ServiceStatus::Failed, 5),
+        ],
+        &[6, 65535],
+    );
+    check(
+        &[
+            (PartitionKind::Singleton, 1),
+            (PartitionKind::Int64Range, 2),
+            (PartitionKind::Named, 3),
+        ],
+        &[0, 4, 65535],
+    );
+    check(
+        &[
+            (PartitionStatus::Invalid, 0),
+            (PartitionStatus::Ready, 1),
+            (PartitionStatus::NotReady, 2),
+            (PartitionStatus::InQuorumLoss, 3),
+            (PartitionStatus::Reconfiguring, 4),
+            (PartitionStatus::Deleting, 5),
+        ],
+        &[6, 65535],
+    );
+    check(
+        &[
+            (ReplicaStatus::Invalid, 0),
+            (ReplicaStatus::InBuild, 1),
+            (ReplicaStatus::Standby, 2),
+            (ReplicaStatus::Ready, 3),
+            (ReplicaStatus::Down, 4),
+            (ReplicaStatus::Dropped, 5),
+        ],
+        &[6, 65535],
+    );
+    check(
+        &[
+            (ReplicaRole::Unknown, 0),
+            (ReplicaRole::None, 1),
+            (ReplicaRole::Primary, 2),
+            (ReplicaRole::IdleSecondary, 3),
+            (ReplicaRole::ActiveSecondary, 4),
+        ],
+        &[5, 65535],
+    );
+    check(
+        &[
+            (DeploymentStatus::Invalid, 0),
+            (DeploymentStatus::Downloading, 1),
+            (DeploymentStatus::Activating, 2),
+            (DeploymentStatus::Active, 3),
+            (DeploymentStatus::Upgrading, 4),
+            (DeploymentStatus::Deactivating, 5),
+        ],
+        &[6, 65535],
+    );
+}
+
+#[test]
+fn strict_enum_defaults_and_rust_ordinals_remain_independent_of_native_codes() {
+    assert_eq!(
+        ApplicationDefinitionKind::default(),
+        ApplicationDefinitionKind::Invalid
+    );
+    assert_eq!(ServiceStatus::default(), ServiceStatus::Unknown);
+    assert_eq!(ApplicationDefinitionKind::Invalid as i64, 3);
+    assert_eq!(PartitionKind::Singleton as i64, 0);
+    assert_eq!(PartitionKind::Int64Range as i64, 1);
+    assert_eq!(PartitionKind::Named as i64, 2);
+}
+
+#[test]
+fn health_state_default_is_unknown_without_defaulting_explicit_values() {
+    assert_eq!(HealthState::default(), HealthState::Unknown);
+    assert_eq!(HealthState::default().as_raw(), 65535);
+    assert_eq!(
+        serde_json::from_str::<HealthState>("0").unwrap(),
+        HealthState::Invalid
+    );
+    assert_eq!(
+        serde_json::from_str::<HealthState>("-99").unwrap(),
+        HealthState::Unrecognized(-99)
+    );
+    assert!(serde_json::from_str::<HealthState>("null").is_err());
+}
+
+#[test]
 fn descriptions_and_parameters_support_json_without_becoming_native_wire_dtos() {
     let paging = Paging {
         continuation_token: Some(" opaque+/\0\u{1f980} ".into()),

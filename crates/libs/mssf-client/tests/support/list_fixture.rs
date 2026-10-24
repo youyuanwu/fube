@@ -405,6 +405,34 @@ impl Http {
             .clone())
     }
 
+    pub async fn partitions(&self, service_name: &str) -> Result<Vec<Value>> {
+        let service_id = app_id(service_name).replace('/', "~");
+        let value = self
+            .get(&format!(
+                "/Services/{service_id}/$/GetPartitions?api-version=6.3"
+            ))
+            .await?;
+        unpaged_items(value, "partitions")
+    }
+
+    pub async fn replicas(&self, partition_id: uuid::Uuid) -> Result<Vec<Value>> {
+        let value = self
+            .get(&format!(
+                "/Partitions/{partition_id}/$/GetReplicas?api-version=6.3"
+            ))
+            .await?;
+        unpaged_items(value, "replicas")
+    }
+
+    pub async fn deployed_applications(&self, node_name: &str) -> Result<Vec<Value>> {
+        let value = self
+            .get(&format!(
+                "/Nodes/{node_name}/$/GetApplications?api-version=6.3&IncludeHealthState=true"
+            ))
+            .await?;
+        unpaged_items(value, "deployed applications")
+    }
+
     pub async fn wait_ready(&self, journal: &Journal) -> Result<()> {
         for _ in 0..120 {
             let apps = self.applications(journal).await?;
@@ -417,6 +445,41 @@ impl Http {
                     && services
                         .iter()
                         .all(|s| s["ServiceStatus"] == "Active" && s["HealthState"] == "Ok");
+                if ready {
+                    for service in &services {
+                        let name = service["Name"]
+                            .as_str()
+                            .ok_or("missing independent service identity")?;
+                        let partitions = self.partitions(name).await?;
+                        let expected = if service["ServiceKind"] == "Stateful" {
+                            2
+                        } else {
+                            1
+                        };
+                        ready &= partitions.len() == expected
+                            && partitions.iter().all(|partition| {
+                                partition["PartitionStatus"] == "Ready"
+                                    && partition["HealthState"] == "Ok"
+                            });
+                        for partition in partitions {
+                            let id = partition["PartitionInformation"]["Id"]
+                                .as_str()
+                                .ok_or("missing independent partition identity")?
+                                .parse()?;
+                            let replicas = self.replicas(id).await?;
+                            let minimum = if service["ServiceKind"] == "Stateless" {
+                                5
+                            } else {
+                                3
+                            };
+                            ready &= replicas.len() >= minimum
+                                && replicas.iter().all(|replica| {
+                                    replica["ReplicaStatus"] == "Ready"
+                                        && replica["HealthState"] == "Ok"
+                                });
+                        }
+                    }
+                }
             }
             if ready {
                 return Ok(());
@@ -488,6 +551,21 @@ pub fn app_id(name: &str) -> &str {
     &name["fabric:/".len()..]
 }
 
+fn unpaged_items(value: Value, description: &str) -> Result<Vec<Value>> {
+    match value.get("ContinuationToken") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(token)) if token.is_empty() => {}
+        Some(Value::String(_)) => {
+            return Err(format!("unexpected oracle pagination for {description}").into());
+        }
+        Some(_) => return Err(format!("malformed oracle continuation for {description}").into()),
+    }
+    Ok(value["Items"]
+        .as_array()
+        .ok_or_else(|| format!("missing independent {description}"))?
+        .clone())
+}
+
 pub async fn cleanup(path: &Path, owner: &str, http: &Http) -> Result<()> {
     if !path.try_exists()? {
         return Ok(());
@@ -507,8 +585,8 @@ fn manifests(type_name: &str) -> [(&'static str, String); 6] {
   <Parameters><Parameter Name="Evidence" DefaultValue="default-list-value" /></Parameters>
   <ServiceManifestImport><ServiceManifestRef ServiceManifestName="ListServices" ServiceManifestVersion="1.0" /></ServiceManifestImport>
   <DefaultServices>
-    <Service Name="Stateless"><StatelessService ServiceTypeName="ListStateless" InstanceCount="1"><SingletonPartition /></StatelessService></Service>
-    <Service Name="Stateful"><StatefulService ServiceTypeName="ListStateful" TargetReplicaSetSize="3" MinReplicaSetSize="1"><SingletonPartition /></StatefulService></Service>
+    <Service Name="Stateless"><StatelessService ServiceTypeName="ListStateless" InstanceCount="-1"><SingletonPartition /></StatelessService></Service>
+    <Service Name="Stateful"><StatefulService ServiceTypeName="ListStateful" TargetReplicaSetSize="3" MinReplicaSetSize="1"><UniformInt64Partition PartitionCount="2" LowKey="-10" HighKey="9" /></StatefulService></Service>
   </DefaultServices>
 </ApplicationManifest>"#)),
         ("ListServices/ServiceManifest.xml", r#"<?xml version="1.0" encoding="utf-8"?>
@@ -601,6 +679,66 @@ mod tests {
             },
             server,
         )
+    }
+
+    #[tokio::test]
+    async fn independent_topology_routes_preserve_polymorphic_fields() {
+        let id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let partition = json!({
+            "ServiceKind": "Stateful",
+            "PartitionInformation": {
+                "Id": id, "ServicePartitionKind": "Int64Range",
+                "LowKey": "-10", "HighKey": "-1"
+            }
+        });
+        let replica = json!({
+            "ServiceKind": "Stateful", "ReplicaId": "9223372036854775807",
+            "ReplicaRole": "Primary", "NodeName": "N0010"
+        });
+        let deployed = json!({
+            "Name": "fabric:/Owned", "Status": "Active", "HealthState": "Ok"
+        });
+        let (http, server) = scripted_http(vec![
+            (
+                "GET /Services/Owned~Stateful/$/GetPartitions?api-version=6.3".into(),
+                StatusCode::OK,
+                json!({"Items": [partition.clone()]}),
+            ),
+            (
+                format!("GET /Partitions/{id}/$/GetReplicas?api-version=6.3"),
+                StatusCode::OK,
+                json!({"Items": [replica.clone()], "ContinuationToken": ""}),
+            ),
+            (
+                "GET /Nodes/N0010/$/GetApplications?api-version=6.3&IncludeHealthState=true".into(),
+                StatusCode::OK,
+                json!({"Items": [deployed.clone()]}),
+            ),
+        ])
+        .await;
+        assert_eq!(
+            http.partitions("fabric:/Owned/Stateful").await.unwrap(),
+            vec![partition]
+        );
+        assert_eq!(http.replicas(id).await.unwrap(), vec![replica]);
+        assert_eq!(
+            http.deployed_applications("N0010").await.unwrap(),
+            vec![deployed]
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn topology_oracle_requires_complete_independent_pages() {
+        for value in [
+            json!({"Items": [], "ContinuationToken": "next"}),
+            json!({"Items": [], "ContinuationToken": 1}),
+            json!({"Items": [], "ContinuationToken": false}),
+            json!({}),
+            json!({"Items": null}),
+        ] {
+            assert!(unpaged_items(value, "test records").is_err());
+        }
     }
 
     fn request(j: &Journal, index: usize, method: &str, delete: bool) -> String {

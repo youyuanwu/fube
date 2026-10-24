@@ -2,7 +2,8 @@
 
 **Status:** experimental native clear-TCP subset. Gateway ping, NameExists,
 typed GetNodeList, single-node GetNodeHealth, native CreateName/DeleteName,
-and application/application-scoped service lists
+application/application-scoped service lists, service partitions,
+partition replicas/stateless instances and node-local deployed applications
 have been demonstrated against the repository's Ubuntu onebox running
 Service Fabric **11.8.121.4**. This is not a complete FabricClient replacement
 and does not support TLS or authentication.
@@ -13,7 +14,9 @@ and does not support TLS or authentication.
 ordered native headers, client-only ListenInstance establishment, and
 continuously driven, bounded concurrent Tokio request/reply I/O. `mssf-client`
 adds native gateway ping, NameExists, typed node/application/service pages, node health and
-single-name creation/deletion, with owned results and explicit errors.
+single-name creation/deletion, with owned results and explicit errors. Additional
+typed pages cover service partitions, partition replicas/stateless instances and
+node-local deployed applications.
 
 Neither package calls the native Service Fabric client or COM libraries.
 Neither uses HTTP to execute client operations. "Clear TCP" still carries the
@@ -28,6 +31,9 @@ Neither uses HTTP to execute client operations. "Clear TCP" still carries the
 | GetNodeHealth | Sends external `GetNodeHealth` via NamingGateway; validates the HM single-item envelope, aggregate, full events and Event evaluations. Independently injected Warning, false/true/inherited policy, event masks, unknown-node error and healthy same-connection reuse qualified live. |
 | GetApplicationList | Native external query with owned application identity/type/version/status/health/parameters/definition; two unique nonempty applications, exact/type/definition filters, parameter exclusion and explicit native continuation qualified live. |
 | GetServiceList | Public Rust method sends external **GetApplicationServiceList** for an ordinary application. Owned kind/type/manifest/status/health/persistence/group results; stateless and volatile stateful guest services, filters and real native continuation qualified live. |
+| GetPartitionList | Sends **GetServicePartitionList**, wrapper tag 5. Singleton/stateless and int64-range/stateful records, GUID selectors and overlapping fields independently compared live for six owned partitions. Named keys and message-size continuations have offline coverage only. |
+| GetReplicaList | Sends **GetServicePartitionReplicaList**, wrapper tag 6. Stateful replicas and stateless instances, signed ID selectors, Ready status filtering, addresses, placement and health compared live for 22 records; missing-partition error followed by healthy reuse. Message-size continuations have offline coverage only. |
+| GetDeployedApplicationList | Sends **GetApplicationPagedListDeployedOnNode**, wrapper tag 10. Node/application selectors, directory fields, requested/default health and real count-limited continuation independently compared live; missing-node error followed by healthy reuse. |
 | Native faults/errors | Retains native signed error codes and available diagnostics. Malformed GetNodeList continuation produced live `E_INVALIDARG` (-2147024809) or `FMFailoverUnitNotFound` (-2147017462); the same connection remained usable. Other fault forms have offline model-peer coverage. |
 | Concurrent operations | Mixed ping, NameExists, node-list and node-health queries on clones sharing one connection; real onebox coverage. Deterministic cancellation/late-reply safety remains model-covered. |
 | Idle disconnect | Real native ping through a test-owned proxy, followed by proxy cutoff; closure detected without another operation. |
@@ -572,6 +578,127 @@ ten-field URI objects, not strings; service records are not the C API kind/value
 union. Native aggregate reply constructors allow absent actor/action headers;
 present headers are validated.
 
+### Partition, replica and deployed application pages
+
+Three additional list APIs extend discovery beyond applications and services:
+
+| API | Scope |
+|---|---|
+| `get_partition_list` | A service's partitions, including partition identity/key information and observed status/health. This is not endpoint resolution. |
+| `get_replica_list` | A partition's stateful replicas or stateless instances, with node placement, status and service address. |
+| `get_deployed_application_list` | Applications deployed on one selected node, not the cluster-wide application inventory. |
+
+Each accepts a `PagedQuery`-based description and returns one owned `QueryPage`.
+The corresponding `_with_timeout` variant uses one whole-operation deadline,
+including parameter validation and decoding. Continuations are opaque and must
+be followed explicitly; observations across pages and families are not a
+snapshot. Native errors remain operation-local, while malformed replies retire
+the shared connection. The existing restricted naming URI profile still applies
+to service names and application selectors.
+
+```rust,no_run
+use std::time::Duration;
+use mssf_client::{
+    DeployedApplicationQueryDescription, DeployedApplicationQueryParameters,
+    FabricClient, PartitionQueryDescription, PartitionQueryParameters,
+    ReplicaQueryDescription, ReplicaQueryParameters,
+};
+
+# async fn topology(client: &FabricClient, partition_id: uuid::Uuid) -> mssf_client::Result<()> {
+let mut partitions = PartitionQueryDescription::new(PartitionQueryParameters::new(
+    "fabric:/MyApplication/MyService".parse()?,
+));
+let page = client.get_partition_list(&partitions).await?;
+for partition in page.items {
+    println!("{} {:?}", partition.partition_information.id, partition.kind);
+    let replicas = ReplicaQueryDescription::new(ReplicaQueryParameters::new(
+        partition.partition_information.id,
+    ));
+    println!("{:?}", client.get_replica_list(&replicas).await?.items);
+}
+partitions.paging.continuation_token = page.continuation_token;
+
+let replicas = ReplicaQueryDescription::new(ReplicaQueryParameters::new(partition_id));
+let page = client
+    .get_replica_list_with_timeout(&replicas, Duration::from_secs(5))
+    .await?;
+println!("{:?}", page.items);
+
+let mut deployments = DeployedApplicationQueryDescription::new(
+    DeployedApplicationQueryParameters::new("N0010"),
+);
+deployments.parameters.include_health_state = true;
+let page = client.get_deployed_application_list(&deployments).await?;
+println!("{:?}", page.items);
+# Ok(())
+# }
+```
+
+Request JSON retains separate `parameters` and `paging` objects. These APIs use
+the same shared request encoder and list reply profile as the existing queries;
+they introduce no new transport session, automatic retries, or HTTP fallback.
+Service partition resolution, resolution caching, notifications and additional
+health-detail APIs remain out of scope.
+
+Native partition and replica queries accept continuation tokens but not
+`MaxResults`. Their shared paging field must leave `max_results` as `None`;
+unsupported counts fail locally rather than being ignored or sent to the
+gateway. Message-size paging can still occur. Deployed-application pages support
+both continuation and the ordinary positive count limit.
+
+`PartitionQueryParameters` requires a service `NamingUri` and optionally selects
+one `partition_id`; a nil selector is omitted, like the native facade.
+`PartitionInformation` retains the native key kind, UUID, name and signed
+inclusive range bounds. Singleton, Int64Range and Named kinds are distinct from
+the partition's Stateless/Stateful service kind. Results retain the signed
+instance count (`-1` means every node), replica-set sizes, health, partition
+status, quorum-loss duration and raw configuration epoch. Epoch field order is
+configuration version then data-loss version; it is **not** the masked REST
+`PrimaryEpoch` projection.
+
+`ReplicaQueryParameters` requires a partition UUID. Its optional
+`replica_or_instance_id` uses the native `ReplicaId` selector for either kind;
+zero is omitted and other signed i64 values are retained. `status_filter` is a
+numeric `ReplicaStatusFilter`: DEFAULT excludes Dropped, ALL is exactly 65535,
+and IN_BUILD/STANDBY/READY/DOWN/DROPPED bits are combinable. Unknown UInt32 bits
+are retained and forwarded, not treated as ALL. Records retain both positional
+IDs; use `replica_id` and `role` for stateful replicas, `instance_id` for
+stateless instances. Addresses are opaque strings, not parsed URLs.
+
+`DeployedApplicationQueryParameters` requires a nonempty node name of at most
+4096 UTF-16 units without NUL, with optional exact `application_name`.
+`include_health_state` defaults to false and is explicitly sent; result health
+is then Unknown, not an inferred Ok. When true, health aggregation is
+best-effort and can still yield Unknown. Unfiltered deployment lists normally
+exclude System; an explicit `fabric:/System` application selector is supported.
+Unlike application-list records, deployed names are native strings, not
+structured URI objects. Results include type name, `DeploymentStatus`,
+work/log/temp directories and health, but no application-type version.
+
+These records preserve complete native positional layouts, including inactive
+service-kind fields. Strict scalar status/kind mappings and list-level health
+validation reject unsupported values. Optional native suffixes default only at
+genuine scope boundaries: partition duration/epoch and replica build duration
+default to zero; deployed directories default empty and health defaults Unknown.
+Malformed present fields are not treated as absent.
+
+Native layouts:
+[ServicePartitionQueryResult](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/ServicePartitionQueryResult.h#L88),
+[ServicePartitionInformation](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/ServicePartitionInformation.h#L58),
+[ServiceReplicaQueryResult](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/ServiceReplicaQueryResult.h#L92-L101),
+[DeployedApplicationQueryResult](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/DeployedApplicationQueryResult.h#L66-L73).
+Native query specifications reject unknown arguments, including count limits
+on the partition/replica routes; the shared encoder's query capability metadata
+rejects those counts before any request is sent.
+
+The existing owned application/service onebox scenario also qualifies these
+APIs. Its stateless service runs on all five nodes and its stateful service has
+two int64-range partitions. Independent REST observations must converge to
+Ready/Ok partition and replica state before native field comparisons. The live
+fixture covers all six partitions, 22 replicas/instances, node-local deployment
+pages and native error reuse. It does not exercise Named keys live, manufacture
+partition/replica continuation evidence, or qualify persisted data replication.
+
 ## 4. Supported inputs and bounds
 
 Naming input is literal lowercase `fabric:/` followed by nonempty ASCII
@@ -744,7 +871,11 @@ to enter its derived scope. Encoding uses the same mapping in reverse.
 It remains available for derived unit enums; unknown codes are errors.
 Application status, definition kind, service kind and service status implement
 their explicit signed-i64 mappings directly and reject unknown codes without
-parallel wire enums. Node scalar enums (`NodeStatus`,
+parallel wire enums. All nine strict scalar enums, including partition,
+replica and deployment kinds/statuses, declare their variants and native codes
+once through `strict_enum!`, which generates the enum and its Serde mappings.
+Documentation, derives, default variants and Rust variant order are preserved;
+native codes are not Rust discriminants. Node scalar enums (`NodeStatus`,
 `HealthState`, deactivation/task enums and `SafetyCheckKind`) implement Serde
 through the shared numeric-enum macro: both native and JSON formats use their
 signed i64 codes, including `Unrecognized(i64)`. This preserves the deliberate
@@ -812,6 +943,14 @@ collapsing partition variants into `Partition { kind, partition_id }`.
 The six partition variants share `PartitionSafetyCheck { partition_id }`; a
 field adapter enters the native derived scope and decodes GUID bytes into a UUID.
 `SafetyCheck::kind()` returns the discriminant implied by the variant.
+`PartitionInformation` uses an ordinary Deserialize derive; its containing
+partition field selects a shared untagged-object adapter, and its UUID field
+selects the shared native GUID adapter. JSON retains the ordinary object and
+UUID-string shapes. Deployed application health uses the generic trailing-default
+adapter; `HealthState` owns its Unknown default through `Default`. The codec has
+no health-specific adapter or default policy. Neither record needs a handwritten
+deserializer or remote derive; malformed tags, GUID metadata and present
+suffixes still fail through the real query path.
 `NodeDeactivationTask` preserves the nested native identity as
 `id: NodeDeactivationTaskId { id, task_type }`, followed by `intent`.
 Callers access the task string through `task.id.id` and its subsystem through

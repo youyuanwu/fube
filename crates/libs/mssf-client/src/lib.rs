@@ -5,6 +5,7 @@
 //! used with an explicitly selected unsecured development gateway.
 
 mod applications;
+mod deployed_applications;
 mod health;
 mod health_protocol;
 mod list_protocol;
@@ -12,16 +13,21 @@ mod naming_uri;
 mod native;
 mod node_protocol;
 mod nodes;
+mod partitions;
 mod protocol;
 mod query;
 mod query_arguments;
 mod query_protocol;
+mod replicas;
 mod services;
 pub use applications::*;
+pub use deployed_applications::*;
 pub use health::*;
 pub use naming_uri::NamingUri;
 pub use nodes::*;
+pub use partitions::*;
 pub use query::*;
+pub use replicas::*;
 pub use services::*;
 
 use std::{net::SocketAddr, time::Duration};
@@ -229,6 +235,71 @@ impl FabricClient {
         query: &ServiceQueryDescription,
         timeout: Duration,
     ) -> Result<ServiceListPage> {
+        self.query(&query.parameters, Some(&query.paging), timeout)
+            .await
+    }
+
+    /// Get one partition page for a service using the default timeout.
+    /// Results describe observed partition state, not service endpoint resolution.
+    pub async fn get_partition_list(
+        &self,
+        query: &PartitionQueryDescription,
+    ) -> Result<PartitionListPage> {
+        self.get_partition_list_with_timeout(query, self.timeout)
+            .await
+    }
+
+    /// Get one partition page with an explicit whole-operation timeout.
+    /// Native partition paging supports continuation tokens, not MaxResults.
+    /// No automatic paging, retries, reconnect or replay occurs.
+    pub async fn get_partition_list_with_timeout(
+        &self,
+        query: &PartitionQueryDescription,
+        timeout: Duration,
+    ) -> Result<PartitionListPage> {
+        self.query(&query.parameters, Some(&query.paging), timeout)
+            .await
+    }
+
+    /// Get one replica or stateless instance page for a partition.
+    /// Uses the default timeout; callers inspect and follow continuation tokens.
+    pub async fn get_replica_list(
+        &self,
+        query: &ReplicaQueryDescription,
+    ) -> Result<ReplicaListPage> {
+        self.get_replica_list_with_timeout(query, self.timeout)
+            .await
+    }
+
+    /// Get one replica/instance page with an explicit whole-operation timeout.
+    /// Native replica paging supports continuation tokens, not MaxResults.
+    /// No automatic paging, retries, reconnect or replay occurs.
+    pub async fn get_replica_list_with_timeout(
+        &self,
+        query: &ReplicaQueryDescription,
+        timeout: Duration,
+    ) -> Result<ReplicaListPage> {
+        self.query(&query.parameters, Some(&query.paging), timeout)
+            .await
+    }
+
+    /// Get one deployed application page on a selected node.
+    /// This is node-local deployment state, not the cluster-wide application list.
+    pub async fn get_deployed_application_list(
+        &self,
+        query: &DeployedApplicationQueryDescription,
+    ) -> Result<DeployedApplicationListPage> {
+        self.get_deployed_application_list_with_timeout(query, self.timeout)
+            .await
+    }
+
+    /// Get one deployment page with an explicit whole-operation timeout.
+    /// No automatic paging, retries, reconnect or replay occurs.
+    pub async fn get_deployed_application_list_with_timeout(
+        &self,
+        query: &DeployedApplicationQueryDescription,
+        timeout: Duration,
+    ) -> Result<DeployedApplicationListPage> {
         self.query(&query.parameters, Some(&query.paging), timeout)
             .await
     }

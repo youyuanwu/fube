@@ -18,6 +18,7 @@ pub(crate) trait Query: Serialize {
     type Reply: Reply<Output = Self::Output>;
     const NAME: &'static str;
     const PAGING_FIRST: bool = false;
+    const SUPPORTS_MAX_RESULTS: bool = true;
 
     fn validate_parameters(&self) -> Result<()> {
         Ok(())
@@ -32,12 +33,12 @@ pub(crate) trait Query: Serialize {
 pub(crate) fn encode_query<Q: Query>(query: &Q, paging: Option<&Paging>) -> Result<Vec<u8>> {
     let mut arguments = QueryArguments::default();
     if Q::PAGING_FIRST {
-        append_paging(&mut arguments, paging)?;
+        append_paging::<Q>(&mut arguments, paging)?;
     }
     query.validate_parameters()?;
     arguments.append(query)?;
     if !Q::PAGING_FIRST {
-        append_paging(&mut arguments, paging)?;
+        append_paging::<Q>(&mut arguments, paging)?;
     }
     encode(Q::NAME, &arguments.values)
 }
@@ -46,10 +47,13 @@ pub(crate) fn decode_reply<Q: Query>(message: &Message) -> Result<Q::Output> {
     Q::Reply::decode(message, Q::validate_record)
 }
 
-fn append_paging(arguments: &mut QueryArguments, paging: Option<&Paging>) -> Result<()> {
+fn append_paging<Q: Query>(arguments: &mut QueryArguments, paging: Option<&Paging>) -> Result<()> {
     let Some(paging) = paging else {
         return Ok(());
     };
+    if paging.max_results.is_some() && !Q::SUPPORTS_MAX_RESULTS {
+        return Err(Error::InvalidInput("query does not support MaxResults"));
+    }
     if paging
         .max_results
         .is_some_and(|max| max.get() > i64::MAX as u64)

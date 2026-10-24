@@ -3,6 +3,34 @@
 use mssf_transport::serialization::serde::{NativeEnum, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod untagged {
+    use super::*;
+    use mssf_transport::serialization::serde::Untagged;
+
+    pub fn deserialize<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<T, D::Error> {
+        if deserializer.is_human_readable() {
+            return T::deserialize(deserializer);
+        }
+        Untagged::<T>::deserialize(deserializer).map(|Untagged(value)| value)
+    }
+}
+
+pub(crate) mod guid {
+    use super::*;
+    use mssf_transport::serialization::serde::Guid;
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<uuid::Uuid, D::Error> {
+        if deserializer.is_human_readable() {
+            return uuid::Uuid::deserialize(deserializer);
+        }
+        Guid::deserialize(deserializer).map(|guid| uuid::Uuid::from_bytes_le(guid.0))
+    }
+}
+
 pub(crate) mod object_array {
     use super::*;
 
@@ -67,7 +95,7 @@ pub(crate) mod string_map {
 
 pub(crate) mod derived_guid {
     use super::*;
-    use mssf_transport::serialization::serde::{Derived, Guid};
+    use mssf_transport::serialization::serde::Derived;
 
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -77,10 +105,11 @@ pub(crate) mod derived_guid {
         }
         #[derive(Deserialize)]
         struct Fields {
-            id: Guid,
+            #[serde(deserialize_with = "super::guid::deserialize")]
+            id: uuid::Uuid,
         }
         let Derived(fields) = Derived::<Fields>::deserialize(deserializer)?;
-        Ok(uuid::Uuid::from_bytes_le(fields.id.0))
+        Ok(fields.id)
     }
 }
 
@@ -137,7 +166,18 @@ pub(crate) mod tagged_pointer_slots {
 }
 
 macro_rules! strict_enum {
-    ($name:ident { $($variant:ident = $code:literal),* $(,)? }) => {
+    (
+        $(#[$meta:meta])*
+        $visibility:vis enum $name:ident {
+            $($(#[$variant_meta:meta])* $variant:ident = $code:literal),* $(,)?
+        }
+    ) => {
+        // Native codes are Serde values, not Rust discriminants.
+        $(#[$meta])*
+        $visibility enum $name {
+            $($(#[$variant_meta])* $variant,)*
+        }
+
         impl serde::Serialize for $name {
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
                 serializer.serialize_i64(match self { $(Self::$variant => $code,)* })
