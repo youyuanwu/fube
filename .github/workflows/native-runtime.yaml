@@ -1,0 +1,101 @@
+name: Standalone native runtime
+
+on:
+  push:
+    paths:
+    - ".github/workflows/native-runtime.yaml"
+    - "scripts/*native_runtime*.py"
+    - "crates/**"
+    - "Cargo.toml"
+    - "Cargo.lock"
+    - "rust-toolchain.toml"
+  pull_request:
+    paths:
+    - ".github/workflows/native-runtime.yaml"
+    - "scripts/*native_runtime*.py"
+    - "crates/**"
+    - "Cargo.toml"
+    - "Cargo.lock"
+    - "rust-toolchain.toml"
+  workflow_dispatch:
+
+jobs:
+  linux-native-runtime:
+    name: Linux standalone native runtime
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      NATIVE_ROOT: build/native-runtime-acceptance-ci
+      NATIVE_DIAGNOSTICS: build/native-runtime-acceptance-ci-evidence
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - uses: actions/setup-python@v7
+      with:
+        python-version: "3.12"
+
+    - name: Install Rust toolchain with cache
+      uses: actions-rust-lang/setup-rust-toolchain@v2
+      with:
+        cache: true
+        rustflags: ""
+
+    - name: Install Ubuntu22 native ABI prerequisites (not Service Fabric)
+      timeout-minutes: 5
+      run: |
+        test "$(uname -m)" = x86_64
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends \
+          libcgroup1 liblttng-ust1 libnuma1 libssh2-1
+        dpkg-query --show libcgroup1 liblttng-ust1 libnuma1 libssh2-1
+
+    - name: Test native profile preparation and diagnostics
+      run: python3 -m unittest discover -s scripts -p "test_native_runtime_test.py"
+
+    - name: Extract and verify pinned native libraries (no node installation)
+      timeout-minutes: 5
+      run: python3 scripts/native_runtime_test.py prepare --root "$NATIVE_ROOT"
+
+    - name: Build locked native app and standalone host
+      timeout-minutes: 8
+      run: cargo build --locked -p mssf-test-host -p stateless-test-app
+
+    - name: Native bootstrap, finite lease polling and unregister
+      timeout-minutes: 6
+      run: |
+        python3 scripts/native_runtime_test.py bootstrap --root "$NATIVE_ROOT" \
+          --diagnostics-directory "$NATIVE_DIAGNOSTICS"
+
+    - name: Native Open, ping, Close and graceful reap
+      timeout-minutes: 6
+      run: |
+        python3 scripts/native_runtime_test.py close --root "$NATIVE_ROOT" \
+          --diagnostics-directory "$NATIVE_DIAGNOSTICS"
+
+    - name: Native independent Abort and owned forced reap
+      timeout-minutes: 6
+      run: |
+        python3 scripts/native_runtime_test.py abort --root "$NATIVE_ROOT" \
+          --diagnostics-directory "$NATIVE_DIAGNOSTICS"
+
+    - name: Retain bounded standalone host and native evidence
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: standalone-native-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          ${{ env.NATIVE_DIAGNOSTICS }}/bootstrap.log
+          ${{ env.NATIVE_DIAGNOSTICS }}/bootstrap.json
+          ${{ env.NATIVE_DIAGNOSTICS }}/close.log
+          ${{ env.NATIVE_DIAGNOSTICS }}/close.json
+          ${{ env.NATIVE_DIAGNOSTICS }}/abort.log
+          ${{ env.NATIVE_DIAGNOSTICS }}/abort.json
+        if-no-files-found: warn
+        retention-days: 7

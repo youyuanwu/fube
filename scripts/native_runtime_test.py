@@ -22,6 +22,7 @@ LIBRARY_HASHES = {
     "libFabricCommon.so": "650ea380d8a892d9015c7159ed09c2b23935b3a0f529c7f3e4b6cf9a2a82414f",
 }
 RELATIVE_NATIVE = pathlib.Path("opt/microsoft/servicefabric/bin/Fabric/Fabric.Code")
+DIAGNOSTIC_LIMIT = 1024 * 1024
 
 
 def digest(path):
@@ -55,6 +56,36 @@ def qualify_libraries(native):
         raise ValueError(f"require native build {VERSION}")
 
 
+def save_diagnostics(directory, scenario, output):
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{scenario}.log").write_bytes(output[-DIAGNOSTIC_LIMIT:])
+    report = directory / f"{scenario}.json"
+    report.unlink(missing_ok=True)
+    for line in reversed(output.splitlines()):
+        if line.startswith(b"MSSF_REPORT "):
+            payload = line.removeprefix(b"MSSF_REPORT ")
+            if len(payload) + 1 > DIAGNOSTIC_LIMIT:
+                raise ValueError("native report exceeds diagnostic size limit")
+            report.write_bytes(payload + b"\n")
+            break
+
+
+def run_host(command, repo, diagnostics, scenario):
+    if diagnostics is None:
+        return subprocess.run(command, cwd=repo, timeout=140, check=False).returncode
+    try:
+        result = subprocess.run(command, cwd=repo, timeout=140, check=False,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except subprocess.TimeoutExpired as error:
+        output = error.stdout or b""
+        save_diagnostics(diagnostics, scenario, output)
+        print(output[-DIAGNOSTIC_LIMIT:].decode("utf-8", errors="replace"), end="")
+        raise
+    save_diagnostics(diagnostics, scenario, result.stdout)
+    print(result.stdout[-DIAGNOSTIC_LIMIT:].decode("utf-8", errors="replace"), end="")
+    return result.returncode
+
+
 def main():
     repo = pathlib.Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description=__doc__)
@@ -63,6 +94,8 @@ def main():
                         default=repo / "build/native-runtime-test-host")
     parser.add_argument("--native-directory", type=pathlib.Path)
     parser.add_argument("--dependency-directory", type=pathlib.Path)
+    parser.add_argument("--diagnostics-directory", type=pathlib.Path,
+                        help="retain <=1 MiB host/native console tail and raw report per scenario")
     args = parser.parse_args()
     root = args.root.resolve()
     if args.action == "prepare":
@@ -86,11 +119,10 @@ def main():
         raise ValueError(f"missing native ABI prerequisites: {', '.join(missing)}")
     subprocess.run(["cargo", "build", "--locked", "-p", "mssf-test-host",
                     "-p", "stateless-test-app"], cwd=repo, check=True, timeout=180)
-    result = subprocess.run([
+    return run_host([
         str(repo / "target/debug/mssf-test-host"), str(native), str(dependencies),
         str(repo / "target/debug/stateless-test-app"), str(root), args.action,
-    ], cwd=repo, timeout=140, check=False)
-    return result.returncode
+    ], repo, args.diagnostics_directory, args.action)
 
 
 if __name__ == "__main__":

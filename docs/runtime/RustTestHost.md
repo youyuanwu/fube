@@ -95,6 +95,19 @@ packages; otherwise extract matching distro packages into private storage.
 Do not replace system libc/loader files or create global compatibility symlinks.
 Other distributions/ABI combinations are not implied by this qualification.
 
+On **Ubuntu 22.04 x86_64**, install only the ABI library packages (and their
+normal Ubuntu dependencies), not the Service Fabric package or node services:
+
+```sh
+sudo apt-get update
+sudo apt-get install --yes --no-install-recommends \
+  libcgroup1 liblttng-ust1 libnuma1 libssh2-1
+```
+
+Ubuntu packages track repository security updates; the SF package and
+Runtime/Common library bytes remain SHA256-pinned. Ubuntu22's default Python
+3.10 is insufficient: supply Python **3.11+** (CI uses 3.12).
+
 ```sh
 python3 scripts/native_runtime_test.py bootstrap
 python3 scripts/native_runtime_test.py close
@@ -126,6 +139,44 @@ The minimal library API is `run(Options, Scenario) -> Result<RunReport>`, with
 the richer handle API sketched in section 4 is **not implemented**. The sample's
 owned stdin shutdown commands and `MSSF_APP` diagnostic events are fixture
 instrumentation; they do not replace native lifecycle callbacks or semantic replies.
+
+#### CI test tiers and diagnostics
+
+| Tier | Job/workflow | Prerequisites and evidence |
+|---|---|---|
+| Native-free | `Native-free Rust client` in [`ci.yaml`](../../.github/workflows/ci.yaml) | Rust model/regression tests, including the host; no SF native libraries or node. These are not native interoperability evidence. |
+| Standalone native | `Linux standalone native runtime` in [`native-runtime.yaml`](../../.github/workflows/native-runtime.yaml) | Ubuntu22 x86_64, Python3.12, pinned Rust toolchain and SHA-verified SF 11.8.121.4 libraries. Runs the real `prepare`, `bootstrap`, `close`, `abort` commands, directly on Linux. **No SF package installation, node, cluster, onebox or container startup.** |
+| Cluster/onebox | `Linux cluster lifecycle`, `Linux onebox lifecycle`, and Windows `build` in `ci.yaml` | Real SF nodes and deployment/lifecycle tests. These exercise a different boundary, not the standalone host profile. |
+
+The standalone workflow runs on pushes and PRs touching its workflow, native
+runner/tests, crates, Cargo manifest/lock or Rust toolchain; it also supports
+manual dispatch once present on the default branch. It does not depend on the
+cluster jobs or launch them. The job has a 20-minute limit, each scenario step
+has a 6-minute limit, and existing runner/host deadlines still apply. A locked
+prebuild avoids spending the scenario build deadline on a cold dependency build.
+Missing ABI libraries and native errors fail explicitly.
+
+To retain the same host/native evidence locally, add the optional diagnostics
+directory to each scenario command:
+
+```sh
+python3 scripts/native_runtime_test.py close \
+  --diagnostics-directory build/native-runtime-evidence
+```
+
+This writes `close.log` (last **1MiB** of merged host/native console output) and,
+when emitted by the real host, `close.json` (the original `MSSF_REPORT` payload,
+at most **1MiB**). Bootstrap and Abort use their own filenames. Timeout retains
+available partial output and remains failure; nonzero native exits remain
+nonzero. Without this option output streams as before. CI uploads only these
+six named files on success or failure, at most **6MiB total**, for seven days.
+Early setup/preflight failures may produce no scenario files; use the failing
+Actions step log. Native archives, extracted libraries, deployment trees,
+native disk traces and environment dumps are not uploaded.
+
+This job qualifies only the Linux pinned trusted-loopback/no-TLS profile above;
+it is not Windows acceptance, a security sandbox, or proof of full RA/node
+equivalence.
 
 ### 2.3 Actual native qualification, 2026-10-25
 

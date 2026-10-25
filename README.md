@@ -28,6 +28,7 @@ an existing debug build. Packaging uses only the Python standard library.
 ```
 
 # Documentation
+* [Runtime test tiers and CI](docs/runtime/RustTestHost.md#ci-test-tiers-and-diagnostics) - native-free regressions, standalone Linux native-library acceptance without a node, and full cluster tests.
 * [FabricRuntime architecture](docs/runtime/FabricRuntime.md), [node-side RA/Hosting](docs/runtime/FabricRuntimeHost.md), and the separate [pure Rust runtime design](docs/runtime/RustFabricRuntime.md).
 * [Ubuntu single-container onebox](docs/UbuntuOnebox.md) - five local nodes in one container, with retained lifecycle and localhost HTTP/native client gateways.
 * [Linux container-cluster lifecycle](docs/LinuxContainerCluster.md) - build, create, resume, inspect, stop, and explicitly destroy a local three-node cluster.
