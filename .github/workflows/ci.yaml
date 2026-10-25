@@ -31,7 +31,7 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: Check production-only native-client libraries
-      run: cargo check --locked -p mssf-transport -p mssf-client --lib
+      run: cargo check --locked -p mssf-transport -p mssf-client -p mssf-test-host --lib
 
     - name: Install pinned nextest
       uses: taiki-e/install-action@v2
@@ -41,7 +41,7 @@ jobs:
 
     - name: Build and archive native-client tests
       run: |
-        cargo nextest archive --locked -p mssf-transport -p mssf-client \
+        cargo nextest archive --locked -p mssf-transport -p mssf-client -p mssf-test-host \
           --archive-file "$RUNNER_TEMP/native-client-tests.tar.zst"
 
     - name: Test isolated native-free packages
@@ -50,10 +50,10 @@ jobs:
           -E 'not group(onebox)' --no-tests fail
 
     - name: Lint native-free packages
-      run: cargo clippy --locked -p mssf-transport -p mssf-client --all-targets -- -D warnings
+      run: cargo clippy --locked -p mssf-transport -p mssf-client -p mssf-test-host --all-targets -- -D warnings
 
     - name: Build API documentation
-      run: cargo doc --locked -p mssf-transport -p mssf-client --no-deps
+      run: cargo doc --locked -p mssf-transport -p mssf-client -p mssf-test-host --no-deps
       env:
         RUSTDOCFLAGS: -D warnings
 
