@@ -869,6 +869,9 @@ mod tests {
     #[test]
     fn utf16_code_units_and_surrogate_pairs() {
         let bytes = encode(|encoder| encoder.string("A🦀é").unwrap());
+        // Pinned FabricSerializationTypes.h: Array (0x80) | WString (0x0d).
+        assert_eq!(bytes[0], 0x8d);
+        assert_eq!(Decoder::new(&[0x8d, 1, b'A', 0]).string().unwrap(), "A");
         let mut decoder = Decoder::new(&bytes);
         assert_eq!(decoder.string().unwrap(), "A🦀é");
         decoder.finish().unwrap();
@@ -984,11 +987,26 @@ mod tests {
                 .unwrap();
         });
         for length in 0..bytes.len() {
+            let mut visited = false;
             assert!(
-                Decoder::new(&bytes[..length]).object(|_| Ok(())).is_err(),
+                Decoder::new(&bytes[..length])
+                    .object(|_| {
+                        visited = true;
+                        Ok(())
+                    })
+                    .is_err(),
                 "accepted truncated object of {length} bytes"
             );
+            assert!(!visited, "invalid extent reached the field callback");
         }
+        let mut visited = false;
+        Decoder::new(&bytes)
+            .object(|_| {
+                visited = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(visited);
         let values = [
             encode(|encoder| encoder.i32(i32::MIN)),
             encode(|encoder| encoder.u32(u32::MAX)),

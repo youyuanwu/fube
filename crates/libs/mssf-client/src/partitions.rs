@@ -127,11 +127,8 @@ impl Query for PartitionQueryParameters {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::query_protocol::{decode_reply, encode_query};
-    use mssf_transport::{
-        message::{Header, Message},
-        serialization::{serde::from_slice, Encoder},
-    };
+    use crate::query_protocol::{encode_query, tests::assert_request};
+    use mssf_transport::serialization::{serde::from_slice, Encoder};
     use std::num::NonZeroU64;
 
     pub(crate) const ID: &str = "00112233-4455-6677-8899-aabbccddeeff";
@@ -140,54 +137,7 @@ pub(crate) mod tests {
         0xff,
     ];
 
-    pub(crate) fn assert_request<Q: Query>(
-        parameters: &Q,
-        paging: Option<&crate::Paging>,
-        name: &str,
-        arguments: &[(&str, &str)],
-    ) {
-        let mut e = Encoder::new();
-        e.object(|e| {
-            e.object(|e| {
-                e.object_array(arguments, |e, (key, value)| {
-                    e.object(|e| e.string(key))?;
-                    e.string(value)
-                })
-            })?;
-            e.string(name)
-        })
-        .unwrap();
-        assert_eq!(encode_query(parameters, paging).unwrap(), e.finish());
-    }
-
-    pub(crate) fn reply(
-        tag: Option<i32>,
-        record: Option<impl FnOnce(&mut Encoder) -> Result<()>>,
-        error: i64,
-        paging: Option<(&[u8], &str)>,
-        single_item: bool,
-    ) -> Message {
-        let mut record = record;
-        let mut e = Encoder::new();
-        e.object(|e| {
-            e.i64(2);
-            let tag = tag.map(i32::to_le_bytes);
-            e.pointer(tag.as_ref().map(|tag| &tag[..]), |e| {
-                e.object_array(if record.is_some() { &[()][..] } else { &[] }, |e, _| {
-                    record.take().unwrap()(e)
-                })?;
-                e.pointer(single_item.then_some(&[][..]), |_| Ok(()))
-            })?;
-            e.i64(error);
-            e.pointer(paging.map(|(tag, _)| tag), |e| e.string(paging.unwrap().1))
-        })
-        .unwrap();
-        Message {
-            headers: Vec::new(),
-            body: e.finish(),
-        }
-    }
-
+    // ServiceModel/ServicePartitionInformation.h FABRIC_FIELDS_05.
     fn information(e: &mut Encoder, key: i64, low: i64, high: i64) -> Result<()> {
         e.object(|e| {
             e.i64(key);
@@ -199,6 +149,7 @@ pub(crate) mod tests {
         })
     }
 
+    // ServiceModel/ServicePartitionQueryResult.h FABRIC_FIELDS_09.
     fn base(e: &mut Encoder, kind: i64, key: i64, low: i64, high: i64) -> Result<()> {
         e.i64(kind);
         information(e, key, low, high)?;
@@ -210,12 +161,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    pub(crate) fn partition_fields(
-        e: &mut Encoder,
-        kind: i64,
-        key: i64,
-        suffix: usize,
-    ) -> Result<()> {
+    fn partition_fields(e: &mut Encoder, kind: i64, key: i64, suffix: usize) -> Result<()> {
         base(e, kind, key, i64::MIN, i64::MAX)?;
         if suffix >= 1 {
             e.i64(i64::MAX);
@@ -237,7 +183,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn partition_arguments_follow_facade_order_with_hyphenated_guids_and_omissions() {
+    fn partition_arguments_preserve_hyphenated_guids_and_omissions() {
         let mut parameters = PartitionQueryParameters::new("fabric:/App/Service".parse().unwrap());
         assert_request(
             &parameters,
@@ -281,19 +227,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn partitions_decode_both_service_kinds_all_key_kinds_and_native_guid_order() {
+    fn partition_model_maps_service_kinds_key_kinds_and_guid_order() {
         for kind in [1, 2] {
             for key in [1, 2, 3] {
-                let page = decode_reply::<PartitionQueryParameters>(&reply(
-                    Some(5),
-                    Some(|e: &mut Encoder| partition_fields(e, kind, key, 2)),
-                    0,
-                    Some((&[], "opaque-next")),
-                    false,
-                ))
-                .unwrap();
-                assert_eq!(page.continuation_token.as_deref(), Some("opaque-next"));
-                let partition = &page.items[0];
+                let partition = decode_fields(|e| partition_fields(e, kind, key, 2)).unwrap();
                 assert_eq!(
                     partition.kind,
                     if kind == 1 {
@@ -387,12 +324,6 @@ pub(crate) mod tests {
             }),
             Err(Error::Protocol(_))
         ));
-        let mut e = Encoder::new();
-        e.object(|e| partition_fields(e, 2, 2, 2)).unwrap();
-        let bytes = e.finish();
-        for end in 0..bytes.len() {
-            assert!(from_slice::<Partition>(&bytes[..end]).is_err(), "{end}");
-        }
     }
 
     #[test]
@@ -434,9 +365,8 @@ pub(crate) mod tests {
     #[test]
     fn partition_information_field_requires_untagged_objects_and_native_guid_metadata() {
         for malformed in 0..3 {
-            let message = reply(
-                Some(5),
-                Some(|e: &mut Encoder| {
+            assert!(matches!(
+                decode_fields(|e| {
                     e.i64(1);
                     e.typed_object(if malformed == 0 { &[1] } else { &[] }, |e| {
                         e.i64(1);
@@ -459,12 +389,6 @@ pub(crate) mod tests {
                     e.i64(1);
                     Ok(())
                 }),
-                0,
-                None,
-                false,
-            );
-            assert!(matches!(
-                decode_reply::<PartitionQueryParameters>(&message),
                 Err(Error::Protocol(_))
             ));
         }
@@ -536,73 +460,6 @@ pub(crate) mod tests {
             missing.as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<Partition>(missing).is_err());
         }
-    }
-
-    #[test]
-    fn partition_reply_profile_validates_structure_before_embedded_remote_errors() {
-        const REMOTE: i64 = -123;
-        for message in [
-            reply(
-                Some(6),
-                Some(|e: &mut Encoder| partition_fields(e, 2, 1, 2)),
-                REMOTE,
-                None,
-                false,
-            ),
-            reply(
-                Some(5),
-                Some(|e: &mut Encoder| partition_fields(e, 0, 1, 2)),
-                REMOTE,
-                None,
-                false,
-            ),
-            reply(
-                Some(5),
-                Some(|e: &mut Encoder| partition_fields(e, 2, 1, 2)),
-                REMOTE,
-                Some((&[1], "next")),
-                false,
-            ),
-            reply(
-                Some(5),
-                Some(|e: &mut Encoder| partition_fields(e, 2, 1, 2)),
-                REMOTE,
-                None,
-                true,
-            ),
-        ] {
-            assert!(matches!(
-                decode_reply::<PartitionQueryParameters>(&message),
-                Err(Error::Protocol(_))
-            ));
-        }
-        let mut message = reply(
-            Some(5),
-            Some(|e: &mut Encoder| partition_fields(e, 2, 1, 2)),
-            REMOTE,
-            None,
-            false,
-        );
-        assert!(matches!(
-            decode_reply::<PartitionQueryParameters>(&message),
-            Err(Error::Remote { code: REMOTE, .. })
-        ));
-        message.headers.push(Header::actor(3).unwrap());
-        assert!(matches!(
-            decode_reply::<PartitionQueryParameters>(&message),
-            Err(Error::Protocol(_))
-        ));
-        let message = reply(
-            None,
-            None::<fn(&mut Encoder) -> Result<()>>,
-            REMOTE,
-            None,
-            false,
-        );
-        assert!(matches!(
-            decode_reply::<PartitionQueryParameters>(&message),
-            Err(Error::Remote { code: REMOTE, .. })
-        ));
     }
 
     #[test]

@@ -174,12 +174,6 @@ fn aggregate(request: &Message, body: Vec<u8>) -> Message {
     }
 }
 
-fn ping_response(request: &Message) -> Message {
-    let mut response = reply(request, "PingRequest", ping_body());
-    response.headers.push(Header::version(1, 1).unwrap());
-    response
-}
-
 fn arguments(request: &Message) -> (String, BTreeMap<String, String>) {
     assert_eq!(request.properties().unwrap().action, "QueryRequest");
     let mut d = Decoder::new(&request.body);
@@ -653,7 +647,7 @@ async fn truncated_and_wrong_metadata_are_not_missing_optional_suffixes() {
 async fn invalid_list_inputs_and_timeouts_send_no_request() {
     let (client, server) = single_reply(|r| {
         assert_eq!(r.properties().unwrap().action, "PingRequest");
-        ping_response(r)
+        ping_reply(r)
     })
     .await;
     assert!(Definitions::try_from_bits(8).is_err());
@@ -882,7 +876,7 @@ async fn native_list_errors_are_local_and_allow_mixed_reuse() {
                 ),
                 2 => aggregate(&request, list_body(&Shape::application(), None)),
                 3 => aggregate(&request, list_body(&Shape::service(), None)),
-                _ => ping_response(&request),
+                _ => ping_reply(&request),
             };
             write_message(&mut stream, &response).await.unwrap();
         }
@@ -941,7 +935,7 @@ async fn mixed_lists_ping_and_name_complete_out_of_order_on_one_stream() {
         }
         for request in requests.into_iter().rev() {
             let response = match request.properties().unwrap().action.as_str() {
-                "PingRequest" => ping_response(&request),
+                "PingRequest" => ping_reply(&request),
                 "NameExistsRequest" => reply(&request, "NameOperationReply", naming_body(true, 1)),
                 "QueryRequest" => {
                     let (name, _) = arguments(&request);
@@ -962,7 +956,7 @@ async fn mixed_lists_ping_and_name_complete_out_of_order_on_one_stream() {
             write_message(&mut stream, &response).await.unwrap();
         }
         let request = read_message(&mut stream).await.unwrap();
-        write_message(&mut stream, &ping_response(&request))
+        write_message(&mut stream, &ping_reply(&request))
             .await
             .unwrap();
     });
@@ -1082,7 +1076,7 @@ async fn explicit_service_paging_stops_at_empty_terminal_page_without_hidden_req
         }
         let request = read_message(&mut stream).await.unwrap();
         assert_eq!(request.properties().unwrap().action, "PingRequest");
-        write_message(&mut stream, &ping_response(&request))
+        write_message(&mut stream, &ping_reply(&request))
             .await
             .unwrap();
     });
@@ -1166,7 +1160,7 @@ async fn timed_out_list_ignores_late_malformed_reply_and_preserves_reuse() {
         .await
         .unwrap();
         let request = read_message(&mut stream).await.unwrap();
-        write_message(&mut stream, &ping_response(&request))
+        write_message(&mut stream, &ping_reply(&request))
             .await
             .unwrap();
     });

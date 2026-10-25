@@ -1259,6 +1259,23 @@ There are no committed golden packet hex files or normalized capture snapshots.
 Native compatibility claims require the self-contained live scenarios below
 to pass against the real onebox.
 
+Offline query tests check explicit query names and argument key/value semantics
+through one shared request decoder, without treating facade insertion order as
+native byte identity. Query declarations are checked against source-derived
+record/tag/paging/actor profiles; generic envelope and error-precedence behavior
+is tested once in the shared query layer.
+
+Handwritten record layouts remain model-conformance regressions: they detect
+DTO mapping changes but share the production Rust codec, so they do not
+authenticate their own wire format. Raw-prefix truncations are codec-level
+extent tests, not field-by-field validation; record tests retain malformed
+fields inside valid extents and absent-versus-malformed suffix checks.
+Allocation, ACK, cancellation, and race tests retain their distinct invariants.
+The codec checks string metadata against the
+[pinned native type definition](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/shared/serialization/inc/FabricSerializationTypes.h#L12-L40),
+but source-derived assertions and Rust round trips are not runtime
+interoperability evidence.
+
 The native Serde migration was qualified with independent old/manual-versus-new
 encoded-byte comparisons for every migrated encoder family, malformed and
 missing-versus-truncated suffix regressions, exact/over-bound adapter tests,

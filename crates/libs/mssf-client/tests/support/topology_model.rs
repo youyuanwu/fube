@@ -176,12 +176,6 @@ fn native_error(kind: QueryKind, request: &Message) -> Message {
     )
 }
 
-fn ping_reply(request: &Message) -> Message {
-    let mut response = reply(request, "PingRequest", ping_body());
-    response.headers.push(Header::version(1, 1).unwrap());
-    response
-}
-
 #[tokio::test]
 async fn unpaged_deployment_continuations_retire_connection_even_with_native_error() {
     for kind in [

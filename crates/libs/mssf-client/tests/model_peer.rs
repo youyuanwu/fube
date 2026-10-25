@@ -1,4 +1,5 @@
-//! Offline model peers exercise the native wire protocol, not a Service Fabric runtime.
+//! Synthetic model peers test source-shaped schemas and lifecycle behavior.
+//! They share the Rust codec with production and do not prove native interoperability.
 
 use std::{net::SocketAddr, time::Duration};
 
@@ -58,6 +59,12 @@ fn ping_body() -> Vec<u8> {
             encoder.string("N0010")
         })
     })
+}
+
+fn ping_reply(request: &Message) -> Message {
+    let mut response = reply(request, "PingRequest", ping_body());
+    response.headers.push(Header::version(1, 1).unwrap());
+    response
 }
 
 fn reply(request: &Message, action: &str, body: Vec<u8>) -> Message {
@@ -962,12 +969,6 @@ mod node_queries {
             headers: vec![Header::relates_to(request.properties().unwrap().id).unwrap()],
             body,
         }
-    }
-
-    fn ping_reply(request: &Message) -> Message {
-        let mut response = reply(request, "PingRequest", ping_body());
-        response.headers.push(Header::version(1, 1).unwrap());
-        response
     }
 
     fn query_arguments(request: &Message) -> Vec<(String, String)> {

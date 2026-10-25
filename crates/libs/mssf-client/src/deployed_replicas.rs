@@ -163,13 +163,10 @@ impl Query for DeployedReplicaQueryParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_protocol::{decode_reply, encode_query};
-    use mssf_transport::{
-        message::{Header, Message},
-        serialization::{
-            serde::{from_slice, to_vec},
-            Encoder, MAX_STRING_UNITS,
-        },
+    use crate::query_protocol::{encode_query, tests::assert_request};
+    use mssf_transport::serialization::{
+        serde::{from_slice, to_vec},
+        Encoder, MAX_STRING_UNITS,
     };
 
     const ID: &str = "00112233-4455-6677-8899-aabbccddeeff";
@@ -266,65 +263,23 @@ mod tests {
         DeployedReplicaQueryParameters::validate_record(from_slice(bytes)?)
     }
 
-    fn reply(
-        kind: i64,
-        tag: Option<i32>,
-        record: Option<(&Fixture<'_>, usize)>,
-        error: i64,
-        paging: Option<(&[u8], &str)>,
-        single_item: bool,
-    ) -> Message {
-        let mut e = Encoder::new();
-        e.object(|e| {
-            e.i64(kind);
-            let tag = tag.map(i32::to_le_bytes);
-            e.pointer(tag.as_ref().map(|tag| &tag[..]), |e| {
-                e.object_array(if record.is_some() { &[()][..] } else { &[] }, |e, _| {
-                    let (f, count) = record.unwrap();
-                    fields(e, f, count)
-                })?;
-                e.pointer(single_item.then_some(&[][..]), |_| Ok(()))
-            })?;
-            e.i64(error);
-            e.pointer(paging.map(|(tag, _)| tag), |e| e.string(paging.unwrap().1))
-        })
-        .unwrap();
-        Message {
-            headers: Vec::new(),
-            body: e.finish(),
-        }
-    }
-
     fn parameters() -> DeployedReplicaQueryParameters {
         DeployedReplicaQueryParameters::new("Node_1", NamingUri::parse("fabric:/App").unwrap())
     }
 
-    fn assert_request(parameters: &DeployedReplicaQueryParameters, arguments: &[(&str, &str)]) {
-        let mut e = Encoder::new();
-        e.object(|e| {
-            e.object(|e| {
-                e.object_array(arguments, |e, (key, value)| {
-                    e.object(|e| e.string(key))?;
-                    e.string(value)
-                })
-            })?;
-            e.string("GetServiceReplicaListDeployedOnNode")
-        })
-        .unwrap();
-        assert_eq!(encode_query(parameters, None).unwrap(), e.finish());
-    }
-
     #[test]
-    fn deployed_replica_query_matches_native_name_order_filters_and_nil_omission() {
+    fn deployed_replica_query_name_filters_and_nil_omission() {
         let mut p = parameters();
         let required = [("NodeName", "Node_1"), ("ApplicationName", "fabric:/App")];
-        assert_request(&p, &required);
+        assert_request(&p, None, "GetServiceReplicaListDeployedOnNode", &required);
         p.service_manifest_name = Some(String::new());
         p.partition_id = Some(Uuid::nil());
-        assert_request(&p, &required);
+        assert_request(&p, None, "GetServiceReplicaListDeployedOnNode", &required);
         p.service_manifest_name = Some("Manifest🦀".into());
         assert_request(
             &p,
+            None,
+            "GetServiceReplicaListDeployedOnNode",
             &[
                 ("NodeName", "Node_1"),
                 ("ApplicationName", "fabric:/App"),
@@ -334,6 +289,8 @@ mod tests {
         p.partition_id = Some(ID.parse().unwrap());
         assert_request(
             &p,
+            None,
+            "GetServiceReplicaListDeployedOnNode",
             &[
                 ("NodeName", "Node_1"),
                 ("ApplicationName", "fabric:/App"),
@@ -344,6 +301,8 @@ mod tests {
         p.service_manifest_name = None;
         assert_request(
             &p,
+            None,
+            "GetServiceReplicaListDeployedOnNode",
             &[
                 ("NodeName", "Node_1"),
                 ("ApplicationName", "fabric:/App"),
@@ -495,16 +454,6 @@ mod tests {
                         reconfiguration_start_time_utc: NodeTimestamp(id),
                     }
                 );
-                let decoded = decode_reply::<DeployedReplicaQueryParameters>(&reply(
-                    2,
-                    Some(12),
-                    Some((&f, 15)),
-                    0,
-                    None,
-                    false,
-                ))
-                .unwrap();
-                assert_eq!(decoded, vec![r]);
             }
         }
         let f = Fixture {
@@ -795,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn deployed_replica_rejects_wrong_guid_metadata_and_all_truncated_bodies() {
+    fn deployed_replica_rejects_wrong_guid_metadata_and_unterminated_timestamp() {
         let f = Fixture::default();
         for wrong in 0..2 {
             let mut e = Encoder::new();
@@ -814,139 +763,10 @@ mod tests {
             ));
         }
         let bytes = record(&f, 15);
-        for end in 0..bytes.len() {
-            assert!(decode_record(&bytes[..end]).is_err(), "{end}");
-        }
-        let message = reply(2, Some(12), Some((&f, 15)), 0, None, false);
-        for end in 0..message.body.len() {
-            let truncated = Message {
-                headers: Vec::new(),
-                body: message.body[..end].to_vec(),
-            };
-            assert!(
-                decode_reply::<DeployedReplicaQueryParameters>(&truncated).is_err(),
-                "{end}"
-            );
-        }
         let mut bytes = bytes;
         let last_timestamp_byte = bytes.len() - 5;
         bytes[last_timestamp_byte] |= 0x80;
         assert!(decode_record(&bytes).is_err());
-    }
-
-    #[test]
-    fn deployed_replica_reply_enforces_unpaged_list_profile_and_payload_error_precedence() {
-        let f = Fixture::default();
-        assert!(decode_reply::<DeployedReplicaQueryParameters>(&reply(
-            2,
-            Some(12),
-            None,
-            0,
-            None,
-            false,
-        ))
-        .unwrap()
-        .is_empty());
-        for kind in [-1, 0, 1, 3, i64::MAX] {
-            assert!(matches!(
-                decode_reply::<DeployedReplicaQueryParameters>(&reply(
-                    kind,
-                    Some(12),
-                    Some((&f, 15)),
-                    0,
-                    None,
-                    false,
-                )),
-                Err(Error::Protocol(_))
-            ));
-        }
-        for error in [0, -456] {
-            for message in [
-                reply(2, Some(6), Some((&f, 15)), error, None, false),
-                reply(2, Some(14), Some((&f, 15)), error, None, false),
-                reply(2, Some(12), Some((&f, 10)), error, None, false),
-                reply(
-                    2,
-                    Some(12),
-                    Some((
-                        &Fixture {
-                            kind: 0,
-                            ..f.clone()
-                        },
-                        15,
-                    )),
-                    error,
-                    None,
-                    false,
-                ),
-                reply(
-                    2,
-                    Some(12),
-                    Some((
-                        &Fixture {
-                            phase: 8,
-                            ..f.clone()
-                        },
-                        15,
-                    )),
-                    error,
-                    None,
-                    false,
-                ),
-                reply(2, Some(12), Some((&f, 15)), error, None, true),
-            ] {
-                assert!(matches!(
-                    decode_reply::<DeployedReplicaQueryParameters>(&message),
-                    Err(Error::Protocol(_))
-                ));
-            }
-        }
-        for error in [0, -456] {
-            for paging in [(&[][..], ""), (&[][..], "opaque-next"), (&[1][..], "next")] {
-                assert!(matches!(
-                    decode_reply::<DeployedReplicaQueryParameters>(&reply(
-                        2,
-                        Some(12),
-                        Some((&f, 15)),
-                        error,
-                        Some(paging),
-                        false,
-                    )),
-                    Err(Error::Protocol(_))
-                ));
-            }
-        }
-        assert!(matches!(
-            decode_reply::<DeployedReplicaQueryParameters>(&reply(2, None, None, 0, None, false,)),
-            Err(Error::Protocol(_))
-        ));
-        for (tag, record) in [(None, None), (Some(12), Some((&f, 15)))] {
-            assert!(matches!(
-                decode_reply::<DeployedReplicaQueryParameters>(&reply(
-                    2, tag, record, -456, None, false,
-                )),
-                Err(Error::Remote { code: -456, .. })
-            ));
-        }
-        let mut message = reply(2, Some(12), Some((&f, 15)), 0, None, false);
-        message.headers = vec![
-            Header::actor(13).unwrap(),
-            Header::action("QueryReply").unwrap(),
-        ];
-        decode_reply::<DeployedReplicaQueryParameters>(&message).unwrap();
-        for actor in [5, 12, 15] {
-            message.headers[0] = Header::actor(actor).unwrap();
-            assert!(matches!(
-                decode_reply::<DeployedReplicaQueryParameters>(&message),
-                Err(Error::Protocol(_))
-            ));
-        }
-        message.headers[0] = Header::actor(13).unwrap();
-        message.headers.push(Header::action("wrong").unwrap());
-        assert!(matches!(
-            decode_reply::<DeployedReplicaQueryParameters>(&message),
-            Err(Error::Protocol(_))
-        ));
     }
 
     #[test]

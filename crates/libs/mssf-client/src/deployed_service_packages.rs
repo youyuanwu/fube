@@ -69,18 +69,15 @@ impl Query for DeployedServicePackageQueryParameters {
 mod tests {
     use super::*;
     use crate::{
-        partitions::tests::assert_request,
-        query_protocol::{decode_reply, encode_query},
+        query_protocol::{encode_query, tests::assert_request},
         Error,
     };
-    use mssf_transport::{
-        message::Message,
-        serialization::{
-            serde::{from_slice, to_vec},
-            Encoder,
-        },
+    use mssf_transport::serialization::{
+        serde::{from_slice, to_vec},
+        Encoder,
     };
 
+    // ServiceModel/DeployedServiceManifestQueryResult.h FABRIC_FIELDS_04.
     fn fields(e: &mut Encoder, count: usize, status: i64) -> Result<()> {
         for field in 0..count {
             match field {
@@ -100,26 +97,8 @@ mod tests {
         e.finish()
     }
 
-    fn reply(tag: i32, status: i64, error: i64, paging: Option<&str>) -> Message {
-        let mut e = Encoder::new();
-        e.object(|e| {
-            e.i64(2);
-            e.pointer(Some(&tag.to_le_bytes()), |e| {
-                e.object_array(&[()], |e, _| fields(e, 4, status))?;
-                e.pointer(None, |_| Ok(()))
-            })?;
-            e.i64(error);
-            e.pointer(paging.map(|_| &[][..]), |e| e.string(paging.unwrap()))
-        })
-        .unwrap();
-        Message {
-            headers: Vec::new(),
-            body: e.finish(),
-        }
-    }
-
     #[test]
-    fn service_package_query_native_order_filters_and_bounded_inputs() {
+    fn service_package_query_name_filters_and_bounded_inputs() {
         let mut parameters =
             DeployedServicePackageQueryParameters::new("Node_1", "fabric:/App".parse().unwrap());
         for filter in [None, Some(String::new())] {
@@ -199,35 +178,6 @@ mod tests {
         })
         .unwrap();
         assert!(from_slice::<DeployedServicePackage>(&e.finish()).is_err());
-        let bytes = record(4, 3);
-        for end in 0..bytes.len() {
-            assert!(from_slice::<DeployedServicePackage>(&bytes[..end]).is_err());
-        }
-    }
-
-    #[test]
-    fn service_package_unpaged_reply_and_payload_error_precedence() {
-        let packages =
-            decode_reply::<DeployedServicePackageQueryParameters>(&reply(11, 3, 0, None)).unwrap();
-        assert_eq!(packages.len(), 1);
-        assert_eq!(packages[0].status, DeploymentStatus::Active);
-        assert!(matches!(
-            decode_reply::<DeployedServicePackageQueryParameters>(&reply(11, 3, 123, None)),
-            Err(Error::Remote { code: 123, .. })
-        ));
-        for error in [0, 123] {
-            for message in [
-                reply(10, 3, error, None),
-                reply(11, 99, error, None),
-                reply(11, 3, error, Some("next")),
-                reply(11, 3, error, Some("")),
-            ] {
-                assert!(matches!(
-                    decode_reply::<DeployedServicePackageQueryParameters>(&message),
-                    Err(Error::Protocol(_))
-                ));
-            }
-        }
     }
 
     #[test]

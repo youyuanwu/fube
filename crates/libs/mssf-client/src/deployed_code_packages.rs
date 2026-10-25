@@ -180,15 +180,12 @@ impl Query for DeployedCodePackageQueryParameters {
 mod tests {
     use super::*;
     use crate::{
-        query_protocol::{decode_reply, encode_query},
+        query_protocol::{encode_query, tests::assert_request},
         Error,
     };
-    use mssf_transport::{
-        message::{Header, Message},
-        serialization::{
-            serde::{from_slice, to_vec},
-            Encoder, MAX_STRING_UNITS,
-        },
+    use mssf_transport::serialization::{
+        serde::{from_slice, to_vec},
+        Encoder, MAX_STRING_UNITS,
     };
 
     #[derive(Clone, Copy)]
@@ -293,31 +290,6 @@ mod tests {
         e.finish()
     }
 
-    fn reply(
-        kind: i64,
-        tag: Option<i32>,
-        records: &[Wire],
-        error: i64,
-        paging: Option<(&[u8], &str)>,
-    ) -> Message {
-        let mut e = Encoder::new();
-        e.object(|e| {
-            e.i64(kind);
-            let tag = tag.map(i32::to_le_bytes);
-            e.pointer(tag.as_ref().map(|tag| tag.as_slice()), |e| {
-                e.object_array(records, |e, wire| package_fields(e, *wire))?;
-                e.pointer(None, |_| Ok(()))
-            })?;
-            e.i64(error);
-            e.pointer(paging.map(|(tag, _)| tag), |e| e.string(paging.unwrap().1))
-        })
-        .unwrap();
-        Message {
-            headers: Vec::new(),
-            body: e.finish(),
-        }
-    }
-
     fn parameters() -> DeployedCodePackageQueryParameters {
         DeployedCodePackageQueryParameters::new(
             " Node_Ab ",
@@ -325,35 +297,32 @@ mod tests {
         )
     }
 
-    fn assert_request(parameters: &DeployedCodePackageQueryParameters, arguments: &[(&str, &str)]) {
-        let mut e = Encoder::new();
-        e.object(|e| {
-            e.object(|e| {
-                e.object_array(arguments, |e, (key, value)| {
-                    e.object(|e| e.string(key))?;
-                    e.string(value)
-                })
-            })?;
-            e.string("GetCodePackageListDeployedOnNode")
-        })
-        .unwrap();
-        assert_eq!(encode_query(parameters, None).unwrap(), e.finish());
-    }
-
     #[test]
-    fn code_query_exact_native_name_argument_order_and_empty_filter_omission() {
+    fn code_query_name_arguments_and_empty_filter_omission() {
         let mut parameters = parameters();
         let required = [
             ("NodeName", " Node_Ab "),
             ("ApplicationName", "fabric:/App"),
         ];
-        assert_request(&parameters, &required);
+        assert_request(
+            &parameters,
+            None,
+            "GetCodePackageListDeployedOnNode",
+            &required,
+        );
         parameters.service_manifest_name = Some(String::new());
         parameters.code_package_name = Some(String::new());
-        assert_request(&parameters, &required);
+        assert_request(
+            &parameters,
+            None,
+            "GetCodePackageListDeployedOnNode",
+            &required,
+        );
         parameters.code_package_name = Some("CodeCase/应用".into());
         assert_request(
             &parameters,
+            None,
+            "GetCodePackageListDeployedOnNode",
             &[
                 required[0],
                 required[1],
@@ -363,6 +332,8 @@ mod tests {
         parameters.service_manifest_name = Some(" ManifestCase ".into());
         assert_request(
             &parameters,
+            None,
+            "GetCodePackageListDeployedOnNode",
             &[
                 required[0],
                 required[1],
@@ -373,6 +344,8 @@ mod tests {
         parameters.code_package_name = None;
         assert_request(
             &parameters,
+            None,
+            "GetCodePackageListDeployedOnNode",
             &[
                 required[0],
                 required[1],
@@ -559,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn code_record_rejects_present_malformed_suffixes_and_all_truncations() {
+    fn code_record_rejects_present_malformed_suffixes() {
         for count in 8..13 {
             let mut e = Encoder::new();
             e.object(|e| {
@@ -597,10 +570,6 @@ mod tests {
             from_slice::<CodePackageEntryPoint>(&e.finish()),
             Err(Error::Protocol(_))
         ));
-        let bytes = record(Wire::default());
-        for end in 0..bytes.len() {
-            assert!(from_slice::<DeployedCodePackage>(&bytes[..end]).is_err());
-        }
     }
 
     #[test]
@@ -674,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn code_record_supported_future_tails_are_skipped_without_weakening_truncation() {
+    fn code_record_supported_future_tails_are_skipped() {
         let mut e = Encoder::new();
         e.object(|e| {
             package_fields(e, Wire::default())?;
@@ -684,9 +653,6 @@ mod tests {
         let bytes = e.finish();
         let package: DeployedCodePackage = from_slice(&bytes).unwrap();
         assert_eq!(package.name, "Code_应用");
-        for end in 0..bytes.len() {
-            assert!(from_slice::<DeployedCodePackage>(&bytes[..end]).is_err());
-        }
         let mut e = Encoder::new();
         e.object(|e| {
             entry_fields(e, Wire::default(), false)?;
@@ -799,114 +765,6 @@ mod tests {
             },
         ] {
             assert!(from_slice::<DeployedCodePackage>(&record(wire)).is_err());
-        }
-    }
-
-    #[test]
-    fn code_list_exact_tag_empty_list_unpaged_success_and_envelope_validation() {
-        for records in [vec![], vec![Wire::default()], vec![Wire::default(); 2]] {
-            let packages = decode_reply::<DeployedCodePackageQueryParameters>(&reply(
-                2,
-                Some(14),
-                &records,
-                0,
-                None,
-            ))
-            .unwrap();
-            assert_eq!(packages.len(), records.len());
-        }
-        for message in [
-            reply(1, Some(14), &[Wire::default()], 0, None),
-            reply(99, Some(14), &[Wire::default()], 0, None),
-            reply(2, Some(11), &[Wire::default()], 0, None),
-            reply(2, None, &[], 0, None),
-            reply(2, Some(14), &[Wire::default()], 0, Some((&[], "next"))),
-            reply(2, Some(14), &[Wire::default()], 0, Some((&[], ""))),
-            reply(2, Some(14), &[Wire::default()], 0, Some((&[1], ""))),
-        ] {
-            assert!(matches!(
-                decode_reply::<DeployedCodePackageQueryParameters>(&message),
-                Err(Error::Protocol(_))
-            ));
-        }
-        let mut message = reply(2, Some(14), &[Wire::default()], 0, None);
-        message.headers = vec![
-            Header::actor(5).unwrap(),
-            Header::action("QueryReply").unwrap(),
-        ];
-        decode_reply::<DeployedCodePackageQueryParameters>(&message).unwrap();
-        message.headers[0] = Header::actor(1).unwrap();
-        assert!(matches!(
-            decode_reply::<DeployedCodePackageQueryParameters>(&message),
-            Err(Error::Protocol(_))
-        ));
-        message.headers[0] = Header::actor(5).unwrap();
-        message.headers[1] = Header::action("OtherAction").unwrap();
-        assert!(matches!(
-            decode_reply::<DeployedCodePackageQueryParameters>(&message),
-            Err(Error::Protocol(_))
-        ));
-    }
-
-    #[test]
-    fn code_list_native_errors_do_not_hide_malformed_typed_payloads() {
-        for message in [
-            reply(2, Some(14), &[Wire::default()], 123, None),
-            reply(0, None, &[], 123, None),
-        ] {
-            assert!(matches!(
-                decode_reply::<DeployedCodePackageQueryParameters>(&message),
-                Err(Error::Remote { code: 123, .. })
-            ));
-        }
-        for message in [
-            reply(2, Some(11), &[Wire::default()], 123, None),
-            reply(2, Some(14), &[Wire::default()], 123, Some((&[], ""))),
-            reply(
-                2,
-                Some(14),
-                &[Wire {
-                    package_fields: 7,
-                    ..Wire::default()
-                }],
-                123,
-                None,
-            ),
-            reply(
-                2,
-                Some(14),
-                &[Wire {
-                    entry_status: 99,
-                    ..Wire::default()
-                }],
-                123,
-                None,
-            ),
-            reply(
-                2,
-                Some(14),
-                &[Wire {
-                    host_type: 99,
-                    ..Wire::default()
-                }],
-                123,
-                None,
-            ),
-            reply(
-                2,
-                Some(14),
-                &[Wire {
-                    host_isolation_mode: 99,
-                    ..Wire::default()
-                }],
-                123,
-                None,
-            ),
-        ] {
-            assert!(matches!(
-                decode_reply::<DeployedCodePackageQueryParameters>(&message),
-                Err(Error::Protocol(_))
-            ));
         }
     }
 

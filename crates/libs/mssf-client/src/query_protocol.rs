@@ -299,14 +299,18 @@ fn decode<T: DeserializeOwned, U>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::*;
-    use mssf_transport::{message::Header, serialization::Encoder};
-    use std::num::NonZeroU64;
+    use mssf_transport::{
+        message::Header,
+        serialization::{Decoder, Encoder},
+    };
+    use std::{collections::BTreeMap, num::NonZeroU64};
 
     #[test]
     fn result_tags_match_native_wire_ids() {
+        // Pinned ServiceModel/QueryResultHelpersEnum.h, not runtime wire evidence.
         assert_eq!(
             [
                 result_tags::NODE,
@@ -321,6 +325,25 @@ mod tests {
                 result_tags::NODE_HEALTH,
             ],
             [1, 2, 4, 5, 6, 10, 11, 12, 14, 16]
+        );
+    }
+
+    #[test]
+    fn query_declarations_select_source_checked_reply_profiles() {
+        fn assert_profile<Q: Query<Reply = R>, R: Reply>() {}
+
+        assert_profile::<PartitionQueryParameters, ListReply<Partition, 5>>();
+        assert_profile::<ReplicaQueryParameters, ListReply<Replica, 6>>();
+        assert_profile::<DeployedApplicationQueryParameters, ListReply<DeployedApplication, 10>>();
+        assert_profile::<
+            DeployedServicePackageQueryParameters,
+            UnpagedListReply<DeployedServicePackage, 11>,
+        >();
+        assert_profile::<
+            DeployedCodePackageQueryParameters,
+            UnpagedListReply<DeployedCodePackage, 14>,
+        >();
+        assert_profile::<DeployedReplicaQueryParameters, UnpagedListReply<DeployedReplica, 12, 13>>(
         );
     }
 
@@ -453,7 +476,7 @@ mod tests {
         ));
         assert_eq!(query.parameters.serializations.get(), 0);
         query.parameters.invalid = false;
-        assert_native_bytes(
+        assert_request(
             &query.parameters,
             None,
             "CheckedQuery",
@@ -564,12 +587,25 @@ mod tests {
                 Err(Error::Protocol(_))
             ));
         }
+        let mut message = reply_fixture(2, Some(23), &[], None, 0, None);
+        message.headers = vec![
+            Header::actor(13).unwrap(),
+            Header::action("QueryReply").unwrap(),
+        ];
+        UnpagedListReply::<ReplyRecord, 23, 13>::decode(&message, Ok).unwrap();
+        for actor in [5, 12, 15] {
+            message.headers[0] = Header::actor(actor).unwrap();
+            assert!(matches!(
+                UnpagedListReply::<ReplyRecord, 23, 13>::decode(&message, Ok),
+                Err(Error::Protocol(_))
+            ));
+        }
     }
 
     #[test]
     fn new_reply_schemas_need_only_derived_records_and_profile_declarations() {
-        assert_native_bytes(&DeclaredListQuery {}, None, "DeclaredList", &[]);
-        assert_native_bytes(&DeclaredItemQuery {}, None, "DeclaredItem", &[]);
+        assert_request(&DeclaredListQuery {}, None, "DeclaredList", &[]);
+        assert_request(&DeclaredItemQuery {}, None, "DeclaredItem", &[]);
         let page = decode_reply::<DeclaredListQuery>(&reply_fixture(
             2,
             Some(23),
@@ -752,24 +788,37 @@ mod tests {
         assert!(decode_reply::<DeclaredItemQuery>(&item).is_err());
     }
 
-    fn assert_native_bytes(
+    pub(crate) fn assert_request(
         query: &impl Query,
         paging: Option<&Paging>,
         name: &str,
         arguments: &[(&str, &str)],
     ) {
-        let mut old = Encoder::new();
-        old.object(|e| {
-            e.object(|e| {
-                e.object_array(arguments, |e, (key, value)| {
-                    e.object(|e| e.string(key))?;
-                    e.string(value)
-                })
-            })?;
-            e.string(name)
-        })
-        .unwrap();
-        assert_eq!(encode_query(query, paging).unwrap(), old.finish());
+        let bytes = encode_query(query, paging).unwrap();
+        let mut decoder = Decoder::new(&bytes);
+        let (actual_name, pairs) = decoder
+            .object(|d| {
+                let pairs = d.object(|d| {
+                    d.object_array(|d| Ok((d.object(Decoder::string)?, d.string()?)))
+                })?;
+                Ok((d.string()?, pairs))
+            })
+            .unwrap();
+        decoder.finish().unwrap();
+        assert_eq!(actual_name, name);
+        let count = pairs.len();
+        let actual: BTreeMap<_, _> = pairs.into_iter().collect();
+        assert_eq!(actual.len(), count, "duplicate query argument");
+        let expected: BTreeMap<_, _> = arguments
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        assert_eq!(
+            expected.len(),
+            arguments.len(),
+            "duplicate expected argument"
+        );
+        assert_eq!(actual, expected);
     }
 
     fn paging() -> Paging {
@@ -846,9 +895,9 @@ mod tests {
     }
 
     #[test]
-    fn node_parameters_and_shared_paging_match_the_previous_wire_layout() {
-        assert_native_bytes(&NodeQueryParameters::default(), None, "GetNodeList", &[]);
-        assert_native_bytes(
+    fn node_parameters_and_paging_preserve_values_and_omissions() {
+        assert_request(&NodeQueryParameters::default(), None, "GetNodeList", &[]);
+        assert_request(
             &NodeQueryParameters {
                 node_name: Some(String::new()),
                 ..Default::default()
@@ -864,22 +913,22 @@ mod tests {
             },
             paging: paging(),
         };
-        assert_native_bytes(
+        assert_request(
             &query.parameters,
             Some(&query.paging),
             "GetNodeList",
             &[
-                ("ContinuationToken", " opaque+/\u{1f980} "),
+                ("NodeStatusFilter", "4294967295"),
                 ("MaxResults", "9223372036854775807"),
                 ("NodeName", "Exact_Node"),
-                ("NodeStatusFilter", "4294967295"),
+                ("ContinuationToken", " opaque+/\u{1f980} "),
             ],
         );
     }
 
     #[test]
-    fn every_application_selector_preserves_order_numeric_flags_and_omission() {
-        assert_native_bytes(
+    fn every_application_selector_preserves_numeric_flags_and_omission() {
+        assert_request(
             &ApplicationQueryParameters::default(),
             None,
             "GetApplicationList",
@@ -924,7 +973,7 @@ mod tests {
                 ("ContinuationToken", " opaque+/\u{1f980} "),
                 ("MaxResults", "9223372036854775807"),
             ]);
-            assert_native_bytes(
+            assert_request(
                 &query.parameters,
                 Some(&query.paging),
                 "GetApplicationList",
@@ -934,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn every_service_selector_preserves_application_scope_and_paging_order() {
+    fn every_service_selector_preserves_application_scope_and_paging_arguments() {
         for (filter, argument) in [
             (ServiceListFilter::All, None),
             (
@@ -959,7 +1008,7 @@ mod tests {
                 ("ContinuationToken", " opaque+/\u{1f980} "),
                 ("MaxResults", "9223372036854775807"),
             ]);
-            assert_native_bytes(
+            assert_request(
                 &query.parameters,
                 Some(&query.paging),
                 "GetApplicationServiceList",
@@ -970,7 +1019,7 @@ mod tests {
 
     #[test]
     fn health_json_stays_embedded_numeric_and_distinguishes_absent_from_false() {
-        assert_native_bytes(
+        assert_request(
             &NodeHealthQueryParameters::new("Node"),
             None,
             "GetNodeHealth",
@@ -1001,7 +1050,7 @@ mod tests {
                 }),
                 events_filter: Some(filter.into()),
             };
-            assert_native_bytes(
+            assert_request(
                 &query,
                 None,
                 "GetNodeHealth",
@@ -1019,7 +1068,7 @@ mod tests {
                 ],
             );
         }
-        assert_native_bytes(
+        assert_request(
             &NodeHealthQueryParameters {
                 node_name: "Node".into(),
                 health_policy: Some(NodeHealthPolicy::default()),
@@ -1032,7 +1081,7 @@ mod tests {
                 ("NodeName", "Node"),
             ],
         );
-        assert_native_bytes(
+        assert_request(
             &NodeHealthQueryParameters {
                 node_name: "Node".into(),
                 health_policy: None,
@@ -1137,7 +1186,8 @@ mod tests {
     }
 
     #[test]
-    fn derived_query_bytes_match_old_order_and_nesting_including_empty_arguments() {
+    fn query_envelope_uses_source_shaped_nested_map_and_query_name() {
+        // QueryRequestMessageBody/QueryArgumentMap nesting, using the shared Rust codec.
         for args in [
             Vec::<(String, String)>::new(),
             vec![
@@ -1146,18 +1196,19 @@ mod tests {
                 ("z".into(), "duplicate".into()),
             ],
         ] {
-            let mut old = Encoder::new();
-            old.object(|e| {
-                e.object(|e| {
-                    e.object_array(&args, |e, (key, value)| {
-                        e.object(|e| e.string(key))?;
-                        e.string(value)
-                    })
-                })?;
-                e.string("Get🦀")
-            })
-            .unwrap();
-            assert_eq!(encode("Get🦀", &args).unwrap(), old.finish());
+            let mut expected = Encoder::new();
+            expected
+                .object(|e| {
+                    e.object(|e| {
+                        e.object_array(&args, |e, (key, value)| {
+                            e.object(|e| e.string(key))?;
+                            e.string(value)
+                        })
+                    })?;
+                    e.string("Get🦀")
+                })
+                .unwrap();
+            assert_eq!(encode("Get🦀", &args).unwrap(), expected.finish());
         }
         let too_many = vec![("key".into(), "value".into()); MAX_COLLECTION_COUNT + 1];
         assert!(matches!(

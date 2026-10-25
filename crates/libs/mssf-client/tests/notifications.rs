@@ -1,9 +1,10 @@
-//! Independent native-schema model peers; not a Service Fabric runtime oracle.
+//! Synthetic schema and lifecycle tests, not a Service Fabric runtime oracle.
+//! Positional field checks bypass production DTOs but share the production Rust codec.
 use mssf_client::*;
 use mssf_transport::{
     connection::{read_message, write_message},
     message::{Header, Message, MessageId, EXPECTS_REPLY, UNCORRELATED_REPLY},
-    serialization::{Decoder, Encoder},
+    serialization::Decoder,
 };
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -11,13 +12,9 @@ use tokio::net::{TcpListener, TcpStream};
 mod ingress;
 #[path = "support/gateway_peer.rs"]
 mod peer;
+use peer::body;
 
 const WAIT: Duration = Duration::from_secs(3);
-fn body(f: impl FnOnce(&mut Encoder) -> mssf_transport::Result<()>) -> Vec<u8> {
-    let mut e = Encoder::new();
-    e.object(f).unwrap();
-    e.finish()
-}
 async fn connect_peer(listener: TcpListener) -> (TcpStream, String) {
     let mut stream = peer::accept(listener).await;
     let request = read_message(&mut stream).await.unwrap();

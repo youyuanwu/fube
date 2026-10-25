@@ -1,3 +1,6 @@
+//! Synthetic positional model tests, not native interoperability evidence.
+//! Handwritten expectations bypass production DTOs but share their low-level Rust codec.
+
 use mssf_client::*;
 use mssf_transport::message::{ListenInstance, MessageId};
 use mssf_transport::serialization::{
@@ -150,61 +153,6 @@ fn node_ids_and_timestamps_map_directly_without_guid_or_datetime_conversion() {
             ticks.to_string()
         );
     }
-}
-
-#[test]
-fn strict_scalar_models_map_explicit_codes_without_duplicate_wire_enums() {
-    fn check<T>(values: &[(T, i64)])
-    where
-        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
-    {
-        for (value, code) in values {
-            let mut e = Encoder::new();
-            e.i64(*code);
-            let bytes = e.finish();
-            assert_eq!(to_vec(value).unwrap(), bytes);
-            assert_eq!(&from_slice::<T>(&bytes).unwrap(), value);
-            assert_eq!(serde_json::to_string(value).unwrap(), code.to_string());
-        }
-        for code in [i64::MIN, -1, 99, i64::MAX] {
-            let mut e = Encoder::new();
-            e.i64(code);
-            assert!(matches!(
-                from_slice::<T>(&e.finish()),
-                Err(Error::Protocol(_))
-            ));
-        }
-    }
-    check(&[
-        (ApplicationStatus::Invalid, 0),
-        (ApplicationStatus::Ready, 1),
-        (ApplicationStatus::Upgrading, 2),
-        (ApplicationStatus::Creating, 3),
-        (ApplicationStatus::Deleting, 4),
-        (ApplicationStatus::Failed, 5),
-    ]);
-    check(&[
-        (
-            ApplicationDefinitionKind::ServiceFabricApplicationDescription,
-            0,
-        ),
-        (ApplicationDefinitionKind::Compose, 1),
-        (ApplicationDefinitionKind::MeshApplicationDescription, 2),
-        (ApplicationDefinitionKind::Invalid, 65535),
-    ]);
-    check(&[
-        (ServiceKind::Invalid, 0),
-        (ServiceKind::Stateless, 1),
-        (ServiceKind::Stateful, 2),
-    ]);
-    check(&[
-        (ServiceStatus::Unknown, 0),
-        (ServiceStatus::Active, 1),
-        (ServiceStatus::Upgrading, 2),
-        (ServiceStatus::Deleting, 3),
-        (ServiceStatus::Creating, 4),
-        (ServiceStatus::Failed, 5),
-    ]);
 }
 
 fn service_fields(

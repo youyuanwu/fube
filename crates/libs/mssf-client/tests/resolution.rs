@@ -1,21 +1,22 @@
-//! Independent positional model peer, not native runtime qualification.
+//! Synthetic positional schema tests, not native runtime qualification.
+//! Field order is checked separately from production DTOs using the shared Rust codec.
 use mssf_client::*;
 use mssf_transport::{
     connection::{read_message, write_message},
-    serialization::{Decoder, Encoder},
+    serialization::Decoder,
 };
 use std::{cmp::Ordering, time::Duration};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 #[path = "support/gateway_peer.rs"]
 mod peer;
+use peer::body;
 
 const WAIT: Duration = Duration::from_secs(3);
 const ID: [u8; 16] = [6; 16];
 
 fn result(kind: i64, low: i64, high: i64, name: &str, version: i64, group: bool) -> Vec<u8> {
-    let mut e = Encoder::new();
-    e.object(|e| {
+    body(|e| {
         e.boolean(group);
         e.object(|e| {
             e.object(|e| {
@@ -49,8 +50,6 @@ fn result(kind: i64, low: i64, high: i64, name: &str, version: i64, group: bool)
         e.pointer(None, |_| unreachable!())?;
         Ok(())
     })
-    .unwrap();
-    e.finish()
 }
 
 fn request(body: &[u8], kind: i64, integer: i64, named: &str, previous: bool) {

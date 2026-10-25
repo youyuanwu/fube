@@ -112,15 +112,12 @@ impl Query for DeployedApplicationQueryParameters {
 mod tests {
     use super::*;
     use crate::{
-        query_protocol::{decode_reply, encode_query},
+        query_protocol::{encode_query, tests::assert_request},
         Paging,
     };
-    use mssf_transport::{
-        message::Message,
-        serialization::{
-            serde::{from_fields, from_slice, to_vec},
-            Decoder, Encoder,
-        },
+    use mssf_transport::serialization::{
+        serde::{from_fields, from_slice, to_vec},
+        Decoder, Encoder,
     };
     use std::num::NonZeroU64;
 
@@ -152,58 +149,13 @@ mod tests {
         DeployedApplicationQueryParameters::validate_record(from_slice(bytes)?)
     }
 
-    fn reply(
-        kind: i64,
-        tag: Option<i32>,
-        count: usize,
-        status: i64,
-        health: i64,
-        error: i64,
-        paging: Option<(&[u8], &str)>,
-    ) -> Message {
-        let mut e = Encoder::new();
-        e.object(|e| {
-            e.i64(kind);
-            let tag = tag.map(i32::to_le_bytes);
-            e.pointer(tag.as_ref().map(|tag| tag.as_slice()), |e| {
-                e.object_array(&[()], |e, _| fields(e, count, status, health))?;
-                e.pointer(None, |_| Ok(()))
-            })?;
-            e.i64(error);
-            e.pointer(paging.map(|(tag, _)| tag), |e| e.string(paging.unwrap().1))
-        })
-        .unwrap();
-        Message {
-            headers: Vec::new(),
-            body: e.finish(),
-        }
-    }
-
-    fn assert_request(
-        parameters: &DeployedApplicationQueryParameters,
-        paging: Option<&Paging>,
-        arguments: &[(&str, &str)],
-    ) {
-        let mut e = Encoder::new();
-        e.object(|e| {
-            e.object(|e| {
-                e.object_array(arguments, |e, (key, value)| {
-                    e.object(|e| e.string(key))?;
-                    e.string(value)
-                })
-            })?;
-            e.string("GetApplicationPagedListDeployedOnNode")
-        })
-        .unwrap();
-        assert_eq!(encode_query(parameters, paging).unwrap(), e.finish());
-    }
-
     #[test]
-    fn deployed_query_native_name_order_omission_boolean_and_paging() {
+    fn deployed_query_name_omission_boolean_and_paging_arguments() {
         let mut parameters = DeployedApplicationQueryParameters::new("Node_1");
         assert_request(
             &parameters,
             None,
+            "GetApplicationPagedListDeployedOnNode",
             &[("NodeName", "Node_1"), ("IncludeHealthState", "false")],
         );
         assert_request(
@@ -212,6 +164,7 @@ mod tests {
                 continuation_token: Some(String::new()),
                 max_results: None,
             }),
+            "GetApplicationPagedListDeployedOnNode",
             &[("NodeName", "Node_1"), ("IncludeHealthState", "false")],
         );
         parameters.application_name = Some(NamingUri::parse("fabric:/App").unwrap());
@@ -222,6 +175,7 @@ mod tests {
                 continuation_token: Some("opaque:/应用".into()),
                 max_results: NonZeroU64::new(3),
             }),
+            "GetApplicationPagedListDeployedOnNode",
             &[
                 ("NodeName", "Node_1"),
                 ("ApplicationName", "fabric:/App"),
@@ -364,10 +318,6 @@ mod tests {
             decode_record(&e.finish()),
             Err(Error::Protocol(_))
         ));
-        let bytes = record(7, 3, 1);
-        for end in 0..bytes.len() {
-            assert!(decode_record(&bytes[..end]).is_err());
-        }
         let mut e = Encoder::new();
         e.object(|e| {
             fields(e, 3, 3, 1)?;
@@ -382,70 +332,6 @@ mod tests {
             Decoder::new(&bytes).object(from_fields::<DeployedApplication>),
             Err(Error::Protocol(_))
         ));
-    }
-
-    #[test]
-    fn deployed_list_shared_envelope_paging_errors_and_payload_precedence() {
-        let page = decode_reply::<DeployedApplicationQueryParameters>(&reply(
-            2,
-            Some(10),
-            7,
-            3,
-            1,
-            0,
-            Some((&[], "opaque-next")),
-        ))
-        .unwrap();
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].name, "fabric:/应用");
-        assert_eq!(page.continuation_token.as_deref(), Some("opaque-next"));
-        let page = decode_reply::<DeployedApplicationQueryParameters>(&reply(
-            2,
-            Some(10),
-            3,
-            3,
-            1,
-            0,
-            Some((&[], "")),
-        ))
-        .unwrap();
-        assert_eq!(page.items[0].health_state, HealthState::Unknown);
-        assert_eq!(page.continuation_token, None);
-        for message in [
-            reply(1, Some(10), 7, 3, 1, 0, None),
-            reply(99, Some(10), 7, 3, 1, 0, None),
-            reply(2, Some(4), 7, 3, 1, 0, None),
-            reply(2, None, 7, 3, 1, 0, None),
-            reply(2, Some(10), 7, 3, 1, 0, Some((&[1], "next"))),
-        ] {
-            assert!(matches!(
-                decode_reply::<DeployedApplicationQueryParameters>(&message),
-                Err(Error::Protocol(_))
-            ));
-        }
-        assert!(matches!(
-            decode_reply::<DeployedApplicationQueryParameters>(&reply(
-                2,
-                Some(10),
-                7,
-                3,
-                1,
-                123,
-                None
-            )),
-            Err(Error::Remote { code: 123, .. })
-        ));
-        for message in [
-            reply(2, Some(10), 7, 99, 1, 123, None),
-            reply(2, Some(10), 7, 3, 99, 123, None),
-            reply(2, Some(10), 2, 3, 1, 123, None),
-            reply(2, Some(4), 7, 3, 1, 123, None),
-        ] {
-            assert!(matches!(
-                decode_reply::<DeployedApplicationQueryParameters>(&message),
-                Err(Error::Protocol(_))
-            ));
-        }
     }
 
     #[test]

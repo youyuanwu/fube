@@ -150,12 +150,6 @@ fn health_reply(request: &Message, bytes: Vec<u8>) -> Message {
     message
 }
 
-fn ping_response(request: &Message) -> Message {
-    let mut response = reply(request, "PingRequest", ping_body());
-    response.headers.push(Header::version(1, 1).unwrap());
-    response
-}
-
 fn arguments(request: &Message) -> Vec<(String, String)> {
     assert_eq!(request.properties().unwrap().actor, 5);
     assert_eq!(request.properties().unwrap().action, "QueryRequest");
@@ -444,7 +438,7 @@ async fn health_local_invalid_names_and_timeouts_send_nothing() {
     let server = tokio::spawn(async move {
         for_stream(listener, [()], |request, _| {
             assert_eq!(request.properties().unwrap().action, "PingRequest");
-            ping_response(request)
+            ping_reply(request)
         })
         .await;
     });
@@ -554,7 +548,7 @@ async fn health_reordered_mixed_operations_and_late_cancelled_malformed_replies(
         let second = read_message(&mut stream).await.unwrap();
         for request in [second, first] {
             let response = if request.properties().unwrap().action == "PingRequest" {
-                ping_response(&request)
+                ping_reply(&request)
             } else {
                 health_reply(&request, result(Shape::Complete, 0))
             };

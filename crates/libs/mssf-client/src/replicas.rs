@@ -126,16 +126,14 @@ impl Query for ReplicaQueryParameters {
 mod tests {
     use super::*;
     use crate::{
-        partitions::tests::{assert_request, reply, ID},
-        query_protocol::{decode_reply, encode_query},
+        partitions::tests::ID,
+        query_protocol::{encode_query, tests::assert_request},
         Paging,
     };
-    use mssf_transport::{
-        message::Header,
-        serialization::{serde::from_slice, Encoder},
-    };
+    use mssf_transport::serialization::{serde::from_slice, Encoder};
     use std::num::NonZeroU64;
 
+    // ServiceModel/ServiceReplicaQueryResult.h FABRIC_FIELDS_09.
     fn base(
         e: &mut Encoder,
         kind: i64,
@@ -179,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn replica_arguments_match_facade_order_signed_ids_numeric_masks_and_omissions() {
+    fn replica_arguments_preserve_signed_ids_numeric_masks_and_omissions() {
         let mut parameters = ReplicaQueryParameters::new(ID.parse().unwrap());
         assert_request(
             &parameters,
@@ -245,16 +243,7 @@ mod tests {
     fn replicas_decode_stateful_and_stateless_with_full_signed_id_range() {
         for kind in [1, 2] {
             for id in [i64::MIN, -1, 0, 1, i64::MAX] {
-                let page = decode_reply::<ReplicaQueryParameters>(&reply(
-                    Some(6),
-                    Some(|e: &mut Encoder| fields(e, kind, id, true)),
-                    0,
-                    Some((&[], "opaque-next")),
-                    false,
-                ))
-                .unwrap();
-                assert_eq!(page.continuation_token.as_deref(), Some("opaque-next"));
-                let replica = &page.items[0];
+                let replica = decode_fields(|e| fields(e, kind, id, true)).unwrap();
                 assert_eq!(
                     replica.kind,
                     if kind == 1 {
@@ -308,9 +297,6 @@ mod tests {
         let mut e = Encoder::new();
         e.object(|e| fields(e, 2, 123, true)).unwrap();
         let bytes = e.finish();
-        for end in 0..bytes.len() {
-            assert!(from_slice::<Replica>(&bytes[..end]).is_err(), "{end}");
-        }
         let mut bytes = bytes;
         // Keep the enclosing extent valid but advertise another varint byte.
         let last_duration_byte = bytes.len() - 3;
@@ -356,85 +342,6 @@ mod tests {
         }
         for invalid in [-1, 6, i64::MAX] {
             assert!(serde_json::from_value::<ReplicaStatus>(invalid.into()).is_err());
-        }
-    }
-
-    #[test]
-    fn replica_reply_profile_checks_tags_slots_paging_and_remote_error_precedence() {
-        const REMOTE: i64 = -456;
-        for message in [
-            reply(
-                Some(5),
-                Some(|e: &mut Encoder| fields(e, 2, 1, true)),
-                REMOTE,
-                None,
-                false,
-            ),
-            reply(
-                Some(6),
-                Some(|e: &mut Encoder| fields(e, 0, 1, true)),
-                REMOTE,
-                None,
-                false,
-            ),
-            reply(
-                Some(6),
-                Some(|e: &mut Encoder| fields(e, 2, 1, true)),
-                REMOTE,
-                Some((&[1], "opaque")),
-                false,
-            ),
-            reply(
-                Some(6),
-                Some(|e: &mut Encoder| fields(e, 2, 1, true)),
-                REMOTE,
-                None,
-                true,
-            ),
-        ] {
-            assert!(matches!(
-                decode_reply::<ReplicaQueryParameters>(&message),
-                Err(Error::Protocol(_))
-            ));
-        }
-        let mut message = reply(
-            Some(6),
-            Some(|e: &mut Encoder| fields(e, 2, 1, true)),
-            REMOTE,
-            None,
-            false,
-        );
-        assert!(matches!(
-            decode_reply::<ReplicaQueryParameters>(&message),
-            Err(Error::Remote { code: REMOTE, .. })
-        ));
-        message.headers.push(Header::action("wrong").unwrap());
-        assert!(matches!(
-            decode_reply::<ReplicaQueryParameters>(&message),
-            Err(Error::Protocol(_))
-        ));
-        let message = reply(
-            None,
-            None::<fn(&mut Encoder) -> Result<()>>,
-            REMOTE,
-            None,
-            false,
-        );
-        assert!(matches!(
-            decode_reply::<ReplicaQueryParameters>(&message),
-            Err(Error::Remote { code: REMOTE, .. })
-        ));
-        for token in [None, Some((&[][..], ""))] {
-            let page = decode_reply::<ReplicaQueryParameters>(&reply(
-                Some(6),
-                None::<fn(&mut Encoder) -> Result<()>>,
-                0,
-                token,
-                false,
-            ))
-            .unwrap();
-            assert!(page.items.is_empty());
-            assert!(page.continuation_token.is_none());
         }
     }
 
