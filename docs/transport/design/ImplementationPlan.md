@@ -2,6 +2,11 @@
 
 **Status:** proposed; all implementation phases are pending.
 
+The focused [uncached resolution/notification scope](ServiceResolutionNotifications.md)
+is now implemented and qualified as an experimental clear-TCP subset on
+SF 11.8.121.4; see the [current coverage guide](../RustFabricClient.md).
+This does not mark the broader production/TLS/recovery phase gates below complete.
+
 An initial [clear-TCP Rust POC](../RustFabricClient.md) now demonstrates native
 gateway ping, NameExists and typed GetNodeList pages against Ubuntu onebox runtime
 11.8.121.4. It is a
@@ -24,6 +29,9 @@ The implementation follows the [design](FabricClient.md) and
 [message-format specification](../FabricClientMessageFormat.md). The
 [native behavior specification](../FabricClient.md) defines gateway operations;
 [Transport.md](../Transport.md) supplies shared transport behavior.
+The focused [resolution and notification design](ServiceResolutionNotifications.md)
+specifies cache-free APIs and an independently owned `ServiceNotificationClient`
+without automatic recovery; the later recovery gates below remain separate.
 
 **The available native test environment is onebox. A native Service Fabric C++
 build is not a prerequisite.** The initial compatibility oracle is the real
@@ -430,7 +438,8 @@ Operator verification:
 - **`mssf-client/src/query.rs`, `protocol/`**: Add a typed node-list query,
   exact argument-map encoding, polymorphic results, processing errors, and paging.
 - **`resolution.rs`**: Add uncached partition resolution with native partition
-  key/previous-version semantics, then a bounded version-aware cache.
+  key/previous-version semantics and owned results. Do not add an endpoint cache;
+  follow the [focused design](ServiceResolutionNotifications.md).
 - **`mssf-client/tests/query_resolution.rs`**: Test wrapper discrimination,
   paging, unknown variants, stale updates, deletion, and partition-key cases.
 - **Live targets**: Add read-only cases to the matching clear/TLS onebox profiles.
@@ -446,8 +455,9 @@ Automated:
   surfaced rather than returned as successful empty lists.
 - [ ] Page tokens and result ordering/version semantics survive request
   boundaries; no implicit switch to the internal query-body schema occurs.
-- [ ] Cached/forced-refresh resolution preserves partition/endpoint/version
-  information and rejects stale replacement according to native comparisons.
+- [ ] Every resolve call sends a gateway request and preserves partition,
+  endpoint, and previous-version metadata without an endpoint cache. Native
+  identity/version comparisons reject unrelated partitions.
 
 Operator verification:
 
@@ -466,9 +476,14 @@ Complete and qualify each independently before publishing its API as supported.
   the correct ClientAuth binding, metadata policy, token deadlines, claims-first
   release ordering, and later denial handling.
 - **`gateway.rs` and transport target management**: Add independently secured
-  normal/high-priority connections associated with the current gateway generation.
-- **`notifications.rs`, `protocol/`**: Add identity, filters, session connection,
-  version/deletion synchronization, duplex routing, and acknowledgments.
+  normal/high-priority paths with each connection's actual gateway
+  identity/generation, reusing machinery without coupling public-client lifetimes.
+- **`notifications.rs`, `protocol/`**: Add a standalone `ServiceNotificationClient`
+  whose constructor establishes its own transport and native session, plus
+  identity, RAII filter registrations, version/deletion synchronization, duplex
+  routing, and acknowledgments. Do not add a notification factory to `FabricClient`.
+  Deliver the focused design's terminal-on-failure notification client first;
+  transparent reconnect is a later gate, not a prerequisite for that API.
 - **Tests**: Add offline `claims_notifications.rs`, extend transport security
   cases, and add `onebox_claims.rs` plus notification cases for qualified profiles.
 
@@ -480,12 +495,17 @@ Automated:
 - [ ] `cargo test -p mssf-client --test onebox_claims -- --ignored` proves valid,
   invalid, and expired-token behavior on a configured claims-enabled gateway.
 - [ ] Initial connection success is not mistaken for token acceptance.
+- [ ] Notification-only construction works without a `FabricClient`, and
+  closing/dropping either client or faulting its connection does not retire
+  the other client's still-healthy connection.
 - [ ] Reverse notifications cannot complete ordinary pending requests; replies
   use the original target/generation and correlation ID.
 - [ ] Queue overflow surfaces lag/desynchronization; version advancement and
   acknowledgment cannot silently skip an unadmitted event.
-- [ ] Reconnect/filter restoration, duplicate pages, deletion, slow consumers,
-  and priority-connection faults preserve synchronization semantics.
+- [ ] Duplicate pages, empty/deletion updates, slow consumers, and
+  priority-connection faults preserve the initial delivery/error contract.
+- [ ] Later recovery gate: reconnect/filter restoration and deletion
+  synchronization preserve continuity before transparent recovery is claimed.
 
 Operator verification:
 

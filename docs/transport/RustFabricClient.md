@@ -4,7 +4,8 @@
 typed GetNodeList, single-node GetNodeHealth, native CreateName/DeleteName,
 application/application-scoped service lists, service partitions,
 partition replicas/stateless instances, node-local deployed applications,
-service packages, code packages and deployed replicas
+service packages, code packages and deployed replicas, uncached partition
+resolution, and independently owned service notification sessions
 have been demonstrated against the repository's Ubuntu onebox running
 Service Fabric **11.8.121.4**. This is not a complete FabricClient replacement
 and does not support TLS or authentication.
@@ -19,6 +20,8 @@ single-name creation/deletion, with owned results and explicit errors. Additiona
 typed pages cover service partitions, partition replicas/stateless instances and
 node-local deployed applications. Unpaged node/application-scoped lists inspect
 service packages, code packages and deployed replicas.
+Uncached resolution and independent notification sessions add endpoint discovery
+without an endpoint-result cache.
 
 Neither package calls the native Service Fabric client or COM libraries.
 Neither uses HTTP to execute client operations. "Clear TCP" still carries the
@@ -39,6 +42,8 @@ Neither uses HTTP to execute client operations. "Clear TCP" still carries the
 | GetDeployedServicePackageList | Sends **GetServiceManifestListDeployedOnNode**, wrapper tag 11. Ten service-package observations independently compared live, including manifest/version/status/activation and exact manifest selectors. No paging. |
 | GetDeployedCodePackageList | Sends **GetCodePackageListDeployedOnNode**, wrapper tag 14. Ten ExeHost code-package observations independently compared live, including entry points/statistics, host/activation fields and exact code-package selectors. Setup execution and container hosts are offline-only. No paging. |
 | GetDeployedReplicaList | Sends **GetServiceReplicaListDeployedOnNode**, wrapper tag 12. Twenty-two stateful/stateless observations independently compared live, including partition selectors, host process IDs, activation and stateful reconfiguration details. Reply actor is RS (13), not RA (12) or NamingGateway (5). No paging. |
+| ResolveServicePartition | Uncached native gateway request with singleton, named or signed-int64 selection and optional previous-result metadata. Owned partition details, endpoints/roles and identity-scoped generation/lookup versions. All three key kinds, refreshes, missing-service errors and independent endpoint/role comparisons qualified on 11.8.121.4. |
+| Service notifications | Standalone noncloneable `ServiceNotificationClient`, independent connection/session/receiver, many owning RAII filter guards. Exact/prefix/primary-only registration, native updates, endpoint-count changes, primary replacement, empty invalidations, unregister and independent close qualified on 11.8.121.4. A lost successful ACK caused a real native retry without duplicate delivery. Distinct-address primary-only delivery remains separately unqualified. |
 | Native faults/errors | Retains native signed error codes and available diagnostics. Malformed GetNodeList continuation produced live `E_INVALIDARG` (-2147024809) or `FMFailoverUnitNotFound` (-2147017462); the same connection remained usable. Other fault forms have offline model-peer coverage. |
 | Concurrent operations | Mixed ping, NameExists, node-list and node-health queries on clones sharing one connection; real onebox coverage. Deterministic cancellation/late-reply safety remains model-covered. |
 | Idle disconnect | Real native ping through a test-owned proxy, followed by proxy cutoff; closure detected without another operation. |
@@ -828,6 +833,88 @@ nondefault reconfiguration phases and fields without REST projections have
 offline model coverage only; reconfiguration transitions were not exercised
 live. No TLS or cross-release compatibility is claimed.
 
+### Uncached resolution and independent notifications
+
+Both clients live in `mssf-client`, but neither owns the other or shares its
+socket/session. Notification-only applications need no `FabricClient`; multiple
+notification clients can coexist. Each connection duration sets that client's
+remote-operation default. `None` uses that default, not infinity.
+
+```rust
+use mssf_client::{
+    FabricClient, NamingUri, PartitionKey, ServiceNotificationClient,
+    ServiceNotificationFilter, DEFAULT_TIMEOUT,
+};
+
+# async fn example() -> mssf_client::NotificationResult<()> {
+let endpoint = "127.0.0.1:19000".parse().unwrap();
+let ordinary = FabricClient::connect_clear(endpoint, DEFAULT_TIMEOUT).await?;
+let mut changes =
+    ServiceNotificationClient::connect_clear(endpoint, DEFAULT_TIMEOUT).await?;
+let name: NamingUri = "fabric:/MyApp/MyService".parse()?;
+let registration = changes.register_filter(&ServiceNotificationFilter {
+    name: name.clone(), name_prefix: false, primary_only: false,
+}, None).await?;
+let initial = ordinary.resolve_service_partition(
+    &name, &PartitionKey::Singleton, None, None,
+).await?;
+if let Some(update) = changes.recv().await {
+    let update = update?;
+    if update.partition_id == initial.partition_information.id {
+        let _ordering = update.version.compare(&initial.version)?;
+    }
+}
+registration.unregister(None).await?;
+changes.close(None).await?;
+ordinary.close().await?;
+# Ok(())
+# }
+```
+
+Keep the returned registration bound to a variable. Dropping it initiates
+bounded asynchronous cleanup; `let _ = register_filter(...).await?` immediately
+drops it. Consuming `unregister(timeout)` waits for confirmation. Guard drop
+never blocks or spawns a task per guard; pending cleanup still occupies its
+filter slot. Guards do not borrow the receiver or keep a dropped owner running.
+
+Register **before** initial lookups: filters are not retroactive, updates can
+precede registration confirmation, and one lookup selects only one partition.
+Reconcile same-identity versions, not arrival order. Generation precedes lookup
+version; store version is private refresh metadata, not an ordering tie-breaker.
+Different partitions/services cannot be compared. Previous results cannot be
+rebound through edits to public identity fields.
+
+Notifications contain service name, partition ID, kind, opaque endpoint
+addresses/roles and version, not description-enriched partition ranges/names or
+store versions. Empty endpoint sets are invalidations, not proof of deletion.
+Prefix means native URI ancestry. Primary-only is a native change filter, not
+secondary-endpoint stripping; overlapping filters do not add per-filter IDs.
+
+`recv(&mut self)` is local and cancellation-safe. On failure, its next result is
+one terminal error, then `None`, independently of a full update queue. Buffered
+updates may be discarded on terminal failure. Full-page delivery and progress
+commit before successful native ACK; application processing is not part of ACK.
+Unconfirmed filter mutations/cleanup retire only this notification session.
+Explicit close attempts deregistration under one deadline and awaits task/socket
+stop even on cleanup failure. Owner drop initiates shutdown; remote disconnect
+cleanup is eventual, not an immediate deregistration guarantee.
+
+Notification construction, registration, receive, unregister, and close return
+`NotificationResult<T>`, whose error is `NotificationError`. Delivery-budget
+exhaustion is `NotificationError::Lagged`; notification filter/bookkeeping/queue
+limits are `NotificationError::ResourceLimit`. Shared transport, protocol,
+timeout, input, and native faults are retained as `NotificationError::Common(Error)`,
+including genuinely shared decoder/control resource limits. The ordinary
+`FabricClient` keeps its existing `Result<T>` and has no notification-only error cases.
+This changes notification method error types, not the native payload or wire
+format. Match `NotificationError::Common(Error::Timeout)` for a notification
+timeout instead of matching `Error::Timeout` directly.
+
+There is no endpoint cache, hidden description query, reconnect, filter replay,
+or snapshot. The gateway can still use its own cache: independent management
+and native observations converge but are not an atomic cluster snapshot.
+See the [focused design/API reference](design/ServiceResolutionNotifications.md).
+
 ## 4. Supported inputs and bounds
 
 Naming input is literal lowercase `fabric:/` followed by nonempty ASCII
@@ -867,9 +954,15 @@ Naming methods accept `impl AsRef<str>`, so both existing string calls and
 | Admitted operations, including unconsumed results | 32 |
 | Queued output frames, including cancelled commands awaiting disposal | 32 |
 | Started write / partial incoming frame | 30 seconds; request expiry ends local waiting, not started frame completion |
+| Notification delivery | 256 events and 8 MiB of accounted page/delivery allocations, whichever is reached first |
+| Notification filters, including pending registration/cleanup | 32 per independently owned session |
+| Notification partition identities / version intervals | 4,096 each; exhaustion is terminal, never silent eviction |
+| Notification page queue / processing | 32 pages and one worker; pages share the delivery memory budget |
+| Notification reply/control / cleanup queues | 32 each, admitted independently of application delivery |
 
-The queue is a count bound, not an aggregate memory limit of one frame: 32
-maximum-sized queued frames can occupy 128 MiB. Memory also includes active
+The ordinary request writer queue is a count bound, not an aggregate memory
+limit of one frame: 32 maximum-sized queued frames can occupy 128 MiB.
+Memory also includes active
 encoding and frame copies, one active writer, one incoming frame and decoded
 results. Admission and queue capacity are acquired before transport frame
 encoding, and admission follows each result through delivery. Facade-prepared
@@ -884,6 +977,19 @@ typed version lookup remains first-match. Supported appended values/scopes
 are typed-skipped, not found by searching for delimiter bytes. The bounded codec
 supports nullable object pointers, typed objects, object arrays, UInt16 and
 base/derived scopes needed by node results.
+
+Notification memory accounting includes queue backing storage, input pages,
+decoded strings/vectors, conversion copies and prospective progress copies.
+Raw input capacity is reserved before queue admission. The shared native Serde
+decoder charges strings, bytes, and conservative sequence storage before owned
+allocation; the worker separately reserves endpoint-conversion and prospective
+progress copies before constructing them. There is no second notification-schema
+parser. This is an accounted allocation budget, not a bound on total process RSS;
+existing transport I/O limits and separately bounded protocol state still apply.
+A page must fit as one transaction. Delivery lag and protocol-bookkeeping/
+cleanup resource failures are terminal; status does not need a queue slot.
+Local filter-admission exhaustion is instead rejected before sending without
+retiring the healthy session (`NotificationError::ResourceLimit("notification filters")`).
 Unsupported trailing metadata, no-copy extensions, or object flags fail
 explicitly. General native forward compatibility is not claimed.
 
@@ -1164,10 +1270,11 @@ independent allocation/container/volume/network/private-tag removal were
 verified. This does not extend compatibility to untested native schemas or
 make test-only REST preparation part of the production client.
 
-The later shared-adapter and direct-model expansions were checked with offline
-byte comparisons, malformed-input regressions and independent model peers.
-Their live onebox consumers compile, but these expansions have not received a
-fresh live-runtime qualification.
+The later shared-adapter/direct-model expansions and focused resolution/
+notification implementation were requalified with the five live scenarios on
+SF **11.8.121.4**, as well as offline byte comparisons, malformed-input
+regressions and independent model peers. Cases/fields not exercised by those
+scenarios retain their documented evidence limits.
 
 Tests that need onebox are named `onebox_*` and assigned to the shared
 **`onebox` nextest group** in `.config/nextest.toml`. They remain `#[ignore]`
@@ -1496,11 +1603,75 @@ gateways, read-only source and a private writable evidence directory. That
 historical container-consumer result is not a new native-name qualification.
 No compiler/SDK installation or separate CI infrastructure is required.
 
+### Owned resolution and notification qualification
+
+`onebox_resolution_and_notifications` is the fifth serialized live scenario.
+It requires a new disposable onebox, an explicit absolute
+`MSSF_NOTIFICATION_CONFIG`, the matching `MSSF_LIST_OWNER`, and the exact
+`MSSF_TEST_ARCHIVE_SHA256`. The profile contains `profile` (`clear`),
+`allocation`, exact controller `allocation_owner`, `endpoint`, `runtime`,
+workload `owner`, and absolute fresh `journal`/`report` paths. The allocation's
+private state must match owner/name/runtime and be ready.
+The [Rust fixture setup](../../crates/libs/mssf-client/tests/support/notification_setup.rs)
+can generate a new profile when `MSSF_NOTIFICATION_ALLOCATION` explicitly names
+the owned allocation and `MSSF_NOTIFICATION_JOURNAL`/`MSSF_NOTIFICATION_REPORT`
+provide absolute fresh output paths. It reads the allocation's actual owner and
+runtime, validates every ownership/readiness gate, and refuses to overwrite an
+existing profile or evidence. CI supplies only these environment inputs, not
+an inline configuration generator. Leave `MSSF_NOTIFICATION_ALLOCATION` unset
+to use an existing explicit JSON profile with the same validation.
+Never select these mutating fixture tests against a shared or pre-existing
+allocation that you do not exclusively own.
+
+```sh
+cargo nextest archive --locked -p mssf-transport -p mssf-client \
+  --archive-file build/native-client-tests.tar.zst
+export MSSF_TEST_ARCHIVE_SHA256="$(sha256sum build/native-client-tests.tar.zst | cut -d ' ' -f 1)"
+mkdir -p build/notification-evidence
+export MSSF_NOTIFICATION_CONFIG="$PWD/build/notification-evidence/config.json"
+export MSSF_NOTIFICATION_ALLOCATION=your-new-owned-onebox
+export MSSF_NOTIFICATION_JOURNAL="$PWD/build/notification-evidence/journal.json"
+export MSSF_NOTIFICATION_REPORT="$PWD/build/notification-evidence/report.json"
+export MSSF_LIST_OWNER=your-exact-workload-owner
+cargo nextest run --archive-file build/native-client-tests.tar.zst \
+  --run-ignored only -E 'test(onebox_resolution_and_notifications)' --no-tests fail
+```
+
+The scenario journals a unique type/upload/two applications before mutation and
+cleans only those exact identities, including after panic/error. It additionally
+creates two named partitions inside an owned application, changes one owned
+stateless service from five endpoints to one, removes an exact owned primary
+replica to observe replacement/versioned updates, and deletes an owned service
+to observe empty invalidations. Native results must eventually match independent
+HTTP endpoint/role **multisets**; equal/empty address strings are not unique IDs.
+A test-only relay drops exactly one successful native processing ACK, observes a
+gateway retry, and verifies no repeated endpoint version is delivered.
+Production operations never use HTTP or this relay.
+
+On SF **11.8.121.4**, clear TCP, the scenario demonstrated six singleton/int64
+partition lookups plus two named lookups, previous-result refresh, native errors
+with healthy reuse, three independent notification sessions, exact/prefix/
+primary-only registration, updates, endpoint-count/primary changes, invalidation,
+unregister and independent close. The relay observed one dropped successful ACK,
+one native retry and zero duplicate delivered versions. The actual gateway
+identity was returned as node N0010; its notification address was intentionally
+empty, not replaced with an advertised/dialed private endpoint.
+
+Qualification limits: these implicit-host volatile fixtures publish empty
+address strings. Nonempty/structured address preservation is covered offline,
+not by an application routing demonstration. Primary-only registration is live
+qualified, but isolated content-change delivery with distinct primary addresses
+is not. No persisted application-data replication, TLS, authentication,
+cross-release compatibility, automatic recovery or transparent failover is
+claimed. Profiles, journals, reports and packet-free diagnostic artifacts stay
+local/ignored.
+
 ## 6. Deliberate exclusions
 
 No TLS/rustls, authentication, HTTP operation fallback, Windows-specific
-integration, native client wrapper, full URI/API coverage, service resolution,
-notifications, automatic recovery/replay, or production failover is provided.
+integration, native client wrapper, full URI/API coverage, cached or prefix
+resolution, legacy change callbacks, service-group expansion, application
+endpoint connections, automatic recovery/replay, or production failover is provided.
 The onebox is privileged and unsecured: keep it local with loopback-only
 published endpoints. Do not use this profile on a production or shared cluster.
 

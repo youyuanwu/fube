@@ -85,6 +85,11 @@ field_adapter!(
     "A bounded native UInt32 count followed by strings, not an object array. Encode a Vec/slice; decode into `CountedStrings<Vec<String>>`."
 );
 field_adapter!(
+    CountedValues,
+    VALUES_ADAPTER,
+    "A bounded native UInt32 count followed by values. In particular, C++ vectors of shared pointers use `CountedValues<Vec<Pointer<T>>>`, not object-array slots."
+);
+field_adapter!(
     NativeEnum,
     ENUM_ADAPTER,
     "A tagged native enum object. Derive Serde on the enum and rename every variant to its canonical i32 code. The adapter writes/validates the i32 type tag and matching i64 kind, then reads/writes variant fields inline."

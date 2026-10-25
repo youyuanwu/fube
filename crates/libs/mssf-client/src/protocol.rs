@@ -73,7 +73,7 @@ pub(crate) fn check_failure(message: &Message) -> Result<()> {
     Ok(())
 }
 
-fn check_reply(message: &Message, actions: &[&str]) -> Result<()> {
+pub(crate) fn check_reply(message: &Message, actions: &[&str]) -> Result<()> {
     check_failure(message)?;
     let properties = message.properties()?;
     if properties.actor != 5 {

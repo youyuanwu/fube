@@ -1,7 +1,10 @@
 # Pure Rust FabricClient design
 
-**Status:** proposed; no Rust wire implementation or live interoperability is
-claimed by this document.
+**Status:** broader production design remains proposed. The experimental
+[clear-TCP subset](../RustFabricClient.md) implements native requests, uncached
+partition resolution and independently owned notification sessions, with
+recorded SF 11.8.121.4 coverage and explicit limitations. This does not complete
+the TLS/authentication/recovery requirements below.
 
 ## 1. Goal and protocol baseline
 
@@ -88,8 +91,9 @@ Application
     |
 mssf-client
     public owned models and async APIs
+    FabricClient / ServiceNotificationClient (independent owners)
     operation schemas / query result dispatch
-    gateway manager / resolution cache / notification sessions
+    gateway manager / uncached resolution / notification sessions
     |
 mssf-transport
     Fabric serialization / native headers / message IDs
@@ -128,8 +132,8 @@ crates/libs/mssf-client/src/
     protocol/            versioned operation bodies and envelopes
     naming.rs            naming/property operations
     query.rs             typed queries and paging
-    resolution.rs        partition lookup and versioned cache
-    notifications.rs     filters, synchronization, acknowledgments
+    resolution.rs        uncached partition lookup and version metadata
+    notifications.rs     standalone notification client, filters, session
     error.rs             native codes and Rust error context
 ```
 
@@ -147,6 +151,12 @@ Expose a cheap-to-clone `FabricClient` backed by shared client state. Building a
 client validates configuration locally; connection is lazy, with an explicit
 `connect()` convenience for callers that want early failure. Connections are
 owned by the client and may outlive an individual operation.
+
+Notifications use a separate, non-cloneable `ServiceNotificationClient` in the
+same crate. It constructs and owns its own connection/session and bounded
+receiver, independently of any `FabricClient`; the two types reuse transport,
+serialization, models, and security machinery, not socket or lifecycle state.
+See the [focused API design](ServiceResolutionNotifications.md#22-standalone-notification-client).
 
 Illustrative API, not a finalized compilable signature:
 
@@ -806,10 +816,11 @@ Do not use COM interface versions or TLS versions as this header.
 [Source: [native gateway protocol version][native-protocol-version].]
 
 Model a target as potentially having normal- and high-priority TCP connections.
-Read-only bootstrap needs normal priority; add the distinct high-priority path
-with notification support. Each connection authenticates independently and is
-associated with the current gateway generation. A high-priority connection is
-not inferred ready from the normal connection's ping.
+The normal operation path belongs to `FabricClient`; the notification path is
+owned independently by `ServiceNotificationClient`, not opened as a side effect
+of constructing a `FabricClient`. Each connection authenticates independently
+and records its own actual gateway identity/generation. A high-priority
+connection is not inferred ready from another client's normal connection ping.
 
 Use bounded jittered backoff for retryable connection failures, constrained by
 each waiting operation's deadline. Cache terminal credential/trust failures
@@ -819,7 +830,8 @@ rustls connection's trust assumptions.
 
 Session-expiration/reconnect controls retire sockets and trigger establishment,
 not TLS renegotiation. Keep notification synchronization separate from basic
-gateway readiness. A connection event must not imply its cache is synchronized.
+gateway readiness. A connection event must not imply its notification session
+is synchronized.
 
 ## 10. Request/reply, errors, deadlines, and retries
 
@@ -869,6 +881,12 @@ Keep distinct error categories:
 Retain the raw native numeric code and meaningful remote text, with operation,
 endpoint, phase, and activity context. Do not convert every failure into a
 timeout, `false`, empty collection, or a generic I/O error.
+
+Scope notification-only failures to `NotificationError`/`NotificationResult`
+on the standalone notification client and registration guards. Shared errors
+remain wrapped in `NotificationError::Common`; delivery lag and notification
+filter/bookkeeping limits do not become impossible cases in ordinary query
+results or transport errors.
 
 Validate expected success envelopes and decode each operation's status even
 when framing and correlation succeeded. A transport fault is not always a
@@ -961,29 +979,45 @@ complete from codec coverage alone.
 
 ### 11.3 Resolution
 
-Initially implement uncached `ResolveServicePartition` with the native partition
+Implement uncached `ResolveServicePartition` with the native partition
 key, previous-result/version metadata, and `ServiceResolutionMessageBody`
 schema. Return owned partition information, endpoint locations/roles, and
 versions. Application endpoint traffic remains outside FabricClient.
 
-Then add a bounded cache keyed by canonical service identity and partition
-selection. Updates use native version/generation comparison, not arrival time.
-Handle deletion, partition changes, endpoint-role changes, stale responses, and
-gateway replacement explicitly. Callers can force a refresh; cache misses never
-become an empty successful resolution.
+Every call sends a gateway request; there is no endpoint-resolution cache or
+notification-driven cache population. A caller-owned previous result supplies
+refresh metadata, not an instruction to wait for a changed endpoint. Compare
+versions using native generation/lookup-version semantics, not arrival time.
+The gateway may still use its own caches.
 
 Do not claim support for the older resolution-change callback API by
 implementing notification filters alone; it is a distinct public behavior.
+See [uncached resolution and notifications](ServiceResolutionNotifications.md)
+for the implemented experimental API, cache boundary, native wire mapping, and
+initial delivery scope.
 [Source: [native resolution behavior](../FabricClient.md#73-service-resolution-and-older-change-callbacks).]
 
 ### 11.4 Notifications
 
 Notification support requires all of session establishment, client identity,
-filters, version/deletion synchronization, pushed pages, and correlated replies.
-It cannot be implemented as an arbitrary callback on every unsolicited frame.
+filters, generation/version bookkeeping, pushed pages, and correlated replies.
+Expose one bounded async receiver per session with multiple filters, not an
+arbitrary callback on every unsolicited frame. No endpoint cache is required.
+The standalone `ServiceNotificationClient` owns that session and connection;
+its constructor performs both transport and native session establishment.
+Filter registration returns an owning RAII guard: drop initiates bounded
+worker-based unregister, while an explicit consuming `unregister` awaits
+confirmation. Unconfirmed cleanup retires the notification session explicitly.
 
-Maintain client ID and desired filters across reconnects; maintain gateway
-generation and synchronization state separately. Reconnect using
+The [focused design](ServiceResolutionNotifications.md) initially terminates
+the stream explicitly on disconnect or loss of continuity, without automatic
+reconnect. Construction, close/drop, and connection failures are independent
+of `FabricClient` in both directions; notification-only applications need not
+create an ordinary client.
+
+Transparent recovery is a later extension. Maintain client ID and desired
+filters across reconnects; maintain gateway generation and synchronization
+state separately. Reconnect using
 `NotificationClientConnectionRequest[clientId_, generation_, clientVersions_,
 filters_]`, complete synchronization, and only then present the stream as
 synchronized. Process `ClientIdentityHeader` and the native action/body variants.
@@ -992,17 +1026,16 @@ For a pushed notification with MessageId `N`, send the correct
 `ServiceNotificationReply` with `RelatesTo(N)` and processing status through
 the high-priority path associated with the notification's original target and
 gateway generation. Never route an old session's acknowledgment to whichever
-gateway happens to be current. Update the versioned cache and admit the event
-into a bounded delivery queue before acknowledging successful processing. The
-acknowledgment does not wait for arbitrary user application work.
+gateway happens to be current. Atomically admit the event into a bounded
+delivery queue and advance protocol versions before acknowledging successful
+processing. Do not populate an endpoint cache. The acknowledgment does not wait
+for arbitrary user application work.
 
 If admission fails, do not acknowledge success and silently drop the event.
-Mark the stream desynchronized, surface a lag/resynchronization event, retire
-the session if necessary, and synchronize again using the last committed
-versions. Commit version advancement consistently with event admission so
-reconnect cannot skip an event that was never delivered into the local stream.
-Duplicate pages are handled idempotently using native notification identity and
-version semantics.
+Surface a terminal lag/resource error and retire the initial session. A future
+recovering session must resynchronize using committed versions, not skip events
+that never entered the local stream. Duplicate pages are handled idempotently
+using native notification identity and version semantics.
 
 No application callback or slow subscriber runs on the connection driver.
 [Sources: [notification protocol](../FabricClient.md#74-notification-sessions-and-reverse-traffic),
@@ -1047,12 +1080,15 @@ typed resource error according to the selected request policy. Keep control
 progress available without promising that control bytes can bypass a partially
 written frame on one TCP stream.
 
-Explicit `close()` stops admission, cancels connection establishment, retires
-notification sessions, completes pending requests, and drains already-started
-output only within a bounded deadline. Use TLS `close_notify` when applicable;
-do not invent a FabricTransport service `Disconnect` exchange. On last-handle
-drop, cancellation is nonblocking and tasks release resources without requiring
-an async destructor.
+Each public client's explicit `close()` stops its own admission, cancels its
+connection establishment, completes its pending requests, and drains
+already-started output only within a bounded deadline. The notification
+client additionally retires its session and filters. Closing a `FabricClient`
+does not close a `ServiceNotificationClient`, or vice versa. Use TLS
+`close_notify` when applicable; do not invent a FabricTransport service
+`Disconnect` exchange. On last-`FabricClient`-handle drop or notification-client
+drop, cancellation is nonblocking and owned tasks release resources without
+requiring an async destructor.
 
 Use socket keepalive where configured. Initial gateway ping is not an invented
 periodic heartbeat protocol. Detect failure through the socket, TLS, deadlines,
@@ -1125,7 +1161,7 @@ For each claimed runtime release, run against a native gateway and record:
 | Certificate allowlist | Accepted configured identity and rejection of an unlisted identity, with real handshake signatures verified. |
 | Claims over TLS | Valid/invalid/expired token, metadata policy, role restrictions, and session re-establishment. |
 | TLS 1.3, if enabled | Native support plus final-flight/post-handshake interoperation, not only a Rust-to-Rust test. |
-| Notifications, if claimed | High-priority connection, registration, update/delete, gateway failover and resynchronization. |
+| Notifications, if claimed | High-priority connection, registration, endpoint/empty updates, bounded delivery, and explicit disconnect/overflow failure. Gateway failover and resynchronization are required only if transparent recovery is claimed. |
 
 Negative trust tests include wrong identity, untrusted issuer, expired/not-yet-valid
 certificate, absent/wrong client certificate, malformed chain, and unauthorized
@@ -1152,7 +1188,7 @@ Rust-to-Rust TLS tests or silently reconfigure a shared onebox.
 | 0: feasibility | Dependency/provider review, observed onebox endpoint/runtime/security profile, ABI/serializer source analysis; begin a small TLS spike as soon as the secured environment and framing exist. | Onebox test contract is explicit. Native TLS handoff/control proof is required before a TLS compatibility claim, not before clear-TCP development. |
 | 1: codec | Bounded serializer, frames, headers, IDs, control schemas. | Internal consistency, fragmentation, malformed input, and allocation bounds pass; native correctness is qualified through live operations, not golden bytes. |
 | 2: first client | Gateway manager, ping, request table, NameExists, explicit clear TCP and separately qualified certificate TLS. | Existing/nonexistent names match independent onebox state; errors, concurrent replies, cancellation and reconnect preserve delivery semantics. |
-| 3: useful reads | Typed node query with paging, uncached partition resolution, then bounded version-aware cache. | Live onebox results agree with independently known state, including claimed stale/error/paging cases. |
+| 3: useful reads | Typed node query with paging and uncached partition resolution with caller-owned previous-result metadata. | Live onebox results agree with independently known state, including claimed stale/error/paging cases. |
 | 4: sessions | Claims profile, priority connections, notification filters, acknowledgments, reconnect synchronization. | Authentication denial and slow-consumer/failover cases work without false readiness or silent event loss. |
 | 5: management breadth | Add one method family at a time; separately design health reporting and file transfer. | Every shipped method has the coverage evidence from section 4; protocol 1.2 enabled only with upload support. |
 | 6: release | Compatibility matrix, dependency/security review, public API/coverage docs, stability policy. | Claims are limited to tested runtime/security/operation combinations; all-Rust crypto profile has explicit production approval. |

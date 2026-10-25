@@ -226,6 +226,10 @@ jobs:
         MSSF_LIST_CONFIG: ${{ runner.temp }}/native-list-config.json
         MSSF_LIST_REPORT: ${{ runner.temp }}/native-list-report.json
         MSSF_LIST_OWNER: ci-${{ github.run_id }}-${{ github.run_attempt }}
+        MSSF_NOTIFICATION_CONFIG: ${{ runner.temp }}/native-notification-config.json
+        MSSF_NOTIFICATION_ALLOCATION: ${{ env.CLUSTER_NAME }}
+        MSSF_NOTIFICATION_JOURNAL: ${{ runner.temp }}/native-notification-journal.json
+        MSSF_NOTIFICATION_REPORT: ${{ runner.temp }}/native-notification-report.json
 
     - name: Upload successful native client evidence
       if: matrix.topology == 'onebox' && steps.native_client.outcome == 'success'
@@ -237,6 +241,7 @@ jobs:
           ${{ runner.temp }}/native-health-report.json
           ${{ runner.temp }}/native-name-report.json
           ${{ runner.temp }}/native-list-report.json
+          ${{ runner.temp }}/native-notification-report.json
         if-no-files-found: error
         retention-days: 7
 

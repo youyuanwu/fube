@@ -16,12 +16,17 @@ mod naming_uri;
 mod native;
 mod node_protocol;
 mod nodes;
+mod notification_protocol;
+mod notification_state;
+mod notifications;
 mod partitions;
 mod protocol;
 mod query;
 mod query_arguments;
 mod query_protocol;
 mod replicas;
+mod resolution;
+mod resolution_protocol;
 mod services;
 pub use applications::*;
 pub use deployed_applications::*;
@@ -31,9 +36,11 @@ pub use deployed_service_packages::*;
 pub use health::*;
 pub use naming_uri::NamingUri;
 pub use nodes::*;
+pub use notifications::*;
 pub use partitions::*;
 pub use query::*;
 pub use replicas::*;
+pub use resolution::*;
 pub use services::*;
 
 use std::{net::SocketAddr, time::Duration};
@@ -85,6 +92,33 @@ pub struct FabricClient {
 }
 
 impl FabricClient {
+    /// Resolve on the gateway without retaining endpoint results in this client.
+    pub async fn resolve_service_partition(
+        &self,
+        name: &NamingUri,
+        key: &PartitionKey,
+        previous: Option<&ResolvedServicePartition>,
+        timeout: Option<Duration>,
+    ) -> Result<ResolvedServicePartition> {
+        let deadline = self.deadline(timeout)?;
+        let body = resolution_protocol::encode(name, key, previous)?;
+        let result = self
+            .request(
+                "ResolveServiceRequest",
+                body,
+                deadline,
+                resolution_protocol::decode,
+            )
+            .await?;
+        if &result.service_name != name || !key.selects(&result.partition_information) {
+            self.connection.abort();
+            return Err(Error::Protocol(
+                "resolution result does not match requested selection",
+            ));
+        }
+        Ok(result)
+    }
+
     /// Connect explicitly without TLS or authentication.
     ///
     /// `timeout` also supplies the default for subsequent operations that pass

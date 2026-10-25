@@ -7,7 +7,12 @@ pub enum Error {
     InvalidInput(&'static str),
     Timeout,
     Closed,
-    Remote { code: i64, message: String },
+    /// A shared codec or transport resource was exhausted.
+    ResourceLimit(&'static str),
+    Remote {
+        code: i64,
+        message: String,
+    },
 }
 
 impl Clone for Error {
@@ -21,6 +26,7 @@ impl Clone for Error {
             Self::InvalidInput(message) => Self::InvalidInput(message),
             Self::Timeout => Self::Timeout,
             Self::Closed => Self::Closed,
+            Self::ResourceLimit(resource) => Self::ResourceLimit(resource),
             Self::Remote { code, message } => Self::Remote {
                 code: *code,
                 message: message.clone(),
@@ -37,6 +43,7 @@ impl fmt::Display for Error {
             Self::InvalidInput(message) => write!(f, "invalid input: {message}"),
             Self::Timeout => f.write_str("native operation deadline exceeded"),
             Self::Closed => f.write_str("native connection is closed"),
+            Self::ResourceLimit(resource) => write!(f, "native resource limit: {resource}"),
             Self::Remote { code, message } => {
                 write!(f, "native error {code} ({:#x}): {message}", *code as u64)
             }
