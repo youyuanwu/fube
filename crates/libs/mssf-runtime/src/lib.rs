@@ -1,8 +1,10 @@
 //! Experimental Rust-native application hosting for SF-activated Linux ExeHost.
 //! Hosting registration is not, by itself, stateless runtime qualification.
 
+mod api;
 mod context;
 mod lease;
+mod lifecycle;
 #[cfg(test)]
 mod model_tests;
 mod wire;
@@ -19,8 +21,14 @@ use mssf_transport::{
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 
+pub use api::{
+    Cancellation, FaultType, Partition, PartitionKind, ServiceContext, ServiceFuture,
+    ServiceIdentity, StatelessFactory, StatelessService,
+};
 pub use context::ActivationContext;
 use lease::Authority;
+pub use lifecycle::{MAX_CALLBACKS, MAX_SERVICE_UNITS, MAX_TOMBSTONES};
+pub use mssf_transport::{Error as RuntimeError, Result as RuntimeResult};
 use wire::*;
 
 pub const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -46,7 +54,7 @@ pub struct Runtime {
     connection: Connection,
     authority: Arc<Authority>,
     tasks: Vec<JoinHandle<()>>,
-    _incoming: Option<mpsc::Receiver<IpcRequest>>,
+    lifecycle: lifecycle::Engine,
     shutdown: bool,
 }
 
@@ -97,6 +105,12 @@ async fn poll_lease(connection: &Connection) -> Result<(Monotonic, i64)> {
             deadline_after(Duration::from_secs(5))?,
         )
         .await?;
+    if let Some(fault) = reply.properties()?.fault.filter(|fault| fault.code != 0) {
+        return Err(Error::Remote {
+            code: fault.code,
+            message: "lease poll transport fault".into(),
+        });
+    }
     let lease: LeaseReply = from_slice(&reply.body)?;
     Ok((sent, lease.ttl))
 }
@@ -270,13 +284,19 @@ impl Runtime {
                 }
             }
         });
+        let lifecycle = lifecycle::Engine::start(
+            activation.clone(),
+            authority.clone(),
+            connection.clone(),
+            incoming,
+        );
         Ok(Self {
             activation,
             node,
             connection,
             authority,
             tasks: vec![monitor, control],
-            _incoming: Some(incoming),
+            lifecycle,
             shutdown: false,
         })
     }
@@ -288,11 +308,56 @@ impl Runtime {
         &self.node
     }
 
+    /// Keep factory ownership until runtime shutdown. There is no invented
+    /// per-service-type unregister operation. Register before placement begins.
+    pub async fn register_stateless(
+        &mut self,
+        name: &str,
+        factory: Arc<dyn StatelessFactory>,
+    ) -> Result<()> {
+        self.authority.check()?;
+        if name.is_empty() || name.encode_utf16().count() > 32_768 {
+            return Err(Error::InvalidInput("invalid service type name"));
+        }
+        self.lifecycle.insert_factory(name.to_owned(), factory)?;
+        let reply: Result<ErrorReply> = call(
+            &self.connection,
+            9,
+            "RegisterServiceTypeRequest",
+            &TypeRequest {
+                context: self.activation.runtime.clone(),
+                id: TypeId {
+                    package: self.activation.runtime.code.id.package.clone(),
+                    name: name.to_owned(),
+                },
+            },
+        )
+        .await;
+        match reply {
+            Ok(reply) if reply.error == 0 || reply.error == 0x80071d31u32 as i32 as i64 => {
+                self.authority.check()
+            }
+            other => {
+                self.authority.retire();
+                self.connection.abort();
+                match other {
+                    Ok(reply) => success(reply),
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
+    pub async fn closed(&self) -> Error {
+        self.connection.closed().await
+    }
+
     /// Orderly host/runtime unregistration. A failed shutdown remains terminal
     /// and the independent authority watchdog bounds application lifetime.
     pub async fn shutdown(mut self) -> Result<()> {
         self.authority.retire();
         let outcome = tokio::time::timeout(Duration::from_millis(400), async {
+            self.lifecycle.quiesce().await?;
             success(
                 call(
                     &self.connection,

@@ -26,7 +26,7 @@ impl ActivationContext {
         Self::parse(&std::env::vars().collect())
     }
 
-    fn parse(env: &BTreeMap<String, String>) -> Result<Self> {
+    pub(crate) fn parse(env: &BTreeMap<String, String>) -> Result<Self> {
         let get = |key: &str| -> Result<String> {
             env.get(key)
                 .filter(|v| !v.is_empty() && v.len() <= 32_768)

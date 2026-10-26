@@ -157,6 +157,176 @@ pub struct UpdateContext {
     pub timeout: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeId {
+    pub package: PackageInstance,
+    pub name: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeRequest {
+    pub context: RuntimeContext,
+    pub id: TypeId,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionId {
+    pub id: Guid,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsistencyUnit {
+    pub id: PartitionId,
+    pub low: i64,
+    pub high: i64,
+    pub name: String,
+    pub kind: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Epoch {
+    pub configuration: i64,
+    pub data_loss: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailoverUnit {
+    pub id: PartitionId,
+    pub consistency: ConsistencyUnit,
+    pub current: Epoch,
+    pub previous: Epoch,
+    pub target: i32,
+    pub minimum: i32,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Node {
+    pub id: ByteArray,
+    pub instance: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Replica {
+    pub node: Node,
+    pub id: i64,
+    pub instance: i64,
+    pub current_role: i64,
+    pub previous_role: i64,
+    pub up: bool,
+    pub last_lsn: i64,
+    pub first_lsn: i64,
+    pub state: i64,
+    pub version: VersionInstance,
+    pub service_endpoint: String,
+    pub replication_endpoint: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceType {
+    pub package: PackageId,
+    pub name: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Correlation {
+    pub service: String,
+    pub scheme: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Metric {
+    pub name: String,
+    pub weight: i64,
+    pub primary: u32,
+    pub secondary: u32,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Placement {
+    pub domain: String,
+    pub kind: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Service {
+    pub name: String,
+    pub instance: u64,
+    pub service_type: ServiceType,
+    pub application: String,
+    pub version: VersionInstance,
+    pub partitions: i32,
+    pub target: i32,
+    pub minimum: i32,
+    pub stateful: bool,
+    pub persisted: bool,
+    pub initialization: ByteArray,
+    pub group: bool,
+    pub correlations: ObjectArray<Vec<Correlation>>,
+    pub constraints: String,
+    pub scaleout: i32,
+    pub metrics: ObjectArray<Vec<Metric>>,
+    pub move_cost: u32,
+    pub restart_wait: i64,
+    pub quorum_wait: i64,
+    pub update_version: u64,
+    pub placement: ObjectArray<Vec<Placement>>,
+    pub standby_keep: i64,
+    pub activation_mode: i64,
+    pub dns: String,
+    pub scaling: mssf_transport::serialization::serde::EmptyObjectArray,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyRequest {
+    pub runtime: String,
+    pub unit: FailoverUnit,
+    pub local: Replica,
+    pub remote: mssf_transport::serialization::serde::EmptyObjectArray,
+    pub service: Service,
+    pub flags: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiName {
+    pub api: i64,
+    pub interface: i64,
+    pub metadata: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyError {
+    pub error: i64,
+    pub message: String,
+    pub api: ApiName,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyReply {
+    pub unit: FailoverUnit,
+    pub local: Replica,
+    pub remote: mssf_transport::serialization::serde::EmptyObjectArray,
+    pub error: ProxyError,
+    pub flags: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateServiceReply {
+    pub error: i64,
+    pub unit: FailoverUnit,
+    pub local: Replica,
+    pub service: Service,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmptyRecord {}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicaDetail {
+    pub kind: i64,
+    pub service: String,
+    pub partition: Guid,
+    pub replica_id: i64,
+    pub instance_id: i64,
+    pub operation: i64,
+    pub operation_start: i64,
+    pub replicator_operation: i64,
+    pub loads: mssf_transport::serialization::serde::EmptyObjectArray,
+    pub read_status: i64,
+    pub write_status: i64,
+    pub replicator: Pointer<EmptyRecord>,
+    pub replica: Pointer<EmptyRecord>,
+    pub deployed_replica: Pointer<EmptyRecord>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryReply {
+    pub error: i64,
+    pub timestamp: i64,
+    pub unit: FailoverUnit,
+    pub local: Replica,
+    pub detail: ReplicaDetail,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
