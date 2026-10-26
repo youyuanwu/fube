@@ -236,7 +236,12 @@ pub fn preflight(runtime: &Path, app: &Path) -> Result<()> {
             }
             hasher.update(&block[..count]);
         }
-        if format!("{:x}", hasher.finalize()) != expected {
+        let actual: String = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if actual != expected {
             return Err(HostError(format!(
                 "unsupported native library hash: {name}"
             )));
@@ -278,5 +283,21 @@ mod tests {
     #[test]
     fn missing_native_profile_fails_before_launch() {
         assert!(preflight(Path::new("/no-such-native-profile"), Path::new("/bin/true")).is_err());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn invalid_native_library_hash_fails_before_launch() {
+        let runtime = std::env::temp_dir().join(format!("native-profile-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&runtime).unwrap();
+        fs::write(runtime.join("ClusterVersion"), "11.8.121.4").unwrap();
+        fs::write(runtime.join("libFabricRuntime.so"), b"invalid library").unwrap();
+
+        let error = preflight(&runtime, &std::env::current_exe().unwrap()).unwrap_err();
+        fs::remove_dir_all(runtime).unwrap();
+        assert_eq!(
+            error.to_string(),
+            "unsupported native library hash: libFabricRuntime.so"
+        );
     }
 }
