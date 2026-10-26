@@ -1,0 +1,229 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  NEXTEST_VERSION: "0.9.146"
+
+jobs:
+  rust-native-client:
+    name: Native-free Rust client (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Install Rust toolchain with cache
+      uses: actions-rust-lang/setup-rust-toolchain@v2
+      with:
+        components: rustfmt, clippy
+        cache: true
+        rustflags: ""
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Check production-only native-client libraries
+      run: cargo check --locked -p mssf-transport -p mssf-client -p mssf-test-host --lib
+
+    - name: Check native app fixture
+      run: cargo check --locked -p stateless-test-app
+
+    - uses: actions/setup-python@v7
+      with:
+        python-version: "3.12"
+
+    - name: Test Python harnesses
+      run: python -m unittest discover -s scripts -p "test_*.py"
+
+    - name: Install pinned nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+        fallback: none
+
+    - name: Build and archive native-client tests
+      run: |
+        cargo nextest archive --locked -p mssf-transport -p mssf-client -p mssf-test-host \
+          --archive-file "$RUNNER_TEMP/native-client-tests.tar.zst"
+
+    - name: Test isolated native-free packages
+      run: |
+        cargo nextest run --archive-file "$RUNNER_TEMP/native-client-tests.tar.zst" \
+          -E 'not group(onebox)' --no-tests fail
+
+    - name: Lint native-free packages
+      run: cargo clippy --locked -p mssf-transport -p mssf-client -p mssf-test-host --all-targets -- -D warnings
+
+    - name: Build API documentation
+      run: cargo doc --locked -p mssf-transport -p mssf-client -p mssf-test-host --no-deps
+      env:
+        RUSTDOCFLAGS: -D warnings
+
+    - name: Upload native-client test archive
+      if: runner.os == 'Linux'
+      uses: actions/upload-artifact@v7
+      with:
+        name: native-client-tests
+        path: ${{ runner.temp }}/native-client-tests.tar.zst
+        if-no-files-found: error
+        compression-level: 0
+        overwrite: true
+        retention-days: 7
+
+  linux-onebox:
+    name: Linux onebox lifecycle
+    needs: rust-native-client
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CLUSTER_NAME: ci-${{ github.run_id }}-${{ github.run_attempt }}
+      CLUSTER_CTL: scripts/onebox_ctl.py
+      CLUSTER_STATE_ROOT: build/oneboxes
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - uses: actions/setup-python@v7
+      with:
+        python-version: "3.12"
+
+    - name: Install pinned nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+        fallback: none
+
+    - name: Download native-client test archive
+      uses: actions/download-artifact@v8
+      with:
+        name: native-client-tests
+        path: ${{ runner.temp }}/native-client-tests
+
+    - name: Check runner prerequisites
+      run: |
+        docker info
+        docker compose version
+        ip -j -4 route
+        free -h
+        df -h /
+
+    - name: Test Linux lifecycle harnesses
+      run: python3 -m unittest discover -s scripts -p "test_linux*.py"
+
+    - name: Build pinned Ubuntu image
+      run: docker build --tag sf-apps-onebox:11.8.121.4 --file docker/onebox/Dockerfile docker
+
+    - name: Create native development cluster
+      run: python3 "$CLUSTER_CTL" create "$CLUSTER_NAME"
+
+    - name: Check fresh cluster health
+      run: python3 "$CLUSTER_CTL" status "$CLUSTER_NAME" > "$RUNNER_TEMP/linux-cluster-status-created.json"
+
+    - name: Exercise real native reads, health, lists and owned fixtures
+      id: native_client
+      run: |
+        export MSSF_TEST_ARCHIVE_SHA256="$(sha256sum "$RUNNER_TEMP/native-client-tests/native-client-tests.tar.zst" | cut -d ' ' -f 1)"
+        cargo-nextest nextest run \
+          --archive-file "$RUNNER_TEMP/native-client-tests/native-client-tests.tar.zst" \
+          --workspace-remap "$GITHUB_WORKSPACE" \
+          --run-ignored all -E 'group(onebox)' --no-tests fail
+      env:
+        MSSF_TEST_CONFIG: ${{ runner.temp }}/native-client-config.json
+        MSSF_TEST_REPORT: ${{ runner.temp }}/native-client-report.json
+        MSSF_HEALTH_CONFIG: ${{ runner.temp }}/native-health-config.json
+        MSSF_HEALTH_REPORT: ${{ runner.temp }}/native-health-report.json
+        MSSF_HEALTH_OWNER: ci-${{ github.run_id }}-${{ github.run_attempt }}
+        MSSF_NAME_CONFIG: ${{ runner.temp }}/native-name-config.json
+        MSSF_NAME_REPORT: ${{ runner.temp }}/native-name-report.json
+        MSSF_NAME_OWNER: ci-${{ github.run_id }}-${{ github.run_attempt }}
+        MSSF_LIST_CONFIG: ${{ runner.temp }}/native-list-config.json
+        MSSF_LIST_REPORT: ${{ runner.temp }}/native-list-report.json
+        MSSF_LIST_OWNER: ci-${{ github.run_id }}-${{ github.run_attempt }}
+        MSSF_NOTIFICATION_CONFIG: ${{ runner.temp }}/native-notification-config.json
+        MSSF_NOTIFICATION_ALLOCATION: ${{ env.CLUSTER_NAME }}
+        MSSF_NOTIFICATION_JOURNAL: ${{ runner.temp }}/native-notification-journal.json
+        MSSF_NOTIFICATION_REPORT: ${{ runner.temp }}/native-notification-report.json
+
+    - name: Upload successful native client evidence
+      if: steps.native_client.outcome == 'success'
+      uses: actions/upload-artifact@v7
+      with:
+        name: native-client-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          ${{ runner.temp }}/native-client-report.json
+          ${{ runner.temp }}/native-health-report.json
+          ${{ runner.temp }}/native-name-report.json
+          ${{ runner.temp }}/native-list-report.json
+          ${{ runner.temp }}/native-notification-report.json
+        if-no-files-found: error
+        retention-days: 7
+
+    - name: Create retained naming-store fixture
+      run: |
+        curl --noproxy '*' --fail --silent --show-error --max-time 30 \
+          --request POST --header 'Content-Type: application/json' \
+          --data '{"Name":"fabric:/lifecycle-retention"}' \
+          'http://127.0.0.1:19080/Names/$/Create?api-version=6.0'
+
+    - name: Remove containers while retaining node data
+      run: python3 "$CLUSTER_CTL" down "$CLUSTER_NAME"
+
+    - name: Resume retained cluster
+      run: python3 "$CLUSTER_CTL" up "$CLUSTER_NAME"
+
+    - name: Check resumed cluster health
+      run: python3 "$CLUSTER_CTL" status "$CLUSTER_NAME" > "$RUNNER_TEMP/linux-cluster-status-resumed.json"
+
+    - name: Check retained naming-store fixture
+      run: |
+        curl --noproxy '*' --fail --silent --show-error --max-time 30 \
+          'http://127.0.0.1:19080/Names/lifecycle-retention?api-version=6.0'
+
+    - name: Capture credential-safe diagnostics
+      if: always()
+      timeout-minutes: 2
+      run: |
+        python3 scripts/linux_cluster_diagnostics.py "$CLUSTER_NAME" --onebox \
+          --output "$RUNNER_TEMP/linux-cluster-diagnostics/diagnostics.json"
+
+    - name: Upload lifecycle diagnostics
+      if: always()
+      timeout-minutes: 2
+      uses: actions/upload-artifact@v7
+      with:
+        name: linux-onebox-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/linux-cluster-diagnostics/diagnostics.json
+        if-no-files-found: error
+        retention-days: 7
+
+    - name: Destroy only this job's cluster
+      if: always()
+      timeout-minutes: 4
+      run: |
+        if [[ -f "$CLUSTER_STATE_ROOT/$CLUSTER_NAME/state.json" ]]; then
+          python3 "$CLUSTER_CTL" destroy "$CLUSTER_NAME" --confirm "$CLUSTER_NAME"
+        else
+          echo "No cluster allocation record; no cluster resources were allocated."
+        fi

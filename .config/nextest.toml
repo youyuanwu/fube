@@ -1,0 +1,8 @@
+nextest-version = { required = "0.9.133" }
+
+[test-groups]
+onebox = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/^onebox_/)'
+test-group = 'onebox'

@@ -1,0 +1,11 @@
+[package]
+name = "stateless-test-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+mssf-core.workspace = true
+mssf-util.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
