@@ -1,0 +1,91 @@
+name: Native-free Rust client
+
+on:
+  workflow_call:
+    inputs:
+      os:
+        description: Runner operating system for the native-free checks
+        required: true
+        type: string
+    outputs:
+      nextest-version:
+        description: Pinned nextest version used to build the test archive
+        value: ${{ jobs.rust-native-client.outputs.nextest-version }}
+
+env:
+  NEXTEST_VERSION: "0.9.146"
+
+jobs:
+  rust-native-client:
+    name: Native-free Rust client
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      nextest-version: ${{ env.NEXTEST_VERSION }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Install Rust toolchain with cache
+      uses: actions-rust-lang/setup-rust-toolchain@v2
+      with:
+        components: rustfmt, clippy
+        cache: true
+        rustflags: ""
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Check production-only native-client libraries
+      run: cargo check --locked -p mssf-transport -p mssf-client -p mssf-test-host --lib
+
+    - name: Check native app fixture
+      run: cargo check --locked -p stateless-test-app
+
+    - uses: actions/setup-python@v7
+      with:
+        python-version: "3.12"
+
+    - name: Test Python harnesses
+      run: python -m unittest discover -s scripts -p "test_*.py"
+
+    - name: Install pinned nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+        fallback: none
+
+    - name: Build and archive native-client tests
+      run: |
+        cargo nextest archive --locked -p mssf-transport -p mssf-client -p mssf-test-host \
+          --archive-file "$RUNNER_TEMP/native-client-tests.tar.zst"
+
+    - name: Test isolated native-free packages
+      run: |
+        cargo nextest run --archive-file "$RUNNER_TEMP/native-client-tests.tar.zst" \
+          -E 'not group(onebox)' --no-tests fail
+
+    - name: Lint native-free packages
+      run: cargo clippy --locked -p mssf-transport -p mssf-client -p mssf-test-host --all-targets -- -D warnings
+
+    - name: Build API documentation
+      run: cargo doc --locked -p mssf-transport -p mssf-client -p mssf-test-host --no-deps
+      env:
+        RUSTDOCFLAGS: -D warnings
+
+    - name: Upload native-client test archive
+      if: runner.os == 'Linux'
+      uses: actions/upload-artifact@v7
+      with:
+        name: native-client-tests
+        path: ${{ runner.temp }}/native-client-tests.tar.zst
+        if-no-files-found: error
+        compression-level: 0
+        overwrite: true
+        retention-days: 7
