@@ -17,6 +17,7 @@ import subprocess
 import time
 import uuid
 import xml.etree.ElementTree as ET
+import onebox_ctl
 
 ROOT = Path(__file__).resolve().parents[1]
 OWNER_LABEL = "io.github.service-fabric-apps.cluster-owner"
@@ -74,8 +75,8 @@ class Allocation:
         cid = self.verify()
         return run("docker", "exec", cid, *args, timeout=timeout)
 
-    def sf(self, *args: str) -> str:
-        return self.execute("sfctl", *args)
+    def sf(self, *args: str, timeout: float = 120) -> str:
+        return self.execute("sfctl", *args, timeout=timeout)
 
 
 # Runs in the container PID namespace. pidfd binds the signal to the verified
@@ -177,47 +178,104 @@ def package(run_id: str) -> tuple[Path, str, str]:
     return destination, type_name, manifest.getroot().attrib["ApplicationTypeVersion"]
 
 
+def items(raw: str) -> list:
+    value=json.loads(raw)
+    return value if isinstance(value,list) else value["items"]
+
+
+def cleanup_deployment(allocation: Allocation, result: dict, attempts: dict) -> None:
+    application, type_name, version=result["application"],result["type_name"],result["version"]
+    cleanup=result["cleanup"]
+    try:
+        if attempts["create"]:
+            apps=items(allocation.sf("application","list",timeout=10))
+            app=next((v for v in apps if v["name"]==application),None)
+            if app:
+                if app["typeName"]!=type_name or app["typeVersion"]!=version:
+                    raise RuntimeError("minted application identity drift; refusing deletion")
+                allocation.sf("application","delete","--application-id",application.removeprefix("fabric:/"))
+                deadline=time.monotonic()+60
+                while any(v["name"]==application for v in items(allocation.sf("application","list",timeout=10))):
+                    if time.monotonic()>=deadline:
+                        raise RuntimeError("owned application deletion did not complete; no force-remove")
+                    time.sleep(0.25)
+                cleanup["application"]="deleted; absence confirmed"
+            elif not attempts["create_completed"]:
+                cleanup["application"]="unconfirmed: ambiguous create and no current observation; late completion possible"
+                result["errors"].append(cleanup["application"])
+            else:
+                cleanup["application"]="absence confirmed"
+        if attempts["provision"]:
+            types=items(allocation.sf("application","type-list",timeout=10))
+            present=any(v["name"]==type_name and v["version"]==version for v in types)
+            if present:
+                allocation.sf("application","unprovision","--application-type-name",type_name,
+                              "--application-type-version",version)
+                cleanup["type"]="unprovisioned"
+            elif not attempts["provision_completed"]:
+                cleanup["type"]="unconfirmed: ambiguous provision and no current observation; late completion possible"
+                result["errors"].append(cleanup["type"])
+            else:
+                cleanup["type"]="absence confirmed"
+    except Exception as error:
+        cleanup["error"]=str(error)
+        result["errors"].append("cleanup: "+str(error))
+        cleanup["retained_for_recovery"]={"application":application,"type":type_name,"version":version}
+
+
+def destroy_owned(name: str, owner: str) -> dict:
+    """Use the existing lifecycle lock/guards, independent of cluster health."""
+    with onebox_ctl.ctl.locked(onebox_ctl.STATE_ROOT,name) as directory:
+        cluster=onebox_ctl.Onebox(directory,name)
+        cluster.load()
+        if cluster.state["owner"]!=owner:
+            raise RuntimeError("successful-create owner changed; cleanup refused")
+        return cluster.destroy(name)
+
+
 def qualify(allocation: Allocation) -> dict:
-    run("cargo", "build", "-p", "rust-runtime-app")
-    run("cargo", "build", "-p", "mssf-client", "--example", "runtime_observer")
-    graph = run("cargo", "tree", "-p", "rust-runtime-app")
-    if any(name in graph.lower() for name in ("mssf-core", "mssf-com", "fabricruntime", "fabriccommon")):
-        raise RuntimeError("application dependency graph contains native SF adapters")
-    needed = run("readelf", "-d", "target/debug/rust-runtime-app")
-    if any(name in needed.lower() for name in ("fabricruntime", "fabriccommon")):
-        raise RuntimeError("application links native SF libraries")
     run_id = uuid.uuid4().hex[:12]
-    source, type_name, version = package(run_id)
-    remote = f"/tmp/fube-rust-runtime-{run_id}"
     application = f"fabric:/FubeRustRuntime{run_id}"
-    provisioned = created = False
+    type_name=f"FubeRustRuntime{run_id}Type"
     result = {"run_id": run_id, "onebox": allocation.name, "owner": allocation.owner,
               "container_id": allocation.container_id, "sf_version": "11.8.121.4",
-              "application": application, "type_name": type_name, "version": version,
-              "dependency_graph": graph, "elf_dynamic": needed}
+              "application": application, "type_name": type_name, "version": "1.1",
+              "status":"FAIL","errors":[],"cleanup":{}}
+    attempts={"provision":False,"provision_completed":False,"create":False,"create_completed":False}
     try:
+        run("cargo", "build", "-p", "rust-runtime-app")
+        run("cargo", "build", "-p", "mssf-client", "--example", "runtime_observer")
+        graph = run("cargo", "tree", "-p", "rust-runtime-app")
+        if any(name in graph.lower() for name in ("mssf-core", "mssf-com", "fabricruntime", "fabriccommon")):
+            raise RuntimeError("application dependency graph contains native SF adapters")
+        needed = run("readelf", "-d", "target/debug/rust-runtime-app")
+        if any(name in needed.lower() for name in ("fabricruntime", "fabriccommon")):
+            raise RuntimeError("application links native SF libraries")
+        result.update(dependency_graph=graph,elf_dynamic=needed)
+        source, type_name, version = package(run_id)
+        result.update(type_name=type_name,version=version)
+        remote=f"/tmp/fube-rust-runtime-{run_id}"
         allocation.sf("cluster", "select", "--endpoint", "http://127.0.0.1:19080")
+        if any(v["name"]==application for v in items(allocation.sf("application","list",timeout=10))):
+            raise RuntimeError("minted application collision; no cleanup capability granted")
+        if any(v["name"]==type_name for v in items(allocation.sf("application","type-list",timeout=10))):
+            raise RuntimeError("minted type collision; no cleanup capability granted")
         run("docker", "cp", str(source), f"{allocation.verify()}:{remote}")
         allocation.sf("application", "upload", "--path", remote)
+        attempts["provision"]=True
         allocation.sf("application", "provision", "--application-type-build-path", remote.rsplit("/", 1)[1])
-        provisioned = True
+        attempts["provision_completed"]=True
+        attempts["create"]=True
         allocation.sf("application", "create", "--app-name", application, "--app-type", type_name, "--app-version", version)
-        created = True
+        attempts["create_completed"]=True
         result["restart"] = restart(allocation, application + "/Singleton")
-        result["status"] = "PASS_SINGLETON_PLACEMENT_RPC_NATIVE_RESTART"
-        return result
+    except Exception as error:
+        result["errors"].append("qualification: "+str(error))
     finally:
-        # Only names minted by this run are removed. Never use force-remove as
-        # an implicit workaround for broken graceful lifecycle behavior.
-        if created:
-            allocation.sf("application", "delete", "--application-id", application.removeprefix("fabric:/"))
-            deadline=time.monotonic()+60
-            while any(item["name"]==application for item in json.loads(allocation.sf("application","list")).get("items",[])):
-                if time.monotonic()>=deadline:
-                    raise RuntimeError("owned application deletion did not complete; refusing forced cleanup")
-                time.sleep(0.25)
-        if provisioned:
-            allocation.sf("application", "unprovision", "--application-type-name", type_name, "--application-type-version", version)
+        cleanup_deployment(allocation,result,attempts)
+    if not result["errors"]:
+        result["status"]="PASS_SINGLETON_PLACEMENT_RPC_NATIVE_RESTART"
+    return result
 
 
 def main() -> None:
@@ -231,7 +289,8 @@ def main() -> None:
     if args.restart_service and not args.existing_owner:
         parser.error("--restart-service requires --existing-owner")
     created = False
-    allocation = None
+    owner = None
+    result={"status":"FAIL","onebox":args.name,"errors":[],"cleanup":{}}
     try:
         if args.existing_owner:
             owner = args.existing_owner
@@ -242,11 +301,27 @@ def main() -> None:
             owner = json.loads((ROOT / "build/oneboxes" / args.name / "state.json").read_text())["owner"]
         allocation = Allocation(args.name, owner)
         result = restart(allocation, args.restart_service) if args.restart_service else qualify(allocation)
-        print(json.dumps(result, indent=2))
+        result.setdefault("status","PASS_SINGLETON_PLACEMENT_RPC_NATIVE_RESTART")
+        result.setdefault("errors",[])
+        result.setdefault("cleanup",{})
+    except Exception as error:
+        result["errors"].append("execution: "+str(error))
     finally:
-        if created and allocation:
-            allocation.verify()
-            run("python3", "scripts/onebox_ctl.py", "destroy", args.name, "--confirm", args.name, timeout=300)
+        if created:
+            try:
+                if owner is None:
+                    raise RuntimeError("successful-create owner unavailable; preserve resources for recovery")
+                result["cleanup"]["onebox"]=destroy_owned(args.name,owner)
+            except Exception as error:
+                result["errors"].append("onebox cleanup: "+str(error))
+                result["cleanup"]["onebox"]="unconfirmed; owned state retained for recovery"
+        else:
+            result["cleanup"]["onebox"]="caller-owned allocation retained" if args.existing_owner else "create rejected; no cleanup capability"
+    if result["errors"]:
+        result["status"]="FAIL"
+    print(json.dumps(result,indent=2))
+    if result["status"]=="FAIL":
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

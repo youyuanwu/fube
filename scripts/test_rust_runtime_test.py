@@ -4,7 +4,9 @@ import copy
 import io
 import json
 import unittest
-from unittest.mock import patch
+import subprocess
+from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 import rust_runtime_test as runtime
 
@@ -43,13 +45,108 @@ class AllocationTests(unittest.TestCase):
 
     def test_collision_or_partial_creation_never_gets_name_only_cleanup(self):
         with patch("sys.argv", ["rust_runtime_test.py", "owned"]), \
-             patch.object(runtime, "run", side_effect=RuntimeError("controller rejected existing/partial allocation")) as call:
-            with self.assertRaises(RuntimeError):
+             patch.object(runtime, "run", side_effect=RuntimeError("controller rejected existing/partial allocation")) as call, \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
                 runtime.main()
             self.assertEqual(call.call_count, 1)
             self.assertEqual(call.call_args.args[2], "create")
         # The controller itself owns partial-create recovery. A failed create
         # cannot grant this script a cleanup capability for a pre-existing box.
+
+    def test_successful_create_retains_cleanup_after_constructor_failure(self):
+        with patch("sys.argv",["rust_runtime_test.py","owned"]), \
+             patch.object(runtime,"run",return_value="{}"), \
+             patch.object(Path,"read_text",return_value='{"owner":"acquired-owner"}'), \
+             patch.object(runtime,"Allocation",side_effect=RuntimeError("post-create status failed")), \
+             patch.object(runtime,"destroy_owned",return_value={"phase":"destroyed"}) as destroy, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(SystemExit):
+                runtime.main()
+            destroy.assert_called_once_with("owned","acquired-owner")
+            result=json.loads(output.getvalue())
+            self.assertEqual(result["status"],"FAIL")
+            self.assertIn("post-create",result["errors"][0])
+            self.assertEqual(result["cleanup"]["onebox"]["phase"],"destroyed")
+
+    def test_cleanup_uses_controller_lock_and_owner_not_readiness(self):
+        cluster=MagicMock()
+        cluster.state={"owner":"acquired-owner","phase":"down"}
+        with patch.object(runtime.onebox_ctl.ctl,"locked",return_value=contextlib.nullcontext(Path("/fake"))), \
+             patch.object(runtime.onebox_ctl,"Onebox",return_value=cluster):
+            runtime.destroy_owned("owned","acquired-owner")
+            cluster.destroy.assert_called_once_with("owned")
+            cluster.destroy.reset_mock()
+            cluster.state["owner"]="different-owner"
+            with self.assertRaises(RuntimeError):
+                runtime.destroy_owned("owned","acquired-owner")
+            cluster.destroy.assert_not_called()
+
+
+class AmbiguousMutationTests(unittest.TestCase):
+    def qualify(self,lost,cleanup_failure=False):
+        allocation=MagicMock(name="allocation")
+        allocation.name="owned";allocation.owner="capability";allocation.container_id="cid"
+        allocation.verify.return_value="cid"
+        present={"type":False,"app":False}
+        calls=[]
+        type_name="FubeRustRuntimeabcdefgh1234Type"
+        application="fabric:/FubeRustRuntimeabcdefgh1234"
+        def sf(*args,**_kwargs):
+            calls.append(args)
+            if args==("application","list"):
+                return json.dumps({"items":[{"name":application,"typeName":type_name,"typeVersion":"1.1"}] if present["app"] else []})
+            if args==("application","type-list"):
+                return json.dumps({"items":[{"name":type_name,"version":"1.1"}] if present["type"] else []})
+            if args[:2]==("application","provision"):
+                present["type"]=True
+                if lost=="provision":raise subprocess.TimeoutExpired("accepted provision",1)
+            if args[:2]==("application","create"):
+                present["app"]=True
+                if lost=="create":raise subprocess.TimeoutExpired("accepted create",1)
+            if args[:2]==("application","delete"):
+                if cleanup_failure:raise RuntimeError("cleanup delete failed")
+                present["app"]=False
+            if args[:2]==("application","unprovision"):present["type"]=False
+            return "{}"
+        allocation.sf.side_effect=sf
+        with patch.object(runtime,"run",return_value="native-free"), \
+             patch.object(runtime.uuid,"uuid4",return_value=MagicMock(hex="abcdefgh1234")), \
+             patch.object(runtime,"package",return_value=(Path("/generated"),type_name,"1.1")):
+            result=runtime.qualify(allocation)
+        return result,present,calls
+
+    def test_accepted_provision_timeout_is_reconciled_and_removed(self):
+        result,present,calls=self.qualify("provision")
+        self.assertEqual(result["status"],"FAIL")
+        self.assertFalse(present["type"])
+        self.assertTrue(any(v[:2]==("application","unprovision") for v in calls))
+        self.assertIn("accepted provision",result["errors"][0])
+
+    def test_accepted_create_timeout_deletes_only_minted_app_then_type(self):
+        result,present,calls=self.qualify("create")
+        self.assertEqual(result["status"],"FAIL")
+        self.assertEqual(present,{"type":False,"app":False})
+        delete=next(i for i,v in enumerate(calls) if v[:2]==("application","delete"))
+        unprovision=next(i for i,v in enumerate(calls) if v[:2]==("application","unprovision"))
+        self.assertLess(delete,unprovision)
+        self.assertIn("accepted create",result["errors"][0])
+
+    def test_cleanup_error_preserves_original_failure_and_recovery_identity(self):
+        result,present,_=self.qualify("create",cleanup_failure=True)
+        self.assertEqual(result["status"],"FAIL")
+        self.assertTrue(present["app"])
+        self.assertIn("accepted create",result["errors"][0])
+        self.assertIn("cleanup delete failed",result["errors"][1])
+        self.assertEqual(result["cleanup"]["retained_for_recovery"]["application"],result["application"])
+
+    def test_existing_owner_allocation_is_never_destroyed(self):
+        with patch("sys.argv",["rust_runtime_test.py","owned","--existing-owner","capability"]), \
+             patch.object(runtime,"Allocation"),patch.object(runtime,"qualify",return_value={"status":"FAIL","errors":["failure"],"cleanup":{}}), \
+             patch.object(runtime,"destroy_owned") as destroy,contextlib.redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(SystemExit):runtime.main()
+            destroy.assert_not_called()
+            self.assertEqual(json.loads(output.getvalue())["cleanup"]["onebox"],"caller-owned allocation retained")
 
 
 class ProcessTests(unittest.TestCase):
