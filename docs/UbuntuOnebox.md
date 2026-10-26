@@ -11,7 +11,7 @@ The topology and endpoint assignments are ported from
 `service-fabric-rs/.devcontainer/onebox/` at source revision
 `7ad146aea4dd2d23b3886121c32175e75e024b06`. The destructive shell bootstrap is
 replaced by the same guarded lifecycle used for the
-[multi-container cluster](LinuxContainerCluster.md). The two workflows share
+[source repository's multi-container cluster](https://github.com/youyuanwu/service-fabric-apps-rs/blob/main/docs/LinuxContainerCluster.md). The two workflows share
 resource ownership checks, image retention, readiness checks, shutdown handling,
 and account/tracing setup. Unlike the multi-container cluster, onebox does not
 provision or upgrade a native Cluster Manager baseline.
@@ -102,7 +102,7 @@ is never an automatic startup optimization.
 
 ## Lifecycle
 
-The command structure matches `just cluster`:
+Use the following lifecycle commands:
 
 ```sh
 just onebox status dev
@@ -176,12 +176,11 @@ Linux images are outside this port.
 
 ## Continuous integration
 
-The Linux lifecycle matrix in `.github/workflows/ci.yaml` independently builds and
-runs the multi-container cluster and this single-container onebox on Ubuntu
-24.04 hosts. Each entry exercises creation, health, retained down/up, resumed
-health, and survival of a synthetic naming-store entry. Only the multi-container
-entry establishes a native baseline; onebox uses source-style startup without
-upgrades or a fixed stability wait. Each entry always attempts allowlisted
+The Linux onebox job in `.github/workflows/ci.yaml` builds and runs this
+single-container onebox on an Ubuntu 24.04 host, then qualifies the native Rust
+client using the archived tests. It exercises creation, health, retained down/up,
+resumed health, and survival of a synthetic naming-store entry. Onebox uses
+source-style startup without upgrades or a fixed stability wait. The job always attempts allowlisted
 credential-safe diagnostics and exact-name confirmed teardown. XML, raw runtime logs,
 environment variables, and arbitrary health/error text are not uploaded.
 

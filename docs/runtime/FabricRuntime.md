@@ -766,8 +766,8 @@ criteria and native-versus-model evidence policy, see
 [host-tests]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Hosting2/NonActivatedApplicationHost.Test.cpp#L298-L356
 [linux-example]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/test/LinuxRunAsTest/FabricRuntimeHost.cpp#L51-L73
 [native-revision]: https://github.com/microsoft/service-fabric/tree/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d
-[sample-main]: ../../crates/samples/kvmap/src/main.rs#L47-L79
-[sample-replica]: ../../crates/samples/kvmap/src/kvmap.rs#L184-L259
+[sample-main]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/samples/kvmap/src/main.rs#L47-L79
+[sample-replica]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/samples/kvmap/src/kvmap.rs#L184-L259
 [ipc-client]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/IpcClient.cpp#L18-L162
 [ipc-client-send]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/IpcClient.cpp#L201-L245
 [ipc-server]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/IpcServer.cpp#L20-L302

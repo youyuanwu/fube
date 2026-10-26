@@ -67,6 +67,10 @@ not reasons to assume liveness is already solved.
 | [`mssf-rplctr`][rust-replicator] | Experimental Rust custom-replicator vocabulary and tonic transport | Epoch, progress, abort, quorum, configuration, build/remove and streams contain TODO/dummy behavior |
 | [`kvmap`][rust-sample] | Deployed application packaging and workload ideas | It uses `mssf-core` runtime/context and calls native partition `CreateReplicator` |
 
+The native-backed `mssf-ext`, `mssf-rplctr`, and `kvmap` examples remain in
+`service-fabric-apps-rs`; the links above pin that source snapshot. They are not
+members of the fube workspace.
+
 In particular, `connect_duplex_clear` is **not generic runtime duplex IPC**.
 Its only accepted reverse envelope is the NamingGateway service-notification
 protocol; its consuming reply context constructs `ServiceNotificationReply`.
@@ -489,9 +493,9 @@ the inspected implementation; line anchors identify the relevant surfaces.
 [rust-serde]: ../../crates/libs/mssf-transport/src/serialization/serde.rs#L1-L28
 [rust-connection]: ../../crates/libs/mssf-transport/src/connection.rs#L265-L554
 [rust-client]: ../../crates/libs/mssf-client/Cargo.toml
-[rust-ext]: ../../crates/libs/mssf-ext/src/state_replicator.rs#L17-L69
-[rust-replicator]: ../../crates/libs/mssf-rplctr/src/rplctr.rs#L73-L138
-[rust-sample]: ../../crates/samples/kvmap/src/kvmap.rs#L210-L259
+[rust-ext]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/libs/mssf-ext/src/state_replicator.rs#L17-L69
+[rust-replicator]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/libs/mssf-rplctr/src/rplctr.rs#L73-L138
+[rust-sample]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/samples/kvmap/src/kvmap.rs#L210-L259
 [rust-reverse]: ../../crates/libs/mssf-transport/src/connection.rs#L119-L164
 [rust-reverse-dispatch]: ../../crates/libs/mssf-transport/src/connection.rs#L579-L639
 [rust-limits]: ../../crates/libs/mssf-transport/src/serialization.rs#L5-L8

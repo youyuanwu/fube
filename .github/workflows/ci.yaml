@@ -4,17 +4,25 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   NEXTEST_VERSION: "0.9.146"
 
 jobs:
   rust-native-client:
-    name: Native-free Rust client
-    runs-on: ubuntu-24.04
+    name: Native-free Rust client (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
     timeout-minutes: 15
     permissions:
       contents: read
+    defaults:
+      run:
+        shell: bash
     steps:
     - uses: actions/checkout@v7
       with:
@@ -32,6 +40,16 @@ jobs:
 
     - name: Check production-only native-client libraries
       run: cargo check --locked -p mssf-transport -p mssf-client -p mssf-test-host --lib
+
+    - name: Check native app fixture
+      run: cargo check --locked -p stateless-test-app
+
+    - uses: actions/setup-python@v7
+      with:
+        python-version: "3.12"
+
+    - name: Test Python harnesses
+      run: python -m unittest discover -s scripts -p "test_*.py"
 
     - name: Install pinned nextest
       uses: taiki-e/install-action@v2
@@ -58,6 +76,7 @@ jobs:
         RUSTDOCFLAGS: -D warnings
 
     - name: Upload native-client test archive
+      if: runner.os == 'Linux'
       uses: actions/upload-artifact@v7
       with:
         name: native-client-tests
@@ -67,98 +86,17 @@ jobs:
         overwrite: true
         retention-days: 7
 
-  build:
-    runs-on: windows-latest
-    steps:
-    - uses: actions/checkout@v7
-
-    - name: Install just
-      uses: taiki-e/install-action@just
-
-    - uses: actions/setup-python@v7
-      with:
-        python-version: "3.x"
-
-    - name: Install Rust toolchain with cache
-      uses: actions-rust-lang/setup-rust-toolchain@v2
-      with:
-        components: rustfmt, clippy
-        cache: true
-        rustflags: ""
-
-    - name: install protoc
-      uses: taiki-e/install-action@protoc
-
-    - name: Run cargo check
-      run: cargo check
-
-    - name: Run cargo fmt
-      run: cargo fmt --all -- --check
-    
-    - name: Run cargo clippy
-      run: cargo clippy --all-targets -- -D warnings   
-
-    - name: Test packaging
-      run: python -m unittest discover -s scripts -p "test_*.py"
-
-    - name: run build
-      run: just build
-
-    # mysql bin has conflicting dlls with fabric than prevents fabric from starting
-    - name: Remove conflict dll paths
-      shell: powershell
-      run: |
-        get-command libprotobuf.dll | format-list
-        Remove-Item -Recurse -Force "C:\Program Files\MySQL\MySQL Server 8.0\bin"
-
-    - name: start sf cluster
-      shell: pwsh
-      run: |
-        Powershell.exe -File "C:\Program Files\Microsoft SDKs\Service Fabric\ClusterSetup\DevClusterSetup.ps1"
-        Start-Sleep -Seconds 20
-        Connect-ServiceFabricCluster
-      
-    - name: provision kvmap app
-      run: |
-        Powershell.exe -File scripts/kvmap_ctl.ps1 -Action Add
-        Start-Sleep -Seconds 30
-      shell: pwsh
-    # todo: may need to sleep to wait for app to be up. but test compilation may take some time.
-
-    - name: run all unittests
-      run: cargo test --all
-      env:
-        RUST_BACKTRACE: '1'
-
-  linux-cluster:
-    name: Linux ${{ matrix.topology }} lifecycle
+  linux-onebox:
+    name: Linux onebox lifecycle
     needs: rust-native-client
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-        - topology: cluster
-          controller: scripts/linux_cluster_ctl.py
-          state-root: build/linux-clusters
-          image: sf-apps-node:11.8.121.4
-          dockerfile: docker/linux-cluster/Dockerfile
-          context: docker/linux-cluster
-          diagnostics-args: ""
-        - topology: onebox
-          controller: scripts/onebox_ctl.py
-          state-root: build/oneboxes
-          image: sf-apps-onebox:11.8.121.4
-          dockerfile: docker/onebox/Dockerfile
-          context: docker
-          diagnostics-args: "--onebox"
     permissions:
       contents: read
     env:
       CLUSTER_NAME: ci-${{ github.run_id }}-${{ github.run_attempt }}
-      CLUSTER_CTL: ${{ matrix.controller }}
-      CLUSTER_STATE_ROOT: ${{ matrix.state-root }}
+      CLUSTER_CTL: scripts/onebox_ctl.py
+      CLUSTER_STATE_ROOT: build/oneboxes
     defaults:
       run:
         shell: bash
@@ -172,14 +110,12 @@ jobs:
         python-version: "3.12"
 
     - name: Install pinned nextest
-      if: matrix.topology == 'onebox'
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
         fallback: none
 
     - name: Download native-client test archive
-      if: matrix.topology == 'onebox'
       uses: actions/download-artifact@v8
       with:
         name: native-client-tests
@@ -197,7 +133,7 @@ jobs:
       run: python3 -m unittest discover -s scripts -p "test_linux*.py"
 
     - name: Build pinned Ubuntu image
-      run: docker build --tag "${{ matrix.image }}" --file "${{ matrix.dockerfile }}" "${{ matrix.context }}"
+      run: docker build --tag sf-apps-onebox:11.8.121.4 --file docker/onebox/Dockerfile docker
 
     - name: Create native development cluster
       run: python3 "$CLUSTER_CTL" create "$CLUSTER_NAME"
@@ -207,7 +143,6 @@ jobs:
 
     - name: Exercise real native reads, health, lists and owned fixtures
       id: native_client
-      if: matrix.topology == 'onebox'
       run: |
         export MSSF_TEST_ARCHIVE_SHA256="$(sha256sum "$RUNNER_TEMP/native-client-tests/native-client-tests.tar.zst" | cut -d ' ' -f 1)"
         cargo-nextest nextest run \
@@ -232,7 +167,7 @@ jobs:
         MSSF_NOTIFICATION_REPORT: ${{ runner.temp }}/native-notification-report.json
 
     - name: Upload successful native client evidence
-      if: matrix.topology == 'onebox' && steps.native_client.outcome == 'success'
+      if: steps.native_client.outcome == 'success'
       uses: actions/upload-artifact@v7
       with:
         name: native-client-${{ github.run_id }}-${{ github.run_attempt }}
@@ -270,7 +205,7 @@ jobs:
       if: always()
       timeout-minutes: 2
       run: |
-        python3 scripts/linux_cluster_diagnostics.py "$CLUSTER_NAME" ${{ matrix.diagnostics-args }} \
+        python3 scripts/linux_cluster_diagnostics.py "$CLUSTER_NAME" --onebox \
           --output "$RUNNER_TEMP/linux-cluster-diagnostics/diagnostics.json"
 
     - name: Upload lifecycle diagnostics
@@ -278,7 +213,7 @@ jobs:
       timeout-minutes: 2
       uses: actions/upload-artifact@v7
       with:
-        name: linux-${{ matrix.topology }}-${{ github.run_id }}-${{ github.run_attempt }}
+        name: linux-onebox-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/linux-cluster-diagnostics/diagnostics.json
         if-no-files-found: error
         retention-days: 7

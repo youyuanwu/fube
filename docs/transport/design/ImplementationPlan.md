@@ -596,7 +596,7 @@ Operator verification:
 - [Workspace dependencies](../../../Cargo.toml)
 - [Pinned Rust toolchain](../../../rust-toolchain.toml)
 - [Existing CI](../../../.github/workflows/ci.yaml)
-- [Linux container-cluster lifecycle](../../LinuxContainerCluster.md), optional
+- [Source Linux container-cluster lifecycle](https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/docs/LinuxContainerCluster.md), optional
   development environment rather than the required onebox provisioning mechanism.
 - [Ubuntu single-container onebox](../../UbuntuOnebox.md), a disposable clear-TCP
   environment with localhost native/HTTP gateways.

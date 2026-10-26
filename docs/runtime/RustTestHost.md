@@ -151,7 +151,7 @@ complete-scenario path without those fixture contracts; see section 2.6.
 |---|---|---|
 | Native-free | `Native-free Rust client` in [`ci.yaml`](../../.github/workflows/ci.yaml) | Rust model/regression tests, including the host; no SF native libraries or node. These are not native interoperability evidence. |
 | Standalone native | `Linux standalone native runtime` in [`native-runtime.yaml`](../../.github/workflows/native-runtime.yaml) | Ubuntu22 x86_64, Python3.12, pinned Rust toolchain and SHA-verified SF 11.8.121.4 libraries. Runs the real `prepare`, `bootstrap`, `close`, `abort`, `manifest-close`, `manifest-abort` commands, directly on Linux. **No SF package installation, node, cluster, onebox or container startup.** |
-| Cluster/onebox | `Linux cluster lifecycle`, `Linux onebox lifecycle`, and Windows `build` in `ci.yaml` | Real SF nodes and deployment/lifecycle tests. These exercise a different boundary, not the standalone host profile. |
+| Onebox | `Linux onebox lifecycle` in `ci.yaml` | Real SF nodes and native-client/lifecycle tests. These exercise a different boundary, not the standalone host profile. Windows runs native-free checks only. |
 
 The standalone workflow runs on pushes and PRs touching its workflow, native
 runner/tests, crates, Cargo manifest/lock or Rust toolchain; it also supports
@@ -640,7 +640,7 @@ The first stateful experiment can use a deliberately declared singleton test
 configuration with `MinReplicaSetSize = TargetReplicaSetSize = 1`, matching
 manifest/bundle and wire service description. This is an explicit test variant,
 not a silent rewrite of production quorum policy and not an HA/quorum test.
-The repository's `kvmap` currently calls the native replicator; it cannot serve
+The source repository's `kvmap` currently calls the native replicator; it cannot serve
 as proof of a Rust replication engine.
 [Existing sample][kvmap].
 
@@ -791,4 +791,4 @@ source maps. Additional bootstrap/materialization evidence follows.
 [health-reply]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/management/HealthManager/ReportHealthReplyMessageBody.h#L12-L47
 [proxy-map]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/LocalFailoverUnitProxyMap.cpp#L58-L150
 [factory-table]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Hosting2/ServiceFactoryRegistrationTable.cpp#L162-L251
-[kvmap]: ../../crates/samples/kvmap/src/kvmap.rs#L210-L259
+[kvmap]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/samples/kvmap/src/kvmap.rs#L210-L259

@@ -1,39 +1,68 @@
-# Service Fabric Rust Apps
-Various service fabric rust apps.
+# fube
 
-# Apps and libs
-* [kvmap](crates\samples\kvmap) an key value store using SF default replicator. Still work in progress.
-* [kvstore](crates\samples\kvstore) app using default SF key value store implementation in FabricRuntime.
-* [ext](crates\libs\mssf-ext) lib that extends mssf-core crate with various support including default replicator.
-* [Native runtime test host](docs/runtime/RustTestHost.md#2-implemented-mvp-and-usage) runs a real stateless FabricRuntime app without a cluster, including a [narrow manifest-package profile](docs/runtime/ManifestTestHost.md) (experimental Linux loopback profile).
+Experimental native-wire Service Fabric client, transport, and standalone test
+host in Rust.
 
-# Build
-Install Rust (using the toolchain pinned in `rust-toolchain.toml`), [just](https://just.systems), Python 3, and Protocol Buffers (`protoc`).
+| Component | Purpose |
+| --- | --- |
+| [`mssf-client`](crates/libs/mssf-client) | Native clear-TCP FabricClient queries, naming, health, resolution, and notifications; no native SF library dependency. |
+| [`mssf-transport`](crates/libs/mssf-transport) | Bounded Fabric framing, serialization, and concurrent TCP messaging. |
+| [`mssf-test-host`](crates/libs/mssf-test-host) | Node-side stateless test-host subset, including manifest-based SharedProcess activation. |
+| [`stateless-test-app`](crates/samples/stateless-test-app) | Acceptance fixture using the **real native FabricRuntime** through published `mssf` bindings. |
 
-Service Fabric dependencies use the published `mssf` 0.10 release family.
-Tokio-based Service Fabric executors require a multi-threaded Tokio runtime.
+The host is not a pure-Rust application runtime or a full Service Fabric node.
+Current native qualification is Linux x86-64, SF 11.8.121.4, trusted loopback,
+without TLS. See the [exact supported manifest profile](docs/runtime/ManifestTestHost.md).
 
-```ps1
-just build
+## Build and test
+
+Install the pinned Rust toolchain and Python 3.11+. `just` is optional. No
+Protocol Buffers compiler or sibling checkout is needed.
+
+```sh
+cargo build --locked --workspace
+cargo test --locked -p mssf-transport -p mssf-client -p mssf-test-host
+python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
-`just` also runs the build by default. It compiles the workspace and packages `kvmap`
-under `build/kvmap_root`, ready for the deployment script below.
-Use `just build-rust` to compile without packaging, or `just package` to repackage
-an existing debug build. Packaging uses only the Python standard library.
+[Development and test tiers](docs/Development.md) describe native-free tests,
+standalone native-runtime acceptance, and live onebox qualification. CI runs
+native-free tests on Linux and Windows, a separate Linux standalone-native job,
+and a Linux onebox lifecycle/client job. Windows does not qualify the native host.
 
-# Run Example on SF-onebox
-```ps1
-.\scripts\kvmap_ctl.ps1 -Action Add
+## Simple Linux onebox
+
+Use a local Linux x86-64 Docker daemon with Compose v2+, Python, and iproute2:
+
+```sh
+just onebox-build
+just onebox create dev
+just onebox status dev
+just onebox down dev
+just onebox up dev
+just onebox destroy dev --confirm dev
 ```
 
-# Documentation
-* [Runtime test tiers and CI](docs/runtime/RustTestHost.md#ci-test-tiers-and-diagnostics) - native-free regressions, standalone Linux native-library acceptance without a node, and full cluster tests.
-* [FabricRuntime architecture](docs/runtime/FabricRuntime.md), [node-side RA/Hosting](docs/runtime/FabricRuntimeHost.md), and the separate [pure Rust runtime design](docs/runtime/RustFabricRuntime.md).
-* [Ubuntu single-container onebox](docs/UbuntuOnebox.md) - five local nodes in one container, with retained lifecycle and localhost HTTP/native client gateways.
-* [Linux container-cluster lifecycle](docs/LinuxContainerCluster.md) - build, create, resume, inspect, stop, and explicitly destroy a local three-node cluster.
-* [Joining an existing Windows Service Fabric cluster](docs/WindowsClusterJoin.md) - standalone PowerShell workflow, source trace, security, and operational caveats.
-* [Linux multi-container cluster design](docs/LinuxContainerClusterDesign.md) - one node per Docker container, Windows orchestration adaptation, and dynamic-join validation gates.
+Without `just`, build with
+`docker build -t sf-apps-onebox:11.8.121.4 -f docker/onebox/Dockerfile docker`
+and run `python3 scripts/onebox_ctl.py ...`.
 
-# License
-MIT
+This is one privileged Ubuntu container with five local SF nodes, retained data,
+and **unsecured loopback-only** gateways at `127.0.0.1:19000` (native TCP) and
+`http://127.0.0.1:19080` (HTTP/Explorer). No app is implicitly deployed.
+See [onebox prerequisites, lifecycle, and recovery](docs/UbuntuOnebox.md).
+
+## Documentation
+
+- [Rust FabricClient API and native qualification](docs/transport/RustFabricClient.md)
+- [Native transport/TCP/TLS specification](docs/transport/Transport.md)
+- [FabricClient behavior](docs/transport/FabricClient.md) and [message formats](docs/transport/FabricClientMessageFormat.md)
+- [Native FabricRuntime](docs/runtime/FabricRuntime.md) and [node-side host responsibilities](docs/runtime/FabricRuntimeHost.md)
+- [Standalone test host](docs/runtime/RustTestHost.md) and [manifest execution](docs/runtime/ManifestTestHost.md)
+- [Pure-Rust application runtime design](docs/runtime/RustFabricRuntime.md) (not implemented)
+- [Migration provenance and repository boundaries](docs/Migration.md)
+
+## License
+
+MIT. The existing [fube license](LICENSE) is retained alongside the
+[original imported-code notice](LICENSE.service-fabric-apps-rs).
