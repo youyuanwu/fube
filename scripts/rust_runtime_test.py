@@ -248,11 +248,16 @@ def controls_and_authority(allocation: Allocation, application: str, result: dic
               "--constraints",constraint]
         args+=["--int-scheme","--int-scheme-count","2","--int-scheme-low","0","--int-scheme-high","1"] if partitioned else ["--singleton-scheme"]
         allocation.sf(*args)
-    def metric(name,minimum,key=None,service="Concurrent"):
+    def metric(name,minimum,key=None,service="Concurrent",abort_min=0):
         v=observe(application+"/"+service,key)
         if v["native_pid"]!=anchor["native_pid"]:
             raise RuntimeError("unrelated partition moved/crashed during control qualification")
-        return v if v["rpc"]["native_actions"][name]>=minimum else None
+        if service=="Concurrent" and key=="int:1" and (
+            v["rpc"]["instance"]!=beta["rpc"]["instance"] or v["rpc"]["incarnation"]!=beta["rpc"]["incarnation"]
+        ):
+            raise RuntimeError("sibling instance/incarnation changed during target-only operation")
+        counters=v["rpc"]["native_actions"]
+        return v if counters[name]>=minimum and counters["abort_callbacks"]>=abort_min else None
     create("Concurrent",True)
     with ThreadPoolExecutor(max_workers=2) as pool:
         alpha,beta=list(pool.map(lambda key:wait_observe(application+"/Concurrent",key=key),["int:0","int:1"]))
@@ -275,7 +280,8 @@ def controls_and_authority(allocation: Allocation, application: str, result: dic
     # the host and is explicitly not accepted as Abort callback evidence.
     allocation.sf("replica","remove","--node-name",alpha["rpc"]["node"],
                   "--partition-id",alpha["rpc"]["partition"],"--replica-id",str(alpha["rpc"]["instance"]))
-    result["abort_observation"]=wait_condition(lambda:metric("abort",baseline["abort"]+1,"int:1"),"native Abort command")
+    result["abort_observation"]=wait_condition(lambda:metric("abort",baseline["abort"]+1,"int:1",
+        abort_min=baseline["abort_callbacks"]+1),"native Abort command and completed cleanup")
     renewed=wait_condition(lambda: (v if (v:=observe(application+"/Concurrent","int:0"))["rpc"]["instance"]!=alpha["rpc"]["instance"] else None),
                            "native replacement of removed partition")
     if renewed["native_pid"]!=beta["native_pid"]:
@@ -286,10 +292,12 @@ def controls_and_authority(allocation: Allocation, application: str, result: dic
     wait_observe(application+"/FailClose")
     allocation.sf("service","delete","--service-id",(application+"/FailClose").removeprefix("fabric:/").replace("/","~"))
     result["close_failure_observation"]=wait_condition(
-        lambda:metric("close_failures",failures_before["close_failures"]+1,"int:1"),"native close failure/abort cleanup")
+        lambda:metric("close_failures",failures_before["close_failures"]+1,"int:1",
+            abort_min=failures_before["abort_callbacks"]+1),"native close failure/abort cleanup")
     create("FailOpen")
     result["open_failure_observation"]=wait_condition(
-        lambda:metric("open_failures",failures_before["open_failures"]+1,"int:1"),"native open failure")
+        lambda:metric("open_failures",failures_before["open_failures"]+1,"int:1",
+            abort_min=failures_before["abort_callbacks"]+2),"native open failure and completed cleanup")
     try:
         observe(application+"/FailOpen")
     except RuntimeError:

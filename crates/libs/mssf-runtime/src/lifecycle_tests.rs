@@ -16,6 +16,7 @@ struct Calls {
     partitions: Mutex<Vec<Partition>>,
     release: Notify,
     abort_release: AtomicBool,
+    abort_running: AtomicUsize,
 }
 struct Factory(Arc<Calls>);
 struct Instance {
@@ -80,7 +81,16 @@ impl StatelessService for Instance {
     }
     fn abort(&self) {
         self.calls.aborts.fetch_add(1, Ordering::SeqCst);
-        if matches!(self.mode, 4..=6) {
+        self.calls.abort_running.fetch_add(1, Ordering::SeqCst);
+        struct Running<'a>(&'a AtomicUsize);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _running = Running(&self.calls.abort_running);
+        assert_ne!(self.mode, 11, "intentional Abort panic");
+        if matches!(self.mode, 4..=6 | 12) {
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             while !self.calls.abort_release.load(Ordering::Acquire)
                 && std::time::Instant::now() < deadline
@@ -538,6 +548,7 @@ async fn query_tracks_actual_abort_cleanup_and_graceful_close_operations() {
             if mode == 4 {
                 request.flags = 4
             }
+
             h.send("ReplicaClose", &request).await;
         }
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -570,4 +581,59 @@ async fn query_tracks_actual_abort_cleanup_and_graceful_close_operations() {
         .await;
         h.engine.quiesce().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn abort_panic_or_cleanup_timeout_never_acknowledges_disposal() {
+    for mode in [11, 12] {
+        let mut h = Harness::new().await;
+        let mut request = h.request(1, 1, mode);
+        h.send("ReplicaOpen", &request).await;
+        h.receive("ReplicaOpenReply").await;
+        request.flags = 4;
+        h.send("ReplicaClose", &request).await;
+        let retired =
+            tokio::time::timeout(Duration::from_secs(1), h.engine.shared.connection.closed()).await;
+        // Release and observe the controlled blocking worker even if the
+        // assertions below fail; it must not outlive the test.
+        h.calls.abort_release.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while h.calls.abort_running.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await
+            }
+        })
+        .await
+        .unwrap();
+        let cause = retired.expect("failing Abort must retire the connection");
+        assert!(if mode == 12 {
+            matches!(cause, Error::Timeout)
+        } else {
+            matches!(cause, Error::Protocol("service abort panicked"))
+        });
+        assert!(h.engine.shared.authority.check().is_err());
+        let response = tokio::time::timeout(Duration::from_secs(1), read_message(&mut h.peer))
+            .await
+            .unwrap();
+        assert!(
+            response.is_err(),
+            "failed Abort must not send successful ReplicaCloseReply"
+        );
+    }
+}
+
+#[tokio::test]
+async fn named_partition_wire_decode_preserves_owned_model_identity() {
+    let mut h = Harness::new().await;
+    let mut request = h.request(9, 1, 0);
+    request.unit.consistency.kind = 3;
+    request.unit.consistency.name = "owned-named-partition".into();
+    h.send("ReplicaOpen", &request).await;
+    h.receive("ReplicaOpenReply").await;
+    assert_eq!(
+        h.calls.partitions.lock().unwrap()[0].kind,
+        PartitionKind::Named("owned-named-partition".into())
+    );
+    h.send("ReplicaClose", &request).await;
+    h.receive("ReplicaCloseReply").await;
+    h.engine.quiesce().await.unwrap();
 }
