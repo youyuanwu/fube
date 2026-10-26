@@ -1,100 +1,114 @@
+use mssf_transport::{Error, Result};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
-use mssf_transport::{Error, Result};
-
+/// Atomic terminal authority. The hard fence never waits for a user lock or I/O.
 #[derive(Debug)]
-struct State {
-    expires: Instant,
-    retired: Option<Instant>,
-    disarmed: bool,
+pub(crate) struct Authority {
+    origin: Instant,
+    expires: AtomicU64,
+    retired: AtomicU64,
+    disarmed: AtomicBool,
 }
-
-/// Terminal authority. Native TTL is relative to request send, never receipt.
-#[derive(Debug)]
-pub(crate) struct Authority(Mutex<State>);
 impl Authority {
     pub(crate) fn new(sent: Instant, ticks: i64) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self(Mutex::new(State {
-            expires: expiration(sent, ticks)?,
-            retired: None,
-            disarmed: false,
-        }))))
+        let expires = ttl_nanos(ticks)?;
+        Ok(Arc::new(Self {
+            origin: sent,
+            expires: AtomicU64::new(expires),
+            retired: AtomicU64::new(u64::MAX),
+            disarmed: AtomicBool::new(false),
+        }))
+    }
+    fn elapsed(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.origin)
+            .as_nanos()
+            .min(u64::MAX as u128 - 1) as u64
+    }
+    fn candidate(&self, sent: Instant, ticks: i64) -> Result<u64> {
+        self.elapsed(sent)
+            .checked_add(ttl_nanos(ticks)?)
+            .filter(|v| *v < u64::MAX)
+            .ok_or(Error::Protocol("lease clock overflow"))
+    }
+    /// Replace provisional startup deadline only after a fresh correlated poll.
+    pub(crate) fn establish(&self, sent: Instant, ticks: i64) -> Result<()> {
+        self.check()?;
+        self.expires
+            .store(self.candidate(sent, ticks)?, Ordering::SeqCst);
+        self.check()
     }
     pub(crate) fn renew(&self, sent: Instant, ticks: i64, now: Instant) -> Result<()> {
-        let expires = expiration(sent, ticks)?;
-        let mut state = self.0.lock().unwrap();
-        if state.retired.is_some() || now >= state.expires || state.disarmed {
-            state.retired.get_or_insert(now);
+        let expires = self.candidate(sent, ticks)?;
+        let current = self.elapsed(now);
+        if self.retired.load(Ordering::SeqCst) != u64::MAX
+            || current >= self.expires.load(Ordering::SeqCst)
+            || self.disarmed.load(Ordering::SeqCst)
+        {
+            self.retired.fetch_min(current, Ordering::SeqCst);
             return Err(Error::Closed);
         }
-        if expires <= now {
+        if expires <= current {
             return Err(Error::Timeout);
         }
-        state.expires = state.expires.max(expires);
-        Ok(())
+        self.expires.fetch_max(expires, Ordering::SeqCst);
+        self.check()
     }
     pub(crate) fn check(&self) -> Result<()> {
-        let mut state = self.0.lock().unwrap();
-        if state.retired.is_some() || state.disarmed || Instant::now() >= state.expires {
-            state.retired.get_or_insert_with(Instant::now);
+        if self.retired.load(Ordering::SeqCst) != u64::MAX
+            || self.disarmed.load(Ordering::SeqCst)
+            || self.elapsed(Instant::now()) >= self.expires.load(Ordering::SeqCst)
+        {
+            self.retire();
             Err(Error::Closed)
         } else {
             Ok(())
         }
     }
     pub(crate) fn retire(&self) {
-        self.0
-            .lock()
-            .unwrap()
-            .retired
-            .get_or_insert_with(Instant::now);
+        self.retired
+            .fetch_min(self.elapsed(Instant::now()), Ordering::SeqCst);
     }
     pub(crate) fn disarm(&self) {
-        self.0.lock().unwrap().disarmed = true;
+        self.disarmed.store(true, Ordering::SeqCst);
     }
-    pub(crate) fn watchdog(self: &Arc<Self>) {
-        let weak = Arc::downgrade(self);
+    pub(crate) fn watchdog(self: &Arc<Self>) -> Result<()> {
+        // Strong ownership deliberately survives Runtime drop, task cancellation
+        // and failed shutdown. Only proven cleanup may disarm it.
+        let authority = self.clone();
         std::thread::Builder::new()
             .name("sf-authority".into())
-            .spawn(move || {
-                loop {
-                    {
-                        let Some(authority) = weak.upgrade() else {
-                            return;
-                        };
-                        let state = authority.0.lock().unwrap();
-                        if state.disarmed {
-                            return;
-                        }
-                        let deadline = state
-                            .retired
-                            .map_or(state.expires, |retired| retired.min(state.expires));
-                        if Instant::now() >= deadline + Duration::from_millis(500) {
-                            // This is deliberately independent of the async executor,
-                            // callback cooperation, locks and user abort handlers.
-                            eprintln!("mssf-runtime: authority lost; terminating application");
-                            std::process::exit(70);
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
+            .spawn(move || loop {
+                if authority.disarmed.load(Ordering::SeqCst) {
+                    return;
                 }
-            })
-            .expect("authority watchdog thread");
+                let deadline = authority
+                    .expires
+                    .load(Ordering::SeqCst)
+                    .min(authority.retired.load(Ordering::SeqCst));
+                if authority.elapsed(Instant::now()).saturating_sub(deadline) >= 500_000_000 {
+                    // _exit does not acquire stdio locks, flush streams or invoke
+                    // application-controlled atexit handlers. OS process boundary only.
+                    unsafe { libc::_exit(70) }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            })?;
+        Ok(())
     }
 }
-fn expiration(sent: Instant, ticks: i64) -> Result<Instant> {
+fn ttl_nanos(ticks: i64) -> Result<u64> {
     if ticks <= 0 {
         return Err(Error::Closed);
     }
-    sent.checked_add(Duration::from_nanos(
-        (ticks as u64)
-            .checked_mul(100)
-            .ok_or(Error::Protocol("lease TTL overflow"))?,
-    ))
-    .ok_or(Error::Protocol("lease clock overflow"))
+    (ticks as u64)
+        .checked_mul(100)
+        .filter(|v| *v < u64::MAX)
+        .ok_or(Error::Protocol("lease TTL overflow"))
 }
 
 #[cfg(test)]
@@ -107,7 +121,7 @@ mod tests {
         assert!(a
             .renew(now, 20_000_000, now + Duration::from_secs(3))
             .is_err());
-        assert_eq!(a.0.lock().unwrap().expires, now + Duration::from_secs(10));
+        assert_eq!(a.expires.load(Ordering::SeqCst), 10_000_000_000);
         assert!(a
             .renew(
                 now + Duration::from_secs(9),
@@ -133,5 +147,6 @@ mod tests {
         a.retire();
         assert!(a.check().is_err());
         assert!(a.renew(now, 200_000_000, now).is_err());
+        assert!(a.establish(now, 200_000_000).is_err());
     }
 }

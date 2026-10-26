@@ -3,6 +3,8 @@
 
 mod context;
 mod lease;
+#[cfg(test)]
+mod model_tests;
 mod wire;
 
 use std::{
@@ -100,6 +102,10 @@ async fn poll_lease(connection: &Connection) -> Result<(Monotonic, i64)> {
 }
 
 impl Runtime {
+    /// Attach using only node-injected context. Once attached, dropping this
+    /// owner, failed/cancelled shutdown or loss of node authority terminates the
+    /// entire application process within the hard-fence bound. Call `shutdown`
+    /// explicitly for successful orderly cleanup.
     pub async fn attach() -> Result<Self> {
         tokio::time::timeout(Duration::from_secs(120), Self::attach_inner())
             .await
@@ -108,12 +114,19 @@ impl Runtime {
 
     async fn attach_inner() -> Result<Self> {
         let activation = ActivationContext::from_environment()?;
+        let authority = Authority::new(Monotonic::now(), 1_200_000_000)?;
+        let ingress_authority = authority.clone();
         let (control_tx, mut controls) = mpsc::channel::<IpcRequest>(MAX_INCOMING_COMMANDS);
         let (command_tx, incoming) = mpsc::channel::<IpcRequest>(MAX_INCOMING_COMMANDS);
         let handler = Arc::new(move |request: IpcRequest| {
             let p = request.message.properties()?;
             let sender = match p.actor {
-                8 => &control_tx,
+                8 => {
+                    // Every currently admitted host control is terminal in this
+                    // profile. Latch before registration can consume its reply.
+                    ingress_authority.retire();
+                    &control_tx
+                }
                 12 => &command_tx,
                 _ => return Err(Error::Protocol("unsupported application IPC actor")),
             };
@@ -143,6 +156,7 @@ impl Runtime {
         )
         .await?;
         success(ErrorReply { error: start.error })?;
+        authority.check()?;
         if start.lease_handle == 0 || start.node_id.is_empty() || start.node_name.is_empty() {
             connection.abort();
             return Err(Error::Protocol(
@@ -160,6 +174,7 @@ impl Runtime {
             )
             .await?,
         )?;
+        authority.check()?;
         success(
             call(
                 &connection,
@@ -171,11 +186,11 @@ impl Runtime {
             )
             .await?,
         )?;
+        authority.check()?;
         // Initial TTL source ambiguity never grants serving authority. A fresh
         // correlated node poll establishes request-send-relative authority.
         let (sent, ttl) = poll_lease(&connection).await?;
-        let authority = Authority::new(sent, ttl)?;
-        authority.check()?;
+        authority.establish(sent, ttl)?;
         let node = NodeContext {
             id: start.node_id,
             instance: start.node_instance,
@@ -186,11 +201,7 @@ impl Runtime {
             deployment_directory: start.deployment,
             work_directory: start.work,
         };
-        eprintln!(
-            "mssf-runtime: attached host={} runtime={} node={} code_sequence={} lease_ticks={ttl}",
-            activation.host_id, activation.runtime.id, node.name, activation.code_sequence
-        );
-        authority.watchdog();
+        authority.watchdog()?;
         let monitor_connection = connection.clone();
         let monitor_authority = authority.clone();
         let monitor = tokio::spawn(async move {
@@ -251,9 +262,10 @@ impl Runtime {
                 }
                 .await;
                 if let Err(error) = result {
-                    eprintln!("mssf-runtime: host control failure: {error}");
                     control_connection.abort();
                     control_authority.retire();
+                    // No synchronous diagnostics may delay fencing.
+                    let _ = error;
                     break;
                 }
             }

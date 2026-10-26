@@ -543,6 +543,7 @@ dependencies = [
 name = "mssf-runtime"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "mssf-transport",
  "serde",
  "tokio",
