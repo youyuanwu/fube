@@ -40,7 +40,10 @@ resource identities remain stable. No multi-container Dockerfile, multi-containe
 CI job, kvmap, or replicator implementation is imported.
 
 The original repository retains `kvmap`, `mssf-ext`, `mssf-rplctr`, their packaging
-and Windows deployment workflow, and the multi-container cluster. Shared
-infrastructure stays there as needed; moved client/host code and onebox-specific
-entry points are removed there. No generated cluster state, native libraries,
+and Windows deployment workflow, and the multi-container cluster. After the
+initial migration removed its onebox-specific entry points, the matching onebox
+infrastructure, offline tests, and lifecycle CI were restored there. Retained-data
+shutdown/restart qualification lives there; fube keeps its self-contained onebox
+for live native-client CI without duplicating that qualification. Moved
+client/host code remains in fube. No generated cluster state, native libraries,
 build output, or local workflow artifacts are migrated.
