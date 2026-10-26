@@ -1578,10 +1578,11 @@ cargo nextest run --archive-file build/native-client-tests.tar.zst \
   -E 'not group(onebox)' --no-tests fail
 ```
 
-CI uploads that archive after the Rust checks pass. The Linux lifecycle matrix
-depends on the producer; only its onebox entry downloads and consumes the
-archive. No additional job is created. Both runners use Ubuntu 24.04 and the
-same pinned nextest version.
+CI uploads that archive after the Linux Rust checks pass. The Linux onebox job
+depends only on that producer and downloads and consumes its archive; Windows
+Rust checks run independently and do not delay or block onebox. Both Linux
+runners use Ubuntu 24.04, and the producer exports its pinned nextest version so
+the onebox consumer installs the same version.
 
 On the target, check out the same source revision and provide the absolute
 private output paths as above. Rust and Cargo are not required to

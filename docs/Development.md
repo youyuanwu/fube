@@ -39,11 +39,13 @@ qualifies all five scenarios on Ubuntu 22.04.
 ## Live native client
 
 Create a [onebox](UbuntuOnebox.md), install the pinned nextest version from
-[CI](../.github/workflows/ci.yaml), and follow the
+[the native-client workflow](../.github/workflows/native-client.yaml), and follow the
 [client qualification instructions](transport/RustFabricClient.md).
 CI builds the test archive once, then runs the explicitly owned fixture/setup
-tests and `group(onebox)` against the real native gateway. The onebox job always
-attempts diagnostics and confirmed teardown. Retained-data shutdown/restart
+tests and `group(onebox)` against the real native gateway. The onebox job depends
+only on the Linux native-free checks; Windows checks run independently and do
+not delay or block it. The onebox job always attempts diagnostics and confirmed
+teardown. Retained-data shutdown/restart
 qualification runs in
 [service-fabric-apps-rs](https://github.com/youyuanwu/service-fabric-apps-rs/blob/main/docs/UbuntuOnebox.md),
 not in this job; offline lifecycle regression tests and local down/up commands
