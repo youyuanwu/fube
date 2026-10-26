@@ -6,6 +6,7 @@ members = [
   "crates/libs/mssf-test-host",
   "crates/libs/mssf-runtime",
   "crates/samples/stateless-test-app",
+  "crates/samples/rust-runtime-app",
 ]
 
 [workspace.dependencies]

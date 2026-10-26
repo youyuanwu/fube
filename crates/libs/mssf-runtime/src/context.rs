@@ -56,8 +56,19 @@ impl ActivationContext {
         let host_id = get("Fabric_ApplicationHostId")?;
         uuid::Uuid::parse_str(&host_id)
             .map_err(|_| Error::InvalidInput("invalid native host GUID"))?;
-        let address: SocketAddr = get("Fabric_RuntimeConnectionAddress")?
+        let address_text = get("Fabric_RuntimeConnectionAddress")?;
+        let address: SocketAddr = address_text
             .parse()
+            .or_else(|_| {
+                // Native Linux activation uses the literal host name "localhost".
+                // Resolve that exact loopback alias only, never discover/substitute
+                // a node address or accept arbitrary DNS for this security profile.
+                address_text
+                    .strip_prefix("localhost:")
+                    .and_then(|port| port.parse::<u16>().ok())
+                    .map(|port| SocketAddr::from(([127, 0, 0, 1], port)))
+                    .ok_or(())
+            })
             .map_err(|_| Error::InvalidInput("invalid native IPC address"))?;
         if !address.ip().is_loopback() {
             return Err(Error::InvalidInput("native IPC must be loopback"));
@@ -253,6 +264,28 @@ mod tests {
             let mut e = env();
             e.insert(k.into(), v.into());
             assert!(ActivationContext::parse(&e).is_err(), "{k}");
+        }
+    }
+
+    #[test]
+    fn actual_native_localhost_alias_is_loopback_only() {
+        let mut e = env();
+        e.insert(
+            "Fabric_RuntimeConnectionAddress".into(),
+            "localhost:12345".into(),
+        );
+        assert_eq!(
+            ActivationContext::parse(&e).unwrap().address,
+            "127.0.0.1:12345".parse().unwrap()
+        );
+        for address in [
+            "node:12345",
+            "localhost:invalid",
+            "localhost:12345:9",
+            "localhost.evil:12345",
+        ] {
+            e.insert("Fabric_RuntimeConnectionAddress".into(), address.into());
+            assert!(ActivationContext::parse(&e).is_err());
         }
     }
 }
