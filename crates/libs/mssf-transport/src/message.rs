@@ -22,6 +22,7 @@ pub const RELATES_TO: u16 = 0x8004;
 pub const EXPECTS_REPLY: u16 = 0x8005;
 pub const FAULT: u16 = 0x8007;
 pub const HIGH_PRIORITY: u16 = 0x8009;
+pub const IPC: u16 = 0x800b;
 pub const ACTIVITY: u16 = 0x8020;
 pub const TIMEOUT: u16 = 0x8023;
 pub const CLIENT_VERSION: u16 = 0x8025;

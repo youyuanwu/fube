@@ -34,6 +34,9 @@ const MAX_UNMATCHED_REPLIES: usize = 1024;
 #[cfg(test)]
 #[path = "connection_duplex_tests.rs"]
 mod duplex_tests;
+#[cfg(test)]
+#[path = "connection_ipc_tests.rs"]
+mod ipc_tests;
 
 pub fn deadline_after(timeout: Duration) -> Result<Instant> {
     let ticks = timeout.as_nanos() / 100;
@@ -110,7 +113,67 @@ struct Shared {
     changed: Notify,
     stopped: watch::Sender<bool>,
     reverse: Option<ReverseHandler>,
+    ipc: Option<IpcHandler>,
+    ipc_identity: Option<Header>,
     controls: mpsc::Sender<Control>,
+}
+
+/// Nonblocking bounded handoff for an explicitly selected application IPC role.
+/// An error retires the session. This never changes gateway dispatch policy.
+pub type IpcHandler = Arc<dyn Fn(IpcRequest) -> Result<()> + Send + Sync>;
+
+pub struct IpcRequest {
+    pub message: Message,
+    /// Present only for transport-correlated requests. Lifecycle semantic
+    /// responses must instead use `Connection::send_one_way`.
+    pub reply: Option<IpcReplyContext>,
+}
+
+/// Single-use correlated response on the original IPC connection.
+pub struct IpcReplyContext {
+    shared: Weak<Shared>,
+    id: MessageId,
+}
+
+impl IpcReplyContext {
+    pub async fn reply(
+        self,
+        actor: i64,
+        action: Option<&str>,
+        body: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let shared = self.shared.upgrade().ok_or(Error::Closed)?;
+        let mut headers = vec![Header::actor(actor)?, Header::relates_to(self.id)?];
+        if let Some(action) = action {
+            headers.push(Header::action(action)?);
+        }
+        queue_control(&shared, Message { headers, body }, deadline).await
+    }
+}
+
+async fn queue_control(shared: &Shared, message: Message, deadline: Instant) -> Result<()> {
+    if let Some(error) = shared.error() {
+        return Err(error);
+    }
+    remaining_ticks(deadline)?;
+    let bytes = message.to_frame()?.encode()?;
+    let (complete, receiver) = oneshot::channel();
+    shared
+        .controls
+        .try_send(Control {
+            bytes,
+            deadline,
+            complete,
+        })
+        .map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => Error::ResourceLimit("reply/control queue"),
+            mpsc::error::TrySendError::Closed(_) => Error::Closed,
+        })?;
+    timeout_at(deadline, receiver)
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|_| shared.error().unwrap_or(Error::Closed))?
 }
 
 /// Bounded, nonblocking handoff executed on the transport reader.
@@ -269,7 +332,7 @@ pub struct Connection {
 
 impl Connection {
     pub async fn connect_clear(endpoint: SocketAddr, deadline: Instant) -> Result<Self> {
-        Self::connect_role(endpoint, deadline, None).await
+        Self::connect_role(endpoint, deadline, None, None).await
     }
 
     /// Explicitly opt into native notification reverse requests on a dedicated socket.
@@ -278,13 +341,35 @@ impl Connection {
         deadline: Instant,
         handler: ReverseHandler,
     ) -> Result<Self> {
-        Self::connect_role(endpoint, deadline, Some(handler)).await
+        Self::connect_role(endpoint, deadline, Some(handler), None).await
+    }
+
+    /// Generic clear application IPC, separate from the gateway notification
+    /// exception. The caller must enforce its activated-host/security policy.
+    pub async fn connect_ipc_clear(
+        endpoint: SocketAddr,
+        deadline: Instant,
+        host_id: &str,
+        handler: IpcHandler,
+    ) -> Result<Self> {
+        if host_id.is_empty() || !endpoint.ip().is_loopback() {
+            return Err(Error::InvalidInput(
+                "IPC requires host identity and loopback destination",
+            ));
+        }
+        let identity = Header::object(crate::message::IPC, |e| {
+            e.string(host_id)?;
+            e.u32(std::process::id());
+            Ok(())
+        })?;
+        Self::connect_role(endpoint, deadline, None, Some((handler, identity))).await
     }
 
     async fn connect_role(
         endpoint: SocketAddr,
         deadline: Instant,
         handler: Option<ReverseHandler>,
+        ipc: Option<(IpcHandler, Header)>,
     ) -> Result<Self> {
         remaining_ticks(deadline)?;
         let process_id = uuid::Uuid::new_v4().to_bytes_le();
@@ -316,7 +401,7 @@ impl Connection {
         })
         .await
         .map_err(|_| Error::Timeout)??;
-        Ok(Self::start_role(stream, remote, process_id, handler))
+        Ok(Self::start_role(stream, remote, process_id, handler, ipc))
     }
 
     #[cfg(test)]
@@ -324,7 +409,7 @@ impl Connection {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        Self::start_role(stream, remote, process_id, None)
+        Self::start_role(stream, remote, process_id, None, None)
     }
 
     fn start_role<S>(
@@ -332,11 +417,16 @@ impl Connection {
         remote: ListenInstance,
         process_id: [u8; 16],
         reverse: Option<ReverseHandler>,
+        ipc: Option<(IpcHandler, Header)>,
     ) -> Self
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (controls, control_rx) = mpsc::channel(MAX_QUEUED_CONTROLS);
+        let (ipc, ipc_identity) = match ipc {
+            Some((handler, identity)) => (Some(handler), Some(identity)),
+            None => (None, None),
+        };
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 terminal: None,
@@ -351,6 +441,8 @@ impl Connection {
             changed: Notify::new(),
             stopped: watch::channel(false).0,
             reverse,
+            ipc,
+            ipc_identity,
             controls,
         });
         let (commands, receiver) = mpsc::channel(MAX_QUEUED_REQUESTS);
@@ -405,6 +497,43 @@ impl Connection {
     ) -> Result<Message> {
         self.request_decoded(action, actor, extra_headers, body, deadline, Ok)
             .await
+    }
+
+    /// Send an IPC semantic response or other one-way message using reserved
+    /// bounded control capacity, with native client host/PID identity.
+    pub async fn send_one_way(
+        &self,
+        actor: i64,
+        action: &str,
+        body: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let shared = &self.handle.shared;
+        let identity = shared
+            .ipc_identity
+            .clone()
+            .ok_or(Error::InvalidInput("not an IPC session"))?;
+        let id = {
+            let mut inner = shared.inner.lock().unwrap();
+            let index = inner.next_index;
+            inner.next_index = index
+                .checked_add(1)
+                .ok_or(Error::Protocol("message ID index exhausted"))?;
+            MessageId {
+                guid: self.handle.process_id,
+                index,
+            }
+        };
+        let message = Message {
+            headers: vec![
+                Header::actor(actor)?,
+                Header::action(action)?,
+                Header::message_id(id)?,
+                identity,
+            ],
+            body,
+        };
+        queue_control(shared, message, deadline).await
     }
 
     /// Decode a correlated reply on the driver before delivering its result.
@@ -478,7 +607,13 @@ impl Connection {
         if body.len() > MAX_FRAME_SIZE {
             return Err(Error::InvalidInput("request body exceeds frame limit"));
         }
-        let mut headers = vec![Header::action(action)?, Header::actor(actor)?];
+        let mut headers = vec![Header::actor(actor)?];
+        if !action.is_empty() {
+            headers.push(Header::action(action)?);
+        }
+        if let Some(identity) = &shared.ipc_identity {
+            headers.push(identity.clone());
+        }
         headers.extend(extra_headers);
         headers.push(Header::timeout(remaining_ticks(deadline)?)?);
         headers.push(Header::boolean(EXPECTS_REPLY, true)?);
@@ -630,6 +765,25 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
                         shared: Arc::downgrade(shared),
                         id: properties.id,
                     },
+                })?;
+                continue;
+            }
+        }
+        if properties.relates_to == MessageId::default() {
+            if let Some(handler) = &shared.ipc {
+                if properties.id == MessageId::default()
+                    || properties.uncorrelated_reply
+                    || properties.fault.is_some()
+                {
+                    return Err(Error::Protocol("invalid IPC command envelope"));
+                }
+                let context = properties.expects_reply.then(|| IpcReplyContext {
+                    shared: Arc::downgrade(shared),
+                    id: properties.id,
+                });
+                handler(IpcRequest {
+                    message: reply,
+                    reply: context,
                 })?;
                 continue;
             }

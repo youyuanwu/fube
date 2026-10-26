@@ -540,6 +540,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mssf-runtime"
+version = "0.1.0"
+dependencies = [
+ "mssf-transport",
+ "serde",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "mssf-test-host"
 version = "0.1.0"
 dependencies = [

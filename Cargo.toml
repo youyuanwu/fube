@@ -4,12 +4,14 @@ members = [
   "crates/libs/mssf-transport",
   "crates/libs/mssf-client",
   "crates/libs/mssf-test-host",
+  "crates/libs/mssf-runtime",
   "crates/samples/stateless-test-app",
 ]
 
 [workspace.dependencies]
 mssf-transport = { path = "./crates/libs/mssf-transport" }
 mssf-client = { path = "./crates/libs/mssf-client" }
+mssf-runtime = { path = "./crates/libs/mssf-runtime" }
 mssf-core = "0.10"
 mssf-util = "0.10"
 uuid = { version = "1", features = ["v4"] }
