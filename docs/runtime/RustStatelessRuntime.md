@@ -72,19 +72,22 @@ Open/Close semantic replies are one-way, not `RelatesTo` responses
 Each service unit has independent operation ownership; callbacks never run on
 the socket reader or under registry/state locks. Duplicate Open reuses the
 stored endpoint; duplicate Close acknowledges a disposed unit. Stale epochs and
-incarnations are fenced. Incompatible operations follow native retry/drop
+incarnations are fenced. All successful Open replies, including cached duplicates,
+check terminal authority at the common publication boundary
+([lifecycle.rs:346](../../crates/libs/mssf-runtime/src/lifecycle.rs#L346)).
+Incompatible operations follow native retry/drop
 semantics; Abort/Drop can cancel an opening instance, followed by abort cleanup.
 Graceful Close errors become successful native Close only **after** cleanup,
 while internal failure counters remain observable
 ([lifecycle.rs:252](../../crates/libs/mssf-runtime/src/lifecycle.rs#L252),
-[lifecycle.rs:569](../../crates/libs/mssf-runtime/src/lifecycle.rs#L569)).
+[lifecycle.rs:574](../../crates/libs/mssf-runtime/src/lifecycle.rs#L574)).
 
 RAPQuery uses the common DTO but a **default service description**, not Open's
 manifest identity. Query validation is operation-specific and replies reflect
 actual local operation/state. Equal-version description updates acknowledge
 without changing stored data; only newer versions apply
-([lifecycle.rs:610](../../crates/libs/mssf-runtime/src/lifecycle.rs#L610),
-[lifecycle.rs:646](../../crates/libs/mssf-runtime/src/lifecycle.rs#L646)).
+([lifecycle.rs:615](../../crates/libs/mssf-runtime/src/lifecycle.rs#L615),
+[lifecycle.rs:651](../../crates/libs/mssf-runtime/src/lifecycle.rs#L651)).
 Unknown required actions/schema fail the host, never silently succeed.
 
 ## Authority and process-wide failure
@@ -163,8 +166,11 @@ mutations. `--existing-owner OWNER` explicitly reuses a caller-owned healthy
 box and never destroys it. It still cleans its exact minted application/type.
 Ownership drift, failed cleanup or unconfirmed late mutations produce FAIL with
 recovery identities
-([harness ownership](../../scripts/rust_runtime_test.py#L39),
-[cleanup](../../scripts/rust_runtime_test.py#L347)).
+([harness ownership](../../scripts/rust_runtime_test.py#L40),
+[cleanup](../../scripts/rust_runtime_test.py#L356)).
+Creation captures its original owner capability under the existing controller
+lock; a later same-name allocation never grants cleanup authority
+([create_owned](../../scripts/rust_runtime_test.py#L406)).
 
 The authority test needs Linux x86-64 pidfd APIs and the existing privileged
 onebox to duplicate **only the verified application's IPC descriptor**, recheck

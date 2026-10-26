@@ -351,6 +351,11 @@ async fn reply(
     error: Option<Error>,
     api: i64,
 ) -> Result<()> {
+    // All successful endpoint publication, including cached duplicate Open,
+    // crosses the same terminal-authority guard at the reply boundary.
+    if action == "ReplicaOpenReply" && error.is_none() {
+        shared.authority.check()?;
+    }
     let mut local = request.local;
     local.service_endpoint = endpoint;
     let failed = error.is_some();

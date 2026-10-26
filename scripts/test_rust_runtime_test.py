@@ -47,19 +47,19 @@ class AllocationTests(unittest.TestCase):
 
     def test_collision_or_partial_creation_never_gets_name_only_cleanup(self):
         with patch("sys.argv", ["rust_runtime_test.py", "owned"]), \
-             patch.object(runtime, "run", side_effect=RuntimeError("controller rejected existing/partial allocation")) as call, \
+             patch.object(runtime, "create_owned", side_effect=RuntimeError("controller rejected existing/partial allocation")) as create, \
+             patch.object(runtime,"destroy_owned") as destroy, \
              contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit):
                 runtime.main()
-            self.assertEqual(call.call_count, 1)
-            self.assertEqual(call.call_args.args[2], "create")
+            create.assert_called_once_with("owned")
+            destroy.assert_not_called()
         # The controller itself owns partial-create recovery. A failed create
         # cannot grant this script a cleanup capability for a pre-existing box.
 
     def test_successful_create_retains_cleanup_after_constructor_failure(self):
         with patch("sys.argv",["rust_runtime_test.py","owned"]), \
-             patch.object(runtime,"run",return_value="{}"), \
-             patch.object(Path,"read_text",return_value='{"owner":"acquired-owner"}'), \
+             patch.object(runtime,"create_owned",return_value="acquired-owner"), \
              patch.object(runtime,"Allocation",side_effect=RuntimeError("post-create status failed")), \
              patch.object(runtime,"destroy_owned",return_value={"phase":"destroyed"}) as destroy, \
              contextlib.redirect_stdout(io.StringIO()) as output:
@@ -83,6 +83,46 @@ class AllocationTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 runtime.destroy_owned("owned","acquired-owner")
             cluster.destroy.assert_not_called()
+
+    def test_creation_captures_original_owner_before_controller_unlock(self):
+        cluster=MagicMock()
+        held={"value":False}
+        @contextlib.contextmanager
+        def lock(_root,_name):
+            held["value"]=True
+            yield Path("/fake")
+            held["value"]=False
+            # Earliest permitted replacement is after creation's transaction.
+            cluster.state={"owner":"b"*32}
+        def create(*_args):
+            self.assertTrue(held["value"])
+            cluster.state={"owner":"a"*32}
+        cluster.create.side_effect=create
+        with patch.object(runtime.onebox_ctl.ctl,"check_local_docker"), \
+             patch.object(runtime.onebox_ctl.ctl,"locked",side_effect=lock), \
+             patch.object(runtime.onebox_ctl,"Onebox",return_value=cluster):
+            owner=runtime.create_owned("owned")
+        self.assertEqual(owner,"a"*32)
+        self.assertEqual(cluster.state["owner"],"b"*32)
+
+    def test_replaced_allocation_never_grants_new_owner_cleanup_authority(self):
+        cluster=MagicMock()
+        cluster.state={"owner":"b"*32}
+        with patch("sys.argv",["rust_runtime_test.py","owned"]), \
+             patch.object(runtime,"create_owned",return_value="a"*32), \
+             patch.object(runtime,"Allocation",side_effect=RuntimeError("replacement owner mismatch")) as allocation, \
+             patch.object(runtime,"qualify") as qualify, \
+             patch.object(runtime.onebox_ctl.ctl,"locked",return_value=contextlib.nullcontext(Path("/fake"))), \
+             patch.object(runtime.onebox_ctl,"Onebox",return_value=cluster), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(SystemExit):
+                runtime.main()
+            allocation.assert_called_once_with("owned","a"*32)
+            qualify.assert_not_called()
+            cluster.destroy.assert_not_called()
+            result=json.loads(output.getvalue())
+            self.assertEqual(result["status"],"FAIL")
+            self.assertIn("owner changed",result["errors"][1])
 
 
 @unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")

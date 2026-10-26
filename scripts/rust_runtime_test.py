@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -402,6 +403,24 @@ def destroy_owned(name: str, owner: str) -> dict:
         return cluster.destroy(name)
 
 
+def create_owned(name: str) -> str:
+    """Capture this creation's owner while its existing controller lock is held."""
+    onebox_ctl.ctl.check_local_docker()
+    previous_umask=os.umask(0o077)
+    try:
+        with onebox_ctl.ctl.locked(onebox_ctl.STATE_ROOT,name) as directory:
+            cluster=onebox_ctl.Onebox(directory,name)
+            cluster.create(onebox_ctl.DEFAULT_SUBNET,"sf-apps-onebox:"+onebox_ctl.ctl.RUNTIME,900)
+            # Return the original in-memory creation capability, never whichever
+            # owner appears in a later name-based state-file read.
+            owner=cluster.state["owner"]
+            if not isinstance(owner,str) or not re.fullmatch(r"[a-f0-9]{32}",owner):
+                raise RuntimeError("creation did not provide a valid owner capability")
+            return owner
+    finally:
+        os.umask(previous_umask)
+
+
 def qualify(allocation: Allocation, full: bool = False) -> dict:
     run_id = uuid.uuid4().hex[:12]
     application = f"fabric:/FubeRustRuntime{run_id}"
@@ -471,10 +490,9 @@ def main() -> None:
         if args.existing_owner:
             owner = args.existing_owner
         else:
-            # The repository controller is the only allocation implementation.
-            run("python3", "scripts/onebox_ctl.py", "create", args.name, timeout=1000)
+            # Creation and capability capture are one controller transaction.
+            owner=create_owned(args.name)
             created = True
-            owner = json.loads((ROOT / "build/oneboxes" / args.name / "state.json").read_text())["owner"]
         allocation = Allocation(args.name, owner)
         result = restart(allocation, args.restart_service) if args.restart_service else qualify(allocation,args.full)
         result.setdefault("status","PASS_SINGLETON_PLACEMENT_RPC_NATIVE_RESTART")

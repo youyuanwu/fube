@@ -637,3 +637,36 @@ async fn named_partition_wire_decode_preserves_owned_model_identity() {
     h.receive("ReplicaCloseReply").await;
     h.engine.quiesce().await.unwrap();
 }
+
+#[tokio::test]
+async fn retired_authority_cannot_republish_cached_duplicate_endpoint() {
+    let mut h = Harness::new().await;
+    let request = h.request(1, 1, 0);
+    h.send("ReplicaOpen", &request).await;
+    h.receive("ReplicaOpenReply").await;
+    // Model an operation already admitted but not yet polled by its task.
+    h.engine.shared.authority.check().unwrap();
+    let admitted = IpcRequest {
+        message: Message {
+            headers: vec![
+                Header::actor(12).unwrap(),
+                Header::action("ReplicaOpen").unwrap(),
+                Header::message_id(MessageId {
+                    guid: [7; 16],
+                    index: 99,
+                })
+                .unwrap(),
+            ],
+            body: to_vec(&request).unwrap(),
+        },
+        reply: None,
+    };
+    h.engine.shared.authority.retire();
+    assert!(matches!(
+        dispatch(h.engine.shared.clone(), admitted).await,
+        Err(Error::Closed)
+    ));
+    h.no_reply().await;
+    assert_eq!(h.calls.opens.load(Ordering::SeqCst), 1);
+    h.engine.quiesce().await.unwrap();
+}
