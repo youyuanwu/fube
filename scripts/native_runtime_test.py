@@ -7,8 +7,10 @@ available in the loader or the explicitly selected private dependency directory.
 import argparse
 import hashlib
 import pathlib
+import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.request
 
 VERSION = "11.8.121.4"
@@ -23,6 +25,7 @@ LIBRARY_HASHES = {
 }
 RELATIVE_NATIVE = pathlib.Path("opt/microsoft/servicefabric/bin/Fabric/Fabric.Code")
 DIAGNOSTIC_LIMIT = 1024 * 1024
+SCENARIOS = ("bootstrap", "close", "abort", "manifest-close", "manifest-abort")
 
 
 def digest(path):
@@ -57,6 +60,8 @@ def qualify_libraries(native):
 
 
 def save_diagnostics(directory, scenario, output):
+    if scenario not in SCENARIOS:
+        raise ValueError(f"unsupported diagnostic scenario: {scenario}")
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"{scenario}.log").write_bytes(output[-DIAGNOSTIC_LIMIT:])
     report = directory / f"{scenario}.json"
@@ -86,10 +91,21 @@ def run_host(command, repo, diagnostics, scenario):
     return result.returncode
 
 
+def manifest_fixture(repo, root):
+    """Fresh ordinary input package; no native/deployment artifacts copied."""
+    package = pathlib.Path(tempfile.mkdtemp(prefix="manifest-package-", dir=root))
+    shutil.copytree(repo / "crates/samples/stateless-test-app/manifests",
+                    package, dirs_exist_ok=True)
+    code = package / "EchoPackage/Executables"
+    code.mkdir()
+    shutil.copy2(repo / "target/debug/stateless-test-app", code / "native-echo")
+    return package
+
+
 def main():
     repo = pathlib.Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["prepare", "bootstrap", "close", "abort"])
+    parser.add_argument("action", choices=["prepare", *SCENARIOS])
     parser.add_argument("--root", type=pathlib.Path,
                         default=repo / "build/native-runtime-test-host")
     parser.add_argument("--native-directory", type=pathlib.Path)
@@ -119,6 +135,16 @@ def main():
         raise ValueError(f"missing native ABI prerequisites: {', '.join(missing)}")
     subprocess.run(["cargo", "build", "--locked", "-p", "mssf-test-host",
                     "-p", "stateless-test-app"], cwd=repo, check=True, timeout=180)
+    if args.action.startswith("manifest-"):
+        subprocess.run(["cargo", "build", "--locked", "-p", "mssf-test-host",
+                        "--example", "manifest_acceptance"],
+                       cwd=repo, check=True, timeout=180)
+        package = manifest_fixture(repo, root)
+        return run_host([
+            str(repo / "target/debug/examples/manifest_acceptance"),
+            str(native), str(dependencies), str(package), str(root),
+            args.action.removeprefix("manifest-"),
+        ], repo, args.diagnostics_directory, args.action)
     return run_host([
         str(repo / "target/debug/mssf-test-host"), str(native), str(dependencies),
         str(repo / "target/debug/stateless-test-app"), str(root), args.action,

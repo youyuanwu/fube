@@ -24,7 +24,12 @@ pub struct ServiceUnit {
 }
 
 impl ServiceUnit {
-    pub fn new(runtime: &wire::RuntimeContext) -> Self {
+    pub fn new(
+        runtime: &wire::RuntimeContext,
+        name: &str,
+        service_type: &str,
+        initialization: &[u8],
+    ) -> Self {
         let partition = PartitionId {
             id: Guid(uuid::Uuid::new_v4().to_bytes_le()),
         };
@@ -73,20 +78,20 @@ impl ServiceUnit {
                 },
                 remote: EmptyObjectArray,
                 service: Service {
-                    name: "fabric:/NativeTestHost/Singleton".into(),
+                    name: name.into(),
                     instance: 1,
                     service_type: ServiceType {
                         package: runtime.code.code.package.package.clone(),
-                        name: wire::SERVICE_TYPE.into(),
+                        name: service_type.into(),
                     },
-                    application: wire::APP_NAME.into(),
+                    application: runtime.code.application_name.clone(),
                     version: runtime.code.version.clone(),
                     partitions: 1,
                     target: 1,
                     minimum: 1,
                     stateful: false,
                     persisted: false,
-                    initialization: ByteArray(b"native-test-host".to_vec()),
+                    initialization: ByteArray(initialization.to_vec()),
                     group: false,
                     correlations: EmptyObjectArray,
                     constraints: String::new(),
@@ -162,7 +167,8 @@ impl ServiceUnit {
             ),
         )?;
         if self.state == UnitState::OpenPending {
-            validate_endpoint(&reply.local.service_endpoint)?;
+            // An application endpoint is an opaque string. Network validation
+            // and probes belong to callers, not native lifecycle admission.
             self.request.local.service_endpoint = reply.local.service_endpoint;
             self.state = UnitState::Open;
         } else {
@@ -220,17 +226,22 @@ mod tests {
     use mssf_transport::message::Header;
 
     fn unit() -> ServiceUnit {
-        ServiceUnit::new(&wire::RuntimeContext {
-            id: "observed-runtime".into(),
-            host: wire::HostContext {
-                host: "owned".into(),
-                kind: 1,
-                pid: 42,
-                container: false,
-                activator: false,
+        ServiceUnit::new(
+            &wire::RuntimeContext {
+                id: "observed-runtime".into(),
+                host: wire::HostContext {
+                    host: "owned".into(),
+                    kind: 1,
+                    pid: 42,
+                    container: false,
+                    activator: false,
+                },
+                code: wire::expected_code(),
             },
-            code: wire::expected_code(),
-        })
+            "fabric:/NativeTestHost/Singleton",
+            wire::SERVICE_TYPE,
+            b"native-test-host",
+        )
     }
     fn reply(unit: &ServiceUnit) -> ProxyReply {
         let mut local = unit.request.local.clone();
@@ -299,6 +310,37 @@ mod tests {
             .unwrap_err();
         assert!(error.0.contains("actual native failure"));
         assert_eq!(unit.state, UnitState::OpenPending);
+    }
+
+    #[test]
+    fn opaque_and_empty_endpoints_are_native_application_values() {
+        for endpoint in [
+            "",
+            "opaque:application/endpoint?x=1&y=2",
+            r#"{"url":"custom"}"#,
+        ] {
+            let mut unit = unit();
+            unit.state = UnitState::OpenPending;
+            let mut value = reply(&unit);
+            value.local.service_endpoint = endpoint.into();
+            unit.accept(&message(&value, "ReplicaOpenReply")).unwrap();
+            assert_eq!(unit.state, UnitState::Open);
+            assert_eq!(unit.request.local.service_endpoint, endpoint);
+        }
+    }
+
+    #[test]
+    fn missing_factory_and_other_errors_are_not_ambiguous_retries() {
+        for code in [-2147017774, -2147017733, -1] {
+            let mut unit = unit();
+            unit.state = UnitState::OpenPending;
+            let mut failure = reply(&unit);
+            failure.error.code = code;
+            assert!(unit.accept(&message(&failure, "ReplicaOpenReply")).is_err());
+            // No success transition, no replay/new incarnation or automatic retry.
+            assert_eq!(unit.state, UnitState::OpenPending);
+            assert_eq!(unit.request.local.instance, 1);
+        }
     }
 
     #[test]

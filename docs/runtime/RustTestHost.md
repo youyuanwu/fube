@@ -16,8 +16,8 @@ Pure Rust runtime:     native node <-> Rust app-side runtime <-> service
 Rust test host:        Rust node-side subset <-> native runtime <-> real service
 ```
 
-**Status:** the narrow stateless MVP in section 2 is implemented and has run
-against a real native FabricRuntime without a cluster. Sections 3–11 preserve
+**Status:** the narrow stateless MVP and manifest-package profile in section 2 are
+implemented and have run against a real native FabricRuntime without a cluster. Sections 3–11 preserve
 the broader design/reference and are **not a claim that all proposed capabilities
 are implemented**. Native source
 baseline is `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`; repository baseline is
@@ -39,7 +39,8 @@ components. Absence of a cluster does not remove those dependencies.
 [`mssf-test-host`](../../crates/libs/mssf-test-host/src/lib.rs) is a native-free
 Rust library and thin CLI. It controls
 [`stateless-test-app`](../../crates/samples/stateless-test-app/src/main.rs),
-which uses **mssf-core 0.10 and the real native FabricRuntime**. It does not
+which uses **mssf-core 0.10 and the real native FabricRuntime**. It also accepts
+validated packages through the [manifest profile](ManifestTestHost.md). It does not
 implement a pure-Rust application runtime or fake `FabricCreateRuntime`.
 
 The implemented profile is deliberately smaller than the design below:
@@ -58,6 +59,8 @@ The implemented profile is deliberately smaller than the design below:
 - Actual factory/Open, independently connected `ping\n`/`native-stateless-pong\n`,
   actual Close or Abort, refused new endpoint connections **while the process
   is still alive**, then separately observed child termination/reap.
+  These network probes are fixture-specific, not requirements on general manifest
+  apps; a native Open endpoint may be opaque or empty.
 - Fresh owned deployment/config/native-object folders; no installed cluster
   config discovery, cluster commands, global configuration changes or name kills.
 - A 120-second scenario deadline, 4MiB frame/object limits, a 64-message input
@@ -139,13 +142,15 @@ The minimal library API is `run(Options, Scenario) -> Result<RunReport>`, with
 the richer handle API sketched in section 4 is **not implemented**. The sample's
 owned stdin shutdown commands and `MSSF_APP` diagnostic events are fixture
 instrumentation; they do not replace native lifecycle callbacks or semantic replies.
+`run_manifest(ManifestOptions, Scenario, observer)` adds a separate general
+complete-scenario path without those fixture contracts; see section 2.6.
 
 #### CI test tiers and diagnostics
 
 | Tier | Job/workflow | Prerequisites and evidence |
 |---|---|---|
 | Native-free | `Native-free Rust client` in [`ci.yaml`](../../.github/workflows/ci.yaml) | Rust model/regression tests, including the host; no SF native libraries or node. These are not native interoperability evidence. |
-| Standalone native | `Linux standalone native runtime` in [`native-runtime.yaml`](../../.github/workflows/native-runtime.yaml) | Ubuntu22 x86_64, Python3.12, pinned Rust toolchain and SHA-verified SF 11.8.121.4 libraries. Runs the real `prepare`, `bootstrap`, `close`, `abort` commands, directly on Linux. **No SF package installation, node, cluster, onebox or container startup.** |
+| Standalone native | `Linux standalone native runtime` in [`native-runtime.yaml`](../../.github/workflows/native-runtime.yaml) | Ubuntu22 x86_64, Python3.12, pinned Rust toolchain and SHA-verified SF 11.8.121.4 libraries. Runs the real `prepare`, `bootstrap`, `close`, `abort`, `manifest-close`, `manifest-abort` commands, directly on Linux. **No SF package installation, node, cluster, onebox or container startup.** |
 | Cluster/onebox | `Linux cluster lifecycle`, `Linux onebox lifecycle`, and Windows `build` in `ci.yaml` | Real SF nodes and deployment/lifecycle tests. These exercise a different boundary, not the standalone host profile. |
 
 The standalone workflow runs on pushes and PRs touching its workflow, native
@@ -166,13 +171,16 @@ python3 scripts/native_runtime_test.py close \
 
 This writes `close.log` (last **1MiB** of merged host/native console output) and,
 when emitted by the real host, `close.json` (the original `MSSF_REPORT` payload,
-at most **1MiB**). Bootstrap and Abort use their own filenames. Timeout retains
+at most **1MiB**). Each of bootstrap, close, abort, manifest-close and manifest-abort
+uses its own filenames. Timeout retains
 available partial output and remains failure; nonzero native exits remain
 nonzero. Without this option output streams as before. CI uploads only these
-six named files on success or failure, at most **6MiB total**, for seven days.
+ten named files on success or failure, at most **10MiB total**, for seven days.
 Early setup/preflight failures may produce no scenario files; use the failing
 Actions step log. Native archives, extracted libraries, deployment trees,
 native disk traces and environment dumps are not uploaded.
+
+The locked prebuild also builds the caller-owned `manifest_acceptance` example.
 
 This job qualifies only the Linux pinned trusted-loopback/no-TLS profile above;
 it is not Windows acceptance, a security sandbox, or proof of full RA/node
@@ -216,7 +224,8 @@ endpoint admission and owned cleanup; they do not self-authenticate the schemas.
 
 ### 2.4 Compatibility limits
 
-- Only the bundled report-free sample and short scenarios above are qualified.
+- Only the bundled report-free sample, its marker-free manifest fixture and the
+  short scenarios here and in [the manifest guide](ManifestTestHost.md) are qualified.
   Native health clients initialize, but no health/load/fault report was needed or
   emitted in these measured runs. There is **no general report/health sink**;
   unsupported traffic fails rather than receiving a canned success.
@@ -229,9 +238,10 @@ endpoint admission and owned cleanup; they do not self-authenticate the schemas.
   implemented, but automatic native host-unregister emission on process exit
   was **not** observed/qualified. Reconnect/replay, registration retries and
   long-running background traffic are unsupported.
-- Open waits for the fixture's actual post-registration callback plus a lease
-  poll, eliminating its local-registration race without a synthetic readiness
-  sleep. This is not a claim to launch arbitrary apps unchanged.
+- Legacy Open waits for the fixture's actual post-registration callback plus a
+  lease poll. Manifest Open instead uses matching host/runtime/type registration
+  and finite lease activity; native lookup queues pending local factory validation.
+  There are no outer retries or marker-based readiness assumptions in that path.
 - Cleanup owns the direct child/process group, not arbitrary daemonized or
   escaped descendants. The sample does not spawn them. Linux parent-death
   containment kills the direct child if its launcher dies; abrupt-owner-death
@@ -248,6 +258,26 @@ endpoint admission and owned cleanup; they do not self-authenticate the schemas.
 | Later singleton stateful | Native default replicator under a deliberately single-replica test configuration; no HA claim |
 | Later multi-process stateful | Several native app processes with real peer replication and scripted RA reconfiguration |
 | Separate extensions | Container/TLS, Windows security, nonactivated/DLL/multicode-package hosts, managed SDK variants, upgrades and service groups |
+
+### 2.6 Implemented manifest-package profile
+
+The [manifest test-host guide](ManifestTestHost.md) defines the exact accepted XML,
+parameter/argument/path limits, public API and CLI. It supports one import, one
+ExeHost code package, SharedProcess activation and one default stateless singleton
+with InstanceCount=1. Unsupported syntax/features/policies are rejected before
+launch. Config/data packages, placement and exclusive activation are not stripped.
+
+The host generates native digested XML, code layout, nine-field static internal
+TCP endpoint metadata and the required SID/endpoint files. It then uses real
+native registration and RA12 semantic replies. Optional caller observers receive
+the actual endpoint while Open and after Close/Abort, before process cleanup.
+General apps require neither `MSSF_APP`, fixture ping nor owned stdin commands.
+
+Native defaults/overrides Close/Abort and an opaque-endpoint run passed on
+2026-10-25. Caller ping and endpoint refusal were independently proven with a live
+child for both socket fixture scenarios. General cleanup was forced/reaped;
+this is **not** graceful native runtime release. Exact evidence is recorded in
+[the guide](ManifestTestHost.md#native-qualification).
 
 This is not a promise to run every SF app unchanged. Apps that require Naming,
 FabricClient management, secrets/certificates from deployment policy, activator
@@ -432,9 +462,13 @@ fixture when necessary. Never take over a port used by another test/cluster.
 
 Do not use sleeps as readiness. Observe host/runtime/type registration, send
 the legal open command, await the **semantic open reply**, and independently
-probe the returned application endpoint. Flushing the type-registration reply
-does not prove the app's asynchronous local factory validation already ran;
-native-compatible same-incarnation retry must tolerate that race.
+probe the returned application endpoint. Flushing the type-registration reply does not prove asynchronous local factory
+validation already ran. In the source-defined ordinary race, native
+[factory lookup waits for validation][factory-table]. A numeric
+`FABRIC_E_SERVICE_TYPE_NOT_REGISTERED` is ambiguous (lookup, wrong factory kind,
+or an application error); the implemented profile fails such replies rather
+than retrying application Open without safe provenance. It does not use readiness
+sleeps or fake success.
 
 ## 6. Node IPC services the host must supply
 
@@ -756,4 +790,5 @@ source maps. Additional bootstrap/materialization evidence follows.
 [health-decoder]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/client/HealthReportingComponent.cpp#L314-L416
 [health-reply]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/ServiceModel/management/HealthManager/ReportHealthReplyMessageBody.h#L12-L47
 [proxy-map]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/LocalFailoverUnitProxyMap.cpp#L58-L150
+[factory-table]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Hosting2/ServiceFactoryRegistrationTable.cpp#L162-L251
 [kvmap]: ../../crates/samples/kvmap/src/kvmap.rs#L210-L259

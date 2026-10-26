@@ -65,7 +65,9 @@ jobs:
 
     - name: Build locked native app and standalone host
       timeout-minutes: 8
-      run: cargo build --locked -p mssf-test-host -p stateless-test-app
+      run: |
+        cargo build --locked -p mssf-test-host -p stateless-test-app
+        cargo build --locked -p mssf-test-host --example manifest_acceptance
 
     - name: Native bootstrap, finite lease polling and unregister
       timeout-minutes: 6
@@ -85,6 +87,18 @@ jobs:
         python3 scripts/native_runtime_test.py abort --root "$NATIVE_ROOT" \
           --diagnostics-directory "$NATIVE_DIAGNOSTICS"
 
+    - name: Native manifest defaults, activation metadata, Open, caller ping and Close
+      timeout-minutes: 6
+      run: |
+        python3 scripts/native_runtime_test.py manifest-close --root "$NATIVE_ROOT" \
+          --diagnostics-directory "$NATIVE_DIAGNOSTICS"
+
+    - name: Native manifest overrides, Open, caller ping and independent Abort
+      timeout-minutes: 6
+      run: |
+        python3 scripts/native_runtime_test.py manifest-abort --root "$NATIVE_ROOT" \
+          --diagnostics-directory "$NATIVE_DIAGNOSTICS"
+
     - name: Retain bounded standalone host and native evidence
       if: always()
       uses: actions/upload-artifact@v7
@@ -97,5 +111,9 @@ jobs:
           ${{ env.NATIVE_DIAGNOSTICS }}/close.json
           ${{ env.NATIVE_DIAGNOSTICS }}/abort.log
           ${{ env.NATIVE_DIAGNOSTICS }}/abort.json
+          ${{ env.NATIVE_DIAGNOSTICS }}/manifest-close.log
+          ${{ env.NATIVE_DIAGNOSTICS }}/manifest-close.json
+          ${{ env.NATIVE_DIAGNOSTICS }}/manifest-abort.log
+          ${{ env.NATIVE_DIAGNOSTICS }}/manifest-abort.json
         if-no-files-found: warn
         retention-days: 7

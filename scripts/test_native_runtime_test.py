@@ -3,7 +3,9 @@
 import hashlib
 import io
 import pathlib
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -41,6 +43,28 @@ class PreparationTests(unittest.TestCase):
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_every_scenario_has_bounded_explicit_workflow_uploads(self):
+        workflow = (pathlib.Path(__file__).resolve().parent.parent
+                    / ".github/workflows/native-runtime.yaml").read_text()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for scenario in profile.SCENARIOS:
+                profile.save_diagnostics(root, scenario, b'MSSF_REPORT {"real":"payload"}\n')
+                for suffix in ("log", "json"):
+                    self.assertIn(f"${{{{ env.NATIVE_DIAGNOSTICS }}}}/{scenario}.{suffix}",
+                                  workflow)
+                    self.assertLessEqual((root / f"{scenario}.{suffix}").stat().st_size,
+                                         profile.DIAGNOSTIC_LIMIT)
+            self.assertEqual(len(list(root.iterdir())), len(profile.SCENARIOS) * 2)
+
+    def test_unknown_diagnostic_scenarios_cannot_write_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary) / "not-created"
+            for scenario in ("../escape", "/absolute", "unknown"):
+                with self.assertRaisesRegex(ValueError, "unsupported diagnostic scenario"):
+                    profile.save_diagnostics(root, scenario, b"failure")
+            self.assertFalse(root.exists())
+
     def test_bounded_tail_and_original_report_not_runtime_tree(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -100,6 +124,30 @@ class DiagnosticTests(unittest.TestCase):
             self.assertEqual(profile.run_host(["host"], pathlib.Path("."), None, "close"), 3)
             self.assertNotIn("stdout", run.call_args.kwargs)
             self.assertNotIn("stderr", run.call_args.kwargs)
+
+
+class ManifestFixtureTests(unittest.TestCase):
+    def test_packaging_copies_only_manifests_and_selected_executable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            repo = pathlib.Path(__file__).resolve().parent.parent
+            fake_repo = root / "repo"
+            (fake_repo / "target/debug").mkdir(parents=True)
+            binary = fake_repo / "target/debug/stateless-test-app"
+            binary.write_bytes(b"fixture executable")
+            binary.chmod(0o755)
+            shutil.copytree(repo / "crates/samples/stateless-test-app/manifests",
+                            fake_repo / "crates/samples/stateless-test-app/manifests")
+            first = profile.manifest_fixture(fake_repo, root)
+            second = profile.manifest_fixture(fake_repo, root)
+            self.assertNotEqual(first, second)
+            self.assertEqual(sorted(p.relative_to(first).as_posix() for p in first.rglob("*") if p.is_file()),
+                             ["ApplicationManifest.xml", "EchoPackage/Executables/native-echo",
+                              "EchoPackage/ServiceManifest.xml"])
+            copied = first / "EchoPackage/Executables/native-echo"
+            self.assertEqual(copied.read_bytes(), binary.read_bytes())
+            if sys.platform != "win32":
+                self.assertEqual(copied.stat().st_mode & 0o777, 0o755)
 
 
 if __name__ == "__main__":

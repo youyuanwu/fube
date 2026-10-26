@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 libc = "0.2"
 mssf-transport.workspace = true
+roxmltree = "0.21"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

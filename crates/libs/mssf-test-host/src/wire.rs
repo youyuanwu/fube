@@ -177,15 +177,24 @@ pub struct HostUnregister {
 }
 
 pub fn expected_code() -> CodeContext {
+    code_context(APP_TYPE, APP_NAME, PACKAGE, CODE)
+}
+
+pub fn code_context(
+    application_type: &str,
+    application_name: &str,
+    package: &str,
+    code: &str,
+) -> CodeContext {
     CodeContext {
         code: CodeId {
             package: PackageInstance {
                 package: PackageId {
                     application: ApplicationId {
-                        kind: APP_TYPE.into(),
+                        kind: application_type.into(),
                         number: 1,
                     },
-                    name: PACKAGE.into(),
+                    name: package.into(),
                 },
                 activation: Activation {
                     guid: Guid([0; 16]),
@@ -193,7 +202,7 @@ pub fn expected_code() -> CodeContext {
                 },
                 public_id: String::new(),
             },
-            name: CODE.into(),
+            name: code.into(),
         },
         code_sequence: 1,
         package_sequence: 1,
@@ -206,6 +215,6 @@ pub fn expected_code() -> CodeContext {
             },
             instance: 1,
         },
-        application_name: APP_NAME.into(),
+        application_name: application_name.into(),
     }
 }

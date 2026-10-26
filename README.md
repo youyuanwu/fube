@@ -5,7 +5,7 @@ Various service fabric rust apps.
 * [kvmap](crates\samples\kvmap) an key value store using SF default replicator. Still work in progress.
 * [kvstore](crates\samples\kvstore) app using default SF key value store implementation in FabricRuntime.
 * [ext](crates\libs\mssf-ext) lib that extends mssf-core crate with various support including default replicator.
-* [Native runtime test host](docs/runtime/RustTestHost.md#2-implemented-mvp-and-usage) runs a real stateless FabricRuntime app without a cluster (experimental Linux loopback profile).
+* [Native runtime test host](docs/runtime/RustTestHost.md#2-implemented-mvp-and-usage) runs a real stateless FabricRuntime app without a cluster, including a [narrow manifest-package profile](docs/runtime/ManifestTestHost.md) (experimental Linux loopback profile).
 
 # Build
 Install Rust (using the toolchain pinned in `rust-toolchain.toml`), [just](https://just.systems), Python 3, and Protocol Buffers (`protoc`).

@@ -5,6 +5,7 @@ mod controller;
 mod deployment;
 mod ipc;
 mod lifecycle_wire;
+mod manifest;
 mod process;
 #[cfg(test)]
 mod tests;
@@ -18,13 +19,22 @@ use serde_json::json;
 use std::{
     fmt,
     net::TcpListener,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::RecvTimeoutError,
     thread,
     time::{Duration, Instant},
 };
 
 pub type Result<T> = std::result::Result<T, HostError>;
+
+/// Validate the supported manifest subset without native libraries or app launch.
+pub fn validate_manifest(
+    package_directory: &std::path::Path,
+    application_name: &str,
+    parameters: &[(String, String)],
+) -> Result<()> {
+    manifest::Package::load(package_directory, application_name, parameters).map(|_| ())
+}
 
 #[derive(Debug)]
 pub struct HostError(pub String);
@@ -57,6 +67,33 @@ pub struct Options {
     pub run_parent: PathBuf,
 }
 
+/// One supported application package. Overrides are pairs so duplicates can be
+/// rejected instead of silently overwritten by a map.
+pub struct ManifestOptions {
+    pub native_directory: PathBuf,
+    pub dependency_directory: PathBuf,
+    pub package_directory: PathBuf,
+    pub application_name: String,
+    pub parameters: Vec<(String, String)>,
+    pub run_parent: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleStage {
+    Opened,
+    Closed,
+    Aborted,
+}
+
+/// Called synchronously before process cleanup, while the owned child is alive.
+/// The observer is trusted application/test code and must bound its own work.
+#[derive(Debug)]
+pub struct LifecycleEvent<'a> {
+    pub stage: LifecycleStage,
+    pub endpoint: &'a str,
+    pub pid: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scenario {
@@ -79,6 +116,11 @@ pub struct RunReport {
     pub loaded_native_libraries: Vec<PathBuf>,
     pub callbacks: Vec<serde_json::Value>,
     pub cleanup: serde_json::Value,
+    pub service_name: String,
+    pub service_type: String,
+    pub lifecycle_completed: bool,
+    /// Actual unregister traffic, never inferred from process termination.
+    pub runtime_unregistered: bool,
 }
 
 #[derive(Default)]
@@ -89,6 +131,7 @@ struct Registration {
     registered_type: bool,
     lease_polls: usize,
     handshake: bool,
+    runtime_unregistered: bool,
 }
 
 fn require(condition: bool, description: &str) -> Result<()> {
@@ -226,7 +269,7 @@ impl Registration {
                                 container: false,
                                 activator: false,
                             }
-                        && context.code == wire::expected_code(),
+                        && context.code == bundle.identity,
                     "invalid runtime registration context/state",
                 )?;
                 println!(
@@ -242,7 +285,7 @@ impl Registration {
                     self.runtime.as_ref() == Some(&request.context)
                         && !self.registered_type
                         && request.service_type.package == request.context.code.code.package
-                        && request.service_type.name == wire::SERVICE_TYPE,
+                        && request.service_type.name == bundle.service_type,
                     "invalid service type context/state",
                 )?;
                 self.registered_type = true;
@@ -268,6 +311,7 @@ impl Registration {
                     "unknown runtime unregister",
                 )?;
                 self.runtime = None;
+                self.runtime_unregistered = true;
                 self.registered_type = false;
                 to_vec(&wire::ErrorReply { error: 0 })?
             }
@@ -342,21 +386,112 @@ fn pump(
 pub fn run(options: Options, scenario: Scenario) -> Result<RunReport> {
     deployment::preflight(&options.native_directory, &options.executable)?;
     let bundle = deployment::Deployment::create(&options.run_parent, &options.executable)?;
+    run_deployment(
+        &options.native_directory,
+        &options.dependency_directory,
+        bundle,
+        scenario,
+        true,
+        &mut |_| Ok(()),
+    )
+}
+
+/// Run Open → observer → Close/Abort → observer → owned cleanup from manifests.
+/// Does not assume app markers, ping, stdin shutdown or graceful runtime release.
+/// Bootstrap is intentionally reserved for the legacy instrumented fixture.
+pub fn run_manifest(
+    options: ManifestOptions,
+    scenario: Scenario,
+    mut observer: impl FnMut(LifecycleEvent<'_>) -> Result<()>,
+) -> Result<RunReport> {
+    require(
+        scenario != Scenario::Bootstrap,
+        "manifest scenarios require Close or Abort",
+    )?;
+    let package = manifest::Package::load(
+        &options.package_directory,
+        &options.application_name,
+        &options.parameters,
+    )?;
+    deployment::preflight(
+        &options.native_directory,
+        &package.source_code.join(&package.program),
+    )?;
+    let bundle = deployment::Deployment::from_manifest(&options.run_parent, &package)?;
+    println!(
+        "MSSF_HOST {}",
+        json!({"event":"manifest_validated", "application_type":package.application_type,
+        "application_version":package.application_version, "manifest":package.service_manifest,
+        "manifest_version":package.manifest_version, "code_version":package.code_version})
+    );
+    run_deployment(
+        &options.native_directory,
+        &options.dependency_directory,
+        bundle,
+        scenario,
+        false,
+        &mut observer,
+    )
+}
+
+fn observe(
+    observer: &mut dyn FnMut(LifecycleEvent<'_>) -> Result<()>,
+    stage: LifecycleStage,
+    endpoint: &str,
+    pid: u32,
+    deadline: Instant,
+) -> Result<()> {
+    require(
+        Instant::now() < deadline,
+        "observer admission deadline exceeded",
+    )?;
+    observer(LifecycleEvent {
+        stage,
+        endpoint,
+        pid,
+    })?;
+    require(
+        Instant::now() < deadline,
+        "observer exceeded scenario deadline",
+    )
+}
+
+fn complete(outcome: Result<()>, cleanup: Result<serde_json::Value>) -> Result<serde_json::Value> {
+    match (outcome, cleanup) {
+        (Err(error), Err(cleanup)) => Err(HostError(format!(
+            "{error}; additionally cleanup failed: {cleanup}"
+        ))),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(cleanup)) => Ok(cleanup),
+    }
+}
+
+fn run_deployment(
+    native_directory: &Path,
+    dependency_directory: &Path,
+    bundle: deployment::Deployment,
+    scenario: Scenario,
+    fixture: bool,
+    observer: &mut dyn FnMut(LifecycleEvent<'_>) -> Result<()>,
+) -> Result<RunReport> {
+    // Resolve caller-relative loader inputs before changing the child's cwd.
+    let (native_directory, dependency_directory) =
+        process::absolute_directories(native_directory, dependency_directory)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?.to_string();
     let host = uuid::Uuid::new_v4().to_string();
     let mut child = process::OwnedApp::launch(
         &bundle,
-        &options.native_directory,
-        &options.dependency_directory,
+        &native_directory,
+        &dependency_directory,
         &host,
         &address,
     )?;
     println!(
         "MSSF_HOST {}",
         json!({"event":"spawned", "host":host, "pid":child.pid(),
-        "profile":"linux-x86_64-11.8.121.4-loopback-clear", "root":bundle.root, "ipc":address})
+        "profile":"linux-x86_64-11.8.121.4-loopback-clear", "root":bundle.root, "code":bundle.code, "ipc":address})
     );
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut endpoint = None;
@@ -364,6 +499,8 @@ pub fn run(options: Options, scenario: Scenario) -> Result<RunReport> {
     let mut lease_polls = 0;
     let mut loaded_native_libraries = Vec::new();
     let mut runtime_id = String::new();
+    let mut lifecycle_completed = false;
+    let mut runtime_unregistered = false;
     let outcome = (|| -> Result<()> {
         let stream = loop {
             child.check_alive()?;
@@ -397,10 +534,11 @@ pub fn run(options: Options, scenario: Scenario) -> Result<RunReport> {
             )?;
             if state.registered_type
                 && state.lease_polls > 0
-                && child
-                    .callbacks()
-                    .iter()
-                    .any(|e| e["event"] == "type_registered")
+                && (!fixture
+                    || child
+                        .callbacks()
+                        .iter()
+                        .any(|e| e["event"] == "type_registered"))
             {
                 println!(
                     "MSSF_HOST {}",
@@ -414,7 +552,7 @@ pub fn run(options: Options, scenario: Scenario) -> Result<RunReport> {
         lease_polls = state.lease_polls;
         let maps = std::fs::read_to_string(format!("/proc/{}/maps", child.pid()))?;
         for name in ["libFabricRuntime.so", "libFabricCommon.so"] {
-            let path = options.native_directory.join(name).canonicalize()?;
+            let path = native_directory.join(name).canonicalize()?;
             let escaped = path
                 .to_string_lossy()
                 .replace('\\', "\\134")
@@ -429,7 +567,12 @@ pub fn run(options: Options, scenario: Scenario) -> Result<RunReport> {
             loaded_native_libraries.push(path);
         }
         if scenario != Scenario::Bootstrap {
-            let mut unit = controller::ServiceUnit::new(runtime);
+            let mut unit = controller::ServiceUnit::new(
+                runtime,
+                &bundle.service_name,
+                &bundle.service_type,
+                &bundle.initialization,
+            );
             partition_id = Some(uuid::Uuid::from_bytes_le(unit.request.unit.id.id.0).to_string());
             unit.open(&mut session)?;
             while unit.state != controller::UnitState::Open {
@@ -444,11 +587,22 @@ pub fn run(options: Options, scenario: Scenario) -> Result<RunReport> {
                 )?;
             }
             let address = unit.request.local.service_endpoint.clone();
-            controller::ping(&address)?;
-            println!(
-                "MSSF_HOST {}",
-                json!({"event":"ping_passed","endpoint":address})
-            );
+            if fixture {
+                controller::ping(&address)?;
+                println!(
+                    "MSSF_HOST {}",
+                    json!({"event":"ping_passed","endpoint":address})
+                );
+            }
+            child.check_alive()?;
+            observe(
+                observer,
+                LifecycleStage::Opened,
+                &address,
+                child.pid(),
+                deadline,
+            )?;
+            child.check_alive()?;
             unit.close(&mut session, scenario == Scenario::Abort)?;
             while unit.state != controller::UnitState::Closed {
                 pump(
@@ -461,15 +615,31 @@ pub fn run(options: Options, scenario: Scenario) -> Result<RunReport> {
                     deadline,
                 )?;
             }
-            controller::stopped(&address)?;
+            lifecycle_completed = true;
+            if fixture {
+                controller::stopped(&address)?;
+            }
+            child.check_alive()?;
+            observe(
+                observer,
+                if scenario == Scenario::Abort {
+                    LifecycleStage::Aborted
+                } else {
+                    LifecycleStage::Closed
+                },
+                &address,
+                child.pid(),
+                deadline,
+            )?;
             child.check_alive()?;
             println!(
                 "MSSF_HOST {}",
-                json!({"event":"endpoint_stopped","process_still_alive":true,"scenario":scenario})
+                json!({"event":if fixture { "endpoint_stopped" } else { "lifecycle_completed" },
+                "process_still_alive":true,"scenario":scenario})
             );
             endpoint = Some(address);
         }
-        if scenario == Scenario::Abort {
+        if !fixture || scenario == Scenario::Abort {
             return Ok(());
         }
         child.command(b"shutdown\n")?;
@@ -484,6 +654,7 @@ pub fn run(options: Options, scenario: Scenario) -> Result<RunReport> {
                 deadline,
             )?;
         }
+        runtime_unregistered = state.runtime_unregistered;
         child.command(b"exit\n")?;
         child.wait_exit(deadline.min(Instant::now() + Duration::from_secs(5)))?;
         Ok(())
@@ -496,10 +667,9 @@ pub fn run(options: Options, scenario: Scenario) -> Result<RunReport> {
         "MSSF_HOST {}",
         json!({"event":"cleanup", "result":cleanup.as_ref().map_err(ToString::to_string)})
     );
-    let cleanup = cleanup?;
-    outcome?;
+    let cleanup = complete(outcome, cleanup)?;
     let callbacks = child.callbacks();
-    if scenario != Scenario::Bootstrap {
+    if fixture && scenario != Scenario::Bootstrap {
         for event in [
             "create",
             "open",
@@ -568,5 +738,9 @@ pub fn run(options: Options, scenario: Scenario) -> Result<RunReport> {
         loaded_native_libraries,
         callbacks,
         cleanup,
+        service_name: bundle.service_name,
+        service_type: bundle.service_type,
+        lifecycle_completed,
+        runtime_unregistered,
     })
 }
