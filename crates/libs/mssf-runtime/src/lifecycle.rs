@@ -43,6 +43,7 @@ struct Snapshot {
     cancel: Cancellation,
     generation: u64,
     operation_start: i64,
+    operation_kind: i64,
     live: Option<OwnedSemaphorePermit>,
 }
 struct Unit {
@@ -232,6 +233,7 @@ fn unit(shared: &Shared, request: &ProxyRequest, create: bool) -> Result<Option<
             cancel: Cancellation::default(),
             generation: 0,
             operation_start: 0,
+            operation_kind: 0,
             live: None,
         }),
     });
@@ -358,6 +360,14 @@ async fn abort(service: Arc<dyn StatelessService>) -> Result<()> {
     .map_err(|_| Error::Protocol("service abort panicked"))?;
     Ok(())
 }
+async fn abort_unit(unit: &Unit, service: Arc<dyn StatelessService>) -> Result<()> {
+    {
+        let mut state = unit.state.lock().unwrap();
+        state.operation_kind = 16;
+        state.operation_start = filetime();
+    }
+    abort(service).await
+}
 async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()> {
     let duplicate = {
         let state = unit.state.lock().unwrap();
@@ -407,6 +417,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
         state.valid = Arc::new(AtomicBool::new(true));
         state.cancel = Cancellation::default();
         state.operation_start = filetime();
+        state.operation_kind = 2;
         (state.generation, state.cancel.clone(), state.valid.clone())
     };
     let factory = shared
@@ -478,7 +489,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
     if let Err(error) = &outcome {
         let service = unit.state.lock().unwrap().service.take();
         if let Some(service) = service {
-            abort(service).await?;
+            abort_unit(unit, service).await?;
         } else if matches!(error, Error::Timeout) {
             // Unknown factory side effects cannot be proven disposed.
             return Err(Error::Protocol(
@@ -498,6 +509,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
             Phase::Closed
         };
         state.endpoint = endpoint.clone();
+        state.operation_kind = 1;
         if outcome.is_err() {
             state.valid.store(false, Ordering::Release);
             state.live = None;
@@ -523,16 +535,17 @@ async fn close(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()
         state.cancel.cancel();
         state.phase = Phase::Closing;
         state.operation_start = filetime();
+        state.operation_kind = if request.flags & 4 != 0 { 16 } else { 8 };
         (state.service.clone(), Cancellation::default(), closed)
     };
     if !already_closed {
         if let Some(service) = service {
             if request.flags & 4 != 0 {
-                abort(service).await?;
+                abort_unit(unit, service).await?;
             } else {
                 let result = tokio::time::timeout(CALLBACK_TIMEOUT, service.close(cancel)).await;
                 if !matches!(result, Ok(Ok(()))) {
-                    abort(service).await?;
+                    abort_unit(unit, service).await?;
                 }
             }
         } else {
@@ -546,6 +559,7 @@ async fn close(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()
         state.service = None;
         state.live = None;
         state.request = request.clone();
+        state.operation_kind = 1;
     }
     // Native normalizes a graceful-close error only after abort/disposal.
     reply(shared, "ReplicaCloseReply", request, String::new(), None, 2).await
@@ -565,7 +579,9 @@ async fn update(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<(
         {
             return Err(Error::Protocol("service update changed immutable identity"));
         }
-        state.request.service = request.service;
+        if request.service.update_version > state.request.service.update_version {
+            state.request.service = request.service;
+        }
         UpdateServiceReply {
             error: 0,
             unit: state.request.unit.clone(),
@@ -623,11 +639,7 @@ fn query(shared: &Shared, request: &ProxyRequest) -> Result<QueryReply> {
             detail.partition = state.request.unit.id.id;
             detail.replica_id = -1;
             detail.instance_id = local.id;
-            detail.operation = match state.phase {
-                Phase::Opening => 2,
-                Phase::Closing => 8,
-                _ => 1,
-            };
+            detail.operation = state.operation_kind;
             detail.operation_start = state.operation_start;
         }
     }

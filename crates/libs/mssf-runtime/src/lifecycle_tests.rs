@@ -15,6 +15,7 @@ struct Calls {
     aborts: AtomicUsize,
     partitions: Mutex<Vec<Partition>>,
     release: Notify,
+    abort_release: AtomicBool,
 }
 struct Factory(Arc<Calls>);
 struct Instance {
@@ -51,7 +52,7 @@ impl StatelessService for Instance {
             if self.mode == 8 {
                 self.calls.release.notified().await;
             }
-            if self.mode == 1 {
+            if self.mode == 1 || self.mode == 5 {
                 return Err(Error::Remote {
                     code: -456,
                     message: "open failure".into(),
@@ -65,7 +66,10 @@ impl StatelessService for Instance {
     fn close(&self, _cancel: Cancellation) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
             self.calls.closes.fetch_add(1, Ordering::SeqCst);
-            if self.mode == 2 {
+            if self.mode == 7 {
+                self.calls.release.notified().await;
+            }
+            if self.mode == 2 || self.mode == 6 {
                 return Err(Error::Remote {
                     code: -789,
                     message: "close failure".into(),
@@ -76,6 +80,14 @@ impl StatelessService for Instance {
     }
     fn abort(&self) {
         self.calls.aborts.fetch_add(1, Ordering::SeqCst);
+        if matches!(self.mode, 4..=6) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !self.calls.abort_release.load(Ordering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }
 struct Harness {
@@ -374,10 +386,23 @@ async fn stale_incarnations_updates_and_callback_errors_are_not_success() {
     h.send("ReplicaClose", &stale).await;
     h.no_reply().await;
     request.service.update_version = 2;
+    request.service.constraints = "accepted-v2".into();
     h.send("ProxyUpdateServiceDescription", &request).await;
     let update: UpdateServiceReply =
         from_slice(&h.receive("ProxyUpdateServiceDescriptionReply").await.body).unwrap();
     assert_eq!(update.service.update_version, 2);
+    let mut duplicate = request.clone();
+    duplicate.service.constraints = "must-not-apply".into();
+    h.send("ProxyUpdateServiceDescription", &duplicate).await;
+    let same: UpdateServiceReply =
+        from_slice(&h.receive("ProxyUpdateServiceDescriptionReply").await.body).unwrap();
+    assert_eq!(same.service.constraints, "accepted-v2");
+    request.service.update_version = 3;
+    request.service.constraints = "accepted-v3".into();
+    h.send("ProxyUpdateServiceDescription", &request).await;
+    let newer: UpdateServiceReply =
+        from_slice(&h.receive("ProxyUpdateServiceDescriptionReply").await.body).unwrap();
+    assert_eq!(newer.service.constraints, "accepted-v3");
     let mut old = request.clone();
     old.service.update_version = 1;
     h.send("ProxyUpdateServiceDescription", &old).await;
@@ -468,4 +493,49 @@ async fn callback_admission_at_32_and_overflow_is_terminal() {
         .await
         .unwrap();
     assert!(h.engine.shared.authority.check().is_err());
+}
+
+#[tokio::test]
+async fn query_tracks_actual_abort_cleanup_and_graceful_close_operations() {
+    for mode in [4, 5, 6, 7] {
+        let mut h = Harness::new().await;
+        let mut request = h.request(1, 1, mode);
+        h.send("ReplicaOpen", &request).await;
+        if mode != 5 {
+            h.receive("ReplicaOpenReply").await;
+            if mode == 4 {
+                request.flags = 4
+            }
+            h.send("ReplicaClose", &request).await;
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let u = unit(&h.engine.shared, &request, false).unwrap();
+                if let Some(u) = u {
+                    let expected = if mode == 7 { 8 } else { 16 };
+                    if u.state.lock().unwrap().operation_kind == expected
+                        && (mode == 7 || h.calls.aborts.load(Ordering::SeqCst) > 0)
+                    {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        h.send("RAPQuery", &request).await;
+        let query: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+        assert_eq!(query.detail.operation, if mode == 7 { 8 } else { 16 });
+        assert!(query.detail.operation_start > 0);
+        h.calls.abort_release.store(true, Ordering::Release);
+        h.calls.release.notify_waiters();
+        h.receive(if mode == 5 {
+            "ReplicaOpenReply"
+        } else {
+            "ReplicaCloseReply"
+        })
+        .await;
+        h.engine.quiesce().await.unwrap();
+    }
 }
