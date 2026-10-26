@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ServiceManifest xmlns="http://schemas.microsoft.com/2011/01/fabric" Name="EchoPackage" Version="3.2">
+  <ServiceTypes>
+    <StatelessServiceType ServiceTypeName="[Type]" />
+  </ServiceTypes>
+  <CodePackage Name="Executables" Version="4.3">
+    <EntryPoint>
+      <ExeHost>
+        <Program>native-echo</Program>
+        <Arguments>[Arguments]</Arguments>
+      </ExeHost>
+    </EntryPoint>
+  </CodePackage>
+  <Resources>
+    <Endpoints>
+      <Endpoint Name="Control" Protocol="tcp" Type="Internal" Port="32123" />
+    </Endpoints>
+  </Resources>
+</ServiceManifest>

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ApplicationManifest xmlns="http://schemas.microsoft.com/2011/01/fabric"
+                     ApplicationTypeName="ManifestHostApplication" ApplicationTypeVersion="2.1">
+  <Parameters>
+    <Parameter Name="Type" DefaultValue="ManifestEchoType" />
+    <Parameter Name="Service" DefaultValue="DefaultEcho" />
+    <Parameter Name="Instances" DefaultValue="1" />
+    <Parameter Name="Arguments" DefaultValue="--manifest-fixture --type ManifestEchoType --service fabric:/ManifestQualification/DefaultEcho --terminal close --endpoint socket" />
+  </Parameters>
+  <ServiceManifestImport>
+    <ServiceManifestRef ServiceManifestName="EchoPackage" ServiceManifestVersion="3.2" />
+  </ServiceManifestImport>
+  <DefaultServices>
+    <Service Name="[Service]" ServicePackageActivationMode="SharedProcess">
+      <StatelessService ServiceTypeName="[Type]" InstanceCount="[Instances]">
+        <SingletonPartition />
+      </StatelessService>
+    </Service>
+  </DefaultServices>
+</ApplicationManifest>

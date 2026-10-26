@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ServiceManifest Name="LinuxClusterSmokePackage" Version="1.0.1"
+                 xmlns="http://schemas.microsoft.com/2011/01/fabric">
+  <ServiceTypes>
+    <StatelessServiceType ServiceTypeName="LinuxClusterSmokeServiceType"
+                          UseImplicitHost="true" />
+  </ServiceTypes>
+  <CodePackage Name="Code" Version="1.0.1">
+    <EntryPoint>
+      <ExeHost>
+        <Program>smoke</Program>
+        <Arguments>8080</Arguments>
+        <WorkingFolder>CodePackage</WorkingFolder>
+        <ConsoleRedirection FileRetentionCount="3" FileMaxSizeInKb="128" />
+      </ExeHost>
+    </EntryPoint>
+  </CodePackage>
+  <Resources>
+    <Endpoints>
+      <Endpoint Name="Http" Protocol="http" Type="Input" Port="8080" />
+    </Endpoints>
+  </Resources>
+</ServiceManifest>
