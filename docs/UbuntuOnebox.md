@@ -177,10 +177,13 @@ Linux images are outside this port.
 ## Continuous integration
 
 The Linux onebox job in `.github/workflows/ci.yaml` builds and runs this
-single-container onebox on an Ubuntu 24.04 host, then qualifies the native Rust
-client using the archived tests. It exercises creation, health, retained down/up,
-resumed health, and survival of a synthetic naming-store entry. Onebox uses
-source-style startup without upgrades or a fixed stability wait. The job always attempts allowlisted
+single-container onebox on an Ubuntu 24.04 host, checks fresh health, then
+qualifies the native Rust client using the archived tests. Retained-data
+shutdown/restart and naming-store survival are qualified in
+[service-fabric-apps-rs](https://github.com/youyuanwu/service-fabric-apps-rs/blob/main/docs/UbuntuOnebox.md),
+not duplicated in this job. Local lifecycle commands and offline regression
+tests remain available. Onebox uses source-style startup without upgrades or a
+fixed stability wait. The job always attempts allowlisted
 credential-safe diagnostics and exact-name confirmed teardown. XML, raw runtime logs,
 environment variables, and arbitrary health/error text are not uploaded.
 

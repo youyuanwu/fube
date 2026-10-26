@@ -42,8 +42,12 @@ Create a [onebox](UbuntuOnebox.md), install the pinned nextest version from
 [CI](../.github/workflows/ci.yaml), and follow the
 [client qualification instructions](transport/RustFabricClient.md).
 CI builds the test archive once, then runs the explicitly owned fixture/setup
-tests and `group(onebox)` against the real native gateway. The onebox job also
-checks retained down/up and always attempts diagnostics and confirmed teardown.
+tests and `group(onebox)` against the real native gateway. The onebox job always
+attempts diagnostics and confirmed teardown. Retained-data shutdown/restart
+qualification runs in
+[service-fabric-apps-rs](https://github.com/youyuanwu/service-fabric-apps-rs/blob/main/docs/UbuntuOnebox.md),
+not in this job; offline lifecycle regression tests and local down/up commands
+remain available here.
 
 The shared lifecycle engine and its regression fixtures retain their historical
 `linux_cluster*` names and `docker/linux-cluster` paths. They are support for
