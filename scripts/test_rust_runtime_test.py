@@ -3,6 +3,7 @@ import contextlib
 import copy
 import io
 import json
+import sys
 import unittest
 import subprocess
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest.mock import patch, MagicMock
 import rust_runtime_test as runtime
 
 
+@unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class AllocationTests(unittest.TestCase):
     def setUp(self):
         self.state = {"name": "owned", "owner": "capability", "project": "sf-onebox-owned",
@@ -83,6 +85,7 @@ class AllocationTests(unittest.TestCase):
             cluster.destroy.assert_not_called()
 
 
+@unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class AmbiguousMutationTests(unittest.TestCase):
     def qualify(self,lost,cleanup_failure=False):
         allocation=MagicMock(name="allocation")
@@ -149,6 +152,7 @@ class AmbiguousMutationTests(unittest.TestCase):
             self.assertEqual(json.loads(output.getvalue())["cleanup"]["onebox"],"caller-owned allocation retained")
 
 
+@unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class ProcessTests(unittest.TestCase):
     def fixture(self):
         return {"native_pid": 321, "native_entry_point": "/owned/app/rust-runtime-app",

@@ -103,6 +103,27 @@ jobs:
         MSSF_NOTIFICATION_JOURNAL: ${{ runner.temp }}/native-notification-journal.json
         MSSF_NOTIFICATION_REPORT: ${{ runner.temp }}/native-notification-report.json
 
+    - name: Install runtime qualification toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v2
+      with:
+        rustflags: ""
+
+    - name: Qualify real Rust application runtime
+      id: native_runtime
+      run: |
+        owner="$(python3 -c 'import json,os; print(json.load(open(os.path.join(os.environ["CLUSTER_STATE_ROOT"],os.environ["CLUSTER_NAME"],"state.json")))["owner"])')"
+        python3 scripts/rust_runtime_test.py "$CLUSTER_NAME" --existing-owner "$owner" \
+          --full --report "$RUNNER_TEMP/rust-runtime-report.json"
+
+    - name: Upload successful Rust runtime evidence
+      if: steps.native_runtime.outcome == 'success'
+      uses: actions/upload-artifact@v7
+      with:
+        name: rust-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/rust-runtime-report.json
+        if-no-files-found: error
+        retention-days: 7
+
     - name: Upload successful native client evidence
       if: steps.native_client.outcome == 'success'
       uses: actions/upload-artifact@v7

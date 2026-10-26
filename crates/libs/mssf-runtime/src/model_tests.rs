@@ -47,6 +47,13 @@ fn model_child() {
                 .await
                 .is_err()),
                 "drop" => drop(runtime),
+                "executor-stall" => {
+                    // The only async executor thread is blocked, no timer or
+                    // transport callback can help. The OS watchdog must expire.
+                    std::thread::sleep(Duration::from_secs(2));
+                    drop(runtime);
+                    panic!("executor stall defeated authority expiry");
+                }
                 "blocked-stderr" => {
                     std::thread::spawn(|| {
                         let mut stderr = std::io::stderr().lock();
@@ -205,7 +212,14 @@ async fn scenario(mode: &str, expected: i32) {
                 "" if p.actor == 15 => {
                     assert_eq!(step, 3);
                     step = 4;
-                    to_vec(&LeaseReply { ttl: 300_000_000 }).unwrap()
+                    to_vec(&LeaseReply {
+                        ttl: if mode_owned == "executor-stall" {
+                            5_000_000
+                        } else {
+                            300_000_000
+                        },
+                    })
+                    .unwrap()
                 }
                 "UnregisterFabricRuntimeRequest" | "UnregisterApplicationHostRequest" => {
                     if mode_owned != "shutdown-ok" {
@@ -304,7 +318,13 @@ async fn startup_controls_cannot_grant_authority() {
 }
 #[tokio::test]
 async fn supervisor_survives_drop_failure_cancellation_and_blocked_diagnostics() {
-    for mode in ["drop", "shutdown-fail", "shutdown-cancel", "blocked-stderr"] {
+    for mode in [
+        "drop",
+        "shutdown-fail",
+        "shutdown-cancel",
+        "blocked-stderr",
+        "executor-stall",
+    ] {
         scenario(mode, 70).await;
     }
     scenario("shutdown-ok", 0).await;

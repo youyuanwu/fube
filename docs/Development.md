@@ -51,6 +51,37 @@ qualification runs in
 not in this job; offline lifecycle regression tests and local down/up commands
 remain available here.
 
+## Rust application runtime (Linux x86-64)
+
+This is separate from the native-backed `stateless-test-app` and standalone
+node-side test host. It deploys a normal ExeHost to real SF nodes:
+
+```sh
+cargo test --locked -p mssf-runtime -p mssf-transport
+cargo clippy --locked -p mssf-runtime -p rust-runtime-app --all-targets -- -D warnings
+cargo doc --locked -p mssf-runtime --no-deps
+python3 -m unittest discover -s scripts -p 'test_rust_runtime_test.py'
+just onebox-build
+python3 scripts/rust_runtime_test.py runtime-check --full
+```
+
+The last command creates and destroys only its exact owned onebox, using the
+existing lifecycle controller. It verifies native placement, independent
+mssf-client resolution/RPC, exact pidfd-based application termination/replacement,
+native lifecycle/query/update/failure traffic, concurrent shared-process
+partitions and bounded fencing of an intentionally non-cooperative application.
+It requires Linux pidfd APIs and the existing privileged development container
+for the exact-owned-IPC shutdown test; unavailable capabilities fail qualification.
+There is no security fallback.
+
+Use `--report NEW_FILE` for a new structured evidence file. To reuse an already
+owned healthy allocation, explicitly supply `--existing-owner OWNER`; the
+harness cleans up only its minted application/type, never the caller's box.
+Failed or ambiguous cleanup is reported with exact recovery identities.
+See [the supported runtime profile](runtime/RustStatelessRuntime.md) before
+interpreting a test result. Delayed/stale commands and lease-expiry races also
+have offline model tests; native IPC-loss proof is not a node-failure/TLS claim.
+
 The shared lifecycle engine and its regression fixtures retain their historical
 `linux_cluster*` names and `docker/linux-cluster` paths. They are support for
 onebox, not a separately shipped multi-container image or CI topology.

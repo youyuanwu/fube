@@ -251,6 +251,10 @@ impl Harness {
         }
     }
     async fn send(&mut self, action: &str, request: &ProxyRequest) -> MessageId {
+        let mut request = request.clone();
+        if action == "RAPQuery" {
+            request.flags = 0;
+        }
         let id = MessageId {
             guid: [7; 16],
             index: self.index,
@@ -268,7 +272,7 @@ impl Harness {
             &mut self.peer,
             &Message {
                 headers,
-                body: to_vec(request).unwrap(),
+                body: to_vec(&request).unwrap(),
             },
         )
         .await
@@ -314,13 +318,41 @@ async fn open_readiness_query_duplicate_close_and_partition_invalidation() {
     h.receive("ReplicaOpenReply").await;
     h.send("ReplicaClose", &old_epoch).await;
     h.no_reply().await;
-    let id = h.send("RAPQuery", &request).await;
+    let mut native_query = request.clone();
+    native_query.service.name.clear();
+    native_query.service.application.clear();
+    native_query.service.service_type.name.clear();
+    native_query.service.service_type.package.name.clear();
+    native_query
+        .service
+        .service_type
+        .package
+        .application
+        .type_name
+        .clear();
+    native_query.service.service_type.package.application.number = 0;
+    native_query.service.restart_wait = i64::MIN;
+    native_query.service.quorum_wait = i64::MIN;
+    native_query.service.standby_keep = i64::MIN;
+    native_query.unit.consistency.kind = 0;
+    let id = h.send("RAPQuery", &native_query).await;
     let response = h.receive("RAPQueryReply").await;
     assert_eq!(response.properties().unwrap().relates_to, id);
     let query: QueryReply = from_slice(&response.body).unwrap();
     assert_eq!(query.error, 0);
     assert_eq!(query.detail.instance_id, 100);
     assert_eq!(query.detail.operation, 1);
+    native_query.local.instance += 1;
+    h.send("RAPQuery", &native_query).await;
+    let newer_query: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+    assert_eq!(
+        newer_query.error, 0,
+        "native query permits newer request incarnation without mutating authority"
+    );
+    native_query.local.instance = 0;
+    h.send("RAPQuery", &native_query).await;
+    let stale_query: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+    assert_ne!(stale_query.error, 0);
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
     assert_eq!(h.calls.closes.load(Ordering::SeqCst), 1);

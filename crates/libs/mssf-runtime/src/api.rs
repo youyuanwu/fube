@@ -89,6 +89,12 @@ pub enum FaultType {
     Permanent,
 }
 impl Partition {
+    /// Remaining send-based authority, for application observability only.
+    /// It does not grant a new lease or permit reconnect/revival.
+    pub fn authority_remaining(&self) -> Result<std::time::Duration> {
+        self.ensure_valid()?;
+        self.authority.remaining()
+    }
     pub fn ensure_valid(&self) -> Result<()> {
         self.authority.check()?;
         if self.valid.load(Ordering::Acquire) {

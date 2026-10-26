@@ -1,4 +1,4 @@
-use crate::{api::*, lease::Authority, wire::*, ActivationContext};
+use crate::{api::*, lease::Authority, wire::*, ActivationContext, RuntimeMetrics};
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
 mod tests;
@@ -59,6 +59,7 @@ struct Shared {
     activation: ActivationContext,
     authority: Arc<Authority>,
     connection: Connection,
+    metrics: Arc<RuntimeMetrics>,
 }
 pub(crate) struct Engine {
     shared: Arc<Shared>,
@@ -66,6 +67,9 @@ pub(crate) struct Engine {
     task: JoinHandle<()>,
 }
 impl Engine {
+    pub(crate) fn metrics(&self) -> Arc<RuntimeMetrics> {
+        self.shared.metrics.clone()
+    }
     pub(crate) fn start(
         activation: ActivationContext,
         authority: Arc<Authority>,
@@ -81,6 +85,7 @@ impl Engine {
             activation,
             authority,
             connection,
+            metrics: Arc::new(RuntimeMetrics::default()),
         });
         let (stop, mut stopped) = watch::channel(false);
         let task_shared = shared.clone();
@@ -93,7 +98,11 @@ impl Engine {
                     result=work.join_next(), if !work.is_empty() => {
                         task_shared.active.fetch_sub(1,Ordering::SeqCst);
                         if !matches!(result,Some(Ok(Ok(())))) {
-                            task_shared.authority.retire(); task_shared.connection.abort(); break;
+                            let error=match result {
+                                Some(Ok(Err(error)))=>error,
+                                _=>Error::Protocol("lifecycle callback task panicked"),
+                            };
+                            task_shared.authority.retire(); task_shared.connection.abort_with_error(error); break;
                         }
                     }
                     request=incoming.recv() => {
@@ -243,8 +252,18 @@ fn unit(shared: &Shared, request: &ProxyRequest, create: bool) -> Result<Option<
 async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
     let props = incoming.message.properties()?;
     let request: ProxyRequest = from_slice(&incoming.message.body)?;
-    validate(&shared, &request)?;
     if props.action == "RAPQuery" {
+        // Native Query.HostQueryAsyncOperation uses a fully serialized DEFAULT
+        // ServiceDescription, not the manifest identity from ReplicaOpen.
+        // Query authority is the routed runtime + existing unit/replica, not
+        // that intentionally empty service description or partition metadata.
+        if request.runtime != shared.activation.runtime.id
+            || request.local.node.id.0.len() != 16
+            || request.flags != 0
+        {
+            return Err(Error::Protocol("invalid native RAPQuery context"));
+        }
+        shared.metrics.queries.fetch_add(1, Ordering::Relaxed);
         let reply = incoming
             .reply
             .ok_or(Error::Protocol("RAPQuery requires correlation"))?;
@@ -257,6 +276,7 @@ async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
             )
             .await;
     }
+    validate(&shared, &request)?;
     if incoming.reply.is_some() {
         return Err(Error::Protocol("lifecycle uses semantic one-way replies"));
     }
@@ -265,6 +285,15 @@ async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
         "ReplicaOpen" | "ReplicaClose" | "ProxyUpdateServiceDescription"
     ) {
         return Err(Error::Protocol("unsupported stateless RAP action"));
+    }
+    if props.action == "ReplicaOpen" {
+        shared.metrics.opens.fetch_add(1, Ordering::Relaxed);
+    }
+    if props.action == "ReplicaClose" {
+        shared.metrics.closes.fetch_add(1, Ordering::Relaxed);
+        if request.flags & 4 != 0 {
+            shared.metrics.aborts.fetch_add(1, Ordering::Relaxed);
+        }
     }
     let create = matches!(props.action.as_str(), "ReplicaOpen" | "ReplicaClose");
     let Some(unit) = unit(&shared, &request, create)? else {
@@ -360,13 +389,22 @@ async fn abort(service: Arc<dyn StatelessService>) -> Result<()> {
     .map_err(|_| Error::Protocol("service abort panicked"))?;
     Ok(())
 }
-async fn abort_unit(unit: &Unit, service: Arc<dyn StatelessService>) -> Result<()> {
+async fn abort_unit(
+    shared: &Shared,
+    unit: &Unit,
+    service: Arc<dyn StatelessService>,
+) -> Result<()> {
     {
         let mut state = unit.state.lock().unwrap();
         state.operation_kind = 16;
         state.operation_start = filetime();
     }
-    abort(service).await
+    abort(service).await?;
+    shared
+        .metrics
+        .abort_callbacks
+        .fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()> {
     let duplicate = {
@@ -487,9 +525,10 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
     }
     .await;
     if let Err(error) = &outcome {
+        shared.metrics.open_failures.fetch_add(1, Ordering::Relaxed);
         let service = unit.state.lock().unwrap().service.take();
         if let Some(service) = service {
-            abort_unit(unit, service).await?;
+            abort_unit(shared, unit, service).await?;
         } else if matches!(error, Error::Timeout) {
             // Unknown factory side effects cannot be proven disposed.
             return Err(Error::Protocol(
@@ -541,11 +580,15 @@ async fn close(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()
     if !already_closed {
         if let Some(service) = service {
             if request.flags & 4 != 0 {
-                abort_unit(unit, service).await?;
+                abort_unit(shared, unit, service).await?;
             } else {
                 let result = tokio::time::timeout(CALLBACK_TIMEOUT, service.close(cancel)).await;
                 if !matches!(result, Ok(Ok(()))) {
-                    abort_unit(unit, service).await?;
+                    shared
+                        .metrics
+                        .close_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    abort_unit(shared, unit, service).await?;
                 }
             }
         } else {
@@ -582,6 +625,7 @@ async fn update(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<(
         if request.service.update_version > state.request.service.update_version {
             state.request.service = request.service;
         }
+        shared.metrics.updates.fetch_add(1, Ordering::Relaxed);
         UpdateServiceReply {
             error: 0,
             unit: state.request.unit.clone(),
@@ -625,10 +669,7 @@ fn query(shared: &Shared, request: &ProxyRequest) -> Result<QueryReply> {
             Phase::Closed => OBJECT_CLOSED,
             _ => 0,
         };
-        if stale(&state.request, request)
-            || state.request.local.id != request.local.id
-            || state.request.local.instance != request.local.instance
-        {
+        if stale(&state.request, request) {
             error = 0x80071d4au32 as i32 as i64;
         }
         if error == 0 {

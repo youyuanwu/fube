@@ -476,6 +476,11 @@ impl Connection {
     pub fn abort(&self) {
         self.handle.shared.fail(Error::Closed);
     }
+    /// Retire the shared connection with the caller's first observed fatal
+    /// protocol cause, without blocking or invoking application diagnostics.
+    pub fn abort_with_error(&self, error: Error) {
+        self.handle.shared.fail(error);
+    }
 
     /// Snapshot of the latest supported peer ListenInstance control.
     pub fn remote_instance(&self) -> ListenInstance {

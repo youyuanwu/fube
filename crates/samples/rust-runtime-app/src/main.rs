@@ -3,7 +3,7 @@ use mssf_runtime::*;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -17,15 +17,25 @@ use tokio::{
 struct Route {
     partition: Partition,
     active: AtomicUsize,
+    deliberately_noncooperative: bool,
 }
 struct Rpc {
     ip: String,
     port: u16,
     node: String,
+    node_type: String,
     host: String,
     code_sequence: i64,
     listener: OnceCell<()>,
     routes: Mutex<HashMap<String, Arc<Route>>>,
+    metrics: Arc<RuntimeMetrics>,
+    opening: AtomicUsize,
+    maximum_opening: AtomicUsize,
+    node_host_pid: u32,
+    initial_ttl: i64,
+    fresh_poll_ttl: i64,
+    fresh_poll_elapsed_micros: u64,
+    deliberately_noncooperative: AtomicBool,
 }
 impl Rpc {
     async fn listen(self: &Arc<Self>) -> RuntimeResult<()> {
@@ -99,11 +109,25 @@ impl Rpc {
         }
         let (status, body, _active) = if let Some(route) = route {
             let active = Active(route.clone());
-            if route.partition.ensure_valid().is_ok() {
+            // Explicit acceptance-only failure injection: prove that even an
+            // application that ignores invalid partition authority cannot serve
+            // beyond the independent process watchdog. Default services check it.
+            if route.deliberately_noncooperative || route.partition.ensure_valid().is_ok() {
                 let id = &route.partition.identity;
+                let counters = self.metrics.snapshot();
                 (200,serde_json::json!({"pid":std::process::id(),"partition":id.partition_id.to_string(),
                     "instance":id.instance_id,"incarnation":id.incarnation,"service":id.service_name,
-                    "node":self.node,"host":self.host,"code_sequence":self.code_sequence}).to_string(),Some(active))
+                    "node":self.node,"node_type":self.node_type,"host":self.host,"code_sequence":self.code_sequence,
+                    "initial_ttl_ticks":self.initial_ttl,"fresh_poll_ttl_ticks":self.fresh_poll_ttl,
+                    "fresh_poll_elapsed_micros":self.fresh_poll_elapsed_micros,
+                    "node_host_pid":self.node_host_pid,"maximum_concurrent_opens":self.maximum_opening.load(Ordering::Relaxed),
+                    "remaining_authority_millis":route.partition.authority_remaining().map(|v|v.as_millis() as u64).unwrap_or(0),
+                    "native_actions":{"open":counters.open_commands,"close":counters.close_commands,
+                        "abort":counters.abort_commands,"query":counters.queries,"update":counters.service_updates,
+                        "open_failures":counters.open_failures,"close_failures":counters.close_failures,
+                        "abort_callbacks":counters.abort_callbacks},
+                    "deliberately_noncooperative":route.deliberately_noncooperative
+                }).to_string(),Some(active))
             } else {
                 (503, "{}".into(), Some(active))
             }
@@ -144,12 +168,34 @@ impl Service {
 impl StatelessService for Service {
     fn open(&self, partition: Partition, _cancellation: Cancellation) -> ServiceFuture<'_, String> {
         Box::pin(async move {
+            struct Opening<'a>(&'a AtomicUsize);
+            impl Drop for Opening<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let count = self.rpc.opening.fetch_add(1, Ordering::SeqCst) + 1;
+            let _opening = Opening(&self.rpc.opening);
+            self.rpc.maximum_opening.fetch_max(count, Ordering::SeqCst);
+            if self.context.identity.service_name.ends_with("/Concurrent") {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
             self.rpc.listen().await?;
             partition.ensure_valid()?;
             let route = Arc::new(Route {
                 partition,
                 active: AtomicUsize::new(0),
+                deliberately_noncooperative: self
+                    .context
+                    .identity
+                    .service_name
+                    .ends_with("/Uncooperative"),
             });
+            if route.deliberately_noncooperative {
+                self.rpc
+                    .deliberately_noncooperative
+                    .store(true, Ordering::Release);
+            }
             self.rpc
                 .routes
                 .lock()
@@ -226,10 +272,19 @@ async fn run() -> RuntimeResult<()> {
             .get("Rpc")
             .ok_or(RuntimeError::InvalidInput("missing SF Rpc endpoint"))?,
         node: runtime.node_context().name.clone(),
+        node_type: runtime.node_context().node_type.clone(),
         host: activation.host_id.clone(),
         code_sequence: activation.code_sequence,
         listener: OnceCell::new(),
         routes: Mutex::new(HashMap::new()),
+        metrics: runtime.metrics(),
+        opening: AtomicUsize::new(0),
+        maximum_opening: AtomicUsize::new(0),
+        node_host_pid: runtime.node_context().host_process_id,
+        initial_ttl: runtime.node_context().initial_lease_ttl_ticks,
+        fresh_poll_ttl: runtime.node_context().fresh_poll_ttl_ticks,
+        fresh_poll_elapsed_micros: runtime.node_context().fresh_poll_elapsed_micros,
+        deliberately_noncooperative: AtomicBool::new(false),
     });
     println!(
         "ATTACHED pid={} host={} node={} code_sequence={}",
@@ -239,14 +294,22 @@ async fn run() -> RuntimeResult<()> {
         rpc.code_sequence
     );
     runtime
-        .register_stateless("RustRuntimeType", Arc::new(Factory(rpc)))
+        .register_stateless("RustRuntimeType", Arc::new(Factory(rpc.clone())))
         .await?;
     println!("TYPE_REGISTERED RustRuntimeType");
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         _=terminate.recv()=>{},
         _=tokio::signal::ctrl_c()=>{},
-        error=runtime.closed()=>return Err(error),
+        error=runtime.closed()=>{
+            if rpc.deliberately_noncooperative.load(Ordering::Acquire) {
+                // Explicit adversarial acceptance fixture: neither application
+                // listener nor main cooperates. Only the independent runtime
+                // watchdog may enforce terminal authority.
+                std::future::pending::<()>().await;
+            }
+            return Err(error)
+        },
     }
     runtime.shutdown().await
 }

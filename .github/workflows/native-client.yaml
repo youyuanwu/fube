@@ -48,6 +48,13 @@ jobs:
     - name: Check native app fixture
       run: cargo check --locked -p stateless-test-app
 
+    - name: Test Linux Rust runtime models
+      if: runner.os == 'Linux'
+      run: |
+        cargo test --locked -p mssf-runtime
+        cargo clippy --locked -p mssf-runtime -p rust-runtime-app --all-targets -- -D warnings
+        RUSTDOCFLAGS='-D warnings' cargo doc --locked -p mssf-runtime --no-deps
+
     - uses: actions/setup-python@v7
       with:
         python-version: "3.12"

@@ -3,6 +3,7 @@
 
 mod api;
 mod context;
+mod diagnostics;
 mod lease;
 mod lifecycle;
 #[cfg(test)]
@@ -26,6 +27,7 @@ pub use api::{
     ServiceIdentity, StatelessFactory, StatelessService,
 };
 pub use context::ActivationContext;
+pub use diagnostics::{RuntimeCounters, RuntimeMetrics};
 use lease::Authority;
 pub use lifecycle::{MAX_CALLBACKS, MAX_SERVICE_UNITS, MAX_TOMBSTONES};
 pub use mssf_transport::{Error as RuntimeError, Result as RuntimeResult};
@@ -45,6 +47,11 @@ pub struct NodeContext {
     pub client_address: String,
     pub deployment_directory: String,
     pub work_directory: String,
+    pub host_process_id: u32,
+    pub initial_lease_ttl_ticks: i64,
+    pub lease_duration_ticks: i64,
+    pub fresh_poll_ttl_ticks: i64,
+    pub fresh_poll_elapsed_micros: u64,
 }
 
 /// Process-wide application host attachment. No reconnect or security fallback.
@@ -214,6 +221,11 @@ impl Runtime {
             client_address: start.client_address,
             deployment_directory: start.deployment,
             work_directory: start.work,
+            host_process_id: start.node_pid,
+            initial_lease_ttl_ticks: start.initial_ttl,
+            lease_duration_ticks: start.lease_duration,
+            fresh_poll_ttl_ticks: ttl,
+            fresh_poll_elapsed_micros: sent.elapsed().as_micros().min(u64::MAX as u128) as u64,
         };
         authority.watchdog()?;
         let monitor_connection = connection.clone();
@@ -306,6 +318,9 @@ impl Runtime {
     }
     pub fn node_context(&self) -> &NodeContext {
         &self.node
+    }
+    pub fn metrics(&self) -> Arc<RuntimeMetrics> {
+        self.lifecycle.metrics()
     }
 
     /// Keep factory ownership until runtime shutdown. There is no invented

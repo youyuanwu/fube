@@ -14,10 +14,14 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
-import onebox_ctl
+if sys.platform == "linux":
+    import onebox_ctl
+else:
+    onebox_ctl = None
 
 ROOT = Path(__file__).resolve().parents[1]
 OWNER_LABEL = "io.github.service-fabric-apps.cluster-owner"
@@ -82,7 +86,7 @@ class Allocation:
 # Runs in the container PID namespace. pidfd binds the signal to the verified
 # incarnation, even if a PID is recycled between inspection and signal delivery.
 PROCESS = r"""
-import json,os,signal,sys,time
+import json,os,signal,sys,time,select,socket,ctypes
 from pathlib import Path
 expected=json.loads(sys.argv[1]); action=sys.argv[2]; pid=expected["native_pid"]
 def require(condition,message):
@@ -108,6 +112,41 @@ try:
     if action=="kill":
         result["terminated_at_monotonic"]=time.monotonic()
         signal.pidfd_send_signal(fd,signal.SIGKILL)
+    elif action=="cut-ipc":
+        # Destroy only the single established TCP socket owned by this verified
+        # app, selected using its actual node-injected IPC destination and fd
+        # inode. No node or unrelated process is signalled.
+        require(rpc.get("deliberately_noncooperative") is True,"authority test requires explicit failure fixture")
+        remote_port=int(env["Fabric_RuntimeConnectionAddress"].rsplit(":",1)[1])
+        descriptors={}
+        for path in (root/"fd").iterdir():
+            try: target=os.readlink(path)
+            except FileNotFoundError: continue
+            if target.startswith("socket:["): descriptors[target[8:-1]]=int(path.name)
+        inodes=set(descriptors)
+        matches=[]
+        for line in (root/"net/tcp").read_text().splitlines()[1:]:
+            row=line.split()
+            local,remote=row[1].split(":"),row[2].split(":")
+            if row[9] in inodes and row[3]=="01" and local[0]==remote[0]=="0100007F" and int(remote[1],16)==remote_port:
+                matches.append(row[9])
+        require(len(matches)==1,"cannot prove unique application IPC socket")
+        # Test-only Linux x86-64 pidfd_getfd: duplicate this verified app's exact
+        # IPC descriptor, recheck its inode, then shut down the shared socket.
+        # No SF libraries/helper runtime, node pause, broad filter or policy
+        # bypass. An unavailable kernel capability is a qualification blocker.
+        require(os.uname().machine=="x86_64","fault injector requires Linux x86-64")
+        libc=ctypes.CDLL(None,use_errno=True)
+        duplicate=libc.syscall(438,fd,descriptors[matches[0]],0)
+        require(duplicate>=0,"pidfd_getfd unavailable: errno "+str(ctypes.get_errno()))
+        with socket.socket(fileno=duplicate) as ipc:
+            require(os.fstat(ipc.fileno()).st_ino==int(matches[0]),"IPC descriptor was reused")
+            result["authority_loss_at_monotonic"]=time.monotonic()
+            ipc.shutdown(socket.SHUT_RDWR)
+        poll=select.poll();poll.register(fd,select.POLLIN)
+        require(bool(poll.poll(1500)),"application did not fence after exact IPC loss")
+        result["authority_fence_seconds"]=time.monotonic()-result["authority_loss_at_monotonic"]
+        require(result["authority_fence_seconds"]<=1,"authority fence exceeded 1 second")
     elif action!="inspect":
         raise ValueError("unsupported process action")
     print(json.dumps(result))
@@ -178,6 +217,128 @@ def package(run_id: str) -> tuple[Path, str, str]:
     return destination, type_name, manifest.getroot().attrib["ApplicationTypeVersion"]
 
 
+def wait_condition(check, description: str, timeout: float = 60):
+    end=time.monotonic()+timeout
+    last="not attempted"
+    while time.monotonic()<end:
+        try:
+            value=check()
+            if value:
+                return value
+        except (RuntimeError,subprocess.TimeoutExpired) as error:
+            last=str(error)
+        time.sleep(0.1)
+    raise RuntimeError(f"{description} not established: {last}")
+
+
+def controls_and_authority(allocation: Allocation, application: str, result: dict | None = None) -> dict:
+    from concurrent.futures import ThreadPoolExecutor
+    import http.client
+    from urllib.parse import urlsplit
+    import threading
+
+    anchor=wait_observe(application+"/Singleton")
+    constraint="NodeType == "+anchor["rpc"]["node_type"]
+    result={} if result is None else result
+    result["anchor"]=anchor
+    def create(suffix,partitioned=False):
+        args=["service","create","--app-id",application.removeprefix("fabric:/"),
+              "--name",application+"/"+suffix,"--service-type","RustRuntimeType",
+              "--stateless","--instance-count","1","--activation-mode","SharedProcess",
+              "--constraints",constraint]
+        args+=["--int-scheme","--int-scheme-count","2","--int-scheme-low","0","--int-scheme-high","1"] if partitioned else ["--singleton-scheme"]
+        allocation.sf(*args)
+    def metric(name,minimum,key=None,service="Concurrent"):
+        v=observe(application+"/"+service,key)
+        if v["native_pid"]!=anchor["native_pid"]:
+            raise RuntimeError("unrelated partition moved/crashed during control qualification")
+        return v if v["rpc"]["native_actions"][name]>=minimum else None
+    create("Concurrent",True)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        alpha,beta=list(pool.map(lambda key:wait_observe(application+"/Concurrent",key=key),["int:0","int:1"]))
+    if not (alpha["native_pid"]==beta["native_pid"]==anchor["native_pid"]
+            and alpha["rpc"]["partition"]!=beta["rpc"]["partition"]
+            and alpha["rpc"]["maximum_concurrent_opens"]>=2):
+        raise RuntimeError("native shared-process concurrent partitions/overlapping Opens not proven")
+    result["concurrent"]={"alpha":alpha,"beta":beta}
+    baseline=alpha["rpc"]["native_actions"]
+    query=json.loads(allocation.sf("replica","deployed","--node-name",alpha["rpc"]["node"],
+        "--partition-id",alpha["rpc"]["partition"],"--replica-id",str(alpha["rpc"]["instance"])))
+    if query.get("serviceKind")!="Stateless" or query.get("serviceName")!=application+"/Concurrent":
+        raise RuntimeError("native correlated stateless query identity mismatch")
+    result["native_query"]=query
+    result["query_observation"]=wait_condition(lambda:metric("query",baseline["query"]+1,"int:0"),"native RAPQuery")
+    allocation.sf("service","update","--service-id",(application+"/Concurrent").removeprefix("fabric:/").replace("/","~"),
+                  "--stateless","--move-cost","High")
+    result["update_observation"]=wait_condition(lambda:metric("update",baseline["update"]+2,"int:0"),"native description updates")
+    # Non-force permanent removal is native Abort=4; force-remove instead kills
+    # the host and is explicitly not accepted as Abort callback evidence.
+    allocation.sf("replica","remove","--node-name",alpha["rpc"]["node"],
+                  "--partition-id",alpha["rpc"]["partition"],"--replica-id",str(alpha["rpc"]["instance"]))
+    result["abort_observation"]=wait_condition(lambda:metric("abort",baseline["abort"]+1,"int:1"),"native Abort command")
+    renewed=wait_condition(lambda: (v if (v:=observe(application+"/Concurrent","int:0"))["rpc"]["instance"]!=alpha["rpc"]["instance"] else None),
+                           "native replacement of removed partition")
+    if renewed["native_pid"]!=beta["native_pid"]:
+        raise RuntimeError("partition Abort disturbed shared-process sibling")
+    result["partition_replacement"]=renewed
+    failures_before=renewed["rpc"]["native_actions"]
+    create("FailClose")
+    wait_observe(application+"/FailClose")
+    allocation.sf("service","delete","--service-id",(application+"/FailClose").removeprefix("fabric:/").replace("/","~"))
+    result["close_failure_observation"]=wait_condition(
+        lambda:metric("close_failures",failures_before["close_failures"]+1,"int:1"),"native close failure/abort cleanup")
+    create("FailOpen")
+    result["open_failure_observation"]=wait_condition(
+        lambda:metric("open_failures",failures_before["open_failures"]+1,"int:1"),"native open failure")
+    try:
+        observe(application+"/FailOpen")
+    except RuntimeError:
+        result["failed_open_not_published"]=True
+    else:
+        raise RuntimeError("failed open published a usable endpoint")
+    allocation.sf("service","delete","--service-id",(application+"/FailOpen").removeprefix("fabric:/").replace("/","~"))
+    allocation.sf("service","delete","--service-id",(application+"/Concurrent").removeprefix("fabric:/").replace("/","~"))
+    create("Uncooperative")
+    noncooperative=wait_observe(application+"/Uncooperative")
+    if noncooperative["native_pid"]!=anchor["native_pid"]:
+        raise RuntimeError("authority fixture did not share the proven application process")
+    result["noncooperative"]=noncooperative
+    endpoint=urlsplit(noncooperative["endpoint"])
+    stop=threading.Event();ready=threading.Event();observations=[]
+    def probe():
+        while not stop.is_set():
+            connection=http.client.HTTPConnection(endpoint.hostname,endpoint.port,timeout=.15)
+            try:
+                connection.request("GET",endpoint.path)
+                response=connection.getresponse()
+                payload=json.loads(response.read(16384))
+                if response.status==200 and payload.get("pid")==noncooperative["native_pid"]:
+                    observations.append((time.monotonic(),payload.get("remaining_authority_millis")))
+                    ready.set()
+            except (OSError,ValueError,http.client.HTTPException):
+                pass
+            finally:
+                connection.close()
+            stop.wait(.01)
+    thread=threading.Thread(target=probe)
+    thread.start()
+    try:
+        if not ready.wait(3):
+            raise RuntimeError("noncooperative application listener was not usable before fault")
+        fence=json.loads(allocation.execute("python3","-c",PROCESS,json.dumps(noncooperative),"cut-ipc",timeout=6))
+    finally:
+        stop.set();thread.join(timeout=1)
+    triggered=fence["authority_loss_at_monotonic"]
+    if any(at>triggered+1 for at,_ in observations):
+        raise RuntimeError("old application RPC survived authority hard deadline")
+    if not any(at>=triggered and remaining==0 for at,remaining in observations):
+        raise RuntimeError("noncooperative serving after invalidation was not actually exercised")
+    result["authority_fence"]=fence
+    result["old_process_rpc_samples"]=len(observations)
+    result["last_usable_old_rpc_after_fault_seconds"]=max(at for at,_ in observations)-triggered
+    return result
+
+
 def items(raw: str) -> list:
     value=json.loads(raw)
     return value if isinstance(value,list) else value["items"]
@@ -233,7 +394,7 @@ def destroy_owned(name: str, owner: str) -> dict:
         return cluster.destroy(name)
 
 
-def qualify(allocation: Allocation) -> dict:
+def qualify(allocation: Allocation, full: bool = False) -> dict:
     run_id = uuid.uuid4().hex[:12]
     application = f"fabric:/FubeRustRuntime{run_id}"
     type_name=f"FubeRustRuntime{run_id}Type"
@@ -269,12 +430,15 @@ def qualify(allocation: Allocation) -> dict:
         allocation.sf("application", "create", "--app-name", application, "--app-type", type_name, "--app-version", version)
         attempts["create_completed"]=True
         result["restart"] = restart(allocation, application + "/Singleton")
+        if full:
+            result["resilience"]={}
+            controls_and_authority(allocation,application,result["resilience"])
     except Exception as error:
         result["errors"].append("qualification: "+str(error))
     finally:
         cleanup_deployment(allocation,result,attempts)
     if not result["errors"]:
-        result["status"]="PASS_SINGLETON_PLACEMENT_RPC_NATIVE_RESTART"
+        result["status"]="PASS_FULL_STATELESS_PROFILE" if full else "PASS_SINGLETON_PLACEMENT_RPC_NATIVE_RESTART"
     return result
 
 
@@ -283,7 +447,11 @@ def main() -> None:
     parser.add_argument("name")
     parser.add_argument("--existing-owner", help="exact owner capability; never destroy caller-owned onebox")
     parser.add_argument("--restart-service", help="qualify replacement of an explicitly named existing owned service")
+    parser.add_argument("--full",action="store_true",help="native shared-process/control/callback/authority qualification")
+    parser.add_argument("--report",type=Path,help="write a new structured evidence file (never overwrite)")
     args = parser.parse_args()
+    if sys.platform!="linux":
+        parser.error("native application-runtime qualification requires Linux x86-64")
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,39}", args.name):
         parser.error("invalid allocation name")
     if args.restart_service and not args.existing_owner:
@@ -300,7 +468,7 @@ def main() -> None:
             created = True
             owner = json.loads((ROOT / "build/oneboxes" / args.name / "state.json").read_text())["owner"]
         allocation = Allocation(args.name, owner)
-        result = restart(allocation, args.restart_service) if args.restart_service else qualify(allocation)
+        result = restart(allocation, args.restart_service) if args.restart_service else qualify(allocation,args.full)
         result.setdefault("status","PASS_SINGLETON_PLACEMENT_RPC_NATIVE_RESTART")
         result.setdefault("errors",[])
         result.setdefault("cleanup",{})
@@ -319,6 +487,13 @@ def main() -> None:
             result["cleanup"]["onebox"]="caller-owned allocation retained" if args.existing_owner else "create rejected; no cleanup capability"
     if result["errors"]:
         result["status"]="FAIL"
+    if args.report:
+        try:
+            with args.report.open("x",encoding="utf-8") as file:
+                json.dump(result,file,indent=2)
+        except Exception as error:
+            result["errors"].append("evidence file: "+str(error))
+            result["status"]="FAIL"
     print(json.dumps(result,indent=2))
     if result["status"]=="FAIL":
         raise SystemExit(1)

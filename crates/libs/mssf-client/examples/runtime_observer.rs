@@ -13,14 +13,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if !(2..=3).contains(&args.len()) {
         return Err(
-            "usage: runtime_observer GATEWAY_IP:PORT fabric:/APP/SERVICE [NAMED_PARTITION]".into(),
+            "usage: runtime_observer GATEWAY_IP:PORT fabric:/APP/SERVICE [NAMED_PARTITION|int:I64]"
+                .into(),
         );
     }
     let client = FabricClient::connect_clear(args[0].parse()?, Duration::from_secs(10)).await?;
     let name: NamingUri = args[1].parse()?;
-    let key = args
-        .get(2)
-        .map_or(PartitionKey::Singleton, |s| PartitionKey::Named(s.clone()));
+    let key = match args.get(2) {
+        None => PartitionKey::Singleton,
+        Some(value) if value.starts_with("int:") => PartitionKey::Int64(value[4..].parse()?),
+        Some(value) => PartitionKey::Named(value.clone()),
+    };
     let resolved = client
         .resolve_service_partition(&name, &key, None, Some(Duration::from_secs(10)))
         .await?;

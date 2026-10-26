@@ -74,6 +74,14 @@ impl Authority {
         self.retired
             .fetch_min(self.elapsed(Instant::now()), Ordering::SeqCst);
     }
+    pub(crate) fn remaining(&self) -> Result<Duration> {
+        self.check()?;
+        Ok(Duration::from_nanos(
+            self.expires
+                .load(Ordering::SeqCst)
+                .saturating_sub(self.elapsed(Instant::now())),
+        ))
+    }
     pub(crate) fn disarm(&self) {
         self.disarmed.store(true, Ordering::SeqCst);
     }
