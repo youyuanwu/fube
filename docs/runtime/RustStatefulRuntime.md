@@ -192,6 +192,19 @@ missing-`--full` rejection and documentation do not alter these tested Rust
 executables. Evidence is local, not checked into the repository; CI runs the
 same strict prebuilt/native tiers and publishes its own results.
 
+**Refreshed-main repeat:** latest-main fetch/rebase was a no-op onto
+`c2601c382cfcdfe7c05cdc5c103005e74c8822af`. A new clean bundle and full native
+run at **`2b3179b6e14b2cafa097b438deb8ca94a16f50ab`** passed every scenario again,
+including the required-full guard and independent RA departure checks:
+`build/stateful-empty-native-final.json`, SHA256
+`78d66aa6c0e4349ab63cb153a4f4a89faf5f63632745133eb6d4ab5eada4ae53`;
+bundle metadata SHA256
+`20257fdf5ef0be0caf9fca619ca96e496c75fcad87592c7dc31402d597b715d4`.
+Both executable hashes are identical to the table above. This repeat replaced
+shared PID 25971 → 26727; all minted app/type/upload and original
+`stempty-dab15f41-final` container/volume/network resources are absence-confirmed.
+Subsequent evidence-note commits are documentation-only.
+
 No application-state writes, replication data plane/storage, persisted recovery,
 durability, native FabricReplicator peer wire compatibility, Reliable Collections,
 rolling code upgrade/rollback, TLS/reconnect, Windows runtime or expanded host
