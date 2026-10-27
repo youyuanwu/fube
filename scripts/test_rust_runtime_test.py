@@ -406,13 +406,11 @@ class AllocationCommitTests(unittest.TestCase):
         runtime.onebox_ctl.ctl.write_json(cluster.directory/"compose.json",compose)
         cluster.save()
 
-    def workflow_script(self,name):
+    def workflow_command(self,name):
         workflow=(runtime.ROOT/".github/workflows/ci.yaml").read_text()
         step=workflow.split("- name: "+name+"\n",1)[1].split("\n    - name:",1)[0]
-        shell=textwrap.dedent(step.split("      run: |\n",1)[1])
-        if shell.startswith("python3 - <<'PY'\n"):
-            return shell.split("\n",1)[1].rsplit("\nPY",1)[0]
-        return shlex.split(shell)[2]
+        shell=textwrap.dedent(step.split("      run:",1)[1].lstrip().removeprefix("|"))
+        return shlex.split(shell)
 
     def test_readiness_failure_cleans_committed_owner_with_independent_absence(self):
         result=self.run_main()
@@ -461,20 +459,29 @@ class AllocationCommitTests(unittest.TestCase):
                         cluster.destroy("owned")
                     # Keep the tombstone so collision rejection reaches Docker preflight.
 
-    def run_ci_failure(self,drift=False):
+    def run_ci_create(self):
         output_path=self.root/"github-output"
-        create=self.workflow_script("Create native development cluster")
-        cleanup=self.workflow_script("Destroy only this job's cluster")
-        with patch.dict(runtime.os.environ,{"CLUSTER_NAME":"owned",
+        command=self.workflow_command("Create native development cluster")
+        with patch.dict(runtime.os.environ,{"CLUSTER_NAME":"owned","CLUSTER_CTL":"scripts/onebox_ctl.py",
                                             "GITHUB_OUTPUT":str(output_path)}), \
-             contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(TimeoutError,"readiness failed"):
-                exec(compile(create,"ci-create","exec"),{})
+             patch("sys.argv",[runtime.os.path.expandvars(arg) for arg in command[1:]]), \
+             patch.object(runtime.os,"umask"), \
+             contextlib.redirect_stdout(io.StringIO()) as output, \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+            status=runtime.onebox_ctl.main()
+        return status,output_path,output.getvalue(),error.getvalue()
+
+    def run_ci_failure(self,drift=False):
+        status,output_path,output,error=self.run_ci_create()
+        self.assertEqual(status,1)
+        self.assertIn("readiness failed",error)
         self.assertTrue(output_path.exists(),"failed create skipped owner output")
         owner=output_path.read_text().strip().removeprefix("owner=")
         self.assertEqual(owner,self.original_owner)
+        self.assertIn("::add-mask::"+owner,output)
         if drift:
             self.replace_owner()
+        cleanup=self.workflow_command("Destroy only this job's cluster")[2]
         with patch.dict(runtime.os.environ,{"CLUSTER_NAME":"owned"}), \
              patch("sys.argv",["-c",owner]),contextlib.redirect_stdout(io.StringIO()):
             if drift:
@@ -494,6 +501,25 @@ class AllocationCommitTests(unittest.TestCase):
 
     def test_ci_failure_never_authorizes_replacement_owner(self):
         self.run_ci_failure(drift=True)
+
+    def test_ci_rejected_existing_create_never_publishes_cleanup_owner(self):
+        with patch.object(runtime.onebox_ctl.Onebox,"wait"):
+            runtime.create_owned("owned")
+        status,output_path,output,error=self.run_ci_create()
+        self.assertEqual(status,1)
+        self.assertIn("already exists",error)
+        self.assertFalse(output_path.exists())
+        self.assertNotIn("::add-mask::",output)
+
+    def test_ci_name_collision_never_publishes_cleanup_owner(self):
+        def collision(arguments,**kwargs):
+            return "collision" if arguments[:3]==["docker","ps","-aq"] else self.docker(arguments,**kwargs)
+        with patch.object(runtime.onebox_ctl.ctl,"run",side_effect=collision):
+            status,output_path,output,error=self.run_ci_create()
+        self.assertEqual(status,1)
+        self.assertIn("refusing adoption",error)
+        self.assertFalse(output_path.exists())
+        self.assertNotIn("::add-mask::",output)
 
     def test_readiness_failure_never_recovers_replacement_owner(self):
         destroy=runtime.destroy_owned

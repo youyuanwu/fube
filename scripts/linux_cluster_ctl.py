@@ -605,6 +605,8 @@ def main(*, cluster_type=Cluster, state_root=STATE_ROOT, default_subnet=DEFAULT_
             action.add_argument("--subnet", default=default_subnet,
                                 help="Private IPv4 subnet (default: %(default)s)")
             action.add_argument("--image", default=default_image)
+            action.add_argument("--github-output", type=Path,
+                                help="Append the masked owner capability to this GitHub Actions output file at allocation commit")
         if command == "up":
             action.add_argument("--restart-node", choices=cluster_type.services,
                                 action="append", default=[])
@@ -620,7 +622,14 @@ def main(*, cluster_type=Cluster, state_root=STATE_ROOT, default_subnet=DEFAULT_
     with locked(root, args.name) as directory:
         cluster = cluster_type(directory, args.name)
         if args.command == "create":
-            result = cluster.create(args.subnet, args.image, args.timeout)
+            def allocated(owner):
+                print("::add-mask::" + owner, flush=True)
+                with args.github_output.open("a", encoding="utf-8") as output:
+                    output.write("owner=" + owner + "\n")
+            result = cluster.create(
+                args.subnet, args.image, args.timeout,
+                on_allocated=allocated if args.github_output is not None else None,
+            )
         else:
             cluster.load()
             if args.command == "up":

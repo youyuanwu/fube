@@ -38,7 +38,9 @@ class CommandLineTests(unittest.TestCase):
                         patch.object(ctl.os, "umask"), patch.object(ctl, "check_local_docker"), \
                         patch.object(ctl.Cluster, "create", return_value={"ready": True}) as create:
                     self.assertEqual(ctl.main(), 0)
-                create.assert_called_once_with(expected, "sf-apps-node:11.8.121.4", 900)
+                create.assert_called_once_with(
+                    expected, "sf-apps-node:11.8.121.4", 900, on_allocated=None,
+                )
 
 
 class LifecycleTests(unittest.TestCase):
