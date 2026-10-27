@@ -26,6 +26,13 @@ stateless test host against a real native app; see the separate
 [MVP scope and execution evidence](RustTestHost.md#2-implemented-mvp-and-usage).
 That does not implement the proposed pure-Rust application runtime.
 
+Later **application-side** work independently qualified a narrow Rust stateless
+runtime, reporting and unchanged-code configuration-context refresh on Linux SF
+11.8.121.4; see [the as-built profile and evidence](RustStatelessRuntime.md).
+Those observations do not establish that the inspected native source revision
+produced the deployed binaries, nor qualify rolling code upgrade/rollback or
+indefinite old-directory availability.
+
 ## 2. Distinct boundaries
 
 ```text
