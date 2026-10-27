@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ServiceManifest Name="RustRuntimeService" Version="1.1"
+ xmlns="http://schemas.microsoft.com/2011/01/fabric">
+  <ServiceTypes>
+    <StatelessServiceType ServiceTypeName="RustRuntimeType" UseImplicitHost="false" />
+  </ServiceTypes>
+  <CodePackage Name="Code" Version="1.1">
+    <EntryPoint>
+      <ExeHost>
+        <Program>rust-runtime-app</Program>
+        <WorkingFolder>CodePackage</WorkingFolder>
+        <ConsoleRedirection FileRetentionCount="5" FileMaxSizeInKb="1024" />
+      </ExeHost>
+    </EntryPoint>
+  </CodePackage>
+  <Resources>
+    <Endpoints>
+      <Endpoint Name="Rpc" Protocol="http" Type="Input" />
+    </Endpoints>
+  </Resources>
+</ServiceManifest>

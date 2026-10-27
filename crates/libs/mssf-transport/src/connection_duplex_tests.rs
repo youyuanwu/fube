@@ -31,6 +31,7 @@ async fn fragmented_reverse_and_correlated_reply_are_independent() {
             tx.try_send(request)
                 .map_err(|_| Error::ResourceLimit("test ingress"))
         })),
+        None,
     );
     let pending = connection.clone();
     let task = tokio::spawn(async move {
@@ -110,6 +111,7 @@ async fn full_reverse_handoff_and_unsupported_actions_retire_only_duplex_socket(
                 tx.try_send(r)
                     .map_err(|_| Error::ResourceLimit("reverse ingress"))
             })),
+            None,
         );
         let mut first = notification(1);
         if !full {
@@ -131,7 +133,7 @@ async fn full_reverse_handoff_and_unsupported_actions_retire_only_duplex_socket(
 #[tokio::test]
 async fn reply_control_capacity_is_bounded_without_request_admission() {
     let (stream, _peer) = duplex(64);
-    let connection = Connection::start_role(stream, ListenInstance::default(), [8; 16], None);
+    let connection = Connection::start_role(stream, ListenInstance::default(), [8; 16], None, None);
     let mut tasks = Vec::new();
     for index in 0..34 {
         let context = ReplyContext {

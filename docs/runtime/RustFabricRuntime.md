@@ -9,7 +9,13 @@ speak the node's private binary protocols, and implement the service lifecycle.
 Stateful replication is a separate, substantially larger compatibility tier.
 The companion [native architecture](FabricRuntime.md) explains those boundaries.
 
-**Status:** proposed design, not an implementation or interoperability claim.
+**Current status:** the Linux stateless application-side slice is implemented in
+`mssf-runtime` and qualified against real 11.8.121.4 nodes. See the
+[as-built API, supported profile and evidence](RustStatelessRuntime.md).
+The broader capability tiers below remain a proposed design, not claims of
+stateful, ABI, security or other-profile interoperability.
+
+**Original research status:** proposed design, not an implementation or interoperability claim.
 Research baseline: local Service Fabric source at
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`; repository baseline
 `e87b47ad1f36e8fa37f3b392bed7a8b2226bee75`, inspected 2026-10-25.

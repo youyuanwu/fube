@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ApplicationManifest ApplicationTypeName="RustRuntimeAppType" ApplicationTypeVersion="1.1"
+ xmlns="http://schemas.microsoft.com/2011/01/fabric">
+  <ServiceManifestImport>
+    <ServiceManifestRef ServiceManifestName="RustRuntimeService" ServiceManifestVersion="1.1" />
+  </ServiceManifestImport>
+  <DefaultServices>
+    <Service Name="Singleton">
+      <StatelessService ServiceTypeName="RustRuntimeType" InstanceCount="1">
+        <SingletonPartition />
+      </StatelessService>
+    </Service>
+  </DefaultServices>
+</ApplicationManifest>
