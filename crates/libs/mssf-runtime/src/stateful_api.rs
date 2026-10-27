@@ -144,6 +144,16 @@ pub trait StatefulService: Send + Sync + 'static {
     fn abort(&self);
 }
 
+/// Owned removal purpose selected by the RAP adapter, never by peer traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaRemoval {
+    /// Native idle-owner removal; fence later builds of this same incarnation.
+    Idle,
+    /// Dispose partial/previous build resources before a node-authorized retry.
+    /// Successful cleanup is not a successful Build or a final native tombstone.
+    BuildRetryCleanup,
+}
+
 /// Custom-replicator control seam. There is deliberately no default all-success
 /// implementation and no application write, storage or built-in-replicator API.
 pub trait Replicator: Send + Sync + 'static {
@@ -183,6 +193,7 @@ pub trait Replicator: Send + Sync + 'static {
     fn remove_replica(
         &self,
         replica: ReplicaInformation,
+        reason: ReplicaRemoval,
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, ()>;
     fn close(&self, cancellation: Cancellation) -> ServiceFuture<'_, ()>;

@@ -64,8 +64,9 @@ struct Unit {
 #[derive(Default)]
 struct ReplyControl {
     api: Option<(i64, i64)>,
-    revision: Option<(Arc<AtomicU64>, u64)>,
+    revision: Option<RevisionFence>,
 }
+type RevisionFence = (Arc<AtomicU64>, u64, Option<Cancellation>);
 
 pub(crate) struct Registry {
     units: Mutex<HashMap<[u8; 16], Arc<Unit>>>,
@@ -209,7 +210,15 @@ impl Registry {
         operation: impl Future<Output = Result<T>> + Send + 'static,
     ) -> Result<T> {
         let timeout = Duration::from_millis(self.callback_timeout_millis.load(Ordering::Acquire));
-        let guard = self.authority.callback_deadline(timeout, false)?;
+        let guard = match self.authority.callback_deadline(timeout, false) {
+            Ok(guard) => guard,
+            Err(error) => {
+                // Even rejecting admission may destroy application captures.
+                self.authority.retire();
+                self.connection.abort();
+                return Err(error);
+            }
+        };
         let mut operation = tokio::spawn(async move {
             let result = operation.await;
             drop(guard);
@@ -764,7 +773,7 @@ impl Registry {
                 (None, None)
             }
         };
-        drop(disposed);
+        final_release(disposed, self.authority.clone()).await?;
         self.reply(
             unit,
             "ReplicaOpenReply",
@@ -933,6 +942,7 @@ impl Registry {
             Ok::<_, Error>(())
         };
         if request.flags & 4 != 0 {
+            drop(graceful);
             dispose(
                 replicator.clone(),
                 service.clone(),
@@ -971,7 +981,13 @@ impl Registry {
             status.replication_address.clear();
             (state.service.take(), state.replicator.take())
         };
-        drop((old_service, old_replicator));
+        // Include the local callback clones: releasing only State's Arcs is
+        // not final runtime-owned destruction. No Close reply precedes it.
+        final_release(
+            (old_service, old_replicator, service, replicator),
+            self.authority.clone(),
+        )
+        .await?;
         self.reply(unit, "ReplicaCloseReply", request, None, 2)
             .await
     }
@@ -1185,9 +1201,12 @@ impl Registry {
                         .upgrade()
                         .is_some_and(|authority| authority.check().is_ok())
                         && (!publish || frame_valid.load(Ordering::Acquire))
-                        && frame_revision.as_ref().is_none_or(|(revision, expected)| {
-                            revision.load(Ordering::Acquire) == *expected
-                        })
+                        && frame_revision.as_ref().is_none_or(
+                            |(revision, expected, cancellation)| {
+                                revision.load(Ordering::Acquire) == *expected
+                                    && cancellation.as_ref().is_none_or(|c| !c.is_cancelled())
+                            },
+                        )
                 })),
             )
             .await;
@@ -1196,9 +1215,12 @@ impl Registry {
             // successful endpoint publication or a process-wide fault.
             Err(Error::Closed)
                 if (publish && !valid.load(Ordering::Acquire)
-                    || revision.as_ref().is_some_and(|(revision, expected)| {
-                        revision.load(Ordering::Acquire) != *expected
-                    }))
+                    || revision
+                        .as_ref()
+                        .is_some_and(|(revision, expected, cancellation)| {
+                            revision.load(Ordering::Acquire) != *expected
+                                || cancellation.as_ref().is_some_and(|c| c.is_cancelled())
+                        }))
                     && self.authority.check().is_ok() =>
             {
                 Ok(())
@@ -1238,9 +1260,29 @@ impl Registry {
             }
         }
         let factories = std::mem::take(&mut *self.factories.lock().unwrap());
-        drop(factories);
+        final_release(factories, self.authority.clone()).await?;
         Ok(())
     }
+}
+
+async fn final_release<T: Send + 'static>(owned: T, authority: Arc<Authority>) -> Result<()> {
+    let guard = match authority.callback_deadline(Duration::from_millis(250), true) {
+        Ok(guard) => guard,
+        Err(error) => {
+            authority.retire();
+            return Err(error);
+        }
+    };
+    tokio::time::timeout(
+        Duration::from_millis(250),
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            drop(owned);
+        }),
+    )
+    .await
+    .map_err(|_| Error::Timeout)?
+    .map_err(|_| Error::Protocol("stateful final participant destruction panicked"))
 }
 
 async fn dispose(
@@ -1249,7 +1291,13 @@ async fn dispose(
     monitor: Option<Arc<Mutex<State>>>,
     authority: Arc<Authority>,
 ) -> Result<()> {
-    let guard = authority.callback_deadline(Duration::from_millis(250), true)?;
+    let guard = match authority.callback_deadline(Duration::from_millis(250), true) {
+        Ok(guard) => guard,
+        Err(error) => {
+            authority.retire();
+            return Err(error);
+        }
+    };
     tokio::time::timeout(
         Duration::from_millis(250),
         tokio::task::spawn_blocking(move || {

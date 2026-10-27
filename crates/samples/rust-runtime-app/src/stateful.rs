@@ -48,7 +48,8 @@ struct EmptyState {
     revision: u64,
     address: String,
     built: BTreeMap<PeerKey, ()>,
-    removed: BTreeMap<PeerKey, ()>,
+    removed: BTreeMap<PeerKey, ReplicaRemoval>,
+    build_tokens: BTreeMap<PeerKey, u64>,
 }
 pub(super) struct EmptyReplicator {
     me: Weak<Self>,
@@ -93,6 +94,7 @@ impl EmptyReplicator {
                 address: String::new(),
                 built: BTreeMap::new(),
                 removed: BTreeMap::new(),
+                build_tokens: BTreeMap::new(),
             }),
             stopped: Cancellation::default(),
             changed: tokio::sync::Notify::new(),
@@ -171,6 +173,7 @@ impl EmptyReplicator {
             state.previous = None;
             state.built.clear();
             state.removed.clear();
+            state.build_tokens.clear();
         }
         self.stopped.cancel();
         self.changed.notify_waiters();
@@ -547,12 +550,25 @@ impl Replicator for EmptyReplicator {
             {
                 return Err(failure("invalid idle build target"));
             }
-            let epoch = {
-                let state = self.state.lock().unwrap();
-                if state.removed.contains_key(&key(&peer)) {
+            let (epoch, token) = {
+                let mut state = self.state.lock().unwrap();
+                if state.removed.get(&key(&peer)) == Some(&ReplicaRemoval::Idle) {
                     return Err(failure("removed incarnation cannot be rebuilt"));
                 }
-                state.epoch.ok_or(failure("uninitialized epoch"))?
+                let epoch = state.epoch.ok_or(failure("uninitialized epoch"))?;
+                if state.build_tokens.len() >= PEER_LIMIT
+                    && !state.build_tokens.contains_key(&key(&peer))
+                {
+                    return Err(failure("empty build token bound"));
+                }
+                state.revision = state
+                    .revision
+                    .checked_add(1)
+                    .ok_or(failure("empty control revision exhausted"))?;
+                let token = state.revision;
+                state.build_tokens.insert(key(&peer), token);
+                state.removed.remove(&key(&peer));
+                (epoch, token)
             };
             self.probe(&peer, epoch, None, true, &cancellation).await?;
             self.view.snapshot()?;
@@ -561,6 +577,7 @@ impl Replicator for EmptyReplicator {
                 || state.epoch != Some(epoch)
                 || state.role != ReplicaRole::Primary
                 || state.removed.contains_key(&key(&peer))
+                || state.build_tokens.get(&key(&peer)) != Some(&token)
                 || cancellation.is_cancelled()
             {
                 return Err(RuntimeError::Closed);
@@ -575,6 +592,7 @@ impl Replicator for EmptyReplicator {
     fn remove_replica(
         &self,
         peer: ReplicaInformation,
+        reason: ReplicaRemoval,
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
@@ -590,7 +608,8 @@ impl Replicator for EmptyReplicator {
                 return Err(failure("empty removal tombstone bound"));
             }
             let was_built = state.built.remove(&key(&peer)).is_some();
-            let newly_removed = state.removed.insert(key(&peer), ()).is_none();
+            state.build_tokens.remove(&key(&peer));
+            let newly_removed = state.removed.insert(key(&peer), reason) != Some(reason);
             if was_built || newly_removed {
                 state.revision = state
                     .revision

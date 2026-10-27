@@ -3,6 +3,7 @@ use super::*;
 async fn caught_up_with_built_peer(
     h: &mut Harness,
     mode: u8,
+    active_member: bool,
 ) -> (Arc<StatefulCalls>, ProxyRequest, ProxyRequest) {
     let calls = register(h);
     let open = request(h, 2, 1, mode);
@@ -11,6 +12,9 @@ async fn caught_up_with_built_peer(
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut target = peer(&open.local, 2);
     target.previous_role = 1;
+    if !active_member {
+        target.current_role = 2;
+    }
     let mut idle = target.clone();
     idle.current_role = 2;
     let build = control(&open, "ReplicatorBuildIdleReplica", vec![idle]);
@@ -37,7 +41,7 @@ async fn caught_up_with_built_peer(
 #[tokio::test]
 async fn successful_remove_revokes_cached_configuration_proof_without_shrinking_membership() {
     let mut h = Harness::new().await;
-    let (calls, open, mut update) = caught_up_with_built_peer(&mut h, 36).await;
+    let (calls, open, mut update) = caught_up_with_built_peer(&mut h, 36, false).await;
     let mut removed = update.remote.0[1].clone();
     removed.current_role = 2;
     let remove = control(&update, "ReplicatorRemoveIdleReplica", vec![removed]);
@@ -99,7 +103,7 @@ async fn unchanged_projected_proof_does_not_hide_changed_native_observations_and
 #[tokio::test]
 async fn late_configuration_during_remove_cannot_reinstall_pre_removal_receipt() {
     let mut h = Harness::new().await;
-    let (calls, _, update) = caught_up_with_built_peer(&mut h, 37).await;
+    let (calls, _, update) = caught_up_with_built_peer(&mut h, 37, false).await;
     let mut removed = update.remote.0[1].clone();
     removed.current_role = 2;
     let remove = control(&update, "ReplicatorRemoveIdleReplica", vec![removed]);
@@ -117,6 +121,140 @@ async fn late_configuration_during_remove_cannot_reinstall_pre_removal_receipt()
     let failed: ProxyReply = from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
     assert_eq!(failed.error.error, -994);
     assert_eq!(calls.configurations.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn configured_peer_handoff_suppresses_stale_idle_remove_without_revoking_proof() {
+    let mut h = Harness::new().await;
+    let (calls, _, update) = caught_up_with_built_peer(&mut h, 36, true).await;
+    let mut idle = update.remote.0[1].clone();
+    idle.current_role = 2;
+    let remove = control(&update, "ReplicatorRemoveIdleReplica", vec![idle]);
+    h.send("ReplicatorRemoveIdleReplica", &remove).await;
+    let reply: ProxyReply =
+        from_slice(&h.receive("ReplicatorRemoveIdleReplicaReply").await.body).unwrap();
+    assert_eq!(reply.error.error, 0);
+    assert!(
+        !calls.events.lock().unwrap().contains(&"remove"),
+        "configured peer's idle owner was not retired"
+    );
+    calls.configuration_failure.store(true, Ordering::Release);
+    h.send("UpdateConfiguration", &update).await;
+    let reply: ProxyReply = from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
+    assert_eq!(
+        reply.error.error, 0,
+        "stale remove revoked applied live configuration proof"
+    );
+    assert_eq!(calls.configurations.lock().unwrap().len(), 1);
+    let mut next = remove.clone();
+    next.remote.0[0].instance += 1;
+    h.send("ReplicatorBuildIdleReplica", &next).await;
+    wait_event(&calls, "remove", 1).await;
+    h.no_reply().await; // retired idle bookkeeping still owns old resources
+    h.send("ReplicatorBuildIdleReplica", &next).await;
+    let rebuilt: ProxyReply =
+        from_slice(&h.receive("ReplicatorBuildIdleReplicaReply").await.body).unwrap();
+    assert_eq!(rebuilt.error.error, 0);
+}
+
+#[tokio::test]
+async fn equal_incarnation_build_retries_prove_cleanup_after_build_or_remove_failure() {
+    for mode in [40, 41, 42] {
+        let mut h = Harness::new().await;
+        let calls = register(&h);
+        let open = request(&h, 2, 1, mode);
+        h.send("ReplicaOpen", &open).await;
+        h.receive("ReplicaOpenReply").await;
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        let mut idle = peer(&open.local, 2);
+        idle.current_role = 2;
+        let build = control(&open, "ReplicatorBuildIdleReplica", vec![idle]);
+        h.send("ReplicatorBuildIdleReplica", &build).await;
+        let first: ProxyReply =
+            from_slice(&h.receive("ReplicatorBuildIdleReplicaReply").await.body).unwrap();
+        assert_eq!(first.error.error, if mode == 41 { 0 } else { -993 });
+        h.engine
+            .shared
+            .stateful
+            .wait_remote_idle([2; 16], [2; 16])
+            .await;
+        if mode == 41 {
+            h.send("ReplicatorRemoveIdleReplica", &build).await;
+            let failed: ProxyReply =
+                from_slice(&h.receive("ReplicatorRemoveIdleReplicaReply").await.body).unwrap();
+            assert_eq!(failed.error.error, -992);
+            h.engine
+                .shared
+                .stateful
+                .wait_remote_idle([2; 16], [2; 16])
+                .await;
+        }
+        h.send("ReplicatorBuildIdleReplica", &build).await;
+        h.engine
+            .shared
+            .stateful
+            .wait_remote_idle([2; 16], [2; 16])
+            .await;
+        h.no_reply().await; // cleanup is not a successful Build
+        if mode == 42 {
+            h.send("ReplicatorBuildIdleReplica", &build).await;
+            h.engine
+                .shared
+                .stateful
+                .wait_remote_idle([2; 16], [2; 16])
+                .await;
+            h.no_reply().await; // a failed cleanup remains an obligation
+        }
+        let events = calls.events.lock().unwrap().clone();
+        assert_eq!(events.iter().filter(|e| **e == "build").count(), 1);
+        assert_eq!(
+            events.iter().filter(|e| **e == "remove").count(),
+            if mode == 40 { 1 } else { 2 }
+        );
+        assert_eq!(
+            calls.removals.lock().unwrap().last(),
+            Some(&crate::ReplicaRemoval::BuildRetryCleanup)
+        );
+        h.send("ReplicatorBuildIdleReplica", &build).await;
+        let rebuilt: ProxyReply =
+            from_slice(&h.receive("ReplicatorBuildIdleReplicaReply").await.body).unwrap();
+        assert_eq!(rebuilt.error.error, 0);
+        assert_eq!(
+            calls
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| **e == "build")
+                .count(),
+            2
+        );
+        h.engine
+            .shared
+            .stateful
+            .wait_remote_idle([2; 16], [2; 16])
+            .await;
+        h.send("ReplicatorRemoveIdleReplica", &build).await;
+        h.receive("ReplicatorRemoveIdleReplicaReply").await;
+        h.engine
+            .shared
+            .stateful
+            .wait_remote_idle([2; 16], [2; 16])
+            .await;
+        h.send("ReplicatorBuildIdleReplica", &build).await;
+        h.no_reply().await;
+        assert_eq!(
+            calls
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| **e == "build")
+                .count(),
+            2,
+            "genuine native removal resurrected a terminal incarnation"
+        );
+    }
 }
 
 #[tokio::test]

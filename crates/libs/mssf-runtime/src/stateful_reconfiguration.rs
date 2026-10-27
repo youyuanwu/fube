@@ -20,7 +20,9 @@ pub(super) struct Pending {
 enum RemotePhase {
     Building,
     Ready,
-    Failed,
+    CleanupRequired,
+    Retryable,
+    Retired,
     Dropped,
 }
 pub(super) struct Remote {
@@ -778,6 +780,32 @@ impl Registry {
             return Err(Error::Closed);
         }
         if result.is_ok() {
+            // Native transfers accepted Ready idle owners into configuration
+            // ownership without calling custom Remove. Retain the tombstone
+            // to suppress delayed Build/RemoveIdle for that exact incarnation.
+            for remote in state.remotes.values_mut() {
+                let accepted = receipt.current.replicas.iter().any(|r| {
+                    r.node_id == remote.descriptor.node.id.0.as_slice()
+                        && r.incarnation == remote.descriptor.instance
+                        && r.replica_id == remote.descriptor.id
+                        && r.node_instance == remote.descriptor.node.instance
+                }) || receipt.previous.as_ref().is_some_and(|pc| {
+                    pc.replicas.iter().any(|r| {
+                        r.node_id == remote.descriptor.node.id.0.as_slice()
+                            && r.incarnation == remote.descriptor.instance
+                            && r.replica_id == remote.descriptor.id
+                            && r.node_instance == remote.descriptor.node.instance
+                            && receipt
+                                .observations
+                                .iter()
+                                .any(|o| o.node_id == r.node_id && o.role == ReplicaRole::None)
+                    })
+                });
+                if accepted && remote.phase == RemotePhase::Ready && !remote.busy {
+                    remote.phase = RemotePhase::Retired;
+                    remote.cancel.cancel();
+                }
+            }
             state.applied_configuration = Some(receipt);
         }
         result
@@ -866,6 +894,7 @@ impl Registry {
                 (
                     state.full_revision.clone(),
                     state.full_revision.load(Ordering::Acquire),
+                    None,
                 ),
             )
         };
@@ -943,16 +972,18 @@ impl Registry {
         let descriptor = request.remote.0[0].clone();
         let info = information(&descriptor, false)?;
         let (replicator, lifetime) = participants(unit)?;
-        let revision = primary_fence(unit);
+        let mut revision = primary_fence(unit);
         let replacement = {
             let state = unit.state.lock().unwrap();
             state
                 .remotes
                 .get(&info.node_id)
                 .filter(|old| {
-                    descriptor.instance > old.descriptor.instance
+                    (descriptor.instance > old.descriptor.instance
+                        || descriptor.instance == old.descriptor.instance
+                            && old.phase == RemotePhase::CleanupRequired)
                         && !old.busy
-                        && old.phase != RemotePhase::Dropped
+                        && !matches!(old.phase, RemotePhase::Dropped | RemotePhase::Retryable)
                 })
                 .map(|old| old.descriptor.clone())
         };
@@ -984,7 +1015,7 @@ impl Registry {
             let key = info.node_id;
             if let Some(remote) = state.remotes.get(&key) {
                 if remote.descriptor.instance > descriptor.instance
-                    || remote.phase == RemotePhase::Dropped
+                    || matches!(remote.phase, RemotePhase::Dropped | RemotePhase::Retired)
                         && remote.descriptor.instance == descriptor.instance
                 {
                     return Ok(());
@@ -1007,7 +1038,7 @@ impl Registry {
                 if descriptor.instance == remote.descriptor.instance
                     && remote.phase == RemotePhase::Ready
                 {
-                    (Cancellation::default(), remote.sequence, true)
+                    (remote.cancel.clone(), remote.sequence, true)
                 } else {
                     state.sequence = state
                         .sequence
@@ -1050,6 +1081,7 @@ impl Registry {
                 (cancel, sequence, false)
             }
         };
+        revision.2 = Some(cancel.clone());
         if cached {
             return self
                 .reply_guarded(
@@ -1085,7 +1117,7 @@ impl Registry {
                     {
                         RemotePhase::Ready
                     } else {
-                        RemotePhase::Failed
+                        RemotePhase::CleanupRequired
                     };
                 }
             }
@@ -1138,8 +1170,27 @@ impl Registry {
             }
             // Removing a peer revokes any cached or queued proof that could
             // count it. This is bookkeeping, not a native membership change.
-            advance(&state.full_revision)?;
-            state.applied_configuration = None;
+            if emit_reply {
+                if let Some(remote) = state.remotes.get_mut(&info.node_id) {
+                    if remote.descriptor.instance == descriptor.instance
+                        && remote.phase == RemotePhase::Retryable
+                    {
+                        // Cleanup already completed, but only this native
+                        // RemoveIdle commits the terminal system tombstone.
+                        remote.phase = RemotePhase::Dropped;
+                        remote.cancel.cancel();
+                    }
+                }
+            }
+            let retired = state.remotes.get(&info.node_id).is_some_and(|r| {
+                r.descriptor.instance == descriptor.instance
+                    && (r.phase == RemotePhase::Dropped
+                        || r.phase == RemotePhase::Retired && emit_reply)
+            });
+            if !retired {
+                advance(&state.full_revision)?;
+                state.applied_configuration = None;
+            }
             if let Some(remote) = state.remotes.get(&info.node_id) {
                 if remote.descriptor.instance > descriptor.instance {
                     return Ok(());
@@ -1150,7 +1201,8 @@ impl Registry {
                     }
                     return Ok(());
                 }
-                if remote.phase == RemotePhase::Dropped
+                if (remote.phase == RemotePhase::Dropped
+                    || remote.phase == RemotePhase::Retired && emit_reply)
                     && remote.descriptor.instance == descriptor.instance
                 {
                     (remote.sequence, Cancellation::default(), true)
@@ -1165,7 +1217,7 @@ impl Registry {
                         info.node_id,
                         Remote {
                             descriptor: descriptor.clone(),
-                            phase: RemotePhase::Failed,
+                            phase: RemotePhase::CleanupRequired,
                             busy: true,
                             cancel: cancel.clone(),
                             sequence,
@@ -1219,7 +1271,15 @@ impl Registry {
         let result = self
             .complete(async move {
                 replicator
-                    .remove_replica(operation_info, operation_cancel)
+                    .remove_replica(
+                        operation_info,
+                        if emit_reply {
+                            crate::ReplicaRemoval::Idle
+                        } else {
+                            crate::ReplicaRemoval::BuildRetryCleanup
+                        },
+                        operation_cancel,
+                    )
                     .await
             })
             .await;
@@ -1232,9 +1292,13 @@ impl Registry {
                 if remote.sequence == sequence {
                     remote.busy = false;
                     remote.phase = if result.is_ok() {
-                        RemotePhase::Dropped
+                        if emit_reply {
+                            RemotePhase::Dropped
+                        } else {
+                            RemotePhase::Retryable
+                        }
                     } else {
-                        RemotePhase::Failed
+                        RemotePhase::CleanupRequired
                     };
                 }
             }
@@ -1365,18 +1429,20 @@ pub(super) fn advance(revision: &AtomicU64) -> Result<()> {
         .map(|_| ())
         .map_err(|_| Error::ResourceLimit("stateful revision"))
 }
-fn full_fence(unit: &Unit) -> (Arc<AtomicU64>, u64) {
+fn full_fence(unit: &Unit) -> RevisionFence {
     let state = unit.state.lock().unwrap();
     (
         state.full_revision.clone(),
         state.full_revision.load(Ordering::Acquire),
+        None,
     )
 }
-fn primary_fence(unit: &Unit) -> (Arc<AtomicU64>, u64) {
+fn primary_fence(unit: &Unit) -> RevisionFence {
     let state = unit.state.lock().unwrap();
     (
         state.primary_revision.clone(),
         state.primary_revision.load(Ordering::Acquire),
+        None,
     )
 }
 fn role_failure_api(unit: &Unit, requested: ReplicaRole) -> (i64, i64) {

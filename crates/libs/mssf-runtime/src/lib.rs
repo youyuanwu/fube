@@ -49,9 +49,9 @@ pub use reporting::{
 };
 pub use stateful_api::{
     AccessStatus, CatchUpMode, CatchUpResult, ConfigurationStage, Epoch, ReplicaIdentity,
-    ReplicaInformation, ReplicaLifecycle, ReplicaRole, ReplicaSetConfiguration, ReplicaStatus,
-    ReplicationProgress, Replicator, StatefulFactory, StatefulPartition, StatefulService,
-    StatefulServiceContext, MAX_REPLICA_SET_SIZE,
+    ReplicaInformation, ReplicaLifecycle, ReplicaRemoval, ReplicaRole, ReplicaSetConfiguration,
+    ReplicaStatus, ReplicationProgress, Replicator, StatefulFactory, StatefulPartition,
+    StatefulService, StatefulServiceContext, MAX_REPLICA_SET_SIZE,
 };
 use wire::*;
 

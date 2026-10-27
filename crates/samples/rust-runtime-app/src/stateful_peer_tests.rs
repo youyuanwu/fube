@@ -1,6 +1,86 @@
 use super::*;
 
 #[tokio::test]
+async fn retry_cleanup_allows_verified_same_incarnation_rebuild_but_native_remove_does_not() {
+    let (primary, _, _) = replica(1, 100, 1, ReplicaRole::Primary, server()).await;
+    let (_peer, _, address) = replica(2, 200, 1, ReplicaRole::Idle, server()).await;
+    let info = information(2, 200, 1, address, ReplicaRole::Idle);
+    let mut unreachable = info.clone();
+    unreachable.address = "http://127.0.0.1:1/unreachable".into();
+    assert!(primary
+        .build_replica(unreachable, Cancellation::default())
+        .await
+        .is_err());
+    primary
+        .remove_replica(
+            info.clone(),
+            ReplicaRemoval::BuildRetryCleanup,
+            Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    primary
+        .build_replica(info.clone(), Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(primary.state.lock().unwrap().built.len(), 1);
+    primary
+        .remove_replica(info.clone(), ReplicaRemoval::Idle, Cancellation::default())
+        .await
+        .unwrap();
+    assert!(primary
+        .build_replica(info, Cancellation::default())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn retry_cleanup_and_rebuild_cannot_accept_a_late_pre_cleanup_peer_receipt() {
+    let (primary, _, _) = replica(1, 100, 1, ReplicaRole::Primary, server()).await;
+    let (peer, _, address) = replica(2, 200, 1, ReplicaRole::Idle, server()).await;
+    let body = peer.peer_body().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let delayed_address = format!("http://{}/old", listener.local_addr().unwrap());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let e = entered.clone();
+    let r = release.clone();
+    let wire = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_header(&mut stream).await.unwrap();
+        e.notify_one();
+        r.notified().await;
+        response(&mut stream, 200, &body).await.unwrap();
+    });
+    let p = primary.clone();
+    let old = tokio::spawn(async move {
+        p.build_replica(
+            information(2, 200, 1, delayed_address, ReplicaRole::Idle),
+            Cancellation::default(),
+        )
+        .await
+    });
+    entered.notified().await;
+    let info = information(2, 200, 1, address, ReplicaRole::Idle);
+    primary
+        .remove_replica(
+            info.clone(),
+            ReplicaRemoval::BuildRetryCleanup,
+            Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    primary
+        .build_replica(info, Cancellation::default())
+        .await
+        .unwrap();
+    release.notify_one();
+    wire.await.unwrap();
+    assert!(old.await.unwrap().is_err());
+    assert_eq!(primary.state.lock().unwrap().built.len(), 1);
+}
+
+#[tokio::test]
 async fn both_native_demotion_all_checks_accept_only_the_authorized_previous_epoch() {
     let (primary, view, _) = replica(1, 100, 1, ReplicaRole::Primary, server()).await;
     let (_peer, _, address) = replica(2, 200, 1, ReplicaRole::Secondary, server()).await;
@@ -109,7 +189,7 @@ async fn removed_incarnation_cannot_prove_pending_or_future_all_catchup() {
     });
     entered.notified().await;
     primary
-        .remove_replica(info, Cancellation::default())
+        .remove_replica(info, ReplicaRemoval::Idle, Cancellation::default())
         .await
         .unwrap();
     release.notify_one();
@@ -185,7 +265,7 @@ async fn remove_during_pending_build_fences_its_late_successful_response() {
     let build = tokio::spawn(async move { p.build_replica(target, Cancellation::default()).await });
     entered.notified().await;
     primary
-        .remove_replica(info, Cancellation::default())
+        .remove_replica(info, ReplicaRemoval::Idle, Cancellation::default())
         .await
         .unwrap();
     release.notify_one();

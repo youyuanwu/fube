@@ -20,6 +20,7 @@ struct StatefulCalls {
     configuration_failure: AtomicBool,
     configurations: Mutex<Vec<(ReplicaSetConfiguration, Option<ReplicaSetConfiguration>)>>,
     builds: Mutex<Vec<ReplicaInformation>>,
+    removals: Mutex<Vec<crate::ReplicaRemoval>>,
     epochs: Mutex<Vec<crate::Epoch>>,
     access_events: Mutex<Vec<(&'static str, (crate::AccessStatus, crate::AccessStatus))>>,
 }
@@ -43,6 +44,29 @@ struct StatefulFixture {
     mode: u8,
 }
 struct ReplicatorFixture(Arc<StatefulCalls>, u8);
+pub(crate) fn destructor_model_factory() -> Arc<dyn StatefulFactory> {
+    Arc::new(StatefulFactoryFixture(Arc::new(StatefulCalls::default())))
+}
+fn blocking_participant_drop() {
+    use std::io::Write;
+    println!("STATEFUL_PARTICIPANT_DROP_ENTERED");
+    std::io::stdout().flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+impl Drop for StatefulFixture {
+    fn drop(&mut self) {
+        if matches!(self.mode, 232 | 233 | 236) {
+            blocking_participant_drop();
+        }
+    }
+}
+impl Drop for ReplicatorFixture {
+    fn drop(&mut self) {
+        if matches!(self.1, 234 | 235) {
+            blocking_participant_drop();
+        }
+    }
+}
 impl StatefulFactory for StatefulFactoryFixture {
     fn create(
         &self,
@@ -84,7 +108,7 @@ impl StatefulService for StatefulFixture {
                 });
             }
             match self.mode {
-                1 => {
+                1 | 233 => {
                     return Err(Error::Remote {
                         code: -456,
                         message: "controlled open failure".into(),
@@ -293,6 +317,12 @@ impl Replicator for ReplicatorFixture {
             }
             self.0.record("build");
             self.0.builds.lock().unwrap().push(replica);
+            if matches!(self.1, 40 | 42) && self.0.builds.lock().unwrap().len() == 1 {
+                return Err(Error::Remote {
+                    code: -993,
+                    message: "partial build resources require cleanup".into(),
+                });
+            }
             if self.1 == 22 {
                 tokio::select! {
                     _ = self.0.build_release.notified() => {},
@@ -302,12 +332,34 @@ impl Replicator for ReplicatorFixture {
             Ok(())
         })
     }
-    fn remove_replica(&self, _: ReplicaInformation, _: Cancellation) -> ServiceFuture<'_, ()> {
+    fn remove_replica(
+        &self,
+        _: ReplicaInformation,
+        reason: crate::ReplicaRemoval,
+        _: Cancellation,
+    ) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
             if self.1 < 20 {
                 return Err(Error::Protocol("unexpected remove in lifecycle fixture"));
             }
             self.0.record("remove");
+            self.0.removals.lock().unwrap().push(reason);
+            if matches!(self.1, 41 | 42)
+                && self
+                    .0
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| **e == "remove")
+                    .count()
+                    == 1
+            {
+                return Err(Error::Remote {
+                    code: -992,
+                    message: "partial removal requires retry".into(),
+                });
+            }
             if self.1 == 37 {
                 self.0.remove_release.notified().await;
             }

@@ -1,6 +1,6 @@
 use super::*;
 #[path = "stateful_tests.rs"]
-mod stateful_tests;
+pub(crate) mod stateful_tests;
 use mssf_transport::{
     connection::{read_message, write_message},
     message::{Header, ListenInstance, Message, MessageId},

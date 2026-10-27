@@ -301,7 +301,11 @@ async fn remove_tombstone_fences_old_instance_but_not_new_instance() {
     let (old, _, address) = replica(2, 200, 1, ReplicaRole::Idle, server()).await;
     let old_info = information(2, 200, 1, address.clone(), ReplicaRole::Idle);
     primary
-        .remove_replica(old_info.clone(), Cancellation::default())
+        .remove_replica(
+            old_info.clone(),
+            ReplicaRemoval::Idle,
+            Cancellation::default(),
+        )
         .await
         .unwrap();
     assert!(primary

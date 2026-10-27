@@ -43,10 +43,19 @@ rejected.
    diagnostics and authority/lifetime checks. A published address or a cached
    role alone is not permission to serve. Shutdown is explicit and awaited.
 
-API: [stateful_api.rs:18-191](../../crates/libs/mssf-runtime/src/stateful_api.rs#L18-L191),
-[partition handles:346-382](../../crates/libs/mssf-runtime/src/stateful_api.rs#L346-L382),
+API: [stateful_api.rs:18-202](../../crates/libs/mssf-runtime/src/stateful_api.rs#L18-L202),
+[partition handles:357-393](../../crates/libs/mssf-runtime/src/stateful_api.rs#L357-L393),
 [registration:405](../../crates/libs/mssf-runtime/src/lib.rs#L405).
 Stateful reporting/write/storage APIs are not supplied by this seam.
+
+`Replicator::remove_replica` receives an owned `ReplicaRemoval` purpose:
+`Idle` for native idle-owner removal, or `BuildRetryCleanup` for disposal of
+partial/previous resources before another node-authorized Build. Cleanup
+success is never Build success. Failed Build/Remove retains a cleanup obligation
+even for equal-incarnation retries; final native removal remains a distinct
+terminal tombstone. The sample fences pre-cleanup network receipts with per-peer
+build tokens, permits a verified retry after cleanup, and still rejects a
+genuinely removed incarnation.
 
 Callbacks execute outside protocol locks/readers. Cancellation is advisory,
 **not proof that work or callback destruction completed**. Owned operations are
@@ -59,6 +68,10 @@ watchdog disarm
 [disarm:158-173](../../crates/libs/mssf-runtime/src/lease.rs#L158-L173)).
 Shared process authority loss fences **both** service kinds; replica disposal
 removes only that generation's routes/operations.
+Final runtime-owned service/replicator references, including local callback
+clones and failed-Open disposal, are released on supervised blocking workers
+**before** semantic disposal replies. A blocking destructor remains deadline
+fenced while a different executor worker renews the host lease.
 
 ## What “empty” proves
 
@@ -84,7 +97,7 @@ may encounter a real peer still in the explicitly native previous epoch,
 because demotion precedes target promotion. That epoch is accepted only during
 native-directed Secondary / still-Primary-replicator demotion in PreWriteRevoke
 or CatchUp, not ordinary Primary quorum readiness
-([regression](../../crates/samples/rust-runtime-app/src/stateful_peer_tests.rs#L3-L59)).
+([regression](../../crates/samples/rust-runtime-app/src/stateful_peer_tests.rs#L83-L139)).
 This is empty-state readiness, **not an acknowledgment of replicated writes**.
 
 ## RAP, access and endpoint semantics
@@ -97,6 +110,13 @@ down/Dropped descriptors in proof keys. Stale epochs/incarnations, removed peer
 receipts and canceled overlap cannot reinstall success
 ([adapter](../../crates/libs/mssf-runtime/src/stateful_reconfiguration.rs),
 [review regressions](../../crates/libs/mssf-runtime/src/stateful_review_tests.rs)).
+
+Successful still-current configuration application transfers matching Ready
+idle-build records to retired bookkeeping according to native CC/applicable PC
+selection. A delayed same-incarnation RemoveIdle then acknowledges without
+calling custom removal or invalidating the live member's readiness; it does not
+silently remove that configured member. A newer native incarnation still
+requires cleanup of its older owned resources before Build retry.
 
 The native RA envelope is actor **12 in both directions**. Lifecycle semantic
 replies are one-way, not ordinary correlated replies. UC/build/remove use native
@@ -111,7 +131,7 @@ replicator roles. Access uses native role/stage/minimum/PC/CC availability rules
 then the partition overlays lifetime and host authority. Pre-write revocation
 cannot be undone by a same-epoch retry. Granted diagnostics **do not introduce
 an application write operation**
-([access:234-342](../../crates/libs/mssf-runtime/src/stateful_api.rs#L234-L342)).
+([access:245-353](../../crates/libs/mssf-runtime/src/stateful_api.rs#L245-L353)).
 
 The sample's service route requires live authority, matching desired/service/
 replicator Primary roles and granted read access; its diagnostic route is
@@ -162,8 +182,15 @@ govern cleanup; application/type/upload and each original container/volume/
 network absence are checked independently
 ([harness](../../scripts/rust_runtime_test.py),
 [observer](../../crates/libs/mssf-client/examples/runtime_observer.rs)).
+The controller publishes the newly committed original owner capability before
+fallible startup/readiness; both the harness and CI retain it for teardown on
+partial creation failure. Rejected pre-existing/colliding names grant no
+capability, and owner drift never authorizes destroying a replacement.
 
 ## Executed evidence and limits
+
+The records below identify pre-remediation executables precisely. They are not
+silently relabeled as qualification of subsequent final-review semantic fixes.
 
 Local ignored evidence `build/stateful-empty-native-three6.json` records actual
 SF 11.8.121.4 **PASS_FULL_EMPTY_STATEFUL_CONTROL_PLANE_AND_STATELESS_PROFILE**,
@@ -203,7 +230,8 @@ bundle metadata SHA256
 Both executable hashes are identical to the table above. This repeat replaced
 shared PID 25971 → 26727; all minted app/type/upload and original
 `stempty-dab15f41-final` container/volume/network resources are absence-confirmed.
-Subsequent evidence-note commits are documentation-only.
+The `2b3179b` → `278de9a` evidence-note change was documentation-only; subsequent
+final-review remediation requires its own executable-qualified record.
 
 No application-state writes, replication data plane/storage, persisted recovery,
 durability, native FabricReplicator peer wire compatibility, Reliable Collections,
