@@ -979,7 +979,6 @@ impl Registry {
     async fn build(&self, unit: &Arc<Unit>, request: w::ProxyRequest) -> Result<()> {
         let descriptor = request.remote.0[0].clone();
         let info = information(&descriptor, false)?;
-        let (replicator, lifetime) = participants(unit)?;
         let mut revision = primary_fence(unit);
         let replacement = {
             let state = unit.state.lock().unwrap();
@@ -999,6 +998,8 @@ impl Registry {
             let mut cleanup = request;
             cleanup.remote.0[0] = old;
             self.remove(unit, cleanup, false).await?;
+            #[cfg(test)]
+            self.hold_remote_reply().await;
             return Ok(());
         }
         let (cancel, sequence, cached) = {
@@ -1104,6 +1105,11 @@ impl Registry {
                 )
                 .await;
         }
+        let Some((replicator, lifetime)) =
+            remote_participants(unit, info.node_id, sequence, false)?
+        else {
+            return Ok(());
+        };
         let operation_cancel = cancel.clone();
         let operation_info = info.clone();
         let result = self
@@ -1154,7 +1160,6 @@ impl Registry {
     ) -> Result<()> {
         let descriptor = request.remote.0[0].clone();
         let info = information(&descriptor, false)?;
-        let (replicator, lifetime) = participants(unit)?;
         let revision = primary_fence(unit);
         let (sequence, cancel, absent) = {
             let mut state = unit.state.lock().unwrap();
@@ -1273,6 +1278,10 @@ impl Registry {
                 )
                 .await;
         }
+        let Some((replicator, lifetime)) = remote_participants(unit, info.node_id, sequence, true)?
+        else {
+            return Ok(());
+        };
         unit.state.lock().unwrap().error_api = (11, 4);
         let operation_cancel = cancel.clone();
         let operation_info = info.clone();
@@ -1416,6 +1425,34 @@ impl Registry {
         }
         retries.push(task);
         Ok(())
+    }
+}
+
+// Acquire participants only after callback ownership is busy, and move them
+// directly into supervised execution. Cached replies/cleanup bookkeeping must
+// never retain an unused Arc behind transport backpressure.
+fn remote_participants(
+    unit: &Unit,
+    node: [u8; 16],
+    sequence: u64,
+    removing: bool,
+) -> Result<Option<(Arc<dyn Replicator>, Cancellation)>> {
+    match participants(unit) {
+        Ok(participants) => Ok(Some(participants)),
+        Err(Error::Closed) => {
+            let mut state = unit.state.lock().unwrap();
+            if removing {
+                state.removing = false;
+            }
+            if let Some(remote) = state.remotes.get_mut(&node) {
+                if remote.sequence == sequence {
+                    remote.busy = false;
+                    remote.phase = RemotePhase::CleanupRequired;
+                }
+            }
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 

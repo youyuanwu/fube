@@ -76,6 +76,10 @@ Close/Abort also acquire the compatible-configuration dispatch gate: clearing a
 callback flag alone is insufficient while a dispatcher retains participants
 behind a queued reply. The whole dispatcher reference lifetime must drain
 before disposal can acknowledge, including after cancellation or backpressure.
+Remote cached/absent replies and retry-cleanup bookkeeping acquire no participant
+references at all. Actual remote callbacks acquire them only after busy ownership
+is installed and move them directly into supervised execution, so transport
+backpressure cannot retain a final unused replicator reference after disposal.
 
 ## What “empty” proves
 

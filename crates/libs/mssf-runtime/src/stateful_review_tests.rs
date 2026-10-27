@@ -1,6 +1,53 @@
 use super::*;
 
 #[tokio::test]
+async fn remote_reply_and_retry_bookkeeping_never_retain_final_participants_after_close() {
+    for path in 0..3 {
+        let mut h = Harness::new().await;
+        let calls = register(&h);
+        let open = request(&h, 2, 1, 151);
+        h.send("ReplicaOpen", &open).await;
+        h.receive("ReplicaOpenReply").await;
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        let mut idle = peer(&open.local, 2);
+        idle.current_role = 2;
+        let build = control(&open, "ReplicatorBuildIdleReplica", vec![idle]);
+        h.send("ReplicatorBuildIdleReplica", &build).await;
+        h.receive("ReplicatorBuildIdleReplicaReply").await;
+        h.engine
+            .shared
+            .stateful
+            .wait_remote_idle([2; 16], [2; 16])
+            .await;
+        let hook = h.engine.shared.stateful.pause_remote_reply();
+        let mut request = build.clone();
+        let action = if path == 1 {
+            request.remote.0[0] = peer(&open.local, 3);
+            "ReplicatorRemoveIdleReplica"
+        } else {
+            if path == 2 {
+                request.remote.0[0].instance += 1;
+            }
+            "ReplicatorBuildIdleReplica"
+        };
+        h.send(action, &request).await;
+        hook.reached.notified().await;
+        h.send("ReplicaClose", &open).await;
+        h.receive("ReplicaCloseReply").await;
+        assert!(
+            calls
+                .events
+                .lock()
+                .unwrap()
+                .contains(&"replicatorFinalDropComplete"),
+            "no-callback remote path {path} retained final runtime participant after Close"
+        );
+        hook.release.notify_one();
+        h.no_reply().await;
+    }
+}
+
+#[tokio::test]
 async fn close_drains_configuration_dispatch_references_even_after_callback_flags_clear() {
     for mode in [151, 152] {
         let mut h = Harness::new().await;

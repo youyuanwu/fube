@@ -85,6 +85,8 @@ pub(crate) struct Registry {
     close_admission_hook: Mutex<Option<Arc<OpenAdmissionHook>>>,
     #[cfg(test)]
     configuration_reply_hook: Mutex<Option<Arc<OpenAdmissionHook>>>,
+    #[cfg(test)]
+    remote_reply_hook: Mutex<Option<Arc<OpenAdmissionHook>>>,
 }
 #[cfg(test)]
 #[derive(Default)]
@@ -118,6 +120,8 @@ impl Registry {
             close_admission_hook: Mutex::new(None),
             #[cfg(test)]
             configuration_reply_hook: Mutex::new(None),
+            #[cfg(test)]
+            remote_reply_hook: Mutex::new(None),
         }
     }
     #[cfg(test)]
@@ -131,6 +135,20 @@ impl Registry {
         let hook = Arc::new(OpenAdmissionHook::default());
         *self.configuration_reply_hook.lock().unwrap() = Some(hook.clone());
         hook
+    }
+    #[cfg(test)]
+    pub(crate) fn pause_remote_reply(&self) -> Arc<OpenAdmissionHook> {
+        let hook = Arc::new(OpenAdmissionHook::default());
+        *self.remote_reply_hook.lock().unwrap() = Some(hook.clone());
+        hook
+    }
+    #[cfg(test)]
+    async fn hold_remote_reply(&self) {
+        let hook = self.remote_reply_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.release.notified().await;
+        }
     }
     #[cfg(test)]
     pub(crate) fn close_through(&self, id: [u8; 16]) -> i64 {
@@ -1210,6 +1228,13 @@ impl Registry {
         let publish = action != "ReplicaCloseReply" && !failed;
         let frame_valid = valid.clone();
         let frame_revision = revision.clone();
+        #[cfg(test)]
+        if matches!(
+            action,
+            "ReplicatorBuildIdleReplicaReply" | "ReplicatorRemoveIdleReplicaReply"
+        ) {
+            self.hold_remote_reply().await;
+        }
         let sent = self
             .connection
             .send_one_way_fenced(
