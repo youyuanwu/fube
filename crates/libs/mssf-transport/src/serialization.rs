@@ -23,6 +23,7 @@ const DOUBLE: u8 = 0x0b;
 const GUID: u8 = 0x0c;
 const STRING: u8 = 0x8d;
 const BYTE_ARRAY: u8 = 0x84;
+const UINT32_ARRAY: u8 = 0x88;
 const TRUE: u8 = 0x42;
 const FALSE: u8 = 0x72;
 
@@ -163,6 +164,29 @@ impl Encoder {
 
     pub fn u32(&mut self, value: u32) {
         self.unsigned(UINT32, u64::from(value));
+    }
+
+    /// Native ULONG vector: array metadata, compressed count, then compressed
+    /// payloads without scalar metadata (including a byte for zero elements).
+    pub fn u32_array(&mut self, values: &[u32]) -> Result<()> {
+        self.u32_array_header(values.len())?;
+        for &value in values {
+            self.write_unsigned_payload(u64::from(value));
+        }
+        Ok(())
+    }
+
+    fn u32_array_header(&mut self, count: usize) -> Result<()> {
+        if count > MAX_COLLECTION_COUNT {
+            return Err(Error::InvalidInput("UInt32-array count limit exceeded"));
+        }
+        if count == 0 {
+            self.bytes.push(UINT32_ARRAY | EMPTY);
+        } else {
+            self.bytes.push(UINT32_ARRAY);
+            self.write_unsigned_payload(count as u64);
+        }
+        Ok(())
     }
 
     pub fn i64(&mut self, value: i64) {
@@ -398,6 +422,28 @@ impl<'a> Decoder<'a> {
         self.unsigned(UINT32, 32).map(|value| value as u32)
     }
 
+    /// Decode a bounded native ULONG vector, not a counted list of scalars.
+    pub fn u32_array(&mut self) -> Result<Vec<u32>> {
+        let count = self.u32_array_count()?;
+        (0..count)
+            .map(|_| self.read_unsigned_payload(32).map(|v| v as u32))
+            .collect()
+    }
+
+    fn u32_array_count(&mut self) -> Result<usize> {
+        match self.byte()? {
+            metadata if metadata == UINT32_ARRAY | EMPTY => Ok(0),
+            UINT32_ARRAY => {
+                let count = self.count(MAX_COLLECTION_COUNT)?;
+                if count > self.limit - self.position {
+                    return Err(Error::Protocol("UInt32-array exceeds enclosing extent"));
+                }
+                Ok(count)
+            }
+            _ => Err(Error::Protocol("expected UInt32-array metadata")),
+        }
+    }
+
     pub fn i64(&mut self) -> Result<i64> {
         self.signed(INT64, 64)
     }
@@ -550,6 +596,13 @@ impl<'a> Decoder<'a> {
                 Ok(())
             }
             BYTE_ARRAY | 0xc4 => self.byte_array_bytes().map(|_| ()),
+            UINT32_ARRAY | 0xc8 => {
+                let count = self.u32_array_count()?;
+                for _ in 0..count {
+                    self.read_unsigned_payload(32)?;
+                }
+                Ok(())
+            }
             _ => Err(Error::Protocol("unsupported trailing value metadata")),
         }
     }
