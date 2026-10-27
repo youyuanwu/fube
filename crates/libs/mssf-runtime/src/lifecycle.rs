@@ -4,7 +4,7 @@ use crate::{api::*, lease::Authority, wire::*, ActivationContext, RuntimeMetrics
 mod tests;
 use mssf_transport::{
     connection::{deadline_after, Connection, IpcRequest},
-    serialization::serde::{from_slice, to_vec, EmptyObjectArray, Guid, ObjectArray, Pointer},
+    serialization::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer},
     Error, Result,
 };
 use std::{
@@ -191,6 +191,7 @@ fn validate(shared: &Shared, request: &ProxyRequest) -> Result<()> {
         || request.service.stateful
         || request.service.persisted
         || request.service.group
+        || !request.remote.0.is_empty()
         || request.service.service_type.package != shared.activation.runtime.code.id.package.package
         || request.service.application != shared.activation.application_name
         || request.local.node.id.0.len() != 16
@@ -372,7 +373,7 @@ async fn reply(
     let body = ProxyReply {
         unit: request.unit,
         local,
-        remote: EmptyObjectArray,
+        remote: ObjectArray(vec![]),
         flags: request.flags,
         error: ProxyError {
             error: error.as_ref().map_or(0, native_error),

@@ -11,6 +11,7 @@ mod model_tests;
 mod package_context;
 mod packages;
 mod reporting;
+mod stateful_api;
 mod wire;
 
 use std::{
@@ -44,6 +45,12 @@ pub use packages::{
 pub use reporting::{
     FaultDelivery, HealthReceipt, HealthReport, HealthSequence, HealthState, LoadMetric, MoveCost,
     MAX_REPORT_METRICS, MAX_REPORT_NAME_UNITS,
+};
+pub use stateful_api::{
+    AccessStatus, CatchUpMode, CatchUpResult, ConfigurationStage, Epoch, ReplicaIdentity,
+    ReplicaInformation, ReplicaLifecycle, ReplicaRole, ReplicaSetConfiguration, ReplicaStatus,
+    ReplicationProgress, Replicator, StatefulFactory, StatefulPartition, StatefulService,
+    StatefulServiceContext, MAX_REPLICA_SET_SIZE,
 };
 use wire::*;
 

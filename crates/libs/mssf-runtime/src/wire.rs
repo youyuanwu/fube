@@ -268,7 +268,7 @@ pub struct ProxyRequest {
     pub runtime: String,
     pub unit: FailoverUnit,
     pub local: Replica,
-    pub remote: mssf_transport::serialization::serde::EmptyObjectArray,
+    pub remote: ObjectArray<Vec<Replica>>,
     pub service: Service,
     pub flags: i64,
 }
@@ -288,7 +288,7 @@ pub struct ProxyError {
 pub struct ProxyReply {
     pub unit: FailoverUnit,
     pub local: Replica,
-    pub remote: mssf_transport::serialization::serde::EmptyObjectArray,
+    pub remote: ObjectArray<Vec<Replica>>,
     pub error: ProxyError,
     pub flags: i64,
 }

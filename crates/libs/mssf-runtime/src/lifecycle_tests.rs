@@ -733,7 +733,7 @@ impl Harness {
                 service_endpoint: String::new(),
                 replication_endpoint: String::new(),
             },
-            remote: EmptyObjectArray,
+            remote: ObjectArray(vec![]),
             service: Service {
                 name: "fabric:/Model/Service".into(),
                 instance: 1,
@@ -762,7 +762,7 @@ impl Harness {
                 standby_keep: 0,
                 activation_mode: 0,
                 dns: String::new(),
-                scaling: EmptyObjectArray,
+                scaling: mssf_transport::serialization::serde::EmptyObjectArray,
             },
             flags: 0,
         }
