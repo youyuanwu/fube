@@ -426,7 +426,8 @@ impl Registry {
                     let state = unit.state.lock().unwrap();
                     let mut status = state.status.lock().unwrap();
                     status.catch_up = CatchUpResult::NotStarted;
-                    status.configuration_stage = ConfigurationStage::PreWriteRevoke;
+                    // Only a newer native epoch can enter PreWriteRevoke.
+                    // A retry must not undo an already completed revocation.
                 }
                 failed_api = (13, 4);
                 self.configuration(unit, &replicator, &request, false, &cancel)
@@ -752,6 +753,9 @@ impl Registry {
         if cancel.is_cancelled()
             || !state.valid.load(Ordering::Acquire)
             || state.full_revision.load(Ordering::Acquire) != revision
+            || state
+                .cancellation_epoch
+                .is_some_and(|epoch| api_epoch(&request.unit.current) <= epoch)
         {
             return Err(Error::Closed);
         }
@@ -820,18 +824,29 @@ impl Registry {
     }
 
     async fn cancel_catch_up(&self, unit: &Arc<Unit>, request: w::ProxyRequest) -> Result<()> {
-        let pending = {
+        let (pending, revision) = {
             let mut state = unit.state.lock().unwrap();
-            if stale(&state.request, &request) {
+            if stale(&state.request, &request) || !state.valid.load(Ordering::Acquire) {
                 return Ok(());
             }
-            state.cancellation_epoch = Some(api_epoch(&state.request.unit.current));
-            if let Some(pending) = &state.catch_up_operation {
+            let epoch = api_epoch(&state.request.unit.current);
+            if state.cancellation_epoch != Some(epoch) {
+                advance(&state.full_revision)?;
+                state.cancellation_epoch = Some(epoch);
+            }
+            let draining = if let Some(pending) = &state.catch_up_operation {
                 pending.cancel.cancel();
                 true
             } else {
-                false
-            }
+                state.configuring
+            };
+            (
+                draining,
+                (
+                    state.full_revision.clone(),
+                    state.full_revision.load(Ordering::Acquire),
+                ),
+            )
         };
         if pending {
             return Ok(());
@@ -841,6 +856,14 @@ impl Registry {
         };
         let (service_role, replicator_role, requested, result) = {
             let state = unit.state.lock().unwrap();
+            if stale(&state.request, &request)
+                || !state.valid.load(Ordering::Acquire)
+                || state.configuring
+                || !Arc::ptr_eq(&state.full_revision, &revision.0)
+                || state.full_revision.load(Ordering::Acquire) != revision.1
+            {
+                return Ok(());
+            }
             let status = state.status.lock().unwrap();
             (
                 status.service_role,
@@ -882,8 +905,17 @@ impl Registry {
             code: DEMOTE_COMPLETED,
             message: "demotion completed".into(),
         });
-        self.reply(unit, "CancelCatchupReplicaSetReply", request, error, 0)
-            .await
+        self.reply_guarded(
+            unit,
+            "CancelCatchupReplicaSetReply",
+            request,
+            error,
+            ReplyControl {
+                api: Some((0, 0)),
+                revision: Some(revision),
+            },
+        )
+        .await
     }
 
     async fn build(&self, unit: &Arc<Unit>, request: w::ProxyRequest) -> Result<()> {

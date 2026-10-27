@@ -1,6 +1,8 @@
 use super::*;
 #[path = "stateful_overlap_tests.rs"]
 mod overlap_tests;
+#[path = "stateful_review_tests.rs"]
+mod review_tests;
 use crate::AccessStatus::{Granted as G, NotPrimary as N, ReconfigurationPending as T};
 
 fn control(request: &ProxyRequest, action: &str, remotes: Vec<Replica>) -> ProxyRequest {

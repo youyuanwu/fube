@@ -183,6 +183,10 @@ impl Registry {
             .is_some()
     }
     #[cfg(test)]
+    pub(crate) fn configuring(&self, id: [u8; 16]) -> bool {
+        self.get(id).unwrap().state.lock().unwrap().configuring
+    }
+    #[cfg(test)]
     pub(crate) fn revisions(&self, id: [u8; 16]) -> (u64, u64) {
         let unit = self.get(id).unwrap();
         let state = unit.state.lock().unwrap();

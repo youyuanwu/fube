@@ -166,6 +166,22 @@ impl Replicator for ReplicatorFixture {
             }
             self.0.record("epoch");
             self.0.epochs.lock().unwrap().push(epoch);
+            if self.1 == 34
+                && self
+                    .0
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| **e == "epoch")
+                    .count()
+                    == 1
+            {
+                return Err(Error::Remote {
+                    code: -996,
+                    message: "first UpdateEpoch fails".into(),
+                });
+            }
             Ok(())
         })
     }
@@ -209,7 +225,8 @@ impl Replicator for ReplicatorFixture {
                 .lock()
                 .unwrap()
                 .push((current, Some(previous)));
-            if self.1 == 23 && self.0.configurations.lock().unwrap().len() == 1 {
+            let count = self.0.configurations.lock().unwrap().len();
+            if (self.1 == 23 && count == 1) || (self.1 == 35 && count == 2) {
                 self.0.configuration_release.notified().await;
             }
             Ok(())
@@ -245,7 +262,7 @@ impl Replicator for ReplicatorFixture {
             } else {
                 "waitQuorum"
             });
-            if self.1 == 21 {
+            if matches!(self.1, 21 | 35) {
                 tokio::select! {
                     _ = self.0.catch_up_release.notified() => {},
                     _ = cancellation.cancelled() => return Err(Error::Closed),
