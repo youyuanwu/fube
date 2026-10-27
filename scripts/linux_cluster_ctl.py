@@ -327,7 +327,7 @@ class Cluster:
             self.helper(node, SEED_VOLUME)
         self.save(phase="starting")
 
-    def create(self, subnet, image, timeout):
+    def create(self, subnet, image, timeout, *, on_allocated=None):
         if self.path.exists():
             self.load()
             if self.state["phase"] != "destroyed":
@@ -371,6 +371,10 @@ class Cluster:
         compose, _ = self.definition(self.state, self.directory)
         write_json(self.directory / "compose.json", compose)
         self.save(manifest_sha256=digest(self.directory / "ClusterManifest.xml"))
+        # Publish only this newly committed allocation, before fallible startup
+        # or journal writes; rejected existing/colliding names grant nothing.
+        if on_allocated is not None:
+            on_allocated(self.state["owner"])
         self.event("allocated")
         return self.up(timeout)
 
@@ -601,6 +605,8 @@ def main(*, cluster_type=Cluster, state_root=STATE_ROOT, default_subnet=DEFAULT_
             action.add_argument("--subnet", default=default_subnet,
                                 help="Private IPv4 subnet (default: %(default)s)")
             action.add_argument("--image", default=default_image)
+            action.add_argument("--github-output", type=Path,
+                                help="Append the masked owner capability to this GitHub Actions output file at allocation commit")
         if command == "up":
             action.add_argument("--restart-node", choices=cluster_type.services,
                                 action="append", default=[])
@@ -616,7 +622,14 @@ def main(*, cluster_type=Cluster, state_root=STATE_ROOT, default_subnet=DEFAULT_
     with locked(root, args.name) as directory:
         cluster = cluster_type(directory, args.name)
         if args.command == "create":
-            result = cluster.create(args.subnet, args.image, args.timeout)
+            def allocated(owner):
+                print("::add-mask::" + owner, flush=True)
+                with args.github_output.open("a", encoding="utf-8") as output:
+                    output.write("owner=" + owner + "\n")
+            result = cluster.create(
+                args.subnet, args.image, args.timeout,
+                on_allocated=allocated if args.github_output is not None else None,
+            )
         else:
             cluster.load()
             if args.command == "up":

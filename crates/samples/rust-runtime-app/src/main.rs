@@ -13,6 +13,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{OnceCell, Semaphore},
 };
+mod stateful;
 
 fn config_evidence(package: &ConfigurationPackage) -> RuntimeResult<serde_json::Value> {
     let description = package.description();
@@ -46,6 +47,8 @@ struct Rpc {
     code_sequence: i64,
     listener: OnceCell<()>,
     routes: Mutex<HashMap<String, Arc<Route>>>,
+    stateful_routes: Mutex<HashMap<String, Arc<stateful::ReplicaRoute>>>,
+    peers: Arc<stateful::PeerServer>,
     retired: Mutex<VecDeque<Partition>>,
     metrics: Arc<RuntimeMetrics>,
     opening: AtomicUsize,
@@ -134,6 +137,9 @@ impl Rpc {
             .map(|(p, _)| p)
             .unwrap_or("");
         let (path, query) = path.split_once('?').unwrap_or((path, ""));
+        if path.starts_with("/stateful/") {
+            return self.stateful_request(stream, path, query).await;
+        }
         let parameters: HashMap<_, _> =
             query.split('&').filter_map(|s| s.split_once('=')).collect();
         let route = {
@@ -454,6 +460,22 @@ async fn run() -> RuntimeResult<()> {
         code_sequence: activation.code_sequence,
         listener: OnceCell::new(),
         routes: Mutex::new(HashMap::new()),
+        stateful_routes: Mutex::new(HashMap::new()),
+        peers: {
+            let port =
+                *activation
+                    .endpoints
+                    .get("Replication")
+                    .ok_or(RuntimeError::InvalidInput(
+                        "missing SF replication/control endpoint",
+                    ))?;
+            if port == 0 || activation.endpoints.get("Rpc") == Some(&port) {
+                return Err(RuntimeError::InvalidInput(
+                    "service/control endpoint collision",
+                ));
+            }
+            stateful::PeerServer::new(activation.node_ip.clone(), port)
+        },
         retired: Mutex::new(VecDeque::new()),
         metrics: runtime.metrics(),
         opening: AtomicUsize::new(0),
@@ -475,6 +497,13 @@ async fn run() -> RuntimeResult<()> {
         .register_stateless("RustRuntimeType", Arc::new(Factory(rpc.clone())))
         .await?;
     println!("TYPE_REGISTERED RustRuntimeType");
+    runtime
+        .register_stateful(
+            "RustStatefulRuntimeType",
+            Arc::new(stateful::Factory(rpc.clone())),
+        )
+        .await?;
+    println!("TYPE_REGISTERED RustStatefulRuntimeType");
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         _=terminate.recv()=>{},

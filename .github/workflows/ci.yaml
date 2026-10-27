@@ -85,7 +85,8 @@ jobs:
       run: docker build --tag sf-apps-onebox:11.8.121.4 --file docker/onebox/Dockerfile docker
 
     - name: Create native development cluster
-      run: python3 "$CLUSTER_CTL" create "$CLUSTER_NAME"
+      id: create_cluster
+      run: python3 "$CLUSTER_CTL" create "$CLUSTER_NAME" --github-output "$GITHUB_OUTPUT"
 
     - name: Check fresh cluster health
       run: python3 "$CLUSTER_CTL" status "$CLUSTER_NAME" > "$RUNNER_TEMP/linux-cluster-status-created.json"
@@ -118,10 +119,9 @@ jobs:
     - name: Qualify real Rust application runtime
       id: native_runtime
       run: |
-        owner="$(python3 -c 'import json,os; print(json.load(open(os.path.join(os.environ["CLUSTER_STATE_ROOT"],os.environ["CLUSTER_NAME"],"state.json")))["owner"])')"
-        python3 scripts/rust_runtime_test.py "$CLUSTER_NAME" --existing-owner "$owner" \
+        python3 scripts/rust_runtime_test.py "$CLUSTER_NAME" --existing-owner "${{ steps.create_cluster.outputs.owner }}" \
           --prebuilt "$RUNNER_TEMP/rust-runtime-binaries" \
-          --full --report "$RUNNER_TEMP/rust-runtime-report.json"
+          --full --stateful three --report "$RUNNER_TEMP/rust-runtime-report.json"
 
     - name: Upload successful Rust runtime evidence
       if: steps.native_runtime.outcome == 'success'
@@ -164,11 +164,7 @@ jobs:
         retention-days: 7
 
     - name: Destroy only this job's cluster
-      if: always()
+      if: always() && steps.create_cluster.outputs.owner != ''
       timeout-minutes: 4
       run: |
-        if [[ -f "$CLUSTER_STATE_ROOT/$CLUSTER_NAME/state.json" ]]; then
-          python3 "$CLUSTER_CTL" destroy "$CLUSTER_NAME" --confirm "$CLUSTER_NAME"
-        else
-          echo "No cluster allocation record; no cluster resources were allocated."
-        fi
+        python3 -c 'import os,sys,json; sys.path.insert(0,"scripts"); import rust_runtime_test as r; print(json.dumps(r.destroy_owned(os.environ["CLUSTER_NAME"],sys.argv[1])))' '${{ steps.create_cluster.outputs.owner }}'

@@ -1,10 +1,10 @@
 use crate::{api::*, lease::Authority, wire::*, ActivationContext, RuntimeMetrics};
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 use mssf_transport::{
     connection::{deadline_after, Connection, IpcRequest},
-    serialization::serde::{from_slice, to_vec, EmptyObjectArray, Guid, ObjectArray, Pointer},
+    serialization::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer},
     Error, Result,
 };
 use std::{
@@ -53,6 +53,8 @@ struct Unit {
 }
 struct Shared {
     units: Mutex<HashMap<[u8; 16], Arc<Unit>>>,
+    owners: Mutex<HashMap<[u8; 16], bool>>,
+    stateful: crate::stateful::Registry,
     factories: Mutex<HashMap<String, Arc<dyn StatelessFactory>>>,
     callbacks: Arc<Semaphore>,
     live: Arc<Semaphore>,
@@ -70,6 +72,10 @@ pub(crate) struct Engine {
     task: JoinHandle<()>,
 }
 impl Engine {
+    #[cfg(test)]
+    pub(crate) fn set_stateful_callback_timeout(&self, timeout: Duration) {
+        self.shared.stateful.set_callback_timeout(timeout);
+    }
     pub(crate) fn metrics(&self) -> Arc<RuntimeMetrics> {
         self.shared.metrics.clone()
     }
@@ -80,18 +86,31 @@ impl Engine {
         mut incoming: mpsc::Receiver<IpcRequest>,
     ) -> Self {
         let activation = (*current.snapshot()).clone();
+        let live = Arc::new(Semaphore::new(MAX_SERVICE_UNITS));
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let reports = Arc::new(Semaphore::new(crate::reporting::MAX_CONCURRENT_REPORTS));
+        let stateful = crate::stateful::Registry::new(
+            current.clone(),
+            authority.clone(),
+            connection.clone(),
+            live.clone(),
+            metrics.clone(),
+            reports.clone(),
+        );
         let shared = Arc::new(Shared {
             units: Mutex::new(HashMap::new()),
+            owners: Mutex::new(HashMap::new()),
+            stateful,
             factories: Mutex::new(HashMap::new()),
             callbacks: Arc::new(Semaphore::new(MAX_CALLBACKS)),
-            live: Arc::new(Semaphore::new(MAX_SERVICE_UNITS)),
+            live,
             active: AtomicUsize::new(0),
             activation,
             current,
             authority,
             connection,
-            metrics: Arc::new(RuntimeMetrics::default()),
-            reports: Arc::new(Semaphore::new(crate::reporting::MAX_CONCURRENT_REPORTS)),
+            metrics,
+            reports,
         });
         let (stop, mut stopped) = watch::channel(false);
         let task_shared = shared.clone();
@@ -136,16 +155,33 @@ impl Engine {
         factory: Arc<dyn StatelessFactory>,
     ) -> Result<()> {
         let mut factories = self.shared.factories.lock().unwrap();
+        if factories.contains_key(&name) || self.shared.stateful.has_factory(&name) {
+            return Err(Error::InvalidInput(
+                "service type already registered locally",
+            ));
+        }
+        if factories.len() + self.shared.stateful.factory_count() >= 32 {
+            return Err(Error::ResourceLimit("service factories"));
+        }
+        factories.insert(name, factory);
+        Ok(())
+    }
+    pub(crate) fn insert_stateful_factory(
+        &self,
+        name: String,
+        factory: Arc<dyn crate::StatefulFactory>,
+    ) -> Result<()> {
+        // The common lock serializes cross-kind type registration, never callbacks.
+        let factories = self.shared.factories.lock().unwrap();
         if factories.contains_key(&name) {
             return Err(Error::InvalidInput(
                 "service type already registered locally",
             ));
         }
-        if factories.len() >= 32 {
+        if factories.len() + self.shared.stateful.factory_count() >= 32 {
             return Err(Error::ResourceLimit("service factories"));
         }
-        factories.insert(name, factory);
-        Ok(())
+        self.shared.stateful.insert_factory(name, factory)
     }
     pub(crate) async fn quiesce(&mut self) -> Result<()> {
         let active = self.shared.active.load(Ordering::SeqCst);
@@ -176,6 +212,9 @@ impl Engine {
         for service in services {
             abort(service).await?;
         }
+        self.shared.stateful.quiesce().await?;
+        let factories = std::mem::take(&mut *self.shared.factories.lock().unwrap());
+        drop(factories);
         Ok(())
     }
 }
@@ -191,6 +230,7 @@ fn validate(shared: &Shared, request: &ProxyRequest) -> Result<()> {
         || request.service.stateful
         || request.service.persisted
         || request.service.group
+        || !request.remote.0.is_empty()
         || request.service.service_type.package != shared.activation.runtime.code.id.package.package
         || request.service.application != shared.activation.application_name
         || request.local.node.id.0.len() != 16
@@ -259,6 +299,51 @@ fn unit(shared: &Shared, request: &ProxyRequest, create: bool) -> Result<Option<
 async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
     let props = incoming.message.properties()?;
     let request: ProxyRequest = from_slice(&incoming.message.body)?;
+    let owner = {
+        let mut owners = shared.owners.lock().unwrap();
+        let id = request.unit.id.id.0;
+        match owners.get(&id).copied() {
+            Some(stateful) => {
+                if matches!(props.action.as_str(), "ReplicaOpen" | "ReplicaClose")
+                    && stateful != request.service.stateful
+                {
+                    return Err(Error::Protocol(
+                        "partition changed stateless/stateful ownership",
+                    ));
+                }
+                Some(stateful)
+            }
+            None if matches!(props.action.as_str(), "ReplicaOpen" | "ReplicaClose") => {
+                if owners.len() >= MAX_TOMBSTONES {
+                    return Err(Error::ResourceLimit("service tombstones"));
+                }
+                owners.insert(id, request.service.stateful);
+                Some(request.service.stateful)
+            }
+            None => None,
+        }
+    };
+    if owner == Some(true) || request.service.stateful {
+        return shared
+            .stateful
+            .dispatch(&props.action, request, incoming.reply)
+            .await;
+    }
+    if owner.is_none()
+        && matches!(
+            props.action.as_str(),
+            "UpdateConfiguration"
+                | "ReplicatorBuildIdleReplica"
+                | "ReplicatorRemoveIdleReplica"
+                | "ReplicatorGetStatus"
+                | "ReplicatorUpdateEpochAndGetStatus"
+                | "CancelCatchupReplicaSet"
+                | "ProxyReplicaEndpointUpdatedReply"
+        )
+    {
+        // Native retries/delayed controls cannot create a missing replica.
+        return Ok(());
+    }
     if props.action == "RAPQuery" {
         // Native Query.HostQueryAsyncOperation uses a fully serialized DEFAULT
         // ServiceDescription, not the manifest identity from ReplicaOpen.
@@ -372,7 +457,7 @@ async fn reply(
     let body = ProxyReply {
         unit: request.unit,
         local,
-        remote: EmptyObjectArray,
+        remote: ObjectArray(vec![]),
         flags: request.flags,
         error: ProxyError {
             error: error.as_ref().map_or(0, native_error),
@@ -727,7 +812,7 @@ fn query(shared: &Shared, request: &ProxyRequest) -> Result<QueryReply> {
         detail,
     })
 }
-fn filetime() -> i64 {
+pub(crate) fn filetime() -> i64 {
     ((SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -736,7 +821,7 @@ fn filetime() -> i64 {
         + 116_444_736_000_000_000)
         .min(i64::MAX as u128) as i64
 }
-fn stopwatch() -> i64 {
+pub(crate) fn stopwatch() -> i64 {
     let mut time = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,

@@ -57,15 +57,17 @@ This is separate from the native-backed `stateless-test-app` and standalone
 node-side test host. It deploys a normal ExeHost to real SF nodes:
 
 ```sh
-cargo test --locked -p mssf-runtime -p mssf-transport
+cargo test --locked -p mssf-runtime -p rust-runtime-app -p mssf-transport
 cargo clippy --locked -p mssf-runtime -p rust-runtime-app --all-targets -- -D warnings
 cargo doc --locked -p mssf-runtime --no-deps
-python3 -m unittest discover -s scripts -p 'test_rust_runtime_test.py'
+python3 -m unittest discover -s scripts -p 'test_*.py'
 just onebox-build
-python3 scripts/rust_runtime_test.py runtime-check --full
+python3 scripts/rust_runtime_test.py --build-bundle build/runtime-binaries
+python3 scripts/rust_runtime_test.py runtime-check --prebuilt build/runtime-binaries --full --stateful three
 ```
 
-The last command creates and destroys only its exact owned onebox, using the
+Use new bundle/report paths and a unique allocation name. The last command
+creates and destroys only its exact owned onebox, using the
 existing lifecycle controller. It verifies native placement, independent
 mssf-client resolution/RPC, exact pidfd-based application termination/replacement,
 native lifecycle/query/update/failure traffic, concurrent shared-process
@@ -81,10 +83,11 @@ It requires Linux pidfd APIs and the existing privileged development container
 for the exact-owned-IPC shutdown test; unavailable capabilities fail qualification.
 There is no security fallback.
 
-Local qualification builds the app and independent observer with `--locked`.
+The explicit build step builds the app and independent observer with `--locked`
+from clean source; native qualification always requires `--prebuilt`.
 CI builds them in the Linux native-free job and transfers a tar bundle containing
 both executables, both versioned package templates, their SHA256 hashes and the
-dependency graph (bundle format 2). The onebox job
+dependency graph (bundle format 3, `linux-x86_64-volatile-empty-control-v1`). The onebox job
 uses `--prebuilt DIRECTORY`: it verifies the bundle and ELF dependencies, then
 deploys/tests without installing Rust or invoking Cargo. Missing or changed
 artifacts fail; there is no compilation fallback. See the
@@ -95,9 +98,20 @@ owned healthy allocation, explicitly supply `--existing-owner OWNER`; the
 harness cleans up only its minted application and all its provisioned type
 versions with absence checks, never the caller's box.
 Failed or ambiguous cleanup is reported with exact recovery identities.
-See [the supported runtime profile](runtime/RustStatelessRuntime.md) before
+See the supported [stateless](runtime/RustStatelessRuntime.md) and
+[volatile empty-state stateful](runtime/RustStatefulRuntime.md) profiles before
 interpreting a test result. Delayed/stale commands and lease-expiry races also
 have offline model tests; native IPC-loss proof is not a node-failure/TLS claim.
+
+The stateful tier first proves target/minimum=1, then target=3/minimum=2,
+constraint-respecting Primary movement, native role/epoch/access observations,
+per-replica graceful Close and nonforce Abort with surviving stateless owners,
+and intentional shared-host termination/replacement affecting both types.
+RA departure inventory, discovery, deployment PIDs and real HTTP are independent
+observations; counters alone do not authenticate success. `--stateful three`
+requires `--full` so reporting/control/authority regressions cannot be omitted
+from a full-profile PASS. This qualifies empty-state lifecycle/control-plane,
+not replicated writes, persisted recovery or durability.
 
 The shared lifecycle engine and its regression fixtures retain their historical
 `linux_cluster*` names and `docker/linux-cluster` paths. They are support for

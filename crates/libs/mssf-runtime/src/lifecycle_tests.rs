@@ -1,4 +1,6 @@
 use super::*;
+#[path = "stateful_tests.rs"]
+pub(crate) mod stateful_tests;
 use mssf_transport::{
     connection::{read_message, write_message},
     message::{Header, ListenInstance, Message, MessageId},
@@ -100,7 +102,7 @@ impl StatelessService for Instance {
         }
     }
 }
-struct Harness {
+pub(crate) struct Harness {
     engine: Engine,
     peer: TcpStream,
     calls: Arc<Calls>,
@@ -677,6 +679,7 @@ impl Harness {
             rx,
         );
         let calls = Arc::new(Calls::default());
+        peer.set_nodelay(true).unwrap();
         engine
             .insert_factory("ModelType".into(), Arc::new(Factory(calls.clone())))
             .unwrap();
@@ -688,7 +691,19 @@ impl Harness {
         }
     }
     fn request(&self, partition: u8, incarnation: i64, mode: u8) -> ProxyRequest {
-        let context = &self.engine.shared.activation.runtime;
+        Self::request_with_context(
+            &self.engine.shared.activation.runtime,
+            partition,
+            incarnation,
+            mode,
+        )
+    }
+    pub(crate) fn request_with_context(
+        context: &RuntimeContext,
+        partition: u8,
+        incarnation: i64,
+        mode: u8,
+    ) -> ProxyRequest {
         let version = context.code.version.clone();
         ProxyRequest {
             runtime: context.id.clone(),
@@ -733,7 +748,7 @@ impl Harness {
                 service_endpoint: String::new(),
                 replication_endpoint: String::new(),
             },
-            remote: EmptyObjectArray,
+            remote: ObjectArray(vec![]),
             service: Service {
                 name: "fabric:/Model/Service".into(),
                 instance: 1,
@@ -762,7 +777,7 @@ impl Harness {
                 standby_keep: 0,
                 activation_mode: 0,
                 dns: String::new(),
-                scaling: EmptyObjectArray,
+                scaling: mssf_transport::serialization::serde::EmptyObjectArray,
             },
             flags: 0,
         }
@@ -809,11 +824,9 @@ impl Harness {
         msg
     }
     async fn no_reply(&mut self) {
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), read_message(&mut self.peer))
-                .await
-                .is_err()
-        );
+        let received =
+            tokio::time::timeout(Duration::from_millis(30), read_message(&mut self.peer)).await;
+        assert!(received.is_err(), "unexpected model response: {received:?}");
     }
 }
 

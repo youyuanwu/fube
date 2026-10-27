@@ -411,6 +411,114 @@ fn overrides(node: Node<'_, '_>, package: &mut ConfigurationPackage) -> Result<(
     Ok(())
 }
 
+fn service_types(node: Node<'_, '_>) -> Result<BTreeMap<String, String>> {
+    shape(node, &[], &["StatelessServiceType", "StatefulServiceType"])?;
+    let mut result = BTreeMap::new();
+    for service in node.children().filter(Node::is_element) {
+        let stateful = service.has_tag_name((NS, "StatefulServiceType"));
+        shape(
+            service,
+            if stateful {
+                &["ServiceTypeName", "HasPersistedState"]
+            } else {
+                &["ServiceTypeName", "UseImplicitHost"]
+            },
+            &[
+                "LoadMetrics",
+                "PlacementConstraints",
+                "ServicePlacementPolicies",
+                "Extensions",
+            ],
+        )?;
+        let name = attr(service, "ServiceTypeName")?;
+        if name.is_empty()
+            || (stateful && boolean(service, "HasPersistedState")?)
+            || (!stateful && boolean(service, "UseImplicitHost")?)
+        {
+            return invalid();
+        }
+        let mut metrics = BTreeMap::new();
+        if let Some(loads) = optional(service, "LoadMetrics")? {
+            shape(loads, &[], &["LoadMetric"])?;
+            for metric in loads.children().filter(Node::is_element) {
+                shape(
+                    metric,
+                    &[
+                        "Name",
+                        "Weight",
+                        "DefaultLoad",
+                        "PrimaryDefaultLoad",
+                        "SecondaryDefaultLoad",
+                    ],
+                    &[],
+                )?;
+                let metric_name = setting_name(metric)?;
+                let number = |name| -> Result<Option<u32>> {
+                    metric
+                        .attribute(name)
+                        .map(|value| {
+                            value
+                                .parse::<u32>()
+                                .map_err(|_| Error::Protocol("invalid type metric load"))
+                        })
+                        .transpose()
+                };
+                let default = number("DefaultLoad")?;
+                let primary = number("PrimaryDefaultLoad")?;
+                if default.is_some() && primary.is_some() && default != primary {
+                    return invalid();
+                }
+                let primary = primary.or(default).unwrap_or(0);
+                let secondary = number("SecondaryDefaultLoad")?.unwrap_or(0);
+                let weight = metric
+                    .attribute("Weight")
+                    .unwrap_or("Low")
+                    .to_ascii_lowercase();
+                if !matches!(weight.as_str(), "zero" | "low" | "medium" | "high")
+                    || metrics
+                        .insert(
+                            metric_name.to_lowercase(),
+                            (metric_name, primary, secondary, weight),
+                        )
+                        .is_some()
+                {
+                    return invalid();
+                }
+            }
+        }
+        let constraint = if let Some(constraint) = optional(service, "PlacementConstraints")? {
+            if constraint.attributes().len() != 0
+                || constraint
+                    .children()
+                    .any(|child| child.is_element() || child.is_pi())
+            {
+                return invalid();
+            }
+            let content: String = constraint
+                .children()
+                .filter(Node::is_text)
+                .filter_map(|child| child.text())
+                .collect();
+            text(&content)?
+        } else {
+            String::new()
+        };
+        for tag in ["ServicePlacementPolicies", "Extensions"] {
+            if let Some(empty) = optional(service, tag)? {
+                shape(empty, &[], &[])?;
+            }
+        }
+        let declaration = format!("{name:?}:{stateful}:{metrics:?}:{constraint:?}");
+        if result.insert(name.to_lowercase(), declaration).is_some() || result.len() > 32 {
+            return invalid();
+        }
+    }
+    if result.is_empty() {
+        return invalid();
+    }
+    Ok(result)
+}
+
 fn canonical(node: Node<'_, '_>, output: &mut String) {
     if node.is_element() {
         output.push('<');
@@ -707,9 +815,11 @@ pub(crate) fn load(activation: &ActivationContext, deployment: &Path) -> Result<
             "Diagnostics",
         ],
     )?;
-    let types = child(manifest, "ServiceTypes")?;
-    shape(types, &[], &["StatelessServiceType"])?;
-    if !types.children().any(|n| n.is_element()) {
+    let types = service_types(child(manifest, "ServiceTypes")?)?;
+    let digested_types = child(root, "DigestedServiceTypes")?;
+    shape(digested_types, &["RolloutVersion"], &["ServiceTypes"])?;
+    rollout(&attr(digested_types, "RolloutVersion")?)?;
+    if service_types(child(digested_types, "ServiceTypes")?)? != types {
         return invalid();
     }
     if name(manifest)? != service || attr(manifest, "Version")? != manifest_version {
@@ -739,7 +849,7 @@ pub(crate) fn load(activation: &ActivationContext, deployment: &Path) -> Result<
         return invalid();
     }
     let mut fingerprint = format!(
-        "{code_decl}:{code_rollout}:{code_shared}:{:?}",
+        "{code_decl}:{code_rollout}:{code_shared}:{types:?}:{:?}",
         digested_code.attribute("ContentChecksum").unwrap_or("")
     );
     for n in digested_code
@@ -880,6 +990,9 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[path = "package_service_type_tests.rs"]
+mod service_type_tests;
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
@@ -935,7 +1048,7 @@ pub(crate) mod tests {
         }
     }
     impl Fixture {
-        fn read_public(&self) -> Result<PackageSnapshot> {
+        pub(super) fn read_public(&self) -> Result<PackageSnapshot> {
             let node = crate::NodeContext {
                 id: "node".into(),
                 instance: 1,

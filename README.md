@@ -66,6 +66,7 @@ See [onebox prerequisites, lifecycle, and recovery](docs/UbuntuOnebox.md).
 - [Native FabricRuntime](docs/runtime/FabricRuntime.md) and [node-side host responsibilities](docs/runtime/FabricRuntimeHost.md)
 - [Standalone test host](docs/runtime/RustTestHost.md) and [manifest execution](docs/runtime/ManifestTestHost.md)
 - [Rust stateless application runtime: API, limits and native evidence](docs/runtime/RustStatelessRuntime.md)
+- [Rust volatile empty-state stateful runtime: control-plane semantics and native evidence](docs/runtime/RustStatefulRuntime.md)
 - [Broader pure-Rust runtime design and capability tiers](docs/runtime/RustFabricRuntime.md)
 - [Migration provenance and repository boundaries](docs/Migration.md)
 

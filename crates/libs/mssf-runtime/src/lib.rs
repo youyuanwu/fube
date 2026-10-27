@@ -11,6 +11,8 @@ mod model_tests;
 mod package_context;
 mod packages;
 mod reporting;
+mod stateful;
+mod stateful_api;
 mod wire;
 
 use std::{
@@ -44,6 +46,12 @@ pub use packages::{
 pub use reporting::{
     FaultDelivery, HealthReceipt, HealthReport, HealthSequence, HealthState, LoadMetric, MoveCost,
     MAX_REPORT_METRICS, MAX_REPORT_NAME_UNITS,
+};
+pub use stateful_api::{
+    AccessStatus, CatchUpMode, CatchUpResult, ConfigurationStage, Epoch, ReplicaIdentity,
+    ReplicaInformation, ReplicaLifecycle, ReplicaRemoval, ReplicaRole, ReplicaSetConfiguration,
+    ReplicaStatus, ReplicationProgress, Replicator, StatefulFactory, StatefulPartition,
+    StatefulService, StatefulServiceContext, MAX_REPLICA_SET_SIZE,
 };
 use wire::*;
 
@@ -389,6 +397,26 @@ impl Runtime {
             return Err(Error::InvalidInput("invalid service type name"));
         }
         self.lifecycle.insert_factory(name.to_owned(), factory)?;
+        self.register_type(name).await
+    }
+
+    /// Register a volatile stateful factory on this same host/runtime. Native
+    /// placement remains the only source of replica membership and roles.
+    pub async fn register_stateful(
+        &mut self,
+        name: &str,
+        factory: Arc<dyn StatefulFactory>,
+    ) -> Result<()> {
+        self.authority.check()?;
+        if name.is_empty() || name.encode_utf16().count() > 32_768 {
+            return Err(Error::InvalidInput("invalid service type name"));
+        }
+        self.lifecycle
+            .insert_stateful_factory(name.to_owned(), factory)?;
+        self.register_type(name).await
+    }
+
+    async fn register_type(&self, name: &str) -> Result<()> {
         let activation = self.current.snapshot();
         let reply: Result<ErrorReply> = call(
             &self.connection,
@@ -470,7 +498,7 @@ impl Runtime {
             task.abort();
         }
         self.connection.close().await?;
-        self.authority.disarm();
+        self.authority.disarm()?;
         self.shutdown = true;
         Ok(())
     }

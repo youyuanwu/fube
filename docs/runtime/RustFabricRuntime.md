@@ -12,8 +12,12 @@ The companion [native architecture](FabricRuntime.md) explains those boundaries.
 **Current status:** the Linux stateless application-side slice is implemented in
 `mssf-runtime` and qualified against real 11.8.121.4 nodes. See the
 [as-built API, supported profile and evidence](RustStatelessRuntime.md).
-The broader capability tiers below remain a proposed design, not claims of
-stateful, ABI, security or other-profile interoperability.
+The same runtime now also qualifies a **volatile empty-state stateful subset**
+with real reconfiguration/peer readiness and mixed-host recovery; see the
+[as-built stateful profile](RustStatefulRuntime.md). It is not replicated
+storage or completion of tier C. The broader capability tiers below remain a
+proposed design, not claims of general stateful, ABI, security or other-profile
+interoperability.
 The implemented slice includes owned configuration/data package snapshots and
 same-incarnation context refresh, qualified by an actual unchanged-code
 configuration-only application upgrade. Rolling code upgrade/rollback remains

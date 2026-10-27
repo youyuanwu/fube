@@ -24,10 +24,13 @@ The native SF node, deployment tools and OS libraries are still expected.
 
 This is not a complete replacement for every FabricRuntime feature. Named
 partition decoding has model coverage, not native qualification. Secret
-decryption/reference resolution, rolling code upgrade/rollback, stateful services, replication/storage,
+decryption/reference resolution, rolling code upgrade/rollback, general stateful services, replication/storage,
 containers, activator/multicodepackage hosts, Windows, TLS and COM ABI compatibility
 are outside this profile. Unsupported security is rejected, never downgraded.
 The broader [design](RustFabricRuntime.md) retains these separate capability tiers.
+The same crate/executable now has a separately qualified
+[volatile empty-state stateful profile](RustStatefulRuntime.md); it does not
+turn this stateless profile into replicated storage.
 
 ## Owned programming model
 
@@ -220,7 +223,7 @@ callbacks and proven abort/disposal before watchdog disarming.
 | Query reported load | Bounded local last-written metrics via native RAPQuery, distinct from independent FM retention |
 | Partition-scoped health | Not exposed; health reports target the originating stateless instance |
 | Named partitions | API/codec/model support; not native-qualified by this suite |
-| Stateful/replication/security-required profiles | Rejected/out of scope, no insecure/native fallback |
+| General stateful/replication/security-required profiles | Out of scope here; separate empty-state stateful subset, no insecure/native fallback |
 
 If an unsupported operation becomes necessary for continued hosting, placement
 or restart, that scenario is a blocker—not successful profile qualification.
@@ -343,14 +346,16 @@ tests are in [transport tests](../../crates/libs/mssf-transport/src/connection_i
 Build the [onebox image](../UbuntuOnebox.md), then:
 
 ```sh
-python3 scripts/rust_runtime_test.py runtime-check --full --report build/runtime-check.json
+python3 scripts/rust_runtime_test.py --build-bundle build/runtime-binaries
+python3 scripts/rust_runtime_test.py runtime-check --prebuilt build/runtime-binaries \
+  --full --report build/runtime-check.json
 ```
 
-By default the harness builds both the application and its independent observer
-with `--locked`. To build once and qualify elsewhere without Rust/Cargo:
+The explicit build mode builds the application and its independent observer
+with `--locked` from clean source. Native qualification requires `--prebuilt`;
+it never builds implicitly. To transfer that bundle and qualify without Rust/Cargo:
 
 ```sh
-python3 scripts/rust_runtime_test.py --build-bundle build/runtime-binaries
 tar -cf build/runtime-binaries.tar -C build/runtime-binaries .
 # On the qualification runner, extract into a new directory:
 mkdir build/runtime-prebuilt
@@ -361,7 +366,8 @@ python3 scripts/rust_runtime_test.py runtime-check --prebuilt build/runtime-preb
 
 The bundle retains executable permissions and includes the build-time dependency
 graph plus SHA256 hashes for both binaries **and both versioned package templates**
-(bundle format 2, producing revision recorded). Prebuilt mode rejects missing,
+(bundle format 3, profile `linux-x86_64-volatile-empty-control-v1`,
+producing revision recorded). Prebuilt mode rejects missing,
 extra, symlinked, nonregular, nonexecutable or modified inputs and invalid dependency evidence before
 allocating a onebox; it never compiles or invokes Cargo. ELF dependencies and
 live application mappings are still checked on the qualification runner. CI

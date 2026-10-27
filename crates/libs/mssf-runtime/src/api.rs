@@ -68,7 +68,9 @@ impl Cancellation {
             wake.await;
         }
     }
-    pub(crate) fn cancel(&self) {
+    /// Signal cancellation of locally owned work. This never grants native
+    /// authority and is not proof that the operation has completed or cleaned up.
+    pub fn cancel(&self) {
         self.0.value.store(true, Ordering::Release);
         self.0.changed.notify_waiters();
     }
@@ -90,7 +92,8 @@ pub enum FaultType {
     Permanent,
 }
 impl Partition {
-    /// Remaining send-based authority, for application observability only.
+    /// Remaining process authority (send-based node lease and any shorter
+    /// callback fence), for application observability only.
     /// It does not grant a new lease or permit reconnect/revival.
     pub fn authority_remaining(&self) -> Result<std::time::Duration> {
         self.ensure_valid()?;

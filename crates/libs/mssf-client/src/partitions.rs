@@ -75,7 +75,9 @@ crate::native::strict_enum! {
     }
 }
 
-/// Raw Reliability::Epoch, not the masked public PrimaryEpoch projection.
+/// Reliability::Epoch wire representation. The native FM partition-list sender
+/// projects its value with ToPrimaryEpoch: its configuration low 32 bits are
+/// masked, unlike the full RA/RAP configuration epoch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 pub struct ConfigurationEpoch {
     pub configuration_version: i64,

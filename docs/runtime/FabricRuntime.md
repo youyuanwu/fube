@@ -14,7 +14,7 @@ inspected 2026-10-25. Native paths below are relative to `src/prod/src/`;
 source links pin that revision. The accompanying
 [pure Rust design](RustFabricRuntime.md) separates proposals from native facts.
 
-**Evidence limit:** no replacement runtime was implemented, no native
+**Original research evidence limit:** no replacement runtime was implemented, no native
 FabricRuntime tests were executed, and no runtime IPC/TLS exchange was captured
 or qualified for these documents. The repository's existing clear-TCP
 FabricClient qualification is not FabricRuntime evidence. Source behavior here
@@ -32,6 +32,11 @@ runtime, reporting and unchanged-code configuration-context refresh on Linux SF
 Those observations do not establish that the inspected native source revision
 produced the deployed binaries, nor qualify rolling code upgrade/rollback or
 indefinite old-directory availability.
+
+Subsequent application-side work also qualified a **volatile empty-state
+stateful subset** in the same mixed-service executable/SharedProcess:
+[as-built APIs, native role/configuration/recovery evidence and nonclaims](RustStatefulRuntime.md).
+This adds no application replication/storage or native replication-wire claim.
 
 ## 2. Distinct boundaries
 

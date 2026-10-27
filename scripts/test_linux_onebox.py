@@ -257,7 +257,9 @@ class OneboxTests(unittest.TestCase):
                     patch.object(sys, "stdout", new_callable=io.StringIO), \
                     patch.object(onebox.Onebox, "create", return_value={"ready": True}) as create:
                 self.assertEqual(onebox.main(), 0)
-                create.assert_called_once_with(subnet, "sf-apps-onebox:" + ctl.RUNTIME, 900)
+                create.assert_called_once_with(
+                    subnet, "sf-apps-onebox:" + ctl.RUNTIME, 900, on_allocated=None,
+                )
 
     def test_entrypoint_layout_and_all_five_retained_deployments(self):
         identity = self.cluster.state["nodes"][0]

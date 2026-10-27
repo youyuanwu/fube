@@ -3,19 +3,28 @@ import contextlib
 import copy
 import io
 import json
+import shlex
 import sys
+import textwrap
 import unittest
 import subprocess
 import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, ANY
 
 import rust_runtime_test as runtime
+
+def model_binaries():
+    return runtime.Binaries(Path("/prebuilt")/"app",Path("/prebuilt")/"observer","native-free",
+                            Path("/prebuilt")/"templates","a"*64,"1"*40)
 
 
 @unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class BinaryBundleTests(unittest.TestCase):
     def setUp(self):
+        source=patch.object(runtime,"clean_source_revision",return_value="1"*40)
+        source.start()
+        self.addCleanup(source.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -31,6 +40,20 @@ class BinaryBundleTests(unittest.TestCase):
         with patch.object(runtime, "build_binaries", return_value=self.binaries):
             runtime.build_bundle(directory)
         return directory
+
+    def test_strict_version_profile_revision_and_keys_reject_old_or_ambiguous_bundles(self):
+        for field,value in [("version",2),("profile","stateless"),("source_revision","dirty"),("extra",True)]:
+            directory=self.bundle("metadata-"+field)
+            path=directory/"build-info.json"
+            metadata=json.loads(path.read_text());metadata[field]=value
+            path.write_text(json.dumps(metadata))
+            with self.assertRaises(RuntimeError):runtime.load_bundle(directory)
+
+    def test_dirty_source_is_rejected_before_build_or_allocation(self):
+        with patch.object(runtime,"clean_source_revision",side_effect=RuntimeError("dirty source")), \
+             patch.object(runtime,"build_binaries") as build:
+            with self.assertRaises(RuntimeError):runtime.build_bundle(self.root/"dirty")
+            build.assert_not_called()
 
     def test_build_only_produces_verified_executables_without_allocation(self):
         directory = self.root / "bundle"
@@ -199,6 +222,8 @@ class ReportingEvidenceTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class AllocationTests(unittest.TestCase):
     def setUp(self):
+        bundle=patch.object(runtime,"load_bundle",return_value=model_binaries())
+        bundle.start(); self.addCleanup(bundle.stop)
         self.state = {"name": "owned", "owner": "capability", "project": "sf-onebox-owned",
                       "runtime_version": "11.8.121.4"}
         self.container = {
@@ -229,20 +254,19 @@ class AllocationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             runtime.validate_allocation(self.state, changed, "owned", "capability")
 
-    def test_collision_or_partial_creation_never_gets_name_only_cleanup(self):
-        with patch("sys.argv", ["rust_runtime_test.py", "owned"]), \
-             patch.object(runtime, "create_owned", side_effect=RuntimeError("controller rejected existing/partial allocation")) as create, \
+    def test_rejected_creation_never_gets_name_only_cleanup(self):
+        with patch("sys.argv", ["rust_runtime_test.py", "owned", "--prebuilt", "bundle"]), \
+             patch.object(runtime, "create_owned", side_effect=RuntimeError("controller rejected preexisting allocation")) as create, \
              patch.object(runtime,"destroy_owned") as destroy, \
              contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit):
                 runtime.main()
-            create.assert_called_once_with("owned")
+            create.assert_called_once_with("owned",on_allocated=ANY)
             destroy.assert_not_called()
-        # The controller itself owns partial-create recovery. A failed create
-        # cannot grant this script a cleanup capability for a pre-existing box.
+        # Rejection before a new allocation commits grants no cleanup authority.
 
     def test_successful_create_retains_cleanup_after_constructor_failure(self):
-        with patch("sys.argv",["rust_runtime_test.py","owned"]), \
+        with patch("sys.argv",["rust_runtime_test.py","owned","--prebuilt","bundle"]), \
              patch.object(runtime,"create_owned",return_value="acquired-owner"), \
              patch.object(runtime,"Allocation",side_effect=RuntimeError("post-create status failed")), \
              patch.object(runtime,"destroy_owned",return_value={"phase":"destroyed"}) as destroy, \
@@ -258,6 +282,8 @@ class AllocationTests(unittest.TestCase):
     def test_cleanup_uses_controller_lock_and_owner_not_readiness(self):
         cluster=MagicMock()
         cluster.state={"owner":"acquired-owner","phase":"down"}
+        cluster.resources.return_value=([],[],[])
+        cluster.destroy.return_value={"phase":"destroyed"}
         with patch.object(runtime.onebox_ctl.ctl,"locked",return_value=contextlib.nullcontext(Path("/fake"))), \
              patch.object(runtime.onebox_ctl,"Onebox",return_value=cluster):
             runtime.destroy_owned("owned","acquired-owner")
@@ -278,9 +304,11 @@ class AllocationTests(unittest.TestCase):
             held["value"]=False
             # Earliest permitted replacement is after creation's transaction.
             cluster.state={"owner":"b"*32}
-        def create(*_args):
+        def create(*_args,on_allocated):
             self.assertTrue(held["value"])
             cluster.state={"owner":"a"*32}
+            on_allocated(cluster.state["owner"])
+            cluster.state={"owner":"c"*32}
         cluster.create.side_effect=create
         with patch.object(runtime.onebox_ctl.ctl,"check_local_docker"), \
              patch.object(runtime.onebox_ctl.ctl,"locked",side_effect=lock), \
@@ -292,7 +320,7 @@ class AllocationTests(unittest.TestCase):
     def test_replaced_allocation_never_grants_new_owner_cleanup_authority(self):
         cluster=MagicMock()
         cluster.state={"owner":"b"*32}
-        with patch("sys.argv",["rust_runtime_test.py","owned"]), \
+        with patch("sys.argv",["rust_runtime_test.py","owned","--prebuilt","bundle"]), \
              patch.object(runtime,"create_owned",return_value="a"*32), \
              patch.object(runtime,"Allocation",side_effect=RuntimeError("replacement owner mismatch")) as allocation, \
              patch.object(runtime,"qualify") as qualify, \
@@ -310,10 +338,209 @@ class AllocationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
+class AllocationCommitTests(unittest.TestCase):
+    def setUp(self):
+        directory=tempfile.TemporaryDirectory(prefix=".allocation-test-",dir=".")
+        self.addCleanup(directory.cleanup)
+        self.root=Path(directory.name).resolve()
+        self.absence=[]
+        self.compose=[]
+        self.original_owner=None
+        image={"Id":"sha256:"+"c"*64,"Os":"linux","Architecture":"amd64",
+               "Config":{"Labels":{runtime.onebox_ctl.Onebox.image_label:"1"}}}
+        def docker(arguments,**_kwargs):
+            if arguments[:3]==["docker","image","inspect"]:
+                return json.dumps([image])
+            if arguments[:2]==["docker","run"] or arguments[:3]==["docker","volume","rm"]:
+                return ""
+            if arguments[:3] in (["docker","ps","-aq"],["docker","volume","ls"],
+                                 ["docker","network","ls"]):
+                return ""
+            raise AssertionError(f"unexpected Docker command: {arguments}")
+        self.docker=docker
+        def resources(cluster,**_kwargs):
+            owner=cluster.state["owner"]
+            return ([{"Id":"container-"+owner}],[{"Name":"volume-"+owner}],
+                    [{"Id":"network-"+owner}])
+        def inspect(arguments,**_kwargs):
+            self.assertEqual(arguments[:1],["docker"])
+            kind,_,identity=arguments[1:]
+            self.absence.append((kind,identity))
+            return subprocess.CompletedProcess(arguments,1,"",f"No such {kind}: {identity}")
+        def readiness(cluster,*_args,**_kwargs):
+            self.original_owner=json.loads(cluster.path.read_text())["owner"]
+            raise TimeoutError("native readiness failed after allocation")
+        for target,attribute,kwargs in (
+            (runtime.onebox_ctl,"STATE_ROOT",{"new":self.root}),
+            (runtime.onebox_ctl.ctl,"check_local_docker",{}),
+            (runtime.onebox_ctl.ctl,"run",{"side_effect":docker}),
+            (runtime.onebox_ctl.Onebox,"subnet_check",{}),
+            (runtime.onebox_ctl.Onebox,"retain_image",{}),
+            (runtime.onebox_ctl.Onebox,"image_tag_id",{"return_value":""}),
+            (runtime.onebox_ctl.Onebox,"allocate",{"autospec":True,"side_effect":
+                lambda cluster:cluster.save(phase="starting")}),
+            (runtime.onebox_ctl.Onebox,"helper",{}),
+            (runtime.onebox_ctl.Onebox,"resources",{"autospec":True,"side_effect":resources}),
+            (runtime.onebox_ctl.Onebox,"compose",{"autospec":True,"side_effect":
+                lambda _cluster,*args,**_kwargs:self.compose.append(args)}),
+            (runtime.onebox_ctl.Onebox,"wait",{"autospec":True,"side_effect":readiness}),
+            (runtime.subprocess,"run",{"side_effect":inspect}),
+            (runtime,"load_bundle",{"return_value":model_binaries()}),
+        ):
+            mocked=patch.object(target,attribute,**kwargs)
+            mocked.start()
+            self.addCleanup(mocked.stop)
+
+    def run_main(self):
+        with patch("sys.argv",["rust_runtime_test.py","owned","--prebuilt","bundle"]), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(SystemExit):
+                runtime.main()
+        return json.loads(output.getvalue())
+
+    def replace_owner(self):
+        cluster=runtime.onebox_ctl.Onebox(self.root/"owned","owned")
+        cluster.load()
+        cluster.state["owner"]="b"*32
+        compose,_=cluster.definition(cluster.state,cluster.directory)
+        runtime.onebox_ctl.ctl.write_json(cluster.directory/"compose.json",compose)
+        cluster.save()
+
+    def workflow_command(self,name):
+        workflow=(runtime.ROOT/".github/workflows/ci.yaml").read_text()
+        step=workflow.split("- name: "+name+"\n",1)[1].split("\n    - name:",1)[0]
+        shell=textwrap.dedent(step.split("      run:",1)[1].lstrip().removeprefix("|"))
+        return shlex.split(shell)
+
+    def test_readiness_failure_cleans_committed_owner_with_independent_absence(self):
+        result=self.run_main()
+        self.assertIn("readiness failed",result["errors"][0])
+        cleanup=result["cleanup"]["onebox"]
+        self.assertIsInstance(cleanup,dict,"newly committed allocation lost its cleanup capability")
+        self.assertTrue(cleanup["absence_verified"])
+        self.assertEqual(self.absence,[(kind,kind+"-"+self.original_owner)
+                                      for kind in ("container","volume","network")])
+        self.assertIn(("down","--timeout",str(runtime.onebox_ctl.ctl.SHUTDOWN_TIMEOUT)),self.compose)
+
+    def test_committed_owner_survives_allocated_journal_failure_before_startup(self):
+        original_event=runtime.onebox_ctl.Onebox.event
+        def event(cluster,name,**values):
+            if name=="allocated":
+                self.original_owner=json.loads(cluster.path.read_text())["owner"]
+                raise OSError("allocation journal failed")
+            return original_event(cluster,name,**values)
+        with patch.object(runtime.onebox_ctl.Onebox,"event",autospec=True,side_effect=event):
+            result=self.run_main()
+        self.assertIn("journal failed",result["errors"][0])
+        self.assertIsInstance(result["cleanup"]["onebox"],dict)
+        self.assertTrue(result["cleanup"]["onebox"]["absence_verified"])
+        self.assertFalse(any(args[0]=="up" for args in self.compose))
+
+    def test_rejected_existing_allocation_and_name_collision_grant_no_capability(self):
+        for rejection in ("existing","collision"):
+            with self.subTest(rejection=rejection):
+                if rejection=="existing":
+                    with patch.object(runtime.onebox_ctl.Onebox,"wait"):
+                        runtime.create_owned("owned")
+                def collision(arguments,**kwargs):
+                    return "collision" if arguments[:3]==["docker","ps","-aq"] else self.docker(arguments,**kwargs)
+                with patch.object(runtime.onebox_ctl.ctl,"run",
+                                  side_effect=collision) if rejection=="collision" else contextlib.nullcontext(), \
+                     patch.object(runtime,"destroy_owned") as destroy:
+                    result=self.run_main()
+                destroy.assert_not_called()
+                self.assertIn("already exists" if rejection=="existing" else "refusing adoption",result["errors"][0])
+                self.assertEqual(result["cleanup"]["onebox"],"create rejected; no cleanup capability")
+                self.assertFalse(self.absence)
+                if rejection=="existing":
+                    cluster=runtime.onebox_ctl.Onebox(self.root/"owned","owned")
+                    cluster.load()
+                    with patch.object(cluster,"resources",return_value=([],[],[])):
+                        cluster.destroy("owned")
+                    # Keep the tombstone so collision rejection reaches Docker preflight.
+
+    def run_ci_create(self):
+        output_path=self.root/"github-output"
+        command=self.workflow_command("Create native development cluster")
+        with patch.dict(runtime.os.environ,{"CLUSTER_NAME":"owned","CLUSTER_CTL":"scripts/onebox_ctl.py",
+                                            "GITHUB_OUTPUT":str(output_path)}), \
+             patch("sys.argv",[runtime.os.path.expandvars(arg) for arg in command[1:]]), \
+             patch.object(runtime.os,"umask"), \
+             contextlib.redirect_stdout(io.StringIO()) as output, \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+            status=runtime.onebox_ctl.main()
+        return status,output_path,output.getvalue(),error.getvalue()
+
+    def run_ci_failure(self,drift=False):
+        status,output_path,output,error=self.run_ci_create()
+        self.assertEqual(status,1)
+        self.assertIn("readiness failed",error)
+        self.assertTrue(output_path.exists(),"failed create skipped owner output")
+        owner=output_path.read_text().strip().removeprefix("owner=")
+        self.assertEqual(owner,self.original_owner)
+        self.assertIn("::add-mask::"+owner,output)
+        if drift:
+            self.replace_owner()
+        cleanup=self.workflow_command("Destroy only this job's cluster")[2]
+        with patch.dict(runtime.os.environ,{"CLUSTER_NAME":"owned"}), \
+             patch("sys.argv",["-c",owner]),contextlib.redirect_stdout(io.StringIO()):
+            if drift:
+                with self.assertRaisesRegex(RuntimeError,"owner changed"):
+                    exec(compile(cleanup,"ci-cleanup","exec"),{})
+            else:
+                exec(compile(cleanup,"ci-cleanup","exec"),{})
+        if drift:
+            self.assertFalse(self.absence)
+            self.assertFalse(any(args[0]=="down" for args in self.compose))
+        else:
+            self.assertEqual(self.absence,[(kind,kind+"-"+owner)
+                                          for kind in ("container","volume","network")])
+
+    def test_ci_failure_retains_original_output_and_owner_checked_teardown(self):
+        self.run_ci_failure()
+
+    def test_ci_failure_never_authorizes_replacement_owner(self):
+        self.run_ci_failure(drift=True)
+
+    def test_ci_rejected_existing_create_never_publishes_cleanup_owner(self):
+        with patch.object(runtime.onebox_ctl.Onebox,"wait"):
+            runtime.create_owned("owned")
+        status,output_path,output,error=self.run_ci_create()
+        self.assertEqual(status,1)
+        self.assertIn("already exists",error)
+        self.assertFalse(output_path.exists())
+        self.assertNotIn("::add-mask::",output)
+
+    def test_ci_name_collision_never_publishes_cleanup_owner(self):
+        def collision(arguments,**kwargs):
+            return "collision" if arguments[:3]==["docker","ps","-aq"] else self.docker(arguments,**kwargs)
+        with patch.object(runtime.onebox_ctl.ctl,"run",side_effect=collision):
+            status,output_path,output,error=self.run_ci_create()
+        self.assertEqual(status,1)
+        self.assertIn("refusing adoption",error)
+        self.assertFalse(output_path.exists())
+        self.assertNotIn("::add-mask::",output)
+
+    def test_readiness_failure_never_recovers_replacement_owner(self):
+        destroy=runtime.destroy_owned
+        def replaced(name,owner):
+            self.assertEqual(owner,self.original_owner)
+            self.replace_owner()
+            return destroy(name,owner)
+        with patch.object(runtime,"destroy_owned",side_effect=replaced) as cleanup:
+            result=self.run_main()
+        cleanup.assert_called_once_with("owned",self.original_owner)
+        self.assertIn("owner changed",result["errors"][1])
+        self.assertFalse(self.absence)
+        self.assertFalse(any(args[0]=="down" for args in self.compose))
+
+
+@unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class AmbiguousUpgradeTests(unittest.TestCase):
     def execute_upgrade_timeout(self, drift=None):
         fixture=AllocationTests()
         fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
         state,container=fixture.state,fixture.container
         allocation=MagicMock()
         allocation.name="owned"; allocation.owner="capability"; allocation.container_id="immutable-container"
@@ -356,7 +583,7 @@ class AmbiguousUpgradeTests(unittest.TestCase):
                      "native_entry_point_instance":7}
         def package(*_args,**kwargs):
             return Path("/generated-upgrade" if kwargs.get("upgrade") else "/generated"),type_name,"1.2" if kwargs.get("upgrade") else "1.1"
-        binaries=runtime.Binaries(Path("/prebuilt/app"),Path("/prebuilt/observer"),"native-free")
+        binaries=model_binaries()
         with patch.object(runtime.uuid,"uuid4",return_value=MagicMock(hex="012345abcdef")), \
              patch.object(runtime,"package",side_effect=package), \
              patch.object(runtime,"run",return_value="native-free"), \
@@ -467,7 +694,7 @@ class AmbiguousMutationTests(unittest.TestCase):
              patch.object(runtime,"digest",return_value="a"*64), \
              patch.object(runtime.uuid,"uuid4",return_value=MagicMock(hex="abcdefgh1234")), \
              patch.object(runtime,"package",return_value=(Path("/generated"),type_name,"1.1")):
-            result=runtime.qualify(allocation)
+            result=runtime.qualify(allocation,binaries=model_binaries())
         return result,present,calls
 
     def test_accepted_provision_timeout_is_reconciled_and_removed(self):
@@ -495,7 +722,8 @@ class AmbiguousMutationTests(unittest.TestCase):
         self.assertEqual(result["cleanup"]["retained_for_recovery"]["application"],result["application"])
 
     def test_existing_owner_allocation_is_never_destroyed(self):
-        with patch("sys.argv",["rust_runtime_test.py","owned","--existing-owner","capability"]), \
+        with patch("sys.argv",["rust_runtime_test.py","owned","--existing-owner","capability","--prebuilt","bundle"]), \
+             patch.object(runtime,"load_bundle",return_value=model_binaries()), \
              patch.object(runtime,"Allocation"),patch.object(runtime,"qualify",return_value={"status":"FAIL","errors":["failure"],"cleanup":{}}), \
              patch.object(runtime,"destroy_owned") as destroy,contextlib.redirect_stdout(io.StringIO()) as output:
             with self.assertRaises(SystemExit):runtime.main()
@@ -535,9 +763,10 @@ class ProcessTests(unittest.TestCase):
              patch("pathlib.Path", FakePath), \
              patch("os.pidfd_open", side_effect=ProcessLookupError if stale else None, return_value=44), \
              patch("os.readlink", return_value="/owned/app/rust-runtime-app"), \
-             patch("os.close"), patch("signal.pidfd_send_signal") as signal, \
+             patch("os.close"), patch("signal.pidfd_send_signal") as signal, patch("select.poll") as poll, \
              contextlib.redirect_stdout(io.StringIO()) as output:
             try:
+                poll.return_value.poll.return_value=[(44,1)]
                 exec(runtime.PROCESS, {})
             except (RuntimeError, ProcessLookupError):
                 self.assertFalse(signal.called)
