@@ -9,6 +9,8 @@ hosting/lifecycle is Rust IPC; resolution is independently mssf-client.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -28,6 +30,8 @@ ROOT = Path(__file__).resolve().parents[1]
 OWNER_LABEL = "io.github.service-fabric-apps.cluster-owner"
 NS = "http://schemas.microsoft.com/2011/01/fabric"
 ET.register_namespace("", NS)
+DEFAULT_APP = ROOT / "target/debug/rust-runtime-app"
+DEFAULT_OBSERVER = ROOT / "target/debug/examples/runtime_observer"
 
 
 def run(*args: str, timeout: float = 120) -> str:
@@ -35,6 +39,64 @@ def run(*args: str, timeout: float = 120) -> str:
     if result.returncode:
         raise RuntimeError(f"{args[0]} failed ({result.returncode}): {result.stderr[-6000:]}")
     return result.stdout
+
+
+@dataclass(frozen=True)
+class Binaries:
+    app: Path
+    observer: Path
+    dependency_graph: str
+
+
+def validate_dependency_graph(graph: str) -> None:
+    if not isinstance(graph, str) or not graph.strip():
+        raise RuntimeError("missing application dependency graph")
+    if any(name in graph.lower() for name in ("mssf-core", "mssf-com", "fabricruntime", "fabriccommon")):
+        raise RuntimeError("application dependency graph contains native SF adapters")
+
+
+def digest(path: Path) -> str:
+    with path.open("rb") as file:
+        return hashlib.file_digest(file, "sha256").hexdigest()
+
+
+def build_binaries() -> Binaries:
+    run("cargo", "build", "--locked", "-p", "rust-runtime-app")
+    run("cargo", "build", "--locked", "-p", "mssf-client", "--example", "runtime_observer")
+    graph = run("cargo", "tree", "--locked", "-p", "rust-runtime-app")
+    validate_dependency_graph(graph)
+    return Binaries(DEFAULT_APP, DEFAULT_OBSERVER, graph)
+
+
+def build_bundle(directory: Path) -> None:
+    binaries = build_binaries()
+    directory.mkdir(parents=True, exist_ok=False)
+    hashes = {}
+    for source, name in ((binaries.app, "rust-runtime-app"), (binaries.observer, "runtime_observer")):
+        destination = directory / name
+        shutil.copy2(source, destination)
+        hashes[name] = digest(destination)
+    metadata = {"version": 1, "dependency_graph": binaries.dependency_graph, "sha256": hashes}
+    (directory / "build-info.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def load_bundle(directory: Path) -> Binaries:
+    directory = directory.resolve(strict=True)
+    metadata = json.loads((directory / "build-info.json").read_text(encoding="utf-8"))
+    if not isinstance(metadata, dict) or metadata.get("version") != 1:
+        raise RuntimeError("unsupported runtime binary bundle")
+    graph = metadata.get("dependency_graph")
+    validate_dependency_graph(graph)
+    hashes = metadata.get("sha256")
+    if not isinstance(hashes, dict) or set(hashes) != {"rust-runtime-app", "runtime_observer"}:
+        raise RuntimeError("missing runtime binary hashes")
+    for name, expected in hashes.items():
+        binary = directory / name
+        if binary.is_symlink() or not binary.is_file() or not os.access(binary, os.X_OK):
+            raise RuntimeError(f"missing regular executable in runtime bundle: {name}")
+        if not isinstance(expected, str) or digest(binary) != expected:
+            raise RuntimeError(f"runtime bundle binary hash mismatch: {name}")
+    return Binaries(directory / "rust-runtime-app", directory / "runtime_observer", graph)
 
 
 def validate_allocation(state: dict, container: dict, name: str, owner: str) -> str:
@@ -156,8 +218,8 @@ finally:
 """
 
 
-def observe(service: str, key: str | None = None) -> dict:
-    args = [str(ROOT / "target/debug/examples/runtime_observer"), "127.0.0.1:19000", service]
+def observe(service: str, key: str | None = None, *, observer: Path = DEFAULT_OBSERVER) -> dict:
+    args = [str(observer), "127.0.0.1:19000", service]
     if key is not None:
         args.append(key)
     lines = run(*args, timeout=15).splitlines()
@@ -171,12 +233,13 @@ def observe(service: str, key: str | None = None) -> dict:
     return observed
 
 
-def wait_observe(service: str, *, old: dict | None = None, started: float | None = None, key: str | None = None) -> dict:
+def wait_observe(service: str, *, old: dict | None = None, started: float | None = None,
+                 key: str | None = None, observer: Path = DEFAULT_OBSERVER) -> dict:
     started = time.monotonic() if started is None else started
     last = "no attempt"
     while time.monotonic() - started < 180:
         try:
-            value = observe(service, key)
+            value = observe(service, key, observer=observer)
             if old and (
                 value["native_pid"] == old["native_pid"]
                 or value["rpc"]["host"] == old["rpc"]["host"]
@@ -192,24 +255,25 @@ def wait_observe(service: str, *, old: dict | None = None, started: float | None
     raise RuntimeError(f"native resolution/RPC did not recover within 180s: {last}")
 
 
-def restart(allocation: Allocation, service: str) -> dict:
-    initial = wait_observe(service)
+def restart(allocation: Allocation, service: str, *, observer: Path = DEFAULT_OBSERVER) -> dict:
+    initial = wait_observe(service, observer=observer)
     before = json.loads(allocation.execute("python3", "-c", PROCESS, json.dumps(initial), "inspect"))
     terminated = json.loads(allocation.execute("python3", "-c", PROCESS, json.dumps(initial), "kill"))
-    replacement = wait_observe(service, old=initial, started=terminated["terminated_at_monotonic"])
+    replacement = wait_observe(service, old=initial, started=terminated["terminated_at_monotonic"],
+                               observer=observer)
     elapsed = time.monotonic() - terminated["terminated_at_monotonic"]
     after = json.loads(allocation.execute("python3", "-c", PROCESS, json.dumps(replacement), "inspect"))
     return {"initial": initial, "initial_process": before, "termination": terminated,
             "replacement": replacement, "replacement_process": after, "recovery_seconds": elapsed}
 
 
-def package(run_id: str) -> tuple[Path, str, str]:
+def package(run_id: str, app: Path) -> tuple[Path, str, str]:
     source = ROOT / "crates/samples/rust-runtime-app/pkg"
     destination = ROOT / "build/rust-runtime" / run_id
     shutil.copytree(source, destination)  # Refuse any pre-existing generated path.
     code = destination / "RustRuntimeService/Code"
     code.mkdir()
-    shutil.copy2(ROOT / "target/debug/rust-runtime-app", code / "rust-runtime-app")
+    shutil.copy2(app, code / "rust-runtime-app")
     path = destination / "ApplicationManifest.xml"
     manifest = ET.parse(path)
     type_name = f"FubeRustRuntime{run_id}Type"
@@ -232,13 +296,14 @@ def wait_condition(check, description: str, timeout: float = 60):
     raise RuntimeError(f"{description} not established: {last}")
 
 
-def controls_and_authority(allocation: Allocation, application: str, result: dict | None = None) -> dict:
+def controls_and_authority(allocation: Allocation, application: str, result: dict | None = None,
+                           *, observer: Path = DEFAULT_OBSERVER) -> dict:
     from concurrent.futures import ThreadPoolExecutor
     import http.client
     from urllib.parse import urlsplit
     import threading
 
-    anchor=wait_observe(application+"/Singleton")
+    anchor=wait_observe(application+"/Singleton",observer=observer)
     constraint="NodeType == "+anchor["rpc"]["node_type"]
     result={} if result is None else result
     result["anchor"]=anchor
@@ -250,7 +315,7 @@ def controls_and_authority(allocation: Allocation, application: str, result: dic
         args+=["--int-scheme","--int-scheme-count","2","--int-scheme-low","0","--int-scheme-high","1"] if partitioned else ["--singleton-scheme"]
         allocation.sf(*args)
     def metric(name,minimum,key=None,service="Concurrent",abort_min=0):
-        v=observe(application+"/"+service,key)
+        v=observe(application+"/"+service,key,observer=observer)
         if v["native_pid"]!=anchor["native_pid"]:
             raise RuntimeError("unrelated partition moved/crashed during control qualification")
         if service=="Concurrent" and key=="int:1" and (
@@ -261,7 +326,7 @@ def controls_and_authority(allocation: Allocation, application: str, result: dic
         return v if counters[name]>=minimum and counters["abort_callbacks"]>=abort_min else None
     create("Concurrent",True)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        alpha,beta=list(pool.map(lambda key:wait_observe(application+"/Concurrent",key=key),["int:0","int:1"]))
+        alpha,beta=list(pool.map(lambda key:wait_observe(application+"/Concurrent",key=key,observer=observer),["int:0","int:1"]))
     if not (alpha["native_pid"]==beta["native_pid"]==anchor["native_pid"]
             and alpha["rpc"]["partition"]!=beta["rpc"]["partition"]
             and alpha["rpc"]["maximum_concurrent_opens"]>=2):
@@ -283,14 +348,14 @@ def controls_and_authority(allocation: Allocation, application: str, result: dic
                   "--partition-id",alpha["rpc"]["partition"],"--replica-id",str(alpha["rpc"]["instance"]))
     result["abort_observation"]=wait_condition(lambda:metric("abort",baseline["abort"]+1,"int:1",
         abort_min=baseline["abort_callbacks"]+1),"native Abort command and completed cleanup")
-    renewed=wait_condition(lambda: (v if (v:=observe(application+"/Concurrent","int:0"))["rpc"]["instance"]!=alpha["rpc"]["instance"] else None),
+    renewed=wait_condition(lambda: (v if (v:=observe(application+"/Concurrent","int:0",observer=observer))["rpc"]["instance"]!=alpha["rpc"]["instance"] else None),
                            "native replacement of removed partition")
     if renewed["native_pid"]!=beta["native_pid"]:
         raise RuntimeError("partition Abort disturbed shared-process sibling")
     result["partition_replacement"]=renewed
     failures_before=renewed["rpc"]["native_actions"]
     create("FailClose")
-    wait_observe(application+"/FailClose")
+    wait_observe(application+"/FailClose",observer=observer)
     allocation.sf("service","delete","--service-id",(application+"/FailClose").removeprefix("fabric:/").replace("/","~"))
     result["close_failure_observation"]=wait_condition(
         lambda:metric("close_failures",failures_before["close_failures"]+1,"int:1",
@@ -300,7 +365,7 @@ def controls_and_authority(allocation: Allocation, application: str, result: dic
         lambda:metric("open_failures",failures_before["open_failures"]+1,"int:1",
             abort_min=failures_before["abort_callbacks"]+2),"native open failure and completed cleanup")
     try:
-        observe(application+"/FailOpen")
+        observe(application+"/FailOpen",observer=observer)
     except RuntimeError:
         result["failed_open_not_published"]=True
     else:
@@ -308,7 +373,7 @@ def controls_and_authority(allocation: Allocation, application: str, result: dic
     allocation.sf("service","delete","--service-id",(application+"/FailOpen").removeprefix("fabric:/").replace("/","~"))
     allocation.sf("service","delete","--service-id",(application+"/Concurrent").removeprefix("fabric:/").replace("/","~"))
     create("Uncooperative")
-    noncooperative=wait_observe(application+"/Uncooperative")
+    noncooperative=wait_observe(application+"/Uncooperative",observer=observer)
     if noncooperative["native_pid"]!=anchor["native_pid"]:
         raise RuntimeError("authority fixture did not share the proven application process")
     result["noncooperative"]=noncooperative
@@ -421,7 +486,7 @@ def create_owned(name: str) -> str:
         os.umask(previous_umask)
 
 
-def qualify(allocation: Allocation, full: bool = False) -> dict:
+def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | None = None) -> dict:
     run_id = uuid.uuid4().hex[:12]
     application = f"fabric:/FubeRustRuntime{run_id}"
     type_name=f"FubeRustRuntime{run_id}Type"
@@ -431,16 +496,14 @@ def qualify(allocation: Allocation, full: bool = False) -> dict:
               "status":"FAIL","errors":[],"cleanup":{}}
     attempts={"provision":False,"provision_completed":False,"create":False,"create_completed":False}
     try:
-        run("cargo", "build", "-p", "rust-runtime-app")
-        run("cargo", "build", "-p", "mssf-client", "--example", "runtime_observer")
-        graph = run("cargo", "tree", "-p", "rust-runtime-app")
-        if any(name in graph.lower() for name in ("mssf-core", "mssf-com", "fabricruntime", "fabriccommon")):
-            raise RuntimeError("application dependency graph contains native SF adapters")
-        needed = run("readelf", "-d", "target/debug/rust-runtime-app")
+        binaries = build_binaries() if binaries is None else binaries
+        needed = run("readelf", "-d", str(binaries.app))
         if any(name in needed.lower() for name in ("fabricruntime", "fabriccommon")):
             raise RuntimeError("application links native SF libraries")
-        result.update(dependency_graph=graph,elf_dynamic=needed)
-        source, type_name, version = package(run_id)
+        result.update(dependency_graph=binaries.dependency_graph,elf_dynamic=needed,
+                      binary_sha256={"rust-runtime-app":digest(binaries.app),
+                                     "runtime_observer":digest(binaries.observer)})
+        source, type_name, version = package(run_id, binaries.app)
         result.update(type_name=type_name,version=version)
         remote=f"/tmp/fube-rust-runtime-{run_id}"
         allocation.sf("cluster", "select", "--endpoint", "http://127.0.0.1:19080")
@@ -456,10 +519,10 @@ def qualify(allocation: Allocation, full: bool = False) -> dict:
         attempts["create"]=True
         allocation.sf("application", "create", "--app-name", application, "--app-type", type_name, "--app-version", version)
         attempts["create_completed"]=True
-        result["restart"] = restart(allocation, application + "/Singleton")
+        result["restart"] = restart(allocation, application + "/Singleton",observer=binaries.observer)
         if full:
             result["resilience"]={}
-            controls_and_authority(allocation,application,result["resilience"])
+            controls_and_authority(allocation,application,result["resilience"],observer=binaries.observer)
     except Exception as error:
         result["errors"].append("qualification: "+str(error))
     finally:
@@ -471,7 +534,10 @@ def qualify(allocation: Allocation, full: bool = False) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("name")
+    parser.add_argument("name", nargs="?")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--build-bundle", type=Path, help="build binaries/evidence into a new directory without a onebox")
+    mode.add_argument("--prebuilt", type=Path, help="use a verified binary bundle; never build or invoke Cargo")
     parser.add_argument("--existing-owner", help="exact owner capability; never destroy caller-owned onebox")
     parser.add_argument("--restart-service", help="qualify replacement of an explicitly named existing owned service")
     parser.add_argument("--full",action="store_true",help="native shared-process/control/callback/authority qualification")
@@ -479,6 +545,14 @@ def main() -> None:
     args = parser.parse_args()
     if sys.platform!="linux":
         parser.error("native application-runtime qualification requires Linux x86-64")
+    if args.build_bundle is not None:
+        if args.name or args.existing_owner or args.restart_service or args.full or args.report:
+            parser.error("--build-bundle cannot be combined with qualification options")
+        build_bundle(args.build_bundle)
+        print(json.dumps({"bundle": str(args.build_bundle), "status": "BUILT"}))
+        return
+    if args.name is None:
+        parser.error("an allocation name is required for qualification")
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,39}", args.name):
         parser.error("invalid allocation name")
     if args.restart_service and not args.existing_owner:
@@ -487,6 +561,7 @@ def main() -> None:
     owner = None
     result={"status":"FAIL","onebox":args.name,"errors":[],"cleanup":{}}
     try:
+        binaries = load_bundle(args.prebuilt) if args.prebuilt is not None else None
         if args.existing_owner:
             owner = args.existing_owner
         else:
@@ -494,7 +569,11 @@ def main() -> None:
             owner=create_owned(args.name)
             created = True
         allocation = Allocation(args.name, owner)
-        result = restart(allocation, args.restart_service) if args.restart_service else qualify(allocation,args.full)
+        if args.restart_service:
+            observer = binaries.observer if binaries is not None else DEFAULT_OBSERVER
+            result = restart(allocation, args.restart_service, observer=observer)
+        else:
+            result = qualify(allocation,args.full,binaries)
         result.setdefault("status","PASS_SINGLETON_PLACEMENT_RPC_NATIVE_RESTART")
         result.setdefault("errors",[])
         result.setdefault("cleanup",{})

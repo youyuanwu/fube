@@ -6,10 +6,114 @@ import json
 import sys
 import unittest
 import subprocess
+import tempfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import rust_runtime_test as runtime
+
+
+@unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
+class BinaryBundleTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.app = self.root / "app"
+        self.observer = self.root / "observer"
+        for binary in (self.app, self.observer):
+            binary.write_bytes(binary.name.encode())
+            binary.chmod(0o755)
+        self.binaries = runtime.Binaries(self.app, self.observer, "rust-runtime-app\n  mssf-runtime")
+
+    def bundle(self, name="bundle"):
+        directory = self.root / name
+        with patch.object(runtime, "build_binaries", return_value=self.binaries):
+            runtime.build_bundle(directory)
+        return directory
+
+    def test_build_only_produces_verified_executables_without_allocation(self):
+        directory = self.root / "bundle"
+        with patch("sys.argv", ["rust_runtime_test.py", "--build-bundle", str(directory)]), \
+             patch.object(runtime, "build_binaries", return_value=self.binaries), \
+             patch.object(runtime, "create_owned") as create, \
+             contextlib.redirect_stdout(io.StringIO()):
+            runtime.main()
+            create.assert_not_called()
+        with patch.object(runtime, "run", side_effect=AssertionError("bundle loading must not invoke Cargo")):
+            binaries = runtime.load_bundle(directory)
+        self.assertEqual(binaries.app.read_bytes(), self.app.read_bytes())
+        self.assertEqual(binaries.observer.read_bytes(), self.observer.read_bytes())
+        self.assertEqual(binaries.dependency_graph, self.binaries.dependency_graph)
+        self.assertEqual(binaries.app.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(binaries.observer.stat().st_mode & 0o777, 0o755)
+
+    def test_invalid_prebuilt_fails_before_allocation_without_build_fallback(self):
+        for failure in ("missing-bundle", "missing-observer", "tampered-app", "missing-graph", "native-graph"):
+            with self.subTest(failure=failure):
+                directory = self.bundle(failure)
+                if failure == "missing-bundle":
+                    directory = directory / "absent"
+                elif failure == "missing-observer":
+                    (directory / "runtime_observer").unlink()
+                elif failure == "tampered-app":
+                    (directory / "rust-runtime-app").write_bytes(b"replaced after build")
+                else:
+                    path = directory / "build-info.json"
+                    metadata = json.loads(path.read_text())
+                    metadata["dependency_graph"] = "" if failure == "missing-graph" else "mssf-core"
+                    path.write_text(json.dumps(metadata))
+                with patch("sys.argv", ["rust_runtime_test.py", "owned", "--prebuilt", str(directory)]), \
+                     patch.object(runtime, "build_binaries") as build, \
+                     patch.object(runtime, "create_owned") as create, \
+                     patch.object(runtime, "Allocation") as allocation, \
+                     contextlib.redirect_stdout(io.StringIO()) as output:
+                    with self.assertRaises(SystemExit):
+                        runtime.main()
+                    build.assert_not_called()
+                    create.assert_not_called()
+                    allocation.assert_not_called()
+                    self.assertEqual(json.loads(output.getvalue())["status"], "FAIL")
+
+    def test_prebuilt_qualification_uses_bundle_app_and_observer_without_cargo(self):
+        binaries = runtime.load_bundle(self.bundle())
+        allocation = MagicMock()
+        allocation.name = "owned"
+        allocation.owner = "capability"
+        allocation.container_id = "cid"
+        allocation.sf.return_value = '{"items":[]}'
+        def run(*args, **_kwargs):
+            self.assertNotEqual(args[0], "cargo")
+            return ""
+        with patch.object(runtime, "run", side_effect=run), \
+             patch.object(runtime, "build_binaries", side_effect=AssertionError("must not build")), \
+             patch.object(runtime, "package", return_value=(self.root, "minted-type", "1.1")) as package, \
+             patch.object(runtime, "restart", return_value={"native": "model observation"}) as restart, \
+             patch.object(runtime, "controls_and_authority") as controls:
+            result = runtime.qualify(allocation, True, binaries)
+        self.assertEqual(result["status"], "PASS_FULL_STATELESS_PROFILE")
+        self.assertEqual(package.call_args.args[1], binaries.app)
+        self.assertEqual(restart.call_args.kwargs["observer"], binaries.observer)
+        self.assertEqual(controls.call_args.kwargs["observer"], binaries.observer)
+        self.assertEqual(result["dependency_graph"], binaries.dependency_graph)
+        self.assertEqual(result["binary_sha256"]["rust-runtime-app"], runtime.digest(binaries.app))
+        observed = {"resolver": "mssf-client", "rpc": {"service": "fabric:/Owned/Singleton", "pid": 7},
+                    "native_pid": 7}
+        with patch.object(runtime, "run", return_value=json.dumps(observed)) as command:
+            runtime.observe("fabric:/Owned/Singleton", observer=binaries.observer)
+        self.assertEqual(command.call_args.args[0], str(binaries.observer))
+
+    def test_default_build_is_locked_and_checks_native_dependencies(self):
+        with patch.object(runtime, "run", return_value=self.binaries.dependency_graph) as command:
+            binaries = runtime.build_binaries()
+        self.assertEqual(binaries.dependency_graph, self.binaries.dependency_graph)
+        commands = [call.args for call in command.call_args_list]
+        self.assertTrue(any(args[:2] == ("cargo", "build") and "rust-runtime-app" in args for args in commands))
+        self.assertTrue(any("--example" in args and "runtime_observer" in args for args in commands))
+        self.assertTrue(all("--locked" in args for args in commands))
+        with patch.object(runtime, "run", return_value="rust-runtime-app\n  mssf-core"):
+            with self.assertRaisesRegex(RuntimeError, "native SF adapters"):
+                runtime.build_binaries()
 
 
 @unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
@@ -154,6 +258,7 @@ class AmbiguousMutationTests(unittest.TestCase):
             return "{}"
         allocation.sf.side_effect=sf
         with patch.object(runtime,"run",return_value="native-free"), \
+             patch.object(runtime,"digest",return_value="a"*64), \
              patch.object(runtime.uuid,"uuid4",return_value=MagicMock(hex="abcdefgh1234")), \
              patch.object(runtime,"package",return_value=(Path("/generated"),type_name,"1.1")):
             result=runtime.qualify(allocation)

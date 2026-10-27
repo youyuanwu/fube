@@ -74,6 +74,14 @@ It requires Linux pidfd APIs and the existing privileged development container
 for the exact-owned-IPC shutdown test; unavailable capabilities fail qualification.
 There is no security fallback.
 
+Local qualification builds the app and independent observer with `--locked`.
+CI builds them in the Linux native-free job and transfers a tar bundle containing
+both executables, their SHA256 hashes and the dependency graph. The onebox job
+uses `--prebuilt DIRECTORY`: it verifies the bundle and ELF dependencies, then
+deploys/tests without installing Rust or invoking Cargo. Missing or changed
+artifacts fail; there is no compilation fallback. See the
+[separate build/run commands](runtime/RustStatelessRuntime.md#reproduce-native-acceptance).
+
 Use `--report NEW_FILE` for a new structured evidence file. To reuse an already
 owned healthy allocation, explicitly supply `--existing-owner OWNER`; the
 harness cleans up only its minted application/type, never the caller's box.

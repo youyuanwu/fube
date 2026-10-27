@@ -58,6 +58,18 @@ jobs:
         name: native-client-tests
         path: ${{ runner.temp }}/native-client-tests
 
+    - name: Download Rust runtime binary bundle
+      uses: actions/download-artifact@v8
+      with:
+        name: rust-runtime-binaries
+        path: ${{ runner.temp }}/rust-runtime-artifact
+
+    - name: Extract Rust runtime binaries
+      run: |
+        mkdir "$RUNNER_TEMP/rust-runtime-binaries"
+        tar -xf "$RUNNER_TEMP/rust-runtime-artifact/rust-runtime-binaries.tar" \
+          -C "$RUNNER_TEMP/rust-runtime-binaries"
+
     - name: Check runner prerequisites
       run: |
         docker info
@@ -103,16 +115,12 @@ jobs:
         MSSF_NOTIFICATION_JOURNAL: ${{ runner.temp }}/native-notification-journal.json
         MSSF_NOTIFICATION_REPORT: ${{ runner.temp }}/native-notification-report.json
 
-    - name: Install runtime qualification toolchain
-      uses: actions-rust-lang/setup-rust-toolchain@v2
-      with:
-        rustflags: ""
-
     - name: Qualify real Rust application runtime
       id: native_runtime
       run: |
         owner="$(python3 -c 'import json,os; print(json.load(open(os.path.join(os.environ["CLUSTER_STATE_ROOT"],os.environ["CLUSTER_NAME"],"state.json")))["owner"])')"
         python3 scripts/rust_runtime_test.py "$CLUSTER_NAME" --existing-owner "$owner" \
+          --prebuilt "$RUNNER_TEMP/rust-runtime-binaries" \
           --full --report "$RUNNER_TEMP/rust-runtime-report.json"
 
     - name: Upload successful Rust runtime evidence

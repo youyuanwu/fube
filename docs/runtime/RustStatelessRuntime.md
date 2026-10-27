@@ -160,17 +160,38 @@ Build the [onebox image](../UbuntuOnebox.md), then:
 python3 scripts/rust_runtime_test.py runtime-check --full --report build/runtime-check.json
 ```
 
+By default the harness builds both the application and its independent observer
+with `--locked`. To build once and qualify elsewhere without Rust/Cargo:
+
+```sh
+python3 scripts/rust_runtime_test.py --build-bundle build/runtime-binaries
+tar -cf build/runtime-binaries.tar -C build/runtime-binaries .
+# On the qualification runner, extract into a new directory:
+mkdir build/runtime-prebuilt
+tar -xf build/runtime-binaries.tar -C build/runtime-prebuilt
+python3 scripts/rust_runtime_test.py runtime-check --prebuilt build/runtime-prebuilt \
+  --full --report build/runtime-prebuilt.json
+```
+
+The bundle retains executable permissions and includes the build-time dependency
+graph plus SHA256 hashes for both binaries. Prebuilt mode rejects missing,
+nonexecutable or modified binaries and invalid dependency evidence before
+allocating a onebox; it never compiles or invokes Cargo. ELF dependencies and
+live application mappings are still checked on the qualification runner. CI
+produces the bundle in the Linux native-free job, then downloads/extracts it in
+the onebox job without installing a Rust toolchain.
+
 The harness uses the existing lifecycle controller, creates/destroys only its
 owned allocation, mints unique app/type names, and reconciles ambiguous native
 mutations. `--existing-owner OWNER` explicitly reuses a caller-owned healthy
 box and never destroys it. It still cleans its exact minted application/type.
 Ownership drift, failed cleanup or unconfirmed late mutations produce FAIL with
 recovery identities
-([harness ownership](../../scripts/rust_runtime_test.py#L40),
-[cleanup](../../scripts/rust_runtime_test.py#L356)).
+([harness ownership](../../scripts/rust_runtime_test.py#L102),
+[cleanup](../../scripts/rust_runtime_test.py#L421)).
 Creation captures its original owner capability under the existing controller
 lock; a later same-name allocation never grants cleanup authority
-([create_owned](../../scripts/rust_runtime_test.py#L406)).
+([create_owned](../../scripts/rust_runtime_test.py#L471)).
 
 The authority test needs Linux x86-64 pidfd APIs and the existing privileged
 onebox to duplicate **only the verified application's IPC descriptor**, recheck
