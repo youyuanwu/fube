@@ -31,6 +31,28 @@ def snapshot():
 
 
 class StatefulEvidenceTests(unittest.TestCase):
+    def test_three_replica_proof_requires_distinct_native_placements_and_secondary_route_denial(self):
+        value=snapshot()
+        value["native_partition"].update(target=3,minimum=2)
+        for node,replica,pid in [("node2",8,12),("node3",9,13)]:
+            secondary=copy.deepcopy(value["replicas"][0])
+            secondary.update(node=node,replica=replica,role="ActiveSecondary",address=f"http://127.0.0.1:{pid}/service",service_http_status=503)
+            secondary["rpc"].update(node=node,replica=replica,pid=pid,host=node,
+                role="Secondary",replicator_role="Secondary",current_role="Secondary",
+                service_address=secondary["address"],replication_address=f"http://127.0.0.1:{pid+100}/control",
+                read_status="NotPrimary",write_status="NotPrimary")
+            secondary["deployed"]["host_process_id"]=pid
+            secondary["control"].update(replica=replica,role="Secondary")
+            value["replicas"].append(secondary)
+        runtime.assert_stateful(value,value["service"],3,2)
+        for mutate in [
+            lambda v:v["replicas"][1].update(node="node"),
+            lambda v:v["replicas"][1].update(service_http_status=200),
+            lambda v:v["replicas"][1]["rpc"].update(read_status="Granted"),
+        ]:
+            bad=copy.deepcopy(value);mutate(bad)
+            with self.assertRaises(RuntimeError):runtime.assert_stateful(bad,value["service"],3,2)
+
     def test_native_discovery_placement_deployment_http_and_control_must_all_agree(self):
         value=snapshot()
         self.assertIs(runtime.assert_stateful(value,value["service"],1,1),value)

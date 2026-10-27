@@ -122,7 +122,7 @@ jobs:
       run: |
         python3 scripts/rust_runtime_test.py "$CLUSTER_NAME" --existing-owner "${{ steps.create_cluster.outputs.owner }}" \
           --prebuilt "$RUNNER_TEMP/rust-runtime-binaries" \
-          --full --stateful one --report "$RUNNER_TEMP/rust-runtime-report.json"
+          --full --stateful three --report "$RUNNER_TEMP/rust-runtime-report.json"
 
     - name: Upload successful Rust runtime evidence
       if: steps.native_runtime.outcome == 'success'

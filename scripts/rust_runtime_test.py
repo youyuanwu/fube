@@ -257,6 +257,11 @@ try:
     if action=="kill":
         result["terminated_at_monotonic"]=time.monotonic()
         signal.pidfd_send_signal(fd,signal.SIGKILL)
+        poll=select.poll();poll.register(fd,select.POLLIN)
+        require(any(ready==fd and flags&select.POLLIN for ready,flags in poll.poll(3000)),
+                "verified old process did not exit after signal")
+        result["old_process_exit_confirmed"]=True
+        result["exit_observed_at_monotonic"]=time.monotonic()
     elif action=="cut-ipc":
         # Destroy only the single established TCP socket owned by this verified
         # app, selected using its actual node-injected IPC destination and fd
@@ -394,6 +399,163 @@ def stateful_singleton(allocation: Allocation, application: str, binaries: Binar
         raise RuntimeError("native serving stateful executable differs from immutable bundle")
     evidence.update(status="PASS_TARGET_MINIMUM_1_EMPTY_CONTROL_PLANE",observation=observed,process=process)
     return evidence
+
+
+def observe_many(service: str, *, observer: Path = DEFAULT_OBSERVER) -> list[dict]:
+    text=run(str(observer),"127.0.0.1:19000",service,timeout=60)
+    if len(text)>2_000_000:raise RuntimeError("mixed observation output bound")
+    values=[json.loads(line) for line in text.splitlines()]
+    if not 1<=len(values)<=5 or len({v["rpc"]["node"] for v in values})!=len(values):
+        raise RuntimeError("mixed stateless endpoint/node cardinality")
+    if any(v["resolver"]!="mssf-client" or v["rpc"]["service"]!=service
+           or v["native_pid"]!=v["rpc"]["pid"] for v in values):
+        raise RuntimeError("mixed native discovery/deployment/HTTP mismatch")
+    return values
+
+
+def wait_mixed(service: str, observer: Path, *, accept=None) -> list[dict]:
+    def check():
+        values=observe_many(service,observer=observer)
+        return values if len(values)==5 and (accept is None or accept(values)) else False
+    return wait_condition(check,"five independently resolved mixed stateless instances",180)
+
+
+def http_probe(address: str) -> dict:
+    import http.client
+    from urllib.parse import urlsplit
+    url=urlsplit(address)
+    if url.scheme!="http" or not url.hostname or url.port is None:
+        raise RuntimeError("invalid owned fixture endpoint")
+    connection=http.client.HTTPConnection(url.hostname,url.port,timeout=2)
+    try:
+        connection.request("GET",url.path)
+        response=connection.getresponse()
+        body=response.read(16385)
+        if len(body)>16384:raise RuntimeError("old endpoint response bound")
+        return {"address":address,"http_status":response.status}
+    except (OSError,http.client.HTTPException) as error:
+        return {"address":address,"http_status":None,"transport_error":str(error)}
+    finally:
+        connection.close()
+
+
+def epoch_of(value: dict) -> tuple[int,int]:
+    epoch=value["native_partition"]["epoch"]
+    return epoch["data_loss"],epoch["configuration"]
+
+
+def stateful_three(allocation: Allocation, application: str, binaries: Binaries, result: dict) -> dict:
+    """Actual native roles/configuration/failover and mixed SharedProcess proof."""
+    service=application+"/Stateful"
+    mixed=application+"/MixedStateless"
+    app_id=application.removeprefix("fabric:/")
+    sid=service.removeprefix("fabric:/").replace("/","~")
+    allocation.sf("service","create","--app-id",app_id,"--name",mixed,
+                  "--service-type","RustRuntimeType","--stateless","--instance-count","-1",
+                  "--activation-mode","SharedProcess","--singleton-scheme")
+    result["mixed_before"]=wait_mixed(mixed,binaries.observer)
+    allocation.sf("service","update","--service-id",sid,"--stateful",
+                  "--target-replica-set-size","3","--min-replica-set-size","2")
+    result["initial"]=wait_stateful(service,3,2,observer=binaries.observer,capture=result)
+    before=result["initial"]
+    old=before["primary"]
+    target=next(replica for replica in before["replicas"] if replica["role"]=="ActiveSecondary")["node"]
+    help_text=allocation.sf("replica","move-primary","--help")
+    required=("--service-id","--partition-id","--current-node-name","--new-node-name")
+    if any(flag not in help_text for flag in required):
+        raise RuntimeError("native sfctl move-primary contract differs; no force/ignore fallback")
+    allocation.sf("replica","move-primary","--service-id",sid,"--partition-id",before["partition"],
+                  "--current-node-name",old["rpc"]["node"],"--new-node-name",target)
+    swapped=wait_stateful(service,3,2,observer=binaries.observer,capture=result,
+        accept=lambda value:value["primary"]["rpc"]["node"]==target and epoch_of(value)>epoch_of(before))
+    result["planned_swap"]={"before":before,"after":swapped,"old_primary_service":http_probe(old["endpoint"])}
+    old_replica=next(r for r in swapped["replicas"] if r["replica"]==old["rpc"]["replica"])
+    if (old_replica["role"]!="ActiveSecondary" or old_replica["rpc"]["pid"]!=old["native_pid"]
+        or result["planned_swap"]["old_primary_service"]["http_status"]!=503):
+        raise RuntimeError("planned role movement did not fence the old primary without process replacement")
+
+    # Nonforce per-replica removal must execute real Abort and retain an
+    # unrelated stateless unit in that same native code-package process.
+    abort_old=swapped["primary"]
+    siblings=wait_mixed(mixed,binaries.observer)
+    sibling=next(v for v in siblings if v["rpc"]["node"]==abort_old["rpc"]["node"])
+    if sibling["native_pid"]!=abort_old["native_pid"] or sibling["rpc"]["host"]!=abort_old["rpc"]["host"]:
+        raise RuntimeError("stateful/stateless native SharedProcess colocation not established")
+    baseline=sibling["rpc"]["native_actions"]
+    allocation.sf("replica","remove","--node-name",abort_old["rpc"]["node"],"--partition-id",swapped["partition"],
+                  "--replica-id",str(abort_old["rpc"]["replica"]))
+    recovered=wait_stateful(service,3,2,observer=binaries.observer,capture=result,
+        accept=lambda value:epoch_of(value)>epoch_of(swapped)
+            and (value["primary"]["rpc"]["node"],value["primary"]["rpc"]["replica"],value["primary"]["rpc"]["incarnation"])
+                !=(abort_old["rpc"]["node"],abort_old["rpc"]["replica"],abort_old["rpc"]["incarnation"]))
+    sibling_after=next(v for v in wait_mixed(mixed,binaries.observer) if v["rpc"]["node"]==sibling["rpc"]["node"])
+    require_same_instance(sibling_after,sibling)
+    old_service=http_probe(abort_old["endpoint"])
+    old_control=http_probe(abort_old["rpc"]["replication_address"])
+    if (old_service["http_status"]==200 or old_control["http_status"]==200
+        or sibling_after["rpc"]["native_actions"]["abort_callbacks"]<=baseline["abort_callbacks"]):
+        raise RuntimeError("per-replica native Abort cleanup/fencing was not independently established")
+    result["replica_abort"]={"old":abort_old,"replacement":recovered,"sibling_before":sibling,
+                            "sibling_after":sibling_after,"old_service":old_service,"old_control":old_control}
+
+    # Graceful per-replica Close: delete a singleton of the same stateful type,
+    # not the host. Normal close must not be confused with fallback Abort.
+    auxiliary=application+"/StatefulClose"
+    allocation.sf("service","create","--app-id",app_id,"--name",auxiliary,
+                  "--service-type","RustStatefulRuntimeType","--stateful","--target-replica-set-size","1",
+                  "--min-replica-set-size","1","--activation-mode","SharedProcess","--singleton-scheme",
+                  "--constraints","NodeType == "+sibling_after["rpc"]["node_type"])
+    aux=wait_stateful(auxiliary,1,1,observer=binaries.observer,capture=result)
+    if aux["primary"]["native_pid"]!=sibling_after["native_pid"]:
+        raise RuntimeError("Close isolation fixture did not colocate with its unrelated stateless unit")
+    close_baseline=sibling_after["rpc"]["native_actions"]
+    allocation.sf("service","delete","--service-id",auxiliary.removeprefix("fabric:/").replace("/","~"))
+    wait_condition(lambda:not any(v["name"]==auxiliary for v in items(allocation.sf("service","list","--application-id",app_id))),
+                   "native stateful service deletion",60)
+    def closed():
+        values=wait_mixed(mixed,binaries.observer)
+        value=next(v for v in values if v["rpc"]["node"]==sibling_after["rpc"]["node"])
+        require_same_instance(value,sibling_after)
+        return value if value["rpc"]["native_actions"]["close"]>close_baseline["close"] else False
+    close_after=wait_condition(closed,"graceful stateful Close with surviving stateless owner",60)
+    closed_service=http_probe(aux["primary"]["endpoint"]); closed_control=http_probe(aux["primary"]["rpc"]["replication_address"])
+    if (closed_service["http_status"]==200 or closed_control["http_status"]==200
+        or close_after["rpc"]["native_actions"]["close_failures"]!=close_baseline["close_failures"]
+        or close_after["rpc"]["native_actions"]["abort_callbacks"]!=close_baseline["abort_callbacks"]):
+        raise RuntimeError("graceful Close was not proven distinct from Abort fallback")
+    result["replica_close"]={"before":aux,"sibling_before":sibling_after,"sibling_after":close_after,
+                             "old_service":closed_service,"old_control":closed_control}
+
+    before=wait_stateful(service,3,2,observer=binaries.observer,capture=result)
+    old=before["primary"]
+    siblings=wait_mixed(mixed,binaries.observer)
+    sibling=next(v for v in siblings if v["rpc"]["node"]==old["rpc"]["node"])
+    if (sibling["native_pid"]!=old["native_pid"] or sibling["rpc"]["host"]!=old["rpc"]["host"]
+        or sibling["native_entry_point_instance"]!=old["native_entry_point_instance"]):
+        raise RuntimeError("mixed shared-host identity not corroborated before intentional termination")
+    process=json.loads(allocation.execute("python3","-c",PROCESS,json.dumps(old),"inspect"))
+    terminated=json.loads(allocation.execute("python3","-c",PROCESS,json.dumps(old),"kill"))
+    if not terminated.get("old_process_exit_confirmed"):raise RuntimeError("old shared process exit unproven")
+    def replaced(values):
+        value=next(v for v in values if v["rpc"]["node"]==old["rpc"]["node"])
+        return (value["native_pid"]!=old["native_pid"] and value["rpc"]["host"]!=old["rpc"]["host"]
+                and value["native_entry_point_instance"]!=old["native_entry_point_instance"])
+    replacement_siblings=wait_mixed(mixed,binaries.observer,accept=replaced)
+    new_sibling=next(v for v in replacement_siblings if v["rpc"]["node"]==old["rpc"]["node"])
+    after=wait_stateful(service,3,2,observer=binaries.observer,capture=result,
+        accept=lambda value:epoch_of(value)>epoch_of(before)
+            and value["primary"]["rpc"]["replica"]!=old["rpc"]["replica"])
+    old_endpoint=http_probe(old["endpoint"]); old_control=http_probe(old["rpc"]["replication_address"])
+    if old_endpoint["http_status"]==200 or old_control["http_status"]==200:
+        raise RuntimeError("old shared-host stateful incarnation still serves")
+    new_process=json.loads(allocation.execute("python3","-c",PROCESS,json.dumps(new_sibling),"inspect"))
+    expected_hash=digest(binaries.app)
+    if process["executable_sha256"]!=expected_hash or new_process["executable_sha256"]!=expected_hash:
+        raise RuntimeError("mixed replacement process differs from immutable executable")
+    result["shared_host_recovery"]={"before":before,"old_stateless":sibling,"old_process":process,"termination":terminated,
+        "new_stateless":new_sibling,"new_process":new_process,"after":after,"old_service":old_endpoint,"old_control":old_control}
+    result["status"]="PASS_THREE_REPLICA_ROLE_CONFIGURATION_FAILOVER_MIXED_RECOVERY_CLOSE_ABORT"
+    return result
 
 
 def failure_artifacts(allocation: Allocation, type_name: str) -> dict:
@@ -1017,12 +1179,18 @@ def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | Non
             result["stateful_singleton"] = {}
             stateful_singleton(allocation,application,binaries,result["stateful_singleton"])
         configuration_upgrade(allocation,binaries,result,attempts)
+        if stateful=="three":
+            result["stateful_three"]={}
+            stateful_three(allocation,application,binaries,result["stateful_three"])
         if full:
             result["resilience"]={}
-            generation=result["configuration_upgrade"]["final"]["rpc"]["packages"]["generation"]
+            generation=(wait_observe(application+"/Singleton",observer=binaries.observer)["rpc"]["packages"]["generation"]
+                        if stateful=="three" else result["configuration_upgrade"]["final"]["rpc"]["packages"]["generation"])
             controls_and_authority(allocation,application,result["resilience"],observer=binaries.observer,
                                    expected_generation=generation)
         result["restart"] = restart(allocation, application + "/Singleton",observer=binaries.observer)
+        if stateful=="three":
+            result["stateful_after_legacy_recovery"]=wait_stateful(application+"/Stateful",3,2,observer=binaries.observer)
     except Exception as error:
         result["errors"].append("qualification: "+str(error))
         try:
@@ -1032,7 +1200,8 @@ def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | Non
     finally:
         cleanup_deployment(allocation,result,attempts)
     if not result["errors"]:
-        result["status"]=("PASS_EMPTY_STATEFUL_ONE_REPLICA_AND_STATELESS_PROFILE" if stateful is not None else
+        result["status"]=("PASS_FULL_EMPTY_STATEFUL_CONTROL_PLANE_AND_STATELESS_PROFILE" if stateful=="three" else
+                         "PASS_EMPTY_STATEFUL_ONE_REPLICA_AND_STATELESS_PROFILE" if stateful is not None else
                          "PASS_FULL_STATELESS_PROFILE" if full else "PASS_SINGLETON_PLACEMENT_RPC_NATIVE_RESTART")
     return result
 
@@ -1046,7 +1215,7 @@ def main() -> None:
     parser.add_argument("--existing-owner", help="exact owner capability; never destroy caller-owned onebox")
     parser.add_argument("--restart-service", help="qualify replacement of an explicitly named existing owned service")
     parser.add_argument("--full",action="store_true",help="native shared-process/control/callback/authority qualification")
-    parser.add_argument("--stateful", choices=["one"], help="also qualify the volatile empty stateful singleton")
+    parser.add_argument("--stateful", choices=["one","three"], help="qualify empty-state singleton then optional three-replica mixed recovery")
     parser.add_argument("--report",type=Path,help="write a new structured evidence file (never overwrite)")
     args = parser.parse_args()
     if sys.platform!="linux":

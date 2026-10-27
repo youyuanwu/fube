@@ -562,9 +562,10 @@ class ProcessTests(unittest.TestCase):
              patch("pathlib.Path", FakePath), \
              patch("os.pidfd_open", side_effect=ProcessLookupError if stale else None, return_value=44), \
              patch("os.readlink", return_value="/owned/app/rust-runtime-app"), \
-             patch("os.close"), patch("signal.pidfd_send_signal") as signal, \
+             patch("os.close"), patch("signal.pidfd_send_signal") as signal, patch("select.poll") as poll, \
              contextlib.redirect_stdout(io.StringIO()) as output:
             try:
+                poll.return_value.poll.return_value=[(44,1)]
                 exec(runtime.PROCESS, {})
             except (RuntimeError, ProcessLookupError):
                 self.assertFalse(signal.called)
