@@ -16,6 +16,7 @@ The native SF node, deployment tools and OS libraries are still expected.
 | IPC | Actual node-injected loopback address, trusted clear transport; no reconnect |
 | Lifecycle | Native type registration, Open, graceful Close, Abort flag 4, failure cleanup |
 | Controls | Correlated stateless RAPQuery; service-description updates |
+| Reporting | Native FM load/move retention; HM instance health with sequencing/expiry; runtime transient-fault replacement |
 | Discovery | Separate mssf-client resolution, then real RPC to that returned endpoint |
 | Recovery | Exact owned-process termination, new native host/PID/incarnation, usable endpoint |
 | Authority | Fresh node lease poll before serving; terminal IPC/lease/host authority |
@@ -121,8 +122,9 @@ callbacks and proven abort/disposal before watchdog disarming.
 | Lease polling and terminal IPC authority | Implemented; native poll/IPC-loss test and model lease races |
 | InvalidateLease | Terminal retirement, correlated acknowledgment; model coverage |
 | UpdateCodePackageContext/upgrade refresh | Explicit terminal refusal; no stale-context acknowledgment |
-| Partition health/load/fault/move-cost reporting | Explicit local error; no empty batches or success logs |
-| Query reported load | Empty because reporting is unsupported, not fabricated measurements |
+| Instance health/load/fault/move-cost reporting | Bounded native application-runtime paths; completion levels below |
+| Query reported load | Bounded local last-written metrics via native RAPQuery, distinct from independent FM retention |
+| Partition-scoped health | Not exposed; health reports target the originating stateless instance |
 | Named partitions | API/codec/model support; not native-qualified by this suite |
 | Stateful/replication/security-required profiles | Rejected/out of scope, no insecure/native fallback |
 
@@ -130,6 +132,78 @@ If an unsupported operation becomes necessary for continued hosting, placement
 or restart, that scenario is a blocker—not successful profile qualification.
 Management `sfctl replica remove` **without force** exercises genuine native
 Abort. Force-remove kills the host and is not accepted as Abort evidence.
+
+## Partition reporting
+
+The owned public report types replace the initial unsupported stub signatures.
+All report calls are asynchronous; `Partition.identity` is only a public snapshot,
+never routing authority. The runtime binds private wire records to the original
+partition/public instance/RAP incarnation and checks terminal authority and
+generation validity at admission and at the writer's pre-frame boundary
+([API](../../crates/libs/mssf-runtime/src/api.rs#L77-L144),
+[reporting](../../crates/libs/mssf-runtime/src/reporting.rs#L137-L149)).
+
+| API | Native application path | Successful completion |
+| --- | --- | --- |
+| `report_load(&[LoadMetric])` | actor 12, `RAPReportLoad`, partition/service/node metrics | Complete local frame write, **not** RA/FM acknowledgment or persistence |
+| `report_move_cost(MoveCost)` | Same path, `_MoveCost_` value Zero/Low/Medium/High = 0/1/2/3 | Same one-way write semantics; not an imperative move |
+| `report_health(&HealthReport)` | actor 7, `ReportHealth`, originating stateless instance | One correlated, identity/sequence-matched HM **per-report** success |
+| `report_fault(FaultType)` | actor 12, `RAReportFault`, native FUD/replica identity | Initial local write, or coalescing with that pending stage's initial result; **not** recovery acknowledgment |
+
+Load requires 1–64 unique, currently declared custom metrics with values below
+`INT_MAX`. Unknown metrics are explicitly rejected rather than silently filtered.
+Partial updates retain other metrics; no report TTL or automatic clearing is
+promised. RAPQuery exposes up to 64 custom metric names plus move cost retained
+from successful local writes for that generation. Removed manifest metric names
+remain in this bounded local retention until closure; further new names can hit
+the retention limit. FM retention is separate, partition-keyed and can outlive
+an instance. Its native query returns stateless secondary reports in the primary
+load array. `_MoveCost_` retention proves receipt, not that effective PLB policy
+uses the cost in placement decisions
+([load implementation](../../crates/libs/mssf-runtime/src/reporting.rs#L150-L256)).
+
+Health supports only Ok/Warning/Error. Source/property are nonempty, bounded
+UTF-16 text without NUL; `System*` sources and `DeleteProperty` are reserved.
+Descriptions exceeding 4096 UTF-16 units are rejected, not silently truncated.
+`HealthSequence::Auto` allocates one process-monotonic positive sequence;
+`Explicit(n)` requires `n > 0`. HM requires strictly newer sequences for the same
+instance/source/property: duplicates/older values are errors, not TTL refreshes.
+`time_to_live: None` maps to native infinite TTL, **not zero wire ticks**.
+Finite durations are rounded down to 100ns ticks and must remain positive and
+below the infinite sentinel. HM expiration starts at its last-modified time,
+not the source timestamp or enqueue time. With `remove_when_expired=false`,
+the event retains its reported state but becomes expired and evaluates Error;
+with `true`, it disappears from health query evaluation before eventual physical
+cleanup. Sequence history after deletion is not promised
+([health implementation](../../crates/libs/mssf-runtime/src/reporting.rs#L257-L355)).
+
+Health is one request/report with no hidden batching or retries. A timeout does
+not prove the report was never applied; retry with the same explicit sequence
+when preserving update identity. `HealthReceipt.sequence` is matched to the HM
+result; outer transport success alone is never reported as health success.
+HM success is not a promise of a fresh durable transaction.
+
+Fault transient/permanent map to internal native values 1/2 (the reverse of
+public COM numeric values). Native stateless transient fault requests Drop and
+replacement; permanent fault requests Abort. The runtime retains at most one
+fault stage/worker per generation and retries its bound body every 30 seconds.
+Equal faults coalesce; permanent supersedes transient. Pending transient callers
+receive an explicit superseded error if their initial result is not yet fixed.
+Already-completed initial results are immutable. Even an **initial write error**
+can leave the stage pending for retry: inspect `fault_delivery()` for current
+attempt count, latest write error, supersession and lifecycle cancellation.
+There is no fabricated fault acknowledgment or retry history collection
+([fault implementation](../../crates/libs/mssf-runtime/src/reporting.rs#L356-L516)).
+
+**Fencing limit:** obsolete unsent frames are cancelled at the writer validity
+boundary and never retargeted to a replacement. A frame that has passed that
+boundary cannot be revoked remotely. Load/move wire data has **no incarnation**;
+health has a public instance ID but no RAP incarnation. Accordingly, already-started
+one-way writes may remain in native retention after closure; retained data is not
+proof that a successor reported it. Native fault receiver incarnation checks
+are stronger. Cancellation/timeout after frame start is uncertain delivery,
+not proof of nonapplication. Closed/aborted and terminal-authority handles reject
+new reports; load/move have no automatic retry.
 
 ## Finite bounds
 
@@ -146,6 +220,12 @@ Abort. Force-remove kills the host and is not accepted as Abort evidence.
 | Async callbacks | 30 s cooperative deadline; abort cleanup 250 ms |
 | Orderly shutdown / independent hard fence | 400 ms / 500 ms after retirement or expiry |
 | Native replacement acceptance | 180 s from exact application termination through usable RPC |
+| Concurrent report sends/health waits | 16 runtime-wide, leaving ordinary lease-poll admission; explicit ResourceLimit on overload |
+| Per-unit load/health work | One admitted call; fault coalescing has one separate bounded stage/worker |
+| Report metric count / retained metric names | 64 per call / 65 per generation including move cost |
+| Report source/property/description/metric names | 4096 UTF-16 units each, no NUL |
+| Reporting request deadline / retained fault retry | 30 s / 30 s; no load/health retry |
+| Sample retired handles / incoming RPC | 32 / 64; bounded acceptance-only fixtures |
 
 Queues do not silently discard required replies. Source/model limits and resource
 tests are in [transport tests](../../crates/libs/mssf-transport/src/connection_ipc_tests.rs),
@@ -234,3 +314,41 @@ Deterministic stale/duplicate commands, delayed/zero TTL, cancellation/panic and
 blocked-stderr/executor-independent watchdog tests remain **model evidence**.
 The native authority test proves IPC-loss fencing, not complete node shutdown,
 upgrade, TLS or delayed-node-lease interoperability.
+
+### Reporting outcome (2026-10-27)
+
+Compiler-free prebuilt run `6bc5933d7071` on SF 11.8.121.4 passed the full suite:
+
+- Independent FM query observed `RuntimeWork=731` and `_MoveCost_=3` with nonzero
+  native timestamps; these were not RAP/self-echo measurements.
+- HM query matched the stateless public instance, observed sequence100 Warning,
+  rejected stale99 with native error `-2147017711`, retained100 unchanged, then
+  accepted101 Ok. Finite TTL tests observed retained expired events evaluating
+  Error, higher-sequence renewal, and remove-on-expiration disappearance.
+- Runtime `report_fault(Transient)` changed instance/incarnation
+  `134375374383572350` → `134375374484938620` for partition
+  `1482d521-857c-9649-8839-6318066a4c13`, while PID23240/host
+  `14724700-b548-42f9-8a13-0d79d096df1a` and the sibling stayed unchanged.
+  Separate mssf-client resolution reached usable replacement RPC.
+- All four old-handle report calls returned Closed; the active replacement's
+  distinct load947 subsequently appeared in FM. Retained pre-replacement load
+  was not counted as successor evidence.
+- Existing lifecycle/query/update/failure tests, native-free graph/ELF/live maps
+  and independent IPC authority fencing (0.513s) also passed. Only owned app/type
+  and onebox resources were cleaned; application absence and onebox data removal
+  were confirmed.
+
+The first two reporting experiments failed in the **observation harness** (wrong
+REST replica path, then assuming nested rather than flattened health JSON) and
+are not counted as passes. Reporting uses no HTTP/management send shortcut.
+Deterministic queue, admission, initial-result/retry, mismatched health result and
+lifecycle/authority cases are model evidence, not additional native claims.
+
+Final tar-extracted prebuilt rerun `688940f27899` also passed with Cargo absent.
+It repeated FM/HM reporting and replaced instance/incarnation
+`134375379356725150` → `134375379458523610` in **1.853s**, retaining PID23334,
+host `c93c1757-808d-4f07-8f35-a71dd086df2a` and the sibling. It additionally
+checked all four rejected report categories after native Abort and inspected
+the exact post-report process mappings (only executable, libc, libm, libgcc_s,
+loader). Independent IPC-loss fencing took **0.507s**. Application/type and owned
+`partition-reports-final` container/network/data cleanup all completed.

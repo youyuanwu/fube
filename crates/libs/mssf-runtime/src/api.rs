@@ -106,6 +106,8 @@ impl Partition {
     }
     /// Await local complete-frame write, NOT native acknowledgment/persistence.
     /// No automatic load retry. Unsent obsolete work is cancelled at the writer.
+    /// Once the writer passes its validity boundary, delivery is uncertain on
+    /// timeout/cancellation. Native load/move retention has no incarnation fence.
     pub async fn report_load(&self, metrics: &[crate::LoadMetric]) -> Result<()> {
         self.ensure_valid()?;
         self.reporting.load(metrics).await
@@ -123,6 +125,10 @@ impl Partition {
     /// Await initial local write (or explicitly coalesce a pending stage).
     /// Retries retain the bound native identity until closure. This is not a
     /// native fault acknowledgment or a promise of replacement.
+    /// An initial write error does not remove the bounded pending fault stage:
+    /// inspect `fault_delivery()` for retry outcomes. Pending transient waiters
+    /// fail explicitly if permanent supersedes them before initial completion.
+    /// Initial completion never changes after a retry; the snapshot may change.
     pub async fn report_fault(&self, fault: FaultType) -> Result<crate::FaultDelivery> {
         self.ensure_valid()?;
         self.reporting.fault(fault).await

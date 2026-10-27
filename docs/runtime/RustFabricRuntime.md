@@ -336,8 +336,11 @@ can honor; do not acknowledge an unsupported in-place package update as applied.
 
 Stateless S includes partition information and source-compatible load, fault,
 health and move-cost behavior required by its advertised API. Health reporting
-uses correlated IPC to node RA and forwarding to Health Manager; implement its
-batching/sequencing and outcomes, not a gateway-query substitute or local log entry.
+uses correlated IPC through ApplicationHostManager (actor 7) and forwarding to
+Health Manager; the host's separate system-health client uses RA (actor 12).
+Implement sequencing and per-report outcomes, not a gateway-query substitute or
+local log entry. The current [as-built profile](RustStatelessRuntime.md#partition-reporting)
+uses bounded awaited individual requests rather than native bulk health streams.
 Methods not implemented must be absent from the Rust API or return a precise
 unsupported-capability error before registration/advertisement makes a stronger
 promise.

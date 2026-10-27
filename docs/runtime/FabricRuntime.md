@@ -490,12 +490,17 @@ their service unit. They do not marshal a partition COM object to the node.
 | Load | Validate/aggregate metrics, then periodic one-way RA `RAPReportLoad` |
 | Move cost | Special metric on the load-report path, not an imperative relocation request |
 | Fault | Retry-aware one-way RA `RAReportFault`, scoped to replica/instance and fault state |
-| Instance/replica/partition health | Health client batches/reports through correlated IPC to RA, which forwards to Health Manager |
+| User instance/replica/partition health | Throttled application health client batches correlated `ReportHealth` IPC through ApplicationHostManager (actor 7), then Health Manager |
 | Stateful read/write access | Local computed status plus host-lease check, not a node round trip per getter |
 
 Sources: [partition implementation][stateless-partition], [load aggregation][load-reports],
 [fault/health handoff][partition-reports], [IPC health client][ipc-health],
 [stateful access getters][stateful-access].
+
+The application host also constructs a separate unthrottled system-health
+client through RA (actor 12). Do not substitute that route for the user client
+selected by partition reporting
+([client selection](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Hosting2/ApplicationHost.cpp#L2661-L2683)).
 
 Access is not simply `role == Primary`: promotion, catch-up, demotion, previous/
 current configuration quorum and minimum replica count affect permissions.
