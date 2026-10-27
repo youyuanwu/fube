@@ -209,9 +209,9 @@ impl ActivationContext {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    fn env() -> BTreeMap<String, String> {
+    pub(crate) fn env() -> BTreeMap<String, String> {
         [
             (
                 "Fabric_ApplicationHostId",

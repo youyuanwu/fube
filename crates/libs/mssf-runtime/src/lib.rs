@@ -8,6 +8,7 @@ mod lease;
 mod lifecycle;
 #[cfg(test)]
 mod model_tests;
+mod packages;
 mod reporting;
 mod wire;
 
@@ -32,6 +33,10 @@ pub use diagnostics::{RuntimeCounters, RuntimeMetrics};
 use lease::Authority;
 pub use lifecycle::{MAX_CALLBACKS, MAX_SERVICE_UNITS, MAX_TOMBSTONES};
 pub use mssf_transport::{Error as RuntimeError, Result as RuntimeResult};
+pub use packages::{
+    ConfigurationPackage, ConfigurationParameter, ConfigurationSection, DataPackage,
+    PackageDescription, PackageSnapshot,
+};
 pub use reporting::{
     FaultDelivery, HealthReceipt, HealthReport, HealthSequence, HealthState, LoadMetric, MoveCost,
     MAX_REPORT_METRICS, MAX_REPORT_NAME_UNITS,
