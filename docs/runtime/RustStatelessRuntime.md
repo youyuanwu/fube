@@ -153,10 +153,13 @@ generation validity at admission and at the writer's pre-frame boundary
 Load requires 1–64 unique, currently declared custom metrics with values below
 `INT_MAX`. Unknown metrics are explicitly rejected rather than silently filtered.
 Partial updates retain other metrics; no report TTL or automatic clearing is
-promised. RAPQuery exposes up to 64 custom metric names plus move cost retained
-from successful local writes for that generation. Removed manifest metric names
-remain in this bounded local retention until closure; further new names can hit
-the retention limit. FM retention is separate, partition-keyed and can outlive
+promised. RAPQuery exposes up to **65 total retained names**, shared by custom
+metrics and move cost, from successful local writes for that generation. No
+move-cost slot is reserved: accumulating 65 custom names through partial reports
+or description updates causes a first move-cost report to return ResourceLimit.
+Removed manifest metric names remain in this bounded local retention until
+closure; further new names can hit the retention limit. FM retention is separate,
+partition-keyed and can outlive
 an instance. Its native query returns stateless secondary reports in the primary
 load array. `_MoveCost_` retention proves receipt, not that effective PLB policy
 uses the cost in placement decisions
