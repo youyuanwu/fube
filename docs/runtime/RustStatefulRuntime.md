@@ -233,6 +233,30 @@ shared PID 25971 → 26727; all minted app/type/upload and original
 The `2b3179b` → `278de9a` evidence-note change was documentation-only; subsequent
 final-review remediation requires its own executable-qualified record.
 
+**Post-remediation qualification:** all four final-review fixes were followed by
+a new clean bundle and actual full native PASS at
+**`0a0a897d0562fdd0e00f7e943ef6a2fb1da1c185`**, after another latest-main
+fetch/no-op rebase onto the same base. Report
+`build/stateful-empty-native-reviewed.json` SHA256
+`c01e8d8adc8c53346242da89309b9c88b27ac23ec0abb2a2f5ab526f0497e652`;
+bundle metadata SHA256
+`104ece2dda813d5b3a4ec1d7b168faa305376db259a7789e32571fbc43241bc1`.
+New application SHA256
+`288db31885ed504e5e7a19fd06938364931fee9832cc8a8c41c435fbce3d036a`;
+observer SHA256 remains
+`9df0ffd68526967618d063eeb9605feead6bcbaf68e3492d5ac8ed06067c9878`.
+All singleton/three-replica swap/Close/Abort/mixed-host and preserved full
+legacy scenarios passed again, errors=[]; shared PID 25525 → 26253.
+Auxiliary Close has empty native RA inventory, removed old replica is absent
+despite a live replacement, and all old service/control routes are fenced.
+Minted app/type1.1&type1.2/uploads and exact original
+`stempty-dab15f41-reviewed` container/volume/network are absence-confirmed.
+Refreshed-main checks pass: 542 workspace tests, 10 doctests, 153 Python tests,
+fmt/check/clippy and strict four-library Rustdoc; 5 explicitly native-tier tests
+are ignored locally, not counted as passes. Focused new tests first reproduced
+each reviewed bug, including positive blocking-destructor entry under healthy
+lease renewal and actual CI-script partial-creation failure handling.
+
 No application-state writes, replication data plane/storage, persisted recovery,
 durability, native FabricReplicator peer wire compatibility, Reliable Collections,
 rolling code upgrade/rollback, TLS/reconnect, Windows runtime or expanded host
