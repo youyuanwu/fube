@@ -18,6 +18,8 @@ use tokio::sync::Semaphore;
 
 pub const MAX_REPORT_METRICS: usize = 64;
 pub const MAX_REPORT_NAME_UNITS: usize = 4096;
+/// Leaves ordinary transport admission available for independent lease polls.
+pub const MAX_CONCURRENT_REPORTS: usize = 16;
 const REPORT_TIMEOUT: Duration = Duration::from_secs(30);
 const FAULT_RETRY: Duration = Duration::from_secs(30);
 static SEQUENCE: AtomicI64 = AtomicI64::new(0);
@@ -73,12 +75,15 @@ pub struct FaultDelivery {
     pub attempts: u64,
     pub last_error: Option<String>,
     pub cancelled: bool,
+    pub superseded_transient: bool,
 }
 
 struct FaultStage {
     delivery: FaultDelivery,
     body: Vec<u8>,
     error: Option<Error>,
+    current: Arc<AtomicBool>,
+    complete: tokio::sync::watch::Sender<Option<Result<FaultDelivery>>>,
 }
 pub(crate) struct Reporting {
     connection: Connection,
@@ -89,6 +94,8 @@ pub(crate) struct Reporting {
     loads: Mutex<BTreeMap<String, ReportedLoad>>,
     fault: Mutex<Option<FaultStage>>,
     cancel: crate::Cancellation,
+    global: Arc<Semaphore>,
+    fault_changed: tokio::sync::Notify,
 }
 impl std::fmt::Debug for Reporting {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -106,6 +113,7 @@ impl Reporting {
         authority: Arc<Authority>,
         request: ProxyRequest,
         cancel: crate::Cancellation,
+        global: Arc<Semaphore>,
     ) -> Arc<Self> {
         Arc::new(Self {
             connection,
@@ -116,6 +124,8 @@ impl Reporting {
             loads: Mutex::new(BTreeMap::new()),
             fault: Mutex::new(None),
             cancel,
+            global,
+            fault_changed: tokio::sync::Notify::new(),
         })
     }
     pub(crate) fn update(&self, request: &ProxyRequest) {
@@ -158,6 +168,10 @@ impl Reporting {
     }
     async fn send_load(self: &Arc<Self>, metrics: &[LoadMetric], move_cost: bool) -> Result<()> {
         self.check()?;
+        let _global = self
+            .global
+            .try_acquire()
+            .map_err(|_| Error::ResourceLimit("runtime report admission"))?;
         let _permit = self
             .admission
             .try_acquire()
@@ -247,6 +261,10 @@ impl Reporting {
     }
     pub(crate) async fn health(self: &Arc<Self>, report: &HealthReport) -> Result<HealthReceipt> {
         self.check()?;
+        let _global = self
+            .global
+            .try_acquire()
+            .map_err(|_| Error::ResourceLimit("runtime report admission"))?;
         let _permit = self
             .admission
             .try_acquire()
@@ -347,32 +365,17 @@ impl Reporting {
     }
     pub(crate) async fn fault(self: &Arc<Self>, fault: FaultType) -> Result<FaultDelivery> {
         self.check()?;
-        let permit = self
-            .admission
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Error::ResourceLimit("partition report in progress"))?;
-        let first = {
+        let (first, changed, receiver) = {
             let mut stage = self.fault.lock().unwrap();
-            if let Some(stage) = &*stage {
-                if stage.delivery.fault == FaultType::Permanent || stage.delivery.fault == fault {
-                    if let Some(error) = &stage.error {
-                        return Err(error.clone());
-                    }
-                    return Ok(stage.delivery.clone());
-                }
-            }
-            let first = stage.is_none();
-            let request = self.request.lock().unwrap().clone();
-            *stage = Some(FaultStage {
-                delivery: FaultDelivery {
-                    fault,
-                    attempts: 0,
-                    last_error: None,
-                    cancelled: false,
-                },
-                error: None,
-                body: to_vec(&FaultBody {
+            if let Some(existing) = stage
+                .as_ref()
+                .filter(|s| s.delivery.fault == FaultType::Permanent || s.delivery.fault == fault)
+            {
+                (false, false, existing.complete.subscribe())
+            } else {
+                let first = stage.is_none();
+                let request = self.request.lock().unwrap().clone();
+                let body = to_vec(&FaultBody {
                     unit: request.unit,
                     local: request.local,
                     fault: match fault {
@@ -388,61 +391,124 @@ impl Reporting {
                         },
                         kind: 2,
                     },
-                })?,
-            });
-            first
-        };
-        // Retain the initial attempt even if its caller drops the future. The
-        // owned permit bounds workers; the first worker alone owns retry duty.
-        let this = self.clone();
-        let (complete, receiver) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = this.send_fault().await;
-            drop(permit);
-            let _ = complete.send(result);
-            if first {
-                loop {
-                    tokio::select! {
-                        _ = this.cancel.cancelled() => break,
-                        _ = tokio::time::sleep(FAULT_RETRY) => {}
-                    }
-                    if this.check().is_err() {
-                        break;
-                    }
-                    if let Ok(_permit) = this.admission.try_acquire() {
-                        let _ = this.send_fault().await; // retained in bounded status
+                })?;
+                if let Some(old) = &*stage {
+                    old.current.store(false, Ordering::Release);
+                    if old.complete.borrow().is_none() {
+                        old.complete.send_replace(Some(Err(Error::InvalidInput(
+                            "transient fault superseded by permanent",
+                        ))));
                     }
                 }
+                let (complete, receiver) = tokio::sync::watch::channel(None);
+                *stage = Some(FaultStage {
+                    delivery: FaultDelivery {
+                        fault,
+                        attempts: 0,
+                        last_error: None,
+                        cancelled: false,
+                        superseded_transient: !first,
+                    },
+                    error: None,
+                    body,
+                    current: Arc::new(AtomicBool::new(true)),
+                    complete,
+                });
+                (first, true, receiver)
             }
-        });
-        receiver.await.map_err(|_| Error::Closed)??;
-        self.fault_status().ok_or(Error::Closed)
-    }
-    async fn send_fault(self: &Arc<Self>) -> Result<()> {
-        let body = self
-            .fault
-            .lock()
-            .unwrap()
-            .as_ref()
-            .ok_or(Error::Closed)?
-            .body
-            .clone();
-        let result = self
-            .connection
-            .send_one_way_fenced(
-                12,
-                "RAReportFault",
-                body,
-                deadline_after(REPORT_TIMEOUT)?,
-                self.fence(),
-            )
-            .await;
-        if let Some(stage) = &mut *self.fault.lock().unwrap() {
-            stage.delivery.attempts = stage.delivery.attempts.saturating_add(1);
-            stage.delivery.last_error = result.as_ref().err().map(ToString::to_string);
-            stage.error = result.as_ref().err().cloned();
+        };
+        if first {
+            let this = self.clone();
+            tokio::spawn(async move {
+                this.fault_worker().await;
+            });
+        } else if changed {
+            self.fault_changed.notify_one();
         }
-        result
+        self.wait_fault(receiver).await
+    }
+    async fn wait_fault(
+        &self,
+        mut receiver: tokio::sync::watch::Receiver<Option<Result<FaultDelivery>>>,
+    ) -> Result<FaultDelivery> {
+        loop {
+            if let Some(result) = receiver.borrow_and_update().clone() {
+                return result;
+            }
+            tokio::select! {
+                _ = self.cancel.cancelled() => return Err(Error::Closed),
+                result = receiver.changed() => { result.map_err(|_| Error::Closed)?; }
+            }
+        }
+    }
+    async fn fault_worker(self: Arc<Self>) {
+        loop {
+            if self.check().is_err() {
+                break;
+            }
+            // Consume a wake already represented by the snapshot we are about
+            // to send. A later upgrade still wakes the post-write wait.
+            tokio::select! {
+                biased;
+                _ = self.fault_changed.notified() => {},
+                _ = std::future::ready(()) => {},
+            }
+            let (body, current) = {
+                let stage = self.fault.lock().unwrap();
+                let Some(stage) = &*stage else {
+                    break;
+                };
+                (stage.body.clone(), stage.current.clone())
+            };
+            let this = Arc::downgrade(&self);
+            let token = current.clone();
+            let sent = SendStatus::fenced(Arc::new(move || {
+                token.load(Ordering::Acquire) && this.upgrade().is_some_and(|s| s.check().is_ok())
+            }));
+            let operation = async {
+                let _permit = self
+                    .global
+                    .try_acquire()
+                    .map_err(|_| Error::ResourceLimit("runtime report admission"))?;
+                self.connection
+                    .send_one_way_fenced(
+                        12,
+                        "RAReportFault",
+                        body,
+                        deadline_after(REPORT_TIMEOUT)?,
+                        sent,
+                    )
+                    .await
+            };
+            let result = tokio::select! {
+                _ = self.cancel.cancelled() => break,
+                result = operation => result,
+            };
+            {
+                let mut stage = self.fault.lock().unwrap();
+                let Some(stage) = &mut *stage else {
+                    break;
+                };
+                if !Arc::ptr_eq(&stage.current, &current) {
+                    continue;
+                }
+                stage.delivery.attempts = stage.delivery.attempts.saturating_add(1);
+                stage.delivery.last_error = result.as_ref().err().map(ToString::to_string);
+                stage.error = result.as_ref().err().cloned();
+                // Initial completion is immutable, including for an unpolled
+                // waiter. Retry outcomes belong only in the delivery snapshot.
+                if stage.complete.borrow().is_none() {
+                    stage
+                        .complete
+                        .send_replace(Some(result.map(|()| stage.delivery.clone())));
+                }
+            }
+            tokio::select! {
+                _ = self.cancel.cancelled() => break,
+                _ = self.fault_changed.notified() => {},
+                _ = tokio::time::sleep(FAULT_RETRY) => {},
+            }
+        }
     }
 }
 

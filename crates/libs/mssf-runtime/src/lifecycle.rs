@@ -61,6 +61,7 @@ struct Shared {
     authority: Arc<Authority>,
     connection: Connection,
     metrics: Arc<RuntimeMetrics>,
+    reports: Arc<Semaphore>,
 }
 pub(crate) struct Engine {
     shared: Arc<Shared>,
@@ -87,6 +88,7 @@ impl Engine {
             authority,
             connection,
             metrics: Arc::new(RuntimeMetrics::default()),
+            reports: Arc::new(Semaphore::new(crate::reporting::MAX_CONCURRENT_REPORTS)),
         });
         let (stop, mut stopped) = watch::channel(false);
         let task_shared = shared.clone();
@@ -487,6 +489,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
         shared.authority.clone(),
         request.clone(),
         cancel.clone(),
+        shared.reports.clone(),
     );
     unit.state.lock().unwrap().reporting = Some(reporting.clone());
     let partition = Partition {
@@ -544,6 +547,10 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
     }
     .await;
     if let Err(error) = &outcome {
+        // Failed generations lose report authority before application cleanup.
+        // In particular, wake their retained fault worker without a retry delay.
+        valid.store(false, Ordering::Release);
+        cancel.cancel();
         shared.metrics.open_failures.fetch_add(1, Ordering::Relaxed);
         let service = unit.state.lock().unwrap().service.take();
         if let Some(service) = service {

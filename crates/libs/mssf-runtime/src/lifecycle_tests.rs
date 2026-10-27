@@ -257,6 +257,235 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
         .is_err());
 }
 
+fn health_report() -> crate::HealthReport {
+    crate::HealthReport {
+        source: "User".into(),
+        property: "Ready".into(),
+        state: crate::HealthState::Ok,
+        description: "detail".into(),
+        time_to_live: Some(Duration::from_secs(3)),
+        sequence: crate::HealthSequence::Auto,
+        remove_when_expired: false,
+    }
+}
+
+#[tokio::test]
+async fn health_saturation_leaves_poll_admission_and_rejects_overload() {
+    let mut h = Harness::new().await;
+    let mut reports = Vec::new();
+    for id in 1..=16 {
+        let request = h.request(id, 1, 0);
+        h.send("ReplicaOpen", &request).await;
+        h.receive("ReplicaOpenReply").await;
+        let p = h.calls.partitions.lock().unwrap().last().unwrap().clone();
+        reports.push(tokio::spawn(async move {
+            p.report_health(&health_report()).await
+        }));
+        h.receive("ReportHealth").await; // withhold HM results
+    }
+    let request = h.request(17, 1, 0);
+    h.send("ReplicaOpen", &request).await;
+    h.receive("ReplicaOpenReply").await;
+    let p = h.calls.partitions.lock().unwrap().last().unwrap().clone();
+    assert!(matches!(
+        p.report_health(&health_report()).await,
+        Err(Error::ResourceLimit("runtime report admission"))
+    ));
+    let connection = h.engine.shared.connection.clone();
+    let poll = tokio::spawn(async move {
+        connection
+            .request(
+                "GetProcessLeaseTTLRequest",
+                15,
+                vec![],
+                vec![],
+                deadline_after(Duration::from_secs(1)).unwrap(),
+            )
+            .await
+    });
+    let message = read_message(&mut h.peer).await.unwrap();
+    assert_eq!(message.properties().unwrap().actor, 15);
+    write_message(
+        &mut h.peer,
+        &Message {
+            headers: vec![Header::relates_to(message.properties().unwrap().id).unwrap()],
+            body: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    poll.await.unwrap().unwrap();
+    for task in reports {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+#[tokio::test]
+async fn health_validation_and_unmatched_results_never_acknowledge() {
+    let mut h = Harness::new().await;
+    let request = h.request(1, 1, 0);
+    h.send("ReplicaOpen", &request).await;
+    h.receive("ReplicaOpenReply").await;
+    let p = h.calls.partitions.lock().unwrap()[0].clone();
+    for ttl in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
+        let mut report = health_report();
+        report.time_to_live = Some(ttl);
+        assert!(p.report_health(&report).await.is_err());
+    }
+    for sequence in [-1, 0] {
+        let mut report = health_report();
+        report.sequence = crate::HealthSequence::Explicit(sequence);
+        assert!(p.report_health(&report).await.is_err());
+    }
+    let mut report = health_report();
+    report.source = "System.Forged".into();
+    assert!(p.report_health(&report).await.is_err());
+    for wrong in 0..5 {
+        let p = p.clone();
+        let task = tokio::spawn(async move { p.report_health(&health_report()).await });
+        let message = h.receive("ReportHealth").await;
+        let sent: HealthBody = from_slice(&message.body).unwrap();
+        let sent = &sent.reports.0[0];
+        assert_eq!(sent.ttl, 30_000_000);
+        assert!(sent.sequence > 0);
+        let mut result = HealthResult {
+            kind: 2,
+            source: sent.source.clone(),
+            sequence: sent.sequence,
+            entity_property: format!(
+                "{}+100+Ready",
+                uuid::Uuid::from_bytes_le(request.unit.id.id.0)
+            ),
+            error: 0,
+        };
+        match wrong {
+            0 => result.kind = 3,
+            1 => result.source = "other".into(),
+            2 => result.sequence -= 1,
+            3 => result.entity_property = "other".into(),
+            _ => {}
+        }
+        write_message(
+            &mut h.peer,
+            &Message {
+                headers: vec![
+                    Header::actor(16).unwrap(),
+                    Header::action("OperationSuccessAction").unwrap(),
+                    Header::relates_to(message.properties().unwrap().id).unwrap(),
+                ],
+                body: to_vec(&HealthReply {
+                    results: ObjectArray(if wrong == 4 { vec![] } else { vec![result] }),
+                    streams: ObjectArray(vec![]),
+                })
+                .unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(task.await.unwrap(), Err(Error::Protocol(_))));
+    }
+}
+
+async fn poll_pending_once<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
+    std::future::poll_fn(|cx| {
+        assert!(future.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn fault_pending_duplicates_and_permanent_upgrade_share_one_worker() {
+    let mut h = Harness::new().await;
+    let request = h.request(1, 1, 0);
+    h.send("ReplicaOpen", &request).await;
+    h.receive("ReplicaOpenReply").await;
+    let p = h.calls.partitions.lock().unwrap()[0].clone();
+    let first = p.report_fault(FaultType::Transient);
+    let duplicate = p.report_fault(FaultType::Transient);
+    let upgrade = p.report_fault(FaultType::Permanent);
+    tokio::pin!(first, duplicate, upgrade);
+    poll_pending_once(first.as_mut()).await;
+    poll_pending_once(duplicate.as_mut()).await;
+    poll_pending_once(upgrade.as_mut()).await;
+    let message = h.receive("RAReportFault").await;
+    assert_eq!(from_slice::<FaultBody>(&message.body).unwrap().fault, 2);
+    assert!(matches!(first.await, Err(Error::InvalidInput(_))));
+    assert!(matches!(duplicate.await, Err(Error::InvalidInput(_))));
+    assert!(upgrade.await.unwrap().superseded_transient);
+    assert_eq!(p.fault_delivery().unwrap().attempts, 1);
+}
+
+#[tokio::test]
+async fn fault_initial_result_survives_retry_failure_for_unpolled_waiter() {
+    let mut h = Harness::new().await;
+    let request = h.request(1, 1, 0);
+    h.send("ReplicaOpen", &request).await;
+    h.receive("ReplicaOpenReply").await;
+    let p = h.calls.partitions.lock().unwrap()[0].clone();
+    let first = p.report_fault(FaultType::Transient);
+    tokio::pin!(first);
+    poll_pending_once(first.as_mut()).await;
+    h.receive("RAReportFault").await;
+    while p.fault_delivery().unwrap().attempts < 1 {
+        tokio::task::yield_now().await;
+    }
+    let permit = h.engine.shared.reports.acquire_many(16).await.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    while p.fault_delivery().unwrap().attempts < 2 {
+        tokio::task::yield_now().await;
+    }
+    assert!(p.fault_delivery().unwrap().last_error.is_some());
+    assert_eq!(first.await.unwrap().attempts, 1);
+    drop(permit);
+}
+
+#[tokio::test]
+async fn failed_open_invalidates_reports_before_blocked_abort_finishes() {
+    let mut h = Harness::new().await;
+    let request = h.request(1, 1, 5);
+    h.send("ReplicaOpen", &request).await;
+    while h.calls.abort_running.load(Ordering::Acquire) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let p = h.calls.partitions.lock().unwrap()[0].clone();
+    assert!(p.ensure_valid().is_err());
+    assert!(p.report_fault(FaultType::Transient).await.is_err());
+    h.calls.abort_release.store(true, Ordering::Release);
+    h.receive("ReplicaOpenReply").await;
+}
+
+#[tokio::test]
+async fn fault_initial_failure_retry_and_cancellation_remain_observable() {
+    let mut h = Harness::new().await;
+    let request = h.request(1, 1, 0);
+    h.send("ReplicaOpen", &request).await;
+    h.receive("ReplicaOpenReply").await;
+    let p = h.calls.partitions.lock().unwrap()[0].clone();
+    let permit = h.engine.shared.reports.acquire_many(16).await.unwrap();
+    assert!(matches!(
+        p.report_fault(FaultType::Transient).await,
+        Err(Error::ResourceLimit(_))
+    ));
+    assert_eq!(p.fault_delivery().unwrap().attempts, 1);
+    assert!(p.fault_delivery().unwrap().last_error.is_some());
+    assert!(p.report_fault(FaultType::Transient).await.is_err());
+    drop(permit);
+    // Escalation wakes the one retained worker; it is not blocked by the old
+    // stage's report admission and carries the correct internal fault enum.
+    let (result, message) = tokio::join!(
+        p.report_fault(FaultType::Permanent),
+        h.receive("RAReportFault")
+    );
+    assert!(result.unwrap().superseded_transient);
+    assert_eq!(from_slice::<FaultBody>(&message.body).unwrap().fault, 2);
+    h.send("ReplicaClose", &request).await;
+    h.receive("ReplicaCloseReply").await;
+    assert!(p.fault_delivery().unwrap().cancelled);
+}
+
 #[tokio::test]
 async fn reporting_bounds_and_current_description_validation() {
     let mut h = Harness::new().await;
