@@ -498,7 +498,7 @@ def stateful_three(allocation: Allocation, application: str, binaries: Binaries,
     # not the host. Normal close must not be confused with fallback Abort.
     auxiliary=application+"/StatefulClose"
     allocation.sf("service","create","--app-id",app_id,"--name",auxiliary,
-                  "--service-type","RustStatefulRuntimeType","--stateful","--target-replica-set-size","1",
+                  "--service-type","RustStatefulRuntimeType","--stateful","--no-persisted-state","--target-replica-set-size","1",
                   "--min-replica-set-size","1","--activation-mode","SharedProcess","--singleton-scheme",
                   "--constraints","NodeType == "+sibling_after["rpc"]["node_type"])
     aux=wait_stateful(auxiliary,1,1,observer=binaries.observer,capture=result)
