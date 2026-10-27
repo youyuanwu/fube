@@ -68,7 +68,9 @@ impl Cancellation {
             wake.await;
         }
     }
-    pub(crate) fn cancel(&self) {
+    /// Signal cancellation of locally owned work. This never grants native
+    /// authority and is not proof that the operation has completed or cleaned up.
+    pub fn cancel(&self) {
         self.0.value.store(true, Ordering::Release);
         self.0.changed.notify_waiters();
     }

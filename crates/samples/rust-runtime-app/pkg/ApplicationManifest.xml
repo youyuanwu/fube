@@ -14,10 +14,15 @@
     </ConfigOverrides>
   </ServiceManifestImport>
   <DefaultServices>
-    <Service Name="Singleton">
+    <Service Name="Singleton" ServicePackageActivationMode="SharedProcess">
       <StatelessService ServiceTypeName="RustRuntimeType" InstanceCount="1">
         <SingletonPartition />
       </StatelessService>
+    </Service>
+    <Service Name="Stateful" ServicePackageActivationMode="SharedProcess">
+      <StatefulService ServiceTypeName="RustStatefulRuntimeType" TargetReplicaSetSize="1" MinReplicaSetSize="1">
+        <SingletonPartition />
+      </StatefulService>
     </Service>
   </DefaultServices>
 </ApplicationManifest>
