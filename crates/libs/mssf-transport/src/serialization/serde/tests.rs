@@ -321,7 +321,49 @@ fn field_bridges_preserve_pointer_tags_scopes_and_continuation() {
 #[derive(Serialize)]
 struct Bad {
     good: u32,
-    bad: f64,
+    bad: f32,
+}
+#[test]
+fn native_double_golden_zero_ieee_truncation_and_unknown_tail() {
+    for value in [
+        0.0,
+        -0.0,
+        1.0,
+        -123.5,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ] {
+        let mut e = Encoder::new();
+        e.f64(value);
+        let bytes = e.finish();
+        if value == 0.0 {
+            assert_eq!(bytes, [0x4b]);
+        } else {
+            assert_eq!(bytes[0], 0x0b);
+            assert_eq!(&bytes[1..], &value.to_le_bytes());
+        }
+        let mut d = Decoder::new(&bytes);
+        let decoded = d.f64().unwrap();
+        if value.is_nan() {
+            assert!(decoded.is_nan());
+        } else {
+            assert_eq!(decoded, value);
+        }
+        d.finish().unwrap();
+        for n in 0..bytes.len() {
+            assert!(Decoder::new(&bytes[..n]).f64().is_err());
+        }
+    }
+    #[derive(Serialize, Deserialize)]
+    struct Double {
+        value: f64,
+    }
+    let bytes = to_vec(&Double { value: 731.0 }).unwrap();
+    assert_eq!(from_slice::<Double>(&bytes).unwrap().value, 731.0);
+    #[derive(Deserialize)]
+    struct Older {}
+    from_slice::<Older>(&bytes).unwrap();
 }
 #[test]
 fn failed_fields_and_nested_objects_roll_back_prior_bytes_and_depth() {
@@ -468,7 +510,6 @@ fn unsupported_standard_serde_shapes_fail_in_both_directions() {
     unsupported(&1u128);
     unsupported(&1i128);
     unsupported(&1.0f32);
-    unsupported(&1.0f64);
     unsupported(&'x');
     unsupported(&());
     unsupported(&Unit);

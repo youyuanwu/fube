@@ -1,7 +1,7 @@
 //! Real SF-activated sample. It never constructs activation identity itself.
 use mssf_runtime::*;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -28,6 +28,7 @@ struct Rpc {
     code_sequence: i64,
     listener: OnceCell<()>,
     routes: Mutex<HashMap<String, Arc<Route>>>,
+    retired: Mutex<VecDeque<Partition>>,
     metrics: Arc<RuntimeMetrics>,
     opening: AtomicUsize,
     maximum_opening: AtomicUsize,
@@ -57,7 +58,7 @@ impl Rpc {
                         tokio::spawn(async move {
                             let _permit = permit;
                             let _ = tokio::time::timeout(
-                                Duration::from_secs(2),
+                                Duration::from_secs(35),
                                 server.request(stream),
                             )
                             .await;
@@ -94,6 +95,9 @@ impl Rpc {
             .and_then(|v| v.split_once(' '))
             .map(|(p, _)| p)
             .unwrap_or("");
+        let (path, query) = path.split_once('?').unwrap_or((path, ""));
+        let parameters: HashMap<_, _> =
+            query.split('&').filter_map(|s| s.split_once('=')).collect();
         let route = {
             let routes = self.routes.lock().unwrap();
             routes.get(path).map(|route| {
@@ -115,6 +119,7 @@ impl Rpc {
             if route.deliberately_noncooperative || route.partition.ensure_valid().is_ok() {
                 let id = &route.partition.identity;
                 let counters = self.metrics.snapshot();
+                let report = self.report(&route.partition, &parameters).await;
                 (200,serde_json::json!({"pid":std::process::id(),"partition":id.partition_id.to_string(),
                     "instance":id.instance_id,"incarnation":id.incarnation,"service":id.service_name,
                     "node":self.node,"node_type":self.node_type,"host":self.host,"code_sequence":self.code_sequence,
@@ -126,7 +131,7 @@ impl Rpc {
                         "abort":counters.abort_commands,"query":counters.queries,"update":counters.service_updates,
                         "open_failures":counters.open_failures,"close_failures":counters.close_failures,
                         "abort_callbacks":counters.abort_callbacks},
-                    "deliberately_noncooperative":route.deliberately_noncooperative
+                    "deliberately_noncooperative":route.deliberately_noncooperative, "report":report
                 }).to_string(),Some(active))
             } else {
                 (503, "{}".into(), Some(active))
@@ -138,6 +143,87 @@ impl Rpc {
         stream.write_all(response.as_bytes()).await?;
         stream.shutdown().await?;
         Ok(())
+    }
+    async fn report(
+        &self,
+        partition: &Partition,
+        parameters: &HashMap<&str, &str>,
+    ) -> serde_json::Value {
+        let Some(operation) = parameters.get("op") else {
+            return serde_json::Value::Null;
+        };
+        let result: RuntimeResult<serde_json::Value> = async {
+            match *operation {
+                "load" => {
+                    let value = parameters.get("value").ok_or(RuntimeError::InvalidInput("missing value"))?
+                        .parse().map_err(|_| RuntimeError::InvalidInput("invalid value"))?;
+                    partition.report_load(&[LoadMetric { name: "RuntimeWork".into(), value }]).await?;
+                    Ok(serde_json::json!({"completion":"local-frame-write"}))
+                }
+                "move" => {
+                    partition.report_move_cost(MoveCost::High).await?;
+                    Ok(serde_json::json!({"completion":"local-frame-write","cost":3}))
+                }
+                "health" => {
+                    let number = |name| -> RuntimeResult<i64> {
+                        parameters.get(name).ok_or(RuntimeError::InvalidInput("missing health argument"))?
+                            .parse().map_err(|_| RuntimeError::InvalidInput("invalid health argument"))
+                    };
+                    let state = match number("state")? {
+                        1 => HealthState::Ok, 2 => HealthState::Warning, 3 => HealthState::Error,
+                        _ => return Err(RuntimeError::InvalidInput("invalid health state")),
+                    };
+                    let ttl = number("ttl")?;
+                    if ttl < 0 { return Err(RuntimeError::InvalidInput("invalid TTL")); }
+                    let receipt = partition.report_health(&HealthReport {
+                        source: "RustRuntime".into(),
+                        property: parameters.get("property").ok_or(RuntimeError::InvalidInput("missing property"))?.to_string(),
+                        state, description: "native Rust runtime acceptance".into(),
+                        time_to_live: if ttl == 0 { None } else { Some(Duration::from_secs(ttl as u64)) },
+                        sequence: HealthSequence::Explicit(number("sequence")?),
+                        remove_when_expired: parameters.get("remove") == Some(&"true"),
+                    }).await?;
+                    Ok(serde_json::json!({"completion":"hm-report-result","sequence":receipt.sequence}))
+                }
+                "fault" => {
+                    let status = partition.report_fault(FaultType::Transient).await?;
+                    Ok(serde_json::json!({"completion":"local-frame-write","attempts":status.attempts}))
+                }
+                "stale" => {
+                    let instance: i64 = parameters.get("instance").ok_or(RuntimeError::InvalidInput("missing old instance"))?
+                        .parse().map_err(|_| RuntimeError::InvalidInput("invalid old instance"))?;
+                    let old = self.retired.lock().unwrap().iter().find(|p|
+                        p.identity.partition_id == partition.identity.partition_id && p.identity.instance_id == instance
+                    ).cloned().ok_or(RuntimeError::InvalidInput("retired instance not retained"))?;
+                    let closed = |r: RuntimeResult<()>| matches!(r, Err(RuntimeError::Closed));
+                    let load = closed(old.report_load(&[LoadMetric { name:"RuntimeWork".into(),value:1 }]).await);
+                    let health = closed(old.report_health(&HealthReport {
+                        source:"RustRuntime".into(),property:"Stale".into(),state:HealthState::Error,
+                        description:"must not be sent".into(),time_to_live:None,sequence:HealthSequence::Auto,
+                        remove_when_expired:false,
+                    }).await.map(|_| ()));
+                    let fault = closed(old.report_fault(FaultType::Transient).await.map(|_| ()));
+                    let move_cost = closed(old.report_move_cost(MoveCost::Low).await);
+                    if !(load && health && fault && move_cost) {
+                        return Err(RuntimeError::InvalidInput("retired reports were not all rejected as closed"));
+                    }
+                    Ok(serde_json::json!({"load_closed":load,"health_closed":health,"fault_closed":fault,
+                        "move_closed":move_cost,"old_instance":instance,"old_incarnation":old.identity.incarnation}))
+                }
+                _ => Err(RuntimeError::InvalidInput("unsupported report command")),
+            }
+        }.await;
+        match result {
+            Ok(value) => serde_json::json!({"ok":true,"result":value}),
+            Err(error) => {
+                let native_code = if let RuntimeError::Remote { code, .. } = &error {
+                    Some(*code)
+                } else {
+                    None
+                };
+                serde_json::json!({"ok":false,"error":error.to_string(),"native_code":native_code})
+            }
+        }
     }
 }
 struct Factory(Arc<Rpc>);
@@ -162,7 +248,15 @@ impl StatelessFactory for Factory {
 impl Service {
     fn remove(&self) -> Option<Arc<Route>> {
         self.rpc.routes.lock().unwrap().remove(&self.path);
-        self.route.lock().unwrap().take()
+        let route = self.route.lock().unwrap().take();
+        if let Some(route) = &route {
+            let mut retired = self.rpc.retired.lock().unwrap();
+            if retired.len() == 32 {
+                retired.pop_front();
+            }
+            retired.push_back(route.partition.clone());
+        }
+        route
     }
 }
 impl StatelessService for Service {
@@ -277,6 +371,7 @@ async fn run() -> RuntimeResult<()> {
         code_sequence: activation.code_sequence,
         listener: OnceCell::new(),
         routes: Mutex::new(HashMap::new()),
+        retired: Mutex::new(VecDeque::new()),
         metrics: runtime.metrics(),
         opening: AtomicUsize::new(0),
         maximum_opening: AtomicUsize::new(0),

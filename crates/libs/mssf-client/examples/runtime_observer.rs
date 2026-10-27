@@ -11,9 +11,9 @@ use tokio::{
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if !(2..=3).contains(&args.len()) {
+    if !(2..=4).contains(&args.len()) {
         return Err(
-            "usage: runtime_observer GATEWAY_IP:PORT fabric:/APP/SERVICE [NAMED_PARTITION|int:I64]"
+            "usage: runtime_observer GATEWAY_IP:PORT fabric:/APP/SERVICE [NAMED_PARTITION|int:I64|-] [REPORT_QUERY]"
                 .into(),
         );
     }
@@ -21,9 +21,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let name: NamingUri = args[1].parse()?;
     let key = match args.get(2) {
         None => PartitionKey::Singleton,
+        Some(value) if value == "-" => PartitionKey::Singleton,
         Some(value) if value.starts_with("int:") => PartitionKey::Int64(value[4..].parse()?),
         Some(value) => PartitionKey::Named(value.clone()),
     };
+    let query = args.get(3).map_or("", String::as_str);
+    if query.len() > 1024
+        || query
+            .bytes()
+            .any(|b| !b.is_ascii_alphanumeric() && !b"-_=&".contains(&b))
+    {
+        return Err("unsupported bounded sample report query".into());
+    }
     let resolved = client
         .resolve_service_partition(&name, &key, None, Some(Duration::from_secs(10)))
         .await?;
@@ -40,13 +49,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(authority)).await??;
         stream
             .write_all(
-                format!("GET /{path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
-                    .as_bytes(),
+                format!(
+                    "GET /{path}{}{} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n",
+                    if query.is_empty() { "" } else { "?" },
+                    query
+                )
+                .as_bytes(),
             )
             .await?;
         let mut response = Vec::new();
         tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(35),
             (&mut stream).take(16_385).read_to_end(&mut response),
         )
         .await??;

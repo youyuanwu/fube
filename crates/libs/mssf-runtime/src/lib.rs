@@ -8,6 +8,7 @@ mod lease;
 mod lifecycle;
 #[cfg(test)]
 mod model_tests;
+mod reporting;
 mod wire;
 
 use std::{
@@ -31,6 +32,10 @@ pub use diagnostics::{RuntimeCounters, RuntimeMetrics};
 use lease::Authority;
 pub use lifecycle::{MAX_CALLBACKS, MAX_SERVICE_UNITS, MAX_TOMBSTONES};
 pub use mssf_transport::{Error as RuntimeError, Result as RuntimeResult};
+pub use reporting::{
+    FaultDelivery, HealthReceipt, HealthReport, HealthSequence, HealthState, LoadMetric, MoveCost,
+    MAX_REPORT_METRICS, MAX_REPORT_NAME_UNITS,
+};
 use wire::*;
 
 pub const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);

@@ -218,11 +218,14 @@ finally:
 """
 
 
-def observe(service: str, key: str | None = None, *, observer: Path = DEFAULT_OBSERVER) -> dict:
+def observe(service: str, key: str | None = None, *, observer: Path = DEFAULT_OBSERVER,
+            command: str | None = None) -> dict:
     args = [str(observer), "127.0.0.1:19000", service]
-    if key is not None:
-        args.append(key)
-    lines = run(*args, timeout=15).splitlines()
+    if key is not None or command is not None:
+        args.append(key if key is not None else "-")
+    if command is not None:
+        args.append(command)
+    lines = run(*args, timeout=45 if command else 15).splitlines()
     if len(lines) != 1:
         raise RuntimeError("singleton acceptance requires exactly one endpoint")
     observed = json.loads(lines[0])
@@ -296,6 +299,131 @@ def wait_condition(check, description: str, timeout: float = 60):
     raise RuntimeError(f"{description} not established: {last}")
 
 
+def native_read(allocation: Allocation, path: str) -> dict:
+    """Read-only native gateway observation, never application report delivery."""
+    code = ("import json,sys,urllib.request;"
+            "response=urllib.request.urlopen('http://127.0.0.1:19080'+sys.argv[1],timeout=10);"
+            "print(json.dumps(json.load(response)))")
+    return json.loads(allocation.execute("python3", "-c", code, path, timeout=15))
+
+
+def require_same_instance(value: dict, expected: dict) -> None:
+    if any(value["rpc"][field] != expected["rpc"][field]
+           for field in ("partition", "instance", "incarnation", "pid", "host")):
+        raise RuntimeError("report/sibling observation changed native runtime identity")
+
+
+def load_value(query: dict, name: str, value: int) -> bool:
+    # Stateless native FM query maps secondary retained entries to primary.
+    metrics = query["PrimaryLoadMetricReports"]
+    return any(metric["Name"] == name and metric["Value"] == value
+               and metric["LastReportedUtc"] not in ("0001-01-01T00:00:00.000Z", "", None)
+               for metric in metrics)
+
+
+def health_event(query: dict, property_name: str) -> dict | None:
+    matches = [event for event in query["HealthEvents"]
+               if event["SourceId"] == "RustRuntime"
+               and event["Property"] == property_name]
+    if len(matches) > 1:
+        raise RuntimeError("duplicate native health event identity")
+    return matches[0] if matches else None
+
+
+def reporting_acceptance(allocation: Allocation, alpha: dict, beta: dict, result: dict,
+                         *, observer: Path = DEFAULT_OBSERVER) -> dict:
+    service = alpha["rpc"]["service"]
+    partition = str(uuid.UUID(alpha["rpc"]["partition"]))
+    instance = alpha["rpc"]["instance"]
+    load_path = f"/Partitions/{partition}/$/GetLoadInformation?api-version=6.0"
+    health_path = f"/Partitions/{partition}/$/GetReplicas/{instance}/$/GetHealth?api-version=6.0"
+
+    def command(query, *, expect_success=True):
+        observed = observe(service, "int:0", observer=observer, command=query)
+        require_same_instance(observed, alpha)
+        report = observed["rpc"]["report"]
+        if report["ok"] is not expect_success:
+            raise RuntimeError("unexpected runtime report result: " + json.dumps(report))
+        return observed
+
+    def load(name, value):
+        query = native_read(allocation, load_path)
+        return query if load_value(query, name, value) else None
+
+    def event(property_name, sequence, state, *, expired=False):
+        query = native_read(allocation, health_path)
+        result["hm_last_raw"] = query
+        if (query["PartitionId"] != partition or int(query["InstanceId"]) != instance
+                or query["ServiceKind"] != "Stateless"):
+            raise RuntimeError("native HM health identity mismatch")
+        item = health_event(query, property_name)
+        if item and (int(item["SequenceNumber"]) == sequence
+                     and item["HealthState"] == state
+                     and item["IsExpired"] is expired):
+            return query
+        return None
+
+    result["load_write"] = command("op=load&value=731")
+    result["fm_load"] = wait_condition(lambda: load("RuntimeWork", 731), "native FM report load", 90)
+    result["move_write"] = command("op=move")
+    result["fm_move_cost"] = wait_condition(lambda: load("_MoveCost_", 3), "native FM move-cost retention", 90)
+    result["move_evidence_scope"] = "FM retained _MoveCost_, not RAP echo or proof placement configuration uses it"
+    result["health_write"] = command("op=health&property=Ready&state=2&sequence=100&ttl=0&remove=false")
+    result["hm_warning"] = wait_condition(lambda: event("Ready", 100, "Warning"), "native HM Warning sequence100", 90)
+    result["stale_health_result"] = command("op=health&property=Ready&state=3&sequence=99&ttl=0&remove=false", expect_success=False)
+    if result["stale_health_result"]["rpc"]["report"]["native_code"] is None:
+        raise RuntimeError("stale health report did not return an actual HM error")
+    result["hm_stale_unchanged"] = event("Ready", 100, "Warning")
+    if result["hm_stale_unchanged"] is None:
+        raise RuntimeError("older health sequence changed native event")
+    result["newer_health_write"] = command("op=health&property=Ready&state=1&sequence=101&ttl=0&remove=false")
+    result["hm_newer_ok"] = wait_condition(lambda: event("Ready", 101, "Ok"), "native HM newer health", 90)
+
+    result["expiring_write"] = command("op=health&property=Retain&state=1&sequence=200&ttl=3&remove=false")
+    result["hm_before_expiry"] = wait_condition(lambda: event("Retain", 200, "Ok"), "native unexpired event", 20)
+    result["hm_expired_retained"] = wait_condition(lambda: event("Retain", 200, "Ok", expired=True), "native expired retained event", 90)
+    if result["hm_expired_retained"]["AggregatedHealthState"] != "Error":
+        raise RuntimeError("native retained expired report did not evaluate Error")
+    result["clear_expired_write"] = command("op=health&property=Retain&state=1&sequence=201&ttl=0&remove=false")
+    result["hm_expired_renewed"] = wait_condition(lambda: event("Retain", 201, "Ok"), "native higher sequence renews expiry", 90)
+    result["removable_write"] = command("op=health&property=Remove&state=1&sequence=300&ttl=3&remove=true")
+    result["hm_before_remove"] = wait_condition(lambda: event("Remove", 300, "Ok"), "native removable initial event", 20)
+    def removed():
+        query = native_read(allocation, health_path)
+        return query if health_event(query, "Remove") is None else None
+    result["hm_removed_from_query"] = wait_condition(removed, "native remove-on-expiration", 90)
+
+    fault_started = time.monotonic()
+    result["runtime_transient_fault"] = command("op=fault")
+    def replacement():
+        value = observe(service, "int:0", observer=observer)
+        if (value["rpc"]["instance"] == instance
+                or value["rpc"]["incarnation"] == alpha["rpc"]["incarnation"]):
+            return None
+        if value["rpc"]["partition"] != partition or value["native_pid"] != beta["native_pid"]:
+            raise RuntimeError("fault replacement changed partition or killed shared-process sibling")
+        return value
+    renewed = wait_condition(replacement, "runtime transient native instance replacement and resolved RPC", 180)
+    result["replacement"] = renewed
+    result["fault_recovery_seconds"] = time.monotonic() - fault_started
+    sibling = observe(service, "int:1", observer=observer)
+    require_same_instance(sibling, beta)
+    result["sibling_after_fault"] = sibling
+    result["closed_reports"] = observe(service, "int:0", observer=observer,
+        command=f"op=stale&instance={instance}")
+    require_same_instance(result["closed_reports"], renewed)
+    if result["closed_reports"]["rpc"]["report"]["ok"] is not True:
+        raise RuntimeError("closed/stale partition report probes failed")
+    # Do not mistake retained pre-replacement FM data for a new-instance report.
+    result["replacement_load_write"] = observe(service, "int:0", observer=observer, command="op=load&value=947")
+    require_same_instance(result["replacement_load_write"], renewed)
+    if result["replacement_load_write"]["rpc"]["report"]["ok"] is not True:
+        raise RuntimeError("replacement partition cannot report load")
+    result["fm_replacement_load"] = wait_condition(lambda: load("RuntimeWork", 947), "new active instance load", 90)
+    result["reporting_process"] = json.loads(allocation.execute("python3", "-c", PROCESS, json.dumps(renewed), "inspect"))
+    return renewed
+
+
 def controls_and_authority(allocation: Allocation, application: str, result: dict | None = None,
                            *, observer: Path = DEFAULT_OBSERVER) -> dict:
     from concurrent.futures import ThreadPoolExecutor
@@ -332,6 +460,8 @@ def controls_and_authority(allocation: Allocation, application: str, result: dic
             and alpha["rpc"]["maximum_concurrent_opens"]>=2):
         raise RuntimeError("native shared-process concurrent partitions/overlapping Opens not proven")
     result["concurrent"]={"alpha":alpha,"beta":beta}
+    result["reports"] = {}
+    alpha = reporting_acceptance(allocation, alpha, beta, result["reports"], observer=observer)
     baseline=alpha["rpc"]["native_actions"]
     query=json.loads(allocation.sf("replica","deployed","--node-name",alpha["rpc"]["node"],
         "--partition-id",alpha["rpc"]["partition"],"--replica-id",str(alpha["rpc"]["instance"])))
@@ -353,6 +483,11 @@ def controls_and_authority(allocation: Allocation, application: str, result: dic
     if renewed["native_pid"]!=beta["native_pid"]:
         raise RuntimeError("partition Abort disturbed shared-process sibling")
     result["partition_replacement"]=renewed
+    result["abort_closed_reports"] = observe(application+"/Concurrent", "int:0", observer=observer,
+        command=f"op=stale&instance={alpha['rpc']['instance']}")
+    require_same_instance(result["abort_closed_reports"], renewed)
+    if result["abort_closed_reports"]["rpc"]["report"]["ok"] is not True:
+        raise RuntimeError("aborted partition reports were not rejected")
     failures_before=renewed["rpc"]["native_actions"]
     create("FailClose")
     wait_observe(application+"/FailClose",observer=observer)

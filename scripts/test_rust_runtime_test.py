@@ -116,6 +116,47 @@ class BinaryBundleTests(unittest.TestCase):
                 runtime.build_binaries()
 
 
+class ReportingEvidenceTests(unittest.TestCase):
+    def test_load_requires_fm_distinctive_value_and_timestamp(self):
+        query = {"PrimaryLoadMetricReports": [
+            {"Name": "RuntimeWork", "Value": 731, "LastReportedUtc": "2026-10-27T01:00:00Z"},
+            {"Name": "_MoveCost_", "Value": 3, "LastReportedUtc": "2026-10-27T01:00:00Z"}]}
+        self.assertTrue(runtime.load_value(query, "RuntimeWork", 731))
+        self.assertTrue(runtime.load_value(query, "_MoveCost_", 3))
+        self.assertFalse(runtime.load_value(query, "RuntimeWork", 947))
+        query["PrimaryLoadMetricReports"][0]["LastReportedUtc"] = ""
+        self.assertFalse(runtime.load_value(query, "RuntimeWork", 731))
+
+    def test_health_source_property_and_duplicate_identity(self):
+        query = {"HealthEvents": [
+            {"SourceId": "Other", "Property": "Ready"},
+            {"SourceId": "RustRuntime", "Property": "Ready", "IsExpired": True}]}
+        self.assertTrue(runtime.health_event(query, "Ready")["IsExpired"])
+        self.assertIsNone(runtime.health_event(query, "Removed"))
+        query["HealthEvents"].append(query["HealthEvents"][1])
+        with self.assertRaises(RuntimeError):
+            runtime.health_event(query, "Ready")
+
+    def test_partition_fault_replacement_is_not_process_replacement(self):
+        before = {"rpc": {"partition": "p", "instance": 5, "incarnation": 6, "pid": 7, "host": "h"}}
+        runtime.require_same_instance(copy.deepcopy(before), before)
+        for field in before["rpc"]:
+            changed = copy.deepcopy(before)
+            changed["rpc"][field] = "changed"
+            with self.assertRaises(RuntimeError):
+                runtime.require_same_instance(changed, before)
+
+    def test_report_command_uses_prebuilt_independent_observer(self):
+        observed = {"resolver": "mssf-client", "native_pid": 7,
+                    "rpc": {"pid": 7, "service": "fabric:/Owned/Concurrent", "report": {"ok": True}}}
+        observer = Path("/bundle") / "runtime_observer"
+        with patch.object(runtime, "run", return_value=json.dumps(observed)) as command:
+            runtime.observe("fabric:/Owned/Concurrent", "int:0", observer=observer,
+                            command="op=fault")
+        command.assert_called_once_with(str(observer), "127.0.0.1:19000",
+                                       "fabric:/Owned/Concurrent", "int:0", "op=fault", timeout=45)
+
+
 @unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class AllocationTests(unittest.TestCase):
     def setUp(self):

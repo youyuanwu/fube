@@ -52,6 +52,97 @@ fn command(index: u32, actor: i64, expects: bool) -> Message {
 }
 
 #[tokio::test]
+async fn reports_use_ordinary_capacity_and_cancel_obsolete_queued_frames() {
+    use std::sync::atomic::AtomicBool;
+    let (conn, mut peer, _rx) = ipc(32);
+    // Occupy writer with a frame larger than duplex capacity.
+    let first = conn.clone();
+    let blocked = tokio::spawn(async move {
+        first
+            .send_one_way_fenced(
+                12,
+                "first",
+                vec![0; 8192],
+                deadline(),
+                SendStatus::default(),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    let valid = Arc::new(AtomicBool::new(true));
+    let predicate = valid.clone();
+    let next = conn.clone();
+    let stale = tokio::spawn(async move {
+        next.send_one_way_fenced(
+            12,
+            "obsolete",
+            vec![1],
+            deadline(),
+            SendStatus::fenced(Arc::new(move || predicate.load(Ordering::Acquire))),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    valid.store(false, Ordering::Release);
+    assert_eq!(conn.handle.shared.controls.capacity(), MAX_QUEUED_CONTROLS);
+    assert_eq!(
+        read_message(&mut peer)
+            .await
+            .unwrap()
+            .properties()
+            .unwrap()
+            .action,
+        "first"
+    );
+    blocked.await.unwrap().unwrap();
+    assert!(matches!(stale.await.unwrap(), Err(Error::Closed)));
+    let current = conn.clone();
+    let task = tokio::spawn(async move {
+        current
+            .send_one_way_fenced(12, "current", vec![2], deadline(), SendStatus::default())
+            .await
+    });
+    assert_eq!(
+        read_message(&mut peer)
+            .await
+            .unwrap()
+            .properties()
+            .unwrap()
+            .action,
+        "current"
+    );
+    task.await.unwrap().unwrap();
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn report_admission_is_explicitly_bounded() {
+    let (conn, _peer, _rx) = ipc(32);
+    let permits = conn
+        .handle
+        .shared
+        .admission
+        .clone()
+        .acquire_many_owned(MAX_PENDING_REQUESTS as u32)
+        .await
+        .unwrap();
+    assert!(matches!(
+        conn.send_one_way_fenced(
+            12,
+            "RAPReportLoad",
+            vec![1],
+            deadline(),
+            SendStatus::default()
+        )
+        .await,
+        Err(Error::ResourceLimit("report admission"))
+    ));
+    assert_eq!(conn.handle.shared.controls.capacity(), MAX_QUEUED_CONTROLS);
+    drop(permits);
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn generic_actor_dispatch_one_way_and_correlated_body_only_reply() {
     let (conn, mut peer, mut rx) = ipc(32);
     let requester = conn.clone();

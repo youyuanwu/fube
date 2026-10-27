@@ -311,7 +311,7 @@ pub struct ReplicaDetail {
     pub operation: i64,
     pub operation_start: i64,
     pub replicator_operation: i64,
-    pub loads: mssf_transport::serialization::serde::EmptyObjectArray,
+    pub loads: ObjectArray<Vec<ReportedLoad>>,
     pub read_status: i64,
     pub write_status: i64,
     pub replicator: Pointer<EmptyRecord>,
@@ -325,6 +325,98 @@ pub struct QueryReply {
     pub unit: FailoverUnit,
     pub local: Replica,
     pub detail: ReplicaDetail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportedLoad {
+    pub name: String,
+    pub value: u32,
+    pub time: i64,
+    pub current: f64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadStats {
+    pub name: String,
+    pub value: u32,
+    pub count: u32,
+    pub weighted_sum: f64,
+    pub weight: f64,
+    pub time: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeLoads {
+    pub node: ByteArray,
+    pub loads: ObjectArray<Vec<LoadStats>>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadDescription {
+    pub partition: Guid,
+    pub service: String,
+    pub stateful: bool,
+    pub primary: ObjectArray<Vec<LoadStats>>,
+    pub secondary: ObjectArray<Vec<LoadStats>>,
+    pub nodes: ObjectArray<Vec<NodeLoads>>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadBody {
+    pub legacy: mssf_transport::serialization::serde::EmptyObjectArray,
+    pub reports: ObjectArray<Vec<LoadDescription>>,
+    pub time: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FaultBody {
+    pub unit: FailoverUnit,
+    pub local: Replica,
+    pub fault: i64,
+    pub activity: Activity,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthEntity {
+    pub kind: i64,
+    pub partition: Guid,
+    pub instance: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attributes {
+    pub values: mssf_transport::serialization::serde::EmptyObjectArray,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstanceHealth {
+    pub entity: Pointer<mssf_transport::serialization::serde::FixedTag<HealthEntity, 2>>,
+    pub source: String,
+    pub property: String,
+    pub ttl: i64,
+    pub state: i64,
+    pub description: String,
+    pub sequence: i64,
+    pub time: i64,
+    pub attributes: Attributes,
+    pub remove: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthBody {
+    pub reports: ObjectArray<Vec<InstanceHealth>>,
+    pub streams: mssf_transport::serialization::serde::EmptyObjectArray,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthResult {
+    pub kind: i64,
+    pub source: String,
+    pub sequence: i64,
+    pub entity_property: String,
+    pub error: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamResult {
+    pub kind: i64,
+    pub source: String,
+    pub instance: i64,
+    pub upto: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthReply {
+    pub results: ObjectArray<Vec<HealthResult>>,
+    pub streams: ObjectArray<Vec<StreamResult>>,
 }
 
 #[cfg(test)]

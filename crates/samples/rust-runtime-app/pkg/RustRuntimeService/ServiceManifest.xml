@@ -2,7 +2,11 @@
 <ServiceManifest Name="RustRuntimeService" Version="1.1"
  xmlns="http://schemas.microsoft.com/2011/01/fabric">
   <ServiceTypes>
-    <StatelessServiceType ServiceTypeName="RustRuntimeType" UseImplicitHost="false" />
+    <StatelessServiceType ServiceTypeName="RustRuntimeType" UseImplicitHost="false">
+      <LoadMetrics>
+        <LoadMetric Name="RuntimeWork" Weight="Low" DefaultLoad="0" />
+      </LoadMetrics>
+    </StatelessServiceType>
   </ServiceTypes>
   <CodePackage Name="Code" Version="1.1">
     <EntryPoint>

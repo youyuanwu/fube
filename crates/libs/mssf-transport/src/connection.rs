@@ -281,12 +281,21 @@ struct Outbound {
     deadline: Instant,
     bytes: Vec<u8>,
     sent: SendStatus,
+    one_way: Option<(
+        oneshot::Sender<Result<()>>,
+        tokio::sync::OwnedSemaphorePermit,
+    )>,
 }
 
 /// Race-free queued/started observation for uncertain remote mutations.
 #[derive(Clone, Default)]
-pub struct SendStatus(Arc<AtomicU8>);
+pub struct SendStatus(Arc<AtomicU8>, Option<Arc<dyn Fn() -> bool + Send + Sync>>);
 impl SendStatus {
+    /// Bounded nonblocking predicate evaluated by the writer before frame start.
+    /// It must not run user callbacks or wait for asynchronous work.
+    pub fn fenced(predicate: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        Self(Arc::new(AtomicU8::new(0)), Some(predicate))
+    }
     /// Prevent an unsent frame starting. Returns true if writing already began.
     pub fn cancel_unsent(&self) -> bool {
         self.0
@@ -297,6 +306,17 @@ impl SendStatus {
         self.0
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+
+    fn valid(&self) -> bool {
+        self.1.as_ref().is_none_or(|predicate| predicate())
+    }
+}
+
+struct CancelUnsent(SendStatus);
+impl Drop for CancelUnsent {
+    fn drop(&mut self) {
+        self.0.cancel_unsent();
     }
 }
 
@@ -541,6 +561,74 @@ impl Connection {
         queue_control(shared, message, deadline).await
     }
 
+    /// Fenced application one-way send on ordinary bounded capacity, never the
+    /// reserved control queue. Success means a complete local frame write only.
+    /// Queue/admission exhaustion is an immediate error. Cancellation retracts
+    /// unsent work, but cannot revoke a frame whose write has started.
+    pub async fn send_one_way_fenced(
+        &self,
+        actor: i64,
+        action: &str,
+        body: Vec<u8>,
+        deadline: Instant,
+        sent: SendStatus,
+    ) -> Result<()> {
+        let shared = &self.handle.shared;
+        if let Some(error) = shared.error() {
+            return Err(error);
+        }
+        remaining_ticks(deadline)?;
+        let permit = shared
+            .admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::ResourceLimit("report admission"))?;
+        let slot = self
+            .handle
+            .commands
+            .try_reserve()
+            .map_err(|_| Error::ResourceLimit("report output queue"))?;
+        let identity = shared
+            .ipc_identity
+            .clone()
+            .ok_or(Error::InvalidInput("not an IPC session"))?;
+        let id = {
+            let mut inner = shared.inner.lock().unwrap();
+            let index = inner.next_index;
+            inner.next_index = index
+                .checked_add(1)
+                .ok_or(Error::Protocol("message ID index exhausted"))?;
+            MessageId {
+                guid: self.handle.process_id,
+                index,
+            }
+        };
+        let bytes = Message {
+            headers: vec![
+                Header::actor(actor)?,
+                Header::action(action)?,
+                Header::message_id(id)?,
+                identity,
+            ],
+            body,
+        }
+        .to_frame()?
+        .encode()?;
+        let (complete, receiver) = oneshot::channel();
+        let _cancel = CancelUnsent(sent.clone());
+        slot.send(Outbound {
+            id,
+            deadline,
+            bytes,
+            sent,
+            one_way: Some((complete, permit)),
+        });
+        timeout_at(deadline, receiver)
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|_| shared.error().unwrap_or(Error::Closed))?
+    }
+
     /// Decode a correlated reply on the driver before delivering its result.
     ///
     /// `decode` must be a bounded, nonblocking wire decoder, not an application
@@ -669,6 +757,7 @@ impl Connection {
             deadline,
             bytes,
             sent,
+            one_way: None,
         });
         shared.changed.notify_one();
         let (result, _permit) = timeout_at(deadline, receiver)
@@ -844,6 +933,23 @@ async fn send_loop<W: AsyncWrite + Unpin>(
                 command
             }
         };
+        if let Some((complete, _permit)) = command.one_way {
+            let result = if Instant::now() >= command.deadline {
+                Err(Error::Timeout)
+            } else if !command.sent.valid() || !command.sent.start() {
+                Err(Error::Closed)
+            } else {
+                let result = timeout(MAX_FRAME_TIME, writer.write_all(&command.bytes))
+                    .await
+                    .map_err(|_| Error::Timeout)
+                    .and_then(|result| result.map_err(Error::from));
+                let _ = complete.send(result.clone());
+                result?;
+                continue;
+            };
+            let _ = complete.send(result);
+            continue;
+        }
         if !shared
             .inner
             .lock()
@@ -855,6 +961,10 @@ async fn send_loop<W: AsyncWrite + Unpin>(
         }
         if Instant::now() >= command.deadline {
             shared.complete(command.id, Err(Error::Timeout));
+            continue;
+        }
+        if !command.sent.valid() {
+            shared.complete(command.id, Err(Error::Closed));
             continue;
         }
         if !command.sent.start() {

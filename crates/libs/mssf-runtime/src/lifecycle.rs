@@ -4,7 +4,7 @@ use crate::{api::*, lease::Authority, wire::*, ActivationContext, RuntimeMetrics
 mod tests;
 use mssf_transport::{
     connection::{deadline_after, Connection, IpcRequest},
-    serialization::serde::{from_slice, to_vec, EmptyObjectArray, Guid, Pointer},
+    serialization::serde::{from_slice, to_vec, EmptyObjectArray, Guid, ObjectArray, Pointer},
     Error, Result,
 };
 use std::{
@@ -45,6 +45,7 @@ struct Snapshot {
     operation_start: i64,
     operation_kind: i64,
     live: Option<OwnedSemaphorePermit>,
+    reporting: Option<Arc<crate::reporting::Reporting>>,
 }
 struct Unit {
     state: Mutex<Snapshot>,
@@ -60,6 +61,7 @@ struct Shared {
     authority: Arc<Authority>,
     connection: Connection,
     metrics: Arc<RuntimeMetrics>,
+    reports: Arc<Semaphore>,
 }
 pub(crate) struct Engine {
     shared: Arc<Shared>,
@@ -86,6 +88,7 @@ impl Engine {
             authority,
             connection,
             metrics: Arc::new(RuntimeMetrics::default()),
+            reports: Arc::new(Semaphore::new(crate::reporting::MAX_CONCURRENT_REPORTS)),
         });
         let (stop, mut stopped) = watch::channel(false);
         let task_shared = shared.clone();
@@ -244,6 +247,7 @@ fn unit(shared: &Shared, request: &ProxyRequest, create: bool) -> Result<Option<
             operation_start: 0,
             operation_kind: 0,
             live: None,
+            reporting: None,
         }),
     });
     units.insert(request.unit.id.id.0, unit.clone());
@@ -326,6 +330,9 @@ async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
         let mut state = unit.state.lock().unwrap();
         if epoch(&request) > epoch(&state.request) {
             state.request.unit = request.unit.clone();
+            if let Some(reporting) = &state.reporting {
+                reporting.update(&state.request);
+            }
         }
     }
     match props.action.as_str() {
@@ -476,6 +483,15 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
         instance_id: request.local.id,
         incarnation: request.local.instance,
     };
+    let reporting = crate::reporting::Reporting::new(
+        shared.connection.clone(),
+        valid.clone(),
+        shared.authority.clone(),
+        request.clone(),
+        cancel.clone(),
+        shared.reports.clone(),
+    );
+    unit.state.lock().unwrap().reporting = Some(reporting.clone());
     let partition = Partition {
         identity: identity.clone(),
         kind: match request.unit.consistency.kind {
@@ -489,6 +505,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
         },
         valid: valid.clone(),
         authority: shared.authority.clone(),
+        reporting,
     };
     let outcome: Result<String> = async {
         let factory = factory.ok_or(Error::Remote {
@@ -530,6 +547,10 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
     }
     .await;
     if let Err(error) = &outcome {
+        // Failed generations lose report authority before application cleanup.
+        // In particular, wake their retained fault worker without a retry delay.
+        valid.store(false, Ordering::Release);
+        cancel.cancel();
         shared.metrics.open_failures.fetch_add(1, Ordering::Relaxed);
         let service = unit.state.lock().unwrap().service.take();
         if let Some(service) = service {
@@ -629,6 +650,9 @@ async fn update(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<(
         }
         if request.service.update_version > state.request.service.update_version {
             state.request.service = request.service;
+            if let Some(reporting) = &state.reporting {
+                reporting.update(&state.request);
+            }
         }
         shared.metrics.updates.fetch_add(1, Ordering::Relaxed);
         UpdateServiceReply {
@@ -660,7 +684,7 @@ fn query(shared: &Shared, request: &ProxyRequest) -> Result<QueryReply> {
         operation: 0,
         operation_start: 0,
         replicator_operation: 0,
-        loads: EmptyObjectArray,
+        loads: ObjectArray(vec![]),
         read_status: 0,
         write_status: 0,
         replicator: Pointer(None),
@@ -687,6 +711,9 @@ fn query(shared: &Shared, request: &ProxyRequest) -> Result<QueryReply> {
             detail.instance_id = local.id;
             detail.operation = state.operation_kind;
             detail.operation_start = state.operation_start;
+            if let Some(reporting) = &state.reporting {
+                detail.loads = ObjectArray(reporting.loads());
+            }
         }
     }
     Ok(QueryReply {

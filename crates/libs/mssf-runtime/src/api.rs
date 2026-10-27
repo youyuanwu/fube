@@ -74,16 +74,17 @@ impl Cancellation {
     }
 }
 
-/// Generation-bound partition. Reporting is explicitly unsupported by this
-/// initial profile; calls never log success or send empty placeholder reports.
+/// Generation-bound partition. Public identity is observational; changing it
+/// never changes the private native report routing identity.
 #[derive(Debug, Clone)]
 pub struct Partition {
     pub identity: ServiceIdentity,
     pub kind: PartitionKind,
     pub(crate) valid: Arc<AtomicBool>,
     pub(crate) authority: Arc<Authority>,
+    pub(crate) reporting: Arc<crate::reporting::Reporting>,
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultType {
     Transient,
     Permanent,
@@ -103,28 +104,42 @@ impl Partition {
             Err(Error::Closed)
         }
     }
-    pub fn report_load(&self, _metrics: &[(String, u32)]) -> Result<()> {
+    /// Await local complete-frame write, NOT native acknowledgment/persistence.
+    /// No automatic load retry. Unsent obsolete work is cancelled at the writer.
+    /// Once the writer passes its validity boundary, delivery is uncertain on
+    /// timeout/cancellation. Native load/move retention has no incarnation fence.
+    pub async fn report_load(&self, metrics: &[crate::LoadMetric]) -> Result<()> {
         self.ensure_valid()?;
-        Err(Error::InvalidInput(
-            "load reporting unsupported by runtime profile",
-        ))
+        self.reporting.load(metrics).await
     }
-    pub fn report_health(&self, _source: &str, _property: &str, _description: &str) -> Result<()> {
+    /// Await one matched HM per-report result. No hidden retries; timeout does
+    /// not prove the report was never applied. Reuse an explicit sequence when
+    /// retrying an uncertain result, rather than inventing a newer update.
+    pub async fn report_health(
+        &self,
+        report: &crate::HealthReport,
+    ) -> Result<crate::HealthReceipt> {
         self.ensure_valid()?;
-        Err(Error::InvalidInput(
-            "health reporting unsupported by runtime profile",
-        ))
+        self.reporting.health(report).await
     }
-    pub fn report_fault(&self, _fault: FaultType) -> Result<()> {
+    /// Await initial local write (or explicitly coalesce a pending stage).
+    /// Retries retain the bound native identity until closure. This is not a
+    /// native fault acknowledgment or a promise of replacement.
+    /// An initial write error does not remove the bounded pending fault stage:
+    /// inspect `fault_delivery()` for retry outcomes. Pending transient waiters
+    /// fail explicitly if permanent supersedes them before initial completion.
+    /// Initial completion never changes after a retry; the snapshot may change.
+    pub async fn report_fault(&self, fault: FaultType) -> Result<crate::FaultDelivery> {
         self.ensure_valid()?;
-        Err(Error::InvalidInput(
-            "fault reporting unsupported by runtime profile",
-        ))
+        self.reporting.fault(fault).await
     }
-    pub fn report_move_cost(&self, _cost: u32) -> Result<()> {
+    /// Latest bounded fault-stage status, including retry error/cancellation.
+    pub fn fault_delivery(&self) -> Option<crate::FaultDelivery> {
+        self.reporting.fault_status()
+    }
+    /// Same one-way completion/retention semantics as load, for `_MoveCost_`.
+    pub async fn report_move_cost(&self, cost: crate::MoveCost) -> Result<()> {
         self.ensure_valid()?;
-        Err(Error::InvalidInput(
-            "move-cost reporting unsupported by runtime profile",
-        ))
+        self.reporting.move_cost(cost).await
     }
 }

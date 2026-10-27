@@ -69,7 +69,12 @@ The last command creates and destroys only its exact owned onebox, using the
 existing lifecycle controller. It verifies native placement, independent
 mssf-client resolution/RPC, exact pidfd-based application termination/replacement,
 native lifecycle/query/update/failure traffic, concurrent shared-process
-partitions and bounded fencing of an intentionally non-cooperative application.
+partitions, runtime load/health/fault/move-cost reporting, and bounded fencing of
+an intentionally non-cooperative application. Reporting qualification reads
+native FM load/move retention and HM health sequence/expiration results, then
+proves runtime transient fault replaces only its target instance with usable
+independently resolved RPC. It also checks stale handles after Close and Abort;
+models cover queued-write and terminal-authority races.
 It requires Linux pidfd APIs and the existing privileged development container
 for the exact-owned-IPC shutdown test; unavailable capabilities fail qualification.
 There is no security fallback.
