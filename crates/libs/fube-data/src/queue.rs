@@ -80,8 +80,12 @@ impl OperationQueue {
         }
         Ok(())
     }
-    /// Sequence assignment occurs only AFTER resource admission.
+    /// Sequence assignment occurs only AFTER resource admission. Promotion must
+    /// first reconcile any noncontiguous secondary tail with truncate/reset.
     pub fn enqueue(&mut self, epoch: Epoch, data: OperationData) -> Result<i64> {
+        if self.assigned != self.received {
+            return Err(Error::InvalidInput("unreconciled receive tail"));
+        }
         self.admit(&data)?;
         let sequence = self
             .assigned
@@ -185,9 +189,12 @@ impl OperationQueue {
         Ok(())
     }
     /// Remove a non-authoritative tail after the provider has reconciled.
-    /// This does not itself mutate provider state.
+    /// This does not itself mutate provider state. A client-completed operation
+    /// cannot be discarded in this queue lifetime; authoritative data-loss reset
+    /// requires the owner to retire old waiters and explicitly call reset.
     pub fn truncate_after(&mut self, sequence: i64) -> Result<()> {
-        if sequence < self.released || sequence > self.received {
+        if sequence < self.released || sequence < self.client_completed || sequence > self.received
+        {
             return Err(Error::Protocol("truncate outside retained prefix"));
         }
         self.entries.split_off(&(sequence + 1));
@@ -274,5 +281,40 @@ mod tests {
         assert_eq!(q.enqueue(E, data(4)).unwrap(), 12);
         assert!(q.receive(0, E, data(0)).is_err());
         assert!(q.reset(i64::MAX).is_err());
+    }
+
+    #[test]
+    fn completed_tail_cannot_be_recycled_and_suppress_new_completion() {
+        let mut q = OperationQueue::new(Settings::default(), 0).unwrap();
+        for n in 1..=4 {
+            q.enqueue(E, data(n)).unwrap();
+        }
+        assert_eq!(q.commit(4).unwrap().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        q.complete(2).unwrap();
+        let before = q.progress();
+        assert!(q.truncate_after(2).is_err());
+        assert_eq!(q.progress(), before);
+        assert!(q.get(3).is_some());
+        assert!(q.commit(2).unwrap().is_empty());
+        assert!(q.commit(4).unwrap().is_empty());
+        // Explicit new authoritative history resets callback ownership.
+        q.reset(2).unwrap();
+        assert_eq!(q.enqueue(E, data(9)).unwrap(), 3);
+        assert_eq!(q.commit(3).unwrap().collect::<Vec<_>>(), vec![3]);
+        assert!(q.commit(3).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unreconciled_gap_cannot_become_a_primary_contiguous_prefix() {
+        let mut q = OperationQueue::new(Settings::default(), 0).unwrap();
+        q.receive(2, E, data(2)).unwrap();
+        let before = q.progress();
+        assert!(q.enqueue(E, data(3)).is_err());
+        assert_eq!(q.progress(), before);
+        assert!(q.commit(3).is_err());
+        assert!(q.get(1).is_none());
+        q.truncate_after(0).unwrap();
+        assert_eq!(q.enqueue(E, data(1)).unwrap(), 1);
+        assert_eq!(q.commit(1).unwrap().collect::<Vec<_>>(), vec![1]);
     }
 }

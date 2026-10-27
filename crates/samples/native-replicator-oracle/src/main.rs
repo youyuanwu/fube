@@ -3,7 +3,7 @@
 
 use native_replicator_oracle::{
     data::{operation_data, read_segments},
-    provider::{get_copy_context, snapshot_provider},
+    provider::snapshot_provider,
     stream::{end_get_next, operation_data_stream, StreamItem},
 };
 use serde_json::json;
@@ -12,7 +12,9 @@ fn self_test() -> windows_core::Result<()> {
     let expected = vec![vec![1, 2, 3], Vec::new(), vec![4, 5]];
     let data = operation_data(expected.clone())?;
     let provider = snapshot_provider(0, vec![data.clone()])?;
-    if get_copy_context(&provider)?.is_some() {
+    let copy_context = unsafe { provider.GetCopyContext()? };
+    let context = unsafe { copy_context.BeginGetNext(None)? };
+    if end_get_next(&copy_context, &context)?.is_some() {
         return Err(windows_core::HRESULT(0x8000_ffffu32 as i32).into());
     }
     let stream = operation_data_stream(vec![StreamItem::Data(data)])?;

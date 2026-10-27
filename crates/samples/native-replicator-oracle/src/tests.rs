@@ -16,7 +16,7 @@ use mssf_com::{
     },
     FabricRuntime::{
         IFabricOperation, IFabricOperationData, IFabricOperationDataStream,
-        IFabricOperationData_Impl, IFabricOperationStream,
+        IFabricOperationData_Impl, IFabricOperationStream, IFabricStateProvider,
     },
     FabricTypes::{FABRIC_EPOCH, FABRIC_OPERATION_DATA_BUFFER, FABRIC_SEQUENCE_NUMBER},
 };
@@ -84,6 +84,28 @@ fn errors_preserve_hresult_clear_outputs_and_consume_only_once() {
     let stream = operation_data_stream(vec![StreamItem::Failure(E_FAIL)]).unwrap();
     assert_eq!(next(&stream).unwrap_err().code(), E_FAIL);
     assert!(operation_data_stream(vec![StreamItem::Failure(com::S_OK)]).is_err());
+}
+
+#[test]
+fn cancellation_preserves_completed_null_eos_and_failure_exactly_once() {
+    for (items, expected) in [
+        (Vec::new(), com::S_OK),
+        (vec![StreamItem::Failure(E_FAIL)], E_FAIL),
+    ] {
+        let stream = operation_data_stream(items).unwrap();
+        let context = unsafe { stream.BeginGetNext(None).unwrap() };
+        unsafe { context.Cancel().unwrap() };
+        let mut raw = stream.as_raw();
+        assert_eq!(
+            unsafe { (stream.vtable().EndGetNext)(stream.as_raw(), context.as_raw(), &mut raw) },
+            expected
+        );
+        assert!(raw.is_null());
+        assert_eq!(
+            end_get_next(&stream, &context).unwrap_err().code(),
+            com::E_INVALIDARG
+        );
+    }
 }
 
 #[test]
@@ -277,19 +299,19 @@ fn synchronous_callback_can_reenter_end_without_lock_or_ownership_hazards() {
 }
 
 #[test]
-fn absent_callback_is_raw_success_null_and_cancel_does_not_undo_completion() {
+fn absent_callback_is_explicit_error_and_cancel_does_not_undo_completion() {
     let stream = operation_data_stream(Vec::new()).unwrap();
     let context = unsafe { stream.BeginGetNext(None).unwrap() };
-    let mut raw = context.as_raw();
-    let status = unsafe { (context.vtable().get_Callback)(context.as_raw(), &mut raw) };
-    assert_eq!(status, com::S_OK);
-    assert!(raw.is_null());
+    assert_eq!(
+        unsafe { context.get_Callback() }.unwrap_err().code(),
+        com::E_POINTER
+    );
     unsafe { context.Cancel().ok().unwrap() };
     assert!(end_get_next(&stream, &context).unwrap().is_none());
 }
 
 #[test]
-fn provider_has_nullable_volatile_context_and_exact_snapshot_boundary() {
+fn provider_has_empty_copy_context_and_accepts_null_volatile_copy_input() {
     let payload = vec![vec![4, 8], vec![]];
     let provider = snapshot_provider(7, vec![operation_data(payload.clone()).unwrap()]).unwrap();
     check_identity(&provider);
@@ -297,7 +319,11 @@ fn provider_has_nullable_volatile_context_and_exact_snapshot_boundary() {
         unsafe { provider.GetLastCommittedSequenceNumber().unwrap() }.0,
         7
     );
-    assert!(get_copy_context(&provider).unwrap().is_none());
+    let copy_context = get_copy_context(&provider)
+        .unwrap()
+        .expect("non-null empty stream");
+    check_identity(&copy_context);
+    assert!(next(&copy_context).unwrap().is_none());
     let stream = unsafe {
         provider
             .GetCopyState(FABRIC_SEQUENCE_NUMBER(7), None)
@@ -341,18 +367,12 @@ fn provider_copy_stream_retains_snapshot_after_provider_release() {
 #[test]
 fn provider_rejects_null_epoch_and_foreign_context_without_consuming_result() {
     let provider = snapshot_provider(0, Vec::new()).unwrap();
-    let mut raw = provider.as_raw();
-    let status = unsafe {
-        (provider.vtable().BeginUpdateEpoch)(
-            provider.as_raw(),
-            ptr::null(),
-            FABRIC_SEQUENCE_NUMBER(0),
-            ptr::null_mut(),
-            &mut raw,
-        )
-    };
-    assert_eq!(status, com::E_POINTER);
-    assert!(raw.is_null());
+    assert_eq!(
+        unsafe { provider.BeginUpdateEpoch(ptr::null(), FABRIC_SEQUENCE_NUMBER(0), None) }
+            .unwrap_err()
+            .code(),
+        com::E_POINTER
+    );
 
     let other = snapshot_provider(0, Vec::new()).unwrap();
     let foreign = unsafe { other.BeginOnDataLoss(None).unwrap() };
@@ -367,6 +387,72 @@ fn provider_rejects_null_epoch_and_foreign_context_without_consuming_result() {
     }
     assert!(!unsafe { provider.EndOnDataLoss(&context).unwrap() });
     assert!(!unsafe { other.EndOnDataLoss(&foreign).unwrap() });
+}
+
+#[implement(IFabricAsyncOperationCallback)]
+struct ProviderCallback {
+    provider: IFabricStateProvider,
+    update_epoch: bool,
+    calls: Arc<AtomicUsize>,
+    output: Arc<Mutex<Option<Result<()>>>>,
+}
+
+impl IFabricAsyncOperationCallback_Impl for ProviderCallback_Impl {
+    fn Invoke(&self, context: Ref<IFabricAsyncOperationContext>) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let result = if self.update_epoch {
+            unsafe { self.provider.EndUpdateEpoch(context.as_ref()) }.ok()
+        } else {
+            unsafe { self.provider.EndOnDataLoss(context.as_ref()) }.and_then(|changed| {
+                if changed {
+                    Err(com::E_UNEXPECTED.into())
+                } else {
+                    Ok(())
+                }
+            })
+        };
+        *self.output.lock().unwrap() = Some(result);
+    }
+}
+
+#[test]
+fn generated_provider_callbacks_can_reenter_end_before_begin_returns() {
+    for update_epoch in [false, true] {
+        let provider = snapshot_provider(7, Vec::new()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let output = Arc::new(Mutex::new(None));
+        let callback: IFabricAsyncOperationCallback = ProviderCallback {
+            provider: provider.clone(),
+            update_epoch,
+            calls: calls.clone(),
+            output: output.clone(),
+        }
+        .into();
+        let context = if update_epoch {
+            let epoch = FABRIC_EPOCH {
+                DataLossNumber: 1,
+                ConfigurationNumber: 2,
+                ..Default::default()
+            };
+            unsafe { provider.BeginUpdateEpoch(&epoch, FABRIC_SEQUENCE_NUMBER(7), &callback) }
+        } else {
+            unsafe { provider.BeginOnDataLoss(&callback) }
+        }
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        output.lock().unwrap().take().unwrap().unwrap();
+        assert!(unsafe { context.CompletedSynchronously() });
+        assert_eq!(
+            unsafe { context.get_Callback().unwrap() }.as_raw(),
+            callback.as_raw()
+        );
+        let repeated = if update_epoch {
+            unsafe { provider.EndUpdateEpoch(&context) }.ok()
+        } else {
+            unsafe { provider.EndOnDataLoss(&context) }.map(|_| ())
+        };
+        assert_eq!(repeated.unwrap_err().code(), com::E_INVALIDARG);
+    }
 }
 
 #[test]

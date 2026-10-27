@@ -1,33 +1,32 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License. See LICENSE.service-fabric-apps-rs at the repository root.
 
-use mssf_com::FabricCommon::{IFabricAsyncOperationCallback, IFabricAsyncOperationContext};
+use mssf_com::FabricCommon::{
+    IFabricAsyncOperationCallback, IFabricAsyncOperationContext, IFabricAsyncOperationContext_Impl,
+};
 use windows_core::{implement, Interface, Ref, Result};
 
-use crate::{
-    abi::{NullableContext, NullableContext_Impl},
-    com,
-};
+use crate::com;
 
-#[implement(NullableContext)]
+#[implement(IFabricAsyncOperationContext)]
 struct CompletedContext {
     callback: Option<IFabricAsyncOperationCallback>,
 }
 
-impl NullableContext_Impl for CompletedContext_Impl {
-    unsafe fn IsCompleted(&self) -> bool {
+impl IFabricAsyncOperationContext_Impl for CompletedContext_Impl {
+    fn IsCompleted(&self) -> bool {
         true
     }
 
-    unsafe fn CompletedSynchronously(&self) -> bool {
+    fn CompletedSynchronously(&self) -> bool {
         true
     }
 
-    unsafe fn get_Callback(&self, out: *mut Option<IFabricAsyncOperationCallback>) -> Result<()> {
-        unsafe { com::return_interface(out, self.callback.clone()) }
+    fn get_Callback(&self) -> Result<IFabricAsyncOperationCallback> {
+        self.callback.clone().ok_or_else(|| com::E_POINTER.into())
     }
 
-    unsafe fn Cancel(&self) -> Result<()> {
+    fn Cancel(&self) -> Result<()> {
         // Cancellation cannot undo an already completed synchronous fixture result.
         Ok(())
     }
@@ -36,21 +35,15 @@ impl NullableContext_Impl for CompletedContext_Impl {
 pub(crate) fn completed(
     callback: Ref<IFabricAsyncOperationCallback>,
 ) -> Result<IFabricAsyncOperationContext> {
-    let context: NullableContext = CompletedContext {
+    Ok(CompletedContext {
         callback: callback.as_ref().cloned(),
     }
-    .into();
-    context.cast()
+    .into())
 }
 
-/// Publish the result and output context before calling this (reentrant callback).
+/// Publish the result before calling this; callbacks may reenter End.
 pub(crate) fn notify(context: &IFabricAsyncOperationContext) {
-    let mut raw = std::ptr::null_mut();
-    let callback: Result<Option<IFabricAsyncOperationCallback>> = unsafe {
-        let status = (context.vtable().get_Callback)(context.as_raw(), &mut raw);
-        com::nullable_result(status, raw)
-    };
-    if let Ok(Some(callback)) = callback {
+    if let Ok(callback) = unsafe { context.get_Callback() } {
         unsafe { callback.Invoke(context) };
     }
 }

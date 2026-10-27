@@ -10,13 +10,15 @@ use std::{ptr, sync::Mutex};
 
 use mssf_com::{
     FabricCommon::{IFabricAsyncOperationCallback, IFabricAsyncOperationContext},
-    FabricRuntime::{IFabricOperationData, IFabricOperationDataStream, IFabricStateProvider},
+    FabricRuntime::{
+        IFabricOperationData, IFabricOperationDataStream, IFabricStateProvider,
+        IFabricStateProvider_Impl,
+    },
     FabricTypes::{FABRIC_EPOCH, FABRIC_SEQUENCE_NUMBER},
 };
 use windows_core::{implement, Interface, Ref, Result};
 
 use crate::{
-    abi::{NullableStateProvider, NullableStateProvider_Impl},
     com,
     context::{self, Pending},
     stream::{operation_data_stream, StreamItem, MAX_STREAM_ITEMS},
@@ -27,7 +29,7 @@ enum Completion {
     DataLoss,
 }
 
-#[implement(NullableStateProvider)]
+#[implement(IFabricStateProvider)]
 struct Provider {
     boundary: i64,
     snapshot: Vec<IFabricOperationData>,
@@ -43,67 +45,54 @@ pub fn snapshot_provider(
     if boundary < 0 || snapshot.len() > MAX_STREAM_ITEMS {
         return Err(com::E_INVALIDARG.into());
     }
-    let provider: NullableStateProvider = Provider {
+    Ok(Provider {
         boundary,
         snapshot,
         pending: Mutex::new(None),
         epoch: Mutex::new(None),
     }
-    .into();
-    provider.cast()
+    .into())
 }
 
-impl NullableStateProvider_Impl for Provider_Impl {
-    unsafe fn GetLastCommittedSequenceNumber(
-        &self,
-        out: *mut FABRIC_SEQUENCE_NUMBER,
-    ) -> Result<()> {
-        if out.is_null() {
-            return Err(com::E_POINTER.into());
-        }
-        unsafe { out.write(FABRIC_SEQUENCE_NUMBER(self.boundary)) };
-        Ok(())
+impl IFabricStateProvider_Impl for Provider_Impl {
+    fn GetLastCommittedSequenceNumber(&self) -> Result<FABRIC_SEQUENCE_NUMBER> {
+        Ok(FABRIC_SEQUENCE_NUMBER(self.boundary))
     }
 
-    unsafe fn GetCopyContext(&self, out: *mut Option<IFabricOperationDataStream>) -> Result<()> {
-        // Volatile classic copy context is null, not an allocated empty stream.
-        unsafe { com::clear_out(out) }
+    fn GetCopyContext(&self) -> Result<IFabricOperationDataStream> {
+        // Native volatile replication never requests copy context.
+        operation_data_stream(Vec::new())
     }
 
-    unsafe fn GetCopyState(
+    fn GetCopyState(
         &self,
         boundary: FABRIC_SEQUENCE_NUMBER,
         copy_context: Ref<IFabricOperationDataStream>,
-        out: *mut Option<IFabricOperationDataStream>,
-    ) -> Result<()> {
+    ) -> Result<IFabricOperationDataStream> {
         com::guard(|| {
-            unsafe { com::clear_out(out)? };
             if copy_context.as_ref().is_some() {
                 return Err(com::E_INVALIDARG.into());
             }
             if boundary.0 != self.boundary {
                 return Err(com::E_NOTIMPL.into());
             }
-            let stream = operation_data_stream(
+            operation_data_stream(
                 self.snapshot
                     .iter()
                     .cloned()
                     .map(StreamItem::Data)
                     .collect(),
-            )?;
-            unsafe { com::return_interface(out, Some(stream)) }
+            )
         })
     }
 
-    unsafe fn BeginUpdateEpoch(
+    fn BeginUpdateEpoch(
         &self,
         epoch: *const FABRIC_EPOCH,
         previous_boundary: FABRIC_SEQUENCE_NUMBER,
         callback: Ref<IFabricAsyncOperationCallback>,
-        out: *mut Option<IFabricAsyncOperationContext>,
-    ) -> Result<()> {
+    ) -> Result<IFabricAsyncOperationContext> {
         com::guard(|| {
-            unsafe { com::clear_out(out)? };
             let epoch = unsafe { epoch.as_ref() }.ok_or(com::E_POINTER)?;
             if previous_boundary.0 != self.boundary {
                 // This fixed fixture cannot truthfully reconcile another history.
@@ -126,13 +115,12 @@ impl NullableStateProvider_Impl for Provider_Impl {
                 *current = Some(next);
                 *pending = Some(Pending::new(context.clone(), Completion::Epoch));
             }
-            unsafe { com::return_interface(out, Some(context.clone()))? };
             context::notify(&context);
-            Ok(())
+            Ok(context)
         })
     }
 
-    unsafe fn EndUpdateEpoch(&self, context: Ref<IFabricAsyncOperationContext>) -> Result<()> {
+    fn EndUpdateEpoch(&self, context: Ref<IFabricAsyncOperationContext>) -> Result<()> {
         com::guard(|| {
             let mut pending = self.pending.lock().map_err(|_| com::E_UNEXPECTED)?;
             if !pending.as_ref().is_some_and(|pending| {
@@ -145,13 +133,11 @@ impl NullableStateProvider_Impl for Provider_Impl {
         })
     }
 
-    unsafe fn BeginOnDataLoss(
+    fn BeginOnDataLoss(
         &self,
         callback: Ref<IFabricAsyncOperationCallback>,
-        out: *mut Option<IFabricAsyncOperationContext>,
-    ) -> Result<()> {
+    ) -> Result<IFabricAsyncOperationContext> {
         com::guard(|| {
-            unsafe { com::clear_out(out)? };
             let context = context::completed(callback)?;
             {
                 let mut pending = self.pending.lock().map_err(|_| com::E_UNEXPECTED)?;
@@ -160,22 +146,13 @@ impl NullableStateProvider_Impl for Provider_Impl {
                 }
                 *pending = Some(Pending::new(context.clone(), Completion::DataLoss));
             }
-            unsafe { com::return_interface(out, Some(context.clone()))? };
             context::notify(&context);
-            Ok(())
+            Ok(context)
         })
     }
 
-    unsafe fn EndOnDataLoss(
-        &self,
-        context: Ref<IFabricAsyncOperationContext>,
-        changed: *mut bool,
-    ) -> Result<()> {
+    fn EndOnDataLoss(&self, context: Ref<IFabricAsyncOperationContext>) -> Result<bool> {
         com::guard(|| {
-            if changed.is_null() {
-                return Err(com::E_POINTER.into());
-            }
-            unsafe { changed.write(false) };
             let mut pending = self.pending.lock().map_err(|_| com::E_UNEXPECTED)?;
             if !pending.as_ref().is_some_and(|pending| {
                 pending.matches(&context) && matches!(pending.result_ref(), Completion::DataLoss)
@@ -184,12 +161,12 @@ impl NullableStateProvider_Impl for Provider_Impl {
             }
             context::finish(&mut pending, context)?;
             // The immutable fixture retains its state; no fabricated state loss.
-            Ok(())
+            Ok(false)
         })
     }
 }
 
-/// Null-aware projection for the volatile provider's GetCopyContext.
+/// Null-aware receive helper; this fixture returns a non-null empty stream.
 pub fn get_copy_context(
     provider: &IFabricStateProvider,
 ) -> Result<Option<IFabricOperationDataStream>> {
