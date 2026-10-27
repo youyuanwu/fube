@@ -255,6 +255,8 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
         .report_move_cost(crate::MoveCost::High)
         .await
         .is_err());
+    assert!(current.report_health(&health_report()).await.is_err());
+    assert!(current.report_fault(FaultType::Transient).await.is_err());
 }
 
 fn health_report() -> crate::HealthReport {
