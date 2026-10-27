@@ -679,6 +679,7 @@ impl Harness {
             rx,
         );
         let calls = Arc::new(Calls::default());
+        peer.set_nodelay(true).unwrap();
         engine
             .insert_factory("ModelType".into(), Arc::new(Factory(calls.clone())))
             .unwrap();
@@ -823,11 +824,9 @@ impl Harness {
         msg
     }
     async fn no_reply(&mut self) {
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), read_message(&mut self.peer))
-                .await
-                .is_err()
-        );
+        let received =
+            tokio::time::timeout(Duration::from_millis(30), read_message(&mut self.peer)).await;
+        assert!(received.is_err(), "unexpected model response: {received:?}");
     }
 }
 

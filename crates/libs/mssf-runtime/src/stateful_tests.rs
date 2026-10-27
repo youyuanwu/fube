@@ -1,6 +1,8 @@
 //! Adapter tests use controlled callbacks, not a purported empty-state policy.
 //! The actual sample custom replicator has its own controlled-peer test gate.
 use super::*;
+#[path = "stateful_control_tests.rs"]
+mod control_tests;
 use crate::{
     CatchUpMode, ReplicaInformation, ReplicaRole, ReplicaSetConfiguration, ReplicationProgress,
     Replicator, StatefulFactory, StatefulPartition, StatefulService, StatefulServiceContext,
@@ -11,12 +13,24 @@ struct StatefulCalls {
     events: Mutex<Vec<&'static str>>,
     partitions: Mutex<Vec<StatefulPartition>>,
     release: Notify,
+    catch_up_release: Notify,
+    build_release: Notify,
+    configuration_release: Notify,
+    configurations: Mutex<Vec<(ReplicaSetConfiguration, Option<ReplicaSetConfiguration>)>>,
+    builds: Mutex<Vec<ReplicaInformation>>,
+    epochs: Mutex<Vec<crate::Epoch>>,
+    access_events: Mutex<Vec<(&'static str, (crate::AccessStatus, crate::AccessStatus))>>,
 }
 impl StatefulCalls {
     fn record(&self, event: &'static str) {
         // A callback must be able to inspect its published snapshot.
         for partition in self.partitions.lock().unwrap().iter() {
-            let _ = partition.status();
+            if let Ok(status) = partition.status() {
+                self.access_events
+                    .lock()
+                    .unwrap()
+                    .push((event, status.access()));
+            }
         }
         self.events.lock().unwrap().push(event);
     }
@@ -26,7 +40,7 @@ struct StatefulFixture {
     calls: Arc<StatefulCalls>,
     mode: u8,
 }
-struct ReplicatorFixture(Arc<StatefulCalls>);
+struct ReplicatorFixture(Arc<StatefulCalls>, u8);
 impl StatefulFactory for StatefulFactoryFixture {
     fn create(
         &self,
@@ -46,11 +60,27 @@ impl StatefulService for StatefulFixture {
     fn open(
         &self,
         partition: StatefulPartition,
-        _: Cancellation,
+        cancellation: Cancellation,
     ) -> ServiceFuture<'_, Arc<dyn Replicator>> {
         Box::pin(async move {
             self.calls.record("serviceOpen");
             self.calls.partitions.lock().unwrap().push(partition);
+            if self.mode == 28
+                && self
+                    .calls
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| **e == "serviceOpen")
+                    .count()
+                    == 1
+            {
+                return Err(Error::Remote {
+                    code: -456,
+                    message: "first Open fails for retry test".into(),
+                });
+            }
             match self.mode {
                 1 => {
                     return Err(Error::Remote {
@@ -58,10 +88,13 @@ impl StatefulService for StatefulFixture {
                         message: "controlled open failure".into(),
                     })
                 }
-                8 => self.calls.release.notified().await,
+                8 => tokio::select! {
+                    _ = self.calls.release.notified() => {},
+                    _ = cancellation.cancelled() => return Err(Error::Closed),
+                },
                 _ => {}
             }
-            Ok(Arc::new(ReplicatorFixture(self.calls.clone())) as Arc<dyn Replicator>)
+            Ok(Arc::new(ReplicatorFixture(self.calls.clone(), self.mode)) as Arc<dyn Replicator>)
         })
     }
     fn change_role(&self, role: ReplicaRole, _: Cancellation) -> ServiceFuture<'_, String> {
@@ -73,6 +106,9 @@ impl StatefulService for StatefulFixture {
                 ReplicaRole::None => "serviceNone",
                 ReplicaRole::Unknown => return Err(Error::Protocol("unexpected unknown role")),
             });
+            if self.mode == 30 && role == ReplicaRole::Primary {
+                self.calls.release.notified().await;
+            }
             Ok(if role == ReplicaRole::Primary {
                 "model://stateful/client"
             } else {
@@ -84,6 +120,9 @@ impl StatefulService for StatefulFixture {
     fn close(&self, _: Cancellation) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
             self.calls.record("serviceClose");
+            if self.mode == 31 {
+                self.calls.release.notified().await;
+            }
             if self.mode == 2 {
                 return Err(Error::Protocol("controlled close failure"));
             }
@@ -104,11 +143,12 @@ impl Replicator for ReplicatorFixture {
     }
     fn change_role(
         &self,
-        _: crate::Epoch,
+        epoch: crate::Epoch,
         role: ReplicaRole,
         _: Cancellation,
     ) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
+            self.0.epochs.lock().unwrap().push(epoch);
             self.0.record(match role {
                 ReplicaRole::Primary => "replicatorPrimary",
                 ReplicaRole::Idle => "replicatorIdle",
@@ -119,53 +159,132 @@ impl Replicator for ReplicatorFixture {
             Ok(())
         })
     }
-    fn update_epoch(&self, _: crate::Epoch, _: Cancellation) -> ServiceFuture<'_, ()> {
-        Box::pin(async {
-            Err(Error::Protocol(
-                "unexpected epoch operation in lifecycle fixture",
-            ))
+    fn update_epoch(&self, epoch: crate::Epoch, _: Cancellation) -> ServiceFuture<'_, ()> {
+        Box::pin(async move {
+            if self.1 < 20 {
+                return Err(Error::Protocol("unexpected epoch in lifecycle fixture"));
+            }
+            self.0.record("epoch");
+            self.0.epochs.lock().unwrap().push(epoch);
+            Ok(())
         })
     }
     fn progress(&self) -> Result<ReplicationProgress> {
+        self.0.record("progress");
+        if self.1 == 24 {
+            return Err(Error::Remote {
+                code: -999,
+                message: "controlled progress failure".into(),
+            });
+        }
         Ok(ReplicationProgress::EMPTY)
     }
     fn on_data_loss(&self, _: Cancellation) -> ServiceFuture<'_, bool> {
         Box::pin(async move {
             self.0.record("dataLoss");
-            Ok(false)
+            if self.1 == 29 {
+                return Err(Error::Remote {
+                    code: -995,
+                    message: "controlled data-loss failure".into(),
+                });
+            }
+            Ok(self.1 == 25)
         })
     }
     fn update_catch_up_configuration(
         &self,
-        _: ReplicaSetConfiguration,
-        _: ReplicaSetConfiguration,
+        current: ReplicaSetConfiguration,
+        previous: ReplicaSetConfiguration,
         _: Cancellation,
     ) -> ServiceFuture<'_, ()> {
-        Box::pin(async {
-            Err(Error::Protocol(
-                "unexpected configuration in lifecycle fixture",
-            ))
+        Box::pin(async move {
+            if self.1 < 20 {
+                return Err(Error::Protocol(
+                    "unexpected configuration in lifecycle fixture",
+                ));
+            }
+            self.0.record("catchupConfiguration");
+            self.0
+                .configurations
+                .lock()
+                .unwrap()
+                .push((current, Some(previous)));
+            if self.1 == 23 && self.0.configurations.lock().unwrap().len() == 1 {
+                self.0.configuration_release.notified().await;
+            }
+            Ok(())
         })
     }
     fn update_current_configuration(
         &self,
-        _: ReplicaSetConfiguration,
+        current: ReplicaSetConfiguration,
         _: Cancellation,
     ) -> ServiceFuture<'_, ()> {
-        Box::pin(async {
-            Err(Error::Protocol(
-                "unexpected current configuration in lifecycle fixture",
-            ))
+        Box::pin(async move {
+            if self.1 < 20 {
+                return Err(Error::Protocol(
+                    "unexpected current configuration in lifecycle fixture",
+                ));
+            }
+            self.0.record("currentConfiguration");
+            self.0.configurations.lock().unwrap().push((current, None));
+            Ok(())
         })
     }
-    fn wait_for_catch_up(&self, _: CatchUpMode, _: Cancellation) -> ServiceFuture<'_, ()> {
-        Box::pin(async { Err(Error::Protocol("unexpected catchup in lifecycle fixture")) })
+    fn wait_for_catch_up(
+        &self,
+        mode: CatchUpMode,
+        cancellation: Cancellation,
+    ) -> ServiceFuture<'_, ()> {
+        Box::pin(async move {
+            if self.1 < 20 {
+                return Err(Error::Protocol("unexpected catchup in lifecycle fixture"));
+            }
+            self.0.record(if mode == CatchUpMode::All {
+                "waitAll"
+            } else {
+                "waitQuorum"
+            });
+            if self.1 == 21 {
+                tokio::select! {
+                    _ = self.0.catch_up_release.notified() => {},
+                    _ = cancellation.cancelled() => return Err(Error::Closed),
+                }
+            }
+            if self.1 == 33 {
+                self.0.catch_up_release.notified().await;
+            }
+            Ok(())
+        })
     }
-    fn build_replica(&self, _: ReplicaInformation, _: Cancellation) -> ServiceFuture<'_, ()> {
-        Box::pin(async { Err(Error::Protocol("unexpected build in lifecycle fixture")) })
+    fn build_replica(
+        &self,
+        replica: ReplicaInformation,
+        cancellation: Cancellation,
+    ) -> ServiceFuture<'_, ()> {
+        Box::pin(async move {
+            if self.1 < 20 {
+                return Err(Error::Protocol("unexpected build in lifecycle fixture"));
+            }
+            self.0.record("build");
+            self.0.builds.lock().unwrap().push(replica);
+            if self.1 == 22 {
+                tokio::select! {
+                    _ = self.0.build_release.notified() => {},
+                    _ = cancellation.cancelled() => return Err(Error::Closed),
+                }
+            }
+            Ok(())
+        })
     }
     fn remove_replica(&self, _: ReplicaInformation, _: Cancellation) -> ServiceFuture<'_, ()> {
-        Box::pin(async { Err(Error::Protocol("unexpected remove in lifecycle fixture")) })
+        Box::pin(async move {
+            if self.1 < 20 {
+                return Err(Error::Protocol("unexpected remove in lifecycle fixture"));
+            }
+            self.0.record("remove");
+            Ok(())
+        })
     }
     fn close(&self, _: Cancellation) -> ServiceFuture<'_, ()> {
         Box::pin(async move {

@@ -13,7 +13,10 @@ fn model_child() {
     let Ok(mode) = std::env::var("MSSF_MODEL_CHILD") else {
         return;
     };
-    let mut builder = if mode == "drop-capture" {
+    let mut builder = if matches!(
+        mode.as_str(),
+        "drop-capture" | "stateful-blocked-create-method" | "stateful-blocked-future-drop"
+    ) {
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder.worker_threads(2);
         builder
@@ -42,13 +45,40 @@ fn model_child() {
         }
         let mut runtime = attached.unwrap();
         match mode.as_str() {
-            "stateful-blocked-factory" => {
-                struct Blocked;
+            "stateful-blocked-factory"
+            | "stateful-blocked-create-method"
+            | "stateful-blocked-future-drop" => {
+                struct Blocked(u8);
+                struct BlockingFutureDrop;
+                impl std::future::Future for BlockingFutureDrop {
+                    type Output = Result<Arc<dyn StatefulService>>;
+                    fn poll(
+                        self: std::pin::Pin<&mut Self>,
+                        _: &mut std::task::Context<'_>,
+                    ) -> std::task::Poll<Self::Output> {
+                        std::task::Poll::Ready(Err(Error::Protocol("controlled factory error")))
+                    }
+                }
+                impl Drop for BlockingFutureDrop {
+                    fn drop(&mut self) {
+                        println!("STATEFUL_FUTURE_DROP_ENTERED");
+                        std::io::stdout().flush().unwrap();
+                        std::thread::sleep(Duration::from_secs(60));
+                    }
+                }
                 impl StatefulFactory for Blocked {
                     fn create(
                         &self,
                         _: StatefulServiceContext,
                     ) -> ServiceFuture<'_, Arc<dyn StatefulService>> {
+                        if self.0 == 1 {
+                            println!("STATEFUL_FACTORY_ENTERED");
+                            std::io::stdout().flush().unwrap();
+                            std::thread::sleep(Duration::from_secs(60));
+                        }
+                        if self.0 == 2 {
+                            return Box::pin(BlockingFutureDrop);
+                        }
                         Box::pin(async {
                             // No executor, cancellation or stderr progress is
                             // available; only the independent OS fence can win.
@@ -59,8 +89,18 @@ fn model_child() {
                         })
                     }
                 }
+                let kind = match mode.as_str() {
+                    "stateful-blocked-create-method" => 1,
+                    "stateful-blocked-future-drop" => 2,
+                    _ => 0,
+                };
+                if kind != 0 {
+                    runtime
+                        .lifecycle
+                        .set_stateful_callback_timeout(Duration::from_millis(50));
+                }
                 runtime
-                    .register_stateful("BlockedStateful", Arc::new(Blocked))
+                    .register_stateful("BlockedStateful", Arc::new(Blocked(kind)))
                     .await
                     .unwrap();
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -240,7 +280,7 @@ async fn scenario(mode: &str, expected: i32) {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if mode == "stateful-blocked-factory" {
+    if mode.starts_with("stateful-blocked-") {
         command.stdout(Stdio::piped());
     }
     for (k, v) in [
@@ -369,7 +409,7 @@ async fn scenario(mode: &str, expected: i32) {
                     if mode_owned == "live-update" {
                         assert_eq!(registration.context.code.version.instance, 4);
                     } else {
-                        assert_eq!(mode_owned, "stateful-blocked-factory");
+                        assert!(mode_owned.starts_with("stateful-blocked-"));
                         assert_eq!(registration.id.name, "BlockedStateful");
                     }
                     assert_eq!(
@@ -407,7 +447,8 @@ async fn scenario(mode: &str, expected: i32) {
             {
                 return;
             }
-            if p.action == "RegisterServiceTypeRequest" && mode_owned == "stateful-blocked-factory"
+            if p.action == "RegisterServiceTypeRequest"
+                && mode_owned.starts_with("stateful-blocked-")
             {
                 let context = runtime_context.as_ref().unwrap();
                 let mut open =
@@ -487,7 +528,7 @@ async fn scenario(mode: &str, expected: i32) {
         }
     });
     let started = Monotonic::now();
-    if mode == "stateful-blocked-factory" {
+    if mode.starts_with("stateful-blocked-") {
         use tokio::io::AsyncBufReadExt;
         let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -498,7 +539,12 @@ async fn scenario(mode: &str, expected: i32) {
                     .unwrap()
                     .expect("child exited without entering stateful factory");
                 assert!(line.len() < 1024);
-                if line.contains("STATEFUL_FACTORY_ENTERED") {
+                let marker = if mode == "stateful-blocked-future-drop" {
+                    "STATEFUL_FUTURE_DROP_ENTERED"
+                } else {
+                    "STATEFUL_FACTORY_ENTERED"
+                };
+                if line.contains(marker) {
                     return;
                 }
             }
@@ -536,6 +582,12 @@ async fn blocking_subscription_capture_destruction_cannot_delay_owner_drop_fence
 #[tokio::test]
 async fn blocked_stateful_factory_cannot_delay_independent_process_fence() {
     scenario("stateful-blocked-factory", 70).await;
+}
+
+#[tokio::test]
+async fn stateful_callback_invocation_and_future_drop_are_supervised_with_unexpired_lease() {
+    scenario("stateful-blocked-create-method", 70).await;
+    scenario("stateful-blocked-future-drop", 70).await;
 }
 
 #[cfg(unix)]

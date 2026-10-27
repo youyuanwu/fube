@@ -72,6 +72,10 @@ pub(crate) struct Engine {
     task: JoinHandle<()>,
 }
 impl Engine {
+    #[cfg(test)]
+    pub(crate) fn set_stateful_callback_timeout(&self, timeout: Duration) {
+        self.shared.stateful.set_callback_timeout(timeout);
+    }
     pub(crate) fn metrics(&self) -> Arc<RuntimeMetrics> {
         self.shared.metrics.clone()
     }
@@ -84,12 +88,14 @@ impl Engine {
         let activation = (*current.snapshot()).clone();
         let live = Arc::new(Semaphore::new(MAX_SERVICE_UNITS));
         let metrics = Arc::new(RuntimeMetrics::default());
+        let reports = Arc::new(Semaphore::new(crate::reporting::MAX_CONCURRENT_REPORTS));
         let stateful = crate::stateful::Registry::new(
             current.clone(),
             authority.clone(),
             connection.clone(),
             live.clone(),
             metrics.clone(),
+            reports.clone(),
         );
         let shared = Arc::new(Shared {
             units: Mutex::new(HashMap::new()),
@@ -104,7 +110,7 @@ impl Engine {
             authority,
             connection,
             metrics,
-            reports: Arc::new(Semaphore::new(crate::reporting::MAX_CONCURRENT_REPORTS)),
+            reports,
         });
         let (stop, mut stopped) = watch::channel(false);
         let task_shared = shared.clone();
@@ -207,6 +213,8 @@ impl Engine {
             abort(service).await?;
         }
         self.shared.stateful.quiesce().await?;
+        let factories = std::mem::take(&mut *self.shared.factories.lock().unwrap());
+        drop(factories);
         Ok(())
     }
 }
@@ -320,6 +328,21 @@ async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
             .stateful
             .dispatch(&props.action, request, incoming.reply)
             .await;
+    }
+    if owner.is_none()
+        && matches!(
+            props.action.as_str(),
+            "UpdateConfiguration"
+                | "ReplicatorBuildIdleReplica"
+                | "ReplicatorRemoveIdleReplica"
+                | "ReplicatorGetStatus"
+                | "ReplicatorUpdateEpochAndGetStatus"
+                | "CancelCatchupReplicaSet"
+                | "ProxyReplicaEndpointUpdatedReply"
+        )
+    {
+        // Native retries/delayed controls cannot create a missing replica.
+        return Ok(());
     }
     if props.action == "RAPQuery" {
         // Native Query.HostQueryAsyncOperation uses a fully serialized DEFAULT

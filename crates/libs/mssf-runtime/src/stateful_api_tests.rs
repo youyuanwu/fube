@@ -234,6 +234,8 @@ fn stateful_partition_snapshot_cannot_grant_or_revive_owner_authority() {
             partition_id: uuid::Uuid::new_v4(),
             replica_id: 43,
             incarnation: 7,
+            node_id: [1; 16],
+            node_instance: 2,
         },
         kind: PartitionKind::Singleton,
         authority: authority.clone(),

@@ -293,6 +293,12 @@ pub struct ProxyReply {
     pub flags: i64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicaMessage {
+    pub unit: FailoverUnit,
+    pub local: Replica,
+    pub service: Service,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateServiceReply {
     pub error: i64,
     pub unit: FailoverUnit,

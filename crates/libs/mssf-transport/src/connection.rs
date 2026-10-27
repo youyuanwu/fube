@@ -160,8 +160,25 @@ impl IpcReplyContext {
         deadline: Instant,
         valid: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<()> {
+        self.reply_with_action_fenced(actor, None, body, deadline, valid)
+            .await
+    }
+
+    /// Preserve an operation's explicit semantic action on a correlated reply,
+    /// with the same cancellation/pre-frame fence as [`Self::reply_fenced`].
+    pub async fn reply_with_action_fenced(
+        self,
+        actor: i64,
+        action: Option<&str>,
+        body: Vec<u8>,
+        deadline: Instant,
+        valid: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<()> {
         let shared = self.shared.upgrade().ok_or(Error::Closed)?;
-        let headers = vec![Header::actor(actor)?, Header::relates_to(self.id)?];
+        let mut headers = vec![Header::actor(actor)?, Header::relates_to(self.id)?];
+        if let Some(action) = action {
+            headers.push(Header::action(action)?);
+        }
         let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
         struct Guard(Arc<std::sync::atomic::AtomicBool>);
         impl Drop for Guard {

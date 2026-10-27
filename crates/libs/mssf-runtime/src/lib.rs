@@ -498,7 +498,7 @@ impl Runtime {
             task.abort();
         }
         self.connection.close().await?;
-        self.authority.disarm();
+        self.authority.disarm()?;
         self.shutdown = true;
         Ok(())
     }

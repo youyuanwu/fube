@@ -21,6 +21,8 @@ pub struct ReplicaIdentity {
     pub partition_id: uuid::Uuid,
     pub replica_id: i64,
     pub incarnation: i64,
+    pub node_id: [u8; 16],
+    pub node_instance: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -96,13 +98,15 @@ impl ReplicationProgress {
     }
 }
 
-/// Remote up/Ready members projected by RAP. The local replica is implicit and
-/// counts towards write_quorum; a quorum is not clamped to available remotes.
+/// Remote up/Ready members projected by RAP. Local is excluded from the array;
+/// count its vote only when `local_member` is true. A quorum is not clamped to
+/// the available remote array length.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaSetConfiguration {
     pub epoch: Epoch,
     pub replicas: Vec<ReplicaInformation>,
     pub write_quorum: usize,
+    pub local_member: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +123,9 @@ pub trait StatefulFactory: Send + Sync + 'static {
 }
 
 /// Callbacks run outside protocol locks/readers. Cancellation is advisory;
-/// Abort must dispose owned resources synchronously before returning.
+/// their futures must complete only after owned work has quiesced. An ignored
+/// cancellation is not a completed operation. Callback deadlines/panics are
+/// terminal host faults. Abort disposes owned resources synchronously.
 pub trait StatefulService: Send + Sync + 'static {
     /// New volatile lifetime only. Return an owned, non-null custom replicator.
     fn open(
