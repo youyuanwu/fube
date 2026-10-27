@@ -108,7 +108,7 @@ class BinaryBundleTests(unittest.TestCase):
         self.assertEqual(command.call_args.args[0], str(binaries.observer))
 
     def test_templates_are_strict_prebuilt_inputs(self):
-        for failure in ("missing","extra","tampered","symlink"):
+        for failure in ("missing","extra","tampered","symlink","fifo","metadata-fifo"):
             directory = self.bundle(f"templates-{failure}")
             path = directory / "package-v2/RustRuntimeService/Config/Settings.xml"
             if failure == "missing":
@@ -117,9 +117,15 @@ class BinaryBundleTests(unittest.TestCase):
                 (directory / "unexpected.xml").write_text("<not-allowed/>")
             elif failure == "tampered":
                 path.write_text("<tampered/>")
-            else:
+            elif failure == "symlink":
                 path.unlink()
                 path.symlink_to(directory / "package-v1/RustRuntimeService/Config/Settings.xml")
+            elif failure == "fifo":
+                runtime.os.mkfifo(directory / "package-v2/unlisted-pipe")
+            else:
+                manifest=directory / "build-info.json"
+                manifest.unlink()
+                runtime.os.mkfifo(manifest)
             with patch.object(runtime,"run",side_effect=AssertionError("compiler fallback")):
                 with self.assertRaises(RuntimeError):
                     runtime.load_bundle(directory)

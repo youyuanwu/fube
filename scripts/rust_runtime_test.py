@@ -117,7 +117,10 @@ def build_bundle(directory: Path) -> None:
 
 def load_bundle(directory: Path) -> Binaries:
     directory = directory.resolve(strict=True)
-    metadata = json.loads((directory / "build-info.json").read_text(encoding="utf-8"))
+    manifest = directory / "build-info.json"
+    if manifest.is_symlink() or not manifest.is_file() or manifest.stat().st_size>1048576:
+        raise RuntimeError("runtime bundle metadata must be a bounded regular file")
+    metadata = json.loads(manifest.read_text(encoding="utf-8"))
     if not isinstance(metadata, dict) or metadata.get("version") != 2:
         raise RuntimeError("unsupported runtime binary bundle")
     graph = metadata.get("dependency_graph")
@@ -134,7 +137,7 @@ def load_bundle(directory: Path) -> Binaries:
         if len(entries)>64:
             raise RuntimeError("runtime bundle entry bound")
     expected_directories = {parent.as_posix() for name in expected_names for parent in Path(name).parents if parent != Path(".")}
-    if any(entry.is_symlink() for entry in entries) or {
+    if any(entry.is_symlink() or not (entry.is_file() or entry.is_dir()) for entry in entries) or {
         entry.relative_to(directory).as_posix() for entry in entries if entry.is_file()
     } != expected_names | {"build-info.json"} or {
         entry.relative_to(directory).as_posix() for entry in entries if entry.is_dir()
