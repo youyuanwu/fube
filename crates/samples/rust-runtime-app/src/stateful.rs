@@ -456,9 +456,18 @@ impl Replicator for EmptyReplicator {
                         state.revision,
                     )
                 };
-                let old_epoch = if native.current_role == ReplicaRole::Secondary
-                    && native.configuration_stage == ConfigurationStage::PreWriteRevoke
-                {
+                // Native demotes before promoting the target. Both ALL checks
+                // surround our UpdateEpoch; neither advances peers' epochs.
+                // An actual peer in the native previous epoch therefore proves
+                // empty readiness during this transition only, not primary
+                // quorum readiness or application replication.
+                let old_epoch = if mode == CatchUpMode::All
+                    && native.current_role == ReplicaRole::Secondary
+                    && native.replicator_role == ReplicaRole::Primary
+                    && matches!(
+                        native.configuration_stage,
+                        ConfigurationStage::PreWriteRevoke | ConfigurationStage::CatchUp
+                    ) {
                     previous.as_ref().map(|old| old.epoch)
                 } else {
                     None

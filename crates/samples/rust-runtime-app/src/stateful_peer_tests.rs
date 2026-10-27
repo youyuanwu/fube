@@ -1,6 +1,64 @@
 use super::*;
 
 #[tokio::test]
+async fn both_native_demotion_all_checks_accept_only_the_authorized_previous_epoch() {
+    let (primary, view, _) = replica(1, 100, 1, ReplicaRole::Primary, server()).await;
+    let (_peer, _, address) = replica(2, 200, 1, ReplicaRole::Secondary, server()).await;
+    let old = epoch();
+    let new = Epoch {
+        data_loss: old.data_loss,
+        configuration: old.configuration + (1 << 32),
+    };
+    {
+        let mut status = view.status.lock().unwrap();
+        status.current_role = ReplicaRole::Secondary;
+        status.current_epoch = new;
+        status.previous_epoch = old;
+        status.configuration_stage = ConfigurationStage::PreWriteRevoke;
+    }
+    let mut current = config(
+        vec![information(2, 200, 1, address, ReplicaRole::Secondary)],
+        2,
+        true,
+    );
+    current.epoch = new;
+    let mut previous = current.clone();
+    previous.epoch = old;
+    primary
+        .update_catch_up_configuration(current.clone(), previous.clone(), Cancellation::default())
+        .await
+        .unwrap();
+    primary
+        .wait_for_catch_up(CatchUpMode::All, Cancellation::default())
+        .await
+        .unwrap();
+    // Native demotes before promoting the target. Updating our epoch does not
+    // advance the peer: the second ALL must still prove that real old peer.
+    view.status.lock().unwrap().configuration_stage = ConfigurationStage::CatchUp;
+    primary
+        .update_epoch(new, Cancellation::default())
+        .await
+        .unwrap();
+    primary
+        .update_catch_up_configuration(current, previous, Cancellation::default())
+        .await
+        .unwrap();
+    primary
+        .wait_for_catch_up(CatchUpMode::All, Cancellation::default())
+        .await
+        .unwrap();
+    assert!(primary
+        .wait_for_catch_up(CatchUpMode::WriteQuorum, Cancellation::default())
+        .await
+        .is_err());
+    view.status.lock().unwrap().current_role = ReplicaRole::Primary;
+    assert!(primary
+        .wait_for_catch_up(CatchUpMode::All, Cancellation::default())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn removed_incarnation_cannot_prove_pending_or_future_all_catchup() {
     let (primary, _, _) = replica(1, 100, 1, ReplicaRole::Primary, server()).await;
     let (target, view, real_address) = replica(2, 200, 1, ReplicaRole::Idle, server()).await;

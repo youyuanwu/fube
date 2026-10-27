@@ -465,8 +465,8 @@ def stateful_three(allocation: Allocation, application: str, binaries: Binaries,
     swapped=wait_stateful(service,3,2,observer=binaries.observer,capture=result,
         accept=lambda value:value["primary"]["rpc"]["node"]==target and epoch_of(value)>epoch_of(before))
     result["planned_swap"]={"before":before,"after":swapped,"old_primary_service":http_probe(old["endpoint"])}
-    old_replica=next(r for r in swapped["replicas"] if r["replica"]==old["rpc"]["replica"])
-    if (old_replica["role"]!="ActiveSecondary" or old_replica["rpc"]["pid"]!=old["native_pid"]
+    old_replica=next((r for r in swapped["replicas"] if r["replica"]==old["rpc"]["replica"]),None)
+    if (old_replica is None or old_replica["role"]!="ActiveSecondary" or old_replica["rpc"]["pid"]!=old["native_pid"]
         or result["planned_swap"]["old_primary_service"]["http_status"]!=503):
         raise RuntimeError("planned role movement did not fence the old primary without process replacement")
 
@@ -559,21 +559,23 @@ def failure_artifacts(allocation: Allocation, type_name: str) -> dict:
     code = r"""
 import json,sys,os
 from pathlib import Path
-kind=sys.argv[1]; result=[]; visited=0
+kind=sys.argv[1]; result=[]; visited=0; logs=[]; metadata=[]
 for base,dirs,files in os.walk("/var/lib/sf-node"):
     visited+=1
     if visited>50000:raise RuntimeError("diagnostic directory bound")
     if kind not in base:continue
     for name in files:
-        if not (name.endswith((".err",".out")) or name.endswith("Package.Current.xml") or ".Manifest." in name):
+        is_log=any(marker in name for marker in (".err",".out",".stdout",".stderr"))
+        if not (is_log or name.endswith("Package.Current.xml") or ".Manifest." in name):
             continue
         path=Path(base)/name
         if path.is_symlink() or not path.is_file():continue
-        with path.open("rb") as file:
-            file.seek(max(0,path.stat().st_size-16384)); text=file.read(16384).decode(errors="replace")
-        result.append({"path":str(path),"tail":text})
-        if len(result)>=24:break
-    if len(result)>=24:break
+        candidates=logs if is_log else metadata
+        if len(candidates)<24:candidates.append(path)
+for path in (logs+metadata)[:24]:
+    with path.open("rb") as file:
+        file.seek(max(0,path.stat().st_size-16384)); text=file.read(16384).decode(errors="replace")
+    result.append({"path":str(path),"tail":text})
 print(json.dumps({"visited":visited,"files":result}))
 """
     return json.loads(allocation.execute("python3","-c",code,type_name,timeout=30))
@@ -1188,7 +1190,7 @@ def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | Non
         if stateful=="three":
             result["stateful_after_legacy_recovery"]=wait_stateful(application+"/Stateful",3,2,observer=binaries.observer)
     except Exception as error:
-        result["errors"].append("qualification: "+str(error))
+        result["errors"].append(f"qualification ({type(error).__name__}): {error!r}")
         try:
             result["failure_artifacts"]=failure_artifacts(allocation,type_name)
         except Exception as diagnostic:
