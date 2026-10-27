@@ -464,6 +464,290 @@ mod tests {
     }
 
     #[test]
+    fn between_read_artifact_change_never_publishes_or_binds() {
+        let (fixture, updater, authority) = setup();
+        let before = updater.handle.snapshot();
+        let path = fixture.base.join("RustService.Package.Current.xml");
+        let original = std::fs::read_to_string(&path).unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let observed = ran.clone();
+        crate::packages::STABILITY_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(path, original + "\n").unwrap();
+                observed.store(true, Ordering::Release);
+            }));
+        });
+        assert!(matches!(
+            apply(&updater, request(&updater), &authority),
+            Err(Error::Protocol("native package changed while loading"))
+        ));
+        assert!(ran.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(&before, &updater.handle.snapshot()));
+        assert_eq!(updater.handle.snapshot().code_activation_instance(), None);
+    }
+
+    #[test]
+    fn coherent_changed_code_fingerprint_fields_cannot_publish() {
+        let (fixture, updater, authority) = setup();
+        let before = updater.handle.snapshot();
+        let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = delivered.clone();
+        let _subscription = updater
+            .handle
+            .subscribe_configuration(move |_| {
+                calls.fetch_add(1, Ordering::AcqRel);
+            })
+            .unwrap();
+        for variant in [
+            "name",
+            "version",
+            "sharing",
+            "program",
+            "arguments",
+            "working",
+            "policy",
+            "digest-sharing",
+        ] {
+            fixture.write(1, "old");
+            let current_path = fixture.base.join("RustService.Package.Current.xml");
+            let manifest_path = fixture.base.join("RustService.Manifest.1.xml");
+            for path in [&current_path, &manifest_path] {
+                let xml = std::fs::read_to_string(path).unwrap();
+                let xml = match variant {
+                    "name" => {
+                        xml.replace("<CodePackage Name=\"Code\"", "<CodePackage Name=\"Other\"")
+                    }
+                    "version" => xml.replace(
+                        "<CodePackage Name=\"Code\" Version=\"1\"",
+                        "<CodePackage Name=\"Code\" Version=\"2\"",
+                    ),
+                    "sharing" => {
+                        if path == &current_path {
+                            xml.replace(
+                                "Version=\"1\" IsShared=\"false\"",
+                                "Version=\"1\" IsShared=\"true\"",
+                            )
+                        } else {
+                            xml.replace(
+                                "<CodePackage Name=\"Code\" Version=\"1\"",
+                                "<CodePackage Name=\"Code\" Version=\"1\" IsShared=\"true\"",
+                            )
+                        }
+                    }
+                    "program" => xml.replace("<Program>app</Program>", "<Program>other</Program>"),
+                    "arguments" => xml.replace(
+                        "<Program>app</Program>",
+                        "<Program>app</Program><Arguments>changed</Arguments>",
+                    ),
+                    "working" => {
+                        if path == &current_path {
+                            xml.replace(
+                                "<WorkingFolder>Work</WorkingFolder>",
+                                "<WorkingFolder>CodePackage</WorkingFolder>",
+                            )
+                        } else {
+                            xml.replace(
+                                "</Program>",
+                                "</Program><WorkingFolder>CodePackage</WorkingFolder>",
+                            )
+                        }
+                    }
+                    "policy" => xml.replace(
+                        "</DigestedCodePackage>",
+                        r#"<ResourceGovernancePolicy CpuShares="1024"/></DigestedCodePackage>"#,
+                    ),
+                    _ => xml.replace(
+                        "ContentChecksum=\"code\" IsShared=\"false\"",
+                        "ContentChecksum=\"code\" IsShared=\"true\"",
+                    ),
+                };
+                std::fs::write(path, xml).unwrap();
+            }
+            assert!(
+                apply(&updater, request(&updater), &authority).is_err(),
+                "{variant}"
+            );
+            assert!(
+                Arc::ptr_eq(&before, &updater.handle.snapshot()),
+                "{variant}"
+            );
+            assert_eq!(updater.handle.snapshot().code_activation_instance(), None);
+            assert_eq!(delivered.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn mixed_package_events_preserve_handler_major_old_then_new_order() {
+        fn data(fixture: &Fixture, names: &[(&str, &str)]) {
+            let mut declarations = String::new();
+            let mut digests = String::new();
+            for (name, rollout) in names {
+                std::fs::create_dir_all(fixture.base.join(format!("RustService.{name}.1")))
+                    .unwrap();
+                let declaration = format!(r#"<DataPackage Name="{name}" Version="1"/>"#);
+                declarations.push_str(&declaration);
+                digests.push_str(&format!(r#"<DigestedDataPackage RolloutVersion="{rollout}">{declaration}</DigestedDataPackage>"#));
+            }
+            for (file, tag, needle, replacement) in [
+                (
+                    "RustService.Package.Current.xml",
+                    "DigestedDataPackage",
+                    "<DigestedResources",
+                    digests,
+                ),
+                (
+                    "RustService.Manifest.1.xml",
+                    "DataPackage",
+                    "</ServiceManifest>",
+                    declarations,
+                ),
+            ] {
+                let path = fixture.base.join(file);
+                let mut xml = std::fs::read_to_string(&path).unwrap();
+                let doc = roxmltree::Document::parse(&xml).unwrap();
+                let ranges: Vec<_> = doc
+                    .root_element()
+                    .children()
+                    .filter(|n| n.is_element() && n.tag_name().name() == tag)
+                    .map(|n| n.range())
+                    .collect();
+                drop(doc);
+                for range in ranges.into_iter().rev() {
+                    xml.replace_range(range, "");
+                }
+                std::fs::write(path, xml.replace(needle, &format!("{replacement}{needle}")))
+                    .unwrap();
+            }
+        }
+        fn label<T>(event: &PackageChange<T>, desc: fn(&T) -> &PackageDescription) -> String {
+            match event {
+                PackageChange::Modified { previous, .. } => format!("M:{}", desc(previous).name()),
+                PackageChange::Removed(previous) => format!("R:{}", desc(previous).name()),
+                PackageChange::Added(current) => format!("A:{}", desc(current).name()),
+            }
+        }
+        let fixture = Fixture::new();
+        fixture.config_count(3, 1, "before");
+        data(
+            &fixture,
+            &[("Data0", "1.0"), ("Data1", "1.0"), ("Data2", "1.0")],
+        );
+        let mut activation = fixture.activation.clone();
+        activation.packages = Some(Arc::new(
+            crate::packages::load(&activation, &fixture.root).unwrap(),
+        ));
+        let old = activation
+            .packages()
+            .unwrap()
+            .configuration_package("Config1")
+            .unwrap();
+        let updater = Updater::new(ActivationContextHandle::new(activation), &fixture.root);
+        let authority = Authority::new(Instant::now(), 3_000_000_000).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut subscriptions = Vec::new();
+        for handler in ["C1", "C2"] {
+            let log = log.clone();
+            subscriptions.push(
+                updater
+                    .handle
+                    .subscribe_configuration(move |event| {
+                        match &event {
+                            PackageChange::Modified { previous, .. }
+                            | PackageChange::Removed(previous) => assert_eq!(
+                                previous
+                                    .section("Main")
+                                    .unwrap()
+                                    .parameter("P0")
+                                    .unwrap()
+                                    .raw_value(),
+                                "before"
+                            ),
+                            PackageChange::Added(current) => assert_eq!(
+                                current
+                                    .section("Main")
+                                    .unwrap()
+                                    .parameter("P0")
+                                    .unwrap()
+                                    .raw_value(),
+                                "new"
+                            ),
+                        }
+                        log.lock().unwrap().push(format!(
+                            "{handler}:{}",
+                            label(&event, ConfigurationPackage::description)
+                        ));
+                    })
+                    .unwrap(),
+            );
+        }
+        for handler in ["D1", "D2"] {
+            let log = log.clone();
+            subscriptions.push(
+                updater
+                    .handle
+                    .subscribe_data(move |event| {
+                        log.lock().unwrap().push(format!(
+                            "{handler}:{}",
+                            label(&event, DataPackage::description)
+                        ));
+                    })
+                    .unwrap(),
+            );
+        }
+        fixture.config_count(3, 1, "new");
+        for file in [
+            "RustService.Package.Current.xml",
+            "RustService.Manifest.1.xml",
+        ] {
+            let path = fixture.base.join(file);
+            let xml = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("Name=\"Config1\"", "Name=\"Config3\"")
+                .replace(
+                    r#"<DigestedConfigPackage RolloutVersion="1.0"><ConfigPackage Name="Config0""#,
+                    r#"<DigestedConfigPackage RolloutVersion="2.0"><ConfigPackage Name="Config0""#,
+                );
+            std::fs::write(path, xml).unwrap();
+        }
+        std::fs::rename(
+            fixture.base.join("RustService.Config1.1"),
+            fixture.base.join("RustService.Config3.1"),
+        )
+        .unwrap();
+        data(
+            &fixture,
+            &[("Data0", "2.0"), ("Data2", "1.0"), ("Data3", "1.0")],
+        );
+        apply(&updater, request(&updater), &authority).unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "C1:M:Config0",
+                "C1:R:Config1",
+                "C1:A:Config3",
+                "C2:M:Config0",
+                "C2:R:Config1",
+                "C2:A:Config3",
+                "D1:M:Data0",
+                "D1:R:Data1",
+                "D1:A:Data3",
+                "D2:M:Data0",
+                "D2:R:Data1",
+                "D2:A:Data3",
+            ]
+        );
+        assert!(!old.description().path().exists());
+        assert_eq!(
+            old.section("Main")
+                .unwrap()
+                .parameter("P0")
+                .unwrap()
+                .raw_value(),
+            "before"
+        );
+    }
+
+    #[test]
     fn subscriptions_and_active_worker_have_exact_bounds() {
         let (_, updater, _) = setup();
         let mut subscriptions = Vec::new();

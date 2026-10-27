@@ -310,6 +310,94 @@ class AllocationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
+class AmbiguousUpgradeTests(unittest.TestCase):
+    def execute_upgrade_timeout(self, drift=None):
+        fixture=AllocationTests()
+        fixture.setUp()
+        state,container=fixture.state,fixture.container
+        allocation=MagicMock()
+        allocation.name="owned"; allocation.owner="capability"; allocation.container_id="immutable-container"
+        def verify():
+            return runtime.validate_allocation(state,container,"owned","capability")
+        allocation.verify.side_effect=verify
+        def execute(*_args,**_kwargs):
+            verify()
+            return "{}"
+        allocation.execute.side_effect=execute
+        present={"app":False,"versions":set(),"version":"1.1"}
+        calls=[]
+        application="fabric:/FubeRustRuntime012345abcdef"
+        type_name="FubeRustRuntime012345abcdefType"
+        def sf(*args,**_kwargs):
+            verify()
+            calls.append(args)
+            if args==("application","list"):
+                return json.dumps({"items":[{"name":application,"typeName":type_name,"typeVersion":present["version"]}] if present["app"] else []})
+            if args==("application","type-list"):
+                return json.dumps({"items":[{"name":type_name,"version":v} for v in present["versions"]]})
+            if args[:2]==("application","provision"):
+                present["versions"].add("1.1" if not present["versions"] else "1.2")
+            elif args[:2]==("application","create"):
+                present["app"]=True
+            elif args[:2]==("application","upgrade"):
+                present["version"]="9.9" if drift=="version" else "1.2"
+                if drift=="owner":
+                    state["owner"]="replacement-owner"
+                    container["Config"]["Labels"][runtime.OWNER_LABEL]="replacement-owner"
+                raise subprocess.TimeoutExpired("accepted upgrade with lost completion",1)
+            elif args[:2]==("application","delete"):
+                present["app"]=False
+            elif args[:2]==("application","unprovision"):
+                present["versions"].remove(args[-1])
+            return "{}"
+        allocation.sf.side_effect=sf
+        observation={"rpc":{"partition":"partition","instance":1,"incarnation":2,"pid":3,"host":"host",
+                           "packages":{"configuration":{"value":"before-upgrade"},"runtime_id":"runtime"}},
+                     "native_entry_point_instance":7}
+        def package(*_args,**kwargs):
+            return Path("/generated-upgrade" if kwargs.get("upgrade") else "/generated"),type_name,"1.2" if kwargs.get("upgrade") else "1.1"
+        binaries=runtime.Binaries(Path("/prebuilt/app"),Path("/prebuilt/observer"),"native-free")
+        with patch.object(runtime.uuid,"uuid4",return_value=MagicMock(hex="012345abcdef")), \
+             patch.object(runtime,"package",side_effect=package), \
+             patch.object(runtime,"run",return_value="native-free"), \
+             patch.object(runtime,"digest",return_value="a"*64), \
+             patch.object(runtime,"wait_observe",return_value=observation), \
+             patch.object(runtime,"observe",return_value=observation), \
+             patch.object(runtime,"deployment_artifacts",return_value={}), \
+             patch.object(runtime,"restart") as restart, \
+             patch.object(runtime,"destroy_owned") as destroy:
+            result=runtime.qualify(allocation,binaries=binaries)
+            restart.assert_not_called()
+            destroy.assert_not_called()
+        return result,present,calls
+
+    def test_accepted_upgrade_timeout_reconciles_exact_two_owned_versions(self):
+        result,present,calls=self.execute_upgrade_timeout()
+        self.assertEqual(result["status"],"FAIL")
+        self.assertIn("accepted upgrade",result["errors"][0])
+        self.assertFalse(present["app"])
+        self.assertFalse(present["versions"])
+        self.assertEqual(result["owner"],"capability")
+        self.assertEqual(set(result["cleanup"]["types"]),{"1.1","1.2"})
+        self.assertEqual(sum(v[:2]==("application","upgrade") for v in calls),1)
+
+    def test_ambiguous_upgrade_version_drift_refuses_deployment_cleanup(self):
+        result,present,calls=self.execute_upgrade_timeout("version")
+        self.assertTrue(present["app"])
+        self.assertEqual(present["versions"],{"1.1","1.2"})
+        self.assertIn("retained_for_recovery",result["cleanup"])
+        self.assertFalse(any(v[:2] in {("application","delete"),("application","unprovision")} for v in calls))
+
+    def test_ambiguous_upgrade_owner_drift_never_uses_replacement_capability(self):
+        result,present,calls=self.execute_upgrade_timeout("owner")
+        self.assertTrue(present["app"])
+        self.assertEqual(result["owner"],"capability")
+        self.assertIn("retained_for_recovery",result["cleanup"])
+        self.assertTrue(any("ownership" in error for error in result["errors"]))
+        self.assertFalse(any(v[:2] in {("application","delete"),("application","unprovision")} for v in calls))
+
+
+@unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class VersionOwnershipTests(unittest.TestCase):
     def test_upgraded_application_and_each_owned_version_are_removed_and_verified(self):
         allocation=MagicMock()

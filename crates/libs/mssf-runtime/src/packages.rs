@@ -294,7 +294,14 @@ struct Reader {
 }
 impl Reader {
     fn read(&mut self, path: &Path) -> Result<String> {
-        let file = File::open(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file: File = options.open(path)?;
         let meta = file.metadata()?;
         if !meta.is_file() || meta.len() > MAX_ARTIFACT_BYTES as u64 {
             return Err(Error::ResourceLimit("native package artifact file"));
@@ -848,6 +855,13 @@ pub(crate) fn load(activation: &ActivationContext, deployment: &Path) -> Result<
         }
         endpoints.insert(component(fields[0])?, port);
     }
+    #[cfg(test)]
+    {
+        let hook = STABILITY_HOOK.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
     if reader.read(&current_path)? != current {
         return Err(Error::Protocol("native package changed while loading"));
     }
@@ -857,6 +871,12 @@ pub(crate) fn load(activation: &ActivationContext, deployment: &Path) -> Result<
         code_fingerprint: fingerprint,
         endpoints,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static STABILITY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]

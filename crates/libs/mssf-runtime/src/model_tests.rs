@@ -13,126 +13,148 @@ fn model_child() {
     let Ok(mode) = std::env::var("MSSF_MODEL_CHILD") else {
         return;
     };
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            if mode == "attach-cancel" {
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(50), Runtime::attach())
-                        .await
-                        .is_err()
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                return;
-            }
-            let attached = Runtime::attach().await;
-            if mode.starts_with("startup-")
-                || mode == "registration-failure"
-                || mode == "overflow"
-                || mode == "attach-cancel"
-            {
-                assert!(attached.is_err());
-                return;
-            }
-            let mut runtime = attached.unwrap();
-            match mode.as_str() {
-                "live-update" => {
-                    struct Unplaced;
-                    impl StatelessFactory for Unplaced {
-                        fn create(
-                            &self,
-                            _: ServiceContext,
-                        ) -> ServiceFuture<'_, Arc<dyn StatelessService>> {
-                            Box::pin(async { panic!("model type is not placed") })
-                        }
+    let mut builder = if mode == "drop-capture" {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(2);
+        builder
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    builder.enable_all().build().unwrap().block_on(async {
+        if mode == "attach-cancel" {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), Runtime::attach())
+                    .await
+                    .is_err()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            return;
+        }
+        let attached = Runtime::attach().await;
+        if mode.starts_with("startup-")
+            || mode == "registration-failure"
+            || mode == "overflow"
+            || mode == "attach-cancel"
+            || mode == "fifo-startup"
+        {
+            assert!(attached.is_err());
+            return;
+        }
+        let mut runtime = attached.unwrap();
+        match mode.as_str() {
+            "live-update" => {
+                struct Unplaced;
+                impl StatelessFactory for Unplaced {
+                    fn create(
+                        &self,
+                        _: ServiceContext,
+                    ) -> ServiceFuture<'_, Arc<dyn StatelessService>> {
+                        Box::pin(async { panic!("model type is not placed") })
                     }
-                    let old = runtime.activation_context();
-                    tokio::time::timeout(Duration::from_secs(2), async {
-                        while runtime.activation_context().generation() == 0 {
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                        }
-                    })
+                }
+                let old = runtime.activation_context();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while runtime.activation_context().generation() == 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    old.packages()
+                        .unwrap()
+                        .configuration_package("Config")
+                        .unwrap()
+                        .description()
+                        .version(),
+                    "1"
+                );
+                assert_eq!(
+                    runtime
+                        .activation_context()
+                        .packages()
+                        .unwrap()
+                        .configuration_package("Config")
+                        .unwrap()
+                        .description()
+                        .version(),
+                    "2"
+                );
+                runtime
+                    .register_stateless("LaterType", Arc::new(Unplaced))
                     .await
                     .unwrap();
-                    assert_eq!(
-                        old.packages()
-                            .unwrap()
-                            .configuration_package("Config")
-                            .unwrap()
-                            .description()
-                            .version(),
-                        "1"
-                    );
-                    assert_eq!(
-                        runtime
-                            .activation_context()
-                            .packages()
-                            .unwrap()
-                            .configuration_package("Config")
-                            .unwrap()
-                            .description()
-                            .version(),
-                        "2"
-                    );
-                    runtime
-                        .register_stateless("LaterType", Arc::new(Unplaced))
-                        .await
-                        .unwrap();
-                    runtime.shutdown().await.unwrap();
-                }
-                "update-block" | "update-panic" => {
-                    let should_panic = mode == "update-panic";
-                    let _registration = runtime
-                        .context_handle()
-                        .subscribe_configuration(move |_| {
-                            assert!(!should_panic, "injected package callback panic");
-                            std::thread::sleep(Duration::from_secs(60));
-                        })
-                        .unwrap();
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    panic!("blocked callback defeated update deadline");
-                }
-                "shutdown-ok" => runtime.shutdown().await.unwrap(),
-                "shutdown-fail" => assert!(runtime.shutdown().await.is_err()),
-                "shutdown-cancel" => assert!(tokio::time::timeout(
-                    Duration::from_millis(100),
-                    runtime.shutdown()
-                )
-                .await
-                .is_err()),
-                "drop" => drop(runtime),
-                "executor-stall" => {
-                    // The only async executor thread is blocked, no timer or
-                    // transport callback can help. The OS watchdog must expire.
-                    std::thread::sleep(Duration::from_secs(2));
-                    drop(runtime);
-                    panic!("executor stall defeated authority expiry");
-                }
-                "blocked-stderr" => {
-                    std::thread::spawn(|| {
-                        let mut stderr = std::io::stderr().lock();
-                        loop {
-                            let _ = stderr.write_all(&[b'x'; 8192]);
-                        }
-                    });
-                    drop(runtime);
-                }
-                "live-invalidate" | "live-context" | "lease-zero" | "eof" => {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    // An armed fence must terminate first.
-                    drop(runtime);
-                    panic!("terminal supervisor failed to terminate");
-                }
-                _ => panic!("unknown model scenario"),
+                runtime.shutdown().await.unwrap();
             }
-            tokio::time::sleep(Duration::from_millis(1100)).await;
-            assert!(
-                matches!(mode.as_str(), "shutdown-ok" | "live-update"),
-                "armed fence failed"
-            );
-        });
+            "update-block" | "update-panic" => {
+                let should_panic = mode == "update-panic";
+                let _registration = runtime
+                    .context_handle()
+                    .subscribe_configuration(move |_| {
+                        assert!(!should_panic, "injected package callback panic");
+                        std::thread::sleep(Duration::from_secs(60));
+                    })
+                    .unwrap();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                panic!("blocked callback defeated update deadline");
+            }
+            "shutdown-ok" => runtime.shutdown().await.unwrap(),
+            "shutdown-fail" => assert!(runtime.shutdown().await.is_err()),
+            "shutdown-cancel" => assert!(tokio::time::timeout(
+                Duration::from_millis(100),
+                runtime.shutdown()
+            )
+            .await
+            .is_err()),
+            "drop" => drop(runtime),
+            "drop-capture" => {
+                struct BlockingDrop;
+                impl Drop for BlockingDrop {
+                    fn drop(&mut self) {
+                        std::thread::sleep(Duration::from_secs(60));
+                    }
+                }
+                let capture = BlockingDrop;
+                let _registration = runtime
+                    .context_handle()
+                    .subscribe_configuration(move |_| {
+                        let _ = &capture;
+                    })
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                drop(runtime);
+                panic!("blocking capture escaped owner-drop hard fence");
+            }
+            "executor-stall" => {
+                // The only async executor thread is blocked, no timer or
+                // transport callback can help. The OS watchdog must expire.
+                std::thread::sleep(Duration::from_secs(2));
+                drop(runtime);
+                panic!("executor stall defeated authority expiry");
+            }
+            "blocked-stderr" => {
+                std::thread::spawn(|| {
+                    let mut stderr = std::io::stderr().lock();
+                    loop {
+                        let _ = stderr.write_all(&[b'x'; 8192]);
+                    }
+                });
+                drop(runtime);
+            }
+            "live-invalidate" | "live-context" | "lease-zero" | "eof" => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                // An armed fence must terminate first.
+                drop(runtime);
+                panic!("terminal supervisor failed to terminate");
+            }
+            _ => panic!("unknown model scenario"),
+        }
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            matches!(mode.as_str(), "shutdown-ok" | "live-update"),
+            "armed fence failed"
+        );
+    });
 }
 
 fn start_reply() -> StartReply {
@@ -174,6 +196,14 @@ fn control(action: &str, index: u32, actor: i64) -> Message {
 
 async fn scenario(mode: &str, expected: i32) {
     let fixture = crate::packages::tests::Fixture::new();
+    #[cfg(unix)]
+    if mode == "fifo-startup" {
+        use std::os::unix::ffi::OsStrExt;
+        let path = fixture.base.join("RustService.Package.Current.xml");
+        std::fs::remove_file(&path).unwrap();
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
@@ -418,6 +448,17 @@ async fn scenario(mode: &str, expected: i32) {
 #[tokio::test]
 async fn successful_native_shaped_update_refreshes_later_registration() {
     scenario("live-update", 0).await;
+}
+
+#[tokio::test]
+async fn blocking_subscription_capture_destruction_cannot_delay_owner_drop_fence() {
+    scenario("drop-capture", 70).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nonregular_artifact_open_cannot_block_startup_worker() {
+    scenario("fifo-startup", 0).await;
 }
 
 #[tokio::test]

@@ -478,7 +478,6 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        self.current.close();
         if !self.shutdown {
             self.authority.retire();
         }
@@ -486,5 +485,6 @@ impl Drop for Runtime {
         for task in &self.tasks {
             task.abort();
         }
+        self.current.close();
     }
 }
