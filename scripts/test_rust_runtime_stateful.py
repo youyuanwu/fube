@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 import rust_runtime_test as runtime
 
@@ -31,6 +32,34 @@ def snapshot():
 
 
 class StatefulEvidenceTests(unittest.TestCase):
+    def test_three_requires_full_before_allocation_and_full_dispatches_preserved_tier(self):
+        from unittest.mock import Mock
+        allocation=SimpleNamespace(name="owned",owner="original",container_id="id",verify=lambda:"id",sf=Mock(return_value="[]"))
+        with self.assertRaises(ValueError):
+            runtime.qualify(allocation,False,stateful="three")
+        allocation.sf.assert_not_called()
+        with patch("sys.argv",["runtime","owned","--stateful","three","--prebuilt","bundle"]), \
+             patch.object(runtime,"create_owned") as create,patch.object(runtime,"load_bundle") as load, \
+             contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):runtime.main()
+            create.assert_not_called();load.assert_not_called()
+        binaries=SimpleNamespace(app=Path("app"),observer=Path("observer"),template_root=Path("template"),
+            dependency_graph="graph",bundle_manifest_sha256="hash",source_revision="a"*40)
+        with contextlib.ExitStack() as stack:
+            for name in ("stateful_singleton","configuration_upgrade","stateful_three","cleanup_deployment"):
+                stack.enter_context(patch.object(runtime,name))
+            stack.enter_context(patch.object(runtime,"run",return_value=""))
+            stack.enter_context(patch.object(runtime,"digest",return_value="hash"))
+            stack.enter_context(patch.object(runtime,"package",return_value=(Path("package"),"OwnedType","1.1")))
+            stack.enter_context(patch.object(runtime,"wait_observe",return_value={"rpc":{"packages":{"generation":1}}}))
+            stack.enter_context(patch.object(runtime,"restart",return_value={}))
+            stack.enter_context(patch.object(runtime,"wait_stateful",return_value={}))
+            controls=stack.enter_context(patch.object(runtime,"controls_and_authority"))
+            result=runtime.qualify(allocation,True,binaries,stateful="three")
+            controls.assert_called_once()
+            self.assertIn("resilience",result)
+            self.assertEqual(result["status"],"PASS_FULL_EMPTY_STATEFUL_CONTROL_PLANE_AND_STATELESS_PROFILE")
+
     def test_native_departure_requires_independent_inventory_not_route_counters(self):
         import json
         value={"observer":"mssf-client","node":"N0010","service":"fabric:/Owned/Stateful",

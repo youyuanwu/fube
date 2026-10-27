@@ -1154,6 +1154,8 @@ def create_owned(name: str) -> str:
 
 def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | None = None,
             stateful: str | None = None) -> dict:
+    if stateful=="three" and not full:
+        raise ValueError("three-replica qualification requires the full preserved regression tier")
     run_id = uuid.uuid4().hex[:12]
     application = f"fabric:/FubeRustRuntime{run_id}"
     type_name=f"FubeRustRuntime{run_id}Type"
@@ -1251,6 +1253,8 @@ def main() -> None:
         parser.error("--restart-service requires --existing-owner")
     if args.restart_service and args.stateful:
         parser.error("--restart-service cannot stand in for stateful qualification")
+    if args.stateful=="three" and not args.full:
+        parser.error("--stateful three requires --full; no partial full-profile qualification")
     created = False
     owner = None
     result={"status":"FAIL","onebox":args.name,"errors":[],"cleanup":{}}
