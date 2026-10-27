@@ -90,11 +90,14 @@ not empty-default substitutes. Shared packages retain the native `.lk` path.
 Code/profile compatibility compares normalized declared fields plus native
 digested rollout/checksum/sharing/policy metadata, not independently rehashed
 filesystem code bytes. Qualification additionally hashes the running executable
-([reader:569](../../crates/libs/mssf-runtime/src/packages.rs#L569),
+([reader:576](../../crates/libs/mssf-runtime/src/packages.rs#L576),
 [upgrade harness:662](../../scripts/rust_runtime_test.py#L662)).
 The reader admits the qualified ordinary ExeHost declarations; setup/external/
 activator/periodic entry points, nonempty custom code-environment declarations and
 unsupported host/security policies fail explicitly rather than being ignored.
+Linux artifact opens are nonblocking before regular-descriptor validation, so a
+FIFO cannot strand attachment before the type check. Owner Drop retires authority
+before releasing callback captures, including application-controlled destructors.
 
 Lookups are case-insensitive. Configuration parameters expose copied raw value,
 MustOverride, IsEncrypted and Type. `plaintext()` refuses encrypted or unresolved
@@ -388,20 +391,22 @@ Unavailable kernel capabilities block that test.
 ### Recorded package-update outcome (2026-10-27)
 
 After refreshing against main `ecd8959ce18e1ede2fadf9f0105d5f1714291a69`,
-full native run **`dc9c2e7b0053`** passed on SF **11.8.121.4**, using the
+post-review full native run **`9c15deaa3c04`** passed on SF **11.8.121.4**, using the
 strict prebuilt bundle produced from code revision
-`9ba0fdb56350bf5ef88ccfb12f0a380957aacb2b`.
-Local evidence: `build/package-context-native-final1.json`;
+`1fcbd3d180d2d102f9eb0ae121846a86cc1cc8b7`.
+Local evidence: `build/package-context-native-final2.json`;
 bundle manifest SHA256
-`aa96fc83ebbada306cdac3acf4f450e7e82729c514fb77f1109ce9cf40e4fe41`.
+`840923d5db871a93e33f47cfdbed7a2e9245aec8bc1bac960856c212fa5ddcef`.
+This fresh allocation/bundle supersedes pre-review run `dc9c2e7b0053`; old
+evidence was not relabeled after executable fixes.
 
 - Real unforced application 1.1→1.2 upgrade delivered native context refresh:
   Config version 1.0→2.0, config/service rollout 1.0→1.1, applied native override;
   unchanged Code version/rollout/checksum and running executable bytes.
-- PID **35015**, process start ticks **14756864**, host
-  `2f3de9ff-45b2-48fe-a430-a148d0965f3e`, runtime
-  `014b890f-e59a-4efa-9fb9-e0036e104b5d` and native entry-point instance
-  **134375456603733283** stayed unchanged. **34** independently resolved RPC
+- PID **23326**, process start ticks **14908311**, host
+  `5e5373dd-79a9-4bbc-bb63-48e3d0969f05`, runtime
+  `952728d4-67ba-486f-87b4-e8c52c053c5f` and native entry-point instance
+  **134375486847215728** stayed unchanged. **35** independently resolved RPC
   observations during upgrade succeeded, with zero sampling errors.
 - Current generation became 1; both retained old context and package handle
   still read `before-upgrade`, current read `after-upgrade`; two callbacks ran
@@ -412,14 +417,14 @@ bundle manifest SHA256
   passed, including independent dependency/ELF/live-map evidence.
 - The application and **both** type versions were confirmed absent. The task
   controller then destroyed its original allocation; exact container, data volume
-  and network absence were independently verified. No existing onebox was reused
-  or commandeered.
+  and network absence were independently verified. No unrelated pre-existing
+  onebox was reused or commandeered.
 
 The source revision remains a research baseline, **not** binary build provenance.
 These observations qualify this successful unchanged-code switch profile, not
 unconditional no-restart upgrades, rolling CODE upgrade/rollback, directory
 retention timing or stronger binary-wide callback guarantees. Ordinary workspace
-checks/Rustdoc and 136 Python tests passed on Linux; existing Windows and separate
+checks/Rustdoc, 51 runtime tests and 139 Python tests passed on Linux; existing Windows and separate
 ignored native-client fixture groups remain CI coverage, not local Windows claims.
 
 ### Recorded native outcome (2026-10-26)
