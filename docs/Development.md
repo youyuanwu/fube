@@ -69,7 +69,9 @@ The last command creates and destroys only its exact owned onebox, using the
 existing lifecycle controller. It verifies native placement, independent
 mssf-client resolution/RPC, exact pidfd-based application termination/replacement,
 native lifecycle/query/update/failure traffic, concurrent shared-process
-partitions, runtime load/health/fault/move-cost reporting, and bounded fencing of
+partitions, a real config-only application upgrade, retained old package/settings
+snapshots and ordered subscription/unregistration behavior, runtime
+load/health/fault/move-cost reporting, and bounded fencing of
 an intentionally non-cooperative application. Reporting qualification reads
 native FM load/move retention and HM health sequence/expiration results, then
 proves runtime transient fault replaces only its target instance with usable
@@ -81,7 +83,8 @@ There is no security fallback.
 
 Local qualification builds the app and independent observer with `--locked`.
 CI builds them in the Linux native-free job and transfers a tar bundle containing
-both executables, their SHA256 hashes and the dependency graph. The onebox job
+both executables, both versioned package templates, their SHA256 hashes and the
+dependency graph (bundle format 2). The onebox job
 uses `--prebuilt DIRECTORY`: it verifies the bundle and ELF dependencies, then
 deploys/tests without installing Rust or invoking Cargo. Missing or changed
 artifacts fail; there is no compilation fallback. See the
@@ -89,7 +92,8 @@ artifacts fail; there is no compilation fallback. See the
 
 Use `--report NEW_FILE` for a new structured evidence file. To reuse an already
 owned healthy allocation, explicitly supply `--existing-owner OWNER`; the
-harness cleans up only its minted application/type, never the caller's box.
+harness cleans up only its minted application and all its provisioned type
+versions with absence checks, never the caller's box.
 Failed or ambiguous cleanup is reported with exact recovery identities.
 See [the supported runtime profile](runtime/RustStatelessRuntime.md) before
 interpreting a test result. Delayed/stale commands and lease-expiry races also

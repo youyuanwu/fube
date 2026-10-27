@@ -150,9 +150,40 @@ impl IpcReplyContext {
         }
         queue_control(&shared, Message { headers, body }, deadline).await
     }
+
+    /// Cancel obsolete queued replies at the writer's pre-frame boundary.
+    /// Neither cancellation nor validity loss revokes an already-started frame.
+    pub async fn reply_fenced(
+        self,
+        actor: i64,
+        body: Vec<u8>,
+        deadline: Instant,
+        valid: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<()> {
+        let shared = self.shared.upgrade().ok_or(Error::Closed)?;
+        let headers = vec![Header::actor(actor)?, Header::relates_to(self.id)?];
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        struct Guard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _guard = Guard(active.clone());
+        let fence = Arc::new(move || active.load(std::sync::atomic::Ordering::Acquire) && valid());
+        queue_control_inner(&shared, Message { headers, body }, deadline, Some(fence)).await
+    }
 }
 
 async fn queue_control(shared: &Shared, message: Message, deadline: Instant) -> Result<()> {
+    queue_control_inner(shared, message, deadline, None).await
+}
+async fn queue_control_inner(
+    shared: &Shared,
+    message: Message,
+    deadline: Instant,
+    valid: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> Result<()> {
     if let Some(error) = shared.error() {
         return Err(error);
     }
@@ -165,6 +196,7 @@ async fn queue_control(shared: &Shared, message: Message, deadline: Instant) -> 
             bytes,
             deadline,
             complete,
+            valid,
         })
         .map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => Error::ResourceLimit("reply/control queue"),
@@ -197,6 +229,7 @@ struct Control {
     bytes: Vec<u8>,
     deadline: Instant,
     complete: oneshot::Sender<Result<()>>,
+    valid: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl ReplyContext {
@@ -224,6 +257,7 @@ impl ReplyContext {
                 bytes,
                 deadline,
                 complete: sender,
+                valid: None,
             })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => Error::ResourceLimit("reply/control queue"),
@@ -920,6 +954,10 @@ async fn send_loop<W: AsyncWrite + Unpin>(
                 let Some(control) = control else { return Err(Error::Closed); };
                 if Instant::now() >= control.deadline {
                     let _ = control.complete.send(Err(Error::Timeout));
+                    continue;
+                }
+                if control.valid.as_ref().is_some_and(|valid| !valid()) {
+                    let _ = control.complete.send(Err(Error::Closed));
                     continue;
                 }
                 let result = timeout(MAX_FRAME_TIME, writer.write_all(&control.bytes))

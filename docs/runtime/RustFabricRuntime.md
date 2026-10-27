@@ -14,6 +14,10 @@ The companion [native architecture](FabricRuntime.md) explains those boundaries.
 [as-built API, supported profile and evidence](RustStatelessRuntime.md).
 The broader capability tiers below remain a proposed design, not claims of
 stateful, ABI, security or other-profile interoperability.
+The implemented slice includes owned configuration/data package snapshots and
+same-incarnation context refresh, qualified by an actual unchanged-code
+configuration-only application upgrade. Rolling code upgrade/rollback remains
+outside that evidence; retained package objects do not pin native directories.
 
 **Original research status:** proposed design, not an implementation or interoperability claim.
 Research baseline: local Service Fabric source at
@@ -328,11 +332,12 @@ configuration, directory and endpoint state. Read the selected profile's
 authoritative deployed artifacts and node-provided data; do not recover
 credentials or missing identity through a management-query guess.
 
-Expose immutable versioned package/configuration snapshots. Once package update
-callbacks are supported, retain old snapshots while callbacks use them, apply
-updates atomically and define callback registration/unregistration races.
-Until then, explicitly qualify only the upgrade behaviors the implementation
-can honor; do not acknowledge an unsupported in-place package update as applied.
+The [as-built package API](RustStatelessRuntime.md#owned-packages-and-context-refresh)
+now exposes immutable versioned package/configuration snapshots, atomic refresh
+and owned package callbacks with defined registration/unregistration races.
+Qualify only the upgrade behaviors the implementation can honor; unsupported
+updates must not be acknowledged as applied. This does not turn the broader
+upgrade/security capability tiers into established interoperability.
 
 Stateless S includes partition information and source-compatible load, fault,
 health and move-cost behavior required by its advertised API. Health reporting

@@ -3,6 +3,15 @@
  xmlns="http://schemas.microsoft.com/2011/01/fabric">
   <ServiceManifestImport>
     <ServiceManifestRef ServiceManifestName="RustRuntimeService" ServiceManifestVersion="1.1" />
+    <ConfigOverrides>
+      <ConfigOverride Name="Config">
+        <Settings>
+          <Section Name="Main">
+            <Parameter Name="Override" Value="native-override" />
+          </Section>
+        </Settings>
+      </ConfigOverride>
+    </ConfigOverrides>
   </ServiceManifestImport>
   <DefaultServices>
     <Service Name="Singleton">

@@ -16,14 +16,15 @@ The native SF node, deployment tools and OS libraries are still expected.
 | IPC | Actual node-injected loopback address, trusted clear transport; no reconnect |
 | Lifecycle | Native type registration, Open, graceful Close, Abort flag 4, failure cleanup |
 | Controls | Correlated stateless RAPQuery; service-description updates |
+| Packages | Owned config/data metadata/settings; real unchanged-code configuration upgrade and package notifications |
 | Reporting | Native FM load/move retention; HM instance health with sequencing/expiry; runtime transient-fault replacement |
 | Discovery | Separate mssf-client resolution, then real RPC to that returned endpoint |
 | Recovery | Exact owned-process termination, new native host/PID/incarnation, usable endpoint |
 | Authority | Fresh node lease poll before serving; terminal IPC/lease/host authority |
 
 This is not a complete replacement for every FabricRuntime feature. Named
-partition decoding has model coverage, not native qualification. Package/config
-XML APIs, upgrades/context refresh, stateful services, replication/storage,
+partition decoding has model coverage, not native qualification. Secret
+decryption/reference resolution, rolling code upgrade/rollback, stateful services, replication/storage,
 containers, activator/multicodepackage hosts, Windows, TLS and COM ABI compatibility
 are outside this profile. Unsupported security is rejected, never downgraded.
 The broader [design](RustFabricRuntime.md) retains these separate capability tiers.
@@ -54,12 +55,105 @@ Its default routes check partition validity per RPC. `/FailOpen`, `/FailClose`,
 not application deployment conventions. The last intentionally ignores authority
 in both listener/main to prove independent hard process fencing.
 
-The activation snapshot intentionally contains real host/package/incarnation,
-work/log/temp directories, node IP and resolved endpoint ports—not a complete
-native activation/configuration API
-([context.rs:7-29](../../crates/libs/mssf-runtime/src/context.rs#L7-L29)).
+The activation snapshot contains real host/package/incarnation, work/log/temp
+directories, node IP, deployed endpoint ports and owned configuration/data state
+([context.rs:9-52](../../crates/libs/mssf-runtime/src/context.rs#L9-L52)).
 Node context comes from the actual Start registration reply. No missing-runtime-
 access fallback discovers a node address or invents host identity.
+
+## Owned packages and context refresh
+
+`activation_context()` now returns `Arc<ActivationContext>`, not a borrowed
+startup-only value. `context_handle()` returns a clonable current-context provider:
+
+```rust
+let current = runtime.context_handle();
+let snapshot = current.snapshot();
+let config = snapshot.packages()?.configuration_package("Config")?;
+let value = config.section("Main")?.parameter("Value")?.plaintext()?;
+```
+
+Keep the snapshot/package Arc as long as needed; later updates do not alter its
+metadata/settings. `ServiceContext.activation` remains the creation-time owned
+snapshot; later service creation/type registration uses the current context.
+The environment-only parser is bootstrap, not a loaded package context:
+`packages()` explicitly errors before loading
+([context.rs:29](../../crates/libs/mssf-runtime/src/context.rs#L29),
+[current provider:90](../../crates/libs/mssf-runtime/src/package_context.rs#L90)).
+
+The reader uses registration's deployment directory and native application/package
+identity, validates `App.<rollout>.xml`, `<service>.Package.Current.xml`, its
+selected versioned service manifest and deployed endpoints, then loads every
+declared configuration package's `Settings.xml`. Digested overrides apply to
+existing targets only. It rejects missing/malformed/duplicate/unsupported data,
+not empty-default substitutes. Shared packages retain the native `.lk` path.
+Code/profile compatibility compares normalized declared fields plus native
+digested rollout/checksum/sharing/policy metadata, not independently rehashed
+filesystem code bytes. Qualification additionally hashes the running executable
+([reader:576](../../crates/libs/mssf-runtime/src/packages.rs#L576),
+[upgrade harness:662](../../scripts/rust_runtime_test.py#L662)).
+The reader admits the qualified ordinary ExeHost declarations; setup/external/
+activator/periodic entry points, nonempty custom code-environment declarations and
+unsupported host/security policies fail explicitly rather than being ignored.
+Linux artifact opens are nonblocking before regular-descriptor validation, so a
+FIFO cannot strand attachment before the type check. Owner Drop retires authority
+before releasing callback captures, including application-controlled destructors.
+
+Lookups are case-insensitive. Configuration parameters expose copied raw value,
+MustOverride, IsEncrypted and Type. `plaintext()` refuses encrypted or unresolved
+typed values; no decryption or secret-reference resolution is supplied.
+Native override application changes Name/Value/nonempty Type, **not** base
+IsEncrypted/MustOverride, even when the override XML contains its own encryption
+flag ([packages.rs:84](../../crates/libs/mssf-runtime/src/packages.rs#L84)).
+
+**A retained path is not a directory lease.** Old descriptions/settings remain
+readable from owned memory; native deployment dependencies and garbage collection
+control old files independently. `path().exists()` is only a momentary observation.
+No post-upgrade retention duration or directory pinning is promised.
+
+### Package subscriptions
+
+Keep the RAII handle returned by `subscribe_configuration` or `subscribe_data`.
+Callbacks receive `PackageChange::{Added,Removed,Modified}` with owned packages;
+Modified carries previous/current packages. Drop or explicit `unregister()`
+removes the registration from future category-list snapshots; repeated unregister
+is harmless. There is no initial replay, veto, callback-drain or remote undo
+([subscriptions:46-130](../../crates/libs/mssf-runtime/src/package_context.rs#L46-L130)).
+
+Publication precedes synchronous callbacks. Configuration runs before data,
+with a separately copied registration list at each category's start. For each
+handler in registration order, modifications/removals follow old declaration
+order, then additions follow new declaration order. Matched names generate
+Modified only when **digested rollout changes**, not from a settings/version diff.
+Self-unregister cannot recall further events already copied for that dispatch;
+a configuration callback can register a handler for the subsequent data category.
+Getters, registration/unregistration and captured-handle destructors run without
+publication/registration locks held across user code
+([updater:17](../../crates/libs/mssf-runtime/src/package_context_update.rs#L17)).
+
+One local update worker serializes refreshes; this is stronger than a claim of
+native global callback FIFO. User callbacks run on a blocking worker, not the
+socket reader. An async supervisor outside that worker enforces a receipt-relative
+deadline, including queue delay, capped at 30 s. Panic, timeout, IPC closure,
+shutdown or authority failure prevents applied-success reply admission and
+terminally retires/aborts the host. A blocked callback cannot evade the independent
+hard fence through healthy lease renewal. Shutdown cannot disarm the fence while
+a package worker is active
+([lib.rs:322](../../crates/libs/mssf-runtime/src/lib.rs#L322)).
+
+Successful updates require the original host/application/package/code/service
+incarnation and a newer native version-instance counter; conflicting/stale input
+is terminal, not falsely acknowledged. An exact current duplicate is idempotent
+and does not reread newer Current.xml or replay callbacks. The separate positive
+code-activation instance is **first learned** on the original trusted IPC
+connection after startup identity/sequence matches, then pinned. It is not aliased
+to another counter or independently prevalidated from startup environment.
+
+Success is replied only after publication and callbacks, with deadline/cancellation/
+authority checked again at the transport writer's pre-frame boundary. Sender
+cancellation is not remotely observable, and local failure does not roll back an
+already-published snapshot or revoke delivered callbacks/already-started frames
+([reply fencing:156](../../crates/libs/mssf-transport/src/connection.rs#L156)).
 
 ## Wire and ownership invariants
 
@@ -121,7 +215,7 @@ callbacks and proven abort/disposal before watchdog disarming.
 | Open/Close/Abort, stateless query, description update | Implemented; real native tests |
 | Lease polling and terminal IPC authority | Implemented; native poll/IPC-loss test and model lease races |
 | InvalidateLease | Terminal retirement, correlated acknowledgment; model coverage |
-| UpdateCodePackageContext/upgrade refresh | Explicit terminal refusal; no stale-context acknowledgment |
+| UpdateCodePackageContext/upgrade refresh | Same-incarnation unchanged-code refresh; atomic snapshots and config/data events |
 | Instance health/load/fault/move-cost reporting | Bounded native application-runtime paths; completion levels below |
 | Query reported load | Bounded local last-written metrics via native RAPQuery, distinct from independent FM retention |
 | Partition-scoped health | Not exposed; health reports target the originating stateless instance |
@@ -232,6 +326,12 @@ new reports; load/move have no automatic retry.
 | Report source/property/description/metric names | 4096 UTF-16 units each, no NUL |
 | Reporting request deadline / retained fault retry | 30 s / 30 s; no load/health retry |
 | Sample retired handles / incoming RPC | 32 / 64; bounded acceptance-only fixtures |
+| Artifact file / complete snapshot input | 1 MiB / 16 MiB including Current.xml stability reread |
+| Configuration / data packages | 64 each; at most 4096 parameters snapshot-wide and 4096 sections per config package |
+| Artifact strings / XML depth | 32,768 UTF-16 units / 32; DTD and processing instructions rejected |
+| Package subscriptions / active update worker | 64 combined / 1; control ingress remains 32 |
+| Package update / callback work | Receipt-relative 30 s cap; conservative 16,384 callback invocations per update |
+| Sample retained package notifications | 32; overflow explicitly fails the fixture |
 
 Queues do not silently discard required replies. Source/model limits and resource
 tests are in [transport tests](../../crates/libs/mssf-transport/src/connection_ipc_tests.rs),
@@ -260,8 +360,9 @@ python3 scripts/rust_runtime_test.py runtime-check --prebuilt build/runtime-preb
 ```
 
 The bundle retains executable permissions and includes the build-time dependency
-graph plus SHA256 hashes for both binaries. Prebuilt mode rejects missing,
-nonexecutable or modified binaries and invalid dependency evidence before
+graph plus SHA256 hashes for both binaries **and both versioned package templates**
+(bundle format 2, producing revision recorded). Prebuilt mode rejects missing,
+extra, symlinked, nonregular, nonexecutable or modified inputs and invalid dependency evidence before
 allocating a onebox; it never compiles or invokes Cargo. ELF dependencies and
 live application mappings are still checked on the qualification runner. CI
 produces the bundle in the Linux native-free job, then downloads/extracts it in
@@ -270,7 +371,9 @@ the onebox job without installing a Rust toolchain.
 The harness uses the existing lifecycle controller, creates/destroys only its
 owned allocation, mints unique app/type names, and reconciles ambiguous native
 mutations. `--existing-owner OWNER` explicitly reuses a caller-owned healthy
-box and never destroys it. It still cleans its exact minted application/type.
+box and never destroys it. It still cleans its exact minted application and
+every provisioned type version, polling for absence. Upload staging is uniquely
+owned beneath the allocation's data volume and removed after use.
 Ownership drift, failed cleanup or unconfirmed late mutations produce FAIL with
 recovery identities
 ([harness ownership](../../scripts/rust_runtime_test.py#L102),
@@ -284,6 +387,45 @@ onebox to duplicate **only the verified application's IPC descriptor**, recheck
 its inode, and shut that socket down. This is test-only OS fault injection, not
 an application runtime helper, node modification or security fallback.
 Unavailable kernel capabilities block that test.
+
+### Recorded package-update outcome (2026-10-27)
+
+After refreshing against main `ecd8959ce18e1ede2fadf9f0105d5f1714291a69`,
+post-review full native run **`9c15deaa3c04`** passed on SF **11.8.121.4**, using the
+strict prebuilt bundle produced from code revision
+`1fcbd3d180d2d102f9eb0ae121846a86cc1cc8b7`.
+Local evidence: `build/package-context-native-final2.json`;
+bundle manifest SHA256
+`840923d5db871a93e33f47cfdbed7a2e9245aec8bc1bac960856c212fa5ddcef`.
+This fresh allocation/bundle supersedes pre-review run `dc9c2e7b0053`; old
+evidence was not relabeled after executable fixes.
+
+- Real unforced application 1.1→1.2 upgrade delivered native context refresh:
+  Config version 1.0→2.0, config/service rollout 1.0→1.1, applied native override;
+  unchanged Code version/rollout/checksum and running executable bytes.
+- PID **23326**, process start ticks **14908311**, host
+  `5e5373dd-79a9-4bbc-bb63-48e3d0969f05`, runtime
+  `952728d4-67ba-486f-87b4-e8c52c053c5f` and native entry-point instance
+  **134375486847215728** stayed unchanged. **35** independently resolved RPC
+  observations during upgrade succeeded, with zero sampling errors.
+- Current generation became 1; both retained old context and package handle
+  still read `before-upgrade`, current read `after-upgrade`; two callbacks ran
+  in registration order after publication, and the unregistered handler ran zero
+  times. Old path existence was observed, not promised or pinned.
+- Later native concurrent service creations both received generation 1 and new
+  settings. Existing reporting/lifecycle/failure/authority/replacement checks
+  passed, including independent dependency/ELF/live-map evidence.
+- The application and **both** type versions were confirmed absent. The task
+  controller then destroyed its original allocation; exact container, data volume
+  and network absence were independently verified. No unrelated pre-existing
+  onebox was reused or commandeered.
+
+The source revision remains a research baseline, **not** binary build provenance.
+These observations qualify this successful unchanged-code switch profile, not
+unconditional no-restart upgrades, rolling CODE upgrade/rollback, directory
+retention timing or stronger binary-wide callback guarantees. Ordinary workspace
+checks/Rustdoc, 51 runtime tests and 139 Python tests passed on Linux; existing Windows and separate
+ignored native-client fixture groups remain CI coverage, not local Windows claims.
 
 ### Recorded native outcome (2026-10-26)
 

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, net::SocketAddr};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 use mssf_transport::{serialization::serde::Guid, Error, Result};
 
@@ -17,11 +17,40 @@ pub struct ActivationContext {
     pub temp_directory: String,
     pub endpoints: BTreeMap<String, u16>,
     pub node_ip: String,
+    pub(crate) packages: Option<Arc<crate::PackageSnapshot>>,
+    pub(crate) generation: u64,
+    pub(crate) activation_instance: Option<i64>,
     pub(crate) address: SocketAddr,
     pub(crate) runtime: RuntimeContext,
 }
 
 impl ActivationContext {
+    /// Complete owned package state, available after successful attachment.
+    pub fn packages(&self) -> Result<Arc<crate::PackageSnapshot>> {
+        self.packages
+            .clone()
+            .ok_or(Error::InvalidInput("activation packages not loaded"))
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn runtime_id(&self) -> &str {
+        &self.runtime.id
+    }
+    pub fn code_activation_instance(&self) -> Option<i64> {
+        self.activation_instance
+    }
+    pub fn package_version_instance(&self) -> String {
+        let version = &self.runtime.code.version;
+        format!(
+            "{}.{}:{}.{}:{}",
+            version.version.application.value.major,
+            version.version.application.value.minor,
+            version.version.value.major,
+            version.version.value.minor,
+            version.instance
+        )
+    }
     pub fn from_environment() -> Result<Self> {
         Self::parse(&std::env::vars().collect())
     }
@@ -202,6 +231,9 @@ impl ActivationContext {
             temp_directory: get("Fabric_Folder_App_Temp")?,
             endpoints,
             node_ip: get("Fabric_NodeIPOrFQDN")?,
+            packages: None,
+            generation: 0,
+            activation_instance: None,
             address,
             runtime,
         })
@@ -209,9 +241,9 @@ impl ActivationContext {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    fn env() -> BTreeMap<String, String> {
+    pub(crate) fn env() -> BTreeMap<String, String> {
         [
             (
                 "Fabric_ApplicationHostId",

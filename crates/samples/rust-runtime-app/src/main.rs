@@ -14,12 +14,30 @@ use tokio::{
     sync::{OnceCell, Semaphore},
 };
 
+fn config_evidence(package: &ConfigurationPackage) -> RuntimeResult<serde_json::Value> {
+    let description = package.description();
+    Ok(serde_json::json!({
+        "name":description.name(),"version":description.version(),"rollout":description.rollout(),
+        "manifest_version":description.manifest_version(),"path":description.path(),
+        "path_exists":description.path().is_dir(),
+        "value":package.section("Main")?.parameter("Value")?.plaintext()?,
+        "override":package.section("Main")?.parameter("Override")?.plaintext()?,
+    }))
+}
+
 struct Route {
     partition: Partition,
+    creation_generation: u64,
+    creation_configuration: String,
     active: AtomicUsize,
     deliberately_noncooperative: bool,
 }
 struct Rpc {
+    current: ActivationContextHandle,
+    initial: Arc<ActivationContext>,
+    retained_config: Arc<ConfigurationPackage>,
+    package_events: Arc<Mutex<Vec<serde_json::Value>>>,
+    unregistered_callbacks: Arc<AtomicUsize>,
     ip: String,
     port: u16,
     node: String,
@@ -39,6 +57,26 @@ struct Rpc {
     deliberately_noncooperative: AtomicBool,
 }
 impl Rpc {
+    fn package_evidence(&self) -> RuntimeResult<serde_json::Value> {
+        let current = self.current.snapshot();
+        let config = current.packages()?.configuration_package("Config")?;
+        let data = current.packages()?.data_package("Data")?;
+        let initial_config = self.initial.packages()?.configuration_package("Config")?;
+        Ok(serde_json::json!({
+            "generation":current.generation(), "runtime_id":current.runtime_id(),
+            "package_sequence":current.package_sequence,
+            "package_version_instance":current.package_version_instance(),
+            "activation_instance":current.code_activation_instance(),
+            "configuration":config_evidence(&config)?,
+            "initial_configuration":config_evidence(&initial_config)?,
+            "retained_configuration":config_evidence(&self.retained_config)?,
+            "initial_generation":self.initial.generation(),
+            "data":{"version":data.description().version(),"rollout":data.description().rollout(),
+                "path":data.description().path(),"path_exists":data.description().path().is_dir()},
+            "events":self.package_events.lock().unwrap().clone(),
+            "unregistered_callbacks":self.unregistered_callbacks.load(Ordering::Acquire),
+        }))
+    }
     async fn listen(self: &Arc<Self>) -> RuntimeResult<()> {
         self.listener
             .get_or_try_init(|| async {
@@ -123,6 +161,8 @@ impl Rpc {
                 (200,serde_json::json!({"pid":std::process::id(),"partition":id.partition_id.to_string(),
                     "instance":id.instance_id,"incarnation":id.incarnation,"service":id.service_name,
                     "node":self.node,"node_type":self.node_type,"host":self.host,"code_sequence":self.code_sequence,
+                    "packages":self.package_evidence()?,
+                    "creation_generation":route.creation_generation,"creation_configuration":route.creation_configuration,
                     "initial_ttl_ticks":self.initial_ttl,"fresh_poll_ttl_ticks":self.fresh_poll_ttl,
                     "fresh_poll_elapsed_micros":self.fresh_poll_elapsed_micros,
                     "node_host_pid":self.node_host_pid,"maximum_concurrent_opens":self.maximum_opening.load(Ordering::Relaxed),
@@ -277,6 +317,16 @@ impl StatelessService for Service {
             self.rpc.listen().await?;
             partition.ensure_valid()?;
             let route = Arc::new(Route {
+                creation_generation: self.context.activation.generation(),
+                creation_configuration: self
+                    .context
+                    .activation
+                    .packages()?
+                    .configuration_package("Config")?
+                    .section("Main")?
+                    .parameter("Value")?
+                    .plaintext()?
+                    .to_owned(),
                 partition,
                 active: AtomicUsize::new(0),
                 deliberately_noncooperative: self
@@ -359,7 +409,40 @@ impl StatelessService for Service {
 async fn run() -> RuntimeResult<()> {
     let mut runtime = Runtime::attach().await?;
     let activation = runtime.activation_context();
+    let current = runtime.context_handle();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut subscriptions = Vec::new();
+    for registration in 1..=2 {
+        let events = events.clone();
+        let provider = current.clone();
+        subscriptions.push(current.subscribe_configuration(move |event| {
+            let record = match event {
+                PackageChange::Modified { previous, current } => serde_json::json!({
+                    "registration":registration,"kind":"modified",
+                    "previous":config_evidence(&previous).expect("old config"),
+                    "current":config_evidence(&current).expect("new config"),
+                    "published_generation":provider.snapshot().generation(),
+                }),
+                _ => panic!("unexpected native config fixture event"),
+            };
+            let mut list = events.lock().unwrap();
+            assert!(list.len() < 32, "package event fixture bound");
+            list.push(record);
+        })?);
+    }
+    let unregistered_callbacks = Arc::new(AtomicUsize::new(0));
+    let calls = unregistered_callbacks.clone();
+    let mut unregistered = current.subscribe_configuration(move |_| {
+        calls.fetch_add(1, Ordering::AcqRel);
+    })?;
+    unregistered.unregister();
+    unregistered.unregister();
     let rpc = Arc::new(Rpc {
+        current,
+        initial: activation.clone(),
+        retained_config: activation.packages()?.configuration_package("Config")?,
+        package_events: events,
+        unregistered_callbacks,
         ip: activation.node_ip.clone(),
         port: *activation
             .endpoints

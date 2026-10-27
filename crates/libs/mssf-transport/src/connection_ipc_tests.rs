@@ -52,6 +52,90 @@ fn command(index: u32, actor: i64, expects: bool) -> Message {
 }
 
 #[tokio::test]
+async fn correlated_success_replies_fence_retirement_cancellation_and_deadline() {
+    use std::sync::atomic::AtomicBool;
+    for mode in ["retired", "cancelled", "expired"] {
+        let (conn, mut peer, mut rx) = ipc(32);
+        write_message(&mut peer, &command(1, 8, true))
+            .await
+            .unwrap();
+        let obsolete = rx.recv().await.unwrap().reply.unwrap();
+        write_message(&mut peer, &command(2, 8, true))
+            .await
+            .unwrap();
+        let current = rx.recv().await.unwrap().reply.unwrap();
+        let first = conn.clone();
+        let blocked = tokio::spawn(async move {
+            first
+                .send_one_way_fenced(
+                    12,
+                    "blocking",
+                    vec![0; 8192],
+                    deadline(),
+                    SendStatus::default(),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        let valid = Arc::new(AtomicBool::new(true));
+        let predicate = valid.clone();
+        let expires = if mode == "expired" {
+            Instant::now() + Duration::from_millis(50)
+        } else {
+            deadline()
+        };
+        let obsolete = tokio::spawn(async move {
+            obsolete
+                .reply_fenced(
+                    8,
+                    vec![0],
+                    expires,
+                    Arc::new(move || predicate.load(Ordering::Acquire)),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while conn.handle.shared.controls.capacity() == MAX_QUEUED_CONTROLS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        match mode {
+            "retired" => valid.store(false, Ordering::Release),
+            "cancelled" => {
+                obsolete.abort();
+                tokio::task::yield_now().await;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(60)).await,
+        }
+        let current = tokio::spawn(async move {
+            current
+                .reply_fenced(8, vec![9], deadline(), Arc::new(|| true))
+                .await
+        });
+        assert_eq!(
+            read_message(&mut peer)
+                .await
+                .unwrap()
+                .properties()
+                .unwrap()
+                .action,
+            "blocking"
+        );
+        blocked.await.unwrap().unwrap();
+        let reply = read_message(&mut peer).await.unwrap();
+        assert_eq!(reply.properties().unwrap().relates_to.index, 2, "{mode}");
+        assert_eq!(reply.body, [9]);
+        current.await.unwrap().unwrap();
+        if mode != "cancelled" {
+            assert!(obsolete.await.unwrap().is_err());
+        }
+        conn.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn reports_use_ordinary_capacity_and_cancel_obsolete_queued_frames() {
     use std::sync::atomic::AtomicBool;
     let (conn, mut peer, _rx) = ipc(32);
