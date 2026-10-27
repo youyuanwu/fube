@@ -51,11 +51,13 @@ impl Reply for EmptyReply {
     fn decode(message: &Message, _: fn(()) -> Result<()>) -> Result<()> {
         crate::protocol::check_failure(message)?;
         let properties = message.properties()?;
-        if (message.headers.iter().any(|h| h.id == ACTOR) && properties.actor != 5)
+        // This is a direct FM query, not a NamingGateway list aggregate:
+        // RSMessage::QueryReply uses CreateFMToCommonMessage / RSActor (13).
+        if (message.headers.iter().any(|h| h.id == ACTOR) && properties.actor != 13)
             || (message.headers.iter().any(|h| h.id == ACTION) && properties.action != "QueryReply")
         {
             return Err(Error::Protocol(
-                "invalid native movement query reply envelope",
+                "movement query requires RS actor 13 and QueryReply",
             ));
         }
         let result: Envelope = from_slice(&message.body)?;
@@ -89,7 +91,10 @@ mod tests {
         })
         .unwrap();
         Message {
-            headers: vec![],
+            headers: vec![
+                mssf_transport::message::Header::actor(13).unwrap(),
+                mssf_transport::message::Header::action("QueryReply").unwrap(),
+            ],
             body: e.finish(),
         }
     }
@@ -104,10 +109,11 @@ mod tests {
         ));
         for header in [
             mssf_transport::message::Header::actor(12).unwrap(),
+            mssf_transport::message::Header::actor(5).unwrap(),
             mssf_transport::message::Header::action("WrongAction").unwrap(),
         ] {
             let mut value = reply(0, 0, false, false);
-            value.headers.push(header);
+            value.headers = vec![header];
             assert!(decode_reply::<MovePrimary>(&value).is_err());
         }
     }
