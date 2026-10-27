@@ -223,6 +223,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let client = FabricClient::connect_clear(args[0].parse()?, Duration::from_secs(10)).await?;
     let name: NamingUri = args[1].parse()?;
+    if args.len() == 4 && args[2] == "--move-primary" {
+        let before = stateful_snapshot(&client, &name).await?;
+        let partition = before["partition"].as_str().ok_or("partition")?.parse()?;
+        if !before["replicas"]
+            .as_array()
+            .ok_or("native replicas")?
+            .iter()
+            .any(|replica| replica["node"] == args[3] && replica["role"] == "ActiveSecondary")
+        {
+            return Err("target is not an independently observed active secondary".into());
+        }
+        client
+            .move_primary(partition, &args[3], Some(Duration::from_secs(60)))
+            .await?;
+        println!(
+            "{}",
+            serde_json::json!({"request":"MovePrimary","partition":partition.to_string(),
+            "target":args[3],"constraints":"enforced","native_request_completed":true})
+        );
+        client.close().await?;
+        return Ok(());
+    }
     if args.len() == 3 && args[2] == "--stateful" {
         let snapshot = stateful_snapshot(&client, &name).await?;
         println!("{snapshot}");

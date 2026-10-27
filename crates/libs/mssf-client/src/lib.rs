@@ -12,6 +12,7 @@ mod deployed_service_packages;
 mod health;
 mod health_protocol;
 mod list_protocol;
+mod movement;
 mod naming_uri;
 mod native;
 mod node_protocol;
@@ -350,6 +351,27 @@ impl FabricClient {
     /// The first terminal connection cause, including failures detected idle.
     pub fn terminal_error(&self) -> Option<Error> {
         self.connection.terminal_error()
+    }
+
+    /// Ask native FM to move a partition's Primary to an explicit node while
+    /// enforcing placement constraints. There is deliberately no force/ignore
+    /// option. Observe placement/discovery separately; this is not an atomic
+    /// cluster snapshot or an application-side membership authority.
+    pub async fn move_primary(
+        &self,
+        partition: Uuid,
+        target_node: &str,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        self.query(
+            &movement::MovePrimary {
+                partition,
+                target: target_node.to_owned(),
+            },
+            None,
+            timeout,
+        )
+        .await
     }
 
     fn deadline(&self, timeout: Option<Duration>) -> Result<Instant> {

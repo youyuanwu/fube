@@ -460,12 +460,8 @@ def stateful_three(allocation: Allocation, application: str, binaries: Binaries,
     before=result["initial"]
     old=before["primary"]
     target=next(replica for replica in before["replicas"] if replica["role"]=="ActiveSecondary")["node"]
-    help_text=allocation.sf("replica","move-primary","--help")
-    required=("--service-id","--partition-id","--current-node-name","--new-node-name")
-    if any(flag not in help_text for flag in required):
-        raise RuntimeError("native sfctl move-primary contract differs; no force/ignore fallback")
-    allocation.sf("replica","move-primary","--service-id",sid,"--partition-id",before["partition"],
-                  "--current-node-name",old["rpc"]["node"],"--new-node-name",target)
+    result["move_request"]=json.loads(run(str(binaries.observer),"127.0.0.1:19000",service,
+                                         "--move-primary",target,timeout=75))
     swapped=wait_stateful(service,3,2,observer=binaries.observer,capture=result,
         accept=lambda value:value["primary"]["rpc"]["node"]==target and epoch_of(value)>epoch_of(before))
     result["planned_swap"]={"before":before,"after":swapped,"old_primary_service":http_probe(old["endpoint"])}
