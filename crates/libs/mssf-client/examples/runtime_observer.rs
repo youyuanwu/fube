@@ -206,6 +206,7 @@ async fn stateful_snapshot(
     Ok(
         serde_json::json!({"observer":"mssf-client","service":service,"partition":id.to_string(),
         "native_partition":{"target":partition.target_replica_set_size,"minimum":partition.min_replica_set_size,
+            "epoch_kind":"FMPrimaryEpoch",
             "status":format!("{:?}",partition.status),"epoch":{"data_loss":partition.current_configuration_epoch.data_loss_version,
                 "configuration":partition.current_configuration_epoch.configuration_version}},
         "replicas":observations,"primary":primary,"best_effort_non_atomic":true}),

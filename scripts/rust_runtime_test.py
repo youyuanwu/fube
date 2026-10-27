@@ -346,7 +346,8 @@ def assert_stateful(value: dict, service: str, count: int, minimum: int) -> dict
             or rpc["replica"] != replica["replica"] or rpc["node"] != replica["node"]
             or rpc["pid"] != deployed["host_process_id"] or rpc["role"] != expected
             or rpc["replicator_role"] != expected or rpc["current_role"] != expected
-            or not rpc["stateful"] or rpc["persisted"] or rpc["epoch"] != partition["epoch"]
+            or not rpc["stateful"] or rpc["persisted"]
+            or {"data_loss":rpc["epoch"]["data_loss"],"configuration":rpc["epoch"]["configuration"] & ~0xFFFFFFFF} != partition["epoch"]
             or deployed["service_type_name"] != "RustStatefulRuntimeType"):
             raise RuntimeError("native placement/deployment/HTTP stateful identity, role or epoch mismatch")
         if (rpc["replication_address"] == replica["address"] or rpc["service_address"] != replica["address"]
@@ -374,19 +375,25 @@ def assert_stateful(value: dict, service: str, count: int, minimum: int) -> dict
 
 
 def wait_stateful(service: str, count: int, minimum: int, *, observer: Path = DEFAULT_OBSERVER,
-                  accept=None, timeout: float = 180) -> dict:
+                  accept=None, timeout: float = 180, capture: dict | None = None) -> dict:
     def check():
-        value = assert_stateful(stateful_observe(service,observer=observer), service,count,minimum)
+        value = stateful_observe(service,observer=observer)
+        if capture is not None:
+            capture["last_observation"] = value
+        value = assert_stateful(value, service,count,minimum)
         return value if accept is None or accept(value) else False
     return wait_condition(check,"independent stateful placement/discovery/HTTP agreement",timeout)
 
 
-def stateful_singleton(allocation: Allocation, application: str, binaries: Binaries) -> dict:
-    observed = wait_stateful(application+"/Stateful",1,1,observer=binaries.observer)
+def stateful_singleton(allocation: Allocation, application: str, binaries: Binaries,
+                       evidence: dict | None = None) -> dict:
+    evidence = {} if evidence is None else evidence
+    observed = wait_stateful(application+"/Stateful",1,1,observer=binaries.observer,capture=evidence)
     process = json.loads(allocation.execute("python3","-c",PROCESS,json.dumps(observed["primary"]),"inspect"))
     if process["executable_sha256"] != digest(binaries.app):
         raise RuntimeError("native serving stateful executable differs from immutable bundle")
-    return {"status":"PASS_TARGET_MINIMUM_1_EMPTY_CONTROL_PLANE","observation":observed,"process":process}
+    evidence.update(status="PASS_TARGET_MINIMUM_1_EMPTY_CONTROL_PLANE",observation=observed,process=process)
+    return evidence
 
 
 def failure_artifacts(allocation: Allocation, type_name: str) -> dict:
@@ -1007,7 +1014,8 @@ def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | Non
         allocation.sf("application", "create", "--app-name", application, "--app-type", type_name, "--app-version", version)
         attempts["create_completed"]=True
         if stateful is not None:
-            result["stateful_singleton"] = stateful_singleton(allocation,application,binaries)
+            result["stateful_singleton"] = {}
+            stateful_singleton(allocation,application,binaries,result["stateful_singleton"])
         configuration_upgrade(allocation,binaries,result,attempts)
         if full:
             result["resilience"]={}

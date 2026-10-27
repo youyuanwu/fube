@@ -19,7 +19,7 @@ def snapshot():
          "replication_address":"http://127.0.0.1:2/control","read_status":"Granted","write_status":"Granted",
          "replicator":{"application_writes":False,"durability":False}}
     return {"observer":"mssf-client","service":service,"partition":"partition",
-            "native_partition":{"target":1,"minimum":1,"status":"Ready","epoch":epoch},
+            "native_partition":{"target":1,"minimum":1,"status":"Ready","epoch":{"data_loss":1,"configuration":1<<32}},
             "replicas":[{"replica":7,"role":"Primary","status":"Ready","node":"node","address":rpc["service_address"],
                          "service_http_status":200,"rpc":rpc,
                          "deployed":{"host_process_id":11,"service_type_name":"RustStatefulRuntimeType"},
