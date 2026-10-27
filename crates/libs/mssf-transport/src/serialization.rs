@@ -19,6 +19,7 @@ const INT32: u8 = 0x07;
 const UINT32: u8 = 0x08;
 const INT64: u8 = 0x09;
 const UINT64: u8 = 0x0a;
+const DOUBLE: u8 = 0x0b;
 const GUID: u8 = 0x0c;
 const STRING: u8 = 0x8d;
 const BYTE_ARRAY: u8 = 0x84;
@@ -170,6 +171,16 @@ impl Encoder {
 
     pub fn u64(&mut self, value: u64) {
         self.unsigned(UINT64, value);
+    }
+
+    /// Native x86-64 IEEE Double; both signed zeros use the empty marker.
+    pub fn f64(&mut self, value: f64) {
+        if value == 0.0 {
+            self.bytes.push(DOUBLE | EMPTY);
+        } else {
+            self.bytes.push(DOUBLE);
+            self.bytes.extend_from_slice(&value.to_le_bytes());
+        }
     }
 
     pub fn boolean(&mut self, value: bool) {
@@ -395,6 +406,14 @@ impl<'a> Decoder<'a> {
         self.unsigned(UINT64, 64)
     }
 
+    pub fn f64(&mut self) -> Result<f64> {
+        match self.byte()? {
+            0x4b => Ok(0.0),
+            DOUBLE => Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap())),
+            _ => Err(Error::Protocol("expected Double metadata")),
+        }
+    }
+
     pub fn boolean(&mut self) -> Result<bool> {
         match self.byte()? {
             TRUE => Ok(true),
@@ -520,6 +539,7 @@ impl<'a> Decoder<'a> {
             UINT32 | 0x48 => self.u32().map(|_| ()),
             INT64 | 0x49 => self.i64().map(|_| ()),
             UINT64 | 0x4a => self.u64().map(|_| ()),
+            DOUBLE | 0x4b => self.f64().map(|_| ()),
             GUID | 0x4c => self.guid().map(|_| ()),
             TRUE | FALSE => self.boolean().map(|_| ()),
             STRING | 0xcd => {

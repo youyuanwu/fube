@@ -4,7 +4,7 @@ use crate::{api::*, lease::Authority, wire::*, ActivationContext, RuntimeMetrics
 mod tests;
 use mssf_transport::{
     connection::{deadline_after, Connection, IpcRequest},
-    serialization::serde::{from_slice, to_vec, EmptyObjectArray, Guid, Pointer},
+    serialization::serde::{from_slice, to_vec, EmptyObjectArray, Guid, ObjectArray, Pointer},
     Error, Result,
 };
 use std::{
@@ -45,6 +45,7 @@ struct Snapshot {
     operation_start: i64,
     operation_kind: i64,
     live: Option<OwnedSemaphorePermit>,
+    reporting: Option<Arc<crate::reporting::Reporting>>,
 }
 struct Unit {
     state: Mutex<Snapshot>,
@@ -244,6 +245,7 @@ fn unit(shared: &Shared, request: &ProxyRequest, create: bool) -> Result<Option<
             operation_start: 0,
             operation_kind: 0,
             live: None,
+            reporting: None,
         }),
     });
     units.insert(request.unit.id.id.0, unit.clone());
@@ -326,6 +328,9 @@ async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
         let mut state = unit.state.lock().unwrap();
         if epoch(&request) > epoch(&state.request) {
             state.request.unit = request.unit.clone();
+            if let Some(reporting) = &state.reporting {
+                reporting.update(&state.request);
+            }
         }
     }
     match props.action.as_str() {
@@ -476,6 +481,14 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
         instance_id: request.local.id,
         incarnation: request.local.instance,
     };
+    let reporting = crate::reporting::Reporting::new(
+        shared.connection.clone(),
+        valid.clone(),
+        shared.authority.clone(),
+        request.clone(),
+        cancel.clone(),
+    );
+    unit.state.lock().unwrap().reporting = Some(reporting.clone());
     let partition = Partition {
         identity: identity.clone(),
         kind: match request.unit.consistency.kind {
@@ -489,6 +502,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
         },
         valid: valid.clone(),
         authority: shared.authority.clone(),
+        reporting,
     };
     let outcome: Result<String> = async {
         let factory = factory.ok_or(Error::Remote {
@@ -629,6 +643,9 @@ async fn update(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<(
         }
         if request.service.update_version > state.request.service.update_version {
             state.request.service = request.service;
+            if let Some(reporting) = &state.reporting {
+                reporting.update(&state.request);
+            }
         }
         shared.metrics.updates.fetch_add(1, Ordering::Relaxed);
         UpdateServiceReply {
@@ -660,7 +677,7 @@ fn query(shared: &Shared, request: &ProxyRequest) -> Result<QueryReply> {
         operation: 0,
         operation_start: 0,
         replicator_operation: 0,
-        loads: EmptyObjectArray,
+        loads: ObjectArray(vec![]),
         read_status: 0,
         write_status: 0,
         replicator: Pointer(None),
@@ -687,6 +704,9 @@ fn query(shared: &Shared, request: &ProxyRequest) -> Result<QueryReply> {
             detail.instance_id = local.id;
             detail.operation = state.operation_kind;
             detail.operation_start = state.operation_start;
+            if let Some(reporting) = &state.reporting {
+                detail.loads = ObjectArray(reporting.loads());
+            }
         }
     }
     Ok(QueryReply {

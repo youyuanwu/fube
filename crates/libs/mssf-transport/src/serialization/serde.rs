@@ -391,10 +391,11 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
     serialize_scalar!(serialize_u32, u32, u32);
     serialize_scalar!(serialize_i64, i64, i64);
     serialize_scalar!(serialize_u64, u64, u64);
+    serialize_scalar!(serialize_f64, f64, f64);
     reject_serialize! {
         serialize_i8(v: i8); serialize_i16(v: i16); serialize_u8(v: u8);
         serialize_i128(v: i128); serialize_u128(v: u128);
-        serialize_f32(v: f32); serialize_f64(v: f64); serialize_char(v: char);
+        serialize_f32(v: f32); serialize_char(v: char);
         serialize_unit(); serialize_unit_struct(n: &'static str);
     }
     fn serialize_unit_variant(self, _: &'static str, _: u32, variant: &'static str) -> Result<()> {
@@ -794,6 +795,7 @@ impl<'de> ::serde::Deserializer<'de> for Deserializer<'_, 'de> {
     deserialize_scalar!(deserialize_u32, u32, visit_u32);
     deserialize_scalar!(deserialize_i64, i64, visit_i64);
     deserialize_scalar!(deserialize_u64, u64, visit_u64);
+    deserialize_scalar!(deserialize_f64, f64, visit_f64);
     reject_deserialize!(
         deserialize_any,
         deserialize_i8,
@@ -802,7 +804,6 @@ impl<'de> ::serde::Deserializer<'de> for Deserializer<'_, 'de> {
         deserialize_i128,
         deserialize_u128,
         deserialize_f32,
-        deserialize_f64,
         deserialize_char,
         deserialize_unit,
         deserialize_map,

@@ -106,6 +106,215 @@ struct Harness {
     calls: Arc<Calls>,
     index: u32,
 }
+
+#[tokio::test]
+async fn reporting_native_paths_identity_health_results_and_close_fences() {
+    let mut h = Harness::new().await;
+    let mut request = h.request(1, 1, 0);
+    request.service.metrics.0.push(Metric {
+        name: "Work".into(),
+        weight: 1,
+        primary: 0,
+        secondary: 0,
+    });
+    h.send("ReplicaOpen", &request).await;
+    h.receive("ReplicaOpenReply").await;
+    let mut partition = h.calls.partitions.lock().unwrap()[0].clone();
+    // Public snapshots must not be usable to retarget a report.
+    partition.identity.partition_id = uuid::Uuid::nil();
+    partition.identity.instance_id = -1;
+    let metrics = vec![crate::LoadMetric {
+        name: "Work".into(),
+        value: 731,
+    }];
+    let (result, message) =
+        tokio::join!(partition.report_load(&metrics), h.receive("RAPReportLoad"));
+    result.unwrap();
+    assert_eq!(message.properties().unwrap().actor, 12);
+    let load: LoadBody = from_slice(&message.body).unwrap();
+    assert_eq!(load.reports.0[0].partition, request.unit.id.id);
+    assert_eq!(load.reports.0[0].secondary.0[0].value, 731);
+    assert_eq!(load.reports.0[0].secondary.0[0].weighted_sum, 731.0);
+    assert_eq!(load.reports.0[0].nodes.0[0].node.0, request.local.node.id.0);
+    assert!(load.reports.0[0].primary.0.is_empty());
+    let (result, message) = tokio::join!(
+        partition.report_move_cost(crate::MoveCost::High),
+        h.receive("RAPReportLoad")
+    );
+    result.unwrap();
+    let cost: LoadBody = from_slice(&message.body).unwrap();
+    assert_eq!(cost.reports.0[0].secondary.0[0].name, "_MoveCost_");
+    assert_eq!(cost.reports.0[0].secondary.0[0].value, 3);
+    h.send("RAPQuery", &request).await;
+    let query: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+    assert_eq!(query.detail.loads.0.len(), 2);
+
+    for code in [0, 0x80071c47u32 as i32 as i64] {
+        let report = crate::HealthReport {
+            source: "User".into(),
+            property: "Ready".into(),
+            state: crate::HealthState::Warning,
+            description: "detail".into(),
+            time_to_live: None,
+            sequence: crate::HealthSequence::Explicit(45),
+            remove_when_expired: true,
+        };
+        let p = partition.clone();
+        let operation = tokio::spawn(async move { p.report_health(&report).await });
+        let message = h.receive("ReportHealth").await;
+        assert_eq!(message.properties().unwrap().actor, 7);
+        let body: HealthBody = from_slice(&message.body).unwrap();
+        let report = &body.reports.0[0];
+        assert_eq!(report.ttl, i64::MAX);
+        assert_eq!(report.state, 2);
+        let entity = &report.entity.0.as_ref().unwrap().0;
+        assert_eq!(entity.instance, 100);
+        assert_eq!(entity.kind, 2);
+        assert_eq!(entity.partition, request.unit.id.id);
+        write_message(
+            &mut h.peer,
+            &Message {
+                headers: vec![
+                    Header::actor(16).unwrap(),
+                    Header::action("OperationSuccessAction").unwrap(),
+                    Header::relates_to(message.properties().unwrap().id).unwrap(),
+                ],
+                body: to_vec(&HealthReply {
+                    results: ObjectArray(vec![HealthResult {
+                        kind: 2,
+                        source: report.source.clone(),
+                        sequence: report.sequence,
+                        entity_property: format!(
+                            "{}+100+Ready",
+                            uuid::Uuid::from_bytes_le(request.unit.id.id.0)
+                        ),
+                        error: code,
+                    }]),
+                    streams: ObjectArray(vec![]),
+                })
+                .unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        let result = operation.await.unwrap();
+        if code == 0 {
+            assert_eq!(result.unwrap().sequence, 45);
+        } else {
+            assert!(matches!(result, Err(Error::Remote { code: actual, .. }) if actual == code));
+        }
+    }
+    let (result, message) = tokio::join!(
+        partition.report_fault(FaultType::Transient),
+        h.receive("RAReportFault")
+    );
+    assert_eq!(result.unwrap().attempts, 1);
+    let fault: FaultBody = from_slice(&message.body).unwrap();
+    assert_eq!(fault.fault, 1); // public COM Transient=2 must NOT leak here
+    assert_eq!(fault.local.instance, 1);
+    assert_eq!(fault.activity.kind, 2);
+    assert_eq!(
+        partition
+            .report_fault(FaultType::Transient)
+            .await
+            .unwrap()
+            .attempts,
+        1
+    );
+    let (result, message) = tokio::join!(
+        partition.report_fault(FaultType::Permanent),
+        h.receive("RAReportFault")
+    );
+    result.unwrap();
+    assert_eq!(from_slice::<FaultBody>(&message.body).unwrap().fault, 2);
+    h.send("ReplicaClose", &request).await;
+    h.receive("ReplicaCloseReply").await;
+    assert!(partition.fault_delivery().unwrap().cancelled);
+    assert!(matches!(
+        partition.report_load(&metrics).await,
+        Err(Error::Closed)
+    ));
+    assert!(matches!(
+        partition.report_move_cost(crate::MoveCost::Low).await,
+        Err(Error::Closed)
+    ));
+    assert!(matches!(
+        partition.report_fault(FaultType::Transient).await,
+        Err(Error::Closed)
+    ));
+    request.local.instance += 1;
+    h.send("ReplicaOpen", &request).await;
+    h.receive("ReplicaOpenReply").await;
+    assert!(partition.report_load(&metrics).await.is_err());
+    let current = h.calls.partitions.lock().unwrap().last().unwrap().clone();
+    let (result, _) = tokio::join!(current.report_load(&metrics), h.receive("RAPReportLoad"));
+    result.unwrap();
+    h.engine.shared.authority.retire();
+    assert!(current.report_load(&metrics).await.is_err());
+    assert!(current
+        .report_move_cost(crate::MoveCost::High)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn reporting_bounds_and_current_description_validation() {
+    let mut h = Harness::new().await;
+    let mut request = h.request(1, 1, 0);
+    request.service.metrics.0.push(Metric {
+        name: "Work".into(),
+        weight: 1,
+        primary: 0,
+        secondary: 0,
+    });
+    h.send("ReplicaOpen", &request).await;
+    h.receive("ReplicaOpenReply").await;
+    let partition = h.calls.partitions.lock().unwrap()[0].clone();
+    for metrics in [
+        vec![],
+        vec![crate::LoadMetric {
+            name: "No".into(),
+            value: 1,
+        }],
+        vec![crate::LoadMetric {
+            name: "Work".into(),
+            value: i32::MAX as u32,
+        }],
+        vec![
+            crate::LoadMetric {
+                name: "Work".into(),
+                value: 1
+            };
+            65
+        ],
+        vec![
+            crate::LoadMetric {
+                name: "Work".into(),
+                value: 1
+            };
+            2
+        ],
+    ] {
+        assert!(partition.report_load(&metrics).await.is_err());
+    }
+    let _permit = partition.reporting.admission_for_test();
+    assert!(matches!(
+        partition.report_move_cost(crate::MoveCost::High).await,
+        Err(Error::ResourceLimit(_))
+    ));
+    drop(_permit);
+    request.service.metrics.0.clear();
+    request.service.update_version += 1;
+    h.send("ProxyUpdateServiceDescription", &request).await;
+    h.receive("ProxyUpdateServiceDescriptionReply").await;
+    assert!(partition
+        .report_load(&[crate::LoadMetric {
+            name: "Work".into(),
+            value: 1
+        }])
+        .await
+        .is_err());
+}
 impl Harness {
     async fn new() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -295,7 +504,10 @@ impl Harness {
             .unwrap()
             .unwrap();
         assert_eq!(msg.properties().unwrap().action, action);
-        assert_eq!(msg.properties().unwrap().actor, 12);
+        assert_eq!(
+            msg.properties().unwrap().actor,
+            if action == "ReportHealth" { 7 } else { 12 }
+        );
         msg
     }
     async fn no_reply(&mut self) {
@@ -316,9 +528,7 @@ async fn open_readiness_query_duplicate_close_and_partition_invalidation() {
     assert_eq!(reply.error.error, 0);
     assert!(!reply.local.service_endpoint.is_empty());
     let partition = h.calls.partitions.lock().unwrap()[0].clone();
-    assert!(partition.report_health("a", "b", "c").is_err());
-    assert!(partition.report_load(&[]).is_err());
-    assert!(partition.report_fault(FaultType::Transient).is_err());
+    assert!(partition.report_load(&[]).await.is_err());
     h.send("ReplicaOpen", &request).await;
     h.receive("ReplicaOpenReply").await;
     assert_eq!(h.calls.opens.load(Ordering::SeqCst), 1);
