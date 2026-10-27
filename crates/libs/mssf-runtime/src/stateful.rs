@@ -34,6 +34,7 @@ struct State {
     live: Option<OwnedSemaphorePermit>,
     operation: i64,
     operation_start: i64,
+    close_through: i64,
 }
 struct Unit {
     state: Mutex<State>,
@@ -48,6 +49,14 @@ pub(crate) struct Registry {
     connection: Connection,
     live: Arc<Semaphore>,
     metrics: Arc<RuntimeMetrics>,
+    #[cfg(test)]
+    open_admission_hook: Mutex<Option<Arc<OpenAdmissionHook>>>,
+}
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct OpenAdmissionHook {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
 }
 impl Registry {
     pub(crate) fn new(
@@ -65,7 +74,19 @@ impl Registry {
             connection,
             live,
             metrics,
+            #[cfg(test)]
+            open_admission_hook: Mutex::new(None),
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn pause_open_admission(&self) -> Arc<OpenAdmissionHook> {
+        let hook = Arc::new(OpenAdmissionHook::default());
+        *self.open_admission_hook.lock().unwrap() = Some(hook.clone());
+        hook
+    }
+    #[cfg(test)]
+    pub(crate) fn close_through(&self, id: [u8; 16]) -> i64 {
+        self.get(id).unwrap().state.lock().unwrap().close_through
     }
     pub(crate) fn has_factory(&self, name: &str) -> bool {
         self.factories.lock().unwrap().contains_key(name)
@@ -153,6 +174,7 @@ impl Registry {
                                 live: None,
                                 operation: 1,
                                 operation_start: 0,
+                                close_through: 0,
                             }),
                             gate: Arc::new(Semaphore::new(1)),
                         })
@@ -182,7 +204,8 @@ impl Registry {
             }
             // Close-for-business and cancel before trying operation ownership.
             // Native retries until the old callback owner drains.
-            let state = unit.state.lock().unwrap();
+            let mut state = unit.state.lock().unwrap();
+            state.close_through = state.close_through.max(request.local.instance);
             state.valid.store(false, Ordering::Release);
             state.cancel.cancel();
             state.status.lock().unwrap().lifecycle = ReplicaLifecycle::Closing;
@@ -265,35 +288,53 @@ impl Registry {
                 .reply(unit, "ReplicaOpenReply", request, result.err(), 1)
                 .await;
         }
-        let (valid, cancel, generation, snapshot) = {
-            let mut state = unit.state.lock().unwrap();
-            state.live = Some(
-                self.live
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| Error::ResourceLimit("live service units"))?,
-            );
-            state.generation = state
-                .generation
-                .checked_add(1)
-                .ok_or(Error::ResourceLimit("stateful generations"))?;
-            state.valid = Arc::new(AtomicBool::new(true));
-            state.cancel = Cancellation::default();
-            state.request = request.clone();
-            state.status = Arc::new(Mutex::new(initial_status(&request)));
-            {
-                let mut status = state.status.lock().unwrap();
-                status.lifecycle = ReplicaLifecycle::Opening;
-                status.current_role = role;
+        #[cfg(test)]
+        {
+            let hook = self.open_admission_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook.reached.notify_one();
+                hook.release.notified().await;
             }
-            state.operation = 2;
-            state.operation_start = super::lifecycle::filetime();
-            (
-                state.valid.clone(),
-                state.cancel.clone(),
-                state.generation,
-                state.status.clone(),
-            )
+        }
+        let installation = {
+            let mut state = unit.state.lock().unwrap();
+            // This check and generation installation share Close's lock.
+            if state.close_through >= request.local.instance {
+                None
+            } else {
+                state.live = Some(
+                    self.live
+                        .clone()
+                        .try_acquire_owned()
+                        .map_err(|_| Error::ResourceLimit("live service units"))?,
+                );
+                state.generation = state
+                    .generation
+                    .checked_add(1)
+                    .ok_or(Error::ResourceLimit("stateful generations"))?;
+                state.valid = Arc::new(AtomicBool::new(true));
+                state.cancel = Cancellation::default();
+                state.request = request.clone();
+                state.status = Arc::new(Mutex::new(initial_status(&request)));
+                {
+                    let mut status = state.status.lock().unwrap();
+                    status.lifecycle = ReplicaLifecycle::Opening;
+                    status.current_role = role;
+                }
+                state.operation = 2;
+                state.operation_start = super::lifecycle::filetime();
+                Some((
+                    state.valid.clone(),
+                    state.cancel.clone(),
+                    state.generation,
+                    state.status.clone(),
+                ))
+            }
+        };
+        let Some((valid, cancel, generation, snapshot)) = installation else {
+            return self
+                .reply(unit, "ReplicaOpenReply", request, Some(Error::Closed), 1)
+                .await;
         };
         let identity = ReplicaIdentity {
             service_name: request.service.name.clone(),
@@ -593,6 +634,8 @@ impl Registry {
             if !stale(&state.request, request) {
                 error = if status.lifecycle == ReplicaLifecycle::Closed {
                     CLOSED
+                } else if !state.service_open || state.replicator.is_none() {
+                    0x80071bc7u32 as i32 as i64 // NotReady, before replicator owner exists.
                 } else {
                     0
                 };
@@ -657,7 +700,9 @@ impl Registry {
         };
         let authority = Arc::downgrade(&self.authority);
         let publish = action == "ReplicaOpenReply" && !failed;
-        self.connection
+        let frame_valid = valid.clone();
+        let sent = self
+            .connection
             .send_one_way_fenced(
                 12,
                 action,
@@ -667,10 +712,20 @@ impl Registry {
                     authority
                         .upgrade()
                         .is_some_and(|authority| authority.check().is_ok())
-                        && (!publish || valid.load(Ordering::Acquire))
+                        && (!publish || frame_valid.load(Ordering::Acquire))
                 })),
             )
-            .await
+            .await;
+        match sent {
+            // A locally revoked queued Open reply is suppressed, not a
+            // successful endpoint publication or a process-wide fault.
+            Err(Error::Closed)
+                if publish && !valid.load(Ordering::Acquire) && self.authority.check().is_ok() =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     pub(crate) async fn quiesce(&self) -> Result<()> {

@@ -432,6 +432,7 @@ async fn active_stateful_callback_prevents_successful_host_quiescence() {
         if !calls.partitions.lock().unwrap().is_empty() {
             break;
         }
+
         tokio::task::yield_now().await;
     }
     assert!(!calls.partitions.lock().unwrap().is_empty());
@@ -439,4 +440,103 @@ async fn active_stateful_callback_prevents_successful_host_quiescence() {
     assert!(h.engine.quiesce().await.is_err());
     assert!(calls.partitions.lock().unwrap()[0].ensure_valid().is_err());
     calls.release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_between_gate_and_generation_install_cannot_be_overwritten() {
+    let mut h = Harness::new().await;
+    let calls = register(&h);
+    let hook = h.engine.shared.stateful.pause_open_admission();
+    let mut request = request(&h, 2, 1, 0);
+    h.send("ReplicaOpen", &request).await;
+    hook.reached.notified().await;
+    request.flags = 4;
+    h.send("ReplicaClose", &request).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while h.engine.shared.stateful.close_through([2; 16]) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    hook.release.notify_one();
+    let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
+    assert_ne!(reply.error.error, 0);
+    assert!(calls.events.lock().unwrap().is_empty());
+    h.send("ReplicaClose", &request).await;
+    h.receive("ReplicaCloseReply").await;
+    request.flags = 0;
+    request.local.instance = 2;
+    h.send("ReplicaOpen", &request).await;
+    let next: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
+    assert_eq!(next.error.error, 0);
+    assert!(calls.partitions.lock().unwrap()[0].ensure_valid().is_ok());
+}
+
+fn native_default_service(mut service: Service) -> Service {
+    service.name.clear();
+    service.instance = 0;
+    service.service_type.name.clear();
+    service.service_type.package.name.clear();
+    service.service_type.package.application.type_name.clear();
+    service.service_type.package.application.number = 0;
+    service.application.clear();
+    service.version.instance = 0;
+    service.version.version.application.value.major = 0;
+    service.version.version.application.value.minor = 0;
+    service.version.version.value.major = 0;
+    service.version.version.value.minor = 0;
+    service.partitions = 0;
+    service.target = 0;
+    service.minimum = 0;
+    service.stateful = false;
+    service.persisted = false;
+    service.initialization.0.clear();
+    service.group = false;
+    service.correlations.0.clear();
+    service.constraints.clear();
+    service.scaleout = 0;
+    service.metrics.0.clear();
+    service.move_cost = 0;
+    service.restart_wait = i64::MIN;
+    service.quorum_wait = i64::MIN;
+    service.update_version = 0;
+    service.placement.0.clear();
+    service.standby_keep = i64::MIN;
+    service.activation_mode = 0;
+    service.dns.clear();
+    service
+}
+
+#[tokio::test]
+async fn stateful_query_default_metadata_is_not_ready_until_replicator_owner_exists() {
+    let mut h = Harness::new().await;
+    let calls = register(&h);
+    let request = request(&h, 2, 1, 8);
+    h.send("ReplicaOpen", &request).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while calls.partitions.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut query = request.clone();
+    query.service = native_default_service(query.service);
+    h.send("RAPQuery", &query).await;
+    let early: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+    assert_eq!(early.error, 0x80071bc7u32 as i32 as i64);
+    calls.release.notify_one();
+    h.receive("ReplicaOpenReply").await;
+    h.send("RAPQuery", &query).await;
+    let ready: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+    assert_eq!(ready.error, 0);
+    assert_eq!(
+        (
+            ready.detail.kind,
+            ready.detail.replica_id,
+            ready.detail.instance_id
+        ),
+        (2, 100, -1)
+    );
 }

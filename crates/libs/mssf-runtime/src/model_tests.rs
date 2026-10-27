@@ -52,6 +52,8 @@ fn model_child() {
                         Box::pin(async {
                             // No executor, cancellation or stderr progress is
                             // available; only the independent OS fence can win.
+                            println!("STATEFUL_FACTORY_ENTERED");
+                            std::io::stdout().flush().unwrap();
                             std::thread::sleep(Duration::from_secs(60));
                             Err(Error::Protocol("stateful factory escaped hard fence"))
                         })
@@ -238,6 +240,9 @@ async fn scenario(mode: &str, expected: i32) {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if mode == "stateful-blocked-factory" {
+        command.stdout(Stdio::piped());
+    }
     for (k, v) in [
         (
             "Fabric_ApplicationHostId",
@@ -388,27 +393,6 @@ async fn scenario(mode: &str, expected: i32) {
                     {
                         return;
                     }
-                    if p.action == "RegisterServiceTypeRequest"
-                        && mode_owned == "stateful-blocked-factory"
-                    {
-                        let mut open = crate::lifecycle::tests::Harness::request_with_context(
-                            runtime_context.as_ref().unwrap(),
-                            9,
-                            1,
-                            0,
-                        );
-                        open.service.stateful = true;
-                        open.service.service_type.name = "BlockedStateful".into();
-                        open.unit.current.configuration = (1 << 32) + 1;
-                        let message = Message {
-                            headers: vec![
-                                Header::actor(12).unwrap(),
-                                Header::action("ReplicaOpen").unwrap(),
-                            ],
-                            body: to_vec(&open).unwrap(),
-                        };
-                        write_message(&mut stream, &message).await.unwrap();
-                    }
                 }
             }
             if write_message(
@@ -422,6 +406,30 @@ async fn scenario(mode: &str, expected: i32) {
             .is_err()
             {
                 return;
+            }
+            if p.action == "RegisterServiceTypeRequest" && mode_owned == "stateful-blocked-factory"
+            {
+                let context = runtime_context.as_ref().unwrap();
+                let mut open =
+                    crate::lifecycle::tests::Harness::request_with_context(context, 9, 1, 0);
+                open.service.application = context.code.application_name.clone();
+                open.service.name = format!("{}/Blocked", context.code.application_name);
+                open.service.stateful = true;
+                open.service.service_type.name = "BlockedStateful".into();
+                open.unit.current.configuration = (1 << 32) + 1;
+                let message = Message {
+                    headers: vec![
+                        Header::actor(12).unwrap(),
+                        Header::action("ReplicaOpen").unwrap(),
+                        Header::message_id(MessageId {
+                            guid: [9; 16],
+                            index: 101,
+                        })
+                        .unwrap(),
+                    ],
+                    body: to_vec(&open).unwrap(),
+                };
+                write_message(&mut stream, &message).await.unwrap();
             }
             if step == 4 && !update_sent {
                 update_sent = true;
@@ -479,6 +487,26 @@ async fn scenario(mode: &str, expected: i32) {
         }
     });
     let started = Monotonic::now();
+    if mode == "stateful-blocked-factory" {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            for _ in 0..16 {
+                let line = lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("child exited without entering stateful factory");
+                assert!(line.len() < 1024);
+                if line.contains("STATEFUL_FACTORY_ENTERED") {
+                    return;
+                }
+            }
+            panic!("stateful factory entry evidence missing");
+        })
+        .await
+        .expect("Open never reached stateful factory");
+    }
     let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
         .await
         .unwrap_or_else(|_| panic!("model {mode} exceeded process bound"))
