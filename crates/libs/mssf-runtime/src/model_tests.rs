@@ -348,11 +348,29 @@ async fn scenario(mode: &str, expected: i32) {
         let mut step = 0;
         let mut runtime_context = None::<RuntimeContext>;
         let mut stateful_request = None::<crate::wire::ProxyRequest>;
+        let mut close_retry = None::<crate::wire::ProxyRequest>;
+        let mut close_index = 102;
+        let mut close_tick = tokio::time::interval(Duration::from_millis(25));
+        let (mut reader, mut stream) = stream.into_split();
         let mut update_sent = false;
         loop {
-            let request = match read_message(&mut stream).await {
-                Ok(r) => r,
-                Err(_) => return,
+            let request = {
+                // Keep a partially read frame alive across retry ticks.
+                let next = read_message(&mut reader);
+                tokio::pin!(next);
+                loop {
+                    tokio::select! {
+                        result=&mut next=>break match result {Ok(r)=>r,Err(_)=>return},
+                        _=close_tick.tick(),if close_retry.is_some()=>{
+                            close_index+=1;
+                            if write_message(&mut stream,&Message {
+                                headers:vec![Header::actor(12).unwrap(),Header::action("ReplicaClose").unwrap(),
+                                    Header::message_id(MessageId {guid:[9;16],index:close_index}).unwrap()],
+                                body:to_vec(close_retry.as_ref().unwrap()).unwrap(),
+                            }).await.is_err() {return;}
+                        }
+                    }
+                }
             };
             let p = request.properties().unwrap();
             if p.relates_to != MessageId::default() {
@@ -427,6 +445,10 @@ async fn scenario(mode: &str, expected: i32) {
                     );
                     let mut close = stateful_request.clone().unwrap();
                     close.flags = if mode_owned.contains("abort") { 4 } else { 0 };
+                    // Semantic Open reply can precede release of its dispatch
+                    // gate. Native retries incompatible Close rather than
+                    // assuming this first one-way attempt was admitted.
+                    close_retry = Some(close.clone());
                     write_message(
                         &mut stream,
                         &Message {
@@ -569,7 +591,7 @@ async fn scenario(mode: &str, expected: i32) {
                     }
                     "eof" => return,
                     "lease-zero" => {
-                        let next = read_message(&mut stream).await.unwrap();
+                        let next = read_message(&mut reader).await.unwrap();
                         write_message(
                             &mut stream,
                             &Message {
@@ -611,7 +633,7 @@ async fn scenario(mode: &str, expected: i32) {
             panic!("stateful factory entry evidence missing");
         })
         .await
-        .expect("Open never reached stateful factory");
+        .unwrap_or_else(|_| panic!("model {mode}: callback/destructor entry never reached"));
     }
     let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
         .await
