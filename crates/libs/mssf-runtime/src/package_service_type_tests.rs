@@ -1,4 +1,32 @@
 use super::tests::Fixture;
+
+#[test]
+fn placement_constraint_text_is_bounded_matched_and_part_of_code_compatibility() {
+    let fixture = Fixture::new();
+    let paths = [
+        fixture.base.join("RustService.Package.Current.xml"),
+        fixture.base.join("RustService.Manifest.1.xml"),
+    ];
+    for path in &paths {
+        let text = std::fs::read_to_string(path).unwrap();
+        std::fs::write(path,text.replace(r#"<StatelessServiceType ServiceTypeName="Type"/>"#,
+            r#"<StatelessServiceType ServiceTypeName="Type"><PlacementConstraints>NodeType == blue</PlacementConstraints></StatelessServiceType>"#)).unwrap();
+    }
+    let old = fixture.read_public().unwrap();
+    for path in &paths {
+        let text = std::fs::read_to_string(path).unwrap();
+        std::fs::write(path, text.replace("NodeType == blue", "NodeType == red")).unwrap();
+    }
+    let new = fixture.read_public().unwrap();
+    assert!(!old.code_compatible_with(&new));
+    let text = std::fs::read_to_string(&paths[0]).unwrap();
+    std::fs::write(
+        &paths[0],
+        text.replace("NodeType == red", "NodeType == green"),
+    )
+    .unwrap();
+    assert!(fixture.read_public().is_err());
+}
 const STATEFUL: &str =
     r#"<StatefulServiceType ServiceTypeName="StatefulType" HasPersistedState="false"/>"#;
 

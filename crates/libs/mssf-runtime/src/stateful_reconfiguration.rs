@@ -3,6 +3,12 @@ use super::*;
 const DEMOTE_COMPLETED: i64 = 0x80071d24u32 as i32 as i64;
 const STATE_CHANGED: i64 = 0x80071d28u32 as i32 as i64;
 const MAX_REMOTE_TOMBSTONES: usize = 256;
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct AppliedConfiguration {
+    epoch: Epoch,
+    current: ReplicaSetConfiguration,
+    previous: Option<ReplicaSetConfiguration>,
+}
 
 pub(super) struct Pending {
     pub(super) cancel: Cancellation,
@@ -380,16 +386,14 @@ impl Registry {
                 .await;
         }
         if completed_catch_up {
-            let (_, _, remotes) = project(&request)?;
-            let unchanged = unit
-                .state
-                .lock()
-                .unwrap()
-                .status
-                .lock()
-                .unwrap()
-                .configuration
-                == remotes;
+            let (current, previous, _) = project(&request)?;
+            let receipt = AppliedConfiguration {
+                epoch: api_epoch(&request.unit.current),
+                current,
+                previous: Some(previous),
+            };
+            let unchanged =
+                unit.state.lock().unwrap().applied_configuration.as_ref() == Some(&receipt);
             let result = if unchanged {
                 Ok(())
             } else {
@@ -693,6 +697,11 @@ impl Registry {
         cancel: &Cancellation,
     ) -> Result<()> {
         let (current, previous, remotes) = project(request)?;
+        let receipt = AppliedConfiguration {
+            epoch: api_epoch(&request.unit.current),
+            current: current.clone(),
+            previous: (!current_only).then(|| previous.clone()),
+        };
         {
             let state = unit.state.lock().unwrap();
             let status = state.status.lock().unwrap();
@@ -729,6 +738,7 @@ impl Registry {
                 return Err(Error::Closed);
             }
             state.configuring = true;
+            state.applied_configuration = None;
             state.error_api = (if current_only { 14 } else { 13 }, 4);
             state.status.lock().unwrap().configuration = remotes;
             state.full_revision.load(Ordering::Acquire)
@@ -758,6 +768,9 @@ impl Registry {
                 .is_some_and(|epoch| api_epoch(&request.unit.current) <= epoch)
         {
             return Err(Error::Closed);
+        }
+        if result.is_ok() {
+            state.applied_configuration = Some(receipt);
         }
         result
     }

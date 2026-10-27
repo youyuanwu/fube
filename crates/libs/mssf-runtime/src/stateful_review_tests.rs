@@ -1,6 +1,38 @@
 use super::*;
 
 #[tokio::test]
+async fn failed_configuration_observation_is_not_a_cached_success_receipt() {
+    let mut h = Harness::new().await;
+    let calls = register(&h);
+    let open = request(&h, 2, 1, 36);
+    h.send("ReplicaOpen", &open).await;
+    h.receive("ReplicaOpenReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    let mut update = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
+    update.flags = 2;
+    update.unit.current.configuration += 1;
+    h.send("UpdateConfiguration", &update).await;
+    h.receive("UpdateConfigurationReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    update.remote.0.push(peer(&open.local, 2));
+    calls.configuration_failure.store(true, Ordering::Release);
+    for _ in 0..2 {
+        h.send("UpdateConfiguration", &update).await;
+        let failed: ProxyReply =
+            from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
+        assert_eq!(failed.error.error, -994);
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+    }
+    assert_eq!(calls.configurations.lock().unwrap().len(), 3);
+    calls.configuration_failure.store(false, Ordering::Release);
+    h.send("UpdateConfiguration", &update).await;
+    let verified: ProxyReply =
+        from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
+    assert_eq!(verified.error.error, 0);
+    assert_eq!(calls.configurations.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
 async fn same_epoch_demotion_retry_never_regrants_revoked_write_access() {
     let mut h = Harness::new().await;
     let calls = register(&h);

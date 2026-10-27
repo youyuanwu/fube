@@ -1,6 +1,109 @@
 use super::*;
 
 #[tokio::test]
+async fn removed_incarnation_cannot_prove_pending_or_future_all_catchup() {
+    let (primary, _, _) = replica(1, 100, 1, ReplicaRole::Primary, server()).await;
+    let (target, view, real_address) = replica(2, 200, 1, ReplicaRole::Idle, server()).await;
+    primary
+        .build_replica(
+            information(2, 200, 1, real_address, ReplicaRole::Idle),
+            Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    {
+        let mut status = view.status.lock().unwrap();
+        status.current_role = ReplicaRole::Secondary;
+        status.service_role = ReplicaRole::Secondary;
+        status.replicator_role = ReplicaRole::Secondary;
+    }
+    target
+        .change_role(epoch(), ReplicaRole::Secondary, Cancellation::default())
+        .await
+        .unwrap();
+    let body = target.peer_body().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}/removedreceipt", listener.local_addr().unwrap());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let e = entered.clone();
+    let r = release.clone();
+    let wire = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_header(&mut stream).await.unwrap();
+        e.notify_one();
+        r.notified().await;
+        response(&mut stream, 200, &body).await.unwrap();
+    });
+    let info = information(2, 200, 1, address, ReplicaRole::Secondary);
+    primary
+        .update_catch_up_configuration(
+            config(vec![info.clone()], 2, true),
+            no_previous(),
+            Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    let p = primary.clone();
+    let pending = tokio::spawn(async move {
+        p.wait_for_catch_up(CatchUpMode::All, Cancellation::default())
+            .await
+    });
+    entered.notified().await;
+    primary
+        .remove_replica(info, Cancellation::default())
+        .await
+        .unwrap();
+    release.notify_one();
+    wire.await.unwrap();
+    assert!(pending.await.unwrap().is_err());
+    assert!(primary
+        .wait_for_catch_up(CatchUpMode::All, Cancellation::default())
+        .await
+        .is_err());
+    assert_eq!(
+        primary
+            .state
+            .lock()
+            .unwrap()
+            .current
+            .as_ref()
+            .unwrap()
+            .write_quorum,
+        2
+    );
+    assert_eq!(
+        primary
+            .state
+            .lock()
+            .unwrap()
+            .current
+            .as_ref()
+            .unwrap()
+            .replicas
+            .len(),
+        1
+    );
+    let (_replacement, _, address) = replica(2, 200, 2, ReplicaRole::Secondary, server()).await;
+    primary
+        .update_catch_up_configuration(
+            config(
+                vec![information(2, 200, 2, address, ReplicaRole::Secondary)],
+                2,
+                true,
+            ),
+            no_previous(),
+            Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    primary
+        .wait_for_catch_up(CatchUpMode::All, Cancellation::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn remove_during_pending_build_fences_its_late_successful_response() {
     let (primary, _, _) = replica(1, 100, 1, ReplicaRole::Primary, server()).await;
     let (target, _, _) = replica(2, 200, 1, ReplicaRole::Idle, server()).await;

@@ -487,8 +487,19 @@ fn service_types(node: Node<'_, '_>) -> Result<BTreeMap<String, String>> {
             }
         }
         let constraint = if let Some(constraint) = optional(service, "PlacementConstraints")? {
-            shape(constraint, &[], &[])?;
-            text(constraint.text().unwrap_or(""))?
+            if constraint.attributes().len() != 0
+                || constraint
+                    .children()
+                    .any(|child| child.is_element() || child.is_pi())
+            {
+                return invalid();
+            }
+            let content: String = constraint
+                .children()
+                .filter(Node::is_text)
+                .filter_map(|child| child.text())
+                .collect();
+            text(&content)?
         } else {
             String::new()
         };

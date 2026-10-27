@@ -472,6 +472,10 @@ impl Replicator for EmptyReplicator {
                     if receipts.contains_key(&key(peer)) {
                         continue;
                     }
+                    if self.state.lock().unwrap().removed.contains_key(&key(peer)) {
+                        receipts.insert(key(peer), false);
+                        continue;
+                    }
                     let verified = self
                         .probe(peer, current.epoch, old_epoch, false, &cancellation)
                         .await
@@ -498,6 +502,9 @@ impl Replicator for EmptyReplicator {
                             && state.revision == revision
                             && !cancellation.is_cancelled()
                             && !self.stopped.is_cancelled()
+                            && receipts.iter().all(|(peer, verified)| {
+                                !*verified || !state.removed.contains_key(peer)
+                            })
                     };
                     if ready {
                         if self.view.snapshot()?.current_epoch.primary() != current.epoch {
@@ -573,8 +580,14 @@ impl Replicator for EmptyReplicator {
             if state.removed.len() >= PEER_LIMIT && !state.removed.contains_key(&key(&peer)) {
                 return Err(failure("empty removal tombstone bound"));
             }
-            state.built.remove(&key(&peer));
-            state.removed.insert(key(&peer), ());
+            let was_built = state.built.remove(&key(&peer)).is_some();
+            let newly_removed = state.removed.insert(key(&peer), ()).is_none();
+            if was_built || newly_removed {
+                state.revision = state
+                    .revision
+                    .checked_add(1)
+                    .ok_or(failure("empty control revision exhausted"))?;
+            }
             self.changed.notify_waiters();
             Ok(())
         })

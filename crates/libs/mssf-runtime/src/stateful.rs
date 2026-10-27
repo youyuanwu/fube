@@ -54,6 +54,7 @@ struct State {
     reporting: Option<Arc<crate::reporting::Reporting>>,
     open_retry: bool,
     removing: bool,
+    applied_configuration: Option<reconfiguration::AppliedConfiguration>,
 }
 struct Unit {
     state: Arc<Mutex<State>>,
@@ -350,6 +351,7 @@ impl Registry {
                                 reporting: None,
                                 open_retry: false,
                                 removing: false,
+                                applied_configuration: None,
                             })),
                             gate: Arc::new(Semaphore::new(1)),
                             configuration_gate: Arc::new(Semaphore::new(1)),
@@ -571,6 +573,7 @@ impl Registry {
                 state.progress_initialized = false;
                 state.open_retry = false;
                 state.removing = false;
+                state.applied_configuration = None;
                 state.operation_start = super::lifecycle::filetime();
                 Some((
                     state.valid.clone(),
@@ -856,6 +859,7 @@ impl Registry {
                 reconfiguration::advance(&state.primary_revision)?;
                 state.remotes.clear();
                 state.status.lock().unwrap().configuration.clear();
+                state.applied_configuration = None;
                 if let Some(pending) = state.endpoint_pending.take() {
                     pending.cancel();
                 }
