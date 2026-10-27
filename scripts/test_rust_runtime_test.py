@@ -149,12 +149,12 @@ class ReportingEvidenceTests(unittest.TestCase):
     def test_report_command_uses_prebuilt_independent_observer(self):
         observed = {"resolver": "mssf-client", "native_pid": 7,
                     "rpc": {"pid": 7, "service": "fabric:/Owned/Concurrent", "report": {"ok": True}}}
+        observer = Path("/bundle") / "runtime_observer"
         with patch.object(runtime, "run", return_value=json.dumps(observed)) as command:
-            runtime.observe("fabric:/Owned/Concurrent", "int:0", observer=Path("/bundle/runtime_observer"),
+            runtime.observe("fabric:/Owned/Concurrent", "int:0", observer=observer,
                             command="op=fault")
-        self.assertEqual(command.call_args.args,
-                         ("/bundle/runtime_observer", "127.0.0.1:19000", "fabric:/Owned/Concurrent", "int:0", "op=fault"))
-        self.assertEqual(command.call_args.kwargs["timeout"], 45)
+        command.assert_called_once_with(str(observer), "127.0.0.1:19000",
+                                       "fabric:/Owned/Concurrent", "int:0", "op=fault", timeout=45)
 
 
 @unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
