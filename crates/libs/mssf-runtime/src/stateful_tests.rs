@@ -62,6 +62,15 @@ impl Drop for StatefulFixture {
 }
 impl Drop for ReplicatorFixture {
     fn drop(&mut self) {
+        if matches!(self.1, 151 | 152) {
+            self.0.record("replicatorFinalDropEntered");
+            std::thread::sleep(std::time::Duration::from_millis(if self.1 == 151 {
+                30
+            } else {
+                700
+            }));
+            self.0.record("replicatorFinalDropComplete");
+        }
         if matches!(self.1, 234 | 235) {
             blocking_participant_drop();
         }
@@ -258,7 +267,8 @@ impl Replicator for ReplicatorFixture {
                 });
             }
             let count = self.0.configurations.lock().unwrap().len();
-            if (self.1 == 23 && count == 1) || (matches!(self.1, 35 | 37) && count == 2) {
+            if (self.1 == 23 && count == 1) || (matches!(self.1, 35 | 37 | 151 | 152) && count == 2)
+            {
                 self.0.configuration_release.notified().await;
             }
             Ok(())
@@ -294,7 +304,7 @@ impl Replicator for ReplicatorFixture {
             } else {
                 "waitQuorum"
             });
-            if matches!(self.1, 21 | 35) {
+            if matches!(self.1, 21 | 35 | 151 | 152) {
                 tokio::select! {
                     _ = self.0.catch_up_release.notified() => {},
                     _ = cancellation.cancelled() => return Err(Error::Closed),

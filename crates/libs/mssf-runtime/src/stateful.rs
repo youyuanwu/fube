@@ -83,6 +83,8 @@ pub(crate) struct Registry {
     open_admission_hook: Mutex<Option<Arc<OpenAdmissionHook>>>,
     #[cfg(test)]
     close_admission_hook: Mutex<Option<Arc<OpenAdmissionHook>>>,
+    #[cfg(test)]
+    configuration_reply_hook: Mutex<Option<Arc<OpenAdmissionHook>>>,
 }
 #[cfg(test)]
 #[derive(Default)]
@@ -114,12 +116,20 @@ impl Registry {
             open_admission_hook: Mutex::new(None),
             #[cfg(test)]
             close_admission_hook: Mutex::new(None),
+            #[cfg(test)]
+            configuration_reply_hook: Mutex::new(None),
         }
     }
     #[cfg(test)]
     pub(crate) fn pause_open_admission(&self) -> Arc<OpenAdmissionHook> {
         let hook = Arc::new(OpenAdmissionHook::default());
         *self.open_admission_hook.lock().unwrap() = Some(hook.clone());
+        hook
+    }
+    #[cfg(test)]
+    pub(crate) fn pause_configuration_reply(&self) -> Arc<OpenAdmissionHook> {
+        let hook = Arc::new(OpenAdmissionHook::default());
+        *self.configuration_reply_hook.lock().unwrap() = Some(hook.clone());
         hook
     }
     #[cfg(test)]
@@ -441,6 +451,17 @@ impl Registry {
         }
         let Ok(_gate) = unit.gate.clone().try_acquire_owned() else {
             return Ok(());
+        };
+        // A compatible configuration dispatcher may retain participants after
+        // its callback flag clears (e.g. behind a queued semantic reply).
+        // Its gate covers that entire reference lifetime, not just the callback.
+        let _configuration_drain = if action == "ReplicaClose" {
+            let Ok(permit) = unit.configuration_gate.clone().try_acquire_owned() else {
+                return Ok(());
+            };
+            Some(permit)
+        } else {
+            None
         };
         if stale(&unit.state.lock().unwrap().request, &request) {
             return Ok(());

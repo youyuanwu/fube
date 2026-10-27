@@ -72,6 +72,10 @@ Final runtime-owned service/replicator references, including local callback
 clones and failed-Open disposal, are released on supervised blocking workers
 **before** semantic disposal replies. A blocking destructor remains deadline
 fenced while a different executor worker renews the host lease.
+Close/Abort also acquire the compatible-configuration dispatch gate: clearing a
+callback flag alone is insufficient while a dispatcher retains participants
+behind a queued reply. The whole dispatcher reference lifetime must drain
+before disposal can acknowledge, including after cancellation or backpressure.
 
 ## What “empty” proves
 

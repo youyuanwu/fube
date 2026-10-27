@@ -1,5 +1,69 @@
 use super::*;
 
+#[tokio::test]
+async fn close_drains_configuration_dispatch_references_even_after_callback_flags_clear() {
+    for mode in [151, 152] {
+        let mut h = Harness::new().await;
+        let calls = register(&h);
+        let open = request(&h, 2, 1, mode);
+        h.send("ReplicaOpen", &open).await;
+        h.receive("ReplicaOpenReply").await;
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        let mut update = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
+        update.flags = 2;
+        update.unit.current.configuration += 1;
+        h.send("UpdateConfiguration", &update).await;
+        wait_event(&calls, "waitQuorum", 1).await;
+        h.send("UpdateConfiguration", &update).await;
+        wait_event(&calls, "catchupConfiguration", 2).await;
+        calls.catch_up_release.notify_one();
+        h.receive("UpdateConfigurationReply").await;
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        let hook = h.engine.shared.stateful.pause_configuration_reply();
+        calls.configuration_release.notify_one();
+        hook.reached.notified().await;
+        assert!(!h.engine.shared.stateful.configuring([2; 16]));
+        let mut close = open.clone();
+        close.unit.current = update.unit.current.clone();
+        h.send("ReplicaClose", &close).await;
+        h.no_reply().await; // callback flag alone is not dispatch ownership drain
+        assert!(!calls.events.lock().unwrap().contains(&"replicatorClose"));
+        hook.release.notify_one();
+        // The old reply is lifetime-fenced. Retry Close only after the actual
+        // overlapping dispatcher releases its participant and configuration gate.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        h.send("ReplicaClose", &close).await;
+        if mode == 152 {
+            wait_event(&calls, "replicatorFinalDropEntered", 1).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(
+                h.engine.shared.authority.check().is_err(),
+                "overlap's final destructor outlived its cleanup deadline with authority live"
+            );
+            let reply = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                read_message(&mut h.peer),
+            )
+            .await;
+            assert!(
+                !matches!(reply, Ok(Ok(_))),
+                "blocked final destructor emitted a semantic Close reply"
+            );
+            wait_event(&calls, "replicatorFinalDropComplete", 1).await;
+            continue;
+        }
+        h.receive("ReplicaCloseReply").await;
+        assert!(
+            calls
+                .events
+                .lock()
+                .unwrap()
+                .contains(&"replicatorFinalDropComplete"),
+            "Close acknowledged before the last runtime-owned participant release"
+        );
+    }
+}
+
 async fn caught_up_with_built_peer(
     h: &mut Harness,
     mode: u8,

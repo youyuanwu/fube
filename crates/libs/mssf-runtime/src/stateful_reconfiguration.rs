@@ -314,6 +314,14 @@ impl Registry {
             }
             let mut response = request;
             response.flags = 0;
+            #[cfg(test)]
+            {
+                let hook = self.configuration_reply_hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook.reached.notify_one();
+                    hook.release.notified().await;
+                }
+            }
             return self
                 .reply_guarded(
                     unit,
