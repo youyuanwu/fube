@@ -31,6 +31,21 @@ def snapshot():
 
 
 class StatefulEvidenceTests(unittest.TestCase):
+    def test_native_departure_requires_independent_inventory_not_route_counters(self):
+        import json
+        value={"observer":"mssf-client","node":"N0010","service":"fabric:/Owned/Stateful",
+               "fixture_contacted":False,"deployed":[{"replica_id":7}]}
+        def once(check,*_):return check()
+        with patch.object(runtime,"wait_condition",side_effect=once),patch.object(runtime,"run",side_effect=lambda *_args,**_kwargs:json.dumps(value)):
+            self.assertFalse(runtime.wait_native_replica_absent(Path("observer"),value["service"],value["node"],7))
+            value["deployed"]=[]
+            self.assertEqual(runtime.wait_native_replica_absent(Path("observer"),value["service"],value["node"],7),value)
+            for mutation in [dict(observer="fixture"),dict(fixture_contacted=True),dict(deployed=[{"replica_id":"7"}])]:
+                bad={**value,**mutation}
+                with patch.object(runtime,"run",return_value=json.dumps(bad)):
+                    with self.assertRaises(RuntimeError):
+                        runtime.wait_native_replica_absent(Path("observer"),value["service"],value["node"],7)
+
     def test_three_replica_proof_requires_distinct_native_placements_and_secondary_route_denial(self):
         value=snapshot()
         value["native_partition"].update(target=3,minimum=2)

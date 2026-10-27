@@ -223,6 +223,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let client = FabricClient::connect_clear(args[0].parse()?, Duration::from_secs(10)).await?;
     let name: NamingUri = args[1].parse()?;
+    if args.len() == 4 && args[2] == "--deployed-replicas" {
+        let application: NamingUri = args[1]
+            .rsplit_once('/')
+            .ok_or("service application")?
+            .0
+            .parse()?;
+        let values = client
+            .get_deployed_replica_list(
+                &DeployedReplicaQueryDescription::new(DeployedReplicaQueryParameters::new(
+                    &args[3],
+                    application,
+                )),
+                Some(Duration::from_secs(10)),
+            )
+            .await?;
+        if values.len() > 64 {
+            return Err("deployed inventory bound".into());
+        }
+        let values: Vec<_> = values
+            .into_iter()
+            .filter(|v| v.service_name == args[1])
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({"observer":"mssf-client","node":args[3],"service":args[1],
+            "deployed":values,"fixture_contacted":false})
+        );
+        client.close().await?;
+        return Ok(());
+    }
     if args.len() == 4 && args[2] == "--move-primary" {
         let before = stateful_snapshot(&client, &name).await?;
         let partition = before["partition"].as_str().ok_or("partition")?.parse()?;

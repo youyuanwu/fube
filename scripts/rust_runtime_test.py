@@ -444,6 +444,21 @@ def epoch_of(value: dict) -> tuple[int,int]:
     return epoch["data_loss"],epoch["configuration"]
 
 
+def wait_native_replica_absent(observer: Path, service: str, node: str, replica: int) -> dict:
+    """RA inventory is independent of route teardown and callback counters."""
+    def check():
+        value=json.loads(run(str(observer),"127.0.0.1:19000",service,"--deployed-replicas",node,timeout=30))
+        if (value.get("observer")!="mssf-client" or value.get("node")!=node
+            or value.get("service")!=service or value.get("fixture_contacted") is not False
+            or not isinstance(value.get("deployed"),list)
+            or any(not isinstance(v,dict) or type(v.get("replica_id")) is not int for v in value.get("deployed",[]))):
+            raise RuntimeError("native replica departure observation shape")
+        # Native query records use their owned Rust field names. Errors never
+        # count as absence.
+        return value if all(v["replica_id"]!=replica for v in value["deployed"]) else False
+    return wait_condition(check,"native RA replica departure after owned cleanup",90)
+
+
 def stateful_three(allocation: Allocation, application: str, binaries: Binaries, result: dict) -> dict:
     """Actual native roles/configuration/failover and mixed SharedProcess proof."""
     service=application+"/Stateful"
@@ -491,7 +506,8 @@ def stateful_three(allocation: Allocation, application: str, binaries: Binaries,
     if (old_service["http_status"]==200 or old_control["http_status"]==200
         or sibling_after["rpc"]["native_actions"]["abort_callbacks"]<=baseline["abort_callbacks"]):
         raise RuntimeError("per-replica native Abort cleanup/fencing was not independently established")
-    result["replica_abort"]={"old":abort_old,"replacement":recovered,"sibling_before":sibling,
+    departed=wait_native_replica_absent(binaries.observer,service,abort_old["rpc"]["node"],abort_old["rpc"]["replica"])
+    result["replica_abort"]={"old":abort_old,"replacement":recovered,"native_departure":departed,"sibling_before":sibling,
                             "sibling_after":sibling_after,"old_service":old_service,"old_control":old_control}
 
     # Graceful per-replica Close: delete a singleton of the same stateful type,
@@ -519,7 +535,8 @@ def stateful_three(allocation: Allocation, application: str, binaries: Binaries,
         or close_after["rpc"]["native_actions"]["close_failures"]!=close_baseline["close_failures"]
         or close_after["rpc"]["native_actions"]["abort_callbacks"]!=close_baseline["abort_callbacks"]):
         raise RuntimeError("graceful Close was not proven distinct from Abort fallback")
-    result["replica_close"]={"before":aux,"sibling_before":sibling_after,"sibling_after":close_after,
+    departed=wait_native_replica_absent(binaries.observer,auxiliary,aux["primary"]["rpc"]["node"],aux["primary"]["rpc"]["replica"])
+    result["replica_close"]={"before":aux,"native_departure":departed,"sibling_before":sibling_after,"sibling_after":close_after,
                              "old_service":closed_service,"old_control":closed_control}
 
     before=wait_stateful(service,3,2,observer=binaries.observer,capture=result)
