@@ -272,6 +272,68 @@ fn health_report() -> crate::HealthReport {
 }
 
 #[tokio::test]
+async fn abort_cancels_outstanding_health_without_retiring_sibling_authority() {
+    let mut h = Harness::new().await;
+    let mut target_request = h.request(1, 1, 0);
+    let sibling_request = h.request(2, 1, 0);
+    for request in [&target_request, &sibling_request] {
+        h.send("ReplicaOpen", request).await;
+        h.receive("ReplicaOpenReply").await;
+    }
+    let (target, sibling) = {
+        let partitions = h.calls.partitions.lock().unwrap();
+        (partitions[0].clone(), partitions[1].clone())
+    };
+    let task = tokio::spawn(async move { target.report_health(&health_report()).await });
+    let original = h.receive("ReportHealth").await;
+    target_request.flags = 4;
+    h.send("ReplicaClose", &target_request).await;
+    let result = tokio::time::timeout(Duration::from_millis(100), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(Error::Closed)));
+    h.receive("ReplicaCloseReply").await;
+    assert!(h.engine.shared.authority.check().is_ok());
+    assert_eq!(h.calls.aborts.load(Ordering::Acquire), 1);
+    // A late successful HM result is unmatched, not an acknowledgment for the
+    // cancelled generation and not a terminal protocol error for its sibling.
+    let sent: HealthBody = from_slice(&original.body).unwrap();
+    write_message(
+        &mut h.peer,
+        &Message {
+            headers: vec![
+                Header::actor(16).unwrap(),
+                Header::action("OperationSuccessAction").unwrap(),
+                Header::relates_to(original.properties().unwrap().id).unwrap(),
+            ],
+            body: to_vec(&HealthReply {
+                results: ObjectArray(vec![HealthResult {
+                    kind: 2,
+                    source: sent.reports.0[0].source.clone(),
+                    sequence: sent.reports.0[0].sequence,
+                    entity_property: format!(
+                        "{}+100+Ready",
+                        uuid::Uuid::from_bytes_le(target_request.unit.id.id.0)
+                    ),
+                    error: 0,
+                }]),
+                streams: ObjectArray(vec![]),
+            })
+            .unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let (result, _) = tokio::join!(
+        sibling.report_move_cost(crate::MoveCost::High),
+        h.receive("RAPReportLoad")
+    );
+    result.unwrap();
+    assert!(h.engine.shared.authority.check().is_ok());
+}
+
+#[tokio::test]
 async fn health_saturation_leaves_poll_admission_and_rejects_overload() {
     let mut h = Harness::new().await;
     let mut reports = Vec::new();

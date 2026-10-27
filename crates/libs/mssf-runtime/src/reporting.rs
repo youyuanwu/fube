@@ -234,15 +234,18 @@ impl Reporting {
             }]),
             time: now,
         };
-        self.connection
-            .send_one_way_fenced(
+        let body = to_vec(&body)?;
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Err(Error::Closed),
+            result = self.connection.send_one_way_fenced(
                 12,
                 "RAPReportLoad",
-                to_vec(&body)?,
+                body,
                 deadline_after(REPORT_TIMEOUT)?,
                 self.fence(),
-            )
-            .await?;
+            ) => result?,
+        }
         self.check()?;
         let utc = utc();
         let mut loads = self.loads.lock().unwrap();
@@ -324,18 +327,21 @@ impl Reporting {
             }]),
             streams: EmptyObjectArray,
         };
-        let reply = self
-            .connection
-            .request_decoded_tracked(
+        let headers = vec![Header::activity(uuid::Uuid::new_v4().to_bytes_le())?];
+        let body = to_vec(&body)?;
+        let reply = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Err(Error::Closed),
+            result = self.connection.request_decoded_tracked(
                 "ReportHealth",
                 7,
-                vec![Header::activity(uuid::Uuid::new_v4().to_bytes_le())?],
-                to_vec(&body)?,
+                headers,
+                body,
                 deadline_after(REPORT_TIMEOUT)?,
                 decode_health,
                 self.fence(),
-            )
-            .await?;
+            ) => result?,
+        };
         self.check()?;
         if reply.results.0.len() != 1 || !reply.streams.0.is_empty() {
             return Err(Error::Protocol("unexpected health result cardinality"));

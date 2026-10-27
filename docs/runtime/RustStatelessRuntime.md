@@ -184,7 +184,10 @@ Health is one request/report with no hidden batching or retries. A timeout does
 not prove the report was never applied; retry with the same explicit sequence
 when preserving update identity. `HealthReceipt.sequence` is matched to the HM
 result; outer transport success alone is never reported as health success.
-HM success is not a promise of a fresh durable transaction.
+HM success is not a promise of a fresh durable transaction. Close/Abort cancels
+outstanding load/health waits promptly, releasing local report/RPC work without
+waiting for HM. A later old HM reply cannot acknowledge the cancelled call;
+cancelling that wait does not remotely revoke an already-started report.
 
 Fault transient/permanent map to internal native values 1/2 (the reverse of
 public COM numeric values). Native stateless transient fault requests Drop and
