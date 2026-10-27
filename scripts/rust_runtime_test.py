@@ -1134,19 +1134,25 @@ def require_resource_absent(kind: str, identity: str) -> None:
         raise RuntimeError(f"could not prove {kind} absence: {checked.stderr}")
 
 
-def create_owned(name: str) -> str:
-    """Capture this creation's owner while its existing controller lock is held."""
+def create_owned(name: str, *, on_allocated=None) -> str:
+    """Publish the committed creation capability, even if readiness later fails."""
     onebox_ctl.ctl.check_local_docker()
     previous_umask=os.umask(0o077)
+    owner=None
+    def allocated(value):
+        nonlocal owner
+        if owner is not None or not isinstance(value,str) or not re.fullmatch(r"[a-f0-9]{32}",value):
+            raise RuntimeError("creation did not provide a valid original owner capability")
+        owner=value
+        if on_allocated is not None:
+            on_allocated(owner)
     try:
         with onebox_ctl.ctl.locked(onebox_ctl.STATE_ROOT,name) as directory:
             cluster=onebox_ctl.Onebox(directory,name)
-            cluster.create(onebox_ctl.DEFAULT_SUBNET,"sf-apps-onebox:"+onebox_ctl.ctl.RUNTIME,900)
-            # Return the original in-memory creation capability, never whichever
-            # owner appears in a later name-based state-file read.
-            owner=cluster.state["owner"]
-            if not isinstance(owner,str) or not re.fullmatch(r"[a-f0-9]{32}",owner):
-                raise RuntimeError("creation did not provide a valid owner capability")
+            cluster.create(onebox_ctl.DEFAULT_SUBNET,"sf-apps-onebox:"+onebox_ctl.ctl.RUNTIME,900,
+                           on_allocated=allocated)
+            if owner is None:
+                raise RuntimeError("creation did not publish an owner capability")
             return owner
     finally:
         os.umask(previous_umask)
@@ -1257,14 +1263,18 @@ def main() -> None:
         parser.error("--stateful three requires --full; no partial full-profile qualification")
     created = False
     owner = None
+    def allocated(value):
+        nonlocal created,owner
+        owner=value
+        created=True
     result={"status":"FAIL","onebox":args.name,"errors":[],"cleanup":{}}
     try:
         binaries = load_bundle(args.prebuilt) if args.prebuilt is not None else None
         if args.existing_owner:
             owner = args.existing_owner
         else:
-            # Creation and capability capture are one controller transaction.
-            owner=create_owned(args.name)
+            # Retain authority at allocation commit, not only after readiness.
+            owner=create_owned(args.name,on_allocated=allocated)
             created = True
         allocation = Allocation(args.name, owner)
         if args.restart_service:

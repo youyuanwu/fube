@@ -327,7 +327,7 @@ class Cluster:
             self.helper(node, SEED_VOLUME)
         self.save(phase="starting")
 
-    def create(self, subnet, image, timeout):
+    def create(self, subnet, image, timeout, *, on_allocated=None):
         if self.path.exists():
             self.load()
             if self.state["phase"] != "destroyed":
@@ -371,6 +371,10 @@ class Cluster:
         compose, _ = self.definition(self.state, self.directory)
         write_json(self.directory / "compose.json", compose)
         self.save(manifest_sha256=digest(self.directory / "ClusterManifest.xml"))
+        # Publish only this newly committed allocation, before fallible startup
+        # or journal writes; rejected existing/colliding names grant nothing.
+        if on_allocated is not None:
+            on_allocated(self.state["owner"])
         self.event("allocated")
         return self.up(timeout)
 

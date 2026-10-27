@@ -87,7 +87,18 @@ jobs:
     - name: Create native development cluster
       id: create_cluster
       run: |
-        python3 -c 'import os,sys; sys.path.insert(0,"scripts"); import rust_runtime_test as r; owner=r.create_owned(os.environ["CLUSTER_NAME"]); print("::add-mask::"+owner); f=open(os.environ["GITHUB_OUTPUT"],"a"); f.write("owner="+owner+"\n"); f.close()'
+        python3 - <<'PY'
+        import os, sys
+        sys.path.insert(0, "scripts")
+        import rust_runtime_test as r
+
+        def allocated(owner):
+            print("::add-mask::" + owner, flush=True)
+            with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                output.write("owner=" + owner + "\n")
+
+        r.create_owned(os.environ["CLUSTER_NAME"], on_allocated=allocated)
+        PY
 
     - name: Check fresh cluster health
       run: python3 "$CLUSTER_CTL" status "$CLUSTER_NAME" > "$RUNNER_TEMP/linux-cluster-status-created.json"
