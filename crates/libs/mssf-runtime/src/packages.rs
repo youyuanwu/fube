@@ -222,9 +222,9 @@ fn setting_name(node: Node<'_, '_>) -> Result<String> {
     Ok(value)
 }
 fn boolean(node: Node<'_, '_>, name: &str) -> Result<bool> {
-    match node.attribute(name) {
-        None | Some("false") | Some("False") => Ok(false),
-        Some("true") | Some("True") => Ok(true),
+    match node.attribute(name).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("false" | "0") => Ok(false),
+        Some("true" | "1") => Ok(true),
         _ => invalid(),
     }
 }
@@ -269,6 +269,8 @@ fn parse<'a>(xml: &'a str, root: &str) -> Result<Document<'a>> {
             for a in n.attributes() {
                 text(a.value())?;
             }
+        } else if n.is_text() {
+            text(n.text().unwrap_or(""))?;
         }
     }
     Ok(doc)
@@ -427,6 +429,101 @@ fn canonical(node: Node<'_, '_>, output: &mut String) {
     }
 }
 
+fn scalar(node: Node<'_, '_>) -> Result<String> {
+    if node.attributes().len() != 0 || node.children().any(|n| n.is_element()) {
+        return invalid();
+    }
+    let value: String = node
+        .children()
+        .filter(Node::is_text)
+        .filter_map(|n| n.text())
+        .collect();
+    text(value.trim())
+}
+fn optional<'a, 'b>(node: Node<'a, 'b>, tag: &str) -> Result<Option<Node<'a, 'b>>> {
+    let mut found = node.children().filter(|n| n.has_tag_name((NS, tag)));
+    let result = found.next();
+    if found.next().is_some() {
+        return invalid();
+    }
+    Ok(result)
+}
+fn code_semantics(node: Node<'_, '_>) -> Result<String> {
+    shape(
+        node,
+        &["Name", "Version", "IsShared", "IsActivator"],
+        &["EntryPoint", "EnvironmentVariables"],
+    )?;
+    if boolean(node, "IsActivator")? {
+        return invalid();
+    }
+    let package_name = name(node)?;
+    let version = component(&attr(node, "Version")?)?;
+    let shared = boolean(node, "IsShared")?;
+    let entry = child(node, "EntryPoint")?;
+    shape(entry, &[], &["ExeHost"])?;
+    let exe = child(entry, "ExeHost")?;
+    shape(
+        exe,
+        &["IsExternalExecutable"],
+        &[
+            "Program",
+            "Arguments",
+            "WorkingFolder",
+            "ConsoleRedirection",
+            "RunFrequency",
+        ],
+    )?;
+    if boolean(exe, "IsExternalExecutable")? {
+        return invalid();
+    }
+    let program = scalar(child(exe, "Program")?)?;
+    if program.is_empty() {
+        return invalid();
+    }
+    let arguments = optional(exe, "Arguments")?
+        .map(scalar)
+        .transpose()?
+        .unwrap_or_default();
+    let working = optional(exe, "WorkingFolder")?
+        .map(scalar)
+        .transpose()?
+        .unwrap_or_else(|| "Work".into());
+    if !matches!(working.as_str(), "Work" | "CodePackage" | "CodeBase") {
+        return invalid();
+    }
+    let mut fingerprint =
+        format!("{package_name:?}:{version:?}:{shared}:{program:?}:{arguments:?}:{working:?}");
+    if let Some(console) = optional(exe, "ConsoleRedirection")? {
+        shape(console, &["FileRetentionCount", "FileMaxSizeInKb"], &[])?;
+        // Native defaults from ExeEntryPointDescription::clear.
+        let retention = console
+            .attribute("FileRetentionCount")
+            .unwrap_or("2")
+            .parse::<u32>()
+            .map_err(|_| Error::Protocol("invalid console retention"))?;
+        let size = console
+            .attribute("FileMaxSizeInKb")
+            .unwrap_or("20480")
+            .parse::<u32>()
+            .map_err(|_| Error::Protocol("invalid console size"))?;
+        fingerprint.push_str(&format!(":console:{retention}:{size}"));
+    }
+    if let Some(frequency) = optional(exe, "RunFrequency")? {
+        shape(frequency, &["IntervalInSeconds"], &[])?;
+        let interval = attr(frequency, "IntervalInSeconds")?
+            .parse::<u32>()
+            .map_err(|_| Error::Protocol("invalid entry point frequency"))?;
+        if interval != 0 {
+            return Err(Error::InvalidInput("periodic entry point unsupported"));
+        }
+    }
+    if let Some(env) = optional(node, "EnvironmentVariables")? {
+        shape(env, &[], &[])?;
+    }
+    Ok(fingerprint)
+}
+
 fn description(
     digest: Node<'_, '_>,
     declaration: Node<'_, '_>,
@@ -444,6 +541,7 @@ fn description(
                 && n.attribute("Name").map(key) == Some(key(&package_name))
         })
         .ok_or(Error::Protocol("digested package missing from manifest"))?;
+    shape(declared, &["Name", "Version"], &["Description"])?;
     if attr(declared, "Version")? != version {
         return invalid();
     }
@@ -495,6 +593,19 @@ pub(crate) fn load(activation: &ActivationContext, deployment: &Path) -> Result<
     )))?;
     let app_doc = parse(&app, "ApplicationPackage")?;
     let app_node = app_doc.root_element();
+    shape(
+        app_node,
+        &[
+            "ApplicationId",
+            "ApplicationTypeName",
+            "NameUri",
+            "RolloutVersion",
+            "ContentChecksum",
+        ],
+        &["DigestedEnvironment", "DigestedCertificates"],
+    )?;
+    child(app_node, "DigestedEnvironment")?;
+    child(app_node, "DigestedCertificates")?;
     if attr(app_node, "ApplicationId")? != app_id
         || attr(app_node, "NameUri")? != activation.application_name
         || attr(app_node, "ApplicationTypeName")? != application.type_name
@@ -507,6 +618,63 @@ pub(crate) fn load(activation: &ActivationContext, deployment: &Path) -> Result<
     let current = reader.read(&current_path)?;
     let current_doc = parse(&current, "ServicePackage")?;
     let root = current_doc.root_element();
+    shape(
+        root,
+        &[
+            "Name",
+            "ManifestVersion",
+            "RolloutVersion",
+            "ManifestChecksum",
+            "ContentChecksum",
+        ],
+        &[
+            "Description",
+            "ServicePackageResourceGovernancePolicy",
+            "ServicePackageContainerPolicy",
+            "ServiceFabricRuntimeAccessPolicy",
+            "DigestedServiceTypes",
+            "DigestedCodePackage",
+            "DigestedConfigPackage",
+            "DigestedDataPackage",
+            "DigestedResources",
+            "NetworkPolicies",
+            "Diagnostics",
+        ],
+    )?;
+    for required in ["DigestedServiceTypes", "DigestedResources", "Diagnostics"] {
+        child(root, required)?;
+    }
+    for tag in [
+        "Description",
+        "ServicePackageResourceGovernancePolicy",
+        "ServicePackageContainerPolicy",
+        "ServiceFabricRuntimeAccessPolicy",
+        "NetworkPolicies",
+    ] {
+        optional(root, tag)?;
+    }
+    if let Some(access) = optional(root, "ServiceFabricRuntimeAccessPolicy")? {
+        shape(
+            access,
+            &[
+                "RemoveServiceFabricRuntimeAccess",
+                "UseServiceFabricReplicatedStore",
+            ],
+            &[],
+        )?;
+        if boolean(access, "RemoveServiceFabricRuntimeAccess")?
+            || boolean(access, "UseServiceFabricReplicatedStore")?
+        {
+            return invalid();
+        }
+    }
+    if optional(root, "ServicePackageContainerPolicy")?.is_some()
+        || optional(root, "NetworkPolicies")?.is_some()
+    {
+        return Err(Error::InvalidInput(
+            "unsupported native package host policy",
+        ));
+    }
     let service_rollout = &code.version.version.value;
     if name(root)? != service
         || rollout(&attr(root, "RolloutVersion")?)?
@@ -519,34 +687,61 @@ pub(crate) fn load(activation: &ActivationContext, deployment: &Path) -> Result<
         reader.read(&base.join(format!("{service}.Manifest.{manifest_version}.xml")))?;
     let manifest_doc = parse(&manifest_xml, "ServiceManifest")?;
     let manifest = manifest_doc.root_element();
+    shape(
+        manifest,
+        &["Name", "Version", "ManifestId"],
+        &[
+            "Description",
+            "ServiceTypes",
+            "CodePackage",
+            "ConfigPackage",
+            "DataPackage",
+            "Resources",
+            "Diagnostics",
+        ],
+    )?;
+    let types = child(manifest, "ServiceTypes")?;
+    shape(types, &[], &["StatelessServiceType"])?;
+    if !types.children().any(|n| n.is_element()) {
+        return invalid();
+    }
     if name(manifest)? != service || attr(manifest, "Version")? != manifest_version {
         return invalid();
     }
     let digested_code = child(root, "DigestedCodePackage")?;
+    shape(
+        digested_code,
+        &["RolloutVersion", "ContentChecksum", "IsShared"],
+        &[
+            "CodePackage",
+            "RunAsPolicy",
+            "ResourceGovernancePolicy",
+            "ConfigPackagePolicies",
+        ],
+    )?;
+    let code_rollout = rollout(&attr(digested_code, "RolloutVersion")?)?;
+    let code_shared = boolean(digested_code, "IsShared")?;
     let declared_code = child(digested_code, "CodePackage")?;
     let manifest_code = child(manifest, "CodePackage")?;
     if name(declared_code)? != code.id.name {
         return invalid();
     }
-    let mut code_decl = String::new();
-    canonical(declared_code, &mut code_decl);
-    let mut manifest_decl = String::new();
-    canonical(manifest_code, &mut manifest_decl);
+    let code_decl = code_semantics(declared_code)?;
+    let manifest_decl = code_semantics(manifest_code)?;
     if code_decl != manifest_decl {
         return invalid();
     }
-    let exe = child(child(declared_code, "EntryPoint")?, "ExeHost")?;
-    if declared_code
+    let mut fingerprint = format!(
+        "{code_decl}:{code_rollout}:{code_shared}:{:?}",
+        digested_code.attribute("ContentChecksum").unwrap_or("")
+    );
+    for n in digested_code
         .children()
-        .any(|n| n.has_tag_name((NS, "SetupEntryPoint")))
-        || exe
-            .children()
-            .any(|n| n.has_tag_name((NS, "IsExternalExecutable")) && n.text() != Some("false"))
+        .filter(Node::is_element)
+        .filter(|n| !n.has_tag_name((NS, "CodePackage")))
     {
-        return invalid();
+        canonical(n, &mut fingerprint);
     }
-    let mut fingerprint = String::new();
-    canonical(digested_code, &mut fingerprint);
     for n in root.children().filter(Node::is_element) {
         if !matches!(
             n.tag_name().name(),
@@ -635,6 +830,17 @@ pub(crate) fn load(activation: &ActivationContext, deployment: &Path) -> Result<
         let port = fields[3]
             .parse::<u16>()
             .map_err(|_| Error::Protocol("invalid deployed endpoint port"))?;
+        if !matches!(
+            fields[1].to_ascii_lowercase().as_str(),
+            "http" | "https" | "tcp" | "udp"
+        ) || !matches!(
+            fields[2].to_ascii_lowercase().as_str(),
+            "input" | "internal"
+        ) || (!fields[7].is_empty() && fields[7] != code.id.name)
+            || endpoints.len() >= 4096
+        {
+            return invalid();
+        }
         if !fields[4].is_empty() || fields[1].eq_ignore_ascii_case("https") {
             return Err(Error::InvalidInput(
                 "unsupported deployed endpoint security",
@@ -654,7 +860,7 @@ pub(crate) fn load(activation: &ActivationContext, deployment: &Path) -> Result<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(crate) struct Fixture {
@@ -682,11 +888,18 @@ mod tests {
             let config = format!(r#"<ConfigPackage Name="Config" Version="{version}"/>"#);
             let data = r#"<DataPackage Name="Data" Version="1"/>"#;
             std::fs::write(self.base.join("App.1.0.xml"),
-                format!(r#"<ApplicationPackage xmlns="{NS}" ApplicationId="RustApp_App0" ApplicationTypeName="RustApp" NameUri="fabric:/RustApp" RolloutVersion="1.0"/>"#)).unwrap();
+                format!(r#"<ApplicationPackage xmlns="{NS}" ApplicationId="RustApp_App0" ApplicationTypeName="RustApp" NameUri="fabric:/RustApp" RolloutVersion="1.0"><DigestedEnvironment RolloutVersion="1.0"><Principals/><Policies/><Diagnostics/></DigestedEnvironment><DigestedCertificates RolloutVersion="1.0"/></ApplicationPackage>"#)).unwrap();
             std::fs::write(self.base.join(format!("RustService.Manifest.{version}.xml")),
-                format!(r#"<ServiceManifest xmlns="{NS}" Name="RustService" Version="{version}">{code}{config}{data}</ServiceManifest>"#)).unwrap();
+                format!(r#"<ServiceManifest xmlns="{NS}" Name="RustService" Version="{version}"><ServiceTypes><StatelessServiceType ServiceTypeName="Type"/></ServiceTypes>{code}{config}{data}</ServiceManifest>"#)).unwrap();
+            let digested_code = code
+                .replace("Version=\"1\"", "Version=\"1\" IsShared=\"false\"")
+                .replace("<ExeHost>", "<ExeHost IsExternalExecutable=\"false\">")
+                .replace(
+                    "</ExeHost>",
+                    "<WorkingFolder>Work</WorkingFolder></ExeHost>",
+                );
             let root = format!(
-                r#"<ServicePackage xmlns="{NS}" Name="RustService" ManifestVersion="{version}" RolloutVersion="2.0"><DigestedCodePackage RolloutVersion="1.0" ContentChecksum="code">{code}</DigestedCodePackage><DigestedConfigPackage RolloutVersion="{version}.0" ContentChecksum="config">{config}</DigestedConfigPackage><DigestedDataPackage RolloutVersion="1.0" IsShared="true">{data}</DigestedDataPackage></ServicePackage>"#
+                r#"<ServicePackage xmlns="{NS}" Name="RustService" ManifestVersion="{version}" RolloutVersion="2.0"><DigestedServiceTypes RolloutVersion="1.0"><ServiceTypes><StatelessServiceType ServiceTypeName="Type"/></ServiceTypes></DigestedServiceTypes><DigestedCodePackage RolloutVersion="1.0" ContentChecksum="code" IsShared="false">{digested_code}</DigestedCodePackage><DigestedConfigPackage RolloutVersion="{version}.0" ContentChecksum="config">{config}</DigestedConfigPackage><DigestedDataPackage RolloutVersion="1.0" IsShared="true">{data}</DigestedDataPackage><DigestedResources RolloutVersion="1.0"><DigestedEndpoints/></DigestedResources><Diagnostics/></ServicePackage>"#
             );
             std::fs::write(self.base.join("RustService.Package.Current.xml"), root).unwrap();
             let config_dir = self.base.join(format!("RustService.Config.{version}"));
@@ -697,6 +910,69 @@ mod tests {
             std::fs::write(
                 self.base.join("RustService.Endpoints.txt"),
                 "Rpc;http;Input;1234;;;;;127.0.0.1",
+            )
+            .unwrap();
+        }
+    }
+    impl Fixture {
+        fn read_public(&self) -> Result<PackageSnapshot> {
+            let node = crate::NodeContext {
+                id: "node".into(),
+                instance: 1,
+                name: "node".into(),
+                node_type: "type".into(),
+                ip_or_fqdn: "127.0.0.1".into(),
+                client_address: "127.0.0.1:19000".into(),
+                deployment_directory: self.root.to_str().unwrap().into(),
+                work_directory: "work".into(),
+                host_process_id: 1,
+                initial_lease_ttl_ticks: 1,
+                lease_duration_ticks: 1,
+                fresh_poll_ttl_ticks: 1,
+                fresh_poll_elapsed_micros: 0,
+            };
+            PackageSnapshot::from_deployment(&self.activation, &node)
+        }
+        fn config_count(&self, count: usize, parameters: usize, value: &str) {
+            self.write(1, "old");
+            let current_path = self.base.join("RustService.Package.Current.xml");
+            let manifest_path = self.base.join("RustService.Manifest.1.xml");
+            let mut digests = String::new();
+            let mut declarations = String::new();
+            for i in 0..count {
+                let declaration = format!(r#"<ConfigPackage Name="Config{i}" Version="1"/>"#);
+                declarations.push_str(&declaration);
+                digests.push_str(&format!(r#"<DigestedConfigPackage RolloutVersion="1.0">{declaration}</DigestedConfigPackage>"#));
+                let path = self.base.join(format!("RustService.Config{i}.1"));
+                std::fs::create_dir_all(&path).unwrap();
+                let mut body = String::new();
+                for j in 0..parameters {
+                    body.push_str(&format!(r#"<Parameter Name="P{j}" Value="{value}"/>"#));
+                }
+                std::fs::write(
+                    path.join("Settings.xml"),
+                    format!(
+                        r#"<Settings xmlns="{NS}"><Section Name="Main">{body}</Section></Settings>"#
+                    ),
+                )
+                .unwrap();
+            }
+            let current = std::fs::read_to_string(&current_path).unwrap();
+            let start = current.find("<DigestedConfigPackage").unwrap();
+            let end = current.find("</DigestedConfigPackage>").unwrap()
+                + "</DigestedConfigPackage>".len();
+            std::fs::write(
+                &current_path,
+                format!("{}{}{}", &current[..start], digests, &current[end..]),
+            )
+            .unwrap();
+            let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+            std::fs::write(
+                &manifest_path,
+                manifest.replace(
+                    r#"<ConfigPackage Name="Config" Version="1"/>"#,
+                    &declarations,
+                ),
             )
             .unwrap();
         }
@@ -785,6 +1061,233 @@ mod tests {
         let large = fixture.base.join("too-large");
         std::fs::write(&large, vec![b'a'; MAX_ARTIFACT_BYTES + 1]).unwrap();
         assert!(Reader { bytes: 0 }.read(&large).is_err());
+    }
+
+    #[test]
+    fn public_reader_rejects_malformed_profiles_and_declarations() {
+        let fixture = Fixture::new();
+        assert!(fixture.read_public().is_ok());
+        let path = fixture.base.join("RustService.Package.Current.xml");
+        let original = std::fs::read_to_string(&path).unwrap();
+        for bad in [
+            original.replace(
+                "IsExternalExecutable=\"false\"",
+                "IsExternalExecutable=\"true\"",
+            ),
+            original.replace(
+                "<CodePackage Name=\"Code\"",
+                "<CodePackage IsActivator=\"true\" Name=\"Code\"",
+            ),
+            original.replace(
+                "<CodePackage Name=\"Code\" Version=\"1\"",
+                "<CodePackage Name=\"Code\"",
+            ),
+            original.replace("<Program>app</Program>", ""),
+            original.replace(
+                "RolloutVersion=\"1.0\" ContentChecksum=\"code\"",
+                "RolloutVersion=\"bad\" ContentChecksum=\"code\"",
+            ),
+            original.replace(
+                "ContentChecksum=\"code\" IsShared=\"false\"",
+                "ContentChecksum=\"code\" IsShared=\"invalid\"",
+            ),
+            original.replace("DigestedConfigPackage", "DigestedConfigPackag"),
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(fixture.read_public().is_err());
+        }
+        fixture.write(1, "old");
+        let manifest = fixture.base.join("RustService.Manifest.1.xml");
+        let original = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            &manifest,
+            original.replace("Name=\"Config\"", "Other=\"x\" Name=\"Config\""),
+        )
+        .unwrap();
+        assert!(fixture.read_public().is_err());
+    }
+
+    #[test]
+    fn empty_packages_duplicates_shared_paths_and_overrides() {
+        let fixture = Fixture::new();
+        fixture.config_count(0, 0, "");
+        assert!(fixture
+            .read_public()
+            .unwrap()
+            .configuration_packages()
+            .is_empty());
+        let current_path = fixture.base.join("RustService.Package.Current.xml");
+        for tag in ["Config", "Data"] {
+            fixture.write(1, "old");
+            let current = std::fs::read_to_string(&current_path).unwrap();
+            let declaration = format!(r#"<{tag}Package Name="{tag}" Version="1"/>"#);
+            let duplicate = format!(
+                r#"<Digested{tag}Package RolloutVersion="1.0">{}</Digested{tag}Package>"#,
+                declaration.replace(
+                    &format!("Name=\"{tag}\""),
+                    &format!("Name=\"{}\"", tag.to_lowercase())
+                )
+            );
+            std::fs::write(
+                &current_path,
+                current.replace(
+                    "</ServicePackage>",
+                    &format!("{duplicate}</ServicePackage>"),
+                ),
+            )
+            .unwrap();
+            assert!(fixture.read_public().is_err());
+        }
+        fixture.write(1, "old");
+        let current = std::fs::read_to_string(&current_path).unwrap();
+        std::fs::write(
+            &current_path,
+            current.replace(
+                "<DigestedConfigPackage RolloutVersion=",
+                "<DigestedConfigPackage IsShared=\"true\" RolloutVersion=",
+            ),
+        )
+        .unwrap();
+        let source = fixture.base.join("RustService.Config.1");
+        let shared = fixture.base.join("RustService.Config.1.lk");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&source, &shared).unwrap();
+        #[cfg(not(unix))]
+        std::fs::rename(&source, &shared).unwrap();
+        assert!(fixture
+            .read_public()
+            .unwrap()
+            .configuration_package("Config")
+            .unwrap()
+            .description()
+            .is_shared());
+        #[cfg(unix)]
+        std::fs::remove_file(&shared).unwrap();
+        #[cfg(not(unix))]
+        std::fs::rename(&shared, &source).unwrap();
+        for target in [
+            r#"<Section Name="Main"><Parameter Name="unknown" Value="x"/></Section>"#,
+            r#"<Section Name="Main"><Parameter Name="Value" Value="x"/><Parameter Name="VALUE" Value="y"/></Section>"#,
+            r#"<Section Name="Main"/><Section Name="MAIN"/>"#,
+        ] {
+            fixture.write(1, "old");
+            let current = std::fs::read_to_string(&current_path).unwrap();
+            let xml = format!(
+                r#"<ConfigOverride Name="Config"><Settings>{target}</Settings></ConfigOverride></DigestedConfigPackage>"#
+            );
+            std::fs::write(
+                &current_path,
+                current.replace("</DigestedConfigPackage>", &xml),
+            )
+            .unwrap();
+            assert!(fixture.read_public().is_err());
+        }
+        fixture.write(1, "old");
+        let settings_path = fixture.base.join("RustService.Config.1/Settings.xml");
+        std::fs::write(&settings_path,format!(r#"<Settings xmlns="{NS}"><Section Name="Main"><Parameter Name="Value" Value="base" MustOverride="TRUE" IsEncrypted="1" Type="Encrypted"/></Section></Settings>"#)).unwrap();
+        let current = std::fs::read_to_string(&current_path).unwrap();
+        let xml = r#"<ConfigOverride Name="Config"><Settings><Section Name="Main"><Parameter Name="Value" Value="cipher" IsEncrypted="0" Type="PlainText"/></Section></Settings></ConfigOverride></DigestedConfigPackage>"#;
+        std::fs::write(
+            &current_path,
+            current.replace("</DigestedConfigPackage>", xml),
+        )
+        .unwrap();
+        let package = fixture
+            .read_public()
+            .unwrap()
+            .configuration_package("Config")
+            .unwrap();
+        let p = package.section("Main").unwrap().parameter("Value").unwrap();
+        assert!(p.is_encrypted() && p.must_override() && p.plaintext().is_err());
+        assert_eq!((p.raw_value(), p.value_type()), ("cipher", "PlainText"));
+        std::fs::remove_file(fixture.base.join("App.1.0.xml")).unwrap();
+        assert!(fixture.read_public().is_err());
+    }
+
+    #[test]
+    fn endpoints_booleans_strings_depth_and_aggregate_bounds() {
+        let fixture = Fixture::new();
+        let path = fixture.base.join("RustService.Endpoints.txt");
+        for bad in [
+            "Rpc;wrong;Input;12;;;;;ip",
+            "Rpc;http;wrong;12;;;;;ip",
+            "Rpc;;Input;12;;;;;ip",
+            "Rpc;http;Input;12;;;;",
+            "Rpc;https;Input;12;;;;;ip",
+            "Rpc;http;Input;12;cert;;;;ip",
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(fixture.read_public().is_err(), "{bad}");
+        }
+        for flag in ["0", "FALSE", "false", "1", "TRUE", "true"] {
+            let xml = format!(
+                r#"<Settings xmlns="{NS}"><Section Name="s"><Parameter Name="p" Value="v" IsEncrypted="{flag}"/></Section></Settings>"#
+            );
+            let p = settings(&xml, &mut 0).unwrap();
+            assert_eq!(
+                p["s"].parameter("p").unwrap().is_encrypted(),
+                matches!(flag, "1" | "TRUE" | "true")
+            );
+        }
+        let field = |value: &str| {
+            format!(
+                r#"<Settings xmlns="{NS}"><Section Name="s"><Parameter Name="p" Value="{value}"/></Section></Settings>"#
+            )
+        };
+        assert!(settings(&field(&"😀".repeat(16384)), &mut 0).is_ok());
+        assert!(settings(&field(&format!("{}x", "😀".repeat(16384))), &mut 0).is_err());
+        let split = format!(
+            "<Program>{}<!--split-->{}</Program>",
+            "x".repeat(20000),
+            "x".repeat(20000)
+        );
+        let doc = Document::parse(&split).unwrap();
+        assert!(scalar(doc.root_element()).is_err());
+        let doc = Document::parse("<Program>a<!--not program text-->pp</Program>").unwrap();
+        assert_eq!(scalar(doc.root_element()).unwrap(), "app");
+        let code = format!(r#"<CodePackage xmlns="{NS}" Name="Code" Version="1"><EntryPoint><ExeHost><Program>app</Program></ExeHost></EntryPoint></CodePackage>"#);
+        let plain = Document::parse(&code).unwrap();
+        let commented_xml = code.replace("app", "a<!--misleading-->pp");
+        let commented = Document::parse(&commented_xml).unwrap();
+        assert_eq!(
+            code_semantics(plain.root_element()).unwrap(),
+            code_semantics(commented.root_element()).unwrap()
+        );
+        let differing_xml = code.replace("app", "amisleadingpp");
+        let differing = Document::parse(&differing_xml).unwrap();
+        assert_ne!(
+            code_semantics(differing.root_element()).unwrap(),
+            code_semantics(commented.root_element()).unwrap()
+        );
+        assert!(parse(
+            &format!(
+                r#"<Settings xmlns="{NS}">{}{}</Settings>"#,
+                "<n>".repeat(32),
+                "</n>".repeat(32)
+            ),
+            "Settings"
+        )
+        .is_err());
+        fixture.config_count(64, 0, "");
+        assert_eq!(
+            fixture
+                .read_public()
+                .unwrap()
+                .configuration_packages()
+                .len(),
+            64
+        );
+        fixture.config_count(65, 0, "");
+        assert!(fixture.read_public().is_err());
+        fixture.config_count(2, 2048, "v");
+        assert!(fixture.read_public().is_ok());
+        fixture.config_count(2, 2049, "v");
+        assert!(fixture.read_public().is_err());
+        fixture.config_count(30, 20, &"x".repeat(30000));
+        assert!(matches!(
+            fixture.read_public(),
+            Err(Error::ResourceLimit("snapshot bytes"))
+        ));
     }
 
     #[test]
