@@ -12,10 +12,17 @@ from unittest.mock import patch, MagicMock
 
 import rust_runtime_test as runtime
 
+def model_binaries():
+    return runtime.Binaries(Path("/prebuilt")/"app",Path("/prebuilt")/"observer","native-free",
+                            Path("/prebuilt")/"templates","a"*64,"1"*40)
+
 
 @unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class BinaryBundleTests(unittest.TestCase):
     def setUp(self):
+        source=patch.object(runtime,"clean_source_revision",return_value="1"*40)
+        source.start()
+        self.addCleanup(source.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -31,6 +38,20 @@ class BinaryBundleTests(unittest.TestCase):
         with patch.object(runtime, "build_binaries", return_value=self.binaries):
             runtime.build_bundle(directory)
         return directory
+
+    def test_strict_version_profile_revision_and_keys_reject_old_or_ambiguous_bundles(self):
+        for field,value in [("version",2),("profile","stateless"),("source_revision","dirty"),("extra",True)]:
+            directory=self.bundle("metadata-"+field)
+            path=directory/"build-info.json"
+            metadata=json.loads(path.read_text());metadata[field]=value
+            path.write_text(json.dumps(metadata))
+            with self.assertRaises(RuntimeError):runtime.load_bundle(directory)
+
+    def test_dirty_source_is_rejected_before_build_or_allocation(self):
+        with patch.object(runtime,"clean_source_revision",side_effect=RuntimeError("dirty source")), \
+             patch.object(runtime,"build_binaries") as build:
+            with self.assertRaises(RuntimeError):runtime.build_bundle(self.root/"dirty")
+            build.assert_not_called()
 
     def test_build_only_produces_verified_executables_without_allocation(self):
         directory = self.root / "bundle"
@@ -199,6 +220,8 @@ class ReportingEvidenceTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class AllocationTests(unittest.TestCase):
     def setUp(self):
+        bundle=patch.object(runtime,"load_bundle",return_value=model_binaries())
+        bundle.start(); self.addCleanup(bundle.stop)
         self.state = {"name": "owned", "owner": "capability", "project": "sf-onebox-owned",
                       "runtime_version": "11.8.121.4"}
         self.container = {
@@ -230,7 +253,7 @@ class AllocationTests(unittest.TestCase):
             runtime.validate_allocation(self.state, changed, "owned", "capability")
 
     def test_collision_or_partial_creation_never_gets_name_only_cleanup(self):
-        with patch("sys.argv", ["rust_runtime_test.py", "owned"]), \
+        with patch("sys.argv", ["rust_runtime_test.py", "owned", "--prebuilt", "bundle"]), \
              patch.object(runtime, "create_owned", side_effect=RuntimeError("controller rejected existing/partial allocation")) as create, \
              patch.object(runtime,"destroy_owned") as destroy, \
              contextlib.redirect_stdout(io.StringIO()):
@@ -242,7 +265,7 @@ class AllocationTests(unittest.TestCase):
         # cannot grant this script a cleanup capability for a pre-existing box.
 
     def test_successful_create_retains_cleanup_after_constructor_failure(self):
-        with patch("sys.argv",["rust_runtime_test.py","owned"]), \
+        with patch("sys.argv",["rust_runtime_test.py","owned","--prebuilt","bundle"]), \
              patch.object(runtime,"create_owned",return_value="acquired-owner"), \
              patch.object(runtime,"Allocation",side_effect=RuntimeError("post-create status failed")), \
              patch.object(runtime,"destroy_owned",return_value={"phase":"destroyed"}) as destroy, \
@@ -258,6 +281,8 @@ class AllocationTests(unittest.TestCase):
     def test_cleanup_uses_controller_lock_and_owner_not_readiness(self):
         cluster=MagicMock()
         cluster.state={"owner":"acquired-owner","phase":"down"}
+        cluster.resources.return_value=([],[],[])
+        cluster.destroy.return_value={"phase":"destroyed"}
         with patch.object(runtime.onebox_ctl.ctl,"locked",return_value=contextlib.nullcontext(Path("/fake"))), \
              patch.object(runtime.onebox_ctl,"Onebox",return_value=cluster):
             runtime.destroy_owned("owned","acquired-owner")
@@ -292,7 +317,7 @@ class AllocationTests(unittest.TestCase):
     def test_replaced_allocation_never_grants_new_owner_cleanup_authority(self):
         cluster=MagicMock()
         cluster.state={"owner":"b"*32}
-        with patch("sys.argv",["rust_runtime_test.py","owned"]), \
+        with patch("sys.argv",["rust_runtime_test.py","owned","--prebuilt","bundle"]), \
              patch.object(runtime,"create_owned",return_value="a"*32), \
              patch.object(runtime,"Allocation",side_effect=RuntimeError("replacement owner mismatch")) as allocation, \
              patch.object(runtime,"qualify") as qualify, \
@@ -314,6 +339,7 @@ class AmbiguousUpgradeTests(unittest.TestCase):
     def execute_upgrade_timeout(self, drift=None):
         fixture=AllocationTests()
         fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
         state,container=fixture.state,fixture.container
         allocation=MagicMock()
         allocation.name="owned"; allocation.owner="capability"; allocation.container_id="immutable-container"
@@ -356,7 +382,7 @@ class AmbiguousUpgradeTests(unittest.TestCase):
                      "native_entry_point_instance":7}
         def package(*_args,**kwargs):
             return Path("/generated-upgrade" if kwargs.get("upgrade") else "/generated"),type_name,"1.2" if kwargs.get("upgrade") else "1.1"
-        binaries=runtime.Binaries(Path("/prebuilt/app"),Path("/prebuilt/observer"),"native-free")
+        binaries=model_binaries()
         with patch.object(runtime.uuid,"uuid4",return_value=MagicMock(hex="012345abcdef")), \
              patch.object(runtime,"package",side_effect=package), \
              patch.object(runtime,"run",return_value="native-free"), \
@@ -467,7 +493,7 @@ class AmbiguousMutationTests(unittest.TestCase):
              patch.object(runtime,"digest",return_value="a"*64), \
              patch.object(runtime.uuid,"uuid4",return_value=MagicMock(hex="abcdefgh1234")), \
              patch.object(runtime,"package",return_value=(Path("/generated"),type_name,"1.1")):
-            result=runtime.qualify(allocation)
+            result=runtime.qualify(allocation,binaries=model_binaries())
         return result,present,calls
 
     def test_accepted_provision_timeout_is_reconciled_and_removed(self):
@@ -495,7 +521,8 @@ class AmbiguousMutationTests(unittest.TestCase):
         self.assertEqual(result["cleanup"]["retained_for_recovery"]["application"],result["application"])
 
     def test_existing_owner_allocation_is_never_destroyed(self):
-        with patch("sys.argv",["rust_runtime_test.py","owned","--existing-owner","capability"]), \
+        with patch("sys.argv",["rust_runtime_test.py","owned","--existing-owner","capability","--prebuilt","bundle"]), \
+             patch.object(runtime,"load_bundle",return_value=model_binaries()), \
              patch.object(runtime,"Allocation"),patch.object(runtime,"qualify",return_value={"status":"FAIL","errors":["failure"],"cleanup":{}}), \
              patch.object(runtime,"destroy_owned") as destroy,contextlib.redirect_stdout(io.StringIO()) as output:
             with self.assertRaises(SystemExit):runtime.main()

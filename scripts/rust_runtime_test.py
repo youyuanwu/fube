@@ -31,8 +31,11 @@ ROOT = Path(__file__).resolve().parents[1]
 OWNER_LABEL = "io.github.service-fabric-apps.cluster-owner"
 NS = "http://schemas.microsoft.com/2011/01/fabric"
 ET.register_namespace("", NS)
-DEFAULT_APP = ROOT / "target/debug/rust-runtime-app"
-DEFAULT_OBSERVER = ROOT / "target/debug/examples/runtime_observer"
+EXE_SUFFIX = ".exe" if os.name == "nt" else ""
+DEFAULT_APP = ROOT / "target" / "debug" / ("rust-runtime-app" + EXE_SUFFIX)
+DEFAULT_OBSERVER = ROOT / "target" / "debug" / "examples" / ("runtime_observer" + EXE_SUFFIX)
+BUNDLE_VERSION = 3
+BUNDLE_PROFILE = "linux-x86_64-volatile-empty-control-v1"
 
 
 def run(*args: str, timeout: float = 120) -> str:
@@ -49,6 +52,7 @@ class Binaries:
     dependency_graph: str
     template_root: Path | None = None
     bundle_manifest_sha256: str | None = None
+    source_revision: str | None = None
 
 
 PACKAGE_FILES = (
@@ -94,7 +98,17 @@ def build_binaries() -> Binaries:
     return Binaries(DEFAULT_APP, DEFAULT_OBSERVER, graph)
 
 
+def clean_source_revision() -> str:
+    if run("git", "status", "--porcelain", "--untracked-files=normal").strip():
+        raise RuntimeError("immutable runtime bundle requires a clean source tree")
+    revision = run("git", "rev-parse", "HEAD").strip()
+    if not re.fullmatch(r"[a-f0-9]{40}", revision):
+        raise RuntimeError("invalid bundle source revision")
+    return revision
+
+
 def build_bundle(directory: Path) -> None:
+    revision = clean_source_revision()
     binaries = build_binaries()
     directory.mkdir(parents=True, exist_ok=False)
     hashes = {}
@@ -110,8 +124,10 @@ def build_bundle(directory: Path) -> None:
         for name in PACKAGE_FILES:
             relative = f"package-v{version}/{name}"
             hashes[relative] = digest(directory / relative)
-    metadata = {"version": 2, "dependency_graph": binaries.dependency_graph,
-                "source_revision": run("git", "rev-parse", "HEAD").strip(), "sha256": hashes}
+    if clean_source_revision() != revision:
+        raise RuntimeError("source changed while building immutable runtime bundle")
+    metadata = {"version": BUNDLE_VERSION, "profile": BUNDLE_PROFILE,
+                "dependency_graph": binaries.dependency_graph, "source_revision": revision, "sha256": hashes}
     (directory / "build-info.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
@@ -121,7 +137,10 @@ def load_bundle(directory: Path) -> Binaries:
     if manifest.is_symlink() or not manifest.is_file() or manifest.stat().st_size>1048576:
         raise RuntimeError("runtime bundle metadata must be a bounded regular file")
     metadata = json.loads(manifest.read_text(encoding="utf-8"))
-    if not isinstance(metadata, dict) or metadata.get("version") != 2:
+    if (not isinstance(metadata, dict) or set(metadata) != {"version","profile","dependency_graph","source_revision","sha256"}
+        or metadata.get("version") != BUNDLE_VERSION or metadata.get("profile") != BUNDLE_PROFILE
+        or not isinstance(metadata.get("source_revision"), str)
+        or not re.fullmatch(r"[a-f0-9]{40}", metadata["source_revision"])):
         raise RuntimeError("unsupported runtime binary bundle")
     graph = metadata.get("dependency_graph")
     validate_dependency_graph(graph)
@@ -152,7 +171,7 @@ def load_bundle(directory: Path) -> Binaries:
         if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}",expected) or digest(binary) != expected:
             raise RuntimeError(f"runtime bundle binary hash mismatch: {name}")
     return Binaries(directory / "rust-runtime-app", directory / "runtime_observer", graph,
-                    directory, digest(directory / "build-info.json"))
+                    directory, digest(directory / "build-info.json"), metadata["source_revision"])
 
 
 def validate_allocation(state: dict, container: dict, name: str, owner: str) -> str:
@@ -297,6 +316,102 @@ def observe(service: str, key: str | None = None, *, observer: Path = DEFAULT_OB
     if observed["rpc"]["pid"] != observed["native_pid"]:
         raise RuntimeError("native query did not confirm serving process")
     return observed
+
+
+def stateful_observe(service: str, *, observer: Path = DEFAULT_OBSERVER) -> dict:
+    text = run(str(observer), "127.0.0.1:19000", service, "--stateful", timeout=60)
+    if len(text) > 2_000_000 or len(text.splitlines()) != 1:
+        raise RuntimeError("bounded singleton stateful observation required")
+    return json.loads(text)
+
+
+def assert_stateful(value: dict, service: str, count: int, minimum: int) -> dict:
+    """Native placement/discovery/deployment and actual HTTP must all agree."""
+    if value.get("observer") != "mssf-client" or value.get("service") != service:
+        raise RuntimeError("stateful observer/service mismatch")
+    partition = value["native_partition"]
+    if partition["target"] != count or partition["minimum"] != minimum or partition["status"] != "Ready":
+        raise RuntimeError("native stateful partition size/status not ready")
+    ready = [replica for replica in value["replicas"] if replica["status"] == "Ready"]
+    if (len(ready) != count or len({replica["node"] for replica in ready}) != count
+        or len({replica["replica"] for replica in ready}) != count
+        or sum(replica["role"] == "Primary" for replica in ready) != 1):
+        raise RuntimeError("independent native placement/role cardinality mismatch")
+    for replica in ready:
+        expected = "Primary" if replica["role"] == "Primary" else "Secondary"
+        if replica["role"] not in {"Primary","ActiveSecondary"}:
+            raise RuntimeError("native ready replica is not active")
+        rpc, deployed, control = replica["rpc"], replica["deployed"], replica["control"]
+        if (rpc["service"] != service or rpc["partition"] != value["partition"]
+            or rpc["replica"] != replica["replica"] or rpc["node"] != replica["node"]
+            or rpc["pid"] != deployed["host_process_id"] or rpc["role"] != expected
+            or rpc["replicator_role"] != expected or rpc["current_role"] != expected
+            or not rpc["stateful"] or rpc["persisted"] or rpc["epoch"] != partition["epoch"]
+            or deployed["service_type_name"] != "RustStatefulRuntimeType"):
+            raise RuntimeError("native placement/deployment/HTTP stateful identity, role or epoch mismatch")
+        if (rpc["replication_address"] == replica["address"] or rpc["service_address"] != replica["address"]
+            or control["version"] != 1 or control["state"] != "empty"
+            or control["partition"] != value["partition"] or control["replica"] != replica["replica"]
+            or control["incarnation"] != rpc["incarnation"] or control["first"] != 0 or control["last"] != 0
+            or control["role"] != expected
+            or control["epoch"] != {"data_loss":partition["epoch"]["data_loss"],
+                                     "configuration":partition["epoch"]["configuration"] & ~0xFFFFFFFF}
+            or rpc["replicator"]["application_writes"] or rpc["replicator"]["durability"]):
+            raise RuntimeError("stateful service/control address or empty-frontier evidence mismatch")
+        if expected == "Primary":
+            if rpc["read_status"] != "Granted" or rpc["write_status"] != "Granted" or replica["service_http_status"] != 200:
+                raise RuntimeError("native primary does not have granted usable access")
+        elif rpc["read_status"] != "NotPrimary" or rpc["write_status"] != "NotPrimary" or replica["service_http_status"] != 503:
+            raise RuntimeError("secondary incorrectly serves the primary route")
+    primary = value["primary"]
+    placed = next(replica for replica in ready if replica["role"] == "Primary")
+    if (primary["resolver"] != "mssf-client" or primary["rpc"]["pid"] != primary["native_pid"]
+        or primary["rpc"]["role"] != "Primary"
+        or any(primary["rpc"][field] != placed["rpc"][field] for field in ("service","partition","replica","incarnation","node","host","pid"))
+        or primary["endpoint"] not in {replica["address"] for replica in ready if replica["role"] == "Primary"}):
+        raise RuntimeError("native primary discovery/HTTP mismatch")
+    return value
+
+
+def wait_stateful(service: str, count: int, minimum: int, *, observer: Path = DEFAULT_OBSERVER,
+                  accept=None, timeout: float = 180) -> dict:
+    def check():
+        value = assert_stateful(stateful_observe(service,observer=observer), service,count,minimum)
+        return value if accept is None or accept(value) else False
+    return wait_condition(check,"independent stateful placement/discovery/HTTP agreement",timeout)
+
+
+def stateful_singleton(allocation: Allocation, application: str, binaries: Binaries) -> dict:
+    observed = wait_stateful(application+"/Stateful",1,1,observer=binaries.observer)
+    process = json.loads(allocation.execute("python3","-c",PROCESS,json.dumps(observed["primary"]),"inspect"))
+    if process["executable_sha256"] != digest(binaries.app):
+        raise RuntimeError("native serving stateful executable differs from immutable bundle")
+    return {"status":"PASS_TARGET_MINIMUM_1_EMPTY_CONTROL_PLANE","observation":observed,"process":process}
+
+
+def failure_artifacts(allocation: Allocation, type_name: str) -> dict:
+    """Bounded read-only diagnostics under this run's unique owned type paths."""
+    code = r"""
+import json,sys,os
+from pathlib import Path
+kind=sys.argv[1]; result=[]; visited=0
+for base,dirs,files in os.walk("/var/lib/sf-node"):
+    visited+=1
+    if visited>50000:raise RuntimeError("diagnostic directory bound")
+    if kind not in base:continue
+    for name in files:
+        if not (name.endswith((".err",".out")) or name.endswith("Package.Current.xml") or ".Manifest." in name):
+            continue
+        path=Path(base)/name
+        if path.is_symlink() or not path.is_file():continue
+        with path.open("rb") as file:
+            file.seek(max(0,path.stat().st_size-16384)); text=file.read(16384).decode(errors="replace")
+        result.append({"path":str(path),"tail":text})
+        if len(result)>=24:break
+    if len(result)>=24:break
+print(json.dumps({"visited":visited,"files":result}))
+"""
+    return json.loads(allocation.execute("python3","-c",code,type_name,timeout=30))
 
 
 def wait_observe(service: str, *, old: dict | None = None, started: float | None = None,
@@ -805,7 +920,34 @@ def destroy_owned(name: str, owner: str) -> dict:
         cluster.load()
         if cluster.state["owner"]!=owner:
             raise RuntimeError("successful-create owner changed; cleanup refused")
-        return cluster.destroy(name)
+        containers, volumes, networks = cluster.resources(require_volumes=False)
+        original = {"container":[v["Id"] for v in containers],
+                    "volume":[v["Name"] for v in volumes],
+                    "network":[v["Id"] for v in networks]}
+        result = cluster.destroy(name)
+        for kind, identities in original.items():
+            for identity in identities:
+                require_resource_absent(kind,identity)
+        result["independent_absence"] = original
+        result["absence_verified"] = True
+        return result
+
+
+def require_resource_absent(kind: str, identity: str) -> None:
+    if kind not in {"container","volume","network"} or not identity:
+        raise ValueError("invalid original resource identity")
+    checked = subprocess.run(["docker",kind,"inspect",identity],cwd=ROOT,text=True,
+                             capture_output=True,timeout=20)
+    if checked.returncode == 0:
+        raise RuntimeError(f"owned {kind} still exists after cleanup: {identity}")
+    error = checked.stderr.lower()
+    absent = {
+        "container": "no such container" in error or "no such object" in error,
+        "volume": "no such volume" in error,
+        "network": "no such network" in error or ("network" in error and "not found" in error),
+    }[kind]
+    if checked.returncode != 1 or identity.lower() not in error or not absent:
+        raise RuntimeError(f"could not prove {kind} absence: {checked.stderr}")
 
 
 def create_owned(name: str) -> str:
@@ -826,7 +968,8 @@ def create_owned(name: str) -> str:
         os.umask(previous_umask)
 
 
-def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | None = None) -> dict:
+def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | None = None,
+            stateful: str | None = None) -> dict:
     run_id = uuid.uuid4().hex[:12]
     application = f"fabric:/FubeRustRuntime{run_id}"
     type_name=f"FubeRustRuntime{run_id}Type"
@@ -836,7 +979,8 @@ def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | Non
               "status":"FAIL","errors":[],"cleanup":{}}
     attempts={"provision":False,"provision_completed":False,"create":False,"create_completed":False}
     try:
-        binaries = build_binaries() if binaries is None else binaries
+        if binaries is None or binaries.template_root is None:
+            raise RuntimeError("native qualification requires a verified prebuilt bundle")
         needed = run("readelf", "-d", str(binaries.app))
         if any(name in needed.lower() for name in ("fabricruntime", "fabriccommon")):
             raise RuntimeError("application links native SF libraries")
@@ -844,6 +988,7 @@ def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | Non
                       binary_sha256={"rust-runtime-app":digest(binaries.app),
                                      "runtime_observer":digest(binaries.observer)})
         result["bundle_manifest_sha256"] = binaries.bundle_manifest_sha256
+        result["executable_source_revision"] = binaries.source_revision
         source, type_name, version = package(run_id, binaries.app,templates=binaries.template_root)
         result.update(type_name=type_name,version=version)
         remote=f"/var/lib/sf-node/fube-rust-runtime-{run_id}"
@@ -861,6 +1006,8 @@ def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | Non
         attempts["create"]=True
         allocation.sf("application", "create", "--app-name", application, "--app-type", type_name, "--app-version", version)
         attempts["create_completed"]=True
+        if stateful is not None:
+            result["stateful_singleton"] = stateful_singleton(allocation,application,binaries)
         configuration_upgrade(allocation,binaries,result,attempts)
         if full:
             result["resilience"]={}
@@ -870,10 +1017,15 @@ def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | Non
         result["restart"] = restart(allocation, application + "/Singleton",observer=binaries.observer)
     except Exception as error:
         result["errors"].append("qualification: "+str(error))
+        try:
+            result["failure_artifacts"]=failure_artifacts(allocation,type_name)
+        except Exception as diagnostic:
+            result["diagnostic_error"]=str(diagnostic)
     finally:
         cleanup_deployment(allocation,result,attempts)
     if not result["errors"]:
-        result["status"]="PASS_FULL_STATELESS_PROFILE" if full else "PASS_SINGLETON_PLACEMENT_RPC_NATIVE_RESTART"
+        result["status"]=("PASS_EMPTY_STATEFUL_ONE_REPLICA_AND_STATELESS_PROFILE" if stateful is not None else
+                         "PASS_FULL_STATELESS_PROFILE" if full else "PASS_SINGLETON_PLACEMENT_RPC_NATIVE_RESTART")
     return result
 
 
@@ -886,22 +1038,27 @@ def main() -> None:
     parser.add_argument("--existing-owner", help="exact owner capability; never destroy caller-owned onebox")
     parser.add_argument("--restart-service", help="qualify replacement of an explicitly named existing owned service")
     parser.add_argument("--full",action="store_true",help="native shared-process/control/callback/authority qualification")
+    parser.add_argument("--stateful", choices=["one"], help="also qualify the volatile empty stateful singleton")
     parser.add_argument("--report",type=Path,help="write a new structured evidence file (never overwrite)")
     args = parser.parse_args()
     if sys.platform!="linux":
         parser.error("native application-runtime qualification requires Linux x86-64")
     if args.build_bundle is not None:
-        if args.name or args.existing_owner or args.restart_service or args.full or args.report:
+        if args.name or args.existing_owner or args.restart_service or args.full or args.stateful or args.report:
             parser.error("--build-bundle cannot be combined with qualification options")
         build_bundle(args.build_bundle)
         print(json.dumps({"bundle": str(args.build_bundle), "status": "BUILT"}))
         return
     if args.name is None:
         parser.error("an allocation name is required for qualification")
+    if args.prebuilt is None:
+        parser.error("native qualification requires --prebuilt; use --build-bundle upstream")
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,39}", args.name):
         parser.error("invalid allocation name")
     if args.restart_service and not args.existing_owner:
         parser.error("--restart-service requires --existing-owner")
+    if args.restart_service and args.stateful:
+        parser.error("--restart-service cannot stand in for stateful qualification")
     created = False
     owner = None
     result={"status":"FAIL","onebox":args.name,"errors":[],"cleanup":{}}
@@ -918,7 +1075,7 @@ def main() -> None:
             observer = binaries.observer if binaries is not None else DEFAULT_OBSERVER
             result = restart(allocation, args.restart_service, observer=observer)
         else:
-            result = qualify(allocation,args.full,binaries)
+            result = qualify(allocation,args.full,binaries,stateful=args.stateful)
         result.setdefault("status","PASS_SINGLETON_PLACEMENT_RPC_NATIVE_RESTART")
         result.setdefault("errors",[])
         result.setdefault("cleanup",{})
