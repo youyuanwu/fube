@@ -51,6 +51,8 @@ pub(crate) struct Registry {
     metrics: Arc<RuntimeMetrics>,
     #[cfg(test)]
     open_admission_hook: Mutex<Option<Arc<OpenAdmissionHook>>>,
+    #[cfg(test)]
+    close_admission_hook: Mutex<Option<Arc<OpenAdmissionHook>>>,
 }
 #[cfg(test)]
 #[derive(Default)]
@@ -76,6 +78,8 @@ impl Registry {
             metrics,
             #[cfg(test)]
             open_admission_hook: Mutex::new(None),
+            #[cfg(test)]
+            close_admission_hook: Mutex::new(None),
         }
     }
     #[cfg(test)]
@@ -87,6 +91,22 @@ impl Registry {
     #[cfg(test)]
     pub(crate) fn close_through(&self, id: [u8; 16]) -> i64 {
         self.get(id).unwrap().state.lock().unwrap().close_through
+    }
+    #[cfg(test)]
+    pub(crate) fn pause_close_admission(&self) -> Arc<OpenAdmissionHook> {
+        let hook = Arc::new(OpenAdmissionHook::default());
+        *self.close_admission_hook.lock().unwrap() = Some(hook.clone());
+        hook
+    }
+    #[cfg(test)]
+    pub(crate) async fn wait_idle(&self, id: [u8; 16]) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while self.get(id).unwrap().gate.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
     pub(crate) fn has_factory(&self, name: &str) -> bool {
         self.factories.lock().unwrap().contains_key(name)
@@ -204,7 +224,18 @@ impl Registry {
             }
             // Close-for-business and cancel before trying operation ownership.
             // Native retries until the old callback owner drains.
+            #[cfg(test)]
+            {
+                let hook = self.close_admission_hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook.reached.notify_one();
+                    hook.release.notified().await;
+                }
+            }
             let mut state = unit.state.lock().unwrap();
+            if stale(&state.request, &request) {
+                return Ok(());
+            }
             state.close_through = state.close_through.max(request.local.instance);
             state.valid.store(false, Ordering::Release);
             state.cancel.cancel();

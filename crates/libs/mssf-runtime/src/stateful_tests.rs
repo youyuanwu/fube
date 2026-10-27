@@ -335,6 +335,7 @@ async fn stateful_abort_cancels_open_owner_and_fences_old_incarnation() {
     let failed: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_ne!(failed.error.error, 0);
     assert!(calls.partitions.lock().unwrap()[0].status().is_err());
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
     request.flags = 0;
@@ -463,6 +464,7 @@ async fn close_between_gate_and_generation_install_cannot_be_overwritten() {
     let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_ne!(reply.error.error, 0);
     assert!(calls.events.lock().unwrap().is_empty());
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
     h.send("ReplicaClose", &request).await;
     h.receive("ReplicaCloseReply").await;
     request.flags = 0;
@@ -471,6 +473,37 @@ async fn close_between_gate_and_generation_install_cannot_be_overwritten() {
     let next: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(next.error.error, 0);
     assert!(calls.partitions.lock().unwrap()[0].ensure_valid().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_becoming_stale_before_revocation_cannot_touch_replacement() {
+    let mut h = Harness::new().await;
+    let calls = register(&h);
+    let old = request(&h, 2, 1, 0);
+    h.send("ReplicaOpen", &old).await;
+    h.receive("ReplicaOpenReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    h.send("ReplicaClose", &old).await;
+    h.receive("ReplicaCloseReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    let hook = h.engine.shared.stateful.pause_close_admission();
+    h.send("ReplicaClose", &old).await;
+    hook.reached.notified().await;
+    let mut newer = old.clone();
+    newer.local.instance = 2;
+    h.send("ReplicaOpen", &newer).await;
+    let opened: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
+    assert_eq!(opened.error.error, 0);
+    let replacement = calls.partitions.lock().unwrap()[1].clone();
+    assert!(replacement.ensure_valid().is_ok());
+    hook.release.notify_one();
+    h.no_reply().await;
+    assert!(replacement.ensure_valid().is_ok());
+    assert_eq!(
+        replacement.access_status().unwrap(),
+        (crate::AccessStatus::Granted, crate::AccessStatus::Granted)
+    );
+    assert_eq!(h.engine.shared.stateful.close_through([2; 16]), 1);
 }
 
 fn native_default_service(mut service: Service) -> Service {
