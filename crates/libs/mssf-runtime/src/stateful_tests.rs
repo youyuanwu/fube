@@ -16,6 +16,7 @@ struct StatefulCalls {
     catch_up_release: Notify,
     build_release: Notify,
     configuration_release: Notify,
+    remove_release: Notify,
     configuration_failure: AtomicBool,
     configurations: Mutex<Vec<(ReplicaSetConfiguration, Option<ReplicaSetConfiguration>)>>,
     builds: Mutex<Vec<ReplicaInformation>>,
@@ -226,14 +227,14 @@ impl Replicator for ReplicatorFixture {
                 .lock()
                 .unwrap()
                 .push((current, Some(previous)));
-            if self.1 == 36 && self.0.configuration_failure.load(Ordering::Acquire) {
+            if matches!(self.1, 36 | 37) && self.0.configuration_failure.load(Ordering::Acquire) {
                 return Err(Error::Remote {
                     code: -994,
                     message: "persistent configuration proof failure".into(),
                 });
             }
             let count = self.0.configurations.lock().unwrap().len();
-            if (self.1 == 23 && count == 1) || (self.1 == 35 && count == 2) {
+            if (self.1 == 23 && count == 1) || (matches!(self.1, 35 | 37) && count == 2) {
                 self.0.configuration_release.notified().await;
             }
             Ok(())
@@ -307,6 +308,9 @@ impl Replicator for ReplicatorFixture {
                 return Err(Error::Protocol("unexpected remove in lifecycle fixture"));
             }
             self.0.record("remove");
+            if self.1 == 37 {
+                self.0.remove_release.notified().await;
+            }
             Ok(())
         })
     }

@@ -1,5 +1,124 @@
 use super::*;
 
+async fn caught_up_with_built_peer(
+    h: &mut Harness,
+    mode: u8,
+) -> (Arc<StatefulCalls>, ProxyRequest, ProxyRequest) {
+    let calls = register(h);
+    let open = request(h, 2, 1, mode);
+    h.send("ReplicaOpen", &open).await;
+    h.receive("ReplicaOpenReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    let mut target = peer(&open.local, 2);
+    target.previous_role = 1;
+    let mut idle = target.clone();
+    idle.current_role = 2;
+    let build = control(&open, "ReplicatorBuildIdleReplica", vec![idle]);
+    h.send("ReplicatorBuildIdleReplica", &build).await;
+    h.receive("ReplicatorBuildIdleReplicaReply").await;
+    h.engine
+        .shared
+        .stateful
+        .wait_remote_idle([2; 16], [2; 16])
+        .await;
+    let mut update = control(
+        &open,
+        "UpdateConfiguration",
+        vec![open.local.clone(), target],
+    );
+    update.flags = 2;
+    update.unit.current.configuration += 1;
+    h.send("UpdateConfiguration", &update).await;
+    h.receive("UpdateConfigurationReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    (calls, open, update)
+}
+
+#[tokio::test]
+async fn successful_remove_revokes_cached_configuration_proof_without_shrinking_membership() {
+    let mut h = Harness::new().await;
+    let (calls, open, mut update) = caught_up_with_built_peer(&mut h, 36).await;
+    let mut removed = update.remote.0[1].clone();
+    removed.current_role = 2;
+    let remove = control(&update, "ReplicatorRemoveIdleReplica", vec![removed]);
+    h.send("ReplicatorRemoveIdleReplica", &remove).await;
+    let reply: ProxyReply =
+        from_slice(&h.receive("ReplicatorRemoveIdleReplicaReply").await.body).unwrap();
+    assert_eq!(reply.error.error, 0);
+    calls.configuration_failure.store(true, Ordering::Release);
+    h.send("UpdateConfiguration", &update).await;
+    let failed: ProxyReply = from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
+    assert_eq!(failed.error.error, -994);
+    assert_eq!(calls.configurations.lock().unwrap().len(), 2);
+    assert_eq!(
+        calls.partitions.lock().unwrap()[0]
+            .status()
+            .unwrap()
+            .configuration
+            .len(),
+        1
+    );
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    calls.configuration_failure.store(false, Ordering::Release);
+    update.remote.0[1].instance += 1;
+    update.unit.current.configuration += 1;
+    h.send("UpdateConfiguration", &update).await;
+    let new: ProxyReply = from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
+    assert_eq!(new.error.error, 0);
+    assert_eq!(new.unit.id.id, open.unit.id.id);
+}
+
+#[tokio::test]
+async fn unchanged_projected_proof_does_not_hide_changed_native_observations_and_access() {
+    let mut h = Harness::new().await;
+    let calls = register(&h);
+    let open = request(&h, 2, 1, 20);
+    h.send("ReplicaOpen", &open).await;
+    h.receive("ReplicaOpenReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    let mut update = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
+    update.flags = 2;
+    update.unit.current.configuration += 1;
+    h.send("UpdateConfiguration", &update).await;
+    h.receive("UpdateConfigurationReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    let mut dropped = peer(&open.local, 2);
+    dropped.up = false;
+    dropped.state = 3;
+    dropped.previous_role = 1;
+    update.remote.0.push(dropped);
+    h.send("UpdateConfiguration", &update).await;
+    let reply: ProxyReply = from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
+    assert_eq!(reply.error.error, 0);
+    let snapshot = calls.partitions.lock().unwrap()[0].status().unwrap();
+    assert_eq!(snapshot.configuration.len(), 1);
+    assert_eq!(snapshot.access().1, crate::AccessStatus::NoWriteQuorum);
+    assert_eq!(calls.configurations.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn late_configuration_during_remove_cannot_reinstall_pre_removal_receipt() {
+    let mut h = Harness::new().await;
+    let (calls, _, update) = caught_up_with_built_peer(&mut h, 37).await;
+    let mut removed = update.remote.0[1].clone();
+    removed.current_role = 2;
+    let remove = control(&update, "ReplicatorRemoveIdleReplica", vec![removed]);
+    h.send("ReplicatorRemoveIdleReplica", &remove).await;
+    wait_event(&calls, "remove", 1).await;
+    h.send("UpdateConfiguration", &update).await;
+    wait_event(&calls, "catchupConfiguration", 2).await;
+    calls.remove_release.notify_one();
+    h.receive("ReplicatorRemoveIdleReplicaReply").await;
+    calls.configuration_release.notify_one();
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    h.no_reply().await;
+    calls.configuration_failure.store(true, Ordering::Release);
+    h.send("UpdateConfiguration", &update).await;
+    let failed: ProxyReply = from_slice(&h.receive("UpdateConfigurationReply").await.body).unwrap();
+    assert_eq!(failed.error.error, -994);
+    assert_eq!(calls.configurations.lock().unwrap().len(), 3);
+}
+
 #[tokio::test]
 async fn failed_configuration_observation_is_not_a_cached_success_receipt() {
     let mut h = Harness::new().await;

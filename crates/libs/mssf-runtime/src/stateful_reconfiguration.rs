@@ -6,8 +6,10 @@ const MAX_REMOTE_TOMBSTONES: usize = 256;
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct AppliedConfiguration {
     epoch: Epoch,
+    revision: u64,
     current: ReplicaSetConfiguration,
     previous: Option<ReplicaSetConfiguration>,
+    observations: Vec<ReplicaInformation>,
 }
 
 pub(super) struct Pending {
@@ -386,11 +388,13 @@ impl Registry {
                 .await;
         }
         if completed_catch_up {
-            let (current, previous, _) = project(&request)?;
+            let (current, previous, observations) = project(&request)?;
             let receipt = AppliedConfiguration {
                 epoch: api_epoch(&request.unit.current),
+                revision: revision.1,
                 current,
                 previous: Some(previous),
+                observations,
             };
             let unchanged =
                 unit.state.lock().unwrap().applied_configuration.as_ref() == Some(&receipt);
@@ -697,10 +701,12 @@ impl Registry {
         cancel: &Cancellation,
     ) -> Result<()> {
         let (current, previous, remotes) = project(request)?;
-        let receipt = AppliedConfiguration {
+        let mut receipt = AppliedConfiguration {
             epoch: api_epoch(&request.unit.current),
+            revision: 0,
             current: current.clone(),
             previous: (!current_only).then(|| previous.clone()),
+            observations: remotes.clone(),
         };
         {
             let state = unit.state.lock().unwrap();
@@ -741,7 +747,9 @@ impl Registry {
             state.applied_configuration = None;
             state.error_api = (if current_only { 14 } else { 13 }, 4);
             state.status.lock().unwrap().configuration = remotes;
-            state.full_revision.load(Ordering::Acquire)
+            let revision = state.full_revision.load(Ordering::Acquire);
+            receipt.revision = revision;
+            revision
         };
         let replicator = replicator.clone();
         let operation_cancel = cancel.clone();
@@ -1121,6 +1129,17 @@ impl Registry {
             {
                 return Ok(());
             }
+            if state
+                .remotes
+                .get(&info.node_id)
+                .is_some_and(|remote| remote.descriptor.instance > descriptor.instance)
+            {
+                return Ok(());
+            }
+            // Removing a peer revokes any cached or queued proof that could
+            // count it. This is bookkeeping, not a native membership change.
+            advance(&state.full_revision)?;
+            state.applied_configuration = None;
             if let Some(remote) = state.remotes.get(&info.node_id) {
                 if remote.descriptor.instance > descriptor.instance {
                     return Ok(());
@@ -1207,6 +1226,8 @@ impl Registry {
         {
             let mut state = unit.state.lock().unwrap();
             state.removing = false;
+            advance(&state.full_revision)?;
+            state.applied_configuration = None;
             if let Some(remote) = state.remotes.get_mut(&info.node_id) {
                 if remote.sequence == sequence {
                     remote.busy = false;
