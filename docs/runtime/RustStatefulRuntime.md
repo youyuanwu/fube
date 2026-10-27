@@ -265,6 +265,27 @@ are ignored locally, not counted as passes. Focused new tests first reproduced
 each reviewed bug, including positive blocking-destructor entry under healthy
 lease renewal and actual CI-script partial-creation failure handling.
 
+**Final ownership-path repeat:** queued configuration and no-callback remote
+reference paths were subsequently corrected and requalified at
+**`b093a98f5d5692b584a4b656fadb410238560e86`**. The full actual native suite again
+passed, errors=[], in `build/stateful-empty-native-owned.json`, report SHA256
+`f8a26c1f6687d8e454988355cb54cb9d2e659c54126a6cef1d0db6034f4b9750`;
+bundle metadata
+`b729b8c7da515a42f5a3b1a9d1ace17100b81a17c80b0923475831077924867c`.
+Application SHA256 is
+`0803a69d22fb6d76613fc152adce5a2bcfe668763f5e6161225df42d849f87c0`;
+observer remains `9df0ffd68526967618d063eeb9605feead6bcbaf68e3492d5ac8ed06067c9878`.
+Shared PID 25614 → 26487; every role/configuration/cleanup/mixed recovery and
+preserved legacy scenario passed. Minted deployments/uploads and original
+`stempty-dab15f41-owned` container/volume/network are individually absence-confirmed.
+Final gates: **544 workspace tests, 10 doctests, 153 Python tests**,
+fmt/check/clippy/strict Rustdoc; 5 native-tier tests explicitly ignored locally.
+A test-only follow-up models native one-way Close retries rather than assuming
+the first attempt was admitted; it preserves partially read frames across retry
+ticks and keeps all positive-entry/deadline assertions. Rebuilding the app after
+that model change proves byte identity with the native-qualified executable.
+Later evidence notes are documentation-only.
+
 No application-state writes, replication data plane/storage, persisted recovery,
 durability, native FabricReplicator peer wire compatibility, Reliable Collections,
 rolling code upgrade/rollback, TLS/reconnect, Windows runtime or expanded host
