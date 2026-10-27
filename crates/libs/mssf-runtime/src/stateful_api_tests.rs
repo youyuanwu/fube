@@ -43,6 +43,14 @@ fn peer(id: i64, role: ReplicaRole, previous_role: ReplicaRole, ready: bool) -> 
 
 #[test]
 fn primary_epoch_masks_membership_bits_and_orders_data_loss_first() {
+    // Native Epoch()/InvalidEpoch() is (0,0), not the -1 LSN sentinel.
+    assert_eq!(
+        Epoch::INVALID,
+        Epoch {
+            data_loss: 0,
+            configuration: 0
+        }
+    );
     let epoch = Epoch {
         data_loss: 7,
         configuration: (3 << 32) + 99,

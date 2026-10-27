@@ -48,8 +48,8 @@ pub struct Epoch {
 }
 impl Epoch {
     pub const INVALID: Self = Self {
-        data_loss: -1,
-        configuration: -1,
+        data_loss: 0,
+        configuration: 0,
     };
     pub fn primary(self) -> Self {
         Self {

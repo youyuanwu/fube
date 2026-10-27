@@ -42,6 +42,28 @@ fn model_child() {
         }
         let mut runtime = attached.unwrap();
         match mode.as_str() {
+            "stateful-blocked-factory" => {
+                struct Blocked;
+                impl StatefulFactory for Blocked {
+                    fn create(
+                        &self,
+                        _: StatefulServiceContext,
+                    ) -> ServiceFuture<'_, Arc<dyn StatefulService>> {
+                        Box::pin(async {
+                            // No executor, cancellation or stderr progress is
+                            // available; only the independent OS fence can win.
+                            std::thread::sleep(Duration::from_secs(60));
+                            Err(Error::Protocol("stateful factory escaped hard fence"))
+                        })
+                    }
+                }
+                runtime
+                    .register_stateful("BlockedStateful", Arc::new(Blocked))
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                panic!("stateful callback defeated process fencing");
+            }
             "live-update" => {
                 struct Unplaced;
                 impl StatelessFactory for Unplaced {
@@ -320,7 +342,10 @@ async fn scenario(mode: &str, expected: i32) {
                     assert!(step >= 3);
                     step = 4;
                     to_vec(&LeaseReply {
-                        ttl: if mode_owned == "executor-stall" {
+                        ttl: if matches!(
+                            mode_owned.as_str(),
+                            "executor-stall" | "stateful-blocked-factory"
+                        ) {
                             5_000_000
                         } else {
                             300_000_000
@@ -335,9 +360,13 @@ async fn scenario(mode: &str, expected: i32) {
                     to_vec(&ErrorReply { error: 0 }).unwrap()
                 }
                 "RegisterServiceTypeRequest" => {
-                    assert_eq!(mode_owned, "live-update");
                     let registration: TypeRequest = from_slice(&request.body).unwrap();
-                    assert_eq!(registration.context.code.version.instance, 4);
+                    if mode_owned == "live-update" {
+                        assert_eq!(registration.context.code.version.instance, 4);
+                    } else {
+                        assert_eq!(mode_owned, "stateful-blocked-factory");
+                        assert_eq!(registration.id.name, "BlockedStateful");
+                    }
                     assert_eq!(
                         registration.context.id,
                         runtime_context.as_ref().unwrap().id
@@ -358,6 +387,27 @@ async fn scenario(mode: &str, expected: i32) {
                         .is_err()
                     {
                         return;
+                    }
+                    if p.action == "RegisterServiceTypeRequest"
+                        && mode_owned == "stateful-blocked-factory"
+                    {
+                        let mut open = crate::lifecycle::tests::Harness::request_with_context(
+                            runtime_context.as_ref().unwrap(),
+                            9,
+                            1,
+                            0,
+                        );
+                        open.service.stateful = true;
+                        open.service.service_type.name = "BlockedStateful".into();
+                        open.unit.current.configuration = (1 << 32) + 1;
+                        let message = Message {
+                            headers: vec![
+                                Header::actor(12).unwrap(),
+                                Header::action("ReplicaOpen").unwrap(),
+                            ],
+                            body: to_vec(&open).unwrap(),
+                        };
+                        write_message(&mut stream, &message).await.unwrap();
                     }
                 }
             }
@@ -453,6 +503,11 @@ async fn successful_native_shaped_update_refreshes_later_registration() {
 #[tokio::test]
 async fn blocking_subscription_capture_destruction_cannot_delay_owner_drop_fence() {
     scenario("drop-capture", 70).await;
+}
+
+#[tokio::test]
+async fn blocked_stateful_factory_cannot_delay_independent_process_fence() {
+    scenario("stateful-blocked-factory", 70).await;
 }
 
 #[cfg(unix)]

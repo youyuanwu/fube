@@ -1,4 +1,6 @@
 use super::*;
+#[path = "stateful_tests.rs"]
+mod stateful_tests;
 use mssf_transport::{
     connection::{read_message, write_message},
     message::{Header, ListenInstance, Message, MessageId},
@@ -100,7 +102,7 @@ impl StatelessService for Instance {
         }
     }
 }
-struct Harness {
+pub(crate) struct Harness {
     engine: Engine,
     peer: TcpStream,
     calls: Arc<Calls>,
@@ -688,7 +690,19 @@ impl Harness {
         }
     }
     fn request(&self, partition: u8, incarnation: i64, mode: u8) -> ProxyRequest {
-        let context = &self.engine.shared.activation.runtime;
+        Self::request_with_context(
+            &self.engine.shared.activation.runtime,
+            partition,
+            incarnation,
+            mode,
+        )
+    }
+    pub(crate) fn request_with_context(
+        context: &RuntimeContext,
+        partition: u8,
+        incarnation: i64,
+        mode: u8,
+    ) -> ProxyRequest {
         let version = context.code.version.clone();
         ProxyRequest {
             runtime: context.id.clone(),

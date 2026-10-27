@@ -11,6 +11,7 @@ mod model_tests;
 mod package_context;
 mod packages;
 mod reporting;
+mod stateful;
 mod stateful_api;
 mod wire;
 
@@ -396,6 +397,26 @@ impl Runtime {
             return Err(Error::InvalidInput("invalid service type name"));
         }
         self.lifecycle.insert_factory(name.to_owned(), factory)?;
+        self.register_type(name).await
+    }
+
+    /// Register a volatile stateful factory on this same host/runtime. Native
+    /// placement remains the only source of replica membership and roles.
+    pub async fn register_stateful(
+        &mut self,
+        name: &str,
+        factory: Arc<dyn StatefulFactory>,
+    ) -> Result<()> {
+        self.authority.check()?;
+        if name.is_empty() || name.encode_utf16().count() > 32_768 {
+            return Err(Error::InvalidInput("invalid service type name"));
+        }
+        self.lifecycle
+            .insert_stateful_factory(name.to_owned(), factory)?;
+        self.register_type(name).await
+    }
+
+    async fn register_type(&self, name: &str) -> Result<()> {
         let activation = self.current.snapshot();
         let reply: Result<ErrorReply> = call(
             &self.connection,
