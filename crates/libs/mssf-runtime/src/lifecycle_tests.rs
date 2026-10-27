@@ -670,7 +670,12 @@ impl Harness {
             }
         );
         let authority = Authority::new(std::time::Instant::now(), 3_000_000_000).unwrap();
-        let engine = Engine::start(activation, authority, client.unwrap(), rx);
+        let engine = Engine::start(
+            crate::ActivationContextHandle::new(activation),
+            authority,
+            client.unwrap(),
+            rx,
+        );
         let calls = Arc::new(Calls::default());
         engine
             .insert_factory("ModelType".into(), Arc::new(Factory(calls.clone())))

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import hashlib
+import concurrent.futures
 import json
 import os
 from pathlib import Path
@@ -46,6 +47,31 @@ class Binaries:
     app: Path
     observer: Path
     dependency_graph: str
+    template_root: Path | None = None
+    bundle_manifest_sha256: str | None = None
+
+
+PACKAGE_FILES = (
+    "ApplicationManifest.xml", "RustRuntimeService/ServiceManifest.xml",
+    "RustRuntimeService/Config/Settings.xml", "RustRuntimeService/Data/marker.txt",
+)
+
+
+def upgrade_template(directory: Path) -> None:
+    path = directory / "ApplicationManifest.xml"
+    manifest = ET.parse(path)
+    manifest.getroot().set("ApplicationTypeVersion", "1.2")
+    manifest.find(f"{{{NS}}}ServiceManifestImport/{{{NS}}}ServiceManifestRef").set("ServiceManifestVersion", "1.2")
+    manifest.write(path, encoding="utf-8", xml_declaration=True)
+    path = directory / "RustRuntimeService/ServiceManifest.xml"
+    manifest = ET.parse(path)
+    manifest.getroot().set("Version", "1.2")
+    manifest.find(f"{{{NS}}}ConfigPackage").set("Version", "2.0")
+    manifest.write(path, encoding="utf-8", xml_declaration=True)
+    path = directory / "RustRuntimeService/Config/Settings.xml"
+    settings = ET.parse(path)
+    settings.find(f"{{{NS}}}Section/{{{NS}}}Parameter[@Name='Value']").set("Value", "after-upgrade")
+    settings.write(path, encoding="utf-8", xml_declaration=True)
 
 
 def validate_dependency_graph(graph: str) -> None:
@@ -76,27 +102,54 @@ def build_bundle(directory: Path) -> None:
         destination = directory / name
         shutil.copy2(source, destination)
         hashes[name] = digest(destination)
-    metadata = {"version": 1, "dependency_graph": binaries.dependency_graph, "sha256": hashes}
+    for version in (1, 2):
+        destination = directory / f"package-v{version}"
+        shutil.copytree(ROOT / "crates/samples/rust-runtime-app/pkg", destination)
+        if version == 2:
+            upgrade_template(destination)
+        for name in PACKAGE_FILES:
+            relative = f"package-v{version}/{name}"
+            hashes[relative] = digest(directory / relative)
+    metadata = {"version": 2, "dependency_graph": binaries.dependency_graph,
+                "source_revision": run("git", "rev-parse", "HEAD").strip(), "sha256": hashes}
     (directory / "build-info.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
 def load_bundle(directory: Path) -> Binaries:
     directory = directory.resolve(strict=True)
     metadata = json.loads((directory / "build-info.json").read_text(encoding="utf-8"))
-    if not isinstance(metadata, dict) or metadata.get("version") != 1:
+    if not isinstance(metadata, dict) or metadata.get("version") != 2:
         raise RuntimeError("unsupported runtime binary bundle")
     graph = metadata.get("dependency_graph")
     validate_dependency_graph(graph)
     hashes = metadata.get("sha256")
-    if not isinstance(hashes, dict) or set(hashes) != {"rust-runtime-app", "runtime_observer"}:
+    expected_names = {"rust-runtime-app", "runtime_observer"} | {
+        f"package-v{version}/{name}" for version in (1, 2) for name in PACKAGE_FILES
+    }
+    if not isinstance(hashes, dict) or set(hashes) != expected_names:
         raise RuntimeError("missing runtime binary hashes")
+    entries = []
+    for entry in directory.rglob("*"):
+        entries.append(entry)
+        if len(entries)>64:
+            raise RuntimeError("runtime bundle entry bound")
+    expected_directories = {parent.as_posix() for name in expected_names for parent in Path(name).parents if parent != Path(".")}
+    if any(entry.is_symlink() for entry in entries) or {
+        entry.relative_to(directory).as_posix() for entry in entries if entry.is_file()
+    } != expected_names | {"build-info.json"} or {
+        entry.relative_to(directory).as_posix() for entry in entries if entry.is_dir()
+    } != expected_directories:
+        raise RuntimeError("unexpected/symlinked runtime bundle entries")
     for name, expected in hashes.items():
         binary = directory / name
-        if binary.is_symlink() or not binary.is_file() or not os.access(binary, os.X_OK):
+        if binary.is_symlink() or not binary.is_file() or (
+            name in {"rust-runtime-app", "runtime_observer"} and not os.access(binary, os.X_OK)
+        ):
             raise RuntimeError(f"missing regular executable in runtime bundle: {name}")
-        if not isinstance(expected, str) or digest(binary) != expected:
+        if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}",expected) or digest(binary) != expected:
             raise RuntimeError(f"runtime bundle binary hash mismatch: {name}")
-    return Binaries(directory / "rust-runtime-app", directory / "runtime_observer", graph)
+    return Binaries(directory / "rust-runtime-app", directory / "runtime_observer", graph,
+                    directory, digest(directory / "build-info.json"))
 
 
 def validate_allocation(state: dict, container: dict, name: str, owner: str) -> str:
@@ -149,7 +202,7 @@ class Allocation:
 # Runs in the container PID namespace. pidfd binds the signal to the verified
 # incarnation, even if a PID is recycled between inspection and signal delivery.
 PROCESS = r"""
-import json,os,signal,sys,time,select,socket,ctypes
+import json,os,signal,sys,time,select,socket,ctypes,hashlib
 from pathlib import Path
 expected=json.loads(sys.argv[1]); action=sys.argv[2]; pid=expected["native_pid"]
 def require(condition,message):
@@ -171,7 +224,14 @@ try:
                   if len(line.split(maxsplit=5))==6 and line.split(maxsplit=5)[5].startswith("/")})
     require(not any("fabricruntime" in p.lower() or "fabriccommon" in p.lower() for p in paths),"native SF application mapping")
     result={"pid":pid,"exe":exe,"start_ticks":int(stat[19]),"parent_pid":int(stat[1]),
-            "loaded_files":paths,"host":rpc["host"],"action":action}
+            "loaded_files":paths,"host":rpc["host"],"action":action,
+            "activation_environment":{k:env[k] for k in (
+                "Fabric_ApplicationId","Fabric_ServicePackageName","Fabric_ServicePackageVersionInstance",
+                "Fabric_CodePackageInstanceSeqNum","Fabric_ServicePackageInstanceSeqNum") if k in env}}
+    hasher=hashlib.sha256()
+    with (root/"exe").open("rb") as binary:
+        for chunk in iter(lambda:binary.read(1048576),b""):hasher.update(chunk)
+    result["executable_sha256"]=hasher.hexdigest()
     if action=="kill":
         result["terminated_at_monotonic"]=time.monotonic()
         signal.pidfd_send_signal(fd,signal.SIGKILL)
@@ -270,10 +330,12 @@ def restart(allocation: Allocation, service: str, *, observer: Path = DEFAULT_OB
             "replacement": replacement, "replacement_process": after, "recovery_seconds": elapsed}
 
 
-def package(run_id: str, app: Path) -> tuple[Path, str, str]:
-    source = ROOT / "crates/samples/rust-runtime-app/pkg"
-    destination = ROOT / "build/rust-runtime" / run_id
+def package(run_id: str, app: Path, *, templates: Path | None = None, upgrade: bool = False) -> tuple[Path, str, str]:
+    source = templates / ("package-v2" if upgrade else "package-v1") if templates else ROOT / "crates/samples/rust-runtime-app/pkg"
+    destination = ROOT / "build/rust-runtime" / (run_id + ("-upgrade" if upgrade else ""))
     shutil.copytree(source, destination)  # Refuse any pre-existing generated path.
+    if upgrade and templates is None:
+        upgrade_template(destination)
     code = destination / "RustRuntimeService/Code"
     code.mkdir()
     shutil.copy2(app, code / "rust-runtime-app")
@@ -425,7 +487,7 @@ def reporting_acceptance(allocation: Allocation, alpha: dict, beta: dict, result
 
 
 def controls_and_authority(allocation: Allocation, application: str, result: dict | None = None,
-                           *, observer: Path = DEFAULT_OBSERVER) -> dict:
+                           *, observer: Path = DEFAULT_OBSERVER, expected_generation: int | None = None) -> dict:
     from concurrent.futures import ThreadPoolExecutor
     import http.client
     from urllib.parse import urlsplit
@@ -460,6 +522,11 @@ def controls_and_authority(allocation: Allocation, application: str, result: dic
             and alpha["rpc"]["maximum_concurrent_opens"]>=2):
         raise RuntimeError("native shared-process concurrent partitions/overlapping Opens not proven")
     result["concurrent"]={"alpha":alpha,"beta":beta}
+    if expected_generation is not None and any(
+        v["rpc"]["creation_generation"] != expected_generation or v["rpc"]["creation_configuration"] != "after-upgrade"
+        for v in (alpha,beta)
+    ):
+        raise RuntimeError("later native service creation received stale package context")
     result["reports"] = {}
     alpha = reporting_acceptance(allocation, alpha, beta, result["reports"], observer=observer)
     baseline=alpha["rpc"]["native_actions"]
@@ -553,6 +620,123 @@ def items(raw: str) -> list:
     return value if isinstance(value,list) else value["items"]
 
 
+def deployment_artifacts(allocation: Allocation, observation: dict) -> dict:
+    config = observation["rpc"]["packages"]["configuration"]
+    script = r"""
+import json,sys
+from pathlib import Path
+config=Path(sys.argv[1]); base=config.parent
+paths=sorted(set(base.glob("App.*.xml"))|set(base.glob("*.Package.Current.xml"))|set(base.glob("*.Manifest.*.xml"))|{config/"Settings.xml"})
+if len(paths)>16: raise RuntimeError("artifact evidence count limit")
+result={}
+for p in paths:
+    if p.stat().st_size>1048576: raise RuntimeError("artifact evidence byte limit")
+    result[str(p)]=p.read_text()
+print(json.dumps(result))
+"""
+    files = json.loads(allocation.execute("python3", "-c", script, str(Path(config["path"]))))
+    current = [ET.fromstring(value) for path,value in files.items() if path.endswith(".Package.Current.xml")]
+    if len(current) != 1:
+        raise RuntimeError("ambiguous native current package evidence")
+    root = current[0]
+    code = root.find(f"{{{NS}}}DigestedCodePackage")
+    native_config = root.find(f"{{{NS}}}DigestedConfigPackage")
+    settings = ET.fromstring(files[str(Path(config["path"]) / "Settings.xml")])
+    value = settings.find(f"{{{NS}}}Section[@Name='Main']/{{{NS}}}Parameter[@Name='Value']").attrib["Value"]
+    override = native_config.find(f"{{{NS}}}ConfigOverride/{{{NS}}}Settings/{{{NS}}}Section/{{{NS}}}Parameter[@Name='Override']").attrib["Value"]
+    if (value,override) != (config["value"],config["override"]):
+        raise RuntimeError("RPC configuration differs from independent native settings/override artifacts")
+    if native_config.attrib["RolloutVersion"] != config["rollout"]:
+        raise RuntimeError("RPC config rollout differs from native artifact")
+    if root.attrib["ManifestVersion"] != config["manifest_version"]:
+        raise RuntimeError("RPC manifest differs from native artifact")
+    return {"files":files,"code_rollout":code.attrib["RolloutVersion"],
+            "code_checksum":code.attrib.get("ContentChecksum",""),
+            "config_rollout":native_config.attrib["RolloutVersion"],
+            "service_rollout":root.attrib["RolloutVersion"],"settings_value":value,"override":override}
+
+
+def configuration_upgrade(allocation: Allocation, binaries: Binaries, result: dict, attempts: dict) -> dict:
+    service = result["application"] + "/Singleton"
+    initial = wait_observe(service, observer=binaries.observer)
+    if initial["rpc"]["packages"]["configuration"]["value"] != "before-upgrade":
+        raise RuntimeError("missing pre-upgrade configuration")
+    evidence = {"initial":initial,
+                "initial_process":json.loads(allocation.execute("python3","-c",PROCESS,json.dumps(initial),"inspect")),
+                "initial_artifacts":deployment_artifacts(allocation,initial),
+                "samples":[],"sample_errors":[]}
+    result["configuration_upgrade"] = evidence  # Preserve partial evidence on failure.
+    source,type_name,version = package(result["run_id"], binaries.app,templates=binaries.template_root,upgrade=True)
+    if type_name != result["type_name"] or version == result["version"]:
+        raise RuntimeError("upgrade package identity mismatch")
+    remote = f"/var/lib/sf-node/fube-rust-runtime-{result['run_id']}-upgrade"
+    result.setdefault("upload_paths",[]).append(remote)
+    run("docker","cp",str(source),f"{allocation.verify()}:{remote}")
+    allocation.sf("application","upload","--path",remote)
+    attempts.setdefault("extra_versions",{})[version] = False
+    allocation.sf("application","provision","--application-type-build-path",remote.rsplit("/",1)[1])
+    attempts["extra_versions"][version] = True
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        upgrade = executor.submit(allocation.sf,"application","upgrade","--application-id",
+                                  result["application"].removeprefix("fabric:/"),
+                                  "--application-version",version,"--parameters","[]","--mode","UnmonitoredAuto")
+        end = time.monotonic()+180
+        while True:
+            try:
+                observation = observe(service,observer=binaries.observer)
+                require_same_instance(observation,initial)
+                if observation["native_entry_point_instance"] != initial["native_entry_point_instance"]:
+                    raise RuntimeError("native entrypoint instance restarted during unchanged-code upgrade")
+                if observation["rpc"]["packages"]["runtime_id"] != initial["rpc"]["packages"]["runtime_id"]:
+                    raise RuntimeError("runtime identity changed during config-only upgrade")
+                evidence["samples"].append({"at":time.monotonic(),"observation":observation})
+            except Exception as error:
+                evidence["sample_errors"].append(str(error))
+                raise
+            if upgrade.done():
+                upgrade.result()
+                status = json.loads(allocation.sf("application","upgrade-status","--application-id",
+                                     result["application"].removeprefix("fabric:/"),"--timeout","10",timeout=15))
+                evidence["native_upgrade_status"] = status
+                if status.get("upgradeState") == "RollingForwardCompleted":
+                    break
+                if status.get("upgradeState") in {"RollingBackCompleted","Failed"}:
+                    raise RuntimeError("native upgrade did not roll forward")
+            if time.monotonic() >= end or len(evidence["samples"]) >= 256:
+                raise RuntimeError("configuration-only upgrade deadline/sample bound")
+            time.sleep(0.25)
+    final = observe(service,observer=binaries.observer)
+    evidence["final"] = final
+    require_same_instance(final,initial)
+    p = final["rpc"]["packages"]
+    before = initial["rpc"]["packages"]
+    if p["configuration"]["value"] != "after-upgrade" or p["generation"] <= before["generation"]:
+        raise RuntimeError("native upgrade completed without current configuration publication")
+    if p["initial_configuration"]["value"] != "before-upgrade" or p["retained_configuration"]["value"] != "before-upgrade":
+        raise RuntimeError("retained old context/package settings changed")
+    if p["initial_configuration"]["path"] != before["configuration"]["path"]:
+        raise RuntimeError("retained old package path changed")
+    if p["unregistered_callbacks"] != 0 or [e["registration"] for e in p["events"]] != [1,2]:
+        raise RuntimeError("package subscription registration/unregistration/order mismatch")
+    if any(e["previous"]["value"] != "before-upgrade" or e["current"]["value"] != "after-upgrade"
+           or e["published_generation"] != p["generation"] for e in p["events"]):
+        raise RuntimeError("package event ownership/publication mismatch")
+    evidence["final_process"] = json.loads(allocation.execute("python3","-c",PROCESS,json.dumps(final),"inspect"))
+    if evidence["initial_process"]["start_ticks"] != evidence["final_process"]["start_ticks"]:
+        raise RuntimeError("native process start time changed during config-only upgrade")
+    if any(v["executable_sha256"] != digest(binaries.app) for v in (evidence["initial_process"],evidence["final_process"])):
+        raise RuntimeError("deployed Code bytes do not match prebuilt bundle")
+    evidence["final_artifacts"] = deployment_artifacts(allocation,final)
+    for field in ("code_rollout","code_checksum"):
+        if evidence["initial_artifacts"][field] != evidence["final_artifacts"][field]:
+            raise RuntimeError("config-only fixture changed native code identity")
+    if initial["native_code_version"] != final["native_code_version"]:
+        raise RuntimeError("config-only fixture changed native code version")
+    evidence["status"] = "PASS_UNCHANGED_CODE_NATIVE_CONTEXT_REFRESH"
+    evidence["directory_lifetime"] = "Observed existence only; retained handles do not pin native directories."
+    return evidence
+
+
 def cleanup_deployment(allocation: Allocation, result: dict, attempts: dict) -> None:
     application, type_name, version=result["application"],result["type_name"],result["version"]
     cleanup=result["cleanup"]
@@ -561,7 +745,7 @@ def cleanup_deployment(allocation: Allocation, result: dict, attempts: dict) -> 
             apps=items(allocation.sf("application","list",timeout=10))
             app=next((v for v in apps if v["name"]==application),None)
             if app:
-                if app["typeName"]!=type_name or app["typeVersion"]!=version:
+                if app["typeName"]!=type_name or app["typeVersion"] not in {version,*attempts.get("extra_versions",{})}:
                     raise RuntimeError("minted application identity drift; refusing deletion")
                 allocation.sf("application","delete","--application-id",application.removeprefix("fabric:/"))
                 deadline=time.monotonic()+60
@@ -575,22 +759,40 @@ def cleanup_deployment(allocation: Allocation, result: dict, attempts: dict) -> 
                 result["errors"].append(cleanup["application"])
             else:
                 cleanup["application"]="absence confirmed"
-        if attempts["provision"]:
+        versions = {version:attempts["provision_completed"]} if attempts["provision"] else {}
+        versions.update(attempts.get("extra_versions",{}))
+        for version,completed in versions.items():
             types=items(allocation.sf("application","type-list",timeout=10))
             present=any(v["name"]==type_name and v["version"]==version for v in types)
             if present:
                 allocation.sf("application","unprovision","--application-type-name",type_name,
                               "--application-type-version",version)
-                cleanup["type"]="unprovisioned"
-            elif not attempts["provision_completed"]:
+                wait_condition(lambda: not any(v["name"]==type_name and v["version"]==version
+                               for v in items(allocation.sf("application","type-list",timeout=10))),
+                               "owned type version absence",timeout=60)
+                cleanup.setdefault("types",{})[version]="unprovisioned; absence confirmed"
+                cleanup["type"]="unprovisioned; absence confirmed"
+            elif not completed:
                 cleanup["type"]="unconfirmed: ambiguous provision and no current observation; late completion possible"
                 result["errors"].append(cleanup["type"])
             else:
                 cleanup["type"]="absence confirmed"
+                cleanup.setdefault("types",{})[version]="absence confirmed"
     except Exception as error:
         cleanup["error"]=str(error)
         result["errors"].append("cleanup: "+str(error))
         cleanup["retained_for_recovery"]={"application":application,"type":type_name,"version":version}
+    finally:
+        for remote in result.get("upload_paths",[]):
+            expected = f"/var/lib/sf-node/fube-rust-runtime-{result['run_id']}"
+            if remote not in {expected,expected+"-upgrade"}:
+                result["errors"].append("upload staging ownership mismatch")
+                continue
+            try:
+                allocation.execute("python3","-c",
+                    "import shutil,sys; from pathlib import Path; p=Path(sys.argv[1]); shutil.rmtree(p) if p.exists() else None; assert not p.exists()",remote)
+            except Exception as error:
+                result["errors"].append("upload staging cleanup: "+str(error))
 
 
 def destroy_owned(name: str, owner: str) -> dict:
@@ -638,14 +840,16 @@ def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | Non
         result.update(dependency_graph=binaries.dependency_graph,elf_dynamic=needed,
                       binary_sha256={"rust-runtime-app":digest(binaries.app),
                                      "runtime_observer":digest(binaries.observer)})
-        source, type_name, version = package(run_id, binaries.app)
+        result["bundle_manifest_sha256"] = binaries.bundle_manifest_sha256
+        source, type_name, version = package(run_id, binaries.app,templates=binaries.template_root)
         result.update(type_name=type_name,version=version)
-        remote=f"/tmp/fube-rust-runtime-{run_id}"
+        remote=f"/var/lib/sf-node/fube-rust-runtime-{run_id}"
         allocation.sf("cluster", "select", "--endpoint", "http://127.0.0.1:19080")
         if any(v["name"]==application for v in items(allocation.sf("application","list",timeout=10))):
             raise RuntimeError("minted application collision; no cleanup capability granted")
         if any(v["name"]==type_name for v in items(allocation.sf("application","type-list",timeout=10))):
             raise RuntimeError("minted type collision; no cleanup capability granted")
+        result["upload_paths"]=[remote]
         run("docker", "cp", str(source), f"{allocation.verify()}:{remote}")
         allocation.sf("application", "upload", "--path", remote)
         attempts["provision"]=True
@@ -654,10 +858,13 @@ def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | Non
         attempts["create"]=True
         allocation.sf("application", "create", "--app-name", application, "--app-type", type_name, "--app-version", version)
         attempts["create_completed"]=True
-        result["restart"] = restart(allocation, application + "/Singleton",observer=binaries.observer)
+        configuration_upgrade(allocation,binaries,result,attempts)
         if full:
             result["resilience"]={}
-            controls_and_authority(allocation,application,result["resilience"],observer=binaries.observer)
+            generation=result["configuration_upgrade"]["final"]["rpc"]["packages"]["generation"]
+            controls_and_authority(allocation,application,result["resilience"],observer=binaries.observer,
+                                   expected_generation=generation)
+        result["restart"] = restart(allocation, application + "/Singleton",observer=binaries.observer)
     except Exception as error:
         result["errors"].append("qualification: "+str(error))
     finally:

@@ -8,6 +8,7 @@ mod lease;
 mod lifecycle;
 #[cfg(test)]
 mod model_tests;
+mod package_context;
 mod packages;
 mod reporting;
 mod wire;
@@ -33,6 +34,9 @@ pub use diagnostics::{RuntimeCounters, RuntimeMetrics};
 use lease::Authority;
 pub use lifecycle::{MAX_CALLBACKS, MAX_SERVICE_UNITS, MAX_TOMBSTONES};
 pub use mssf_transport::{Error as RuntimeError, Result as RuntimeResult};
+pub use package_context::{
+    ActivationContextHandle, PackageChange, PackageSubscription, MAX_PACKAGE_SUBSCRIPTIONS,
+};
 pub use packages::{
     ConfigurationPackage, ConfigurationParameter, ConfigurationSection, DataPackage,
     PackageDescription, PackageSnapshot,
@@ -67,6 +71,7 @@ pub struct NodeContext {
 /// Process-wide application host attachment. No reconnect or security fallback.
 pub struct Runtime {
     activation: ActivationContext,
+    current: ActivationContextHandle,
     node: NodeContext,
     connection: Connection,
     authority: Arc<Authority>,
@@ -144,26 +149,32 @@ impl Runtime {
     }
 
     async fn attach_inner() -> Result<Self> {
-        let activation = ActivationContext::from_environment()?;
+        let mut activation = ActivationContext::from_environment()?;
         let authority = Authority::new(Monotonic::now(), 1_200_000_000)?;
         let ingress_authority = authority.clone();
-        let (control_tx, mut controls) = mpsc::channel::<IpcRequest>(MAX_INCOMING_COMMANDS);
+        let controls_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ingress_ready = controls_ready.clone();
+        let (control_tx, mut controls) =
+            mpsc::channel::<(Monotonic, IpcRequest)>(MAX_INCOMING_COMMANDS);
         let (command_tx, incoming) = mpsc::channel::<IpcRequest>(MAX_INCOMING_COMMANDS);
         let handler = Arc::new(move |request: IpcRequest| {
             let p = request.message.properties()?;
-            let sender = match p.actor {
+            match p.actor {
                 8 => {
-                    // Every currently admitted host control is terminal in this
-                    // profile. Latch before registration can consume its reply.
-                    ingress_authority.retire();
-                    &control_tx
+                    if p.action != "UpdateCodePackageContextRequest"
+                        || !ingress_ready.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        ingress_authority.retire();
+                    }
+                    control_tx
+                        .try_send((Monotonic::now(), request))
+                        .map_err(|_| Error::ResourceLimit("runtime control ingress"))
                 }
-                12 => &command_tx,
-                _ => return Err(Error::Protocol("unsupported application IPC actor")),
-            };
-            sender
-                .try_send(request)
-                .map_err(|_| Error::ResourceLimit("runtime ingress"))
+                12 => command_tx
+                    .try_send(request)
+                    .map_err(|_| Error::ResourceLimit("runtime ingress")),
+                _ => Err(Error::Protocol("unsupported application IPC actor")),
+            }
         });
         let connection = Connection::connect_ipc_clear(
             activation.address,
@@ -194,6 +205,16 @@ impl Runtime {
                 "incomplete native node registration context",
             ));
         }
+        let deployment = std::path::PathBuf::from(&start.deployment);
+        let load_activation = activation.clone();
+        let load_deployment = deployment.clone();
+        let packages =
+            tokio::task::spawn_blocking(move || packages::load(&load_activation, &load_deployment))
+                .await
+                .map_err(|_| Error::Protocol("package artifact worker panicked"))??;
+        authority.check()?;
+        activation.endpoints = packages.endpoints().clone();
+        activation.packages = Some(Arc::new(packages));
         success(
             call(
                 &connection,
@@ -238,6 +259,7 @@ impl Runtime {
             fresh_poll_elapsed_micros: sent.elapsed().as_micros().min(u64::MAX as u128) as u64,
         };
         authority.watchdog()?;
+        let current = ActivationContextHandle::new(activation.clone());
         let monitor_connection = connection.clone();
         let monitor_authority = authority.clone();
         let monitor = tokio::spawn(async move {
@@ -266,8 +288,10 @@ impl Runtime {
         });
         let control_authority = authority.clone();
         let control_connection = connection.clone();
+        let updater = Arc::new(package_context::Updater::new(current.clone(), &deployment));
+        controls_ready.store(true, std::sync::atomic::Ordering::Release);
         let control = tokio::spawn(async move {
-            while let Some(request) = controls.recv().await {
+            while let Some((received, request)) = controls.recv().await {
                 let result: Result<()> = async {
                     let p = request.message.properties()?;
                     let reply = request
@@ -285,13 +309,29 @@ impl Runtime {
                                 )
                                 .await
                         }
-                        // Upgrades are not ACKed while retaining old context.
-                        // A changed incarnation requires terminal host restart.
                         "UpdateCodePackageContextRequest" => {
-                            let _: UpdateContext = from_slice(&request.message.body)?;
-                            Err(Error::Protocol(
-                                "package context refresh is not yet supported",
-                            ))
+                            let update: UpdateContext = from_slice(&request.message.body)?;
+                            if update.timeout <= 0 { return Err(Error::Timeout); }
+                            let duration = Duration::from_nanos((update.timeout.min(300_000_000) as u64)*100);
+                            let deadline = received.checked_add(duration).ok_or(Error::Timeout)?;
+                            control_authority.check()?;
+                            if Monotonic::now() >= deadline { return Err(Error::Timeout); }
+                            let worker = updater.clone();
+                            let permit = worker.admit()?;
+                            let worker_authority = control_authority.clone();
+                            let work = tokio::task::spawn_blocking(move || {
+                                let _permit = permit;
+                                worker.apply(update,&worker_authority,deadline)
+                            });
+                            tokio::select! {
+                                result = work => result.map_err(|_| Error::Protocol("package callback/worker panicked"))??,
+                                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => return Err(Error::Timeout),
+                                _ = control_connection.closed() => return Err(Error::Closed),
+                            }
+                            let authority = control_authority.clone();
+                            reply.reply_fenced(8,to_vec(&ErrorReply {error:0})?,
+                                tokio::time::Instant::from_std(deadline),
+                                Arc::new(move || authority.check().is_ok())).await
                         }
                         _ => Err(Error::Protocol("unsupported host control")),
                     }
@@ -307,13 +347,14 @@ impl Runtime {
             }
         });
         let lifecycle = lifecycle::Engine::start(
-            activation.clone(),
+            current.clone(),
             authority.clone(),
             connection.clone(),
             incoming,
         );
         Ok(Self {
             activation,
+            current,
             node,
             connection,
             authority,
@@ -323,8 +364,11 @@ impl Runtime {
         })
     }
 
-    pub fn activation_context(&self) -> &ActivationContext {
-        &self.activation
+    pub fn activation_context(&self) -> Arc<ActivationContext> {
+        self.current.snapshot()
+    }
+    pub fn context_handle(&self) -> ActivationContextHandle {
+        self.current.clone()
     }
     pub fn node_context(&self) -> &NodeContext {
         &self.node
@@ -345,14 +389,15 @@ impl Runtime {
             return Err(Error::InvalidInput("invalid service type name"));
         }
         self.lifecycle.insert_factory(name.to_owned(), factory)?;
+        let activation = self.current.snapshot();
         let reply: Result<ErrorReply> = call(
             &self.connection,
             9,
             "RegisterServiceTypeRequest",
             &TypeRequest {
-                context: self.activation.runtime.clone(),
+                context: activation.runtime.clone(),
                 id: TypeId {
-                    package: self.activation.runtime.code.id.package.clone(),
+                    package: activation.runtime.code.id.package.clone(),
                     name: name.to_owned(),
                 },
             },
@@ -381,7 +426,9 @@ impl Runtime {
     /// and the independent authority watchdog bounds application lifetime.
     pub async fn shutdown(mut self) -> Result<()> {
         self.authority.retire();
+        self.current.close();
         let outcome = tokio::time::timeout(Duration::from_millis(400), async {
+            self.current.quiescent()?;
             self.lifecycle.quiesce().await?;
             success(
                 call(
@@ -431,6 +478,7 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        self.current.close();
         if !self.shutdown {
             self.authority.retire();
         }

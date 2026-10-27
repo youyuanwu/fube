@@ -36,8 +36,64 @@ fn model_child() {
                 assert!(attached.is_err());
                 return;
             }
-            let runtime = attached.unwrap();
+            let mut runtime = attached.unwrap();
             match mode.as_str() {
+                "live-update" => {
+                    struct Unplaced;
+                    impl StatelessFactory for Unplaced {
+                        fn create(
+                            &self,
+                            _: ServiceContext,
+                        ) -> ServiceFuture<'_, Arc<dyn StatelessService>> {
+                            Box::pin(async { panic!("model type is not placed") })
+                        }
+                    }
+                    let old = runtime.activation_context();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while runtime.activation_context().generation() == 0 {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        old.packages()
+                            .unwrap()
+                            .configuration_package("Config")
+                            .unwrap()
+                            .description()
+                            .version(),
+                        "1"
+                    );
+                    assert_eq!(
+                        runtime
+                            .activation_context()
+                            .packages()
+                            .unwrap()
+                            .configuration_package("Config")
+                            .unwrap()
+                            .description()
+                            .version(),
+                        "2"
+                    );
+                    runtime
+                        .register_stateless("LaterType", Arc::new(Unplaced))
+                        .await
+                        .unwrap();
+                    runtime.shutdown().await.unwrap();
+                }
+                "update-block" | "update-panic" => {
+                    let should_panic = mode == "update-panic";
+                    let _registration = runtime
+                        .context_handle()
+                        .subscribe_configuration(move |_| {
+                            assert!(!should_panic, "injected package callback panic");
+                            std::thread::sleep(Duration::from_secs(60));
+                        })
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    panic!("blocked callback defeated update deadline");
+                }
                 "shutdown-ok" => runtime.shutdown().await.unwrap(),
                 "shutdown-fail" => assert!(runtime.shutdown().await.is_err()),
                 "shutdown-cancel" => assert!(tokio::time::timeout(
@@ -72,7 +128,10 @@ fn model_child() {
                 _ => panic!("unknown model scenario"),
             }
             tokio::time::sleep(Duration::from_millis(1100)).await;
-            assert_eq!(mode, "shutdown-ok", "armed fence failed");
+            assert!(
+                matches!(mode.as_str(), "shutdown-ok" | "live-update"),
+                "armed fence failed"
+            );
         });
 }
 
@@ -114,6 +173,7 @@ fn control(action: &str, index: u32, actor: i64) -> Message {
 }
 
 async fn scenario(mode: &str, expected: i32) {
+    let fixture = crate::packages::tests::Fixture::new();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
@@ -132,13 +192,13 @@ async fn scenario(mode: &str, expected: i32) {
             "443de6bf-b823-40d2-915d-0826843aeddb",
         ),
         ("Fabric_ApplicationHostType", "Activated_SingleCodePackage"),
-        ("Fabric_ApplicationId", "Model_App0"),
-        ("Fabric_ServicePackageName", "ModelService"),
+        ("Fabric_ApplicationId", "RustApp_App0"),
+        ("Fabric_ServicePackageName", "RustService"),
         ("Fabric_CodePackageName", "Code"),
         ("Fabric_CodePackageInstanceSeqNum", "1"),
         ("Fabric_ServicePackageInstanceSeqNum", "2"),
-        ("Fabric_ServicePackageVersionInstance", "1.0:1.0:3"),
-        ("Fabric_ApplicationName", "fabric:/Model"),
+        ("Fabric_ServicePackageVersionInstance", "1.0:2.0:3"),
+        ("Fabric_ApplicationName", "fabric:/RustApp"),
         ("Fabric_Folder_App_Work", "/model/work"),
         ("Fabric_Folder_App_Log", "/model/log"),
         ("Fabric_Folder_App_Temp", "/model/temp"),
@@ -155,6 +215,7 @@ async fn scenario(mode: &str, expected: i32) {
     let mut child = command.spawn().unwrap();
     let child_pid = child.id().unwrap();
     let mode_owned = mode.to_owned();
+    let deployment = fixture.root.to_str().unwrap().to_owned();
     let peer = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let hello = read_message(&mut stream).await.unwrap();
@@ -173,6 +234,8 @@ async fn scenario(mode: &str, expected: i32) {
         .await
         .unwrap();
         let mut step = 0;
+        let mut runtime_context = None::<RuntimeContext>;
+        let mut update_sent = false;
         loop {
             let request = match read_message(&mut stream).await {
                 Ok(r) => r,
@@ -180,6 +243,18 @@ async fn scenario(mode: &str, expected: i32) {
             };
             let p = request.properties().unwrap();
             if p.relates_to != MessageId::default() {
+                if p.relates_to.index == 99
+                    && matches!(
+                        mode_owned.as_str(),
+                        "live-update" | "update-block" | "update-panic"
+                    )
+                {
+                    assert_eq!(
+                        mode_owned, "live-update",
+                        "failed update was falsely acknowledged"
+                    );
+                    assert_eq!(from_slice::<ErrorReply>(&request.body).unwrap().error, 0);
+                }
                 continue;
             }
             let body = match p.action.as_str() {
@@ -192,6 +267,7 @@ async fn scenario(mode: &str, expected: i32) {
                         continue;
                     }
                     let mut reply = start_reply();
+                    reply.deployment = deployment.clone();
                     if mode_owned == "registration-failure" {
                         reply.error = 0x80004005u32 as i32 as i64;
                     }
@@ -207,10 +283,11 @@ async fn scenario(mode: &str, expected: i32) {
                     step = 3;
                     let runtime: RuntimeRequest = from_slice(&request.body).unwrap();
                     assert_eq!(runtime.context.host.pid, child_pid);
+                    runtime_context = Some(runtime.context);
                     to_vec(&ErrorReply { error: 0 }).unwrap()
                 }
                 "" if p.actor == 15 => {
-                    assert_eq!(step, 3);
+                    assert!(step >= 3);
                     step = 4;
                     to_vec(&LeaseReply {
                         ttl: if mode_owned == "executor-stall" {
@@ -222,9 +299,19 @@ async fn scenario(mode: &str, expected: i32) {
                     .unwrap()
                 }
                 "UnregisterFabricRuntimeRequest" | "UnregisterApplicationHostRequest" => {
-                    if mode_owned != "shutdown-ok" {
+                    if !matches!(mode_owned.as_str(), "shutdown-ok" | "live-update") {
                         continue;
                     }
+                    to_vec(&ErrorReply { error: 0 }).unwrap()
+                }
+                "RegisterServiceTypeRequest" => {
+                    assert_eq!(mode_owned, "live-update");
+                    let registration: TypeRequest = from_slice(&request.body).unwrap();
+                    assert_eq!(registration.context.code.version.instance, 4);
+                    assert_eq!(
+                        registration.context.id,
+                        runtime_context.as_ref().unwrap().id
+                    );
                     to_vec(&ErrorReply { error: 0 }).unwrap()
                 }
                 _ => panic!("unexpected MODEL action {}", p.action),
@@ -256,9 +343,30 @@ async fn scenario(mode: &str, expected: i32) {
             {
                 return;
             }
-            if step == 4 {
+            if step == 4 && !update_sent {
+                update_sent = true;
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 match mode_owned.as_str() {
+                    "live-update" | "update-block" | "update-panic" => {
+                        fixture.write(2, "new");
+                        let mut code = runtime_context.as_ref().unwrap().code.clone();
+                        code.version.instance += 1;
+                        let mut message = control("UpdateCodePackageContextRequest", 99, 8);
+                        message.body = to_vec(&UpdateContext {
+                            code,
+                            activation: CodeActivation {
+                                host: runtime_context.as_ref().unwrap().host.id.clone(),
+                                instance: 1234,
+                            },
+                            timeout: if mode_owned == "update-block" {
+                                500_000
+                            } else {
+                                30_000_000
+                            },
+                        })
+                        .unwrap();
+                        write_message(&mut stream, &message).await.unwrap();
+                    }
                     "live-invalidate" => {
                         write_message(&mut stream, &control("InvalidateLeaseRequest", 99, 8))
                             .await
@@ -305,6 +413,21 @@ async fn scenario(mode: &str, expected: i32) {
     if let Err(error) = peer.await {
         assert!(error.is_cancelled(), "{error}");
     }
+}
+
+#[tokio::test]
+async fn successful_native_shaped_update_refreshes_later_registration() {
+    scenario("live-update", 0).await;
+}
+
+#[tokio::test]
+async fn uncooperative_package_callback_is_deadline_fenced_with_healthy_lease() {
+    scenario("update-block", 70).await;
+}
+
+#[tokio::test]
+async fn package_callback_panic_never_acknowledges_applied_success() {
+    scenario("update-panic", 70).await;
 }
 
 #[tokio::test]

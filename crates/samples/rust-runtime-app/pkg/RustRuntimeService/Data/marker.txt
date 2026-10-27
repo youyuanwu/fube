@@ -1,0 +1,1 @@
+Owned immutable data package fixture; retaining its metadata is not a directory lease.

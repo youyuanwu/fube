@@ -58,6 +58,7 @@ struct Shared {
     live: Arc<Semaphore>,
     active: AtomicUsize,
     activation: ActivationContext,
+    current: crate::ActivationContextHandle,
     authority: Arc<Authority>,
     connection: Connection,
     metrics: Arc<RuntimeMetrics>,
@@ -73,11 +74,12 @@ impl Engine {
         self.shared.metrics.clone()
     }
     pub(crate) fn start(
-        activation: ActivationContext,
+        current: crate::ActivationContextHandle,
         authority: Arc<Authority>,
         connection: Connection,
         mut incoming: mpsc::Receiver<IpcRequest>,
     ) -> Self {
+        let activation = (*current.snapshot()).clone();
         let shared = Arc::new(Shared {
             units: Mutex::new(HashMap::new()),
             factories: Mutex::new(HashMap::new()),
@@ -85,6 +87,7 @@ impl Engine {
             live: Arc::new(Semaphore::new(MAX_SERVICE_UNITS)),
             active: AtomicUsize::new(0),
             activation,
+            current,
             authority,
             connection,
             metrics: Arc::new(RuntimeMetrics::default()),
@@ -519,7 +522,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
             factory.create(ServiceContext {
                 identity,
                 initialization_data: request.service.initialization.0.clone(),
-                activation: shared.activation.clone(),
+                activation: (*shared.current.snapshot()).clone(),
             }),
         )
         .await

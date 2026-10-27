@@ -89,10 +89,14 @@ class BinaryBundleTests(unittest.TestCase):
              patch.object(runtime, "build_binaries", side_effect=AssertionError("must not build")), \
              patch.object(runtime, "package", return_value=(self.root, "minted-type", "1.1")) as package, \
              patch.object(runtime, "restart", return_value={"native": "model observation"}) as restart, \
+             patch.object(runtime, "configuration_upgrade", side_effect=lambda a,b,result,attempts:
+                          result.update(configuration_upgrade={"final":{"rpc":{"packages":{"generation":1}}}})) as upgrade, \
              patch.object(runtime, "controls_and_authority") as controls:
             result = runtime.qualify(allocation, True, binaries)
         self.assertEqual(result["status"], "PASS_FULL_STATELESS_PROFILE")
         self.assertEqual(package.call_args.args[1], binaries.app)
+        self.assertEqual(package.call_args.kwargs["templates"], binaries.template_root)
+        self.assertEqual(upgrade.call_args.args[1], binaries)
         self.assertEqual(restart.call_args.kwargs["observer"], binaries.observer)
         self.assertEqual(controls.call_args.kwargs["observer"], binaries.observer)
         self.assertEqual(result["dependency_graph"], binaries.dependency_graph)
@@ -102,6 +106,35 @@ class BinaryBundleTests(unittest.TestCase):
         with patch.object(runtime, "run", return_value=json.dumps(observed)) as command:
             runtime.observe("fabric:/Owned/Singleton", observer=binaries.observer)
         self.assertEqual(command.call_args.args[0], str(binaries.observer))
+
+    def test_templates_are_strict_prebuilt_inputs(self):
+        for failure in ("missing","extra","tampered","symlink"):
+            directory = self.bundle(f"templates-{failure}")
+            path = directory / "package-v2/RustRuntimeService/Config/Settings.xml"
+            if failure == "missing":
+                path.unlink()
+            elif failure == "extra":
+                (directory / "unexpected.xml").write_text("<not-allowed/>")
+            elif failure == "tampered":
+                path.write_text("<tampered/>")
+            else:
+                path.unlink()
+                path.symlink_to(directory / "package-v1/RustRuntimeService/Config/Settings.xml")
+            with patch.object(runtime,"run",side_effect=AssertionError("compiler fallback")):
+                with self.assertRaises(RuntimeError):
+                    runtime.load_bundle(directory)
+
+    def test_bundled_versions_keep_code_identity_and_update_only_configuration(self):
+        binaries=runtime.load_bundle(self.bundle("versioned"))
+        with patch.object(runtime,"ROOT",self.root):
+            first,first_type,first_version=runtime.package("fixture",binaries.app,templates=binaries.template_root)
+            second,second_type,second_version=runtime.package("fixture",binaries.app,templates=binaries.template_root,upgrade=True)
+        self.assertEqual((first_type,first_version,second_type,second_version),
+                         ("FubeRustRuntimefixtureType","1.1","FubeRustRuntimefixtureType","1.2"))
+        self.assertEqual((first/"RustRuntimeService/Code/rust-runtime-app").read_bytes(),
+                         (second/"RustRuntimeService/Code/rust-runtime-app").read_bytes())
+        self.assertIn("before-upgrade",(first/"RustRuntimeService/Config/Settings.xml").read_text())
+        self.assertIn("after-upgrade",(second/"RustRuntimeService/Config/Settings.xml").read_text())
 
     def test_default_build_is_locked_and_checks_native_dependencies(self):
         with patch.object(runtime, "run", return_value=self.binaries.dependency_graph) as command:
@@ -271,6 +304,44 @@ class AllocationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
+class VersionOwnershipTests(unittest.TestCase):
+    def test_upgraded_application_and_each_owned_version_are_removed_and_verified(self):
+        allocation=MagicMock()
+        present={"app":True,"versions":{"1.1","1.2"}}
+        calls=[]
+        def sf(*args,**_kwargs):
+            calls.append(args)
+            if args==("application","list"):
+                return json.dumps({"items":[{"name":"fabric:/Minted","typeName":"MintedType","typeVersion":"1.2"}] if present["app"] else []})
+            if args==("application","type-list"):
+                return json.dumps({"items":[{"name":"MintedType","version":v} for v in present["versions"]]})
+            if args[:2]==("application","delete"): present["app"]=False
+            if args[:2]==("application","unprovision"): present["versions"].remove(args[-1])
+            return "{}"
+        allocation.sf.side_effect=sf
+        result={"application":"fabric:/Minted","type_name":"MintedType","version":"1.1","cleanup":{},"errors":[]}
+        attempts={"create":True,"create_completed":True,"provision":True,"provision_completed":True,
+                  "extra_versions":{"1.2":True}}
+        runtime.cleanup_deployment(allocation,result,attempts)
+        self.assertEqual(present,{"app":False,"versions":set()})
+        self.assertFalse(result["errors"])
+        self.assertEqual(set(result["cleanup"]["types"]),{"1.1","1.2"})
+        self.assertEqual(sum(call==("application","type-list") for call in calls),4)
+        self.assertLess(next(i for i,v in enumerate(calls) if v[:2]==("application","delete")),
+                        next(i for i,v in enumerate(calls) if v[:2]==("application","unprovision")))
+
+    def test_unowned_upgrade_version_drift_never_authorizes_cleanup(self):
+        allocation=MagicMock()
+        allocation.sf.return_value=json.dumps({"items":[{"name":"fabric:/Minted","typeName":"MintedType","typeVersion":"9.9"}]})
+        result={"application":"fabric:/Minted","type_name":"MintedType","version":"1.1","cleanup":{},"errors":[]}
+        runtime.cleanup_deployment(allocation,result,{"create":True,"create_completed":True,
+            "provision":True,"provision_completed":True,"extra_versions":{"1.2":True}})
+        self.assertTrue(result["errors"])
+        self.assertEqual(allocation.sf.call_count,1)
+        self.assertIn("retained_for_recovery",result["cleanup"])
+
+
+@unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class AmbiguousMutationTests(unittest.TestCase):
     def qualify(self,lost,cleanup_failure=False):
         allocation=MagicMock(name="allocation")
@@ -361,18 +432,25 @@ class ProcessTests(unittest.TestCase):
                     return "321 (rust-runtime-app) S 119 " + "0 " * 40
                 return f"1-2 r-xp 0 0 0 {maps}"
 
+            def open(self,mode):
+                if mode != "rb" or not self.value.endswith("/exe"):
+                    raise AssertionError("unexpected process file read")
+                return io.BytesIO(b"model executable")
+
         with patch("sys.argv", ["probe", json.dumps(expected), "kill"]), \
              patch("pathlib.Path", FakePath), \
              patch("os.pidfd_open", side_effect=ProcessLookupError if stale else None, return_value=44), \
              patch("os.readlink", return_value="/owned/app/rust-runtime-app"), \
              patch("os.close"), patch("signal.pidfd_send_signal") as signal, \
-             contextlib.redirect_stdout(io.StringIO()):
+             contextlib.redirect_stdout(io.StringIO()) as output:
             try:
                 exec(runtime.PROCESS, {})
             except (RuntimeError, ProcessLookupError):
                 self.assertFalse(signal.called)
                 return False
             self.assertEqual(signal.call_args.args[:2], (44, 9))
+            self.assertEqual(json.loads(output.getvalue())["executable_sha256"],
+                             runtime.hashlib.sha256(b"model executable").hexdigest())
             return True
 
     def test_pidfd_signal_is_bound_to_verified_native_identity(self):

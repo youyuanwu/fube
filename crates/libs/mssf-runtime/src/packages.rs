@@ -933,7 +933,7 @@ pub(crate) mod tests {
             };
             PackageSnapshot::from_deployment(&self.activation, &node)
         }
-        fn config_count(&self, count: usize, parameters: usize, value: &str) {
+        pub(crate) fn config_count(&self, count: usize, parameters: usize, value: &str) {
             self.write(1, "old");
             let current_path = self.base.join("RustService.Package.Current.xml");
             let manifest_path = self.base.join("RustService.Manifest.1.xml");
@@ -1245,7 +1245,9 @@ pub(crate) mod tests {
         assert!(scalar(doc.root_element()).is_err());
         let doc = Document::parse("<Program>a<!--not program text-->pp</Program>").unwrap();
         assert_eq!(scalar(doc.root_element()).unwrap(), "app");
-        let code = format!(r#"<CodePackage xmlns="{NS}" Name="Code" Version="1"><EntryPoint><ExeHost><Program>app</Program></ExeHost></EntryPoint></CodePackage>"#);
+        let code = format!(
+            r#"<CodePackage xmlns="{NS}" Name="Code" Version="1"><EntryPoint><ExeHost><Program>app</Program></ExeHost></EntryPoint></CodePackage>"#
+        );
         let plain = Document::parse(&code).unwrap();
         let commented_xml = code.replace("app", "a<!--misleading-->pp");
         let commented = Document::parse(&commented_xml).unwrap();

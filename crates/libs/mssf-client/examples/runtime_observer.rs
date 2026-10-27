@@ -100,6 +100,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "native_entry_point_instance":package.main_entry_point.instance_id,
                 "native_activation_count":package.main_entry_point.statistics.activation_count,
                 "native_entry_point":package.main_entry_point.entry_point_location,
+                "native_code_version":package.version,
                 "resolver":"mssf-client",
             })
         );
