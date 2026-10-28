@@ -645,6 +645,35 @@ class DataLossCommandModels(unittest.TestCase):
     qualification = AuxiliaryOwnershipModels.qualification
     auxiliary = staticmethod(AuxiliaryOwnershipModels.auxiliary)
 
+    def test_native_fasless_driver_removes_only_original_auxiliary_primary_and_one_secondary(self):
+        before, _, _ = loss_model(False, True)
+        qualification, original = self.qualification(True, "mixed")
+        auxiliary = self.auxiliary(original)
+        auxiliary.update(mixed=True, eligible_nodes=data.MIXED_NODES)
+        removed = []
+        def remove(value, replica):
+            self.assertIs(value, before)
+            removed.append((replica["node"], replica["replica"], replica["role"]))
+        evidence = {}
+        with patch.object(qualification, "guard_application"), \
+             patch.object(qualification, "auxiliary_partition", return_value=PARTITION), \
+             patch.object(qualification, "remove", side_effect=remove), \
+             patch.object(data.runtime, "wait_native_replica_absent", return_value={"absent": True}) as absent, \
+             patch.object(data, "native_management") as fas:
+            qualification.native_partial_loss_removals(auxiliary, before, evidence)
+        self.assertEqual(len(removed), 2)
+        self.assertEqual(sum(role == "Primary" for _, _, role in removed), 1)
+        self.assertEqual(sum(role == "ActiveSecondary" for _, _, role in removed), 1)
+        self.assertIn("N0020", {node for node, _, _ in removed})
+        self.assertEqual(absent.call_count, 2)
+        fas.assert_not_called()
+        self.assertEqual(evidence["native_removal_driver"]["accepted_requests"], 2)
+        with patch.object(qualification, "remove") as remove:
+            with self.assertRaises(RuntimeError):
+                qualification.native_partial_loss_removals(
+                    {**auxiliary, "partition": MAIN_PARTITION}, before, {})
+            remove.assert_not_called()
+
     def move_fixture(self):
         after, _, seed = loss_model(False, True)
         before = copy.deepcopy(after)
@@ -725,6 +754,8 @@ class DataLossCommandModels(unittest.TestCase):
         for changed, mixed, initial_rust_primary in itertools.product((False, True), (False, True), (False, True)):
             before, after, seed = loss_model(changed, mixed)
             qualification, original = self.qualification(mixed, "mixed" if mixed else "rust")
+            qualification.allocation.sf.return_value = json.dumps([
+                {"name": "fabric:/System/FaultAnalysisService"}])
             auxiliary = self.auxiliary(original)
             auxiliary.update(mixed=mixed, eligible_nodes=data.MIXED_NODES if mixed else tuple(data.NODE_ENGINES))
             initial = copy.deepcopy(before)

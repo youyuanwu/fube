@@ -1951,17 +1951,29 @@ class Qualification:
         operation = {"operation_id": str(uuid.uuid4()), "service": service, "partition": auxiliary["partition"],
                      "application_native_id": auxiliary["application_native_id"],
                      "state": "StartRequested", "progress": []}
-        auxiliary["fas"] = operation
         evidence["native_fas"] = operation
         try:
-            operation["start_path"] = fas_path(service, auxiliary["partition"], operation["operation_id"], "StartDataLoss")
-            operation["start_reply"] = native_management(self.allocation, "POST", operation["start_path"])
-            operation["start_http_status"] = operation["start_reply"]["http_status"]
-            native_success(operation["start_reply"], 202, "StartDataLoss PartialDataLoss")
-            evidence["completed_progress"] = poll_fas(self.allocation, operation)
+            system = runtime.items(self.allocation.sf("service", "list", "--application-id", "System"))
+            fas_available = any(item["name"] == "fabric:/System/FaultAnalysisService" for item in system)
+            if fas_available:
+                auxiliary["fas"] = operation
+                operation["start_path"] = fas_path(service, auxiliary["partition"], operation["operation_id"], "StartDataLoss")
+                operation["start_reply"] = native_management(self.allocation, "POST", operation["start_path"])
+                operation["start_http_status"] = operation["start_reply"]["http_status"]
+                native_success(operation["start_reply"], 202, "StartDataLoss PartialDataLoss")
+                evidence["completed_progress"] = poll_fas(self.allocation, operation)
+            else:
+                # The Linux11.8 native validator excludes FAS configuration.
+                # Use only native per-unit RemoveReplica for the exact original
+                # auxiliary members. No callback/election/transport-rule shortcut.
+                operation.update(state="NotSubmitted", native_cleanup_terminal=True,
+                                 service_available=False)
+                self.native_partial_loss_removals(auxiliary, before, evidence)
             # The FAS terminal response also confirms native transport-fault
             # cleanup. No forced cancellation or user-created transport fault.
-            after = self.wait(service=service, target=target, minimum=minimum, mixed=auxiliary["mixed"], capture=evidence)
+            after = self.wait(service=service, target=target, minimum=minimum, mixed=auxiliary["mixed"], capture=evidence,
+                accept=lambda value: value["native_partition"]["epoch"]["data_loss"]
+                    > before["native_partition"]["epoch"]["data_loss"])
             self.remember_auxiliary(auxiliary, after)
             evidence["after_native_data_loss"] = after
             reconciled = data_loss_invariants(before, after, seed, changed)
@@ -2004,8 +2016,32 @@ class Qualification:
         finally:
             self.cleanup_auxiliary(auxiliary)
 
+    def native_partial_loss_removals(self, auxiliary: dict, before: dict, evidence: dict) -> None:
+        require(before["service"] == auxiliary["service"] and before["partition"] == auxiliary["partition"]
+                and len(before["replicas"]) == 3, "original auxiliary native partial-loss binding")
+        primary = next(replica for replica in before["replicas"] if replica["role"] == "Primary")
+        secondary = next(replica for replica in before["replicas"] if replica["role"] == "ActiveSecondary")
+        targets = [primary, secondary]
+        evidence["native_removal_driver"] = {
+            "mechanism": "concurrent native RemoveReplica, no FAS/no transport fault/no manual callback",
+            "targets": [{"node": r["node"], "replica": r["replica"], "identity": identity(r)} for r in targets],
+            "started_at_monotonic": time.monotonic(),
+        }
+        self.guard_application()
+        require(self.auxiliary_partition(auxiliary) == before["partition"],
+                "original auxiliary partition changed before native loss")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            requests = [pool.submit(self.remove, before, replica) for replica in targets]
+            for result in requests:
+                result.result(timeout=45)
+        evidence["native_removal_driver"]["accepted_requests"] = len(requests)
+        evidence["native_removed_departures"] = [
+            runtime.wait_native_replica_absent(self.bundle.observer, auxiliary["service"],
+                                              replica["node"], replica["replica"])
+            for replica in targets]
+
     def authoritative_data_loss(self, evidence: dict) -> None:
-        evidence.update(unchanged={}, changed={}, driver="Native FaultAnalysisService PartialDataLoss, not a manual callback/election",
+        evidence.update(unchanged={}, changed={}, driver="Native FAS if deployed; otherwise exact native per-unit concurrent removals. Never a manual callback/election",
                         source_contract="service-fabric 51a7703a1f83749a9234d3ceb4296d8622e42cca: "
                         "httpgateway/FaultsHandler.cpp (StartDataLoss, GetDataLossProgress, CancelTestCommand); "
                         "Constants.cpp:398-406; managed/FabricFAS/.../InvokeDataLossSteps.cs:90-104,270-320; "
