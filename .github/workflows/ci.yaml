@@ -123,10 +123,13 @@ jobs:
         MSSF_NOTIFICATION_JOURNAL: ${{ runner.temp }}/native-notification-journal.json
         MSSF_NOTIFICATION_REPORT: ${{ runner.temp }}/native-notification-report.json
 
-    - name: Qualify full native data, interoperability and legacy runtime
+    - name: Qualify Rust-only data, native interoperability and full legacy runtime
       id: native_data
       timeout-minutes: 150
       run: |
+        python3 scripts/fube_data_test.py "$CLUSTER_NAME" --existing-owner "${{ steps.create_cluster.outputs.owner }}" \
+          --prebuilt "$RUNNER_TEMP/fube-data-binaries" \
+          --profile rust --report "$RUNNER_TEMP/fube-data-rust-report.json"
         python3 scripts/fube_data_test.py "$CLUSTER_NAME" --existing-owner "${{ steps.create_cluster.outputs.owner }}" \
           --prebuilt "$RUNNER_TEMP/fube-data-binaries" \
           --profile full --report "$RUNNER_TEMP/fube-data-report.json"
@@ -137,7 +140,9 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: fube-data-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/fube-data-report.json
+        path: |
+          ${{ runner.temp }}/fube-data-rust-report.json
+          ${{ runner.temp }}/fube-data-report.json
         if-no-files-found: error
         retention-days: 7
 
@@ -147,7 +152,9 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: fube-data-failure-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/fube-data-report.json
+        path: |
+          ${{ runner.temp }}/fube-data-rust-report.json
+          ${{ runner.temp }}/fube-data-report.json
         if-no-files-found: warn
         retention-days: 7
 

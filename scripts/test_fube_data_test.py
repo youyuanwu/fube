@@ -2891,6 +2891,17 @@ class NativeOwnershipIdentityTests(ProjectFiles):
 
 
 class ReportingTests(unittest.TestCase):
+    def test_native_ci_executes_rust_only_and_full_profiles_from_strict_prebuilt_inputs(self):
+        workflow = (data.ROOT / ".github/workflows/ci.yaml").read_text()
+        step = workflow.split("id: native_data", 1)[1].split(
+            "- name: Upload successful combined", 1)[0]
+        self.assertLess(step.index("--profile rust"), step.index("--profile full"))
+        self.assertEqual(step.count('--prebuilt "$RUNNER_TEMP/fube-data-binaries"'), 2)
+        self.assertNotIn("cargo ", step)
+        self.assertNotIn("rustc ", step)
+        self.assertIn("fube-data-rust-report.json", workflow)
+        self.assertIn("fube-data-report.json", workflow)
+
     def result(self, profile):
         return {"profile": profile, "status": "FAIL", "errors": [],
                 "scenarios": {name: {"status": "PASS"} for name in data.required_scenarios(profile)}}
