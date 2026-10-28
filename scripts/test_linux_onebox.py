@@ -91,6 +91,19 @@ class OneboxTests(unittest.TestCase):
         self.assertEqual(sum(map(len, ranges)), len(set().union(*ranges)))
         self.assertFalse(set(map(int, ports)) & set().union(*ranges))
 
+    def test_native_fault_analysis_is_enabled_without_changing_security_profile(self):
+        manifest = ET.fromstring(self.xml)
+        settings = manifest.find("sf:FabricSettings", NS)
+        def values(name):
+            section = next(item for item in settings if item.get("Name") == name)
+            return {item.get("Name"): item.get("Value") for item in section}
+        self.assertEqual(values("FaultAnalysisService"), {
+            "TargetReplicaSetSize": "3", "MinReplicaSetSize": "1",
+            "ReplicaRestartWaitDuration": "5"})
+        self.assertEqual(values("Security"), {
+            "ClusterCredentialType": "None", "ServerAuthCredentialType": "None"})
+        self.assertEqual(values("Hosting")["RunAsPolicyEnabled"], "True")
+
     def test_frozen_inputs_and_separate_cluster_namespace(self):
         self.cluster.load()
         self.assertNotEqual(ctl.Cluster(self.directory, "test").project, self.cluster.project)
