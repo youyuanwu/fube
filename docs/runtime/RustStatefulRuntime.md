@@ -46,7 +46,23 @@ rejected.
 API: [stateful_api.rs:18-202](../../crates/libs/mssf-runtime/src/stateful_api.rs#L18-L202),
 [partition handles:357-393](../../crates/libs/mssf-runtime/src/stateful_api.rs#L357-L393),
 [registration:405](../../crates/libs/mssf-runtime/src/lib.rs#L405).
-Stateful reporting/write/storage APIs are not supplied by this seam.
+Stateful load/health/write/storage APIs are not supplied by this seam.
+
+`StatefulPartition::report_fault(FaultType)` reuses the runtime's existing
+actor-12 `RAReportFault` path, bound to the full native unit, replica incarnation
+and epochs. Its receipt means an initial local frame write, **not native
+acknowledgment, persistence or replacement**. `fault_delivery()` exposes the
+bounded retry/error/cancellation snapshot. Retries run on the installing Runtime
+executor until unit disposal, not on a calling provider/engine executor; stale
+handles and retired process authority cannot start queued fault frames.
+`fube-data`'s qualified `Engine::bind_partition` reports one transient
+notification for a terminal engine fault (including an internal provider
+barrier failure without an active RAP callback), never for normal Close/Abort
+or ordinary write backpressure/cancellation. Close/Abort cancels its receipt
+wait and joins owned cleanup; the Runtime retains only fault DTOs/authority/
+connection state for retries, not service/replicator participants. Standalone
+`Engine::bind` has no native reporting authority. These fault-delivery paths
+have source-contract tests; native recovery validation remains pending.
 
 `Replicator::remove_replica` receives an owned `ReplicaRemoval` purpose:
 `Idle` for native idle-owner removal, or `BuildRetryCleanup` for disposal of

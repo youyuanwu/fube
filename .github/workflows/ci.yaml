@@ -39,7 +39,7 @@ jobs:
       CLUSTER_STATE_ROOT: build/oneboxes
       # Review identity stays unset; executable identity comes from the bundle.
       FUBE_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-      FUBE_CI_MERGE: ${{ github.sha }}
+      FUBE_CI_MERGE: ${{ github.event_name == 'pull_request' && github.sha || '' }}
       FUBE_CI_RUN_ID: ${{ github.run_id }}
     defaults:
       run:

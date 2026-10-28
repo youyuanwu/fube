@@ -392,12 +392,21 @@ class BundleTests(ProjectFiles):
                 package, name, version = data.package(bundle, run_id, mixed)
                 manifest = ET.parse(package / "ApplicationManifest.xml")
                 defaults = manifest.findall(f".//{{{data.runtime.NS}}}DefaultServices/{{{data.runtime.NS}}}Service")
-                self.assertEqual([entry.get("Name") for entry in defaults], [] if mixed else ["Singleton", "Stateful"])
+                self.assertEqual([entry.get("Name") for entry in defaults], ["NativeBootstrap"] if mixed else ["Singleton", "Stateful"])
+                if mixed:
+                    bootstrap=defaults[0].find(f"{{{data.runtime.NS}}}StatefulService")
+                    self.assertIsNotNone(bootstrap)
+                    self.assertEqual(bootstrap.find(f"{{{data.runtime.NS}}}PlacementConstraints").text,
+                                     "NodeType == N0010Ref")
+                    self.assertEqual(bootstrap.get("TargetReplicaSetSize"),"1")
+                    self.assertIsNone(defaults[0].find(f"{{{data.runtime.NS}}}StatelessService"))
                 self.assertEqual(name, f"FubeData{run_id}Type")
                 self.assertEqual(version, "1.1")
                 service = ET.parse(package / "RustRuntimeService/ServiceManifest.xml")
                 types = {entry.get("ServiceTypeName") for entry in service.find(f"{{{data.runtime.NS}}}ServiceTypes")}
                 self.assertEqual(types, {"RustRuntimeType", "RustStatefulRuntimeType"})
+                endpoints=service.find(f"{{{data.runtime.NS}}}Resources/{{{data.runtime.NS}}}Endpoints")
+                self.assertEqual({entry.get("Name") for entry in endpoints},{"Rpc","Replication"})
                 code = package / "RustRuntimeService/Code"
                 self.assertEqual((code / "native-replicator-oracle").exists(), mixed)
 
@@ -467,6 +476,30 @@ def observation(mixed=True, target=3):
 
 
 class NativeIdentityTests(unittest.TestCase):
+    def test_only_empty_native_secondary_can_have_an_unobserved_provider_epoch(self):
+        value=observation()
+        rpc=value["replicas"][2]["rpc"]
+        rpc["native_epoch"]=None
+        rpc["native_current_progress"]=0
+        rpc["engine"]["progress"]["received"]=0
+        data.assert_data(value,value["service"],True)
+        rpc["state"]["last"]=1
+        with self.assertRaises(RuntimeError):
+            data.assert_data(value,value["service"],True)
+
+    def test_primary_refresh_allows_real_quorum_while_replacement_is_in_build(self):
+        value=observation()
+        value["replicas"][1]={"node":"N0020","replica":11,"role":"IdleSecondary","status":"InBuild","address":""}
+        with self.assertRaises(RuntimeError):
+            data.assert_data(value,value["service"],True)
+        data.assert_data(value,value["service"],True,require_full=False)
+        # This is availability only, never a full mixed-partition qualification.
+        value["replicas"][2]["rpc"]["write_status"]="NoWriteQuorum"
+        value["primary"]["rpc"]["write_status"]="NoWriteQuorum"
+        value["replicas"][0]["rpc"]["write_status"]="NoWriteQuorum"
+        with self.assertRaises(RuntimeError):
+            data.assert_data(value,value["service"],True,require_full=False)
+
     def test_real_native_and_rust_roles_and_null_native_endopen_are_distinct(self):
         value = observation()
         self.assertIs(data.assert_data(value, value["service"], True), value)
@@ -1242,6 +1275,9 @@ class LegacyDeploymentTests(ProjectFiles):
             self.fail(path)
 
         def execute(*args, **kwargs):
+            if args[2] == data.OWNERSHIP_READ:
+                self.assertRegex(args[3],r"^/ImageStore/fube-data-[a-f0-9]{32}\?api-version=6\.2$")
+                return json.dumps({"status":404,"body":None})
             if args[2] == data.APPLICATION_PACKAGE_ID:
                 if stage == "initial-native-id-unavailable":
                     raise RuntimeError("actual native ApplicationId unavailable")
@@ -2649,6 +2685,43 @@ class ReportingTests(unittest.TestCase):
 
 
 class ExecutedImageStoreContractTests(unittest.TestCase):
+    def test_native_upload_absence_is_independent_read_only_and_exact_container_bound(self):
+        allocation=MagicMock()
+        allocation.verify.return_value="cid"
+        upload=data.UploadOwnership("/var/lib/sf-node/fube-data-"+"1"*32,"cid",(1,2),(1,3),(1,4),"a"*64)
+        allocation.execute.return_value=json.dumps({"status":404,"body":None})
+        proof=data.verify_image_store_upload_absent(allocation,upload)
+        self.assertTrue(proof["absence_verified"])
+        self.assertEqual(proof["path"],"fube-data-"+"1"*32)
+        allocation.sf.assert_not_called()
+        for reply in [{"status":200,"body":{"StoreFiles":[],"StoreFolders":[]}},
+                      {"status":204,"body":None},{"status":503,"body":None}]:
+            allocation.execute.return_value=json.dumps(reply)
+            with self.assertRaises(RuntimeError):
+                data.verify_image_store_upload_absent(allocation,upload)
+        allocation.verify.return_value="replacement"
+        with self.assertRaises(RuntimeError):
+            data.verify_image_store_upload_absent(allocation,upload)
+
+    def test_non_pull_request_ci_has_no_fabricated_merge_commit(self):
+        bundle=MagicMock(source_revision="a"*40,manifest_sha256="b"*64)
+        with patch.dict(os.environ,{"FUBE_CI_HEAD":"c"*40,"FUBE_CI_MERGE":"",
+                                   "FUBE_CI_RUN_ID":"42"},clear=True):
+            proof=data.provenance(bundle)
+        self.assertIsNone(proof["ci_merge"])
+        self.assertEqual(proof["ci_head"],"c"*40)
+        self.assertEqual(proof["ci_run_id"],"42")
+        self.assertRegex(proof["qualification_script_sha256"],"^[a-f0-9]{64}$")
+
+    def test_native_parameter_map_order_preserves_exact_values_and_generation_identity(self):
+        text=f'<ApplicationManifest xmlns="{data.runtime.NS}" ApplicationTypeName="TestType" ApplicationTypeVersion="1.1"><Parameters><Parameter Name="FubeDataTypeCapability" DefaultValue="{"a"*64}"/><Parameter Name="FubeDataCreationCapability" DefaultValue=""/></Parameters><DefaultServices/></ApplicationManifest>'
+        root=ET.fromstring(text)
+        parameters=root.find(f"{{{data.runtime.NS}}}Parameters")
+        parameters[:]=list(reversed(list(parameters)))
+        self.assertEqual(data.manifest_identity(text),data.manifest_identity(ET.tostring(root,encoding="unicode")))
+        parameters[0].set("DefaultValue","different")
+        self.assertNotEqual(data.manifest_identity(text),data.manifest_identity(ET.tostring(root,encoding="unicode")))
+
     def test_native_empty_404_is_scoped_to_the_pinned_manifest_query(self):
         allocation=MagicMock()
         allocation.execute.return_value=json.dumps({"status":404,"body":None})

@@ -107,6 +107,8 @@ struct Route {
     copy_stream_eos: AtomicU64,
     replication_stream_items: AtomicU64,
     replication_stream_eos: AtomicU64,
+    acknowledged_sequence: [AtomicI64; 2],
+    acknowledgment_calls: [AtomicU64; 2],
     received: AtomicI64,
     assigned: AtomicI64,
     completions: Mutex<BTreeMap<String, Arc<Completion>>>,
@@ -362,6 +364,9 @@ impl Route {
             }
             // Receipt, empty data, local progress and EOS are never implicit ACKs.
             unsafe { operation.Acknowledge().ok()? };
+            let index = usize::from(!copy);
+            self.acknowledged_sequence[index].store(sequence, Ordering::Release);
+            self.acknowledgment_calls[index].fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -613,6 +618,11 @@ impl Route {
                 "copy_eos":self.copy_stream_eos.load(Ordering::Acquire),
                 "replication_items":self.replication_stream_items.load(Ordering::Acquire),
                 "replication_eos":self.replication_stream_eos.load(Ordering::Acquire),
+                "copy_acknowledged_sequence":self.acknowledged_sequence[0].load(Ordering::Acquire),
+                "replication_acknowledged_lsn":self.acknowledged_sequence[1].load(Ordering::Acquire),
+                "copy_acknowledgment_calls":self.acknowledgment_calls[0].load(Ordering::Acquire),
+                "replication_acknowledgment_calls":self.acknowledgment_calls[1].load(Ordering::Acquire),
+                "ack_observation":"last successful application Acknowledge call per stream; not native quorum commitment",
                 "replication_original_epochs":null,
                 "epoch_observation":"published IFabricOperation metadata does not expose original replication epochs"
             },
@@ -760,6 +770,8 @@ impl IFabricStatefulServiceFactory_Impl for Factory_Impl {
                 copy_stream_eos: AtomicU64::new(0),
                 replication_stream_items: AtomicU64::new(0),
                 replication_stream_eos: AtomicU64::new(0),
+                acknowledged_sequence: [AtomicI64::new(0), AtomicI64::new(0)],
+                acknowledgment_calls: [AtomicU64::new(0), AtomicU64::new(0)],
                 received: AtomicI64::new(0),
                 assigned: AtomicI64::new(0),
                 completions: Mutex::new(BTreeMap::new()),

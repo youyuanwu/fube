@@ -14,11 +14,12 @@ pub mod engine;
 pub mod provider;
 pub mod queue;
 pub mod quorum;
+mod supervised;
 pub mod transport;
 pub mod wire;
 
 pub use api::*;
 pub use engine::{Engine, EngineSnapshot, PeerSnapshot, Replication};
-pub use mssf_runtime::{Cancellation, Epoch, ReplicaRole};
+pub use mssf_runtime::{Cancellation, Epoch, ReplicaRole, StatefulPartition};
 pub use mssf_transport::{Error, Result};
 pub use provider::{MemoryProvider, Mutation, ProviderSnapshot};

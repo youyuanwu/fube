@@ -96,6 +96,7 @@ pub(crate) struct Reporting {
     cancel: crate::Cancellation,
     global: Arc<Semaphore>,
     fault_changed: tokio::sync::Notify,
+    executor: Option<tokio::runtime::Handle>,
 }
 impl std::fmt::Debug for Reporting {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -126,6 +127,7 @@ impl Reporting {
             cancel,
             global,
             fault_changed: tokio::sync::Notify::new(),
+            executor: tokio::runtime::Handle::try_current().ok(),
         })
     }
     pub(crate) fn update(&self, request: &ProxyRequest) {
@@ -425,9 +427,14 @@ impl Reporting {
         };
         if first {
             let this = self.clone();
-            tokio::spawn(async move {
-                this.fault_worker().await;
-            });
+            // Participant executors may stop immediately after a terminal fault.
+            // Retries belong to the runtime that installed this native unit.
+            self.executor
+                .clone()
+                .unwrap_or_else(tokio::runtime::Handle::current)
+                .spawn(async move {
+                    this.fault_worker().await;
+                });
         } else if changed {
             self.fault_changed.notify_one();
         }

@@ -110,6 +110,10 @@ local native EndReplicate results whose identities remain in current state**.
 secondary's quorum watermark is not publicly observed and is never inferred
 from provider progress or its application ACK. Unknown native peer observations
 remain null. These limitations are explicitly labeled in diagnostics.
+`native_streams` separately records successful copy/replication application
+`Acknowledge` calls and their last sequence numbers; an injected delay can show
+provider apply ahead of actual acknowledgment. Those counters are not relabelled
+as native quorum or queue-completion knowledge.
 
 `copy_delay_ms` defaults to zero and is shared with the live provider's
 `BeginGetNext` work. It delays each actual non-null source copy item, not EOS,

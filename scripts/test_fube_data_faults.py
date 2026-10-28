@@ -2,6 +2,7 @@
 import contextlib
 import copy
 import io
+import itertools
 import json
 import sys
 import unittest
@@ -14,6 +15,7 @@ from test_fube_data_test import observation
 
 
 PARTITION = "00000000-0000-0000-0000-000000000123"
+MAIN_PARTITION = "00000000-0000-0000-0000-000000000789"
 OPERATION = "00000000-0000-0000-0000-000000000456"
 SERVICE = "fabric:/Owned/DataLossChanged-model"
 
@@ -89,9 +91,6 @@ def loss_model(changed, native=False):
         record = seed.mutation(f"seed-{index}")
         seed.reply(record, 200, {"request_id": record["id"], "sequence": index + 1, "outcome": "committed"})
     before = observation(native)
-    if native:
-        before["replicas"] = [before["replicas"][0], before["replicas"][2]]
-        before["native_partition"].update(target=2, minimum=2)
     before.update(service=SERVICE, partition=PARTITION)
     for replica in before["replicas"]:
         rpc = replica["rpc"]
@@ -101,12 +100,14 @@ def loss_model(changed, native=False):
             last_data_loss_boundary=None, results={key: record["sequence"] for key, record in seed.records.items()},
             values={record["key"]: record["value"] for record in seed.records.values()})
         rpc["engine"]["progress"].update(assigned=20, applied=20)
-    primary(before, 0)
+    primary(before, 1 if native else 0)
     after = copy.deepcopy(before)
-    replacement = after["replicas"][0]
-    replacement["replica"] = replacement["rpc"]["replica"] = 99
-    replacement["rpc"].update(incarnation="replacement", engine_incarnation="replacement")
-    replacement["address"] = replacement["rpc"]["service_address"] = "http://127.0.0.1:2000/data/replacement/service"
+    for index in ((0, 1) if native else (0, 2)):
+        replacement = after["replicas"][index]
+        replacement["replica"] = replacement["rpc"]["replica"] = 99 + index
+        replacement["rpc"].update(incarnation="replacement", engine_incarnation="replacement")
+        replacement["address"] = replacement["rpc"]["service_address"] = (
+            f"http://127.0.0.1:{2000 + index}/data/replacement/service")
     after["native_partition"]["epoch"]["data_loss"] += 1
     retained = {key: record for key, record in seed.records.items() if not changed or record["sequence"] <= 5}
     last = 5 if changed else 20
@@ -118,10 +119,11 @@ def loss_model(changed, native=False):
         rpc["state"].update(last=last, history_count=len(retained),
                             results={key: record["sequence"] for key, record in retained.items()},
                             values={record["key"]: record["value"] for record in retained.values()})
-    survivor = after["replicas"][1]
+    survivor_index = 2 if native else 1
+    survivor = after["replicas"][survivor_index]
     survivor["rpc"]["state"].update(data_loss_calls=1, data_loss_changed_calls=1 if changed else 0,
                                      last_data_loss_boundary=5 if changed else None)
-    primary(after, 1)
+    primary(after, survivor_index)
     return before, after, seed
 
 
@@ -385,6 +387,18 @@ class WireFaultModels(unittest.TestCase):
 
 
 class DataLossInvariantModels(unittest.TestCase):
+    def test_source_partial_loss_math_removes_both_of_two_but_three_with_rust_primary_leaves_native(self):
+        for nodes, primary_node, survivor_kinds in (
+                (("N0010", "N0030"), "N0010", set()),
+                (data.MIXED_NODES, "N0020", {"native-classic-v1"})):
+            secondaries = set(nodes) - {primary_node}
+            choices = list(itertools.combinations(secondaries, len(nodes) // 2))
+            self.assertTrue(choices)
+            for selected in choices:
+                survivors = set(nodes) - {primary_node, *selected}
+                self.assertEqual(len(survivors), 0 if len(nodes) == 2 else 1)
+                self.assertEqual({data.NODE_ENGINES[node] for node in survivors}, survivor_kinds)
+
     def test_changed_and_unchanged_native_callbacks_preserve_exact_authoritative_contents_and_progress(self):
         for native in (False, True):
             for changed in (False, True):
@@ -435,7 +449,7 @@ class DataLossInvariantModels(unittest.TestCase):
             data.data_loss_invariants(before, after, seed, True)
         before, after, seed = loss_model(True)
         after["replicas"][1]["rpc"].update(incarnation="another replacement", engine_incarnation="another replacement")
-        with self.assertRaisesRegex(RuntimeError, "no actual native OnDataLoss"):
+        with self.assertRaisesRegex(RuntimeError, "original survivor"):
             data.data_loss_invariants(before, after, seed, True)
 
     def test_actual_callback_counter_and_boundary_schema_is_required_even_on_copied_replacements(self):
@@ -450,15 +464,34 @@ class DataLossInvariantModels(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "boundary telemetry"):
             data.data_loss_invariants(before, after, seed, True)
 
-    def test_small_auxiliary_native_only_placement_is_honestly_native_not_mixed_three(self):
+    def test_mixed_auxiliary_requires_three_ready_before_fault_but_client_can_use_real_minimum(self):
         value = observation(True)
-        value["replicas"] = [value["replicas"][0], value["replicas"][2]]
-        value["native_partition"].update(target=2, minimum=2)
-        data.assert_data(value, value["service"], True, 2, 2)
-        client = data.Client(MagicMock(), value["service"], True, data.Ledger(), 2, 2)
+        data.assert_data(value, value["service"], True, 3, 2)
+        client = data.Client(MagicMock(), value["service"], True, data.Ledger(), 3, 2)
         with patch.object(data, "native_snapshot", return_value=value):
             self.assertIs(client.refresh(), value)
+            value["replicas"] = [value["replicas"][0], value["replicas"][2]]
+            self.assertIs(client.refresh(),value)
+            # Fault setup and qualification convergence remain full-three checks.
+            with self.assertRaisesRegex(RuntimeError, "cardinality"):
+                data.assert_data(value,value["service"],True,3,2)
+            value["native_partition"].update(target=2, minimum=2)
+            with self.assertRaisesRegex(RuntimeError, "requested size"):
+                client.refresh()
         self.assertEqual(client.endpoint, value["primary"]["endpoint"])
+
+    def test_mixed_claim_requires_the_original_native_survivor_callback_and_new_native_primary(self):
+        actions = [
+            lambda before, after: primary(before, 0),
+            lambda before, after: primary(after, 1),
+            lambda before, after: after["replicas"][2]["rpc"].update(engine_kind="rust"),
+            lambda before, after: before["native_partition"].update(target=2),
+        ]
+        for action in actions:
+            before, after, seed = loss_model(True, True)
+            action(before, after)
+            with self.subTest(action=action), self.assertRaisesRegex(RuntimeError, "mixed partial loss"):
+                data.data_loss_invariants(before, after, seed, True)
 
 
 class AuxiliaryOwnershipModels(unittest.TestCase):
@@ -510,9 +543,9 @@ class AuxiliaryOwnershipModels(unittest.TestCase):
         self.assertFalse(any(call.args[:2] == ("service", "delete")
                              for call in qualification.allocation.sf.call_args_list))
 
-    def test_mixed_uses_two_native_nodes_full_uses_three_rust_nodes_without_relabeling(self):
+    def test_mixed_uses_three_mixed_nodes_full_uses_three_rust_nodes_without_relabeling(self):
         for profile, mixed, nodes, target, aux_mixed in (
-                ("mixed", True, ("N0010", "N0030"), 2, True),
+                ("mixed", True, data.MIXED_NODES, 3, True),
                 ("full", True, ("N0020", "N0040", "N0050"), 3, False),
                 ("rust", False, tuple(data.NODE_ENGINES), 3, False)):
             qualification, original = self.qualification(mixed, profile)
@@ -530,6 +563,7 @@ class AuxiliaryOwnershipModels(unittest.TestCase):
             self.assertEqual(create.call_args.args[3:], (nodes, target, 2))
             self.assertEqual(wait.call_args.kwargs["mixed"], aux_mixed)
             self.assertEqual(record["mixed"], aux_mixed)
+            self.assertEqual(record["eligible_nodes"], nodes)
 
     def test_reused_service_name_with_new_partition_cannot_be_deleted(self):
         qualification, original = self.qualification()
@@ -599,11 +633,98 @@ class DataLossCommandModels(unittest.TestCase):
     qualification = AuxiliaryOwnershipModels.qualification
     auxiliary = staticmethod(AuxiliaryOwnershipModels.auxiliary)
 
+    def move_fixture(self):
+        after, _, seed = loss_model(False, True)
+        before = copy.deepcopy(after)
+        before["native_partition"]["epoch"]["configuration"] -= 1 << 32
+        for replica in before["replicas"]:
+            replica["rpc"]["native_epoch"]["configuration"] -= 1 << 32
+        primary(before, 0)
+        qualification, original = self.qualification(True, "mixed")
+        auxiliary = self.auxiliary(original)
+        auxiliary.update(mixed=True, eligible_nodes=data.MIXED_NODES)
+        reply = {"request": "MovePrimary", "partition": PARTITION, "target": "N0020",
+                 "constraints": "enforced", "native_request_completed": True}
+        return qualification, auxiliary, before, after, seed, reply
+
+    def test_auxiliary_move_requires_original_application_partition_and_observed_active_secondary(self):
+        for invalid in ("application", "partition", "main_service", "already_primary", "ineligible"):
+            qualification, auxiliary, before, _, seed, _ = self.move_fixture()
+            partition = PARTITION
+            if invalid == "application":
+                auxiliary["application_native_id"] = "OwnedType_App2"
+            elif invalid == "partition":
+                partition = MAIN_PARTITION
+            elif invalid == "main_service":
+                auxiliary["service"] = qualification.service
+            elif invalid == "already_primary":
+                primary(before, 1)
+            else:
+                auxiliary["eligible_nodes"] = ("N0010", "N0030")
+            with self.subTest(invalid=invalid), \
+                 patch.object(qualification, "guard_application"), \
+                 patch.object(qualification, "auxiliary_partition", return_value=partition), \
+                 patch.object(data.runtime, "run") as move:
+                with self.assertRaises(RuntimeError):
+                    qualification.move_auxiliary_primary(auxiliary, before, "N0020", seed, {})
+            move.assert_not_called()
+
+    def test_auxiliary_move_rejects_another_guid_target_or_unenforced_native_receipt(self):
+        for field, invalid in (("partition", MAIN_PARTITION), ("target", "N0010"),
+                               ("constraints", "ignored"), ("native_request_completed", False)):
+            qualification, auxiliary, before, _, seed, reply = self.move_fixture()
+            reply[field] = invalid
+            with self.subTest(field=field), \
+                 patch.object(qualification, "guard_application"), \
+                 patch.object(qualification, "auxiliary_partition", return_value=PARTITION), \
+                 patch.object(data.runtime, "run", return_value=json.dumps(reply)), \
+                 patch.object(qualification, "wait") as wait:
+                with self.assertRaisesRegex(RuntimeError, "constraints enforced"):
+                    qualification.move_auxiliary_primary(auxiliary, before, "N0020", seed, {})
+            wait.assert_not_called()
+
+    def test_auxiliary_move_requires_full_membership_epoch_agreement_all_applied_and_same_lifetimes(self):
+        for invalid in ("membership", "epoch", "applied", "native_progress", "lifetime", "unadvanced"):
+            qualification, auxiliary, before, after, seed, reply = self.move_fixture()
+            if invalid == "membership":
+                after["replicas"].pop()
+            elif invalid == "epoch":
+                after["replicas"][0]["rpc"]["native_epoch"]["configuration"] += 1 << 32
+            elif invalid == "applied":
+                after["replicas"][2]["rpc"]["engine"]["progress"]["applied"] = 19
+            elif invalid == "native_progress":
+                after["replicas"][2]["rpc"]["native_current_progress"] = 19
+            elif invalid == "lifetime":
+                after["replicas"][2]["rpc"]["incarnation"] = "replacement"
+            else:
+                after["native_partition"]["epoch"] = dict(before["native_partition"]["epoch"])
+                for replica in after["replicas"]:
+                    replica["rpc"]["native_epoch"] = dict(before["native_partition"]["epoch"])
+                primary(after, 1)
+            with self.subTest(invalid=invalid), \
+                 patch.object(qualification, "guard_application"), \
+                 patch.object(qualification, "auxiliary_partition", return_value=PARTITION), \
+                 patch.object(data.runtime, "run", return_value=json.dumps(reply)), \
+                 patch.object(qualification, "wait", return_value=after):
+                with self.assertRaises(RuntimeError):
+                    qualification.move_auxiliary_primary(auxiliary, before, "N0020", seed, {})
+
     def test_changed_and_unchanged_dispatch_native_fas_with_local_ledger_and_truthful_next_assignment(self):
-        for changed in (False, True):
-            before, after, seed = loss_model(changed)
-            qualification, original = self.qualification()
+        for changed, mixed, initial_rust_primary in itertools.product((False, True), (False, True), (False, True)):
+            before, after, seed = loss_model(changed, mixed)
+            qualification, original = self.qualification(mixed, "mixed" if mixed else "rust")
             auxiliary = self.auxiliary(original)
+            auxiliary.update(mixed=mixed, eligible_nodes=data.MIXED_NODES if mixed else tuple(data.NODE_ENGINES))
+            initial = copy.deepcopy(before)
+            away = copy.deepcopy(before)
+            if mixed:
+                for value, configuration, selected in (
+                        (initial, 0 if initial_rust_primary else 1 << 32, 1 if initial_rust_primary else 0),
+                        (away, 1 << 32, 0)):
+                    value["native_partition"]["epoch"]["configuration"] = configuration
+                    for replica in value["replicas"]:
+                        replica["rpc"]["native_epoch"]["configuration"] = configuration
+                    primary(value, selected)
             final = copy.deepcopy(after)
             retained = data.data_loss_invariants(before, after, seed, changed)
             start = 6 if changed else 21
@@ -615,16 +736,20 @@ class DataLossCommandModels(unittest.TestCase):
                     last=start + 3, history_count=len(retained.records),
                     results={key: record["sequence"] for key, record in retained.records.items()},
                     values={record["key"]: record["value"] for record in retained.records.values()})
-            primary(final, 1)
+            primary(final, 2 if mixed else 1)
             evidence = {}
             main, _ = wire_model()
+            main["partition"] = MAIN_PARTITION
+            for replica in main["replicas"]:
+                replica["rpc"]["partition"] = MAIN_PARTITION
+            primary(main, 0)
             main_ledger = qualification.ledger
             def create_aux(changed, evidence):
                 qualification.auxiliaries.append(auxiliary)
-                evidence.update(auxiliary=auxiliary, initial_observation=before)
+                evidence.update(auxiliary=auxiliary, initial_observation=initial)
                 return auxiliary
             def client_factory(bundle, service, mixed, ledger, target, minimum):
-                self.assertEqual((service, mixed, target, minimum), (SERVICE, False, 3, 2))
+                self.assertEqual((service, mixed, target, minimum), (SERVICE, auxiliary["mixed"], 3, 2))
                 client = MagicMock()
                 def write(request_id):
                     record = ledger.mutation(request_id)
@@ -636,44 +761,79 @@ class DataLossCommandModels(unittest.TestCase):
             def arm(endpoint, operation, parameters):
                 self.assertEqual(operation, "test")
                 self.assertEqual(parameters, {"data_loss_boundary": 5})
+                self.assertEqual(evidence["before"], before)
+                if mixed:
+                    self.assertEqual(evidence["pre_fas_moves"][-1]["after"], before)
                 return 200, {"qualification_only": True, "armed_only": True, "data_loss_boundary": 5}
+            def move(*args, **kwargs):
+                self.assertEqual(args[:4], (str(qualification.bundle.observer), "127.0.0.1:19000", SERVICE,
+                                            "--move-primary"))
+                self.assertEqual(kwargs, {"timeout": 75})
+                return json.dumps({"request": "MovePrimary", "partition": PARTITION, "target": args[4],
+                                   "constraints": "enforced", "native_request_completed": True})
             def management(allocation, method, path):
                 self.assertIs(allocation, qualification.allocation)
                 self.assertEqual(method, "POST")
                 self.assertIs(auxiliary["fas"], evidence["native_fas"])
                 self.assertEqual(auxiliary["fas"]["application_native_id"], original.native_application_id)
                 self.assertEqual(parse_qs(urlsplit(path).query)["DataLossMode"], ["PartialDataLoss"])
+                self.assertIn(f"/Faults/Services/Owned~DataLossChanged-model/$/GetPartitions/{PARTITION}/", path)
+                self.assertEqual(evidence["before"], before)
                 return {"http_status": 202, "body": None}
             def cleanup_aux(record):
                 record["cleanup"].update(native_absence_confirmed=True, original_routes_retired=True)
-            waits = [before, before, after, final] if changed else [before, after, final]
+            waits = [initial] + ([away, before] if initial_rust_primary else [before]) if mixed else [before]
+            waits += ([before] if changed else []) + [after, final]
+            def observe(**kwargs):
+                self.assertEqual((kwargs["service"], kwargs["target"], kwargs["minimum"], kwargs["mixed"]),
+                                 (SERVICE, 3, 2, mixed))
+                value = waits.pop(0)
+                data.assert_data(value, SERVICE, mixed, 3, 2)
+                if kwargs.get("accept"):
+                    self.assertTrue(kwargs["accept"](value) or kwargs["accept"](value))
+                return value
             with patch.object(qualification, "converge", return_value=main), \
                  patch.object(qualification, "stateless_siblings", return_value=[]), \
                  patch.object(qualification, "unchanged_stateless", return_value=[]), \
                  patch.object(qualification, "create_auxiliary", side_effect=create_aux), \
-                 patch.object(qualification, "wait", side_effect=waits), \
+                 patch.object(qualification, "wait", side_effect=observe), \
                  patch.object(qualification, "guard_application"), \
                  patch.object(qualification, "auxiliary_partition", return_value=PARTITION), \
                  patch.object(qualification, "cleanup_auxiliary", side_effect=cleanup_aux) as cleanup, \
                  patch.object(data, "Client", side_effect=client_factory), \
                  patch.object(data, "request", side_effect=arm) as request, \
+                 patch.object(data.runtime, "run", side_effect=move) as native_move, \
                  patch.object(data, "native_management", side_effect=management), \
                  patch.object(data, "poll_fas", return_value=completed()):
                 qualification.data_loss_case(evidence, changed)
+            self.assertEqual(waits, [])
             self.assertIs(qualification.ledger, main_ledger)
             self.assertEqual(qualification.service, "fabric:/Owned/Data")
             self.assertEqual(request.call_count, 3 if changed else 0)
             self.assertEqual(evidence["subsequent_writes"][0]["sequence"], start)
             self.assertEqual(evidence["final_workload"]["last"], start + 3)
             self.assertEqual(len(evidence["seed_workload"]["results"]), 20)
+            self.assertEqual(native_move.call_count, (2 if initial_rust_primary else 1) if mixed else 0)
+            self.assertEqual(evidence["expected_survivor_engine_kind"], "native-classic-v1" if mixed else "rust")
+            self.assertEqual({callback["engine_kind"] for callback in evidence["actual_survivor_callbacks"]},
+                             {"native-classic-v1"} if mixed else {"rust"})
+            if mixed:
+                self.assertEqual(evidence["pre_fas_moves"][-1]["move_request"]["target"], "N0020")
+                self.assertEqual([target["node"] for target in evidence["pre_fas_moves"][-1]["eligible_targets"]
+                                  if target["engine_kind"] == "rust"], ["N0020"])
+                self.assertEqual(evidence["after_native_data_loss"]["primary"]["rpc"]["engine_kind"], "native-classic-v1")
             self.assertNotIn("status", evidence)
             cleanup.assert_called_once_with(auxiliary)
 
     def test_seed_or_arming_failure_still_cleans_the_auxiliary_before_leaving_the_case(self):
-        for stage in ("seed", "arming"):
-            qualification, original = self.qualification()
-            before, _, _ = loss_model(True)
+        for stage in ("seed", "move", "arming"):
+            mixed = stage == "move"
+            qualification, original = self.qualification(mixed, "mixed" if mixed else "rust")
+            before, _, _ = loss_model(True, mixed)
+            if mixed:
+                primary(before, 0)
             auxiliary = self.auxiliary(original)
+            auxiliary.update(mixed=mixed, eligible_nodes=data.MIXED_NODES)
             def create_aux(changed, evidence):
                 qualification.auxiliaries.append(auxiliary)
                 evidence.update(auxiliary=auxiliary, initial_observation=before)
@@ -701,9 +861,13 @@ class DataLossCommandModels(unittest.TestCase):
                  patch.object(qualification, "wait", return_value=before), \
                  patch.object(data, "Client", side_effect=make_client), \
                  patch.object(data, "request", return_value=(400, {"error": "hook unavailable"})), \
+                 patch.object(qualification, "guard_application"), \
+                 patch.object(qualification, "auxiliary_partition", return_value=PARTITION), \
+                 patch.object(data.runtime, "run", side_effect=RuntimeError("move failed")), \
                  patch.object(qualification, "cleanup_auxiliary", side_effect=cleanup_aux) as cleanup, \
                  patch.object(data, "native_management") as native:
-                with self.assertRaisesRegex(RuntimeError, "seed failed" if stage == "seed" else "arming API"):
+                with self.assertRaisesRegex(RuntimeError, {
+                        "seed": "seed failed", "move": "move failed", "arming": "arming API"}[stage]):
                     qualification.data_loss_case({}, True)
             cleanup.assert_called_once_with(auxiliary)
             native.assert_not_called()

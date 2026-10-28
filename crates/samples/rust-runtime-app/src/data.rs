@@ -671,7 +671,8 @@ impl StatefulService for Service {
                     .map_err(|_| RuntimeError::InvalidInput("invalid data listener IP"))?,
                 0,
             );
-            let engine = Engine::bind(
+            let engine = Engine::bind_partition(
+                partition.clone(),
                 Actor {
                     partition: self.context.identity.partition_id,
                     replica: self.context.identity.replica_id,

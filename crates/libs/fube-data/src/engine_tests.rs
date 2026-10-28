@@ -147,6 +147,14 @@ async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
         .unwrap()
         .unwrap();
         assert_eq!(operation.sequence, sequence);
+        if sequence == 1 {
+            until(|| target.snapshot().progress.received == sequence).await;
+            assert_eq!(
+                target.progress().unwrap(),
+                ReplicationProgress { first: 0, last: 1 },
+                "receive is not completed replay capability"
+            );
+        }
         let progress = primary.snapshot();
         assert!(progress.progress.first_retained <= sequence, "{progress:?}");
         assert!(!progress.peers[0].cleanup_required);
@@ -154,6 +162,14 @@ async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
         operation.acknowledge().unwrap();
         drop(operation);
         until(|| primary.snapshot().peers[0].applied == sequence).await;
+        assert_eq!(
+            primary.progress().unwrap(),
+            ReplicationProgress {
+                first: 0,
+                last: sequence
+            },
+            "released committed history is not available replay data"
+        );
     }
     let written_after = primary.transport.diagnostics()["events"]["written_data"][0]
         .as_u64()
@@ -1166,6 +1182,78 @@ fn configuration(
     }
 }
 
+// Runtime status shapes from stateful_reconfiguration.rs:admit_epoch,
+// configuration and catch_up. These are source fixtures, not a native node.
+struct SourceNativeView(Mutex<Result<ReplicaStatus>>);
+
+impl NativeControlView for SourceNativeView {
+    fn status(&self) -> Result<ReplicaStatus> {
+        self.0.lock().unwrap().clone()
+    }
+    fn report_fault(
+        &self,
+        _: mssf_runtime::FaultType,
+    ) -> ServiceFuture<'_, mssf_runtime::FaultDelivery> {
+        Box::pin(async { Err(Error::Closed) })
+    }
+}
+
+fn prewrite_status() -> ReplicaStatus {
+    ReplicaStatus {
+        lifecycle: ReplicaLifecycle::Open,
+        service_role: ReplicaRole::Primary,
+        replicator_role: ReplicaRole::Primary,
+        replicator_open: true,
+        current_role: ReplicaRole::Secondary,
+        current_epoch: Epoch {
+            configuration: NEXT_EPOCH.configuration + 7,
+            ..NEXT_EPOCH
+        },
+        previous_epoch: Epoch {
+            configuration: EPOCH.configuration + 3,
+            ..EPOCH
+        },
+        configuration_stage: ConfigurationStage::PreWriteRevoke,
+        catch_up: mssf_runtime::CatchUpResult::NotStarted,
+        minimum_replica_set_size: 1,
+        configuration: vec![],
+        service_address: String::new(),
+        replication_address: String::new(),
+        progress: ReplicationProgress::EMPTY,
+    }
+}
+
+fn primary_status() -> ReplicaStatus {
+    ReplicaStatus {
+        current_role: ReplicaRole::Primary,
+        current_epoch: EPOCH,
+        previous_epoch: Epoch::INVALID,
+        configuration_stage: ConfigurationStage::Current,
+        catch_up: mssf_runtime::CatchUpResult::Completed,
+        ..prewrite_status()
+    }
+}
+
+fn engine_with_native_view(
+    partition: Uuid,
+    id: i64,
+    provider: Arc<dyn StateProvider>,
+    view: Arc<SourceNativeView>,
+) -> Arc<Engine> {
+    Engine::bind_with_native_control(
+        Actor {
+            partition,
+            replica: id,
+            incarnation: Uuid::new_v4(),
+        },
+        "127.0.0.1:0",
+        provider,
+        Settings::default(),
+        Some(view),
+    )
+    .unwrap()
+}
+
 async fn until(mut condition: impl FnMut() -> bool) {
     timeout(std::time::Duration::from_secs(5), async {
         while !condition() {
@@ -1293,10 +1381,19 @@ async fn three_loopback_engines_require_explicit_apply_for_one_hundred_writes() 
 }
 
 async fn pair() -> (Arc<Engine>, Arc<Engine>, Arc<Provider>) {
+    pair_with_native_view(None).await
+}
+
+async fn pair_with_native_view(
+    view: Option<Arc<SourceNativeView>>,
+) -> (Arc<Engine>, Arc<Engine>, Arc<Provider>) {
     let partition = Uuid::new_v4();
     let primary = engine(partition, 1, Arc::new(Provider::default()));
     let provider = Arc::new(Provider::default());
-    let secondary = engine(partition, 2, provider.clone());
+    let secondary = match view {
+        Some(view) => engine_with_native_view(partition, 2, provider.clone(), view),
+        None => engine(partition, 2, provider.clone()),
+    };
     primary
         .change_role(EPOCH, ReplicaRole::Primary, cancel())
         .await
@@ -1318,6 +1415,434 @@ async fn pair() -> (Arc<Engine>, Arc<Engine>, Arc<Provider>) {
         .await
         .unwrap();
     (primary, secondary, provider)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_epoch_and_swap() {
+    let partition = Uuid::new_v4();
+    let pp = Arc::new(Provider::default());
+    let sp = Arc::new(Provider::default());
+    let view = Arc::new(SourceNativeView(Mutex::new(Ok(primary_status()))));
+    let p = engine_with_native_view(partition, 1, pp.clone(), view.clone());
+    let s = engine(partition, 2, sp.clone());
+    p.change_role(EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    p.update_current_configuration(configuration(vec![], true, 1), cancel())
+        .await
+        .unwrap();
+    s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .await
+        .unwrap();
+    p.build_replica(descriptor(&s), cancel()).await.unwrap();
+    s.change_role(EPOCH, ReplicaRole::Secondary, cancel())
+        .await
+        .unwrap();
+    let previous = configuration(vec![descriptor(&s)], true, 2);
+    p.update_current_configuration(previous.clone(), cancel())
+        .await
+        .unwrap();
+    let mut write = p
+        .submit(OperationData::new(vec![vec![1]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    pp.last.store(1, Ordering::Release);
+    let operation = s
+        .replication_stream()
+        .next(cancel())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.epoch, EPOCH);
+    let provider_epochs = pp.epochs.lock().unwrap().clone();
+    let revision = p.shared.revision.load(Ordering::Acquire);
+    let mut current = previous.clone();
+    current.epoch = NEXT_EPOCH;
+    let mut status = prewrite_status();
+    status.configuration = vec![descriptor(&s)];
+    status.configuration[0].role = ReplicaRole::Primary;
+    *view.0.lock().unwrap() = Ok(status.clone());
+    p.update_catch_up_configuration(current.clone(), previous.clone(), cancel())
+        .await
+        .unwrap();
+    until(|| !p.snapshot().ready).await;
+    assert_eq!(p.snapshot().epoch, Some(EPOCH));
+    assert_eq!(pp.epochs.lock().unwrap().as_slice(), provider_epochs);
+    assert_eq!(p.shared.revision.load(Ordering::Acquire), revision);
+    assert!(p
+        .submit(OperationData::new(vec![vec![2]]).unwrap(), cancel())
+        .await
+        .is_err());
+    assert_eq!(p.snapshot().progress.assigned, 1);
+    let first_all = p.wait_for_catch_up(CatchUpMode::All, cancel());
+    tokio::pin!(first_all);
+    assert!(
+        timeout(std::time::Duration::from_millis(40), &mut first_all)
+            .await
+            .is_err()
+    );
+    // ACK has no epoch: the existing E1 session can drain the first native ALL,
+    // even though installed membership metadata already describes E2.
+    sp.last.store(1, Ordering::Release);
+    operation.acknowledge().unwrap();
+    drop(operation);
+    timeout(std::time::Duration::from_secs(2), &mut first_all)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(write.wait(cancel()).await.unwrap(), 1);
+    assert_eq!(p.snapshot().epoch, Some(EPOCH));
+    assert!(!p.snapshot().ready);
+    assert_eq!(s.snapshot().epoch, Some(EPOCH));
+    assert_eq!(pp.epochs.lock().unwrap().as_slice(), provider_epochs);
+
+    status.configuration_stage = ConfigurationStage::CatchUp;
+    assert_eq!(
+        status.access().1,
+        mssf_runtime::AccessStatus::ReconfigurationPending
+    );
+    *view.0.lock().unwrap() = Ok(status);
+    p.update_epoch(NEXT_EPOCH, cancel()).await.unwrap();
+    until(|| p.snapshot().epoch == Some(NEXT_EPOCH) && p.snapshot().ready).await;
+    assert!(pp.epochs.lock().unwrap().contains(&(NEXT_EPOCH, 1)));
+    // Engine readiness after UpdateEpoch is not the independent native gate.
+    assert_eq!(
+        view.status().unwrap().access().1,
+        mssf_runtime::AccessStatus::ReconfigurationPending
+    );
+    p.update_catch_up_configuration(current, previous, cancel())
+        .await
+        .unwrap();
+    p.wait_for_catch_up(CatchUpMode::All, cancel())
+        .await
+        .unwrap();
+    let mut status = view.status().unwrap();
+    status.catch_up = mssf_runtime::CatchUpResult::Completed;
+    *view.0.lock().unwrap() = Ok(status);
+    p.change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+        .await
+        .unwrap();
+    let mut status = view.status().unwrap();
+    status.service_role = ReplicaRole::Secondary;
+    status.replicator_role = ReplicaRole::Secondary;
+    status.configuration_stage = ConfigurationStage::Current;
+    *view.0.lock().unwrap() = Ok(status);
+    s.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    let mut current = configuration(vec![descriptor(&p)], true, 2);
+    current.epoch = NEXT_EPOCH;
+    s.update_catch_up_configuration(
+        current,
+        configuration(vec![descriptor(&p)], true, 2),
+        cancel(),
+    )
+    .await
+    .unwrap();
+    let mut write = s
+        .submit(OperationData::new(vec![vec![2]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    sp.last.store(2, Ordering::Release);
+    let operation = p
+        .replication_stream()
+        .next(cancel())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.sequence, 2);
+    assert_eq!(operation.epoch, NEXT_EPOCH);
+    assert!(s.snapshot().progress.committed < write.sequence);
+    pp.last.store(2, Ordering::Release);
+    operation.acknowledge().unwrap();
+    drop(operation);
+    assert_eq!(write.wait(cancel()).await.unwrap(), 2);
+    assert!(!p.snapshot().ready);
+    p.abort();
+    s.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_prewrite_rejects_wrong_views_future_pc_and_stale_cc_without_mutation() {
+    let partition = Uuid::new_v4();
+    let provider = Arc::new(Provider::default());
+    let view = Arc::new(SourceNativeView(Mutex::new(Ok(primary_status()))));
+    let p = engine_with_native_view(partition, 1, provider.clone(), view.clone());
+    let s = engine(partition, 2, Arc::new(Provider::default()));
+    p.change_role(EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    let previous = configuration(vec![], true, 1);
+    p.update_current_configuration(previous.clone(), cancel())
+        .await
+        .unwrap();
+    until(|| p.snapshot().ready).await;
+    let before = p.snapshot();
+    let epochs = provider.epochs.lock().unwrap().clone();
+    let revision = p.shared.revision.load(Ordering::Acquire);
+    let mut current = configuration(vec![descriptor(&s)], true, 2);
+    current.epoch = NEXT_EPOCH;
+    let variants: &[fn(&mut ReplicaStatus)] = &[
+        |s| s.configuration_stage = ConfigurationStage::Current,
+        |s| s.configuration_stage = ConfigurationStage::CatchUp,
+        |s| s.current_role = ReplicaRole::Primary,
+        |s| s.current_role = ReplicaRole::Idle,
+        |s| s.service_role = ReplicaRole::Secondary,
+        |s| s.replicator_role = ReplicaRole::Secondary,
+        |s| s.replicator_open = false,
+        |s| s.lifecycle = ReplicaLifecycle::Opening,
+        |s| s.lifecycle = ReplicaLifecycle::Closing,
+        |s| s.lifecycle = ReplicaLifecycle::Closed,
+        |s| s.current_epoch = EPOCH,
+        |s| s.current_epoch.configuration += 0x1_0000_0000,
+        |s| s.current_epoch.data_loss += 1,
+        |s| s.previous_epoch = NEXT_EPOCH,
+        |s| s.previous_epoch = Epoch::INVALID,
+    ];
+    for (index, change) in variants.iter().enumerate() {
+        let mut status = prewrite_status();
+        change(&mut status);
+        *view.0.lock().unwrap() = Ok(status);
+        assert!(
+            p.update_catch_up_configuration(current.clone(), previous.clone(), cancel())
+                .await
+                .is_err(),
+            "accepted invalid source view {index}"
+        );
+        // PC-less controls still require the complete stage/role/CC proof.
+        if index < variants.len() - 2 {
+            assert!(p
+                .update_current_configuration(current.clone(), cancel())
+                .await
+                .is_err());
+        }
+        let after = p.snapshot();
+        assert_eq!(after.progress, before.progress);
+        assert_eq!(after.epoch, before.epoch);
+        assert_eq!(after.role, before.role);
+        assert!(after.ready);
+        assert!(after.peers.is_empty());
+        assert!(after.fault.is_none());
+    }
+    *view.0.lock().unwrap() = Err(Error::Closed);
+    assert!(p
+        .update_current_configuration(previous.clone(), cancel())
+        .await
+        .is_err());
+    *view.0.lock().unwrap() = Ok(prewrite_status());
+    for epoch in [
+        NEXT_EPOCH,
+        Epoch {
+            data_loss: 2,
+            configuration: 0,
+        },
+        Epoch {
+            data_loss: -1,
+            configuration: EPOCH.configuration,
+        },
+        Epoch {
+            data_loss: 1,
+            configuration: -1,
+        },
+        Epoch::INVALID,
+    ] {
+        let mut invalid_pc = previous.clone();
+        invalid_pc.epoch = epoch;
+        assert!(p
+            .update_catch_up_configuration(previous.clone(), invalid_pc, cancel())
+            .await
+            .is_err());
+        assert!(p.snapshot().peers.is_empty());
+        assert_eq!(p.snapshot().progress, before.progress);
+        assert!(p.snapshot().ready);
+    }
+    // The active PC must match native provenance even when it is an older,
+    // otherwise valid epoch.
+    let mut wrong_pc = previous.clone();
+    wrong_pc.epoch.data_loss = 0;
+    assert!(p
+        .update_catch_up_configuration(current.clone(), wrong_pc, cancel())
+        .await
+        .is_err());
+    p.update_catch_up_configuration(current.clone(), previous.clone(), cancel())
+        .await
+        .unwrap();
+    p.update_current_configuration(current.clone(), cancel())
+        .await
+        .unwrap();
+    until(|| !p.snapshot().ready && p.snapshot().peers.len() == 1).await;
+    // E1 is still the engine epoch, but cannot undo installed E2 metadata.
+    assert!(p
+        .update_current_configuration(previous, cancel())
+        .await
+        .is_err());
+    let mut future = current.clone();
+    future.epoch.configuration += 0x1_0000_0000;
+    assert!(p
+        .update_current_configuration(future, cancel())
+        .await
+        .is_err());
+    assert!(p.snapshot().peers[0].configured);
+    assert!(!p.snapshot().ready);
+    assert_eq!(p.snapshot().progress, before.progress);
+    assert_eq!(p.snapshot().epoch, Some(EPOCH));
+    assert_eq!(provider.epochs.lock().unwrap().as_slice(), epochs);
+    assert_eq!(p.shared.revision.load(Ordering::Acquire), revision);
+    p.abort();
+    s.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unqualified_configuration_cannot_advance_or_rewind_native_epoch() {
+    let p = engine(Uuid::new_v4(), 1, Arc::new(Provider::default()));
+    p.change_role(EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    p.update_current_configuration(configuration(vec![], true, 1), cancel())
+        .await
+        .unwrap();
+    until(|| p.snapshot().ready).await;
+    for epoch in [
+        NEXT_EPOCH,
+        Epoch {
+            data_loss: 2,
+            configuration: 0,
+        },
+        Epoch {
+            data_loss: 0,
+            configuration: NEXT_EPOCH.configuration,
+        },
+    ] {
+        let mut current = configuration(vec![], true, 1);
+        current.epoch = epoch;
+        assert!(p
+            .update_current_configuration(current.clone(), cancel())
+            .await
+            .is_err());
+        assert!(p
+            .update_catch_up_configuration(current, configuration(vec![], true, 1), cancel())
+            .await
+            .is_err());
+        assert!(p.snapshot().ready);
+        assert_eq!(p.snapshot().epoch, Some(EPOCH));
+        assert_eq!(p.snapshot().progress.assigned, 0);
+    }
+    p.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catchup() {
+    let mut status = primary_status();
+    status.service_role = ReplicaRole::Secondary;
+    status.replicator_role = ReplicaRole::Secondary;
+    status.current_role = ReplicaRole::Secondary;
+    let view = Arc::new(SourceNativeView(Mutex::new(Ok(status))));
+    let (old, p, provider) = pair_with_native_view(Some(view.clone())).await;
+    old.change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+        .await
+        .unwrap();
+    p.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    let mut status = primary_status();
+    status.current_epoch = NEXT_EPOCH;
+    status.previous_epoch = EPOCH;
+    status.configuration_stage = ConfigurationStage::CatchUp;
+    status.catch_up = mssf_runtime::CatchUpResult::NotStarted;
+    status.configuration = vec![descriptor(&old)];
+    *view.0.lock().unwrap() = Ok(status);
+    let mut current = configuration(vec![], true, 1);
+    current.epoch = NEXT_EPOCH;
+    let mut inactive = configuration(vec![], false, 0);
+    inactive.epoch = Epoch::INVALID;
+    p.update_catch_up_configuration(current.clone(), inactive, cancel())
+        .await
+        .unwrap();
+    // Epoch ordering is lexicographic: a lower data-loss epoch may carry a
+    // larger configuration number without becoming a future PC.
+    let mut older = configuration(vec![], true, 1);
+    older.epoch = Epoch {
+        data_loss: 0,
+        configuration: NEXT_EPOCH.configuration + 0x1_0000_0000,
+    };
+    p.update_catch_up_configuration(current.clone(), older, cancel())
+        .await
+        .unwrap();
+    let previous = configuration(vec![descriptor(&old)], false, 1);
+    p.update_catch_up_configuration(current.clone(), previous.clone(), cancel())
+        .await
+        .unwrap();
+    let mut accepted = p
+        .submit(OperationData::new(vec![vec![7]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    provider.last.store(1, Ordering::Release);
+    let operation = old
+        .replication_stream()
+        .next(cancel())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.epoch, NEXT_EPOCH);
+    until(|| p.snapshot().peers[0].received == 1).await;
+    assert_eq!(p.snapshot().progress.committed, 0);
+    assert!(timeout(
+        std::time::Duration::from_millis(40),
+        accepted.wait(cancel())
+    )
+    .await
+    .is_err());
+    // Native catch-up uses CC plus the retained fence, not PC write commitment.
+    p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel())
+        .await
+        .unwrap();
+    let mut required = current.clone();
+    let mut target = descriptor(&old);
+    target.must_catch_up = true;
+    required.replicas.push(target);
+    p.update_catch_up_configuration(required, previous.clone(), cancel())
+        .await
+        .unwrap();
+    for mode in [CatchUpMode::WriteQuorum, CatchUpMode::All] {
+        assert!(timeout(
+            std::time::Duration::from_millis(40),
+            p.wait_for_catch_up(mode, cancel())
+        )
+        .await
+        .is_err());
+    }
+    let mut unavailable = previous.clone();
+    unavailable.write_quorum = 2;
+    p.update_catch_up_configuration(current.clone(), unavailable, cancel())
+        .await
+        .unwrap();
+    until(|| !p.snapshot().ready).await;
+    assert!(p
+        .submit(OperationData::new(vec![vec![8]]).unwrap(), cancel())
+        .await
+        .is_err());
+    assert_eq!(p.snapshot().progress.assigned, 1);
+    p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel())
+        .await
+        .unwrap();
+    p.wait_for_catch_up(CatchUpMode::All, cancel())
+        .await
+        .unwrap();
+    let mut previous = previous;
+    previous.local_member = true;
+    p.update_catch_up_configuration(current, previous, cancel())
+        .await
+        .unwrap();
+    assert_eq!(
+        p.snapshot().progress.committed,
+        0,
+        "PC q1 cannot self-commit"
+    );
+    operation.acknowledge().unwrap();
+    drop(operation);
+    assert_eq!(accepted.wait(cancel()).await.unwrap(), 1);
+    p.abort();
+    old.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1692,6 +2217,192 @@ impl StateProvider for ControlledProvider {
     ) -> Result<Arc<dyn OperationDataStream>> {
         self.base.copy_state(up_to, context)
     }
+}
+
+struct FaultNativeView {
+    faults: Mutex<Vec<mssf_runtime::FaultType>>,
+    pending: bool,
+    active: Arc<AtomicUsize>,
+    disposed: Arc<AtomicUsize>,
+}
+
+impl FaultNativeView {
+    fn new(pending: bool) -> Self {
+        Self {
+            faults: Mutex::new(Vec::new()),
+            pending,
+            active: Arc::new(AtomicUsize::new(0)),
+            disposed: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl NativeControlView for FaultNativeView {
+    fn status(&self) -> Result<ReplicaStatus> {
+        Ok(primary_status())
+    }
+    fn report_fault(
+        &self,
+        fault: mssf_runtime::FaultType,
+    ) -> ServiceFuture<'_, mssf_runtime::FaultDelivery> {
+        Box::pin(async move {
+            self.faults.lock().unwrap().push(fault);
+            self.active.fetch_add(1, Ordering::AcqRel);
+            let _capture = CallbackGuard {
+                active: self.active.clone(),
+                disposed: self.disposed.clone(),
+            };
+            if self.pending {
+                std::future::pending::<()>().await;
+            }
+            Ok(mssf_runtime::FaultDelivery {
+                fault,
+                attempts: 1,
+                last_error: None,
+                cancelled: false,
+                superseded_transient: false,
+            })
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn internal_provider_fault_notifies_once_and_pending_receipt_cannot_block_joined_abort() {
+    for mode in [1, 2] {
+        for pending in [false, true] {
+            let provider = Arc::new(ControlledProvider::default());
+            let provider_weak = Arc::downgrade(&provider);
+            let view = Arc::new(FaultNativeView::new(pending));
+            let partition = Uuid::new_v4();
+            let secondary = Engine::bind_with_native_control(
+                Actor {
+                    partition,
+                    replica: 2,
+                    incarnation: Uuid::new_v4(),
+                },
+                "127.0.0.1:0",
+                provider.clone(),
+                Settings::default(),
+                Some(view.clone()),
+            )
+            .unwrap();
+            secondary
+                .change_role(EPOCH, ReplicaRole::Idle, cancel())
+                .await
+                .unwrap();
+            let (transport, _incoming) =
+                PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+            let primary = endpoint(&transport, partition, 1);
+            transport.register_peer(&secondary.endpoint()).unwrap();
+            raw_send(
+                &transport,
+                &primary,
+                &secondary,
+                Body::StartCopy {
+                    epoch: EPOCH,
+                    target: 2,
+                    start: 1,
+                },
+            );
+            until(|| secondary.snapshot().epoch == Some(EPOCH)).await;
+            raw_send(
+                &transport,
+                &primary,
+                &secondary,
+                Body::Copy {
+                    epoch: EPOCH,
+                    target: 2,
+                    sequence: 1,
+                    data: vec![],
+                    last: true,
+                },
+            );
+            until(|| secondary.snapshot().copy_done).await;
+            let previous_disposed = provider.disposed.load(Ordering::Acquire);
+            provider.epoch_mode.store(mode, Ordering::Release);
+            // No native control callback is active: peer data triggers the
+            // internal epoch barrier whose provider completion faults the owner.
+            raw_send(
+                &transport,
+                &primary,
+                &secondary,
+                replication(NEXT_EPOCH, NEXT_EPOCH, 1, 7),
+            );
+            until(|| view.faults.lock().unwrap().len() == 1).await;
+            assert!(secondary.snapshot().fault.is_some());
+            assert!(!secondary.snapshot().ready);
+            let active = provider.active.clone();
+            let disposed = provider.disposed.clone();
+            drop(provider);
+            let closing = secondary.clone();
+            timeout(
+                std::time::Duration::from_secs(2),
+                tokio::task::spawn_blocking(move || closing.abort()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                *view.faults.lock().unwrap(),
+                vec![mssf_runtime::FaultType::Transient]
+            );
+            assert_eq!(view.active.load(Ordering::Acquire), 0);
+            assert_eq!(view.disposed.load(Ordering::Acquire), 1);
+            assert_eq!(active.load(Ordering::Acquire), 0);
+            assert_eq!(disposed.load(Ordering::Acquire), previous_disposed + 1);
+            assert!(provider_weak.upgrade().is_none());
+            assert!(secondary.snapshot().closed);
+            secondary.close(cancel()).await.unwrap();
+            assert_eq!(view.faults.lock().unwrap().len(), 1);
+            transport.shutdown();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn normal_shutdown_never_notifies_fault_and_standalone_has_no_native_view() {
+    for abort in [false, true] {
+        let view = Arc::new(FaultNativeView::new(true));
+        let engine = Engine::bind_with_native_control(
+            Actor {
+                partition: Uuid::new_v4(),
+                replica: 1,
+                incarnation: Uuid::new_v4(),
+            },
+            "127.0.0.1:0",
+            Arc::new(Provider::default()),
+            Settings::default(),
+            Some(view.clone()),
+        )
+        .unwrap();
+        if abort {
+            engine.abort();
+        } else {
+            engine.close(cancel()).await.unwrap();
+        }
+        assert!(view.faults.lock().unwrap().is_empty());
+        assert_eq!(view.disposed.load(Ordering::Acquire), 0);
+    }
+    let standalone = engine(Uuid::new_v4(), 1, Arc::new(Provider::default()));
+    assert!(standalone.native_control.is_none());
+    standalone.abort();
+    let view = Arc::new(FaultNativeView::new(true));
+    let startup_error = Engine::bind_with_native_control(
+        Actor {
+            partition: Uuid::new_v4(),
+            replica: 1,
+            incarnation: Uuid::new_v4(),
+        },
+        "127.0.0.1:0",
+        Arc::new(Provider {
+            last: AtomicI64::new(-1),
+            ..Provider::default()
+        }),
+        Settings::default(),
+        Some(view.clone()),
+    );
+    assert!(startup_error.is_err());
+    assert!(view.faults.lock().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

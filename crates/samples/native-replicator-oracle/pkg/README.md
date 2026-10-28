@@ -4,9 +4,18 @@
 environment. The injected `Fabric_NodeName` must be one of the five actual
 onebox names: N0010/native, N0020/Rust, N0030/native, N0040/Rust, N0050/Rust.
 There is no role override, native-engine substitute or compilation fallback.
-The mixed package declares both types but has **no default services**: the
-native branch registers only the stateful type. The Rust package preserves
+The mixed package declares both types but has **no default stateless service**:
+the native branch registers only the stateful type. One singleton
+`NativeBootstrap` stateful service is natively placed on N0010 to activate the
+native host and make the original `ApplicationId` observable before any
+separately-created data workload. It is not interoperability evidence; the real
+three-replica `Data` partition is still created separately with explicit profile
+bytes and mixed native placement. The Rust package preserves
 default stateless and empty-state services; data is a separately created service.
+Both templates retain the distinct `Replication` resource required by the
+unchanged mixed application's empty-profile bootstrap. It is not the data wire:
+the actual Rust/native data engines publish their own per-replica Fabric TCP
+listeners. The native oracle does not use HTTP for replication.
 
 From a clean source checkout, build once upstream:
 

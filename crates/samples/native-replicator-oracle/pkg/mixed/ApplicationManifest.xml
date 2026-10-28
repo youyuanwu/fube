@@ -17,5 +17,12 @@
       </ConfigOverride>
     </ConfigOverrides>
   </ServiceManifestImport>
-  <DefaultServices />
+  <DefaultServices>
+    <Service Name="NativeBootstrap" ServicePackageActivationMode="SharedProcess">
+      <StatefulService ServiceTypeName="RustStatefulRuntimeType" TargetReplicaSetSize="1" MinReplicaSetSize="1">
+        <SingletonPartition />
+        <PlacementConstraints>NodeType == N0010Ref</PlacementConstraints>
+      </StatefulService>
+    </Service>
+  </DefaultServices>
 </ApplicationManifest>

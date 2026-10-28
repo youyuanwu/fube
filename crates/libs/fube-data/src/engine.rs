@@ -32,7 +32,9 @@
 //! Control admission and the transport's bounded frame budget are separate.
 //! Callback futures are aborted and actually
 //! joined before transport disposal. Uncooperative synchronous user code or
-//! destructors remain subject to the runtime's independent fatal watchdog.
+//! destructors are enrolled in the runtime's independent fatal watchdog by
+//! [`Engine::bind_partition`]. Standalone [`Engine::bind`] callers must supply
+//! their own blocking fence; a Tokio timeout cannot fence a blocked executor.
 //! This is the volatile legacy-null-EOS, trusted clear-TCP profile, not durable
 //! storage, persisted copy context, an election system, or a native qualification.
 
@@ -46,8 +48,8 @@ use std::{
 };
 
 use mssf_runtime::{
-    CatchUpMode, ReplicaInformation, ReplicaRemoval, ReplicaSetConfiguration, ReplicationProgress,
-    Replicator, ServiceFuture,
+    CatchUpMode, ConfigurationStage, ReplicaInformation, ReplicaLifecycle, ReplicaRemoval,
+    ReplicaSetConfiguration, ReplicaStatus, ReplicationProgress, Replicator, ServiceFuture,
 };
 use serde::{ser::SerializeStruct, Serialize, Serializer};
 use tokio::{
@@ -62,7 +64,7 @@ use crate::{
     transport::{Incoming, PeerTransport},
     wire::{Actor, Body, Endpoint, Packet, WireOperation},
     Acknowledgment, Cancellation, Epoch, Error, Operation, OperationData, OperationDataStream,
-    OperationStream, Progress, ReplicaRole, Result, Settings, StateProvider,
+    OperationStream, Progress, ReplicaRole, Result, Settings, StateProvider, StatefulPartition,
 };
 
 #[cfg(test)]
@@ -223,6 +225,58 @@ struct Shared {
     callbacks: Arc<Semaphore>,
 }
 
+trait NativeControlView: Send + Sync {
+    fn status(&self) -> Result<ReplicaStatus>;
+    fn report_fault(
+        &self,
+        fault: mssf_runtime::FaultType,
+    ) -> ServiceFuture<'_, mssf_runtime::FaultDelivery>;
+}
+
+impl NativeControlView for StatefulPartition {
+    fn status(&self) -> Result<ReplicaStatus> {
+        StatefulPartition::status(self)
+    }
+    fn report_fault(
+        &self,
+        fault: mssf_runtime::FaultType,
+    ) -> ServiceFuture<'_, mssf_runtime::FaultDelivery> {
+        Box::pin(StatefulPartition::report_fault(self, fault))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NativePreWrite {
+    current: Epoch,
+    previous: Epoch,
+}
+
+impl NativePreWrite {
+    fn from_status(status: ReplicaStatus) -> Option<Self> {
+        (status.lifecycle == ReplicaLifecycle::Open
+            && status.replicator_open
+            && status.current_role == ReplicaRole::Secondary
+            && status.service_role == ReplicaRole::Primary
+            && status.replicator_role == ReplicaRole::Primary
+            && status.configuration_stage == ConfigurationStage::PreWriteRevoke)
+            .then_some(Self {
+                current: status.current_epoch.primary(),
+                previous: status.previous_epoch.primary(),
+            })
+    }
+
+    fn matches(
+        self,
+        current: &ReplicaSetConfiguration,
+        previous: Option<&ReplicaSetConfiguration>,
+    ) -> bool {
+        self.current == current.epoch.primary()
+            && previous
+                .filter(|pc| pc.write_quorum != 0)
+                .is_none_or(|pc| self.previous == pc.epoch.primary())
+    }
+}
+
 /// The last engine owner synchronously stops admission, drains buffered service
 /// operations, joins callbacks/the engine thread, then joins peer transport.
 /// Captures already published to application code stay charged until dropped.
@@ -237,14 +291,70 @@ pub struct Engine {
     copy: Arc<OperationStream>,
     thread: Mutex<Option<JoinHandle<()>>>,
     transport: PeerTransport,
+    native_control: Option<Arc<dyn NativeControlView>>,
 }
 
 impl Engine {
+    /// Bind an SF-activated replica and enroll every provider callback,
+    /// enumeration and owned capture disposal in the runtime's existing fence.
+    /// Qualified activated applications must use this entry point.
+    ///
+    /// Call from the runtime-owned service Open callback: the enclosing runtime
+    /// guard also supervises rejected argument destruction/initialization errors.
+    /// Accounting does not grant application access or authorize late results.
+    /// The partition's native status also authorizes pre-write-revoke membership
+    /// metadata ahead of UpdateEpoch, never an engine epoch or access change.
+    /// Terminal engine faults report a native transient fault through this same
+    /// generation; normal Close/Abort do not. Delivery is not a replacement ack.
+    pub fn bind_partition(
+        partition: StatefulPartition,
+        actor: Actor,
+        address: &str,
+        provider: Arc<dyn StateProvider>,
+        settings: Settings,
+    ) -> Result<Arc<Self>> {
+        settings.validate()?;
+        let provider = Arc::new(crate::supervised::SupervisedProvider::new(
+            partition.clone(),
+            settings.callback_timeout,
+            provider,
+        ));
+        partition.ensure_valid()?;
+        if actor.partition != partition.identity().partition_id
+            || actor.replica != partition.identity().replica_id
+        {
+            return Err(Error::InvalidInput(
+                "replication actor does not match native partition",
+            ));
+        }
+        Self::bind_with_native_control(
+            actor,
+            address,
+            provider,
+            settings,
+            Some(Arc::new(partition)),
+        )
+    }
+
+    /// Standalone binding for Rust source fixtures or use outside an SF host.
+    /// The caller is responsible for a blocking callback/destructor fence:
+    /// Tokio deadlines alone cannot supervise synchronous provider code.
+    /// SF-activated qualification must instead use [`Self::bind_partition`].
     pub fn bind(
         actor: Actor,
         address: &str,
         provider: Arc<dyn StateProvider>,
         settings: Settings,
+    ) -> Result<Arc<Self>> {
+        Self::bind_with_native_control(actor, address, provider, settings, None)
+    }
+
+    fn bind_with_native_control(
+        actor: Actor,
+        address: &str,
+        provider: Arc<dyn StateProvider>,
+        settings: Settings,
+        native_control: Option<Arc<dyn NativeControlView>>,
     ) -> Result<Arc<Self>> {
         settings.validate()?;
         let (transport, incoming) = PeerTransport::bind(address, settings.clone())?;
@@ -294,6 +404,7 @@ impl Engine {
         let state_settings = settings.clone();
         let state_replication = replication.clone();
         let state_copy = copy.clone();
+        let state_native_control = native_control.clone();
         let (ready, readiness) = std_mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("fube-engine".into())
@@ -342,6 +453,7 @@ impl Engine {
                         ack_tx,
                         replication_tx,
                         copy_tx,
+                        state_native_control,
                     );
                     owner.publish();
                     if ready.send(Ok(())).is_ok() {
@@ -369,7 +481,19 @@ impl Engine {
             copy,
             thread: Mutex::new(Some(thread)),
             transport,
+            native_control,
         }))
+    }
+
+    fn native_prewrite(&self) -> Result<Option<NativePreWrite>> {
+        // Capture the runtime-owned view before entering the owner queue and
+        // without holding engine locks (the runtime has its own status lock).
+        Ok(self
+            .native_control
+            .as_ref()
+            .map(|view| view.status())
+            .transpose()?
+            .and_then(NativePreWrite::from_status))
     }
 
     pub fn endpoint(&self) -> Endpoint {
@@ -566,6 +690,7 @@ enum Command {
     Configure {
         current: ReplicaSetConfiguration,
         previous: Option<ReplicaSetConfiguration>,
+        native_prewrite: Option<NativePreWrite>,
         cancellation: Cancellation,
         reply: Reply<()>,
     },
@@ -720,6 +845,7 @@ struct Owner {
     replication_tx: Option<mpsc::Sender<Operation>>,
     copy_tx: Option<mpsc::Sender<Operation>>,
     fault: Option<Error>,
+    native_control: Option<Arc<dyn NativeControlView>>,
 }
 
 impl Drop for Owner {
@@ -747,6 +873,7 @@ impl Owner {
         ack_tx: mpsc::Sender<ApplyAck>,
         replication_tx: mpsc::Sender<Operation>,
         copy_tx: mpsc::Sender<Operation>,
+        native_control: Option<Arc<dyn NativeControlView>>,
     ) -> Self {
         let dispatched = queue.progress().applied;
         Self {
@@ -783,6 +910,7 @@ impl Owner {
             replication_tx: Some(replication_tx),
             copy_tx: Some(copy_tx),
             fault: None,
+            native_control,
         }
     }
 
@@ -843,6 +971,22 @@ impl Owner {
         }
         self.shared.stopped.store(true, Ordering::Release);
         self.shared.revision.fetch_add(1, Ordering::AcqRel);
+        if self.fault.is_some() {
+            if let Some(view) = &self.native_control {
+                // Poll notification first to install the runtime-owned retry
+                // stage even when Close/Abort has already requested shutdown.
+                // Never wait for our own native disposal to release a receipt.
+                tokio::select! {
+                    biased;
+                    _ = view.report_fault(mssf_runtime::FaultType::Transient) => {},
+                    _ = async {
+                        if !*stop.borrow_and_update() {
+                            let _ = stop.changed().await;
+                        }
+                    } => {},
+                }
+            }
+        }
         if let Some(control) = &self.control {
             control.cancellation.cancel();
         }
@@ -1146,13 +1290,14 @@ impl Owner {
             Command::Configure {
                 current,
                 previous,
+                native_prewrite,
                 cancellation,
                 reply,
             } => {
                 let result = if cancellation.is_cancelled() {
                     Err(Error::Closed)
                 } else {
-                    self.configure(current, previous)
+                    self.configure(current, previous, native_prewrite)
                 };
                 let _ = reply.send(result);
             }
@@ -1317,7 +1462,6 @@ impl Owner {
 
     fn validate_configuration(&self, configuration: &ReplicaSetConfiguration) -> Result<()> {
         if self.role != ReplicaRole::Primary
-            || self.epoch != Some(configuration.epoch.primary())
             || configuration.replicas.len() > self.settings.connections
             || configuration.write_quorum > 65
         {
@@ -1373,7 +1517,37 @@ impl Owner {
         &mut self,
         current: ReplicaSetConfiguration,
         previous: Option<ReplicaSetConfiguration>,
+        native_prewrite: Option<NativePreWrite>,
     ) -> Result<()> {
+        let epoch = self
+            .epoch
+            .ok_or(Error::InvalidInput("configuration before native epoch"))?;
+        let current_epoch = current.epoch.primary();
+        // Native Update*ReplicaSetConfiguration has no epoch argument. Owned
+        // CC/PC epochs describe distinct node-selected configurations, not one
+        // shared quorum epoch (ComReplicator.cpp:815-861,893-915). RAP demotion
+        // installs CC before UpdateEpoch, but only in PreWriteRevoke.
+        let prewrite = current_epoch > epoch
+            && native_prewrite.is_some_and(|proof| proof.matches(&current, previous.as_ref()));
+        if current.epoch.data_loss < 0
+            || current.epoch.configuration < 0
+            || (current_epoch != epoch && !prewrite)
+            || self
+                .current
+                .as_ref()
+                .is_some_and(|old| current_epoch < old.epoch.primary())
+        {
+            return Err(Error::InvalidInput("configuration epoch"));
+        }
+        if let Some(pc) = &previous {
+            if pc.epoch.data_loss < 0
+                || pc.epoch.configuration < 0
+                || pc.epoch.primary() > current_epoch
+                || (pc.write_quorum != 0 && pc.epoch.primary() == Epoch::INVALID)
+            {
+                return Err(Error::InvalidInput("previous configuration epoch"));
+            }
+        }
         self.validate_configuration(&current)?;
         if let Some(previous) = &previous {
             self.validate_configuration(previous)?;
@@ -2977,10 +3151,23 @@ impl Replicator for Engine {
         } else {
             snapshot.progress.received
         };
-        Ok(ReplicationProgress {
-            first: snapshot.progress.first_retained.min(last),
-            last,
-        })
+        // Native queue capability is zero when no eligible committed
+        // (primary) / application-completed (secondary) history is retained;
+        // it is not the next sequence nor all received-but-unapplied history.
+        // ReplicationQueueManager.cpp:206-227; OperationQueue.h:80-87.
+        let available_through = if snapshot.role == ReplicaRole::Primary {
+            snapshot.progress.committed
+        } else {
+            snapshot.progress.applied
+        };
+        let first = if snapshot.progress.retained_operations > 0
+            && snapshot.progress.first_retained <= available_through
+        {
+            snapshot.progress.first_retained
+        } else {
+            0
+        };
+        Ok(ReplicationProgress { first, last })
     }
 
     fn on_data_loss(&self, cancellation: Cancellation) -> ServiceFuture<'_, bool> {
@@ -2997,9 +3184,11 @@ impl Replicator for Engine {
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
+            let native_prewrite = self.native_prewrite()?;
             self.request(|reply| Command::Configure {
                 current,
                 previous: Some(previous),
+                native_prewrite,
                 cancellation,
                 reply,
             })
@@ -3013,9 +3202,11 @@ impl Replicator for Engine {
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
+            let native_prewrite = self.native_prewrite()?;
             self.request(|reply| Command::Configure {
                 current,
                 previous: None,
+                native_prewrite,
                 cancellation,
                 reply,
             })

@@ -19,6 +19,7 @@
   <Resources>
     <Endpoints>
       <Endpoint Name="Rpc" Protocol="http" Type="Input" />
+      <Endpoint Name="Replication" Protocol="http" Type="Internal" />
     </Endpoints>
   </Resources>
 </ServiceManifest>

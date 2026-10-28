@@ -10,6 +10,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+use std::time::Duration;
 
 /// Bound on native-selected configuration descriptors admitted by this profile.
 pub const MAX_REPLICA_SET_SIZE: usize = 64;
@@ -78,8 +79,10 @@ pub struct ReplicaInformation {
     pub must_catch_up: bool,
 }
 
-/// Initialized application progress, independent of epochs and callback counts.
-/// A permanently empty implementation may report (0,0), never an invented log.
+/// Initialized native control progress, independent of epoch/callback counts.
+/// `first` is the catch-up/replay capability; zero can mean no eligible retained
+/// completed history even when `last` is nonzero. `last` is the replicator's
+/// role-specific current progress. Permanently empty state reports (0,0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicationProgress {
     pub first: i64,
@@ -351,8 +354,23 @@ impl ReplicaStatus {
     }
 }
 
-/// Generation-bound stateful partition. It does not expose stateless-shaped
-/// reporting methods or infer readiness from the returned client endpoint.
+/// Owned accounting for a stateful participant's callback or cleanup.
+///
+/// Keep this guard until the callback future AND its captures have actually
+/// been disposed, including on cancellation and unwind. Its finite deadline
+/// participates in the runtime's existing independent process fence and cannot
+/// be renewed or disarmed by the holder.
+///
+/// This is NOT authorization: it grants no role, lifetime, or native access.
+/// A guard may account for already-owned cleanup after partition invalidation;
+/// application operations still require the normal partition/access checks.
+#[must_use = "retain until the owned callback and its captures are actually disposed"]
+pub struct StatefulCallbackGuard {
+    _deadline: crate::lease::CallbackDeadline,
+}
+
+/// Generation-bound stateful partition. Fault reporting uses the bound native
+/// replica identity; it never infers readiness from the returned client endpoint.
 #[derive(Clone)]
 pub struct StatefulPartition {
     pub(crate) identity: ReplicaIdentity,
@@ -360,6 +378,7 @@ pub struct StatefulPartition {
     pub(crate) valid: Arc<AtomicBool>,
     pub(crate) authority: Arc<crate::lease::Authority>,
     pub(crate) status: Arc<Mutex<ReplicaStatus>>,
+    pub(crate) reporting: Option<Arc<crate::reporting::Reporting>>,
 }
 impl StatefulPartition {
     pub fn identity(&self) -> &ReplicaIdentity {
@@ -375,6 +394,42 @@ impl StatefulPartition {
         } else {
             Err(Error::Closed)
         }
+    }
+    /// Await the initial local fault-frame write, not native acknowledgment or
+    /// replacement. Retries retain this generation's native identity until unit
+    /// disposal, even if the caller drops its future or executor.
+    /// Initial errors leave a bounded retry stage; permanent supersedes transient.
+    pub async fn report_fault(&self, fault: crate::FaultType) -> Result<crate::FaultDelivery> {
+        self.ensure_valid()?;
+        self.reporting
+            .as_ref()
+            .ok_or(Error::Closed)?
+            .fault(fault)
+            .await
+    }
+    /// Latest bounded fault-stage status, including retry error/cancellation.
+    pub fn fault_delivery(&self) -> Option<crate::FaultDelivery> {
+        self.reporting
+            .as_ref()
+            .and_then(|reporting| reporting.fault_status())
+    }
+    /// Account for an owned callback/capture lifetime, including its destruction.
+    ///
+    /// This does not authorize invoking new application work. Callers must
+    /// independently enforce partition validity and native access. Cleanup of
+    /// already-owned work may enroll after unit validity is revoked, without
+    /// reviving terminal process authority or extending any existing deadline.
+    /// Enrollment is finite (at most 30 seconds), shares the runtime's 64
+    /// callback slots, and is rejected once runtime disarming begins.
+    pub fn supervise_owned_callback(&self, timeout: Duration) -> Result<StatefulCallbackGuard> {
+        if timeout.is_zero() || timeout > Duration::from_secs(30) {
+            return Err(Error::InvalidInput(
+                "owned callback deadline must be >0 and <=30 seconds",
+            ));
+        }
+        Ok(StatefulCallbackGuard {
+            _deadline: self.authority.callback_deadline(timeout, true)?,
+        })
     }
     pub fn authority_remaining(&self) -> Result<std::time::Duration> {
         self.ensure_valid()?;
@@ -394,3 +449,7 @@ impl StatefulPartition {
 #[cfg(test)]
 #[path = "stateful_api_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "stateful_callback_tests.rs"]
+mod callback_tests;

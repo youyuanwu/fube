@@ -81,8 +81,10 @@ async fn native_socket(address: &str, published: &str) -> TcpStream {
         },
         &ListenInstance {
             address: published.into(),
-            instance: 1,
-            nonce: [8; 16],
+            // Native replication transports default to instance zero, and an
+            // initiating TcpConnection has no listen-side nonce yet.
+            instance: 0,
+            nonce: [0; 16],
         },
     )
     .unwrap();
@@ -442,7 +444,7 @@ async fn malformed_security_and_identity_only_retire_the_offending_session() {
 }
 
 #[tokio::test]
-async fn invalid_listen_identity_releases_its_session_and_byte_charge() {
+async fn invalid_listener_address_releases_its_session_and_byte_charge() {
     let (transport, mut incoming) = PeerTransport::bind(
         "127.0.0.1:0",
         Settings {
@@ -451,7 +453,7 @@ async fn invalid_listen_identity_releases_its_session_and_byte_charge() {
         },
     )
     .unwrap();
-    for nonce in [[0; 16], [9; 16]] {
+    for address in ["", "not-a-listener"] {
         let mut bad = TcpStream::connect(transport.address()).await.unwrap();
         read_message(&mut bad).await.unwrap();
         write_message(
@@ -462,9 +464,9 @@ async fn invalid_listen_identity_releases_its_session_and_byte_charge() {
                     index: 1,
                 },
                 &ListenInstance {
-                    address: "127.0.0.1:32111".into(),
-                    instance: if nonce == [0; 16] { 1 } else { 0 },
-                    nonce,
+                    address: address.into(),
+                    instance: 0,
+                    nonce: [0; 16],
                 },
             )
             .unwrap(),
@@ -479,6 +481,53 @@ async fn invalid_listen_identity_releases_its_session_and_byte_charge() {
         .await
         .unwrap();
     receive(&mut incoming.control).await;
+    transport.shutdown();
+}
+
+#[tokio::test]
+async fn native_zero_instance_acceptor_and_directional_nonce_are_wire_compatible() {
+    let (transport, mut incoming) =
+        PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap().to_string();
+    let source = transport.address().to_owned();
+    transport.register_peer(&endpoint(&remote, 2)).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let hello = read_message(&mut socket).await.unwrap();
+        let hello = ListenInstance::decode(&hello.body).unwrap();
+        assert_eq!(hello.address, source);
+        assert_eq!(
+            hello.nonce, [0; 16],
+            "initiating connections have no listen-side nonce"
+        );
+        write_message(
+            &mut socket,
+            &Message::listen_instance(
+                MessageId {
+                    guid: [1; 16],
+                    index: 1,
+                },
+                &ListenInstance {
+                    address: remote.clone(),
+                    instance: 0,
+                    nonce: [7; 16],
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let packet = Packet::decode(&read_message(&mut socket).await.unwrap()).unwrap();
+        assert_eq!(packet.body, Body::RequestAck);
+        let reply = request(&remote, 2, 1);
+        write_message(&mut socket, &reply.encode(true).unwrap())
+            .await
+            .unwrap();
+        reply
+    });
+    transport.send(request(transport.address(), 1, 2)).unwrap();
+    assert_eq!(receive(&mut incoming.control).await, server.await.unwrap());
     transport.shutdown();
 }
 

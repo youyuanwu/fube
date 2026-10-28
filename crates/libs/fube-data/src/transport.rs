@@ -177,7 +177,7 @@ impl PeerTransport {
                     .unwrap_or_default()
                     .as_micros()
                     .clamp(1, u64::MAX as u128) as u64,
-                nonce: Uuid::new_v4().to_bytes_le(),
+                nonce: [0; 16],
             },
             settings,
             routes: Mutex::new(HashMap::new()),
@@ -473,7 +473,7 @@ async fn supervise(
                     let network = network.clone();
                     let ready = ready.clone();
                     tasks.spawn(async move {
-                        let _ = run_session(socket, id, network, ready, data_rx, control_rx).await;
+                        let _ = run_session(socket, id, network, ready, data_rx, control_rx, true).await;
                         id
                     });
                 }
@@ -535,7 +535,8 @@ fn route_outgoing(
                 )
                 .await
                 {
-                    let _ = run_session(stream, id, network, ready, data_rx, control_rx).await;
+                    let _ =
+                        run_session(stream, id, network, ready, data_rx, control_rx, false).await;
                 }
                 id
             });
@@ -558,16 +559,28 @@ async fn run_session(
     ready: mpsc::Sender<Ready>,
     mut data: mpsc::Receiver<Outgoing>,
     mut control: mpsc::Receiver<Outgoing>,
+    inbound: bool,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let (mut reader, mut writer) = stream.into_split();
     let deadline = network.settings.callback_timeout;
+    // Native TcpConnection.cpp:126 uses zero on an initiating connection and a
+    // new listen-side nonce on an accepted one. Transport instance zero is also
+    // the native default (TcpDatagramTransport.h:251). Neither is replica proof.
+    let local_instance = ListenInstance {
+        nonce: if inbound {
+            Uuid::new_v4().to_bytes_le()
+        } else {
+            [0; 16]
+        },
+        ..network.local.clone()
+    };
     let instance = Message::listen_instance(
         MessageId {
             guid: Uuid::new_v4().to_bytes_le(),
             index: 1,
         },
-        &network.local,
+        &local_instance,
     )?;
     timeout(deadline, write_message(&mut writer, &instance))
         .await
@@ -603,10 +616,7 @@ async fn run_session(
         return Err(Error::Protocol("expected native peer ListenInstance"));
     }
     let remote_instance = ListenInstance::decode(&remote.message.body)?;
-    if remote_instance.instance == 0
-        || remote_instance.nonce == [0; 16]
-        || remote_instance.address.is_empty()
-    {
+    if remote_instance.address.is_empty() {
         return Err(Error::Protocol("invalid peer ListenInstance"));
     }
     // Reuse endpoint validation without resolving peer-supplied hostnames.

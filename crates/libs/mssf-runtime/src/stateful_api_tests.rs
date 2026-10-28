@@ -4,7 +4,7 @@ use AccessStatus::{
 };
 use ReplicaRole::{Idle, None, Primary, Secondary};
 
-fn status() -> ReplicaStatus {
+pub(super) fn status() -> ReplicaStatus {
     ReplicaStatus {
         lifecycle: ReplicaLifecycle::Open,
         service_role: Primary,
@@ -241,6 +241,7 @@ fn stateful_partition_snapshot_cannot_grant_or_revive_owner_authority() {
         authority: authority.clone(),
         valid: valid.clone(),
         status: Arc::new(Mutex::new(status())),
+        reporting: Option::None,
     };
     assert_eq!(partition.identity().replica_id, 43);
     assert_eq!(partition.identity().incarnation, 7);

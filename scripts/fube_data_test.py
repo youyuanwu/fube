@@ -541,15 +541,17 @@ def identity(replica: dict) -> tuple:
     return replica["node"], replica["replica"], rpc["incarnation"], rpc["engine_incarnation"], rpc["host"], rpc["pid"]
 
 
-def assert_data(value: dict, service: str, mixed: bool, target: int = 3, minimum: int = 2) -> dict:
+def assert_data(value: dict, service: str, mixed: bool, target: int = 3, minimum: int = 2,
+                *, require_full: bool = True) -> dict:
     require(value.get("observer") == "mssf-client" and value.get("service") == service,
             "native data service identity")
     native = value["native_partition"]
     require(native["target"] == target and native["minimum"] == minimum and native["status"] == "Ready",
             "native partition is not ready at its actual requested size")
     ready = [replica for replica in value["replicas"] if replica["status"] == "Ready"]
-    require(len(ready) == target and len({r["node"] for r in ready}) == target
-            and len({r["replica"] for r in ready}) == target
+    require((len(ready) == target if require_full else minimum <= len(ready) <= target)
+            and len({r["node"] for r in ready}) == len(ready)
+            and len({r["replica"] for r in ready}) == len(ready)
             and sum(r["role"] == "Primary" for r in ready) == 1, "native role/placement cardinality")
     kinds = set()
     for replica in ready:
@@ -570,9 +572,19 @@ def assert_data(value: dict, service: str, mixed: bool, target: int = 3, minimum
         if "service" in rpc:
             require(rpc["service"] == service, "HTTP service mismatch")
         epoch = rpc["native_epoch"]
-        require(isinstance(epoch, dict) and epoch["data_loss"] == native["epoch"]["data_loss"]
-                and epoch["configuration"] & ~0xFFFFFFFF == native["epoch"]["configuration"],
-                "native projected/full epoch mismatch")
+        if epoch is None:
+            # A native empty secondary can complete copy before receiving its
+            # first original-epoch operation/provider UpdateEpoch callback.
+            # Keep the observation null; FM remains the actual epoch authority.
+            require(kind=="native-classic-v1" and role=="Secondary"
+                    and rpc["state"]["last"]==0 and not rpc["state"]["values"] and not rpc["state"]["results"]
+                    and rpc["engine"]["progress"].get("received")==0
+                    and rpc.get("native_current_progress")==0,
+                    "missing native epoch callback after nonempty progress")
+        else:
+            require(isinstance(epoch, dict) and epoch["data_loss"] == native["epoch"]["data_loss"]
+                    and epoch["configuration"] & ~0xFFFFFFFF == native["epoch"]["configuration"],
+                    "native projected/full epoch mismatch")
         require(not rpc["state"]["copy_in_progress"] and rpc["engine"]["copy_done"]
                 and not rpc["engine"]["closed"] and not rpc["engine"]["fault"] and not rpc["pump_fault"],
                 "data provider/engine not ready or faulted")
@@ -597,7 +609,8 @@ def assert_data(value: dict, service: str, mixed: bool, target: int = 3, minimum
                     and rpc["write_status"] == "Granted", "native primary access is not granted")
         else:
             require(replica["service_http_status"] == 503, "secondary serves authoritative reads")
-    require(not mixed or target != 3 or kinds == {"rust", "native-classic-v1"}, "actual partition is not mixed")
+    require(not require_full or not mixed or target != 3 or kinds == {"rust", "native-classic-v1"},
+            "actual partition is not mixed")
     primary = value["primary"]
     placed = next(r for r in ready if r["role"] == "Primary")
     require(primary["resolver"] == "mssf-client"
@@ -675,17 +688,23 @@ class Client:
 
     def refresh(self) -> dict:
         observed = assert_data(native_snapshot(self.bundle, self.service), self.service, self.mixed,
-                               self.target, self.minimum)
+                               self.target, self.minimum, require_full=False)
         self.endpoint = observed["primary"]["endpoint"]
         return observed
 
     def write(self, request_id: str, timeout: float = 40, stop: threading.Event | None = None) -> dict:
         record = self.ledger.mutation(request_id)
         deadline = time.monotonic() + timeout
-        if self.endpoint is None:
-            self.refresh()
         while time.monotonic() < deadline:
             require(stop is None or not stop.is_set(), "owned write workload cancelled")
+            if self.endpoint is None:
+                try:
+                    self.refresh()
+                except (RuntimeError, subprocess.TimeoutExpired, OSError) as error:
+                    record["attempts"].append({"at":time.monotonic(),"outcome":"observation_unavailable",
+                                               "error":str(error)})
+                    time.sleep(.1)
+                    continue
             try:
                 status, reply = request(self.endpoint, "write",
                                         {key: record[key] for key in ("id", "key", "value")})
@@ -694,15 +713,15 @@ class Client:
                     return record
                 if outcome == "rejected" and record["sequence"] is None:
                     # Only definite pre-admission rejection allows a fresh attempt.
-                    self.refresh()
+                    self.endpoint = None
                 else:
                     # An accepted operation is never undone. Same ID/sequence only.
                     time.sleep(0.1)
-                    self.refresh()
+                    self.endpoint = None
             except (OSError, http.client.HTTPException) as error:
                 record["attempts"].append({"at": time.monotonic(), "outcome": "ambiguous_transport",
                                            "error": str(error)})
-                self.refresh()
+                self.endpoint = None
         raise RuntimeError(f"identified write remains unresolved: {request_id}, sequence={record['sequence']}")
 
 
@@ -976,6 +995,17 @@ def data_loss_invariants(before: dict, after: dict, ledger: Ledger, changed: boo
             require(replica["rpc"]["native_current_progress"] == expected_last,
                     "native replicator progress differs from its actual reconciled provider")
     require(callbacks, "no actual native OnDataLoss callback increment on a queried original surviving provider")
+    if any(replica["rpc"]["engine_kind"] == "native-classic-v1" for replica in before["replicas"]):
+        require(before["native_partition"]["target"] == 3 and before["native_partition"]["minimum"] == 2
+                and len(before["replicas"]) == 3
+                and {replica["node"] for replica in before["replicas"]} == set(MIXED_NODES)
+                and before["primary"]["rpc"]["node"] == "N0020"
+                and before["primary"]["rpc"]["engine_kind"] == "rust",
+                "mixed partial loss requires three ready replicas with the Rust primary selected for removal")
+        require(len(survivors) == 1 and survivors[0]["rpc"]["engine_kind"] == "native-classic-v1"
+                and after["primary"]["rpc"]["engine_kind"] == "native-classic-v1"
+                and any(replica["role"] == "Primary" for replica in callbacks),
+                "mixed partial loss did not establish the original native survivor as the new primary with an actual callback")
     primary = after["primary"]["rpc"]
     if primary["engine_kind"] == "rust":
         require(primary["engine"]["progress"]["assigned"] == expected_last
@@ -1654,10 +1684,10 @@ class Qualification:
             "service", "list", "--application-id", self.result["application"].removeprefix("fabric:/")))),
             "minted auxiliary service collision; no adoption")
         auxiliary_mixed = self.mixed and self.result.get("profile") != "full"
-        nodes = (("N0010", "N0030") if auxiliary_mixed else
+        nodes = (MIXED_NODES if auxiliary_mixed else
                  tuple(node for node, kind in NODE_ENGINES.items() if kind == "rust") if self.mixed else tuple(NODE_ENGINES))
         auxiliary = {"service": service, "partition": None, "changed": changed,
-                     "target": 2 if auxiliary_mixed else 3, "minimum": 2, "mixed": auxiliary_mixed,
+                     "target": 3, "minimum": 2, "mixed": auxiliary_mixed, "eligible_nodes": nodes,
                      "application_native_id": self.original_application.native_application_id,
                      "original_routes": [], "create_state": "requested", "cleanup": {}}
         # A lost create response must remain visible to the original-app cleanup.
@@ -1675,6 +1705,52 @@ class Qualification:
         self.remember_auxiliary(auxiliary, value)
         evidence["initial_observation"] = value
         return auxiliary
+
+    def move_auxiliary_primary(self, auxiliary: dict, before: dict, target_node: str,
+                               seed: Ledger, evidence: dict) -> dict:
+        self.guard_application()
+        require(auxiliary["application_native_id"] == self.original_application.native_application_id
+                and self.auxiliary_partition(auxiliary) == before["partition"],
+                "native MovePrimary requires the original application's owned auxiliary partition")
+        service = auxiliary["service"]
+        assert_data(before, service, auxiliary["mixed"], auxiliary["target"], auxiliary["minimum"])
+        targets = [replica for replica in before["replicas"]
+                   if replica["role"] == "ActiveSecondary" and replica["status"] == "Ready"
+                   and replica["node"] in auxiliary["eligible_nodes"]]
+        selected = next((replica for replica in targets if replica["node"] == target_node), None)
+        require(selected is not None, "auxiliary MovePrimary requires an observed eligible ActiveSecondary")
+        evidence.update(service=service, partition=auxiliary["partition"],
+                        application_native_id=auxiliary["application_native_id"], before=before,
+                        target=target_node, eligible_targets=[{
+                            "identity": identity(replica), "node": replica["node"], "role": replica["role"],
+                            "engine_kind": replica["rpc"]["engine_kind"], "epoch": replica["rpc"]["native_epoch"]}
+                            for replica in targets])
+        response = runtime.run(str(self.bundle.observer), "127.0.0.1:19000", service,
+                               "--move-primary", target_node, timeout=75)
+        reply = evidence["move_request"] = strict_json(response)
+        require(reply.get("request") == "MovePrimary" and reply.get("partition") == auxiliary["partition"]
+                and reply.get("target") == target_node and reply.get("constraints") == "enforced"
+                and reply.get("native_request_completed") is True,
+                "native auxiliary MovePrimary did not confirm the owned partition/target with constraints enforced")
+        original = {identity(replica) for replica in before["replicas"]}
+        def settled(value):
+            require(value["partition"] == auxiliary["partition"], "auxiliary MovePrimary partition identity drift")
+            seed.compare(value)
+            return (value["primary"]["rpc"]["node"] == target_node
+                    and runtime.epoch_of(value) > runtime.epoch_of(before)
+                    and {identity(replica) for replica in value["replicas"]} == original
+                    and all(replica["rpc"]["state"]["last"] == 20
+                            and replica["rpc"]["engine"]["progress"]["applied"] == 20
+                            and (replica["rpc"]["engine_kind"] != "native-classic-v1"
+                                 or replica["rpc"]["native_current_progress"] == 20)
+                            for replica in value["replicas"]))
+        after = self.wait(service=service, target=auxiliary["target"], minimum=auxiliary["minimum"],
+                          mixed=auxiliary["mixed"], capture=evidence, accept=settled)
+        assert_data(after, service, auxiliary["mixed"], auxiliary["target"], auxiliary["minimum"])
+        require(settled(after), "auxiliary MovePrimary did not settle with all 20 writes applied in the original lifetimes")
+        self.remember_auxiliary(auxiliary, after)
+        evidence["after"] = after
+        return after
 
     def cleanup_auxiliary(self, auxiliary: dict) -> None:
         cleanup = auxiliary["cleanup"]
@@ -1759,6 +1835,7 @@ class Qualification:
         siblings = self.stateless_siblings() if not self.mixed else None
         auxiliary = self.create_auxiliary(changed, evidence)
         service, target, minimum = auxiliary["service"], auxiliary["target"], auxiliary["minimum"]
+        require(target == 3 and minimum == 2, "native partial loss requires auxiliary membership bound to target 3/minimum 2")
         seed = Ledger()
         client = Client(self.bundle, service, auxiliary["mixed"], seed, target, minimum)
         client.endpoint = evidence["initial_observation"]["primary"]["endpoint"]
@@ -1774,7 +1851,10 @@ class Qualification:
         settled_seed = None
         def seeded_and_stable(value):
             nonlocal settled_seed
-            if not coherent(seed)(value):
+            if not coherent(seed)(value) or not all(
+                    replica["rpc"]["state"]["last"] == 20
+                    and replica["rpc"]["engine"]["progress"]["applied"] == 20
+                    for replica in value["replicas"]):
                 return False
             previous, settled_seed = settled_seed, value
             if previous is None:
@@ -1787,8 +1867,27 @@ class Qualification:
         before = self.wait(service=service, target=target, minimum=minimum, mixed=auxiliary["mixed"],
                            capture=evidence, accept=seeded_and_stable)
         self.remember_auxiliary(auxiliary, before)
+        if auxiliary["mixed"]:
+            moves = evidence["pre_fas_moves"] = []
+            if before["primary"]["rpc"]["node"] == "N0020":
+                native_secondary = next((replica for replica in before["replicas"]
+                                         if replica["role"] == "ActiveSecondary"
+                                         and replica["rpc"]["engine_kind"] == "native-classic-v1"), None)
+                require(native_secondary is not None, "no observed native secondary to prepare the auxiliary Rust primary move")
+                moves.append({})
+                before = self.move_auxiliary_primary(auxiliary, before, native_secondary["node"], seed, moves[-1])
+            moves.append({})
+            before = self.move_auxiliary_primary(auxiliary, before, "N0020", seed, moves[-1])
+            require(before["primary"]["rpc"]["node"] == "N0020"
+                    and before["primary"]["rpc"]["engine_kind"] == "rust",
+                    "mixed auxiliary must have the observed Rust primary before arming/FAS")
         evidence.update(before=before, seed_workload=seed.compare(before),
                         actual_engine_kinds=sorted({replica["rpc"]["engine_kind"] for replica in before["replicas"]}),
+                        expected_survivor_engine_kind="native-classic-v1" if auxiliary["mixed"] else "rust",
+                        pre_fas_roles_epochs=[{
+                            "identity": identity(replica), "node": replica["node"], "role": replica["role"],
+                            "engine_kind": replica["rpc"]["engine_kind"], "epoch": replica["rpc"]["native_epoch"]}
+                            for replica in before["replicas"]],
                         explicit_data_loss_scope="Only this fresh auxiliary may lose acknowledged volatile writes; main ledger is never reset.")
         require(before["primary"]["rpc"]["state"]["last"] == 20, "fresh auxiliary provider seed progress differs")
         for replica in before["replicas"]:
@@ -1872,7 +1971,9 @@ class Qualification:
         evidence.update(unchanged={}, changed={}, driver="Native FaultAnalysisService PartialDataLoss, not a manual callback/election",
                         source_contract="service-fabric 51a7703a1f83749a9234d3ceb4296d8622e42cca: "
                         "httpgateway/FaultsHandler.cpp (StartDataLoss, GetDataLossProgress, CancelTestCommand); "
-                        "Constants.cpp:398-406; managed/FabricFAS/.../InvokeDataLossSteps.cs:90-104,270-320")
+                        "Constants.cpp:398-406; managed/FabricFAS/.../InvokeDataLossSteps.cs:90-104,270-320; "
+                        "FaultAnalysisServiceUtility.cs:565-595 GetReplicasForPartialLoss removes the primary plus "
+                        "floor(live replicas/2) secondaries: two loses both; three with a Rust primary leaves one native survivor")
         self.data_loss_case(evidence["unchanged"], False)
         self.data_loss_case(evidence["changed"], True)
 
@@ -1975,7 +2076,7 @@ class Qualification:
 
 def provenance(bundle: Bundle) -> dict:
     def sha_env(name):
-        value = os.environ.get(name)
+        value = os.environ.get(name) or None
         require(value is None or re.fullmatch(r"[a-f0-9]{40}", value), f"invalid provenance SHA: {name}")
         return value
     return {
@@ -1984,7 +2085,8 @@ def provenance(bundle: Bundle) -> dict:
         "review_head": sha_env("FUBE_REVIEW_HEAD"),
         "ci_head": sha_env("FUBE_CI_HEAD"),
         "ci_merge": sha_env("FUBE_CI_MERGE"),
-        "ci_run_id": os.environ.get("GITHUB_RUN_ID"),
+        "ci_run_id": os.environ.get("FUBE_CI_RUN_ID") or os.environ.get("GITHUB_RUN_ID"),
+        "qualification_script_sha256": runtime.digest(Path(__file__)),
         "note": "Review/CI revisions are caller labels, not executable or successful CI evidence.",
     }
 
@@ -2637,8 +2739,17 @@ def manifest_identity(text: str) -> TypeIdentity:
     require(marker is not None and re.fullmatch(r"[a-f0-9]{64}", marker.get("DefaultValue", "")),
             "native type has no run-created immutable manifest capability")
     def canonical(element):
+        children=list(element)
+        if element.tag==f"{{{runtime.NS}}}Parameters":
+            # Native GetApplicationManifest serializes this name-keyed map in
+            # lexical order. The executed 11.8.121.4 response reverses our two
+            # inserted capability declarations without changing either value.
+            require(all(child.tag==f"{{{runtime.NS}}}Parameter" and child.get("Name") for child in children)
+                    and len({child.get("Name") for child in children})==len(children),
+                    "ambiguous native manifest parameter map")
+            children.sort(key=lambda child:child.attrib["Name"])
         return [element.tag, sorted(element.attrib.items()), (element.text or "").strip(),
-                [canonical(child) for child in element]]
+                [canonical(child) for child in children]]
     fingerprint = hashlib.sha256(json.dumps(canonical(root), separators=(",", ":")).encode()).hexdigest()
     return TypeIdentity(root.attrib["ApplicationTypeName"], root.attrib["ApplicationTypeVersion"],
                         marker.attrib["DefaultValue"], fingerprint)
@@ -2701,7 +2812,10 @@ def native_type_identity(allocation, expected: TypeIdentity, *, capture: bool = 
         return None
     actual = manifest_identity(value["Manifest"])
     require(actual == replace(expected, native_generation=None),
-            "original native type manifest/capability changed; refuse unprovision")
+            "original native type manifest/capability changed; refuse unprovision; "
+            + json.dumps({"expected":vars(replace(expected,native_generation=None)),
+                          "actual":vars(actual),"observed_generation":generation,
+                          "native_manifest":value["Manifest"][:16384]}))
     if not capture:
         generation = native_type_generation(allocation, expected)
     require(expected.native_generation in (None, generation),
@@ -2799,6 +2913,18 @@ def deployment_mutation(allocation, outcomes: dict, stage: str, *args: str) -> N
     outcomes[stage] = "accepted"
 
 
+def verify_image_store_upload_absent(allocation, upload: UploadOwnership) -> dict:
+    """Read-only proof for the native upload, separately from local staging."""
+    require(allocation.verify()==upload.container_id,"original upload allocation changed")
+    name=upload.path.rsplit("/",1)[1]
+    require(re.fullmatch(r"fube-data-[a-f0-9]{32}",name),"invalid original ImageStore upload path")
+    path="/ImageStore/"+name+"?api-version=6.2"
+    response=strict_json(allocation.execute("python3","-c",OWNERSHIP_READ,path,timeout=15))
+    require(response=={"status":404,"body":None},
+            "native ImageStore upload absence not proven; retain recovery path, never delete by name")
+    return {"path":name,"native_response":response,"absence_verified":True}
+
+
 def cleanup_data_deployment(allocation, result: dict, outcomes: dict,
                             original_type: TypeIdentity | None,
                             original_application: ApplicationIdentity | None,
@@ -2867,6 +2993,10 @@ def cleanup_data_deployment(allocation, result: dict, outcomes: dict,
         retain("deployment", str(error))
     finally:
         if upload is not None:
+            try:
+                cleanup["image_store_upload"]=verify_image_store_upload_absent(allocation,upload)
+            except Exception as error:
+                retain("image_store_upload",str(error))
             try:
                 check_upload(allocation, upload, "remove")
                 cleanup["upload"] = "original reservation removed"
@@ -3090,6 +3220,11 @@ class NativeDataDeploymentPolicy:
         finally:
             for version, record in self.versions.items():
                 if record.upload is not None:
+                    try:
+                        cleanup.setdefault("image_store_uploads",{})[version]=verify_image_store_upload_absent(
+                            allocation,record.upload)
+                    except Exception as error:
+                        retain("image_store_upload "+version,error)
                     try:
                         check_upload(allocation, record.upload, "remove")
                         cleanup.setdefault("uploads", {})[version] = "original reservation removed; absence confirmed"

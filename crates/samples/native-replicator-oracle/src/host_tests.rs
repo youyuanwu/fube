@@ -68,6 +68,8 @@ fn route() -> Arc<Route> {
         copy_stream_items: AtomicU64::new(0),
         copy_stream_eos: AtomicU64::new(0),
         replication_stream_items: AtomicU64::new(0),
+        acknowledged_sequence: [AtomicI64::new(0), AtomicI64::new(0)],
+        acknowledgment_calls: [AtomicU64::new(0), AtomicU64::new(0)],
         replication_stream_eos: AtomicU64::new(0),
         received: AtomicI64::new(0),
         assigned: AtomicI64::new(0),

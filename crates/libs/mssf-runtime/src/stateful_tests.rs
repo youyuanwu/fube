@@ -405,6 +405,205 @@ fn request(h: &Harness, partition: u8, incarnation: i64, mode: u8) -> ProxyReque
 }
 
 #[tokio::test]
+async fn owned_stateful_fault_uses_native_identity_epochs_and_generation_fences() {
+    let mut h = Harness::new().await;
+    let calls = register(&h);
+    let sibling_request = h.request(1, 1, 0);
+    h.send("ReplicaOpen", &sibling_request).await;
+    h.receive("ReplicaOpenReply").await;
+    let mut open = request(&h, 2, 17, 20);
+    h.send("ReplicaOpen", &open).await;
+    h.receive("ReplicaOpenReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    let mut current = open.clone();
+    current.unit.current.configuration += 7;
+    current.unit.previous = open.unit.current.clone();
+    current.remote = ObjectArray(vec![open.local.clone()]);
+    current.runtime.clear();
+    current.service = native_default_service(current.service);
+    h.send("UpdateConfiguration", &current).await;
+    h.receive("UpdateConfigurationReply").await;
+    let mut partition = calls.partitions.lock().unwrap()[0].clone();
+    // Neither mutable copies of identity nor role diagnostics retarget reports.
+    partition.identity.partition_id = uuid::Uuid::nil();
+    partition.identity.replica_id = -1;
+    partition.identity.incarnation = -1;
+    let (result, message) = tokio::join!(
+        partition.report_fault(FaultType::Transient),
+        h.receive("RAReportFault")
+    );
+    assert_eq!(result.unwrap().attempts, 1);
+    assert_eq!(message.properties().unwrap().actor, 12);
+    let fault: FaultBody = from_slice(&message.body).unwrap();
+    assert_eq!(fault.fault, 1);
+    assert_eq!(to_vec(&fault.unit).unwrap(), to_vec(&current.unit).unwrap());
+    assert_eq!((fault.local.id, fault.local.instance), (100, 17));
+    assert_eq!(fault.local.node.id.0, current.local.node.id.0);
+    assert_eq!(fault.local.node.instance, current.local.node.instance);
+    assert_eq!(fault.activity.kind, 2);
+    assert_eq!(
+        partition
+            .report_fault(FaultType::Transient)
+            .await
+            .unwrap()
+            .attempts,
+        1
+    );
+    h.no_reply().await;
+    open.unit = current.unit.clone();
+    h.send("ReplicaClose", &open).await;
+    h.receive("ReplicaCloseReply").await;
+    assert!(partition.fault_delivery().unwrap().cancelled);
+    assert!(matches!(
+        partition.report_fault(FaultType::Transient).await,
+        Err(Error::Closed)
+    ));
+    let sibling = h.calls.partitions.lock().unwrap()[0].clone();
+    assert!(sibling.ensure_valid().is_ok());
+    assert!(sibling.fault_delivery().is_none());
+    open.local.instance += 1;
+    h.send("ReplicaOpen", &open).await;
+    h.receive("ReplicaOpenReply").await;
+    let replacement = calls.partitions.lock().unwrap().last().unwrap().clone();
+    assert!(matches!(
+        partition.report_fault(FaultType::Permanent).await,
+        Err(Error::Closed)
+    ));
+    let (result, message) = tokio::join!(
+        replacement.report_fault(FaultType::Transient),
+        h.receive("RAReportFault")
+    );
+    result.unwrap();
+    assert_eq!(
+        from_slice::<FaultBody>(&message.body)
+            .unwrap()
+            .local
+            .instance,
+        18
+    );
+}
+
+#[tokio::test]
+async fn stateful_fault_retry_outlives_callers_executor_and_stops_with_unit() {
+    let mut h = Harness::new().await;
+    let calls = register(&h);
+    let mut open = request(&h, 2, 9, 0);
+    open.local.current_role = 2;
+    h.send("ReplicaOpen", &open).await;
+    h.receive("ReplicaOpenReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    let partition = calls.partitions.lock().unwrap()[0].clone();
+    assert_eq!(
+        partition.access_status().unwrap(),
+        (
+            crate::AccessStatus::NotPrimary,
+            crate::AccessStatus::NotPrimary
+        )
+    );
+    let caller = partition.clone();
+    let permit = h.engine.shared.reports.acquire_many(16).await.unwrap();
+    // The owner executor cannot run while this current-thread test joins the
+    // engine-like executor. The enqueued worker must survive that executor.
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let fault = caller.report_fault(FaultType::Transient);
+            tokio::pin!(fault);
+            poll_pending_once(fault.as_mut()).await;
+        });
+    })
+    .join()
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while partition.fault_delivery().unwrap().attempts == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(partition.fault_delivery().unwrap().last_error.is_some());
+    drop(permit);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let message = h.receive("RAReportFault").await;
+    let body: FaultBody = from_slice(&message.body).unwrap();
+    assert_eq!(
+        (body.local.id, body.local.instance, body.fault),
+        (100, 9, 1)
+    );
+    while partition.fault_delivery().unwrap().attempts < 2 {
+        tokio::task::yield_now().await;
+    }
+    let backend = partition.reporting.as_ref().unwrap();
+    let running_references = Arc::strong_count(backend);
+    h.send("ReplicaClose", &open).await;
+    h.receive("ReplicaCloseReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(Arc::strong_count(backend), running_references - 1);
+    let attempts = partition.fault_delivery().unwrap().attempts;
+    tokio::time::advance(Duration::from_secs(61)).await;
+    assert_eq!(partition.fault_delivery().unwrap().attempts, attempts);
+    assert!(partition.fault_delivery().unwrap().cancelled);
+    h.no_reply().await;
+}
+
+#[tokio::test]
+async fn queued_stateful_fault_is_fenced_after_authority_retirement() {
+    use tokio::io::AsyncReadExt;
+
+    let mut h = Harness::new().await;
+    let calls = register(&h);
+    let open = request(&h, 2, 7, 0);
+    h.send("ReplicaOpen", &open).await;
+    h.receive("ReplicaOpenReply").await;
+    let partition = calls.partitions.lock().unwrap()[0].clone();
+    let connection = h.engine.shared.connection.clone();
+    let blocker = connection.send_one_way_fenced(
+        12,
+        "FixtureBlocked",
+        vec![0; mssf_transport::frame::MAX_FRAME_SIZE - 4096],
+        deadline_after(Duration::from_secs(5)).unwrap(),
+        mssf_transport::connection::SendStatus::default(),
+    );
+    tokio::pin!(blocker);
+    poll_pending_once(blocker.as_mut()).await;
+    let mut fixed = [0; mssf_transport::frame::FIXED_HEADER_SIZE];
+    h.peer.read_exact(&mut fixed).await.unwrap();
+    let fault = partition.report_fault(FaultType::Transient);
+    tokio::pin!(fault);
+    poll_pending_once(fault.as_mut()).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while h.engine.shared.reports.available_permits() != 15 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(partition.fault_delivery().unwrap().attempts, 0);
+    h.engine.shared.authority.retire();
+    let size = u32::from_le_bytes(fixed[..4].try_into().unwrap()) as usize;
+    h.peer
+        .read_exact(&mut vec![0; size - fixed.len()])
+        .await
+        .unwrap();
+    blocker.await.unwrap();
+    assert!(matches!(fault.await, Err(Error::Closed)));
+    assert!(partition.fault_delivery().unwrap().cancelled);
+    assert!(matches!(
+        partition.report_fault(FaultType::Permanent).await,
+        Err(Error::Closed)
+    ));
+    h.no_reply().await;
+    assert_eq!(partition.fault_delivery().unwrap().attempts, 1);
+}
+
+#[tokio::test]
 async fn stateful_open_order_endpoints_access_duplicate_and_graceful_isolation() {
     let mut h = Harness::new().await;
     let calls = register(&h);
