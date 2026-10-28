@@ -874,6 +874,9 @@ class DataLossCommandModels(unittest.TestCase):
 
     def test_required_inventory_dispatches_real_functions_instead_of_overwriting_missing(self):
         qualification, _ = self.qualification()
+        # This dispatch-only model does not execute scenario(); supply its
+        # successful prerequisite explicitly rather than bypassing the gate.
+        qualification.result["scenarios"] = {"deployment_identity": {"status": "PASS"}}
         names = []
         with patch.object(qualification, "scenario", side_effect=lambda name, action: names.append((name, action))):
             qualification.run()

@@ -846,6 +846,22 @@ class ProcessBindingTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "linux", "Linux-only onebox ownership")
 class OwnershipTests(ProjectFiles):
+    def test_interrupted_readiness_persists_report_and_cleans_only_original_capability(self):
+        def create(name, *, on_allocated):
+            on_allocated("a" * 32)
+            raise KeyboardInterrupt
+        with patch.object(data, "load_bundle", return_value=MagicMock()), \
+             patch.object(data.runtime, "create_owned", side_effect=create), \
+             patch.object(data.runtime, "Allocation") as allocation, \
+             patch.object(data.runtime, "destroy_owned", return_value={"absence_verified": True}) as destroy:
+            result = self.cli(self.root / "unused")
+        allocation.assert_not_called()
+        destroy.assert_called_once_with("owned", "a" * 32)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["original_allocation_owner"], "a" * 32)
+        self.assertIn("KeyboardInterrupt", result["errors"][0])
+        self.assertTrue(result["cleanup"]["onebox"]["absence_verified"])
+
     def test_original_capability_survives_partial_readiness_failure(self):
         def create(name, *, on_allocated):
             on_allocated("a" * 32)
@@ -1021,6 +1037,8 @@ class OwnershipTests(ProjectFiles):
                 present["generation"] = (131510254310497004, 24, 25769803776)
             if stage == "scenario-timeout":
                 raise subprocess.TimeoutExpired("lost response after original identity captured", 1)
+            if stage == "scenario-interrupt":
+                raise KeyboardInterrupt
         def wait(check, description, timeout=0):
             value = check()
             if not value:
@@ -1089,6 +1107,19 @@ class OwnershipTests(ProjectFiles):
             self.assertEqual(str(allocation.copy.call_args.args[2]), result["local_package_path"])
             self.assertFalse(any(call.args[:2] == ("application", "upload")
                                  for call in allocation.sf.call_args_list))
+
+    def test_interrupted_qualifier_preserves_original_identities_and_cleanup_result(self):
+        for profile in ("rust", "mixed"):
+            result, present, allocation = self.deployment("scenario-interrupt", profile=profile)
+            self.assertEqual(result["status"], "FAIL")
+            self.assertIn("KeyboardInterrupt", result["errors"][0])
+            self.assertFalse(present["app"])
+            self.assertFalse(present["type"])
+            self.assertTrue(result["original_application_identity"]["native_application_id"].endswith("_App1"))
+            self.assertEqual(result["cleanup"]["application"], "deleted; absence confirmed")
+            self.assertEqual(result["cleanup"]["type"], "unprovisioned; absence confirmed")
+            self.assertEqual(result["cleanup"]["upload"], "original reservation removed")
+            allocation.copy.assert_called_once()
 
     def test_replacements_with_same_name_type_version_and_copied_token_are_not_original(self):
         for replacement in ("application", "type", "type-generation"):
@@ -2673,6 +2704,42 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(result["scenarios"]["stale_wire_receipts"]["status"], "MISSING")
         self.assertEqual(data.finalize(result)["status"], "FAIL")
 
+    def test_interrupted_scenario_keeps_captured_evidence_and_never_stays_running(self):
+        result = self.result("rust")
+        qualification = data.Qualification(
+            MagicMock(), MagicMock(), {**result, "application": "fabric:/Owned"}, False)
+        def interrupted(evidence):
+            evidence["original_native_instance"] = "captured-before-interruption"
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            qualification.scenario("deployment_identity", interrupted)
+        evidence = result["scenarios"]["deployment_identity"]
+        self.assertEqual(evidence["status"], "FAIL")
+        self.assertEqual(evidence["original_native_instance"], "captured-before-interruption")
+        self.assertIn("KeyboardInterrupt", evidence["error"])
+        self.assertIn("finished_at", evidence)
+        self.assertEqual(data.finalize(result)["status"], "FAIL")
+
+    def test_failed_deployment_skips_unusable_scenarios_without_claiming_pass(self):
+        result = self.result("mixed")
+        result["application"] = "fabric:/Owned"
+        result["scenarios"] = {name: {"status": "MISSING", "reason": "not executed"}
+                               for name in data.required_scenarios("mixed")}
+        qualification = data.Qualification(MagicMock(), MagicMock(), result, True)
+        def failed(evidence):
+            evidence["activation_error"] = "selected prebuilt engine is not executable"
+            raise RuntimeError(evidence["activation_error"])
+        with patch.object(qualification, "deployment_identity", side_effect=failed), \
+             patch.object(qualification, "writes_100") as writes, \
+             patch.object(qualification, "direction") as direction:
+            qualification.run()
+        writes.assert_not_called()
+        direction.assert_not_called()
+        self.assertEqual(result["scenarios"]["deployment_identity"]["status"], "FAIL")
+        self.assertTrue(all(value["status"] == "MISSING" for name, value in
+                            result["scenarios"].items() if name != "deployment_identity"))
+        self.assertEqual(data.finalize(result)["status"], "FAIL")
+
     def test_provenance_never_relabels_review_or_ci_heads_as_executables(self):
         bundle = MagicMock(source_revision="a" * 40, manifest_sha256="b" * 64)
         with patch.dict(os.environ, {"FUBE_REVIEW_HEAD": "c" * 40, "FUBE_CI_HEAD": "d" * 40,
@@ -2685,6 +2752,16 @@ class ReportingTests(unittest.TestCase):
 
 
 class ExecutedImageStoreContractTests(unittest.TestCase):
+    def test_native_omits_only_exact_schema_default_service_attributes(self):
+        prefix=f'<ApplicationManifest xmlns="{data.runtime.NS}" ApplicationTypeName="TestType" ApplicationTypeVersion="1.1"><Parameters><Parameter Name="FubeDataTypeCapability" DefaultValue="{"a"*64}"/></Parameters>'
+        explicit=prefix+'<DefaultServices><Service Name="Bootstrap" ServicePackageActivationMode="SharedProcess"><StatefulService ServiceTypeName="Type" TargetReplicaSetSize="1" MinReplicaSetSize="1"><SingletonPartition/></StatefulService></Service></DefaultServices></ApplicationManifest>'
+        omitted=explicit.replace(' ServicePackageActivationMode="SharedProcess"','').replace(' TargetReplicaSetSize="1"','').replace(' MinReplicaSetSize="1"','')
+        self.assertEqual(data.manifest_identity(explicit),data.manifest_identity(omitted))
+        for changed in [explicit.replace('MinReplicaSetSize="1"','MinReplicaSetSize="2"'),
+                        explicit.replace('SharedProcess','ExclusiveProcess'),
+                        explicit.replace('ServiceTypeName="Type"','ServiceTypeName="Other"')]:
+            self.assertNotEqual(data.manifest_identity(explicit),data.manifest_identity(changed))
+
     def test_native_upload_absence_is_independent_read_only_and_exact_container_bound(self):
         allocation=MagicMock()
         allocation.verify.return_value="cid"

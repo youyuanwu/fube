@@ -1036,6 +1036,9 @@ class Qualification:
             evidence["status"] = "PASS"
         except MissingEvidence as error:
             evidence.update(status="MISSING", error=str(error))
+        except KeyboardInterrupt:
+            evidence.update(status="FAIL", error="KeyboardInterrupt: qualification interrupted")
+            raise
         except Exception as error:
             evidence.update(status="FAIL", error=f"{type(error).__name__}: {error}")
         finally:
@@ -2048,8 +2051,14 @@ class Qualification:
         self.converge(evidence)
 
     def run(self) -> None:
+        self.scenario("deployment_identity", self.deployment_identity)
+        if self.result["scenarios"]["deployment_identity"]["status"] != "PASS":
+            # Nothing below can qualify a peer that did not activate and prove
+            # its real native deployment/executable identity. Preserve MISSING
+            # rather than spending every scenario timeout on the same failure.
+            self.result["errors"].append("deployment identity failed; remaining scenarios not executed")
+            return
         actions = (
-            ("deployment_identity", self.deployment_identity),
             ("writes_100", self.writes_100),
             ("identified_retry", self.identified_retry),
             ("planned_move", self.planned_move),
@@ -2740,6 +2749,14 @@ def manifest_identity(text: str) -> TypeIdentity:
             "native type has no run-created immutable manifest capability")
     def canonical(element):
         children=list(element)
+        # Native XSD defaults (ServiceFabricServiceModel.xsd:1449,1620,
+        # 1634-1643) are omitted by the executed native XML serializer.
+        defaults={
+            f"{{{runtime.NS}}}Service":{"ServicePackageActivationMode":"SharedProcess"},
+            f"{{{runtime.NS}}}StatelessService":{"InstanceCount":"1"},
+            f"{{{runtime.NS}}}StatefulService":{"TargetReplicaSetSize":"1","MinReplicaSetSize":"1"},
+        }.get(element.tag,{})
+        attributes=[(name,value) for name,value in element.attrib.items() if defaults.get(name)!=value]
         if element.tag==f"{{{runtime.NS}}}Parameters":
             # Native GetApplicationManifest serializes this name-keyed map in
             # lexical order. The executed 11.8.121.4 response reverses our two
@@ -2748,7 +2765,7 @@ def manifest_identity(text: str) -> TypeIdentity:
                     and len({child.get("Name") for child in children})==len(children),
                     "ambiguous native manifest parameter map")
             children.sort(key=lambda child:child.attrib["Name"])
-        return [element.tag, sorted(element.attrib.items()), (element.text or "").strip(),
+        return [element.tag, sorted(attributes), (element.text or "").strip(),
                 [canonical(child) for child in children]]
     fingerprint = hashlib.sha256(json.dumps(canonical(root), separators=(",", ":")).encode()).hexdigest()
     return TypeIdentity(root.attrib["ApplicationTypeName"], root.attrib["ApplicationTypeVersion"],
@@ -3335,7 +3352,7 @@ def qualify(allocation, bundle: Bundle, profile: str) -> dict:
         }
         qualification = Qualification(allocation, bundle, result, profile != "rust", original_application)
         qualification.run()
-    except Exception as error:
+    except (Exception, KeyboardInterrupt) as error:
         result["errors"].append(f"qualification: {type(error).__name__}: {error}")
         if getattr(error, "__notes__", None):
             result["qualification_recovery_notes"] = list(error.__notes__)
@@ -3434,7 +3451,7 @@ def main() -> None:
             require(created and returned_owner == owner, "create returned a different/unpublished owner capability")
         allocation = runtime.Allocation(args.name, owner)
         result = qualify(allocation, bundle, args.profile)
-    except Exception as error:
+    except (Exception, KeyboardInterrupt) as error:
         result["errors"].append(f"execution: {type(error).__name__}: {error}")
     finally:
         if created:
