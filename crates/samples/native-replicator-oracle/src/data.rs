@@ -42,11 +42,9 @@ pub fn operation_data(segments: Vec<Vec<u8>>) -> Result<IFabricOperationData> {
         .iter()
         .map(|bytes| FABRIC_OPERATION_DATA_BUFFER {
             BufferSize: bytes.len() as u32,
-            Buffer: if bytes.is_empty() {
-                ptr::null_mut()
-            } else {
-                bytes.as_ptr().cast_mut()
-            },
+            // Native ValidateOperation rejects NULL even for a zero-byte
+            // segment. The owned empty slice has a non-null zero-length pointer.
+            Buffer: bytes.as_ptr().cast_mut(),
         })
         .collect();
     Ok(Segments {
@@ -131,4 +129,30 @@ unsafe fn read_buffers(
             }
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_replication_validation_accepts_nonnull_zero_length_segments() {
+        let segments = vec![vec![], vec![1, 2, 3], vec![]];
+        let data = operation_data(segments.clone()).unwrap();
+        let mut count = 0;
+        let buffers = unsafe { data.GetData(&mut count) }.unwrap();
+        assert_eq!(count, 3);
+        let descriptors = unsafe { slice::from_raw_parts(buffers, count as usize) };
+        assert_eq!(
+            descriptors.iter().map(|b| b.BufferSize).collect::<Vec<_>>(),
+            vec![0, 3, 0]
+        );
+        // EnumOperators.cpp ValidateOperation requires every Buffer != NULL;
+        // it does not dereference a zero-length segment.
+        assert!(descriptors.iter().all(|b| !b.Buffer.is_null()));
+        assert_eq!(unsafe { read_segments(&data) }.unwrap(), segments);
+        let empty = operation_data(vec![]).unwrap();
+        assert!(unsafe { empty.GetData(&mut count) }.unwrap().is_null());
+        assert_eq!(count, 0);
+    }
 }
