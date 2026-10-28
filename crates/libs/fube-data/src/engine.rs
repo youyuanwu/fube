@@ -361,7 +361,10 @@ impl Engine {
         let endpoint = Endpoint {
             actor,
             address: transport.address().to_owned(),
-            transport_id: None,
+            // EndOpen's public address always includes the transport suffix,
+            // even when empty. Native ReplicaInformation.cpp requires the
+            // second ';' before splitting transport ID from the actor endpoint.
+            transport_id: Some(String::new()),
         };
         endpoint.to_string().parse::<Endpoint>()?;
         let (commands, command_rx) = mpsc::channel(settings.control_messages);

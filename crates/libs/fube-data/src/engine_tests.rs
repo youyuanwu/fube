@@ -17,6 +17,20 @@ const NEXT_EPOCH: Epoch = Epoch {
     configuration: 0x2_0000_0000,
 };
 
+#[tokio::test]
+async fn public_open_endpoint_includes_native_required_empty_transport_suffix() {
+    let node = engine(Uuid::new_v4(), 1, Arc::new(Provider::default()));
+    let published = node.open(cancel()).await.unwrap();
+    // Native ReplicaInformation first finds the actor-incarnation ';', then
+    // requires another ';' delimiting the transport ID (which may be empty).
+    let first = published.find(';').unwrap();
+    let second = published[first + 1..].find(';').unwrap() + first + 1;
+    assert_eq!(second, published.len() - 1);
+    assert_eq!(published.parse::<Endpoint>().unwrap(), node.endpoint());
+    assert_eq!(node.endpoint().transport_id.as_deref(), Some(""));
+    node.close(cancel()).await.unwrap();
+}
+
 #[cfg(feature = "qualification")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete_traffic() {
@@ -1849,7 +1863,11 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
 async fn joint_quorums_previous_one_excludes_primary_and_catchup_is_not_write_commit() {
     let (p, s, provider) = pair().await;
     let mut remote = descriptor(&s);
-    remote.address.push_str(";fixture-transport-id");
+    remote.address = Endpoint {
+        transport_id: Some("fixture-transport-id".into()),
+        ..s.endpoint()
+    }
+    .to_string();
     p.update_catch_up_configuration(
         configuration(vec![], true, 1),
         configuration(vec![remote.clone()], false, 1),
