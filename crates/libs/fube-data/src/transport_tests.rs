@@ -38,7 +38,11 @@ fn request(address: &str, from: i64, to: i64) -> Packet {
 async fn removing_one_shared_address_actor_keeps_the_other_actor_socket_usable() {
     let (a, _incoming_a) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
     let (b, mut incoming_b) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
-    a.register_peer(&endpoint(&b.address, 2)).unwrap();
+    let alias = format!(
+        "localhost:{}",
+        b.address.parse::<SocketAddr>().unwrap().port()
+    );
+    a.register_peer(&endpoint(&alias, 2)).unwrap();
     a.register_peer(&endpoint(&b.address, 3)).unwrap();
     let first = a
         .send_observed(request(&a.address, 1, 2))

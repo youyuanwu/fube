@@ -1158,7 +1158,15 @@ async fn configured_peer_retirement_releases_session_capacity_before_replacement
     for id in 2..12 {
         let (network, mut incoming) =
             PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
-        let remote = endpoint(&network, partition, id);
+        let mut remote = endpoint(&network, partition, id);
+        if id % 2 == 0 {
+            let port = remote
+                .address
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .port();
+            remote.address = format!("localhost:{port}");
+        }
         let mut peer = descriptor(&p);
         peer.replica_id = id;
         peer.address = remote.to_string();
@@ -4439,6 +4447,7 @@ async fn outgoing_budget_repro_requires_eos_or_explicit_preassignment_write_reje
     })
     .await
     .expect("retained write starved outgoing EOS enumeration");
+    until(|| p.snapshot().peers[0].copy_finish == Some(assigned)).await;
     assert_eq!(p.snapshot().peers[0].copy_finish, Some(assigned));
     if accepted.is_some() {
         timeout(std::time::Duration::from_secs(2), async {

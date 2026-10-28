@@ -353,7 +353,10 @@ impl PeerTransport {
         routes.insert(
             endpoint.actor,
             Route {
-                address: endpoint.address.clone(),
+                // Session/accounting keys are resolved socket identities, not
+                // interchangeable DNS spellings. Wire actor addresses remain
+                // unchanged and are still compared exactly.
+                address: socket.to_string(),
                 socket: Some(socket),
                 learned_on: None,
             },
@@ -795,8 +798,9 @@ async fn run_session_inner(
     inbound: bool,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
+    let peer_socket = stream.peer_addr()?;
     #[cfg(any(test, feature = "qualification"))]
-    let (local, peer_socket) = (stream.local_addr()?, stream.peer_addr()?);
+    let local = stream.local_addr()?;
     let (mut reader, mut writer) = stream.into_split();
     let deadline = network.settings.callback_timeout;
     // Native TcpConnection.cpp:126 uses zero on an initiating connection and a
@@ -867,11 +871,27 @@ async fn run_session_inner(
     .to_string()
     .parse::<Endpoint>()?;
     drop(remote);
-    let _socket_owner = network.own_socket_address(&remote_instance.address);
+    let remote_listener = match remote_instance.address.parse::<SocketAddr>() {
+        Ok(socket) => socket,
+        Err(_) => {
+            // The advertised hostname is still the exact wire identity. For
+            // socket ownership use its listener port and the connected IP,
+            // without a blocking DNS lookup on the network reader.
+            let port = remote_instance
+                .address
+                .rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok())
+                .filter(|port| *port != 0)
+                .ok_or(Error::Protocol("invalid peer listener port"))?;
+            SocketAddr::new(peer_socket.ip(), port)
+        }
+    };
+    let remote_address = remote_listener.to_string();
+    let _socket_owner = network.own_socket_address(&remote_address);
     ready
         .try_send(Ready {
             id,
-            address: remote_instance.address.clone(),
+            address: remote_address.clone(),
         })
         .map_err(|_| Error::ResourceLimit("session announcements"))?;
     let read = async {
@@ -929,8 +949,8 @@ async fn run_session_inner(
                         return Err(Error::ResourceLimit("peer routes"));
                     }
                     entry.insert(Route {
-                        address: remote_instance.address.clone(),
-                        socket: remote_instance.address.parse().ok(),
+                        address: remote_address.clone(),
+                        socket: Some(remote_listener),
                         learned_on: Some(id),
                     });
                 }
