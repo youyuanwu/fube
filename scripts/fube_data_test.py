@@ -1307,7 +1307,9 @@ class Qualification:
         siblings = self.stateless_siblings() if not self.mixed else None
         if siblings is not None:
             evidence["stateless_siblings_before"] = siblings
-        evidence["hook"] = self.hook(endpoint, "copy_delay_ms", 20)
+        copy_sources = ([replica["address"] for replica in before["replicas"]]
+                        if move_during_copy else [endpoint])
+        evidence["hooks"] = [self.hook(source, "copy_delay_ms", 20) for source in copy_sources]
         self.remove(before, removed)
         first_build = None
         started = time.monotonic()
@@ -1335,7 +1337,8 @@ class Qualification:
                     if replacements and first_build is None:
                         first_build = replacements[0]
                         evidence["first_in_build"] = first_build
-                        begin_writes.set()
+                        if not cancel:
+                            begin_writes.set()
                     if first_build is not None and not action_done:
                         if move_during_copy:
                             # The destination is an existing ready secondary, never the unfinished build.
@@ -1350,6 +1353,12 @@ class Qualification:
                             evidence["cancelled_native_departure"] = runtime.wait_native_replica_absent(
                                 self.bundle.observer, self.service, first_build["node"], first_build["replica"])
                         action_done = True
+                    if cancel and action_done and first_build is not None and any(
+                            (replica["node"], replica["replica"]) !=
+                            (first_build["node"], first_build["replica"]) for replica in replacements):
+                        # The cancelled build is not the positive build window.
+                        # Start the live workload only on its actual successor.
+                        begin_writes.set()
                     ready = all(r["status"] == "Ready" for r in value["replicas"])
                     if writer.done() and ready and len(value["replicas"]) == 3 and action_done:
                         break
@@ -1392,7 +1401,7 @@ class Qualification:
             require(any(sum(sequence > horizon["copy_horizon"] for sequence in writes["sequences"]) >= 100
                         for horizon in live["horizons"]), "fewer than 100 writes beyond the pinned copy horizon")
         finally:
-            evidence["hook_cleanup"] = self.reset_hooks([(endpoint, "copy_delay_ms")])
+            evidence["hook_cleanup"] = self.reset_hooks([(source, "copy_delay_ms") for source in copy_sources])
 
     def apply_ack_delay(self, evidence: dict) -> None:
         before = self.converge(evidence)
@@ -1619,6 +1628,9 @@ class Qualification:
             if current["primary"]["rpc"]["engine_kind"] != primary_kind:
                 group["native_move"] = {}
                 self.move(group["native_move"], primary_kind)
+            # A demoted continuing secondary learns the new primary session
+            # from real traffic, not merely from a role callback.
+            group["session_establishing_write"] = self.writes(1, "wire-session")
             roles = ("Primary",) if primary_kind == "rust" and self.mixed else ("ActiveSecondary",)
             if not self.mixed:
                 roles = ("Primary", "ActiveSecondary")
@@ -1678,7 +1690,10 @@ class Qualification:
         require(service.startswith(self.result["application"] + "/DataLoss")
                 and service != self.service, "data loss is restricted to this run's auxiliary service")
         if allow_absent:
-            description = native_management(self.allocation, "GET", service_path(service) + "?api-version=6.0")
+            description = native_management(self.allocation, "GET",
+                application_path(self.result["application"]) + "/$/GetServices/"
+                + quote(service.removeprefix("fabric:/").replace("/", "~"), safe="")
+                + "?api-version=6.0")
             if description["http_status"] == 204 and description["body"] is None:
                 return None
             if description["http_status"] == 404 and isinstance(description["body"], dict) and (
@@ -1777,7 +1792,8 @@ class Qualification:
                     and runtime.epoch_of(value) > runtime.epoch_of(before)
                     and {identity(replica) for replica in value["replicas"]} == original
                     and all(replica["rpc"]["state"]["last"] == 20
-                            and replica["rpc"]["engine"]["progress"]["applied"] == 20
+                            and (replica["role"] == "Primary"
+                                 or replica["rpc"]["engine"]["progress"]["applied"] == 20)
                             and (replica["rpc"]["engine_kind"] != "native-classic-v1"
                                  or replica["rpc"]["native_current_progress"] == 20)
                             for replica in value["replicas"]))
@@ -1890,7 +1906,8 @@ class Qualification:
             nonlocal settled_seed
             if not coherent(seed)(value) or not all(
                     replica["rpc"]["state"]["last"] == 20
-                    and replica["rpc"]["engine"]["progress"]["applied"] == 20
+                    and (replica["role"] == "Primary"
+                         or replica["rpc"]["engine"]["progress"]["applied"] == 20)
                     for replica in value["replicas"]):
                 return False
             previous, settled_seed = settled_seed, value

@@ -388,11 +388,12 @@ class WireFaultModels(unittest.TestCase):
             qualification.stale_wire_receipts(evidence)
         self.assertEqual(request.call_count, 6)
         self.assertEqual(native.call_count, 18)
-        self.assertEqual(writes.call_count, 6)
+        self.assertEqual(writes.call_count, 7)  # real post-move primary-session establishment plus six positives
         self.assertEqual(positive_copy.call_args.kwargs, {"target_kind": "rust"})
         self.assertNotIn("status", evidence)  # A model is not a native PASS report.
         with patch.object(qualification, "converge", return_value=before), \
              patch.object(qualification, "wait", return_value=before), \
+             patch.object(qualification, "writes", return_value={"sequences": [21]}), \
              patch.object(data, "request", return_value=(400, {"error": "wire API unsupported"})):
             with self.assertRaisesRegex(RuntimeError, "required actual wire probe API"):
                 qualification.stale_wire_receipts({})
@@ -584,9 +585,11 @@ class AuxiliaryOwnershipModels(unittest.TestCase):
         partitions = {"http_status": 200, "body": {"Items": [
             {"ServiceKind": "Stateful", "PartitionInformation": {"Id": OPERATION}}]}}
         with patch.object(data, "native_application_identity", return_value=original), \
-             patch.object(data, "native_management", side_effect=[description, partitions]):
+             patch.object(data, "native_management", side_effect=[description, partitions]) as native:
             with self.assertRaisesRegex(RuntimeError, "name reused"):
                 qualification.cleanup_auxiliary(auxiliary)
+        self.assertEqual(native.call_args_list[0].args[2],
+                         "/Applications/Owned/$/GetServices/Owned~DataLossChanged-model?api-version=6.0")
         qualification.allocation.sf.assert_not_called()
 
     def test_cleanup_cancels_only_recorded_fas_before_guarded_partition_deletion_and_route_retirement(self):
@@ -768,6 +771,13 @@ class DataLossCommandModels(unittest.TestCase):
                     for replica in value["replicas"]:
                         replica["rpc"]["native_epoch"]["configuration"] = configuration
                     primary(value, selected)
+            # Primary application state is authoritative application progress;
+            # its queue's applied frontier can still be the reconciliation
+            # boundary until the next role/epoch operation.
+            for value in (before, initial, away):
+                for replica in value["replicas"]:
+                    if replica["role"] == "Primary" and replica["rpc"]["engine_kind"] == "rust":
+                        replica["rpc"]["engine"]["progress"]["applied"] = 0
             final = copy.deepcopy(after)
             retained = data.data_loss_invariants(before, after, seed, changed)
             start = 6 if changed else 21

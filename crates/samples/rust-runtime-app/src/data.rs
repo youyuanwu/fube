@@ -819,7 +819,19 @@ impl Rpc {
             {
                 return response(&mut stream, 503, &serde_json::json!({})).await;
             }
-            let result = route.engine.qualification_probe(&kind, None).await?;
+            let result = match route.engine.qualification_probe(&kind, None).await {
+                Ok(result) => result,
+                Err(error) => {
+                    return response(
+                        &mut stream,
+                        503,
+                        &serde_json::json!({
+                            "qualification_only":true,"error":error.to_string()
+                        }),
+                    )
+                    .await
+                }
+            };
             if route.lifetime().is_err() {
                 return response(&mut stream, 503, &serde_json::json!({})).await;
             }
