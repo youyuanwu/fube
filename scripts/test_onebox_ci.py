@@ -100,21 +100,203 @@ class ProofFiles(fixtures.ProjectFiles):
             }
         return result
 
-    def data_report(self, profile, name, owner, container, start):
+    def essential_data(self, profile, reject_quorum=False):
+        nodes = ["N0020", "N0040", "N0010"] if profile == "rust" else ["N0020", "N0030", "N0010"]
+        kinds = ["rust"] * 3 if profile == "rust" else [ci.data.NODE_ENGINES[node] for node in nodes]
+        rows = [{
+            "node": node, "replica": 1000 + index, "incarnation": 2000 + index if kind == "rust" else "engine-" + node,
+            "engine_incarnation": "engine-" + node, "host": "host-" + node,
+            "pid": 3000 + index, "engine_kind": kind,
+        } for index, (node, kind) in enumerate(zip(nodes, kinds))]
+        service, partition = "fabric:/Fixture/Data", "data-partition"
+        initial = {"initial-1-" + str(index): index + 1 for index in range(100)}
+
+        def writes(results):
+            return {"requested": len(results), "successful": len(results),
+                    "ids": list(results), "sequences": list(results.values())}
+
+        def snapshot(results, primary=0, configuration=1, members=None, name=service, part=partition):
+            replicas = []
+            members = members or rows
+            for index, member in enumerate(members):
+                rpc = {**member, "profile": "fube-data-v1", "partition": part}
+                endpoint = "http://" + rpc["node"] + "/" + part + "/" + str(rpc["replica"]) + "/service"
+                role = ("Primary" if index == primary else
+                        "Secondary" if rpc["engine_kind"] == "rust" else "ActiveSecondary")
+                rpc.update(role=role, current_role=role, service_address=endpoint,
+                           state={"last": max(results.values()), "copy_in_progress": False, "results": results,
+                                  "history_count": len(results), "retained_bytes": len(results) * 100},
+                           engine={"closed": False, "fault": None, "copy_done": True,
+                                   "progress": dict.fromkeys(ci.PROGRESS_SPEC, max(results.values()))})
+                if role == "ActiveSecondary":
+                    rpc["engine"]["progress"].update(assigned=0, committed=0, completed=0, client_completed=0)
+                elif role == "Primary" and rpc["engine_kind"] == "rust":
+                    rpc["engine"]["progress"]["applied"] = 0
+                replicas.append({
+                    "node": rpc["node"], "replica": rpc["replica"], "role": "Primary" if index == primary else "ActiveSecondary",
+                    "status": "Ready", "address": endpoint, "service_http_status": 200 if index == primary else 503,
+                    "deployed": {"host_process_id": rpc["pid"]}, "rpc": rpc,
+                })
+            placed = replicas[primary]
+            return {
+                "observer": "mssf-client", "service": name, "partition": part,
+                "native_partition": {"target": len(members), "minimum": 1 if len(members) == 1 else 2,
+                                     "status": "Ready", "epoch": {"data_loss": 1, "configuration": configuration}},
+                "replicas": replicas, "primary": {
+                    "resolver": "mssf-client", "endpoint": placed["address"],
+                    "native_pid": placed["rpc"]["pid"], "rpc": copy.deepcopy(placed["rpc"])},
+            }
+
+        def workload(results, successful=None):
+            return {"successful": len(results) if successful is None else successful,
+                    "accepted": len(results), "last": max(results.values())}
+
+        def process(rpc, action="inspect"):
+            return {
+                "pid": rpc["pid"], "host": rpc["host"], "start_ticks": rpc["pid"] * 10,
+                "code_sequence": rpc["pid"] * 100, "action": action,
+                "executable_sha256": self.built["inputs"]["app" if rpc["engine_kind"] == "rust" else "native_oracle"]["sha256"],
+                "classification": "native-free" if rpc["engine_kind"] == "rust" else "native-classic-dynamic",
+                "native_libraries": dict.fromkeys(("fabricruntime", "fabriccommon", "fabricclient"),
+                                                rpc["engine_kind"] != "rust"),
+                "activation_environment": {
+                    "Fabric_NodeName": rpc["node"], "Fabric_ApplicationHostId": rpc["host"],
+                    "Fabric_CodePackageInstanceSeqNum": str(rpc["pid"] * 100)},
+            }
+
+        def expected(rpc, captured=False):
+            return {
+                "native_pid": rpc["pid"], "host": rpc["host"], "node": rpc["node"], "kind": rpc["engine_kind"],
+                "engine_sha256": process(rpc)["executable_sha256"],
+                "native_entry_point_instance": str(rpc["pid"] * 100 + 1), "native_code_version": "1.1",
+                "native_query": {
+                    "Name": "Code", "ServiceManifestName": "RustRuntimeService", "Version": "1.1",
+                    "MainEntryPoint": {"ProcessId": str(rpc["pid"]), "InstanceId": str(rpc["pid"] * 100 + 1)}},
+                **({"captured": process(rpc)} if captured else {}),
+            }
+
+        def duplicate(request_id, sequence):
+            return {"request_id": request_id, "sequence": sequence, "duplicate": True, "outcome": "committed"}
+
+        def move(before, after):
+            return {"before": before, "after": after, "old_primary_http_status": 503,
+                    "move_request": {"request": "MovePrimary", "constraints": "enforced",
+                                     "native_request_completed": True, "partition": partition,
+                                     "target": after["primary"]["rpc"]["node"]}}
+
+        baseline = snapshot(initial)
+        values = {"key-" + key: "value-" + key for key in initial}
+        for replica in baseline["replicas"]:
+            replica["rpc"]["state"]["values"] = values
+        baseline["primary"]["rpc"]["state"]["values"] = values
+        original_id = next(iter(initial))
+        post_move = {"planned-1-" + str(index): 101 + index for index in range(5)}
+        moved_results = {**initial, **post_move}
+        moved = snapshot(moved_results, primary=1, configuration=2)
+        lost_id, lost_sequence = "lost-reply-6", 106
+        lost_results = {**moved_results, lost_id: lost_sequence}
+        lost_before = snapshot(lost_results, primary=1, configuration=2)
+        lost_after = snapshot(lost_results, configuration=3)
+        retry = duplicate(lost_id, lost_sequence)
+        record = {"id": lost_id, "key": "key-" + lost_id, "value": "value-" + lost_id,
+                  "sequence": lost_sequence, "committed": True, "attempts": [
+                      {"outcome": "ambiguous_transport", "reply_intentionally_unread": True},
+                      {"http_status": 200, "reply": retry}, {"http_status": 200, "reply": retry}]}
+        no_quorum = {"id": "no-quorum-7", "sequence": 107, "committed": False, "attempts": [
+            {"outcome": "acceptance_unknown_until_HTTP_reply", "native_quorum_unavailable": True},
+            {"http_status": 202, "reply": {"request_id": "no-quorum-7", "outcome": "ambiguous",
+                                         "sequence": 107, "duplicate": False}}]}
+        if reject_quorum:
+            no_quorum["sequence"] = None
+            no_quorum["attempts"][1] = {
+                "http_status": 503, "reply": {"request_id": "no-quorum-7", "outcome": "rejected", "duplicate": False}}
+        recovered_results = lost_results if reject_quorum else {**lost_results, "no-quorum-7": 107}
+        recovered = snapshot(recovered_results, configuration=3)
+        old = recovered["primary"]["rpc"]
+        diagnostics = copy.deepcopy(old)
+        diagnostics["engine"]["progress"]["committed"] = 106
+        post_failure = {"failure-1-" + str(index): max(recovered_results.values()) + 1 + index for index in range(5)}
+        failure_results = {**recovered_results, **post_failure}
+        replaced_rows = copy.deepcopy(rows)
+        replaced_rows[0].update(host="replacement-host", pid=4000, engine_incarnation="replacement-engine",
+                                incarnation=4001 if kinds[0] == "rust" else "replacement-engine")
+        failed_over = snapshot(failure_results, primary=1, configuration=4, members=replaced_rows)
+        new = failed_over["primary"]["rpc"]
+        auxiliary_row = {**replaced_rows[1], "replica": 9001,
+                         "incarnation": 9002 if kinds[1] == "rust" else "auxiliary-engine",
+                         "engine_incarnation": "auxiliary-engine"}
+        auxiliary = snapshot({"auxiliary": 1}, members=[auxiliary_row],
+                             name="fabric:/Fixture/CloseIsolation", part="auxiliary-partition")
+        capacity_results = dict(failure_results)
+        capacity_results.update({"c-" + str(index): index + 1 for index in range(len(failure_results), 4096)})
+        full = snapshot(capacity_results, configuration=4, members=replaced_rows)
+        rejection = {"id": "capacity-rejected", "sequence": None, "committed": False, "attempts": [{
+            "http_status": 503, "reply": {"request_id": "capacity-rejected", "outcome": "rejected",
+                                        "duplicate": False, "error": "native resource limit: provider history/identity ledger"}}]}
+        scenarios = {
+            "writes_100": {"writes": writes(initial), "observation": baseline,
+                           "workload": {**workload(initial), "results": initial, "values": values}},
+            "identified_retry": {
+                "identical_retry": duplicate(original_id, 1),
+                "conflicting_retry": {"http_status": 503, "reply": {
+                    "outcome": "rejected", "request_id": original_id, "duplicate": False,
+                    "error": "invalid input: conflicting request identity"}},
+                "workload": workload(initial), "observation": baseline},
+            "planned_move": {
+                **move(baseline, snapshot(initial, primary=1, configuration=2)),
+                "post_move_writes": writes(post_move), "observation": moved, "workload": workload(moved_results)},
+            "lost_reply_dedup": {**move(lost_before, lost_after), "before_move": lost_before,
+                                "observation": lost_after, "workload": workload(lost_results), "retry_outcome": "committed"},
+            "unavailable_quorum": {
+                "before": lost_after, "observation": recovered, "workload": workload(recovered_results, 106),
+                "paused_processes": [process(r["rpc"], "pause") for r in lost_after["replicas"][1:]],
+                "resume": [process(r["rpc"], "resume") for r in lost_after["replicas"][1:]],
+                "native_while_unavailable": {"Items": [{
+                    "TargetReplicaSetSize": 3, "MinReplicaSetSize": 2, "PartitionInformation": {"Id": partition}}]},
+                "write": no_quorum, "accepted_write_outcome_after_recovery": no_quorum, "diagnostics": diagnostics},
+            "abrupt_primary_loss": {
+                "observation": failed_over, "workload": workload(failure_results, len(failure_results) - (not reject_quorum)),
+                "native_identity": expected(old, captured=True),
+                "kill": {**process(old, "kill"), "old_process_exit_confirmed": True},
+                "process_wide_not_per_unit": True, "new_primary_native_identity": expected(new),
+                "new_primary_process": process(new),
+                "replacement_hosts": [{"native_identity": expected(failed_over["replicas"][0]["rpc"]),
+                                       "process": process(failed_over["replicas"][0]["rpc"])}],
+                "post_failure_writes": writes(post_failure), "lost_reply_retries_after_recovery_copy": [retry]},
+            "per_unit_close": {
+                "observation": failed_over, "workload": workload(failure_results, len(failure_results) - (not reject_quorum)),
+                "unrelated_before": failed_over, "unrelated_after": failed_over, "auxiliary_before": auxiliary,
+                "old_auxiliary_http_status": 404, "native_departure": {
+                    "observer": "mssf-client", "node": new["node"], "service": auxiliary["service"],
+                    "fixture_contacted": False, "deployed": []}},
+            "ledger_capacity_backpressure": {
+                "observation": full, "workload": workload(capacity_results, 4096 - (not reject_quorum)),
+                "new_successful_writes": 4096 - len(failure_results), "capacity_rejection": rejection,
+                "old_identity_retry_at_capacity": duplicate(original_id, 1)},
+        }
+        if profile == "rust":
+            def siblings(members):
+                return [{"native_pid": row["pid"], "native_entry_point_instance": row["pid"] * 100 + 1,
+                         "rpc": {"node": row["node"], "partition": "stateless-" + row["node"],
+                                 "instance": index + 1, "incarnation": index + 1,
+                                 "pid": row["pid"], "host": row["host"]}} for index, row in enumerate(members)]
+            scenarios["abrupt_primary_loss"].update(
+                stateless_siblings_before=siblings(rows), stateless_siblings_after=siblings(replaced_rows))
+            scenarios["per_unit_close"].update(
+                stateless_siblings_before=siblings(replaced_rows), stateless_siblings_after=siblings(replaced_rows))
+        processes = [{"native_identity": expected(r["rpc"]), "process": process(r["rpc"])}
+                     for r in baseline["replicas"]]
+        return scenarios, {lost_id: record}, processes
+
+    def data_report(self, profile, name, owner, container, start, reject_quorum=False):
         required = ci.data.required_scenarios(profile)
         scenarios = {case: {"status": "PASS", "started_at": start + index / 100,
                             "finished_at": start + (index + 1) / 100}
                      for index, case in enumerate(required)}
-        kinds = ["rust"] * 3 if profile == "rust" else ["native-classic-v1", "rust", "native-classic-v1"]
-        scenarios["deployment_identity"]["processes"] = [{
-            "native_identity": {
-                "kind": kind, "engine_sha256": self.built["inputs"]["app" if kind == "rust" else "native_oracle"]["sha256"]},
-            "process": {
-                "executable_sha256": self.built["inputs"]["app" if kind == "rust" else "native_oracle"]["sha256"],
-                "classification": "native-free" if kind == "rust" else "native-classic-dynamic",
-                "native_libraries": dict.fromkeys(("fabricruntime", "fabriccommon", "fabricclient"), kind != "rust"),
-            },
-        } for kind in kinds]
+        essential, ledger, processes = self.essential_data(profile, reject_quorum)
+        for case, evidence in essential.items():
+            scenarios[case].update(evidence)
+        scenarios["deployment_identity"]["processes"] = processes
         scenarios["apply_ack_delay"].update(blocked_after_receive=True, elapsed_seconds=2.0)
         for case in ("replacement_copy", "copy_cancellation_recovery"):
             scenarios[case].update(self.copy_proof())
@@ -175,7 +357,7 @@ class ProofFiles(fixtures.ProjectFiles):
                 interrupt_move={"native_move": "accepted"})
         return {
             "profile": profile, "sf_version": "11.8.121.4", "status": "PASS", "errors": [], "missing_or_failed": [],
-            "required_scenarios": list(required), "scenarios": scenarios,
+            "required_scenarios": list(required), "scenarios": scenarios, "identified_workload": ledger,
             "onebox": name, "owner": owner, "container_id": container,
             "provenance": self.provenance(),
             "bundle": {
@@ -500,6 +682,167 @@ class CleanupLegacyTests(ProofFiles):
 
 @unittest.skipUnless(ci.sys.platform == "linux", "uses existing real native policy offline fixture")
 class WorkerTests(ProofFiles):
+    def reject_data_mutations(self, changes, routes=ci.ROUTES):
+        for route in ci.ROUTES:
+            self.assertEqual(self.sealing(route, self.worker(route)), 0, self.last_stdout)
+        for route, filename in (("client-runtime", "rust-report.json"), ("native-data", "native-data-report.json")):
+            if route not in routes:
+                continue
+            directory = self.root / "workers" / route
+            path, proof_path = directory / filename, directory / "worker-proof.json"
+            original, proof = ci.read(path, ci.REPORT), ci.read(proof_path)
+            for index, (name, change) in enumerate(changes):
+                with self.subTest(route=route, witness=name):
+                    broken = copy.deepcopy(original)
+                    change(broken)
+                    self.emit(path, broken)
+                    output = self.root / (route + "-seal-" + str(index) + ".json")
+                    self.assertEqual(self.sealing(route, directory, output), 1, self.last_stdout)
+                    forged = copy.deepcopy(proof)
+                    forged["reports"][filename] = ci.identity(path, ci.REPORT)
+                    self.emit(proof_path, forged)
+                    output = self.root / (route + "-aggregate-" + str(index) + ".json")
+                    self.assertEqual(self.aggregating(output), 1, self.last_stdout)
+                    result = ci.read(output)
+                    self.assertEqual(result["status"], "FAIL")
+                    self.assertNotIn("sealed worker report hash/proof mismatch", str(result["errors"]))
+            self.emit(path, original)
+            self.emit(proof_path, proof)
+        self.assertEqual(self.aggregating(self.root / "restored-aggregate.json"), 0, self.last_stdout)
+
+    def test_essential_witness_absence_rejected_by_seal_and_rehashed_aggregate(self):
+        fields = {
+            "writes_100": ("writes", "workload", "observation"),
+            "identified_retry": ("identical_retry", "conflicting_retry"),
+            "planned_move": ("before", "after", "move_request", "post_move_writes"),
+            "unavailable_quorum": ("paused_processes", "resume", "native_while_unavailable",
+                                   "write", "diagnostics", "accepted_write_outcome_after_recovery"),
+            "lost_reply_dedup": ("before_move", "retry_outcome"),
+            "abrupt_primary_loss": ("native_identity", "kill", "new_primary_native_identity",
+                                    "new_primary_process", "replacement_hosts", "post_failure_writes",
+                                    "lost_reply_retries_after_recovery_copy"),
+            "per_unit_close": ("auxiliary_before", "unrelated_before", "unrelated_after", "native_departure"),
+            "ledger_capacity_backpressure": ("capacity_rejection", "old_identity_retry_at_capacity",
+                                             "new_successful_writes"),
+        }
+        changes = [(case + "/" + field, lambda v, case=case, field=field: v["scenarios"][case].pop(field))
+                   for case, names in fields.items() for field in names]
+        for case in fields:
+            changes.append((case + "/bare-PASS", lambda v, case=case: v["scenarios"].update({
+                case: {key: v["scenarios"][case][key] for key in ("status", "started_at", "finished_at")}})))
+        changes.append(("root/identified_workload", lambda v: v.pop("identified_workload")))
+        self.reject_data_mutations(changes)
+
+    def test_contradictory_typed_witnesses_rejected_by_seal_and_rehashed_aggregate(self):
+        self.reject_data_mutations([
+            ("zero-writes", lambda v: v["scenarios"]["writes_100"]["writes"].update(
+                requested=0, successful=0, ids=[], sequences=[])),
+            ("false-write-count", lambda v: v["scenarios"]["writes_100"]["writes"].update(successful=False)),
+            ("bool-sequence", lambda v: v["scenarios"]["writes_100"]["writes"]["sequences"].__setitem__(0, True)),
+            ("duplicate-sequence", lambda v: v["scenarios"]["writes_100"]["writes"]["sequences"].__setitem__(1, 1)),
+            ("reordered-sequences", lambda v: v["scenarios"]["writes_100"]["writes"]["sequences"].reverse()),
+            ("zero-workload", lambda v: v["scenarios"]["writes_100"]["workload"].update(
+                successful=0, accepted=0, last=0, results={}, values={})),
+            ("provider-map-conflict", lambda v: v["scenarios"]["writes_100"]["observation"]["replicas"][1]
+                ["rpc"]["state"]["results"].update({"initial-1-0": 999})),
+            ("provider-value-conflict", lambda v: v["scenarios"]["writes_100"]["observation"]["replicas"][1]
+                ["rpc"]["state"]["values"].update({"key-initial-1-0": "wrong"})),
+            ("secondary-no-apply", lambda v: v["scenarios"]["writes_100"]["observation"]["replicas"][1]
+                ["rpc"]["engine"]["progress"].update(applied=0)),
+            ("bool-provider-last", lambda v: v["scenarios"]["writes_100"]["observation"]["replicas"][1]
+                ["rpc"]["state"].update(last=True)),
+            ("bool-committed", lambda v: v["scenarios"]["writes_100"]["observation"]["primary"]
+                ["rpc"]["engine"]["progress"].update(committed=True)),
+            ("retry-not-duplicate", lambda v: v["scenarios"]["identified_retry"]["identical_retry"].update(duplicate=False)),
+            ("retry-different-LSN", lambda v: v["scenarios"]["identified_retry"]["identical_retry"].update(sequence=2)),
+            ("retry-different-ID", lambda v: v["scenarios"]["identified_retry"]["identical_retry"].update(request_id="absent")),
+            ("conflict-assigned", lambda v: v["scenarios"]["identified_retry"]["conflicting_retry"]["reply"].update(sequence=1)),
+            ("move-not-native", lambda v: v["scenarios"]["planned_move"]["move_request"].update(native_request_completed=False)),
+            ("move-wrong-target", lambda v: v["scenarios"]["planned_move"]["move_request"].update(target="N0050")),
+            ("move-epoch-unchanged", lambda v: v["scenarios"]["planned_move"]["after"]["native_partition"]["epoch"]
+                .update(configuration=1)),
+            ("move-old-route-200", lambda v: v["scenarios"]["planned_move"].update(old_primary_http_status=200)),
+            ("move-replaced-old-process", lambda v: v["scenarios"]["planned_move"]["after"]["replicas"][0]
+                ["rpc"].update(host="unrelated-host")),
+            ("quorum-native-target-bool", lambda v: v["scenarios"]["unavailable_quorum"]["native_while_unavailable"]
+                ["Items"][0].update(TargetReplicaSetSize=True)),
+            ("quorum-manufactured-commit", lambda v: v["scenarios"]["unavailable_quorum"]["write"].update(committed=True)),
+            ("quorum-advanced-frontier", lambda v: v["scenarios"]["unavailable_quorum"]["diagnostics"]
+                ["engine"]["progress"].update(committed=107)),
+            ("quorum-wrong-paused-process", lambda v: v["scenarios"]["unavailable_quorum"]["paused_processes"][0]
+                .update(pid=1)),
+            ("quorum-resume-false", lambda v: v["scenarios"]["unavailable_quorum"]["resume"][0].update(action=False)),
+            ("lost-reply-was-read", lambda v: v["identified_workload"]["lost-reply-6"]["attempts"][0]
+                .update(reply_intentionally_unread=False)),
+            ("lost-reply-not-duplicate", lambda v: v["identified_workload"]["lost-reply-6"]["attempts"][1]
+                ["reply"].update(duplicate=False)),
+            ("lost-reply-false-commit-record", lambda v: v["identified_workload"]["lost-reply-6"].update(committed=False)),
+            ("lost-reply-different-LSN", lambda v: v["identified_workload"]["lost-reply-6"].update(sequence=105)),
+            ("lost-reply-not-replicated", lambda v: v["scenarios"]["lost_reply_dedup"]["before_move"]["replicas"][1]
+                ["rpc"]["state"]["results"].pop("lost-reply-6")),
+            ("kill-not-exited", lambda v: v["scenarios"]["abrupt_primary_loss"]["kill"].update(old_process_exit_confirmed=False)),
+            ("kill-wrong-host", lambda v: v["scenarios"]["abrupt_primary_loss"]["native_identity"].update(host="other")),
+            ("replacement-wrong-native-PID", lambda v: v["scenarios"]["abrupt_primary_loss"]
+                ["new_primary_native_identity"]["native_query"]["MainEntryPoint"].update(ProcessId="1")),
+            ("failure-epoch-unchanged", lambda v: v["scenarios"]["abrupt_primary_loss"]["observation"]
+                ["native_partition"]["epoch"].update(configuration=3)),
+            ("close-no-shared-process", lambda v: v["scenarios"]["per_unit_close"]["auxiliary_before"]["primary"]
+                ["rpc"].update(pid=1)),
+            ("close-main-replaced", lambda v: v["scenarios"]["per_unit_close"]["unrelated_after"]["primary"]
+                ["rpc"].update(engine_incarnation="replacement")),
+            ("close-native-departure-fake", lambda v: v["scenarios"]["per_unit_close"]["native_departure"]
+                .update(fixture_contacted=True)),
+            ("close-native-unit-still-present", lambda v: v["scenarios"]["per_unit_close"]["native_departure"]
+                .update(deployed=[{"replica_id": 9001}])),
+            ("root-process-identity-wrong", lambda v: v["scenarios"]["deployment_identity"]["processes"][0]
+                ["native_identity"].update(native_pid=True)),
+            ("capacity-null", lambda v: v["scenarios"]["ledger_capacity_backpressure"].update(capacity_rejection=None)),
+            ("capacity-rejected-sequence", lambda v: v["scenarios"]["ledger_capacity_backpressure"]
+                ["capacity_rejection"].update(sequence=4097)),
+            ("capacity-reply-assigned", lambda v: v["scenarios"]["ledger_capacity_backpressure"]
+                ["capacity_rejection"]["attempts"][0]["reply"].update(sequence=4097)),
+            ("capacity-zero-writes", lambda v: v["scenarios"]["ledger_capacity_backpressure"].update(new_successful_writes=0)),
+            ("capacity-bool-writes", lambda v: v["scenarios"]["ledger_capacity_backpressure"].update(new_successful_writes=True)),
+            ("capacity-history-short", lambda v: v["scenarios"]["ledger_capacity_backpressure"]["observation"]
+                ["replicas"][1]["rpc"]["state"].update(history_count=4095)),
+            ("capacity-bool-bytes", lambda v: v["scenarios"]["ledger_capacity_backpressure"]["observation"]
+                ["replicas"][1]["rpc"]["state"].update(retained_bytes=True)),
+            ("capacity-over-budget", lambda v: v["scenarios"]["ledger_capacity_backpressure"]["observation"]
+                ["replicas"][1]["rpc"]["state"].update(retained_bytes=16 * ci.SMALL + 1)),
+            ("capacity-missing-old-ID", lambda v: v["scenarios"]["ledger_capacity_backpressure"]["observation"]
+                ["primary"]["rpc"]["state"]["results"].pop("initial-1-0")),
+            ("capacity-old-retry-false", lambda v: v["scenarios"]["ledger_capacity_backpressure"]
+                ["old_identity_retry_at_capacity"].update(duplicate=False)),
+            ("capacity-old-retry-bool-LSN", lambda v: v["scenarios"]["ledger_capacity_backpressure"]
+                ["old_identity_retry_at_capacity"].update(sequence=True)),
+        ])
+
+    def test_rust_shared_process_siblings_are_required_but_not_invented_for_native_profile(self):
+        self.reject_data_mutations([
+            ("failure-sibling-absence", lambda v: v["scenarios"]["abrupt_primary_loss"].pop("stateless_siblings_after")),
+            ("close-sibling-absence", lambda v: v["scenarios"]["per_unit_close"].pop("stateless_siblings_before")),
+            ("close-sibling-replacement", lambda v: v["scenarios"]["per_unit_close"]["stateless_siblings_after"][0]
+                ["rpc"].update(host="replaced")),
+            ("failure-colocated-sibling-survived", lambda v: v["scenarios"]["abrupt_primary_loss"]
+                ["stateless_siblings_after"][0].update(
+                    native_entry_point_instance=v["scenarios"]["abrupt_primary_loss"]
+                    ["stateless_siblings_before"][0]["native_entry_point_instance"])),
+        ], routes=("client-runtime",))
+
+    def test_unavailable_quorum_pre_assignment_rejection_is_valid_without_manufactured_acceptance(self):
+        for route, filename, profile in (("client-runtime", "rust-report.json", "rust"),
+                                         ("native-data", "native-data-report.json", "native-data")):
+            directory = self.worker(route)
+            path = directory / filename
+            value = ci.read(path, ci.REPORT)
+            essential, ledger, _ = self.essential_data(profile, reject_quorum=True)
+            for case, evidence in essential.items():
+                value["scenarios"][case].update(evidence)
+            value["identified_workload"] = ledger
+            self.emit(path, value)
+            self.assertEqual(self.sealing(route, directory), 0, self.last_stdout)
+        self.assertEqual(self.aggregating(), 0, self.last_stdout)
+
     def test_exact_two_routes_namespaced_32_plus_5_and_hashes_after_teardown(self):
         for route in ci.ROUTES:
             directory = self.worker(route)
@@ -743,6 +1086,22 @@ class WorkerTests(ProofFiles):
             (native / "worker-proof.json").unlink()
 
 class BoundedParserTests(fixtures.ProjectFiles):
+    def test_lost_reply_prefix_projection_retains_real_attempts_not_the_full_identity_ledger(self):
+        path = self.root / "workload.json"
+        lost = {"id": "lost-reply-6", "sequence": 106, "committed": True, "attempts": [
+            {"outcome": "ambiguous_transport", "reply_intentionally_unread": True}]}
+        discarded = {str(index): {"payload": "x" * 1000} for index in range(4096)}
+        path.write_text(json.dumps({"identified_workload": {**discarded, "lost-reply-6": lost}}))
+        projected = ci.read(path, ci.REPORT, {"identified_workload": ci.DATA_SPEC["identified_workload"]})
+        self.assertEqual(projected, {"identified_workload": {"lost-reply-6": lost}})
+        self.assertLess(len(ci.encode(projected)), 1024)
+        path.write_text('{"identified_workload":{"discarded":{"id":1,"id":2},"lost-reply-6":{}}}')
+        with self.assertRaises(ci.ProofError):
+            ci.read(path, ci.REPORT, ci.DATA_SPEC)
+        path.write_text('{"identified_workload":[]}')
+        with self.assertRaises(ci.ProofError):
+            ci.read(path, ci.REPORT, ci.DATA_SPEC)
+
     def test_scalars_crossing_stream_chunks_do_not_truncate_numeric_prefixes(self):
         path = self.root / "chunks.json"
         for token in ("1.25", "1.25e-3", "-12.0E+4", "true", "null", '"escaped\\\\\\"text"'):

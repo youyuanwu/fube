@@ -154,6 +154,13 @@ def small_json(value):
     return data.strict_json(value)
 
 
+class PrefixSpec:
+    """Select existing workload identities without retaining the whole ledger."""
+
+    def __init__(self, prefix, spec):
+        self.prefix, self.spec = prefix, spec
+
+
 class Projection:
     """Streaming strict JSON projection; even discarded objects reject duplicates.
 
@@ -225,6 +232,7 @@ class Projection:
         require(depth <= 96, "JSON nesting bound")
         char = self.peek()
         require(char, "truncated JSON")
+        require(not isinstance(spec, PrefixSpec) or char == "{", "workload identity map required")
         if char == "{":
             self.pos += 1
             seen, result = set(), {}
@@ -237,7 +245,10 @@ class Projection:
                     seen.add(key)
                     require(len(seen) <= 16384, "JSON object inventory bound")
                     self.take(":")
-                    child = True if spec is True else spec.get(key, spec.get("*")) if spec else None
+                    if isinstance(spec, PrefixSpec):
+                        child = spec.spec if key.startswith(spec.prefix) else None
+                    else:
+                        child = True if spec is True else spec.get(key, spec.get("*")) if spec else None
                     value = self.value(child, depth + 1)
                     if child is not None:
                         result[key] = value
@@ -631,6 +642,407 @@ def epoch(value):
     return item["data_loss"], item["configuration"]
 
 
+def replica_identity(rpc):
+    require(all(integer(rpc.get(key), 1) for key in ("replica", "pid"))
+            and (integer(rpc.get("incarnation"), 1) if rpc.get("engine_kind") != "native-classic-v1"
+                 else text(rpc.get("incarnation")) and rpc["incarnation"] == rpc.get("engine_incarnation"))
+            and all(text(rpc.get(key)) for key in ("partition", "node", "engine_incarnation", "host")),
+            "actual data replica/process identity required")
+    return tuple(rpc[key] for key in
+                 ("partition", "node", "replica", "incarnation", "engine_incarnation", "host", "pid"))
+
+
+def data_snapshot(value, profile, service=None, target=3, minimum=2):
+    require(value.get("observer") == "mssf-client" and text(value.get("service"))
+            and text(value.get("partition")) and (service is None or value["service"] == service),
+            "independent native data observation identity")
+    native = value["native_partition"]
+    require(type(native.get("target")) is int and native["target"] == target
+            and type(native.get("minimum")) is int and native["minimum"] == minimum
+            and native.get("status") == "Ready", "actual native data configuration size")
+    epoch(value)
+    replicas = value["replicas"]
+    require(type(replicas) is list and len(replicas) == target, "actual ready data replica count")
+    nodes, identities, primaries = set(), set(), []
+    for replica in replicas:
+        rpc = replica["rpc"]
+        identity = replica_identity(rpc)
+        kind = "rust" if profile == "rust" else data.NODE_ENGINES.get(replica.get("node"))
+        require(kind in ("rust", "native-classic-v1") and rpc.get("engine_kind") == kind
+                and (profile == "rust" or replica["node"] in data.MIXED_NODES)
+                and rpc.get("profile") == "fube-data-v1"
+                and replica.get("status") == "Ready"
+                and replica.get("role") in ("Primary", "ActiveSecondary")
+                and same(replica.get("replica"), rpc["replica"])
+                and replica.get("node") == rpc["node"] and rpc["partition"] == value["partition"]
+                and same(replica["deployed"].get("host_process_id"), rpc["pid"])
+                and text(replica.get("address")) and replica["address"] == rpc.get("service_address"),
+                "native placement/deployed PID/HTTP data identity binding")
+        role = ("Primary" if replica["role"] == "Primary" else
+                "ActiveSecondary" if kind == "native-classic-v1" else "Secondary")
+        require(rpc.get("role") == rpc.get("current_role") == role
+                and type(replica.get("service_http_status")) is int
+                and replica["service_http_status"] == (200 if role == "Primary" else 503),
+                "actual native role and authoritative route")
+        state, engine = rpc["state"], rpc["engine"]
+        require(integer(state.get("last")) and state.get("copy_in_progress") is False
+                and engine.get("closed") is False and engine.get("fault") is None
+                and engine.get("copy_done") is True
+                and all(integer(engine["progress"].get(key)) for key in PROGRESS_SPEC),
+                "actual data state/progress readiness")
+        require(replica["node"] not in nodes and identity not in identities,
+                "independent data replica identities")
+        nodes.add(replica["node"])
+        identities.add(identity)
+        if replica["role"] == "Primary":
+            primaries.append(replica)
+    require(len(primaries) == 1, "one actual native primary")
+    primary, placed = value["primary"], primaries[0]
+    require(primary.get("resolver") == "mssf-client" and primary.get("endpoint") == placed["address"]
+            and same(primary.get("native_pid"), placed["rpc"]["pid"])
+            and replica_identity(primary["rpc"]) == replica_identity(placed["rpc"])
+            and all(same(primary["rpc"].get(key), placed["rpc"][key])
+                    for key in placed["rpc"] if key != "state")
+            and all(same(primary["rpc"]["state"].get(key), item)
+                    for key, item in placed["rpc"]["state"].items() if key not in ("results", "values")),
+            "native resolver must bind the actual primary")
+    return placed["rpc"]
+
+
+def successful_writes(value, minimum):
+    count, sequences, ids = value.get("successful"), value.get("sequences"), value.get("ids")
+    require(integer(count, minimum) and type(value.get("requested")) is int
+            and value["requested"] == count and type(sequences) is list and type(ids) is list
+            and len(sequences) == len(ids) == count
+            and all(integer(sequence, 1) for sequence in sequences)
+            and sequences == sorted(set(sequences))
+            and all(text(request_id) for request_id in ids) and len(set(ids)) == count,
+            "successful writes need nonzero unique ordered sequences and identities")
+    return dict(zip(ids, sequences))
+
+
+def duplicate_result(reply, results):
+    require(reply.get("duplicate") is True and reply.get("outcome") in ("committed", "ambiguous")
+            and text(reply.get("request_id")) and reply["request_id"] in results
+            and integer(reply.get("sequence"), 1)
+            and same(reply["sequence"], results[reply["request_id"]]),
+            "identified duplicate must retain its original accepted sequence")
+
+
+def rejected_record(record, capacity=False):
+    require(type(record) is dict and text(record.get("id")) and record.get("sequence") is None
+            and "sequence" in record and record.get("committed") is False,
+            "rejection cannot manufacture an accepted sequence/commit")
+    attempts = record["attempts"]
+    require(type(attempts) is list and attempts, "actual rejection attempt required")
+    for attempt in attempts:
+        reply = attempt["reply"]
+        require(type(attempt.get("http_status")) is int and attempt["http_status"] == 503
+                and reply.get("outcome") == "rejected" and reply.get("sequence") is None
+                and reply.get("request_id") == record["id"], "actual pre-admission rejection required")
+        if capacity:
+            error = reply.get("error")
+            require(text(error) and "provider" in error.lower()
+                    and any(token in error.lower() for token in ("identity ledger", "history", "resource")),
+                    "actual provider capacity rejection required")
+
+
+def validate_process(captured, rpc, built, action):
+    environment = captured["activation_environment"]
+    kind = rpc["engine_kind"]
+    require(captured.get("action") == action and same(captured.get("pid"), rpc["pid"])
+            and captured.get("host") == rpc["host"]
+            and integer(captured.get("start_ticks"), 1) and integer(captured.get("code_sequence"), 1)
+            and captured.get("executable_sha256") == built["inputs"][
+                "app" if kind == "rust" else "native_oracle"]["sha256"]
+            and captured.get("classification") ==
+                ("native-free" if kind == "rust" else "native-classic-dynamic")
+            and environment.get("Fabric_NodeName") == rpc["node"]
+            and environment.get("Fabric_ApplicationHostId") == rpc["host"]
+            and environment.get("Fabric_CodePackageInstanceSeqNum") == str(captured["code_sequence"]),
+            "original process action must bind native node/host/PID/executable/start")
+    libraries = captured["native_libraries"]
+    exact(libraries, ("fabricruntime", "fabriccommon", "fabricclient"), "process native library inventory")
+    require(all(value is (kind != "rust") for value in libraries.values()), "process native library profile")
+    return tuple(captured[key] for key in ("pid", "host", "start_ticks", "code_sequence", "executable_sha256"))
+
+
+def validate_expected_process(expected, rpc, built):
+    query = expected["native_query"]
+    entry = query["MainEntryPoint"]
+    require(same(expected.get("native_pid"), rpc["pid"]) and expected.get("host") == rpc["host"]
+            and expected.get("node") == rpc["node"] and expected.get("kind") == rpc["engine_kind"]
+            and expected.get("engine_sha256") == built["inputs"][
+                "app" if rpc["engine_kind"] == "rust" else "native_oracle"]["sha256"]
+            and query.get("Name") == "Code" and query.get("ServiceManifestName") == "RustRuntimeService"
+            and text(expected.get("native_code_version")) and query.get("Version") == expected["native_code_version"]
+            and entry.get("ProcessId") == str(rpc["pid"])
+            and text(expected.get("native_entry_point_instance"))
+            and entry.get("InstanceId") == expected["native_entry_point_instance"],
+            "independent native code package identity must bind the actual process")
+
+
+def validate_move(value, profile, service, partition):
+    before, after = value["before"], value["after"]
+    old, new = data_snapshot(before, profile, service), data_snapshot(after, profile, service)
+    request = value["move_request"]
+    require(before["partition"] == after["partition"] == partition and epoch(after) > epoch(before)
+            and old["node"] != new["node"] and request.get("request") == "MovePrimary"
+            and request.get("constraints") == "enforced" and request.get("native_request_completed") is True
+            and request.get("partition") == before["partition"] and request.get("target") == new["node"]
+            and any(r["role"] == "ActiveSecondary" and r["node"] == new["node"]
+                    for r in before["replicas"])
+            and type(value.get("old_primary_http_status")) is int and value["old_primary_http_status"] == 503,
+            "actual native planned move/epoch/old-route evidence")
+    surviving = [r for r in after["replicas"] if r["replica"] == old["replica"]]
+    require(len(surviving) == 1 and surviving[0]["role"] == "ActiveSecondary"
+            and replica_identity(surviving[0]["rpc"]) == replica_identity(old),
+            "planned move must preserve and demote the original old-primary process")
+
+
+def validate_siblings(value, old, process_loss):
+    before, after = value["stateless_siblings_before"], value["stateless_siblings_after"]
+    require(type(before) is list and type(after) is list and len(before) == len(after) >= 3,
+            "actual colocated stateless sibling observations")
+    previous, current = {}, {}
+    for records, destination in ((before, previous), (after, current)):
+        for record in records:
+            rpc = record["rpc"]
+            require(all(integer(rpc.get(key), 1) for key in ("instance", "incarnation", "pid"))
+                    and all(text(rpc.get(key)) for key in ("partition", "node", "host"))
+                    and same(record.get("native_pid"), rpc["pid"])
+                    and integer(record.get("native_entry_point_instance"), 1)
+                    and rpc["node"] not in destination, "native stateless sibling identity")
+            destination[rpc["node"]] = record
+    require(set(previous) == set(current) and old["node"] in previous
+            and previous[old["node"]]["rpc"]["host"] == old["host"]
+            and previous[old["node"]]["rpc"]["pid"] == old["pid"], "actual shared-process sibling binding")
+    for node, original in previous.items():
+        fresh = current[node]
+        if process_loss and node == old["node"]:
+            require(fresh["rpc"]["host"] != old["host"]
+                    and fresh["native_entry_point_instance"] != original["native_entry_point_instance"],
+                    "process-wide failure must replace its colocated stateless host")
+        else:
+            require(same(fresh, original), "per-unit/unrelated stateless identity must survive")
+    for replica in value["observation"]["replicas"]:
+        sibling = current.get(replica["node"])
+        require(sibling is not None and sibling["rpc"]["host"] == replica["rpc"]["host"]
+                and same(sibling["native_pid"], replica["rpc"]["pid"]),
+                "recovered data/stateless units must bind the same native host")
+
+
+def validate_post_writes(writes, before, observation, original_results):
+    results = successful_writes(writes, 5)
+    boundary = before["primary"]["rpc"]["state"]["last"]
+    primary = observation["primary"]["rpc"]
+    require(not set(results) & set(original_results) and min(results.values()) > boundary
+            and max(results.values()) == primary["state"]["last"]
+            and all(primary["engine"]["progress"][key] >= max(results.values())
+                    for key in ("assigned", "committed", "completed", "client_completed")),
+            "post-movement/failure writes must actually advance successful primary progress")
+
+
+def validate_essential_data(value, profile, built):
+    scenarios = value["scenarios"]
+    baseline = scenarios["writes_100"]
+    observation = baseline["observation"]
+    primary = data_snapshot(observation, profile)
+    service, partition = observation["service"], observation["partition"]
+    processes = scenarios["deployment_identity"]["processes"]
+    for replica in observation["replicas"]:
+        matches = [process for process in processes
+                   if process["native_identity"].get("node") == replica["node"]]
+        require(len(matches) == 1, "baseline writes must bind the independently inspected deployment")
+        validate_expected_process(matches[0]["native_identity"], replica["rpc"], built)
+        validate_process(matches[0]["process"], replica["rpc"], built, "inspect")
+    results = successful_writes(baseline["writes"], 100)
+    workload = baseline["workload"]
+    require(integer(workload.get("successful"), 100) and same(workload["successful"], len(results))
+            and same(workload.get("accepted"), len(results)) and integer(workload.get("last"), 1)
+            and workload["last"] == max(results.values()) and same(workload.get("results"), results)
+            and workload.get("values") == {"key-" + key: "value-" + key for key in results},
+            "100 successful writes must bind the independently converged workload")
+    for replica in observation["replicas"]:
+        state, progress = replica["rpc"]["state"], replica["rpc"]["engine"]["progress"]
+        require(same(state.get("results"), results) and same(state.get("values"), workload["values"])
+                and same(state["last"], workload["last"])
+                and progress["received"] >= state["last"]
+                and (replica["role"] == "Primary" or progress["applied"] >= state["last"]),
+                "independent provider state/order/receive/apply must match successful writes")
+    require(all(primary["engine"]["progress"][key] >= workload["last"]
+                for key in ("assigned", "committed", "completed", "client_completed")),
+            "primary progress must substantiate actual successful commitments")
+    for name in ESSENTIAL_SCENARIO_SPECS:
+        scenario = scenarios[name]
+        rpc = data_snapshot(scenario["observation"], profile, service)
+        require(rpc["partition"] == partition, "data scenarios must bind the original partition")
+        summary = scenario["workload"]
+        require(integer(summary.get("successful"), 100) and integer(summary.get("accepted"), summary["successful"])
+                and integer(summary.get("last"), summary["accepted"])
+                and same(summary["last"], rpc["state"]["last"])
+                and all(same(r["rpc"]["state"]["last"], summary["last"])
+                        for r in scenario["observation"]["replicas"]), "converged scenario workload/progress")
+    retry = scenarios["identified_retry"]
+    duplicate_result(retry["identical_retry"], results)
+    conflict = retry["conflicting_retry"]
+    require(type(conflict.get("http_status")) is int and conflict["http_status"] in (400, 503)
+            and conflict["reply"].get("outcome") == "rejected" and "sequence" not in conflict["reply"]
+            and conflict["reply"].get("request_id") == retry["identical_retry"]["request_id"]
+            and same(retry["workload"], {key: workload[key] for key in WORKLOAD_SPEC}),
+            "conflicting retry must reject before admission without changing the workload")
+    planned = scenarios["planned_move"]
+    validate_move(planned, profile, service, partition)
+    validate_post_writes(planned["post_move_writes"], planned["before"], planned["observation"], results)
+
+    lost = scenarios["lost_reply_dedup"]
+    validate_move(lost, profile, service, partition)
+    records = value["identified_workload"]
+    require(type(records) is dict and len(records) == 1, "one actual intentionally unread identified write")
+    request_id, record = next(iter(records.items()))
+    require(record.get("id") == request_id and integer(record.get("sequence"), 1)
+            and type(record.get("committed")) is bool, "actual lost-reply identity/sequence")
+    lost_result = {request_id: record["sequence"]}
+    attempts = record["attempts"]
+    require(type(attempts) is list and len(attempts) >= 2
+            and attempts[0].get("outcome") == "ambiguous_transport"
+            and attempts[0].get("reply_intentionally_unread") is True
+            and "reply" not in attempts[0], "actual sent/unread response transport attempt")
+    for attempt in attempts[1:]:
+        duplicate_result(attempt["reply"], lost_result)
+        require(type(attempt.get("http_status")) is int
+                and attempt["http_status"] == (200 if attempt["reply"]["outcome"] == "committed" else 202),
+                "lost-reply duplicate HTTP outcome")
+    require(record["committed"] is any(attempt["reply"]["outcome"] == "committed" for attempt in attempts[1:]),
+            "lost-reply ledger must truthfully retain actual committed/ambiguous results")
+    require(lost.get("retry_outcome") == attempts[1]["reply"]["outcome"], "lost-reply retry outcome binding")
+    for key in ("before_move", "before", "after", "observation"):
+        data_snapshot(lost[key], profile, service)
+        require(lost[key]["partition"] == partition
+                and all(same(r["rpc"]["state"].get("results"), lost_result) for r in lost[key]["replicas"]),
+                "lost reply must actually replicate before movement and deduplicate after it")
+
+    quorum = scenarios["unavailable_quorum"]
+    old = data_snapshot(quorum["before"], profile, service)
+    replicas = quorum["before"]["replicas"]
+    require(old["partition"] == partition and len({r["rpc"]["pid"] for r in replicas}) == 3,
+            "quorum loss needs the original partition and three independent processes")
+    paused, resumed = quorum["paused_processes"], quorum["resume"]
+    require(type(paused) is list and type(resumed) is list and len(paused) == len(resumed) == 2,
+            "both actual secondary processes must be paused and resumed")
+    for index, secondary in enumerate(r for r in replicas if r["role"] == "ActiveSecondary"):
+        require(validate_process(paused[index], secondary["rpc"], built, "pause") ==
+                validate_process(resumed[index], secondary["rpc"], built, "resume"),
+                "resume must bind the original paused process")
+    native = quorum["native_while_unavailable"]
+    partitions = native if type(native) is list else native["Items"]
+    require(type(partitions) is list and len(partitions) == 1
+            and type(partitions[0].get("TargetReplicaSetSize")) is int
+            and partitions[0]["TargetReplicaSetSize"] == 3
+            and type(partitions[0].get("MinReplicaSetSize")) is int
+            and partitions[0]["MinReplicaSetSize"] == 2
+            and partitions[0]["PartitionInformation"].get("Id") == partition,
+            "native unavailable quorum cannot be manufactured by changing membership")
+    write = quorum["write"]
+    require(type(write.get("committed")) is bool and write["committed"] is False
+            and text(write.get("id")) and same(write, quorum["accepted_write_outcome_after_recovery"]),
+            "unavailable quorum must not manufacture a recovered success")
+    attempts = write["attempts"]
+    require(type(attempts) is list and len(attempts) == 2
+            and attempts[0].get("native_quorum_unavailable") is True
+            and attempts[0].get("outcome") == "acceptance_unknown_until_HTTP_reply",
+            "actual unavailable quorum write attempt")
+    reply = attempts[1]["reply"]
+    require(reply.get("request_id") == write["id"], "unavailable quorum request identity")
+    if reply.get("outcome") == "rejected":
+        rejected_record({**write, "attempts": attempts[1:]})
+    else:
+        require(reply.get("outcome") == "ambiguous" and type(attempts[1].get("http_status")) is int
+                and attempts[1]["http_status"] == 202 and integer(write.get("sequence"), 1)
+                and same(reply.get("sequence"), write["sequence"])
+                and write["sequence"] > old["engine"]["progress"]["committed"],
+                "unavailable quorum permits only real ambiguity or pre-assignment rejection")
+    diagnostics = quorum["diagnostics"]
+    require(replica_identity(diagnostics) == replica_identity(old)
+            and all(integer(diagnostics["engine"]["progress"].get(key)) for key in PROGRESS_SPEC)
+            and diagnostics["engine"]["progress"]["committed"] == old["engine"]["progress"]["committed"]
+            and (write["sequence"] is None or diagnostics["engine"]["progress"]["assigned"] >= write["sequence"]),
+            "unavailable quorum must not advance committed progress from sends/receipts")
+
+    failure = scenarios["abrupt_primary_loss"]
+    old = quorum["observation"]["primary"]["rpc"]
+    new = failure["observation"]["primary"]["rpc"]
+    validate_expected_process(failure["native_identity"], old, built)
+    require(validate_process(failure["native_identity"]["captured"], old, built, "inspect") ==
+            validate_process(failure["kill"], old, built, "kill")
+            and failure["kill"].get("old_process_exit_confirmed") is True
+            and failure.get("process_wide_not_per_unit") is True
+            and new["host"] != old["host"] and new["engine_incarnation"] != old["engine_incarnation"]
+            and epoch(failure["observation"]) > epoch(quorum["observation"]),
+            "abrupt failure must kill the bound original process and advance native epoch")
+    validate_expected_process(failure["new_primary_native_identity"], new, built)
+    validate_process(failure["new_primary_process"], new, built, "inspect")
+    validate_post_writes(failure["post_failure_writes"], quorum["observation"], failure["observation"], results)
+    replacements = failure["replacement_hosts"]
+    require(type(replacements) is list and 1 <= len(replacements) <= 3, "actual replacement hosts required")
+    replacement_ids = set()
+    for replacement in replacements:
+        expected = replacement["native_identity"]
+        matches = [r["rpc"] for r in failure["observation"]["replicas"]
+                   if r["rpc"]["host"] == expected["host"] and r["rpc"]["node"] == expected["node"]]
+        require(len(matches) == 1 and expected["host"] != old["host"], "bound replacement native host")
+        validate_expected_process(expected, matches[0], built)
+        validate_process(replacement["process"], matches[0], built, "inspect")
+        replacement_ids.add(replica_identity(matches[0]))
+    require(len(replacement_ids) == len(replacements), "distinct replacement host observations")
+    retries = failure["lost_reply_retries_after_recovery_copy"]
+    require(type(retries) is list and len(retries) == 1, "lost-reply retry after replacement copy required")
+    duplicate_result(retries[0], lost_result)
+
+    close = scenarios["per_unit_close"]
+    before = data_snapshot(close["unrelated_before"], profile, service)
+    after = data_snapshot(close["unrelated_after"], profile, service)
+    auxiliary = close["auxiliary_before"]
+    aux = data_snapshot(auxiliary, profile, target=1, minimum=1)
+    require(replica_identity(before) == replica_identity(after)
+            and before["partition"] == partition
+            and replica_identity(after) == replica_identity(close["observation"]["primary"]["rpc"])
+            and before["host"] == aux["host"] and before["pid"] == aux["pid"]
+            and auxiliary["service"] != service and auxiliary["partition"] != partition
+            and auxiliary["service"].rsplit("/", 1)[0] == service.rsplit("/", 1)[0]
+            and type(close.get("old_auxiliary_http_status")) is int
+            and close["old_auxiliary_http_status"] in (404, 503),
+            "per-unit close must isolate a real colocated unit without replacing the main replica")
+    departure = close["native_departure"]
+    require(departure.get("observer") == "mssf-client" and departure.get("fixture_contacted") is False
+            and departure.get("service") == auxiliary["service"] and departure.get("node") == aux["node"]
+            and type(departure.get("deployed")) is list
+            and all(integer(item.get("replica_id"), 1) and item["replica_id"] != aux["replica"]
+                    for item in departure["deployed"]), "independent native per-unit departure")
+    if profile == "rust":
+        validate_siblings(failure, old, True)
+        validate_siblings(close, before, False)
+
+    capacity = scenarios["ledger_capacity_backpressure"]
+    rejected_record(capacity["capacity_rejection"], capacity=True)
+    require(integer(capacity.get("new_successful_writes"), 1)
+            and capacity["new_successful_writes"] <= 4096
+            and same(capacity["workload"]["accepted"], 4096), "actual finite capacity workload")
+    full = capacity["observation"]["primary"]["rpc"]["state"]
+    full_results = full["results"]
+    require(type(full_results) is dict and len(full_results) == 4096
+            and all(text(key) and integer(sequence, 1) for key, sequence in full_results.items())
+            and len(set(full_results.values())) == 4096
+            and all(same(full_results.get(key), sequence) for key, sequence in results.items()),
+            "finite capacity must retain 4096 actual unique identified results including old writes")
+    for replica in capacity["observation"]["replicas"]:
+        state = replica["rpc"]["state"]
+        require(type(state.get("history_count")) is int and state["history_count"] == 4096
+                and integer(state.get("retained_bytes"), 1) and state["retained_bytes"] <= 16 * SMALL,
+                "independently observed finite 4096-entry/16-MiB provider capacity")
+    duplicate_result(capacity["old_identity_retry_at_capacity"], results)
+
+
 def validate_data(value, profile, built):
     required = data.required_scenarios(profile)
     require(value.get("profile") == profile and value.get("status") == "PASS"
@@ -690,6 +1102,7 @@ def validate_data(value, profile, built):
                 and type(auxiliary.get("target")) is int and auxiliary.get("minimum") == 2
                 and type(auxiliary.get("minimum")) is int, "baseline full auxiliary placement policy")
         true_fields(auxiliary["cleanup"], ("native_absence_confirmed", "original_routes_retired"))
+    validate_essential_data(value, profile, built)
     ack = value["scenarios"]["apply_ack_delay"]
     true_fields(ack, ("blocked_after_receive",))
     require(number(ack.get("elapsed_seconds"), 1.8), "actual ACK delay evidence")
@@ -914,6 +1327,124 @@ SCENARIO_SPEC = {
     "unchanged": LOSS_SPEC,
     "changed": LOSS_SPEC,
 }
+REPLY_SPEC = fields("request_id", "outcome", "sequence", "duplicate", "error")
+RECORD_SPEC = {
+    **fields("id", "key", "value", "sequence", "committed"),
+    "attempts": {"*": {
+        **fields("http_status", "outcome", "reply_intentionally_unread", "native_quorum_unavailable"),
+        "reply": REPLY_SPEC,
+    }},
+}
+LOST_RESULTS = PrefixSpec("lost-reply-", True)
+PROGRESS_SPEC = fields("assigned", "received", "applied", "committed", "completed", "client_completed")
+WORKLOAD_SPEC = fields("successful", "accepted", "last")
+WRITES_SPEC = fields("requested", "successful", "ids", "sequences")
+PROCESS_SPEC = {
+    **fields("pid", "host", "start_ticks", "code_sequence", "action", "old_process_exit_confirmed",
+             "executable_sha256", "classification", "native_libraries"),
+    "activation_environment": fields("Fabric_NodeName", "Fabric_ApplicationHostId",
+                                     "Fabric_CodePackageInstanceSeqNum"),
+}
+EXPECTED_PROCESS_SPEC = {
+    **fields("native_pid", "native_entry_point_instance", "native_code_version", "host", "node",
+             "kind", "engine_sha256"),
+    "native_query": {
+        **fields("Name", "Version", "ServiceManifestName"),
+        "MainEntryPoint": fields("ProcessId", "InstanceId"),
+    },
+    "captured": PROCESS_SPEC,
+}
+SIBLING_SPEC = {"*": {
+    **fields("native_pid", "native_entry_point_instance"),
+    "rpc": fields("partition", "instance", "incarnation", "pid", "host", "node"),
+}}
+
+
+def snapshot_spec(results=LOST_RESULTS, values=None, primary_results=LOST_RESULTS):
+    def rpc(selected):
+        return {
+            **fields("profile", "partition", "replica", "node", "incarnation", "engine_incarnation",
+                     "host", "pid", "engine_kind", "role", "current_role", "service_address"),
+            "state": {**fields("last", "copy_in_progress", "history_count", "retained_bytes"),
+                      "results": selected, **({"values": values} if values is not None else {})},
+            "engine": {**fields("closed", "fault", "copy_done"), "progress": PROGRESS_SPEC},
+        }
+    return {
+        **fields("observer", "service", "partition"),
+        "native_partition": {**fields("target", "minimum", "status"),
+                             "epoch": fields("data_loss", "configuration")},
+        "primary": {**fields("resolver", "endpoint", "native_pid"), "rpc": rpc(primary_results)},
+        "replicas": {"*": {
+            **fields("node", "replica", "role", "status", "address", "service_http_status"),
+            "deployed": fields("host_process_id"), "rpc": rpc(results),
+        }},
+    }
+
+
+SNAPSHOT_SPEC = snapshot_spec()
+MOVE_SPEC = {
+    "before": SNAPSHOT_SPEC, "after": SNAPSHOT_SPEC,
+    "move_request": fields("constraints", "native_request_completed", "partition", "request", "target"),
+    **fields("old_primary_http_status"),
+}
+PARTITION_REST_SPEC = {
+    **fields("TargetReplicaSetSize", "MinReplicaSetSize"),
+    "PartitionInformation": fields("Id"),
+}
+ESSENTIAL_SCENARIO_SPECS = {
+    "writes_100": {
+        "writes": WRITES_SPEC,
+        "workload": {**WORKLOAD_SPEC, **fields("results", "values")},
+        "observation": snapshot_spec(results=True, values=True),
+    },
+    "identified_retry": {
+        "identical_retry": REPLY_SPEC,
+        "conflicting_retry": {**fields("http_status"), "reply": REPLY_SPEC},
+        "workload": WORKLOAD_SPEC, "observation": SNAPSHOT_SPEC,
+    },
+    "planned_move": {
+        **MOVE_SPEC, "post_move_writes": WRITES_SPEC,
+        "observation": SNAPSHOT_SPEC, "workload": WORKLOAD_SPEC,
+    },
+    "unavailable_quorum": {
+        "before": SNAPSHOT_SPEC, "observation": SNAPSHOT_SPEC, "workload": WORKLOAD_SPEC,
+        "paused_processes": {"*": PROCESS_SPEC}, "resume": {"*": PROCESS_SPEC},
+        "native_while_unavailable": {"Items": {"*": PARTITION_REST_SPEC}, "*": PARTITION_REST_SPEC},
+        "write": RECORD_SPEC, "accepted_write_outcome_after_recovery": RECORD_SPEC,
+        "diagnostics": {
+            **fields("partition", "replica", "node", "host", "pid", "incarnation", "engine_incarnation", "engine_kind"),
+            "engine": {"progress": PROGRESS_SPEC},
+        },
+    },
+    "lost_reply_dedup": {
+        **MOVE_SPEC, "before_move": SNAPSHOT_SPEC, "observation": SNAPSHOT_SPEC,
+        "workload": WORKLOAD_SPEC, **fields("retry_outcome"),
+    },
+    "abrupt_primary_loss": {
+        "observation": SNAPSHOT_SPEC, "workload": WORKLOAD_SPEC,
+        "native_identity": EXPECTED_PROCESS_SPEC, "kill": PROCESS_SPEC,
+        "new_primary_native_identity": EXPECTED_PROCESS_SPEC, "new_primary_process": PROCESS_SPEC,
+        "replacement_hosts": {"*": {"native_identity": EXPECTED_PROCESS_SPEC, "process": PROCESS_SPEC}},
+        "post_failure_writes": WRITES_SPEC,
+        "lost_reply_retries_after_recovery_copy": {"*": REPLY_SPEC},
+        **fields("process_wide_not_per_unit"),
+        "stateless_siblings_before": SIBLING_SPEC, "stateless_siblings_after": SIBLING_SPEC,
+    },
+    "per_unit_close": {
+        **{key: SNAPSHOT_SPEC for key in ("observation", "unrelated_before", "unrelated_after", "auxiliary_before")},
+        "workload": WORKLOAD_SPEC, **fields("old_auxiliary_http_status"),
+        "native_departure": {
+            **fields("observer", "node", "service", "fixture_contacted"),
+            "deployed": {"*": fields("replica_id")},
+        },
+        "stateless_siblings_before": SIBLING_SPEC, "stateless_siblings_after": SIBLING_SPEC,
+    },
+    "ledger_capacity_backpressure": {
+        "observation": snapshot_spec(primary_results=True), "workload": WORKLOAD_SPEC,
+        "capacity_rejection": RECORD_SPEC,
+        "old_identity_retry_at_capacity": REPLY_SPEC, **fields("new_successful_writes"),
+    },
+}
 DATA_SPEC = {
     **fields("profile", "status", "sf_version", "errors", "missing_or_failed", "required_scenarios", "onebox",
              "owner", "container_id", "provenance"),
@@ -927,7 +1458,14 @@ DATA_SPEC = {
                       "retained_for_recovery", "pending_native_fas", "deployment"),
     "auxiliary_data_services": {"*": fields("mixed", "eligible_nodes", "changed", "target",
                                          "minimum", "cleanup")},
-    "scenarios": {"*": SCENARIO_SPEC},
+    "identified_workload": PrefixSpec("lost-reply-", RECORD_SPEC),
+    "scenarios": {"*": SCENARIO_SPEC, "deployment_identity": {
+        **SCENARIO_SPEC, "processes": {"*": {
+            "native_identity": EXPECTED_PROCESS_SPEC, "process": PROCESS_SPEC,
+        }},
+    }, **{
+        name: {**SCENARIO_SPEC, **spec} for name, spec in ESSENTIAL_SCENARIO_SPECS.items()
+    }},
 }
 LEGACY_SPEC = {
     **fields("version", "kind", "profile", "status", "errors", "allocation", "context",
