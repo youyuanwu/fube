@@ -1666,7 +1666,11 @@ impl Owner {
             configured: false,
             received: 0,
             applied: 0,
-            maximum_sent: 0,
+            // A promoted primary may have an authoritative reconciled prefix
+            // but no retained suffix to resend. Native existing peers still
+            // ACK that prefix. It is an upper bound, never a peer vote; newer
+            // receipts remain bounded by actual subsequent sends.
+            maximum_sent: self.queue.progress().completed,
             receipt_seen: false,
             copy_received: 0,
             copy_applied: 0,

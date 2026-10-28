@@ -18,6 +18,83 @@ const NEXT_EPOCH: Epoch = Epoch {
 };
 
 #[tokio::test]
+async fn promoted_prefix_without_retained_suffix_accepts_bounded_existing_peer_receipt() {
+    let partition = Uuid::new_v4();
+    let primary = engine(
+        partition,
+        1,
+        Arc::new(Provider {
+            last: AtomicI64::new(20),
+            ..Provider::default()
+        }),
+    );
+    primary
+        .change_role(EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    let (transport, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let remote = endpoint(&transport, partition, 2);
+    transport.register_peer(&primary.endpoint()).unwrap();
+    let peer = ReplicaInformation {
+        node_id: [2; 16],
+        node_instance: 1,
+        replica_id: 2,
+        incarnation: 1,
+        role: ReplicaRole::Secondary,
+        previous_role: ReplicaRole::Secondary,
+        up: true,
+        ready: true,
+        address: remote.to_string(),
+        progress: ReplicationProgress { first: 0, last: 20 },
+        must_catch_up: false,
+    };
+    primary
+        .update_current_configuration(configuration(vec![peer], true, 2), cancel())
+        .await
+        .unwrap();
+    assert_eq!(primary.snapshot().progress.completed, 20);
+    assert_eq!(
+        primary.snapshot().peers[0].maximum_sent,
+        20,
+        "the reconciled prefix bounds receipts even when no retained operation needs resending"
+    );
+    raw_send(
+        &transport,
+        &remote,
+        &primary,
+        Body::Ack {
+            received: 20,
+            applied: 20,
+            copy_received: -1,
+            copy_applied: -1,
+            error: 0,
+        },
+    );
+    until(|| primary.snapshot().peers[0].applied == 20).await;
+    primary
+        .wait_for_catch_up(CatchUpMode::All, cancel())
+        .await
+        .unwrap();
+    raw_send(
+        &transport,
+        &remote,
+        &primary,
+        Body::Ack {
+            received: 21,
+            applied: 21,
+            copy_received: -1,
+            copy_applied: -1,
+            error: 0,
+        },
+    );
+    tokio::time::sleep(Settings::default().retry * 2).await;
+    assert_eq!(primary.snapshot().peers[0].applied, 20);
+    assert_eq!(primary.snapshot().progress.assigned, 20);
+    primary.abort();
+    transport.shutdown();
+}
+
+#[tokio::test]
 async fn public_open_endpoint_includes_native_required_empty_transport_suffix() {
     let node = engine(Uuid::new_v4(), 1, Arc::new(Provider::default()));
     let published = node.open(cancel()).await.unwrap();
