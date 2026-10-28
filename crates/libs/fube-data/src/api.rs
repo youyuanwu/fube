@@ -122,10 +122,35 @@ pub trait OperationDataStream: Send + Sync + 'static {
     fn next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>>;
 }
 
+/// An authentic operation at the exact sequence requested from a provider.
+/// The payload, segment boundaries and original operation epoch are unchanged.
+#[derive(Clone, Debug)]
+pub struct ReplayOperation {
+    pub epoch: Epoch,
+    pub data: OperationData,
+}
+
 /// Author-owned state contract. Calls may fail; no callback runs under a
 /// transport/engine lock. Volatile native builds pass `None` for copy context.
 pub trait StateProvider: Send + Sync + 'static {
     fn last_committed(&self) -> Result<i64>;
+    /// Return only the original operation at exactly `sequence` in applied or
+    /// completed copied history. Never synthesize a snapshot operation or
+    /// relabel its epoch. Unknown/unavailable metadata returns `None`.
+    /// The caller reserves bounded operation ownership before this callback.
+    fn replication_checkpoint(
+        &self,
+        _sequence: i64,
+        cancellation: Cancellation,
+    ) -> ServiceFuture<'_, Option<ReplayOperation>> {
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                Err(Error::Closed)
+            } else {
+                Ok(None)
+            }
+        })
+    }
     /// Reconcile authoritative state to the supplied prior-epoch boundary;
     /// ambiguous tail mutations may survive only in the selected history.
     fn update_epoch(

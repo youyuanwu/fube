@@ -1312,6 +1312,21 @@ def data_loss_invariants(before: dict, after: dict, ledger: Ledger, changed: boo
     return reconciled
 
 
+def no_write_native_acks(value: dict, boundary: int) -> bool:
+    source = value["primary"]["rpc"]
+    if source["engine_kind"] != "rust":
+        return False
+    expected = {replica["replica"] for replica in value["replicas"] if replica["role"] == "ActiveSecondary"}
+    peers = source["engine"]["peers"]
+    return (len(expected) == 2 and len(peers) == 2
+            and {peer["replica"] for peer in peers} == expected
+            and source["state"]["last"] == boundary
+            and source["engine"]["progress"]["assigned"] == boundary
+            and source["engine"]["progress"]["committed"] == boundary
+            and all(peer["applied"] >= boundary and peer["received"] >= boundary
+                    and not peer["building"] and not peer["cleanup_required"] for peer in peers))
+
+
 class CopyAckGate:
     """Keep actual CopyEnd ACK ownership separate from native build status."""
     def __init__(self, qualification, before: dict, removed: dict, evidence: dict):
@@ -2535,10 +2550,13 @@ class Qualification:
         evidence["post_copy_no_write_moves"] = []
         boundary = after["primary"]["rpc"]["state"]["last"]
         original_replicas = {identity(replica) for replica in after["replicas"]}
-        for selected_kind in (other, kind):
+        for selected_kind in (other, kind, other, kind):
             moved = {"requested_engine": selected_kind, "no_intervening_client_writes": True}
             evidence["post_copy_no_write_moves"].append(moved)
             moved_after = self.move(moved, selected_kind)
+            if selected_kind == "rust":
+                moved_after = self.wait(capture=moved, accept=lambda value: no_write_native_acks(value, boundary))
+                moved["actual_fresh_native_ack_frontiers"] = moved_after["primary"]["rpc"]["engine"]["peers"]
             self.ledger.compare(moved_after)
             require({identity(replica) for replica in moved_after["replicas"]} == original_replicas
                     and all(replica["rpc"]["state"]["last"] == boundary for replica in moved_after["replicas"]),

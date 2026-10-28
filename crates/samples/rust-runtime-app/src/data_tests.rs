@@ -306,11 +306,20 @@ fn query_decodes_strict_utf8_and_rejects_malformed_unknown_and_bounded_requests(
 #[tokio::test]
 async fn copy_pacing_is_cancelable_and_does_not_consume_or_change_snapshot_data() {
     let provider = MemoryProvider::new();
+    let original = mutation("checkpoint").operation_for_epoch(EPOCH).unwrap();
+    provider.apply_replication(1, &original).unwrap();
     let delay = Arc::new(AtomicU64::new(100));
     let wrapper = CopyProvider {
         inner: provider,
         delay: delay.clone(),
     };
+    let checkpoint = wrapper
+        .replication_checkpoint(1, Cancellation::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.epoch, EPOCH);
+    assert_eq!(checkpoint.data, original);
     let stream = wrapper.copy_state(0, None).unwrap();
     assert!(tokio::time::timeout(
         Duration::from_millis(10),
@@ -420,6 +429,49 @@ async fn concurrent_writes_apply_before_waiting_and_deduplicate_before_assigning
     assert!(result.json().get("sequence").is_none());
     assert_eq!(route.engine.snapshot().progress.assigned, 1);
     assert_eq!(route.provider.snapshot().history_count, 1);
+    let checkpoint = route
+        .provider
+        .replication_checkpoint(1, Cancellation::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.epoch, EPOCH.primary());
+    assert_eq!(
+        checkpoint.data,
+        mutation("same")
+            .operation_for_epoch(EPOCH.primary())
+            .unwrap()
+    );
+    route.shutdown();
+}
+
+#[tokio::test]
+async fn native_primary_epoch_change_between_authority_reads_rejects_before_admission() {
+    struct ChangedEpoch(AtomicUsize);
+    impl NativeView for ChangedEpoch {
+        fn snapshot(&self) -> RuntimeResult<ReplicaStatus> {
+            let mut view = status(ReplicaRole::Primary);
+            if self.0.fetch_add(1, Ordering::AcqRel) > 0 {
+                view.current_epoch.configuration += 1 << 32;
+            }
+            Ok(view)
+        }
+    }
+    let (route, _) = route(Uuid::new_v4(), 1, ReplicaRole::Primary).await;
+    let Admission::Result(result) = admit(
+        &ChangedEpoch(AtomicUsize::new(0)),
+        &route.engine,
+        &route.provider,
+        &route.stopped,
+        &mutation("changed-epoch"),
+    )
+    .await
+    else {
+        panic!("changed native epoch must not be admitted");
+    };
+    assert_eq!(result.outcome, Outcome::Rejected);
+    assert_eq!(route.engine.snapshot().progress.assigned, 0);
+    assert_eq!(route.provider.snapshot().last, 0);
     route.shutdown();
 }
 

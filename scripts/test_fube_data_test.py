@@ -768,6 +768,27 @@ class NativeIdentityTests(unittest.TestCase):
 
 
 class CopyAckGateTests(unittest.TestCase):
+    def test_no_write_native_acks_require_actual_receipts_not_descriptor_prefix_or_new_assignments(self):
+        value = observation()
+        source = value["primary"]["rpc"]
+        source["engine_kind"] = "rust"
+        source["state"]["last"] = 20
+        source["engine"]["progress"].update(assigned=20, committed=20)
+        expected = [replica["replica"] for replica in value["replicas"] if replica["role"] == "ActiveSecondary"]
+        source["engine"]["peers"] = [{"replica": replica, "received": 20, "applied": 20,
+            "native_catchup_prefix": 20, "building": False, "cleanup_required": False} for replica in expected]
+        self.assertTrue(data.no_write_native_acks(value, 20))
+        for field in ("received", "applied"):
+            altered = copy.deepcopy(value)
+            altered["primary"]["rpc"]["engine"]["peers"][0][field] = 0
+            self.assertFalse(data.no_write_native_acks(altered, 20))
+        altered = copy.deepcopy(value)
+        altered["primary"]["rpc"]["engine"]["progress"]["assigned"] = 21
+        self.assertFalse(data.no_write_native_acks(altered, 20))
+        altered = copy.deepcopy(value)
+        altered["primary"]["rpc"]["engine"]["peers"].pop()
+        self.assertFalse(data.no_write_native_acks(altered, 20))
+
     def fixture(self, primary_kind):
         before = observation()
         primary_index = 1 if primary_kind == "rust" else 0

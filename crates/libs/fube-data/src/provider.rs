@@ -9,18 +9,23 @@
 //! loses both values and identity protection.
 
 use crate::{
-    Cancellation, Epoch, Error, OperationData, OperationDataStream, Result, StateProvider,
+    Cancellation, Epoch, Error, OperationData, OperationDataStream, ReplayOperation, Result,
+    StateProvider,
 };
 use mssf_runtime::ServiceFuture;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 const CAPACITY: usize = 4096;
 const BYTES: usize = 16 * 1024 * 1024;
 const MAX_VALUE: usize = 64 * 1024;
+const MAX_OPERATION: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,7 +51,23 @@ impl Mutation {
         encode(&Payload::Mutation {
             version: 1,
             mutation: self.clone(),
+            origin_epoch: None,
         })
+    }
+    /// Stamp the actual admitted primary operation epoch, not a future replay's
+    /// epoch. Callers must fence submission against this same authority epoch.
+    pub fn operation_for_epoch(&self, epoch: Epoch) -> Result<OperationData> {
+        self.validate()?;
+        if epoch.data_loss < 0 || epoch.configuration < 0 || epoch != epoch.primary() {
+            return Err(Error::InvalidInput("mutation primary operation epoch"));
+        }
+        let data = encode(&Payload::Mutation {
+            version: 2,
+            mutation: self.clone(),
+            origin_epoch: Some(OriginEpoch::from(epoch)),
+        })?;
+        validate_copy_bound(self, Some(&data))?;
+        Ok(data)
     }
 }
 
@@ -65,10 +86,21 @@ pub struct ProviderSnapshot {
     pub last_data_loss_boundary: Option<i64>,
 }
 
-#[derive(Clone)]
 struct Record {
     sequence: i64,
     mutation: Mutation,
+    replay: Option<ReplayOperation>,
+    // Drop the charge after all record-owned payloads, including snapshot pins.
+    _charge: RetainedCharge,
+}
+struct RetainedCharge {
+    bytes: usize,
+    budget: Arc<AtomicUsize>,
+}
+impl Drop for RetainedCharge {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
 }
 #[derive(Default)]
 struct State {
@@ -76,7 +108,7 @@ struct State {
     history: BTreeMap<i64, Arc<Record>>,
     values: BTreeMap<String, String>,
     ledger: BTreeMap<String, (Mutation, i64)>,
-    bytes: usize,
+    budget: Arc<AtomicUsize>,
     copying: Option<i64>,
     epoch: Option<Epoch>,
     data_loss: Option<i64>,
@@ -100,7 +132,13 @@ impl MemoryProvider {
         if state.copying.is_some() {
             return Err(Error::Closed);
         }
-        check_admission(&state, mutation)
+        // Largest valid epoch has the largest canonical metadata. This also
+        // validates copy escaping before either producer submits an operation.
+        let data = mutation.operation_for_epoch(Epoch {
+            data_loss: i64::MAX,
+            configuration: i64::MAX & !0xffff_ffff,
+        })?;
+        check_admission(&state, mutation, Some(&data))
     }
     pub fn snapshot(&self) -> ProviderSnapshot {
         let state = self.state.lock().unwrap();
@@ -114,7 +152,7 @@ impl MemoryProvider {
                 .map(|(id, (_, lsn))| (id.clone(), *lsn))
                 .collect(),
             history_count: state.history.len(),
-            retained_bytes: state.bytes,
+            retained_bytes: state.budget.load(Ordering::Acquire),
             epoch_data_loss: state.epoch.map_or(0, |e| e.data_loss),
             epoch_configuration: state.epoch.map_or(0, |e| e.configuration),
             data_loss_calls: state.data_loss_calls,
@@ -124,19 +162,16 @@ impl MemoryProvider {
     }
     /// Primary local application or secondary application BEFORE explicit ACK.
     pub fn apply_replication(&self, sequence: i64, data: &OperationData) -> Result<i64> {
-        match decode(data)? {
-            Payload::Mutation {
-                version: 1,
-                mutation,
-            } => {
-                let mut state = self.state.lock().unwrap();
-                if state.copying.is_some() {
-                    return Err(Error::Protocol("replication before copied state"));
-                }
-                apply(&mut state, sequence, mutation)
-            }
-            _ => Err(Error::Protocol("invalid replication provider payload")),
+        let (mutation, epoch) = replication_payload(data)?;
+        let replay = epoch.map(|epoch| ReplayOperation {
+            epoch,
+            data: data.clone(),
+        });
+        let mut state = self.state.lock().unwrap();
+        if state.copying.is_some() {
+            return Err(Error::Protocol("replication before copied state"));
         }
+        apply(&mut state, sequence, mutation, replay)
     }
     pub fn apply_copy(&self, data: &OperationData) -> Result<()> {
         let payload = decode(data)?;
@@ -151,6 +186,7 @@ impl MemoryProvider {
                 }
                 let epoch = state.epoch;
                 *state = State {
+                    budget: state.budget.clone(),
                     copying: Some(boundary),
                     epoch,
                     data_loss: state.data_loss,
@@ -161,17 +197,19 @@ impl MemoryProvider {
                 };
             }
             Payload::CopyRecord {
-                version: 1,
+                version,
                 sequence,
                 mutation,
-            } => {
+                replay,
+            } if (version == 1 && replay.is_none()) || (version == 2 && replay.is_some()) => {
                 let boundary = state
                     .copying
                     .ok_or(Error::Protocol("copy record outside snapshot"))?;
                 if sequence > boundary {
                     return Err(Error::Protocol("copy record beyond horizon"));
                 }
-                apply(&mut state, sequence, mutation)?;
+                let replay = replay.map(|replay| replay.restore(&mutation)).transpose()?;
+                apply(&mut state, sequence, mutation, replay)?;
             }
             Payload::CopyEnd {
                 version: 1,
@@ -197,7 +235,11 @@ impl MemoryProvider {
     }
 }
 
-fn check_admission(state: &State, mutation: &Mutation) -> Result<Option<i64>> {
+fn check_admission(
+    state: &State,
+    mutation: &Mutation,
+    data: Option<&OperationData>,
+) -> Result<Option<i64>> {
     if let Some((old, result)) = state.ledger.get(&mutation.id) {
         return if old == mutation {
             Ok(Some(*result))
@@ -205,26 +247,37 @@ fn check_admission(state: &State, mutation: &Mutation) -> Result<Option<i64>> {
             Err(Error::InvalidInput("conflicting request identity"))
         };
     }
-    let charge = charge(mutation);
+    let charge = charge(mutation, data);
     if state.history.len() >= CAPACITY
         || state.ledger.len() >= CAPACITY
-        || charge > BYTES.saturating_sub(state.bytes)
+        || charge > BYTES.saturating_sub(state.budget.load(Ordering::Acquire))
     {
         return Err(Error::ResourceLimit("provider history/identity ledger"));
     }
     Ok(None)
 }
-fn charge(m: &Mutation) -> usize {
-    // Account history + value + ledger ownership and BTree node/descriptor costs.
-    1024 + m.id.len() * 2 + m.key.len() * 3 + m.value.len() * 3
+fn charge(m: &Mutation, data: Option<&OperationData>) -> usize {
+    // History, value, ledger, BTree/Arc descriptors, and exact replay buffers.
+    1024 + m.id.len() * 2
+        + m.key.len() * 3
+        + m.value.len() * 3
+        + data.map_or(0, OperationData::retained_bytes)
 }
-fn apply(state: &mut State, sequence: i64, mutation: Mutation) -> Result<i64> {
+fn apply(
+    state: &mut State,
+    sequence: i64,
+    mutation: Mutation,
+    replay: Option<ReplayOperation>,
+) -> Result<i64> {
     mutation.validate()?;
     if sequence <= 0 {
         return Err(Error::Protocol("nonpositive provider LSN"));
     }
     if let Some(old) = state.history.get(&sequence) {
-        if old.mutation != mutation {
+        if old.mutation != mutation
+            || old.replay.as_ref().map(|r| (r.epoch, &r.data))
+                != replay.as_ref().map(|r| (r.epoch, &r.data))
+        {
             return Err(Error::Protocol("conflicting provider LSN"));
         }
         return Ok(state.ledger[&mutation.id].1);
@@ -237,9 +290,13 @@ fn apply(state: &mut State, sequence: i64, mutation: Mutation) -> Result<i64> {
     {
         return Err(Error::Protocol("provider sequence gap"));
     }
-    let existing = check_admission(state, &mutation)?;
-    let retained = charge(&mutation);
-    if state.history.len() >= CAPACITY || retained > BYTES.saturating_sub(state.bytes) {
+    let data = replay.as_ref().map(|r| &r.data);
+    validate_copy_bound(&mutation, data)?;
+    let existing = check_admission(state, &mutation, data)?;
+    let retained = charge(&mutation, data);
+    if state.history.len() >= CAPACITY
+        || retained > BYTES.saturating_sub(state.budget.load(Ordering::Acquire))
+    {
         return Err(Error::ResourceLimit("provider operation history"));
     }
     let result = existing.unwrap_or(sequence);
@@ -251,10 +308,19 @@ fn apply(state: &mut State, sequence: i64, mutation: Mutation) -> Result<i64> {
             .ledger
             .insert(mutation.id.clone(), (mutation.clone(), sequence));
     }
-    state
-        .history
-        .insert(sequence, Arc::new(Record { sequence, mutation }));
-    state.bytes += retained;
+    state.budget.fetch_add(retained, Ordering::AcqRel);
+    state.history.insert(
+        sequence,
+        Arc::new(Record {
+            sequence,
+            mutation,
+            replay,
+            _charge: RetainedCharge {
+                bytes: retained,
+                budget: state.budget.clone(),
+            },
+        }),
+    );
     state.last = sequence;
     Ok(result)
 }
@@ -269,6 +335,7 @@ fn reconcile(state: &mut State, boundary: i64) -> Result<()> {
         .collect();
     let epoch = state.epoch;
     *state = State {
+        budget: state.budget.clone(),
         epoch,
         data_loss: state.data_loss,
         data_loss_calls: state.data_loss_calls,
@@ -277,7 +344,16 @@ fn reconcile(state: &mut State, boundary: i64) -> Result<()> {
         ..State::default()
     };
     for r in retained {
-        apply(state, r.sequence, r.mutation.clone())?;
+        if !state.ledger.contains_key(&r.mutation.id) {
+            state
+                .values
+                .insert(r.mutation.key.clone(), r.mutation.value.clone());
+            state
+                .ledger
+                .insert(r.mutation.id.clone(), (r.mutation.clone(), r.sequence));
+        }
+        state.last = r.sequence;
+        state.history.insert(r.sequence, r);
     }
     Ok(())
 }
@@ -288,6 +364,8 @@ enum Payload {
     Mutation {
         version: u32,
         mutation: Mutation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_epoch: Option<OriginEpoch>,
     },
     CopyBegin {
         version: u32,
@@ -297,12 +375,122 @@ enum Payload {
         version: u32,
         sequence: i64,
         mutation: Mutation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay: Option<CopyReplay>,
     },
     CopyEnd {
         version: u32,
         boundary: i64,
     },
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginEpoch {
+    data_loss: i64,
+    configuration: i64,
+}
+impl From<Epoch> for OriginEpoch {
+    fn from(epoch: Epoch) -> Self {
+        Self {
+            data_loss: epoch.data_loss,
+            configuration: epoch.configuration,
+        }
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CopyReplay {
+    // The full JSON is UTF8; an individual original segment need not be.
+    raw: String,
+    segment_lengths: Vec<usize>,
+}
+impl CopyReplay {
+    fn capture(data: &OperationData) -> Result<Self> {
+        let bytes = data
+            .segments()
+            .iter()
+            .flat_map(|s| s.iter().copied())
+            .collect();
+        Ok(Self {
+            raw: String::from_utf8(bytes).map_err(|_| Error::Protocol("provider replay UTF8"))?,
+            segment_lengths: data.segments().iter().map(|s| s.len()).collect(),
+        })
+    }
+    fn restore(self, mutation: &Mutation) -> Result<ReplayOperation> {
+        if self.segment_lengths.len() > 1024 {
+            return Err(Error::Protocol("provider replay segments"));
+        }
+        let mut position = 0usize;
+        let mut segments = Vec::with_capacity(self.segment_lengths.len());
+        for length in self.segment_lengths {
+            let end = position
+                .checked_add(length)
+                .ok_or(Error::Protocol("provider replay length overflow"))?;
+            segments.push(
+                self.raw
+                    .as_bytes()
+                    .get(position..end)
+                    .ok_or(Error::Protocol("provider replay lengths"))?
+                    .to_vec(),
+            );
+            position = end;
+        }
+        if position != self.raw.len() {
+            return Err(Error::Protocol("provider replay trailing bytes"));
+        }
+        let data = OperationData::new(segments)?;
+        let (original, epoch) = replication_payload(&data)?;
+        if &original != mutation {
+            return Err(Error::Protocol("provider replay mutation mismatch"));
+        }
+        Ok(ReplayOperation {
+            epoch: epoch.ok_or(Error::Protocol("provider replay missing origin epoch"))?,
+            data,
+        })
+    }
+}
+
+fn replication_payload(data: &OperationData) -> Result<(Mutation, Option<Epoch>)> {
+    match decode(data)? {
+        Payload::Mutation {
+            version: 1,
+            mutation,
+            origin_epoch: None,
+        } => Ok((mutation, None)),
+        Payload::Mutation {
+            version: 2,
+            mutation,
+            origin_epoch: Some(epoch),
+        } => {
+            let epoch = Epoch {
+                data_loss: epoch.data_loss,
+                configuration: epoch.configuration,
+            };
+            if epoch.data_loss < 0 || epoch.configuration < 0 || epoch != epoch.primary() {
+                return Err(Error::Protocol("provider original operation epoch"));
+            }
+            Ok((mutation, Some(epoch)))
+        }
+        _ => Err(Error::Protocol("invalid replication provider payload")),
+    }
+}
+
+fn copy_record(sequence: i64, mutation: Mutation, data: Option<&OperationData>) -> Result<Payload> {
+    Ok(Payload::CopyRecord {
+        version: if data.is_some() { 2 } else { 1 },
+        sequence,
+        mutation,
+        replay: data.map(CopyReplay::capture).transpose()?,
+    })
+}
+
+fn validate_copy_bound(mutation: &Mutation, data: Option<&OperationData>) -> Result<()> {
+    // Reserve the largest sequence spelling before admission. Nested JSON
+    // escaping and all original segment descriptors must fit one copy item.
+    encode(&copy_record(i64::MAX, mutation.clone(), data)?)?;
+    Ok(())
+}
+
 fn encode(payload: &Payload) -> Result<OperationData> {
     let bytes = serde_json::to_vec(payload)
         .map_err(|_| Error::InvalidInput("provider payload encoding"))?;
@@ -312,7 +500,7 @@ fn encode(payload: &Payload) -> Result<OperationData> {
 fn decode(data: &OperationData) -> Result<Payload> {
     // Schema strings may expand sixfold through JSON escaping. Match the
     // actual operation/encoder bound, not a smaller unescaped-value estimate.
-    if data.bytes() > 1024 * 1024 {
+    if data.bytes() > MAX_OPERATION {
         return Err(Error::Protocol("provider payload bound"));
     }
     let bytes: Vec<_> = data
@@ -341,11 +529,11 @@ impl OperationDataStream for SnapshotStream {
                     boundary: self.boundary,
                 })?)
             } else if let Some(r) = self.records.get(*position - 1) {
-                Some(encode(&Payload::CopyRecord {
-                    version: 1,
-                    sequence: r.sequence,
-                    mutation: r.mutation.clone(),
-                })?)
+                Some(encode(&copy_record(
+                    r.sequence,
+                    r.mutation.clone(),
+                    r.replay.as_ref().map(|r| &r.data),
+                )?)?)
             } else if *position == self.records.len() + 1 {
                 Some(encode(&Payload::CopyEnd {
                     version: 1,
@@ -376,6 +564,25 @@ impl OperationDataStream for Empty {
 impl StateProvider for MemoryProvider {
     fn last_committed(&self) -> Result<i64> {
         Ok(self.state.lock().unwrap().last)
+    }
+    fn replication_checkpoint(
+        &self,
+        sequence: i64,
+        cancellation: Cancellation,
+    ) -> ServiceFuture<'_, Option<ReplayOperation>> {
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(Error::Closed);
+            }
+            let state = self.state.lock().unwrap();
+            if state.copying.is_some() {
+                return Ok(None);
+            }
+            Ok(state
+                .history
+                .get(&sequence)
+                .and_then(|record| record.replay.clone()))
+        })
     }
     fn update_epoch(
         &self,
@@ -452,6 +659,10 @@ impl StateProvider for MemoryProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const ORIGINAL_EPOCH: Epoch = Epoch {
+        data_loss: 7,
+        configuration: 3 << 32,
+    };
     fn mutation(n: i64) -> Mutation {
         Mutation {
             id: format!("r{n}"),
@@ -565,7 +776,12 @@ mod tests {
             value: "\0".repeat(MAX_VALUE),
         };
         assert_eq!(p.admission(&mutation).unwrap(), None);
-        let data = mutation.operation().unwrap();
+        let data = mutation
+            .operation_for_epoch(Epoch {
+                data_loss: i64::MAX,
+                configuration: i64::MAX & !0xffff_ffff,
+            })
+            .unwrap();
         assert!(data.bytes() > MAX_VALUE * 2);
         assert!(data.bytes() < 1024 * 1024);
         p.apply_replication(1, &data).unwrap();
@@ -576,5 +792,184 @@ mod tests {
         }
         assert_eq!(p.snapshot().values, target.snapshot().values);
         assert_eq!(target.admission(&mutation).unwrap(), Some(1));
+        assert_eq!(
+            target
+                .replication_checkpoint(1, Cancellation::default())
+                .await
+                .unwrap()
+                .unwrap()
+                .data,
+            data
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoints_preserve_original_epoch_bytes_and_segments_through_copy_and_reconciliation(
+    ) {
+        let source = MemoryProvider::new();
+        let mut m = mutation(1);
+        m.value = "☃".into();
+        let raw = format!(
+            " \n{{\"mutation\":{},\"origin_epoch\":{{\"configuration\":{},\"data_loss\":7}},\"version\":2,\"kind\":\"Mutation\"}}\t",
+            serde_json::to_string(&m).unwrap(),
+            ORIGINAL_EPOCH.configuration
+        ).into_bytes();
+        let split = raw.windows(3).position(|w| w == "☃".as_bytes()).unwrap() + 1;
+        let data = OperationData::new(vec![
+            vec![],
+            raw[..split].to_vec(),
+            vec![],
+            raw[split..].to_vec(),
+            vec![],
+        ])
+        .unwrap();
+        // A native secondary can receive payloads without any UpdateEpoch call.
+        source.apply_replication(1, &data).unwrap();
+        assert_eq!(source.state.lock().unwrap().epoch, None);
+        source
+            .apply_replication(2, &mutation(2).operation_for_epoch(ORIGINAL_EPOCH).unwrap())
+            .unwrap();
+        let copy = source.copy_state(1, None).unwrap();
+        let copied = MemoryProvider::new();
+        copied
+            .apply_copy(&copy.next(Cancellation::default()).await.unwrap().unwrap())
+            .unwrap();
+        copied
+            .apply_copy(&copy.next(Cancellation::default()).await.unwrap().unwrap())
+            .unwrap();
+        assert!(copied
+            .replication_checkpoint(1, Cancellation::default())
+            .await
+            .unwrap()
+            .is_none());
+        copied
+            .apply_copy(&copy.next(Cancellation::default()).await.unwrap().unwrap())
+            .unwrap();
+        let second_copy = copied.copy_state(1, None).unwrap();
+        let twice = MemoryProvider::new();
+        while let Some(item) = second_copy.next(Cancellation::default()).await.unwrap() {
+            twice.apply_copy(&item).unwrap();
+        }
+        for provider in [&source, &copied, &twice] {
+            let checkpoint = provider
+                .replication_checkpoint(1, Cancellation::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(checkpoint.epoch, ORIGINAL_EPOCH);
+            assert_eq!(checkpoint.data, data);
+            assert_eq!(provider.admission(&m).unwrap(), Some(1));
+        }
+        source
+            .update_epoch(
+                Epoch {
+                    data_loss: 8,
+                    configuration: 5 << 32,
+                },
+                1,
+                Cancellation::default(),
+            )
+            .await
+            .unwrap();
+        assert!(source
+            .replication_checkpoint(2, Cancellation::default())
+            .await
+            .unwrap()
+            .is_none());
+        let checkpoint = source
+            .replication_checkpoint(1, Cancellation::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.epoch, ORIGINAL_EPOCH);
+        assert_eq!(checkpoint.data, data);
+        source.request_data_loss(0).unwrap();
+        assert!(source.on_data_loss(Cancellation::default()).await.unwrap());
+        assert!(source
+            .replication_checkpoint(1, Cancellation::default())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(source.admission(&m).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn legacy_unknown_metadata_and_cancellation_never_synthesize_a_checkpoint() {
+        let p = MemoryProvider::new();
+        p.apply_replication(1, &mutation(1).operation().unwrap())
+            .unwrap();
+        for sequence in [-1, 0, 1, 2] {
+            assert!(p
+                .replication_checkpoint(sequence, Cancellation::default())
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let copy = p.copy_state(1, None).unwrap();
+        let target = MemoryProvider::new();
+        while let Some(data) = copy.next(Cancellation::default()).await.unwrap() {
+            target.apply_copy(&data).unwrap();
+        }
+        assert!(target
+            .replication_checkpoint(1, Cancellation::default())
+            .await
+            .unwrap()
+            .is_none());
+        let cancel = Cancellation::default();
+        cancel.cancel();
+        assert!(target.replication_checkpoint(1, cancel).await.is_err());
+        assert!(p
+            .apply_replication(1, &mutation(1).operation_for_epoch(ORIGINAL_EPOCH).unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn replay_copy_expansion_and_invalid_segment_metadata_reject_before_state_application() {
+        let m = mutation(1);
+        let mut bytes = vec![b'\t'; MAX_OPERATION / 2];
+        bytes.extend(m.operation_for_epoch(ORIGINAL_EPOCH).unwrap().segments()[1].iter());
+        let oversized_copy = OperationData::new(vec![bytes]).unwrap();
+        let p = MemoryProvider::new();
+        assert!(matches!(
+            p.apply_replication(1, &oversized_copy),
+            Err(Error::ResourceLimit("operation bytes"))
+        ));
+        assert_eq!(p.snapshot().last, 0);
+        assert_eq!(p.snapshot().retained_bytes, 0);
+        let data = m.operation_for_epoch(ORIGINAL_EPOCH).unwrap();
+        let mut replay = CopyReplay::capture(&data).unwrap();
+        replay.segment_lengths.push(1);
+        assert!(replay.restore(&m).is_err());
+        let mut replay = CopyReplay::capture(&data).unwrap();
+        replay.segment_lengths = vec![usize::MAX, 1];
+        assert!(replay.restore(&m).is_err());
+        let replay = CopyReplay::capture(&data).unwrap();
+        assert!(replay.restore(&mutation(2)).is_err());
+    }
+
+    #[tokio::test]
+    async fn pinned_snapshot_replay_ownership_stays_charged_until_actual_disposal() {
+        let p = MemoryProvider::new();
+        let mut m = mutation(1);
+        m.value = "x".repeat(MAX_VALUE);
+        let data = m.operation_for_epoch(ORIGINAL_EPOCH).unwrap();
+        for n in 1.. {
+            match p.apply_replication(n, &data) {
+                Ok(_) => {}
+                Err(Error::ResourceLimit(_)) => break,
+                other => panic!("unexpected admission: {other:?}"),
+            }
+        }
+        let before = p.snapshot();
+        let pinned = p.copy_state(before.last, None).unwrap();
+        p.update_epoch(ORIGINAL_EPOCH, 0, Cancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(p.snapshot().retained_bytes, before.retained_bytes);
+        assert!(p.apply_replication(1, &data).is_err());
+        drop(pinned);
+        assert_eq!(p.snapshot().retained_bytes, 0);
+        p.apply_replication(1, &data).unwrap();
+        assert!(p.snapshot().retained_bytes >= data.retained_bytes());
     }
 }

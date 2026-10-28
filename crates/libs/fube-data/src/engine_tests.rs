@@ -1256,6 +1256,244 @@ async fn promotion_total_deadline_covers_receive_drain_and_final_callback_public
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiet_promotion_drain_wakes_on_absolute_deadline_or_cancellation_without_retry() {
+    for cancel_early in [false, true] {
+        let provider = Arc::new(Provider::default());
+        let settings = Settings {
+            retry: std::time::Duration::from_secs(2),
+            callback_timeout: std::time::Duration::from_millis(200),
+            ..Settings::default()
+        };
+        let (secondary, network, primary, _incoming) =
+            copying_raw_secondary(EPOCH, provider.clone(), settings).await;
+        raw_send(
+            &network,
+            &primary,
+            &secondary,
+            copy_item(EPOCH, 1, vec![], true),
+        );
+        until(|| secondary.snapshot().copy_done).await;
+        secondary
+            .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+            .await
+            .unwrap();
+        raw_send(
+            &network,
+            &primary,
+            &secondary,
+            replication(EPOCH, EPOCH, 1, 1),
+        );
+        let held = secondary
+            .replication_stream()
+            .next(cancel())
+            .await
+            .unwrap()
+            .unwrap();
+        provider.last.store(1, Ordering::Release);
+        network.shutdown();
+        let cancellation = cancel();
+        let promotion =
+            secondary.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancellation.clone());
+        tokio::pin!(promotion);
+        assert!(
+            timeout(std::time::Duration::from_millis(40), &mut promotion)
+                .await
+                .is_err()
+        );
+        if cancel_early {
+            cancellation.cancel();
+        }
+        assert!(
+            timeout(std::time::Duration::from_millis(260), &mut promotion)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        until(|| secondary.snapshot().closed).await;
+        assert_ne!(secondary.snapshot().role, ReplicaRole::Primary);
+        assert_eq!(secondary.snapshot().progress.applied, 0);
+        assert!(held.acknowledge().is_err());
+        drop(held);
+        secondary.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copied_primary_replays_only_authentic_prefix_to_an_unbound_native_behavior_peer() {
+    let partition = Uuid::new_v4();
+    let pp = MemoryProvider::new();
+    let sp = MemoryProvider::new();
+    let p = engine(partition, 1, pp.clone());
+    let s = engine_with_settings(
+        partition,
+        2,
+        sp.clone(),
+        Settings {
+            queue_operations: 1,
+            retry: std::time::Duration::from_millis(30),
+            ..Settings::default()
+        },
+    );
+    initial_primary(&p).await;
+    let original = Mutation {
+        id: "original".into(),
+        key: "key".into(),
+        value: "value".into(),
+    }
+    .operation_for_epoch(EPOCH)
+    .unwrap();
+    let mut write = p
+        .submit_in_epoch(EPOCH, original.clone(), cancel())
+        .await
+        .unwrap();
+    pp.apply_replication(1, &original).unwrap();
+    write.wait(cancel()).await.unwrap();
+    build_memory(&p, &s, &sp).await;
+    p.abort();
+    s.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    assert_eq!(s.snapshot().progress.retained_operations, 0);
+    let (network, mut incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let remote = endpoint(&network, partition, 3);
+    network.register_peer(&s.endpoint()).unwrap();
+    let mut peer = descriptor(&s);
+    peer.replica_id = 3;
+    peer.address = remote.to_string();
+    let mut cc = configuration(vec![peer], true, 2);
+    cc.epoch = NEXT_EPOCH;
+    s.update_current_configuration(cc, cancel()).await.unwrap();
+    let all = s.wait_for_catch_up(CatchUpMode::All, cancel());
+    tokio::pin!(all);
+    assert!(timeout(std::time::Duration::from_millis(30), &mut all)
+        .await
+        .is_err());
+    // Source-behavior fixture for SecondaryReplicator.cpp:1214-1395:
+    // epoch-less RequestAck cannot bind a demoted native secondary. Only a
+    // genuine replication packet sets its target; duplicate enqueue is harmless.
+    let replay = timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                packet = incoming.control.recv() => {
+                    assert!(matches!(packet.unwrap().body, Body::RequestAck));
+                    // No target, therefore no ACK and no invented progress.
+                }
+                packet = incoming.data.recv() => break packet.unwrap(),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    match replay.body {
+        Body::Replication {
+            primary_epoch,
+            operation_epoch,
+            operations,
+            ..
+        } => {
+            assert_eq!(primary_epoch, NEXT_EPOCH);
+            assert_eq!(
+                operation_epoch, EPOCH,
+                "do not restamp the original operation"
+            );
+            assert_eq!(operations.len(), 1);
+            assert_eq!(operations[0].sequence, 1);
+            assert_eq!(operations[0].data, original.to_segments());
+        }
+        _ => panic!("a snapshot or new operation cannot establish the native target"),
+    }
+    assert_eq!(sp.snapshot().last, 1);
+    assert_eq!(sp.snapshot().results.len(), 1);
+    assert!(timeout(std::time::Duration::from_millis(40), &mut all)
+        .await
+        .is_err());
+    raw_send(
+        &network,
+        &remote,
+        &s,
+        Body::Ack {
+            received: 1,
+            applied: 0,
+            copy_received: -1,
+            copy_applied: -1,
+            error: 0,
+        },
+    );
+    assert!(timeout(std::time::Duration::from_millis(40), &mut all)
+        .await
+        .is_err());
+    raw_send(
+        &network,
+        &remote,
+        &s,
+        Body::Ack {
+            received: 1,
+            applied: 1,
+            copy_received: -1,
+            copy_applied: -1,
+            error: 0,
+        },
+    );
+    timeout(std::time::Duration::from_secs(1), &mut all)
+        .await
+        .unwrap()
+        .unwrap();
+    until(|| s.snapshot().peers[0].applied == 1 && s.snapshot().owned_operations == 0).await;
+    assert_eq!(s.snapshot().peers[0].native_catchup_prefix, 0);
+    // The one-operation budget was a temporary callback owner, not a forever
+    // retained anchor that makes the next real assignment impossible.
+    let next = Mutation {
+        id: "next".into(),
+        key: "key".into(),
+        value: "next".into(),
+    }
+    .operation_for_epoch(NEXT_EPOCH)
+    .unwrap();
+    let accepted = s.submit_in_epoch(NEXT_EPOCH, next, cancel()).await.unwrap();
+    assert_eq!(accepted.sequence, 2);
+    s.abort();
+    network.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn epoch_fenced_submission_rejects_before_assignment_or_checkpoint_restamping() {
+    let provider = MemoryProvider::new();
+    let p = engine(Uuid::new_v4(), 1, provider.clone());
+    initial_primary(&p).await;
+    let record = Mutation {
+        id: "one".into(),
+        key: "key".into(),
+        value: "value".into(),
+    };
+    assert!(p
+        .submit_in_epoch(
+            NEXT_EPOCH,
+            record.operation_for_epoch(NEXT_EPOCH).unwrap(),
+            cancel()
+        )
+        .await
+        .is_err());
+    assert_eq!(p.snapshot().progress.assigned, 0);
+    assert!(provider.snapshot().results.is_empty());
+    let operation = record.operation_for_epoch(EPOCH).unwrap();
+    let mut write = p
+        .submit_in_epoch(EPOCH, operation.clone(), cancel())
+        .await
+        .unwrap();
+    assert_eq!(write.sequence, 1);
+    provider.apply_replication(1, &operation).unwrap();
+    write.wait(cancel()).await.unwrap();
+    let checkpoint = provider
+        .replication_checkpoint(1, cancel())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.epoch, EPOCH);
+    assert_eq!(checkpoint.data, operation);
+    p.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adopted_copy_retirement_does_not_pin_completed_writes_as_idle_history() {
     let partition = Uuid::new_v4();
     let pp = MemoryProvider::new();
@@ -4840,6 +5078,7 @@ async fn outgoing_build_admission_counts_pending_writes_before_installing_any_pe
                 let (reply, result) = oneshot::channel();
                 p.writes
                     .try_send(Submit {
+                        expected_epoch: None,
                         data: data.clone(),
                         charge,
                         cancellation: cancel(),

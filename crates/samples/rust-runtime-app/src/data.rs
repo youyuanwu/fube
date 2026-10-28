@@ -2,7 +2,7 @@
 use super::*;
 use fube_data::{
     wire::Actor, Engine, EngineSnapshot, MemoryProvider, Mutation, Operation, OperationData,
-    OperationDataStream, OperationStream, Replication, Settings, StateProvider,
+    OperationDataStream, OperationStream, ReplayOperation, Replication, Settings, StateProvider,
 };
 use std::{
     net::{IpAddr, SocketAddr},
@@ -265,9 +265,10 @@ async fn admit(
     mutation: &Mutation,
 ) -> Admission {
     let reject = |error| Admission::Result(WriteResult::rejected(mutation.id.clone(), error));
-    if let Err(error) = check_authority(native, engine, stopped, true) {
-        return reject(error);
-    }
+    let expected_epoch = match check_authority(native, engine, stopped, true) {
+        Ok(status) => status.current_epoch.primary(),
+        Err(error) => return reject(error),
+    };
     match provider.admission(mutation) {
         Ok(Some(sequence)) => {
             let committed = check_authority(native, engine, stopped, true).is_ok()
@@ -282,14 +283,19 @@ async fn admit(
         Err(error) => return reject(error),
         Ok(None) => {}
     }
-    let data = match mutation.operation() {
+    let data = match mutation.operation_for_epoch(expected_epoch) {
         Ok(data) => data,
         Err(error) => return reject(error),
     };
-    if let Err(error) = check_authority(native, engine, stopped, true) {
-        return reject(error);
+    match check_authority(native, engine, stopped, true) {
+        Ok(status) if status.current_epoch.primary() == expected_epoch => {}
+        Ok(_) => return reject(RuntimeError::Closed),
+        Err(error) => return reject(error),
     }
-    let replication = match engine.submit(data.clone(), stopped.clone()).await {
+    let replication = match engine
+        .submit_in_epoch(expected_epoch, data.clone(), stopped.clone())
+        .await
+    {
         Ok(replication) => replication,
         Err(error) => return reject(error),
     };
@@ -343,6 +349,13 @@ impl OperationDataStream for CopyStream {
 impl StateProvider for CopyProvider {
     fn last_committed(&self) -> RuntimeResult<i64> {
         self.inner.last_committed()
+    }
+    fn replication_checkpoint(
+        &self,
+        sequence: i64,
+        cancellation: Cancellation,
+    ) -> ServiceFuture<'_, Option<ReplayOperation>> {
+        self.inner.replication_checkpoint(sequence, cancellation)
     }
     fn update_epoch(
         &self,

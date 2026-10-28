@@ -170,6 +170,20 @@ impl StateProvider for Provider {
         self.0.event("last");
         Ok(0)
     }
+    fn replication_checkpoint(
+        &self,
+        _: i64,
+        _: Cancellation,
+    ) -> ServiceFuture<'_, Option<ReplayOperation>> {
+        self.0.event("checkpoint-constructor");
+        if self.0.mode.load(Ordering::SeqCst) == 3 {
+            panic!("controlled checkpoint constructor panic");
+        }
+        Box::pin(Callback {
+            probe: self.0.clone(),
+            output: Some(None),
+        })
+    }
     fn update_epoch(&self, _: Epoch, _: i64, _: Cancellation) -> ServiceFuture<'_, ()> {
         self.0.event("update-constructor");
         if self.0.mode.load(Ordering::SeqCst) == 3 {
@@ -257,6 +271,15 @@ fn all_callbacks_enroll_before_construction_and_hold_through_actual_future_dispo
     // Completion itself does not release accounting for retained captures.
     assert_eq!(probe.count(), 1);
     drop(epoch);
+    assert_eq!(probe.count(), 0);
+    let unpolled = provider.replication_checkpoint(1, Cancellation::default());
+    assert_eq!(probe.count(), 1);
+    drop(unpolled);
+    assert_eq!(probe.count(), 0);
+    let mut checkpoint = provider.replication_checkpoint(1, Cancellation::default());
+    assert!(matches!(poll(&mut checkpoint), Poll::Ready(Ok(None))));
+    assert_eq!(probe.count(), 1);
+    drop(checkpoint);
     assert_eq!(probe.count(), 0);
     let unpolled = provider.on_data_loss(Cancellation::default());
     drop(unpolled);
@@ -560,6 +583,13 @@ fn admission_failure_never_invokes_user_code_and_rejected_capture_cleanup_waits_
         Poll::Ready(Err(Error::ResourceLimit(_)))
     ));
     drop(callback);
+    probe.reject.store(1, Ordering::SeqCst);
+    let mut checkpoint = provider.replication_checkpoint(1, Cancellation::default());
+    assert!(matches!(
+        poll(&mut checkpoint),
+        Poll::Ready(Err(Error::ResourceLimit(_)))
+    ));
+    drop(checkpoint);
     probe.reject.store(1, Ordering::SeqCst);
     assert!(provider.copy_context().is_err());
     assert!(probe.events.lock().unwrap().is_empty());

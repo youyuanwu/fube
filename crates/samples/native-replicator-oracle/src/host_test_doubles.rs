@@ -24,6 +24,7 @@ pub(super) struct EngineState {
     pub creates: AtomicUsize,
     pub control_opens: AtomicUsize,
     pub progress_calls: AtomicUsize,
+    pub last_payload: Mutex<Option<OperationData>>,
 }
 
 impl EngineState {
@@ -40,6 +41,7 @@ impl EngineState {
             creates: AtomicUsize::new(0),
             control_opens: AtomicUsize::new(0),
             progress_calls: AtomicUsize::new(0),
+            last_payload: Mutex::new(None),
         })
     }
 
@@ -74,7 +76,10 @@ impl IFabricStateReplicator_Impl for EngineDouble_Impl {
             return Err(com::E_INVALIDARG.into());
         }
         let data = data.as_ref().ok_or(com::E_POINTER)?;
-        unsafe { crate::data::read_segments(data)? };
+        *self.0.last_payload.lock().unwrap() = Some(
+            OperationData::new(unsafe { crate::data::read_segments(data)? })
+                .map_err(application_error)?,
+        );
         sequence.0 = self.0.assigned.fetch_add(1, Ordering::AcqRel) + 1;
         let assigned = sequence.0;
         let state = self.0.clone();

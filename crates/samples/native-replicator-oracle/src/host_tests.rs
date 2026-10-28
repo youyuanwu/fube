@@ -2,6 +2,11 @@ use super::test_doubles::{callback, EngineState};
 use super::*;
 use std::sync::atomic::AtomicUsize;
 
+const FIXTURE_EPOCH: fube_data::Epoch = fube_data::Epoch {
+    data_loss: 1,
+    configuration: 3 << 32,
+};
+
 #[test]
 fn common_http_schema_percent_utf8_and_limits() {
     let Request::Write(mutation) = parse("write", "id=a&key=%C3%A9&value=a%26b%3Dc+z").unwrap()
@@ -139,6 +144,9 @@ async fn primary(
     assert_eq!(actual.as_raw(), control.as_raw());
     assert_eq!(engine.creates.load(Ordering::Acquire), 1);
     assert_eq!(engine.control_opens.load(Ordering::Acquire), 0);
+    // EngineDouble never runs native provider callbacks: explicitly supply the
+    // unit fixture's epoch. This is not native interoperability evidence.
+    *route.app.native_epoch.lock().unwrap() = Some(FIXTURE_EPOCH);
     let context =
         unsafe { replica.BeginChangeRole(FABRIC_REPLICA_ROLE::FABRIC_REPLICA_ROLE_PRIMARY, None) }
             .unwrap();
@@ -521,6 +529,28 @@ async fn native_write_begin_failure_does_not_apply_even_with_dirty_assigned_lsn(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_write_missing_callback_epoch_rejects_before_begin_replicate() {
+    let route = route();
+    let engine = EngineState::new();
+    let (replica, lifecycle) = primary(&route, &engine).await;
+    *route.app.native_epoch.lock().unwrap() = None;
+    let (status, body) = route.write(mutation("no-origin")).await;
+    assert_eq!(status, 503);
+    assert_eq!(body["outcome"], "rejected");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("epoch unavailable"));
+    assert_eq!(engine.begins.load(Ordering::Acquire), 0);
+    assert_eq!(route.app.provider.snapshot().last, 0);
+    assert_eq!(route.assigned.load(Ordering::Acquire), 0);
+    assert!(route.completions.lock().unwrap().is_empty());
+    unsafe { replica.Abort() };
+    lifecycle.join().await.unwrap();
+    engine.workers.join().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assigned_lsn_applies_before_delayed_end_and_retries_keep_native_outcomes() {
     for fail in [false, true] {
         let route = route();
@@ -537,6 +567,16 @@ async fn assigned_lsn_applies_before_delayed_end_and_retries_keep_native_outcome
         .await
         .unwrap();
         assert_eq!(route.app.provider.snapshot().values["key"], "value");
+        let checkpoint = fube_data::StateProvider::replication_checkpoint(
+            &*route.app.provider,
+            1,
+            Cancellation::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(checkpoint.epoch, FIXTURE_EPOCH);
+        assert_eq!(Some(checkpoint.data), *engine.last_payload.lock().unwrap());
         assert_eq!(route.assigned.load(Ordering::Acquire), 1);
         assert_eq!(engine.ends.load(Ordering::Acquire), 0);
         assert!(!task.is_finished());
@@ -673,6 +713,46 @@ impl NullableOperationStream_Impl for Operations_Impl {
 fn operations(operations: Vec<IFabricOperation>) -> IFabricOperationStream {
     let stream: NullableOperationStream = Operations(Mutex::new(operations.into())).into();
     stream.cast().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_secondary_keeps_original_checkpoint_without_update_epoch_callback() {
+    let route = route();
+    let data = mutation("native-secondary")
+        .operation_for_epoch(FIXTURE_EPOCH)
+        .unwrap();
+    let acks = Arc::new(AtomicU64::new(0));
+    let operation: IFabricOperation = Operation {
+        data: operation_data(data.to_segments()).unwrap(),
+        metadata: FABRIC_OPERATION_METADATA {
+            Type: FABRIC_OPERATION_TYPE::FABRIC_OPERATION_TYPE_NORMAL,
+            SequenceNumber: FABRIC_SEQUENCE_NUMBER(1),
+            ..Default::default()
+        },
+        applied: route.app.provider.clone(),
+        acknowledgments: acks.clone(),
+        expected: 1,
+    }
+    .into();
+    route
+        .consume(operations(vec![operation]), false, Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(*route.app.native_epoch.lock().unwrap(), None);
+    assert_eq!(acks.load(Ordering::Acquire), 1);
+    let copy = fube_data::StateProvider::copy_state(&*route.app.provider, 1, None).unwrap();
+    let target = fube_data::MemoryProvider::new();
+    while let Some(item) = copy.next(Cancellation::default()).await.unwrap() {
+        target.apply_copy(&item).unwrap();
+    }
+    let checkpoint =
+        fube_data::StateProvider::replication_checkpoint(&*target, 1, Cancellation::default())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(checkpoint.epoch, FIXTURE_EPOCH);
+    assert_eq!(checkpoint.data, data);
+    route.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

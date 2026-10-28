@@ -8,7 +8,9 @@
 //! construction, individual `next` calls/captures, and final disposal enroll;
 //! Runtime's outer participant guard still owns Close/Abort disposal.
 
-use crate::{Cancellation, Epoch, OperationData, OperationDataStream, Result, StateProvider};
+use crate::{
+    Cancellation, Epoch, OperationData, OperationDataStream, ReplayOperation, Result, StateProvider,
+};
 use mssf_runtime::{ServiceFuture, StatefulCallbackGuard, StatefulPartition};
 use std::{
     future::Future,
@@ -99,6 +101,22 @@ impl<S: Supervision> StateProvider for SupervisedProvider<S> {
     fn last_committed(&self) -> Result<i64> {
         let _guard = self.supervision.arm()?;
         self.inner().last_committed()
+    }
+
+    fn replication_checkpoint(
+        &self,
+        sequence: i64,
+        cancellation: Cancellation,
+    ) -> ServiceFuture<'_, Option<ReplayOperation>> {
+        let guard = match self.supervision.arm() {
+            Ok(guard) => guard,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        let inner = self.inner().replication_checkpoint(sequence, cancellation);
+        Box::pin(SupervisedFuture {
+            inner,
+            _guard: guard,
+        })
     }
 
     fn update_epoch(

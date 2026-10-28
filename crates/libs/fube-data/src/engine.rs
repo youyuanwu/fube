@@ -64,7 +64,8 @@ use crate::{
     transport::{Incoming, PeerTransport},
     wire::{Actor, Body, Endpoint, Packet, WireOperation},
     Acknowledgment, Cancellation, Epoch, Error, Operation, OperationData, OperationDataStream,
-    OperationStream, Progress, ReplicaRole, Result, Settings, StateProvider, StatefulPartition,
+    OperationStream, Progress, ReplayOperation, ReplicaRole, Result, Settings, StateProvider,
+    StatefulPartition,
 };
 
 #[cfg(test)]
@@ -575,8 +576,33 @@ impl Engine {
         data: OperationData,
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, Replication> {
+        self.submit_owned(None, data, cancellation)
+    }
+
+    /// Admit only in this exact primary epoch. Providers that carry an original
+    /// epoch in their opaque payload must not stamp a different admission epoch.
+    pub fn submit_in_epoch(
+        &self,
+        expected_epoch: Epoch,
+        data: OperationData,
+        cancellation: Cancellation,
+    ) -> ServiceFuture<'_, Replication> {
+        self.submit_owned(Some(expected_epoch), data, cancellation)
+    }
+
+    fn submit_owned(
+        &self,
+        expected_epoch: Option<Epoch>,
+        data: OperationData,
+        cancellation: Cancellation,
+    ) -> ServiceFuture<'_, Replication> {
         Box::pin(async move {
             self.check()?;
+            if expected_epoch.is_some_and(|epoch| {
+                epoch.data_loss < 0 || epoch.configuration < 0 || epoch != epoch.primary()
+            }) {
+                return Err(Error::InvalidInput("invalid admission epoch"));
+            }
             if cancellation.is_cancelled() {
                 return Err(Error::Closed);
             }
@@ -615,6 +641,7 @@ impl Engine {
                 drop(snapshot);
                 self.writes
                     .try_send(Submit {
+                        expected_epoch,
                         data,
                         charge,
                         cancellation,
@@ -697,6 +724,7 @@ fn same_endpoint(left: &Endpoint, right: &Endpoint) -> bool {
 }
 
 struct Submit {
+    expected_epoch: Option<Epoch>,
     data: OperationData,
     charge: Charge,
     cancellation: Cancellation,
@@ -818,6 +846,11 @@ struct Control {
 #[derive(Clone, Copy)]
 enum Job {
     Control,
+    Replay {
+        revision: u64,
+        sequence: i64,
+        epoch: Epoch,
+    },
     CopyOpen(Actor, u64),
     CopyNext(Actor, u64),
 }
@@ -827,9 +860,11 @@ enum JobValue {
     Loss(bool, Option<i64>),
     CopyOpen(Arc<dyn OperationDataStream>),
     CopyNext(Option<OperationData>, Charge),
+    Replay(Option<ReplayOperation>, Charge),
 }
 
 enum Event {
+    Deadline,
     Ack(ApplyAck),
     Command(Command),
     Job(Option<std::result::Result<(Job, Result<JobValue>), tokio::task::JoinError>>),
@@ -881,6 +916,7 @@ struct Owner {
     catchups: Vec<CatchUp>,
     removals: Vec<Removal>,
     jobs: JoinSet<(Job, Result<JobValue>)>,
+    replay_job: bool,
     ack_tx: mpsc::Sender<ApplyAck>,
     replication_tx: Option<mpsc::Sender<Operation>>,
     copy_tx: Option<mpsc::Sender<Operation>>,
@@ -946,6 +982,7 @@ impl Owner {
             catchups: Vec::new(),
             removals: Vec::new(),
             jobs: JoinSet::new(),
+            replay_job: false,
             ack_tx,
             replication_tx: Some(replication_tx),
             copy_tx: Some(copy_tx),
@@ -968,9 +1005,28 @@ impl Owner {
             if self.shared.stopped.load(Ordering::Acquire) || self.fault.is_some() {
                 break;
             }
+            let deadline = self
+                .control
+                .iter()
+                .map(|control| control.started)
+                .chain(self.apply_deadlines.values().copied())
+                .min()
+                .map(|started| started + self.settings.callback_timeout);
+            let cancellation = self
+                .control
+                .as_ref()
+                .map(|control| control.cancellation.clone());
             let event = tokio::select! {
                 biased;
                 _ = stop.changed() => break,
+                _ = async {
+                    if let Some(deadline) = deadline { tokio::time::sleep_until(deadline).await; }
+                    else { std::future::pending::<()>().await; }
+                } => Event::Deadline,
+                _ = async {
+                    if let Some(cancellation) = cancellation { cancellation.cancelled().await; }
+                    else { std::future::pending::<()>().await; }
+                } => Event::Deadline,
                 Some(ack) = acks.recv() => Event::Ack(ack),
                 Some(command) = commands.recv() => Event::Command(command),
                 result = self.jobs.join_next(), if !self.jobs.is_empty() => Event::Job(result),
@@ -987,6 +1043,7 @@ impl Owner {
                 break;
             }
             match event {
+                Event::Deadline => {}
                 Event::Ack(ack) => {
                     if let Err(error) = self.apply_ack(ack) {
                         self.fail(error);
@@ -1191,6 +1248,15 @@ impl Owner {
             let _ = write
                 .reply
                 .send(Err(Error::InvalidInput("primary is not write ready")));
+            return;
+        }
+        if write
+            .expected_epoch
+            .is_some_and(|epoch| Some(epoch) != self.epoch)
+        {
+            let _ = write
+                .reply
+                .send(Err(Error::InvalidInput("native admission epoch changed")));
             return;
         }
         match self
@@ -2079,6 +2145,57 @@ impl Owner {
                 peer.maximum_sent = peer.maximum_sent.max(entry.sequence);
             }
         }
+        self.start_prefix_replay();
+    }
+
+    fn start_prefix_replay(&mut self) {
+        let progress = self.queue.progress();
+        if self.replay_job
+            || self.role != ReplicaRole::Primary
+            || self.control.is_some()
+            || !self.reconciled
+            || progress.assigned <= 0
+            || progress.completed != progress.assigned
+            || self.queue.get(progress.assigned).is_some()
+            || !self.peers.values().any(|peer| {
+                peer.configured
+                    && !peer.cleanup_required
+                    && peer.build.is_none()
+                    && !peer.receipt_seen
+            })
+        {
+            return;
+        }
+        let Ok(charge) = self
+            .shared
+            .budget
+            .acquire(maximum_copy_bytes(&self.settings))
+        else {
+            return;
+        };
+        let provider = self.provider.clone();
+        let sequence = progress.assigned;
+        let epoch = self.epoch.unwrap();
+        let revision = self.shared.revision.load(Ordering::Acquire);
+        let deadline = self.settings.callback_timeout;
+        self.replay_job = true;
+        self.jobs.spawn(async move {
+            let result = timeout(
+                deadline,
+                provider.replication_checkpoint(sequence, Cancellation::default()),
+            )
+            .await
+            .unwrap_or(Err(Error::Timeout))
+            .map(|operation| JobValue::Replay(operation, charge));
+            (
+                Job::Replay {
+                    revision,
+                    sequence,
+                    epoch,
+                },
+                result,
+            )
+        });
     }
 
     fn send_copies(&mut self) {
@@ -3068,6 +3185,75 @@ impl Owner {
 
     fn job_done(&mut self, job: Job, result: Result<JobValue>) {
         match job {
+            Job::Replay {
+                revision,
+                sequence,
+                epoch,
+            } => {
+                self.replay_job = false;
+                if self.role != ReplicaRole::Primary
+                    || self.control.is_some()
+                    || self.epoch != Some(epoch)
+                    || revision != self.shared.revision.load(Ordering::Acquire)
+                    || self.queue.progress().assigned != sequence
+                    || self.queue.progress().completed != sequence
+                {
+                    return;
+                }
+                match result {
+                    Ok(JobValue::Replay(Some(operation), charge)) => {
+                        if operation.epoch > epoch
+                            || operation.epoch.data_loss < 0
+                            || operation.epoch.configuration < 0
+                            || operation.epoch != operation.epoch.primary()
+                            || operation.data.bytes() > self.settings.operation_bytes
+                            || operation.data.segments().len() > self.settings.operation_segments
+                            || operation.data.retained_bytes() > charge.bytes.num_permits()
+                        {
+                            self.fail(Error::Protocol("invalid authentic replay checkpoint"));
+                            return;
+                        }
+                        for peer in self.peers.values_mut().filter(|peer| {
+                            peer.configured
+                                && !peer.cleanup_required
+                                && peer.build.is_none()
+                                && !peer.receipt_seen
+                        }) {
+                            // Genuine duplicate: no new assignment, mutation,
+                            // provider epoch, or vote. Native accepts the real
+                            // historical operation to bind its new primary and
+                            // then sends its actual receive/application ACK.
+                            if self
+                                .transport
+                                .send(Packet {
+                                    from: self.endpoint.clone(),
+                                    to: peer.endpoint.actor,
+                                    body: Body::Replication {
+                                        primary_epoch: epoch,
+                                        operation_epoch: operation.epoch,
+                                        operations: vec![WireOperation {
+                                            sequence,
+                                            kind: 1,
+                                            atomic_group: -1,
+                                            data: operation.data.to_segments(),
+                                        }],
+                                        batch_end: sequence,
+                                        completed: sequence,
+                                    },
+                                })
+                                .is_ok()
+                            {
+                                peer.maximum_sent = peer.maximum_sent.max(sequence);
+                            }
+                        }
+                    }
+                    Ok(JobValue::Replay(None, _)) => {}
+                    Ok(_) => self.fail(Error::Protocol(
+                        "provider replay callback category mismatch",
+                    )),
+                    Err(error) => self.fail(error),
+                }
+            }
             Job::Control => {
                 if let Err(error) = self.finish_control(result) {
                     self.fail(error);

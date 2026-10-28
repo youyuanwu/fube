@@ -49,6 +49,13 @@ stateless registration. This is not an environment role override.
   data-loss, copy-context and exact-horizon copy-state callbacks
   ([contract](../../crates/libs/fube-data/src/api.rs#L135-L160)).
   Provider progress means application state, not quorum knowledge.
+- Optional `StateProvider::replication_checkpoint(sequence, cancellation)` returns
+  an authentic original operation at exactly that applied/completed-copy
+  sequence: original epoch, bytes **and segment boundaries**. Its default is
+  bounded `None`; unavailable provenance must not be reconstructed from current
+  state or relabeled with the current epoch. Callback/capture supervision is
+  unchanged. The engine reserves bounded operation ownership before requesting
+  a checkpoint; this is not a permanent extra retained-queue allowance.
 - `Engine::submit` returns an admitted sequence and `Replication` waiter.
   The primary must apply that sequence locally **before** waiting for quorum.
   Its accepted operation and local apply must outlive a disconnected caller;
@@ -74,6 +81,29 @@ new identities at **4096 operations / 16 MiB**, without silent expiry
 [admission/apply](../../crates/libs/fube-data/src/provider.rs#L93-L143)).
 Applications implementing other providers own their payload semantics,
 reconciliation, exact-boundary snapshots and retry guarantees.
+
+The public `Mutation { id, key, value }` shape is unchanged.
+`Mutation::operation_for_epoch(epoch)` emits version-2 application JSON carrying
+the genuine admitted primary operation epoch. Both sample producers fence this
+against their real authority: Rust uses the native snapshot's primary epoch
+and `Engine::submit_in_epoch`; the native oracle uses its actual provider
+UpdateEpoch callback under the admission gate, returning pre-admission 503 if
+that epoch is unavailable. Native secondary operation metadata has no epoch;
+the opaque application bytes preserve its origin even when that secondary's
+provider has never received UpdateEpoch. Legacy `operation()`/version-1 copy
+records remain readable but provide **no** replay checkpoint.
+
+Version-2 copy records carry the original concatenated UTF-8 JSON string and
+original byte segment lengths, including empty segments and splits within a
+UTF-8 code point. They do not re-encode the replay operation. Admission validates
+nested JSON escaping and segment metadata against the 1 MiB copy-item limit;
+provider accounting includes retained replay buffers/descriptors. Snapshot pins
+keep their charges through reconciliation until actual disposal, preventing
+truncation from recycling still-owned memory. Epoch/data-loss reconciliation
+retains or discards matching replay metadata together with history and ledger.
+These payload additions require updated participating sample executables;
+rolling upgrades remain unsupported. No historical qualification below is
+evidence for the new checkpoint path.
 
 ## Progress, quorums, copy and failures
 
@@ -113,6 +143,30 @@ remain ordered during that drain. Every configuration installation captures the
 latest assigned catch-up fence. Departed adopted sessions are retired when
 absent from both active configurations, without retaining obsolete copy fences
 or waiting for a delayed RemoveIdle to free their budgets.
+The admitted control's absolute deadline and cancellation wake the owner even
+when no peer, application ACK or retry event arrives.
+
+An already completed native secondary has no primary target immediately after
+demotion; RequestAck deliberately cannot establish one. If the promoted Rust
+primary has no ordinary retained suffix, it requests a bounded
+`StateProvider::replication_checkpoint` and retransmits that **authentic original
+operation** at the existing LSN with its unchanged original epoch/segments.
+The duplicate establishes the native primary target without applying again or
+assigning a new LSN. Only the resulting real receive/application ACK can satisfy
+ALL. One temporary charged callback owns this recovery path; there is no
+permanently retained free anchor or unbounded extra queue.
+
+The matching sample producers embed their actual admitted primary epoch in
+version-2 application mutations. `submit_in_epoch` rejects an epoch race before
+assignment. Native stream metadata does not expose an original epoch, so its
+unchanged opaque application bytes carry that provenance through native receive
+and exact-horizon copy. The provider preserves the exact original bytes and
+segment boundaries, and pinned history stays charged until disposal. Legacy
+version-1 records remain readable but cannot acquire invented replay provenance.
+Providers without authentic checkpoint metadata return `None`; that is not
+permission to fabricate an operation or grant catch-up. All qualified sample
+executables use the matching version-2 payload; mixed-generation/rolling
+executable upgrades are not supported.
 
 Read/write admission requires current native access, live lifetime/host
 authority, agreement of native service/replicator/engine roles and epoch, and

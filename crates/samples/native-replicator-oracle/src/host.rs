@@ -431,6 +431,17 @@ impl Route {
             if let Err(error) = self.authority(true) {
                 return rejected(error.to_string());
             }
+            // Only the real provider UpdateEpoch callback publishes this value.
+            // The application gate also serializes that callback with BeginReplicate.
+            let epoch = match self.app.native_epoch.lock() {
+                Ok(epoch) => match *epoch {
+                    Some(epoch) => epoch.primary(),
+                    None => {
+                        return rejected("native primary epoch unavailable before admission".into())
+                    }
+                },
+                Err(error) => return rejected(error.to_string()),
+            };
             match self.app.provider.admission(&mutation) {
                 Err(error) => return rejected(error.to_string()),
                 Ok(Some(sequence)) => {
@@ -464,7 +475,7 @@ impl Route {
                         Ok(v) => v,
                         Err(e) => return rejected(e.to_string()),
                     };
-                    let payload = match mutation.operation() {
+                    let payload = match mutation.operation_for_epoch(epoch) {
                         Ok(v) => v,
                         Err(e) => return rejected(e.to_string()),
                     };
