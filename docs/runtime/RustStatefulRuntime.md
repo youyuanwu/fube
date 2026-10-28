@@ -1,10 +1,13 @@
 # Rust volatile empty-state runtime
 
-`mssf-runtime` now hosts owned stateful replicas with custom replicators, beside
+`mssf-runtime` hosts owned stateful replicas with custom replicators, beside
 stateless instances in the **same executable, code package and Runtime**.
-The qualified implementation is an **empty-state lifecycle/control-plane
-milestone, not replicated storage**. There is no application write API, data
-copy/replication stream, persistence or durability claim.
+This document describes the **default empty-state lifecycle/control-plane
+profile, not replicated storage**. That profile has no application write API
+or data copy/replication stream. The separate opt-in
+[`fube-data-v1` profile](FubeData.md) now implements volatile classic V1 data
+replication in the same mixed executable; it does not change the default empty
+policy or add persistence/durability.
 
 ## Supported profile and ownership
 
@@ -63,6 +66,11 @@ wait and joins owned cleanup; the Runtime retains only fault DTOs/authority/
 connection state for retries, not service/replicator participants. Standalone
 `Engine::bind` has no native reporting authority. These fault-delivery paths
 have source-contract tests; native recovery validation remains pending.
+
+The data profile's executed native qualification now also covers primary
+failure/replacement, copy and per-unit isolation; see [its exact evidence and
+limits](FubeData.md#executed-qualification). These results do not turn every
+internal fault-report race into an independently observed native scenario.
 
 `Replicator::remove_replica` receives an owned `ReplicaRemoval` purpose:
 `Idle` for native idle-owner removal, or `BuildRetryCleanup` for disposal of

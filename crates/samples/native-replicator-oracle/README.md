@@ -268,3 +268,8 @@ through `mssf-core`. An empty ELF `NEEDED` list does **not** make the activated
 binary native-free. Native API/load/registration failure is reported; there is
 no stub fallback. Production Rust runtime/data code must not depend on this
 oracle. Native interoperation is **unqualified until externally executed**.
+
+The external harness has now executed both primary directions, actual nonempty
+native copy enumeration and nonzero replication against SF 11.8.121.4; see
+[the qualified profile and source-specific reports](../../../docs/runtime/FubeData.md#executed-qualification).
+The distinction above still applies to every local ABI/model-only invocation.

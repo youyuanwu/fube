@@ -15,7 +15,10 @@ The companion [native architecture](FabricRuntime.md) explains those boundaries.
 The same runtime now also qualifies a **volatile empty-state stateful subset**
 with real reconfiguration/peer readiness and mixed-host recovery; see the
 [as-built stateful profile](RustStatefulRuntime.md). It is not replicated
-storage or completion of tier C. The broader capability tiers below remain a
+storage by itself. A separate [`fube-data` implementation](FubeData.md) now adds
+an executed **volatile Linux classic V1 subset of tier N**, with real native
+peers in both primary directions. Neither profile establishes full V1 parity
+or completion of all tier C/N behavior. The broader capability tiers below remain a
 proposed design, not claims of general stateful, ABI, security or other-profile
 interoperability.
 The implemented slice includes owned configuration/data package snapshots and
@@ -99,7 +102,9 @@ connection. Establish limits from the selected profile and real startup/package
 payloads; reject oversize inputs explicitly and keep aggregate memory bounded.
 [Native defaults][native-ipc-config]; [Rust limits][rust-limits].
 
-No existing Rust component above establishes native runtime interoperability.
+The historical reuse candidates above do not by themselves establish native
+runtime interoperability; the implemented profiles linked in §1 have their own
+executed evidence.
 The [current client qualification][client-status] concerns gateway operations,
 not host registration, RAP or replication.
 

@@ -116,3 +116,38 @@ not replicated writes, persisted recovery or durability.
 The shared lifecycle engine and its regression fixtures retain their historical
 `linux_cluster*` names and `docker/linux-cluster` paths. They are support for
 onebox, not a separately shipped multi-container image or CI topology.
+
+## Volatile classic V1 replication
+
+The opt-in [`fube-data-v1` profile](runtime/FubeData.md) is separate from the
+default empty-state fixture above. It uses real Fabric TCP peer replication;
+HTTP is only its client/observer interface.
+
+```sh
+cargo test --locked -p fube-data -p mssf-runtime -p rust-runtime-app -p native-replicator-oracle
+# Upstream build from clean source; use a NEW bundle directory:
+python3 scripts/fube_data_test.py --build-bundle build/data-binaries
+# Compiler-free consumer; use unique allocation/report paths:
+python3 scripts/fube_data_test.py data-rust-01 --prebuilt build/data-binaries --profile rust --report build/data-rust-01.json
+python3 scripts/fube_data_test.py data-full-01 --prebuilt build/data-binaries --profile full --report build/data-full-01.json
+```
+
+`rust` qualifies Rust-to-Rust data; `mixed` adds both native classic directions;
+`full` additionally executes the preserved empty-state/stateless full suite.
+The version-2 strict data bundle includes exact executable, package, launcher,
+source and dependency metadata. It is not interchangeable with the version-3
+empty-state bundle. Missing/tampered inputs fail before allocation; qualification
+never invokes Cargo. CI builds the native-backed oracle upstream, then runs
+archived native clients, Rust-only data and full mixed qualification in the
+compiler-free onebox consumer. Linux/Windows portable checks and the separate
+standalone native job remain independent.
+
+Only the named oracle loads native SF libraries; `fube-data`, `mssf-runtime` and
+the Rust app do not. Packaging validates exact fixed-name regular non-symlink
+files and hashes. Already-executable files run under actual SF application
+credentials without ownership/mode changes; adding needed owner-execute is
+restricted to an exact owned artifact. There is no RunAs, ACL or trust fallback.
+Each run retains immutable original allocation and minted deployment ownership,
+verifies absence independently, and reports cleanup errors instead of adopting
+same-name replacements. `--existing-owner` explicitly retains the caller's
+allocation; its caller must perform final original-capability teardown.
