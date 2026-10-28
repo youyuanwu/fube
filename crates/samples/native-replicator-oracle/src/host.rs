@@ -1134,25 +1134,31 @@ impl Host {
     }
 }
 
+fn validate_native_node_identity(
+    node_name: &str,
+    ip: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> std::result::Result<(), String> {
+    // SF_NODE_* describes the inherited container, not a node in a five-node
+    // onebox. Only native activation's Fabric_* fields bind this process.
+    for (name, actual) in [("Fabric_NodeName", node_name), ("Fabric_NodeIPOrFQDN", ip)] {
+        if let Some(expected) = lookup(name) {
+            if expected != actual {
+                return Err(format!(
+                    "{name} {expected:?} differs from actual native NodeContext {actual:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run as an SF activated code package; errors are not replaced with a fake host.
 pub async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let node = NodeContext::get(Duration::from_secs(10), None).await?;
     let node_name = node.node_name.to_string_lossy();
     let ip: IpAddr = node.ip_address_or_fqdn.to_string_lossy().parse()?;
-    for (name, actual) in [
-        ("SF_NODE_NAME", node_name.clone()),
-        ("SF_NODE_IP", ip.to_string()),
-        ("Fabric_NodeName", node_name.clone()),
-        ("Fabric_NodeIPOrFQDN", ip.to_string()),
-    ] {
-        if let Ok(expected) = std::env::var(name) {
-            if expected != actual {
-                return Err(
-                    format!("{name} identity differs from actual native NodeContext").into(),
-                );
-            }
-        }
-    }
+    validate_native_node_identity(&node_name, &ip.to_string(), |name| std::env::var(name).ok())?;
     let activation = CodePackageActivationContext::create()?;
     let endpoint = activation.get_endpoint_resource(&WString::from("Rpc"))?;
     if !matches!(endpoint.protocol.to_string_lossy().as_str(), "http" | "tcp")

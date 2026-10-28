@@ -760,3 +760,25 @@ async fn close_and_abort_join_pending_provider_contexts_without_claiming_native_
         assert_eq!(route.app.callbacks.load(Ordering::Acquire), 0);
     }
 }
+#[test]
+fn native_node_identity_uses_activation_not_inherited_container_hints() {
+    let lookup = |name: &str| match name {
+        "SF_NODE_NAME" => Some("onebox".to_owned()),
+        "SF_NODE_IP" => Some("unrelated-container-hint".to_owned()),
+        "Fabric_NodeName" => Some("N0010".to_owned()),
+        "Fabric_NodeIPOrFQDN" => Some("127.0.0.1".to_owned()),
+        _ => None,
+    };
+    assert!(super::validate_native_node_identity("N0010", "127.0.0.1", lookup).is_ok());
+    assert!(
+        super::validate_native_node_identity("N0020", "127.0.0.1", lookup)
+            .unwrap_err()
+            .contains("Fabric_NodeName")
+    );
+    assert!(
+        super::validate_native_node_identity("N0010", "127.0.0.2", lookup)
+            .unwrap_err()
+            .contains("Fabric_NodeIPOrFQDN")
+    );
+    assert!(super::validate_native_node_identity("N0010", "127.0.0.1", |_| None).is_ok());
+}

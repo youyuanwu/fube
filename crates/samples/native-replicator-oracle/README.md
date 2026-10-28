@@ -47,9 +47,11 @@ SF's activated environment. The service package must declare
 registered by this binary. Initialization data may be empty or `fube-data-v1`.
 Activation must expose a nonzero HTTP/TCP endpoint named **`Rpc`**.
 
-The native `NodeContext` supplies the actual IP and node name. Injected
-`SF_NODE_NAME`, `SF_NODE_IP`, `Fabric_NodeName` and `Fabric_NodeIPOrFQDN`, when
-present, must agree. `host` is SF's `Fabric_ApplicationHostId` GUID, not a
+The native `NodeContext` supplies the actual IP and node name. Native activation
+`Fabric_NodeName` and `Fabric_NodeIPOrFQDN`, when present, must agree. Inherited
+container hints `SF_NODE_NAME`/`SF_NODE_IP` are not native node identity (the
+five-node onebox inherits `SF_NODE_NAME=onebox`). `host` is SF's
+`Fabric_ApplicationHostId` GUID, not a
 fabricated process identity. This fixture requires a numeric native node IP.
 Native replication binds to that IP at port zero, separately for every replica.
 It never uses the HTTP port as a replication address.
