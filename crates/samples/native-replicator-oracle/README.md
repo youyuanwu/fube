@@ -97,7 +97,12 @@ is substituted.
 
 `native_epoch` preserves full data-loss/configuration values from the actual
 provider callback, without projecting configuration bits; it is null until a
-successful native epoch callback has been observed. Effective settings
+successful native epoch callback has been observed.
+The native secondary may replicate nonzero operations without any provider
+epoch callback in its initial epoch; a later last-callback epoch may lag the
+current FM epoch. The qualifier records the authoritative FM epoch separately
+and never fills this nullable callback observation from provider data or role.
+Effective settings
 are queried through native `IFabricStateReplicator2::GetReplicatorSettings`;
 query failures remain explicit. Requested settings are also recorded:
 **RequireServiceAck=true AND its flag**, replication/copy initial queues 64,

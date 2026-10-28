@@ -584,15 +584,18 @@ def assert_data(value: dict, service: str, mixed: bool, target: int = 3, minimum
         if "service" in rpc:
             require(rpc["service"] == service, "HTTP service mismatch")
         epoch = rpc["native_epoch"]
-        if epoch is None:
-            # A native empty secondary can complete copy before receiving its
-            # first original-epoch operation/provider UpdateEpoch callback.
-            # Keep the observation null; FM remains the actual epoch authority.
-            require(kind=="native-classic-v1" and role=="Secondary"
-                    and rpc["state"]["last"]==0 and not rpc["state"]["values"] and not rpc["state"]["results"]
-                    and rpc["engine"]["progress"].get("received")==0
-                    and rpc.get("native_current_progress")==0,
-                    "missing native epoch callback after nonempty progress")
+        if kind == "native-classic-v1" and role == "Secondary":
+            # This is the last PUBLIC provider callback, not the native
+            # replicator's current epoch. Initial same-epoch replication need
+            # never call UpdateEpoch; later callbacks may lag FM until a barrier.
+            # Preserve null/older observations; never invent a current epoch.
+            if epoch is not None:
+                require(isinstance(epoch, dict) and type(epoch.get("data_loss")) is int
+                        and type(epoch.get("configuration")) is int
+                        and epoch["data_loss"] >= 0 and epoch["configuration"] >= 0
+                        and (epoch["data_loss"], epoch["configuration"] & ~0xFFFFFFFF)
+                        <= (native["epoch"]["data_loss"], native["epoch"]["configuration"]),
+                        "native provider callback epoch is invalid or ahead of authority")
         else:
             require(isinstance(epoch, dict) and epoch["data_loss"] == native["epoch"]["data_loss"]
                     and epoch["configuration"] & ~0xFFFFFFFF == native["epoch"]["configuration"],

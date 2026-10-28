@@ -642,7 +642,7 @@ def observation(mixed=True, target=3):
 
 
 class NativeIdentityTests(unittest.TestCase):
-    def test_only_empty_native_secondary_can_have_an_unobserved_provider_epoch(self):
+    def test_native_secondary_callback_epoch_can_remain_unknown_after_real_progress(self):
         value=observation()
         rpc=value["replicas"][2]["rpc"]
         rpc["native_epoch"]=None
@@ -650,8 +650,22 @@ class NativeIdentityTests(unittest.TestCase):
         rpc["engine"]["progress"]["received"]=0
         data.assert_data(value,value["service"],True)
         rpc["state"]["last"]=1
+        rpc["state"]["values"]={"key":"value"}
+        rpc["state"]["results"]={"request":1}
+        rpc["native_current_progress"]=1
+        rpc["engine"]["progress"]["received"]=1
+        data.assert_data(value,value["service"],True)
+        self.assertIsNone(rpc["native_epoch"])
+        rpc["native_epoch"]={"data_loss":1,"configuration":1 << 32}
+        data.assert_data(value,value["service"],True)
+        rpc["native_epoch"]={"data_loss":2,"configuration":2 << 32}
         with self.assertRaises(RuntimeError):
             data.assert_data(value,value["service"],True)
+        for index in (0,1):
+            current=observation()
+            current["replicas"][index]["rpc"]["native_epoch"]=None
+            with self.assertRaises(RuntimeError):
+                data.assert_data(current,current["service"],True)
 
     def test_primary_refresh_allows_real_quorum_while_replacement_is_in_build(self):
         value=observation()
