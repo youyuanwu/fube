@@ -119,11 +119,6 @@
       <Parameter Name="MinReplicaSetSize" Value="1" />
       <Parameter Name="ReplicaRestartWaitDuration" Value="5" />
     </Section>
-    <Section Name="FaultAnalysisService">
-      <Parameter Name="TargetReplicaSetSize" Value="3" />
-      <Parameter Name="MinReplicaSetSize" Value="1" />
-      <Parameter Name="ReplicaRestartWaitDuration" Value="5" />
-    </Section>
     <Section Name="Hosting">
       <Parameter Name="RunAsPolicyEnabled" Value="True" />
       <Parameter Name="EndpointProviderEnabled" Value="True" />
