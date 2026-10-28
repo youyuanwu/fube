@@ -4,9 +4,11 @@ import copy
 import io
 import itertools
 import json
+import struct
 import sys
 import unittest
 import urllib.error
+import uuid
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -78,11 +80,37 @@ def receipt(value, source, kind):
         actor, _, suffix = identity.split(";")
         return f"{address}/{actor};00000000-0000-0000-0000-000000000999;{suffix}"
     epoch = {"data_loss": 1, "configuration": 2 << 32}
-    return {"qualification_only": True, "admission_only": True, "kind": kind,
+    result = {"qualification_only": True, "admission_only": False, "kind": kind,
             "from": wrong(own) if kind == "wrong_sender" else own,
             "target": wrong(selected) if kind == "wrong_target" else selected,
             "native_selected_peer": selected, "sequence": 21, "native_epoch": dict(epoch),
             "sent_epoch": {"data_loss": 1, "configuration": 1 << 32} if kind == "stale_epoch" else dict(epoch)}
+    # Explicit offline completed-frame fixture, not a native capture.
+    message_id = str(uuid.uuid4())
+    body = b"offline-wire-fault-model:" + uuid.UUID(message_id).bytes_le
+    frame = struct.pack("<I", len(body) + 12) + b"\0" * 8 + body
+    own_socket, selected_socket = own.split("/", 1)[0], selected.split("/", 1)[0]
+    result["delivery"] = {
+        "classification": "socket_write_all_and_flush", "session": 1,
+        "local": "127.0.0.1:40001" if source["role"] == "Primary" else own_socket,
+        "remote": selected_socket if source["role"] == "Primary" else "127.0.0.1:40002",
+        "remote_listener": selected_socket, "message_id": {"guid": message_id, "index": 1},
+        "frame_hex": frame.hex(), "frame_bytes": len(frame),
+    }
+    return result
+
+
+def wire_observation(reply):
+    """Offline independent-ingress model paired with the explicit frame fixture."""
+    delivery = reply["delivery"]
+    return {
+        "classification": "destination_kernel_ingress", "interface": "lo", "kernel_drops": 0,
+        "allowed": [[reply["from"].split("/", 1)[0], reply["native_selected_peer"].split("/", 1)[0]]],
+        "seen_packets": 1, "wire_bytes": delivery["frame_bytes"] + 40,
+        "payload_bytes": delivery["frame_bytes"],
+        "packets": [{"local": delivery["local"], "remote": delivery["remote"],
+                     "sequence": 100, "payload_hex": delivery["frame_hex"]}],
+    }
 
 
 def loss_model(changed, native=False):
@@ -311,7 +339,7 @@ class WireFaultModels(unittest.TestCase):
         source = value["replicas"][1]
         source["rpc"]["observed_primary"] = endpoints[0].removesuffix(";transport")
         proof = receipt(value, source, "stale_copy_ack")
-        result = data.wire_receipt(value, source, "stale_copy_ack", proof)
+        result = data.wire_receipt(value, source, "stale_copy_ack", proof, wire_observation(proof))
         self.assertEqual(result["destination_kind"], "rust")
         self.assertIsNone(data.wire_endpoint(proof["native_selected_peer"])["suffix"])
         self.assertEqual(data.wire_endpoint(endpoints[0])["suffix"], ";transport")
@@ -321,7 +349,8 @@ class WireFaultModels(unittest.TestCase):
         source = value["replicas"][1]
         source["rpc"]["replication_address"] = endpoints[1].removesuffix("transport")
         for kind in ("stale_epoch", "wrong_sender", "wrong_target"):
-            result = data.wire_receipt(value, source, kind, receipt(value, source, kind))
+            proof = receipt(value, source, kind)
+            result = data.wire_receipt(value, source, kind, proof, wire_observation(proof))
             self.assertEqual(result["source_kind"], "rust")
         self.assertEqual(data.wire_endpoint(source["rpc"]["replication_address"])["suffix"], ";")
         for suffix in (";bad/path", ";bad id", ";a;b"):
@@ -335,7 +364,8 @@ class WireFaultModels(unittest.TestCase):
             source = value["replicas"][1]
             for kind in kinds:
                 with self.subTest(rust_primary=rust_primary, kind=kind):
-                    result = data.wire_receipt(value, source, kind, receipt(value, source, kind))
+                    proof = receipt(value, source, kind)
+                    result = data.wire_receipt(value, source, kind, proof, wire_observation(proof))
                     self.assertEqual(result["source_kind"], "rust")
                     self.assertEqual(result["destination_kind"], "native-classic-v1")
                     # The native fixture UUID/port-zero bind is not EndOpen.
@@ -345,7 +375,7 @@ class WireFaultModels(unittest.TestCase):
         value, endpoints = wire_model(True, True)
         source = value["replicas"][1]
         actions = [
-            lambda reply: reply.update(admission_only=False),
+            lambda reply: reply.update(admission_only=True),
             lambda reply: reply.update(sequence=22),
             lambda reply: reply.update(sent_epoch=reply["native_epoch"]),
             lambda reply: reply.update(native_selected_peer=endpoints[1]),
@@ -384,17 +414,22 @@ class WireFaultModels(unittest.TestCase):
         before, _ = wire_model()
         qualification = data.Qualification(MagicMock(), MagicMock(), {"application": "fabric:/Owned"}, False)
         evidence = {}
-        def send(endpoint, operation, parameters):
+        latest = {}
+        capture = MagicMock()
+        capture.__enter__.return_value.finish.side_effect = lambda: wire_observation(latest["reply"])
+        def send(endpoint, operation, parameters, **kwargs):
             self.assertEqual(operation, "test")
             self.assertEqual(set(parameters), {"wire_probe"})
             source = next(replica for replica in before["replicas"] if replica["address"] == endpoint)
-            return 200, receipt(before, source, parameters["wire_probe"])
+            latest["reply"] = receipt(before, source, parameters["wire_probe"])
+            return 200, latest["reply"]
         with patch.object(qualification, "converge", return_value=before), \
              patch.object(qualification, "wait", return_value=before), \
              patch.object(data, "native_snapshot", return_value=before) as native, \
              patch.object(data, "request", side_effect=send) as request, \
              patch.object(qualification, "writes", return_value={"sequences": [21]}) as writes, \
-             patch.object(qualification, "copy") as positive_copy, patch.object(data.time, "sleep"):
+             patch.object(qualification, "copy") as positive_copy, patch.object(data.time, "sleep"), \
+             patch.object(data, "WireCapture", return_value=capture):
             qualification.stale_wire_receipts(evidence)
         self.assertEqual(request.call_count, 6)
         self.assertEqual(native.call_count, 18)
@@ -404,7 +439,8 @@ class WireFaultModels(unittest.TestCase):
         with patch.object(qualification, "converge", return_value=before), \
              patch.object(qualification, "wait", return_value=before), \
              patch.object(qualification, "writes", return_value={"sequences": [21]}), \
-             patch.object(data, "request", return_value=(400, {"error": "wire API unsupported"})):
+             patch.object(data, "request", return_value=(400, {"error": "wire API unsupported"})), \
+             patch.object(data, "WireCapture", return_value=capture):
             with self.assertRaisesRegex(RuntimeError, "required actual wire probe API"):
                 qualification.stale_wire_receipts({})
 

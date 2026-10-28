@@ -193,7 +193,16 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
     for kind in ["stale_epoch", "wrong_sender", "wrong_target"] {
         let receipt = primary.qualification_probe(kind, Some(2)).await.unwrap();
         assert_eq!(receipt["kind"], kind);
-        assert_eq!(receipt["admission_only"], true);
+        assert_eq!(receipt["admission_only"], false);
+        assert_eq!(
+            receipt["delivery"]["classification"],
+            "socket_write_all_and_flush"
+        );
+        assert!(receipt["delivery"]["session"].as_u64().unwrap() > 0);
+        assert!(!receipt["delivery"]["frame_hex"]
+            .as_str()
+            .unwrap()
+            .is_empty());
     }
     for kind in ["stale_copy_ack", "wrong_sender", "wrong_target"] {
         secondary.qualification_probe(kind, Some(1)).await.unwrap();
@@ -878,7 +887,7 @@ async fn unfinished_copy_rejects_epoch_update_and_promotion_without_success() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn promotion_reconciles_then_discards_nondispatched_and_out_of_order_tail() {
+async fn promotion_drains_contiguous_received_before_discarding_only_out_of_order_tail() {
     let provider = Arc::new(Provider::default());
     let (secondary, network, primary, mut incoming) =
         initialized_raw_secondary(provider.clone()).await;
@@ -919,23 +928,47 @@ async fn promotion_reconciles_then_discards_nondispatched_and_out_of_order_tail(
         &network,
         &primary,
         &secondary,
-        replication(EPOCH, EPOCH, 67, 67),
+        replication(NEXT_EPOCH, NEXT_EPOCH, 66, 66),
     );
-    until(|| secondary.snapshot().progress.assigned == 67).await;
-    assert_eq!(secondary.snapshot().progress.received, 65);
+    raw_send(
+        &network,
+        &primary,
+        &secondary,
+        replication(NEXT_EPOCH, NEXT_EPOCH, 68, 68),
+    );
+    until(|| secondary.snapshot().progress.assigned == 68).await;
+    assert_eq!(secondary.snapshot().progress.received, 66);
     let next = Epoch {
         configuration: EPOCH.configuration * 2,
         ..EPOCH
     };
-    secondary
-        .change_role(next, ReplicaRole::Primary, cancel())
-        .await
-        .unwrap();
+    let promotion = secondary.change_role(next, ReplicaRole::Primary, cancel());
+    tokio::pin!(promotion);
+    assert!(
+        timeout(std::time::Duration::from_millis(80), &mut promotion)
+            .await
+            .is_err()
+    );
+    assert_eq!(secondary.snapshot().progress.received, 66);
+    drop(held);
+    let operation = stream.next(cancel()).await.unwrap().unwrap();
+    assert_eq!(operation.sequence, 65);
+    provider.last.store(65, Ordering::Release);
+    operation.acknowledge().unwrap();
+    drop(operation);
+    let operation = stream.next(cancel()).await.unwrap().unwrap();
+    assert_eq!(operation.sequence, 66);
+    assert_eq!(operation.epoch, NEXT_EPOCH);
+    assert!(provider.epochs.lock().unwrap().contains(&(NEXT_EPOCH, 65)));
+    provider.last.store(66, Ordering::Release);
+    operation.acknowledge().unwrap();
+    drop(operation);
+    promotion.await.unwrap();
     until(|| secondary.snapshot().role == ReplicaRole::Primary).await;
-    assert_eq!(provider.last_committed().unwrap(), 64);
-    assert!(provider.epochs.lock().unwrap().contains(&(next, 64)));
-    assert_eq!(secondary.snapshot().progress.assigned, 64);
-    assert_eq!(secondary.snapshot().progress.received, 64);
+    assert_eq!(provider.last_committed().unwrap(), 66);
+    assert!(provider.epochs.lock().unwrap().contains(&(next, 66)));
+    assert_eq!(secondary.snapshot().progress.assigned, 66);
+    assert_eq!(secondary.snapshot().progress.received, 66);
     let mut current = configuration(vec![], true, 1);
     current.epoch = next;
     secondary
@@ -946,12 +979,469 @@ async fn promotion_reconciles_then_discards_nondispatched_and_out_of_order_tail(
         .submit(OperationData::new(vec![vec![99]]).unwrap(), cancel())
         .await
         .unwrap();
-    assert_eq!(write.sequence, 65);
-    drop(held);
+    assert_eq!(write.sequence, 67);
     secondary.abort();
     network.shutdown();
     drainer.abort();
     let _ = drainer.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promotion_preserves_an_old_quorum_acknowledged_but_undispatched_write() {
+    let partition = Uuid::new_v4();
+    let ap = MemoryProvider::new();
+    let bp = MemoryProvider::new();
+    let cp = MemoryProvider::new();
+    let a = engine(partition, 1, ap.clone());
+    let b = engine_with_settings(
+        partition,
+        2,
+        bp.clone(),
+        Settings {
+            provider_operations: 1,
+            ..Settings::default()
+        },
+    );
+    let c = engine(partition, 3, cp.clone());
+    initial_primary(&a).await;
+    build_memory(&a, &b, &bp).await;
+    build_memory(&a, &c, &cp).await;
+    a.update_current_configuration(
+        configuration(vec![descriptor(&b), descriptor(&c)], true, 2),
+        cancel(),
+    )
+    .await
+    .unwrap();
+    let data = mutation("first", "base");
+    let mut first = a.submit(data.clone(), cancel()).await.unwrap();
+    ap.apply_replication(1, &data).unwrap();
+    let held = apply_memory(&b, &bp, 1).await;
+    drop(apply_memory(&c, &cp, 1).await);
+    first.wait(cancel()).await.unwrap();
+    let data = mutation("old-success", "old-value");
+    let mut old = a.submit(data.clone(), cancel()).await.unwrap();
+    ap.apply_replication(2, &data).unwrap();
+    drop(apply_memory(&c, &cp, 2).await);
+    assert_eq!(old.wait(cancel()).await.unwrap(), 2);
+    until(|| b.snapshot().progress.received == 2).await;
+    assert_eq!(bp.snapshot().last, 1);
+    a.abort();
+    c.update_epoch(NEXT_EPOCH, cancel()).await.unwrap();
+    let promotion = b.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel());
+    tokio::pin!(promotion);
+    assert!(
+        timeout(std::time::Duration::from_millis(80), &mut promotion)
+            .await
+            .is_err()
+    );
+    drop(held);
+    drop(apply_memory(&b, &bp, 2).await);
+    promotion.await.unwrap();
+    assert_eq!(bp.snapshot().results, cp.snapshot().results);
+    assert_eq!(bp.snapshot().values, cp.snapshot().values);
+    let mut cc = configuration(vec![descriptor(&c)], true, 2);
+    cc.epoch = NEXT_EPOCH;
+    b.update_current_configuration(cc, cancel()).await.unwrap();
+    let data = mutation("new-success", "new-value");
+    let mut new = b.submit(data.clone(), cancel()).await.unwrap();
+    assert_eq!(
+        new.sequence, 3,
+        "never recycle the previously successful LSN2"
+    );
+    bp.apply_replication(3, &data).unwrap();
+    drop(apply_memory(&c, &cp, 3).await);
+    assert_eq!(new.wait(cancel()).await.unwrap(), 3);
+    assert_eq!(bp.snapshot().values, cp.snapshot().values);
+    assert_eq!(bp.snapshot().results, cp.snapshot().results);
+    b.abort();
+    c.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configuration_captures_preexisting_assigned_fence_but_not_later_writes() {
+    for joint in [false, true] {
+        let partition = Uuid::new_v4();
+        let provider = Arc::new(Provider::default());
+        let p = engine(partition, 1, provider.clone());
+        initial_primary(&p).await;
+        let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+        let remote = endpoint(&network, partition, 2);
+        network.register_peer(&p.endpoint()).unwrap();
+        let mut replica = descriptor(&p);
+        replica.replica_id = 2;
+        replica.address = remote.to_string();
+        let cc = configuration(vec![replica], true, 2);
+        p.update_current_configuration(cc.clone(), cancel())
+            .await
+            .unwrap();
+        let mut first = p
+            .submit(OperationData::new(vec![vec![1]]).unwrap(), cancel())
+            .await
+            .unwrap();
+        provider.last.store(1, Ordering::Release);
+        if joint {
+            p.update_catch_up_configuration(cc.clone(), cc, cancel())
+                .await
+                .unwrap();
+        } else {
+            p.update_current_configuration(cc, cancel()).await.unwrap();
+        }
+        let wait = p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel());
+        tokio::pin!(wait);
+        assert!(timeout(std::time::Duration::from_millis(80), &mut wait)
+            .await
+            .is_err());
+        assert!(
+            timeout(std::time::Duration::from_millis(30), first.wait(cancel()))
+                .await
+                .is_err()
+        );
+        raw_send(
+            &network,
+            &remote,
+            &p,
+            Body::Ack {
+                received: 1,
+                applied: 1,
+                copy_received: -1,
+                copy_applied: -1,
+                error: 0,
+            },
+        );
+        timeout(std::time::Duration::from_secs(2), &mut wait)
+            .await
+            .unwrap()
+            .unwrap();
+        first.wait(cancel()).await.unwrap();
+        let mut second = p
+            .submit(OperationData::new(vec![vec![2]]).unwrap(), cancel())
+            .await
+            .unwrap();
+        provider.last.store(2, Ordering::Release);
+        timeout(
+            std::time::Duration::from_secs(1),
+            p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(timeout(
+            std::time::Duration::from_millis(50),
+            p.wait_for_catch_up(CatchUpMode::All, cancel())
+        )
+        .await
+        .is_err());
+        assert!(
+            timeout(std::time::Duration::from_millis(30), second.wait(cancel()))
+                .await
+                .is_err()
+        );
+        p.abort();
+        network.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_peer_retirement_releases_session_capacity_before_replacement() {
+    let partition = Uuid::new_v4();
+    let p = engine_with_settings(
+        partition,
+        1,
+        Arc::new(Provider::default()),
+        Settings {
+            connections: 2,
+            ..Settings::default()
+        },
+    );
+    initial_primary(&p).await;
+    let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    for id in 2..12 {
+        let remote = endpoint(&network, partition, id);
+        let mut peer = descriptor(&p);
+        peer.replica_id = id;
+        peer.address = remote.to_string();
+        p.update_current_configuration(configuration(vec![peer], true, 2), cancel())
+            .await
+            .unwrap();
+        until(|| p.snapshot().peers.len() == 1 && p.snapshot().peers[0].replica == id).await;
+        assert_eq!(p.snapshot().peers[0].replica, id);
+    }
+    p.update_current_configuration(configuration(vec![], true, 1), cancel())
+        .await
+        .unwrap();
+    until(|| p.snapshot().peers.is_empty()).await;
+    p.abort();
+    network.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopted_copy_retirement_does_not_pin_completed_writes_as_idle_history() {
+    let partition = Uuid::new_v4();
+    let pp = MemoryProvider::new();
+    let sp = MemoryProvider::new();
+    let p = engine_with_settings(
+        partition,
+        1,
+        pp.clone(),
+        Settings {
+            queue_operations: 8,
+            ..Settings::default()
+        },
+    );
+    let s = engine(partition, 2, sp.clone());
+    initial_primary(&p).await;
+    let data = mutation("one", "copied");
+    let mut one = p.submit(data.clone(), cancel()).await.unwrap();
+    pp.apply_replication(1, &data).unwrap();
+    one.wait(cancel()).await.unwrap();
+    build_memory(&p, &s, &sp).await;
+    p.update_current_configuration(configuration(vec![descriptor(&s)], true, 2), cancel())
+        .await
+        .unwrap();
+    p.wait_for_catch_up(CatchUpMode::All, cancel())
+        .await
+        .unwrap();
+    p.update_current_configuration(configuration(vec![], true, 1), cancel())
+        .await
+        .unwrap();
+    s.abort();
+    until(|| p.snapshot().peers.is_empty()).await;
+    for sequence in 2..20 {
+        let data = mutation(&format!("write-{sequence}"), &sequence.to_string());
+        let mut write = p.submit(data.clone(), cancel()).await.unwrap();
+        pp.apply_replication(sequence, &data).unwrap();
+        assert_eq!(write.wait(cancel()).await.unwrap(), sequence);
+    }
+    until(|| p.snapshot().owned_operations == 0).await;
+    assert_eq!(p.snapshot().progress.completed, 19);
+    p.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn three_copied_engines_complete_repeated_no_write_native_selected_promotions() {
+    let partition = Uuid::new_v4();
+    let providers = [
+        MemoryProvider::new(),
+        MemoryProvider::new(),
+        MemoryProvider::new(),
+    ];
+    let mut engines = Vec::new();
+    let mut views = Vec::new();
+    for (index, provider) in providers.iter().enumerate() {
+        let mut initial_status = prewrite_status();
+        initial_status.current_epoch = EPOCH;
+        initial_status.current_role = ReplicaRole::None;
+        initial_status.service_role = ReplicaRole::None;
+        initial_status.replicator_role = ReplicaRole::None;
+        let view = Arc::new(SourceNativeView(Mutex::new(Ok(initial_status))));
+        let engine = Engine::bind_with_native_control(
+            Actor {
+                partition,
+                replica: index as i64 + 1,
+                incarnation: Uuid::new_v4(),
+            },
+            "127.0.0.1:0",
+            provider.clone(),
+            Settings::default(),
+            Some(view.clone()),
+        )
+        .unwrap();
+        engines.push(engine);
+        views.push(view);
+    }
+    initial_primary(&engines[0]).await;
+    let data = mutation("only-write", "copied-prefix");
+    let mut write = engines[0].submit(data.clone(), cancel()).await.unwrap();
+    providers[0].apply_replication(1, &data).unwrap();
+    write.wait(cancel()).await.unwrap();
+    build_memory(&engines[0], &engines[1], &providers[1]).await;
+    build_memory(&engines[0], &engines[2], &providers[2]).await;
+    engines[0]
+        .update_current_configuration(
+            configuration(
+                vec![descriptor(&engines[1]), descriptor(&engines[2])],
+                true,
+                3,
+            ),
+            cancel(),
+        )
+        .await
+        .unwrap();
+    engines[0]
+        .wait_for_catch_up(CatchUpMode::All, cancel())
+        .await
+        .unwrap();
+    let mut old_primary = 0;
+    for (round, new_primary) in [1, 2, 0].into_iter().enumerate() {
+        let epoch = Epoch {
+            configuration: EPOCH.configuration * (round as i64 + 2),
+            ..EPOCH
+        };
+        engines[old_primary]
+            .change_role(epoch, ReplicaRole::Secondary, cancel())
+            .await
+            .unwrap();
+        for (index, engine) in engines.iter().enumerate() {
+            if index != new_primary && index != old_primary {
+                engine.update_epoch(epoch, cancel()).await.unwrap();
+            }
+        }
+        engines[new_primary]
+            .change_role(epoch, ReplicaRole::Primary, cancel())
+            .await
+            .unwrap();
+        for (index, view) in views.iter().enumerate() {
+            let mut status = prewrite_status();
+            let role = if index == new_primary {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::Secondary
+            };
+            status.current_epoch = epoch;
+            status.current_role = role;
+            status.service_role = role;
+            status.replicator_role = role;
+            status.configuration_stage = ConfigurationStage::CatchUp;
+            status.configuration = engines
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .map(|(other, engine)| {
+                    let mut peer = descriptor(engine);
+                    peer.role = if other == new_primary {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::Secondary
+                    };
+                    // Deliberately no native progress attestation: this regression
+                    // must get actual fresh network ACKs, not catch-up-only proof.
+                    peer.progress = ReplicationProgress::EMPTY;
+                    peer
+                })
+                .collect();
+            *view.0.lock().unwrap() = Ok(status);
+        }
+        let mut cc = configuration(
+            engines
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != new_primary)
+                .map(|(_, engine)| descriptor(engine))
+                .collect(),
+            true,
+            3,
+        );
+        cc.epoch = epoch;
+        engines[new_primary]
+            .update_current_configuration(cc, cancel())
+            .await
+            .unwrap();
+        timeout(
+            std::time::Duration::from_secs(3),
+            engines[new_primary].wait_for_catch_up(CatchUpMode::All, cancel()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let snapshot = engines[new_primary].snapshot();
+        assert_eq!(snapshot.progress.assigned, 1);
+        assert_eq!(snapshot.progress.retained_operations, 0);
+        assert!(snapshot
+            .peers
+            .iter()
+            .all(|peer| peer.applied == 1 && peer.native_catchup_prefix == 0));
+        for provider in &providers {
+            assert_eq!(provider.snapshot().results, providers[0].snapshot().results);
+            assert_eq!(provider.snapshot().values, providers[0].snapshot().values);
+        }
+        let target = (new_primary + 1) % 3;
+        let expected = engines[target].snapshot().observed_primary;
+        // Epoch-less RequestAck from the old primary is never a rebind.
+        engines[old_primary]
+            .transport
+            .register_peer(&engines[target].endpoint())
+            .unwrap();
+        raw_send(
+            &engines[old_primary].transport,
+            &engines[old_primary].endpoint(),
+            &engines[target],
+            Body::RequestAck,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert_eq!(engines[target].snapshot().observed_primary, expected);
+        old_primary = new_primary;
+    }
+    for engine in &engines {
+        engine.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_completed_prefix_attestation_is_not_a_new_write_or_all_ack() {
+    let partition = Uuid::new_v4();
+    let view = Arc::new(SourceNativeView(Mutex::new(Err(Error::Closed))));
+    let provider = Arc::new(Provider {
+        last: AtomicI64::new(20),
+        ..Provider::default()
+    });
+    let p = Engine::bind_with_native_control(
+        Actor {
+            partition,
+            replica: 1,
+            incarnation: Uuid::new_v4(),
+        },
+        "127.0.0.1:0",
+        provider.clone(),
+        Settings::default(),
+        Some(view.clone()),
+    )
+    .unwrap();
+    p.change_role(EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let remote = endpoint(&network, partition, 2);
+    let mut peer = descriptor(&p);
+    peer.replica_id = 2;
+    peer.address = remote.to_string();
+    peer.progress.last = 20;
+    let mut status = prewrite_status();
+    status.current_epoch = EPOCH;
+    status.current_role = ReplicaRole::Primary;
+    status.configuration = vec![peer.clone()];
+    *view.0.lock().unwrap() = Ok(status);
+    p.update_current_configuration(configuration(vec![peer], true, 2), cancel())
+        .await
+        .unwrap();
+    timeout(
+        std::time::Duration::from_secs(1),
+        p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(p.snapshot().peers[0].native_catchup_prefix, 20);
+    assert_eq!(p.snapshot().peers[0].applied, 0);
+    assert!(timeout(
+        std::time::Duration::from_millis(50),
+        p.wait_for_catch_up(CatchUpMode::All, cancel())
+    )
+    .await
+    .is_err());
+    let mut write = p
+        .submit(OperationData::new(vec![vec![21]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    provider.last.store(21, Ordering::Release);
+    assert!(
+        timeout(std::time::Duration::from_millis(80), write.wait(cancel()))
+            .await
+            .is_err()
+    );
+    assert_eq!(p.snapshot().progress.committed, 20);
+    assert_eq!(p.snapshot().peers[0].applied, 0);
+    p.abort();
+    network.shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2967,7 +3457,7 @@ async fn apply_memory(engine: &Engine, provider: &MemoryProvider, sequence: i64)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn demotion_does_not_turn_an_ambiguous_tail_into_a_false_apply_ack() {
+async fn rejected_demotion_then_promotion_drains_the_pending_tail_without_sequence_reuse() {
     let partition = Uuid::new_v4();
     let ap = MemoryProvider::new();
     let bp = MemoryProvider::new();
@@ -3015,11 +3505,19 @@ async fn demotion_does_not_turn_an_ambiguous_tail_into_a_false_apply_ack() {
     assert!(a.snapshot().owned_operations > 0);
     assert!(a.snapshot().fault.is_none());
 
-    b.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
-        .await
-        .unwrap();
+    let promotion = b.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel());
+    tokio::pin!(promotion);
+    assert!(
+        timeout(std::time::Duration::from_millis(80), &mut promotion)
+            .await
+            .is_err()
+    );
+    drop(held);
+    drop(apply_memory(&b, &bp, 2).await);
+    assert_eq!(ambiguous.wait(cancel()).await.unwrap(), 2);
+    promotion.await.unwrap();
     until(|| b.snapshot().role == ReplicaRole::Primary).await;
-    assert_eq!(b.snapshot().progress.assigned, 1);
+    assert_eq!(b.snapshot().progress.assigned, 2);
     let mut current = configuration(vec![descriptor(&a)], true, 2);
     current.epoch = NEXT_EPOCH;
     b.update_current_configuration(current, cancel())
@@ -3027,8 +3525,8 @@ async fn demotion_does_not_turn_an_ambiguous_tail_into_a_false_apply_ack() {
         .unwrap();
     let replacement = mutation("new-tail", "new");
     let mut committed = b.submit(replacement.clone(), cancel()).await.unwrap();
-    assert_eq!(committed.sequence, 2);
-    bp.apply_replication(2, &replacement).unwrap();
+    assert_eq!(committed.sequence, 3);
+    bp.apply_replication(3, &replacement).unwrap();
     // The divergent real maps may exist as ambiguous local history, but can
     // never acquire the successful two-member result from the original repro.
     assert_ne!(ap.snapshot().values, bp.snapshot().values);
@@ -3038,16 +3536,10 @@ async fn demotion_does_not_turn_an_ambiguous_tail_into_a_false_apply_ack() {
     )
     .await
     .is_err());
-    assert!(timeout(
-        std::time::Duration::from_millis(40),
-        ambiguous.wait(cancel())
-    )
-    .await
-    .is_err());
-    assert_eq!(a.snapshot().progress.committed, 1);
-    assert_eq!(b.snapshot().progress.committed, 1);
+    assert_eq!(a.snapshot().progress.committed, 2);
+    assert!(b.snapshot().progress.committed <= 2);
+    assert_eq!(b.snapshot().progress.client_completed, 2);
     assert_eq!(ap.snapshot().values["key"], "old");
-    drop(held);
     a.abort();
     b.abort();
 }

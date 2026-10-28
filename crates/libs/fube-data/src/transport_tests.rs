@@ -157,6 +157,205 @@ async fn real_fabric_tcp_is_duplex_and_reuses_an_accepted_socket() {
 }
 
 #[tokio::test]
+async fn observed_invalid_frame_completion_keeps_exact_bytes_tuple_and_bounded_charge() {
+    let settings = Settings {
+        control_messages: 1,
+        ..Settings::default()
+    };
+    let (transport, mut incoming) = PeerTransport::bind("127.0.0.1:0", settings.clone()).unwrap();
+    let published = "127.0.0.1:32112";
+    let mut socket = native_socket(transport.address(), published).await;
+    write_message(&mut socket, &request(published, 2, 1).encode(true).unwrap())
+        .await
+        .unwrap();
+    receive(&mut incoming.control).await;
+    let mut invalid = request(transport.address(), 1, 2);
+    invalid.from.actor.incarnation = Uuid::new_v4();
+    let completion = transport.send_observed(invalid.clone()).unwrap();
+    let mut fixed = [0; FIXED_HEADER_SIZE];
+    socket.read_exact(&mut fixed).await.unwrap();
+    let (size, _) = validate_fixed(&fixed).unwrap();
+    let mut actual = fixed.to_vec();
+    actual.resize(size, 0);
+    socket
+        .read_exact(&mut actual[FIXED_HEADER_SIZE..])
+        .await
+        .unwrap();
+    let receipt = timeout(std::time::Duration::from_secs(2), completion)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.frame, actual);
+    let message = Message::from_frame(Frame::decode(&actual).unwrap()).unwrap();
+    assert_eq!(Packet::decode(&message).unwrap(), invalid);
+    assert_eq!(receipt.message_id, message.properties().unwrap().id);
+    assert_ne!(receipt.message_id, MessageId::default());
+    assert_eq!(receipt.local, socket.peer_addr().unwrap());
+    assert_eq!(receipt.remote, socket.local_addr().unwrap());
+    assert_eq!(receipt.remote_listener, published);
+    assert!(receipt.session > 0);
+    assert!(matches!(
+        transport.send_observed(invalid.clone()),
+        Err(Error::ResourceLimit("outgoing peer queue"))
+    ));
+    assert!(transport.handle.network.control.bytes.available_permits() < settings.control_bytes);
+    drop(receipt);
+    assert_eq!(
+        transport.handle.network.control.bytes.available_permits(),
+        settings.control_bytes
+    );
+    let completion = transport.send_observed(invalid).unwrap();
+    read_message(&mut socket).await.unwrap();
+    let next = completion.await.unwrap();
+    assert_ne!(next.message_id, message.properties().unwrap().id);
+    drop(next);
+    transport.shutdown();
+}
+
+#[tokio::test]
+async fn observed_admission_is_an_error_when_no_frame_can_reach_a_socket() {
+    let settings = Settings {
+        callback_timeout: std::time::Duration::from_millis(100),
+        connections: 1,
+        ..Settings::default()
+    };
+    for failure in ["refused", "handshake", "session_limit", "shutdown"] {
+        let (transport, _incoming) = PeerTransport::bind("127.0.0.1:0", settings.clone()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        transport
+            .register_peer(&endpoint(&listener.local_addr().unwrap().to_string(), 2))
+            .unwrap();
+        let occupied = if failure == "session_limit" {
+            Some(native_socket(transport.address(), "127.0.0.1:32113").await)
+        } else {
+            None
+        };
+        if failure == "refused" {
+            drop(listener);
+            let completion = transport
+                .send_observed(request(transport.address(), 1, 2))
+                .unwrap();
+            assert!(timeout(std::time::Duration::from_secs(1), completion)
+                .await
+                .unwrap()
+                .is_err());
+        } else {
+            let completion = transport
+                .send_observed(request(transport.address(), 1, 2))
+                .unwrap();
+            if failure == "handshake" {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_message(&mut socket).await.unwrap();
+                // Never send the peer ListenInstance.
+                assert!(timeout(std::time::Duration::from_secs(1), completion)
+                    .await
+                    .unwrap()
+                    .is_err());
+            } else {
+                if failure == "shutdown" {
+                    transport.shutdown();
+                }
+                assert!(timeout(std::time::Duration::from_secs(1), completion)
+                    .await
+                    .unwrap()
+                    .is_err());
+            }
+        }
+        drop(occupied);
+        transport.shutdown();
+        assert!(matches!(
+            transport.send_observed(request(transport.address(), 1, 2)),
+            Err(Error::Closed)
+        ));
+        assert_eq!(
+            transport.handle.network.control.bytes.available_permits(),
+            settings.control_bytes
+        );
+        assert_eq!(
+            transport
+                .handle
+                .network
+                .control
+                .outgoing_slots
+                .available_permits(),
+            settings.control_messages
+        );
+    }
+}
+
+#[tokio::test]
+async fn observed_receiver_cancellation_does_not_retain_or_detach_a_session() {
+    let settings = Settings {
+        callback_timeout: std::time::Duration::from_millis(100),
+        ..Settings::default()
+    };
+    let (transport, _incoming) = PeerTransport::bind("127.0.0.1:0", settings.clone()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    transport
+        .register_peer(&endpoint(&listener.local_addr().unwrap().to_string(), 2))
+        .unwrap();
+    let completion = transport
+        .send_observed(request(transport.address(), 1, 2))
+        .unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    drop(completion);
+    let started = Instant::now();
+    transport.shutdown();
+    assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    drop(socket);
+    assert_eq!(
+        transport.handle.network.control.bytes.available_permits(),
+        settings.control_bytes
+    );
+    assert_eq!(
+        transport
+            .handle
+            .network
+            .control
+            .outgoing_slots
+            .available_permits(),
+        settings.control_messages
+    );
+}
+
+#[tokio::test]
+async fn observed_unregistered_and_oversized_frames_never_take_a_queue_charge() {
+    let settings = Settings::default();
+    let (transport, _incoming) = PeerTransport::bind("127.0.0.1:0", settings.clone()).unwrap();
+    assert!(matches!(
+        transport.send_observed(request(transport.address(), 1, 2)),
+        Err(Error::InvalidInput("unregistered peer actor"))
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    transport
+        .register_peer(&endpoint(&listener.local_addr().unwrap().to_string(), 2))
+        .unwrap();
+    assert!(matches!(
+        transport.send_observed(operation(transport.address(), 1, 2, 16 * 1024)),
+        Err(Error::ResourceLimit("qualification frame bytes"))
+    ));
+    assert_eq!(
+        transport.handle.network.data.bytes.available_permits(),
+        settings.queue_bytes
+    );
+    assert_eq!(
+        transport
+            .handle
+            .network
+            .data
+            .outgoing_slots
+            .available_permits(),
+        settings.queue_operations
+    );
+    assert!(
+        timeout(std::time::Duration::from_millis(20), listener.accept())
+            .await
+            .is_err()
+    );
+    transport.shutdown();
+}
+
+#[tokio::test]
 async fn fragmented_native_listen_instance_and_header_in_body_packets() {
     let (transport, mut incoming) =
         PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();

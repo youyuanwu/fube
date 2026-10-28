@@ -17,6 +17,10 @@ use uuid::Uuid;
 #[path = "data_tests.rs"]
 mod tests;
 
+#[path = "copy_ack_hold.rs"]
+mod copy_ack_hold;
+use copy_ack_hold::CopyAckHold;
+
 const PROFILE: &str = "fube-data-v1";
 const REQUEST_LIMIT: usize = 4096;
 const WRITE_WAIT: Duration = Duration::from_secs(5);
@@ -75,6 +79,7 @@ enum Request {
     Write(Mutation),
     Test(u64),
     CopyTest(u64),
+    CopyAckHold(u64),
     WireProbe(String),
     DataLoss(i64),
 }
@@ -159,6 +164,17 @@ fn parse(operation: &str, query: &str) -> RuntimeResult<Request> {
                     .filter(|_| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
                     .ok_or(RuntimeError::InvalidInput("copy delay must be 0..100 ms"))?;
                 return Ok(Request::CopyTest(delay));
+            }
+            if let Some(value) = parameters.get("copy_ack_hold_ms") {
+                let milliseconds = value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|n| *n <= 6000)
+                    .filter(|_| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+                    .ok_or(RuntimeError::InvalidInput(
+                        "copy ACK hold must be 0..6000 ms",
+                    ))?;
+                return Ok(Request::CopyAckHold(milliseconds));
             }
             let delay = parameters
                 .get("ack_delay_ms")
@@ -361,6 +377,7 @@ struct PumpInput {
     replication: Arc<OperationStream>,
     requests: mpsc::Receiver<Submit>,
     delay: Arc<AtomicU64>,
+    copy_ack_hold: Arc<CopyAckHold>,
     fault: Arc<Mutex<Option<String>>>,
 }
 impl Pump {
@@ -427,6 +444,7 @@ async fn apply_ack(
     operation: Operation,
     copy: bool,
     delay: &AtomicU64,
+    copy_ack_hold: &CopyAckHold,
     stopped: &Cancellation,
 ) -> RuntimeResult<()> {
     if stopped.is_cancelled() {
@@ -438,6 +456,20 @@ async fn apply_ack(
     } else {
         provider.apply_replication(operation.sequence, &operation.data)?;
     }
+    // Only the nonempty final CopyEnd switches the provider out of copy mode.
+    // Keep the real operation owned by this joined pump until explicit release.
+    let held = if copy && !provider.snapshot().copy_in_progress && provider.snapshot().last > 0 {
+        copy_ack_hold
+            .wait(
+                operation.sequence,
+                provider.snapshot().last,
+                stopped,
+                stopped,
+            )
+            .await?
+    } else {
+        false
+    };
     let delay = delay.load(Ordering::Acquire);
     if delay != 0 {
         tokio::select! {
@@ -450,7 +482,11 @@ async fn apply_ack(
         return Err(RuntimeError::Closed);
     }
     native.snapshot()?;
-    operation.acknowledge()
+    operation.acknowledge()?;
+    if held {
+        copy_ack_hold.acknowledged();
+    }
+    Ok(())
 }
 
 async fn pump(mut input: PumpInput, stopped: Cancellation) -> RuntimeResult<()> {
@@ -464,13 +500,13 @@ async fn pump(mut input: PumpInput, stopped: Cancellation) -> RuntimeResult<()> 
             _ = stopped.cancelled() => return Ok(()),
             item = input.copy.next(stopped.clone()), if !copy_done => {
                 match item? {
-                    Some(operation) => apply_ack(input.native.as_ref(), &input.provider, operation, true, &input.delay, &stopped).await?,
+                    Some(operation) => apply_ack(input.native.as_ref(), &input.provider, operation, true, &input.delay, &input.copy_ack_hold, &stopped).await?,
                     None => copy_done = true,
                 }
             }
             item = input.replication.next(stopped.clone()), if !replication_done => {
                 match item? {
-                    Some(operation) => apply_ack(input.native.as_ref(), &input.provider, operation, false, &input.delay, &stopped).await?,
+                    Some(operation) => apply_ack(input.native.as_ref(), &input.provider, operation, false, &input.delay, &input.copy_ack_hold, &stopped).await?,
                     None => replication_done = true,
                 }
             }
@@ -499,6 +535,7 @@ pub(super) struct Route {
     requests: mpsc::Sender<Submit>,
     delay: Arc<AtomicU64>,
     copy_delay: Arc<AtomicU64>,
+    copy_ack_hold: Arc<CopyAckHold>,
     fault: Arc<Mutex<Option<String>>>,
     service_address: String,
     generation: u64,
@@ -517,6 +554,7 @@ impl Route {
         let stopped = Cancellation::default();
         let delay = Arc::new(AtomicU64::new(0));
         let fault = Arc::new(Mutex::new(None));
+        let copy_ack_hold = Arc::new(CopyAckHold::default());
         let pump = Pump::start(
             PumpInput {
                 native: native.clone(),
@@ -526,6 +564,7 @@ impl Route {
                 replication: engine.replication_stream(),
                 requests: receiver,
                 delay: delay.clone(),
+                copy_ack_hold: copy_ack_hold.clone(),
                 fault: fault.clone(),
             },
             stopped.clone(),
@@ -541,6 +580,7 @@ impl Route {
             requests: sender,
             delay,
             copy_delay,
+            copy_ack_hold,
             fault,
             service_address,
             generation,
@@ -768,6 +808,20 @@ impl Rpc {
             let routes = self.data_routes.lock().unwrap();
             routes
                 .get(base)
+                .or_else(|| {
+                    // InBuild has no published service address yet. Discovery
+                    // is diagnostics-only and bound to the exact native ID.
+                    (operation == "diagnostics")
+                        .then(|| {
+                            routes.values().find(|route| {
+                                base == format!(
+                                    "/data/{}/{}",
+                                    route.identity.partition_id, route.identity.replica_id
+                                )
+                            })
+                        })
+                        .flatten()
+                })
                 .inspect(|route| {
                     route.active.fetch_add(1, Ordering::SeqCst);
                 })
@@ -849,6 +903,12 @@ impl Rpc {
             .await;
         }
         let hook = match request {
+            Request::CopyAckHold(milliseconds) => {
+                if route.copy_ack_hold.set(milliseconds).is_err() {
+                    return response(&mut stream, 400, &serde_json::json!({})).await;
+                }
+                Some(("copy_ack_hold_ms", milliseconds))
+            }
             Request::Test(delay) => {
                 route.delay.store(delay, Ordering::Release);
                 Some(("ack_delay_ms", delay))
@@ -892,6 +952,7 @@ impl Rpc {
             "creation_generation":route.generation,"packages":self.package_evidence()?,
             "ack_delay_ms":route.delay.load(Ordering::Acquire),
             "copy_delay_ms":route.copy_delay.load(Ordering::Acquire),"pump_fault":route.fault.lock().unwrap().clone(),
+            "copy_ack_hold":route.copy_ack_hold.snapshot(),
             "native_actions":{"open":counters.open_commands,"close":counters.close_commands,
                 "abort":counters.abort_commands,"query":counters.queries,"update":counters.service_updates,
                 "open_failures":counters.open_failures,"close_failures":counters.close_failures,

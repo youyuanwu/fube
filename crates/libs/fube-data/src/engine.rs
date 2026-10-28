@@ -105,6 +105,9 @@ pub struct PeerSnapshot {
     pub configured: bool,
     pub building: bool,
     pub cleanup_required: bool,
+    /// Node-advertised already-completed prefix, used only for WRITE_QUORUM
+    /// catch-up, never as an application ACK for a new write or ALL catch-up.
+    pub native_catchup_prefix: i64,
 }
 
 impl Serialize for EngineSnapshot {
@@ -533,6 +536,7 @@ impl Engine {
     /// Test-fixture-only invalid/obsolete peer traffic on existing connections.
     /// Destinations are restricted to native-selected current engine sessions;
     /// this never changes membership, epochs, roles, queues or progress.
+    /// Waits for exact socket write/flush outside the owner; not peer parsing.
     #[cfg(feature = "qualification")]
     pub fn qualification_probe(
         &self,
@@ -544,12 +548,21 @@ impl Engine {
             if kind.len() > 32 {
                 return Err(Error::InvalidInput("probe kind bound"));
             }
-            self.request(|reply| Command::Probe {
-                kind,
-                target,
-                reply,
+            timeout(self.settings.callback_timeout, async {
+                let (mut evidence, completion) = self
+                    .request(|reply| Command::Probe {
+                        kind,
+                        target,
+                        reply,
+                    })
+                    .await?;
+                let receipt = completion.await.map_err(|_| Error::Closed)?;
+                self.check()?;
+                evidence["delivery"] = receipt.evidence();
+                Ok(evidence)
             })
             .await
+            .map_err(|_| Error::Timeout)?
         })
     }
 
@@ -695,7 +708,10 @@ enum Command {
     Probe {
         kind: String,
         target: Option<i64>,
-        reply: Reply<serde_json::Value>,
+        reply: Reply<(
+            serde_json::Value,
+            oneshot::Receiver<crate::transport::WriteReceipt>,
+        )>,
     },
     Epoch {
         epoch: Epoch,
@@ -749,6 +765,10 @@ struct Peer {
     native_version: i64,
     session: u64,
     configured: bool,
+    // Configuration adoption ends idle-build ownership, even if a later
+    // promotion temporarily clears the active sender flag.
+    adopted: bool,
+    native_catchup_prefix: i64,
     received: i64,
     applied: i64,
     maximum_sent: i64,
@@ -790,6 +810,9 @@ struct Control {
     cancellation: Cancellation,
     running: bool,
     started: Instant,
+    // A frozen secondary drain can cross original-operation epoch barriers.
+    // Run that bounded callback without dropping the pending native control.
+    drain_barrier: Option<(Epoch, i64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1124,6 +1147,7 @@ impl Owner {
                 configured: peer.configured,
                 building: peer.build.as_ref().is_some_and(|b| b.reply.is_some()),
                 cleanup_required: peer.cleanup_required,
+                native_catchup_prefix: peer.native_catchup_prefix,
             })
             .collect();
         peers.sort_by_key(|peer| peer.replica);
@@ -1200,6 +1224,9 @@ impl Owner {
                 target,
                 reply,
             } => {
+                if reply.is_closed() {
+                    return;
+                }
                 let result = self.qualification_probe(&kind, target);
                 let _ = reply.send(result);
             }
@@ -1256,7 +1283,10 @@ impl Owner {
                 let boundary = if self.role == ReplicaRole::Primary {
                     self.queue.progress().assigned
                 } else {
-                    self.dispatched
+                    // A contiguous received operation may already have been
+                    // committed by the old primary and a different secondary.
+                    // Provider capture backpressure cannot authorize its loss.
+                    self.queue.progress().received
                 };
                 if self.role == ReplicaRole::Primary && role != ReplicaRole::Primary {
                     for peer in self.peers.values_mut() {
@@ -1285,6 +1315,7 @@ impl Owner {
                     cancellation,
                     running: false,
                     started: Instant::now(),
+                    drain_barrier: None,
                 });
             }
             Command::Loss(cancellation, reply) => {
@@ -1301,6 +1332,7 @@ impl Owner {
                         cancellation,
                         running: false,
                         started: Instant::now(),
+                        drain_barrier: None,
                     });
                 }
             }
@@ -1361,7 +1393,14 @@ impl Owner {
     }
 
     #[cfg(feature = "qualification")]
-    fn qualification_probe(&self, kind: &str, target: Option<i64>) -> Result<serde_json::Value> {
+    fn qualification_probe(
+        &self,
+        kind: &str,
+        target: Option<i64>,
+    ) -> Result<(
+        serde_json::Value,
+        oneshot::Receiver<crate::transport::WriteReceipt>,
+    )> {
         if self.control.is_some() || !self.copy_done || self.fault.is_some() {
             return Err(Error::Closed);
         }
@@ -1461,7 +1500,7 @@ impl Owner {
         if temporary {
             self.transport.register_peer(&destination)?;
         }
-        let result = self.transport.send(Packet {
+        let result = self.transport.send_observed(Packet {
             from: from.clone(),
             to: destination.actor,
             body,
@@ -1469,12 +1508,15 @@ impl Owner {
         if temporary {
             let _ = self.transport.unregister_peer(&destination.actor);
         }
-        result?;
-        Ok(serde_json::json!({"qualification_only":true,"kind":kind,
-                "from":from.to_string(),"target":destination.to_string(),"admission_only":true,
+        let completion = result?;
+        Ok((
+            serde_json::json!({"qualification_only":true,"kind":kind,
+                "from":from.to_string(),"target":destination.to_string(),"admission_only":false,
                 "native_selected_peer":peer.to_string(),"sequence":sequence,
                 "native_epoch":{"data_loss":epoch.data_loss,"configuration":epoch.configuration},
-                "sent_epoch":{"data_loss":sent_epoch.data_loss,"configuration":sent_epoch.configuration}}))
+                "sent_epoch":{"data_loss":sent_epoch.data_loss,"configuration":sent_epoch.configuration}}),
+            completion,
+        ))
     }
 
     fn validate_configuration(&self, configuration: &ReplicaSetConfiguration) -> Result<()> {
@@ -1569,10 +1611,24 @@ impl Owner {
         if let Some(previous) = &previous {
             self.validate_configuration(previous)?;
         }
+        let native_status = self
+            .native_control
+            .as_ref()
+            .and_then(|view| view.status().ok())
+            .filter(|status| {
+                status.lifecycle == ReplicaLifecycle::Open
+                    && status.replicator_open
+                    && status.current_role == ReplicaRole::Primary
+                    && status.replicator_role == ReplicaRole::Primary
+                    && status.current_epoch.primary() == current_epoch
+                    && Some(current_epoch) == self.epoch
+            });
+        let completed_prefix = self.queue.progress().completed;
         let mut desired: HashMap<i64, (&ReplicaInformation, Endpoint)> = HashMap::new();
         for replica in current.replicas.iter().chain(
             previous
                 .as_ref()
+                .filter(|configuration| configuration.write_quorum != 0)
                 .into_iter()
                 .flat_map(|configuration| configuration.replicas.iter()),
         ) {
@@ -1587,11 +1643,41 @@ impl Owner {
             }
             desired.insert(replica.replica_id, (replica, endpoint));
         }
+        let selected: HashSet<_> = current
+            .replicas
+            .iter()
+            .chain(
+                previous
+                    .as_ref()
+                    .filter(|pc| pc.write_quorum != 0)
+                    .into_iter()
+                    .flat_map(|pc| pc.replicas.iter()),
+            )
+            .map(|replica| replica.replica_id)
+            .collect();
+        let retiring: Vec<_> = self
+            .peers
+            .iter()
+            .filter(|(id, peer)| peer.adopted && !selected.contains(id))
+            .map(|(&id, _)| id)
+            .collect();
+        // A canceled callback is not disposed. Keep its ownership charged and
+        // reject this configuration until the tracked job has actually joined.
+        for id in &retiring {
+            let peer = self.peers.get_mut(id).unwrap();
+            if let Some(build) = peer.build.as_mut().filter(|build| build.job) {
+                build.cancellation.cancel();
+                peer.cleanup_required = true;
+                return Err(Error::ResourceLimit(
+                    "retired configuration enumeration requires disposal",
+                ));
+            }
+        }
         let additions = desired
             .iter()
             .filter(|(id, _)| !self.peers.contains_key(id))
             .count();
-        if self.peers.len() + additions > self.settings.connections {
+        if self.peers.len() - retiring.len() + additions > self.settings.connections {
             return Err(Error::ResourceLimit("peer sessions"));
         }
         for (&id, (_, endpoint)) in &desired {
@@ -1604,6 +1690,14 @@ impl Owner {
                 ));
             }
         }
+        if let Some(previous) = &self.previous {
+            if let Some(progress) = self.progress_for(previous, true) {
+                self.previous_quorum = self.previous_quorum.max(progress.quorum);
+            }
+        }
+        for id in retiring {
+            self.retire_peer(id, Error::Closed);
+        }
         for (_, endpoint) in desired.values() {
             if let Some(old) = self.peers.get(&endpoint.actor.replica) {
                 if old.endpoint.actor != endpoint.actor {
@@ -1611,11 +1705,6 @@ impl Owner {
                 }
             }
             self.transport.register_peer(endpoint)?;
-        }
-        if let Some(previous) = &self.previous {
-            if let Some(progress) = self.progress_for(previous, true) {
-                self.previous_quorum = self.previous_quorum.max(progress.quorum);
-            }
         }
         for peer in self.peers.values_mut() {
             peer.configured = false;
@@ -1642,11 +1731,47 @@ impl Owner {
             let peer = self.peers.get_mut(&id).unwrap();
             peer.endpoint = endpoint;
             peer.configured = true;
+            peer.adopted = true;
+            // Native ReplicaManager::CreateReplica passes the node-supplied
+            // CurrentProgress into ReliableOperationSender's initial progress.
+            // Be stricter: an exact current native descriptor can attest only
+            // our already-completed prefix, and only for catch-up. Do not turn
+            // received/provider progress into a fresh application/write vote.
+            peer.native_catchup_prefix = native_status
+                .as_ref()
+                .and_then(|status| {
+                    status.configuration.iter().find(|native| {
+                        native.replica_id == id
+                            && native.incarnation == replica.incarnation
+                            && native.up
+                            && native.ready
+                            && native.role == replica.role
+                            && native.progress == replica.progress
+                            && native
+                                .address
+                                .parse::<Endpoint>()
+                                .is_ok_and(|address| same_endpoint(&address, &peer.endpoint))
+                    })
+                })
+                .map_or(0, |native| {
+                    native.progress.last.max(0).min(completed_prefix)
+                });
+            if peer.build.as_ref().is_some_and(|build| {
+                !build.job
+                    && build.reply.is_none()
+                    && peer.copy_applied == -1
+                    && build.finish.is_some_and(|finish| peer.applied >= finish)
+            }) {
+                peer.build = None;
+            }
         }
         self.current = Some(current);
         // Updating CC alone terminates the prior joint configuration, just as
         // the native UpdateCurrentReplicaSetConfiguration control does.
         self.previous = previous.filter(|configuration| configuration.write_quorum != 0);
+        // Native UpdateCatchupCompletionLSN snapshots LastSequenceNumber at
+        // every configuration installation, not merely previous apply quorum.
+        self.catch_up_fence = self.catch_up_fence.max(self.queue.progress().assigned);
         if let Some(previous) = &self.previous {
             if let Some(progress) = self.progress_for(previous, true) {
                 self.previous_quorum = self.previous_quorum.max(progress.quorum);
@@ -1664,6 +1789,8 @@ impl Owner {
             native_version,
             session: self.session,
             configured: false,
+            adopted: false,
+            native_catchup_prefix: 0,
             received: 0,
             applied: 0,
             // A promoted primary may have an authoritative reconciled prefix
@@ -1816,7 +1943,7 @@ impl Owner {
             }
             // RAP may adopt an idle build into CC before its delayed RemoveIdle
             // arrives. That message no longer owns this configured session.
-            if peer.configured && !peer.cleanup_required {
+            if peer.adopted && !peer.cleanup_required {
                 return Ok(());
             }
             if let Some(build) = peer.build.as_mut() {
@@ -2073,6 +2200,15 @@ impl Owner {
                 completed,
                 ..
             } => {
+                if self
+                    .control
+                    .as_ref()
+                    .is_some_and(|control| matches!(control.kind, ControlKind::Epoch { .. }))
+                {
+                    // The native control froze its admitted receive boundary.
+                    // Later packets cannot extend that drain or change history.
+                    return;
+                }
                 if operation_epoch > primary_epoch
                     || operations
                         .iter()
@@ -2543,13 +2679,26 @@ impl Owner {
                 self.copy_tx.take();
             }
         }
-        if !self.copy_done || self.control.is_some() {
+        let drain_boundary = match self.control.as_ref() {
+            Some(Control {
+                kind: ControlKind::Epoch { boundary, .. },
+                running: false,
+                drain_barrier: None,
+                ..
+            }) if self.role != ReplicaRole::Primary => *boundary,
+            Some(_) => {
+                self.send_ack();
+                return Ok(());
+            }
+            None => self.queue.progress().received,
+        };
+        if !self.copy_done {
             self.send_ack();
             return Ok(());
         }
         loop {
             let next = self.dispatched + 1;
-            if next > self.queue.progress().received {
+            if next > self.queue.progress().received.min(drain_boundary) {
                 break;
             }
             let entry = self
@@ -2568,6 +2717,10 @@ impl Owner {
                 if self.provider_epoch.is_some_and(|epoch| entry.epoch < epoch) {
                     return Err(Error::Protocol("operation original epoch regressed"));
                 }
+                if let Some(control) = self.control.as_mut() {
+                    control.drain_barrier = Some((entry.epoch, next - 1));
+                    break;
+                }
                 self.control = Some(Control {
                     kind: ControlKind::Barrier {
                         epoch: entry.epoch,
@@ -2576,6 +2729,7 @@ impl Owner {
                     cancellation: Cancellation::default(),
                     running: false,
                     started: Instant::now(),
+                    drain_barrier: None,
                 });
                 break;
             }
@@ -2604,7 +2758,82 @@ impl Owner {
 }
 
 impl Owner {
+    fn project_native_primary(&mut self) -> Result<()> {
+        if self.role != ReplicaRole::Secondary || !self.copy_done || self.control.is_some() {
+            return Ok(());
+        }
+        let Some(status) = self
+            .native_control
+            .as_ref()
+            .and_then(|view| view.status().ok())
+        else {
+            return Ok(());
+        };
+        if status.lifecycle != ReplicaLifecycle::Open
+            || !status.replicator_open
+            || status.current_role != ReplicaRole::Secondary
+            || status.replicator_role != ReplicaRole::Secondary
+            || status.service_role != ReplicaRole::Secondary
+            || Some(status.current_epoch.primary()) != self.epoch
+        {
+            return Ok(());
+        }
+        let mut primaries = status
+            .configuration
+            .iter()
+            .filter(|peer| peer.role == ReplicaRole::Primary && peer.up && peer.ready);
+        let Some(primary) = primaries.next() else {
+            return Ok(());
+        };
+        if primaries.next().is_some() {
+            return Err(Error::Protocol("ambiguous native primary"));
+        }
+        let mut endpoint = self.validate_replica(primary)?;
+        // REFrom has actor/address only; public transport IDs are not identity.
+        endpoint.transport_id = None;
+        if self.secondary.as_ref().is_some_and(|copy| {
+            same_endpoint(&copy.primary, &endpoint)
+                && copy.primary_epoch == status.current_epoch.primary()
+        }) {
+            return Ok(());
+        }
+        if self
+            .secondary
+            .as_ref()
+            .is_some_and(|copy| copy.primary_epoch > status.current_epoch.primary())
+        {
+            return Ok(());
+        }
+        if let Some(copy) = &self.secondary {
+            if copy.primary.actor != endpoint.actor {
+                self.transport.unregister_peer(&copy.primary.actor)?;
+            }
+        }
+        self.transport.register_peer(&endpoint)?;
+        if let Some(copy) = self.secondary.as_mut() {
+            copy.primary = endpoint;
+            copy.primary_epoch = status.current_epoch.primary();
+        } else {
+            // This is an already reconciled active replica, NOT a new copy.
+            // No provider data, progress or ACK is synthesized.
+            self.secondary = Some(SecondaryCopy {
+                primary: endpoint,
+                primary_epoch: status.current_epoch.primary(),
+                copy_epoch: status.current_epoch.primary(),
+                horizon: self.queue.progress().applied,
+                queue: OperationQueue::new(self.settings.clone(), 1)?,
+                charges: BTreeMap::new(),
+                dispatched: 1,
+                eos: Some(1),
+            });
+            self.copy_tx.take();
+        }
+        self.send_ack();
+        Ok(())
+    }
+
     fn advance(&mut self) -> Result<()> {
+        self.project_native_primary()?;
         // RAP can complete a native singleton Primary without a separate
         // Update*ReplicaSetConfiguration callback. Project only its actual
         // stable singleton view; role alone (or standalone binding) is not proof.
@@ -2696,7 +2925,18 @@ impl Owner {
             .current
             .as_ref()
             .and_then(|current| self.progress_for(current, false));
-        let ready_quorum = current.is_some_and(|progress| {
+        let catchup_current = self.current.as_ref().and_then(|configuration| {
+            configuration_progress(configuration, self.queue.progress().assigned, false, |id| {
+                self.peers
+                    .get(&id)
+                    .filter(|peer| !peer.cleanup_required)
+                    .map(|peer| PeerProgress {
+                        received: peer.received.max(peer.native_catchup_prefix),
+                        applied: peer.applied.max(peer.native_catchup_prefix),
+                    })
+            })
+        });
+        let ready_quorum = catchup_current.is_some_and(|progress| {
             progress.quorum >= self.catch_up_fence
                 && self
                     .current
@@ -2708,14 +2948,15 @@ impl Owner {
                     .all(|replica| {
                         self.peers.get(&replica.replica_id).is_some_and(|peer| {
                             !peer.cleanup_required
-                                && peer.applied >= progress.quorum
+                                && peer.applied.max(peer.native_catchup_prefix) >= progress.quorum
                                 && peer.configured
                                 && replica.up
                                 && replica.ready
                         })
                     })
         });
-        let ready_all = ready_quorum
+        let ready_all = current.is_some_and(|progress| progress.quorum >= self.catch_up_fence)
+            && ready_quorum
             && current
                 .is_some_and(|progress| progress.all_applied >= self.queue.progress().assigned);
         let mut pending = Vec::new();
@@ -2746,12 +2987,15 @@ impl Owner {
         if control.running {
             return;
         }
-        let boundary = match &control.kind {
-            ControlKind::Epoch { boundary, .. } | ControlKind::Barrier { boundary, .. } => {
-                *boundary
-            }
-            ControlKind::Loss(_) => self.dispatched,
-        };
+        let boundary = control
+            .drain_barrier
+            .map(|(_, boundary)| boundary)
+            .unwrap_or_else(|| match &control.kind {
+                ControlKind::Epoch { boundary, .. } | ControlKind::Barrier { boundary, .. } => {
+                    *boundary
+                }
+                ControlKind::Loss(_) => self.dispatched,
+            });
         if matches!(&control.kind, ControlKind::Epoch { role, .. } if *role != ReplicaRole::Primary)
             && self.role == ReplicaRole::Primary
         {
@@ -2777,14 +3021,19 @@ impl Owner {
         }
         // Secondary node controls drain admission, not original-operation
         // epochs. Advancing the provider here would poison historical replay.
-        let epoch = match &control.kind {
-            ControlKind::Epoch { epoch, role, .. } => {
-                (*role == ReplicaRole::Primary).then_some(*epoch)
+        let epoch = if let Some((epoch, _)) = control.drain_barrier {
+            Some(epoch)
+        } else {
+            match &control.kind {
+                ControlKind::Epoch { epoch, role, .. } => {
+                    (*role == ReplicaRole::Primary).then_some(*epoch)
+                }
+                ControlKind::Barrier { epoch, .. } => Some(*epoch),
+                ControlKind::Loss(_) => None,
             }
-            ControlKind::Barrier { epoch, .. } => Some(*epoch),
-            ControlKind::Loss(_) => None,
         };
-        let admission_only = matches!(&control.kind, ControlKind::Epoch { role, .. } if *role != ReplicaRole::Primary);
+        let admission_only = control.drain_barrier.is_none()
+            && matches!(&control.kind, ControlKind::Epoch { role, .. } if *role != ReplicaRole::Primary);
         control.running = true;
         let provider = self.provider.clone();
         let cancellation = control.cancellation.clone();
@@ -2883,6 +3132,22 @@ impl Owner {
         // Preserve the reply until disposal/terminal cleanup when a callback
         // fails, rather than accidentally dropping it as a successful barrier.
         let value = result?;
+        if let Some(control) = self.control.as_mut() {
+            if let Some((epoch, boundary)) = control.drain_barrier {
+                if !matches!(value, JobValue::Epoch(authoritative) if authoritative == boundary) {
+                    return Err(Error::Protocol(
+                        "provider drain barrier reconciliation mismatch",
+                    ));
+                }
+                if control.cancellation.is_cancelled() {
+                    return Err(Error::Protocol("provider drain barrier canceled"));
+                }
+                self.provider_epoch = Some(epoch);
+                control.drain_barrier = None;
+                control.running = false;
+                return Ok(());
+            }
+        }
         let control = self
             .control
             .take()
@@ -2923,6 +3188,7 @@ impl Owner {
                             peer.maximum_sent = boundary;
                             peer.receipt_seen = false;
                             peer.configured = false;
+                            peer.native_catchup_prefix = 0;
                         }
                     }
                 }
@@ -3048,7 +3314,7 @@ impl Owner {
                 // Build success is not CC adoption. A copied but still idle
                 // session remains a history-retention owner while writes
                 // continue (native ReplicationSession::IdleReplicaProgress).
-                if !done || !peer.configured {
+                if !done || !peer.adopted {
                     let idle_release = build
                         .finish
                         .map_or(peer.received, |finish| {

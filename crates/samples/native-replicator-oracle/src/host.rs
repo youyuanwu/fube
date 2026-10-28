@@ -42,6 +42,10 @@ use tokio::{
 use uuid::Uuid;
 use windows_core::{implement, Interface, Ref, Result, GUID, PCWSTR};
 
+#[path = "../../rust-runtime-app/src/copy_ack_hold.rs"]
+mod copy_ack_hold;
+use copy_ack_hold::CopyAckHold;
+
 use crate::{
     async_context::{guard_future, ReentrantAbort, Slot, Workers, E_ABORT},
     com, create_native_replicator,
@@ -102,6 +106,7 @@ struct Route {
     workers: Arc<Workers>,
     pump: tokio::sync::Mutex<Option<Pump>>,
     delay: AtomicU64,
+    copy_ack_hold: CopyAckHold,
     copy_done: AtomicBool,
     copy_stream_items: AtomicU64,
     copy_stream_eos: AtomicU64,
@@ -356,6 +361,28 @@ impl Route {
                         .map_err(application_error)?;
                 }
             }
+            let held = if copy
+                && !self.app.provider.snapshot().copy_in_progress
+                && self.app.provider.snapshot().last > 0
+            {
+                self.copy_ack_hold
+                    .wait(
+                        sequence,
+                        self.app.provider.snapshot().last,
+                        &stop,
+                        &self.workers.stop,
+                    )
+                    .await
+                    .map_err(|error| {
+                        if stop.is_cancelled() || self.workers.stop.is_cancelled() {
+                            E_ABORT.into()
+                        } else {
+                            application_error(error)
+                        }
+                    })?
+            } else {
+                false
+            };
             // Hold the explicit ACK after application, matching the Rust pump.
             // This exposes applied-but-not-acknowledged progress to qualification.
             let delay = self.delay.load(Ordering::Acquire);
@@ -370,6 +397,9 @@ impl Route {
             }
             // Receipt, empty data, local progress and EOS are never implicit ACKs.
             unsafe { operation.Acknowledge().ok()? };
+            if held {
+                self.copy_ack_hold.acknowledged();
+            }
             let index = usize::from(!copy);
             self.acknowledged_sequence[index].store(sequence, Ordering::Release);
             self.acknowledgment_calls[index].fetch_add(1, Ordering::AcqRel);
@@ -636,6 +666,7 @@ impl Route {
             "commit_observation":"local successful native EndReplicate only; secondary quorum watermark is not publicly observed",
             "ack_delay_ms":self.delay.load(Ordering::Acquire),
             "copy_delay_ms":self.app.copy_delay.load(Ordering::Acquire),"pump_fault":fault,
+            "copy_ack_hold":self.copy_ack_hold.snapshot(),
             "engine":engine
         }))
     }
@@ -771,6 +802,7 @@ impl IFabricStatefulServiceFactory_Impl for Factory_Impl {
                 workers,
                 pump: tokio::sync::Mutex::new(None),
                 delay: AtomicU64::new(0),
+                copy_ack_hold: CopyAckHold::default(),
                 copy_done: AtomicBool::new(false),
                 copy_stream_items: AtomicU64::new(0),
                 copy_stream_eos: AtomicU64::new(0),
@@ -921,6 +953,7 @@ enum Request {
     DataLoss(i64),
     Write(Mutation),
     Test { copy: bool, delay: u64 },
+    CopyAckHold(u64),
 }
 fn decode(value: &str) -> std::result::Result<String, &'static str> {
     let mut output = Vec::with_capacity(value.len());
@@ -967,6 +1000,15 @@ fn parse(operation: &str, query: &str) -> std::result::Result<Request, &'static 
             Ok(Request::Write(mutation))
         }
         "test" if parameters.len() == 1 => {
+            if let Some(value) = parameters.get("copy_ack_hold_ms") {
+                let milliseconds = value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|n| *n <= 6000)
+                    .filter(|_| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+                    .ok_or("copy ACK hold must be 0..6000 ms")?;
+                return Ok(Request::CopyAckHold(milliseconds));
+            }
             if let Some(value) = parameters.get("data_loss_boundary") {
                 let boundary = value
                     .parse::<i64>()
@@ -1047,12 +1089,20 @@ impl Host {
         }
         let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
         let (base, operation) = path.rsplit_once('/').unwrap_or(("", ""));
-        let route = self
-            .routes
-            .lock()
-            .map_err(|_| com::E_UNEXPECTED)?
-            .get(base)
-            .and_then(Weak::upgrade);
+        let route = {
+            let routes = self.routes.lock().map_err(|_| com::E_UNEXPECTED)?;
+            routes.get(base).and_then(Weak::upgrade).or_else(|| {
+                // Discovery only; writes and hook releases still require the
+                // canonical incarnation-bearing route returned by diagnostics.
+                (operation == "diagnostics")
+                    .then(|| {
+                        routes.values().filter_map(Weak::upgrade).find(|route| {
+                            base == format!("/data/{}/{}", route.partition, route.replica)
+                        })
+                    })
+                    .flatten()
+            })
+        };
         let Some(route) = route else {
             return response(&mut stream, 404, json!({})).await;
         };
@@ -1089,6 +1139,19 @@ impl Host {
                 .await,
             };
         match request {
+            Request::CopyAckHold(milliseconds) => {
+                route.access()?;
+                if route.copy_ack_hold.set(milliseconds).is_err() {
+                    return response(&mut stream, 400, json!({})).await;
+                }
+                response(
+                    &mut stream,
+                    200,
+                    json!({"qualification_only":true,
+                    "copy_ack_hold_ms":milliseconds}),
+                )
+                .await
+            }
             Request::DataLoss(boundary) => {
                 route.access()?;
                 route

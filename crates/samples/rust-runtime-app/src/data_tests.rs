@@ -256,6 +256,11 @@ fn query_decodes_strict_utf8_and_rejects_malformed_unknown_and_bounded_requests(
         ("test", "copy_delay_ms=101"),
         ("test", "copy_delay_ms=-1"),
         ("test", "copy_delay_ms=1&ack_delay_ms=1"),
+        ("test", "copy_ack_hold_ms=6001"),
+        ("test", "copy_ack_hold_ms=-1"),
+        ("test", "copy_ack_hold_ms=+1"),
+        ("test", "copy_ack_hold_ms="),
+        ("test", "copy_ack_hold_ms=1&ack_delay_ms=1"),
         ("test", "wire_probe=arbitrary"),
         ("test", "wire_probe=stale_epoch&ack_delay_ms=0"),
         ("test", "data_loss_boundary=-1"),
@@ -274,6 +279,12 @@ fn query_decodes_strict_utf8_and_rejects_malformed_unknown_and_bounded_requests(
         parse("test", "copy_delay_ms=100").unwrap(),
         Request::CopyTest(100)
     ));
+    for milliseconds in [0, 6000] {
+        assert!(
+            matches!(parse("test", &format!("copy_ack_hold_ms={milliseconds}")).unwrap(),
+            Request::CopyAckHold(value) if value == milliseconds)
+        );
+    }
     assert!(matches!(
         parse("test", "wire_probe=stale_epoch").unwrap(),
         Request::WireProbe(_)
@@ -592,7 +603,7 @@ async fn build_waits_for_accepted_primary_local_apply_at_the_exact_horizon() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_copy_pumps_apply_nonempty_ledger_then_replication_ack_and_copied_retry() {
+async fn real_copy_pumps_copy_ack_hold_after_receive_eos_then_replication_ack_and_copied_retry() {
     let partition = Uuid::new_v4();
     let provider = MemoryProvider::new();
     let eos = Arc::new(Semaphore::new(1));
@@ -616,11 +627,27 @@ async fn real_copy_pumps_apply_nonempty_ledger_then_replication_ack_and_copied_r
         assert_eq!(primary.write(mutation(n)).await.outcome, Outcome::Committed);
     }
     let (secondary, secondary_native) = route(partition, 2, ReplicaRole::Idle).await;
-    primary
+    secondary.copy_ack_hold.set(6000).unwrap();
+    let build = primary
         .engine
-        .build_replica(descriptor(&secondary), Cancellation::default())
-        .await
-        .unwrap();
+        .build_replica(descriptor(&secondary), Cancellation::default());
+    tokio::pin!(build);
+    tokio::select! {
+        result = &mut build => panic!("copy completed before release: {result:?}"),
+        _ = until(|| secondary.copy_ack_hold.snapshot()["held"] == true
+            && primary.engine.snapshot().peers.iter().any(|peer| peer.replica == 2 && peer.copy_received == -1)) => {},
+    }
+    assert!(!secondary.engine.snapshot().copy_done);
+    assert_eq!(secondary.provider.snapshot().last, 4);
+    assert!(!secondary.provider.snapshot().copy_in_progress);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), &mut build)
+            .await
+            .is_err(),
+        "actual EOS receipt and CopyEnd application cannot complete build without its ACK"
+    );
+    secondary.copy_ack_hold.set(0).unwrap();
+    build.await.unwrap();
     assert_eq!(secondary.provider.snapshot().last, 4);
     assert_eq!(
         secondary.provider.snapshot().results,
@@ -896,6 +923,13 @@ type PumpFixture = (
     mpsc::Sender<Submit>,
 );
 fn pump_fixture(provider: Arc<MemoryProvider>, delay: u64) -> PumpFixture {
+    pump_fixture_with_hold(provider, delay, Arc::new(CopyAckHold::default()))
+}
+fn pump_fixture_with_hold(
+    provider: Arc<MemoryProvider>,
+    delay: u64,
+    copy_ack_hold: Arc<CopyAckHold>,
+) -> PumpFixture {
     let (copy_tx, copy_rx) = mpsc::channel(8);
     let (replication_tx, replication_rx) = mpsc::channel(8);
     let (request_tx, requests) = mpsc::channel(1);
@@ -914,6 +948,7 @@ fn pump_fixture(provider: Arc<MemoryProvider>, delay: u64) -> PumpFixture {
             replication: Arc::new(OperationStream::new(replication_rx)),
             requests,
             delay: Arc::new(AtomicU64::new(delay)),
+            copy_ack_hold,
             fault: fault.clone(),
         },
         Cancellation::default(),
@@ -927,6 +962,89 @@ fn operation(sequence: i64, data: OperationData, ack: Acknowledgment) -> Operati
         epoch: EPOCH,
         data,
         acknowledgment: ack,
+    }
+}
+
+#[tokio::test]
+async fn pump_copy_ack_hold_final_nonempty_receive_release_cancel_deadline_and_eos() {
+    for action in ["release", "cancel", "deadline"] {
+        let provider = MemoryProvider::new();
+        let hold = Arc::new(CopyAckHold::default());
+        hold.set(if action == "deadline" { 100 } else { 6000 })
+            .unwrap();
+        let (mut pump, copy, replication, fault, _requests) =
+            pump_fixture_with_hold(provider.clone(), 0, hold.clone());
+        let source = MemoryProvider::new();
+        source
+            .apply_replication(1, &mutation("copied").operation().unwrap())
+            .unwrap();
+        let stream = source.copy_state(1, None).unwrap();
+        let acknowledgments = Arc::new(AtomicUsize::new(0));
+        let mut sequence = 0;
+        while let Some(data) = stream.next(Cancellation::default()).await.unwrap() {
+            sequence += 1;
+            let acks = acknowledgments.clone();
+            copy.send(operation(
+                sequence,
+                data,
+                Acknowledgment::new(move || {
+                    acks.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                }),
+            ))
+            .await
+            .unwrap();
+        }
+        // EOS is available, but neither stream disposal nor provider CopyEnd
+        // application is permission to acknowledge the held real operation.
+        drop(copy);
+        until(|| hold.snapshot()["held"] == true).await;
+        assert_eq!(acknowledgments.load(Ordering::Acquire), 2);
+        assert_eq!(provider.snapshot().last, 1);
+        assert!(!provider.snapshot().copy_in_progress);
+        assert!(
+            hold.set(6000).is_err(),
+            "rearming cannot extend an owned hold"
+        );
+        let acks = acknowledgments.clone();
+        replication
+            .send(operation(
+                2,
+                mutation("tail").operation().unwrap(),
+                Acknowledgment::new(move || {
+                    acks.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(provider.snapshot().last, 1);
+        match action {
+            "release" => {
+                hold.set(0).unwrap();
+                until(|| acknowledgments.load(Ordering::Acquire) == 4).await;
+                assert_eq!(provider.snapshot().last, 2);
+                assert_eq!(hold.snapshot()["acknowledged"], true);
+                assert_eq!(hold.snapshot()["released"], true);
+            }
+            "cancel" => {
+                let start = Instant::now();
+                pump.join();
+                assert!(start.elapsed() < Duration::from_millis(150));
+                assert_eq!(hold.snapshot()["cancelled"], true);
+                assert_eq!(acknowledgments.load(Ordering::Acquire), 2);
+            }
+            _ => {
+                until(|| fault.lock().unwrap().is_some()).await;
+                assert_eq!(hold.snapshot()["expired"], true);
+                assert_eq!(acknowledgments.load(Ordering::Acquire), 2);
+            }
+        }
+        pump.join();
+        assert_eq!(hold.snapshot()["held"], false);
+        if action != "deadline" {
+            assert!(fault.lock().unwrap().is_none());
+        }
     }
 }
 

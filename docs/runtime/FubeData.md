@@ -91,7 +91,12 @@ Required targets and ALL catch-up are not ordinary write quorum. Removal does
 not shrink native membership to manufacture success. Epoch/role revisions,
 replica and engine incarnations, original operation epochs and build sessions
 fence stale data/ACK/copy receipts. Repeated promotion with no intervening write
-still requires fresh peer ACKs of the authoritative inherited prefix.
+binds a secondary session only from the exact current native-selected primary
+descriptor/epoch, never an arbitrary epoch-less RequestAck. Fresh network ACKs
+drive write commitment and ALL catch-up. Native-advertised progress may attest
+only the local already-completed prefix for WRITE_QUORUM catch-up; it is
+separately labeled `native_catchup_prefix`, cannot acknowledge a new write, and
+cannot satisfy ALL.
 
 Copy pins coherent state **and retry ledger** at the native-selected
 `replicationStart - 1` horizon, even while the provider and new writes advance.
@@ -99,6 +104,15 @@ Live replication buffers behind copy and joins at its explicit finish fence;
 unavailable history fails instead of selecting a different boundary. Native
 volatile copy context is null. A successful canceled Build invocation's scope
 is distinct from the lifetime of the established configured peer.
+
+Promotion freezes and drains the contiguous received prefix through actual
+application ACK, including operations not yet dispatched because captures
+exhausted their budget. It does not silently reuse their sequence numbers;
+only a noncontiguous tail can be discarded. Original-operation epoch barriers
+remain ordered during that drain. Every configuration installation captures the
+latest assigned catch-up fence. Departed adopted sessions are retired when
+absent from both active configurations, without retaining obsolete copy fences
+or waiting for a delayed RemoveIdle to free their budgets.
 
 Read/write admission requires current native access, live lifetime/host
 authority, agreement of native service/replicator/engine roles and epoch, and

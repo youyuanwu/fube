@@ -28,11 +28,22 @@ fn common_http_schema_percent_utf8_and_limits() {
         ("test", "copy_delay_ms=-1"),
         ("test", "copy_delay_ms="),
         ("test", "copy_delay_ms=18446744073709551616"),
+        ("test", "copy_ack_hold_ms=6001"),
+        ("test", "copy_ack_hold_ms=-1"),
+        ("test", "copy_ack_hold_ms=+1"),
+        ("test", "copy_ack_hold_ms="),
+        ("test", "copy_ack_hold_ms=1&ack_delay_ms=1"),
     ] {
         assert!(parse(operation, query).is_err(), "{operation} {query}");
     }
 
     assert!(parse("service", &"x".repeat(LIMIT + 1)).is_err());
+    for milliseconds in [0, 6000] {
+        assert!(
+            matches!(parse("test", &format!("copy_ack_hold_ms={milliseconds}")),
+            Ok(Request::CopyAckHold(value)) if value == milliseconds)
+        );
+    }
     assert!(matches!(
         parse("test", "ack_delay_ms=2000"),
         Ok(Request::Test {
@@ -64,6 +75,7 @@ fn route() -> Arc<Route> {
         workers,
         pump: tokio::sync::Mutex::new(None),
         delay: AtomicU64::new(0),
+        copy_ack_hold: CopyAckHold::default(),
         copy_done: AtomicBool::new(false),
         copy_stream_items: AtomicU64::new(0),
         copy_stream_eos: AtomicU64::new(0),
@@ -661,6 +673,174 @@ impl NullableOperationStream_Impl for Operations_Impl {
 fn operations(operations: Vec<IFabricOperation>) -> IFabricOperationStream {
     let stream: NullableOperationStream = Operations(Mutex::new(operations.into())).into();
     stream.cast().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_copy_ack_hold_final_nonempty_receive_release_cancel_deadline_and_eos() {
+    for action in ["release", "cancel", "deadline"] {
+        let route = route();
+        let engine = EngineState::new();
+        let opened = if action == "release" {
+            let opened = primary(&route, &engine).await;
+            *route.role.lock().unwrap() = FABRIC_REPLICA_ROLE::FABRIC_REPLICA_ROLE_IDLE_SECONDARY;
+            route.copy_done.store(false, Ordering::Release);
+            Some(opened)
+        } else {
+            None
+        };
+        route
+            .copy_ack_hold
+            .set(if action == "deadline" { 100 } else { 6000 })
+            .unwrap();
+        let source = fube_data::MemoryProvider::new();
+        source
+            .apply_replication(
+                1,
+                &Mutation {
+                    id: "copied".into(),
+                    key: "key".into(),
+                    value: "value".into(),
+                }
+                .operation()
+                .unwrap(),
+            )
+            .unwrap();
+        let stream = fube_data::StateProvider::copy_state(source.as_ref(), 1, None).unwrap();
+        let acks = Arc::new(AtomicU64::new(0));
+        let mut items = Vec::new();
+        let mut sequence = 0;
+        while let Some(data) = stream.next(Cancellation::default()).await.unwrap() {
+            sequence += 1;
+            let operation: IFabricOperation = Operation {
+                data: operation_data(data.to_segments()).unwrap(),
+                metadata: FABRIC_OPERATION_METADATA {
+                    Type: FABRIC_OPERATION_TYPE::FABRIC_OPERATION_TYPE_NORMAL,
+                    SequenceNumber: FABRIC_SEQUENCE_NUMBER(sequence),
+                    ..Default::default()
+                },
+                applied: route.app.provider.clone(),
+                acknowledgments: acks.clone(),
+                expected: if sequence >= 2 { 1 } else { 0 },
+            }
+            .into();
+            items.push(operation);
+        }
+        // Exercise the non-null native EOS variant too. It must not bypass
+        // CopyEnd's held Acknowledge, and must itself be acknowledged on release.
+        items.push(
+            Operation {
+                data: operation_data(vec![]).unwrap(),
+                metadata: FABRIC_OPERATION_METADATA {
+                    Type: FABRIC_OPERATION_TYPE::FABRIC_OPERATION_TYPE_END_OF_STREAM,
+                    SequenceNumber: FABRIC_SEQUENCE_NUMBER(sequence + 1),
+                    ..Default::default()
+                },
+                applied: route.app.provider.clone(),
+                acknowledgments: acks.clone(),
+                expected: 1,
+            }
+            .into(),
+        );
+        let consumer = route.clone();
+        let stop = Cancellation::default();
+        let token = stop.clone();
+        let task =
+            tokio::spawn(async move { consumer.consume(operations(items), true, token).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while route.copy_ack_hold.snapshot()["held"] != true {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(route.app.provider.snapshot().last, 1);
+        assert!(!route.app.provider.snapshot().copy_in_progress);
+        assert_eq!(acks.load(Ordering::Acquire), 2);
+        assert_eq!(route.copy_stream_eos.load(Ordering::Acquire), 0);
+        match action {
+            "release" => {
+                let host = Host {
+                    rt: tokio::runtime::Handle::current(),
+                    node: "test".into(),
+                    ip: "127.0.0.1".parse().unwrap(),
+                    port: 1,
+                    host: "test".into(),
+                    routes: Mutex::new(HashMap::from([(
+                        "/data/test".into(),
+                        Arc::downgrade(&route),
+                    )])),
+                    worker_owners: Mutex::new(Vec::new()),
+                };
+                async fn http(host: &Host, path: &str) -> (String, Value) {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let address = listener.local_addr().unwrap();
+                    let (_server, client) = tokio::join!(
+                        async {
+                            let (stream, _) = listener.accept().await.unwrap();
+                            host.request(stream).await.unwrap();
+                        },
+                        async {
+                            let mut stream = TcpStream::connect(address).await.unwrap();
+                            stream
+                                .write_all(
+                                    format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                                        .as_bytes(),
+                                )
+                                .await
+                                .unwrap();
+                            let mut bytes = Vec::new();
+                            stream.read_to_end(&mut bytes).await.unwrap();
+                            String::from_utf8(bytes).unwrap()
+                        }
+                    );
+                    let (headers, body) = client.split_once("\r\n\r\n").unwrap();
+                    (
+                        headers.lines().next().unwrap().into(),
+                        serde_json::from_str(body).unwrap(),
+                    )
+                }
+                let alias = format!("/data/{}/{}", route.partition, route.replica);
+                let (status, diagnostics) = http(&host, &format!("{alias}/diagnostics")).await;
+                assert!(status.contains("200"));
+                assert_eq!(diagnostics["copy_ack_hold"]["held"], true);
+                assert_eq!(diagnostics["engine"]["copy_done"], false);
+                assert_eq!(diagnostics["role"], "IdleSecondary");
+                let (status, _) = http(&host, &format!("{alias}/test?copy_ack_hold_ms=0")).await;
+                assert!(
+                    status.contains("404"),
+                    "incarnation-free aliases cannot change a hook"
+                );
+                let (status, _) = http(&host, "/data/test/test?copy_ack_hold_ms=0").await;
+                assert!(
+                    status.contains("200"),
+                    "canonical test route releases during native InBuild"
+                );
+                task.await.unwrap().unwrap();
+                assert_eq!(acks.load(Ordering::Acquire), 4);
+                assert_eq!(route.copy_ack_hold.snapshot()["acknowledged"], true);
+                assert_eq!(route.copy_stream_eos.load(Ordering::Acquire), 1);
+            }
+            "cancel" => {
+                stop.cancel();
+                assert_eq!(task.await.unwrap().unwrap_err().code(), E_ABORT);
+                assert_eq!(route.copy_ack_hold.snapshot()["cancelled"], true);
+                assert_eq!(acks.load(Ordering::Acquire), 2);
+            }
+            _ => {
+                assert!(task.await.unwrap().is_err());
+                assert_eq!(route.copy_ack_hold.snapshot()["expired"], true);
+                assert_eq!(acks.load(Ordering::Acquire), 2);
+            }
+        }
+        assert_eq!(route.copy_ack_hold.snapshot()["held"], false);
+        if let Some((replica, lifecycle)) = opened {
+            unsafe { replica.Abort() };
+            lifecycle.join().await.unwrap();
+        } else {
+            route.shutdown().await.unwrap();
+        }
+        engine.workers.join().await.unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

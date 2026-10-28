@@ -916,9 +916,271 @@ def wire_endpoint(value: str) -> dict:
             "replica": int(replica), "engine": native_uuid(engine), "suffix": suffix}
 
 
-def wire_receipt(before: dict, source: dict, kind: str, reply: dict) -> dict:
-    require(reply.get("qualification_only") is True and reply.get("admission_only") is True
-            and reply.get("kind") == kind, "required real wire probe unavailable; admission is not rejection evidence")
+WIRE_CAPTURE_SECONDS = 20
+WIRE_CAPTURE_PACKETS = 1024
+WIRE_CAPTURE_BYTES = 512 * 1024
+WIRE_CAPTURE_OUTPUT = 2 * 1024 * 1024
+
+# Read-only, test-only observer in the original container/network namespace.
+# PACKET_HOST on lo observes the destination ingress clone, not PACKET_OUTGOING.
+# No expected probe bytes enter this helper; they are compared independently.
+WIRE_CAPTURE = r"""
+import ipaddress,json,os,select,signal,socket,struct,sys,time
+def require(value, message):
+    if not value: raise RuntimeError(message)
+deadline=float(sys.argv[2]); token=sys.argv[3]
+signal.signal(signal.SIGALRM,lambda *_: sys.exit("wire observer absolute deadline"))
+signal.alarm(max(1,min(20,int(deadline-time.time()+1))))
+with open("/proc/self/stat") as status: start=status.read().rsplit(") ",1)[1].split()[19]
+with open("/proc/self/status") as status:
+    cap_eff=next(line.split()[1] for line in status if line.startswith("CapEff:"))
+proof={"pid":os.getpid(),"start_time":start,"token":token}
+credentials={"euid":os.geteuid(),"egid":os.getegid(),
+             "cap_eff":cap_eff}
+sock=None
+try:
+    allowed=json.loads(sys.argv[1])
+    require(type(allowed) is list and 1<=len(allowed)<=64,"wire observer endpoint bound")
+    pairs=[]
+    for pair in allowed:
+        require(type(pair) is list and len(pair)==2,"wire observer endpoint pair")
+        endpoints=[]
+        for endpoint in pair:
+            host,port=endpoint.rsplit(":",1)
+            host=str(ipaddress.IPv4Address(host))
+            require(port.isdigit() and 0<int(port)<65536,"wire observer numeric IPv4 endpoint required")
+            endpoints.append((host,int(port)))
+        pairs.append(endpoints)
+    sock=socket.socket(socket.AF_PACKET,socket.SOCK_DGRAM,socket.htons(0x0800))
+    sock.bind(("lo",0)); sock.setblocking(False)
+    # Reset packet statistics before readiness; loss is never a successful trace.
+    sock.getsockopt(263,6,12)
+    ready={**proof,"classification":"destination_kernel_ingress","interface":"lo",
+           "netns_inode":os.stat("/proc/self/ns/net").st_ino,"credentials":credentials,"allowed":allowed}
+    print(json.dumps(ready),flush=True)
+    packets=[]; total=0; seen=0; wire_bytes=0
+    while True:
+        remaining=deadline-time.time()
+        require(remaining>0,"wire observer deadline")
+        readable,_,_=select.select([sock,sys.stdin],[],[],remaining)
+        # Drain the ready socket before honouring finish on stdin.
+        if sock in readable:
+            for _ in range(32769):
+                try: packet,address=sock.recvfrom(65536)
+                except BlockingIOError: break
+                seen+=1; wire_bytes+=len(packet)
+                require(seen<=32768 and wire_bytes<=16777216,"wire observer packet/wire byte bound")
+                if address[2]!=0: continue
+                if len(packet)<40 or packet[0]>>4!=4 or packet[9]!=6: continue
+                ihl=(packet[0]&15)*4; size=struct.unpack_from("!H",packet,2)[0]
+                require(20<=ihl<=60 and ihl+20<=size<=len(packet),"wire observer truncated IPv4/TCP")
+                require(struct.unpack_from("!H",packet,6)[0]&0x3fff==0,"wire observer fragmented IPv4")
+                src=socket.inet_ntoa(packet[12:16]); dst=socket.inet_ntoa(packet[16:20])
+                sport,dport,sequence=struct.unpack_from("!HHI",packet,ihl)
+                tcp=(packet[ihl+12]>>4)*4
+                require(tcp>=20 and ihl+tcp<=size,"wire observer truncated TCP header")
+                if not any(src==a[0] and dst==b[0] and (sport==a[1] or dport==b[1]) for a,b in pairs):
+                    continue
+                payload=packet[ihl+tcp:size]
+                if not payload: continue
+                total+=len(payload)
+                require(len(packets)<1024 and total<=524288,"wire observer captured payload bound")
+                packets.append({"local":src+":"+str(sport),"remote":dst+":"+str(dport),
+                                "sequence":sequence,"payload_hex":payload.hex()})
+            else: raise RuntimeError("wire observer drain bound")
+        if sys.stdin in readable:
+            require(os.read(sys.stdin.fileno(),16)==b"finish\n","wire observer finish protocol")
+            break
+    stats=sock.getsockopt(263,6,12)
+    received,dropped=struct.unpack_from("II",stats)
+    require(dropped==0,"wire observer kernel packet loss")
+    print(json.dumps({"helper":proof,"classification":"destination_kernel_ingress","interface":"lo",
+                      "netns_inode":ready["netns_inode"],"allowed":allowed,
+                      "packets":packets,"payload_bytes":total,"seen_packets":seen,
+                      "wire_bytes":wire_bytes,"kernel_drops":dropped}),flush=True)
+except Exception as error:
+    print(json.dumps({"helper":proof,"error":str(error),"credentials":credentials}),flush=True)
+    sys.exit(1)
+finally:
+    if sock is not None: sock.close()
+"""
+
+
+class WireCapture:
+    def __init__(self, allocation, allowed: list, evidence: dict):
+        self.allocation, self.allowed, self.evidence = allocation, allowed, evidence
+        self.container_id = allocation.verify()
+        self.token = secrets.token_hex(32)
+        self.helper = None
+        self.process = None
+
+    def __enter__(self):
+        self.deadline = time.monotonic() + WIRE_CAPTURE_SECONDS
+        self.process = subprocess.Popen(
+            ["docker", "exec", "-i", self.container_id, "python3", "-c", WIRE_CAPTURE,
+             json.dumps(self.allowed), str(time.time() + WIRE_CAPTURE_SECONDS), self.token],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT, bufsize=0)
+        try:
+            import select
+            line = b""
+            while not line.endswith(b"\n"):
+                left = self.deadline - time.monotonic()
+                if left <= 0 or not select.select([self.process.stdout], [], [], left)[0]:
+                    raise MissingEvidence("destination wire observer readiness deadline")
+                part = os.read(self.process.stdout.fileno(), 8193 - len(line))
+                if not part:
+                    raise MissingEvidence("destination wire observer exited before readiness: " + line.decode(errors="replace"))
+                line += part
+                require(len(line) <= 8192, "wire observer readiness byte bound")
+            ready = strict_json(line.decode())
+            proof = ready.get("helper", ready)
+            require(type(proof.get("pid")) is int and proof["pid"] > 1
+                    and type(proof.get("start_time")) is str and proof["start_time"].isdigit()
+                    and proof.get("token") == self.token, "wire observer original helper identity")
+            self.helper = {key: proof[key] for key in ("pid", "start_time", "token")}
+            self.evidence["observer_ready"] = ready
+            if "error" in ready:
+                raise MissingEvidence("destination wire observer unavailable using existing credentials: " + ready["error"])
+            require(ready.get("classification") == "destination_kernel_ingress" and ready.get("interface") == "lo"
+                    and type(ready.get("netns_inode")) is int and ready["netns_inode"] > 0
+                    and ready.get("allowed") == self.allowed, "wire observer readiness scope changed")
+            require(self.allocation.verify() == self.container_id, "original wire observer allocation changed")
+            return self
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
+
+    def finish(self) -> dict:
+        require(self.allocation.verify() == self.container_id, "original wire observer allocation changed")
+        # communicate is bounded by the helper's finite output/absolute alarm;
+        # it also joins the docker client before returning evidence.
+        stdout, stderr = self.process.communicate(
+            b"finish\n", timeout=max(.001, self.deadline - time.monotonic()) + 2)
+        require(len(stdout) <= WIRE_CAPTURE_OUTPUT and len(stderr) <= 8192, "wire observer output bound")
+        if not stdout:
+            raise MissingEvidence("destination wire observer produced no receipt: " + stderr.decode(errors="replace"))
+        result = strict_json(stdout.decode())
+        self.evidence["observer_receipt"] = result
+        if self.process.returncode != 0:
+            raise MissingEvidence(f"destination wire observer failed: {result}; {stderr.decode(errors='replace')}")
+        require(result.get("helper") == self.helper and result.get("allowed") == self.allowed
+                and result.get("netns_inode") == self.evidence["observer_ready"]["netns_inode"],
+                "wire observer process/namespace/scope changed")
+        return result
+
+    def __exit__(self, exc_type, error, traceback):
+        if self.process is None:
+            return
+        try:
+            if self.helper is not None:
+                require(self.allocation.verify() == self.container_id, "original wire observer allocation changed; refuse signal")
+                self.allocation.execute("python3", "-c", STOP_UPLOAD_HELPER, json.dumps(self.helper), timeout=12)
+                self.evidence["observer_cleanup"] = "original helper pidfd exit confirmed"
+            else:
+                self.evidence["observer_cleanup"] = (
+                    "no original helper receipt; no PID/name adoption or signal; finite absolute alarm remains")
+        except BaseException as cleanup_error:
+            self.evidence["observer_cleanup_error"] = str(cleanup_error)
+            if error is None:
+                raise
+            error.add_note("wire observer cleanup unconfirmed; absolute alarm remains: " + str(cleanup_error))
+        finally:
+            if self.process.poll() is None:
+                self.process.kill()
+            self.process.communicate(timeout=3)
+
+
+def wire_capture_scope(source: dict) -> list:
+    own = wire_endpoint(source["rpc"]["replication_address"])["address"]
+    peers = ([peer["address"] for peer in source["rpc"]["engine"].get("peers", [])
+              if peer["configured"] and not peer["building"] and not peer["cleanup_required"]]
+             if source["role"] == "Primary" else [source["rpc"].get("observed_primary")])
+    require(1 <= len(peers) <= 64, "wire observer requires bounded existing native-selected peers")
+    return [[own, wire_endpoint(peer)["address"]] for peer in peers]
+
+
+def wire_delivery(reply: dict, own: dict, selected: dict, observation: dict | None) -> dict:
+    delivery = reply.get("delivery")
+    if not isinstance(delivery, dict) or reply.get("admission_only") is not False:
+        raise MissingEvidence("exact invalid frame socket write/flush completion missing (admission is insufficient)")
+    require(delivery.get("classification") == "socket_write_all_and_flush"
+            and type(delivery.get("session")) is int and delivery["session"] > 0
+            and delivery.get("remote_listener") == selected["address"], "wire completion session/listener mismatch")
+    frame_hex = delivery.get("frame_hex")
+    require(type(frame_hex) is str and re.fullmatch(r"(?:[a-f0-9]{2}){12,16384}", frame_hex) is not None,
+            "wire completion exact bounded frame bytes required")
+    frame = bytes.fromhex(frame_hex)
+    require(type(delivery.get("frame_bytes")) is int and delivery["frame_bytes"] == len(frame)
+            and struct.unpack_from("<I", frame)[0] == len(frame), "wire completion frame length mismatch")
+    message_id = delivery.get("message_id")
+    require(isinstance(message_id, dict) and native_uuid(message_id.get("guid")) != str(uuid.UUID(int=0))
+            and message_id.get("index") == 1
+            and frame.count(uuid.UUID(message_id["guid"]).bytes_le) == 1,
+            "wire completion unique encoded message identity missing")
+    local, remote = (urlsplit("//" + delivery.get(key, "")) for key in ("local", "remote"))
+    own_socket, peer_socket = urlsplit("//" + own["address"]), urlsplit("//" + selected["address"])
+    require(local.hostname == own_socket.hostname and remote.hostname == peer_socket.hostname
+            and local.port and remote.port
+            and (local.port == own_socket.port or remote.port == peer_socket.port),
+            "wire completion actual socket tuple is not the selected session")
+    if not isinstance(observation, dict):
+        raise MissingEvidence("independent destination-wire evidence missing")
+    require(observation.get("classification") == "destination_kernel_ingress"
+            and observation.get("interface") == "lo"
+            and type(observation.get("kernel_drops")) is int and observation["kernel_drops"] == 0
+            and [own["address"], selected["address"]] in observation.get("allowed", [])
+            and type(observation.get("seen_packets")) is int and 0 <= observation["seen_packets"] <= 32768
+            and type(observation.get("wire_bytes")) is int and 0 <= observation["wire_bytes"] <= 16777216,
+            "wire evidence is not loss-free destination ingress")
+    packets = observation.get("packets")
+    require(type(packets) is list and len(packets) <= WIRE_CAPTURE_PACKETS,
+            "wire evidence packet bound")
+    payload_bytes = 0
+    chunks = []
+    anchor = None
+    for packet in packets:
+        require(type(packet) is dict and type(packet.get("payload_hex")) is str
+                and len(packet["payload_hex"]) <= 131072
+                and re.fullmatch(r"(?:[a-f0-9]{2})+", packet["payload_hex"]) is not None
+                and type(packet.get("sequence")) is int and 0 <= packet["sequence"] < 2**32,
+                "wire evidence malformed TCP payload")
+        payload = bytes.fromhex(packet["payload_hex"])
+        payload_bytes += len(payload)
+        require(payload_bytes <= WIRE_CAPTURE_BYTES, "wire evidence payload byte bound")
+        if (packet.get("local"), packet.get("remote")) != (delivery["local"], delivery["remote"]):
+            continue
+        if anchor is None:
+            anchor = packet["sequence"]
+        offset = ((packet["sequence"] - anchor + 2**31) % 2**32) - 2**31
+        require(abs(offset) <= WIRE_CAPTURE_BYTES, "wire evidence TCP sequence window bound")
+        chunks.append((offset, payload))
+    require(observation.get("payload_bytes") == payload_bytes, "wire evidence payload accounting mismatch")
+    streams = []
+    for offset, payload in sorted(chunks):
+        if not streams or offset > streams[-1][0] + len(streams[-1][1]):
+            streams.append((offset, bytearray(payload)))
+            continue
+        start, stream = streams[-1]
+        overlap = min(len(payload), start + len(stream) - offset)
+        require(stream[offset-start:offset-start+overlap] == payload[:overlap],
+                "wire evidence conflicting TCP retransmission")
+        stream.extend(payload[overlap:])
+    matches = [(offset + stream.find(frame), stream) for offset, stream in streams if frame in stream]
+    if len(matches) != 1 or matches[0][1].count(frame) != 1:
+        raise MissingEvidence("exact invalid frame absent/ambiguous at destination for the completed socket tuple")
+    offset, _ = matches[0]
+    return {"classification": "destination_kernel_ingress_not_native_parse_or_rejection",
+            "frame_sha256": hashlib.sha256(frame).hexdigest(), "frame_bytes": len(frame),
+            "message_id": message_id, "session": delivery["session"],
+            "local": delivery["local"], "remote": delivery["remote"],
+            "first_tcp_sequence": (anchor + offset) % 2**32,
+            "socket_completion": delivery["classification"]}
+
+
+def wire_receipt(before: dict, source: dict, kind: str, reply: dict,
+                 observation: dict | None = None) -> dict:
+    require(reply.get("qualification_only") is True
+            and reply.get("kind") == kind, "required real wire probe unavailable")
     own = wire_endpoint(source["rpc"]["replication_address"])
     sender = wire_endpoint(reply.get("from"))
     selected = wire_endpoint(reply.get("native_selected_peer"))
@@ -971,9 +1233,11 @@ def wire_receipt(before: dict, source: dict, kind: str, reply: dict) -> dict:
             and all(type(value) is int and value >= 0 for value in sent.values())
             and ((sent["data_loss"], sent["configuration"]) < (projected["data_loss"], projected["configuration"])
                  if kind == "stale_epoch" else sent == projected), "wire probe did not exercise the requested epoch")
+    delivery = wire_delivery(reply, own, selected, observation)
     return {"source_identity": identity(source), "destination_identity": identity(destination),
             "source_kind": source["rpc"]["engine_kind"], "destination_kind": destination["rpc"]["engine_kind"],
             "native_selected_peer": reply["native_selected_peer"],
+            "wire_delivery": delivery,
             "address_evidence": "Rust native-configured session actor matches native partition/replica; "
                                 "native listener host matches oracle bind telemetry (RA-owned GUID/port not invented)"}
 
@@ -1046,6 +1310,149 @@ def data_loss_invariants(before: dict, after: dict, ledger: Ledger, changed: boo
                 and primary["engine"]["progress"]["applied"] == expected_last,
                 "Rust primary queue did not reset to authoritative provider progress")
     return reconciled
+
+
+class CopyAckGate:
+    """Keep actual CopyEnd ACK ownership separate from native build status."""
+    def __init__(self, qualification, before: dict, removed: dict, evidence: dict):
+        self.qualification, self.before, self.removed, self.evidence = qualification, before, removed, evidence
+        self.endpoint = None
+        self.replica = None
+        self.previous_held_at = None
+        self.negative_started = None
+        self.negative_count = 0
+        self.released = False
+        evidence.update(hold_ms=6000, observations=[], released=False)
+
+    @staticmethod
+    def held(rpc: dict) -> bool:
+        hold = rpc.get("copy_ack_hold", {})
+        if hold.get("expired") or hold.get("cancelled"):
+            raise RuntimeError("destination copy ACK hold expired/cancelled before explicit release")
+        return (hold.get("held") is True and hold.get("copy_end_received") is True
+                and hold.get("released") is False and hold.get("acknowledged") is False
+                and type(hold.get("sequence")) is int and hold["sequence"] > 0
+                and type(hold.get("boundary")) is int and hold["boundary"] > 0
+                and rpc.get("state", {}).get("last") == hold["boundary"]
+                and rpc.get("state", {}).get("copy_in_progress") is False
+                and bool(rpc.get("state", {}).get("results")))
+
+    @staticmethod
+    def negative(value: dict, replica: dict, rpc: dict) -> dict:
+        require(replica["status"] == "InBuild", "native build became Ready before destination copy ACK release")
+        require(not rpc["engine"]["copy_done"] and not rpc["engine"]["ready"]
+                and not rpc["engine"]["fault"] and not rpc["pump_fault"],
+                "held copy ACK did not keep destination copy completion fenced")
+        if not CopyAckGate.held(rpc):
+            raise MissingEvidence("no independently received nonempty CopyEnd with its actual ACK held")
+        boundary = rpc["copy_ack_hold"]["boundary"]
+        primary = next(r for r in value["replicas"] if r["role"] == "Primary")["rpc"]
+        if primary["engine_kind"] == "rust":
+            peer = next((p for p in primary["engine"].get("peers", [])
+                         if p["replica"] == replica["replica"]), None)
+            if not (peer and peer.get("copy_horizon") == boundary and peer.get("copy_received") == -1):
+                raise MissingEvidence("source has no exact destination copy EOS receipt")
+            require(peer.get("copy_applied") != -1 and peer.get("building") is True,
+                    "source completed native build on receive-only copy progress")
+            require(type(peer.get("copy_applied")) is int
+                    and peer["copy_applied"] < rpc["copy_ack_hold"]["sequence"]
+                    and type(peer.get("copy_finish")) is int and peer["copy_finish"] > boundary
+                    and peer["applied"] < peer["copy_finish"],
+                    "held copy ACK or final live replication fence was already reported applied")
+            return {"kind": "destination_EOS_receipt_at_source", "peer": peer}
+        observation = next((o for o in primary.get("native_copy_horizons", [])
+                            if o.get("requested_horizon") == boundary and o.get("enumeration_end") is True), None)
+        if observation is None:
+            raise MissingEvidence("native source has no actual copy enumeration EOS at received CopyEnd boundary")
+        require(rpc["engine"]["progress"]["applied"] < primary["state"]["last"],
+                "held destination already applied the live replication finish fence")
+        return {"kind": "native_source_enumeration_EOS_and_destination_CopyEnd_receipt",
+                "observation": observation}
+
+    def observe(self, value: dict, native_started: float) -> None:
+        if self.released:
+            return
+        replacements = [r for r in value["replicas"] if r["node"] == self.removed["node"]
+                        and r["replica"] != self.removed["replica"]]
+        if not replacements:
+            return
+        replica = replacements[0]
+        origin = urlsplit(self.removed["address"])
+        if self.endpoint is None:
+            if replica["status"] == "Ready":
+                raise MissingEvidence("replacement became Ready before a destination copy ACK hold was installed")
+            lookup = f"{origin.scheme}://{origin.netloc}/data/{value['partition']}/{replica['replica']}/service"
+            try:
+                status, rpc = request(lookup, "diagnostics", timeout=1)
+            except (OSError, http.client.HTTPException):
+                return
+            if status != 200:
+                return
+            canonical = urlsplit(rpc.get("service_address", ""))
+            require((canonical.scheme, canonical.netloc) == (origin.scheme, origin.netloc)
+                    and rpc.get("partition") == self.before["partition"]
+                    and rpc.get("replica") == replica["replica"] and rpc.get("node") == replica["node"]
+                    and rpc.get("engine_kind") == self.removed["rpc"]["engine_kind"]
+                    and rpc.get("incarnation") is not None and rpc.get("engine_incarnation")
+                    and rpc.get("host") and type(rpc.get("pid")) is int,
+                    "InBuild destination diagnostics are not bound to the exact native replacement")
+            self.endpoint, self.replica = rpc["service_address"], replica["replica"]
+            self.evidence["destination"] = rpc
+            self.evidence["arm"] = self.qualification.hook(self.endpoint, "copy_ack_hold_ms", 6000)
+        require(replica["replica"] == self.replica, "copy ACK gate destination was replaced before release")
+        require(replica["status"] == "InBuild", "native build completed before explicit copy ACK release")
+        status, rpc = request(self.endpoint, "diagnostics", timeout=1)
+        require(status == 200 and rpc.get("replica") == self.replica
+                and all(rpc.get(key) == self.evidence["destination"][key]
+                        for key in ("partition", "node", "incarnation", "engine_incarnation", "host", "pid")),
+                "held copy ACK diagnostics lifetime drifted")
+        now = time.monotonic()
+        held = self.held(rpc)
+        if not held:
+            self.evidence["last_destination_before_hold"] = rpc
+            self.previous_held_at = None
+            return
+        operation = {key: rpc["copy_ack_hold"][key] for key in ("sequence", "boundary")}
+        require(self.evidence.setdefault("held_operation", operation) == operation,
+                "held destination copy operation changed before release")
+        self.evidence["observations"].append({"at_monotonic": now, "native_started": native_started,
+            "native_replica": replica, "destination": rpc})
+        require(len(self.evidence["observations"]) <= 100, "bounded destination copy ACK observations")
+        if held and self.previous_held_at is not None and native_started > self.previous_held_at:
+            try:
+                eos = self.negative(value, replica, rpc)
+            except MissingEvidence:
+                self.previous_held_at = now
+                return
+            self.negative_started = self.negative_started or now
+            self.negative_count += 1
+            self.evidence.update(source_eos=eos, negative_observations=self.negative_count,
+                                 blocked_after_receive=True)
+            # At least two native queries bracketed by actual held-ACK reads.
+            if self.negative_count >= 2 and now - self.negative_started >= 1:
+                self.evidence["release"] = self.qualification.hook(self.endpoint, "copy_ack_hold_ms", 0)
+                self.released = True
+                self.evidence.update(released=True, released_at_monotonic=time.monotonic())
+        self.previous_held_at = now if held else None
+
+    def complete(self, recovered: dict, workload: dict) -> None:
+        if not self.released or not self.evidence.get("blocked_after_receive"):
+            raise MissingEvidence("replacement copy lacks receive/held-ACK plus independent native InBuild negative evidence")
+        replica = next((r for r in recovered["replicas"] if r["node"] == self.removed["node"]
+                        and r["replica"] == self.replica), None)
+        require(replica is not None and replica["status"] == "Ready", "held build did not complete on the same native replica")
+        rpc = replica["rpc"]
+        hold = rpc.get("copy_ack_hold", {})
+        require(all(rpc.get(key) == self.evidence["destination"][key]
+                    for key in ("partition", "node", "incarnation", "engine_incarnation", "host", "pid"))
+                and all(hold.get(key) == self.evidence["held_operation"][key] for key in ("sequence", "boundary"))
+                and hold.get("released") is True and hold.get("acknowledged") is True and hold.get("held") is False
+                and hold.get("expired") is False and hold.get("cancelled") is False
+                and rpc["engine"]["copy_done"] and not rpc["pump_fault"]
+                and rpc["state"]["last"] == workload["last"]
+                and rpc["state"]["last"] > hold["boundary"],
+                "released copy ACK/final replication fence did not finish with the coherent live-write ledger")
+        self.evidence.update(completed_native_replica=replica, coherent_workload=workload)
 
 
 class Qualification:
@@ -1143,8 +1550,9 @@ class Qualification:
                 stop.set()
 
     def hook(self, endpoint: str, name: str, value: int) -> dict:
-        require(name in {"ack_delay_ms", "copy_delay_ms"}
-                and type(value) is int and 0 <= value <= (2000 if name == "ack_delay_ms" else 100),
+        require(name in {"ack_delay_ms", "copy_delay_ms", "copy_ack_hold_ms"}
+                and type(value) is int and 0 <= value <= {
+                    "ack_delay_ms": 2000, "copy_delay_ms": 100, "copy_ack_hold_ms": 6000}[name],
                 "qualification hook bounds")
         # Retain before sending: a lost response may have installed the hook.
         self.hooks.add((endpoint, name))
@@ -1299,7 +1707,7 @@ class Qualification:
         return {"native_in_build": in_build, "horizons": horizons, "peer_observations": peer_observations}
 
     def copy(self, evidence: dict, *, target_kind: str | None = None,
-             cancel: bool = False, move_during_copy: bool = False) -> None:
+             cancel: bool = False, move_during_copy: bool = False, hold_copy_ack: bool = False) -> None:
         before = self.converge(evidence)
         candidates = [replica for replica in before["replicas"] if replica["role"] == "ActiveSecondary"
                       and (target_kind is None or replica["rpc"]["engine_kind"] == target_kind)]
@@ -1314,6 +1722,11 @@ class Qualification:
         copy_sources = ([replica["address"] for replica in before["replicas"]]
                         if move_during_copy else [endpoint])
         evidence["hooks"] = [self.hook(source, "copy_delay_ms", 20) for source in copy_sources]
+        gate = None
+        if hold_copy_ack:
+            require(not cancel and not move_during_copy, "copy ACK gate requires an uninterrupted native build")
+            evidence["destination_copy_ack"] = {}
+            gate = CopyAckGate(self, before, removed, evidence["destination_copy_ack"])
         self.remove(before, removed)
         first_build = None
         started = time.monotonic()
@@ -1337,6 +1750,8 @@ class Qualification:
                         continue
                     evidence["samples"].append({"at_monotonic": stamp,
                         "query_finished_at_monotonic": time.monotonic(), "native": value})
+                    if gate is not None:
+                        gate.observe(value, stamp)
                     replacements = [replica for replica in value["replicas"]
                         if replica["status"] == "InBuild" and (
                             replica["node"], replica["replica"]) != (removed["node"], removed["replica"])]
@@ -1370,12 +1785,16 @@ class Qualification:
                         begin_writes.set()
                     ready = all(r["status"] == "Ready" for r in value["replicas"])
                     if writer.done() and ready and len(value["replicas"]) == 3 and action_done:
+                        if gate is not None and not gate.released:
+                            raise MissingEvidence("native replacement became Ready without the delayed-copy-ACK negative gate")
                         break
                     require(len(evidence["samples"]) < 500, "bounded copy observation count")
                     time.sleep(0.05)
                 require(action_done, "native InBuild/cancellation was not observed")
                 evidence["concurrent_writes"] = writer.result(timeout=45)
             recovered = self.converge(evidence)
+            if gate is not None:
+                gate.complete(recovered, evidence["workload"])
             evidence["removed_native_departure"] = runtime.wait_native_replica_absent(
                 self.bundle.observer, self.service, removed["node"], removed["replica"])
             replacement = next((replica for replica in recovered["replicas"] if (
@@ -1413,6 +1832,8 @@ class Qualification:
             if move_pool is not None:
                 move_pool.shutdown(wait=True, cancel_futures=True)
             evidence["hook_cleanup"] = self.reset_hooks([(source, "copy_delay_ms") for source in copy_sources])
+            if gate is not None and gate.endpoint is not None:
+                evidence["copy_ack_hook_cleanup"] = self.reset_hooks([(gate.endpoint, "copy_ack_hold_ms")])
 
     def apply_ack_delay(self, evidence: dict) -> None:
         before = self.converge(evidence)
@@ -1631,7 +2052,9 @@ class Qualification:
 
     def stale_wire_receipts(self, evidence: dict) -> None:
         evidence.update(coverage=[], admission_is_not_rejection_evidence=True,
-                        limitation="No native-primary packet spoofing. Rust probes use only existing native-selected sessions.")
+                        limitation="No native-primary packet spoofing. Rust probes use only existing native-selected sessions. "
+                                   "Exact socket write/flush plus independent destination kernel ingress are required; "
+                                   "neither proves native parsing or rejection.")
         for primary_kind in (("rust", "native-classic-v1") if self.mixed else ("rust",)):
             group = {"primary_kind": primary_kind, "receipts": [], "positive_copy": {}}
             evidence["coverage"].append(group)
@@ -1667,10 +2090,13 @@ class Qualification:
                                    if replica["role"] == role and replica["rpc"]["engine_kind"] == "rust"), None)
                     require(source is not None, "required Rust wire-probe source is not natively placed in this direction")
                     case["before"] = before
-                    status, reply = request(source["address"], "test", {"wire_probe": kind})
-                    case["receipt"] = {"http_status": status, "reply": reply}
-                    require(status == 200, f"required actual wire probe API failed: {kind}, HTTP {status}: {reply}")
-                    case["peer_correlation"] = wire_receipt(before, source, kind, reply)
+                    with WireCapture(self.allocation, wire_capture_scope(source), case) as capture:
+                        status, reply = request(source["address"], "test", {"wire_probe": kind},
+                                                timeout=WIRE_CAPTURE_SECONDS - 4)
+                        case["receipt"] = {"http_status": status, "reply": reply}
+                        require(status == 200, f"required actual wire probe API failed: {kind}, HTTP {status}: {reply}")
+                        observation = capture.finish()
+                        case["peer_correlation"] = wire_receipt(before, source, kind, reply, observation)
                     if self.mixed:
                         require(case["peer_correlation"]["destination_kind"] == "native-classic-v1",
                                 "mixed negative probe did not actually target the native engine")
@@ -2097,8 +2523,28 @@ class Qualification:
         evidence["apply_ack_delay"] = {}
         self.apply_ack_delay(evidence["apply_ack_delay"])
         evidence["replacement_copy"] = {}
-        self.copy(evidence["replacement_copy"], target_kind=other)
+        self.copy(evidence["replacement_copy"], target_kind=other, hold_copy_ack=True)
         after = self.converge(evidence)
+        # No client write may be used to establish a newly promoted session.
+        # The freshly copied opposite-engine replica must support native
+        # movement and then movement back with the exact existing prefix.
+        evidence["post_copy_no_write_moves"] = []
+        boundary = after["primary"]["rpc"]["state"]["last"]
+        original_replicas = {identity(replica) for replica in after["replicas"]}
+        for selected_kind in (other, kind):
+            moved = {"requested_engine": selected_kind, "no_intervening_client_writes": True}
+            evidence["post_copy_no_write_moves"].append(moved)
+            moved_after = self.move(moved, selected_kind)
+            self.ledger.compare(moved_after)
+            require({identity(replica) for replica in moved_after["replicas"]} == original_replicas
+                    and all(replica["rpc"]["state"]["last"] == boundary for replica in moved_after["replicas"]),
+                    "post-copy no-write movement changed replica lifetimes or reused/advanced a sequence")
+        after = self.converge(evidence)
+        members = {replica["replica"] for replica in after["replicas"]}
+        for replica in after["replicas"]:
+            if replica["role"] == "Primary" and replica["rpc"]["engine_kind"] == "rust":
+                require(all(peer["replica"] in members for peer in replica["rpc"]["engine"]["peers"]),
+                        "retired configuration peer retained after replacement convergence")
         evidence["native_issued_peer_observations"] = [{
             "node": r["node"], "replica": r["replica"], "role": r["role"],
             "epoch": r["rpc"]["native_epoch"], "replication_address": r["rpc"]["replication_address"],

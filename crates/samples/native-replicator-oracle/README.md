@@ -70,7 +70,7 @@ Sibling operations use that same owner path:
 | `service` | Authoritative primary read; actual native read access must be Granted. |
 | `diagnostics` | Observations on primary or secondary, not an authority grant. |
 | `write` | Exactly `id`, `key`, `value`; percent-encoded UTF-8 supported. |
-| `test` | Exactly **one** of `ack_delay_ms=0..2000` (secondary apply/ACK) or `copy_delay_ms=0..100` (source provider copy item); decimal, qualification-only. |
+| `test` | Exactly **one** of `ack_delay_ms=0..2000` (secondary apply/ACK), `copy_delay_ms=0..100` (source provider copy item), or `copy_ack_hold_ms=0..6000` (destination final nonempty CopyEnd ACK); decimal, qualification-only. |
 
 Requests are limited to **4096 bytes** including headers. Invalid UTF-8,
 malformed percent encoding, duplicate/missing/unknown query parameters and
@@ -121,6 +121,28 @@ remain null. These limitations are explicitly labeled in diagnostics.
 `Acknowledge` calls and their last sequence numbers; an injected delay can show
 provider apply ahead of actual acknowledgment. Those counters are not relabelled
 as native quorum or queue-completion knowledge.
+
+Both qualification samples support `copy_ack_hold_ms`: arm it on the new
+destination during delayed source enumeration, then release with zero on that
+same canonical incarnation-bearing route. The joined consumer applies the
+nonempty final CopyEnd but retains its real operation without acknowledging it
+or advancing to replication. Its finite deadline starts at that receipt;
+expiry fails the pump rather than acknowledging, and cancellation disposes the
+operation without ACK. `copy_ack_hold` diagnostics distinguish the received
+sequence/boundary, held, released, acknowledged, expired and cancelled states.
+No native callback, payload or membership authority is synthesized.
+
+Because native discovery does not yet publish an InBuild service address,
+`/data/<partition>/<replica>/diagnostics` on the existing node HTTP listener
+discovers that exact live replica's canonical service address. This alias is
+diagnostics-only: neither writes nor test hooks accept an incarnation-free
+path. The bidirectional replacement-copy qualifier binds that discovery to the
+native replica/node, repeatedly brackets native InBuild observations with held
+CopyEnd ACK diagnostics for at least one second, and requires source EOS evidence before release.
+Rust source EOS receipts and native source enumeration EOS are recorded
+distinctly, not relabelled as each other. The same replica must subsequently
+be native Ready with the acknowledged copy and exact live-write state/ledger.
+Missing negative evidence is not a qualification pass.
 
 `copy_delay_ms` defaults to zero and is shared with the live provider's
 `BeginGetNext` work. It delays each actual non-null source copy item, not EOS,

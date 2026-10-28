@@ -767,6 +767,125 @@ class NativeIdentityTests(unittest.TestCase):
                 data.native_process_id(value)
 
 
+class CopyAckGateTests(unittest.TestCase):
+    def fixture(self, primary_kind):
+        before = observation()
+        primary_index = 1 if primary_kind == "rust" else 0
+        destination_index = 2 if primary_kind == "rust" else 1
+        for index, replica in enumerate(before["replicas"]):
+            replica["role"] = "Primary" if index == primary_index else "ActiveSecondary"
+        removed = copy.deepcopy(before["replicas"][destination_index])
+        value = copy.deepcopy(before)
+        destination = value["replicas"][destination_index]
+        destination.update(replica=30, role="IdleSecondary", status="InBuild", address="")
+        rpc = copy.deepcopy(removed["rpc"])
+        rpc.update(replica=30, incarnation="new", engine_incarnation="new-engine",
+                   service_address=removed["address"].replace("/owner/", "/replacement/"))
+        rpc["state"].update(last=5, results={"copied": 5}, values={"key": "value"})
+        rpc["engine"].update(copy_done=False, ready=False)
+        rpc["engine"]["progress"]["applied"] = 0
+        rpc["copy_ack_hold"] = {"armed_ms": 6000, "held": True, "sequence": 7, "boundary": 5,
+            "copy_end_received": True, "released": False, "acknowledged": False,
+            "expired": False, "cancelled": False}
+        primary = value["replicas"][primary_index]["rpc"]
+        primary["engine"]["peers"] = [{"replica": 30, "copy_horizon": 5, "copy_received": -1,
+            "copy_applied": 6, "copy_finish": 8, "applied": 0, "building": True}]
+        primary["native_copy_horizons"] = [{"requested_horizon": 5, "enumeration_end": True}]
+        primary["state"]["last"] = 8
+        qualification = data.Qualification(MagicMock(), MagicMock(), {"application": "fabric:/Owned"}, True)
+        evidence = {}
+        return data.CopyAckGate(qualification, before, removed, evidence), value, destination, rpc
+
+    def test_both_native_directions_require_bracketed_inbuild_then_explicit_release_and_same_ready_ledger(self):
+        for primary_kind in ("rust", "native-classic-v1"):
+            gate, value, destination, rpc = self.fixture(primary_kind)
+            gate.qualification.hook = MagicMock(return_value={"qualification_only": True})
+            with patch.object(data, "request", return_value=(200, rpc)), \
+                 patch.object(data.time, "monotonic", side_effect=[1, 2, 3.2, 3.3]):
+                gate.observe(value, 0)
+                self.assertFalse(gate.released)
+                gate.observe(value, 1.1)
+                self.assertFalse(gate.released, "one negative native query is insufficient")
+                gate.observe(value, 2.1)
+            self.assertTrue(gate.released)
+            self.assertEqual(gate.evidence["negative_observations"], 2)
+            self.assertEqual([call.args[1:] for call in gate.qualification.hook.call_args_list],
+                             [("copy_ack_hold_ms", 6000), ("copy_ack_hold_ms", 0)])
+            recovered = copy.deepcopy(value)
+            ready = next(r for r in recovered["replicas"] if r["replica"] == 30)
+            ready.update(status="Ready", rpc=copy.deepcopy(rpc))
+            ready["rpc"]["copy_ack_hold"].update(held=False, released=True, acknowledged=True)
+            ready["rpc"]["engine"]["copy_done"] = True
+            ready["rpc"]["state"]["last"] = 8
+            gate.complete(recovered, {"last": 8})
+            ready["replica"] = 31
+            with self.assertRaisesRegex(RuntimeError, "same native replica"):
+                gate.complete(recovered, {"last": 8})
+
+    def test_receive_eos_without_actual_held_ack_or_native_not_ready_never_passes(self):
+        for primary_kind in ("rust", "native-classic-v1"):
+            gate, value, replica, rpc = self.fixture(primary_kind)
+            data.CopyAckGate.negative(value, replica, rpc)
+            for key, changed in (("held", False), ("copy_end_received", False), ("acknowledged", True),
+                                 ("released", True), ("boundary", 0), ("sequence", None)):
+                altered = copy.deepcopy(rpc)
+                altered["copy_ack_hold"][key] = changed
+                with self.subTest(key=key), self.assertRaises(data.MissingEvidence):
+                    data.CopyAckGate.negative(value, replica, altered)
+            for key in ("expired", "cancelled"):
+                altered = copy.deepcopy(rpc)
+                altered["copy_ack_hold"][key] = True
+                with self.assertRaises(RuntimeError):
+                    data.CopyAckGate.negative(value, replica, altered)
+            replica["status"] = "Ready"
+            with self.assertRaisesRegex(RuntimeError, "before destination copy ACK release"):
+                data.CopyAckGate.negative(value, replica, rpc)
+            with self.assertRaises(data.MissingEvidence):
+                gate.complete(value, {"last": 8})
+
+    def test_missing_source_eos_and_receive_only_source_completion_are_refused(self):
+        for primary_kind in ("rust", "native-classic-v1"):
+            _, value, replica, rpc = self.fixture(primary_kind)
+            primary = next(r["rpc"] for r in value["replicas"] if r["role"] == "Primary")
+            if primary_kind == "rust":
+                primary["engine"]["peers"][0]["copy_applied"] = -1
+                with self.assertRaisesRegex(RuntimeError, "receive-only"):
+                    data.CopyAckGate.negative(value, replica, rpc)
+                primary["engine"]["peers"][0]["copy_received"] = 6
+            else:
+                primary["native_copy_horizons"][0]["enumeration_end"] = False
+            with self.assertRaises(data.MissingEvidence):
+                data.CopyAckGate.negative(value, replica, rpc)
+
+    def test_inbuild_discovery_and_release_never_rebind_to_a_different_incarnation(self):
+        gate, value, _, rpc = self.fixture("rust")
+        gate.qualification.hook = MagicMock()
+        drifted = copy.deepcopy(rpc)
+        drifted["incarnation"] = "different"
+        with patch.object(data, "request", side_effect=[(200, rpc), (200, drifted)]):
+            with self.assertRaisesRegex(RuntimeError, "lifetime drifted"):
+                gate.observe(value, 0)
+        self.assertFalse(gate.released)
+        gate.qualification.hook.assert_called_once()
+
+    def test_actual_direction_scenarios_cannot_omit_destination_copy_ack_gate(self):
+        for kind in ("rust", "native-classic-v1"):
+            gate, value, _, _ = self.fixture(kind)
+            value = copy.deepcopy(gate.before)
+            primary = next(r for r in value["replicas"] if r["role"] == "Primary")
+            value["primary"]["rpc"] = primary["rpc"]
+            for replica in value["replicas"]:
+                if replica["rpc"]["engine_kind"] == "rust":
+                    replica["rpc"]["observed_primary"] = "real-native-selected-peer"
+            q = gate.qualification
+            with patch.object(q, "wait", return_value=value), patch.object(q, "move", return_value=value), \
+                 patch.object(q, "writes"), patch.object(q, "apply_ack_delay"), \
+                 patch.object(q, "copy") as copying, patch.object(q, "converge", return_value=value):
+                q.direction(kind, {})
+            copying.assert_called_once()
+            self.assertIs(copying.call_args.kwargs["hold_copy_ack"], True)
+
+
 class WorkloadTests(unittest.TestCase):
     def test_ambiguous_retry_keeps_sequence_and_never_undoes_or_creates_new_identity(self):
         ledger = data.Ledger()
@@ -2888,6 +3007,318 @@ class NativeOwnershipIdentityTests(ProjectFiles):
         allocation.execute.return_value = json.dumps({"status": 404, "body": {"Name": "not-an-error"}})
         with self.assertRaisesRegex(RuntimeError, "absence is not established"):
             data.ownership_read(allocation, "/Applications/Owned")
+
+
+class WireDeliveryTests(unittest.TestCase):
+    def setUp(self):
+        self.partition = str(uuid.uuid4())
+        self.engine = str(uuid.uuid4())
+        self.peer_engine = str(uuid.uuid4())
+        self.own_address, self.peer_address = "127.0.0.1:30001", "127.0.0.1:30002"
+        self.message_id = {"guid": str(uuid.uuid4()), "index": 1}
+        body = b"offline-frame-fixture:" + uuid.UUID(self.message_id["guid"]).bytes_le
+        self.frame = struct.pack("<I", len(body) + 12) + b"\0" * 8 + body
+
+    def endpoint(self, replica, engine, address):
+        return f"{address}/{self.partition}-{replica};{engine}"
+
+    def fixture(self, role="Primary", kind="wrong_sender"):
+        own = self.endpoint(1, self.engine, self.own_address)
+        peer = self.endpoint(2, self.peer_engine, self.peer_address)
+        source = {"replica": 1, "role": role, "node": "N0020", "rpc": {
+            "replication_address": own, "engine_incarnation": self.engine, "incarnation": "runtime",
+            "host": "host", "pid": 123, "engine_kind": "rust",
+            "native_epoch": {"data_loss": 1, "configuration": 2**33 + 7},
+            "engine": {"progress": {"assigned": 10}, "copy_done": True, "peers": [
+                {"address": peer, "configured": True, "building": False, "cleanup_required": False}]},
+            "observed_primary": peer}}
+        destination = {"replica": 2, "node": "N0010",
+                       "role": "ActiveSecondary" if role == "Primary" else "Primary", "rpc": {
+            "incarnation": "native-runtime", "engine_incarnation": self.peer_engine, "host": "native",
+            "pid": 124, "engine_kind": "native-classic-v1", "replication_bind_address": "127.0.0.1:0"}}
+        before = {"partition": self.partition, "replicas": [source, destination]}
+        reply = {"qualification_only": True, "admission_only": False, "kind": kind, "from": own,
+                 "target": peer, "native_selected_peer": peer, "sequence": 11,
+                 "native_epoch": {"data_loss": 1, "configuration": 2**33},
+                 "sent_epoch": {"data_loss": 1, "configuration": 2**33},
+                 "delivery": {"classification": "socket_write_all_and_flush", "session": 7,
+                              "local": "127.0.0.1:40001", "remote": self.peer_address,
+                              "remote_listener": self.peer_address, "message_id": self.message_id,
+                              "frame_hex": self.frame.hex(), "frame_bytes": len(self.frame)}}
+        if kind == "wrong_sender":
+            reply["from"] = self.endpoint(1, str(uuid.uuid4()), self.own_address)
+        elif kind == "wrong_target":
+            reply["target"] = self.endpoint(2, str(uuid.uuid4()), self.peer_address)
+        elif kind == "stale_epoch":
+            reply["sent_epoch"]["configuration"] -= 2**32
+        if role == "ActiveSecondary":
+            reply["delivery"].update(local=self.own_address, remote="127.0.0.1:40002")
+        packets = [
+            {"local": reply["delivery"]["local"], "remote": reply["delivery"]["remote"],
+             "sequence": (2**32 - 4 + offset) % 2**32, "payload_hex": part.hex()}
+            for offset, part in ((0, self.frame[:7]), (7, self.frame[7:23]), (23, self.frame[23:]))]
+        observation = {"classification": "destination_kernel_ingress", "interface": "lo",
+                       "kernel_drops": 0, "allowed": [[self.own_address, self.peer_address]],
+                       "seen_packets": 3, "wire_bytes": len(self.frame) + 120,
+                       "packets": packets, "payload_bytes": len(self.frame)}
+        return before, source, reply, observation
+
+    def test_exact_segmented_reordered_and_retransmitted_frames_in_both_native_directions(self):
+        for role, kinds in (("Primary", ("wrong_sender", "wrong_target", "stale_epoch")),
+                            ("ActiveSecondary", ("wrong_sender", "wrong_target", "stale_copy_ack"))):
+            for kind in kinds:
+                with self.subTest(role=role, kind=kind):
+                    before, source, reply, observation = self.fixture(role, kind)
+                    observation["packets"] = [observation["packets"][2], observation["packets"][0],
+                                              observation["packets"][1], observation["packets"][0]]
+                    observation["payload_bytes"] += len(self.frame[:7])
+                    result = data.wire_receipt(before, source, kind, reply, observation)
+                    self.assertEqual(result["destination_kind"], "native-classic-v1")
+                    delivery = result["wire_delivery"]
+                    self.assertEqual(delivery["classification"],
+                                     "destination_kernel_ingress_not_native_parse_or_rejection")
+                    self.assertEqual(delivery["frame_sha256"], hashlib.sha256(self.frame).hexdigest())
+                    self.assertEqual(delivery["first_tcp_sequence"], 2**32 - 4)
+
+    def test_admitted_but_dropped_packet_and_absent_observation_are_missing_not_pass(self):
+        for missing in ("completion", "destination", "bytes"):
+            before, source, reply, observation = self.fixture()
+            if missing == "completion":
+                reply["admission_only"] = True
+                del reply["delivery"]
+            elif missing == "destination":
+                observation = None
+            else:
+                observation.update(packets=[], payload_bytes=0)
+            result = {"profile": "rust", "errors": [], "application": "fabric:/Owned",
+                      "scenarios": {name: {"status": "PASS"} for name in data.required_scenarios("rust")}}
+            qualification = data.Qualification(MagicMock(), MagicMock(), result, False)
+            qualification.scenario("stale_wire_receipts",
+                lambda _: data.wire_receipt(before, source, "wrong_sender", reply, observation))
+            self.assertEqual(result["scenarios"]["stale_wire_receipts"]["status"], "MISSING")
+            self.assertEqual(data.finalize(result)["status"], "FAIL")
+
+    def test_partial_wrongtuple_wrongbytes_gapped_and_later_healthy_traffic_cannot_prove_delivery(self):
+        for invalid in ("partial", "wrongtuple", "wrongbytes", "gap", "healthy"):
+            before, source, reply, observation = self.fixture()
+            if invalid == "partial":
+                observation["packets"].pop()
+            elif invalid == "wrongtuple":
+                for packet in observation["packets"]:
+                    packet["local"] = "127.0.0.1:40002"
+            elif invalid == "wrongbytes":
+                observation["packets"][-1]["payload_hex"] = "ff" + observation["packets"][-1]["payload_hex"][2:]
+            elif invalid == "gap":
+                observation["packets"][-1]["sequence"] += 1
+            else:
+                healthy = self.frame.replace(uuid.UUID(self.message_id["guid"]).bytes_le, uuid.uuid4().bytes_le)
+                observation["packets"] = [{**observation["packets"][0], "payload_hex": healthy.hex()}]
+            observation["payload_bytes"] = sum(len(bytes.fromhex(p["payload_hex"])) for p in observation["packets"])
+            with self.subTest(invalid=invalid), self.assertRaises(data.MissingEvidence):
+                data.wire_receipt(before, source, "wrong_sender", reply, observation)
+
+    def test_conflicting_retransmission_loss_wrong_session_or_capture_scope_rejected(self):
+        for invalid in ("conflict", "drops", "session", "scope", "message_id", "listener", "accounting"):
+            before, source, reply, observation = self.fixture()
+            if invalid == "conflict":
+                packet = {**observation["packets"][0], "payload_hex": "ff" + observation["packets"][0]["payload_hex"][2:]}
+                observation["packets"].append(packet)
+                observation["payload_bytes"] += len(bytes.fromhex(packet["payload_hex"]))
+            elif invalid == "drops":
+                observation["kernel_drops"] = 1
+            elif invalid == "session":
+                reply["delivery"]["session"] = 0
+            elif invalid == "scope":
+                observation["allowed"] = [[self.own_address, "127.0.0.1:30003"]]
+            elif invalid == "message_id":
+                reply["delivery"]["message_id"] = {"guid": str(uuid.uuid4()), "index": 1}
+            elif invalid == "listener":
+                reply["delivery"]["remote_listener"] = "127.0.0.1:30003"
+            else:
+                observation["payload_bytes"] += 1
+            with self.subTest(invalid=invalid), self.assertRaises(RuntimeError):
+                data.wire_receipt(before, source, "wrong_sender", reply, observation)
+
+    def test_retained_native_mapping_guards_cannot_be_bypassed_by_matching_wire_bytes(self):
+        for invalid in ("unconfigured", "native_identity", "native_host", "sender", "target", "epoch"):
+            before, source, reply, observation = self.fixture()
+            if invalid == "unconfigured":
+                source["rpc"]["engine"]["peers"][0]["configured"] = False
+            elif invalid == "native_identity":
+                before["replicas"][1]["replica"] = 3
+            elif invalid == "native_host":
+                before["replicas"][1]["rpc"]["replication_bind_address"] = "127.0.0.2:0"
+            elif invalid == "sender":
+                reply["from"] = source["rpc"]["replication_address"]
+            elif invalid == "target":
+                reply["target"] = self.endpoint(3, self.peer_engine, self.peer_address)
+            else:
+                reply["native_epoch"]["configuration"] = 0
+            with self.subTest(invalid=invalid), self.assertRaises(RuntimeError):
+                data.wire_receipt(before, source, "wrong_sender", reply, observation)
+
+
+class WireCaptureTests(unittest.TestCase):
+    def local_capture(self, allowed, evidence, *, protocol_only=False):
+        allocation = MagicMock()
+        allocation.verify.return_value = "d" * 64
+        original_popen = subprocess.Popen
+        processes = []
+        def launch(command, **kwargs):
+            self.assertEqual(command[:4], ["docker", "exec", "-i", "d" * 64])
+            self.assertEqual(command[4:7], ["python3", "-c", data.WIRE_CAPTURE])
+            arguments = [sys.executable, *command[5:]]
+            if protocol_only:
+                # This fixture tests process ownership/cancellation only. It
+                # is never used as destination-wire qualification evidence.
+                arguments[2] = """
+import json,os,signal,sys,time
+signal.alarm(3)
+print(json.dumps({"pid":os.getpid(),"token":sys.argv[3],
+    "start_time":open("/proc/self/stat").read().rsplit(") ",1)[1].split()[19],
+    "classification":"destination_kernel_ingress","interface":"lo",
+    "netns_inode":os.stat("/proc/self/ns/net").st_ino,"allowed":json.loads(sys.argv[1])}),flush=True)
+os.read(0,16)
+"""
+            process = original_popen(arguments, **kwargs)
+            processes.append(process)
+            return process
+        def execute(*args, **kwargs):
+            self.assertEqual(args[:3], ("python3", "-c", data.STOP_UPLOAD_HELPER))
+            stopped = original_popen([sys.executable, *args[1:]], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = stopped.communicate(timeout=kwargs["timeout"])
+            self.assertEqual(stopped.returncode, 0, stderr.decode())
+            return stdout.decode()
+        allocation.execute.side_effect = execute
+        return allocation, launch, processes, data.WireCapture(allocation, allowed, evidence)
+
+    def test_original_helper_observes_loopback_destination_bytes_without_sender_receipt_input(self):
+        with data.socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            peer = "127.0.0.1:" + str(listener.getsockname()[1])
+            evidence = {}
+            allocation, launch, processes, capture = self.local_capture([["127.0.0.1:30001", peer]], evidence)
+            try:
+                with patch.object(data.subprocess, "Popen", side_effect=launch), capture:
+                    with data.socket.create_connection(listener.getsockname()) as client:
+                        server, _ = listener.accept()
+                        with server:
+                            payload = b"independent-offline-observer-" + uuid.uuid4().bytes
+                            client.sendall(payload)
+                            self.assertEqual(server.recv(4096), payload)
+                            observation = capture.finish()
+                            matching = [packet for packet in observation["packets"]
+                                        if packet["local"] == "127.0.0.1:" + str(client.getsockname()[1])
+                                        and packet["remote"] == peer]
+                            self.assertTrue(any(payload in bytes.fromhex(packet["payload_hex"]) for packet in matching))
+            except data.MissingEvidence as error:
+                if "Operation not permitted" in str(error):
+                    self.skipTest("current credentials lack AF_PACKET capability: " + str(error))
+                raise
+            self.assertTrue(all(process.poll() is not None for process in processes))
+            self.assertEqual(evidence["observer_receipt"]["classification"], "destination_kernel_ingress")
+            self.assertEqual(evidence["observer_ready"]["token"], evidence["observer_receipt"]["helper"]["token"])
+            allocation.execute.assert_called_once()
+
+    def test_cancelled_capture_signals_only_original_pidfd_and_joins_client(self):
+        evidence = {}
+        allocation, launch, processes, capture = self.local_capture(
+            [["127.0.0.1:30001", "127.0.0.1:30002"]], evidence, protocol_only=True)
+        started = time.monotonic()
+        with patch.object(data.subprocess, "Popen", side_effect=launch):
+            with self.assertRaisesRegex(RuntimeError, "cancel fixture"):
+                with capture:
+                    raise RuntimeError("cancel fixture")
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertTrue(all(process.poll() is not None for process in processes))
+        proof = json.loads(allocation.execute.call_args.args[3])
+        self.assertEqual(proof, capture.helper)
+        self.assertEqual(evidence["observer_cleanup"], "original helper pidfd exit confirmed")
+
+    def test_allocation_drift_never_authorizes_signalling_an_adopted_helper(self):
+        evidence = {}
+        allocation, launch, processes, capture = self.local_capture(
+            [["127.0.0.1:30001", "127.0.0.1:30002"]], evidence, protocol_only=True)
+        with patch.object(data.subprocess, "Popen", side_effect=launch):
+            with self.assertRaisesRegex(RuntimeError, "allocation changed"):
+                with capture:
+                    allocation.verify.return_value = "e" * 64
+        allocation.execute.assert_not_called()
+        self.assertTrue(all(process.poll() is not None for process in processes))
+        self.assertIn("refuse signal", evidence["observer_cleanup_error"])
+
+    def test_readiness_deadline_joins_client_without_pid_or_name_adoption(self):
+        import select
+        evidence = {}
+        allocation, launch, processes, capture = self.local_capture(
+            [["127.0.0.1:30001", "127.0.0.1:30002"]], evidence, protocol_only=True)
+        started = time.monotonic()
+        with patch.object(data.subprocess, "Popen", side_effect=launch), \
+                patch.object(select, "select", return_value=([], [], [])):
+            with self.assertRaisesRegex(data.MissingEvidence, "readiness deadline"):
+                with capture:
+                    self.fail("unready capture yielded to probe sender")
+        self.assertLess(time.monotonic() - started, 3)
+        allocation.execute.assert_not_called()
+        self.assertTrue(all(process.poll() is not None for process in processes))
+        self.assertIn("no PID/name adoption", evidence["observer_cleanup"])
+
+    def helper_packets(self, packets, *, drops=0):
+        import select
+        fake = MagicMock()
+        fake.recvfrom.side_effect = [*packets, BlockingIOError()]
+        fake.getsockopt.return_value = struct.pack("III", 10, drops, 0)
+        stdout = io.StringIO()
+        allowed = [["127.0.0.1:30001", "127.0.0.1:30002"]]
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(data.socket, "socket", return_value=fake))
+            stack.enter_context(patch.object(select, "select", side_effect=[([fake], [], []), ([sys.stdin], [], [])]))
+            stack.enter_context(patch.object(signal, "signal"))
+            alarm = stack.enter_context(patch.object(signal, "alarm"))
+            stack.enter_context(patch.object(os, "read", return_value=b"finish\n"))
+            stack.enter_context(patch.object(sys, "argv", ["observer", json.dumps(allowed),
+                                                         str(time.time() + 10), "a" * 64]))
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            try:
+                exec(data.WIRE_CAPTURE, {})
+                code = 0
+            except SystemExit as error:
+                code = error.code
+        self.assertEqual(fake.bind.call_args.args, (("lo", 0),))
+        fake.close.assert_called_once()
+        self.assertGreaterEqual(alarm.call_args.args[0], 1)
+        self.assertLessEqual(alarm.call_args.args[0], 20)
+        return code, [json.loads(line) for line in stdout.getvalue().splitlines()]
+
+    def datagram(self, payload=b"invalid-fixture", *, packet_type=0, source=40001, destination=30002):
+        tcp = struct.pack("!HHIIBBHHH", source, destination, 42, 0, 0x50, 0x18, 4096, 0, 0)
+        ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(tcp) + len(payload), 0, 0, 64, 6, 0,
+                         data.socket.inet_aton("127.0.0.1"), data.socket.inet_aton("127.0.0.1"))
+        return ip + tcp + payload, ("lo", 0x0800, packet_type, 772, b"")
+
+    def test_helper_filters_destination_ingress_and_keeps_exact_tcp_tuple_sequence_bytes(self):
+        code, lines = self.helper_packets([self.datagram(packet_type=4), self.datagram(destination=30003),
+                                           self.datagram(), self.datagram(source=30001, destination=40002)])
+        self.assertEqual(code, 0)
+        self.assertEqual(lines[0]["classification"], "destination_kernel_ingress")
+        self.assertEqual(lines[1]["packets"], [
+            {"local": "127.0.0.1:40001", "remote": "127.0.0.1:30002",
+             "sequence": 42, "payload_hex": b"invalid-fixture".hex()},
+            {"local": "127.0.0.1:30001", "remote": "127.0.0.1:40002",
+             "sequence": 42, "payload_hex": b"invalid-fixture".hex()}])
+        self.assertEqual(lines[1]["payload_bytes"], 2 * len(b"invalid-fixture"))
+
+    def test_helper_packet_bound_loss_and_truncation_are_failures_not_evidence(self):
+        for invalid in ("packets", "drops", "truncated"):
+            packets = ([self.datagram()] * 1025 if invalid == "packets" else [self.datagram()])
+            if invalid == "truncated":
+                packet, address = packets[0]
+                packets[0] = (packet[:-1], address)
+            code, lines = self.helper_packets(packets, drops=1 if invalid == "drops" else 0)
+            self.assertEqual(code, 1)
+            self.assertIn("error", lines[-1])
+            self.assertNotIn("packets", lines[-1])
 
 
 class ReportingTests(unittest.TestCase):

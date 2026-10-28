@@ -142,6 +142,38 @@ struct Outgoing {
     _slot: OwnedSemaphorePermit,
     #[cfg(any(test, feature = "qualification"))]
     data: bool,
+    #[cfg(any(test, feature = "qualification"))]
+    completion: Option<(MessageId, tokio::sync::oneshot::Sender<WriteReceipt>)>,
+}
+
+/// Socket completion only, not a peer parse, ACK or rejection receipt. Retained
+/// evidence keeps its original queue/byte permits until consumed or cancelled.
+#[cfg(any(test, feature = "qualification"))]
+pub(crate) struct WriteReceipt {
+    pub session: u64,
+    pub local: SocketAddr,
+    pub remote: SocketAddr,
+    pub remote_listener: String,
+    pub message_id: MessageId,
+    pub frame: Vec<u8>,
+    _bytes: OwnedSemaphorePermit,
+    _slot: OwnedSemaphorePermit,
+}
+
+#[cfg(feature = "qualification")]
+impl WriteReceipt {
+    pub(crate) fn evidence(&self) -> serde_json::Value {
+        serde_json::json!({
+            "classification": "socket_write_all_and_flush",
+            "session": self.session,
+            "local": self.local.to_string(), "remote": self.remote.to_string(),
+            "remote_listener": self.remote_listener,
+            "message_id": {"guid": Uuid::from_bytes_le(self.message_id.guid).to_string(),
+                           "index": self.message_id.index},
+            "frame_hex": self.frame.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "frame_bytes": self.frame.len()
+        })
+    }
 }
 
 impl PeerTransport {
@@ -291,6 +323,30 @@ impl PeerTransport {
     /// Nonblocking bounded admission only. A successful socket write, failed
     /// session or dropped data packet never fabricates a replication receipt.
     pub fn send(&self, packet: Packet) -> Result<()> {
+        self.enqueue(
+            packet,
+            #[cfg(any(test, feature = "qualification"))]
+            None,
+        )
+    }
+
+    #[cfg(any(test, feature = "qualification"))]
+    pub(crate) fn send_observed(
+        &self,
+        packet: Packet,
+    ) -> Result<tokio::sync::oneshot::Receiver<WriteReceipt>> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.enqueue(packet, Some(sender))?;
+        Ok(receiver)
+    }
+
+    fn enqueue(
+        &self,
+        packet: Packet,
+        #[cfg(any(test, feature = "qualification"))] completion: Option<
+            tokio::sync::oneshot::Sender<WriteReceipt>,
+        >,
+    ) -> Result<()> {
         let _admission = self.handle.admission.lock().unwrap();
         self.handle.check()?;
         if packet.from.address != self.address {
@@ -313,7 +369,14 @@ impl PeerTransport {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::ResourceLimit("outgoing peer queue"))?;
-        let bytes = packet.encode(true)?.to_frame()?.encode()?;
+        let message = packet.encode(true)?;
+        #[cfg(any(test, feature = "qualification"))]
+        let message_id = message.properties()?.id;
+        let bytes = message.to_frame()?.encode()?;
+        #[cfg(any(test, feature = "qualification"))]
+        if completion.is_some() && bytes.len() > 16 * 1024 {
+            return Err(Error::ResourceLimit("qualification frame bytes"));
+        }
         let permit = class.reserve(bytes.len() + route.address.len() + 128)?;
         let outgoing = Outgoing {
             route,
@@ -322,6 +385,8 @@ impl PeerTransport {
             _slot: slot,
             #[cfg(any(test, feature = "qualification"))]
             data,
+            #[cfg(any(test, feature = "qualification"))]
+            completion: completion.map(|sender| (message_id, sender)),
         };
         let sender = if data {
             &self.handle.data
@@ -518,6 +583,14 @@ fn route_outgoing(
     addresses: &mut HashMap<String, u64>,
     tasks: &mut JoinSet<u64>,
 ) {
+    #[cfg(any(test, feature = "qualification"))]
+    if outgoing
+        .completion
+        .as_ref()
+        .is_some_and(|(_, sender)| sender.is_closed())
+    {
+        return;
+    }
     let address = &outgoing.route.address;
     let id = match addresses.get(address).copied() {
         Some(id) => id,
@@ -587,6 +660,8 @@ async fn run_session_inner(
     inbound: bool,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
+    #[cfg(any(test, feature = "qualification"))]
+    let (local, peer_socket) = (stream.local_addr()?, stream.peer_addr()?);
     let (mut reader, mut writer) = stream.into_split();
     let deadline = network.settings.callback_timeout;
     // Native TcpConnection.cpp:126 uses zero on an initiating connection and a
@@ -759,9 +834,23 @@ async fn run_session_inner(
                 Some(outgoing) = data.recv() => outgoing,
                 else => return Ok(()),
             };
+            #[cfg(any(test, feature = "qualification"))]
+            if outgoing
+                .completion
+                .as_ref()
+                .is_some_and(|(_, sender)| sender.is_closed())
+            {
+                continue;
+            }
             timeout(deadline, writer.write_all(&outgoing.bytes))
                 .await
                 .map_err(|_| Error::Timeout)??;
+            #[cfg(any(test, feature = "qualification"))]
+            if outgoing.completion.is_some() {
+                timeout(deadline, writer.flush())
+                    .await
+                    .map_err(|_| Error::Timeout)??;
+            }
             #[cfg(any(test, feature = "qualification"))]
             network.note(
                 if outgoing.data {
@@ -771,6 +860,19 @@ async fn run_session_inner(
                 },
                 id.to_string(),
             );
+            #[cfg(any(test, feature = "qualification"))]
+            if let Some((message_id, sender)) = outgoing.completion {
+                let _ = sender.send(WriteReceipt {
+                    session: id,
+                    local,
+                    remote: peer_socket,
+                    remote_listener: remote_instance.address.clone(),
+                    message_id,
+                    frame: outgoing.bytes,
+                    _bytes: outgoing._bytes,
+                    _slot: outgoing._slot,
+                });
+            }
         }
     };
     let result = tokio::select! {
