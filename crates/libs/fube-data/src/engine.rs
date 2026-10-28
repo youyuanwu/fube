@@ -2918,7 +2918,9 @@ impl Owner {
                         for peer in self.peers.values_mut() {
                             peer.received = 0;
                             peer.applied = 0;
-                            peer.maximum_sent = 0;
+                            // Retained peers need the same reconciled-prefix
+                            // bound as new peers, but no vote before fresh ACK.
+                            peer.maximum_sent = boundary;
                             peer.receipt_seen = false;
                             peer.configured = false;
                         }

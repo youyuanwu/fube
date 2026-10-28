@@ -48,10 +48,12 @@ async fn promoted_prefix_without_retained_suffix_accepts_bounded_existing_peer_r
         progress: ReplicationProgress { first: 0, last: 20 },
         must_catch_up: false,
     };
+    let cc = configuration(vec![peer], true, 2);
     primary
-        .update_current_configuration(configuration(vec![peer], true, 2), cancel())
+        .update_current_configuration(cc.clone(), cancel())
         .await
         .unwrap();
+    until(|| primary.snapshot().peers.len() == 1).await;
     assert_eq!(primary.snapshot().progress.completed, 20);
     assert_eq!(
         primary.snapshot().peers[0].maximum_sent,
@@ -90,6 +92,50 @@ async fn promoted_prefix_without_retained_suffix_accepts_bounded_existing_peer_r
     tokio::time::sleep(Settings::default().retry * 2).await;
     assert_eq!(primary.snapshot().peers[0].applied, 20);
     assert_eq!(primary.snapshot().progress.assigned, 20);
+    primary
+        .change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+        .await
+        .unwrap();
+    primary
+        .change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    let mut next = cc;
+    next.epoch = NEXT_EPOCH;
+    primary
+        .update_current_configuration(next, cancel())
+        .await
+        .unwrap();
+    until(|| {
+        let snapshot = primary.snapshot();
+        snapshot.role == ReplicaRole::Primary
+            && snapshot.epoch == Some(NEXT_EPOCH)
+            && snapshot.peers.len() == 1
+            && snapshot.peers[0].configured
+    })
+    .await;
+    assert_eq!(
+        primary.snapshot().peers[0].maximum_sent,
+        20,
+        "retained peer promotion needs the same reconciled prefix bound"
+    );
+    raw_send(
+        &transport,
+        &remote,
+        &primary,
+        Body::Ack {
+            received: 20,
+            applied: 20,
+            copy_received: -1,
+            copy_applied: -1,
+            error: 0,
+        },
+    );
+    until(|| primary.snapshot().peers[0].applied == 20).await;
+    primary
+        .wait_for_catch_up(CatchUpMode::All, cancel())
+        .await
+        .unwrap();
     primary.abort();
     transport.shutdown();
 }
