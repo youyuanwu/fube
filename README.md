@@ -34,7 +34,8 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 [Development and test tiers](docs/Development.md) describe native-free tests,
 standalone native-runtime acceptance, and live onebox qualification. CI runs
 native-free tests on Linux and Windows, a separate Linux standalone-native job,
-and a Linux onebox native-client/runtime job. On Windows, build the existing
+and two independent compiler-free Linux onebox workers with a strict
+[complete-coverage aggregate](docs/Development.md#parallel-onebox-ci). On Windows, build the existing
 client/transport/test-host packages explicitly; neither native runtime profile
 is qualified there.
 

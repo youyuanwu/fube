@@ -35,7 +35,7 @@ The existing mixed `rust-runtime-app` keeps `RustRuntimeType` stateless and
 `RustStatefulRuntimeType` volatile stateful in the same executable/code package.
 The **default remains empty-state**. Exact service initialization bytes
 `fube-data-v1` select the data implementation
-([selector](../../crates/samples/rust-runtime-app/src/data.rs#L20-L26));
+([selector](../../crates/samples/rust-runtime-app/src/data.rs#L24-L30));
 the data harness creates services with those bytes, preserving unrelated
 stateless registration. This is not an environment role override.
 
@@ -44,10 +44,10 @@ stateless registration. This is not an environment role override.
 - `Engine::bind_partition` installs the existing runtime's partition authority
   and callback/destructor supervision. `Engine::bind` is a standalone test seam,
   not native application authority
-  ([constructors](../../crates/libs/fube-data/src/engine.rs#L309-L354)).
+  ([constructors](../../crates/libs/fube-data/src/engine.rs#L313-L355)).
 - `StateProvider` supplies progress, `update_epoch(previous_epoch_last)`,
   data-loss, copy-context and exact-horizon copy-state callbacks
-  ([contract](../../crates/libs/fube-data/src/api.rs#L135-L160)).
+  ([contract](../../crates/libs/fube-data/src/api.rs#L135-L170)).
   Provider progress means application state, not quorum knowledge.
 - Optional `StateProvider::replication_checkpoint(sequence, cancellation)` returns
   an authentic original operation at exactly that applied/completed-copy
@@ -60,12 +60,12 @@ stateless registration. This is not an environment role override.
   The primary must apply that sequence locally **before** waiting for quorum.
   Its accepted operation and local apply must outlive a disconnected caller;
   canceling/dropping `wait` does not undo admission
-  ([wait](../../crates/libs/fube-data/src/engine.rs#L136-L157),
-  [sample owned admission](../../crates/samples/rust-runtime-app/src/data.rs#L230-L282)).
+  ([wait](../../crates/libs/fube-data/src/engine.rs#L140-L161),
+  [sample owned admission](../../crates/samples/rust-runtime-app/src/data.rs#L258-L325)).
 - Secondary application pumps consume copy then replication; apply before
   `Operation::acknowledge`. Receipt, polling and Drop do not acknowledge.
   A late retired-owner ACK fails rather than reviving progress
-  ([ACK and stream contract](../../crates/libs/fube-data/src/api.rs#L163-L244)).
+  ([ACK and stream contract](../../crates/libs/fube-data/src/api.rs#L173-L267)).
 - Provider callbacks run outside engine/transport locks. Returned errors,
   panics, cancellation and timeout are explicit; failed barriers cannot grant
   readiness. Qualified runtime watchdog guards supervise actual callback and
@@ -77,8 +77,8 @@ not a storage subsystem. Mutations contain `id`, `key`, `value`.
 Identical retries retain the original sequence; conflicting identity payloads
 fail. Ledger/history travels with copy and epoch reconciliation. It rejects
 new identities at **4096 operations / 16 MiB**, without silent expiry
-([provider](../../crates/libs/fube-data/src/provider.rs#L21-L44),
-[admission/apply](../../crates/libs/fube-data/src/provider.rs#L93-L143)).
+([provider](../../crates/libs/fube-data/src/provider.rs#L25-L72),
+[admission/apply](../../crates/libs/fube-data/src/provider.rs#L125-L187)).
 Applications implementing other providers own their payload semantics,
 reconciliation, exact-boundary snapshots and retry guarantees.
 
@@ -103,7 +103,7 @@ truncation from recycling still-owned memory. Epoch/data-loss reconciliation
 retains or discards matching replay metadata together with history and ledger.
 These payload additions require updated participating sample executables;
 rolling upgrades remain unsupported. No historical qualification below is
-evidence for the new checkpoint path.
+evidence for the new checkpoint path unless its exact source includes it.
 
 ## Progress, quorums, copy and failures
 
@@ -112,7 +112,7 @@ are different frontiers. Secondary received progress is not application ACK;
 neither is a global quorum proof. The primary's queue `applied` may remain its
 reconciliation frontier while actual provider state has advanced locally.
 Inspect provider progress separately; socket-write success never means commit
-([progress](../../crates/libs/fube-data/src/api.rs#L247-L260),
+([progress](../../crates/libs/fube-data/src/api.rs#L270-L283),
 [quorum calculation](../../crates/libs/fube-data/src/quorum.rs)).
 
 Current and previous configuration write obligations remain separate, including
@@ -155,23 +155,16 @@ The duplicate establishes the native primary target without applying again or
 assigning a new LSN. Only the resulting real receive/application ACK can satisfy
 ALL. One temporary charged callback owns this recovery path; there is no
 permanently retained free anchor or unbounded extra queue.
-
-The matching sample producers embed their actual admitted primary epoch in
-version-2 application mutations. `submit_in_epoch` rejects an epoch race before
-assignment. Native stream metadata does not expose an original epoch, so its
-unchanged opaque application bytes carry that provenance through native receive
-and exact-horizon copy. The provider preserves the exact original bytes and
-segment boundaries, and pinned history stays charged until disposal. Legacy
-version-1 records remain readable but cannot acquire invented replay provenance.
-Providers without authentic checkpoint metadata return `None`; that is not
-permission to fabricate an operation or grant catch-up. All qualified sample
-executables use the matching version-2 payload; mixed-generation/rolling
-executable upgrades are not supported.
+Cooldown starts only after actual payload/capture disposal, fanout, publication
+and producer-admission unlock. The next retry wakes independently, but holds no
+data slot while waiting; an unavailable checkpoint or transport backpressure
+cannot turn completion into an immediate retransmission loop. `None` is not
+permission to fabricate an operation or grant catch-up.
 
 Read/write admission requires current native access, live lifetime/host
 authority, agreement of native service/replicator/engine roles and epoch, and
 actual replication readiness
-([authority gate](../../crates/samples/rust-runtime-app/src/data.rs#L37-L72)).
+([authority gate](../../crates/samples/rust-runtime-app/src/data.rs#L41-L76)).
 No Primary flag, management observation or diagnostic endpoint alone grants
 access. Terminal authority cannot revive. Per-unit Close/Abort removes only its
 owned routes and drains work; actual shared-process termination affects both
@@ -248,14 +241,16 @@ Source-guided port baseline:
 This source revision is **not assumed to match** deployed SF 11.8.121.4 binaries.
 Microsoft/MIT notices accompany derived algorithms and regression scenarios.
 
-At source `e78eada771f842a02f4321e857588ce07c50a7e9`, tree
-`424275f027a24363242484a270b9b8bd320b43e6`:
+Executed implementation snapshot:
+`1414adca03635cde661b7e8ec19cf49dfdc113f8`, tree
+`a2145f3d56cd3368cd5737c3f29f34367c70f453`:
 
-- [Main CI 40733937944](https://github.com/youyuanwu/fube/actions/runs/40733937944):
-  Linux/Windows portable jobs and compiler-free native consumer **SUCCESS**;
-  5 archived native-client tests executed; Rust-only data **14/14** and full
-  mixed-native plus preserved legacy runtime **18/18** required scenarios PASS.
-- [Standalone CI 40733943872](https://github.com/youyuanwu/fube/actions/runs/40733943872):
+- [Two-worker CI 40781117241](https://github.com/youyuanwu/fube/actions/runs/40781117241):
+  Linux/Windows portable, both compiler-free workers and strict aggregate
+  **SUCCESS**. Rust-only14, baseline native-data17, hardened full legacy1 and
+  all five archived native-client tests executed. All32+5 asserted separately;
+  both original allocations have uploaded independent post-teardown absence.
+- [Standalone CI 40780908481](https://github.com/youyuanwu/fube/actions/runs/40780908481):
   bootstrap, close, abort, manifest-close and manifest-abort **SUCCESS**.
   Forced reaping where recorded is not relabeled graceful shutdown.
 - These are `workflow_dispatch` head executions, **not PR merge-tree evidence**.
@@ -268,6 +263,16 @@ horizons with concurrent writes, delayed application ACKs, native planned swap
 and abrupt primary failure, replacement copy, quorum unavailability, identical
 retry/ambiguous results, stale traffic, interrupted copy/epoch transition,
 data-loss changed/unchanged callbacks, bounds and per-unit/process isolation.
+Both directions hold the destination's real final nonempty CopyEnd ACK while
+independently observing InBuild/EOS, release it and require same-replica coherent
+completion. Four post-copy no-write moves per direction include the next
+Rust-to-native demotion and require fresh actual native ACK frontiers; descriptor
+progress is not substituted. Invalid-frame tests require exact socket write/
+flush plus independently captured destination kernel ingress before unchanged
+state/epoch/ledger observations; this is not a native parser/rejection-callback
+or TCP-ACK claim. Native InBuild diagnostics intentionally omit
+GetCurrentProgress, whose native copy-in-progress error path would fault the
+replica rather than merely observe it.
 Linux FAS deployment is not assumed: where absent, exact auxiliary native
 replica removals must produce actual node-selected data-loss epoch and callback/
 content/sequence evidence; no manual provider callback or election substitutes.
@@ -279,6 +284,8 @@ The Rust process mapping check and oracle's intentionally native mapping class
 are separate. Codec/model tests are not counted as native interoperation.
 
 See [build/run commands and cleanup contract](../Development.md#volatile-classic-v1-replication).
+The [parallel CI routing and measured result](../Development.md#parallel-onebox-ci)
+preserve the complete dependent profile chains; native-data alone is not full.
 All allocations are uniquely owned; immutable original creation capabilities
 survive partial failure. Minted app/type/upload absence and exact original
 container/volume/network absence are independently checked. Physical teardown

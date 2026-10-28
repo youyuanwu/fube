@@ -42,10 +42,11 @@ Create a [onebox](UbuntuOnebox.md), install the pinned nextest version from
 [the native-client workflow](../.github/workflows/native-client.yaml), and follow the
 [client qualification instructions](transport/RustFabricClient.md).
 CI builds the test archive once, then runs the explicitly owned fixture/setup
-tests and `group(onebox)` against the real native gateway. The onebox job depends
-only on the Linux native-free checks; Windows checks run independently and do
-not delay or block it. The onebox job always attempts diagnostics and confirmed
-teardown. Retained-data shutdown/restart
+tests and `group(onebox)` against the real native gateway. The two
+[onebox workers and aggregate](#parallel-onebox-ci) depend only on the Linux
+native-free checks; Windows checks run independently and do not delay them.
+Each worker always attempts diagnostics and original-owner teardown.
+Retained-data shutdown/restart
 qualification runs in
 [service-fabric-apps-rs](https://github.com/youyuanwu/service-fabric-apps-rs/blob/main/docs/UbuntuOnebox.md),
 not in this job; offline lifecycle regression tests and local down/up commands
@@ -87,7 +88,7 @@ The explicit build step builds the app and independent observer with `--locked`
 from clean source; native qualification always requires `--prebuilt`.
 CI builds them in the Linux native-free job and transfers a tar bundle containing
 both executables, both versioned package templates, their SHA256 hashes and the
-dependency graph (bundle format 3, `linux-x86_64-volatile-empty-control-v1`). The onebox job
+dependency graph (bundle format 3, `linux-x86_64-volatile-empty-control-v1`). Its native consumer
 uses `--prebuilt DIRECTORY`: it verifies the bundle and ELF dependencies, then
 deploys/tests without installing Rust or invoking Cargo. Missing or changed
 artifacts fail; there is no compilation fallback. See the
@@ -128,19 +129,25 @@ cargo test --locked -p fube-data -p mssf-runtime -p rust-runtime-app -p native-r
 # Upstream build from clean source; use a NEW bundle directory:
 python3 scripts/fube_data_test.py --build-bundle build/data-binaries
 # Compiler-free consumer; use unique allocation/report paths:
-python3 scripts/fube_data_test.py data-rust-01 --prebuilt build/data-binaries --profile rust --report build/data-rust-01.json
-python3 scripts/fube_data_test.py data-full-01 --prebuilt build/data-binaries --profile full --report build/data-full-01.json
+python3 scripts/fube_data_test.py data-rust-01 --prebuilt build/data-binaries --profile rust --report build/data-rust-01.json --summary
+python3 scripts/fube_data_test.py data-full-01 --prebuilt build/data-binaries --profile full --report build/data-full-01.json --summary
 ```
 
-`rust` qualifies Rust-to-Rust data; `mixed` adds both native classic directions;
-`full` additionally executes the preserved empty-state/stateless full suite.
+| Profile | Complete scope |
+|---|---|
+| `rust` | 14 Rust-to-Rust data scenarios; Rust replicas on the five-node allocation. |
+| `mixed` | 17 mixed-native data scenarios; mixed-native auxiliary data-loss topology. |
+| `full` | 17 mixed-native data scenarios with constrained three-Rust auxiliary topology, then the hardened full empty-state/stateless legacy suite. |
+| `native-data` | Exactly `full`'s 17 data scenarios and auxiliary policy, **without legacy**; not a full-profile claim. |
+
+Dependent scenarios stay sequential within a profile. `mixed` is not simply
+`full` minus legacy: its data-loss auxiliary policy differs. `--summary` bounds
+console output only; the complete structured report is still written.
 The version-2 strict data bundle includes exact executable, package, launcher,
 source and dependency metadata. It is not interchangeable with the version-3
 empty-state bundle. Missing/tampered inputs fail before allocation; qualification
-never invokes Cargo. CI builds the native-backed oracle upstream, then runs
-archived native clients, Rust-only data and full mixed qualification in the
-compiler-free onebox consumer. Linux/Windows portable checks and the separate
-standalone native job remain independent.
+never invokes Cargo. CI builds the native-backed oracle upstream. Linux/Windows
+portable checks and the separate standalone native job remain independent.
 
 Only the named oracle loads native SF libraries; `fube-data`, `mssf-runtime` and
 the Rust app do not. Packaging validates exact fixed-name regular non-symlink
@@ -151,3 +158,54 @@ Each run retains immutable original allocation and minted deployment ownership,
 verifies absence independently, and reports cleanup errors instead of adopting
 same-name replacements. `--existing-owner` explicitly retains the caller's
 allocation; its caller must perform final original-capability teardown.
+
+## Parallel onebox CI
+
+The [main workflow](../.github/workflows/ci.yaml) runs two non-fail-fast workers
+on **different hosted runners**. They never share a mutable cluster, daemon,
+application or port namespace:
+
+- **client-runtime**: all five archived native-client tests, complete Rust14
+  data, then the existing hardened full legacy empty-state/stateless suite.
+- **native-data**: the complete baseline 17-case mixed-native data chain,
+  including both replication directions, held copy-ACK negatives, no-write
+  moves, stale-frame ingress, failures and the original full-data auxiliary
+  policy. No dependent scenario is sliced across workers.
+
+The existing **Linux onebox native client** check name now belongs to the strict
+aggregate: **Rust14 + native-data17 + hardened legacy1 =32 namespaced profile
+assertions**, plus five archived native tests. A partial report cannot label
+itself full. Native-client reports retain their actual heterogeneous schemas;
+seven internal clear-client cases are not seven native tests.
+
+The upstream producer publishes a current-attempt receipt outside the immutable
+bundle. [`onebox_ci.py`](../scripts/onebox_ci.py) verifies actual checkout/tree,
+PR head versus nullable merge, run/attempt, tar/archive/manifests and executable
+hashes before allocation. Each worker retains its immutable original creation
+capability through partial failure, verifies logical app/type/upload absence,
+then publishes a structured original container/volume/network absence receipt
+**after teardown**. The aggregate revalidates report bytes and typed evidence;
+missing/failed/skipped work or cleanup cannot become green.
+
+Legacy dispatch reuses the strict outer/nested loaders and
+`NativeDataDeploymentPolicy`, including both package versions. The direct
+nested-bundle `rust_runtime_test.py` CLI is not a substitute for this hardened
+CI adapter. Use `--profile full` above for local combined qualification.
+`python3 scripts/onebox_ci.py --help` describes the CI-only receipt commands.
+
+Artifact names include run and attempt: `onebox-inputs-*`,
+`onebox-client-runtime-*`, `onebox-native-data-*`, `onebox-aggregate-*`.
+Each worker artifact includes full reports, `validated-input.json`,
+`worker-proof.json`, post-teardown `cleanup.json` and optional credential-safe
+diagnostics. No bootstrap, owner state, journals or raw logs are required.
+Do not mix attempts: after partial reruns/missing inputs, start a **fresh
+complete workflow dispatch**, rather than reuse an earlier-attempt receipt.
+
+[Measured run40781117241](https://github.com/youyuanwu/fube/actions/runs/40781117241)
+passed at source1414adca with all32+5. Compared with successful sequential
+[baseline40771194035](https://github.com/youyuanwu/fube/actions/runs/40771194035)
+at4e92d27, identical app/observer/oracle ELF bytes qualified in both:
+native-stage wall time **22m01s →12m59s**, including aggregate (**41.0% less**);
+workflow API envelope **25m11s →15m22s** (**39.0% less**). This is one observed
+comparison, not an SLO; setup/cache/scheduling/artifact and bounded-console
+logging differences are included, not attributed solely to parallel execution.

@@ -289,7 +289,7 @@ This dependency profile dynamically loads native FabricRuntime/Common/Client
 through `mssf-core`. An empty ELF `NEEDED` list does **not** make the activated
 binary native-free. Native API/load/registration failure is reported; there is
 no stub fallback. Production Rust runtime/data code must not depend on this
-oracle. Native interoperation is **unqualified until externally executed**.
+oracle. Local ABI/model invocations alone do **not** qualify interoperation.
 
 The external harness has now executed both primary directions, actual nonempty
 native copy enumeration and nonzero replication against SF 11.8.121.4; see
