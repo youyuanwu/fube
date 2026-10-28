@@ -2593,6 +2593,40 @@ impl Owner {
 
 impl Owner {
     fn advance(&mut self) -> Result<()> {
+        // RAP can complete a native singleton Primary without a separate
+        // Update*ReplicaSetConfiguration callback. Project only its actual
+        // stable singleton view; role alone (or standalone binding) is not proof.
+        if self.current.is_none()
+            && self.control.is_none()
+            && self.role == ReplicaRole::Primary
+            && self.reconciled
+            && self.copy_done
+        {
+            if let Some(status) = self
+                .native_control
+                .as_ref()
+                .and_then(|view| view.status().ok())
+            {
+                if status.lifecycle == ReplicaLifecycle::Open
+                    && status.replicator_open
+                    && status.current_role == ReplicaRole::Primary
+                    && status.service_role == ReplicaRole::Primary
+                    && status.replicator_role == ReplicaRole::Primary
+                    && status.configuration_stage == ConfigurationStage::Current
+                    && status.catch_up == mssf_runtime::CatchUpResult::Completed
+                    && status.minimum_replica_set_size == 1
+                    && status.configuration.is_empty()
+                    && Some(status.current_epoch.primary()) == self.epoch
+                {
+                    self.current = Some(ReplicaSetConfiguration {
+                        epoch: status.current_epoch.primary(),
+                        replicas: Vec::new(),
+                        write_quorum: 1,
+                        local_member: true,
+                    });
+                }
+            }
+        }
         if self
             .apply_deadlines
             .values()

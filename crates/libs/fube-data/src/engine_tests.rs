@@ -1274,6 +1274,47 @@ fn engine_with_native_view(
     .unwrap()
 }
 
+#[tokio::test]
+async fn native_singleton_requires_stable_runtime_membership_not_primary_role_alone() {
+    let mut native = primary_status();
+    native.minimum_replica_set_size = 2;
+    let view = Arc::new(SourceNativeView(Mutex::new(Ok(native))));
+    let provider = Arc::new(Provider::default());
+    let node = engine_with_native_view(Uuid::new_v4(), 1, provider.clone(), view.clone());
+    node.change_role(EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    tokio::time::sleep(Settings::default().retry * 2).await;
+    assert!(
+        !node.snapshot().ready,
+        "min2 cannot become a singleton from role"
+    );
+    let variants: &[fn(&mut ReplicaStatus)] = &[
+        |s: &mut ReplicaStatus| s.lifecycle = ReplicaLifecycle::Closing,
+        |s: &mut ReplicaStatus| s.configuration_stage = ConfigurationStage::CatchUp,
+        |s: &mut ReplicaStatus| s.catch_up = mssf_runtime::CatchUpResult::NotStarted,
+        |s: &mut ReplicaStatus| s.current_epoch = NEXT_EPOCH,
+        |s: &mut ReplicaStatus| s.replicator_open = false,
+        |s: &mut ReplicaStatus| s.service_role = ReplicaRole::Secondary,
+    ];
+    for mutate in variants {
+        let mut status = primary_status();
+        mutate(&mut status);
+        *view.0.lock().unwrap() = Ok(status);
+        tokio::time::sleep(Settings::default().retry * 2).await;
+        assert!(!node.snapshot().ready);
+    }
+    *view.0.lock().unwrap() = Ok(primary_status());
+    until(|| node.snapshot().ready).await;
+    let mut write = node
+        .submit(OperationData::new(vec![vec![1]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    provider.last.store(write.sequence, Ordering::Release);
+    assert_eq!(write.wait(cancel()).await.unwrap(), 1);
+    node.abort();
+}
+
 async fn until(mut condition: impl FnMut() -> bool) {
     timeout(std::time::Duration::from_secs(5), async {
         while !condition() {
