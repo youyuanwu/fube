@@ -306,6 +306,16 @@ class NativeFaultHttpModels(unittest.TestCase):
 
 
 class WireFaultModels(unittest.TestCase):
+    def test_rust_destination_wire_identity_does_not_invent_public_transport_suffix(self):
+        value, endpoints = wire_model()
+        source = value["replicas"][1]
+        source["rpc"]["observed_primary"] = endpoints[0].removesuffix(";transport")
+        proof = receipt(value, source, "stale_copy_ack")
+        result = data.wire_receipt(value, source, "stale_copy_ack", proof)
+        self.assertEqual(result["destination_kind"], "rust")
+        self.assertIsNone(data.wire_endpoint(proof["native_selected_peer"])["suffix"])
+        self.assertEqual(data.wire_endpoint(endpoints[0])["suffix"], ";transport")
+
     def test_native_empty_transport_suffix_reaches_actual_wire_receipt_validation(self):
         value, endpoints = wire_model(True, True)
         source = value["replicas"][1]

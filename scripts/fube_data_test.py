@@ -946,7 +946,11 @@ def wire_receipt(before: dict, source: dict, kind: str, reply: dict) -> dict:
     require(destination["role"] == ("ActiveSecondary" if source["role"] == "Primary" else "Primary"),
             "native-selected peer role mismatch")
     if destination["rpc"]["engine_kind"] == "rust":
-        require(wire_endpoint(destination["rpc"]["replication_address"]) == selected,
+        published = wire_endpoint(destination["rpc"]["replication_address"])
+        # REFrom has actor/address only; its learned primary cannot include
+        # the public-only transport suffix. Do not equate that with identity.
+        require({key: value for key, value in published.items() if key != "suffix"}
+                == {key: value for key, value in selected.items() if key != "suffix"},
                 "Rust destination differs from the native-selected endpoint")
     else:
         # Native EndOpen's GUID/ephemeral port are RA-owned, not the oracle's
