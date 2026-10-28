@@ -734,7 +734,9 @@ class Client:
                 record["attempts"].append({"at": time.monotonic(), "outcome": "ambiguous_transport",
                                            "error": str(error)})
                 self.endpoint = None
-        raise RuntimeError(f"identified write remains unresolved: {request_id}, sequence={record['sequence']}")
+        last = record["attempts"][-1] if record["attempts"] else None
+        raise RuntimeError(f"identified write remains unresolved: {request_id}, "
+                           f"sequence={record['sequence']}, last_attempt={last}")
 
 
 DATA_PROCESS = r"""
@@ -1069,6 +1071,10 @@ class Qualification:
         finally:
             evidence["finished_at"] = time.time()
             evidence["duration_seconds"] = evidence["finished_at"] - evidence["started_at"]
+            self.result["identified_workload"] = self.ledger.records
+            if os.environ.get("FUBE_PROGRESS") == "1":
+                print(json.dumps({"scenario": name, "status": evidence["status"],
+                                  "error": evidence.get("error")}), file=sys.stderr, flush=True)
 
     def wait(self, *, accept=None, timeout: float = 180, capture: dict | None = None,
              service: str | None = None, target: int = 3, minimum: int = 2,
@@ -2083,8 +2089,11 @@ class Qualification:
             # rather than spending every scenario timeout on the same failure.
             self.result["errors"].append("deployment identity failed; remaining scenarios not executed")
             return
+        self.scenario("writes_100", self.writes_100)
+        if self.result["scenarios"]["writes_100"]["status"] != "PASS":
+            self.result["errors"].append("baseline writes failed; dependent scenarios not executed")
+            return
         actions = (
-            ("writes_100", self.writes_100),
             ("identified_retry", self.identified_retry),
             ("planned_move", self.planned_move),
             ("apply_ack_delay", self.apply_ack_delay),

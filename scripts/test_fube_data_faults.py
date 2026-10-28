@@ -876,7 +876,8 @@ class DataLossCommandModels(unittest.TestCase):
         qualification, _ = self.qualification()
         # This dispatch-only model does not execute scenario(); supply its
         # successful prerequisite explicitly rather than bypassing the gate.
-        qualification.result["scenarios"] = {"deployment_identity": {"status": "PASS"}}
+        qualification.result["scenarios"] = {
+            "deployment_identity": {"status": "PASS"}, "writes_100": {"status": "PASS"}}
         names = []
         with patch.object(qualification, "scenario", side_effect=lambda name, action: names.append((name, action))):
             qualification.run()

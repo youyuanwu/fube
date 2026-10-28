@@ -2881,12 +2881,15 @@ class ReportingTests(unittest.TestCase):
     def test_missing_live_probe_and_failed_scenario_never_get_relabelled_pass(self):
         result = self.result("rust")
         qualification = data.Qualification(MagicMock(), MagicMock(), {**result, "application": "fabric:/Owned"}, False)
+        record = qualification.ledger.mutation("retained-after-failure")
+        record["attempts"].append({"outcome": "observation_unavailable", "error": "actual cause"})
         def missing(evidence):
             evidence["actual_writes"] = 100
             raise data.MissingEvidence("no native stale-actor injection")
         qualification.scenario("stale_wire_receipts", missing)
         self.assertEqual(result["scenarios"]["stale_wire_receipts"]["status"], "MISSING")
         self.assertEqual(data.finalize(result)["status"], "FAIL")
+        self.assertIs(qualification.result["identified_workload"]["retained-after-failure"], record)
 
     def test_interrupted_scenario_keeps_captured_evidence_and_never_stays_running(self):
         result = self.result("rust")
@@ -2934,6 +2937,22 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(value["ci_head"], "d" * 40)
         self.assertEqual(value["ci_merge"], "e" * 40)
 
+    def test_failed_baseline_writes_leave_dependent_qualification_missing(self):
+        result = {"application": "fabric:/Owned", "profile": "mixed", "errors": [],
+                  "scenarios": {name: {"status": "MISSING"} for name in data.required_scenarios("mixed")}}
+        qualification = data.Qualification(MagicMock(), MagicMock(), result, True)
+        def failed(evidence):
+            qualification.ledger.mutation("baseline-failed")["attempts"].append({"error": "cause"})
+            raise RuntimeError("actual write rejection")
+        with patch.object(qualification, "deployment_identity"), \
+             patch.object(qualification, "writes_100", side_effect=failed), \
+             patch.object(qualification, "identified_retry") as retry:
+            qualification.run()
+        retry.assert_not_called()
+        self.assertEqual(result["scenarios"]["writes_100"]["status"], "FAIL")
+        self.assertEqual(result["scenarios"]["planned_move"]["status"], "MISSING")
+        self.assertIn("baseline-failed", result["identified_workload"])
+        self.assertEqual(data.finalize(result)["status"], "FAIL")
 
 class ExecutedImageStoreContractTests(unittest.TestCase):
     def test_native_omits_only_exact_schema_default_service_attributes(self):
