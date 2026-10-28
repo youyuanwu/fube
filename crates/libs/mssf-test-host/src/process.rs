@@ -17,6 +17,22 @@ use crate::{deployment::Deployment, HostError, Result};
 
 const LOG_LIMIT: usize = 1024 * 1024;
 
+#[cfg(target_os = "linux")]
+fn proc_stat_result(result: std::io::Result<Vec<u8>>) -> std::io::Result<Option<Vec<u8>>> {
+    match result {
+        Ok(stat) => Ok(Some(stat)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn absolute_directories(
     native: &Path,
     dependencies: &Path,
@@ -302,17 +318,11 @@ impl OwnedApp {
             if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
                 continue;
             }
-            let stat = match std::fs::read(entry.path().join("stat")) {
-                Ok(stat) => stat,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                    ) =>
-                {
-                    continue
-                }
-                Err(error) => return Err(error.into()),
+            // An unrelated process can exit between /proc enumeration and
+            // stat read; Linux may report ESRCH as well as ENOENT. This does
+            // not relax the separate WNOWAIT reservation of our owned leader.
+            let Some(stat) = proc_stat_result(std::fs::read(entry.path().join("stat")))? else {
+                continue;
             };
             // comm can contain spaces/parentheses. Fields after its final ')':
             // state, ppid, pgrp. Zombies are terminated, but only our direct
@@ -419,6 +429,30 @@ fn require_stat(fields: &[&str]) -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_scan_skips_disappeared_entries_but_propagates_real_io_failures() {
+        for error in [libc::ESRCH, libc::ENOENT, libc::EACCES] {
+            assert!(
+                proc_stat_result(Err(std::io::Error::from_raw_os_error(error)))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for error in [libc::EIO, libc::EBADF] {
+            assert_eq!(
+                proc_stat_result(Err(std::io::Error::from_raw_os_error(error)))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(error)
+            );
+        }
+        assert_eq!(
+            proc_stat_result(Ok(b"owned stat".to_vec())).unwrap(),
+            Some(b"owned stat".to_vec())
+        );
+    }
 
     #[test]
     fn forced_cleanup_kills_and_reaps_only_owned_child() {
