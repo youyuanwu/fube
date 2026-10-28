@@ -151,6 +151,23 @@ struct Outgoing {
     completion: Option<(MessageId, tokio::sync::oneshot::Sender<WriteReceipt>)>,
 }
 
+fn peer_socket(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+    local: SocketAddr,
+) -> Result<SocketAddr> {
+    let mut addresses = addresses.into_iter();
+    let first = addresses
+        .next()
+        .ok_or(Error::InvalidInput("peer address did not resolve"))?;
+    // A dual-stack hostname must not select ::1 for an IPv4 listener merely
+    // because resolver ordering differs across hosts. Keep single-family
+    // destinations usable, and never change the advertised wire identity.
+    Ok(std::iter::once(first)
+        .chain(addresses)
+        .find(|address| address.is_ipv4() == local.is_ipv4())
+        .unwrap_or(first))
+}
+
 // A queued frame, including a one-shot qualification frame whose temporary
 // actor route was removed, still owns its socket until write/disposal.
 struct AddressOwner {
@@ -337,11 +354,11 @@ impl PeerTransport {
     pub fn register_peer(&self, endpoint: &Endpoint) -> Result<()> {
         self.handle.check()?;
         endpoint.to_string().parse::<Endpoint>()?;
-        let socket = endpoint
+        let local = self
             .address
-            .to_socket_addrs()?
-            .next()
-            .ok_or(Error::InvalidInput("peer address did not resolve"))?;
+            .parse()
+            .map_err(|_| Error::InvalidInput("local peer listener address"))?;
+        let socket = peer_socket(endpoint.address.to_socket_addrs()?, local)?;
         let _admission = self.handle.admission.lock().unwrap();
         self.handle.check()?;
         let mut routes = self.handle.network.routes.lock().unwrap();

@@ -3182,6 +3182,8 @@ class WireDeliveryTests(unittest.TestCase):
                 data.wire_receipt(before, source, "wrong_sender", reply, observation)
 
 
+@unittest.skipUnless(sys.platform == "linux",
+    "Linux-only AF_PACKET, /proc, pidfd and pipe observer; portable wire-delivery models remain enabled")
 class WireCaptureTests(unittest.TestCase):
     def local_capture(self, allowed, evidence, *, protocol_only=False):
         allocation = MagicMock()

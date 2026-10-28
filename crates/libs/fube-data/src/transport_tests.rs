@@ -34,6 +34,18 @@ fn request(address: &str, from: i64, to: i64) -> Packet {
     }
 }
 
+#[test]
+fn dual_stack_peer_resolution_prefers_listener_family_without_dropping_single_family_destinations()
+{
+    let v4: SocketAddr = "127.0.0.1:31000".parse().unwrap();
+    let v6: SocketAddr = "[::1]:31000".parse().unwrap();
+    assert_eq!(peer_socket([v6, v4], v4).unwrap(), v4);
+    assert_eq!(peer_socket([v4, v6], v6).unwrap(), v6);
+    assert_eq!(peer_socket([v6], v4).unwrap(), v6);
+    assert_eq!(peer_socket([v4], v6).unwrap(), v4);
+    assert!(peer_socket([], v4).is_err());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_one_shared_address_actor_keeps_the_other_actor_socket_usable() {
     let (a, _incoming_a) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
