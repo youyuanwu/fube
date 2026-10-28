@@ -193,24 +193,51 @@ impl Operation {
 /// A bounded, single-consumer service stream. Cancellation stops only that poll;
 /// it does not acknowledge the operation or dispose its owning replica.
 pub struct OperationStream {
-    receiver: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Operation>>,
+    receiver: std::sync::Mutex<tokio::sync::mpsc::Receiver<Operation>>,
+    poller: tokio::sync::Semaphore,
+    stopped: Cancellation,
 }
 impl OperationStream {
     /// Wrap an already-bounded channel owned by an engine/adapter.
     pub fn new(receiver: tokio::sync::mpsc::Receiver<Operation>) -> Self {
         Self {
-            receiver: tokio::sync::Mutex::new(receiver),
+            receiver: std::sync::Mutex::new(receiver),
+            poller: tokio::sync::Semaphore::new(1),
+            stopped: Cancellation::default(),
         }
     }
     pub async fn next(&self, cancellation: Cancellation) -> Result<Option<Operation>> {
-        let mut receiver = tokio::select! {
+        // mpsc records only one receive waker. Serialize polls without keeping
+        // the receiver locked while waiting, including behind another poll.
+        let _poller = tokio::select! {
+            biased;
             _ = cancellation.cancelled() => return Err(Error::Closed),
-            receiver = self.receiver.lock() => receiver,
+            _ = self.stopped.cancelled() => return Ok(None),
+            permit = self.poller.acquire() => permit.map_err(|_| Error::Closed)?,
         };
         tokio::select! {
+            biased;
             _ = cancellation.cancelled() => Err(Error::Closed),
-            operation = receiver.recv() => Ok(operation),
+            _ = self.stopped.cancelled() => Ok(None),
+            operation = std::future::poll_fn(|cx| {
+                let mut receiver = self.receiver.lock().unwrap();
+                if self.stopped.is_cancelled() {
+                    return std::task::Poll::Ready(None);
+                }
+                // Dequeue/publication and terminal disposal share this lock.
+                // A dequeued capture is application-owned even if shutdown
+                // follows before the caller resumes.
+                receiver.poll_recv(cx)
+            }) => Ok(operation),
         }
+    }
+
+    /// Dispose only buffered engine ownership, never application-held captures.
+    pub(crate) fn shutdown(&self) {
+        let mut receiver = self.receiver.lock().unwrap();
+        receiver.close();
+        self.stopped.cancel();
+        while receiver.try_recv().is_ok() {}
     }
 }
 

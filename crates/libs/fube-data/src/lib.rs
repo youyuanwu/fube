@@ -10,9 +10,15 @@
 //! separate executed qualification gate, not implied by codec unit tests.
 
 pub mod api;
+pub mod engine;
+pub mod provider;
 pub mod queue;
+pub mod quorum;
+pub mod transport;
 pub mod wire;
 
 pub use api::*;
+pub use engine::{Engine, EngineSnapshot, PeerSnapshot, Replication};
 pub use mssf_runtime::{Cancellation, Epoch, ReplicaRole};
 pub use mssf_transport::{Error, Result};
+pub use provider::{MemoryProvider, Mutation, ProviderSnapshot};
