@@ -590,7 +590,7 @@ class SelectorTests(ProjectFiles):
                 execute.assert_not_called()
 
     def test_startup_diagnostic_records_actual_caller_once_without_overwriting(self):
-        path = self.work / "RustRuntimeService.FubeDataStartup.stderr"
+        path = self.work / f"RustRuntimeService.FubeDataStartup.{os.getpid()}.stderr"
         with patch.object(os, "dup2") as redirect:
             self.record_startup(self.work, "native-replicator-oracle", os.getuid() + 1, 0o674, False)
             self.assertEqual(redirect.call_count, 2)

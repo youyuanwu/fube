@@ -634,13 +634,21 @@ impl Engine {
     ) -> Result<T> {
         self.check()?;
         let (reply, result) = oneshot::channel();
+        let command = make(reply);
+        #[cfg(feature = "qualification")]
+        let kind = std::mem::discriminant(&command);
         self.commands
-            .try_send(make(reply))
+            .try_send(command)
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => Error::ResourceLimit("control admission"),
                 mpsc::error::TrySendError::Closed(_) => Error::Closed,
             })?;
-        result.await.map_err(|_| Error::Closed)?
+        let result = result.await.map_err(|_| Error::Closed)?;
+        #[cfg(feature = "qualification")]
+        if let Err(error) = &result {
+            eprintln!("FUBE_CONTROL_ERROR {kind:?}: {error}");
+        }
+        result
     }
 
     fn shutdown(&self) {

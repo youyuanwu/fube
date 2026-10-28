@@ -26,7 +26,9 @@ def record_startup(work, name, owner, mode, changed):
     # Linux native console redirection does not reliably archive failed startup.
     # Preserve the first actual activated caller and its child's stderr per app.
     try:
-        log = os.open(work / "RustRuntimeService.FubeDataStartup.stderr",
+        if len(list(work.glob("RustRuntimeService.FubeDataStartup.*.stderr"))) >= 16:
+            return
+        log = os.open(work / f"RustRuntimeService.FubeDataStartup.{os.getpid()}.stderr",
                       os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     except OSError:
         return
