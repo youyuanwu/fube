@@ -51,7 +51,7 @@ import rust_runtime_test as runtime
 
 ROOT = runtime.ROOT
 PKG = ROOT / "crates/samples/native-replicator-oracle/pkg"
-BUNDLE_VERSION = 1
+BUNDLE_VERSION = 2
 BUNDLE_PROFILE = "linux-x86_64-sf-11.8.121.4-volatile-fube-data-v1-native-classic-v1"
 MAX_RESPONSE = 4 * 1024 * 1024
 ENGINES = ("rust-runtime-app", "runtime_observer", "native-replicator-oracle")
@@ -183,7 +183,10 @@ def build_bundle(directory: Path) -> None:
     for profile in ("rust", "mixed"):
         launcher = directory / f"launchers/launch-{profile}.py"
         launcher.parent.mkdir(exist_ok=True)
-        shutil.copyfile(PKG / launcher.name, launcher)
+        if profile == "mixed":
+            launcher.write_text(render_mixed_launcher(directory), encoding="utf-8")
+        else:
+            shutil.copyfile(PKG / launcher.name, launcher)
         launcher.chmod(0o755)
         for name in runtime.PACKAGE_FILES:
             target = directory / f"packages/{profile}" / name
@@ -211,6 +214,15 @@ def build_bundle(directory: Path) -> None:
     except Exception:
         manifest.unlink()
         raise
+
+
+def render_mixed_launcher(directory: Path) -> str:
+    source = (PKG / "launch-mixed.py").read_text(encoding="utf-8")
+    for name in ("rust-runtime-app", "native-replicator-oracle"):
+        marker = "@" + name + ":sha256@"
+        require(source.count(marker) == 1, "mixed launcher prebuilt hash marker drift")
+        source = source.replace(marker, runtime.digest(directory / "bin" / name))
+    return source
 
 
 def load_bundle(directory: Path) -> Bundle:
@@ -820,7 +832,7 @@ def process_expected(allocation, bundle: Bundle, service: str, replica: dict, mi
     package_info = matches[0]
     kind = NODE_ENGINES[node] if mixed else "rust"
     engine = bundle.binary(kind)
-    launcher_name = "launch-mixed.py" if mixed else "launch-rust.py"
+    launcher_name = "launch-mixed.py" if mixed else engine.name
     return {
         "native_pid": rpc["pid"], "native_entry_point": package_info["MainEntryPoint"]["EntryPointLocation"],
         "native_entry_point_instance": package_info["MainEntryPoint"]["InstanceId"],
@@ -828,7 +840,8 @@ def process_expected(allocation, bundle: Bundle, service: str, replica: dict, mi
         "host": rpc["host"], "node": node, "application": service.rsplit("/", 1)[0], "kind": kind,
         "engine_name": engine.name, "engine_sha256": bundle.metadata["artifacts"]["bin/" + engine.name]["sha256"],
         "launcher_name": launcher_name,
-        "launcher_sha256": bundle.metadata["artifacts"]["launchers/" + launcher_name]["sha256"],
+        "launcher_sha256": bundle.metadata["artifacts"][
+            ("launchers/" if mixed else "bin/") + launcher_name]["sha256"],
     }
 
 

@@ -100,7 +100,10 @@ class ProjectFiles(unittest.TestCase):
             if name.startswith("bin/"):
                 path.write_bytes(executable(path.name))
             elif name.startswith("launchers/"):
-                shutil.copyfile(data.PKG / path.name, path)
+                if path.name == "launch-mixed.py":
+                    path.write_text(data.render_mixed_launcher(directory))
+                else:
+                    shutil.copyfile(data.PKG / path.name, path)
             else:
                 _, profile, relative = name.split("/", 2)
                 shutil.copyfile(data.PKG / profile / relative, path)
@@ -412,12 +415,30 @@ class BundleTests(ProjectFiles):
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux-only activated selector")
-class SelectorTests(unittest.TestCase):
+class SelectorTests(ProjectFiles):
     def setUp(self):
+        super().setUp()
         path = data.PKG / "launch-mixed.py"
         spec = importlib.util.spec_from_file_location("test_data_selector", path)
         self.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.module)
+        self.package = self.root / "RustRuntimeService.Code.1.1"
+        self.package.mkdir()
+        self.work = self.root / "work"
+        self.work.mkdir()
+        self.module.__file__ = str(self.package / "launch-mixed.py")
+        for name in set(self.module.NODE_ENGINES.values()):
+            target = self.package / name
+            target.write_bytes(executable(name))
+            target.chmod(0o674)
+            self.module.EXPECTED_SHA256[name] = data.runtime.digest(target)
+        self.addCleanup(os.chdir, Path.cwd())
+        os.chdir(self.package)
+
+    def environment(self, node="N0010"):
+        return {"Fabric_NodeName": node, "Fabric_ApplicationHostId": "native-host",
+                "Fabric_CodePackageInstanceSeqNum": "71", "Fabric_CodePackageName": "Code",
+                "Fabric_Folder_App_Work": str(self.work), "CUSTOM": "preserved"}
 
     def test_unknown_or_missing_injected_node_never_execs_or_infers_role(self):
         for value in (None, "_Node_0", "N0000", "N0010\n", "N0060"):
@@ -432,14 +453,98 @@ class SelectorTests(unittest.TestCase):
             "N0010": "native-replicator-oracle", "N0020": "rust-runtime-app",
             "N0030": "native-replicator-oracle", "N0040": "rust-runtime-app", "N0050": "rust-runtime-app"})
         for node, binary in self.module.NODE_ENGINES.items():
-            env = {"Fabric_NodeName": node, "Fabric_ApplicationHostId": "native-host",
-                   "Fabric_CodePackageInstanceSeqNum": "71", "CUSTOM": "preserved"}
+            env = self.environment(node)
+            target = self.package / binary
+            before = target.stat().st_mode & 0o7777
+            def execute(fd, arguments, environment):
+                self.assertIsInstance(fd, int)
+                self.assertEqual(os.fstat(fd).st_ino, target.stat().st_ino)
+                self.assertEqual(arguments, [str(target)])
+                self.assertEqual(environment, env)
             with patch.dict(os.environ, env, clear=True), \
-                 patch.object(Path, "is_file", return_value=True), \
-                 patch.object(Path, "is_symlink", return_value=False), \
-                 patch.object(os, "access", return_value=True), patch.object(os, "execve") as execute:
+                 patch.object(os, "execve", side_effect=execute) as invoked:
                 self.module.main()
-                execute.assert_called_once_with(str(data.PKG / binary), [str(data.PKG / binary)], env)
+                invoked.assert_called_once()
+            self.assertEqual(target.stat().st_mode & 0o7777, before | 0o100)
+
+    def test_hash_mismatch_never_chmods_or_executes(self):
+        target = self.package / "native-replicator-oracle"
+        target.write_bytes(b"foreign bytes")
+        with patch.dict(os.environ, self.environment(), clear=True), \
+             patch.object(os, "fchmod") as chmod, patch.object(os, "execve") as execute:
+            with self.assertRaisesRegex(SystemExit, "hash/identity mismatch"):
+                self.module.main()
+            chmod.assert_not_called()
+            execute.assert_not_called()
+
+    def test_nonregular_symlink_and_hardlinked_targets_are_refused(self):
+        target = self.package / "native-replicator-oracle"
+        for kind in ("directory", "fifo", "symlink", "hardlink"):
+            target.unlink()
+            unrelated = self.root / ("unrelated-" + kind)
+            unrelated.write_bytes(executable(target.name))
+            if kind == "directory":
+                target.mkdir()
+            elif kind == "fifo":
+                os.mkfifo(target)
+            elif kind == "symlink":
+                target.symlink_to(unrelated)
+            else:
+                os.link(unrelated, target)
+            before = unrelated.stat().st_mode
+            with self.subTest(kind=kind), patch.dict(os.environ, self.environment(), clear=True), \
+                 patch.object(os, "fchmod") as chmod, patch.object(os, "execve") as execute:
+                with self.assertRaises((SystemExit, OSError)):
+                    self.module.main()
+                chmod.assert_not_called()
+                execute.assert_not_called()
+            self.assertEqual(unrelated.stat().st_mode, before)
+            if kind == "directory":
+                target.rmdir()
+            else:
+                target.unlink()
+            target.write_bytes(executable(target.name))
+
+    def test_foreign_file_owner_is_refused_before_hash_or_mode_installation(self):
+        original = os.fstat
+        def foreign(fd):
+            value = original(fd)
+            if not __import__("stat").S_ISREG(value.st_mode):
+                return value
+            return types.SimpleNamespace(st_mode=value.st_mode, st_uid=os.getuid() + 1)
+        with patch.dict(os.environ, self.environment(), clear=True), \
+             patch.object(os, "fstat", side_effect=foreign), \
+             patch.object(os, "fchmod") as chmod, patch.object(os, "execve") as execute:
+            with self.assertRaisesRegex(SystemExit, "owned regular"):
+                self.module.main()
+            chmod.assert_not_called()
+            execute.assert_not_called()
+
+    def test_already_executable_file_is_not_chmodded_and_unbound_hash_is_rejected(self):
+        target = self.package / "native-replicator-oracle"
+        target.chmod(0o754)
+        with patch.dict(os.environ, self.environment(), clear=True), \
+             patch.object(os, "fchmod") as chmod, patch.object(os, "execve") as execute:
+            self.module.main()
+            chmod.assert_not_called()
+            execute.assert_called_once()
+            execute.reset_mock()
+            self.module.EXPECTED_SHA256[target.name] = "@unbuilt:sha256@"
+            with self.assertRaisesRegex(SystemExit, "no strict prebuilt"):
+                self.module.main()
+            execute.assert_not_called()
+
+    def test_unrelated_activation_directory_is_refused(self):
+        for field, value in (("Fabric_Folder_App_Work", "/foreign/work"),
+                             ("Fabric_CodePackageName", "Other")):
+            env = self.environment()
+            env[field] = value
+            with patch.dict(os.environ, env, clear=True), patch.object(os, "fchmod") as chmod, \
+                 patch.object(os, "execve") as execute:
+                with self.assertRaisesRegex(SystemExit, "activation-owned"):
+                    self.module.main()
+                chmod.assert_not_called()
+                execute.assert_not_called()
 
 
 def observation(mixed=True, target=3):
@@ -555,7 +660,7 @@ class NativeIdentityTests(unittest.TestCase):
         replica = value["replicas"][0]
         package = {"Name": "Code", "ServiceManifestName": "RustRuntimeService", "Version": "1.1:1",
                    "MainEntryPoint": {"ProcessId": 100, "InstanceId": 77,
-                                      "EntryPointLocation": "/native/deployed/launch-rust.py"}}
+                                      "EntryPointLocation": "/native/deployed/rust-runtime-app"}}
         bundle = MagicMock()
         bundle.binary.return_value = Path("/prebuilt/rust-runtime-app")
         bundle.directory = Path("/prebuilt")
@@ -566,11 +671,11 @@ class NativeIdentityTests(unittest.TestCase):
         with patch.object(data.runtime, "native_read", return_value=[package]), \
              patch.object(data.runtime, "digest", return_value="a" * 64):
             expected = data.process_expected(MagicMock(), bundle, value["service"], replica, False)
-            self.assertEqual(expected["native_entry_point"], "/native/deployed/launch-rust.py")
+            self.assertEqual(expected["native_entry_point"], "/native/deployed/rust-runtime-app")
             self.assertEqual(expected["engine_name"], "rust-runtime-app")
             self.assertEqual(expected["native_entry_point_instance"], 77)
             self.assertEqual(expected["engine_sha256"], "a" * 64)
-            self.assertEqual(expected["launcher_sha256"], "b" * 64)
+            self.assertEqual(expected["launcher_sha256"], "a" * 64)
             package["MainEntryPoint"]["ProcessId"] = 999
             with self.assertRaises(RuntimeError):
                 data.process_expected(MagicMock(), bundle, value["service"], replica, False)

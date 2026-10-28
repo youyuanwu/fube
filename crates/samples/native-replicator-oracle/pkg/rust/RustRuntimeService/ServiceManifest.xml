@@ -12,7 +12,7 @@
   <CodePackage Name="Code" Version="1.1">
     <EntryPoint>
       <ExeHost>
-        <Program>launch-rust.py</Program>
+        <Program>rust-runtime-app</Program>
         <WorkingFolder>CodePackage</WorkingFolder>
         <ConsoleRedirection FileRetentionCount="5" FileMaxSizeInKb="1024" />
       </ExeHost>
