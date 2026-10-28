@@ -917,6 +917,7 @@ struct Owner {
     removals: Vec<Removal>,
     jobs: JoinSet<(Job, Result<JobValue>)>,
     replay_job: bool,
+    replay_next: Instant,
     ack_tx: mpsc::Sender<ApplyAck>,
     replication_tx: Option<mpsc::Sender<Operation>>,
     copy_tx: Option<mpsc::Sender<Operation>>,
@@ -983,6 +984,7 @@ impl Owner {
             removals: Vec::new(),
             jobs: JoinSet::new(),
             replay_job: false,
+            replay_next: Instant::now(),
             ack_tx,
             replication_tx: Some(replication_tx),
             copy_tx: Some(copy_tx),
@@ -1011,7 +1013,12 @@ impl Owner {
                 .map(|control| control.started)
                 .chain(self.apply_deadlines.values().copied())
                 .min()
-                .map(|started| started + self.settings.callback_timeout);
+                .map(|started| started + self.settings.callback_timeout)
+                .into_iter()
+                .chain(
+                    (!self.replay_job && self.prefix_replay_needed()).then_some(self.replay_next),
+                )
+                .min();
             let cancellation = self
                 .control
                 .as_ref()
@@ -2150,20 +2157,7 @@ impl Owner {
 
     fn start_prefix_replay(&mut self) {
         let progress = self.queue.progress();
-        if self.replay_job
-            || self.role != ReplicaRole::Primary
-            || self.control.is_some()
-            || !self.reconciled
-            || progress.assigned <= 0
-            || progress.completed != progress.assigned
-            || self.queue.get(progress.assigned).is_some()
-            || !self.peers.values().any(|peer| {
-                peer.configured
-                    && !peer.cleanup_required
-                    && peer.build.is_none()
-                    && !peer.receipt_seen
-            })
-        {
+        if self.replay_job || Instant::now() < self.replay_next || !self.prefix_replay_needed() {
             return;
         }
         let Ok(charge) = self
@@ -2171,6 +2165,7 @@ impl Owner {
             .budget
             .acquire(maximum_copy_bytes(&self.settings))
         else {
+            self.replay_next = Instant::now() + self.settings.retry;
             return;
         };
         let provider = self.provider.clone();
@@ -2179,6 +2174,7 @@ impl Owner {
         let revision = self.shared.revision.load(Ordering::Acquire);
         let deadline = self.settings.callback_timeout;
         self.replay_job = true;
+        self.replay_next = Instant::now() + self.settings.retry;
         self.jobs.spawn(async move {
             let result = timeout(
                 deadline,
@@ -2196,6 +2192,22 @@ impl Owner {
                 result,
             )
         });
+    }
+
+    fn prefix_replay_needed(&self) -> bool {
+        let progress = self.queue.progress();
+        self.role == ReplicaRole::Primary
+            && self.control.is_none()
+            && self.reconciled
+            && progress.assigned > 0
+            && progress.completed == progress.assigned
+            && self.queue.get(progress.assigned).is_none()
+            && self.peers.values().any(|peer| {
+                peer.configured
+                    && !peer.cleanup_required
+                    && peer.build.is_none()
+                    && !peer.receipt_seen
+            })
     }
 
     fn send_copies(&mut self) {
@@ -3191,6 +3203,10 @@ impl Owner {
                 epoch,
             } => {
                 self.replay_job = false;
+                // Completion (including None or failed transport admission)
+                // must leave an uncharged interval for real data admission.
+                // Job events cannot self-rearm ahead of queued peer ACKs.
+                self.replay_next = Instant::now() + self.settings.retry;
                 if self.role != ReplicaRole::Primary
                     || self.control.is_some()
                     || self.epoch != Some(epoch)

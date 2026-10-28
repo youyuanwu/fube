@@ -1494,6 +1494,108 @@ async fn epoch_fenced_submission_rejects_before_assignment_or_checkpoint_restamp
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for_real_admission() {
+    for mode in ["none", "some", "transport_failure"] {
+        let data = Mutation {
+            id: "original".into(),
+            key: "key".into(),
+            value: "value".into(),
+        }
+        .operation_for_epoch(EPOCH)
+        .unwrap();
+        let gate = Arc::new(Semaphore::new(0));
+        let provider = Arc::new(Provider {
+            last: AtomicI64::new(1),
+            checkpoint: Mutex::new(
+                (mode != "none").then_some(ReplayOperation { epoch: EPOCH, data }),
+            ),
+            checkpoint_gate: Mutex::new((mode == "transport_failure").then(|| gate.clone())),
+            ..Provider::default()
+        });
+        let partition = Uuid::new_v4();
+        let p = engine_with_settings(
+            partition,
+            1,
+            provider.clone(),
+            Settings {
+                queue_operations: 1,
+                retry: std::time::Duration::from_secs(1),
+                ..Settings::default()
+            },
+        );
+        initial_primary(&p).await;
+        let (network, mut incoming) =
+            PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+        let remote = endpoint(&network, partition, 2);
+        let mut peer = descriptor(&p);
+        peer.replica_id = 2;
+        peer.address = remote.to_string();
+        p.update_current_configuration(configuration(vec![peer], true, 2), cancel())
+            .await
+            .unwrap();
+        until(|| provider.checkpoint_calls.load(Ordering::Acquire) == 1).await;
+        if mode == "transport_failure" {
+            p.transport.unregister_peer(&remote.actor).unwrap();
+            gate.add_permits(1);
+        }
+        if mode == "some" {
+            assert!(matches!(
+                timeout(std::time::Duration::from_secs(1), incoming.data.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .body,
+                Body::Replication { .. }
+            ));
+        }
+        until(|| p.snapshot().owned_operations == 0).await;
+        let disposed_at = Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            provider.checkpoint_calls.load(Ordering::Acquire),
+            1,
+            "callback completion, None and transport-full must not bypass retry pacing"
+        );
+        assert_eq!(p.snapshot().progress.assigned, 1);
+        assert!(timeout(
+            std::time::Duration::from_millis(30),
+            p.wait_for_catch_up(CatchUpMode::All, cancel())
+        )
+        .await
+        .is_err());
+        *provider.checkpoint_gate.lock().unwrap() = None;
+        timeout(std::time::Duration::from_millis(1500), async {
+            until(|| provider.checkpoint_calls.load(Ordering::Acquire) == 2).await;
+        })
+        .await
+        .unwrap();
+        assert!(disposed_at.elapsed() >= std::time::Duration::from_millis(950));
+        until(|| p.snapshot().owned_operations == 0).await;
+        let next = Mutation {
+            id: "next".into(),
+            key: "key".into(),
+            value: "next".into(),
+        }
+        .operation_for_epoch(EPOCH)
+        .unwrap();
+        let write = timeout(
+            std::time::Duration::from_millis(100),
+            p.submit_in_epoch(EPOCH, next, cancel()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            write.sequence, 2,
+            "replay cannot permanently monopolize the sole operation slot"
+        );
+        assert_eq!(provider.checkpoint_calls.load(Ordering::Acquire), 2);
+        p.abort();
+        network.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adopted_copy_retirement_does_not_pin_completed_writes_as_idle_history() {
     let partition = Uuid::new_v4();
     let pp = MemoryProvider::new();
@@ -2057,9 +2159,35 @@ struct Provider {
     epochs: Mutex<Vec<(Epoch, i64)>>,
     horizons: Mutex<Vec<i64>>,
     epoch_delay: std::time::Duration,
+    checkpoint_calls: AtomicUsize,
+    checkpoint: Mutex<Option<ReplayOperation>>,
+    checkpoint_gate: Mutex<Option<Arc<Semaphore>>>,
 }
 
 impl StateProvider for Provider {
+    fn replication_checkpoint(
+        &self,
+        _: i64,
+        cancellation: Cancellation,
+    ) -> ServiceFuture<'_, Option<ReplayOperation>> {
+        self.checkpoint_calls.fetch_add(1, Ordering::AcqRel);
+        let value = self.checkpoint.lock().unwrap().clone();
+        let gate = self.checkpoint_gate.lock().unwrap().clone();
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(Error::Closed),
+                    permit = gate.acquire() => permit.map_err(|_| Error::Closed)?.forget(),
+                }
+            }
+            if cancellation.is_cancelled() {
+                Err(Error::Closed)
+            } else {
+                Ok(value)
+            }
+        })
+    }
     fn last_committed(&self) -> Result<i64> {
         Ok(self.last.load(Ordering::Acquire))
     }
