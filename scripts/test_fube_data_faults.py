@@ -606,6 +606,7 @@ class AuxiliaryOwnershipModels(unittest.TestCase):
         for profile, mixed, nodes, target, aux_mixed in (
                 ("mixed", True, data.MIXED_NODES, 3, True),
                 ("full", True, ("N0020", "N0040", "N0050"), 3, False),
+                ("native-data", True, ("N0020", "N0040", "N0050"), 3, False),
                 ("rust", False, tuple(data.NODE_ENGINES), 3, False)):
             qualification, original = self.qualification(mixed, profile)
             evidence = {}

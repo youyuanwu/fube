@@ -867,7 +867,7 @@ def inspect_process(allocation, expected: dict, action: str = "inspect") -> dict
 
 
 def required_scenarios(profile: str) -> tuple[str, ...]:
-    require(profile in {"rust", "mixed", "full"}, "unknown qualification profile")
+    require(profile in {"rust", "mixed", "full", "native-data"}, "unknown qualification profile")
     return COMMON_SCENARIOS + (MIXED_SCENARIOS if profile != "rust" else ()) + (
         ("legacy_full",) if profile == "full" else ())
 
@@ -2192,7 +2192,9 @@ class Qualification:
         require(not any(item["name"] == service for item in runtime.items(self.allocation.sf(
             "service", "list", "--application-id", self.result["application"].removeprefix("fabric:/")))),
             "minted auxiliary service collision; no adoption")
-        auxiliary_mixed = self.mixed and self.result.get("profile") != "full"
+        # CI may dispatch the complete full-data chain separately from hardened
+        # legacy. It must retain full's auxiliary topology, not mixed's variant.
+        auxiliary_mixed = self.mixed and self.result.get("profile") not in {"full", "native-data"}
         nodes = (MIXED_NODES if auxiliary_mixed else
                  tuple(node for node, kind in NODE_ENGINES.items() if kind == "rust") if self.mixed else tuple(NODE_ENGINES))
         auxiliary = {"service": service, "partition": None, "changed": changed,
@@ -3986,14 +3988,16 @@ def main() -> None:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--build-bundle", type=Path, help="upstream-only, NEW directory, clean source")
     mode.add_argument("--prebuilt", type=Path, help="strict bundle; no Cargo or compiler fallback")
-    parser.add_argument("--profile", choices=["rust", "mixed", "full"])
+    parser.add_argument("--profile", choices=["rust", "mixed", "full", "native-data"])
     parser.add_argument("--existing-owner", help="exact caller-owned allocation capability; retain allocation")
     parser.add_argument("--report", type=Path, help="NEW evidence file, never overwrite")
+    parser.add_argument("--summary", action="store_true",
+                        help="print bounded status only; retain complete structured evidence in --report")
     args = parser.parse_args()
     if sys.platform != "linux" or os.uname().machine != "x86_64":
         parser.error("data/native qualification requires Linux x86-64")
     if args.build_bundle is not None:
-        if args.name or args.existing_owner or args.profile or args.report:
+        if args.name or args.existing_owner or args.profile or args.report or args.summary:
             parser.error("--build-bundle is not qualification; do not combine options")
         build_bundle(args.build_bundle)
         print(json.dumps({"status": "BUILT", "bundle": str(args.build_bundle)}))
@@ -4050,7 +4054,11 @@ def main() -> None:
                 result["status"] = "FAIL"
             finally:
                 report_file.close()
-    print(json.dumps(result, indent=2))
+    console = ({"status": result["status"], "profile": result["profile"], "report": str(args.report),
+                "error_count": len(result["errors"]), "missing_or_failed": result["missing_or_failed"],
+                "scenarios": {name: item["status"] for name, item in result["scenarios"].items()}}
+               if args.summary else result)
+    print(json.dumps(console, indent=2))
     if result["status"] != "PASS":
         raise SystemExit(1)
 

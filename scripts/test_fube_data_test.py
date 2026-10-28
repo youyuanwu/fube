@@ -14,6 +14,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import types
@@ -3348,23 +3349,70 @@ os.read(0,16)
 
 
 class ReportingTests(unittest.TestCase):
-    def test_native_ci_executes_rust_only_and_full_profiles_from_strict_prebuilt_inputs(self):
+    @unittest.skipUnless(sys.platform == "linux", "activated qualification CLI is Linux-only")
+    def test_summary_console_retains_complete_report_without_allocating_or_weakening_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            result = {"profile": "rust", "errors": [], "cleanup": {}, "large_evidence": "X" * 100000,
+                      "scenarios": {name: {"status": "PASS"} for name in data.required_scenarios("rust")}}
+            stdout = io.StringIO()
+            with patch.object(sys, "argv", ["fube_data_test", "summary-model", "--prebuilt", directory,
+                    "--existing-owner", "a" * 32, "--profile", "rust", "--report", str(report), "--summary"]), \
+                 patch.object(data, "load_bundle"), patch.object(data.runtime, "Allocation"), \
+                 patch.object(data, "qualify", return_value=result), \
+                 patch.object(data.runtime, "create_owned") as create, \
+                 patch.object(data.runtime, "destroy_owned") as destroy, contextlib.redirect_stdout(stdout):
+                data.main()
+            self.assertEqual(json.loads(report.read_text())["large_evidence"], "X" * 100000)
+            self.assertEqual(json.loads(stdout.getvalue())["status"], "PASS")
+            self.assertNotIn("large_evidence", stdout.getvalue())
+            self.assertLess(len(stdout.getvalue()), 4000)
+            create.assert_not_called()
+            destroy.assert_not_called()
+
+    def test_native_data_is_truthfully_partial_without_changing_full_or_mixed_inventories(self):
+        names = data.required_scenarios("native-data")
+        self.assertEqual(len(names), 17)
+        self.assertEqual(names, data.required_scenarios("mixed"))
+        self.assertNotIn("legacy_full", names)
+        self.assertEqual(data.required_scenarios("full"), names + ("legacy_full",))
+        value = {"profile": "native-data", "errors": [], "scenarios": {
+            name: {"status": "PASS"} for name in names}}
+        self.assertEqual(data.finalize(value)["status"], "PASS")
+        value["profile"] = "full"
+        self.assertEqual(data.finalize(value)["status"], "FAIL")
+        self.assertEqual(value["missing_or_failed"], ["legacy_full"])
+
+    def test_native_ci_executes_two_whole_profiles_and_hardened_legacy_with_strict_aggregate(self):
         workflow = (data.ROOT / ".github/workflows/ci.yaml").read_text()
-        step = workflow.split("id: native_data", 1)[1].split(
-            "- name: Upload successful combined", 1)[0]
-        self.assertLess(step.index("--profile rust"), step.index("--profile full"))
-        self.assertEqual(step.count('--prebuilt "$RUNNER_TEMP/fube-data-binaries"'), 2)
-        self.assertNotIn("cargo ", step)
-        self.assertNotIn("rustc ", step)
-        self.assertIn("fube-data-rust-report.json", workflow)
-        self.assertIn("fube-data-report.json", workflow)
+        def step(identifier):
+            return workflow.split("id: " + identifier + "\n", 1)[1].split("\n    - ", 1)[0]
+        self.assertIn("fail-fast: false", workflow)
+        for identifier, flag, report in (("rust_data", "--profile rust", "rust-report.json"),
+                                         ("native_data", "--profile native-data", "native-data-report.json"),
+                                         ("legacy", "scripts/onebox_ci.py legacy", "legacy-report.json")):
+            block = step(identifier)
+            self.assertIn(flag, block)
+            self.assertIn(report, block)
+            self.assertIn('--prebuilt "$RUNNER_TEMP/fube-data-binaries"', block)
+            self.assertIn("if: always()", block)
+            self.assertIn("steps.validate_inputs.outcome == 'success'", block)
+            self.assertIn("steps.create_cluster.outcome == 'success'", block)
+            self.assertNotIn("cargo ", block)
+            self.assertNotIn("rustc ", block)
+        self.assertIn("name: Linux onebox native client", workflow)
+        self.assertIn("needs: [rust-native-client-linux, onebox-workers]", workflow)
+        self.assertIn("scripts/onebox_ci.py aggregate", workflow)
+        self.assertIn("scripts/onebox_ci.py cleanup", workflow)
+        self.assertLess(workflow.index("id: destroy"), workflow.index("name: Upload this worker"))
+        self.assertNotIn("continue-on-error", workflow)
 
     def result(self, profile):
         return {"profile": profile, "status": "FAIL", "errors": [],
                 "scenarios": {name: {"status": "PASS"} for name in data.required_scenarios(profile)}}
 
     def test_pass_requires_every_required_scenario_not_skips_errors_or_omissions(self):
-        for profile in ("rust", "mixed", "full"):
+        for profile in ("rust", "mixed", "full", "native-data"):
             self.assertEqual(data.finalize(self.result(profile))["status"], "PASS")
             for name in data.required_scenarios(profile):
                 for status in ("MISSING", "FAIL", "SKIPPED", "PASS_SOURCE_ONLY"):

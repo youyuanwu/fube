@@ -24,6 +24,10 @@ jobs:
       contents: read
     outputs:
       nextest-version: ${{ env.NEXTEST_VERSION }}
+    env:
+      FUBE_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+      FUBE_CI_MERGE: ${{ github.event_name == 'pull_request' && github.sha || '' }}
+      FUBE_CI_RUN_ID: ${{ github.run_id }}
     defaults:
       run:
         shell: bash
@@ -121,4 +125,22 @@ jobs:
         if-no-files-found: error
         compression-level: 0
         overwrite: true
+        retention-days: 7
+
+    - name: Bind exact current-attempt compiler-free inputs
+      if: runner.os == 'Linux'
+      run: |
+        python3 scripts/onebox_ci.py produce \
+          --bundle-tar "$RUNNER_TEMP/fube-data-binaries.tar" \
+          --bundle-dir "$RUNNER_TEMP/fube-data-binaries" \
+          --archive "$RUNNER_TEMP/native-client-tests.tar.zst" \
+          --out "$RUNNER_TEMP/onebox-input-receipt.json"
+
+    - name: Upload current-attempt producer receipt
+      if: runner.os == 'Linux'
+      uses: actions/upload-artifact@v7
+      with:
+        name: onebox-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/onebox-input-receipt.json
+        if-no-files-found: error
         retention-days: 7
