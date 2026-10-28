@@ -1314,6 +1314,8 @@ class Qualification:
         first_build = None
         started = time.monotonic()
         begin_writes = threading.Event()
+        move_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1) if move_during_copy else None
+        move_request = None
         try:
             # Use surplus writes so at least 100 completed writes can be proven
             # inside the independently observed build/horizon interval.
@@ -1339,19 +1341,22 @@ class Qualification:
                         evidence["first_in_build"] = first_build
                         if not cancel:
                             begin_writes.set()
-                    if first_build is not None and not action_done:
+                    if first_build is not None and not action_done and move_request is None:
                         if move_during_copy:
                             # The destination is an existing ready secondary, never the unfinished build.
                             eligible = [r for r in value["replicas"] if r["role"] == "ActiveSecondary"
                                         and r["status"] == "Ready"]
                             require(bool(eligible), "no ready secondary for an interrupted-copy epoch transition")
-                            evidence["interrupt_move"] = strict_json(runtime.run(
+                            move_request = move_pool.submit(runtime.run,
                                 str(self.bundle.observer), "127.0.0.1:19000", self.service,
-                                "--move-primary", eligible[0]["node"], timeout=75))
+                                "--move-primary", eligible[0]["node"], timeout=75)
                         else:
                             self.remove(value, first_build)
                             evidence["cancelled_native_departure"] = runtime.wait_native_replica_absent(
                                 self.bundle.observer, self.service, first_build["node"], first_build["replica"])
+                            action_done = True
+                    if move_request is not None and move_request.done() and not action_done:
+                        evidence["interrupt_move"] = strict_json(move_request.result())
                         action_done = True
                     if cancel and action_done and first_build is not None and any(
                             (replica["node"], replica["replica"]) !=
@@ -1401,6 +1406,8 @@ class Qualification:
             require(any(sum(sequence > horizon["copy_horizon"] for sequence in writes["sequences"]) >= 100
                         for horizon in live["horizons"]), "fewer than 100 writes beyond the pinned copy horizon")
         finally:
+            if move_pool is not None:
+                move_pool.shutdown(wait=True, cancel_futures=True)
             evidence["hook_cleanup"] = self.reset_hooks([(source, "copy_delay_ms") for source in copy_sources])
 
     def apply_ack_delay(self, evidence: dict) -> None:
