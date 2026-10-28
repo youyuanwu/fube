@@ -737,9 +737,20 @@ class NativeIdentityTests(unittest.TestCase):
             self.assertEqual(expected["native_entry_point_instance"], 77)
             self.assertEqual(expected["engine_sha256"], "a" * 64)
             self.assertEqual(expected["launcher_sha256"], "a" * 64)
+            package["MainEntryPoint"]["ProcessId"] = "100"
+            self.assertEqual(data.process_expected(
+                MagicMock(), bundle, value["service"], replica, False)["native_pid"], 100)
             package["MainEntryPoint"]["ProcessId"] = 999
             with self.assertRaises(RuntimeError):
                 data.process_expected(MagicMock(), bundle, value["service"], replica, False)
+
+    def test_native_rest_pid_normalization_preserves_strict_identity(self):
+        for value in (1, 100, 2**31 - 1, "1", "100", str(2**31 - 1)):
+            self.assertEqual(data.native_process_id(value), int(value))
+        for value in (None, True, False, 0, -1, 2**31, "0", "-1", "+1", " 1", "1 ",
+                      "01", "1.0", "1\n", str(2**31), "9" * 100):
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                data.native_process_id(value)
 
 
 class WorkloadTests(unittest.TestCase):

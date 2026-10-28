@@ -817,6 +817,15 @@ finally:
 """
 
 
+def native_process_id(value) -> int:
+    # Native REST represents its INT64 ProcessId as a decimal JSON string.
+    require(type(value) is int or (type(value) is str
+            and re.fullmatch(r"[1-9][0-9]{0,9}", value)), "invalid native process ID")
+    number = int(value)
+    require(0 < number <= 2**31 - 1, "invalid native process ID")
+    return number
+
+
 def process_expected(allocation, bundle: Bundle, service: str, replica: dict, mixed: bool) -> dict:
     node, rpc = replica["node"], replica["rpc"]
     sid = service.rsplit("/", 1)[0].removeprefix("fabric:/").replace("/", "~")
@@ -826,7 +835,7 @@ def process_expected(allocation, bundle: Bundle, service: str, replica: dict, mi
     packages = query if isinstance(query, list) else query["Items"]
     matches = [item for item in packages if item["Name"] == "Code"
                and item["ServiceManifestName"] == "RustRuntimeService"
-               and item["MainEntryPoint"]["ProcessId"] == rpc["pid"]]
+               and native_process_id(item["MainEntryPoint"]["ProcessId"]) == rpc["pid"]]
     require(len(matches) == 1 and replica["deployed"]["host_process_id"] == rpc["pid"],
             "independent native code package/PID identity mismatch")
     package_info = matches[0]
