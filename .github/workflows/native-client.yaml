@@ -19,7 +19,7 @@ jobs:
   rust-native-client:
     name: Native-free Rust client
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 15
+    timeout-minutes: ${{ inputs.os == 'ubuntu-24.04' && 30 || 15 }}
     permissions:
       contents: read
     outputs:
@@ -48,22 +48,33 @@ jobs:
     - name: Check native app fixture
       run: cargo check --locked -p stateless-test-app
 
-    - name: Test Linux Rust runtime models
+    - name: Test Linux Rust runtime, data and native oracle models
       if: runner.os == 'Linux'
       run: |
-        cargo test --locked -p mssf-runtime -p rust-runtime-app
-        cargo clippy --locked -p mssf-runtime -p rust-runtime-app --all-targets -- -D warnings
-        RUSTDOCFLAGS='-D warnings' cargo doc --locked -p mssf-runtime --no-deps
+        cargo test --locked -p mssf-runtime -p fube-data -p rust-runtime-app -p native-replicator-oracle
+        cargo clippy --locked -p mssf-runtime -p fube-data -p rust-runtime-app -p native-replicator-oracle --all-targets -- -D warnings
+        RUSTDOCFLAGS='-D warnings' cargo doc --locked -p mssf-runtime -p fube-data -p rust-runtime-app -p native-replicator-oracle --no-deps
 
     - uses: actions/setup-python@v7
       with:
         python-version: "3.12"
 
-    - name: Build and archive Rust runtime binaries
+    - name: Build and archive strict data and legacy runtime bundles
       if: runner.os == 'Linux'
       run: |
-        python3 scripts/rust_runtime_test.py --build-bundle "$RUNNER_TEMP/rust-runtime-binaries"
-        tar -cf "$RUNNER_TEMP/rust-runtime-binaries.tar" -C "$RUNNER_TEMP/rust-runtime-binaries" .
+        python3 scripts/fube_data_test.py --build-bundle "$RUNNER_TEMP/fube-data-binaries"
+        tar -cf "$RUNNER_TEMP/fube-data-binaries.tar" -C "$RUNNER_TEMP/fube-data-binaries" .
+        # Preserve the v3 artifact contract without rebuilding its app/observer.
+        tar -cf "$RUNNER_TEMP/rust-runtime-binaries.tar" -C "$RUNNER_TEMP/fube-data-binaries/legacy" .
+
+    - name: Upload strict data binary bundle
+      if: runner.os == 'Linux'
+      uses: actions/upload-artifact@v7
+      with:
+        name: fube-data-binaries
+        path: ${{ runner.temp }}/fube-data-binaries.tar
+        if-no-files-found: error
+        retention-days: 7
 
     - name: Upload Rust runtime binary bundle
       if: runner.os == 'Linux'

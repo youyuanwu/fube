@@ -17,6 +17,85 @@ const NEXT_EPOCH: Epoch = Epoch {
     configuration: 0x2_0000_0000,
 };
 
+#[cfg(feature = "qualification")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete_traffic() {
+    let partition = Uuid::new_v4();
+    let pp = Arc::new(Provider::default());
+    let sp = Arc::new(Provider::default());
+    let primary = engine(partition, 1, pp.clone());
+    let secondary = engine(partition, 2, sp.clone());
+    primary
+        .change_role(EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    primary
+        .update_current_configuration(configuration(vec![], true, 1), cancel())
+        .await
+        .unwrap();
+    secondary
+        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .await
+        .unwrap();
+    primary
+        .build_replica(descriptor(&secondary), cancel())
+        .await
+        .unwrap();
+    secondary
+        .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+        .await
+        .unwrap();
+    let mut member = descriptor(&secondary);
+    member.role = ReplicaRole::Secondary;
+    member.ready = true;
+    primary
+        .update_current_configuration(configuration(vec![member], true, 2), cancel())
+        .await
+        .unwrap();
+    let before = primary.snapshot();
+    for kind in ["stale_epoch", "wrong_sender", "wrong_target"] {
+        let receipt = primary.qualification_probe(kind, Some(2)).await.unwrap();
+        assert_eq!(receipt["kind"], kind);
+        assert_eq!(receipt["admission_only"], true);
+    }
+    for kind in ["stale_copy_ack", "wrong_sender", "wrong_target"] {
+        secondary.qualification_probe(kind, Some(1)).await.unwrap();
+    }
+    assert!(primary
+        .qualification_probe("arbitrary", None)
+        .await
+        .is_err());
+    assert!(primary
+        .qualification_probe("stale_epoch", Some(99))
+        .await
+        .is_err());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(primary.snapshot().progress, before.progress);
+    assert_eq!(primary.snapshot().peers.len(), before.peers.len());
+    assert_eq!(secondary.snapshot().progress.received, 0);
+    assert!(primary.snapshot().fault.is_none());
+    assert!(secondary.snapshot().fault.is_none());
+    let mut write = primary
+        .submit(OperationData::new(vec![vec![1]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    assert_eq!(write.sequence, 1);
+    pp.last.store(1, Ordering::Release);
+    let operation = secondary
+        .replication_stream()
+        .next(cancel())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.sequence, 1);
+    sp.last.store(1, Ordering::Release);
+    operation.acknowledge().unwrap();
+    drop(operation);
+    assert_eq!(write.wait(cancel()).await.unwrap(), 1);
+    primary.abort();
+    secondary.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
     let partition = Uuid::new_v4();
@@ -40,6 +119,10 @@ async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
         .build_replica(descriptor(&target), cancel())
         .await
         .unwrap();
+    let started = std::time::Instant::now();
+    let written_before = primary.transport.diagnostics()["events"]["written_data"][0]
+        .as_u64()
+        .unwrap_or(0);
     for sequence in 1..=100 {
         let mut accepted = primary
             .submit(OperationData::new(vec![vec![1]]).unwrap(), cancel())
@@ -52,7 +135,15 @@ async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
             target.replication_stream().next(cancel()),
         )
         .await
-        .unwrap()
+        .unwrap_or_else(|_| {
+            panic!(
+                "idle handoff stalled at {sequence}: primary={:?}; target={:?}; pnet={}; tnet={}",
+                primary.snapshot(),
+                target.snapshot(),
+                primary.transport.diagnostics(),
+                target.transport.diagnostics()
+            )
+        })
         .unwrap()
         .unwrap();
         assert_eq!(operation.sequence, sequence);
@@ -64,6 +155,18 @@ async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
         drop(operation);
         until(|| primary.snapshot().peers[0].applied == sequence).await;
     }
+    let written_after = primary.transport.diagnostics()["events"]["written_data"][0]
+        .as_u64()
+        .unwrap_or(0);
+    // At most one outstanding operation here. Legitimate timer retries scale
+    // with elapsed time, not with the count of duplicate cumulative receipts.
+    let retry_allowance =
+        8 * (1 + started.elapsed().as_millis() / Settings::default().retry.as_millis());
+    assert!(
+        (written_after - written_before) as u128 <= 100 + retry_allowance,
+        "duplicate receipts amplified data: {}",
+        primary.transport.diagnostics()
+    );
     let mut member = descriptor(&target);
     member.role = ReplicaRole::Secondary;
     member.ready = true;

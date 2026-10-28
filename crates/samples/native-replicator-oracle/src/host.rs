@@ -900,6 +900,7 @@ impl IFabricStatefulServiceReplica_Impl for Replica_Impl {
 enum Request {
     Read,
     Diagnostics,
+    DataLoss(i64),
     Write(Mutation),
     Test { copy: bool, delay: u64 },
 }
@@ -948,6 +949,15 @@ fn parse(operation: &str, query: &str) -> std::result::Result<Request, &'static 
             Ok(Request::Write(mutation))
         }
         "test" if parameters.len() == 1 => {
+            if let Some(value) = parameters.get("data_loss_boundary") {
+                let boundary = value
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|n| *n >= 0)
+                    .filter(|_| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+                    .ok_or("invalid data loss qualification boundary")?;
+                return Ok(Request::DataLoss(boundary));
+            }
             let copy = parameters.contains_key("copy_delay_ms");
             let name = if copy {
                 "copy_delay_ms"
@@ -1061,6 +1071,22 @@ impl Host {
                 .await,
             };
         match request {
+            Request::DataLoss(boundary) => {
+                route.access()?;
+                route
+                    .app
+                    .provider
+                    .request_data_loss(boundary)
+                    .map_err(application_error)?;
+                response(
+                    &mut stream,
+                    200,
+                    json!({"qualification_only":true,
+                    "data_loss_boundary":boundary,"armed_only":true,
+                    "note":"Only a later native OnDataLoss callback may change provider state."}),
+                )
+                .await
+            }
             Request::Write(mutation) => {
                 let (status, body) = route.write(mutation).await;
                 response(&mut stream, status, body).await

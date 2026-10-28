@@ -256,6 +256,9 @@ fn query_decodes_strict_utf8_and_rejects_malformed_unknown_and_bounded_requests(
         ("test", "copy_delay_ms=101"),
         ("test", "copy_delay_ms=-1"),
         ("test", "copy_delay_ms=1&ack_delay_ms=1"),
+        ("test", "wire_probe=arbitrary"),
+        ("test", "wire_probe=stale_epoch&ack_delay_ms=0"),
+        ("test", "data_loss_boundary=-1"),
     ] {
         assert!(parse(operation, query).is_err(), "{operation}?{query}");
     }
@@ -270,6 +273,14 @@ fn query_decodes_strict_utf8_and_rejects_malformed_unknown_and_bounded_requests(
     assert!(matches!(
         parse("test", "copy_delay_ms=100").unwrap(),
         Request::CopyTest(100)
+    ));
+    assert!(matches!(
+        parse("test", "wire_probe=stale_epoch").unwrap(),
+        Request::WireProbe(_)
+    ));
+    assert!(matches!(
+        parse("test", "data_loss_boundary=5").unwrap(),
+        Request::DataLoss(5)
     ));
     assert!(parse("write", &format!("id={}&key=k&value=x", "x".repeat(129))).is_err());
     assert!(parse("write", &format!("id=a&key={}&value=x", "x".repeat(1025))).is_err());

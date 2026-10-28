@@ -5,6 +5,10 @@ edition = "2021"
 license = "MIT"
 description = "Owned volatile Service Fabric classic V1 replication engine"
 
+[features]
+# Outbound negative-path fixtures, never membership/role setters.
+qualification = []
+
 [dependencies]
 mssf-runtime.workspace = true
 mssf-transport.workspace = true

@@ -31,6 +31,7 @@ GRAPHS = {
     "native-replicator-oracle": "native-replicator-oracle\n mssf-core v0.10.0\n mssf-com v0.10.0\n fube-data",
 }
 DYNAMIC = "\nDynamic section:\n (NEEDED) Shared library: [libc.so.6]\n"
+LEGACY_PKG = data.ROOT / "crates/samples/rust-runtime-app/pkg"
 
 
 def executable(name):
@@ -73,8 +74,12 @@ class ProjectFiles(unittest.TestCase):
             for name in data.runtime.PACKAGE_FILES:
                 path = directory / f"package-v{version}" / name
                 path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(data.PKG / "rust" / name, path)
+                shutil.copyfile(LEGACY_PKG / name, path)
                 path.chmod(0o644)
+            if version == 2:
+                data.runtime.upgrade_template(directory / "package-v2")
+            for name in data.runtime.PACKAGE_FILES:
+                path = directory / f"package-v{version}" / name
                 hashes[f"package-v{version}/{name}"] = data.runtime.digest(path)
         manifest = directory / "build-info.json"
         manifest.write_text(json.dumps({
@@ -206,6 +211,33 @@ class BundleTests(ProjectFiles):
             self.mutate(directory, lambda metadata: metadata["dependency_graphs"].update({name: graph}))
             with self.assertRaises(RuntimeError):
                 data.load_bundle(directory)
+
+    def test_prepopulated_legacy_owners_fail_before_allocation_even_with_consistent_nested_hashes(self):
+        for number, parameter in ((1, "FubeDataTypeCapability"), (2, "FubeDataCreationCapability")):
+            with self.subTest(version=number, parameter=parameter):
+                directory = self.bundle(f"legacy-owner-{number}")
+                relative = f"package-v{number}/ApplicationManifest.xml"
+                path = directory / "legacy" / relative
+                manifest = ET.parse(path)
+                parameters = ET.Element(f"{{{data.runtime.NS}}}Parameters")
+                ET.SubElement(parameters, f"{{{data.runtime.NS}}}Parameter", Name=parameter,
+                              DefaultValue="a" * 64)
+                manifest.getroot().insert(0, parameters)
+                manifest.write(path, encoding="utf-8", xml_declaration=True)
+                metadata_path = directory / "legacy/build-info.json"
+                metadata = json.loads(metadata_path.read_text())
+                metadata["sha256"][relative] = data.runtime.digest(path)
+                metadata_path.write_text(json.dumps(metadata))
+                self.mutate(directory, lambda value: value["artifacts"]["legacy/" + relative].update(
+                    sha256=data.runtime.digest(path)))
+                self.mutate(directory, lambda value: value["artifacts"]["legacy/build-info.json"].update(
+                    sha256=data.runtime.digest(metadata_path)))
+                with patch.object(data.runtime, "create_owned") as create, \
+                     patch.object(data.runtime, "Allocation") as allocation:
+                    result = self.cli(directory, report=f"legacy-owner-{number}.json")
+                create.assert_not_called()
+                allocation.assert_not_called()
+                self.assertIn("legacy bundle ownership parameters must be absent or empty", result["errors"][0])
 
     def test_extra_missing_symlink_fifo_tamper_and_modes_are_rejected(self):
         for case in ("extra-file", "extra-dir", "missing", "symlink", "fifo", "tamper",
@@ -975,8 +1007,8 @@ class OwnershipTests(ProjectFiles):
              patch.object(data.Qualification, "run", side_effect=run), \
              patch.object(data.runtime, "cleanup_deployment", side_effect=AssertionError(
                  "name/attempt-only shared cleanup must not run")), \
-             patch.object(data.runtime, "qualify", side_effect=AssertionError(
-                 "legacy runner must not bypass owned deployment cleanup")), \
+             patch.object(data.runtime, "qualify", side_effect=RuntimeError(
+                 "modeled preserved legacy runtime failure")) as legacy, \
              patch.object(data.runtime, "wait_condition", side_effect=wait), \
              patch.object(data, "transfer_upload", side_effect=(
                  copy_error if stage == "copy" else None),
@@ -986,6 +1018,7 @@ class OwnershipTests(ProjectFiles):
         allocation.reservation = reserve
         allocation.upload = upload
         allocation.copy = copy
+        allocation.legacy = legacy
         return result, present, allocation
 
     def test_accepted_timeouts_without_original_native_identity_retain_instead_of_adopting(self):
@@ -1087,15 +1120,310 @@ class OwnershipTests(ProjectFiles):
         self.assertFalse(any(call.args[:2] in {("application", "delete"), ("application", "unprovision")}
                              for call in allocation.sf.call_args_list))
 
-    def test_full_explicitly_fails_legacy_gate_rather_than_using_unsafe_shared_cleanup(self):
-        result, _, _ = self.deployment(profile="full")
-        self.assertEqual(result["scenarios"]["legacy_full"]["status"], "MISSING")
-        self.assertIn("original-resource ownership proofs", result["scenarios"]["legacy_full"]["reason"])
-        self.assertTrue(any("legacy_full not executed" in error for error in result["errors"]))
+    def test_full_records_legacy_runner_failure_without_using_unsafe_shared_cleanup(self):
+        result, _, allocation = self.deployment(profile="full")
+        self.assertEqual(result["scenarios"]["legacy_full"]["status"], "FAIL")
+        self.assertIn("modeled preserved legacy runtime failure", result["scenarios"]["legacy_full"]["error"])
+        self.assertTrue(any("legacy_full:" in error for error in result["errors"]))
+        allocation.legacy.assert_called_once()
+        self.assertIs(allocation.legacy.call_args.args[0], allocation)
+        self.assertTrue(allocation.legacy.call_args.kwargs["full"])
+        self.assertEqual(allocation.legacy.call_args.kwargs["stateful"], "three")
+        self.assertIsInstance(allocation.legacy.call_args.kwargs["deployment_policy"], data.NativeDataDeploymentPolicy)
         self.assertEqual(result["status"], "FAIL")
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux-only descriptor-relative upload cleanup")
+class LegacyDeploymentTests(ProjectFiles):
+    """Run the real legacy dispatcher/config-upgrade body against modeled native I/O."""
+
+    def run_legacy(self, stage="success"):
+        bundle = data.load_bundle(self.bundle("bundle-" + uuid.uuid4().hex))
+        hashes = {name: data.runtime.digest(bundle.directory / name) for name in data.expected_files()}
+        allocation = MagicMock()
+        allocation.name, allocation.owner, allocation.container_id = "owned", "a" * 32, "original-cid"
+        allocation.verify.return_value = allocation.container_id
+        state = {"application": None, "type_name": None, "version": "1.1", "parameters": {},
+                 "native_id": None, "types": {}, "uploads": {}, "transfers": {}, "calls": []}
+
+        def reserve(owned, run_id):
+            self.assertIs(owned, allocation)
+            self.assertRegex(run_id, r"^[a-f0-9]{32}$")
+            proof = data.UploadOwnership("/var/lib/sf-node/fube-data-" + run_id,
+                allocation.container_id, (1, 2), (1, len(state["uploads"]) + 3),
+                (1, len(state["uploads"]) + 30), run_id * 2)
+            state["uploads"][proof.path] = proof
+            return proof
+
+        def check(owned, proof, action="verify"):
+            self.assertIs(owned, allocation)
+            self.assertEqual(state["uploads"][proof.path], proof)
+            if action == "remove":
+                if stage == "v2-upload-drift" and state["transfers"].get(proof.path, (None,))[0] == "1.2":
+                    raise RuntimeError("original upload directory incarnation changed; retain")
+                del state["uploads"][proof.path]
+
+        def transfer(owned, proof, source):
+            self.assertIs(owned, allocation)
+            text = (source / "ApplicationManifest.xml").read_text()
+            expected = data.manifest_identity(text)
+            state["transfers"][proof.path] = expected.version, text
+            state["type_name"] = expected.name
+            if stage == ("initial-copy" if expected.version == "1.1" else "v2-copy"):
+                error = RuntimeError("partial pinned-FD copy")
+                error.add_note("original upload reservation: " + json.dumps(proof.evidence()))
+                raise error
+            return {"copy_api": "modeled original descriptor-bound upload"}
+
+        def sf(*args, **kwargs):
+            state["calls"].append(args)
+            if args[:2] == ("application", "list"):
+                return json.dumps({"items": [{"name": state["application"]}] if state["application"] else []})
+            if args[:2] == ("application", "type-list"):
+                return json.dumps({"items": [{"name": state["type_name"], "version": version}
+                                             for version in state["types"]]})
+            if args[:2] == ("application", "provision"):
+                path = "/var/lib/sf-node/" + args[args.index("--application-type-build-path") + 1]
+                version, text = state["transfers"][path]
+                state["types"][version] = {"text": text, "generation": (131510254310497004,
+                    23 if version == "1.1" else 24, 25769803776)}
+                prefix = "initial" if version == "1.1" else "v2"
+                if stage == prefix + "-provision-timeout":
+                    raise subprocess.TimeoutExpired("accepted " + prefix + " provision", 1)
+                if stage == prefix + "-provision-rejected":
+                    raise RuntimeError("ApplicationTypeAlreadyExists")
+            elif args[:2] == ("application", "create"):
+                state["application"] = args[args.index("--app-name") + 1]
+                state["parameters"] = json.loads(args[args.index("--parameters") + 1])
+                state["native_id"] = state["type_name"] + "_App1"
+                if stage == "initial-create-timeout":
+                    raise subprocess.TimeoutExpired("accepted create", 1)
+                if stage == "initial-create-rejected":
+                    raise RuntimeError("ApplicationAlreadyExists")
+            elif args[:2] == ("application", "upgrade"):
+                self.assertEqual(json.loads(args[args.index("--parameters") + 1]), state["parameters"])
+                self.assertEqual(args[-2:], ("--mode", "UnmonitoredAuto"))
+                state["version"] = args[args.index("--application-version") + 1]
+                if stage == "upgrade-timeout":
+                    raise subprocess.TimeoutExpired("accepted native upgrade", 1)
+            elif args[:2] == ("application", "upgrade-status"):
+                return '{"upgradeState":"RollingForwardCompleted"}'
+            elif args[:2] == ("application", "delete"):
+                state["application"] = None
+            elif args[:2] == ("application", "unprovision"):
+                del state["types"][args[-1]]
+            else:
+                self.assertEqual(args[:2], ("cluster", "select"), "no directory upload or unsafe fallback")
+            return "{}"
+        allocation.sf.side_effect = sf
+
+        def native(owned, path):
+            self.assertIs(owned, allocation)
+            if path.startswith("/ImageStore/"):
+                version = "1.2" if ".1.2.xml" in path else "1.1"
+                record = state["types"].get(version)
+                if record is None:
+                    return {"StoreFiles": [], "StoreFolders": []}
+                if stage == ("initial-generation-unavailable" if version == "1.1" else "v2-generation-unavailable"):
+                    raise RuntimeError("native FileVersion unavailable")
+                return store_generation(data.manifest_identity(record["text"]), record["generation"])
+            if "/GetApplicationManifest?" in path:
+                version = "1.2" if "ApplicationTypeVersion=1.2" in path else "1.1"
+                record = state["types"].get(version)
+                return {"Manifest": record["text"]} if record else None
+            if path.startswith("/Applications/"):
+                return {"Name": state["application"], "TypeName": state["type_name"],
+                        "TypeVersion": state["version"], "Status": "Ready",
+                        "Parameters": [{"Key": key, "Value": value} for key, value in state["parameters"].items()]
+                        } if state["application"] else None
+            if path.startswith("/Nodes/"):
+                return {"Name": state["application"], "TypeName": state["type_name"], "Status": "Active",
+                        "WorkDirectory": "/native/" + state["native_id"] + "/work"} if state["application"] else None
+            self.fail(path)
+
+        def execute(*args, **kwargs):
+            if args[2] == data.APPLICATION_PACKAGE_ID:
+                if stage == "initial-native-id-unavailable":
+                    raise RuntimeError("actual native ApplicationId unavailable")
+                return json.dumps({"native_application_id": state["native_id"]})
+            self.assertEqual(args[2], data.runtime.PROCESS)
+            return json.dumps({"start_ticks": 10, "executable_sha256": data.runtime.digest(bundle.legacy.app)})
+        allocation.execute.side_effect = execute
+
+        def observe(*args, **kwargs):
+            self.assertEqual(kwargs["observer"], bundle.legacy.observer)
+            after = state["version"] == "1.2"
+            before_config = {"value": "before-upgrade", "path": "/native/config-v1"}
+            current = {"value": "after-upgrade", "path": "/native/config-v2"} if after else before_config
+            generation = 2 if after else 1
+            return {"native_entry_point_instance": 7, "native_code_version": "1.1",
+                    "rpc": {"partition": "partition", "instance": 1, "incarnation": 2, "pid": 3, "host": "host",
+                            "packages": {"configuration": current, "generation": generation, "runtime_id": "original",
+                                "initial_configuration": before_config, "retained_configuration": before_config,
+                                "unregistered_callbacks": 0, "events": [
+                                    {"registration": index, "previous": before_config, "current": current,
+                                     "published_generation": generation} for index in (1, 2)] if after else []}}}
+
+        def wait(check, description, timeout=0):
+            value = check()
+            if not value:
+                raise RuntimeError(description)
+            return value
+
+        dispatched = []
+        def scenario(name):
+            def invoke(*args, **kwargs):
+                dispatched.append(name)
+                if name == "restart":
+                    if stage == "application-replacement":
+                        state["native_id"] = state["type_name"] + "_App2"
+                    elif stage == "version-drift":
+                        state["version"] = "9.9"
+                    elif stage.startswith("generation-drift-"):
+                        version = stage.removeprefix("generation-drift-")
+                        state["types"][version]["generation"] = (131510254310497004, 99, 25769803776)
+                if name == "controls_and_authority":
+                    self.assertEqual(kwargs["expected_generation"], 2)
+                return {}
+            return invoke
+        outer = {"scenarios": {"legacy_full": {"status": "MISSING", "reason": "not executed"}}, "errors": []}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(data.runtime, "ROOT", self.root))
+            stack.enter_context(patch.object(data, "reserve_upload", side_effect=reserve))
+            stack.enter_context(patch.object(data, "check_upload", side_effect=check))
+            stack.enter_context(patch.object(data, "transfer_upload", side_effect=transfer))
+            stack.enter_context(patch.object(data, "ownership_read", side_effect=native))
+            stack.enter_context(patch.object(data.runtime, "wait_condition", side_effect=wait))
+            stack.enter_context(patch.object(data.runtime, "wait_observe", side_effect=observe))
+            stack.enter_context(patch.object(data.runtime, "observe", side_effect=observe))
+            stack.enter_context(patch.object(data.runtime, "deployment_artifacts", return_value={
+                "code_rollout": "1", "code_checksum": "unchanged"}))
+            stack.enter_context(patch.object(data.runtime, "failure_artifacts", return_value={}))
+            for name in ("stateful_singleton", "stateful_three", "controls_and_authority", "restart", "wait_stateful"):
+                stack.enter_context(patch.object(data.runtime, name, side_effect=scenario(name)))
+            unsafe = stack.enter_context(patch.object(data.runtime, "cleanup_deployment",
+                side_effect=AssertionError("unsafe legacy cleanup")))
+            allocation_create = stack.enter_context(patch.object(data.runtime, "create_owned",
+                side_effect=AssertionError("must reuse the original allocation")))
+            allocation_destroy = stack.enter_context(patch.object(data.runtime, "destroy_owned",
+                side_effect=AssertionError("the outer data runner owns allocation cleanup")))
+            data.legacy_full(allocation, bundle, outer)
+            unsafe.assert_not_called()
+            allocation_create.assert_not_called()
+            allocation_destroy.assert_not_called()
+        self.assertEqual(hashes, {name: data.runtime.digest(bundle.directory / name) for name in data.expected_files()},
+                         "minted owner capabilities must never mutate stored templates")
+        return outer, state, dispatched
+
+    def test_real_full_dispatch_and_configuration_upgrade_preserve_original_identity_and_clean_both_versions(self):
+        outer, state, dispatched = self.run_legacy()
+        evidence = outer["scenarios"]["legacy_full"]
+        self.assertEqual(evidence["status"], "PASS", evidence)
+        nested = evidence["qualification"]
+        self.assertEqual(dispatched, ["stateful_singleton", "stateful_three", "controls_and_authority",
+                                      "restart", "wait_stateful"])
+        self.assertEqual(nested["configuration_upgrade"]["status"], "PASS_UNCHANGED_CODE_NATIVE_CONTEXT_REFRESH")
+        self.assertEqual(nested["configuration_upgrade"]["native_application_identity"]["native_application_id"],
+                         nested["original_application_identity"]["native_application_id"])
+        self.assertEqual(nested["configuration_upgrade"]["native_upgrade_status"]["upgradeState"],
+                         "RollingForwardCompleted")
+        self.assertEqual(len([call for call in state["calls"] if call[:2] == ("application", "upgrade")]), 1)
+        self.assertIsNone(state["application"])
+        self.assertEqual(state["types"], {})
+        self.assertEqual(state["uploads"], {})
+        versions = nested["deployment_versions"]
+        self.assertEqual(set(versions), {"1.1", "1.2"})
+        self.assertNotEqual(versions["1.1"]["original_type"]["native_generation"],
+                            versions["1.2"]["original_type"]["native_generation"])
+        for version in versions.values():
+            manifest = ET.parse(Path(version["local_package_path"]) / "ApplicationManifest.xml")
+            parameters = {item.attrib["Name"]: item.attrib["DefaultValue"] for item in
+                          manifest.findall(f"{{{data.runtime.NS}}}Parameters/{{{data.runtime.NS}}}Parameter")}
+            self.assertEqual(parameters, state["parameters"])
+        self.assertEqual(nested["cleanup"]["independent_absence"], {
+            "application": True, "types": {"1.1": True, "1.2": True}, "uploads": {"1.1": True, "1.2": True}})
+        self.assertTrue(nested["cleanup"]["safe_owner_cleanup"])
+
+    def test_partial_initial_mutations_never_adopt_unknown_startup_or_rejected_instances(self):
+        for stage in ("initial-provision-timeout", "initial-provision-rejected",
+                      "initial-create-timeout", "initial-create-rejected", "initial-native-id-unavailable",
+                      "initial-generation-unavailable"):
+            with self.subTest(stage=stage):
+                outer, state, _ = self.run_legacy(stage)
+                self.assertEqual(outer["scenarios"]["legacy_full"]["status"], "FAIL")
+                nested = outer["scenarios"]["legacy_full"]["qualification"]
+                self.assertTrue(state["types"])
+                self.assertFalse(any(call[:2] in {("application", "delete"), ("application", "unprovision")}
+                                     for call in state["calls"]))
+                self.assertEqual(state["uploads"], {})
+                self.assertIn("retained_for_recovery", nested["cleanup"])
+                self.assertIsNone(nested["cleanup"]["retained_for_recovery"]["original_native_application_id"])
+
+    def test_partial_copies_clean_only_the_original_reservations_and_known_initial_deployment(self):
+        for stage in ("initial-copy", "v2-copy", "v2-provision-timeout",
+                      "v2-provision-rejected", "v2-generation-unavailable"):
+            with self.subTest(stage=stage):
+                outer, state, _ = self.run_legacy(stage)
+                nested = outer["scenarios"]["legacy_full"]["qualification"]
+                self.assertEqual(outer["scenarios"]["legacy_full"]["status"], "FAIL")
+                self.assertIsNone(state["application"])
+                self.assertNotIn("1.1", state["types"])
+                self.assertEqual(state["uploads"], {})
+                if "provision" in stage or "generation" in stage:
+                    self.assertIn("1.2", state["types"])
+                    recovery = nested["cleanup"]["retained_for_recovery"]
+                    self.assertIsNone(recovery["versions"]["1.2"]["original_type"])
+                    self.assertIn("no captured original manifest/generation", recovery["reasons"]["type 1.2"])
+                else:
+                    self.assertEqual(state["types"], {})
+                    self.assertIn("original upload reservation", "\n".join(nested["qualification_recovery_notes"]))
+
+    def test_native_upgrade_timeout_is_failure_even_when_same_original_instance_is_safely_cleaned(self):
+        outer, state, dispatched = self.run_legacy("upgrade-timeout")
+        nested = outer["scenarios"]["legacy_full"]["qualification"]
+        self.assertEqual(outer["scenarios"]["legacy_full"]["status"], "FAIL")
+        self.assertTrue(nested["cleanup"]["safe_owner_cleanup"])
+        self.assertIn("accepted native upgrade", nested["errors"][0])
+        self.assertNotIn("stateful_three", dispatched)
+        self.assertIsNone(state["application"])
+        self.assertEqual(state["types"], {})
+        self.assertEqual(state["uploads"], {})
+
+    def test_version_generation_and_copied_capability_drift_retain_deployment_but_cleanup_uploads(self):
+        for stage in ("version-drift", "application-replacement", "generation-drift-1.1", "generation-drift-1.2"):
+            with self.subTest(stage=stage):
+                outer, state, _ = self.run_legacy(stage)
+                nested = outer["scenarios"]["legacy_full"]["qualification"]
+                self.assertEqual(outer["scenarios"]["legacy_full"]["status"], "FAIL")
+                self.assertIsNotNone(state["application"])
+                self.assertEqual(set(state["types"]), {"1.1", "1.2"})
+                self.assertEqual(state["uploads"], {})
+                self.assertIn("deployment", nested["cleanup"]["retained"])
+                self.assertFalse(any(call[:2] in {("application", "delete"), ("application", "unprovision")}
+                                     for call in state["calls"]))
+
+    def test_upload_replacement_fails_cleanup_gate_even_after_real_legacy_native_checks_pass(self):
+        outer, state, _ = self.run_legacy("v2-upload-drift")
+        nested = outer["scenarios"]["legacy_full"]["qualification"]
+        self.assertEqual(outer["scenarios"]["legacy_full"]["status"], "FAIL")
+        self.assertIsNone(state["application"])
+        self.assertEqual(state["types"], {})
+        self.assertEqual(len(state["uploads"]), 1)
+        self.assertIn("upload 1.2", nested["cleanup"]["retained"])
+        self.assertFalse(nested["cleanup"]["safe_owner_cleanup"])
+
+    def test_fabricated_expected_status_without_running_policy_cannot_pass_full_scenario(self):
+        bundle = data.load_bundle(self.bundle())
+        result = {"scenarios": {"legacy_full": {"status": "MISSING"}}, "errors": []}
+        with patch.object(data.runtime, "qualify", return_value={
+            "status": "PASS_FULL_EMPTY_STATEFUL_CONTROL_PLANE_AND_STATELESS_PROFILE", "errors": [],
+            "cleanup": {"safe_owner_cleanup": True}}):
+            data.legacy_full(MagicMock(), bundle, result)
+        self.assertEqual(result["scenarios"]["legacy_full"]["status"], "FAIL")
+        self.assertIn("original-owner cleanup", result["scenarios"]["legacy_full"]["error"])
+
+
+@unittest.skipUnless(sys.platform == "linux", "Linux-only descriptor-bound upload")
 class UploadReservationTests(ProjectFiles):
     def run_upload(self, path, action, proof, archive=None, upload=None):
         # Execute the production program against project-local fixtures, not a
@@ -2318,6 +2646,27 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(value["review_head"], "c" * 40)
         self.assertEqual(value["ci_head"], "d" * 40)
         self.assertEqual(value["ci_merge"], "e" * 40)
+
+
+class ExecutedImageStoreContractTests(unittest.TestCase):
+    def test_native_empty_404_is_scoped_to_the_pinned_manifest_query(self):
+        allocation=MagicMock()
+        allocation.execute.return_value=json.dumps({"status":404,"body":None})
+        path="/ImageStore/Store%2FFubeDataExampleType%2FApplicationManifest.1.1.xml?api-version=6.2"
+        self.assertIsNone(data.ownership_read(allocation,path))
+        for invalid in ["/Applications/FubeDataExample?api-version=6.0",
+                        "/ImageStore/Store?api-version=6.2",
+                        "/ImageStore/Store%2FFubeDataExampleType%2FApplicationManifest.1.1.xml?api-version=6.0"]:
+            with self.assertRaises(RuntimeError):
+                data.ownership_read(allocation,invalid)
+
+    def test_empty_404_never_becomes_positive_original_generation_proof(self):
+        allocation=MagicMock()
+        allocation.execute.return_value=json.dumps({"status":404,"body":None})
+        expected=data.TypeIdentity("FubeDataExampleType","1.1","a"*64,"b"*64)
+        self.assertIsNone(data.native_type_generation(allocation,expected,allow_absent=True))
+        with self.assertRaisesRegex(RuntimeError,"positive native"):
+            data.native_type_generation(allocation,expected)
 
 
 if __name__ == "__main__":

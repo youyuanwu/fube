@@ -27,13 +27,20 @@ jobs:
     name: Linux onebox native client
     needs: rust-native-client-linux
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Full data/interop repeats 180s convergence and 240s FAS waits across 17
+    # scenarios, plus 300s ledger saturation and the preserved full legacy tier.
+    # Reserve 150m for qualification and 30m for setup, evidence and teardown.
+    timeout-minutes: 180
     permissions:
       contents: read
     env:
       CLUSTER_NAME: ci-${{ github.run_id }}-${{ github.run_attempt }}
       CLUSTER_CTL: scripts/onebox_ctl.py
       CLUSTER_STATE_ROOT: build/oneboxes
+      # Review identity stays unset; executable identity comes from the bundle.
+      FUBE_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+      FUBE_CI_MERGE: ${{ github.sha }}
+      FUBE_CI_RUN_ID: ${{ github.run_id }}
     defaults:
       run:
         shell: bash
@@ -58,17 +65,17 @@ jobs:
         name: native-client-tests
         path: ${{ runner.temp }}/native-client-tests
 
-    - name: Download Rust runtime binary bundle
+    - name: Download strict data binary bundle
       uses: actions/download-artifact@v8
       with:
-        name: rust-runtime-binaries
-        path: ${{ runner.temp }}/rust-runtime-artifact
+        name: fube-data-binaries
+        path: ${{ runner.temp }}/fube-data-artifact
 
-    - name: Extract Rust runtime binaries
+    - name: Extract strict data binaries and nested legacy bundle
       run: |
-        mkdir "$RUNNER_TEMP/rust-runtime-binaries"
-        tar -xf "$RUNNER_TEMP/rust-runtime-artifact/rust-runtime-binaries.tar" \
-          -C "$RUNNER_TEMP/rust-runtime-binaries"
+        mkdir "$RUNNER_TEMP/fube-data-binaries"
+        tar -xf "$RUNNER_TEMP/fube-data-artifact/fube-data-binaries.tar" \
+          -C "$RUNNER_TEMP/fube-data-binaries"
 
     - name: Check runner prerequisites
       run: |
@@ -116,20 +123,32 @@ jobs:
         MSSF_NOTIFICATION_JOURNAL: ${{ runner.temp }}/native-notification-journal.json
         MSSF_NOTIFICATION_REPORT: ${{ runner.temp }}/native-notification-report.json
 
-    - name: Qualify real Rust application runtime
-      id: native_runtime
+    - name: Qualify full native data, interoperability and legacy runtime
+      id: native_data
+      timeout-minutes: 150
       run: |
-        python3 scripts/rust_runtime_test.py "$CLUSTER_NAME" --existing-owner "${{ steps.create_cluster.outputs.owner }}" \
-          --prebuilt "$RUNNER_TEMP/rust-runtime-binaries" \
-          --full --stateful three --report "$RUNNER_TEMP/rust-runtime-report.json"
+        python3 scripts/fube_data_test.py "$CLUSTER_NAME" --existing-owner "${{ steps.create_cluster.outputs.owner }}" \
+          --prebuilt "$RUNNER_TEMP/fube-data-binaries" \
+          --profile full --report "$RUNNER_TEMP/fube-data-report.json"
 
-    - name: Upload successful Rust runtime evidence
-      if: steps.native_runtime.outcome == 'success'
+    - name: Upload successful combined data and legacy runtime evidence
+      if: always() && steps.native_data.outcome == 'success'
+      timeout-minutes: 2
       uses: actions/upload-artifact@v7
       with:
-        name: rust-runtime-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/rust-runtime-report.json
+        name: fube-data-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/fube-data-report.json
         if-no-files-found: error
+        retention-days: 7
+
+    - name: Upload failed combined data and legacy runtime evidence
+      if: always() && steps.native_data.outcome != 'success'
+      timeout-minutes: 2
+      uses: actions/upload-artifact@v7
+      with:
+        name: fube-data-failure-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/fube-data-report.json
+        if-no-files-found: warn
         retention-days: 7
 
     - name: Upload successful native client evidence

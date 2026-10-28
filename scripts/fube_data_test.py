@@ -269,6 +269,17 @@ def load_bundle(directory: Path) -> Bundle:
         } and elf[name] == elf_identity(directory / "bin" / name, CLASSIFICATIONS[name]),
             f"ELF classification/identity mismatch: {name}")
     legacy = runtime.load_bundle(directory / "legacy")
+    for version in (1, 2):
+        template = directory / "legacy" / f"package-v{version}" / "ApplicationManifest.xml"
+        require(template.stat().st_size <= 65536, "legacy ownership template byte bound")
+        root = ET.fromstring(template.read_text())
+        require(root.tag == f"{{{runtime.NS}}}ApplicationManifest"
+                and len(root.findall(f"{{{runtime.NS}}}Parameters")) <= 1,
+                "legacy ownership template schema/parameter container")
+        for parameter in ("FubeDataTypeCapability", "FubeDataCreationCapability"):
+            matches = root.findall(f"{{{runtime.NS}}}Parameters/{{{runtime.NS}}}Parameter[@Name='{parameter}']")
+            require(len(matches) <= 1 and (not matches or matches[0].get("DefaultValue") == ""),
+                    "legacy bundle ownership parameters must be absent or empty before allocation")
     require(legacy.source_revision == metadata["source_revision"], "legacy/data source mismatch")
     require(runtime.digest(legacy.app) == artifacts["bin/rust-runtime-app"]["sha256"]
             and runtime.digest(legacy.observer) == artifacts["bin/runtime_observer"]["sha256"],
@@ -348,6 +359,150 @@ def create_data_service(allocation, application: str, service: str, nodes: tuple
         f"/Applications/{quote(sid, safe='')}/$/GetServices/$/Create?api-version=6.0",
         json.dumps(description), timeout=40))
     return {"request": description, "response": result}
+
+
+NATIVE_MANAGEMENT = r"""
+import json,sys,urllib.error,urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,*args,**kwargs):
+        raise RuntimeError("native management redirect refused")
+method,path=sys.argv[1:]
+request=urllib.request.Request("http://127.0.0.1:19080"+path,
+    data=b"" if method=="POST" else None,method=method)
+try:
+    response=urllib.request.build_opener(NoRedirect).open(request,timeout=10)
+except urllib.error.HTTPError as error:
+    response=error
+with response:
+    body=response.read(4194305)
+    if len(body)>4194304: raise RuntimeError("native management response bound")
+    try:
+        value=json.loads(body) if body else None
+    except (ValueError,UnicodeError):
+        value={"non_json_body":body[:4096].decode("utf-8",errors="replace")}
+    print(json.dumps({"http_status":response.code,"body":value}))
+"""
+
+
+def native_management(allocation, method: str, path: str) -> dict:
+    require(method in {"GET", "POST"} and path.startswith("/") and not path.startswith("//")
+            and not urlsplit(path).netloc and not urlsplit(path).fragment,
+            "bounded local native management request")
+    reply = strict_json(allocation.execute("python3", "-c", NATIVE_MANAGEMENT, method, path, timeout=15))
+    require(type(reply) is dict and set(reply) == {"http_status", "body"}
+            and type(reply["http_status"]) is int, "native management response schema")
+    return reply
+
+
+def native_success(reply: dict, status: int, description: str):
+    require(reply["http_status"] == status,
+            f"required native {description} API failed: HTTP {reply['http_status']}: {reply['body']}")
+    return reply["body"]
+
+
+def native_uuid(value: str) -> str:
+    require(type(value) is str, "native UUID must be a string")
+    parsed = uuid.UUID(value)
+    require(parsed.int != 0 and str(parsed) == value.lower(), "canonical nonzero native UUID required")
+    return str(parsed)
+
+
+def service_path(service: str) -> str:
+    require(service.startswith("fabric:/") and len(service) > len("fabric:/"), "native service URI required")
+    return "/Services/" + quote(service.removeprefix("fabric:/").replace("/", "~"), safe="")
+
+
+def fas_path(service: str, partition: str, operation_id: str, action: str) -> str:
+    require(action in {"StartDataLoss", "GetDataLossProgress", "Cancel"}, "unsupported native FAS action")
+    parameters = {"api-version": "6.0", "OperationId": native_uuid(operation_id)}
+    if action == "Cancel":
+        parameters["Force"] = "false"
+        prefix = "/Faults/$/Cancel"
+    else:
+        prefix = "/Faults" + service_path(service) + "/$/GetPartitions/" + native_uuid(partition) + "/$/" + action
+        if action == "StartDataLoss":
+            parameters["DataLossMode"] = "PartialDataLoss"
+    return prefix + "?" + urlencode(parameters)
+
+
+FAS_TERMINAL = {"Completed", "Faulted", "Cancelled", "ForceCancelled"}
+
+
+def fas_state(body: dict, operation: dict, *, completed_required: bool = True) -> str:
+    # Native httpgateway/InvokeDataLossProgress.h and management/FaultAnalysisService/
+    # InvokeDataLossResult.h, SelectedPartition.h, TestCommandProgressState.h at
+    # service-fabric 51a7703a1f83749a9234d3ceb4296d8622e42cca define this JSON.
+    require(type(body) is dict and body.get("State") in FAS_TERMINAL | {"Running", "RollingBack"},
+            "required native FAS progress schema/state unavailable")
+    state = body["State"]
+    if state == "Completed":
+        result = body.get("InvokeDataLossResult")
+        require(type(result) is dict and type(result.get("ErrorCode")) is int and result["ErrorCode"] == 0,
+                "native FAS completed with a missing/nonzero result ErrorCode")
+        selected = result.get("SelectedPartition")
+        require(type(selected) is dict and selected.get("ServiceName") == operation["service"]
+                and native_uuid(selected.get("PartitionId")) == operation["partition"],
+                "native FAS result selected a different owned service/partition")
+    if completed_required:
+        require(state not in FAS_TERMINAL - {"Completed"}, f"required native FAS operation ended {state}: {body}")
+    require(state != "ForceCancelled", "native FAS force cancellation cannot establish transport cleanup")
+    return state
+
+
+def poll_fas(allocation, operation: dict, *, timeout: float = 240, cancelling: bool = False) -> dict:
+    require(0 < timeout <= 300, "bounded native FAS polling timeout")
+    deadline = time.monotonic() + timeout
+    samples = operation.setdefault("progress", [])
+    for _ in range(301):
+        if time.monotonic() >= deadline:
+            break
+        reply = native_management(allocation, "GET", fas_path(
+            operation["service"], operation["partition"], operation["operation_id"], "GetDataLossProgress"))
+        body = native_success(reply, 200, "GetDataLossProgress")
+        samples.append({"at": time.time(), "reply": reply})
+        require(len(samples) <= 610, "bounded native FAS progress inventory")
+        state = fas_state(body, operation, completed_required=False)
+        operation["state"] = state
+        if not cancelling:
+            fas_state(body, operation)
+        if state in FAS_TERMINAL:
+            operation["native_cleanup_terminal"] = True
+            return body
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    raise RuntimeError("required native FAS operation did not reach a cleanup-terminal state within bounded polling")
+
+
+def cancel_fas(allocation, operation: dict) -> None:
+    if operation.get("native_cleanup_terminal"):
+        return
+    # The UUID was minted and recorded before StartDataLoss; cancellation never
+    # targets a command discovered by name or another user's command inventory.
+    try:
+        reply = native_management(allocation, "GET", fas_path(
+            operation["service"], operation["partition"], operation["operation_id"], "GetDataLossProgress"))
+        operation["cleanup_query"] = reply
+        if reply["http_status"] == 404 and isinstance(reply["body"], dict) and (
+                reply["body"].get("Error", {}).get("Code") == "FABRIC_E_TEST_COMMAND_OPERATION_ID_NOT_FOUND"):
+            require(operation.get("start_http_status") != 202, "accepted native FAS operation disappeared before cleanup")
+            operation.update(state="Absent", native_cleanup_terminal=True)
+            return
+        body = native_success(reply, 200, "GetDataLossProgress cleanup")
+        state = fas_state(body, operation, completed_required=False)
+        operation["state"] = state
+        if state in FAS_TERMINAL:
+            operation["native_cleanup_terminal"] = True
+            return
+    except Exception as error:
+        operation["cleanup_query_error"] = f"{type(error).__name__}: {error}"
+    operation["cancel_requested"] = True
+    reply = native_management(allocation, "POST", fas_path(
+        operation["service"], operation["partition"], operation["operation_id"], "Cancel"))
+    operation["cancel_reply"] = reply
+    # Completion can race cancellation. Only a terminal progress observation,
+    # never the cancellation response alone, establishes cleanup.
+    if reply["http_status"] != 200:
+        operation["cancel_error"] = f"required native CancelTestCommand API failed: {reply}"
+    poll_fas(allocation, operation, timeout=90, cancelling=True)
 
 
 def request(address: str, operation: str | None = None, parameters: dict | None = None,
@@ -512,12 +667,15 @@ class Ledger:
 
 
 class Client:
-    def __init__(self, bundle: Bundle, service: str, mixed: bool, ledger: Ledger):
+    def __init__(self, bundle: Bundle, service: str, mixed: bool, ledger: Ledger,
+                 target: int = 3, minimum: int = 2):
         self.bundle, self.service, self.mixed, self.ledger = bundle, service, mixed, ledger
+        self.target, self.minimum = target, minimum
         self.endpoint: str | None = None
 
     def refresh(self) -> dict:
-        observed = assert_data(native_snapshot(self.bundle, self.service), self.service, self.mixed)
+        observed = assert_data(native_snapshot(self.bundle, self.service), self.service, self.mixed,
+                               self.target, self.minimum)
         self.endpoint = observed["primary"]["endpoint"]
         return observed
 
@@ -680,8 +838,154 @@ class MissingEvidence(RuntimeError):
     """Executed work is retained, but a required independent observation is absent."""
 
 
+def stable_data(before: dict, after: dict) -> None:
+    require(before["service"] == after["service"] and before["partition"] == after["partition"]
+            and before["native_partition"] == after["native_partition"],
+            "negative probe changed native service/partition/full epoch/configuration")
+    original = {identity(replica): replica for replica in before["replicas"]}
+    current = {identity(replica): replica for replica in after["replicas"]}
+    require(original.keys() == current.keys(), "negative probe replaced a native/engine identity")
+    for key, replica in original.items():
+        other = current[key]
+        require(all(replica[field] == other[field] for field in ("role", "status", "address"))
+                and replica["rpc"]["native_epoch"] == other["rpc"]["native_epoch"],
+                "negative probe changed a native role/route/full epoch")
+        require(replica["rpc"]["state"] == other["rpc"]["state"]
+                and replica["rpc"]["engine"]["progress"] == other["rpc"]["engine"]["progress"],
+                "negative probe changed actual provider contents/ledger/progress or engine progress")
+
+
+def wire_endpoint(value: str) -> dict:
+    require(type(value) is str and len(value) <= 4096, "bounded native-selected wire endpoint")
+    match = re.fullmatch(r"([^/\s]+)/([a-fA-F0-9-]{36})-([0-9]+);([a-fA-F0-9-]{36})(;[^/;\s]+)?", value)
+    require(match is not None, "native-selected wire endpoint actor schema")
+    address, partition, replica, engine, suffix = match.groups()
+    parsed = urlsplit("//" + address)
+    require(parsed.hostname and parsed.port and not parsed.username and not parsed.password,
+            "native-selected TCP listener required")
+    return {"address": address, "host": parsed.hostname, "partition": native_uuid(partition),
+            "replica": int(replica), "engine": native_uuid(engine), "suffix": suffix}
+
+
+def wire_receipt(before: dict, source: dict, kind: str, reply: dict) -> dict:
+    require(reply.get("qualification_only") is True and reply.get("admission_only") is True
+            and reply.get("kind") == kind, "required real wire probe unavailable; admission is not rejection evidence")
+    own = wire_endpoint(source["rpc"]["replication_address"])
+    sender = wire_endpoint(reply.get("from"))
+    selected = wire_endpoint(reply.get("native_selected_peer"))
+    target = wire_endpoint(reply.get("target"))
+    require(own["partition"] == before["partition"] and own["replica"] == source["replica"]
+            and own["engine"] == source["rpc"]["engine_incarnation"],
+            "Rust sender endpoint does not match the independently deployed native identity")
+    require({k: v for k, v in own.items() if k != "engine"}
+            == {k: v for k, v in sender.items() if k != "engine"}
+            and (sender["engine"] != own["engine"] if kind == "wrong_sender"
+                 else sender["engine"] == own["engine"]), "wire probe changed the wrong sender identity fields")
+    peers = source["rpc"]["engine"].get("peers") or []
+    if source["role"] == "Primary":
+        require(any(peer["address"] == reply["native_selected_peer"] and peer["configured"]
+                    and not peer["building"] and not peer["cleanup_required"] for peer in peers),
+                "wire destination was not an actual completed native-configured peer")
+    else:
+        require(source["rpc"].get("observed_primary") == reply["native_selected_peer"]
+                and source["rpc"]["engine"]["copy_done"], "secondary probe lacks its actual completed primary session")
+    candidates = [replica for replica in before["replicas"]
+                  if replica["replica"] == selected["replica"] and selected["partition"] == before["partition"]]
+    require(len(candidates) == 1 and candidates[0]["replica"] != source["replica"],
+            "native-selected wire peer is not in the queried partition")
+    destination = candidates[0]
+    require(destination["role"] == ("ActiveSecondary" if source["role"] == "Primary" else "Primary"),
+            "native-selected peer role mismatch")
+    if destination["rpc"]["engine_kind"] == "rust":
+        require(wire_endpoint(destination["rpc"]["replication_address"]) == selected,
+                "Rust destination differs from the native-selected endpoint")
+    else:
+        # Native EndOpen's GUID/ephemeral port are RA-owned, not the oracle's
+        # fixture incarnation or its configured port-zero bind request.
+        bind = urlsplit("//" + destination["rpc"]["replication_bind_address"])
+        require(bind.hostname == selected["host"], "native-selected peer listener host differs from native telemetry")
+    require({k: v for k, v in target.items() if k != "engine"}
+            == {k: v for k, v in selected.items() if k != "engine"}
+            and (target["engine"] != selected["engine"] if kind == "wrong_target"
+                 else target["engine"] == selected["engine"]), "wire probe changed the wrong destination fields")
+    epoch = source["rpc"]["native_epoch"]
+    projected = {"data_loss": epoch["data_loss"], "configuration": epoch["configuration"] & ~0xFFFFFFFF}
+    require(reply.get("native_epoch") == projected and type(reply.get("sequence")) is int
+            and reply["sequence"] == source["rpc"]["engine"]["progress"]["assigned"] + 1
+            and reply["sequence"] > 0, "wire probe native epoch/nonassigned nonzero candidate mismatch")
+    sent = reply.get("sent_epoch")
+    require(type(sent) is dict and set(sent) == {"data_loss", "configuration"}
+            and all(type(value) is int and value >= 0 for value in sent.values())
+            and ((sent["data_loss"], sent["configuration"]) < (projected["data_loss"], projected["configuration"])
+                 if kind == "stale_epoch" else sent == projected), "wire probe did not exercise the requested epoch")
+    return {"source_identity": identity(source), "destination_identity": identity(destination),
+            "source_kind": source["rpc"]["engine_kind"], "destination_kind": destination["rpc"]["engine_kind"],
+            "native_selected_peer": reply["native_selected_peer"],
+            "address_evidence": "Rust native-configured session actor matches native partition/replica; "
+                                "native listener host matches oracle bind telemetry (RA-owned GUID/port not invented)"}
+
+
+def data_loss_invariants(before: dict, after: dict, ledger: Ledger, changed: bool, boundary: int = 5) -> Ledger:
+    require(before["service"] == after["service"] and before["partition"] == after["partition"],
+            "native data loss changed the owned service/partition")
+    require(after["native_partition"]["epoch"]["data_loss"] > before["native_partition"]["epoch"]["data_loss"],
+            "actual native full data-loss epoch did not advance")
+    original = {identity(replica): replica for replica in before["replicas"]}
+    survivors = [replica for replica in after["replicas"] if identity(replica) in original]
+    require(survivors and any(identity(replica) not in original for replica in after["replicas"]),
+            "native partial data loss requires an original survivor and a copied replacement")
+    reconciled = Ledger()
+    for key, record in ledger.records.items():
+        require(record["committed"] and type(record["sequence"]) is int, "auxiliary seed lacked quorum success")
+        if not changed or record["sequence"] <= boundary:
+            reconciled.records[key] = dict(record)
+    expected_last = boundary if changed else before["primary"]["rpc"]["state"]["last"]
+    require(len(ledger.records) >= 20 and sorted(record["sequence"] for record in ledger.records.values())
+            == list(range(1, len(ledger.records) + 1)), "fresh auxiliary requires at least 20 contiguous acknowledged writes")
+    reconciled.compare(after)
+    callbacks = []
+    for replica in after["replicas"]:
+        state = replica["rpc"]["state"]
+        require(state["last"] == expected_last and state["history_count"] == len(reconciled.records),
+                "provider retained a divergent tail or lied about reconciled progress/history")
+        for field in ("data_loss_calls", "data_loss_changed_calls"):
+            require(type(state.get(field)) is int and state[field] >= 0, "actual native data-loss callback counters required")
+        require(state["data_loss_changed_calls"] <= state["data_loss_calls"], "invalid provider callback counters")
+        require("last_data_loss_boundary" in state and (
+                    state["last_data_loss_boundary"] is None or
+                    type(state["last_data_loss_boundary"]) is int and state["last_data_loss_boundary"] >= 0),
+                "actual provider last native data-loss boundary telemetry required")
+        if changed and state["data_loss_changed_calls"]:
+            require(state["last_data_loss_boundary"] == boundary, "native changed callback used the wrong provider boundary")
+        if not changed:
+            require(state["data_loss_changed_calls"] == 0 and state["last_data_loss_boundary"] is None,
+                    "unarmed native OnDataLoss incorrectly changed provider state")
+        old = original.get(identity(replica))
+        if old is not None:
+            previous = old["rpc"]["state"]
+            require(state["data_loss_calls"] >= previous["data_loss_calls"]
+                    and state["data_loss_changed_calls"] >= previous["data_loss_changed_calls"],
+                    "provider callback counters reset within a surviving lifetime")
+            if state["data_loss_calls"] > previous["data_loss_calls"]:
+                callbacks.append(replica)
+                if changed:
+                    require(state["data_loss_changed_calls"] > previous["data_loss_changed_calls"]
+                            and state["last_data_loss_boundary"] == boundary,
+                            "armed actual native survivor callback did not report Changed=true at the boundary")
+        if replica["rpc"]["engine_kind"] == "native-classic-v1":
+            require(replica["rpc"]["native_current_progress"] == expected_last,
+                    "native replicator progress differs from its actual reconciled provider")
+    require(callbacks, "no actual native OnDataLoss callback increment on a queried original surviving provider")
+    primary = after["primary"]["rpc"]
+    if primary["engine_kind"] == "rust":
+        require(primary["engine"]["progress"]["assigned"] == expected_last
+                and primary["engine"]["progress"]["applied"] == expected_last,
+                "Rust primary queue did not reset to authoritative provider progress")
+    return reconciled
+
+
 class Qualification:
-    def __init__(self, allocation, bundle: Bundle, result: dict, mixed: bool):
+    def __init__(self, allocation, bundle: Bundle, result: dict, mixed: bool, original_application=None):
         self.allocation, self.bundle, self.result, self.mixed = allocation, bundle, result, mixed
         self.service = result["application"] + "/Data"
         self.ledger = Ledger()
@@ -690,9 +994,12 @@ class Qualification:
         self.hook_identities: dict[str, dict] = {}
         self.paused: list[dict] = []
         self.serial = 0
+        self.original_application = original_application
+        self.auxiliaries: list[dict] = []
 
     def scenario(self, name: str, action) -> None:
         evidence = self.result["scenarios"][name]
+        evidence.pop("reason", None)
         evidence.update(status="RUNNING", started_at=time.time())
         try:
             action(evidence)
@@ -1235,6 +1542,340 @@ class Qualification:
             evidence["stateless_siblings_before"] = siblings
             evidence["stateless_siblings_after"] = self.unchanged_stateless(siblings)
 
+    def stale_wire_receipts(self, evidence: dict) -> None:
+        evidence.update(coverage=[], admission_is_not_rejection_evidence=True,
+                        limitation="No native-primary packet spoofing. Rust probes use only existing native-selected sessions.")
+        for primary_kind in (("rust", "native-classic-v1") if self.mixed else ("rust",)):
+            group = {"primary_kind": primary_kind, "receipts": [], "positive_copy": {}}
+            evidence["coverage"].append(group)
+            current = self.converge(group)
+            if current["primary"]["rpc"]["engine_kind"] != primary_kind:
+                group["native_move"] = {}
+                self.move(group["native_move"], primary_kind)
+            roles = ("Primary",) if primary_kind == "rust" and self.mixed else ("ActiveSecondary",)
+            if not self.mixed:
+                roles = ("Primary", "ActiveSecondary")
+            for role in roles:
+                kinds = ("stale_epoch", "wrong_sender", "wrong_target") if role == "Primary" else (
+                    "wrong_sender", "stale_copy_ack", "wrong_target")
+                for kind in kinds:
+                    case = {"kind": kind, "rust_role": role, "samples": []}
+                    group["receipts"].append(case)
+                    baseline = self.converge(case)
+                    # Let already-completed ACK/queue housekeeping settle before
+                    # measuring a negative packet with no concurrent writer.
+                    def settled(value):
+                        nonlocal baseline
+                        try:
+                            stable_data(baseline, value)
+                        except RuntimeError:
+                            baseline = value
+                            return False
+                        return True
+                    before = self.wait(accept=settled, capture=case)
+                    source = next((replica for replica in before["replicas"]
+                                   if replica["role"] == role and replica["rpc"]["engine_kind"] == "rust"), None)
+                    require(source is not None, "required Rust wire-probe source is not natively placed in this direction")
+                    case["before"] = before
+                    status, reply = request(source["address"], "test", {"wire_probe": kind})
+                    case["receipt"] = {"http_status": status, "reply": reply}
+                    require(status == 200, f"required actual wire probe API failed: {kind}, HTTP {status}: {reply}")
+                    case["peer_correlation"] = wire_receipt(before, source, kind, reply)
+                    if self.mixed:
+                        require(case["peer_correlation"]["destination_kind"] == "native-classic-v1",
+                                "mixed negative probe did not actually target the native engine")
+                    for _ in range(3):
+                        time.sleep(.2)
+                        after = assert_data(native_snapshot(self.bundle, self.service), self.service, self.mixed)
+                        case["samples"].append(after)
+                        stable_data(before, after)
+                        self.ledger.compare(after)
+                    case["negative_observation"] = "Native identities/roles/full epochs and actual provider ledger/state/engine progress unchanged."
+                    case["positive_write"] = self.writes(1, "after-wire-" + kind)
+                    require(case["positive_write"]["sequences"] == [before["primary"]["rpc"]["state"]["last"] + 1],
+                            "negative packet consumed a real assignment or blocked the next matching write")
+                    self.converge(case)
+            target_kind = "native-classic-v1" if primary_kind == "rust" and self.mixed else "rust"
+            self.copy(group["positive_copy"], target_kind=target_kind)
+
+    def guard_application(self) -> None:
+        original = self.original_application
+        require(original is not None and original.name == self.result["application"],
+                "auxiliary mutation requires the originally captured native application/capability")
+        require(native_application_identity(self.allocation, original.name, original.type_identity,
+                                            original.capability) == original,
+                "original native application instance/capability drift; no auxiliary mutation authorized")
+
+    def auxiliary_partition(self, auxiliary: dict, *, allow_absent: bool = False) -> str | None:
+        service = auxiliary["service"]
+        require(service.startswith(self.result["application"] + "/DataLoss")
+                and service != self.service, "data loss is restricted to this run's auxiliary service")
+        if allow_absent:
+            description = native_management(self.allocation, "GET", service_path(service) + "?api-version=6.0")
+            if description["http_status"] == 204 and description["body"] is None:
+                return None
+            if description["http_status"] == 404 and isinstance(description["body"], dict) and (
+                    description["body"].get("Error", {}).get("Code") == "FABRIC_E_SERVICE_DOES_NOT_EXIST"):
+                return None
+            body = native_success(description, 200, "owned auxiliary service absence/identity")
+            require(isinstance(body, dict) and body.get("Name") == service and body.get("ServiceKind") == "Stateful",
+                    "native auxiliary service resource identity drift")
+        reply = native_management(self.allocation, "GET",
+                                  service_path(service) + "/$/GetPartitions?api-version=6.0")
+        if allow_absent and reply["http_status"] == 404 and isinstance(reply["body"], dict) and (
+                reply["body"].get("Error", {}).get("Code") == "FABRIC_E_SERVICE_DOES_NOT_EXIST"):
+            return None
+        body = native_success(reply, 200, "owned auxiliary partition query")
+        partitions = body if isinstance(body, list) else body.get("Items") if isinstance(body, dict) else None
+        require(isinstance(partitions, list) and len(partitions) == 1
+                and not (isinstance(body, dict) and body.get("ContinuationToken")),
+                "owned auxiliary singleton partition query incomplete/ambiguous")
+        item = partitions[0]
+        require(item.get("ServiceKind") == "Stateful" and isinstance(item.get("PartitionInformation"), dict),
+                "owned auxiliary partition is not a native stateful service")
+        partition = native_uuid(item["PartitionInformation"].get("Id"))
+        if auxiliary.get("partition") is not None:
+            require(partition == auxiliary["partition"], "auxiliary name reused with a different native partition; retain")
+        return partition
+
+    @staticmethod
+    def remember_auxiliary(auxiliary: dict, value: dict) -> None:
+        require(value["service"] == auxiliary["service"] and value["partition"] == auxiliary["partition"],
+                "auxiliary observation identity drift")
+        for replica in value["replicas"]:
+            endpoint = replica.get("address")
+            if endpoint and endpoint not in auxiliary["original_routes"]:
+                auxiliary["original_routes"].append(endpoint)
+
+    def create_auxiliary(self, changed: bool, evidence: dict) -> dict:
+        self.guard_application()
+        service = self.result["application"] + "/DataLoss" + ("Changed" if changed else "Unchanged") + uuid.uuid4().hex
+        require(not any(item["name"] == service for item in runtime.items(self.allocation.sf(
+            "service", "list", "--application-id", self.result["application"].removeprefix("fabric:/")))),
+            "minted auxiliary service collision; no adoption")
+        auxiliary_mixed = self.mixed and self.result.get("profile") != "full"
+        nodes = (("N0010", "N0030") if auxiliary_mixed else
+                 tuple(node for node, kind in NODE_ENGINES.items() if kind == "rust") if self.mixed else tuple(NODE_ENGINES))
+        auxiliary = {"service": service, "partition": None, "changed": changed,
+                     "target": 2 if auxiliary_mixed else 3, "minimum": 2, "mixed": auxiliary_mixed,
+                     "application_native_id": self.original_application.native_application_id,
+                     "original_routes": [], "create_state": "requested", "cleanup": {}}
+        # A lost create response must remain visible to the original-app cleanup.
+        self.auxiliaries.append(auxiliary)
+        self.result.setdefault("auxiliary_data_services", []).append(auxiliary)
+        evidence["auxiliary"] = auxiliary
+        auxiliary["create"] = create_data_service(
+            self.allocation, self.result["application"], service, nodes, auxiliary["target"], auxiliary["minimum"])
+        auxiliary["create_state"] = "accepted"
+        value = self.wait(service=service, target=auxiliary["target"], minimum=auxiliary["minimum"],
+                          mixed=auxiliary_mixed, capture=evidence)
+        self.guard_application()
+        auxiliary["partition"] = self.auxiliary_partition(auxiliary)
+        native_uuid(auxiliary["partition"])
+        self.remember_auxiliary(auxiliary, value)
+        evidence["initial_observation"] = value
+        return auxiliary
+
+    def cleanup_auxiliary(self, auxiliary: dict) -> None:
+        cleanup = auxiliary["cleanup"]
+        if auxiliary.get("fas"):
+            cancel_fas(self.allocation, auxiliary["fas"])
+        if cleanup.get("native_absence_confirmed"):
+            self.retired_auxiliary_routes(auxiliary)
+            return
+        self.guard_application()
+        require(auxiliary["application_native_id"] == self.original_application.native_application_id,
+                "auxiliary was not created under the captured original native application")
+        require(auxiliary.get("partition") is not None,
+                "partial auxiliary creation has no captured partition; original-app cleanup required")
+        partition = self.auxiliary_partition(auxiliary, allow_absent=True)
+        if partition is not None:
+            cleanup["delete_requested"] = True
+            self.allocation.sf("service", "delete", "--service-id",
+                               auxiliary["service"].removeprefix("fabric:/").replace("/", "~"))
+        runtime.wait_condition(lambda: self.auxiliary_partition(auxiliary, allow_absent=True) is None,
+                               "original auxiliary native absence", timeout=60)
+        cleanup["native_absence_confirmed"] = True
+        self.retired_auxiliary_routes(auxiliary)
+
+    @staticmethod
+    def retired_auxiliary_routes(auxiliary: dict) -> None:
+        require(auxiliary["cleanup"].get("native_absence_confirmed") is True,
+                "original auxiliary route retirement requires independent native absence")
+        observations = []
+        auxiliary["cleanup"]["original_routes_retired"] = False
+        auxiliary["cleanup"]["retired_routes"] = observations
+        for endpoint in auxiliary["original_routes"]:
+            try:
+                status, body = request(endpoint)
+                observations.append({"endpoint": endpoint, "http_status": status, "body": body})
+                require(status in (404, 503), "deleted auxiliary retained a usable original route")
+            except (OSError, http.client.HTTPException) as error:
+                observations.append({"endpoint": endpoint, "unreachable_after_native_absence": str(error)})
+        auxiliary["cleanup"]["original_routes_retired"] = True
+
+    def cleanup_auxiliaries(self) -> list:
+        outcomes = []
+        for auxiliary in self.auxiliaries:
+            try:
+                self.cleanup_auxiliary(auxiliary)
+                outcomes.append({"service": auxiliary["service"], "cleanup": auxiliary["cleanup"]})
+            except Exception as error:
+                auxiliary["cleanup"]["error"] = f"{type(error).__name__}: {error}"
+                outcomes.append({"service": auxiliary["service"], "error": auxiliary["cleanup"]["error"]})
+        return outcomes
+
+    def confirm_auxiliaries_absent(self) -> None:
+        for auxiliary in self.auxiliaries:
+            require(self.auxiliary_partition(auxiliary, allow_absent=True) is None,
+                    "auxiliary remains after original-app cleanup")
+            auxiliary["cleanup"]["native_absence_confirmed"] = True
+            self.retired_auxiliary_routes(auxiliary)
+
+    def data_loss_case(self, evidence: dict, changed: bool) -> None:
+        first = len(self.auxiliaries)
+        try:
+            self._data_loss_case(evidence, changed)
+        finally:
+            original_error = sys.exc_info()[1]
+            for auxiliary in self.auxiliaries[first:]:
+                if auxiliary["cleanup"].get("native_absence_confirmed") and auxiliary["cleanup"].get("original_routes_retired"):
+                    continue
+                try:
+                    self.cleanup_auxiliary(auxiliary)
+                except Exception as error:
+                    evidence["cleanup_error"] = f"{type(error).__name__}: {error}"
+                    if original_error is None:
+                        raise
+        main_after_delete = self.converge(evidence)
+        stable_data(evidence["unrelated_main_before"], main_after_delete)
+        evidence["unrelated_main_after_auxiliary_delete"] = main_after_delete
+        if "stateless_siblings_before" in evidence:
+            evidence["stateless_siblings_after_auxiliary_delete"] = self.unchanged_stateless(
+                evidence["stateless_siblings_before"])
+
+    def _data_loss_case(self, evidence: dict, changed: bool) -> None:
+        unrelated_before = self.converge(evidence)
+        siblings = self.stateless_siblings() if not self.mixed else None
+        auxiliary = self.create_auxiliary(changed, evidence)
+        service, target, minimum = auxiliary["service"], auxiliary["target"], auxiliary["minimum"]
+        seed = Ledger()
+        client = Client(self.bundle, service, auxiliary["mixed"], seed, target, minimum)
+        client.endpoint = evidence["initial_observation"]["primary"]["endpoint"]
+        evidence["seed_writes"] = [dict(client.write(f"seed-{index}")) for index in range(20)]
+        def coherent(ledger):
+            def accept(value):
+                try:
+                    ledger.compare(value)
+                    return True
+                except RuntimeError:
+                    return False
+            return accept
+        settled_seed = None
+        def seeded_and_stable(value):
+            nonlocal settled_seed
+            if not coherent(seed)(value):
+                return False
+            previous, settled_seed = settled_seed, value
+            if previous is None:
+                return False
+            try:
+                stable_data(previous, value)
+                return True
+            except RuntimeError:
+                return False
+        before = self.wait(service=service, target=target, minimum=minimum, mixed=auxiliary["mixed"],
+                           capture=evidence, accept=seeded_and_stable)
+        self.remember_auxiliary(auxiliary, before)
+        evidence.update(before=before, seed_workload=seed.compare(before),
+                        actual_engine_kinds=sorted({replica["rpc"]["engine_kind"] for replica in before["replicas"]}),
+                        explicit_data_loss_scope="Only this fresh auxiliary may lose acknowledged volatile writes; main ledger is never reset.")
+        require(before["primary"]["rpc"]["state"]["last"] == 20, "fresh auxiliary provider seed progress differs")
+        for replica in before["replicas"]:
+            state = replica["rpc"]["state"]
+            require(type(state.get("data_loss_calls")) is int and state["data_loss_calls"] >= 0
+                    and type(state.get("data_loss_changed_calls")) is int and state["data_loss_changed_calls"] == 0
+                    and state.get("last_data_loss_boundary") is None, "actual fresh provider callback counters unavailable")
+        if changed:
+            evidence["arming"] = []
+            for replica in before["replicas"]:
+                armed = {"native_identity": identity(replica), "endpoint": replica["address"], "boundary": 5}
+                evidence["arming"].append(armed)
+                status, reply = request(replica["address"], "test", {"data_loss_boundary": 5})
+                armed.update(http_status=status, reply=reply)
+                require(status == 200 and reply.get("qualification_only") is True
+                        and reply.get("armed_only") is True and reply.get("data_loss_boundary") == 5,
+                        "required native-callback-only data-loss arming API unavailable")
+            armed = self.wait(service=service, target=target, minimum=minimum, mixed=auxiliary["mixed"], capture=evidence)
+            stable_data(before, armed)
+            evidence["after_arming_without_callback"] = armed
+        self.guard_application()
+        require(self.auxiliary_partition(auxiliary) == before["partition"],
+                "native FAS target differs from the original observed auxiliary")
+        operation = {"operation_id": str(uuid.uuid4()), "service": service, "partition": auxiliary["partition"],
+                     "application_native_id": auxiliary["application_native_id"],
+                     "state": "StartRequested", "progress": []}
+        auxiliary["fas"] = operation
+        evidence["native_fas"] = operation
+        try:
+            operation["start_path"] = fas_path(service, auxiliary["partition"], operation["operation_id"], "StartDataLoss")
+            operation["start_reply"] = native_management(self.allocation, "POST", operation["start_path"])
+            operation["start_http_status"] = operation["start_reply"]["http_status"]
+            native_success(operation["start_reply"], 202, "StartDataLoss PartialDataLoss")
+            evidence["completed_progress"] = poll_fas(self.allocation, operation)
+            # The FAS terminal response also confirms native transport-fault
+            # cleanup. No forced cancellation or user-created transport fault.
+            after = self.wait(service=service, target=target, minimum=minimum, mixed=auxiliary["mixed"], capture=evidence)
+            self.remember_auxiliary(auxiliary, after)
+            evidence["after_native_data_loss"] = after
+            reconciled = data_loss_invariants(before, after, seed, changed)
+            evidence["reconciled_workload"] = reconciled.compare(after)
+            evidence["actual_survivor_callbacks"] = [{
+                "identity": identity(replica), "engine_kind": replica["rpc"]["engine_kind"],
+                "state": replica["rpc"]["state"]} for replica in after["replicas"]
+                if identity(replica) in {identity(original) for original in before["replicas"]}
+                and replica["rpc"]["state"]["data_loss_calls"] > next(
+                    original["rpc"]["state"]["data_loss_calls"] for original in before["replicas"]
+                    if identity(original) == identity(replica))]
+            continued = Client(self.bundle, service, auxiliary["mixed"], reconciled, target, minimum)
+            continued.endpoint = after["primary"]["endpoint"]
+            first = continued.write("post-native-data-loss-0")
+            require(first["sequence"] == (6 if changed else 21),
+                    "actual next native-driven assignment ignored authoritative provider progress")
+            evidence["subsequent_writes"] = [dict(first)] + [
+                dict(continued.write(f"post-native-data-loss-{index}")) for index in range(1, 4)]
+            final = self.wait(service=service, target=target, minimum=minimum, mixed=auxiliary["mixed"],
+                              capture=evidence, accept=coherent(reconciled))
+            self.remember_auxiliary(auxiliary, final)
+            evidence.update(final_observation=final, final_workload=reconciled.compare(final))
+            require(all(replica["rpc"]["state"]["last"] == (9 if changed else 24) for replica in final["replicas"]),
+                    "post-data-loss replacement providers did not converge to actual continued writes")
+            recovered = {identity(replica): replica["rpc"]["state"] for replica in after["replicas"]}
+            for replica in final["replicas"]:
+                previous = recovered.get(identity(replica))
+                if previous is not None:
+                    state = replica["rpc"]["state"]
+                    require(all(state[field] >= previous[field] for field in ("data_loss_calls", "data_loss_changed_calls"))
+                            and (previous["last_data_loss_boundary"] is None
+                                 or state["last_data_loss_boundary"] == previous["last_data_loss_boundary"]),
+                            "actual provider callback counters/boundary reset after reconciliation/copy/continued writes")
+            main_after = self.converge(evidence)
+            stable_data(unrelated_before, main_after)
+            evidence.update(unrelated_main_before=unrelated_before, unrelated_main_after=main_after)
+            if siblings is not None:
+                evidence.update(stateless_siblings_before=siblings,
+                                stateless_siblings_after=self.unchanged_stateless(siblings))
+        finally:
+            self.cleanup_auxiliary(auxiliary)
+
+    def authoritative_data_loss(self, evidence: dict) -> None:
+        evidence.update(unchanged={}, changed={}, driver="Native FaultAnalysisService PartialDataLoss, not a manual callback/election",
+                        source_contract="service-fabric 51a7703a1f83749a9234d3ceb4296d8622e42cca: "
+                        "httpgateway/FaultsHandler.cpp (StartDataLoss, GetDataLossProgress, CancelTestCommand); "
+                        "Constants.cpp:398-406; managed/FabricFAS/.../InvokeDataLossSteps.cs:90-104,270-320")
+        self.data_loss_case(evidence["unchanged"], False)
+        self.data_loss_case(evidence["changed"], True)
+
     def direction(self, kind: str, evidence: dict) -> None:
         value = self.wait(capture=evidence)
         evidence["move"] = {}
@@ -1318,6 +1959,8 @@ class Qualification:
             ("unavailable_quorum", self.unavailable_quorum),
             ("abrupt_primary_loss", self.abrupt_primary_loss),
             ("per_unit_close", self.per_unit_close),
+            ("stale_wire_receipts", self.stale_wire_receipts),
+            ("authoritative_data_loss", self.authoritative_data_loss),
         )
         for name, action in actions:
             self.scenario(name, action)
@@ -1940,6 +2583,15 @@ def ownership_read(allocation, path: str) -> dict | None:
         return None
     if value["status"] == 404:
         body = value["body"]
+        # Native ImageStoreHandler::HandleListContentResult (h:129-183)
+        # deliberately emits an empty 404 for a nonexistent nonempty path.
+        # Executed against SF11.8.121.4; do NOT generalize to other routes.
+        # A later provision still must yield positive native FileVersion proof.
+        if body is None and re.fullmatch(
+            r"/ImageStore/Store%2F[A-Za-z0-9][A-Za-z0-9_.-]{0,255}%2FApplicationManifest\."
+            r"[A-Za-z0-9][A-Za-z0-9_.-]{0,255}\.xml\?api-version=6\.2", path
+        ):
+            return None
         require(type(body) is dict and type(body.get("Error")) is dict
                 and body["Error"].get("Code") in {
                     "FABRIC_E_APPLICATION_NOT_FOUND", "FABRIC_E_APPLICATION_TYPE_NOT_FOUND"},
@@ -2002,6 +2654,9 @@ def native_type_generation(allocation, expected: TypeIdentity, *,
                            allow_absent: bool = False) -> tuple[int, int, int] | None:
     path = type_store_path(expected)
     value = ownership_read(allocation, "/ImageStore/" + quote(path, safe="") + "?api-version=6.2")
+    if value is None:
+        require(allow_absent, "positive native manifest generation unavailable; retain type")
+        return None
     require(type(value) is dict and value.get("ContinuationToken") in (None, "")
             and type(value.get("StoreFiles")) is list
             and value.get("StoreFolders") in (None, []),
@@ -2026,7 +2681,7 @@ def native_type_generation(allocation, expected: TypeIdentity, *,
                 "invalid native provisioned manifest generation; retain type")
         number = int(number)
         minimum, maximum = ((1, 2**64 - 1) if field == "VersionNumber" else
-                            (1, 2**63 - 1) if field == "EpochDataLossNumber" else (-1, 2**63 - 1))
+                            (0, 2**63 - 1) if field == "EpochDataLossNumber" else (-1, 2**63 - 1))
         require(minimum <= number <= maximum,
                 "invalid native provisioned manifest generation range; retain type")
         numbers.append(number)
@@ -2219,6 +2874,266 @@ def cleanup_data_deployment(allocation, result: dict, outcomes: dict,
                 retain("upload", str(error))
 
 
+@dataclass
+class DeploymentVersion:
+    source: Path
+    expected: TypeIdentity
+    outcomes: dict
+    original: TypeIdentity | None = None
+    upload: UploadOwnership | None = None
+
+    def evidence(self) -> dict:
+        return {
+            "local_package_path": str(self.source), "requested_type": vars(self.expected),
+            "original_type": vars(self.original) if self.original else None,
+            "outcomes": dict(self.outcomes),
+            "upload": ({"path": self.upload.path, "container_id": self.upload.container_id,
+                        **self.upload.evidence()} if self.upload else None),
+        }
+
+
+class NativeDataDeploymentPolicy:
+    """Original native identities and pinned uploads for the preserved runtime suite."""
+
+    def __init__(self, bundle: Bundle):
+        self.bundle = bundle
+        self.type_capability = secrets.token_hex(32)
+        self.creation_capability = secrets.token_hex(32)
+        self.versions: dict[str, DeploymentVersion] = {}
+        self.outcomes = {"create": "not_requested"}
+        self.original_application: ApplicationIdentity | None = None
+        self.allocation_identity: tuple[str, str, str] | None = None
+        self.cleanup_complete = False
+
+    def verify_allocation(self, allocation) -> None:
+        require(self.allocation_identity == (allocation.name, allocation.owner, allocation.container_id)
+                and allocation.verify() == self.allocation_identity[2],
+                "legacy deployment original allocation changed; retain all capabilities")
+
+    def parameters(self) -> str:
+        return json.dumps({"FubeDataTypeCapability": self.type_capability,
+                           "FubeDataCreationCapability": self.creation_capability})
+
+    def prepare(self, binaries: runtime.Binaries, result: dict, *, upgrade: bool) -> DeploymentVersion:
+        require(binaries == self.bundle.legacy and binaries.template_root is not None,
+                "legacy deployment requires the verified nested v3 bundle; no build fallback")
+        number = 2 if upgrade else 1
+        for name in runtime.PACKAGE_FILES:
+            self.bundle.artifact(f"legacy/package-v{number}/{name}")
+        self.bundle.artifact("legacy/rust-runtime-app")
+        self.bundle.artifact("legacy/runtime_observer")
+        source, type_name, version = runtime.package(
+            result["run_id"], binaries.app, templates=binaries.template_root, upgrade=upgrade)
+        require(type_name == result["type_name"] and version == ("1.2" if upgrade else "1.1")
+                and version not in self.versions, "legacy minted package version/type drift")
+        self.bundle.artifact("legacy/rust-runtime-app", source / "RustRuntimeService/Code/rust-runtime-app")
+        path = source / "ApplicationManifest.xml"
+        manifest = ET.parse(path)
+        root = manifest.getroot()
+        containers = root.findall(f"{{{runtime.NS}}}Parameters")
+        require(len(containers) <= 1, "ambiguous legacy ownership parameter container")
+        if containers:
+            parameters = containers[0]
+        else:
+            parameters = ET.Element(f"{{{runtime.NS}}}Parameters")
+            root.insert(0, parameters)
+        for name, capability in json.loads(self.parameters()).items():
+            matches = parameters.findall(f"{{{runtime.NS}}}Parameter[@Name='{name}']")
+            require(len(matches) <= 1 and (not matches or matches[0].get("DefaultValue") == ""),
+                    "legacy ownership templates must be empty; never reuse stored capabilities")
+            marker = matches[0] if matches else ET.SubElement(
+                parameters, f"{{{runtime.NS}}}Parameter", Name=name)
+            marker.set("DefaultValue", capability)
+        manifest.write(path, encoding="utf-8", xml_declaration=True)
+        record = DeploymentVersion(source, manifest_identity(path.read_text()),
+                                   {"provision": "not_requested"})
+        self.versions[version] = record
+        result.setdefault("local_package_paths", {})[version] = str(source)
+        return record
+
+    def provision(self, allocation, record: DeploymentVersion, result: dict) -> None:
+        self.verify_allocation(allocation)
+        require(native_type_generation(allocation, record.expected, allow_absent=True) is None,
+                "provisioned ImageStore manifest path collision; no unprovision authority")
+        record.upload = reserve_upload(allocation, uuid.uuid4().hex)
+        result.setdefault("upload_paths", []).append(record.upload.path)
+        check_upload(allocation, record.upload)
+        result.setdefault("upload_transfers", {})[record.expected.version] = transfer_upload(
+            allocation, record.upload, record.source)
+        deployment_mutation(allocation, record.outcomes, "provision", "provision",
+                            "--application-type-build-path", record.upload.path.rsplit("/", 1)[1])
+        record.original = native_type_identity(allocation, record.expected, capture=True)
+        require(record.original is not None, "accepted legacy provision has no original native manifest/generation")
+        result["deployment_versions"] = {version: value.evidence() for version, value in self.versions.items()}
+
+    def deploy_initial(self, allocation, binaries: runtime.Binaries, result: dict) -> None:
+        require(self.allocation_identity is None, "legacy deployment policy cannot be reused")
+        self.allocation_identity = (allocation.name, allocation.owner, allocation.container_id)
+        self.verify_allocation(allocation)
+        result["native_type_identity_method"] = TYPE_IDENTITY_METHOD
+        record = self.prepare(binaries, result, upgrade=False)
+        allocation.sf("cluster", "select", "--endpoint", "http://127.0.0.1:19080")
+        require(not any(item["name"] == result["application"] for item in
+                        runtime.items(allocation.sf("application", "list", timeout=10))),
+                "minted legacy application collision; no adoption/deletion capability granted")
+        require(not any(item["name"] == record.expected.name for item in
+                        runtime.items(allocation.sf("application", "type-list", timeout=10))),
+                "minted legacy type collision; no adoption/unprovision capability granted")
+        self.provision(allocation, record, result)
+        deployment_mutation(allocation, self.outcomes, "create", "create",
+                            "--app-name", result["application"], "--app-type", record.expected.name,
+                            "--app-version", record.expected.version, "--parameters", self.parameters())
+        self.original_application = runtime.wait_condition(lambda: native_application_identity(
+            allocation, result["application"], record.original, self.creation_capability),
+            "initial legacy native application instance/capability", timeout=60)
+        result["original_application_identity"] = {
+            "native_application_id": self.original_application.native_application_id,
+            "creation_capability": self.original_application.capability,
+        }
+
+    def current_application(self, allocation) -> ApplicationIdentity | None:
+        original = self.original_application
+        require(original is not None and self.outcomes["create"] == "accepted",
+                "legacy create has no captured original native application; never adopt at cleanup")
+        value = ownership_read(allocation, application_path(original.name) + "?api-version=6.0")
+        if value is None:
+            return None
+        record = self.versions.get(value.get("TypeVersion"))
+        require(record is not None and record.original is not None
+                and record.outcomes["provision"] == "accepted",
+                "legacy application version drift/unconfirmed provisioning; retain application and types")
+        current = native_application_identity(allocation, original.name, record.original, original.capability)
+        require(current is not None and current == replace(original, type_identity=record.original),
+                "original legacy native application instance changed; refuse copied-capability replacement")
+        return current
+
+    def provision_upgrade(self, allocation, binaries: runtime.Binaries, result: dict) -> tuple[str, str]:
+        self.verify_allocation(allocation)
+        require(self.current_application(allocation) == self.original_application,
+                "legacy application changed before config-only upgrade")
+        record = self.prepare(binaries, result, upgrade=True)
+        require(not any(item["name"] == record.expected.name and item["version"] == record.expected.version
+                        for item in runtime.items(allocation.sf("application", "type-list", timeout=10))),
+                "legacy upgrade type collision; no adoption/unprovision capability granted")
+        self.provision(allocation, record, result)
+        return record.expected.version, self.parameters()
+
+    def confirm_upgrade(self, allocation, result: dict, version: str) -> None:
+        self.verify_allocation(allocation)
+        current = self.current_application(allocation)
+        require(current is not None and current.type_identity.version == version,
+                "native config-only upgrade did not retain the original application at the requested version")
+        result["configuration_upgrade"]["native_application_identity"] = {
+            "native_application_id": current.native_application_id, "version": version,
+            "creation_capability": current.capability,
+        }
+
+    def require_type_absent(self, allocation, record: DeploymentVersion) -> bool:
+        expected = record.original
+        require(expected is not None, "no original native type generation; retain")
+        require(native_type_identity(allocation, expected) is None
+                and native_type_generation(allocation, expected, allow_absent=True) is None
+                and not any(item["name"] == expected.name and item["version"] == expected.version for item in
+                            runtime.items(allocation.sf("application", "type-list", timeout=10))),
+                "legacy original type absence not independently confirmed")
+        return True
+
+    def cleanup(self, allocation, result: dict) -> None:
+        cleanup = result["cleanup"]
+        absence = {"application": False, "types": {}, "uploads": {}}
+        cleanup["independent_absence"] = absence
+        def retain(kind, reason):
+            cleanup.setdefault("retained", {})[kind] = str(reason)
+            result["errors"].append(f"legacy {kind} cleanup: {reason}")
+        try:
+            if self.allocation_identity is not None:
+                self.verify_allocation(allocation)
+            for record in self.versions.values():
+                if record.original is not None:
+                    require(record.outcomes["provision"] == "accepted",
+                            "unconfirmed/rejected provision cannot grant legacy cleanup authority")
+                    if native_type_identity(allocation, record.original) is None:
+                        self.require_type_absent(allocation, record)
+            application_clear = self.outcomes["create"] == "not_requested"
+            if self.original_application is not None:
+                current = self.current_application(allocation)
+                if current is not None:
+                    allocation.sf("application", "delete", "--application-id",
+                                  current.name.removeprefix("fabric:/"))
+                    runtime.wait_condition(lambda: ownership_read(allocation,
+                        application_path(current.name) + "?api-version=6.0") is None,
+                        "original legacy application absence (no replacement retries)", timeout=60)
+                cleanup["application"] = "deleted; absence confirmed" if current else "absence confirmed"
+                absence["application"] = application_clear = True
+            elif not application_clear:
+                retain("application", f"{self.outcomes['create']} create has no captured original native instance; "
+                       "late completion possible; matching names/parameters grant no deletion authority")
+            for version, record in self.versions.items():
+                try:
+                    if record.outcomes["provision"] == "not_requested":
+                        continue
+                    require(record.original is not None,
+                            f"{record.outcomes['provision']} provision has no captured original manifest/generation; "
+                            "late completion possible; no adoption from later queries")
+                    require(application_clear, "legacy application identity unresolved; original type retained")
+                    if native_type_identity(allocation, record.original) is not None:
+                        allocation.sf("application", "unprovision", "--application-type-name", record.original.name,
+                                      "--application-type-version", version)
+                    runtime.wait_condition(lambda: self.require_type_absent(allocation, record),
+                                           "original legacy type absence in independent native queries", timeout=60)
+                    cleanup.setdefault("types", {})[version] = "unprovisioned; absence confirmed"
+                    absence["types"][version] = True
+                except Exception as error:
+                    retain("type " + version, error)
+        except Exception as error:
+            retain("deployment", error)
+        finally:
+            for version, record in self.versions.items():
+                if record.upload is not None:
+                    try:
+                        check_upload(allocation, record.upload, "remove")
+                        cleanup.setdefault("uploads", {})[version] = "original reservation removed; absence confirmed"
+                        absence["uploads"][version] = True
+                    except Exception as error:
+                        retain("upload " + version, error)
+            result["deployment_outcomes"] = dict(self.outcomes)
+            result["deployment_versions"] = {version: record.evidence() for version, record in self.versions.items()}
+            if cleanup.get("retained"):
+                cleanup["retained_for_recovery"] = {
+                    "application": result["application"], "original_allocation": self.allocation_identity,
+                    "original_native_application_id": (self.original_application.native_application_id
+                                                       if self.original_application else None),
+                    "application_creation_capability": self.creation_capability,
+                    "versions": result["deployment_versions"], "outcomes": dict(self.outcomes),
+                    "native_type_identity_method": TYPE_IDENTITY_METHOD, "reasons": dict(cleanup["retained"]),
+                    "note": "No name/token/content-only adoption; missing original native proof grants no authority.",
+                }
+            self.cleanup_complete = (not cleanup.get("retained") and absence["application"]
+                and set(absence["types"]) == set(absence["uploads"]) == set(self.versions) == {"1.1", "1.2"})
+            cleanup["safe_owner_cleanup"] = self.cleanup_complete
+
+
+def legacy_full(allocation, bundle: Bundle, result: dict) -> None:
+    evidence = result["scenarios"]["legacy_full"]
+    evidence.update(status="FAIL", started_at=time.time())
+    evidence.pop("reason", None)
+    policy = NativeDataDeploymentPolicy(bundle)
+    try:
+        qualified = runtime.qualify(allocation, full=True, binaries=bundle.legacy, stateful="three",
+                                    deployment_policy=policy)
+        evidence["qualification"] = qualified
+        require(qualified["status"] == "PASS_FULL_EMPTY_STATEFUL_CONTROL_PLANE_AND_STATELESS_PROFILE"
+                and not qualified["errors"], "preserved native full empty-state/stateless qualification failed")
+        require(policy.cleanup_complete and qualified["cleanup"].get("safe_owner_cleanup") is True,
+                "legacy full native qualification lacks original-owner cleanup/independent absence evidence")
+        evidence["status"] = "PASS"
+    except Exception as error:
+        evidence["error"] = f"{type(error).__name__}: {error}"
+        result["errors"].append("legacy_full: " + evidence["error"])
+    finally:
+        evidence["finished_at"] = time.time()
+
+
 def qualify(allocation, bundle: Bundle, profile: str) -> dict:
     run_id = uuid.uuid4().hex
     result = {
@@ -2283,13 +3198,8 @@ def qualify(allocation, bundle: Bundle, profile: str) -> dict:
             "creation_capability": original_application.capability,
             "note": "Captured after accepted creation, before scenarios; the REST Id is only an encoded name.",
         }
-        qualification = Qualification(allocation, bundle, result, profile != "rust")
+        qualification = Qualification(allocation, bundle, result, profile != "rust", original_application)
         qualification.run()
-        for name, reason in {
-            "stale_wire_receipts": "No native actor/epoch/incarnation wire-injection probe is bundled; codec/unit tests are not live evidence.",
-            "authoritative_data_loss": "Changed/unchanged native data-loss and divergent-tail rollback probe is not yet available.",
-        }.items():
-            result["scenarios"][name] = {"status": "MISSING", "reason": reason}
     except Exception as error:
         result["errors"].append(f"qualification: {type(error).__name__}: {error}")
         if getattr(error, "__notes__", None):
@@ -2298,6 +3208,7 @@ def qualify(allocation, bundle: Bundle, profile: str) -> dict:
         if qualification is not None:
             result["cleanup"]["resume"] = qualification.resume()
             result["cleanup"]["hooks"] = qualification.reset_hooks()
+            result["cleanup"]["auxiliaries"] = qualification.cleanup_auxiliaries()
             if qualification.paused:
                 result["errors"].append("owned process resume not confirmed")
             if qualification.hooks:
@@ -2326,16 +3237,20 @@ def qualify(allocation, bundle: Bundle, profile: str) -> dict:
             except Exception as error:
                 result["diagnostic_error"] = str(error)
         result["deployment_outcomes"] = outcomes
-        cleanup_data_deployment(allocation, result, outcomes, original_type, original_application, upload)
+        pending_fas = [auxiliary["fas"] for auxiliary in qualification.auxiliaries
+                       if auxiliary.get("fas") and not auxiliary["fas"].get("native_cleanup_terminal")] if qualification else []
+        if pending_fas:
+            result["errors"].append("owned native FAS operation/transport rollback remains unconfirmed; original deployment retained")
+            result["cleanup"]["pending_native_fas"] = pending_fas
+        else:
+            cleanup_data_deployment(allocation, result, outcomes, original_type, original_application, upload)
+            if qualification is not None:
+                try:
+                    qualification.confirm_auxiliaries_absent()
+                except Exception as error:
+                    result["errors"].append("auxiliary native absence/original-route retirement: " + str(error))
         if profile == "full":
-            legacy = result["scenarios"]["legacy_full"]
-            legacy["started_at"] = time.time()
-            legacy.update(status="MISSING", reason=(
-                "The preserved standalone legacy runner still uses name/attempt-based deployment cleanup. "
-                "The data entrypoint refuses to invoke it without original-resource ownership proofs; "
-                "legacy_full requires a separately hardened integration, not a skipped/PASS result."))
-            result["errors"].append("legacy_full not executed: unsafe legacy cleanup integration is blocked")
-            legacy["finished_at"] = time.time()
+            legacy_full(allocation, bundle, result)
     return finalize(result)
 
 

@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import time
+from typing import Protocol
 import uuid
 import xml.etree.ElementTree as ET
 if sys.platform == "linux":
@@ -53,6 +54,19 @@ class Binaries:
     template_root: Path | None = None
     bundle_manifest_sha256: str | None = None
     source_revision: str | None = None
+
+
+class DeploymentPolicy(Protocol):
+    """Optional deployment authority; qualification and native lifecycle stay here."""
+
+    def deploy_initial(self, allocation: Allocation, binaries: Binaries, result: dict) -> None: ...
+
+    def provision_upgrade(self, allocation: Allocation, binaries: Binaries,
+                          result: dict) -> tuple[str, str]: ...
+
+    def confirm_upgrade(self, allocation: Allocation, result: dict, version: str) -> None: ...
+
+    def cleanup(self, allocation: Allocation, result: dict) -> None: ...
 
 
 PACKAGE_FILES = (
@@ -958,7 +972,8 @@ print(json.dumps(result))
             "service_rollout":root.attrib["RolloutVersion"],"settings_value":value,"override":override}
 
 
-def configuration_upgrade(allocation: Allocation, binaries: Binaries, result: dict, attempts: dict) -> dict:
+def configuration_upgrade(allocation: Allocation, binaries: Binaries, result: dict, attempts: dict, *,
+                          deployment_policy: DeploymentPolicy | None = None) -> dict:
     service = result["application"] + "/Singleton"
     initial = wait_observe(service, observer=binaries.observer)
     if initial["rpc"]["packages"]["configuration"]["value"] != "before-upgrade":
@@ -968,20 +983,24 @@ def configuration_upgrade(allocation: Allocation, binaries: Binaries, result: di
                 "initial_artifacts":deployment_artifacts(allocation,initial),
                 "samples":[],"sample_errors":[]}
     result["configuration_upgrade"] = evidence  # Preserve partial evidence on failure.
-    source,type_name,version = package(result["run_id"], binaries.app,templates=binaries.template_root,upgrade=True)
-    if type_name != result["type_name"] or version == result["version"]:
-        raise RuntimeError("upgrade package identity mismatch")
-    remote = f"/var/lib/sf-node/fube-rust-runtime-{result['run_id']}-upgrade"
-    result.setdefault("upload_paths",[]).append(remote)
-    run("docker","cp",str(source),f"{allocation.verify()}:{remote}")
-    allocation.sf("application","upload","--path",remote)
-    attempts.setdefault("extra_versions",{})[version] = False
-    allocation.sf("application","provision","--application-type-build-path",remote.rsplit("/",1)[1])
-    attempts["extra_versions"][version] = True
+    if deployment_policy is None:
+        source,type_name,version = package(result["run_id"], binaries.app,templates=binaries.template_root,upgrade=True)
+        if type_name != result["type_name"] or version == result["version"]:
+            raise RuntimeError("upgrade package identity mismatch")
+        remote = f"/var/lib/sf-node/fube-rust-runtime-{result['run_id']}-upgrade"
+        result.setdefault("upload_paths",[]).append(remote)
+        run("docker","cp",str(source),f"{allocation.verify()}:{remote}")
+        allocation.sf("application","upload","--path",remote)
+        attempts.setdefault("extra_versions",{})[version] = False
+        allocation.sf("application","provision","--application-type-build-path",remote.rsplit("/",1)[1])
+        attempts["extra_versions"][version] = True
+        parameters = "[]"
+    else:
+        version, parameters = deployment_policy.provision_upgrade(allocation, binaries, result)
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         upgrade = executor.submit(allocation.sf,"application","upgrade","--application-id",
                                   result["application"].removeprefix("fabric:/"),
-                                  "--application-version",version,"--parameters","[]","--mode","UnmonitoredAuto")
+                                  "--application-version",version,"--parameters",parameters,"--mode","UnmonitoredAuto")
         end = time.monotonic()+180
         while True:
             try:
@@ -1007,6 +1026,8 @@ def configuration_upgrade(allocation: Allocation, binaries: Binaries, result: di
             if time.monotonic() >= end or len(evidence["samples"]) >= 256:
                 raise RuntimeError("configuration-only upgrade deadline/sample bound")
             time.sleep(0.25)
+    if deployment_policy is not None:
+        deployment_policy.confirm_upgrade(allocation, result, version)
     final = observe(service,observer=binaries.observer)
     evidence["final"] = final
     require_same_instance(final,initial)
@@ -1159,7 +1180,7 @@ def create_owned(name: str, *, on_allocated=None) -> str:
 
 
 def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | None = None,
-            stateful: str | None = None) -> dict:
+            stateful: str | None = None, *, deployment_policy: DeploymentPolicy | None = None) -> dict:
     if stateful=="three" and not full:
         raise ValueError("three-replica qualification requires the full preserved regression tier")
     run_id = uuid.uuid4().hex[:12]
@@ -1181,27 +1202,34 @@ def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | Non
                                      "runtime_observer":digest(binaries.observer)})
         result["bundle_manifest_sha256"] = binaries.bundle_manifest_sha256
         result["executable_source_revision"] = binaries.source_revision
-        source, type_name, version = package(run_id, binaries.app,templates=binaries.template_root)
-        result.update(type_name=type_name,version=version)
-        remote=f"/var/lib/sf-node/fube-rust-runtime-{run_id}"
-        allocation.sf("cluster", "select", "--endpoint", "http://127.0.0.1:19080")
-        if any(v["name"]==application for v in items(allocation.sf("application","list",timeout=10))):
-            raise RuntimeError("minted application collision; no cleanup capability granted")
-        if any(v["name"]==type_name for v in items(allocation.sf("application","type-list",timeout=10))):
-            raise RuntimeError("minted type collision; no cleanup capability granted")
-        result["upload_paths"]=[remote]
-        run("docker", "cp", str(source), f"{allocation.verify()}:{remote}")
-        allocation.sf("application", "upload", "--path", remote)
-        attempts["provision"]=True
-        allocation.sf("application", "provision", "--application-type-build-path", remote.rsplit("/", 1)[1])
-        attempts["provision_completed"]=True
-        attempts["create"]=True
-        allocation.sf("application", "create", "--app-name", application, "--app-type", type_name, "--app-version", version)
-        attempts["create_completed"]=True
+        if deployment_policy is None:
+            source, type_name, version = package(run_id, binaries.app,templates=binaries.template_root)
+            result.update(type_name=type_name,version=version)
+            remote=f"/var/lib/sf-node/fube-rust-runtime-{run_id}"
+            allocation.sf("cluster", "select", "--endpoint", "http://127.0.0.1:19080")
+            if any(v["name"]==application for v in items(allocation.sf("application","list",timeout=10))):
+                raise RuntimeError("minted application collision; no cleanup capability granted")
+            if any(v["name"]==type_name for v in items(allocation.sf("application","type-list",timeout=10))):
+                raise RuntimeError("minted type collision; no cleanup capability granted")
+            result["upload_paths"]=[remote]
+            run("docker", "cp", str(source), f"{allocation.verify()}:{remote}")
+            allocation.sf("application", "upload", "--path", remote)
+            attempts["provision"]=True
+            allocation.sf("application", "provision", "--application-type-build-path", remote.rsplit("/", 1)[1])
+            attempts["provision_completed"]=True
+            attempts["create"]=True
+            allocation.sf("application", "create", "--app-name", application, "--app-type", type_name, "--app-version", version)
+            attempts["create_completed"]=True
+        else:
+            deployment_policy.deploy_initial(allocation, binaries, result)
+            type_name = result["type_name"]
         if stateful is not None:
             result["stateful_singleton"] = {}
             stateful_singleton(allocation,application,binaries,result["stateful_singleton"])
-        configuration_upgrade(allocation,binaries,result,attempts)
+        if deployment_policy is None:
+            configuration_upgrade(allocation,binaries,result,attempts)
+        else:
+            configuration_upgrade(allocation,binaries,result,attempts,deployment_policy=deployment_policy)
         if stateful=="three":
             result["stateful_three"]={}
             stateful_three(allocation,application,binaries,result["stateful_three"])
@@ -1216,12 +1244,17 @@ def qualify(allocation: Allocation, full: bool = False, binaries: Binaries | Non
             result["stateful_after_legacy_recovery"]=wait_stateful(application+"/Stateful",3,2,observer=binaries.observer)
     except Exception as error:
         result["errors"].append(f"qualification ({type(error).__name__}): {error!r}")
+        if getattr(error, "__notes__", None):
+            result["qualification_recovery_notes"] = list(error.__notes__)
         try:
             result["failure_artifacts"]=failure_artifacts(allocation,type_name)
         except Exception as diagnostic:
             result["diagnostic_error"]=str(diagnostic)
     finally:
-        cleanup_deployment(allocation,result,attempts)
+        if deployment_policy is None:
+            cleanup_deployment(allocation,result,attempts)
+        else:
+            deployment_policy.cleanup(allocation,result)
     if not result["errors"]:
         result["status"]=("PASS_FULL_EMPTY_STATEFUL_CONTROL_PLANE_AND_STATELESS_PROFILE" if stateful=="three" else
                          "PASS_EMPTY_STATEFUL_ONE_REPLICA_AND_STATELESS_PROFILE" if stateful is not None else

@@ -60,6 +60,9 @@ pub struct ProviderSnapshot {
     pub retained_bytes: usize,
     pub epoch_data_loss: i64,
     pub epoch_configuration: i64,
+    pub data_loss_calls: usize,
+    pub data_loss_changed_calls: usize,
+    pub last_data_loss_boundary: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -77,6 +80,9 @@ struct State {
     copying: Option<i64>,
     epoch: Option<Epoch>,
     data_loss: Option<i64>,
+    data_loss_calls: usize,
+    data_loss_changed_calls: usize,
+    last_data_loss_boundary: Option<i64>,
 }
 
 #[derive(Default)]
@@ -111,6 +117,9 @@ impl MemoryProvider {
             retained_bytes: state.bytes,
             epoch_data_loss: state.epoch.map_or(0, |e| e.data_loss),
             epoch_configuration: state.epoch.map_or(0, |e| e.configuration),
+            data_loss_calls: state.data_loss_calls,
+            data_loss_changed_calls: state.data_loss_changed_calls,
+            last_data_loss_boundary: state.last_data_loss_boundary,
         }
     }
     /// Primary local application or secondary application BEFORE explicit ACK.
@@ -144,6 +153,10 @@ impl MemoryProvider {
                 *state = State {
                     copying: Some(boundary),
                     epoch,
+                    data_loss: state.data_loss,
+                    data_loss_calls: state.data_loss_calls,
+                    data_loss_changed_calls: state.data_loss_changed_calls,
+                    last_data_loss_boundary: state.last_data_loss_boundary,
                     ..State::default()
                 };
             }
@@ -257,6 +270,10 @@ fn reconcile(state: &mut State, boundary: i64) -> Result<()> {
     let epoch = state.epoch;
     *state = State {
         epoch,
+        data_loss: state.data_loss,
+        data_loss_calls: state.data_loss_calls,
+        data_loss_changed_calls: state.data_loss_changed_calls,
+        last_data_loss_boundary: state.last_data_loss_boundary,
         ..State::default()
     };
     for r in retained {
@@ -393,8 +410,11 @@ impl StateProvider for MemoryProvider {
                 return Err(Error::Closed);
             }
             let mut state = self.state.lock().unwrap();
+            state.data_loss_calls = state.data_loss_calls.saturating_add(1);
             if let Some(boundary) = state.data_loss.take() {
                 reconcile(&mut state, boundary)?;
+                state.data_loss_changed_calls = state.data_loss_changed_calls.saturating_add(1);
+                state.last_data_loss_boundary = Some(boundary);
                 Ok(true)
             } else {
                 Ok(false)
@@ -500,11 +520,25 @@ mod tests {
         p.apply_replication(8, &mutation(80).operation().unwrap())
             .unwrap();
         p.request_data_loss(3).unwrap();
+        // A node epoch transition cannot silently clear the armed fixture hook.
+        p.update_epoch(
+            Epoch {
+                data_loss: 2,
+                configuration: 1,
+            },
+            8,
+            Cancellation::default(),
+        )
+        .await
+        .unwrap();
         assert!(p.on_data_loss(Cancellation::default()).await.unwrap());
         assert_eq!(p.last_committed().unwrap(), 3);
         p.apply_replication(4, &mutation(90).operation().unwrap())
             .unwrap();
         assert_eq!(p.last_committed().unwrap(), 4);
+        assert_eq!(p.snapshot().data_loss_calls, 2);
+        assert_eq!(p.snapshot().data_loss_changed_calls, 1);
+        assert_eq!(p.snapshot().last_data_loss_boundary, Some(3));
     }
     #[test]
     fn capacity_retains_retry_protection_and_rejects_gaps() {

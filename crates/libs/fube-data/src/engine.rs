@@ -397,6 +397,29 @@ impl Engine {
         snapshot
     }
 
+    /// Test-fixture-only invalid/obsolete peer traffic on existing connections.
+    /// Destinations are restricted to native-selected current engine sessions;
+    /// this never changes membership, epochs, roles, queues or progress.
+    #[cfg(feature = "qualification")]
+    pub fn qualification_probe(
+        &self,
+        kind: &str,
+        target: Option<i64>,
+    ) -> ServiceFuture<'_, serde_json::Value> {
+        let kind = kind.to_owned();
+        Box::pin(async move {
+            if kind.len() > 32 {
+                return Err(Error::InvalidInput("probe kind bound"));
+            }
+            self.request(|reply| Command::Probe {
+                kind,
+                target,
+                reply,
+            })
+            .await
+        })
+    }
+
     /// Admit without conflating acceptance with quorum completion. The primary
     /// service applies the returned sequence locally before waiting/publishing.
     /// ResourceLimit, including outgoing-copy headroom, rejects before assigning
@@ -527,6 +550,12 @@ struct Submit {
 }
 
 enum Command {
+    #[cfg(feature = "qualification")]
+    Probe {
+        kind: String,
+        target: Option<i64>,
+        reply: Reply<serde_json::Value>,
+    },
     Epoch {
         epoch: Epoch,
         role: Option<ReplicaRole>,
@@ -1004,6 +1033,15 @@ impl Owner {
 impl Owner {
     fn command(&mut self, command: Command) {
         match command {
+            #[cfg(feature = "qualification")]
+            Command::Probe {
+                kind,
+                target,
+                reply,
+            } => {
+                let result = self.qualification_probe(&kind, target);
+                let _ = reply.send(result);
+            }
             Command::Epoch {
                 epoch,
                 role,
@@ -1158,6 +1196,123 @@ impl Owner {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "qualification")]
+    fn qualification_probe(&self, kind: &str, target: Option<i64>) -> Result<serde_json::Value> {
+        if self.control.is_some() || !self.copy_done || self.fault.is_some() {
+            return Err(Error::Closed);
+        }
+        let primary = self.role == ReplicaRole::Primary;
+        let peer = if primary {
+            self.peers
+                .values()
+                .find(|peer| {
+                    peer.configured
+                        && !peer.cleanup_required
+                        && target.is_none_or(|id| peer.endpoint.actor.replica == id)
+                })
+                .map(|peer| peer.endpoint.clone())
+        } else if self.role == ReplicaRole::Secondary {
+            self.secondary
+                .as_ref()
+                .map(|copy| copy.primary.clone())
+                .filter(|peer| target.is_none_or(|id| peer.actor.replica == id))
+        } else {
+            None
+        }
+        .ok_or(Error::InvalidInput(
+            "probe requires native-selected live peer",
+        ))?;
+        let epoch = self.epoch.ok_or(Error::Closed)?;
+        let progress = self.queue.progress();
+        let sequence = progress
+            .assigned
+            .checked_add(1)
+            .filter(|n| *n > 0 && *n < i64::MAX)
+            .ok_or(Error::InvalidInput("probe sequence exhausted"))?;
+        let mut from = self.endpoint.clone();
+        let mut destination = peer.clone();
+        let mut sent_epoch = epoch;
+        let body = match kind {
+            "stale_epoch" if primary => {
+                sent_epoch = if epoch.configuration >= 0x1_0000_0000 {
+                    Epoch {
+                        configuration: epoch.configuration - 0x1_0000_0000,
+                        ..epoch
+                    }
+                } else if epoch.data_loss > 0 {
+                    Epoch {
+                        data_loss: epoch.data_loss - 1,
+                        ..epoch
+                    }
+                } else {
+                    return Err(Error::InvalidInput("no earlier valid native epoch"));
+                };
+                let payload = crate::Mutation {
+                    id: format!("__probe-{}", uuid::Uuid::new_v4()),
+                    key: "__invalid_stale_epoch".into(),
+                    value: "must-not-apply".into(),
+                }
+                .operation()?;
+                Body::Replication {
+                    primary_epoch: sent_epoch,
+                    operation_epoch: sent_epoch,
+                    operations: vec![WireOperation {
+                        sequence,
+                        kind: 1,
+                        atomic_group: -1,
+                        data: payload.to_segments(),
+                    }],
+                    batch_end: sequence,
+                    completed: progress.completed,
+                }
+            }
+            "wrong_sender" => {
+                from.actor.incarnation = uuid::Uuid::new_v4();
+                if primary {
+                    Body::RequestAck
+                } else {
+                    Body::Ack {
+                        received: progress.received,
+                        applied: progress.applied,
+                        copy_received: -1,
+                        copy_applied: -1,
+                        error: 0,
+                    }
+                }
+            }
+            "stale_copy_ack" if !primary => Body::Ack {
+                received: progress.received,
+                applied: progress.applied,
+                copy_received: 0,
+                copy_applied: 0,
+                error: 0,
+            },
+            "wrong_target" => {
+                destination.actor.incarnation = uuid::Uuid::new_v4();
+                Body::RequestAck
+            }
+            _ => return Err(Error::InvalidInput("unsupported role/probe kind")),
+        };
+        let temporary = destination.actor != peer.actor;
+        if temporary {
+            self.transport.register_peer(&destination)?;
+        }
+        let result = self.transport.send(Packet {
+            from: from.clone(),
+            to: destination.actor,
+            body,
+        });
+        if temporary {
+            let _ = self.transport.unregister_peer(&destination.actor);
+        }
+        result?;
+        Ok(serde_json::json!({"qualification_only":true,"kind":kind,
+                "from":from.to_string(),"target":destination.to_string(),"admission_only":true,
+                "native_selected_peer":peer.to_string(),"sequence":sequence,
+                "native_epoch":{"data_loss":epoch.data_loss,"configuration":epoch.configuration},
+                "sent_epoch":{"data_loss":sent_epoch.data_loss,"configuration":sent_epoch.configuration}}))
     }
 
     fn validate_configuration(&self, configuration: &ReplicaSetConfiguration) -> Result<()> {
@@ -1532,6 +1687,10 @@ impl Owner {
     }
 
     fn send_replication(&mut self) {
+        self.send_replication_mode(false);
+    }
+
+    fn send_replication_mode(&mut self, retransmit: bool) {
         if self.role != ReplicaRole::Primary || self.control.is_some() {
             return;
         }
@@ -1548,6 +1707,12 @@ impl Owner {
                 .received
                 .saturating_add(1)
                 .max(peer.build.as_ref().map_or(1, |build| build.horizon + 1));
+            if !retransmit {
+                // New admission/progress sends only the unsent suffix. A
+                // duplicate cumulative ACK must not amplify into another copy
+                // of every outstanding operation and starve newer data.
+                from = from.max(peer.maximum_sent.saturating_add(1));
+            }
             if from < progress.first_retained && from <= progress.assigned {
                 if !peer.receipt_seen && peer.build.is_none() {
                     // A promoted active peer can already own this authoritative
@@ -1629,7 +1794,7 @@ impl Owner {
             self.send_start(id);
         }
         self.send_copies();
-        self.send_replication();
+        self.send_replication_mode(true);
         if self.role == ReplicaRole::Primary {
             for peer in self.peers.values() {
                 if !peer.cleanup_required {
@@ -2001,6 +2166,8 @@ impl Owner {
             }
             return;
         }
+        let receive_advanced = received > peer.received;
+        let establishing = peer.build.as_ref().is_some_and(|build| !build.established);
         peer.received = received;
         peer.applied = applied;
         peer.receipt_seen = true;
@@ -2017,7 +2184,9 @@ impl Owner {
             };
             build.pending.retain(|sequence, _| *sequence > through);
         }
-        self.send_replication();
+        if receive_advanced || establishing {
+            self.send_replication();
+        }
     }
 
     fn send_ack(&self) {

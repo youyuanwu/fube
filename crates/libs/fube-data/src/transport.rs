@@ -86,6 +86,8 @@ struct Network {
     data: Class,
     control: Class,
     local: ListenInstance,
+    #[cfg(test)]
+    diagnostics: Mutex<std::collections::BTreeMap<&'static str, (u64, String)>>,
 }
 
 struct Class {
@@ -138,6 +140,8 @@ struct Outgoing {
     bytes: Vec<u8>,
     _bytes: OwnedSemaphorePermit,
     _slot: OwnedSemaphorePermit,
+    #[cfg(test)]
+    data: bool,
 }
 
 impl PeerTransport {
@@ -177,6 +181,8 @@ impl PeerTransport {
             },
             settings,
             routes: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            diagnostics: Mutex::new(std::collections::BTreeMap::new()),
         });
         let owned_network = network.clone();
         let (ready, readiness) = std_mpsc::sync_channel(1);
@@ -230,6 +236,17 @@ impl PeerTransport {
 
     pub fn address(&self) -> &str {
         &self.address
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diagnostics(&self) -> serde_json::Value {
+        let n = &self.handle.network;
+        serde_json::json!({"events":*n.diagnostics.lock().unwrap(),
+            "data_bytes_free":n.data.bytes.available_permits(),
+            "control_bytes_free":n.control.bytes.available_permits(),
+            "data_slots":n.data.outgoing_slots.available_permits(),
+            "control_slots":n.control.outgoing_slots.available_permits(),
+            "routes":n.routes.lock().unwrap().len()})
     }
 
     /// Seeds an authoritative destination. Packet carries a destination actor,
@@ -303,6 +320,8 @@ impl PeerTransport {
             bytes,
             _bytes: permit,
             _slot: slot,
+            #[cfg(test)]
+            data,
         };
         let sender = if data {
             &self.handle.data
@@ -353,6 +372,13 @@ impl Drop for Handle {
 }
 
 impl Network {
+    #[cfg(test)]
+    fn note(&self, kind: &'static str, detail: String) {
+        let mut d = self.diagnostics.lock().unwrap();
+        let entry = d.entry(kind).or_default();
+        entry.0 += 1;
+        entry.1 = detail.chars().take(512).collect();
+    }
     fn class(&self, data: bool) -> &Class {
         if data {
             &self.data
@@ -624,6 +650,25 @@ async fn run_session(
                 return Err(Error::Protocol("invalid classic peer envelope"));
             }
             let packet = Packet::decode(&frame.message)?;
+            #[cfg(test)]
+            network.note(
+                if is_data(&packet.body) {
+                    "received_data"
+                } else {
+                    "received_control"
+                },
+                format!(
+                    "{}:{}",
+                    id,
+                    match &packet.body {
+                        Body::Replication { operations, .. } =>
+                            operations.first().map_or(0, |o| o.sequence),
+                        Body::Copy { sequence, .. } | Body::CopyContext { sequence, .. } =>
+                            *sequence,
+                        _ => 0,
+                    }
+                ),
+            );
             if packet.from.address != remote_instance.address {
                 return Err(Error::Protocol("packet source differs from ListenInstance"));
             }
@@ -662,7 +707,10 @@ async fn run_session(
             };
             match class.deliver(packet, permit) {
                 Ok(()) => {}
-                Err(Error::ResourceLimit(_)) if data => {}
+                Err(Error::ResourceLimit(_)) if data => {
+                    #[cfg(test)]
+                    network.note("incoming_drop", "capacity".into());
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -679,12 +727,24 @@ async fn run_session(
             timeout(deadline, writer.write_all(&outgoing.bytes))
                 .await
                 .map_err(|_| Error::Timeout)??;
+            #[cfg(test)]
+            network.note(
+                if outgoing.data {
+                    "written_data"
+                } else {
+                    "written_control"
+                },
+                id.to_string(),
+            );
         }
     };
-    tokio::select! {
+    let result = tokio::select! {
         result = read => result,
         result = write => result,
-    }
+    };
+    #[cfg(test)]
+    network.note("session_end", format!("{id}: {result:?}"));
+    result
 }
 
 fn packet_bytes(packet: &Packet) -> usize {

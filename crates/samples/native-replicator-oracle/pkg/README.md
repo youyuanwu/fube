@@ -24,10 +24,20 @@ python3 scripts/fube_data_test.py data-owned --prebuilt build/data-bundle \
 `--profile rust` runs the Rust data scenarios; `mixed` runs both classic native
 directions in one partition restricted to N0010/N0020/N0030. `full` also requires
 the preserved full empty-state/stateless suite. That integration is currently
-explicitly **MISSING/FAIL**: the standalone legacy runner's attempt/name-based
-deployment cleanup cannot safely be invoked by this entrypoint. Its behavior
-is unchanged; the strict nested v3 bundle remains required. This is a blocked
-required scenario, not a skipped or passing legacy qualification.
+run through the real runtime `qualify(full=True, stateful="three")` on the same
+original allocation after data deployment cleanup. An explicit deployment policy
+replaces only package preparation, provisioning, creation and teardown; the native
+configuration upgrade, reporting, authority, queries, aborts and restart checks
+are unchanged. Both minted legacy versions receive the same immutable ownership
+parameters, separate pinned upload reservations and independently captured native
+ImageStore generations. The actual native application ID and creation capability
+must survive the config-only upgrade. Teardown revalidates both versions and the
+original application before deletion, then independently confirms application,
+type and upload-reservation absence. Missing proofs retain resources with recovery
+details and fail `legacy_full`; an expected qualification status alone cannot pass.
+The standalone legacy CLI/default cleanup is unchanged and is never called by
+this full entrypoint. The strict nested v3 bundle remains required; no templates
+in the stored bundle are modified and there is no Cargo fallback.
 `--existing-owner` explicitly retains a caller-owned allocation.
 
 ## Cleanup ownership and recovery

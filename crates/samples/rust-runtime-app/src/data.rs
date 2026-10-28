@@ -75,6 +75,8 @@ enum Request {
     Write(Mutation),
     Test(u64),
     CopyTest(u64),
+    WireProbe(String),
+    DataLoss(i64),
 }
 
 fn decode(value: &str) -> RuntimeResult<String> {
@@ -129,6 +131,26 @@ fn parse(operation: &str, query: &str) -> RuntimeResult<Request> {
             Ok(Request::Write(mutation))
         }
         "test" if parameters.len() == 1 => {
+            if let Some(value) = parameters.get("wire_probe") {
+                if matches!(
+                    value.as_str(),
+                    "stale_epoch" | "wrong_sender" | "stale_copy_ack" | "wrong_target"
+                ) {
+                    return Ok(Request::WireProbe(value.clone()));
+                }
+                return Err(RuntimeError::InvalidInput("unsupported bounded wire probe"));
+            }
+            if let Some(value) = parameters.get("data_loss_boundary") {
+                let boundary = value
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|n| *n >= 0)
+                    .filter(|_| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+                    .ok_or(RuntimeError::InvalidInput(
+                        "invalid data loss qualification boundary",
+                    ))?;
+                return Ok(Request::DataLoss(boundary));
+            }
             if let Some(value) = parameters.get("copy_delay_ms") {
                 let delay = value
                     .parse::<u64>()
@@ -787,6 +809,32 @@ impl Rpc {
         let Ok(status) = status else {
             return response(&mut stream, 503, &serde_json::json!({})).await;
         };
+        if let Request::WireProbe(kind) = request {
+            let snapshot = route.engine.snapshot();
+            if snapshot.epoch != Some(status.current_epoch.primary())
+                || snapshot.role != status.service_role
+                || !matches!(snapshot.role, ReplicaRole::Primary | ReplicaRole::Secondary)
+                || (snapshot.role == ReplicaRole::Primary && route.authority(true).is_err())
+            {
+                return response(&mut stream, 503, &serde_json::json!({})).await;
+            }
+            let result = route.engine.qualification_probe(&kind, None).await?;
+            if route.lifetime().is_err() {
+                return response(&mut stream, 503, &serde_json::json!({})).await;
+            }
+            return response(&mut stream, 200, &result).await;
+        }
+        if let Request::DataLoss(boundary) = request {
+            route.provider.request_data_loss(boundary)?;
+            return response(
+                &mut stream,
+                200,
+                &serde_json::json!({"qualification_only":true,
+                "data_loss_boundary":boundary,"armed_only":true,
+                "note":"Only a later native OnDataLoss callback may change provider state."}),
+            )
+            .await;
+        }
         let hook = match request {
             Request::Test(delay) => {
                 route.delay.store(delay, Ordering::Release);
