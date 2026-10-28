@@ -573,7 +573,7 @@ def validate_legacy(value, built):
             "assertions": ["legacy/legacy_full"]}
 
 
-def validate_copy(value, ack=False):
+def validate_copy(value, ack=False, source_kind=None):
     require(value.get("live_copy", {}).get("commits_inside_observed_build_horizon_window", 0) >= 100
             and integer(value["live_copy"]["commits_inside_observed_build_horizon_window"], 100)
             and integer(value.get("concurrent_writes", {}).get("successful"), 100),
@@ -581,12 +581,46 @@ def validate_copy(value, ack=False):
     if ack:
         gate = value["destination_copy_ack"]
         true_fields(gate, ("blocked_after_receive", "released"))
-        require(integer(gate.get("negative_observations"), 2) and nonempty(gate.get("source_eos")),
+        require(integer(gate.get("negative_observations"), 2),
                 "native copy independent receive-before-ACK negative gate")
-        hold = gate["completed_native_replica"]["rpc"]["copy_ack_hold"]
-        true_fields(hold, ("released", "acknowledged"))
+        held = gate["held_operation"]
+        require(integer(held.get("sequence"), 1) and integer(held.get("boundary"), 1),
+                "held native copy operation/boundary")
+        replica = gate["completed_native_replica"]
+        require(integer(replica.get("replica"), 1) and replica.get("status") == "Ready",
+                "same completed native copy replica")
+        hold = replica["rpc"]["copy_ack_hold"]
+        true_fields(hold, ("released", "acknowledged", "copy_end_received"))
+        require(all(type(hold.get(field)) is int and hold[field] == held[field]
+                   for field in ("sequence", "boundary")), "held/completed copy identity")
         require(all(hold.get(field) is False for field in ("held", "expired", "cancelled")),
                 "native copy hold did not complete safely")
+        eos = gate["source_eos"]
+        if source_kind == "rust":
+            require(eos.get("kind") == "destination_EOS_receipt_at_source",
+                   "Rust source requires destination copy EOS receipt")
+            peer = eos["peer"]
+            require(integer(peer.get("replica"), 1) and peer["replica"] == replica["replica"]
+                   and type(peer.get("copy_horizon")) is int and peer["copy_horizon"] == held["boundary"]
+                   and type(peer.get("copy_received")) is int and peer["copy_received"] == -1
+                   and integer(peer.get("copy_applied")) and peer["copy_applied"] < held["sequence"]
+                   and integer(peer.get("copy_finish"), held["boundary"] + 1)
+                   and integer(peer.get("applied")) and peer["applied"] < peer["copy_finish"]
+                   and peer.get("building") is True,
+                   "destination EOS receipt must precede actual held ACK/build finish")
+        else:
+            require(source_kind == "native-classic-v1"
+                   and eos.get("kind") == "native_source_enumeration_EOS_and_destination_CopyEnd_receipt",
+                   "native source requires real enumeration EOS evidence")
+            observation = eos["observation"]
+            require(type(observation.get("requested_horizon")) is int
+                   and observation["requested_horizon"] == held["boundary"]
+                   and observation.get("enumeration_end") is True
+                   and all(integer(observation.get(field), 1)
+                           for field in ("items", "begin_count", "end_count", "callback_count"))
+                   and observation["end_count"] <= observation["begin_count"]
+                   and observation["callback_count"] <= observation["begin_count"],
+                   "actual native enumeration EOS must bind the held copy boundary")
 
 
 def epoch(value):
@@ -699,7 +733,8 @@ def validate_data(value, profile, built):
         for name in data.MIXED_SCENARIOS[:2]:
             direction = value["scenarios"][name]
             true_fields(direction["apply_ack_delay"], ("blocked_after_receive",))
-            validate_copy(direction["replacement_copy"], ack=True)
+            validate_copy(direction["replacement_copy"], ack=True,
+                          source_kind="rust" if name.startswith("rust_primary") else "native-classic-v1")
             moves = direction["post_copy_no_write_moves"]
             require(type(moves) is list and len(moves) == 4, "four post-copy no-write moves required")
             for move in moves:
@@ -821,9 +856,18 @@ COPY_SPEC = {
     "concurrent_writes": fields("successful"),
     "destination_copy_ack": {
         **fields("blocked_after_receive", "released", "negative_observations"),
-        "source_eos": fields("kind"),
-        "completed_native_replica": {"rpc": {"copy_ack_hold": fields(
-            "released", "acknowledged", "held", "expired", "cancelled")}},
+        "held_operation": fields("sequence", "boundary"),
+        "source_eos": {
+            **fields("kind"),
+            "peer": fields("replica", "copy_horizon", "copy_received", "copy_applied",
+                           "copy_finish", "applied", "building"),
+            "observation": fields("requested_horizon", "enumeration_end", "items",
+                                  "begin_count", "end_count", "callback_count"),
+        },
+        "completed_native_replica": {
+            **fields("replica", "status"),
+            "rpc": {"copy_ack_hold": fields("released", "acknowledged", "held", "expired",
+                                           "cancelled", "sequence", "boundary", "copy_end_received")}},
     },
 }
 EPOCH_SPEC = {"native_partition": {"epoch": fields("data_loss", "configuration")}}

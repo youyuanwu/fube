@@ -77,16 +77,26 @@ class ProofFiles(fixtures.ProjectFiles):
                 "native_response": {"status": 404, "body": None}}
 
     @staticmethod
-    def copy_proof(ack=False):
+    def copy_proof(ack=False, source_kind="rust"):
         result = {"concurrent_writes": {"successful": 100},
                   "live_copy": {"commits_inside_observed_build_horizon_window": 100}}
         if ack:
             result["destination_copy_ack"] = {
                 "blocked_after_receive": True, "released": True, "negative_observations": 2,
-                "source_eos": {"kind": "actual source EOS"},
-                "completed_native_replica": {"rpc": {"copy_ack_hold": {
+                "held_operation": {"sequence": 12, "boundary": 10},
+                "source_eos": ({
+                    "kind": "destination_EOS_receipt_at_source",
+                    "peer": {"replica": 42, "copy_horizon": 10, "copy_received": -1,
+                             "copy_applied": 11, "copy_finish": 20, "applied": 0, "building": True},
+                } if source_kind == "rust" else {
+                    "kind": "native_source_enumeration_EOS_and_destination_CopyEnd_receipt",
+                    "observation": {"requested_horizon": 10, "enumeration_end": True, "items": 12,
+                                    "begin_count": 13, "end_count": 13, "callback_count": 13},
+                }),
+                "completed_native_replica": {"replica": 42, "status": "Ready", "rpc": {"copy_ack_hold": {
                     "released": True, "acknowledged": True, "held": False,
-                    "expired": False, "cancelled": False}}},
+                    "expired": False, "cancelled": False, "sequence": 12,
+                    "boundary": 10, "copy_end_received": True}}},
             }
         return result
 
@@ -144,7 +154,8 @@ class ProofFiles(fixtures.ProjectFiles):
                          else ["rust", "native-classic-v1"] * 2)
                 scenarios[case].update(
                     apply_ack_delay={"blocked_after_receive": True},
-                    replacement_copy=self.copy_proof(ack=True),
+                    replacement_copy=self.copy_proof(ack=True, source_kind=(
+                        "rust" if case.startswith("rust_primary") else "native-classic-v1")),
                     post_copy_no_write_moves=[{
                         "requested_engine": engine, "no_intervening_client_writes": True,
                         "old_primary_http_status": 503,
@@ -564,6 +575,58 @@ class WorkerTests(ProofFiles):
                                           self.root / ("fake-native-" + str(index) + ".json")), 1)
             self.emit(path, original)
         self.assertEqual(self.sealing("client-runtime", directory), 0)
+
+    def test_source_eos_variants_require_typed_payloads_bound_to_actual_held_copy(self):
+        directory = self.worker("native-data")
+        path = directory / "native-data-report.json"
+        original = ci.read(path, ci.REPORT)
+        for case in ci.data.MIXED_SCENARIOS[:2]:
+            changes = [
+                lambda gate: gate.update(source_eos={"kind": False}),
+                lambda gate: gate.update(source_eos={"kind": "unknown"}),
+                lambda gate: gate["source_eos"].pop(
+                    "peer" if case.startswith("rust_primary") else "observation"),
+                lambda gate: gate["held_operation"].update(boundary=True),
+                lambda gate: gate["completed_native_replica"]["rpc"]["copy_ack_hold"].update(sequence=13),
+            ]
+            if case.startswith("rust_primary"):
+                changes.extend((
+                    lambda gate: gate["source_eos"]["peer"].update(copy_received=True),
+                    lambda gate: gate["source_eos"]["peer"].update(replica=43),
+                    lambda gate: gate["source_eos"]["peer"].update(copy_applied=12),
+                    lambda gate: gate["source_eos"]["peer"].update(building=False),
+                ))
+            else:
+                changes.extend((
+                    lambda gate: gate["source_eos"]["observation"].update(requested_horizon=11),
+                    lambda gate: gate["source_eos"]["observation"].update(enumeration_end=1),
+                    lambda gate: gate["source_eos"]["observation"].update(items=False),
+                    lambda gate: gate["source_eos"]["observation"].update(end_count=14),
+                ))
+            for index, change in enumerate(changes):
+                broken = copy.deepcopy(original)
+                change(broken["scenarios"][case]["replacement_copy"]["destination_copy_ack"])
+                self.emit(path, broken)
+                self.assertEqual(self.sealing("native-data", directory,
+                    self.root / (case + "-eos-" + str(index) + ".json")), 1, (case, index))
+        self.emit(path, original)
+        self.assertEqual(self.sealing("native-data", directory), 0)
+
+    def test_aggregate_rechecks_source_eos_even_when_tampered_report_hash_is_resealed(self):
+        for route in ci.ROUTES:
+            self.assertEqual(self.sealing(route, self.worker(route)), 0)
+        directory = self.root / "workers/native-data"
+        path = directory / "native-data-report.json"
+        report = ci.read(path, ci.REPORT)
+        report["scenarios"]["rust_primary_native_secondary"]["replacement_copy"][
+            "destination_copy_ack"]["source_eos"] = {"kind": False}
+        self.emit(path, report)
+        proof_path = directory / "worker-proof.json"
+        proof = ci.read(proof_path)
+        proof["reports"]["native-data-report.json"] = ci.identity(path, ci.REPORT)
+        self.emit(proof_path, proof)
+        self.assertEqual(self.aggregating(), 1)
+        self.assertEqual(ci.read(self.root / "aggregate.json")["status"], "FAIL")
 
     def test_each_archived_native_digest_and_essential_boolean_is_enforced(self):
         directory = self.worker("client-runtime")
