@@ -1704,7 +1704,8 @@ class Qualification:
             if description["http_status"] == 204 and description["body"] is None:
                 return None
             if description["http_status"] == 404 and isinstance(description["body"], dict) and (
-                    description["body"].get("Error", {}).get("Code") == "FABRIC_E_SERVICE_DOES_NOT_EXIST"):
+                    description["body"].get("Error", {}).get("Code") in {
+                        "FABRIC_E_SERVICE_DOES_NOT_EXIST", "FABRIC_E_APPLICATION_NOT_FOUND"}):
                 return None
             body = native_success(description, 200, "owned auxiliary service absence/identity")
             require(isinstance(body, dict) and body.get("Name") == service and body.get("ServiceKind") == "Stateful",

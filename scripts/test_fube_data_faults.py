@@ -627,6 +627,7 @@ class AuxiliaryOwnershipModels(unittest.TestCase):
         for response, accepted in (
                 ({"http_status": 404, "body": {"Error": {"Code": "UnknownAPI"}}}, False),
                 ({"http_status": 404, "body": {"Error": {"Code": "FABRIC_E_SERVICE_DOES_NOT_EXIST"}}}, True),
+                ({"http_status": 404, "body": {"Error": {"Code": "FABRIC_E_APPLICATION_NOT_FOUND"}}}, True),
                 ({"http_status": 204, "body": None}, True)):
             with patch.object(data, "native_management", return_value=response):
                 if accepted:
