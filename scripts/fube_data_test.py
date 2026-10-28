@@ -744,7 +744,10 @@ expected=json.loads(sys.argv[1]);action=sys.argv[2];pid=expected["native_pid"]
 def require(value,message):
     if not value: raise RuntimeError(message)
 def digest(path):
-    with path.open("rb") as file: return hashlib.file_digest(file,"sha256").hexdigest()
+    value=hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda:file.read(1048576),b""):value.update(chunk)
+    return value.hexdigest()
 require(type(pid) is int and pid>1,"invalid native-deployed PID")
 fd=os.pidfd_open(pid)
 try:

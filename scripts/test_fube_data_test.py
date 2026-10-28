@@ -865,6 +865,13 @@ class WorkloadTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "linux", "Linux-only pidfd qualification")
 class ProcessBindingTests(unittest.TestCase):
+    def test_digest_works_on_native_python310_without_file_digest(self):
+        with patch.object(hashlib, "file_digest", side_effect=AssertionError("not on Python 3.10"),
+                          create=True):
+            evidence = self.probe(self.expected(), action="inspect")
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence["executable_sha256"], hashlib.sha256(b"engine").hexdigest())
+
     def expected(self, kind="rust"):
         engine = "rust-runtime-app" if kind == "rust" else "native-replicator-oracle"
         launcher = "launch-rust.py" if kind == "rust" else "launch-mixed.py"
