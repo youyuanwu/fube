@@ -3041,7 +3041,14 @@ impl Owner {
             if peer.copy_applied == -1 && build.finish.is_some_and(|finish| peer.applied >= finish)
             {
                 if let Some(reply) = build.reply.take() {
-                    let _ = reply.send(Ok(()));
+                    if reply.send(Ok(())).is_ok() {
+                        // The invocation is complete. RAP may now retire that
+                        // call's token; the established session remains owned
+                        // by native membership/explicit removal, not that token.
+                        build.cancellation = Cancellation::default();
+                    } else {
+                        peer.cleanup_required = true;
+                    }
                 }
                 continue;
             }

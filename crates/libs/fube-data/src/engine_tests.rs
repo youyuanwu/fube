@@ -129,10 +129,16 @@ async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
         .change_role(EPOCH, ReplicaRole::Idle, cancel())
         .await
         .unwrap();
+    let completed_build = cancel();
     primary
-        .build_replica(descriptor(&target), cancel())
+        .build_replica(descriptor(&target), completed_build.clone())
         .await
         .unwrap();
+    // RAP retires a completed invocation's cancellation scope independently of
+    // the established idle/configured session's lifetime.
+    completed_build.cancel();
+    tokio::time::sleep(Settings::default().retry * 2).await;
+    assert!(!primary.snapshot().peers[0].cleanup_required);
     let started = std::time::Instant::now();
     let written_before = primary.transport.diagnostics()["events"]["written_data"][0]
         .as_u64()

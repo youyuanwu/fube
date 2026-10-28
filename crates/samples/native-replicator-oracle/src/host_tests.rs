@@ -693,7 +693,8 @@ async fn native_operation_pump_applies_before_explicit_ack_and_empty_data_fails(
     });
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(acknowledgments.load(Ordering::SeqCst), 0);
-    assert_eq!(route.app.provider.snapshot().last, 0);
+    assert_eq!(route.app.provider.snapshot().last, 1);
+    assert_eq!(route.acknowledgment_calls[1].load(Ordering::Acquire), 0);
     task.await.unwrap().unwrap();
     assert_eq!(acknowledgments.load(Ordering::SeqCst), 1);
     assert_eq!(route.app.provider.snapshot().values["k"], "v");
@@ -715,6 +716,43 @@ async fn native_operation_pump_applies_before_explicit_ack_and_empty_data_fails(
         .consume(operations(vec![empty]), false, Cancellation::default())
         .await
         .is_err());
+    assert_eq!(acknowledgments.load(Ordering::SeqCst), 1);
+    route.delay.store(2000, Ordering::Release);
+    let cancel = Cancellation::default();
+    let mutation = Mutation {
+        id: "cancelled-ack".into(),
+        key: "k2".into(),
+        value: "v2".into(),
+    };
+    let operation: IFabricOperation = Operation {
+        data: operation_data(mutation.operation().unwrap().to_segments()).unwrap(),
+        metadata: FABRIC_OPERATION_METADATA {
+            Type: FABRIC_OPERATION_TYPE::FABRIC_OPERATION_TYPE_NORMAL,
+            SequenceNumber: FABRIC_SEQUENCE_NUMBER(2),
+            ..Default::default()
+        },
+        applied: route.app.provider.clone(),
+        acknowledgments: acknowledgments.clone(),
+        expected: 2,
+    }
+    .into();
+    let consumer = route.clone();
+    let stopped = cancel.clone();
+    let pending = tokio::spawn(async move {
+        consumer
+            .consume(operations(vec![operation]), false, stopped)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while route.app.provider.snapshot().last != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    cancel.cancel();
+    assert_eq!(pending.await.unwrap().unwrap_err().code(), E_ABORT);
+    assert_eq!(route.app.provider.snapshot().last, 2);
     assert_eq!(acknowledgments.load(Ordering::SeqCst), 1);
     route.shutdown().await.unwrap();
 }

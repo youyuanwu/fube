@@ -340,12 +340,6 @@ impl Route {
             if !copy {
                 self.received.fetch_max(sequence, Ordering::AcqRel);
             }
-            let delay = self.delay.load(Ordering::Acquire);
-            tokio::select! {
-                _ = stop.cancelled() => return Err(E_ABORT.into()),
-                _ = self.workers.stop.cancelled() => return Err(E_ABORT.into()),
-                _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
-            }
             {
                 let _gate = self.app.gate.lock().await;
                 if copy {
@@ -361,6 +355,18 @@ impl Route {
                         .apply_replication(sequence, &data)
                         .map_err(application_error)?;
                 }
+            }
+            // Hold the explicit ACK after application, matching the Rust pump.
+            // This exposes applied-but-not-acknowledged progress to qualification.
+            let delay = self.delay.load(Ordering::Acquire);
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => return Err(E_ABORT.into()),
+                _ = self.workers.stop.cancelled() => return Err(E_ABORT.into()),
+                _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+            }
+            if stop.is_cancelled() || self.workers.stop.is_cancelled() {
+                return Err(E_ABORT.into());
             }
             // Receipt, empty data, local progress and EOS are never implicit ACKs.
             unsafe { operation.Acknowledge().ok()? };
