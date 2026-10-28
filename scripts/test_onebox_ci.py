@@ -602,6 +602,9 @@ class WorkerTests(ProofFiles):
                     lambda gate: gate["source_eos"]["observation"].update(enumeration_end=1),
                     lambda gate: gate["source_eos"]["observation"].update(items=False),
                     lambda gate: gate["source_eos"]["observation"].update(end_count=14),
+                    lambda gate: gate["source_eos"]["observation"].update(begin_count=12),
+                    lambda gate: gate["source_eos"]["observation"].update(end_count=1),
+                    lambda gate: gate["source_eos"]["observation"].update(callback_count=1),
                 ))
             for index, change in enumerate(changes):
                 broken = copy.deepcopy(original)
@@ -618,15 +621,24 @@ class WorkerTests(ProofFiles):
         directory = self.root / "workers/native-data"
         path = directory / "native-data-report.json"
         report = ci.read(path, ci.REPORT)
-        report["scenarios"]["rust_primary_native_secondary"]["replacement_copy"][
-            "destination_copy_ack"]["source_eos"] = {"kind": False}
-        self.emit(path, report)
         proof_path = directory / "worker-proof.json"
         proof = ci.read(proof_path)
-        proof["reports"]["native-data-report.json"] = ci.identity(path, ci.REPORT)
-        self.emit(proof_path, proof)
-        self.assertEqual(self.aggregating(), 1)
-        self.assertEqual(ci.read(self.root / "aggregate.json")["status"], "FAIL")
+        for index, variant in enumerate(("wrong_tag", "inconsistent_counts")):
+            broken = copy.deepcopy(report)
+            if variant == "wrong_tag":
+                broken["scenarios"]["rust_primary_native_secondary"]["replacement_copy"][
+                    "destination_copy_ack"]["source_eos"] = {"kind": False}
+            else:
+                broken["scenarios"]["native_primary_rust_secondary"]["replacement_copy"][
+                    "destination_copy_ack"]["source_eos"]["observation"].update(
+                        begin_count=1, end_count=1, callback_count=1)
+            self.emit(path, broken)
+            forged = copy.deepcopy(proof)
+            forged["reports"]["native-data-report.json"] = ci.identity(path, ci.REPORT)
+            self.emit(proof_path, forged)
+            output = self.root / ("aggregate-eos-" + str(index) + ".json")
+            self.assertEqual(self.aggregating(output), 1)
+            self.assertEqual(ci.read(output)["status"], "FAIL")
 
     def test_each_archived_native_digest_and_essential_boolean_is_enforced(self):
         directory = self.worker("client-runtime")

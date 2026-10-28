@@ -618,8 +618,9 @@ def validate_copy(value, ack=False, source_kind=None):
                    and observation.get("enumeration_end") is True
                    and all(integer(observation.get(field), 1)
                            for field in ("items", "begin_count", "end_count", "callback_count"))
-                   and observation["end_count"] <= observation["begin_count"]
-                   and observation["callback_count"] <= observation["begin_count"],
+                   and observation["begin_count"] >= observation["items"] + 1
+                   and observation["items"] <= observation["end_count"] <= observation["begin_count"]
+                   and observation["items"] <= observation["callback_count"] <= observation["begin_count"],
                    "actual native enumeration EOS must bind the held copy boundary")
 
 
