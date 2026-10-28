@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ApplicationManifest ApplicationTypeName="FubeDataTemplateType" ApplicationTypeVersion="1.1"
+ xmlns="http://schemas.microsoft.com/2011/01/fabric">
+  <Parameters>
+    <Parameter Name="FubeDataTypeCapability" DefaultValue="" />
+    <Parameter Name="FubeDataCreationCapability" DefaultValue="" />
+  </Parameters>
+  <ServiceManifestImport>
+    <ServiceManifestRef ServiceManifestName="RustRuntimeService" ServiceManifestVersion="1.1" />
+    <ConfigOverrides>
+      <ConfigOverride Name="Config">
+        <Settings>
+          <Section Name="Main">
+            <Parameter Name="Override" Value="native-override" />
+          </Section>
+        </Settings>
+      </ConfigOverride>
+    </ConfigOverrides>
+  </ServiceManifestImport>
+  <DefaultServices>
+    <Service Name="Singleton" ServicePackageActivationMode="SharedProcess">
+      <StatelessService ServiceTypeName="RustRuntimeType" InstanceCount="1">
+        <SingletonPartition />
+      </StatelessService>
+    </Service>
+    <Service Name="Stateful" ServicePackageActivationMode="SharedProcess">
+      <StatefulService ServiceTypeName="RustStatefulRuntimeType" TargetReplicaSetSize="1" MinReplicaSetSize="1">
+        <SingletonPartition />
+      </StatefulService>
+    </Service>
+  </DefaultServices>
+</ApplicationManifest>

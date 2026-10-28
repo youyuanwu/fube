@@ -81,6 +81,7 @@ async fn route_using(
     provider: Arc<MemoryProvider>,
     engine_provider: Arc<dyn StateProvider>,
 ) -> Arc<Route> {
+    let copy_delay = Arc::new(AtomicU64::new(0));
     let engine = Engine::bind(
         Actor {
             partition,
@@ -88,7 +89,10 @@ async fn route_using(
             incarnation: Uuid::new_v4(),
         },
         "127.0.0.1:0",
-        engine_provider,
+        Arc::new(CopyProvider {
+            inner: engine_provider,
+            delay: copy_delay.clone(),
+        }),
         Settings::default(),
     )
     .unwrap();
@@ -108,6 +112,7 @@ async fn route_using(
         provider,
         format!("http://127.0.0.1/data/fixture-{replica}/service"),
         1,
+        copy_delay,
     )
     .unwrap();
     engine.open(Cancellation::default()).await.unwrap();
@@ -248,6 +253,9 @@ fn query_decodes_strict_utf8_and_rejects_malformed_unknown_and_bounded_requests(
         ("test", "ack_delay_ms=+1"),
         ("test", "ack_delay_ms=18446744073709551616"),
         ("test", "ack_delay_ms=1&x=2"),
+        ("test", "copy_delay_ms=101"),
+        ("test", "copy_delay_ms=-1"),
+        ("test", "copy_delay_ms=1&ack_delay_ms=1"),
     ] {
         assert!(parse(operation, query).is_err(), "{operation}?{query}");
     }
@@ -259,6 +267,10 @@ fn query_decodes_strict_utf8_and_rejects_malformed_unknown_and_bounded_requests(
         parse("test", "ack_delay_ms=2000").unwrap(),
         Request::Test(2000)
     ));
+    assert!(matches!(
+        parse("test", "copy_delay_ms=100").unwrap(),
+        Request::CopyTest(100)
+    ));
     assert!(parse("write", &format!("id={}&key=k&value=x", "x".repeat(129))).is_err());
     assert!(parse("write", &format!("id=a&key={}&value=x", "x".repeat(1025))).is_err());
     assert!(parse("write", &format!("id=a&key=k&value={}", "x".repeat(4096))).is_err());
@@ -267,6 +279,33 @@ fn query_decodes_strict_utf8_and_rejects_malformed_unknown_and_bounded_requests(
         parse("diagnostics", "").unwrap(),
         Request::Diagnostics
     ));
+}
+
+#[tokio::test]
+async fn copy_pacing_is_cancelable_and_does_not_consume_or_change_snapshot_data() {
+    let provider = MemoryProvider::new();
+    let delay = Arc::new(AtomicU64::new(100));
+    let wrapper = CopyProvider {
+        inner: provider,
+        delay: delay.clone(),
+    };
+    let stream = wrapper.copy_state(0, None).unwrap();
+    assert!(tokio::time::timeout(
+        Duration::from_millis(10),
+        stream.next(Cancellation::default())
+    )
+    .await
+    .is_err());
+    let cancellation = Cancellation::default();
+    cancellation.cancel();
+    assert!(stream.next(cancellation).await.is_err());
+    delay.store(0, Ordering::Release);
+    let target = MemoryProvider::new();
+    while let Some(data) = stream.next(Cancellation::default()).await.unwrap() {
+        target.apply_copy(&data).unwrap();
+    }
+    assert!(!target.snapshot().copy_in_progress);
+    assert_eq!(target.snapshot().last, 0);
 }
 
 #[tokio::test]

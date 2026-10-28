@@ -13,6 +13,16 @@ use tokio::{
 type ObserverResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 async fn http_status(address: &str) -> ObserverResult<(u16, serde_json::Value)> {
+    http_status_limit(address, 16_384).await
+}
+async fn http_status_limit(address: &str, limit: u64) -> ObserverResult<(u16, serde_json::Value)> {
+    let (status, value, _) = http_status_extent(address, limit).await?;
+    Ok((status, value))
+}
+async fn http_status_extent(
+    address: &str,
+    limit: u64,
+) -> ObserverResult<(u16, serde_json::Value, usize)> {
     let (authority, path) = address
         .strip_prefix("http://")
         .and_then(|v| v.split_once('/'))
@@ -28,12 +38,13 @@ async fn http_status(address: &str) -> ObserverResult<(u16, serde_json::Value)> 
     let mut bytes = Vec::new();
     tokio::time::timeout(
         Duration::from_secs(5),
-        (&mut stream).take(16_385).read_to_end(&mut bytes),
+        (&mut stream).take(limit + 1).read_to_end(&mut bytes),
     )
     .await??;
-    if bytes.len() > 16_384 {
+    if bytes.len() as u64 > limit {
         return Err("HTTP response bound".into());
     }
+    let extent = bytes.len();
     let reply = String::from_utf8(bytes)?;
     let status = reply
         .lines()
@@ -45,7 +56,20 @@ async fn http_status(address: &str) -> ObserverResult<(u16, serde_json::Value)> 
     Ok((
         status,
         serde_json::from_str(reply.split_once("\r\n\r\n").ok_or("HTTP framing")?.1)?,
+        extent,
     ))
+}
+async fn stateful_http(address: &str) -> ObserverResult<serde_json::Value> {
+    // Data diagnostics include a bounded map/result ledger, separately from
+    // the historical stateless and empty-control response profile.
+    let (status, value, extent) = http_status_extent(address, 512 * 1024).await?;
+    if status != 200 {
+        return Err(format!("endpoint not ready: HTTP {status}").into());
+    }
+    if value["profile"] != "fube-data-v1" && extent > 16_384 {
+        return Err("non-data response exceeds historical profile".into());
+    }
+    Ok(value)
 }
 async fn http(address: &str) -> ObserverResult<serde_json::Value> {
     let (status, value) = http_status(address).await?;
@@ -130,9 +154,18 @@ async fn stateful_snapshot(
                 .address
                 .strip_suffix("/service")
                 .ok_or("stateful service-address profile")?;
-            let rpc = http(&format!("{base}/diagnostics")).await?;
-            if rpc["service"] != service
-                || rpc["partition"] != id.to_string()
+            let rpc = stateful_http(&format!("{base}/diagnostics")).await?;
+            let data = rpc["profile"] == "fube-data-v1";
+            if (if data {
+                rpc["service_address"] != replica.address
+                    || deployed.service_name != service
+                    || !matches!(
+                        rpc["engine_kind"].as_str(),
+                        Some("rust" | "native-classic-v1")
+                    )
+            } else {
+                rpc["service"] != service
+            }) || rpc["partition"] != id.to_string()
                 || rpc["replica"].as_i64() != Some(replica.replica_id)
                 || rpc["node"] != replica.node_name
                 || rpc["pid"].as_i64() != Some(deployed.host_process_id)
@@ -141,14 +174,30 @@ async fn stateful_snapshot(
                 return Err("independent replica/deployment/HTTP identity mismatch".into());
             }
             item["deployed"] = serde_json::to_value(&deployed)?;
-            item["service_http_status"] = serde_json::json!(http_status(&replica.address).await?.0);
-            let control = rpc["replication_address"]
-                .as_str()
-                .ok_or("missing separate control address")?;
-            if control == replica.address {
-                return Err("client and replication address conflated".into());
+            item["service_http_status"] = serde_json::json!(
+                http_status_limit(&replica.address, if data { 512 * 1024 } else { 16_384 })
+                    .await?
+                    .0
+            );
+            if data {
+                if rpc["replication_address"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("http"))
+                {
+                    return Err("data replication address is HTTP".into());
+                }
+                item["control"] = serde_json::json!({"protocol":"FabricTCP-classic-V1",
+                    "published_replication_address":rpc["replication_address"],
+                    "observed_primary":rpc["observed_primary"],"fixture_contacted":false});
+            } else {
+                let control = rpc["replication_address"]
+                    .as_str()
+                    .ok_or("missing separate control address")?;
+                if control == replica.address {
+                    return Err("client and replication address conflated".into());
+                }
+                item["control"] = http(control).await?;
             }
-            item["control"] = http(control).await?;
             item["rpc"] = rpc;
         }
         observations.push(item);
@@ -173,7 +222,7 @@ async fn stateful_snapshot(
         return Err("native discovery does not have exactly one primary".into());
     }
     let address = &primaries[0].address;
-    let rpc = http(address).await?;
+    let rpc = stateful_http(address).await?;
     let native = observations
         .iter()
         .find(|r| r["role"] == "Primary" && r["address"] == *address)
@@ -375,5 +424,55 @@ async fn main() {
     if let Err(error) = run().await {
         eprintln!("{error}");
         std::process::exit(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    async fn serve(body: String, padding: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await;
+            let response=format!("HTTP/1.1 200 OK\r\nX-Pad: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}","x".repeat(padding),body.len());
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+        format!("http://{address}/diagnostics")
+    }
+    #[tokio::test]
+    async fn nondata_raw_json_whitespace_and_header_bounds_are_preserved() {
+        for (body, padding) in [
+            (format!("{{\"state\":\"empty\"}}{}", " ".repeat(20_000)), 0),
+            ("{\"state\":\"empty\"}".into(), 20_000),
+        ] {
+            let address = serve(body, padding).await;
+            assert!(stateful_http(&address).await.is_err());
+        }
+        let address = serve("{\"state\":\"empty\"}".into(), 0).await;
+        assert_eq!(stateful_http(&address).await.unwrap()["state"], "empty");
+    }
+    #[tokio::test]
+    async fn data_has_a_separate_finite_raw_bound_without_relaxing_stateless() {
+        let body = format!(
+            "{{\"profile\":\"fube-data-v1\",\"state\":\"{}\"}}",
+            "v".repeat(20_000)
+        );
+        let address = serve(body.clone(), 0).await;
+        assert!(stateful_http(&address).await.is_ok());
+        let address = serve(body, 0).await;
+        assert!(http_status(&address).await.is_err());
+        let address = serve(
+            format!(
+                "{{\"profile\":\"fube-data-v1\",\"state\":\"{}\"}}",
+                "v".repeat(512 * 1024)
+            ),
+            0,
+        )
+        .await;
+        assert!(stateful_http(&address).await.is_err());
     }
 }

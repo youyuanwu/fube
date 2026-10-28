@@ -1,0 +1,1 @@
+Test-only volatile data package. No durable-state guarantee.

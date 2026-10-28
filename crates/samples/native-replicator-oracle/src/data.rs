@@ -79,6 +79,23 @@ impl IFabricOperationData_Impl for Segments_Impl {
 pub unsafe fn read_segments(data: &IFabricOperationData) -> Result<Vec<Vec<u8>>> {
     let mut count = 0;
     let buffers = unsafe { data.GetData(&mut count)? };
+    unsafe { read_buffers(count, buffers) }
+}
+
+/// # Safety
+/// The operation must honor the native borrowed buffer lifetime contract.
+pub unsafe fn read_operation(
+    operation: &mssf_com::FabricRuntime::IFabricOperation,
+) -> Result<Vec<Vec<u8>>> {
+    let mut count = 0;
+    let buffers = unsafe { operation.GetData(&mut count)? };
+    unsafe { read_buffers(count, buffers) }
+}
+
+unsafe fn read_buffers(
+    count: u32,
+    buffers: *mut FABRIC_OPERATION_DATA_BUFFER,
+) -> Result<Vec<Vec<u8>>> {
     if count as usize > MAX_SEGMENTS {
         return Err(com::E_INVALIDARG.into());
     }

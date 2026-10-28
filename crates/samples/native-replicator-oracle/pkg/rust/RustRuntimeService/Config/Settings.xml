@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Settings xmlns="http://schemas.microsoft.com/2011/01/fabric">
+  <Section Name="Main">
+    <Parameter Name="Value" Value="before-upgrade" />
+    <Parameter Name="Override" Value="base-value" MustOverride="true" />
+  </Section>
+</Settings>

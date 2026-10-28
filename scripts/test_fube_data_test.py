@@ -1,0 +1,2324 @@
+"""Offline harness-contract tests. These do not claim native qualification."""
+import contextlib
+import copy
+import ctypes
+import hashlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tarfile
+import threading
+import time
+import types
+import unittest
+import uuid
+from unittest.mock import MagicMock, patch
+import xml.etree.ElementTree as ET
+
+import fube_data_test as data
+
+
+GRAPHS = {
+    "rust-runtime-app": "rust-runtime-app\n fube-data\n mssf-runtime",
+    "runtime_observer": "mssf-client\n mssf-transport",
+    "native-replicator-oracle": "native-replicator-oracle\n mssf-core v0.10.0\n mssf-com v0.10.0\n fube-data",
+}
+DYNAMIC = "\nDynamic section:\n (NEEDED) Shared library: [libc.so.6]\n"
+
+
+def executable(name):
+    header = bytearray(64)
+    header[:6] = b"\x7fELF\x02\x01"
+    struct.pack_into("<H", header, 18, 62)
+    return bytes(header) + name.encode()
+
+
+def store_generation(expected, generation=(131510254310497004, 23, 25769803776)):
+    return {"StoreFiles": [{"StoreRelativePath": data.type_store_path(expected),
+                           "FileVersion": dict(zip(data.TYPE_IDENTITY_METHOD["native_generation_fields"],
+                                                   map(str, generation)))}], "StoreFolders": []}
+
+
+class ProjectFiles(unittest.TestCase):
+    def setUp(self):
+        self.root = data.ROOT / "build/fube-data-unit" / uuid.uuid4().hex
+        self.root.mkdir(parents=True, exist_ok=False)
+        self.addCleanup(shutil.rmtree, self.root)
+        reader = patch.object(data.runtime, "run", side_effect=self.readelf_only)
+        reader.start()
+        self.addCleanup(reader.stop)
+
+    @staticmethod
+    def readelf_only(*args, **kwargs):
+        if args[:2] == ("readelf", "-d"):
+            return DYNAMIC
+        raise AssertionError(f"qualification attempted an unexpected command: {args}")
+
+    def make_legacy(self, directory):
+        directory.mkdir(parents=True)
+        hashes = {}
+        for name in ("rust-runtime-app", "runtime_observer"):
+            path = directory / name
+            path.write_bytes(executable(name))
+            path.chmod(0o755)
+            hashes[name] = data.runtime.digest(path)
+        for version in (1, 2):
+            for name in data.runtime.PACKAGE_FILES:
+                path = directory / f"package-v{version}" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(data.PKG / "rust" / name, path)
+                path.chmod(0o644)
+                hashes[f"package-v{version}/{name}"] = data.runtime.digest(path)
+        manifest = directory / "build-info.json"
+        manifest.write_text(json.dumps({
+            "version": data.runtime.BUNDLE_VERSION, "profile": data.runtime.BUNDLE_PROFILE,
+            "source_revision": "a" * 40, "dependency_graph": GRAPHS["rust-runtime-app"], "sha256": hashes,
+        }))
+        manifest.chmod(0o644)
+
+    def bundle(self, name="bundle"):
+        directory = self.root / name
+        directory.mkdir()
+        self.make_legacy(directory / "legacy")
+        for name, mode in data.expected_files().items():
+            path = directory / name
+            if name.startswith("legacy/"):
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if name.startswith("bin/"):
+                path.write_bytes(executable(path.name))
+            elif name.startswith("launchers/"):
+                shutil.copyfile(data.PKG / path.name, path)
+            else:
+                _, profile, relative = name.split("/", 2)
+                shutil.copyfile(data.PKG / profile / relative, path)
+            path.chmod(mode)
+        metadata = {
+            "version": data.BUNDLE_VERSION, "profile": data.BUNDLE_PROFILE, "source_revision": "a" * 40,
+            "dependency_graphs": copy.deepcopy(GRAPHS),
+            "elf": {name: data.elf_identity(directory / "bin" / name, data.CLASSIFICATIONS[name])
+                    for name in data.ENGINES},
+            "artifacts": {name: {"sha256": data.runtime.digest(directory / name), "mode": mode}
+                          for name, mode in data.expected_files().items()},
+        }
+        manifest = directory / "build-info.json"
+        manifest.write_text(json.dumps(metadata))
+        manifest.chmod(0o644)
+        return directory
+
+    @staticmethod
+    def mutate(directory, action):
+        path = directory / "build-info.json"
+        metadata = json.loads(path.read_text())
+        action(metadata)
+        path.write_text(json.dumps(metadata))
+
+    def cli(self, directory, *, create=None, owner=None, name="owned", report="evidence.json"):
+        args = ["fube_data_test.py", name, "--prebuilt", str(directory), "--profile", "rust",
+                "--report", str(self.root / report)]
+        if owner is not None:
+            args += ["--existing-owner", owner]
+        with patch("sys.argv", args), contextlib.redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(SystemExit) as exit:
+                data.main()
+            self.assertEqual(exit.exception.code, 1)
+            return json.loads(output.getvalue())
+
+
+@unittest.skipUnless(sys.platform == "linux", "Linux-only data qualification")
+class BundleTests(ProjectFiles):
+    def test_roundtrip_exact_artifacts_source_and_native_classification_without_cargo(self):
+        directory = self.bundle()
+        bundle = data.load_bundle(directory)
+        self.assertEqual(bundle.source_revision, "a" * 40)
+        self.assertEqual(bundle.observer, directory / "bin/runtime_observer")
+        self.assertEqual(bundle.legacy.app.read_bytes(), bundle.binary("rust").read_bytes())
+        self.assertEqual(bundle.metadata["elf"]["native-replicator-oracle"]["classification"], "native-classic-dynamic")
+        self.assertEqual(set(bundle.metadata["artifacts"]), set(data.expected_files()))
+
+    def test_metadata_exact_schema_profile_version_and_source(self):
+        cases = [
+            ("version", 0), ("version", True), ("profile", "empty-control"),
+            ("source_revision", "dirty"), ("source_revision", "A" * 40), ("extra", True),
+            ("dependency_graphs", {}), ("elf", {}), ("artifacts", {}),
+        ]
+        for index, (field, value) in enumerate(cases):
+            with self.subTest(field=field, value=value):
+                directory = self.bundle(f"bad-{index}")
+                self.mutate(directory, lambda metadata: metadata.update({field: value}))
+                with self.assertRaises(RuntimeError):
+                    data.load_bundle(directory)
+
+    def test_duplicate_json_keys_are_rejected(self):
+        directory = self.bundle()
+        path = directory / "build-info.json"
+        text = path.read_text()
+        path.write_text(text[:-1] + ',"version":1}')
+        with self.assertRaisesRegex(RuntimeError, "duplicate JSON"):
+            data.load_bundle(directory)
+
+    def test_inventory_stops_at_first_excess_entry_without_materializing_the_walk(self):
+        directory = self.bundle()
+        visited = []
+        def inventory(_path, _pattern):
+            for index in range(100000):
+                visited.append(index)
+                if index > 160:
+                    self.fail("continued walking after the first over-bound entry")
+                yield directory / str(index)
+        with patch.object(Path, "rglob", inventory):
+            with self.assertRaisesRegex(RuntimeError, "inventory bound"):
+                data.load_bundle(directory)
+        self.assertEqual(len(visited), 161)
+
+    def test_self_consistent_old_or_prepopulated_ownership_templates_fail_before_allocation(self):
+        for index, replacement in enumerate(("", "copied-owner-value")):
+            directory = self.bundle(f"ownership-template-{index}")
+            path = directory / "packages/rust/ApplicationManifest.xml"
+            original = '<Parameter Name="FubeDataCreationCapability" DefaultValue="" />'
+            path.write_text(path.read_text().replace(original, "" if not replacement else
+                '<Parameter Name="FubeDataCreationCapability" DefaultValue="copied-owner-value" />'))
+            self.mutate(directory, lambda metadata: metadata["artifacts"][
+                "packages/rust/ApplicationManifest.xml"].update(sha256=data.runtime.digest(path)))
+            with patch.object(data.runtime, "create_owned") as create, \
+                 patch.object(data.runtime, "Allocation") as allocation:
+                result = self.cli(directory, report=f"ownership-template-{index}.json")
+            create.assert_not_called()
+            allocation.assert_not_called()
+            self.assertIn("ownership parameter templates before allocation", result["errors"][0])
+
+    def test_dependency_graphs_never_relax_rust_or_observer_native_boundary(self):
+        for index, (name, graph) in enumerate([
+            ("rust-runtime-app", GRAPHS["rust-runtime-app"] + "\n mssf-core"),
+            ("runtime_observer", "mssf-client\n mssf-com"),
+            ("runtime_observer", "mssf-client\n FabricClient"),
+            ("native-replicator-oracle", "native-replicator-oracle\n fube-data"),
+            ("rust-runtime-app", ""),
+        ]):
+            directory = self.bundle(str(index))
+            self.mutate(directory, lambda metadata: metadata["dependency_graphs"].update({name: graph}))
+            with self.assertRaises(RuntimeError):
+                data.load_bundle(directory)
+
+    def test_extra_missing_symlink_fifo_tamper_and_modes_are_rejected(self):
+        for case in ("extra-file", "extra-dir", "missing", "symlink", "fifo", "tamper",
+                     "not-executable", "world-writable", "setuid", "metadata-mode", "metadata-fifo"):
+            with self.subTest(case=case):
+                directory = self.bundle(case)
+                path = directory / "bin/native-replicator-oracle"
+                if case == "extra-file":
+                    (directory / "unexpected").write_bytes(b"extra")
+                elif case == "extra-dir":
+                    (directory / "unexpected").mkdir()
+                elif case == "missing":
+                    path.unlink()
+                elif case == "symlink":
+                    path.unlink()
+                    path.symlink_to(directory / "bin/rust-runtime-app")
+                elif case == "fifo":
+                    os.mkfifo(directory / "unexpected")
+                elif case == "tamper":
+                    path.write_bytes(path.read_bytes() + b"tampered")
+                elif case == "not-executable":
+                    path.chmod(0o644)
+                elif case == "world-writable":
+                    path.chmod(0o777)
+                elif case == "setuid":
+                    path.chmod(0o4755)
+                elif case == "metadata-mode":
+                    (directory / "build-info.json").chmod(0o666)
+                else:
+                    manifest = directory / "build-info.json"
+                    manifest.unlink()
+                    os.mkfifo(manifest)
+                with self.assertRaises(RuntimeError):
+                    data.load_bundle(directory)
+
+    def test_artifact_records_and_elf_evidence_have_exact_keys(self):
+        for index, action in enumerate([
+            lambda metadata: metadata["artifacts"]["bin/rust-runtime-app"].update(extra=1),
+            lambda metadata: metadata["artifacts"]["bin/rust-runtime-app"].update(sha256="0" * 64),
+            lambda metadata: metadata["artifacts"]["bin/rust-runtime-app"].update(mode=0o777),
+            lambda metadata: metadata["elf"]["native-replicator-oracle"].update(classification="native-free"),
+            lambda metadata: metadata["elf"]["rust-runtime-app"].update(dynamic="invented"),
+            lambda metadata: metadata["elf"]["runtime_observer"].update(extra=True),
+        ]):
+            directory = self.bundle(str(index))
+            self.mutate(directory, action)
+            with self.assertRaises(RuntimeError):
+                data.load_bundle(directory)
+
+    def test_changed_elf_header_is_rejected_even_if_its_hash_was_updated(self):
+        directory = self.bundle()
+        path = directory / "bin/rust-runtime-app"
+        content = bytearray(path.read_bytes())
+        struct.pack_into("<H", content, 18, 183)
+        path.write_bytes(content)
+        self.mutate(directory, lambda metadata: metadata["artifacts"]["bin/rust-runtime-app"].update(
+            sha256=data.runtime.digest(path)))
+        with self.assertRaisesRegex(RuntimeError, "x86-64 ELF"):
+            data.load_bundle(directory)
+
+    def test_native_dynamic_import_is_rejected_for_production_only(self):
+        path = self.bundle() / "bin/rust-runtime-app"
+        with patch.object(data.runtime, "run", return_value=DYNAMIC + "libFabricRuntime.so"):
+            with self.assertRaisesRegex(RuntimeError, "native-free ELF"):
+                data.elf_identity(path, "native-free")
+            self.assertEqual(data.elf_identity(path, "native-classic-dynamic")["classification"], "native-classic-dynamic")
+
+    def test_nested_legacy_loader_remains_strict(self):
+        directory = self.bundle()
+        legacy = directory / "legacy/build-info.json"
+        metadata = json.loads(legacy.read_text())
+        metadata["extra"] = True
+        legacy.write_text(json.dumps(metadata))
+        self.mutate(directory, lambda outer: outer["artifacts"]["legacy/build-info.json"].update(
+            sha256=data.runtime.digest(legacy)))
+        with self.assertRaises(RuntimeError):
+            data.load_bundle(directory)
+
+    def test_artifact_drift_after_load_cannot_relabel_the_deployed_executable_hash(self):
+        directory = self.bundle()
+        bundle = data.load_bundle(directory)
+        path = directory / "bin/rust-runtime-app"
+        path.write_bytes(path.read_bytes() + b"changed after validation")
+        with patch.object(data, "ROOT", self.root):
+            with self.assertRaisesRegex(RuntimeError, "artifact drift"):
+                data.package(bundle, "1" * 32, False)
+        observer = directory / "bin/runtime_observer"
+        observer.chmod(0o777)
+        with self.assertRaisesRegex(RuntimeError, "artifact drift"):
+            _ = bundle.observer
+
+    def test_invalid_bundle_and_report_collision_fail_before_any_allocation_without_fallback(self):
+        directory = self.bundle()
+        (directory / "bin/runtime_observer").unlink()
+        with patch.object(data.runtime, "create_owned") as create, \
+             patch.object(data.runtime, "Allocation") as allocation, \
+             patch.object(data, "build_bundle") as build:
+            result = self.cli(directory)
+            self.assertEqual(result["status"], "FAIL")
+            create.assert_not_called()
+            allocation.assert_not_called()
+            build.assert_not_called()
+        report = self.root / "already.json"
+        report.write_text("original evidence")
+        with patch.object(data, "load_bundle") as load, patch.object(data.runtime, "create_owned") as create:
+            self.cli(directory, report="already.json")
+            create.assert_not_called()
+            load.assert_not_called()
+        self.assertEqual(report.read_text(), "original evidence")
+
+    def test_build_only_uses_clean_source_locked_cargo_and_rechecks_after(self):
+        native = self.root / "target/debug/native-replicator-oracle"
+        native.parent.mkdir(parents=True)
+        native.write_bytes(executable("native-replicator-oracle"))
+        def commands(*args, **kwargs):
+            if args[:2] == ("readelf", "-d"):
+                return DYNAMIC
+            self.assertEqual(args[0], "cargo")
+            self.assertIn("--locked", args)
+            if args[1] == "tree":
+                package = args[-1]
+                return GRAPHS["runtime_observer" if package == "mssf-client" else package]
+            return ""
+        with patch.object(data, "ROOT", self.root), \
+             patch.object(data.runtime, "build_bundle", side_effect=self.make_legacy), \
+             patch.object(data.runtime, "clean_source_revision", return_value="a" * 40) as clean, \
+             patch.object(data.runtime, "run", side_effect=commands), \
+             patch.object(data.runtime, "create_owned") as create:
+            data.build_bundle(self.root / "built")
+            create.assert_not_called()
+            self.assertEqual(clean.call_count, 3)
+            data.load_bundle(self.root / "built")
+        with patch.object(data.runtime, "clean_source_revision", side_effect=RuntimeError("dirty")), \
+             patch.object(data.runtime, "build_bundle") as build:
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                data.build_bundle(self.root / "dirty")
+            build.assert_not_called()
+        self.assertFalse((self.root / "dirty").exists())
+        with patch.object(data, "ROOT", self.root), \
+             patch.object(data.runtime, "build_bundle", side_effect=self.make_legacy), \
+             patch.object(data.runtime, "clean_source_revision", side_effect=["a" * 40, "b" * 40]), \
+             patch.object(data.runtime, "run", side_effect=commands):
+            with self.assertRaisesRegex(RuntimeError, "source changed"):
+                data.build_bundle(self.root / "changed")
+        self.assertFalse((self.root / "changed/build-info.json").exists())
+
+    def test_new_package_preserves_rust_defaults_and_no_mixed_default_stateless(self):
+        bundle = data.load_bundle(self.bundle())
+        with patch.object(data, "ROOT", self.root):
+            for mixed in (False, True):
+                run_id = ("1" if mixed else "2") * 32
+                package, name, version = data.package(bundle, run_id, mixed)
+                manifest = ET.parse(package / "ApplicationManifest.xml")
+                defaults = manifest.findall(f".//{{{data.runtime.NS}}}DefaultServices/{{{data.runtime.NS}}}Service")
+                self.assertEqual([entry.get("Name") for entry in defaults], [] if mixed else ["Singleton", "Stateful"])
+                self.assertEqual(name, f"FubeData{run_id}Type")
+                self.assertEqual(version, "1.1")
+                service = ET.parse(package / "RustRuntimeService/ServiceManifest.xml")
+                types = {entry.get("ServiceTypeName") for entry in service.find(f"{{{data.runtime.NS}}}ServiceTypes")}
+                self.assertEqual(types, {"RustRuntimeType", "RustStatefulRuntimeType"})
+                code = package / "RustRuntimeService/Code"
+                self.assertEqual((code / "native-replicator-oracle").exists(), mixed)
+
+
+@unittest.skipUnless(sys.platform == "linux", "Linux-only activated selector")
+class SelectorTests(unittest.TestCase):
+    def setUp(self):
+        path = data.PKG / "launch-mixed.py"
+        spec = importlib.util.spec_from_file_location("test_data_selector", path)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+
+    def test_unknown_or_missing_injected_node_never_execs_or_infers_role(self):
+        for value in (None, "_Node_0", "N0000", "N0010\n", "N0060"):
+            env = {} if value is None else {"Fabric_NodeName": value, "SF_NODE_NAME": "N0010"}
+            with patch.dict(os.environ, env, clear=True), patch.object(os, "execve") as execute:
+                with self.assertRaises(SystemExit):
+                    self.module.main()
+                execute.assert_not_called()
+
+    def test_exact_static_map_execs_one_engine_preserving_all_activation_environment(self):
+        self.assertEqual(self.module.NODE_ENGINES, {
+            "N0010": "native-replicator-oracle", "N0020": "rust-runtime-app",
+            "N0030": "native-replicator-oracle", "N0040": "rust-runtime-app", "N0050": "rust-runtime-app"})
+        for node, binary in self.module.NODE_ENGINES.items():
+            env = {"Fabric_NodeName": node, "Fabric_ApplicationHostId": "native-host",
+                   "Fabric_CodePackageInstanceSeqNum": "71", "CUSTOM": "preserved"}
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(Path, "is_file", return_value=True), \
+                 patch.object(Path, "is_symlink", return_value=False), \
+                 patch.object(os, "access", return_value=True), patch.object(os, "execve") as execute:
+                self.module.main()
+                execute.assert_called_once_with(str(data.PKG / binary), [str(data.PKG / binary)], env)
+
+
+def observation(mixed=True, target=3):
+    epoch = {"data_loss": 1, "configuration": 2 << 32}
+    replicas = []
+    for index, node in enumerate(("N0010", "N0020", "N0030")[:target]):
+        kind = data.NODE_ENGINES[node] if mixed else "rust"
+        role = "Primary" if index == 0 else "ActiveSecondary"
+        service_role = role if kind == "native-classic-v1" else ("Primary" if index == 0 else "Secondary")
+        rpc = {
+            "profile": "fube-data-v1", "engine_kind": kind, "partition": "partition", "replica": index + 10,
+            "node": node, "host": "host-" + node, "pid": 100 + index, "incarnation": index + 1000,
+            "engine_incarnation": "engine-" + node, "service_address": f"http://127.0.0.1:{2000+index}/data/owner/service",
+            "role": service_role, "current_role": service_role, "native_epoch": dict(epoch),
+            "replicator_role": None if kind == "native-classic-v1" else service_role,
+            "replication_address": None if kind == "native-classic-v1" else "127.0.0.1:3000+actor",
+            "engine": {"copy_done": True, "closed": False, "fault": None, "peers": [], "progress": {"committed": 0}},
+            "pump_fault": None, "read_status": "Granted" if index == 0 else "NotPrimary",
+            "write_status": "Granted" if index == 0 else "NotPrimary",
+            "state": {"copy_in_progress": False, "last": 0, "results": {}, "values": {}},
+            "native_settings": {"require_service_ack": 1, "flags": 32},
+            "requested_native_settings": {"require_service_ack": True, "require_service_ack_flag": 32},
+            "native_settings_error": None,
+        }
+        replicas.append({"node": node, "replica": index + 10, "role": role, "status": "Ready",
+            "rpc": rpc, "deployed": {"host_process_id": 100 + index, "service_type_name": "RustStatefulRuntimeType"},
+            "address": rpc["service_address"], "service_http_status": 200 if index == 0 else 503})
+    return {
+        "observer": "mssf-client", "service": "fabric:/Owned/Data", "partition": "partition",
+        "native_partition": {"target": target, "minimum": 2 if target == 3 else 1, "status": "Ready", "epoch": epoch},
+        "replicas": replicas, "primary": {"resolver": "mssf-client", "endpoint": replicas[0]["address"],
+            "native_pid": 100, "rpc": copy.deepcopy(replicas[0]["rpc"])},
+    }
+
+
+class NativeIdentityTests(unittest.TestCase):
+    def test_real_native_and_rust_roles_and_null_native_endopen_are_distinct(self):
+        value = observation()
+        self.assertIs(data.assert_data(value, value["service"], True), value)
+        self.assertIsNone(value["replicas"][0]["rpc"]["replication_address"])
+        rust = observation(False)
+        data.assert_data(rust, rust["service"], False)
+        native_singleton = observation(True, 1)
+        data.assert_data(native_singleton, native_singleton["service"], True, 1, 1)
+
+    def test_mismatched_deployment_process_service_role_epoch_and_ack_flag_fail_closed(self):
+        mutations = [
+            lambda value: value["replicas"][0]["deployed"].update(host_process_id=999),
+            lambda value: value["primary"].update(native_pid=999),
+            lambda value: value["replicas"][1]["rpc"].update(engine_kind="native-classic-v1"),
+            lambda value: value["replicas"][1]["rpc"].update(partition="wrong"),
+            lambda value: value["replicas"][0]["rpc"].update(replication_address="invented"),
+            lambda value: value["replicas"][0]["rpc"]["native_settings"].update(require_service_ack=0),
+            lambda value: value["replicas"][0]["rpc"]["native_settings"].update(flags=0),
+            lambda value: value["replicas"][1]["rpc"]["native_epoch"].update(configuration=9 << 32),
+            lambda value: value["replicas"][1].update(service_http_status=200),
+            lambda value: value["replicas"][0]["rpc"].update(write_status="NoWriteQuorum"),
+        ]
+        for action in mutations:
+            value = observation()
+            action(value)
+            with self.assertRaises(RuntimeError):
+                data.assert_data(value, value["service"], True)
+
+    def test_initialization_is_sdk_integer_bytes_not_base64_and_placement_is_real_nodes(self):
+        description = data.service_description("fabric:/Owned", "fabric:/Owned/Data", data.MIXED_NODES)
+        self.assertEqual(description["InitializationData"], list(b"fube-data-v1"))
+        self.assertEqual(description["PartitionDescription"], {"PartitionScheme": "Singleton"})
+        self.assertFalse(description["HasPersistedState"])
+        self.assertEqual(description["PlacementConstraints"],
+                         "NodeName == N0010 || NodeName == N0020 || NodeName == N0030")
+        allocation = MagicMock()
+        allocation.execute.return_value = '{"http_status":202,"body":""}'
+        data.create_data_service(allocation, "fabric:/Owned", "fabric:/Owned/Data", data.MIXED_NODES)
+        args = allocation.execute.call_args.args
+        self.assertEqual(args[:2], ("python3", "-c"))
+        self.assertIn("/Applications/Owned/$/GetServices/$/Create?api-version=6.0", args)
+        self.assertEqual(json.loads(args[-1]), description)
+        allocation.sf.assert_not_called()
+
+    def test_no_http_probe_can_target_a_classic_tcp_control_address(self):
+        for endpoint in ("127.0.0.1:32000+actor", "tcp://127.0.0.1:32000/",
+                         "http://127.0.0.1:32000/not-service", "http://user@127.0.0.1:2/owner/service"):
+            with self.assertRaises(RuntimeError):
+                data.request(endpoint, "diagnostics")
+
+    def test_process_expected_comes_from_native_code_query_not_self_reported_exe(self):
+        value = observation(False)
+        replica = value["replicas"][0]
+        package = {"Name": "Code", "ServiceManifestName": "RustRuntimeService", "Version": "1.1:1",
+                   "MainEntryPoint": {"ProcessId": 100, "InstanceId": 77,
+                                      "EntryPointLocation": "/native/deployed/launch-rust.py"}}
+        bundle = MagicMock()
+        bundle.binary.return_value = Path("/prebuilt/rust-runtime-app")
+        bundle.directory = Path("/prebuilt")
+        bundle.metadata = {"artifacts": {
+            "bin/rust-runtime-app": {"sha256": "a" * 64},
+            "launchers/launch-rust.py": {"sha256": "b" * 64},
+        }}
+        with patch.object(data.runtime, "native_read", return_value=[package]), \
+             patch.object(data.runtime, "digest", return_value="a" * 64):
+            expected = data.process_expected(MagicMock(), bundle, value["service"], replica, False)
+            self.assertEqual(expected["native_entry_point"], "/native/deployed/launch-rust.py")
+            self.assertEqual(expected["engine_name"], "rust-runtime-app")
+            self.assertEqual(expected["native_entry_point_instance"], 77)
+            self.assertEqual(expected["engine_sha256"], "a" * 64)
+            self.assertEqual(expected["launcher_sha256"], "b" * 64)
+            package["MainEntryPoint"]["ProcessId"] = 999
+            with self.assertRaises(RuntimeError):
+                data.process_expected(MagicMock(), bundle, value["service"], replica, False)
+
+
+class WorkloadTests(unittest.TestCase):
+    def test_ambiguous_retry_keeps_sequence_and_never_undoes_or_creates_new_identity(self):
+        ledger = data.Ledger()
+        record = ledger.mutation("operation")
+        ledger.reply(record, 202, {"request_id": "operation", "outcome": "ambiguous", "sequence": 7})
+        ledger.reply(record, 200, {"request_id": "operation", "outcome": "committed", "sequence": 7})
+        self.assertTrue(record["committed"])
+        self.assertEqual(record["sequence"], 7)
+        with self.assertRaisesRegex(RuntimeError, "changed"):
+            ledger.reply(record, 200, {"request_id": "operation", "outcome": "committed", "sequence": 8})
+        with self.assertRaises(RuntimeError):
+            ledger.reply(record, 503, {"request_id": "operation", "outcome": "rejected", "sequence": 7})
+
+    def test_independent_map_ledger_comparison_requires_every_successful_id_and_value(self):
+        ledger = data.Ledger()
+        record = ledger.mutation("id-1")
+        ledger.reply(record, 200, {"request_id": "id-1", "outcome": "committed", "sequence": 9})
+        value = observation()
+        for replica in value["replicas"]:
+            replica["rpc"]["state"].update(last=9, results={"id-1": 9}, values={record["key"]: record["value"]})
+        self.assertEqual(ledger.compare(value)["successful"], 1)
+        value["replicas"][1]["rpc"]["state"]["results"] = {}
+        with self.assertRaises(RuntimeError):
+            ledger.compare(value)
+
+    def test_client_caches_primary_and_refreshes_only_on_definite_rejection_or_ambiguous_poll(self):
+        ledger = data.Ledger()
+        client = data.Client(MagicMock(), "fabric:/Owned/Data", False, ledger)
+        client.endpoint = "http://old:20/data/owner/service"
+        def refresh():
+            client.endpoint = "http://new:21/data/owner/service"
+        replies = [
+            (503, {"request_id": "one", "outcome": "rejected"}),
+            (202, {"request_id": "one", "outcome": "ambiguous", "sequence": 2}),
+            (200, {"request_id": "one", "outcome": "committed", "sequence": 2}),
+            (200, {"request_id": "two", "outcome": "committed", "sequence": 3}),
+        ]
+        with patch.object(data, "request", side_effect=replies) as request, \
+             patch.object(client, "refresh", side_effect=refresh) as resolver, \
+             patch.object(data.time, "sleep"):
+            client.write("one")
+            client.write("two")
+        self.assertEqual(resolver.call_count, 2)
+        self.assertEqual([call.args[2]["id"] for call in request.call_args_list], ["one", "one", "one", "two"])
+        self.assertEqual(request.call_args_list[0].args[0], "http://old:20/data/owner/service")
+        self.assertEqual(request.call_args_list[-1].args[0], "http://new:21/data/owner/service")
+
+    def test_copy_evidence_requires_native_inbuild_and_observed_not_invented_horizons(self):
+        removed = {"node": "N0010", "replica": 10}
+        value = observation()
+        value["replicas"][0].update(status="InBuild", replica=30)
+        value["replicas"][1]["rpc"]["engine"]["peers"] = [
+            {"replica": 30, "copy_horizon": 100, "copy_finish": 200, "address": "native-control+actor"}]
+        evidence = data.Qualification.copy_evidence([{"at_monotonic": 10, "native": value}], removed)
+        self.assertEqual(evidence["native_in_build"][0]["replica"], 30)
+        self.assertEqual(evidence["horizons"][0]["copy_horizon"], 100)
+        value["replicas"][1]["rpc"]["engine"]["peers"] = []
+        self.assertFalse(data.Qualification.copy_evidence([{"at_monotonic": 10, "native": value}], removed)["horizons"])
+
+    def test_no_force_remove_and_native_bound_partition_replica_node(self):
+        allocation = MagicMock()
+        result = {"application": "fabric:/Owned"}
+        qualification = data.Qualification(allocation, MagicMock(), result, True)
+        value = observation()
+        qualification.remove(value, value["replicas"][1])
+        args = allocation.sf.call_args.args
+        self.assertEqual(args, ("replica", "remove", "--node-name", "N0020", "--partition-id", "partition",
+                                "--replica-id", "11"))
+        self.assertNotIn("--force-remove", args)
+
+    def test_capacity_rejection_preserves_an_old_committed_identity_even_if_retry_is_ambiguous(self):
+        qualification = data.Qualification(MagicMock(), MagicMock(), {"application": "fabric:/Owned"}, False)
+        original = qualification.ledger.mutation("original")
+        qualification.ledger.reply(original, 200, {
+            "request_id": "original", "outcome": "committed", "sequence": 1})
+        full = observation(False)
+        full["primary"]["rpc"]["state"].update(
+            results={str(index): index for index in range(1, 4097)},
+            history_count=4096, retained_bytes=5 * 1024 * 1024)
+        rejected = (503, {"request_id": "ledger-capacity-0", "outcome": "rejected",
+                          "error": "resource limit: provider history/identity ledger"})
+        retry = (202, {"request_id": "original", "outcome": "ambiguous", "duplicate": True, "sequence": 1})
+        evidence = {}
+        with patch.object(qualification, "converge", return_value=full), \
+             patch.object(data, "request", side_effect=[rejected, retry]) as request:
+            qualification.ledger_capacity_backpressure(evidence)
+        self.assertEqual(request.call_count, 2)
+        self.assertTrue(original["committed"])
+        self.assertEqual(original["sequence"], 1)
+        self.assertIsNone(qualification.ledger.records["ledger-capacity-0"]["sequence"])
+        self.assertEqual(evidence["old_identity_retry_at_capacity"]["outcome"], "ambiguous")
+
+    def test_no_write_quorum_is_not_mislabeled_as_capacity_backpressure(self):
+        qualification = data.Qualification(MagicMock(), MagicMock(), {"application": "fabric:/Owned"}, False)
+        with patch.object(qualification, "converge", return_value=observation(False)), \
+             patch.object(data, "request", return_value=(503, {
+                 "request_id": "ledger-capacity-0", "outcome": "rejected", "error": "NoWriteQuorum"})):
+            with self.assertRaisesRegex(RuntimeError, "not actual provider capacity"):
+                qualification.ledger_capacity_backpressure({})
+
+    def test_native_inbuild_gate_cancellation_joins_worker_without_sending_writes(self):
+        qualification = data.Qualification(MagicMock(), MagicMock(), {"application": "fabric:/Owned"}, False)
+        with patch.object(qualification, "writes") as writes:
+            with qualification.writing(200, "copy", threading.Event()) as worker:
+                pass
+        self.assertTrue(worker.done())
+        self.assertIsInstance(worker.exception(), RuntimeError)
+        writes.assert_not_called()
+
+
+@unittest.skipUnless(sys.platform == "linux", "Linux-only pidfd qualification")
+class ProcessBindingTests(unittest.TestCase):
+    def expected(self, kind="rust"):
+        engine = "rust-runtime-app" if kind == "rust" else "native-replicator-oracle"
+        launcher = "launch-rust.py" if kind == "rust" else "launch-mixed.py"
+        return {
+            "native_pid": 321, "native_entry_point": "/native/deployed/" + launcher,
+            "launcher_name": launcher, "launcher_sha256": hashlib.sha256(b"selector").hexdigest(),
+            "engine_name": engine, "engine_sha256": hashlib.sha256(b"engine").hexdigest(),
+            "host": "native-host", "application": "fabric:/Owned", "node": "N0010", "kind": kind,
+            "captured": {"pid": 321, "exe": "/native/deployed/" + engine, "start_ticks": 81,
+                         "code_sequence": 71, "host": "native-host",
+                         "launcher_sha256": hashlib.sha256(b"selector").hexdigest(),
+                         "executable_sha256": hashlib.sha256(b"engine").hexdigest()},
+        }
+
+    def probe(self, expected, *, host="native-host", engine=b"engine", launcher=b"selector",
+              mappings=("/usr/lib/libc.so.6",), start=81, action="kill", stale=False):
+        engine_path = "/native/deployed/" + expected["engine_name"]
+        class FakePath:
+            def __init__(self, value):
+                self.value = str(value)
+            def __truediv__(self, value):
+                return FakePath(self.value + "/" + str(value))
+            def __str__(self):
+                return self.value
+            @property
+            def name(self):
+                return self.value.rsplit("/", 1)[-1]
+            @property
+            def parent(self):
+                return FakePath(self.value.rsplit("/", 1)[0])
+            def is_absolute(self):
+                return self.value.startswith("/")
+            def is_symlink(self):
+                return False
+            def is_file(self):
+                return True
+            def read_bytes(self):
+                return (f"Fabric_ApplicationHostId={host}\0Fabric_ApplicationName=fabric:/Owned\0"
+                        "Fabric_NodeName=N0010\0Fabric_ServicePackageName=RustRuntimeService\0"
+                        "Fabric_CodePackageInstanceSeqNum=71\0").encode()
+            def read_text(self):
+                if self.value.endswith("/stat"):
+                    fields = ["T" if action == "pause" else "S", "119"] + ["0"] * 17 + [str(start)] + ["0"] * 8
+                    return "321 (test engine) " + " ".join(fields)
+                return "\n".join(f"1-2 r-xp 0 0 0 {path}" for path in mappings)
+            def open(self, mode):
+                if mode != "rb":
+                    raise AssertionError("unexpected mode")
+                return io.BytesIO(engine if self.value.endswith("/exe") else launcher)
+        with patch("sys.argv", ["process", json.dumps(expected), action]), \
+             patch("pathlib.Path", FakePath), \
+             patch("os.pidfd_open", side_effect=ProcessLookupError if stale else None, return_value=44), \
+             patch("os.readlink", return_value=engine_path), patch("os.close"), \
+             patch("signal.pidfd_send_signal") as signal, patch("select.poll") as poll, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            poll.return_value.poll.return_value = [(44, 1)]
+            try:
+                exec(data.DATA_PROCESS, {})
+            except (RuntimeError, ProcessLookupError):
+                signal.assert_not_called()
+                return None
+            if action in ("kill", "pause", "resume"):
+                signal.assert_called_once_with(44, {"kill": 9, "pause": 19, "resume": 18}[action])
+            else:
+                signal.assert_not_called()
+            return json.loads(output.getvalue())
+
+    def test_pidfd_kill_requires_native_launcher_engine_host_and_code_incarnation(self):
+        expected = self.expected()
+        evidence = self.probe(expected)
+        self.assertTrue(evidence["old_process_exit_confirmed"])
+        self.assertEqual(evidence["classification"], "native-free")
+        for kwargs in ({"host": "other-host"}, {"engine": b"replaced"},
+                       {"launcher": b"changed-selector"}, {"start": 82}, {"stale": True}):
+            with self.subTest(kwargs=kwargs):
+                self.assertIsNone(self.probe(expected, **kwargs))
+        changed = copy.deepcopy(expected)
+        changed["captured"]["code_sequence"] = 72
+        self.assertIsNone(self.probe(changed))
+
+    def test_classification_is_per_process_and_never_relaxes_rust_for_native_peer(self):
+        for library in ("libFabricRuntime.so", "libFabricCommon.so", "libFabricClient.so"):
+            self.assertIsNone(self.probe(self.expected(), mappings=("/opt/" + library,)))
+        native = self.expected("native-classic-v1")
+        self.assertIsNone(self.probe(native))
+        evidence = self.probe(native, mappings=(
+            "/opt/libFabricRuntime.so", "/opt/libFabricCommon.so", "/opt/libFabricClient.so"))
+        self.assertEqual(evidence["classification"], "native-classic-dynamic")
+        self.assertTrue(all(evidence["native_libraries"].values()))
+
+    def test_mutation_without_prior_captured_identity_never_signals_a_process(self):
+        expected = self.expected()
+        del expected["captured"]
+        self.assertIsNone(self.probe(expected))
+        self.assertEqual(self.probe(expected, action="inspect")["code_sequence"], 71)
+
+    def test_all_mutations_require_complete_well_typed_prior_capture(self):
+        malformed = ({}, False, 0, [], "", {"host": "native-host"},
+                     {"start_ticks": True, "code_sequence": 71, "host": "native-host"},
+                     {"start_ticks": 81, "code_sequence": True, "host": "native-host"},
+                     {"start_ticks": 81, "code_sequence": -1, "host": "native-host"},
+                     {"start_ticks": 81, "code_sequence": 71, "host": 3},
+                     {"start_ticks": 81, "code_sequence": 71, "host": ""})
+        for action in ("kill", "pause", "resume"):
+            for capture in malformed:
+                with self.subTest(action=action, capture=capture):
+                    expected = self.expected()
+                    expected["captured"] = ({**expected["captured"], **capture}
+                                            if isinstance(capture, dict) and len(capture) > 1 else capture)
+                    self.assertIsNone(self.probe(expected, action=action))
+
+    def test_pause_resume_require_original_start_code_host_and_bind_the_pidfd(self):
+        for action in ("pause", "resume"):
+            with self.subTest(action=action):
+                evidence = self.probe(self.expected(), action=action)
+                self.assertEqual(evidence["action"], action)
+                for kwargs in ({"start": 82}, {"host": "replacement"}, {"stale": True}):
+                    self.assertIsNone(self.probe(self.expected(), action=action, **kwargs))
+                changed = self.expected()
+                changed["captured"]["code_sequence"] = 72
+                self.assertIsNone(self.probe(changed, action=action))
+                for field, value in (("pid", 322), ("exe", "/foreign/engine"),
+                                     ("launcher_sha256", "0" * 64), ("executable_sha256", "0" * 64)):
+                    changed = self.expected()
+                    changed["captured"][field] = value
+                    self.assertIsNone(self.probe(changed, action=action))
+
+    def test_resume_keeps_paused_owner_on_malformed_capture_or_replacement_without_recapturing(self):
+        for malformed in (False, True):
+            qualification = data.Qualification(MagicMock(), MagicMock(), {"application": "fabric:/Owned"}, False)
+            expected = self.expected()
+            if malformed:
+                expected["captured"] = {}
+            qualification.paused.append(expected)
+            def resume(_allocation, original, action):
+                self.assertIs(original, expected)
+                self.assertEqual(action, "resume")
+                value = self.probe(original, action=action, start=81 if malformed else 82)
+                if value is None:
+                    raise RuntimeError("original captured identity refused")
+                return value
+            with patch.object(data, "inspect_process", side_effect=resume):
+                evidence = qualification.resume()
+            self.assertEqual(qualification.paused, [expected])
+            self.assertIn("original captured identity refused", evidence[0]["error"])
+            self.assertEqual(expected["captured"], {} if malformed else self.expected()["captured"])
+        qualification = data.Qualification(MagicMock(), MagicMock(), {"application": "fabric:/Owned"}, False)
+        expected = self.expected()
+        qualification.paused.append(expected)
+        with patch.object(data, "inspect_process", side_effect=lambda _, original, action:
+                          self.probe(original, action=action)):
+            evidence = qualification.resume()
+        self.assertEqual(qualification.paused, [])
+        self.assertEqual(evidence[0]["action"], "resume")
+
+
+@unittest.skipUnless(sys.platform == "linux", "Linux-only onebox ownership")
+class OwnershipTests(ProjectFiles):
+    def test_original_capability_survives_partial_readiness_failure(self):
+        def create(name, *, on_allocated):
+            on_allocated("a" * 32)
+            raise RuntimeError("readiness failed after committed allocation")
+        with patch.object(data, "load_bundle", return_value=MagicMock()), \
+             patch.object(data.runtime, "create_owned", side_effect=create), \
+             patch.object(data.runtime, "Allocation") as allocation, \
+             patch.object(data.runtime, "destroy_owned", return_value={"absence_verified": True}) as destroy:
+            result = self.cli(self.root / "unused")
+        allocation.assert_not_called()
+        destroy.assert_called_once_with("owned", "a" * 32)
+        self.assertIn("readiness", result["errors"][0])
+
+    def test_returned_or_repeated_owner_cannot_replace_the_original_capability(self):
+        for index, duplicate in enumerate((False, True)):
+            def create(name, *, on_allocated):
+                on_allocated("a" * 32)
+                if duplicate:
+                    on_allocated("b" * 32)
+                return "b" * 32
+            with patch.object(data, "load_bundle", return_value=MagicMock()), \
+                 patch.object(data.runtime, "create_owned", side_effect=create), \
+                 patch.object(data.runtime, "Allocation") as allocation, \
+                 patch.object(data.runtime, "destroy_owned", return_value={}) as destroy:
+                self.cli(self.root / "unused", report=f"duplicate-{index}.json")
+            allocation.assert_not_called()
+            destroy.assert_called_once_with("owned", "a" * 32)
+
+    def test_rejected_create_or_existing_owner_never_gets_name_only_destroy(self):
+        with patch.object(data, "load_bundle", return_value=MagicMock()), \
+             patch.object(data.runtime, "create_owned", side_effect=RuntimeError("pre-existing allocation")), \
+             patch.object(data.runtime, "destroy_owned") as destroy:
+            self.cli(self.root / "unused")
+            destroy.assert_not_called()
+        with patch.object(data, "load_bundle", return_value=MagicMock()), \
+             patch.object(data.runtime, "create_owned") as create, \
+             patch.object(data.runtime, "Allocation", side_effect=RuntimeError("drift")), \
+             patch.object(data.runtime, "destroy_owned") as destroy:
+            result = self.cli(self.root / "unused", owner="a" * 32, report="existing.json")
+            create.assert_not_called()
+            destroy.assert_not_called()
+            self.assertEqual(result["cleanup"]["onebox"], "caller-owned allocation retained")
+
+    def test_constructor_failure_still_destroys_only_original_owned_allocation(self):
+        def create(name, *, on_allocated):
+            on_allocated("a" * 32)
+            return "a" * 32
+        with patch.object(data, "load_bundle", return_value=MagicMock()), \
+             patch.object(data.runtime, "create_owned", side_effect=create), \
+             patch.object(data.runtime, "Allocation", side_effect=RuntimeError("container changed")), \
+             patch.object(data.runtime, "destroy_owned", return_value={}) as destroy:
+            result = self.cli(self.root / "unused")
+            destroy.assert_called_once_with("owned", "a" * 32)
+        self.assertIn("container changed", result["errors"][0])
+
+    def test_allocation_reuse_requires_the_exact_original_container_incarnation(self):
+        state = {"name": "owned", "owner": "a" * 32, "project": "sf-onebox-owned", "runtime_version": "11.8.121.4"}
+        directory = self.root / "build/oneboxes/owned"
+        directory.mkdir(parents=True)
+        (directory / "state.json").write_text(json.dumps(state))
+        container = {
+            "Id": "original", "Config": {"Labels": {
+                data.runtime.OWNER_LABEL: "a" * 32, "com.docker.compose.project": "sf-onebox-owned",
+                "com.docker.compose.service": "onebox"}},
+            "State": {"Running": True}, "Mounts": [{"Name": "sf-onebox-owned_data", "Destination": "/var/lib/sf-node"}],
+        }
+        allocation = data.runtime.Allocation.__new__(data.runtime.Allocation)
+        allocation.name, allocation.owner, allocation.container_id = "owned", "a" * 32, "original"
+        with patch.object(data.runtime, "ROOT", self.root), patch.object(data.runtime, "run", return_value=json.dumps([container])):
+            self.assertEqual(allocation.verify(), "original")
+        container["Id"] = "replacement"
+        with patch.object(data.runtime, "ROOT", self.root), patch.object(data.runtime, "run", return_value=json.dumps([container])):
+            with self.assertRaisesRegex(RuntimeError, "incarnation"):
+                allocation.verify()
+
+    def test_destroy_checks_original_container_volume_and_network_independently(self):
+        cluster = MagicMock()
+        cluster.state = {"owner": "a" * 32}
+        cluster.resources.return_value = ([{"Id": "cid"}], [{"Name": "volume"}], [{"Id": "netid"}])
+        cluster.destroy.return_value = {"phase": "destroyed"}
+        with patch.object(data.runtime.onebox_ctl.ctl, "locked", return_value=contextlib.nullcontext(self.root)), \
+             patch.object(data.runtime.onebox_ctl, "Onebox", return_value=cluster), \
+             patch.object(data.runtime, "require_resource_absent") as absent:
+            result = data.runtime.destroy_owned("owned", "a" * 32)
+        self.assertEqual([call.args for call in absent.call_args_list],
+                         [("container", "cid"), ("volume", "volume"), ("network", "netid")])
+        self.assertTrue(result["absence_verified"])
+        cluster.state["owner"] = "b" * 32
+        cluster.destroy.reset_mock()
+        with patch.object(data.runtime.onebox_ctl.ctl, "locked", return_value=contextlib.nullcontext(self.root)), \
+             patch.object(data.runtime.onebox_ctl, "Onebox", return_value=cluster):
+            with self.assertRaises(RuntimeError):
+                data.runtime.destroy_owned("owned", "a" * 32)
+        cluster.destroy.assert_not_called()
+
+    def deployment(self, stage="success", *, visible=True, collision=False, replacement=None, profile="rust"):
+        allocation = MagicMock()
+        allocation.name, allocation.owner, allocation.container_id = "owned", "a" * 32, "cid"
+        allocation.verify.return_value = "cid"
+        run_id = "1" * 32
+        application, type_name = f"fabric:/FubeData{run_id}", f"FubeData{run_id}Type"
+        source = self.root / ("package-" + uuid.uuid4().hex)
+        source.mkdir()
+        manifest = ET.parse(data.PKG / "rust/ApplicationManifest.xml")
+        manifest.getroot().set("ApplicationTypeName", type_name)
+        manifest.find(f"{{{data.runtime.NS}}}Parameters/{{{data.runtime.NS}}}Parameter"
+                      "[@Name='FubeDataTypeCapability']").set("DefaultValue", "c" * 64)
+        manifest.write(source / "ApplicationManifest.xml", encoding="utf-8")
+        text = (source / "ApplicationManifest.xml").read_text()
+        present = {"app": collision, "type": False, "native_id": type_name + "_App1",
+                   "capability": None, "manifest": text, "generation": (131510254310497004, 23, 25769803776)}
+        reservation = data.UploadOwnership("/var/lib/sf-node/fube-data-" + run_id,
+            "cid", (1, 2), (1, 3), (1, 4), "d" * 64)
+        def sf(*args, **kwargs):
+            if args[:2] == ("application", "list"):
+                return json.dumps({"items": [{"name": application, "typeName": type_name, "typeVersion": "1.1"}]
+                                  if present["app"] else []})
+            if args[:2] == ("application", "type-list"):
+                return json.dumps({"items": [{"name": type_name, "version": "1.1"}] if present["type"] else []})
+            if args[:2] == ("application", "provision"):
+                present["type"] = visible
+                if stage == "provision-rejected":
+                    raise RuntimeError("ApplicationTypeAlreadyExists: foreign resource won race")
+                if stage in ("provision", "provision-lost-response"):
+                    raise subprocess.TimeoutExpired("accepted provision", 1)
+            if args[:2] == ("application", "create"):
+                present["app"] = visible
+                present["capability"] = json.loads(args[args.index("--parameters") + 1])["FubeDataCreationCapability"]
+                if stage == "create-rejected":
+                    raise RuntimeError("ApplicationAlreadyExists: foreign resource won race")
+                if stage in ("create", "create-lost-response"):
+                    raise subprocess.TimeoutExpired("accepted create", 1)
+            if args[:2] == ("application", "delete"):
+                present["app"] = False
+            if args[:2] == ("application", "unprovision"):
+                present["type"] = False
+            return "{}"
+        allocation.sf.side_effect = sf
+        allocation.execute.side_effect = lambda *args, **kwargs: json.dumps({
+            "native_application_id": present["native_id"]})
+        def native(_, path):
+            if "/GetApplicationManifest?" in path:
+                return {"Manifest": present["manifest"]} if present["type"] else None
+            if path.startswith("/ImageStore/"):
+                if not present["type"] and stage != "generation-collision":
+                    return {"StoreFiles": [], "StoreFolders": []}
+                if stage == "generation-unavailable":
+                    raise RuntimeError("native ImageStore metadata unavailable")
+                value = store_generation(data.manifest_identity(text), present["generation"])
+                if stage == "generation-missing":
+                    value["StoreFiles"][0].pop("FileVersion")
+                elif stage == "generation-ambiguous":
+                    value["StoreFiles"] *= 2
+                return value
+            if path.startswith("/Applications/"):
+                return {"Id": application.removeprefix("fabric:/"), "Name": application,
+                        "TypeName": type_name, "TypeVersion": "1.1", "Status": "Ready", "Parameters": [
+                            {"Key": "FubeDataCreationCapability", "Value": present["capability"]}
+                        ]} if present["app"] else None
+            if path.startswith("/Nodes/"):
+                return {"Name": application, "TypeName": type_name,
+                        "Status": "Active", "WorkDirectory": "/native/" + present["native_id"] + "/work"
+                        } if present["app"] else None
+            raise AssertionError(path)
+        def run():
+            if replacement == "application":
+                # Even a replacement with an exact copy of the owner's parameter
+                # is not the captured, server-assigned native application ID.
+                present["native_id"] = type_name + "_App2"
+            elif replacement == "type":
+                present["manifest"] = text.replace("c" * 64, "e" * 64)
+            elif replacement == "type-generation":
+                present["generation"] = (131510254310497004, 24, 25769803776)
+            if stage == "scenario-timeout":
+                raise subprocess.TimeoutExpired("lost response after original identity captured", 1)
+        def wait(check, description, timeout=0):
+            value = check()
+            if not value:
+                raise RuntimeError(description)
+            return value
+        copy_error = RuntimeError("partial descriptor copy failed")
+        copy_error.add_note("original upload reservation: " + json.dumps(reservation.evidence()))
+        with patch.object(data.uuid, "uuid4", return_value=MagicMock(hex=run_id)), \
+             patch.object(data, "provenance", return_value={}), \
+             patch.object(data, "package", return_value=(source, type_name, "1.1")), \
+             patch.object(data, "ownership_read", side_effect=native), \
+             patch.object(data, "create_data_service", return_value={}), \
+             patch.object(data, "reserve_upload", side_effect=(
+                 FileExistsError("foreign upload path") if stage == "reserve" else None),
+                 return_value=reservation) as reserve, \
+             patch.object(data, "check_upload") as upload, \
+             patch.object(data.Qualification, "run", side_effect=run), \
+             patch.object(data.runtime, "cleanup_deployment", side_effect=AssertionError(
+                 "name/attempt-only shared cleanup must not run")), \
+             patch.object(data.runtime, "qualify", side_effect=AssertionError(
+                 "legacy runner must not bypass owned deployment cleanup")), \
+             patch.object(data.runtime, "wait_condition", side_effect=wait), \
+             patch.object(data, "transfer_upload", side_effect=(
+                 copy_error if stage == "copy" else None),
+                 return_value={"copy_api": "descriptor-bound model"}) as copy, \
+             patch.object(data.runtime, "failure_artifacts", return_value={"diagnostic": "bounded"}):
+            result = data.qualify(allocation, MagicMock(), profile)
+        allocation.reservation = reserve
+        allocation.upload = upload
+        allocation.copy = copy
+        return result, present, allocation
+
+    def test_accepted_timeouts_without_original_native_identity_retain_instead_of_adopting(self):
+        for stage in ("provision", "create"):
+            result, present, allocation = self.deployment(stage)
+            self.assertEqual(result["status"], "FAIL")
+            self.assertTrue(present["type"])
+            self.assertEqual(present["app"], stage == "create")
+            self.assertFalse(any(call.args[:2] in {("application", "delete"), ("application", "unprovision")}
+                                 for call in allocation.sf.call_args_list))
+            self.assertIn("accepted " + stage, result["errors"][0])
+            self.assertEqual(result["upload_paths"], ["/var/lib/sf-node/fube-data-" + result["run_id"]])
+            self.assertEqual(result["cleanup"]["upload"], "original reservation removed")
+            self.assertIsNone(result["cleanup"]["retained_for_recovery"]["original_native_application_id"])
+
+    def test_definitive_collisions_after_both_absence_checks_never_grant_authority(self):
+        for stage in ("provision-rejected", "create-rejected"):
+            result, present, allocation = self.deployment(stage)
+            self.assertTrue(present["type"])
+            self.assertEqual(present["app"], stage == "create-rejected")
+            self.assertFalse(any(call.args[:2] in {("application", "delete"), ("application", "unprovision")}
+                                 for call in allocation.sf.call_args_list))
+            self.assertEqual(result["deployment_outcomes"][stage.split("-")[0]], "rejected")
+
+    def test_successful_original_identity_allows_cleanup_even_after_later_timeout(self):
+        for stage in ("success", "scenario-timeout"):
+            result, present, allocation = self.deployment(stage)
+            self.assertFalse(present["app"])
+            self.assertFalse(present["type"])
+            self.assertTrue(result["original_application_identity"]["native_application_id"].endswith("_App1"))
+            self.assertEqual(result["cleanup"]["application"], "deleted; absence confirmed")
+            self.assertEqual(result["cleanup"]["type"], "unprovisioned; absence confirmed")
+            self.assertEqual(result["cleanup"]["upload"], "original reservation removed")
+            allocation.copy.assert_called_once()
+            self.assertEqual(str(allocation.copy.call_args.args[2]), result["local_package_path"])
+            self.assertFalse(any(call.args[:2] == ("application", "upload")
+                                 for call in allocation.sf.call_args_list))
+
+    def test_replacements_with_same_name_type_version_and_copied_token_are_not_original(self):
+        for replacement in ("application", "type", "type-generation"):
+            result, present, allocation = self.deployment(replacement=replacement)
+            self.assertTrue(present["app"])
+            self.assertTrue(present["type"])
+            self.assertFalse(any(call.args[:2] in {("application", "delete"), ("application", "unprovision")}
+                                 for call in allocation.sf.call_args_list))
+            self.assertIn("changed", result["cleanup"]["deployment"])
+            self.assertTrue(result["original_application_identity"]["native_application_id"].endswith("_App1"))
+            self.assertEqual(result["status"], "FAIL")
+
+    def test_missing_ambiguous_or_unavailable_generation_retains_type_and_never_creates_application(self):
+        for stage in ("generation-missing", "generation-ambiguous", "generation-unavailable"):
+            result, present, allocation = self.deployment(stage)
+            self.assertTrue(present["type"])
+            self.assertFalse(present["app"])
+            self.assertFalse(any(call.args[:2] in {("application", "create"), ("application", "unprovision")}
+                                 for call in allocation.sf.call_args_list))
+            recovery = result["cleanup"]["retained_for_recovery"]
+            self.assertIsNone(recovery["original_native_type_generation"])
+            self.assertIn("manifest/generation", result["cleanup"]["type"])
+            self.assertEqual(result["cleanup"]["upload"], "original reservation removed")
+            self.assertEqual(result["status"], "FAIL")
+
+    def test_existing_provisioned_manifest_path_grants_no_authority_even_if_type_query_reports_absent(self):
+        result, _, allocation = self.deployment("generation-collision")
+        allocation.reservation.assert_not_called()
+        allocation.upload.assert_not_called()
+        self.assertFalse(any(call.args[:2] in {("application", "provision"), ("application", "unprovision")}
+                             for call in allocation.sf.call_args_list))
+        self.assertIn("ImageStore manifest path collision", result["errors"][0])
+        self.assertEqual(result["status"], "FAIL")
+
+    def test_lost_mutation_responses_cannot_adopt_foreign_resources(self):
+        for stage in ("provision-lost-response", "create-lost-response"):
+            result, present, allocation = self.deployment(stage)
+            self.assertTrue(present["type"])
+            self.assertEqual(present["app"], stage.startswith("create"))
+            self.assertFalse(any(call.args[:2] in {("application", "delete"), ("application", "unprovision")}
+                                 for call in allocation.sf.call_args_list))
+            self.assertIn("retained_for_recovery", result["cleanup"])
+
+    def test_failed_reservation_grants_no_cleanup_but_partial_owned_copy_is_removed(self):
+        result, _, allocation = self.deployment("reserve")
+        self.assertNotIn("upload_paths", result)
+        allocation.upload.assert_not_called()
+        allocation.copy.assert_not_called()
+        result, _, allocation = self.deployment("copy")
+        self.assertIn("partial descriptor copy failed", result["errors"][0])
+        self.assertIn(result["upload_reservation"]["capability"],
+                      "\n".join(result["qualification_recovery_notes"]))
+        self.assertEqual(allocation.upload.call_args.args[2], "remove")
+        self.assertEqual(result["cleanup"]["upload"], "original reservation removed")
+
+    def test_ambiguous_absence_remains_failure_and_collision_grants_no_deletion(self):
+        result, _, _ = self.deployment("provision", visible=False)
+        self.assertTrue(any("late completion possible" in error for error in result["errors"]))
+        result, present, allocation = self.deployment("create", collision=True)
+        self.assertTrue(present["app"])
+        self.assertNotIn("upload_paths", result)
+        self.assertFalse(any(call.args[:2] in {("application", "delete"), ("application", "unprovision")}
+                             for call in allocation.sf.call_args_list))
+
+    def test_full_explicitly_fails_legacy_gate_rather_than_using_unsafe_shared_cleanup(self):
+        result, _, _ = self.deployment(profile="full")
+        self.assertEqual(result["scenarios"]["legacy_full"]["status"], "MISSING")
+        self.assertIn("original-resource ownership proofs", result["scenarios"]["legacy_full"]["reason"])
+        self.assertTrue(any("legacy_full not executed" in error for error in result["errors"]))
+        self.assertEqual(result["status"], "FAIL")
+
+
+@unittest.skipUnless(sys.platform == "linux", "Linux-only descriptor-relative upload cleanup")
+class UploadReservationTests(ProjectFiles):
+    def run_upload(self, path, action, proof, archive=None, upload=None):
+        # Execute the production program against project-local fixtures, not a
+        # native allocation or the real /var/lib/sf-node mount.
+        code = data.UPLOAD.replace('parent=="/var/lib/sf-node"', "parent==" + repr(str(self.root)))
+        args = ["upload", str(path), action, json.dumps(proof)]
+        if action == "transfer":
+            args += [str(time.time() + data.UPLOAD_SECONDS), "e" * 64]
+        self.native_upload = MagicMock(side_effect=upload)
+        with patch("sys.argv", args), \
+             patch("sys.stdin", types.SimpleNamespace(buffer=io.BytesIO(archive or b""))), \
+             patch.object(subprocess, "run", self.native_upload), \
+             patch.object(signal, "setitimer"), \
+             patch.object(signal, "signal"), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            exec(code, {})
+        return json.loads(output.getvalue().splitlines()[-1])
+
+    @staticmethod
+    def archive(*entries):
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            for name, kind, content in entries:
+                header = tarfile.TarInfo(name)
+                header.type = kind
+                header.mode = 0o700 if kind == tarfile.DIRTYPE else 0o644
+                header.size = len(content) if kind == tarfile.REGTYPE else 0
+                if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+                    header.linkname = "foreign"
+                archive.addfile(header, io.BytesIO(content) if header.size else None)
+        return output.getvalue()
+
+    def reserve(self):
+        path = self.root / ("fube-data-" + "1" * 32)
+        proof = self.run_upload(path, "reserve", {"capability": "a" * 64})
+        return path, proof
+
+    def intercept_publish(self, callback):
+        libc = ctypes.CDLL(None, use_errno=True)
+        rename = libc.renameat2
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        libc.renameat2 = MagicMock(side_effect=lambda *args: callback(rename, *args))
+        return patch.object(ctypes, "CDLL", return_value=libc)
+
+    def test_published_path_is_never_reopened_to_mint_a_reservation(self):
+        path = self.root / ("fube-data-" + "1" * 32)
+        original_open = os.open
+        opened = []
+        def substitute_at_public_open(name, *args, **kwargs):
+            if name == path.name:
+                opened.append(name)
+                path.rename(self.root / "actual-created")
+                path.mkdir()
+                (path / "foreign").write_text("replacement between mkdir and descriptor capture")
+            return original_open(name, *args, **kwargs)
+        with patch.object(os, "open", side_effect=substitute_at_public_open):
+            _, proof = self.reserve()
+        self.assertEqual(opened, [], "the review's post-mkdir/open replacement window must not exist")
+        self.assertEqual(proof["directory"], [path.stat().st_dev, path.stat().st_ino])
+        self.run_upload(path, "remove", proof)
+        self.assertFalse(path.exists())
+
+    def test_public_collision_during_private_open_grants_no_authority_and_cleans_only_private_original(self):
+        path = self.root / ("fube-data-" + "1" * 32)
+        original_open = os.open
+        def collide_at_private_open(name, *args, **kwargs):
+            if isinstance(name, str) and name.startswith(".fube-data-reserve-"):
+                path.mkdir()
+                (path / "foreign").write_text("foreign before descriptor capture")
+            return original_open(name, *args, **kwargs)
+        with patch.object(os, "open", side_effect=collide_at_private_open):
+            with self.assertRaises(FileExistsError):
+                self.reserve()
+        self.assertEqual((path / "foreign").read_text(), "foreign before descriptor capture")
+        self.assertFalse((path / ".fube-upload-owner").exists())
+        self.assertFalse(list(self.root.glob(".fube-data-reserve-*")))
+
+    def test_private_open_substitution_cannot_mint_an_owner_in_the_replacement(self):
+        original_open = os.open
+        original = self.root / "created-private"
+        replaced = []
+        def substitute_at_private_open(name, *args, **kwargs):
+            if isinstance(name, str) and name.startswith(".fube-data-reserve-"):
+                private = self.root / name
+                private.rename(original)
+                private.mkdir()
+                (private / "foreign").write_text("foreign before private open")
+                replaced.append(private)
+            return original_open(name, *args, **kwargs)
+        with patch.object(os, "open", side_effect=substitute_at_private_open):
+            with self.assertRaisesRegex(RuntimeError, "changed before descriptor capture"):
+                self.reserve()
+        self.assertEqual(len(replaced), 1)
+        self.assertEqual((replaced[0] / "foreign").read_text(), "foreign before private open")
+        self.assertFalse((replaced[0] / ".fube-upload-owner").exists())
+        self.assertTrue(original.is_dir())
+
+    def test_replacement_at_atomic_publication_cannot_be_adopted_with_a_copied_owner(self):
+        path = self.root / ("fube-data-" + "1" * 32)
+        original = self.root / "original-published"
+        def substitute(rename, *args):
+            result = rename(*args)
+            self.assertEqual(result, 0)
+            path.rename(original)
+            path.mkdir()
+            shutil.copyfile(original / ".fube-upload-owner", path / ".fube-upload-owner")
+            (path / "foreign").write_text("foreign at publication")
+            return result
+        with self.intercept_publish(substitute):
+            with self.assertRaisesRegex(RuntimeError, "incarnation changed") as raised:
+                self.reserve()
+        self.assertEqual((path / "foreign").read_text(), "foreign at publication")
+        self.assertEqual((original / ".fube-upload-owner").read_text(), "a" * 64)
+        self.assertIn("original upload recovery", "\n".join(raised.exception.__notes__))
+
+    def test_private_source_substitution_after_capture_is_rejected_at_publication(self):
+        path = self.root / ("fube-data-" + "1" * 32)
+        original = self.root / "original-private"
+        def substitute(rename, source_fd, source, target_fd, target, flags):
+            source_path = self.root / os.fsdecode(source)
+            source_path.rename(original)
+            source_path.mkdir()
+            (source_path / "foreign").write_text("foreign substituted source")
+            return rename(source_fd, source, target_fd, target, flags)
+        with self.intercept_publish(substitute):
+            with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
+                self.reserve()
+        self.assertEqual((path / "foreign").read_text(), "foreign substituted source")
+        self.assertFalse((path / ".fube-upload-owner").exists())
+        self.assertEqual((original / ".fube-upload-owner").read_text(), "a" * 64)
+
+    def test_unavailable_atomic_publication_has_no_overwriting_fallback(self):
+        path = self.root / ("fube-data-" + "1" * 32)
+        with patch.object(ctypes, "CDLL", return_value=object()):
+            with self.assertRaisesRegex(RuntimeError, "RENAME_NOREPLACE.*unavailable"):
+                self.reserve()
+        self.assertFalse(path.exists())
+        self.assertFalse(list(self.root.glob(".fube-data-reserve-*")))
+
+    def test_existing_directory_file_and_symlinks_refuse_reservation_without_mutating_them(self):
+        path = self.root / ("fube-data-" + "1" * 32)
+        foreign = self.root / "foreign"
+        foreign.mkdir()
+        (foreign / "sentinel").write_text("foreign")
+        for kind in ("directory", "file", "symlink", "dangling-symlink"):
+            with self.subTest(kind=kind):
+                if kind == "directory":
+                    path.mkdir()
+                    (path / "sentinel").write_text("foreign")
+                elif kind == "file":
+                    path.write_text("foreign")
+                else:
+                    path.symlink_to(foreign if kind == "symlink" else self.root / "absent")
+                with self.assertRaises(FileExistsError):
+                    self.run_upload(path, "reserve", {"capability": "a" * 64})
+                self.assertEqual((foreign / "sentinel").read_text(), "foreign")
+                if kind == "directory":
+                    self.assertEqual((path / "sentinel").read_text(), "foreign")
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+
+    def test_partial_copy_into_successfully_reserved_original_is_cleaned(self):
+        path, proof = self.reserve()
+        (self.root / "keep").write_text("not copied")
+        archive = self.archive(("partial", tarfile.DIRTYPE, b""),
+                               ("partial/payload", tarfile.REGTYPE, b"x" * 70000))
+        with self.assertRaisesRegex(RuntimeError, "truncated bounded upload"):
+            self.run_upload(path, "transfer", proof, archive[:68000])
+        self.assertEqual(self.run_upload(path, "verify", proof), proof)
+        self.assertEqual(self.run_upload(path, "remove", proof), proof)
+        self.assertFalse(path.exists())
+        self.assertEqual((self.root / "keep").read_text(), "not copied")
+        self.assertFalse(list(self.root.glob(".fube-data-remove-*")))
+
+    def test_descriptor_transfer_preserves_package_modes_and_uploads_original_scoped_source(self):
+        path, proof = self.reserve()
+        source = self.root / "source"
+        (source / "Code").mkdir(parents=True)
+        (source / "ApplicationManifest.xml").write_text("manifest")
+        (source / "Code/app").write_bytes(b"executable")
+        (source / "Code/app").chmod(0o755)
+        archive, entries, size = data.upload_archive(source)
+        uploaded, markers = {}, []
+        def upload(command, **options):
+            self.assertEqual(command[:3], [
+                "/opt/microsoft/servicefabric/bin/Fabric/Fabric.Code/azurecliproxy",
+                "copyapplicationpackage", "127.0.0.1:19000"])
+            scoped, store, remote, certificate = command[3:]
+            self.assertEqual((store, certificate), ("fabric:ImageStore", ""))
+            self.assertRegex(scoped, f"^/proc/{os.getpid()}/fd/[0-9]+$")
+            file = Path(scoped)
+            self.assertTrue(file.is_file(), "native SDK must never receive a directory")
+            relative = remote.removeprefix(path.name + "/")
+            if relative.endswith("_.dir"):
+                self.assertEqual(file.read_bytes(), b"")
+                markers.append(relative)
+            else:
+                uploaded[relative] = hashlib.sha256(file.read_bytes()).hexdigest()
+                self.assertEqual(file.read_bytes(), (source / relative).read_bytes())
+                self.assertEqual(file.stat().st_mode & 0o777, (source / relative).stat().st_mode & 0o777)
+            self.assertEqual((path / "Code").stat().st_mode & 0o777, 0o700)
+            self.assertTrue(options["check"])
+            self.assertLessEqual(options["timeout"], 120)
+        before = len(os.listdir("/proc/self/fd"))
+        receipt = self.run_upload(path, "transfer", proof, archive, upload)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+        self.assertEqual(self.native_upload.call_count, 4)
+        self.assertEqual((receipt["entries"], receipt["bytes"]), (entries, size))
+        self.assertEqual(receipt["ownership"], proof)
+        self.assertEqual(receipt["image_store_path"], path.name)
+        self.assertEqual(uploaded, {name: item["sha256"] for name, item in receipt["files"].items()})
+        self.assertEqual(markers, ["Code/_.dir", "_.dir"], "native directory existence markers, root last")
+        self.assertEqual(set(receipt["markers"]), set(markers))
+        with self.assertRaises(FileNotFoundError):
+            os.stat(receipt["source"])
+        for item in receipt["files"].values():
+            with self.assertRaises(FileNotFoundError):
+                os.stat(item["source"])
+        for item in receipt["markers"].values():
+            with self.assertRaises(FileNotFoundError):
+                os.stat(item["source"])
+        self.run_upload(path, "remove", proof)
+
+    def replace_public(self, path, original):
+        path.rename(original)
+        path.mkdir()
+        shutil.copyfile(original / ".fube-upload-owner", path / ".fube-upload-owner")
+        (path / "payload").write_text("foreign must not change")
+        return {entry.name: entry.read_bytes() for entry in path.iterdir()}
+
+    def test_replacement_between_precheck_and_transfer_setup_is_never_written_or_uploaded(self):
+        path, proof = self.reserve()
+        self.run_upload(path, "verify", proof)
+        original = self.root / "original-before-copy"
+        before = self.replace_public(path, original)
+        archive = self.archive(("payload", tarfile.REGTYPE, b"owned payload"))
+        with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
+            self.run_upload(path, "transfer", proof, archive)
+        self.native_upload.assert_not_called()
+        self.assertEqual({entry.name: entry.read_bytes() for entry in path.iterdir()}, before)
+        self.assertEqual(list(original.iterdir()), [original / ".fube-upload-owner"])
+        with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
+            self.run_upload(path, "remove", proof)
+        self.assertTrue(original.exists())
+
+    def test_replacement_during_transfer_writes_only_retained_original_inode_and_retains_recovery(self):
+        path, proof = self.reserve()
+        original = self.root / "original-during-copy"
+        archive = self.archive(("Code", tarfile.DIRTYPE, b""),
+                               ("Code/app", tarfile.REGTYPE, b"x" * 70000),
+                               ("payload", tarfile.REGTYPE, b"owned payload"))
+        write = os.write
+        foreign = []
+        def replace_then_write(fd, value):
+            if not foreign:
+                foreign.append(self.replace_public(path, original))
+            return write(fd, value)
+        before = len(os.listdir("/proc/self/fd"))
+        with patch.object(os, "write", side_effect=replace_then_write):
+            with self.assertRaisesRegex(RuntimeError, "incarnation changed") as raised:
+                self.run_upload(path, "transfer", proof, archive)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+        self.native_upload.assert_not_called()
+        self.assertEqual({entry.name: entry.read_bytes() for entry in path.iterdir()}, foreign[0])
+        self.assertEqual((original / "Code/app").read_bytes(), b"x" * 70000)
+        self.assertEqual((original / "payload").read_bytes(), b"owned payload")
+        self.assertIn("original upload recovery", "\n".join(raised.exception.__notes__))
+        with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
+            self.run_upload(path, "remove", proof)
+        self.assertTrue(original.exists())
+
+    def test_replacement_during_native_read_cannot_redirect_original_file_source_to_foreign_tree(self):
+        path, proof = self.reserve()
+        original = self.root / "original-during-upload"
+        before = []
+        def read_original(command, **_):
+            before.append(self.replace_public(path, original))
+            scoped = Path(command[3])
+            self.assertEqual(scoped.read_bytes(), b"owned payload")
+            self.assertEqual(scoped.stat().st_ino, (original / "payload").stat().st_ino)
+        archive = self.archive(("payload", tarfile.REGTYPE, b"owned payload"))
+        with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
+            self.run_upload(path, "transfer", proof, archive, read_original)
+        self.native_upload.assert_called_once()
+        self.assertEqual({entry.name: entry.read_bytes() for entry in path.iterdir()}, before[0])
+        self.assertEqual((original / "payload").read_bytes(), b"owned payload")
+
+    def test_replacement_immediately_before_native_upload_fails_closed(self):
+        path, proof = self.reserve()
+        original = self.root / "original-before-upload"
+        stat_call = os.stat
+        before = []
+        def replace_at_scoped_check(entry, *args, **kwargs):
+            if str(entry).startswith(f"/proc/{os.getpid()}/fd/") and not before:
+                before.append(self.replace_public(path, original))
+            return stat_call(entry, *args, **kwargs)
+        archive = self.archive(("payload", tarfile.REGTYPE, b"owned payload"))
+        with patch.object(os, "stat", side_effect=replace_at_scoped_check):
+            with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
+                self.run_upload(path, "transfer", proof, archive)
+        self.native_upload.assert_not_called()
+        self.assertEqual({entry.name: entry.read_bytes() for entry in path.iterdir()}, before[0])
+
+    def test_review_preexisting_foreign_child_is_refused_without_copy_or_cleanup_authority(self):
+        path, proof = self.reserve()
+        foreign = path / "Code"
+        foreign.mkdir()
+        (foreign / "sentinel").write_bytes(b"preexisting foreign content")
+        before = {entry.name: entry.read_bytes() for entry in foreign.iterdir()}
+        descriptors = len(os.listdir("/proc/self/fd"))
+        with self.assertRaisesRegex(FileExistsError, "preexisting upload child"):
+            self.run_upload(path, "transfer", proof, self.archive(
+                ("Code", tarfile.DIRTYPE, b""), ("Code/app", tarfile.REGTYPE, b"owned payload")))
+        self.native_upload.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "child inventory changed"):
+            self.run_upload(path, "remove", proof)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
+        self.assertEqual({entry.name: entry.read_bytes() for entry in foreign.iterdir()}, before)
+        self.assertEqual((path / ".fube-upload-owner").read_text(), proof["capability"])
+        self.assertFalse(list(self.root.glob(".fube-data-remove-*")))
+
+    def test_review_child_mkdir_stat_substitution_never_adopts_or_writes_foreign_directory(self):
+        path, proof = self.reserve()
+        original = self.root / "original-created-Code"
+        foreign = self.root / "foreign-Code"
+        foreign.mkdir()
+        (foreign / "sentinel").write_bytes(b"foreign existing content")
+        before = {entry.name: entry.read_bytes() for entry in foreign.iterdir()}
+        stat_call = os.stat
+        swapped = []
+        def substitute_at_first_child_stat(entry, *args, **kwargs):
+            # Exact v4 R2.1: only intercept the first descriptor-relative
+            # stat("Code"). It now follows private capture/publication, not mkdir.
+            if entry == "Code" and "dir_fd" in kwargs and not swapped:
+                swapped.append(True)
+                (path / "Code").rename(original)
+                foreign.rename(path / "Code")
+            return stat_call(entry, *args, **kwargs)
+        descriptors = len(os.listdir("/proc/self/fd"))
+        with patch.object(os, "stat", side_effect=substitute_at_first_child_stat):
+            with self.assertRaisesRegex(RuntimeError, "child incarnation changed") as raised:
+                self.run_upload(path, "transfer", proof, self.archive(
+                    ("Code", tarfile.DIRTYPE, b""), ("Code/app", tarfile.REGTYPE, b"owned payload")))
+        self.assertEqual(swapped, [True], "execute the review's first child-stat mutation")
+        self.native_upload.assert_not_called()
+        self.assertEqual(list(original.iterdir()), [], "capture substitution must fail before payload creation")
+        self.assertIn(proof["capability"], "\n".join(raised.exception.__notes__))
+        with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
+            self.run_upload(path, "remove", proof)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
+        self.assertEqual({entry.name: entry.read_bytes() for entry in (path / "Code").iterdir()}, before)
+        self.assertFalse(list(self.root.glob(".fube-data-remove-*")))
+
+    def test_collision_at_child_publication_never_overwrites_or_cleans_foreign_child(self):
+        path, proof = self.reserve()
+        foreign = path / "Code"
+        def collide(rename, source_fd, source, target_fd, target, flags):
+            if target == b"Code":
+                foreign.mkdir()
+                (foreign / "sentinel").write_bytes(b"foreign at publication")
+            return rename(source_fd, source, target_fd, target, flags)
+        descriptors = len(os.listdir("/proc/self/fd"))
+        with self.intercept_publish(collide):
+            with self.assertRaises(FileExistsError):
+                self.run_upload(path, "transfer", proof, self.archive(
+                    ("Code", tarfile.DIRTYPE, b""), ("Code/app", tarfile.REGTYPE, b"owned payload")))
+        self.native_upload.assert_not_called()
+        private = list(path.glob(".fube-data-child-*"))
+        self.assertEqual(len(private), 1)
+        self.assertEqual(list(private[0].iterdir()), [])
+        with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
+            self.run_upload(path, "remove", proof)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
+        self.assertEqual({entry.name: entry.read_bytes() for entry in foreign.iterdir()},
+                         {"sentinel": b"foreign at publication"})
+        # Once the independently foreign collision is moved aside by its owner,
+        # the recorded private original is still removable with the original proof.
+        foreign.rename(self.root / "foreign-retained")
+        self.run_upload(path, "remove", proof)
+        self.assertFalse(path.exists())
+        self.assertEqual((self.root / "foreign-retained/sentinel").read_bytes(), b"foreign at publication")
+
+    def test_child_replacement_during_copy_writes_only_original_retained_directory_and_files(self):
+        path, proof = self.reserve()
+        original = self.root / "original-copy-Code"
+        foreign = self.root / "foreign-copy-Code"
+        foreign.mkdir()
+        (foreign / "sentinel").write_bytes(b"not owned")
+        before = {entry.name: entry.read_bytes() for entry in foreign.iterdir()}
+        write = os.write
+        swapped = []
+        def swap_during_payload(fd, value):
+            if bytes(value).startswith(b"x") and not swapped:
+                swapped.append(True)
+                (path / "Code").rename(original)
+                foreign.rename(path / "Code")
+            return write(fd, value)
+        descriptors = len(os.listdir("/proc/self/fd"))
+        with patch.object(os, "write", side_effect=swap_during_payload):
+            with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
+                self.run_upload(path, "transfer", proof, self.archive(
+                    ("Code", tarfile.DIRTYPE, b""), ("Code/app", tarfile.REGTYPE, b"x" * 70000),
+                    ("Code/other", tarfile.REGTYPE, b"also original")))
+        self.native_upload.assert_not_called()
+        self.assertEqual(swapped, [True])
+        self.assertEqual((original / "app").read_bytes(), b"x" * 70000)
+        self.assertEqual((original / "other").read_bytes(), b"also original")
+        with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
+            self.run_upload(path, "remove", proof)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
+        self.assertEqual({entry.name: entry.read_bytes() for entry in (path / "Code").iterdir()}, before)
+
+    def test_review_upload_time_child_substitution_reads_only_original_file_fds_and_refuses_success(self):
+        path, proof = self.reserve()
+        original = self.root / "original-upload-Code"
+        uploaded = {}
+        expected = {"Code/app": b"owned executable", "Code/other": b"owned other file"}
+        foreign = {"app": b"foreign executable", "sentinel": b"foreign existing content"}
+        def native_read(command, **_):
+            # Exact v4 R2.2: substitute Code at uploader entry. The existing
+            # SDK is now given a FILE procfd, so it cannot enumerate Code.
+            (path / "Code").rename(original)
+            (path / "Code").mkdir()
+            for name, value in foreign.items():
+                (path / "Code" / name).write_bytes(value)
+            source = Path(command[3])
+            self.assertRegex(str(source), f"^/proc/{os.getpid()}/fd/[0-9]+$")
+            self.assertTrue(source.is_file())
+            relative = command[5].removeprefix(path.name + "/")
+            payload = source.read_bytes()
+            uploaded[relative] = hashlib.sha256(payload).hexdigest()
+            self.assertEqual(payload, expected[relative])
+            self.assertEqual(source.stat().st_ino, (original / Path(relative).name).stat().st_ino)
+        archive = self.archive(("Code", tarfile.DIRTYPE, b""), *(
+            (name, tarfile.REGTYPE, content) for name, content in expected.items()))
+        descriptors = len(os.listdir("/proc/self/fd"))
+        with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
+            self.run_upload(path, "transfer", proof, archive, native_read)
+        self.native_upload.assert_called_once()
+        self.assertEqual(uploaded, {"Code/app": hashlib.sha256(expected["Code/app"]).hexdigest()})
+        self.assertNotIn("Code/sentinel", uploaded)
+        with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
+            self.run_upload(path, "remove", proof)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
+        self.assertEqual({entry.name: entry.read_bytes() for entry in (path / "Code").iterdir()}, foreign)
+        self.assertEqual({f"Code/{entry.name}": entry.read_bytes() for entry in original.iterdir()}, expected)
+
+    def test_upload_file_name_substitution_cannot_redirect_sdk_even_when_original_is_unlinked(self):
+        for replacement in ("regular", "symlink"):
+            with self.subTest(replacement=replacement):
+                path, proof = self.reserve()
+                target = self.root / "foreign-file"
+                target.write_bytes(b"foreign executable")
+                uploaded = []
+                original_inode = []
+                def native_read(command, **_):
+                    source = Path(command[3])
+                    original_inode.append(source.stat().st_ino)
+                    (path / "payload").unlink()
+                    if replacement == "regular":
+                        (path / "payload").write_bytes(target.read_bytes())
+                    else:
+                        (path / "payload").symlink_to(target)
+                    uploaded.append(hashlib.sha256(source.read_bytes()).hexdigest())
+                    self.assertEqual(source.stat().st_ino, original_inode[0])
+                descriptors = len(os.listdir("/proc/self/fd"))
+                with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
+                    self.run_upload(path, "transfer", proof,
+                        self.archive(("payload", tarfile.REGTYPE, b"owned payload")), native_read)
+                self.assertEqual(uploaded, [hashlib.sha256(b"owned payload").hexdigest()])
+                self.assertEqual((path / "payload").read_bytes(), b"foreign executable")
+                self.assertNotEqual((path / "payload").stat().st_ino, original_inode[0])
+                with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
+                    self.run_upload(path, "remove", proof)
+                self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
+                # Remove the foreign fixture explicitly, never through the helper.
+                (path / "payload").unlink()
+                shutil.rmtree(path)
+
+    def test_all_original_file_descriptors_remain_pinned_through_last_sdk_read_with_finite_inventory(self):
+        path, proof = self.reserve()
+        entries = [(f"file{i}", tarfile.REGTYPE, str(i).encode()) for i in range(data.UPLOAD_MAX_ENTRIES)]
+        descriptors = len(os.listdir("/proc/self/fd"))
+        sources = []
+        def native_read(command, **_):
+            active = os.listdir("/proc/self/fd")
+            self.assertLessEqual(len(active) - descriptors, 160)
+            pinned = set()
+            for fd in active:
+                try:
+                    info = os.fstat(int(fd))
+                    pinned.add((info.st_dev, info.st_ino))
+                except OSError:
+                    pass
+            for name, _, _ in entries:
+                info = (path / name).stat()
+                self.assertIn((info.st_dev, info.st_ino), pinned)
+            for source in sources:
+                self.assertTrue(Path(source).is_file(), "do not close originals between SDK reads")
+            if command[5].endswith("/_.dir"):
+                self.assertEqual(Path(command[3]).read_bytes(), b"")
+            else:
+                sources.append(command[3])
+                self.assertEqual(Path(command[3]).read_bytes(), entries[len(sources) - 1][2])
+        receipt = self.run_upload(path, "transfer", proof, self.archive(*entries), native_read)
+        self.assertEqual(len(receipt["files"]), data.UPLOAD_MAX_ENTRIES)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
+        self.run_upload(path, "remove", proof)
+        self.assertFalse(path.exists())
+
+    def test_native_file_upload_failure_closes_all_original_fds_and_preserves_partial_cleanup_capability(self):
+        path, proof = self.reserve()
+        archive = self.archive(("Code", tarfile.DIRTYPE, b""),
+                               ("Code/app", tarfile.REGTYPE, b"owned executable"),
+                               ("Code/other", tarfile.REGTYPE, b"owned other file"))
+        descriptors = len(os.listdir("/proc/self/fd"))
+        def fail(command, **_):
+            raise subprocess.CalledProcessError(1, command)
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            self.run_upload(path, "transfer", proof, archive, fail)
+        self.assertIn(proof["capability"], "\n".join(raised.exception.__notes__))
+        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
+        self.assertEqual((path / "Code/app").read_bytes(), b"owned executable")
+        self.assertEqual((path / "Code/other").read_bytes(), b"owned other file")
+        self.run_upload(path, "remove", proof)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
+        self.assertFalse(path.exists())
+
+    def test_source_hash_drift_before_native_upload_is_refused_even_when_file_inode_is_unchanged(self):
+        path, proof = self.reserve()
+        stat_call = os.stat
+        original_inode = []
+        def mutate_at_source_verification(entry, *args, **kwargs):
+            if str(entry).startswith(f"/proc/{os.getpid()}/fd/") and not original_inode:
+                original_inode.append((path / "payload").stat().st_ino)
+                (path / "payload").write_bytes(b"other payload")
+            return stat_call(entry, *args, **kwargs)
+        descriptors = len(os.listdir("/proc/self/fd"))
+        with patch.object(os, "stat", side_effect=mutate_at_source_verification):
+            with self.assertRaisesRegex(RuntimeError, "file identity/hash changed"):
+                self.run_upload(path, "transfer", proof,
+                    self.archive(("payload", tarfile.REGTYPE, b"owned payload")))
+        self.native_upload.assert_not_called()
+        self.assertEqual((path / "payload").stat().st_ino, original_inode[0])
+        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
+        self.run_upload(path, "remove", proof)
+
+    def test_truncated_stream_cleans_only_original_partial_files_and_closes_descriptors(self):
+        path, proof = self.reserve()
+        archive = self.archive(("Code", tarfile.DIRTYPE, b""),
+                               ("Code/complete", tarfile.REGTYPE, b"first"),
+                               ("Code/partial", tarfile.REGTYPE, b"x" * 70000))
+        before = len(os.listdir("/proc/self/fd"))
+        with self.assertRaisesRegex(RuntimeError, "truncated bounded upload"):
+            self.run_upload(path, "transfer", proof, archive[:68000])
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+        self.native_upload.assert_not_called()
+        self.assertEqual((path / "Code/complete").read_bytes(), b"first")
+        self.assertEqual((path / "Code/partial").stat().st_size, 65536)
+        self.run_upload(path, "remove", proof)
+        self.assertFalse(path.exists())
+
+    def test_archive_rejects_links_special_files_traversal_duplicates_and_uncreated_ancestors(self):
+        cases = [
+            [("symlink", tarfile.SYMTYPE, b"")],
+            [("hardlink", tarfile.LNKTYPE, b"")],
+            [("fifo", tarfile.FIFOTYPE, b"")],
+            [("device", tarfile.CHRTYPE, b"")],
+            [("../foreign", tarfile.REGTYPE, b"bad")],
+            [("/foreign", tarfile.REGTYPE, b"bad")],
+            [("./foreign", tarfile.REGTYPE, b"bad")],
+            [("Code/../foreign", tarfile.REGTYPE, b"bad")],
+            [(".fube-upload-owner", tarfile.REGTYPE, b"bad")],
+            [("Code/app", tarfile.REGTYPE, b"bad")],
+            [("payload", tarfile.REGTYPE, b"original"), ("payload", tarfile.REGTYPE, b"bad")],
+        ]
+        for entries in cases:
+            with self.subTest(entries=entries):
+                path, proof = self.reserve()
+                with self.assertRaises(RuntimeError):
+                    self.run_upload(path, "transfer", proof, self.archive(*entries))
+                self.native_upload.assert_not_called()
+                self.assertTrue((path / ".fube-upload-owner").read_text().startswith(proof["capability"]))
+                if (path / "payload").exists():
+                    self.assertEqual((path / "payload").read_bytes(), b"original")
+                self.run_upload(path, "remove", proof)
+                self.assertFalse(path.exists())
+
+    def test_archive_entry_and_byte_bounds_abort_without_upload_and_partial_tree_is_removable(self):
+        path, proof = self.reserve()
+        entries = [(f"dir{i}", tarfile.DIRTYPE, b"") for i in range(data.UPLOAD_MAX_ENTRIES + 1)]
+        with self.assertRaisesRegex(RuntimeError, "entry bound"):
+            self.run_upload(path, "transfer", proof, self.archive(*entries))
+        self.native_upload.assert_not_called()
+        self.run_upload(path, "remove", proof)
+        path, proof = self.reserve()
+        header = tarfile.TarInfo("too-large")
+        header.mode = 0o644
+        header.size = data.UPLOAD_MAX_BYTES + 1
+        with self.assertRaisesRegex(RuntimeError, "byte bound"):
+            self.run_upload(path, "transfer", proof, header.tobuf(format=tarfile.USTAR_FORMAT))
+        self.assertFalse((path / "too-large").exists())
+        self.native_upload.assert_not_called()
+        self.run_upload(path, "remove", proof)
+        self.assertFalse(path.exists())
+
+    def test_existing_file_directory_or_symlink_is_never_overwritten_during_extraction(self):
+        path, proof = self.reserve()
+        target = self.root / "outside"
+        target.write_bytes(b"foreign")
+        for kind in ("file", "symlink", "directory"):
+            entry = path / "payload"
+            if kind == "file":
+                entry.write_bytes(b"foreign")
+            elif kind == "symlink":
+                entry.symlink_to(target)
+            else:
+                entry.mkdir()
+            with self.assertRaises(FileExistsError):
+                self.run_upload(path, "transfer", proof,
+                                self.archive(("payload", tarfile.REGTYPE, b"bad")))
+            self.native_upload.assert_not_called()
+            self.assertEqual(target.read_bytes(), b"foreign")
+            if kind == "directory":
+                entry.rmdir()
+            else:
+                self.assertEqual(entry.read_bytes(), b"foreign")
+                entry.unlink()
+
+    def test_strict_archive_rejects_extended_headers_bad_checksums_modes_and_trailing_data(self):
+        regular = self.archive(("payload", tarfile.REGTYPE, b"owned"))
+        header = tarfile.TarInfo("metadata")
+        header.type = tarfile.XHDTYPE
+        header.mode = 0o644
+        unsafe_mode = tarfile.TarInfo("unsafe-mode")
+        unsafe_mode.mode = 0o4755
+        archives = [
+            header.tobuf(format=tarfile.USTAR_FORMAT),
+            b"x" + regular[1:],
+            unsafe_mode.tobuf(format=tarfile.USTAR_FORMAT),
+            regular + b"hidden archive",
+            regular + b"\0" * 10241,
+        ]
+        for archive in archives:
+            with self.subTest(prefix=archive[:20]):
+                path, proof = self.reserve()
+                with self.assertRaises(RuntimeError):
+                    self.run_upload(path, "transfer", proof, archive)
+                self.native_upload.assert_not_called()
+                self.run_upload(path, "remove", proof)
+
+    def test_local_archive_refuses_symlinks_special_modes_and_inventory_or_size_excess(self):
+        source = self.root / "source"
+        source.mkdir()
+        file = source / "payload"
+        file.symlink_to(self.root / "absent")
+        with self.assertRaisesRegex(RuntimeError, "regular package"):
+            data.upload_archive(source)
+        file.unlink()
+        file.write_bytes(b"payload")
+        file.chmod(0o4755)
+        with self.assertRaisesRegex(RuntimeError, "regular package"):
+            data.upload_archive(source)
+        file.chmod(0o644)
+        with patch.object(data, "UPLOAD_MAX_BYTES", 1):
+            with self.assertRaisesRegex(RuntimeError, "byte bound"):
+                data.upload_archive(source)
+        (source / "other").write_bytes(b"other")
+        with patch.object(data, "UPLOAD_MAX_ENTRIES", 1):
+            with self.assertRaisesRegex(RuntimeError, "entry bound"):
+                data.upload_archive(source)
+
+    def local_helper(self, path, proof, *, interrupt=False, timeout=False, receipt_tamper=None):
+        """Real pipe/child lifetime, with only native network I/O modeled."""
+        ownership = data.UploadOwnership(str(path), "original-cid", tuple(proof["parent"]),
+            tuple(proof["directory"]), tuple(proof["owner_file"]), proof["capability"])
+        allocation = MagicMock()
+        allocation.verify.return_value = ownership.container_id
+        source = self.root / "source"
+        source.mkdir()
+        (source / "payload").write_bytes(b"owned payload")
+        popen = subprocess.Popen
+        processes, commands = [], []
+        code = data.UPLOAD.replace('parent=="/var/lib/sf-node"', "parent==" + repr(str(self.root)))
+        code = code.replace("path,action=sys.argv[1:3]; proof=json.loads(sys.argv[3])", """
+def modeled_native_upload(command,**options):
+    scoped=command[3]
+    require(scoped.startswith("/proc/"+str(os.getpid())+"/fd/"),"model requires original file source")
+    with open(scoped,"rb") as file:
+        expected=b"" if command[5].endswith("/_.dir") else b"owned payload"
+        require(file.read()==expected,"model received a different source")
+subprocess.run=modeled_native_upload
+path,action=sys.argv[1:3]; proof=json.loads(sys.argv[3])
+""")
+        if interrupt:
+            code = code.replace("remaining-=len(chunk)",
+                                'remaining-=len(chunk)\n                    raise RuntimeError("model interrupted copy")')
+        if receipt_tamper:
+            code = code.replace('print(json.dumps(transfer() if action=="transfer" else proof),flush=True)',
+                'receipt=transfer()\n    ' + receipt_tamper + '\n    print(json.dumps(receipt),flush=True)')
+        def launch(command, **kwargs):
+            commands.append(command)
+            self.assertEqual(command[:6], ["docker", "exec", "-i", "original-cid", "python3", "-c"])
+            child = popen([sys.executable, "-c", code, *command[7:]], **kwargs)
+            processes.append(child)
+            if not timeout:
+                return child
+            wrapper = MagicMock()
+            wrapper.poll.side_effect = child.poll
+            wrapper.kill.side_effect = child.kill
+            first = True
+            def communicate(value=None, **options):
+                nonlocal first
+                if first:
+                    first = False
+                    receipt = child.stdout.readline()
+                    self.assertTrue(receipt, "helper must publish a process identity before blocking on stdin")
+                    raise subprocess.TimeoutExpired(command, options["timeout"], output=receipt)
+                return child.communicate(value, **options)
+            wrapper.communicate.side_effect = communicate
+            return wrapper
+        def execute(*args, **kwargs):
+            self.assertEqual(args[:3], ("python3", "-c", data.STOP_UPLOAD_HELPER))
+            stop = popen([sys.executable, *args[1:]], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = stop.communicate(timeout=kwargs["timeout"])
+            self.assertEqual(stop.returncode, 0, err.decode())
+            return out.decode()
+        allocation.execute.side_effect = execute
+        with patch.object(data.subprocess, "Popen", side_effect=launch):
+            if interrupt or timeout or receipt_tamper:
+                with self.assertRaises(subprocess.TimeoutExpired if timeout else RuntimeError) as error:
+                    data.transfer_upload(allocation, ownership, source)
+                result = error.exception
+            else:
+                result = data.transfer_upload(allocation, ownership, source)
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].poll(), "the original helper must be reaped")
+        return result, processes[0], allocation, commands[0]
+
+    def test_host_transfer_uses_bounded_docker_exec_stdin_and_captures_original_provenance(self):
+        path, proof = self.reserve()
+        result, process, allocation, command = self.local_helper(path, proof)
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(result["ownership"], proof)
+        self.assertEqual(result["container_id"], "original-cid")
+        self.assertEqual(result["upload_api"], "native SDK ImageStore.UploadContent (azurecliproxy; per-file)")
+        self.assertEqual(result["helper"]["pid"], process.pid)
+        self.assertEqual(result["helper"]["token"], command[-1])
+        self.assertIn("retained original root FD", result["copy_api"])
+        self.assertEqual((path / "payload").read_bytes(), b"owned payload")
+        allocation.execute.assert_not_called()
+        self.run_upload(path, "remove", proof)
+
+    def test_host_partial_copy_failure_retains_creation_capability_for_original_only_cleanup(self):
+        path, proof = self.reserve()
+        error, _, _, _ = self.local_helper(path, proof, interrupt=True)
+        self.assertIn("model interrupted copy", str(error))
+        self.assertIn("original upload reservation retained", "\n".join(error.__notes__))
+        self.assertIn(proof["capability"], "\n".join(error.__notes__))
+        self.assertEqual((path / "payload").read_bytes(), b"owned payload")
+        self.run_upload(path, "remove", proof)
+        self.assertFalse(path.exists())
+
+    def test_host_rejects_file_hash_foreign_helper_pid_and_missing_native_marker_receipts(self):
+        for mutation in (
+            'receipt["files"]["payload"]["sha256"]="0"*64',
+            'receipt["files"]["payload"]["source"]="/proc/"+str(os.getpid()+1)+"/fd/7"',
+            'receipt["markers"].pop("_.dir")',
+        ):
+            with self.subTest(mutation=mutation):
+                path, proof = self.reserve()
+                error, _, _, _ = self.local_helper(path, proof, receipt_tamper=mutation)
+                self.assertRegex(str(error), "original upload (file|directory marker)")
+                self.assertIn(proof["capability"], "\n".join(error.__notes__))
+                self.run_upload(path, "remove", proof)
+                shutil.rmtree(self.root / "source")
+
+    def test_timeout_stops_exact_captured_helper_incarnation_and_reaps_client(self):
+        path, proof = self.reserve()
+        error, process, allocation, command = self.local_helper(path, proof, timeout=True)
+        self.assertIsInstance(error, subprocess.TimeoutExpired)
+        self.assertNotEqual(process.returncode, 0)
+        allocation.execute.assert_called_once()
+        helper = json.loads(allocation.execute.call_args.args[3])
+        self.assertEqual(helper["pid"], process.pid)
+        self.assertEqual(helper["token"], command[-1])
+        self.assertEqual(list(path.iterdir()), [path / ".fube-upload-owner"])
+        self.run_upload(path, "remove", proof)
+
+    def test_helper_deadline_expires_while_stream_is_blocked_without_leaving_a_process(self):
+        path, proof = self.reserve()
+        code = data.UPLOAD.replace('parent=="/var/lib/sf-node"', "parent==" + repr(str(self.root)))
+        process = subprocess.Popen([sys.executable, "-c", code, str(path), "transfer",
+            json.dumps(proof), str(time.time() + 0.5), "e" * 64],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            helper = json.loads(process.stdout.readline())
+            self.assertEqual(helper["pid"], process.pid)
+            process.wait(timeout=5)
+            _, stderr = process.communicate(timeout=1)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn(b"descriptor-bound transfer deadline", stderr)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=1)
+        self.assertEqual(list(path.iterdir()), [path / ".fube-upload-owner"])
+        self.run_upload(path, "remove", proof)
+
+    def test_deadline_and_verified_pidfd_stop_reap_an_active_uploader_before_releasing_original_fds(self):
+        for stop in (False, True):
+            with self.subTest(pidfd_stop=stop):
+                path, proof = self.reserve()
+                marker = self.root / ("native-child-" + str(stop))
+                child_code = (
+                    "import hashlib,json,os,pathlib,sys,time;"
+                    "source=pathlib.Path(sys.argv[2]);"
+                    "assert source.read_bytes()==b'owned payload';"
+                    "pathlib.Path(sys.argv[1]).write_text(json.dumps({'pid':os.getpid(),"
+                    "'sha256':hashlib.sha256(source.read_bytes()).hexdigest()}));"
+                    "time.sleep(60)"
+                )
+                code = data.UPLOAD.replace('parent=="/var/lib/sf-node"', "parent==" + repr(str(self.root)))
+                code = code.replace("path,action=sys.argv[1:3]; proof=json.loads(sys.argv[3])", f"""
+real_run=subprocess.run
+def local_blocked_uploader(command,**options):
+    require(command[3].startswith("/proc/"+str(os.getpid())+"/fd/"),"original helper source required")
+    return real_run([sys.executable,"-c",{child_code!r},{str(marker)!r},command[3]],**options)
+subprocess.run=local_blocked_uploader
+path,action=sys.argv[1:3]; proof=json.loads(sys.argv[3])
+""")
+                descriptors = len(os.listdir("/proc/self/fd"))
+                process = subprocess.Popen([sys.executable, "-c", code, str(path), "transfer",
+                    json.dumps(proof), str(time.time() + (data.UPLOAD_SECONDS if stop else 2)), "e" * 64],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                native_pidfd = None
+                try:
+                    helper = json.loads(process.stdout.readline())
+                    self.assertEqual(helper["pid"], process.pid)
+                    process.stdin.write(self.archive(("payload", tarfile.REGTYPE, b"owned payload")))
+                    process.stdin.close()
+                    process.stdin = None
+                    for _ in range(150):
+                        if marker.exists():
+                            break
+                        time.sleep(.01)
+                    self.assertTrue(marker.exists(), "execute cancellation during an actual blocked file read")
+                    native = json.loads(marker.read_text())
+                    self.assertEqual(native["sha256"], hashlib.sha256(b"owned payload").hexdigest())
+                    native_pidfd = os.pidfd_open(native["pid"])
+                    if stop:
+                        stopped = subprocess.run([sys.executable, "-c", data.STOP_UPLOAD_HELPER,
+                            json.dumps(helper)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=12)
+                        self.assertEqual(stopped.returncode, 0, stopped.stderr.decode())
+                    _, errors = process.communicate(timeout=5)
+                    self.assertNotEqual(process.returncode, 0)
+                    self.assertTrue(b"descriptor-bound transfer deadline" in errors
+                                    or b"TimeoutExpired" in errors, errors.decode())
+                    self.assertFalse(Path(f"/proc/{native['pid']}").exists(),
+                                     "the uploader must be killed AND reaped, not orphaned by helper stop")
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
+                    if native_pidfd is not None:
+                        with contextlib.suppress(ProcessLookupError):
+                            signal.pidfd_send_signal(native_pidfd, signal.SIGKILL)
+                        os.close(native_pidfd)
+                self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
+                self.assertEqual((path / "payload").read_bytes(), b"owned payload")
+                self.run_upload(path, "remove", proof)
+                self.assertFalse(path.exists())
+
+    def test_stop_helper_cannot_signal_unrelated_process_with_wrong_nonce_or_start_time(self):
+        # A non-child process model is unnecessary: use ourselves, and assert
+        # pidfd_send_signal is unreachable for either mismatching identity.
+        with open("/proc/self/stat") as status:
+            start = status.read().rsplit(") ", 1)[1].split()[19]
+        for start_time in (start, str(int(start) + 1)):
+            proof = {"pid": os.getpid(), "start_time": start_time, "token": "e" * 64}
+            with patch("sys.argv", ["stop", json.dumps(proof)]), \
+                 patch.object(signal, "pidfd_send_signal") as send:
+                with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
+                    exec(data.STOP_UPLOAD_HELPER, {})
+            send.assert_not_called()
+
+    def test_same_name_replacement_with_copied_owner_token_never_gets_rmtree(self):
+        path, proof = self.reserve()
+        original = self.root / "original"
+        path.rename(original)
+        path.mkdir()
+        shutil.copyfile(original / ".fube-upload-owner", path / ".fube-upload-owner")
+        (path / "foreign").write_text("foreign replacement")
+        with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
+            self.run_upload(path, "remove", proof)
+        self.assertEqual((path / "foreign").read_text(), "foreign replacement")
+        self.assertTrue(original.is_dir())
+        self.assertFalse(list(self.root.glob(".fube-data-remove-*")))
+
+    def test_replaced_owner_file_even_with_same_bytes_and_symlinked_root_are_retained(self):
+        path, proof = self.reserve()
+        owner = path / ".fube-upload-owner"
+        owner.rename(path / "original-owner")
+        owner.write_text(proof["capability"])
+        with self.assertRaisesRegex(RuntimeError, "capability changed"):
+            self.run_upload(path, "remove", proof)
+        original = self.root / "original"
+        path.rename(original)
+        path.symlink_to(original)
+        with self.assertRaises(OSError):
+            self.run_upload(path, "remove", proof)
+        self.assertTrue(path.is_symlink())
+        self.assertTrue(original.is_dir())
+
+    def test_replacement_during_detach_is_rechecked_before_recursive_removal(self):
+        path, proof = self.reserve()
+        original = self.root / "original"
+        rename = os.rename
+        def swap_then_rename(source, destination, **kwargs):
+            rename(path, original)
+            path.mkdir()
+            (path / "foreign").write_text("foreign")
+            return rename(source, destination, **kwargs)
+        with patch.object(os, "rename", side_effect=swap_then_rename):
+            with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
+                self.run_upload(path, "remove", proof)
+        quarantine = list(self.root.glob(".fube-data-remove-*"))
+        self.assertEqual(len(quarantine), 1)
+        self.assertEqual((quarantine[0] / "foreign").read_text(), "foreign")
+
+    def test_replacement_after_detach_cannot_redirect_descriptor_bound_recursive_removal(self):
+        path, proof = self.reserve()
+        self.run_upload(path, "transfer", proof, self.archive(
+            ("partial", tarfile.DIRTYPE, b""), ("partial/payload", tarfile.REGTYPE, b"own")))
+        unlink = os.unlink
+        moved = self.root / "original-detached"
+        def swap_then_remove(entry, *, dir_fd):
+            if not moved.exists():
+                quarantine = next(self.root.glob(".fube-data-remove-*"))
+                quarantine.rename(moved)
+                quarantine.mkdir()
+                (quarantine / "foreign").write_text("foreign")
+            return unlink(entry, dir_fd=dir_fd)
+        with patch.object(os, "unlink", swap_then_remove):
+            with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
+                self.run_upload(path, "remove", proof)
+        quarantine = next(self.root.glob(".fube-data-remove-*"))
+        self.assertEqual((quarantine / "foreign").read_text(), "foreign")
+        self.assertFalse((moved / "partial").exists())
+
+
+class NativeOwnershipIdentityTests(ProjectFiles):
+    def test_application_instance_id_comes_from_native_package_not_the_rest_encoded_name(self):
+        native_id = "MintedType_App412"
+        base = self.root / native_id
+        work = base / "work"
+        work.mkdir(parents=True)
+        manifest = base / "App.1.0.xml"
+        manifest.write_text(f'<ApplicationPackage xmlns="{data.runtime.NS}" '
+                            f'ApplicationId="{native_id}" ApplicationTypeName="MintedType" '
+                            'NameUri="fabric:/Owned" RolloutVersion="1.0"/>')
+        def run():
+            with patch("sys.argv", ["native", str(work), "fabric:/Owned", "MintedType"]), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                exec(data.APPLICATION_PACKAGE_ID, {})
+            return json.loads(output.getvalue())
+        self.assertEqual(run(), {"native_application_id": native_id})
+        manifest.write_text(manifest.read_text().replace(native_id, "OtherType_App413"))
+        with self.assertRaisesRegex(RuntimeError, "instance ID/path mismatch"):
+            run()
+
+    def test_type_manifest_fingerprint_binds_content_version_and_run_creation_marker(self):
+        text = (data.PKG / "rust/ApplicationManifest.xml").read_text().replace(
+            'Name="FubeDataTypeCapability" DefaultValue=""',
+            'Name="FubeDataTypeCapability" DefaultValue="' + "a" * 64 + '"')
+        original = data.replace(data.manifest_identity(text), native_generation=(131510254310497004, 23, 25769803776))
+        allocation = MagicMock()
+        for replacement in (text.replace("a" * 64, "b" * 64),
+                            text.replace('ApplicationTypeVersion="1.1"', 'ApplicationTypeVersion="1.2"'),
+                            text.replace("native-override", "foreign-override")):
+            with patch.object(data, "ownership_read", return_value={"Manifest": replacement}):
+                with self.assertRaisesRegex(RuntimeError, "manifest/capability changed"):
+                    data.native_type_identity(allocation, original)
+        with patch.object(data, "ownership_read", side_effect=lambda _, path:
+                          store_generation(original) if path.startswith("/ImageStore/") else
+                          {"Manifest": text.replace("  <", "    <") + "\n"}):
+            self.assertEqual(data.native_type_identity(allocation, original), original)
+
+    def test_original_type_can_be_cleaned_without_an_application_but_replaced_manifest_is_retained(self):
+        text = (data.PKG / "rust/ApplicationManifest.xml").read_text().replace(
+            'Name="FubeDataTypeCapability" DefaultValue=""',
+            'Name="FubeDataTypeCapability" DefaultValue="' + "a" * 64 + '"')
+        requested = data.manifest_identity(text)
+        for replacement in (False, True):
+            result = {"application": "fabric:/Owned", "type_name": requested.name, "version": requested.version,
+                      "errors": [], "cleanup": {}}
+            allocation = MagicMock()
+            present = {"manifest": text}
+            def sf(*args):
+                self.assertEqual(args[:2], ("application", "unprovision"))
+                present["manifest"] = None
+            allocation.sf.side_effect = sf
+            with patch.object(data, "ownership_read", side_effect=lambda _, path:
+                              store_generation(requested) if path.startswith("/ImageStore/") else
+                              {"Manifest": present["manifest"]} if present["manifest"] else None):
+                original = data.native_type_identity(allocation, requested, capture=True)
+                if replacement:
+                    present["manifest"] = text.replace("native-override", "foreign-override")
+                data.cleanup_data_deployment(allocation, result,
+                    {"provision": "accepted", "create": "not_requested"}, original, None, None)
+            if replacement:
+                allocation.sf.assert_not_called()
+                self.assertIn("changed", result["cleanup"]["deployment"])
+            else:
+                allocation.sf.assert_called_once()
+                self.assertEqual(result["cleanup"]["type"], "unprovisioned; absence confirmed")
+
+    def type_manifest(self):
+        return (data.PKG / "rust/ApplicationManifest.xml").read_text().replace(
+            'Name="FubeDataTypeCapability" DefaultValue=""',
+            'Name="FubeDataTypeCapability" DefaultValue="' + "a" * 64 + '"')
+
+    def test_identical_manifest_reprovision_with_different_native_generation_is_never_unprovisioned(self):
+        text = self.type_manifest()
+        requested = data.manifest_identity(text)
+        for field in range(3):
+            with self.subTest(field=field):
+                allocation = MagicMock()
+                generation = [131510254310497004, 23, 25769803776]
+                result = {"application": "fabric:/Owned", "type_name": requested.name,
+                          "version": requested.version, "errors": [], "cleanup": {}}
+                def native(_, path):
+                    return (store_generation(requested, generation) if path.startswith("/ImageStore/")
+                            else {"Manifest": text})
+                with patch.object(data, "ownership_read", side_effect=native):
+                    original = data.native_type_identity(allocation, requested, capture=True)
+                    generation[field] += 1
+                    data.cleanup_data_deployment(allocation, result,
+                        {"provision": "accepted", "create": "not_requested"}, original, None, None)
+                allocation.sf.assert_not_called()
+                self.assertIn("generation changed", result["cleanup"]["deployment"])
+                self.assertTrue(result["errors"])
+                self.assertEqual(result["cleanup"]["retained_for_recovery"]["original_native_type_generation"],
+                                 original.native_generation)
+
+    def test_replacement_during_native_generation_capture_is_not_pinned_as_original(self):
+        text = self.type_manifest()
+        requested = data.manifest_identity(text)
+        generation_reads = []
+        def native(_, path):
+            if not path.startswith("/ImageStore/"):
+                return {"Manifest": text}
+            generation_reads.append(path)
+            return store_generation(requested, (131510254310497004, 22 + len(generation_reads), 25769803776))
+        with patch.object(data, "ownership_read", side_effect=native):
+            with self.assertRaisesRegex(RuntimeError, "generation changed during capture"):
+                data.native_type_identity(MagicMock(), requested, capture=True)
+        self.assertEqual(len(generation_reads), 2)
+
+    def test_replacement_between_initial_manifest_and_generation_queries_cannot_be_adopted(self):
+        text = self.type_manifest()
+        requested = data.manifest_identity(text)
+        generation = [131510254310497004, 23, 25769803776]
+        manifests = []
+        def native(_, path):
+            if path.startswith("/ImageStore/"):
+                return store_generation(requested, generation)
+            if not manifests:
+                # The review's identical package, including copied marker,
+                # but a different server-assigned provisioning file lifetime.
+                generation[1] += 1
+            manifests.append(path)
+            return {"Manifest": text}
+        with patch.object(data, "ownership_read", side_effect=native):
+            with self.assertRaisesRegex(RuntimeError, "generation changed during capture"):
+                data.native_type_identity(MagicMock(), requested, capture=True)
+
+    def test_missing_ambiguous_malformed_and_staging_generations_grant_no_type_authority(self):
+        text = self.type_manifest()
+        requested = data.manifest_identity(text)
+        valid = store_generation(requested)
+        invalid = [None, {}, {"StoreFiles": []}, {**valid, "StoreFiles": valid["StoreFiles"] * 2},
+                   {**valid, "ContinuationToken": "more"}]
+        for field, value in (("FileVersion", None), ("StoreRelativePath", "fube-data-upload/ApplicationManifest.xml")):
+            item = copy.deepcopy(valid)
+            item["StoreFiles"][0][field] = value
+            invalid.append(item)
+        for version in ({"EpochDataLossNumber": "1", "VersionNumber": "2"},
+                        {"EpochDataLossNumber": "1", "VersionNumber": True, "EpochConfigurationNumber": "3"},
+                        {"EpochDataLossNumber": "1", "VersionNumber": str(2**64), "EpochConfigurationNumber": "3"}):
+            item = copy.deepcopy(valid)
+            item["StoreFiles"][0]["FileVersion"] = version
+            invalid.append(item)
+        for value in invalid:
+            with self.subTest(value=value), patch.object(data, "ownership_read", side_effect=lambda _, path:
+                            value if path.startswith("/ImageStore/") else {"Manifest": text}):
+                with self.assertRaisesRegex(RuntimeError, "generation|FileVersion"):
+                    data.native_type_identity(MagicMock(), requested, capture=True)
+
+    def test_loss_of_generation_metadata_at_teardown_retains_the_original_type(self):
+        text = self.type_manifest()
+        requested = data.manifest_identity(text)
+        valid = store_generation(requested)
+        for unavailable in ({"StoreFiles": []}, {**valid, "StoreFiles": valid["StoreFiles"] * 2}):
+            with self.subTest(unavailable=unavailable):
+                current = valid
+                allocation = MagicMock()
+                result = {"application": "fabric:/Owned", "type_name": requested.name,
+                          "version": requested.version, "errors": [], "cleanup": {}}
+                with patch.object(data, "ownership_read", side_effect=lambda _, path:
+                                  current if path.startswith("/ImageStore/") else {"Manifest": text}):
+                    original = data.native_type_identity(allocation, requested, capture=True)
+                    current = unavailable
+                    data.cleanup_data_deployment(allocation, result,
+                        {"provision": "accepted", "create": "not_requested"}, original, None, None)
+                allocation.sf.assert_not_called()
+                self.assertIn("generation unavailable/ambiguous", result["cleanup"]["deployment"])
+                self.assertEqual(result["cleanup"]["retained_for_recovery"]["original_native_type_generation"],
+                                 original.native_generation)
+
+    def test_content_only_identity_cannot_be_promoted_into_cleanup_authority(self):
+        requested = data.manifest_identity(self.type_manifest())
+        allocation = MagicMock()
+        result = {"application": "fabric:/Owned", "type_name": requested.name, "version": requested.version,
+                  "errors": [], "cleanup": {}}
+        with patch.object(data, "ownership_read") as read:
+            with self.assertRaisesRegex(RuntimeError, "manifest-only adoption"):
+                data.native_type_identity(allocation, requested)
+            data.cleanup_data_deployment(allocation, result,
+                {"provision": "accepted", "create": "not_requested"}, requested, None, None)
+        read.assert_not_called()
+        allocation.sf.assert_not_called()
+        self.assertIn("refuse manifest-only cleanup", result["cleanup"]["deployment"])
+
+    def test_explicit_rejection_revokes_authority_even_if_a_matching_identity_was_supplied(self):
+        original_type = data.TypeIdentity("Type", "1.1", "a" * 64, "b" * 64)
+        original_app = data.ApplicationIdentity("fabric:/Owned", original_type, "c" * 64, "Type_App1")
+        for stage in ("provision", "create"):
+            result = {"application": "fabric:/Owned", "type_name": "Type", "version": "1.1",
+                      "errors": [], "cleanup": {}}
+            allocation = MagicMock()
+            outcomes = {"provision": "accepted", "create": "accepted"}
+            outcomes[stage] = "rejected"
+            with patch.object(data, "ownership_read") as read:
+                data.cleanup_data_deployment(allocation, result, outcomes,
+                                             original_type, original_app, None)
+            allocation.sf.assert_not_called()
+            read.assert_not_called()
+            self.assertIn("cannot grant original", result["cleanup"]["deployment"])
+
+    def test_missing_native_instance_cannot_be_substituted_by_a_copied_application_parameter(self):
+        expected = data.TypeIdentity("Type", "1.1", "a" * 64, "b" * 64)
+        allocation = MagicMock()
+        app = {"Id": "Owned", "Name": "fabric:/Owned", "TypeName": "Type", "TypeVersion": "1.1", "Status": "Ready",
+               "Parameters": [{"Key": "FubeDataCreationCapability", "Value": "c" * 64}]}
+        with patch.object(data, "ownership_read", side_effect=lambda _, path:
+                          None if path.startswith("/Nodes/") else app), \
+             patch.object(data, "native_type_identity", return_value=expected):
+            with self.assertRaisesRegex(RuntimeError, "unavailable/ambiguous"):
+                data.native_application_identity(allocation, "fabric:/Owned", expected, "c" * 64)
+
+    def test_native_ownership_reader_distinguishes_404_absence_from_unavailable_queries(self):
+        allocation = MagicMock()
+        for status in (200, 204, 404, 409, 500):
+            body = (None if status == 204 else {"Error": {"Code": "FABRIC_E_APPLICATION_NOT_FOUND"}}
+                    if status == 404 else {"Name": "Owned"})
+            allocation.execute.return_value = json.dumps({"status": status, "body": body})
+            if status in (200, 204, 404):
+                self.assertEqual(data.ownership_read(allocation, "/Applications/Owned"),
+                                 {"Name": "Owned"} if status == 200 else None)
+            else:
+                with self.assertRaisesRegex(RuntimeError, "query failed"):
+                    data.ownership_read(allocation, "/Applications/Owned")
+        allocation.execute.return_value = json.dumps({"status": 404, "body": {"Name": "not-an-error"}})
+        with self.assertRaisesRegex(RuntimeError, "absence is not established"):
+            data.ownership_read(allocation, "/Applications/Owned")
+
+
+class ReportingTests(unittest.TestCase):
+    def result(self, profile):
+        return {"profile": profile, "status": "FAIL", "errors": [],
+                "scenarios": {name: {"status": "PASS"} for name in data.required_scenarios(profile)}}
+
+    def test_pass_requires_every_required_scenario_not_skips_errors_or_omissions(self):
+        for profile in ("rust", "mixed", "full"):
+            self.assertEqual(data.finalize(self.result(profile))["status"], "PASS")
+            for name in data.required_scenarios(profile):
+                for status in ("MISSING", "FAIL", "SKIPPED", "PASS_SOURCE_ONLY"):
+                    value = self.result(profile)
+                    value["scenarios"][name]["status"] = status
+                    self.assertEqual(data.finalize(value)["status"], "FAIL")
+                value = self.result(profile)
+                del value["scenarios"][name]
+                self.assertEqual(data.finalize(value)["status"], "FAIL")
+            value = self.result(profile)
+            value["errors"].append("cleanup failed")
+            self.assertEqual(data.finalize(value)["status"], "FAIL")
+        full = self.result("full")
+        full["scenarios"]["legacy_full"]["status"] = "MISSING"
+        self.assertEqual(data.finalize(full)["status"], "FAIL")
+
+    def test_missing_live_probe_and_failed_scenario_never_get_relabelled_pass(self):
+        result = self.result("rust")
+        qualification = data.Qualification(MagicMock(), MagicMock(), {**result, "application": "fabric:/Owned"}, False)
+        def missing(evidence):
+            evidence["actual_writes"] = 100
+            raise data.MissingEvidence("no native stale-actor injection")
+        qualification.scenario("stale_wire_receipts", missing)
+        self.assertEqual(result["scenarios"]["stale_wire_receipts"]["status"], "MISSING")
+        self.assertEqual(data.finalize(result)["status"], "FAIL")
+
+    def test_provenance_never_relabels_review_or_ci_heads_as_executables(self):
+        bundle = MagicMock(source_revision="a" * 40, manifest_sha256="b" * 64)
+        with patch.dict(os.environ, {"FUBE_REVIEW_HEAD": "c" * 40, "FUBE_CI_HEAD": "d" * 40,
+                                    "FUBE_CI_MERGE": "e" * 40}, clear=True):
+            value = data.provenance(bundle)
+        self.assertEqual(value["executable_source_revision"], "a" * 40)
+        self.assertEqual(value["review_head"], "c" * 40)
+        self.assertEqual(value["ci_head"], "d" * 40)
+        self.assertEqual(value["ci_merge"], "e" * 40)
+
+
+if __name__ == "__main__":
+    unittest.main()

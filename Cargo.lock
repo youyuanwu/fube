@@ -603,10 +603,14 @@ dependencies = [
 name = "native-replicator-oracle"
 version = "0.1.0"
 dependencies = [
+ "fube-data",
  "mssf-com",
  "mssf-core",
  "mssf-pal",
+ "mssf-util",
  "serde_json",
+ "tokio",
+ "uuid",
  "windows-interface 0.100.0",
 ]
 

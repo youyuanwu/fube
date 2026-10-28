@@ -1,8 +1,8 @@
 //! Opt-in, volatile qualification fixture; HTTP is never the replication wire.
 use super::*;
 use fube_data::{
-    wire::Actor, Engine, EngineSnapshot, MemoryProvider, Mutation, Operation, OperationStream,
-    Replication, Settings,
+    wire::Actor, Engine, EngineSnapshot, MemoryProvider, Mutation, Operation, OperationData,
+    OperationDataStream, OperationStream, Replication, Settings, StateProvider,
 };
 use std::{
     net::{IpAddr, SocketAddr},
@@ -74,6 +74,7 @@ enum Request {
     Diagnostics,
     Write(Mutation),
     Test(u64),
+    CopyTest(u64),
 }
 
 fn decode(value: &str) -> RuntimeResult<String> {
@@ -128,6 +129,15 @@ fn parse(operation: &str, query: &str) -> RuntimeResult<Request> {
             Ok(Request::Write(mutation))
         }
         "test" if parameters.len() == 1 => {
+            if let Some(value) = parameters.get("copy_delay_ms") {
+                let delay = value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|n| *n <= 100)
+                    .filter(|_| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+                    .ok_or(RuntimeError::InvalidInput("copy delay must be 0..100 ms"))?;
+                return Ok(Request::CopyTest(delay));
+            }
             let delay = parameters
                 .get("ack_delay_ms")
                 .filter(|s| !s.is_empty() && s.bytes().all(|v| v.is_ascii_digit()))
@@ -266,6 +276,60 @@ async fn admit(
 struct Pump {
     stopped: Cancellation,
     thread: Option<JoinHandle<()>>,
+}
+
+/// Qualification-only copy pacing. The engine owns enumeration/deadlines; this
+/// wrapper never delays transport/control callbacks or changes snapshot data.
+struct CopyProvider {
+    inner: Arc<dyn StateProvider>,
+    delay: Arc<AtomicU64>,
+}
+struct CopyStream {
+    inner: Arc<dyn OperationDataStream>,
+    delay: Arc<AtomicU64>,
+}
+impl OperationDataStream for CopyStream {
+    fn next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+        Box::pin(async move {
+            let delay = self.delay.load(Ordering::Acquire);
+            if delay > 0 {
+                tokio::select! {
+                    _=cancellation.cancelled()=>return Err(RuntimeError::Closed),
+                    _=tokio::time::sleep(Duration::from_millis(delay))=>{},
+                }
+            }
+            self.inner.next(cancellation).await
+        })
+    }
+}
+impl StateProvider for CopyProvider {
+    fn last_committed(&self) -> RuntimeResult<i64> {
+        self.inner.last_committed()
+    }
+    fn update_epoch(
+        &self,
+        epoch: Epoch,
+        previous: i64,
+        cancellation: Cancellation,
+    ) -> ServiceFuture<'_, ()> {
+        self.inner.update_epoch(epoch, previous, cancellation)
+    }
+    fn on_data_loss(&self, cancellation: Cancellation) -> ServiceFuture<'_, bool> {
+        self.inner.on_data_loss(cancellation)
+    }
+    fn copy_context(&self) -> RuntimeResult<Arc<dyn OperationDataStream>> {
+        self.inner.copy_context()
+    }
+    fn copy_state(
+        &self,
+        up_to: i64,
+        context: Option<Arc<dyn OperationDataStream>>,
+    ) -> RuntimeResult<Arc<dyn OperationDataStream>> {
+        Ok(Arc::new(CopyStream {
+            inner: self.inner.copy_state(up_to, context)?,
+            delay: self.delay.clone(),
+        }))
+    }
 }
 struct PumpInput {
     native: Arc<dyn NativeView>,
@@ -412,6 +476,7 @@ pub(super) struct Route {
     pump: Mutex<Option<Pump>>,
     requests: mpsc::Sender<Submit>,
     delay: Arc<AtomicU64>,
+    copy_delay: Arc<AtomicU64>,
     fault: Arc<Mutex<Option<String>>>,
     service_address: String,
     generation: u64,
@@ -424,6 +489,7 @@ impl Route {
         provider: Arc<MemoryProvider>,
         service_address: String,
         generation: u64,
+        copy_delay: Arc<AtomicU64>,
     ) -> RuntimeResult<Arc<Self>> {
         let (sender, receiver) = mpsc::channel(64);
         let stopped = Cancellation::default();
@@ -452,6 +518,7 @@ impl Route {
             pump: Mutex::new(Some(pump)),
             requests: sender,
             delay,
+            copy_delay,
             fault,
             service_address,
             generation,
@@ -574,6 +641,7 @@ impl StatefulService for Service {
             partition.ensure_valid()?;
             self.rpc.listen().await?;
             let provider = MemoryProvider::new();
+            let copy_delay = Arc::new(AtomicU64::new(0));
             let address = SocketAddr::new(
                 self.rpc
                     .ip
@@ -588,7 +656,10 @@ impl StatefulService for Service {
                     incarnation: self.incarnation,
                 },
                 &address.to_string(),
-                provider.clone(),
+                Arc::new(CopyProvider {
+                    inner: provider.clone(),
+                    delay: copy_delay.clone(),
+                }),
                 Settings::default(),
             )?;
             let route = Route::start(
@@ -602,6 +673,7 @@ impl StatefulService for Service {
                     self.path
                 ),
                 self.context.activation.generation(),
+                copy_delay,
             )?;
             if cancellation.is_cancelled() || partition.ensure_valid().is_err() {
                 route.shutdown();
@@ -715,8 +787,18 @@ impl Rpc {
         let Ok(status) = status else {
             return response(&mut stream, 503, &serde_json::json!({})).await;
         };
-        if let Request::Test(delay) = request {
-            route.delay.store(delay, Ordering::Release);
+        let hook = match request {
+            Request::Test(delay) => {
+                route.delay.store(delay, Ordering::Release);
+                Some(("ack_delay_ms", delay))
+            }
+            Request::CopyTest(delay) => {
+                route.copy_delay.store(delay, Ordering::Release);
+                Some(("copy_delay_ms", delay))
+            }
+            _ => None,
+        };
+        if let Some((name, delay)) = hook {
             if route.lifetime().is_err() {
                 return response(&mut stream, 503, &serde_json::json!({})).await;
             }
@@ -724,7 +806,7 @@ impl Rpc {
                 &mut stream,
                 200,
                 &serde_json::json!({
-                    "profile":PROFILE,"qualification_only":true,"ack_delay_ms":delay
+                    "profile":PROFILE,"qualification_only":true,(name):delay
                 }),
             )
             .await;
@@ -742,10 +824,12 @@ impl Rpc {
             "native_epoch":{"data_loss":status.current_epoch.data_loss,"configuration":status.current_epoch.configuration},
             "read_status":format!("{read:?}"),"write_status":format!("{write:?}"),
             "state":route.provider.snapshot(),"engine":route.engine.snapshot(),
+            "observed_primary":route.engine.snapshot().observed_primary,
             "role":format!("{:?}",status.service_role),"current_role":format!("{:?}",status.current_role),
             "replicator_role":format!("{:?}",status.replicator_role),
             "creation_generation":route.generation,"packages":self.package_evidence()?,
-            "ack_delay_ms":route.delay.load(Ordering::Acquire),"pump_fault":route.fault.lock().unwrap().clone(),
+            "ack_delay_ms":route.delay.load(Ordering::Acquire),
+            "copy_delay_ms":route.copy_delay.load(Ordering::Acquire),"pump_fault":route.fault.lock().unwrap().clone(),
             "native_actions":{"open":counters.open_commands,"close":counters.close_commands,
                 "abort":counters.abort_commands,"query":counters.queries,"update":counters.service_updates,
                 "open_failures":counters.open_failures,"close_failures":counters.close_failures,

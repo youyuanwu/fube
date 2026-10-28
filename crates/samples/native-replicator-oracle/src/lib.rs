@@ -1,18 +1,21 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License. See LICENSE.service-fabric-apps-rs at the repository root.
 
-//! Test-only COM ABI foundation for an independent native classic replicator.
+//! Activated test-only host for the actual native classic replicator.
 //!
 //! Successful null stream results are represented by `Option`, not by invalid
 //! null values of the generated non-null Rust interface types. No engine is
-//! registered or started by this crate's ABI self-test.
+//! registered or started by this crate's separate ABI self-test.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod abi;
+mod async_context;
 mod com;
 mod context;
 pub mod data;
+pub mod host;
+pub mod live;
 pub mod provider;
 pub mod stream;
 
@@ -34,9 +37,8 @@ pub struct NativeReplicator {
 
 /// Construct the actual native V1 engine through a node-supplied partition.
 ///
-/// This is only a construction seam, not a factory/replica registration path.
-/// The caller must retain the provider and return `control` from its real
-/// service replica's EndOpen. No partition is synthesized by this fixture.
+/// The activated host retains the provider and returns `control` unchanged from
+/// its service replica's EndOpen. No partition is synthesized by this fixture.
 pub fn create_native_replicator(
     partition: &IFabricStatefulServicePartition,
     provider: &IFabricStateProvider,

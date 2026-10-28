@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License. See LICENSE.service-fabric-apps-rs at the repository root.
 
-//! Unresolved nullable stream adapters retained pending binding/API permission.
+//! User-authorized minimal nullable stream adapters.
 //!
 //! The published implementation traits cannot return S_OK/null EOS. These
-//! existing declarations are NOT a duplicate-free solution; see the README's
-//! concrete blocker. Providers, contexts and operation data use published traits.
+//! declarations preserve S_OK/null without invalid Rust interface values.
+//! Providers, contexts, replicas, factories and operation data use published traits.
 
 #![allow(non_snake_case, unsafe_op_in_unsafe_fn)]
 

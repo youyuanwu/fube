@@ -12,3 +12,7 @@ mssf-com = { version = "0.10", features = ["ServiceFabric_FabricRuntime", "Servi
 windows_core = { package = "mssf-pal", version = "0.10" }
 windows-interface = "0.100"
 serde_json = "1"
+fube-data.workspace = true
+tokio.workspace = true
+mssf-util.workspace = true
+uuid.workspace = true

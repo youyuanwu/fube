@@ -85,12 +85,14 @@ pub struct EngineSnapshot {
     pub owned_operations: usize,
     pub owned_bytes: usize,
     pub peers: Vec<PeerSnapshot>,
+    pub observed_primary: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PeerSnapshot {
     pub replica: i64,
     pub incarnation: String,
+    pub address: String,
     pub received: i64,
     pub applied: i64,
     pub maximum_sent: i64,
@@ -105,7 +107,7 @@ pub struct PeerSnapshot {
 
 impl Serialize for EngineSnapshot {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let mut out = serializer.serialize_struct("EngineSnapshot", 13)?;
+        let mut out = serializer.serialize_struct("EngineSnapshot", 14)?;
         out.serialize_field("role", &format!("{:?}", self.role))?;
         out.serialize_field(
             "epoch",
@@ -124,6 +126,7 @@ impl Serialize for EngineSnapshot {
         out.serialize_field("owned_operations", &self.owned_operations)?;
         out.serialize_field("owned_bytes", &self.owned_bytes)?;
         out.serialize_field("peers", &self.peers)?;
+        out.serialize_field("observed_primary", &self.observed_primary)?;
         out.end()
     }
 }
@@ -277,6 +280,7 @@ impl Engine {
                 owned_operations: 0,
                 owned_bytes: 0,
                 peers: Vec::new(),
+                observed_primary: None,
             }),
             budget: Budget {
                 operations: Arc::new(Semaphore::new(settings.queue_operations)),
@@ -919,6 +923,7 @@ impl Owner {
             .map(|peer| PeerSnapshot {
                 replica: peer.endpoint.actor.replica,
                 incarnation: peer.endpoint.actor.incarnation.to_string(),
+                address: peer.endpoint.to_string(),
                 received: peer.received,
                 applied: peer.applied,
                 maximum_sent: peer.maximum_sent,
@@ -959,6 +964,7 @@ impl Owner {
                 - self.shared.budget.operations.available_permits(),
             owned_bytes: self.settings.queue_bytes - self.shared.budget.bytes.available_permits(),
             peers,
+            observed_primary: self.secondary.as_ref().map(|copy| copy.primary.to_string()),
         };
     }
 

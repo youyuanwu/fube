@@ -41,18 +41,40 @@ fn self_test() -> windows_core::Result<()> {
 }
 
 fn main() -> std::process::ExitCode {
-    if std::env::args().skip(1).collect::<Vec<_>>() != ["--abi-self-test"] {
-        eprintln!(
-            "usage: native-replicator-oracle --abi-self-test\n\
-             Phase 1 provides local ABI checks only; native service registration \
-             and replication are not implemented."
-        );
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args == ["--abi-self-test"] {
+        return match self_test() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("ABI self-test failed: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    if !args.is_empty() {
+        eprintln!("usage: native-replicator-oracle [--abi-self-test]");
         return std::process::ExitCode::FAILURE;
     }
-    match self_test() {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("ABI self-test failed: {error}");
+    let result = std::panic::catch_unwind(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()?
+            .block_on(native_replicator_oracle::host::run())
+    });
+    match result {
+        Ok(Ok(())) => std::process::ExitCode::SUCCESS,
+        Ok(Err(error)) => {
+            eprintln!("native activated host failed: {error}");
+            std::process::ExitCode::FAILURE
+        }
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown native API panic");
+            eprintln!("native activated host API construction failed: {message}");
             std::process::ExitCode::FAILURE
         }
     }

@@ -18,6 +18,9 @@ The published endpoint is `/data/<unique-owner-path>/service`. Its siblings:
 - `test?ack_delay_ms=<0..2000>`: **qualification-only**, delays actual
   application ACKs after provider apply, never sends receipt-only apply ACKs.
   Set `0` to reset. This route needs replica lifetime, not Primary access.
+- `test?copy_delay_ms=<0..100>`: qualification-only provider enumeration pacing,
+  under unchanged engine callback deadlines; set `0` to reset. Exactly one
+  hook parameter is permitted. It does not delay native control or replace TCP.
 
 Requests retain the existing 4 KiB total HTTP-header bound (including URL).
 Decoded IDs are 1–128 bytes, keys 1–1024 bytes; values must fit that request.
@@ -43,3 +46,5 @@ Read/diagnostic JSON includes `profile:"fube-data-v1"`, `engine_kind:"rust"`,
 counters and `packages`. Additional role, creation-generation, ACK-delay and
 pump-fault evidence is diagnostic only. Fabric TCP replication uses a separate
 per-replica `node-IP:0` listener, never these HTTP routes.
+Rust diagnostics expose actual received `observed_primary` and configured peer
+addresses/incarnations for independent wire/identity correlation.
