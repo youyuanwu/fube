@@ -503,6 +503,12 @@ impl Engine {
         self.endpoint.clone()
     }
 
+    /// Bounded transport observations for the qualification fixture, not authority.
+    #[cfg(feature = "qualification")]
+    pub fn qualification_transport_snapshot(&self) -> serde_json::Value {
+        self.transport.diagnostics()
+    }
+
     pub fn replication_stream(&self) -> Arc<OperationStream> {
         self.replication.clone()
     }

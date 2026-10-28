@@ -86,7 +86,7 @@ struct Network {
     data: Class,
     control: Class,
     local: ListenInstance,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     diagnostics: Mutex<std::collections::BTreeMap<&'static str, (u64, String)>>,
 }
 
@@ -140,7 +140,7 @@ struct Outgoing {
     bytes: Vec<u8>,
     _bytes: OwnedSemaphorePermit,
     _slot: OwnedSemaphorePermit,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     data: bool,
 }
 
@@ -181,7 +181,7 @@ impl PeerTransport {
             },
             settings,
             routes: Mutex::new(HashMap::new()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "qualification"))]
             diagnostics: Mutex::new(std::collections::BTreeMap::new()),
         });
         let owned_network = network.clone();
@@ -238,7 +238,7 @@ impl PeerTransport {
         &self.address
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     pub(crate) fn diagnostics(&self) -> serde_json::Value {
         let n = &self.handle.network;
         serde_json::json!({"events":*n.diagnostics.lock().unwrap(),
@@ -320,7 +320,7 @@ impl PeerTransport {
             bytes,
             _bytes: permit,
             _slot: slot,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "qualification"))]
             data,
         };
         let sender = if data {
@@ -372,12 +372,19 @@ impl Drop for Handle {
 }
 
 impl Network {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     fn note(&self, kind: &'static str, detail: String) {
         let mut d = self.diagnostics.lock().unwrap();
         let entry = d.entry(kind).or_default();
-        entry.0 += 1;
+        entry.0 = entry.0.saturating_add(1);
         entry.1 = detail.chars().take(512).collect();
+        #[cfg(feature = "qualification")]
+        let first_error = (kind == "connection_error" && entry.0 == 1).then(|| entry.1.clone());
+        drop(d);
+        #[cfg(feature = "qualification")]
+        if let Some(detail) = first_error {
+            eprintln!("FUBE_PEER_TRANSPORT {detail}");
+        }
     }
     fn class(&self, data: bool) -> &Class {
         if data {
@@ -557,6 +564,24 @@ async fn run_session(
     id: u64,
     network: Arc<Network>,
     ready: mpsc::Sender<Ready>,
+    data: mpsc::Receiver<Outgoing>,
+    control: mpsc::Receiver<Outgoing>,
+    inbound: bool,
+) -> Result<()> {
+    let result =
+        run_session_inner(stream, id, network.clone(), ready, data, control, inbound).await;
+    #[cfg(any(test, feature = "qualification"))]
+    if let Err(error) = &result {
+        network.note("connection_error", format!("{id}: {error:?}"));
+    }
+    result
+}
+
+async fn run_session_inner(
+    stream: TcpStream,
+    id: u64,
+    network: Arc<Network>,
+    ready: mpsc::Sender<Ready>,
     mut data: mpsc::Receiver<Outgoing>,
     mut control: mpsc::Receiver<Outgoing>,
     inbound: bool,
@@ -660,7 +685,7 @@ async fn run_session(
                 return Err(Error::Protocol("invalid classic peer envelope"));
             }
             let packet = Packet::decode(&frame.message)?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "qualification"))]
             network.note(
                 if is_data(&packet.body) {
                     "received_data"
@@ -718,7 +743,7 @@ async fn run_session(
             match class.deliver(packet, permit) {
                 Ok(()) => {}
                 Err(Error::ResourceLimit(_)) if data => {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "qualification"))]
                     network.note("incoming_drop", "capacity".into());
                 }
                 Err(error) => return Err(error),
@@ -737,7 +762,7 @@ async fn run_session(
             timeout(deadline, writer.write_all(&outgoing.bytes))
                 .await
                 .map_err(|_| Error::Timeout)??;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "qualification"))]
             network.note(
                 if outgoing.data {
                     "written_data"
@@ -752,7 +777,7 @@ async fn run_session(
         result = read => result,
         result = write => result,
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     network.note("session_end", format!("{id}: {result:?}"));
     result
 }

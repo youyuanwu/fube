@@ -873,6 +873,7 @@ impl Rpc {
             "native_epoch":{"data_loss":status.current_epoch.data_loss,"configuration":status.current_epoch.configuration},
             "read_status":format!("{read:?}"),"write_status":format!("{write:?}"),
             "state":route.provider.snapshot(),"engine":route.engine.snapshot(),
+            "peer_transport":route.engine.qualification_transport_snapshot(),
             "observed_primary":route.engine.snapshot().observed_primary,
             "role":format!("{:?}",status.service_role),"current_role":format!("{:?}",status.current_role),
             "replicator_role":format!("{:?}",status.replicator_role),
