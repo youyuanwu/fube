@@ -906,7 +906,7 @@ def stable_data(before: dict, after: dict) -> None:
 
 def wire_endpoint(value: str) -> dict:
     require(type(value) is str and len(value) <= 4096, "bounded native-selected wire endpoint")
-    match = re.fullmatch(r"([^/\s]+)/([a-fA-F0-9-]{36})-([0-9]+);([a-fA-F0-9-]{36})(;[^/;\s]+)?", value)
+    match = re.fullmatch(r"([^/\s]+)/([a-fA-F0-9-]{36})-([0-9]+);([a-fA-F0-9-]{36})(;[^/;\s]*)?", value)
     require(match is not None, "native-selected wire endpoint actor schema")
     address, partition, replica, engine, suffix = match.groups()
     parsed = urlsplit("//" + address)
@@ -2146,6 +2146,10 @@ import ctypes,hashlib,json,os,re,secrets,signal,stat,subprocess,sys,time
 path,action=sys.argv[1:3]; proof=json.loads(sys.argv[3])
 def require(value,message):
     if not value: raise RuntimeError(message)
+def recovery_note(error,message):
+    message=message[:16384]
+    if hasattr(error,"add_note"):error.add_note(message)
+    else:print(message,file=sys.stderr,flush=True)
 if action=="transfer":
     deadline=float(sys.argv[4]); token=sys.argv[5]
     require(0<deadline-time.time()<=180 and re.fullmatch(r"[a-f0-9]{64}",token),
@@ -2510,12 +2514,12 @@ except Exception as error:
                         "private upload directory changed; retain")
                 os.rmdir(private,dir_fd=parent_fd)
             except Exception as cleanup_error:
-                error.add_note("private upload retained: "+str(cleanup_error))
-        error.add_note("original upload recovery (not target adoption): "+json.dumps({
+                recovery_note(error,"private upload retained: "+str(cleanup_error))
+        recovery_note(error,"original upload recovery (not target adoption): "+json.dumps({
             "private_path":parent+"/"+private,"private_identity":private_identity,
             "published_path":path,"proof":proof}))
     if action=="transfer":
-        error.add_note("original upload recovery (not target adoption): "+json.dumps({
+        recovery_note(error,"original upload recovery (not target adoption): "+json.dumps({
             "published_path":path,"proof":proof}))
     raise
 finally:

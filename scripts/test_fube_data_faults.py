@@ -306,6 +306,18 @@ class NativeFaultHttpModels(unittest.TestCase):
 
 
 class WireFaultModels(unittest.TestCase):
+    def test_native_empty_transport_suffix_reaches_actual_wire_receipt_validation(self):
+        value, endpoints = wire_model(True, True)
+        source = value["replicas"][1]
+        source["rpc"]["replication_address"] = endpoints[1].removesuffix("transport")
+        for kind in ("stale_epoch", "wrong_sender", "wrong_target"):
+            result = data.wire_receipt(value, source, kind, receipt(value, source, kind))
+            self.assertEqual(result["source_kind"], "rust")
+        self.assertEqual(data.wire_endpoint(source["rpc"]["replication_address"])["suffix"], ";")
+        for suffix in (";bad/path", ";bad id", ";a;b"):
+            with self.assertRaises(RuntimeError):
+                data.wire_endpoint(endpoints[1].removesuffix(";transport") + suffix)
+
     def test_both_rust_to_native_negative_directions_correlate_actual_configured_peers(self):
         for rust_primary, kinds in ((True, ("stale_epoch", "wrong_sender", "wrong_target")),
                                     (False, ("wrong_sender", "stale_copy_ack", "wrong_target"))):

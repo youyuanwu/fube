@@ -2219,6 +2219,27 @@ class UploadReservationTests(ProjectFiles):
         self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
         self.assertFalse(path.exists())
 
+    def test_native_python310_upload_failure_preserves_exception_and_recovery_stderr(self):
+        class Python310Error(RuntimeError):
+            @property
+            def add_note(self):
+                raise AttributeError("Python 3.10 has no add_note")
+        path, proof = self.reserve()
+        archive = self.archive(("payload", tarfile.REGTYPE, b"owned executable"))
+        original = Python310Error("native SDK upload failed")
+        def fail(*args, **kwargs):
+            raise original
+        before = len(os.listdir("/proc/self/fd"))
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(Python310Error) as raised:
+                self.run_upload(path, "transfer", proof, archive, fail)
+        self.assertIs(raised.exception, original)
+        self.assertIn("original upload recovery", stderr.getvalue())
+        self.assertIn(proof["capability"], stderr.getvalue())
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+        self.run_upload(path, "remove", proof)
+        self.assertFalse(path.exists())
+
     def test_source_hash_drift_before_native_upload_is_refused_even_when_file_inode_is_unchanged(self):
         path, proof = self.reserve()
         stat_call = os.stat
