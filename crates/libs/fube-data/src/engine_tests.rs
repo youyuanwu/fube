@@ -1154,8 +1154,10 @@ async fn configured_peer_retirement_releases_session_capacity_before_replacement
         },
     );
     initial_primary(&p).await;
-    let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let mut networks = Vec::new();
     for id in 2..12 {
+        let (network, mut incoming) =
+            PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
         let remote = endpoint(&network, partition, id);
         let mut peer = descriptor(&p);
         peer.replica_id = id;
@@ -1165,13 +1167,84 @@ async fn configured_peer_retirement_releases_session_capacity_before_replacement
             .unwrap();
         until(|| p.snapshot().peers.len() == 1 && p.snapshot().peers[0].replica == id).await;
         assert_eq!(p.snapshot().peers[0].replica, id);
+        assert!(matches!(
+            timeout(std::time::Duration::from_secs(2), incoming.control.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            Body::RequestAck
+        ));
+        networks.push((network, incoming)); // departed remote processes remain alive
     }
     p.update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
     until(|| p.snapshot().peers.is_empty()).await;
     p.abort();
+    for (network, _) in networks {
+        network.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promotion_total_deadline_covers_receive_drain_and_final_callback_publication() {
+    let provider = Arc::new(Provider {
+        epoch_delay: std::time::Duration::from_millis(150),
+        ..Provider::default()
+    });
+    let settings = Settings {
+        retry: std::time::Duration::from_secs(2),
+        callback_timeout: std::time::Duration::from_millis(200),
+        ..Settings::default()
+    };
+    let (secondary, network, primary, _incoming) =
+        copying_raw_secondary(EPOCH, provider.clone(), settings).await;
+    raw_send(
+        &network,
+        &primary,
+        &secondary,
+        copy_item(EPOCH, 1, vec![], true),
+    );
+    until(|| secondary.snapshot().copy_done).await;
+    secondary
+        .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+        .await
+        .unwrap();
+    raw_send(
+        &network,
+        &primary,
+        &secondary,
+        replication(EPOCH, EPOCH, 1, 1),
+    );
+    let operation = secondary
+        .replication_stream()
+        .next(cancel())
+        .await
+        .unwrap()
+        .unwrap();
+    provider.last.store(1, Ordering::Release);
     network.shutdown();
+    let started = Instant::now();
+    let promotion = secondary.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel());
+    tokio::pin!(promotion);
+    assert!(
+        timeout(std::time::Duration::from_millis(120), &mut promotion)
+            .await
+            .is_err()
+    );
+    operation.acknowledge().unwrap();
+    drop(operation);
+    assert!(
+        timeout(std::time::Duration::from_millis(180), &mut promotion)
+            .await
+            .unwrap()
+            .is_err()
+    );
+    until(|| secondary.snapshot().closed).await;
+    assert!(started.elapsed() < std::time::Duration::from_millis(350));
+    assert_ne!(secondary.snapshot().role, ReplicaRole::Primary);
+    secondary.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1343,6 +1416,14 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
         .await
         .unwrap()
         .unwrap();
+        until(|| {
+            engines[new_primary]
+                .snapshot()
+                .peers
+                .iter()
+                .all(|peer| peer.applied == 1 && peer.native_catchup_prefix == 0)
+        })
+        .await;
         let snapshot = engines[new_primary].snapshot();
         assert_eq!(snapshot.progress.assigned, 1);
         assert_eq!(snapshot.progress.retained_operations, 0);
@@ -1729,6 +1810,7 @@ struct Provider {
     last: AtomicI64,
     epochs: Mutex<Vec<(Epoch, i64)>>,
     horizons: Mutex<Vec<i64>>,
+    epoch_delay: std::time::Duration,
 }
 
 impl StateProvider for Provider {
@@ -1737,6 +1819,9 @@ impl StateProvider for Provider {
     }
     fn update_epoch(&self, epoch: Epoch, previous: i64, _: Cancellation) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
+            if epoch == NEXT_EPOCH && !self.epoch_delay.is_zero() {
+                tokio::time::sleep(self.epoch_delay).await;
+            }
             self.epochs.lock().unwrap().push((epoch, previous));
             self.last.store(previous, Ordering::Release);
             Ok(())

@@ -3037,7 +3037,10 @@ impl Owner {
         control.running = true;
         let provider = self.provider.clone();
         let cancellation = control.cancellation.clone();
-        let deadline = self.settings.callback_timeout;
+        let deadline = self
+            .settings
+            .callback_timeout
+            .saturating_sub(control.started.elapsed());
         self.jobs.spawn(async move {
             let result = timeout(deadline, async {
                 tokio::select! {
@@ -3131,6 +3134,16 @@ impl Owner {
     fn finish_control(&mut self, result: Result<JobValue>) -> Result<()> {
         // Preserve the reply until disposal/terminal cleanup when a callback
         // fails, rather than accidentally dropping it as a successful barrier.
+        if self
+            .control
+            .as_ref()
+            .is_some_and(|control| control.started.elapsed() >= self.settings.callback_timeout)
+        {
+            if let Some(control) = &self.control {
+                control.cancellation.cancel();
+            }
+            return Err(Error::Timeout);
+        }
         let value = result?;
         if let Some(control) = self.control.as_mut() {
             if let Some((epoch, boundary)) = control.drain_barrier {
@@ -3220,6 +3233,10 @@ impl Owner {
                     self.secondary = None;
                     self.copy_done = false;
                 }
+                if control.started.elapsed() >= self.settings.callback_timeout {
+                    let _ = reply.send(Err(Error::Timeout));
+                    return Err(Error::Timeout);
+                }
                 self.role = role;
                 self.epoch = Some(epoch);
                 if role == ReplicaRole::Primary {
@@ -3260,6 +3277,10 @@ impl Owner {
                         }
                         self.retire_peer(id, Error::Closed);
                     }
+                }
+                if control.started.elapsed() >= self.settings.callback_timeout {
+                    let _ = reply.send(Err(Error::Timeout));
+                    return Err(Error::Timeout);
                 }
                 self.reconciled = true;
                 let _ = reply.send(Ok(changed));

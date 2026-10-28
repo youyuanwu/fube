@@ -23,6 +23,7 @@ pub(super) struct EngineState {
     assigned: AtomicI64,
     pub creates: AtomicUsize,
     pub control_opens: AtomicUsize,
+    pub progress_calls: AtomicUsize,
 }
 
 impl EngineState {
@@ -38,6 +39,7 @@ impl EngineState {
             assigned: AtomicI64::new(0),
             creates: AtomicUsize::new(0),
             control_opens: AtomicUsize::new(0),
+            progress_calls: AtomicUsize::new(0),
         })
     }
 
@@ -149,6 +151,7 @@ impl IFabricReplicator_Impl for EngineDouble_Impl {
     }
     fn Abort(&self) {}
     fn GetCurrentProgress(&self) -> Result<FABRIC_SEQUENCE_NUMBER> {
+        self.0.progress_calls.fetch_add(1, Ordering::AcqRel);
         Ok(FABRIC_SEQUENCE_NUMBER(
             self.0.assigned.load(Ordering::Acquire),
         ))

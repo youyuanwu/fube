@@ -34,6 +34,47 @@ fn request(address: &str, from: i64, to: i64) -> Packet {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_one_shared_address_actor_keeps_the_other_actor_socket_usable() {
+    let (a, _incoming_a) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let (b, mut incoming_b) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    a.register_peer(&endpoint(&b.address, 2)).unwrap();
+    a.register_peer(&endpoint(&b.address, 3)).unwrap();
+    let first = a
+        .send_observed(request(&a.address, 1, 2))
+        .unwrap()
+        .await
+        .unwrap();
+    assert_eq!(receive(&mut incoming_b.control).await.to, actor(2));
+    a.unregister_peer(&actor(2)).unwrap();
+    let second = a
+        .send_observed(request(&a.address, 1, 3))
+        .unwrap()
+        .await
+        .unwrap();
+    assert_eq!(receive(&mut incoming_b.control).await.to, actor(3));
+    assert_eq!(first.session, second.session);
+    drop(first);
+    drop(second);
+    a.unregister_peer(&actor(3)).unwrap();
+    for _ in 0..100 {
+        if a.handle.network.live_addresses.lock().unwrap().is_empty() {
+            break;
+        }
+        sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(a.handle.network.live_addresses.lock().unwrap().is_empty());
+    assert!(a
+        .handle
+        .network
+        .retired_addresses
+        .lock()
+        .unwrap()
+        .is_empty());
+    a.shutdown();
+    b.shutdown();
+}
+
 fn operation(address: &str, from: i64, to: i64, bytes: usize) -> Packet {
     Packet {
         from: endpoint(address, from),

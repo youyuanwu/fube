@@ -800,11 +800,15 @@ async fn native_copy_ack_hold_final_nonempty_receive_release_cancel_deadline_and
                     )
                 }
                 let alias = format!("/data/{}/{}", route.partition, route.replica);
+                let progress_calls = engine.progress_calls.load(Ordering::Acquire);
                 let (status, diagnostics) = http(&host, &format!("{alias}/diagnostics")).await;
                 assert!(status.contains("200"));
                 assert_eq!(diagnostics["copy_ack_hold"]["held"], true);
                 assert_eq!(diagnostics["engine"]["copy_done"], false);
                 assert_eq!(diagnostics["role"], "IdleSecondary");
+                assert_eq!(diagnostics["native_current_progress"], Value::Null);
+                assert_eq!(engine.progress_calls.load(Ordering::Acquire), progress_calls,
+                    "InBuild diagnostics must not call native GetCurrentProgress and fault the copy");
                 let (status, _) = http(&host, &format!("{alias}/test?copy_ack_hold_ms=0")).await;
                 assert!(
                     status.contains("404"),

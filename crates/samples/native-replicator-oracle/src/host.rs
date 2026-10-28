@@ -599,9 +599,19 @@ impl Route {
                 "max_copy_queue_size":settings.MaxCopyQueueSize
             }))
         })();
-        let native_progress = unsafe { native.replicator.control.GetCurrentProgress() }
-            .ok()
-            .map(|n| n.0);
+        // Native SecondaryReplicator::GetCurrentProgress reports a transient
+        // replica fault while copy is in progress. Diagnostics must not invoke
+        // that state-changing error path merely to observe an InBuild replica.
+        let native_progress = if self.copy_done.load(Ordering::Acquire)
+            && !state.copy_in_progress
+            && matches!(role, "Primary" | "ActiveSecondary")
+        {
+            unsafe { native.replicator.control.GetCurrentProgress() }
+                .ok()
+                .map(|n| n.0)
+        } else {
+            None
+        };
         let fault = self.fault.lock().map_err(|_| com::E_UNEXPECTED)?.clone();
         let completions = self.completions.lock().map_err(|_| com::E_UNEXPECTED)?;
         let valid = completions

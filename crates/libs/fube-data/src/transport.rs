@@ -15,7 +15,7 @@
 //! nor admission slots. Within each class incoming and outgoing bytes aggregate.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::{SocketAddr, TcpListener as StdListener, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -86,6 +86,10 @@ struct Network {
     data: Class,
     control: Class,
     local: ListenInstance,
+    retired_addresses: Mutex<HashSet<String>>,
+    outgoing_addresses: Mutex<HashMap<String, usize>>,
+    live_addresses: Mutex<HashMap<String, usize>>,
+    route_revision: watch::Sender<u64>,
     #[cfg(any(test, feature = "qualification"))]
     diagnostics: Mutex<std::collections::BTreeMap<&'static str, (u64, String)>>,
 }
@@ -140,10 +144,51 @@ struct Outgoing {
     bytes: Vec<u8>,
     _bytes: OwnedSemaphorePermit,
     _slot: OwnedSemaphorePermit,
+    _address: AddressOwner,
     #[cfg(any(test, feature = "qualification"))]
     data: bool,
     #[cfg(any(test, feature = "qualification"))]
     completion: Option<(MessageId, tokio::sync::oneshot::Sender<WriteReceipt>)>,
+}
+
+// A queued frame, including a one-shot qualification frame whose temporary
+// actor route was removed, still owns its socket until write/disposal.
+struct AddressOwner {
+    network: Arc<Network>,
+    address: String,
+    queued: bool,
+}
+impl Drop for AddressOwner {
+    fn drop(&mut self) {
+        let pool = if self.queued {
+            &self.network.outgoing_addresses
+        } else {
+            &self.network.live_addresses
+        };
+        let mut owners = pool.lock().unwrap();
+        if let Some(count) = owners.get_mut(&self.address) {
+            *count -= 1;
+            if *count == 0 {
+                owners.remove(&self.address);
+            }
+        }
+        drop(owners);
+        let live = self.network.live_addresses.lock().unwrap();
+        let outgoing = self.network.outgoing_addresses.lock().unwrap();
+        let mut retired = self.network.retired_addresses.lock().unwrap();
+        let changed = retired.contains(&self.address);
+        if !live.contains_key(&self.address) && !outgoing.contains_key(&self.address) {
+            retired.remove(&self.address);
+        }
+        drop(retired);
+        drop(outgoing);
+        drop(live);
+        if changed {
+            self.network
+                .route_revision
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+    }
 }
 
 /// Socket completion only, not a peer parse, ACK or rejection receipt. Retained
@@ -189,7 +234,12 @@ impl PeerTransport {
         let (out_data, data_rx) = mpsc::channel(settings.queue_operations);
         let (out_control, control_rx) = mpsc::channel(settings.control_messages);
         let (stop, stop_rx) = watch::channel(false);
+        let (route_revision, _) = watch::channel(0);
         let network = Arc::new(Network {
+            retired_addresses: Mutex::new(HashSet::new()),
+            outgoing_addresses: Mutex::new(HashMap::new()),
+            live_addresses: Mutex::new(HashMap::new()),
+            route_revision,
             data: Class {
                 bytes: Arc::new(Semaphore::new(settings.queue_bytes)),
                 outgoing_slots: Arc::new(Semaphore::new(settings.queue_operations)),
@@ -311,12 +361,28 @@ impl PeerTransport {
         Ok(())
     }
 
-    /// Removes a membership route. A duplex socket may serve other actors and
-    /// is therefore not closed by this operation; actor fencing is external.
+    /// Retire this actor route. Unshared sockets are canceled and joined by the
+    /// network owner after all queued frame captures drain. Other legitimate
+    /// actors at the same address retain their duplex socket.
     pub fn unregister_peer(&self, actor: &Actor) -> Result<()> {
         let _admission = self.handle.admission.lock().unwrap();
         self.handle.check()?;
-        self.handle.network.routes.lock().unwrap().remove(actor);
+        if let Some(route) = self.handle.network.routes.lock().unwrap().remove(actor) {
+            let live = self.handle.network.live_addresses.lock().unwrap();
+            let outgoing = self.handle.network.outgoing_addresses.lock().unwrap();
+            if live.contains_key(&route.address) || outgoing.contains_key(&route.address) {
+                self.handle
+                    .network
+                    .retired_addresses
+                    .lock()
+                    .unwrap()
+                    .insert(route.address);
+            }
+            self.handle
+                .network
+                .route_revision
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
         Ok(())
     }
 
@@ -379,6 +445,7 @@ impl PeerTransport {
         }
         let permit = class.reserve(bytes.len() + route.address.len() + 128)?;
         let outgoing = Outgoing {
+            _address: self.handle.network.own_address(&route.address),
             route,
             bytes,
             _bytes: permit,
@@ -437,6 +504,54 @@ impl Drop for Handle {
 }
 
 impl Network {
+    fn own_address(self: &Arc<Self>, address: &str) -> AddressOwner {
+        *self
+            .outgoing_addresses
+            .lock()
+            .unwrap()
+            .entry(address.to_owned())
+            .or_default() += 1;
+        AddressOwner {
+            network: self.clone(),
+            address: address.to_owned(),
+            queued: true,
+        }
+    }
+
+    fn own_socket_address(self: &Arc<Self>, address: &str) -> AddressOwner {
+        *self
+            .live_addresses
+            .lock()
+            .unwrap()
+            .entry(address.to_owned())
+            .or_default() += 1;
+        AddressOwner {
+            network: self.clone(),
+            address: address.to_owned(),
+            queued: false,
+        }
+    }
+
+    fn retire_unused(&self, sessions: &HashMap<u64, Session>, _addresses: &HashMap<String, u64>) {
+        let retired = self.retired_addresses.lock().unwrap().clone();
+        let routes = self.routes.lock().unwrap();
+        let outgoing = self.outgoing_addresses.lock().unwrap();
+        for address in retired {
+            if outgoing.get(&address).is_some_and(|count| *count != 0)
+                || routes
+                    .values()
+                    .any(|route| route.address == address && route.learned_on.is_none())
+            {
+                continue;
+            }
+            for session in sessions
+                .values()
+                .filter(|session| session.address.as_ref() == Some(&address))
+            {
+                session.stop.cancel();
+            }
+        }
+    }
     #[cfg(any(test, feature = "qualification"))]
     fn note(&self, kind: &'static str, detail: String) {
         let mut d = self.diagnostics.lock().unwrap();
@@ -492,6 +607,8 @@ fn validate_operation_limits(packet: &Packet, settings: &Settings) -> Result<()>
 struct Session {
     data: mpsc::Sender<Outgoing>,
     control: mpsc::Sender<Outgoing>,
+    stop: crate::Cancellation,
+    address: Option<String>,
 }
 
 struct Ready {
@@ -511,10 +628,12 @@ async fn supervise(
     let mut sessions = HashMap::<u64, Session>::new();
     let mut addresses = HashMap::<String, u64>::new();
     let mut next = 0u64;
+    let mut route_revision = network.route_revision.subscribe();
     loop {
         tokio::select! {
             biased;
             _ = stop.changed() => break,
+            _ = route_revision.changed() => network.retire_unused(&sessions, &addresses),
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 if let Ok(id) = result {
                     sessions.remove(&id);
@@ -524,8 +643,10 @@ async fn supervise(
                 }
             }
             Some(Ready { id, address }) = ready_rx.recv() => {
-                if sessions.contains_key(&id) {
+                if let Some(session) = sessions.get_mut(&id) {
+                    session.address = Some(address.clone());
                     addresses.entry(address).or_insert(id);
+                    network.retire_unused(&sessions, &addresses);
                 }
             }
             Some(outgoing) = control.recv() => {
@@ -541,11 +662,15 @@ async fn supervise(
                     next += 1;
                     let id = next;
                     let (session, data_rx, control_rx) = session_channels(&network.settings);
+                    let stopped = session.stop.clone();
                     sessions.insert(id, session);
                     let network = network.clone();
                     let ready = ready.clone();
                     tasks.spawn(async move {
-                        let _ = run_session(socket, id, network, ready, data_rx, control_rx, true).await;
+                        tokio::select! {
+                            _ = stopped.cancelled() => {},
+                            _ = run_session(socket, id, network, ready, data_rx, control_rx, true) => {},
+                        }
                         id
                     });
                 }
@@ -569,7 +694,16 @@ fn session_channels(
 ) -> (Session, mpsc::Receiver<Outgoing>, mpsc::Receiver<Outgoing>) {
     let (data, data_rx) = mpsc::channel(settings.queue_operations);
     let (control, control_rx) = mpsc::channel(settings.control_messages);
-    (Session { data, control }, data_rx, control_rx)
+    (
+        Session {
+            data,
+            control,
+            stop: crate::Cancellation::default(),
+            address: None,
+        },
+        data_rx,
+        control_rx,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -603,21 +737,22 @@ fn route_outgoing(
             }
             *next += 1;
             let id = *next;
-            let (session, data_rx, control_rx) = session_channels(&network.settings);
+            let (mut session, data_rx, control_rx) = session_channels(&network.settings);
+            session.address = Some(address.clone());
+            let stopped = session.stop.clone();
             sessions.insert(id, session);
             addresses.insert(address.clone(), id);
             let ready = ready.clone();
             let network = network.clone();
             tasks.spawn(async move {
-                if let Ok(Ok(stream)) = timeout(
-                    network.settings.callback_timeout,
-                    TcpStream::connect(socket),
-                )
-                .await
-                {
-                    let _ =
-                        run_session(stream, id, network, ready, data_rx, control_rx, false).await;
-                }
+                tokio::select! {
+                    _ = stopped.cancelled() => {},
+                    _ = async {
+                        if let Ok(Ok(stream)) = timeout(network.settings.callback_timeout, TcpStream::connect(socket)).await {
+                            let _ = run_session(stream, id, network, ready, data_rx, control_rx, false).await;
+                        }
+                    } => {},
+                };
                 id
             });
             id
@@ -732,6 +867,7 @@ async fn run_session_inner(
     .to_string()
     .parse::<Endpoint>()?;
     drop(remote);
+    let _socket_owner = network.own_socket_address(&remote_instance.address);
     ready
         .try_send(Ready {
             id,

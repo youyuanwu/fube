@@ -1397,6 +1397,10 @@ class CopyAckGate:
                     and rpc.get("host") and type(rpc.get("pid")) is int,
                     "InBuild destination diagnostics are not bound to the exact native replacement")
             self.endpoint, self.replica = rpc["service_address"], replica["replica"]
+            # Retain exact native ownership before the hook request, including
+            # a lost response or a lifetime that disappears while still InBuild.
+            self.qualification.hook_identities[self.endpoint] = {
+                "node": replica["node"], "replica": replica["replica"], "service": self.qualification.service}
             self.evidence["destination"] = rpc
             self.evidence["arm"] = self.qualification.hook(self.endpoint, "copy_ack_hold_ms", 6000)
         require(replica["replica"] == self.replica, "copy ACK gate destination was replaced before release")

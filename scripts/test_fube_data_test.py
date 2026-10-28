@@ -803,6 +803,9 @@ class CopyAckGateTests(unittest.TestCase):
             with patch.object(data, "request", return_value=(200, rpc)), \
                  patch.object(data.time, "monotonic", side_effect=[1, 2, 3.2, 3.3]):
                 gate.observe(value, 0)
+                self.assertEqual(gate.qualification.hook_identities[gate.endpoint],
+                    {"node": destination["node"], "replica": destination["replica"],
+                     "service": gate.qualification.service})
                 self.assertFalse(gate.released)
                 gate.observe(value, 1.1)
                 self.assertFalse(gate.released, "one negative native query is insufficient")
