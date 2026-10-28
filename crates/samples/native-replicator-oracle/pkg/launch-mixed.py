@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Test-only, placement-based engine selector; never selects a replica role."""
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,27 @@ NODE_ENGINES = {
 }
 
 
+def record_startup(work, name, owner, mode, changed):
+    # Linux native console redirection does not reliably archive failed startup.
+    # Preserve the first actual activated caller and its child's stderr per app.
+    try:
+        log = os.open(work / "RustRuntimeService.FubeDataStartup.stderr",
+                      os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return
+    try:
+        context = {"event": "FUBE_SELECTOR_CONTEXT", "pid": os.getpid(),
+                   "uid": os.getuid(), "euid": os.geteuid(), "gid": os.getgid(),
+                   "egid": os.getegid(), "groups": os.getgroups(),
+                   "engine": name, "file_owner": owner, "mode": mode,
+                   "mode_changed": changed}
+        os.write(log, (json.dumps(context) + "\n").encode())
+        os.dup2(log, 1)
+        os.dup2(log, 2)
+    finally:
+        os.close(log)
+
+
 def main():
     node = os.environ.get("Fabric_NodeName")
     if node not in NODE_ENGINES:
@@ -38,16 +60,14 @@ def main():
         raise SystemExit("selector is outside its activation-owned code package")
     directory = os.open(package, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        if os.fstat(directory).st_uid != os.getuid():
-            raise SystemExit("foreign code package owner")
         file = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         try:
             before = os.fstat(file)
-            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+            if (not stat.S_ISREG(before.st_mode)
                     or before.st_nlink != 1
                     or before.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
                     or before.st_size > 512 * 1024 * 1024):
-                raise SystemExit("selected engine is not an owned regular packaged executable")
+                raise SystemExit("selected engine is not a regular packaged executable")
             digest = hashlib.sha256()
             size = 0
             while chunk := os.read(file, 1024 * 1024):
@@ -61,13 +81,21 @@ def main():
             if digest.hexdigest() != expected or any(
                     getattr(after, field) != getattr(before, field) for field in identity):
                 raise SystemExit("selected engine strict prebuilt hash/identity mismatch")
-            if not before.st_mode & stat.S_IXUSR:
-                # SF grants execute to the declared selector, not child payloads.
-                # Install only the missing owner-execute bit on this verified FD.
-                os.fchmod(file, stat.S_IMODE(before.st_mode) | stat.S_IXUSR)
+            mode = stat.S_IMODE(before.st_mode)
+            executable = "/proc/self/fd/" + str(file)
+            if not os.access(executable, os.X_OK, effective_ids=True):
+                if before.st_uid != os.geteuid():
+                    raise SystemExit("selected engine is not executable and is foreign-owned")
+                # Only installation changes require ownership. Normal read/exec
+                # honors the real activated caller's existing group/ACL access.
+                mode |= stat.S_IXUSR
+                os.fchmod(file, mode)
             installed = os.fstat(file)
-            if stat.S_IMODE(installed.st_mode) != stat.S_IMODE(before.st_mode) | stat.S_IXUSR:
+            if stat.S_IMODE(installed.st_mode) != mode or not os.access(
+                    executable, os.X_OK, effective_ids=True):
                 raise SystemExit("selected engine owner-execute installation failed")
+            record_startup(work, name, before.st_uid, mode,
+                           mode != stat.S_IMODE(before.st_mode))
             # Execute the verified inode, not a path that could have been replaced.
             os.execve(file, [str(package / name)], dict(os.environ))
         finally:

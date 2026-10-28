@@ -422,6 +422,10 @@ class SelectorTests(ProjectFiles):
         spec = importlib.util.spec_from_file_location("test_data_selector", path)
         self.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.module)
+        self.record_startup = self.module.record_startup
+        recorder = patch.object(self.module, "record_startup")
+        recorder.start()
+        self.addCleanup(recorder.stop)
         self.package = self.root / "RustRuntimeService.Code.1.1"
         self.package.mkdir()
         self.work = self.root / "work"
@@ -505,20 +509,59 @@ class SelectorTests(ProjectFiles):
                 target.unlink()
             target.write_bytes(executable(target.name))
 
-    def test_foreign_file_owner_is_refused_before_hash_or_mode_installation(self):
+    def test_foreign_nonexecutable_file_is_refused_without_modification(self):
         original = os.fstat
         def foreign(fd):
             value = original(fd)
             if not __import__("stat").S_ISREG(value.st_mode):
                 return value
-            return types.SimpleNamespace(st_mode=value.st_mode, st_uid=os.getuid() + 1)
+            fields = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_size",
+                      "st_nlink", "st_mtime_ns", "st_ctime_ns")
+            return types.SimpleNamespace(**{
+                field: os.geteuid() + 1 if field == "st_uid" else getattr(value, field)
+                for field in fields})
         with patch.dict(os.environ, self.environment(), clear=True), \
              patch.object(os, "fstat", side_effect=foreign), \
+             patch.object(os, "access", return_value=False), \
              patch.object(os, "fchmod") as chmod, patch.object(os, "execve") as execute:
-            with self.assertRaisesRegex(SystemExit, "owned regular"):
+            with self.assertRaisesRegex(SystemExit, "not executable and is foreign-owned"):
                 self.module.main()
             chmod.assert_not_called()
             execute.assert_not_called()
+
+    def test_executable_runtime_owned_package_and_file_executes_without_chmod(self):
+        original = os.fstat
+        def foreign(fd):
+            value = original(fd)
+            fields = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_size",
+                      "st_nlink", "st_mtime_ns", "st_ctime_ns")
+            return types.SimpleNamespace(**{
+                field: os.geteuid() + 1 if field == "st_uid" else getattr(value, field)
+                for field in fields})
+        target = self.package / "native-replicator-oracle"
+        before = target.stat().st_mode
+        with patch.dict(os.environ, self.environment(), clear=True), \
+             patch.object(os, "fstat", side_effect=foreign), \
+             patch.object(os, "access", return_value=True) as access, \
+             patch.object(os, "fchmod") as chmod, patch.object(os, "execve") as execute:
+            self.module.main()
+            chmod.assert_not_called()
+            execute.assert_called_once()
+            self.assertTrue(all(call.kwargs == {"effective_ids": True}
+                                for call in access.call_args_list))
+        self.assertEqual(target.stat().st_mode, before)
+
+    def test_owned_nonexecutable_file_adds_only_owner_execute(self):
+        target = self.package / "native-replicator-oracle"
+        target.chmod(0o640)
+        with patch.dict(os.environ, self.environment(), clear=True), \
+             patch.object(os, "access", side_effect=[False, True]), \
+             patch.object(os, "fchmod", wraps=os.fchmod) as chmod, \
+             patch.object(os, "execve") as execute:
+            self.module.main()
+            self.assertEqual(chmod.call_args.args[1], 0o740)
+            self.assertEqual(target.stat().st_mode & 0o7777, 0o740)
+            execute.assert_called_once()
 
     def test_already_executable_file_is_not_chmodded_and_unbound_hash_is_rejected(self):
         target = self.package / "native-replicator-oracle"
@@ -545,6 +588,24 @@ class SelectorTests(ProjectFiles):
                     self.module.main()
                 chmod.assert_not_called()
                 execute.assert_not_called()
+
+    def test_startup_diagnostic_records_actual_caller_once_without_overwriting(self):
+        path = self.work / "RustRuntimeService.FubeDataStartup.stderr"
+        with patch.object(os, "dup2") as redirect:
+            self.record_startup(self.work, "native-replicator-oracle", os.getuid() + 1, 0o674, False)
+            self.assertEqual(redirect.call_count, 2)
+            before = path.read_bytes()
+            context = json.loads(before.decode())
+            self.assertEqual(context["uid"], os.getuid())
+            self.assertEqual(context["euid"], os.geteuid())
+            self.assertEqual(context["gid"], os.getgid())
+            self.assertEqual(context["egid"], os.getegid())
+            self.assertEqual(context["groups"], os.getgroups())
+            self.assertIs(context["mode_changed"], False)
+            redirect.reset_mock()
+            self.record_startup(self.work, "rust-runtime-app", os.getuid(), 0o740, True)
+            redirect.assert_not_called()
+            self.assertEqual(path.read_bytes(), before)
 
 
 def observation(mixed=True, target=3):
