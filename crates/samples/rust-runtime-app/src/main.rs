@@ -13,6 +13,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{OnceCell, Semaphore},
 };
+mod data;
 mod stateful;
 
 fn config_evidence(package: &ConfigurationPackage) -> RuntimeResult<serde_json::Value> {
@@ -48,6 +49,7 @@ struct Rpc {
     listener: OnceCell<()>,
     routes: Mutex<HashMap<String, Arc<Route>>>,
     stateful_routes: Mutex<HashMap<String, Arc<stateful::ReplicaRoute>>>,
+    data_routes: Mutex<HashMap<String, Arc<data::Route>>>,
     peers: Arc<stateful::PeerServer>,
     retired: Mutex<VecDeque<Partition>>,
     metrics: Arc<RuntimeMetrics>,
@@ -139,6 +141,9 @@ impl Rpc {
         let (path, query) = path.split_once('?').unwrap_or((path, ""));
         if path.starts_with("/stateful/") {
             return self.stateful_request(stream, path, query).await;
+        }
+        if path.starts_with("/data/") {
+            return self.data_request(stream, path, query).await;
         }
         let parameters: HashMap<_, _> =
             query.split('&').filter_map(|s| s.split_once('=')).collect();
@@ -461,6 +466,7 @@ async fn run() -> RuntimeResult<()> {
         listener: OnceCell::new(),
         routes: Mutex::new(HashMap::new()),
         stateful_routes: Mutex::new(HashMap::new()),
+        data_routes: Mutex::new(HashMap::new()),
         peers: {
             let port =
                 *activation

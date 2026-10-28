@@ -2639,7 +2639,10 @@ impl Owner {
             if let Some(build) = &peer.build {
                 let done = peer.copy_applied == -1
                     && build.finish.is_some_and(|finish| peer.applied >= finish);
-                if !done {
+                // Build success is not CC adoption. A copied but still idle
+                // session remains a history-retention owner while writes
+                // continue (native ReplicationSession::IdleReplicaProgress).
+                if !done || !peer.configured {
                     let idle_release = build
                         .finish
                         .map_or(peer.received, |finish| {
@@ -2724,6 +2727,18 @@ impl Owner {
                     let result = timeout(deadline, async {
                         if cancellation.is_cancelled() {
                             return Err(Error::Closed);
+                        }
+                        // Assignment/quorum progress can precede the primary
+                        // application's local continuation after submit. Keep
+                        // the exact horizon, but wait under this already-owned
+                        // callback deadline before consuming provider history.
+                        // Never turn this normal scheduling window into a
+                        // fabricated lower snapshot or a premature source fault.
+                        while provider.last_committed()? < horizon {
+                            tokio::select! {
+                                _ = cancellation.cancelled() => return Err(Error::Closed),
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(2)) => {},
+                            }
                         }
                         provider.copy_state(horizon, None).map(JobValue::CopyOpen)
                     })

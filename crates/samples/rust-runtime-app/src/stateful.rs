@@ -805,6 +805,9 @@ impl StatefulFactory for Factory {
         context: StatefulServiceContext,
     ) -> ServiceFuture<'_, Arc<dyn StatefulService>> {
         Box::pin(async move {
+            if data::selected(&context.initialization_data) {
+                return Ok(data::Service::new(self.0.clone(), context) as Arc<dyn StatefulService>);
+            }
             let generation = ROUTE_GENERATION
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
                 .map_err(|_| failure("route generation exhausted"))?;

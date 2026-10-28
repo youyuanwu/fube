@@ -772,9 +772,11 @@ dependencies = [
 name = "rust-runtime-app"
 version = "0.1.0"
 dependencies = [
+ "fube-data",
  "mssf-runtime",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

@@ -17,6 +17,72 @@ const NEXT_EPOCH: Epoch = Epoch {
     configuration: 0x2_0000_0000,
 };
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
+    let partition = Uuid::new_v4();
+    let provider = Arc::new(SnapshotProvider::default());
+    let primary = engine(partition, 1, provider.clone());
+    let target_provider = Arc::new(Provider::default());
+    let target = engine(partition, 2, target_provider.clone());
+    primary
+        .change_role(EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    primary
+        .update_current_configuration(configuration(vec![], true, 1), cancel())
+        .await
+        .unwrap();
+    target
+        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .await
+        .unwrap();
+    primary
+        .build_replica(descriptor(&target), cancel())
+        .await
+        .unwrap();
+    for sequence in 1..=100 {
+        let mut accepted = primary
+            .submit(OperationData::new(vec![vec![1]]).unwrap(), cancel())
+            .await
+            .unwrap();
+        provider.record(accepted.sequence);
+        assert_eq!(accepted.wait(cancel()).await.unwrap(), sequence);
+        let operation = timeout(
+            std::time::Duration::from_secs(2),
+            target.replication_stream().next(cancel()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(operation.sequence, sequence);
+        let progress = primary.snapshot();
+        assert!(progress.progress.first_retained <= sequence, "{progress:?}");
+        assert!(!progress.peers[0].cleanup_required);
+        target_provider.last.store(sequence, Ordering::Release);
+        operation.acknowledge().unwrap();
+        drop(operation);
+        until(|| primary.snapshot().peers[0].applied == sequence).await;
+    }
+    let mut member = descriptor(&target);
+    member.role = ReplicaRole::Secondary;
+    member.ready = true;
+    target
+        .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+        .await
+        .unwrap();
+    primary
+        .update_current_configuration(configuration(vec![member], true, 2), cancel())
+        .await
+        .unwrap();
+    primary
+        .wait_for_catch_up(CatchUpMode::All, cancel())
+        .await
+        .unwrap();
+    primary.abort();
+    target.abort();
+}
+
 struct SnapshotProvider {
     last: AtomicI64,
     history: Mutex<BTreeMap<i64, u64>>,

@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+fube-data.workspace = true
 mssf-runtime.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
