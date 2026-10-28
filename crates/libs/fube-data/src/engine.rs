@@ -918,6 +918,7 @@ struct Owner {
     jobs: JoinSet<(Job, Result<JobValue>)>,
     replay_job: bool,
     replay_next: Instant,
+    replay_rearm_pending: bool,
     ack_tx: mpsc::Sender<ApplyAck>,
     replication_tx: Option<mpsc::Sender<Operation>>,
     copy_tx: Option<mpsc::Sender<Operation>>,
@@ -985,6 +986,7 @@ impl Owner {
             jobs: JoinSet::new(),
             replay_job: false,
             replay_next: Instant::now(),
+            replay_rearm_pending: false,
             ack_tx,
             replication_tx: Some(replication_tx),
             copy_tx: Some(copy_tx),
@@ -1072,6 +1074,13 @@ impl Owner {
                 }
             }
             self.publish();
+            drop(_admission);
+            if self.replay_rearm_pending {
+                // Start cooldown only after payload/charge disposal, fanout,
+                // publication, AND the producer admission mutex are released.
+                self.replay_next = Instant::now() + self.settings.retry;
+                self.replay_rearm_pending = false;
+            }
         }
         self.shared.stopped.store(true, Ordering::Release);
         self.shared.revision.fetch_add(1, Ordering::AcqRel);
@@ -2165,7 +2174,7 @@ impl Owner {
             .budget
             .acquire(maximum_copy_bytes(&self.settings))
         else {
-            self.replay_next = Instant::now() + self.settings.retry;
+            self.replay_rearm_pending = true;
             return;
         };
         let provider = self.provider.clone();
@@ -2197,6 +2206,7 @@ impl Owner {
     fn prefix_replay_needed(&self) -> bool {
         let progress = self.queue.progress();
         self.role == ReplicaRole::Primary
+            && !self.replay_rearm_pending
             && self.control.is_none()
             && self.reconciled
             && progress.assigned > 0
@@ -3203,10 +3213,7 @@ impl Owner {
                 epoch,
             } => {
                 self.replay_job = false;
-                // Completion (including None or failed transport admission)
-                // must leave an uncharged interval for real data admission.
-                // Job events cannot self-rearm ahead of queued peer ACKs.
-                self.replay_next = Instant::now() + self.settings.retry;
+                self.replay_rearm_pending = true;
                 if self.role != ReplicaRole::Primary
                     || self.control.is_some()
                     || self.epoch != Some(epoch)

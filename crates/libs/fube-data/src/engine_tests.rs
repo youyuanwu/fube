@@ -1596,6 +1596,93 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_cooldown_starts_after_slow_publication_releases_producer_admission() {
+    let data = Mutation {
+        id: "original".into(),
+        key: "key".into(),
+        value: "value".into(),
+    }
+    .operation_for_epoch(EPOCH)
+    .unwrap();
+    let gate = Arc::new(Semaphore::new(0));
+    let provider = Arc::new(Provider {
+        last: AtomicI64::new(1),
+        checkpoint: Mutex::new(Some(ReplayOperation { epoch: EPOCH, data })),
+        checkpoint_gate: Mutex::new(Some(gate.clone())),
+        ..Provider::default()
+    });
+    let partition = Uuid::new_v4();
+    let p = engine_with_settings(
+        partition,
+        1,
+        provider.clone(),
+        Settings {
+            queue_operations: 1,
+            retry: std::time::Duration::from_millis(400),
+            ..Settings::default()
+        },
+    );
+    initial_primary(&p).await;
+    let (network, mut incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let remote = endpoint(&network, partition, 2);
+    let mut peer = descriptor(&p);
+    peer.replica_id = 2;
+    peer.address = remote.to_string();
+    p.update_current_configuration(configuration(vec![peer], true, 2), cancel())
+        .await
+        .unwrap();
+    until(|| provider.checkpoint_calls.load(Ordering::Acquire) == 1).await;
+    let shared = p.shared.clone();
+    let (held_tx, held_rx) = std_mpsc::channel();
+    let (release_tx, release_rx) = std_mpsc::channel();
+    let blocker = std::thread::spawn(move || {
+        let _snapshot = shared.snapshot.lock().unwrap();
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(3));
+    });
+    held_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    gate.add_permits(1);
+    let replay = timeout(std::time::Duration::from_secs(1), incoming.data.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(replay.body, Body::Replication { .. }));
+    tokio::time::sleep(std::time::Duration::from_millis(850)).await;
+    assert!(
+        p.shared.admission.try_lock().is_err(),
+        "publication retains producer admission until it completes"
+    );
+    release_tx.send(()).unwrap();
+    blocker.join().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(
+        provider.checkpoint_calls.load(Ordering::Acquire),
+        1,
+        "time spent in charged fanout/publication cannot consume the producer's retry window"
+    );
+    let next = Mutation {
+        id: "next".into(),
+        key: "key".into(),
+        value: "next".into(),
+    }
+    .operation_for_epoch(EPOCH)
+    .unwrap();
+    let write = timeout(
+        std::time::Duration::from_millis(100),
+        p.submit_in_epoch(EPOCH, next, cancel()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(write.sequence, 2);
+    assert_eq!(provider.checkpoint_calls.load(Ordering::Acquire), 1);
+    p.abort();
+    network.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adopted_copy_retirement_does_not_pin_completed_writes_as_idle_history() {
     let partition = Uuid::new_v4();
     let pp = MemoryProvider::new();
