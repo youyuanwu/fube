@@ -1,10 +1,13 @@
 # Rust volatile empty-state runtime
 
-`mssf-runtime` now hosts owned stateful replicas with custom replicators, beside
+`mssf-runtime` hosts owned stateful replicas with custom replicators, beside
 stateless instances in the **same executable, code package and Runtime**.
-The qualified implementation is an **empty-state lifecycle/control-plane
-milestone, not replicated storage**. There is no application write API, data
-copy/replication stream, persistence or durability claim.
+This document describes the **default empty-state lifecycle/control-plane
+profile, not replicated storage**. That profile has no application write API
+or data copy/replication stream. The separate opt-in
+[`fube-data-v1` profile](FubeData.md) now implements volatile classic V1 data
+replication in the same mixed executable; it does not change the default empty
+policy or add persistence/durability.
 
 ## Supported profile and ownership
 
@@ -46,7 +49,28 @@ rejected.
 API: [stateful_api.rs:18-202](../../crates/libs/mssf-runtime/src/stateful_api.rs#L18-L202),
 [partition handles:357-393](../../crates/libs/mssf-runtime/src/stateful_api.rs#L357-L393),
 [registration:405](../../crates/libs/mssf-runtime/src/lib.rs#L405).
-Stateful reporting/write/storage APIs are not supplied by this seam.
+Stateful load/health/write/storage APIs are not supplied by this seam.
+
+`StatefulPartition::report_fault(FaultType)` reuses the runtime's existing
+actor-12 `RAReportFault` path, bound to the full native unit, replica incarnation
+and epochs. Its receipt means an initial local frame write, **not native
+acknowledgment, persistence or replacement**. `fault_delivery()` exposes the
+bounded retry/error/cancellation snapshot. Retries run on the installing Runtime
+executor until unit disposal, not on a calling provider/engine executor; stale
+handles and retired process authority cannot start queued fault frames.
+`fube-data`'s qualified `Engine::bind_partition` reports one transient
+notification for a terminal engine fault (including an internal provider
+barrier failure without an active RAP callback), never for normal Close/Abort
+or ordinary write backpressure/cancellation. Close/Abort cancels its receipt
+wait and joins owned cleanup; the Runtime retains only fault DTOs/authority/
+connection state for retries, not service/replicator participants. Standalone
+`Engine::bind` has no native reporting authority. These fault-delivery paths
+have source-contract tests; native recovery validation remains pending.
+
+The data profile's executed native qualification now also covers primary
+failure/replacement, copy and per-unit isolation; see [its exact evidence and
+limits](FubeData.md#executed-qualification). These results do not turn every
+internal fault-report race into an independently observed native scenario.
 
 `Replicator::remove_replica` receives an owned `ReplicaRemoval` purpose:
 `Idle` for native idle-owner removal, or `BuildRetryCleanup` for disposal of

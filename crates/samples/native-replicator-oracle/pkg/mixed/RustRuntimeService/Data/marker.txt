@@ -1,0 +1,1 @@
+Test-only mixed classic V1 package. The node, not the launcher, chooses roles.

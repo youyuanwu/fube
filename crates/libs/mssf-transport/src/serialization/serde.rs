@@ -68,7 +68,7 @@ use std::fmt;
 mod adapters;
 pub use adapters::{
     guid, CountedStrings, CountedValues, Derived, EmptyObjectArray, FixedTag, Inline, NativeEnum,
-    NativeType, NumericEnum, Pointer, RawTagged, Trailing, Typed, Untagged,
+    NativeType, NumericEnum, Pointer, RawTagged, Trailing, Typed, UInt32Array, Untagged,
 };
 
 const GUID_ADAPTER: &str = "$fabric::Guid";
@@ -80,6 +80,7 @@ const DERIVED_ADAPTER: &str = "$fabric::Derived";
 const TRAILING_ADAPTER: &str = "$fabric::Trailing";
 const STRINGS_ADAPTER: &str = "$fabric::CountedStrings";
 const VALUES_ADAPTER: &str = "$fabric::CountedValues";
+const U32_ARRAY_ADAPTER: &str = "$fabric::UInt32Array";
 const ENUM_ADAPTER: &str = "$fabric::NativeEnum";
 const NUMERIC_ENUM_ADAPTER: &str = "$fabric::NumericEnum";
 
@@ -290,6 +291,8 @@ enum Mode {
     Trailing,
     Strings,
     Values,
+    UInt32Array,
+    UInt32Element,
     StringElement,
     Enum,
     EnumPointer,
@@ -388,7 +391,14 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
     serialize_scalar!(serialize_bool, bool, boolean);
     serialize_scalar!(serialize_u16, u16, u16);
     serialize_scalar!(serialize_i32, i32, i32);
-    serialize_scalar!(serialize_u32, u32, u32);
+    fn serialize_u32(self, value: u32) -> Result<()> {
+        match self.mode {
+            Mode::Value => self.encoder.u32(value),
+            Mode::UInt32Element => self.encoder.write_unsigned_payload(u64::from(value)),
+            _ => return Err(encode_error()),
+        }
+        Ok(())
+    }
     serialize_scalar!(serialize_i64, i64, i64);
     serialize_scalar!(serialize_u64, u64, u64);
     serialize_scalar!(serialize_f64, f64, f64);
@@ -477,11 +487,12 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
             }
             (Mode::Value, STRINGS_ADAPTER) => Mode::Strings,
             (Mode::Value, VALUES_ADAPTER) => Mode::Values,
+            (Mode::Value, U32_ARRAY_ADAPTER) => Mode::UInt32Array,
             (
                 _,
                 GUID_ADAPTER | ARRAY_ADAPTER | POINTER_ADAPTER | TYPED_ADAPTER | TRAILING_ADAPTER
                 | INLINE_ADAPTER | DERIVED_ADAPTER | STRINGS_ADAPTER | ENUM_ADAPTER
-                | NUMERIC_ENUM_ADAPTER | VALUES_ADAPTER,
+                | NUMERIC_ENUM_ADAPTER | VALUES_ADAPTER | U32_ARRAY_ADAPTER,
             ) => return Err(encode_error()),
             _ => self.mode,
         };
@@ -505,7 +516,10 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
         compound.finish()
     }
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq> {
-        if !matches!(self.mode, Mode::Array | Mode::Strings | Mode::Values) {
+        if !matches!(
+            self.mode,
+            Mode::Array | Mode::Strings | Mode::Values | Mode::UInt32Array
+        ) {
             return Err(encode_error());
         }
         let len = len.ok_or_else(encode_error)?;
@@ -514,6 +528,9 @@ impl<'a> ::serde::Serializer for Serializer<'a> {
         let framing = if self.mode == Mode::Array {
             self.encoder.object_array_header(len)?;
             Framing::Array
+        } else if self.mode == Mode::UInt32Array {
+            self.encoder.u32_array_header(len)?;
+            Framing::UInt32Array
         } else {
             if len > MAX_COLLECTION_COUNT {
                 return Err(Error::InvalidInput("counted-string limit exceeded"));
@@ -659,6 +676,7 @@ enum Framing {
     Array,
     Strings,
     Values,
+    UInt32Array,
 }
 struct Compound<'a> {
     encoder: &'a mut Encoder,
@@ -677,6 +695,7 @@ impl Compound<'_> {
         let mode = match self.framing {
             Framing::Array => Mode::Object,
             Framing::Strings => Mode::StringElement,
+            Framing::UInt32Array => Mode::UInt32Element,
             Framing::Typed { .. } if self.remaining == 1 => Mode::TypeInfo,
             Framing::Typed { .. } => Mode::Fields,
             _ => Mode::Value,
@@ -687,7 +706,7 @@ impl Compound<'_> {
         })?;
         if (!matches!(
             self.framing,
-            Framing::Array | Framing::Strings | Framing::Values
+            Framing::Array | Framing::Strings | Framing::Values | Framing::UInt32Array
         ) || self.depth > 0)
             && self.encoder.bytes.len() - self.start > MAX_OBJECT_SIZE
         {
@@ -792,7 +811,14 @@ impl<'de> ::serde::Deserializer<'de> for Deserializer<'_, 'de> {
     deserialize_scalar!(deserialize_bool, boolean, visit_bool);
     deserialize_scalar!(deserialize_u16, u16, visit_u16);
     deserialize_scalar!(deserialize_i32, i32, visit_i32);
-    deserialize_scalar!(deserialize_u32, u32, visit_u32);
+    fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        let value = match self.mode {
+            Mode::Value => self.decoder.u32()?,
+            Mode::UInt32Element => self.decoder.read_unsigned_payload(32)? as u32,
+            _ => return Err(decode_error()),
+        };
+        visitor.visit_u32(value)
+    }
     deserialize_scalar!(deserialize_i64, i64, visit_i64);
     deserialize_scalar!(deserialize_u64, u64, visit_u64);
     deserialize_scalar!(deserialize_f64, f64, visit_f64);
@@ -928,10 +954,12 @@ impl<'de> ::serde::Deserializer<'de> for Deserializer<'_, 'de> {
             }
             (Mode::Value, STRINGS_ADAPTER) => Mode::Strings,
             (Mode::Value, VALUES_ADAPTER) => Mode::Values,
+            (Mode::Value, U32_ARRAY_ADAPTER) => Mode::UInt32Array,
             (
                 _,
                 GUID_ADAPTER | ARRAY_ADAPTER | POINTER_ADAPTER | TRAILING_ADAPTER | INLINE_ADAPTER
-                | DERIVED_ADAPTER | STRINGS_ADAPTER | NUMERIC_ENUM_ADAPTER | VALUES_ADAPTER,
+                | DERIVED_ADAPTER | STRINGS_ADAPTER | NUMERIC_ENUM_ADAPTER | VALUES_ADAPTER
+                | U32_ARRAY_ADAPTER,
             ) => return Err(decode_error()),
             _ => self.mode,
         };
@@ -943,11 +971,16 @@ impl<'de> ::serde::Deserializer<'de> for Deserializer<'_, 'de> {
         })
     }
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        if !matches!(self.mode, Mode::Array | Mode::Strings | Mode::Values) {
+        if !matches!(
+            self.mode,
+            Mode::Array | Mode::Strings | Mode::Values | Mode::UInt32Array
+        ) {
             return Err(decode_error());
         }
         let count = if self.mode == Mode::Array {
             self.decoder.object_array_count()?
+        } else if self.mode == Mode::UInt32Array {
+            self.decoder.u32_array_count()?
         } else {
             let count = self.decoder.u32()? as usize;
             if count > MAX_COLLECTION_COUNT || count > self.decoder.limit - self.decoder.position {
@@ -964,6 +997,8 @@ impl<'de> ::serde::Deserializer<'de> for Deserializer<'_, 'de> {
                 Mode::Object
             } else if self.mode == Mode::Strings {
                 Mode::StringElement
+            } else if self.mode == Mode::UInt32Array {
+                Mode::UInt32Element
             } else {
                 Mode::Value
             },

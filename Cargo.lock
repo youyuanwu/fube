@@ -144,6 +144,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fube-data"
+version = "0.1.0"
+dependencies = [
+ "mssf-runtime",
+ "mssf-transport",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -588,6 +600,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "native-replicator-oracle"
+version = "0.1.0"
+dependencies = [
+ "fube-data",
+ "mssf-com",
+ "mssf-core",
+ "mssf-pal",
+ "mssf-util",
+ "serde_json",
+ "tokio",
+ "uuid",
+ "windows-interface 0.100.0",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -749,9 +776,11 @@ dependencies = [
 name = "rust-runtime-app"
 version = "0.1.0"
 dependencies = [
+ "fube-data",
  "mssf-runtime",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

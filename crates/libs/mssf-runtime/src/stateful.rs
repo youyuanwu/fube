@@ -652,6 +652,15 @@ impl Registry {
                 .map_err(|_| Error::Protocol("invalid native node identity"))?,
             node_instance: request.local.node.instance,
         };
+        let reporting = crate::reporting::Reporting::new(
+            self.connection.clone(),
+            valid.clone(),
+            self.authority.clone(),
+            request.clone(),
+            cancel.clone(),
+            self.reports.clone(),
+        );
+        unit.state.lock().unwrap().reporting = Some(reporting.clone());
         let partition = StatefulPartition {
             identity: identity.clone(),
             kind: match request.unit.consistency.kind {
@@ -666,6 +675,7 @@ impl Registry {
             valid: valid.clone(),
             authority: self.authority.clone(),
             status: snapshot.clone(),
+            reporting: Some(reporting),
         };
         let factory = self
             .factories
@@ -673,14 +683,6 @@ impl Registry {
             .unwrap()
             .get(&request.service.service_type.name)
             .cloned();
-        unit.state.lock().unwrap().reporting = Some(crate::reporting::Reporting::new(
-            self.connection.clone(),
-            valid.clone(),
-            self.authority.clone(),
-            request.clone(),
-            cancel.clone(),
-            self.reports.clone(),
-        ));
         let outcome = async {
             let factory = factory.ok_or(Error::Remote {
                 code: 0x80071bd2u32 as i32 as i64,

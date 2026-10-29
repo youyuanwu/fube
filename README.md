@@ -8,9 +8,11 @@ and standalone test host in Rust.
 | [`mssf-client`](crates/libs/mssf-client) | Native clear-TCP FabricClient queries, naming, health, resolution, and notifications; no native SF library dependency. |
 | [`mssf-transport`](crates/libs/mssf-transport) | Bounded Fabric framing, serialization, and concurrent TCP messaging. |
 | [`mssf-test-host`](crates/libs/mssf-test-host) | Node-side stateless test-host subset, including manifest-based SharedProcess activation. |
-| [`mssf-runtime`](crates/libs/mssf-runtime) | Owned async stateless application runtime; real SF placement/restart without native SF libraries in the application. Linux x86-64 only. |
+| [`mssf-runtime`](crates/libs/mssf-runtime) | Owned async stateless/stateful application runtime; real SF placement/reconfiguration without native SF libraries in the application. Linux x86-64 only. |
+| [`fube-data`](crates/libs/fube-data) | Owned volatile classic V1 replication, explicit acknowledgments, copy streams and native Fabric TCP peers. |
 | [`rust-runtime-app`](crates/samples/rust-runtime-app) | Listener-backed pure-Rust ExeHost fixture deployed by real SF nodes. |
 | [`stateless-test-app`](crates/samples/stateless-test-app) | Acceptance fixture using the **real native FabricRuntime** through published `mssf` bindings. |
+| [`native-replicator-oracle`](crates/samples/native-replicator-oracle) | Isolated test-only native classic V1 reference peer; not a production dependency. |
 
 The node-side `mssf-test-host` is not an application runtime or a full SF node.
 `mssf-runtime` is a separate application-side component. Native qualification is
@@ -32,7 +34,8 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 [Development and test tiers](docs/Development.md) describe native-free tests,
 standalone native-runtime acceptance, and live onebox qualification. CI runs
 native-free tests on Linux and Windows, a separate Linux standalone-native job,
-and a Linux onebox native-client/runtime job. On Windows, build the existing
+and two independent compiler-free Linux onebox workers with a strict
+[complete-coverage aggregate](docs/Development.md#parallel-onebox-ci). On Windows, build the existing
 client/transport/test-host packages explicitly; neither native runtime profile
 is qualified there.
 
@@ -67,6 +70,7 @@ See [onebox prerequisites, lifecycle, and recovery](docs/UbuntuOnebox.md).
 - [Standalone test host](docs/runtime/RustTestHost.md) and [manifest execution](docs/runtime/ManifestTestHost.md)
 - [Rust stateless application runtime: API, limits and native evidence](docs/runtime/RustStatelessRuntime.md)
 - [Rust volatile empty-state stateful runtime: control-plane semantics and native evidence](docs/runtime/RustStatefulRuntime.md)
+- [Fube Data: volatile classic V1 replication, provider contract and executed native profile](docs/runtime/FubeData.md)
 - [Broader pure-Rust runtime design and capability tiers](docs/runtime/RustFabricRuntime.md)
 - [Migration provenance and repository boundaries](docs/Migration.md)
 

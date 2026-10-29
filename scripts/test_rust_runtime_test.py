@@ -130,6 +130,27 @@ class BinaryBundleTests(unittest.TestCase):
             runtime.observe("fabric:/Owned/Singleton", observer=binaries.observer)
         self.assertEqual(command.call_args.args[0], str(binaries.observer))
 
+    def test_injected_deployment_failure_uses_only_its_policy_cleanup_without_default_copy_or_cleanup(self):
+        binaries = runtime.load_bundle(self.bundle())
+        allocation = MagicMock()
+        allocation.name, allocation.owner, allocation.container_id = "owned", "original", "cid"
+        policy = MagicMock(spec=runtime.DeploymentPolicy)
+        policy.deploy_initial.side_effect = RuntimeError("unconfirmed native generation")
+        with patch.object(runtime, "run", return_value="native-free") as command, \
+             patch.object(runtime, "package", side_effect=AssertionError("policy owns minted packages")), \
+             patch.object(runtime, "cleanup_deployment", side_effect=AssertionError("unsafe default cleanup")) as cleanup, \
+             patch.object(runtime, "failure_artifacts", return_value={}):
+            result = runtime.qualify(allocation, full=True, binaries=binaries, stateful="three",
+                                     deployment_policy=policy)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("unconfirmed native generation", result["errors"][0])
+        policy.deploy_initial.assert_called_once_with(allocation, binaries, result)
+        policy.cleanup.assert_called_once_with(allocation, result)
+        policy.provision_upgrade.assert_not_called()
+        cleanup.assert_not_called()
+        self.assertEqual([call.args[:2] for call in command.call_args_list], [("readelf", "-d")])
+        allocation.sf.assert_not_called()
+
     def test_templates_are_strict_prebuilt_inputs(self):
         for failure in ("missing","extra","tampered","symlink","fifo","metadata-fifo"):
             directory = self.bundle(f"templates-{failure}")
@@ -410,7 +431,7 @@ class AllocationCommitTests(unittest.TestCase):
         workflow=(runtime.ROOT/".github/workflows/ci.yaml").read_text()
         step=workflow.split("- name: "+name+"\n",1)[1].split("\n    - name:",1)[0]
         shell=textwrap.dedent(step.split("      run:",1)[1].lstrip().removeprefix("|"))
-        return shlex.split(shell)
+        return shlex.split(shell.replace("\\\n",""))
 
     def test_readiness_failure_cleans_committed_owner_with_independent_absence(self):
         result=self.run_main()
@@ -481,14 +502,28 @@ class AllocationCommitTests(unittest.TestCase):
         self.assertIn("::add-mask::"+owner,output)
         if drift:
             self.replace_owner()
-        cleanup=self.workflow_command("Destroy only this job's cluster")[2]
-        with patch.dict(runtime.os.environ,{"CLUSTER_NAME":"owned"}), \
-             patch("sys.argv",["-c",owner]),contextlib.redirect_stdout(io.StringIO()):
-            if drift:
-                with self.assertRaisesRegex(RuntimeError,"owner changed"):
-                    exec(compile(cleanup,"ci-cleanup","exec"),{})
-            else:
-                exec(compile(cleanup,"ci-cleanup","exec"),{})
+        import onebox_ci
+        command=self.workflow_command("Destroy only this job's cluster")
+        self.assertEqual(command[:3],["python3","scripts/onebox_ci.py","cleanup"])
+        runner=self.root/"runner"
+        with patch.dict(runtime.os.environ,{"CLUSTER_NAME":"owned","WORKER_ROUTE":"client-runtime",
+                                            "RUNNER_TEMP":str(runner)}), \
+             patch.object(runtime,"destroy_owned",wraps=runtime.destroy_owned) as destroy, \
+             contextlib.redirect_stdout(io.StringIO()):
+            arguments=[owner if argument=="${{ steps.create_cluster.outputs.owner }}"
+                       else runtime.os.path.expandvars(argument) for argument in command[2:]]
+            # Missing producer/context is deliberate after failed readiness:
+            # the real workflow adapter must still attempt only original
+            # authority, preserve failure, and publish its cleanup observation.
+            status=onebox_ci.main(arguments)
+        self.assertEqual(status,1)
+        destroy.assert_called_once_with("owned",owner)
+        receipt=json.loads((runner/"onebox-proof/client-runtime/cleanup.json").read_text())
+        self.assertEqual(receipt["status"],"FAIL")
+        if drift:
+            self.assertIsNone(receipt["destroy"])
+        else:
+            self.assertTrue(receipt["destroy"]["absence_verified"])
         if drift:
             self.assertFalse(self.absence)
             self.assertFalse(any(args[0]=="down" for args in self.compose))
