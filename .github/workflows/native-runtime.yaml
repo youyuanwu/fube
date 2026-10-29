@@ -4,7 +4,13 @@ on:
   push:
     paths:
     - ".github/workflows/native-runtime.yaml"
-    - "scripts/*native_runtime*.py"
+    - "tests/__init__.py"
+    - "tests/run.py"
+    - "tests/suites.py"
+    - "tests/suites.toml"
+    - "tests/offline/__init__.py"
+    - "tests/native_runtime/**"
+    - "tests/offline/native_runtime/**"
     - "crates/**"
     - "Cargo.toml"
     - "Cargo.lock"
@@ -12,7 +18,13 @@ on:
   pull_request:
     paths:
     - ".github/workflows/native-runtime.yaml"
-    - "scripts/*native_runtime*.py"
+    - "tests/__init__.py"
+    - "tests/run.py"
+    - "tests/suites.py"
+    - "tests/suites.toml"
+    - "tests/offline/__init__.py"
+    - "tests/native_runtime/**"
+    - "tests/offline/native_runtime/**"
     - "crates/**"
     - "Cargo.toml"
     - "Cargo.lock"
@@ -57,11 +69,11 @@ jobs:
         dpkg-query --show libcgroup1 liblttng-ust1 libnuma1 libssh2-1
 
     - name: Test native profile preparation and diagnostics
-      run: python3 -m unittest discover -s scripts -p "test_native_runtime_test.py"
+      run: python3 -m tests.run --suite native_runtime_models
 
     - name: Extract and verify pinned native libraries (no node installation)
       timeout-minutes: 5
-      run: python3 scripts/native_runtime_test.py prepare --root "$NATIVE_ROOT"
+      run: python3 -m tests.native_runtime.runner prepare --root "$NATIVE_ROOT"
 
     - name: Build locked native app and standalone host
       timeout-minutes: 8
@@ -72,31 +84,31 @@ jobs:
     - name: Native bootstrap, finite lease polling and unregister
       timeout-minutes: 6
       run: |
-        python3 scripts/native_runtime_test.py bootstrap --root "$NATIVE_ROOT" \
+        python3 -m tests.run --suite native_bootstrap --root "$NATIVE_ROOT" \
           --diagnostics-directory "$NATIVE_DIAGNOSTICS"
 
     - name: Native Open, ping, Close and graceful reap
       timeout-minutes: 6
       run: |
-        python3 scripts/native_runtime_test.py close --root "$NATIVE_ROOT" \
+        python3 -m tests.run --suite native_close --root "$NATIVE_ROOT" \
           --diagnostics-directory "$NATIVE_DIAGNOSTICS"
 
     - name: Native independent Abort and owned forced reap
       timeout-minutes: 6
       run: |
-        python3 scripts/native_runtime_test.py abort --root "$NATIVE_ROOT" \
+        python3 -m tests.run --suite native_abort --root "$NATIVE_ROOT" \
           --diagnostics-directory "$NATIVE_DIAGNOSTICS"
 
     - name: Native manifest defaults, activation metadata, Open, caller ping and Close
       timeout-minutes: 6
       run: |
-        python3 scripts/native_runtime_test.py manifest-close --root "$NATIVE_ROOT" \
+        python3 -m tests.run --suite native_manifest_close --root "$NATIVE_ROOT" \
           --diagnostics-directory "$NATIVE_DIAGNOSTICS"
 
     - name: Native manifest overrides, Open, caller ping and independent Abort
       timeout-minutes: 6
       run: |
-        python3 scripts/native_runtime_test.py manifest-abort --root "$NATIVE_ROOT" \
+        python3 -m tests.run --suite native_manifest_abort --root "$NATIVE_ROOT" \
           --diagnostics-directory "$NATIVE_DIAGNOSTICS"
 
     - name: Retain bounded standalone host and native evidence

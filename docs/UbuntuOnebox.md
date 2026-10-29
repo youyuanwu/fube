@@ -178,7 +178,11 @@ Linux images are outside this port.
 
 The Linux onebox job in `.github/workflows/ci.yaml` builds and runs this
 single-container onebox on an Ubuntu 24.04 host, checks fresh health, then
-qualifies the native Rust client using the archived tests. Retained-data
+qualifies the native Rust client using the archived tests. The partition runner owns normal
+bootstrap, native readiness, diagnostics and teardown through the guarded
+controller; CI retains an `always()` original-capability emergency cleanup for
+interruption. Suites deploy/remove their own applications, not the cluster.
+Retained-data
 shutdown/restart and naming-store survival are qualified in
 [service-fabric-apps-rs](https://github.com/youyuanwu/service-fabric-apps-rs/blob/main/docs/UbuntuOnebox.md),
 not duplicated in this job. Local lifecycle commands and offline regression
@@ -190,7 +194,7 @@ environment variables, and arbitrary health/error text are not uploaded.
 Run the offline controller tests without Docker:
 
 ```sh
-python3 -m unittest discover -s scripts -p "test_linux*.py"
+python3 -m unittest discover -s tests/offline/cluster -t .
 ```
 
 Onebox tests also check five-node port separation, all-five-gateway readiness,

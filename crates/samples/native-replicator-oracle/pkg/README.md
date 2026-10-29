@@ -20,13 +20,13 @@ listeners. The native oracle does not use HTTP for replication.
 From a clean source checkout, build once upstream:
 
 ```sh
-python3 scripts/fube_data_test.py --build-bundle build/data-bundle
+python3 -m tests.onebox.shared.data --build-bundle build/data-bundle
 ```
 
 Qualification never invokes Cargo. Use a new allocation name and evidence path:
 
 ```sh
-python3 scripts/fube_data_test.py data-owned --prebuilt build/data-bundle \
+python3 -m tests.onebox.shared.data data-owned --prebuilt build/data-bundle \
   --profile full --report build/data-evidence.json
 ```
 

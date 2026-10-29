@@ -9,7 +9,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 
-ENTRYPOINT = Path(__file__).resolve().parents[1] / "docker/linux-cluster/node-entrypoint.py"
+from tests import ROOT
+
+ENTRYPOINT = ROOT / "docker/linux-cluster/node-entrypoint.py"
 TEMPLATE = ENTRYPOINT.with_name("ClusterManifest.template.xml")
 
 
@@ -274,8 +276,8 @@ print("stopped", flush=True)
         self.assertIn("FabricHost", stderr.write.call_args_list[0].args[0])
 
     def test_shutdown_budget_fits_inside_both_compose_grace_periods(self):
-        from linux_cluster import SHUTDOWN_TIMEOUT, generate
-        from onebox_ctl import generate as generate_onebox
+        from scripts.linux_cluster import SHUTDOWN_TIMEOUT, generate
+        from scripts.onebox_ctl import generate as generate_onebox
 
         self.assertGreater(
             SHUTDOWN_TIMEOUT, self.node.HOST_SHUTDOWN_TIMEOUT + self.node.AUXILIARY_SHUTDOWN_TIMEOUT

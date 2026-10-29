@@ -11,6 +11,9 @@ on:
       nextest-version:
         description: Pinned nextest version used to build the test archive
         value: ${{ jobs.rust-native-client.outputs.nextest-version }}
+      onebox-matrix:
+        description: Onebox partitions declared in tests/suites.toml
+        value: ${{ jobs.rust-native-client.outputs.onebox-matrix }}
 
 env:
   NEXTEST_VERSION: "0.9.146"
@@ -24,6 +27,7 @@ jobs:
       contents: read
     outputs:
       nextest-version: ${{ env.NEXTEST_VERSION }}
+      onebox-matrix: ${{ steps.suites.outputs.matrix }}
     env:
       FUBE_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
       FUBE_CI_MERGE: ${{ github.event_name == 'pull_request' && github.sha || '' }}
@@ -63,10 +67,17 @@ jobs:
       with:
         python-version: "3.12"
 
+    - name: Read declarative onebox partitions
+      id: suites
+      if: runner.os == 'Linux'
+      run: |
+        MATRIX="$(python3 -m tests.run --matrix)"
+        echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
     - name: Build and archive strict data and legacy runtime bundles
       if: runner.os == 'Linux'
       run: |
-        python3 scripts/fube_data_test.py --build-bundle "$RUNNER_TEMP/fube-data-binaries"
+        python3 -m tests.onebox.shared.data --build-bundle "$RUNNER_TEMP/fube-data-binaries"
         tar -cf "$RUNNER_TEMP/fube-data-binaries.tar" -C "$RUNNER_TEMP/fube-data-binaries" .
         # Preserve the v3 artifact contract without rebuilding its app/observer.
         tar -cf "$RUNNER_TEMP/rust-runtime-binaries.tar" -C "$RUNNER_TEMP/fube-data-binaries/legacy" .
@@ -90,7 +101,7 @@ jobs:
         retention-days: 7
 
     - name: Test Python harnesses
-      run: python -m unittest discover -s scripts -p "test_*.py"
+      run: python -m tests.run --suite offline
 
     - name: Install pinned nextest
       uses: taiki-e/install-action@v2
@@ -105,8 +116,7 @@ jobs:
 
     - name: Test isolated native-free packages
       run: |
-        cargo nextest run --archive-file "$RUNNER_TEMP/native-client-tests.tar.zst" \
-          -E 'not group(onebox)' --no-tests fail
+        python -m tests.run --suite native_free --archive "$RUNNER_TEMP/native-client-tests.tar.zst"
 
     - name: Lint native-free packages
       run: cargo clippy --locked -p fube-transport -p fube-client -p fube-test-host --all-targets -- -D warnings
@@ -130,7 +140,7 @@ jobs:
     - name: Bind exact current-attempt compiler-free inputs
       if: runner.os == 'Linux'
       run: |
-        python3 scripts/onebox_ci.py produce \
+        python3 -m tests.onebox.shared.ci produce \
           --bundle-tar "$RUNNER_TEMP/fube-data-binaries.tar" \
           --bundle-dir "$RUNNER_TEMP/fube-data-binaries" \
           --archive "$RUNNER_TEMP/native-client-tests.tar.zst" \

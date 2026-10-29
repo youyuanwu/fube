@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock, ANY
 
-import rust_runtime_test as runtime
+from tests.onebox.shared import runtime
 
 def model_binaries():
     return runtime.Binaries(Path("/prebuilt")/"app",Path("/prebuilt")/"observer","native-free",
@@ -481,44 +481,52 @@ class AllocationCommitTests(unittest.TestCase):
                     # Keep the tombstone so collision rejection reaches Docker preflight.
 
     def run_ci_create(self):
+        from tests import run as suite_run
+        from tests.onebox.shared import fixture
         output_path=self.root/"github-output"
-        command=self.workflow_command("Create native development cluster")
-        with patch.dict(runtime.os.environ,{"CLUSTER_NAME":"owned","CLUSTER_CTL":"scripts/onebox_ctl.py",
-                                            "GITHUB_OUTPUT":str(output_path)}), \
-             patch("sys.argv",[runtime.os.path.expandvars(arg) for arg in command[1:]]), \
+        arguments=["--partition","client-runtime","--name","owned",
+                   "--prebuilt",str(self.root/"bundle"),"--bundle-tar",str(self.root/"bundle.tar"),
+                   "--producer",str(self.root/"producer.json"),"--report-dir",str(self.root/"proof"),
+                   "--archive",str(self.root/"archive"),"--config-dir",str(self.root/"private"),
+                   "--fixture-owner","ci-100-1","--github-output",str(output_path)]
+        # Model interruption before normal teardown; exercise the real guarded
+        # create and the actual YAML emergency command with the captured owner.
+        with patch.object(fixture,"validate_inputs",return_value={
+                "context":{},"producer_sha256":"d"*64}), \
+             patch.object(fixture,"diagnostics"), patch.object(fixture,"cleanup_owned",return_value=1), \
              patch.object(runtime.os,"umask"), \
              contextlib.redirect_stdout(io.StringIO()) as output, \
              contextlib.redirect_stderr(io.StringIO()) as error:
-            status=runtime.onebox_ctl.main()
+            status=suite_run.main(arguments)
         return status,output_path,output.getvalue(),error.getvalue()
 
     def run_ci_failure(self,drift=False):
         status,output_path,output,error=self.run_ci_create()
         self.assertEqual(status,1)
-        self.assertIn("readiness failed",error)
+        self.assertIn("create failed: TimeoutError",error)
         self.assertTrue(output_path.exists(),"failed create skipped owner output")
         owner=output_path.read_text().strip().removeprefix("owner=")
         self.assertEqual(owner,self.original_owner)
         self.assertIn("::add-mask::"+owner,output)
         if drift:
             self.replace_owner()
-        import onebox_ci
-        command=self.workflow_command("Destroy only this job's cluster")
-        self.assertEqual(command[:3],["python3","scripts/onebox_ci.py","cleanup"])
+        from tests.onebox.shared import ci as onebox_ci
+        command=self.workflow_command("Emergency cleanup of the original allocation")
+        self.assertEqual(command[:4],["python3","-m","tests.onebox.shared.ci","cleanup"])
         runner=self.root/"runner"
         with patch.dict(runtime.os.environ,{"CLUSTER_NAME":"owned","WORKER_ROUTE":"client-runtime",
                                             "RUNNER_TEMP":str(runner)}), \
              patch.object(runtime,"destroy_owned",wraps=runtime.destroy_owned) as destroy, \
              contextlib.redirect_stdout(io.StringIO()):
-            arguments=[owner if argument=="${{ steps.create_cluster.outputs.owner }}"
-                       else runtime.os.path.expandvars(argument) for argument in command[2:]]
+            arguments=[owner if argument=="${{ steps.partition.outputs.owner }}"
+                       else runtime.os.path.expandvars(argument) for argument in command[3:]]
             # Missing producer/context is deliberate after failed readiness:
             # the real workflow adapter must still attempt only original
             # authority, preserve failure, and publish its cleanup observation.
             status=onebox_ci.main(arguments)
         self.assertEqual(status,1)
         destroy.assert_called_once_with("owned",owner)
-        receipt=json.loads((runner/"onebox-proof/client-runtime/cleanup.json").read_text())
+        receipt=json.loads((runner/"onebox-proof/client-runtime/emergency-cleanup.json").read_text())
         self.assertEqual(receipt["status"],"FAIL")
         if drift:
             self.assertIsNone(receipt["destroy"])
@@ -542,7 +550,7 @@ class AllocationCommitTests(unittest.TestCase):
             runtime.create_owned("owned")
         status,output_path,output,error=self.run_ci_create()
         self.assertEqual(status,1)
-        self.assertIn("already exists",error)
+        self.assertIn("create failed: ValueError",error)
         self.assertFalse(output_path.exists())
         self.assertNotIn("::add-mask::",output)
 
@@ -552,7 +560,7 @@ class AllocationCommitTests(unittest.TestCase):
         with patch.object(runtime.onebox_ctl.ctl,"run",side_effect=collision):
             status,output_path,output,error=self.run_ci_create()
         self.assertEqual(status,1)
-        self.assertIn("refusing adoption",error)
+        self.assertIn("create failed: ValueError",error)
         self.assertFalse(output_path.exists())
         self.assertNotIn("::add-mask::",output)
 
@@ -568,6 +576,17 @@ class AllocationCommitTests(unittest.TestCase):
         self.assertIn("owner changed",result["errors"][1])
         self.assertFalse(self.absence)
         self.assertFalse(any(args[0]=="down" for args in self.compose))
+
+    def test_fixture_diagnostics_never_inspects_a_replacement_owner(self):
+        from argparse import Namespace
+        from scripts import linux_cluster_diagnostics
+        from tests.onebox.shared import fixture
+        with patch.object(runtime.onebox_ctl.Onebox,"wait"):
+            owner=runtime.create_owned("owned")
+        self.replace_owner()
+        with patch.object(linux_cluster_diagnostics,"collect") as collect, self.assertRaises(RuntimeError):
+            fixture.diagnostics(Namespace(name="owned",report_dir=self.root/"proof",prebuilt=self.root/"bundle"),owner)
+        collect.assert_not_called()
 
 
 @unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")

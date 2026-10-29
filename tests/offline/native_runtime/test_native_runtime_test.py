@@ -11,7 +11,8 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-import native_runtime_test as profile
+from tests import ROOT
+from tests.native_runtime import runner as profile
 
 
 class PreparationTests(unittest.TestCase):
@@ -44,8 +45,7 @@ class PreparationTests(unittest.TestCase):
 
 class DiagnosticTests(unittest.TestCase):
     def test_every_scenario_has_bounded_explicit_workflow_uploads(self):
-        workflow = (pathlib.Path(__file__).resolve().parent.parent
-                    / ".github/workflows/native-runtime.yaml").read_text()
+        workflow = (ROOT / ".github/workflows/native-runtime.yaml").read_text()
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             for scenario in profile.SCENARIOS:
@@ -130,7 +130,7 @@ class ManifestFixtureTests(unittest.TestCase):
     def test_packaging_copies_only_manifests_and_selected_executable(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
-            repo = pathlib.Path(__file__).resolve().parent.parent
+            repo = ROOT
             fake_repo = root / "repo"
             (fake_repo / "target/debug").mkdir(parents=True)
             binary = fake_repo / "target/debug/stateless-test-app"

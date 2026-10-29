@@ -188,10 +188,10 @@ uniquely owned allocation name:
 
 ```sh
 cargo test --locked -p fube-runtime -p rust-runtime-app -p fube-transport -p fube-client
-python3 -m unittest discover -s scripts -p 'test_*.py'
-python3 scripts/rust_runtime_test.py --build-bundle build/stateful-binaries
+python3 -m unittest discover -s tests/offline -t . -p 'test_*.py'
+python3 -m tests.onebox.shared.runtime --build-bundle build/stateful-binaries
 # Transfer the complete bundle preserving executable modes when using another runner.
-python3 scripts/rust_runtime_test.py runtime-stateful-check \
+python3 -m tests.onebox.shared.runtime runtime-stateful-check \
   --prebuilt build/stateful-binaries --stateful three --full \
   --report build/stateful-native.json
 ```
@@ -212,7 +212,7 @@ contact. Host termination uses the corroborated native PID/executable/identity
 and pidfd exit proof, not a process-name kill. Original creation capabilities
 govern cleanup; application/type/upload and each original container/volume/
 network absence are checked independently
-([harness](../../scripts/rust_runtime_test.py),
+([harness](../../tests/onebox/shared/runtime.py),
 [observer](../../crates/libs/fube-client/examples/runtime_observer.rs)).
 The controller publishes the newly committed original owner capability before
 fallible startup/readiness; both the harness and CI retain it for teardown on

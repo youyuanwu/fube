@@ -80,7 +80,7 @@ Use the repository's Rust toolchain and Python **3.11+**. Obtain the native pack
 without installing/starting node services:
 
 ```sh
-python3 scripts/native_runtime_test.py prepare
+python3 -m tests.native_runtime.runner prepare
 ```
 
 This downloads and SHA256-verifies `ServiceFabric.U22.11.8.121.4.deb`, then uses
@@ -112,9 +112,9 @@ Runtime/Common library bytes remain SHA256-pinned. Ubuntu22's default Python
 3.10 is insufficient: supply Python **3.11+** (CI uses 3.12).
 
 ```sh
-python3 scripts/native_runtime_test.py bootstrap
-python3 scripts/native_runtime_test.py close
-python3 scripts/native_runtime_test.py abort
+python3 -m tests.native_runtime.runner bootstrap
+python3 -m tests.native_runtime.runner close
+python3 -m tests.native_runtime.runner abort
 ```
 
 Each invocation builds the app/host with `--locked` and creates fresh host,
@@ -165,7 +165,7 @@ To retain the same host/native evidence locally, add the optional diagnostics
 directory to each scenario command:
 
 ```sh
-python3 scripts/native_runtime_test.py close \
+python3 -m tests.native_runtime.runner close \
   --diagnostics-directory build/native-runtime-evidence
 ```
 
@@ -209,13 +209,14 @@ The private generated manifests, empty endpoint/principal files and null
 shared-log settings were accepted by the real runtime for this sample.
 
 Final repeated runs after native hash checks, private lock isolation and
-verification of the actual native-library mappings in the app:
+verification of the actual native-library mappings in the app. These historical
+observations predate the Python test-layout move; current commands are above.
 
-| Command | Observed evidence | Result |
+| Scenario | Observed evidence | Result |
 |---|---|---|
-| `python3 scripts/native_runtime_test.py bootstrap` | PID 341024; native runtime `08f8bcbd-71ea-ba4c-aaf9-4ea8af60e11a`; real registration/context/type callback; finite lease poll; runtime unregister | exit 0, graceful/reaped |
-| `python3 scripts/native_runtime_test.py close` | PID 341109; runtime `46f3e694-f008-0741-a37c-b5d69ab13837`; partition `76023d10-bb5c-4735-840a-a9e7558f704f`; actual endpoint `127.0.0.1:38951`; factory/Open, ping, Close, matched flags0 reply, refused endpoint, unregister | exit 0, forced=false, reaped=true |
-| `python3 scripts/native_runtime_test.py abort` | fresh PID 341196; runtime `67200dc5-c35b-8847-85b3-402f94bd1bc9`; actual endpoint `127.0.0.1:43433`; factory/Open, ping, Abort with **no Close**, matched flags4 reply, refused endpoint while alive | scenario exit 0, owned SIGKILL, forced=true, reaped=true |
+| `bootstrap` | PID 341024; native runtime `08f8bcbd-71ea-ba4c-aaf9-4ea8af60e11a`; real registration/context/type callback; finite lease poll; runtime unregister | exit 0, graceful/reaped |
+| `close` | PID 341109; runtime `46f3e694-f008-0741-a37c-b5d69ab13837`; partition `76023d10-bb5c-4735-840a-a9e7558f704f`; actual endpoint `127.0.0.1:38951`; factory/Open, ping, Close, matched flags0 reply, refused endpoint, unregister | exit 0, forced=false, reaped=true |
+| `abort` | fresh PID 341196; runtime `67200dc5-c35b-8847-85b3-402f94bd1bc9`; actual endpoint `127.0.0.1:43433`; factory/Open, ping, Abort with **no Close**, matched flags4 reply, refused endpoint while alive | scenario exit 0, owned SIGKILL, forced=true, reaped=true |
 
 These are **actual native acceptance observations**, not Rust-generated request/
 Rust-decoder roundtrips. Native-free regressions cover malformed input, stale

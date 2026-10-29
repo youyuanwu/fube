@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
-from linux_cluster import TEMPLATE, check_subnet, generate, prepare
+from scripts.linux_cluster import TEMPLATE, check_subnet, generate, prepare
 
 
 class LinuxClusterHarnessTests(unittest.TestCase):
@@ -64,7 +64,7 @@ class LinuxClusterHarnessTests(unittest.TestCase):
 
     def test_existing_output_is_rejected_before_docker_commands(self):
         with tempfile.TemporaryDirectory() as temporary:
-            with patch("linux_cluster.output") as output:
+            with patch("scripts.linux_cluster.output") as output:
                 with self.assertRaisesRegex(ValueError, "already exists"):
                     prepare("cluster", "172.30.80.0/24", "image", Path(temporary))
                 output.assert_not_called()
@@ -89,8 +89,8 @@ class LinuxClusterHarnessTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "new-run"
-            with patch("linux_cluster.output", side_effect=responses):
-                with patch("linux_cluster.subprocess.run") as run:
+            with patch("scripts.linux_cluster.output", side_effect=responses):
+                with patch("scripts.linux_cluster.subprocess.run") as run:
                     prepare("test-cluster", "172.30.80.0/24", "node", destination)
             self.assertEqual((destination / "ClusterManifest.xml").stat().st_mode & 0o777,
                              0o600)
@@ -125,8 +125,8 @@ class LinuxClusterHarnessTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "new-run"
-            with patch("linux_cluster.output", side_effect=responses):
-                with patch("linux_cluster.subprocess.run") as run:
+            with patch("scripts.linux_cluster.output", side_effect=responses):
+                with patch("scripts.linux_cluster.subprocess.run") as run:
                     with self.assertRaisesRegex(ValueError, "identity reuse"):
                         prepare("test-cluster", "172.30.80.0/24", "node", destination)
                     run.assert_not_called()
@@ -139,8 +139,8 @@ class LinuxClusterHarnessTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "local-run"
-            with patch("linux_cluster.output", side_effect=responses), \
-                    patch("linux_cluster.subprocess.run"):
+            with patch("scripts.linux_cluster.output", side_effect=responses), \
+                    patch("scripts.linux_cluster.subprocess.run"):
                 prepare("test-cluster", "172.30.80.0/24", "node", destination)
             inventory = json.loads((destination / "inventory.json").read_text())
             self.assertEqual(inventory["image"], "sha256:local")

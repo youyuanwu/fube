@@ -23,7 +23,7 @@ import uuid
 from unittest.mock import MagicMock, patch
 import xml.etree.ElementTree as ET
 
-import fube_data_test as data
+from tests.onebox.shared import data
 
 
 GRAPHS = {
@@ -3388,23 +3388,29 @@ class ReportingTests(unittest.TestCase):
         def step(identifier):
             return workflow.split("id: " + identifier + "\n", 1)[1].split("\n    - ", 1)[0]
         self.assertIn("fail-fast: false", workflow)
-        for identifier, flag, report in (("rust_data", "--profile rust", "rust-report.json"),
-                                         ("native_data", "--profile native-data", "native-data-report.json"),
-                                         ("legacy", "scripts/onebox_ci.py legacy", "legacy-report.json")):
-            block = step(identifier)
-            self.assertIn(flag, block)
-            self.assertIn(report, block)
-            self.assertIn('--prebuilt "$RUNNER_TEMP/fube-data-binaries"', block)
-            self.assertIn("if: always()", block)
-            self.assertIn("steps.validate_inputs.outcome == 'success'", block)
-            self.assertIn("steps.create_cluster.outcome == 'success'", block)
-            self.assertNotIn("cargo ", block)
-            self.assertNotIn("rustc ", block)
+        block = step("partition")
+        self.assertIn("-m tests.run", block)
+        self.assertIn('--partition "$WORKER_ROUTE"', block)
+        self.assertIn('--prebuilt "$RUNNER_TEMP/fube-data-binaries"', block)
+        self.assertIn('--github-output "$GITHUB_OUTPUT"', block)
+        self.assertIn('--bundle-tar "$RUNNER_TEMP/fube-data-artifact/fube-data-binaries.tar"', block)
+        self.assertNotIn("--owner", block)
+        self.assertNotIn("id: create_cluster", workflow)
+        self.assertNotIn("id: health", workflow)
+        self.assertIn("if: always() && steps.partition.outputs.owner != ''", workflow)
+        self.assertIn("steps.partition.outputs.cleaned != 'true'", workflow)
+        self.assertNotIn("cargo ", block)
+        self.assertNotIn("rustc ", block)
+        self.assertIn("fromJSON(needs.rust-native-client-linux.outputs.onebox-matrix)", workflow)
+        self.assertIn("pattern: onebox-worker-*-${{ github.run_id }}-${{ github.run_attempt }}", workflow)
+        self.assertIn("merge-multiple: true", workflow)
+        self.assertNotIn("name: onebox-client-runtime-", workflow)
+        self.assertNotIn("name: onebox-native-data-", workflow)
         self.assertIn("name: Linux onebox native client", workflow)
         self.assertIn("needs: [rust-native-client-linux, onebox-workers]", workflow)
-        self.assertIn("scripts/onebox_ci.py aggregate", workflow)
-        self.assertIn("scripts/onebox_ci.py cleanup", workflow)
-        self.assertLess(workflow.index("id: destroy"), workflow.index("name: Upload this worker"))
+        self.assertIn("-m tests.onebox.shared.ci aggregate", workflow)
+        self.assertIn("-m tests.onebox.shared.ci cleanup", workflow)
+        self.assertLess(workflow.index("name: Emergency cleanup"), workflow.index("name: Upload this worker"))
         self.assertNotIn("continue-on-error", workflow)
 
     def result(self, profile):

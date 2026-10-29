@@ -47,7 +47,8 @@ import uuid
 from urllib.parse import quote, urlencode, urlsplit
 import xml.etree.ElementTree as ET
 
-import rust_runtime_test as runtime
+from tests.onebox.shared import runtime
+from tests.suites import MANIFEST
 
 ROOT = runtime.ROOT
 PKG = ROOT / "crates/samples/native-replicator-oracle/pkg"
@@ -65,17 +66,8 @@ NODE_ENGINES = {
     "N0040": "rust", "N0050": "rust",
 }
 MIXED_NODES = ("N0010", "N0020", "N0030")
-COMMON_SCENARIOS = (
-    "deployment_identity", "writes_100", "identified_retry", "planned_move",
-    "replacement_copy", "copy_cancellation_recovery", "apply_ack_delay",
-    "unavailable_quorum", "lost_reply_dedup", "abrupt_primary_loss",
-    "per_unit_close", "stale_wire_receipts", "authoritative_data_loss",
-    "ledger_capacity_backpressure",
-)
-MIXED_SCENARIOS = (
-    "rust_primary_native_secondary", "native_primary_rust_secondary",
-    "native_interrupted_copy_epoch",
-)
+COMMON_SCENARIOS = tuple(MANIFEST.groups["common"])
+MIXED_SCENARIOS = tuple(MANIFEST.groups["mixed"])
 
 
 def require(condition, message: str) -> None:
@@ -867,9 +859,7 @@ def inspect_process(allocation, expected: dict, action: str = "inspect") -> dict
 
 
 def required_scenarios(profile: str) -> tuple[str, ...]:
-    require(profile in {"rust", "mixed", "full", "native-data"}, "unknown qualification profile")
-    return COMMON_SCENARIOS + (MIXED_SCENARIOS if profile != "rust" else ()) + (
-        ("legacy_full",) if profile == "full" else ())
+    return MANIFEST.scenarios(profile)
 
 
 def finalize(result: dict) -> dict:
@@ -3982,18 +3972,18 @@ def qualify(allocation, bundle: Bundle, profile: str) -> dict:
     return finalize(result)
 
 
-def main() -> None:
+def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("name", nargs="?")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--build-bundle", type=Path, help="upstream-only, NEW directory, clean source")
     mode.add_argument("--prebuilt", type=Path, help="strict bundle; no Cargo or compiler fallback")
-    parser.add_argument("--profile", choices=["rust", "mixed", "full", "native-data"])
+    parser.add_argument("--profile", choices=MANIFEST.profiles)
     parser.add_argument("--existing-owner", help="exact caller-owned allocation capability; retain allocation")
     parser.add_argument("--report", type=Path, help="NEW evidence file, never overwrite")
     parser.add_argument("--summary", action="store_true",
                         help="print bounded status only; retain complete structured evidence in --report")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if sys.platform != "linux" or os.uname().machine != "x86_64":
         parser.error("data/native qualification requires Linux x86-64")
     if args.build_bundle is not None:

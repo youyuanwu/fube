@@ -6,7 +6,10 @@ from pathlib import Path
 import subprocess
 import sys
 
-from linux_cluster_ctl import STATE_ROOT, validate_name
+if __package__:
+    from .linux_cluster_ctl import STATE_ROOT, validate_name
+else:
+    from linux_cluster_ctl import STATE_ROOT, validate_name
 
 
 def pick(record, fields):

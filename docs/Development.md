@@ -3,6 +3,109 @@
 Use the toolchain in `rust-toolchain.toml` and Python 3.11+. The workspace does
 not require `protoc`, app packaging tools, or a sibling repository.
 
+## Test layout and CI partitions
+
+Python test code lives under `tests/`; reusable cluster lifecycle commands stay
+under `scripts/`. Run module commands from the repository root, without a
+`PYTHONPATH` override. Rust unit/integration tests remain with their crates.
+[`tests/suites.toml`](../tests/suites.toml) defines suite selectors, profiles,
+timeouts, report inventories and ordered onebox partitions. Python's standard
+`tomllib` reads it; no additional framework or package is required.
+
+```text
+tests/
+  suites.toml                      suite/partition and expected coverage definitions
+  suites.py                        strict manifest validation
+  run.py                           suite runner and CI matrix output
+  offline/
+    cluster/                       lifecycle, topology, diagnostics
+    native_runtime/                standalone harness models
+    onebox/
+      client_runtime/              runtime harness models
+      native_data/                 common and mixed-native data harness models
+      shared/                      CI receipts, aggregation, partition routing
+  native_runtime/runner.py         clusterless native acceptance
+  onebox/
+    client_runtime/__main__.py     client-runtime partition alias
+    native_data/__main__.py        native-data partition alias
+    shared/
+      data.py                     replication harness and bundle producer
+      runtime.py                  runtime harness and bundle producer
+      ci.py                       input validation, cleanup, evidence aggregate
+      fixture.py                  partition-owned onebox startup and finalization
+```
+
+The two onebox directory names map to the existing `client-runtime` and
+`native-data` CI workers. The Linux producer emits the worker matrix from this
+file. CI invokes `python3 -m tests.run --partition "$WORKER_ROUTE" ...`; YAML
+retains prerequisites, pinned image building, artifact transfer and an
+`always()` emergency-cleanup step, not normal cluster lifecycle or suite lists.
+
+The manifest selects supported runners (`unittest`, archived `nextest`, data,
+strict legacy, standalone native runtime), not arbitrary shell commands.
+Unknown options/references, duplicate or unassigned onebox suites, invalid
+resource scopes and empty unittest selections fail. Each onebox suite must be
+assigned exactly once. Move a **whole suite** between partition lists to change
+distribution; shared-state scenario implementations and their order remain in
+Python. This is not automatic per-test sharding.
+
+Each partition acquires one onebox fixture. Before allocation the runner checks
+output/config paths and validates the strict current-attempt producer receipt,
+bundle tar, extracted binaries and any native-client archive. It requires the
+pinned image to be built already; there is no compiler or image-build fallback.
+The existing guarded controller creates the cluster, publishes its immutable
+original owner before fallible startup, and waits for native readiness. A fresh
+ownership/health check gates suite execution.
+
+Partition execution is ordered and non-fail-fast: a failed/timed-out suite stays
+failed while later suites still run. Suites continue owning only their minted
+applications/services, not the cluster. In `finally`, the fixture collects
+credential-safe diagnostics under the original-owner guard and destroys its
+owned allocation, independently verifying resource absence. Partial startup,
+suite interruption and diagnostic failure still attempt teardown. Replacement
+owners and colliding allocations are never adopted or deleted.
+
+`--existing-owner OWNER` (also accepted as `--owner`) explicitly reuses a
+caller-owned healthy allocation and **retains it**, including after failure.
+It publishes no emergency-destroy capability. Such retained runs cannot satisfy
+the CI aggregate's original-allocation teardown requirement. Normal partition
+commands require `--name`, `--bundle-tar`, `--prebuilt`, `--producer` and a new
+`--report-dir`; native-client partitions also require their archive, private
+config directory and fixture owner. The shared whole-profile commands below
+remain available for local qualification.
+
+In CI, `--github-output` publishes the masked original capability immediately;
+`cleaned=true` is emitted only after verified teardown. An `always()` emergency
+step retries cleanup with that exact capability when normal cleanup did not
+complete, including cancellation that prevents Python finalization. Its receipt
+is separate and cannot overwrite/heal a failed normal run. Runner loss can still
+prevent all cleanup; no in-process fixture guarantees recovery from host loss.
+
+The five native-client tests remain crate-local and execute
+through nextest, with `--no-tests fail`, before Rust data and legacy in their
+current partition. Private fixture configs/journals stay outside uploaded proof
+directories. The aggregate independently revalidates typed reports, exact
+manifest-derived coverage, `suite-outcomes.json`, its manifest hash, actual
+`fixture.json` readiness/ownership/phase evidence and original-resource cleanup.
+A command-success receipt alone cannot pass.
+
+Offline groups mirror these responsibilities and are selected by suite name:
+
+```sh
+python3 -m tests.run --suite offline
+python3 -m tests.run --suite cluster_models
+python3 -m tests.run --suite runtime_models
+python3 -m tests.run --suite data_models
+python3 -m tests.run --suite ci_models
+python3 -m tests.run --suite native_runtime_models
+python3 -m tests.run --matrix
+python3 -m tests.run --partition client-runtime --help
+```
+
+Direct `unittest discover -s tests/offline -t .` remains available for targeted
+Python debugging. The shared harness commands below retain local whole-profile
+qualification and upstream bundle production.
+
 ## Native-free checks
 
 ```sh
@@ -11,7 +114,7 @@ cargo check --locked --workspace --all-targets
 cargo test --locked -p fube-transport -p fube-client -p fube-test-host
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo doc --locked -p fube-transport -p fube-client -p fube-test-host --no-deps
-python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 -m unittest discover -s tests/offline -t . -p 'test_*.py'
 ```
 
 The live tests are ignored by ordinary `cargo test`. Offline model tests do not
@@ -22,12 +125,12 @@ establish native wire compatibility. Linux lifecycle tests skip on Windows.
 Follow [native ABI prerequisites and commands](runtime/RustTestHost.md#22-prerequisites-and-commands):
 
 ```sh
-python3 scripts/native_runtime_test.py prepare
-python3 scripts/native_runtime_test.py bootstrap
-python3 scripts/native_runtime_test.py close
-python3 scripts/native_runtime_test.py abort
-python3 scripts/native_runtime_test.py manifest-close
-python3 scripts/native_runtime_test.py manifest-abort
+python3 -m tests.native_runtime.runner prepare
+python3 -m tests.native_runtime.runner bootstrap
+python3 -m tests.native_runtime.runner close
+python3 -m tests.native_runtime.runner abort
+python3 -m tests.native_runtime.runner manifest-close
+python3 -m tests.native_runtime.runner manifest-abort
 ```
 
 The helper extracts SHA256-pinned libraries under ignored `build/`; it does not
@@ -61,10 +164,10 @@ node-side test host. It deploys a normal ExeHost to real SF nodes:
 cargo test --locked -p fube-runtime -p rust-runtime-app -p fube-transport
 cargo clippy --locked -p fube-runtime -p rust-runtime-app --all-targets -- -D warnings
 cargo doc --locked -p fube-runtime --no-deps
-python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 -m unittest discover -s tests/offline -t . -p 'test_*.py'
 just onebox-build
-python3 scripts/rust_runtime_test.py --build-bundle build/runtime-binaries
-python3 scripts/rust_runtime_test.py runtime-check --prebuilt build/runtime-binaries --full --stateful three
+python3 -m tests.onebox.shared.runtime --build-bundle build/runtime-binaries
+python3 -m tests.onebox.shared.runtime runtime-check --prebuilt build/runtime-binaries --full --stateful three
 ```
 
 Use new bundle/report paths and a unique allocation name. The last command
@@ -127,10 +230,10 @@ HTTP is only its client/observer interface.
 ```sh
 cargo test --locked -p fube-data -p fube-runtime -p rust-runtime-app -p native-replicator-oracle
 # Upstream build from clean source; use a NEW bundle directory:
-python3 scripts/fube_data_test.py --build-bundle build/data-binaries
+python3 -m tests.onebox.shared.data --build-bundle build/data-binaries
 # Compiler-free consumer; use unique allocation/report paths:
-python3 scripts/fube_data_test.py data-rust-01 --prebuilt build/data-binaries --profile rust --report build/data-rust-01.json --summary
-python3 scripts/fube_data_test.py data-full-01 --prebuilt build/data-binaries --profile full --report build/data-full-01.json --summary
+python3 -m tests.onebox.shared.data data-rust-01 --prebuilt build/data-binaries --profile rust --report build/data-rust-01.json --summary
+python3 -m tests.onebox.shared.data data-full-01 --prebuilt build/data-binaries --profile full --report build/data-full-01.json --summary
 ```
 
 | Profile | Complete scope |
@@ -179,7 +282,7 @@ itself full. Native-client reports retain their actual heterogeneous schemas;
 seven internal clear-client cases are not seven native tests.
 
 The upstream producer publishes a current-attempt receipt outside the immutable
-bundle. [`onebox_ci.py`](../scripts/onebox_ci.py) verifies actual checkout/tree,
+bundle. [`shared/ci.py`](../tests/onebox/shared/ci.py) verifies actual checkout/tree,
 PR head versus nullable merge, run/attempt, tar/archive/manifests and executable
 hashes before allocation. Each worker retains its immutable original creation
 capability through partial failure, verifies logical app/type/upload absence,
@@ -189,15 +292,19 @@ missing/failed/skipped work or cleanup cannot become green.
 
 Legacy dispatch reuses the strict outer/nested loaders and
 `NativeDataDeploymentPolicy`, including both package versions. The direct
-nested-bundle `rust_runtime_test.py` CLI is not a substitute for this hardened
+nested-bundle `tests.onebox.shared.runtime` CLI is not a substitute for this hardened
 CI adapter. Use `--profile full` above for local combined qualification.
-`python3 scripts/onebox_ci.py --help` describes the CI-only receipt commands.
+`python3 -m tests.onebox.shared.ci --help` describes the CI-only receipt commands.
 
 Artifact names include run and attempt: `onebox-inputs-*`,
-`onebox-client-runtime-*`, `onebox-native-data-*`, `onebox-aggregate-*`.
+`onebox-worker-<partition>-*`, `onebox-aggregate-*`. Worker artifacts retain their
+partition subdirectory so the aggregate can download all workers without a
+second hardcoded partition list.
 Each worker artifact includes full reports, `validated-input.json`,
-`worker-proof.json`, post-teardown `cleanup.json` and optional credential-safe
-diagnostics. No bootstrap, owner state, journals or raw logs are required.
+`suite-outcomes.json`, `fixture.json`, `worker-proof.json`, post-teardown
+`cleanup.json` and credential-safe diagnostics. Emergency cleanup, when needed,
+adds a separate `emergency-cleanup.json`. No bootstrap, owner state, journals or
+raw logs are required.
 Do not mix attempts: after partial reruns/missing inputs, start a **fresh
 complete workflow dispatch**, rather than reuse an earlier-attempt receipt.
 
