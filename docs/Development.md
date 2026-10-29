@@ -145,6 +145,7 @@ compile. Build the required binaries/examples explicitly first.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo test --locked -p fube-transport -p fube-client -p fube-test-host
+cargo test --locked -p fube-ra-store
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo doc --locked -p fube-transport -p fube-client -p fube-test-host --no-deps
 python3 -m unittest discover -s tests/offline -t . -p 'test_*.py'
@@ -153,6 +154,14 @@ python3 -m unittest discover -s tests/offline -t . -p 'test_*.py'
 The live tests are ignored by ordinary `cargo test`. Offline model tests do not
 establish native wire compatibility. Unsupported host platforms fail before
 Python test discovery.
+
+The [RA P1 store](cluster/RaStore.md) uses bundled SQLite C through
+`tokio-rusqlite`; producers need a C compiler and archiver (no SF or system
+SQLite development package). Do not override the bundled build with
+`LIBSQLITE3_SYS_USE_PKG_CONFIG` or custom `LIBSQLITE3_FLAGS`. Its nonignored
+workspace tests are automatically included in the existing `rust-tests` archive
+and resource-free `rust_tests` suite. Acceptance consumers execute that archive
+with standalone nextest; they do not compile Rust, install SQLite/SF, or start SF.
 
 ## Standalone native runtime
 

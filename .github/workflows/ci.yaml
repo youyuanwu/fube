@@ -70,7 +70,7 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check
     - name: Check production-only native-free libraries
-      run: cargo check --locked -p fube-transport -p fube-client -p fube-test-host --lib
+      run: cargo check --locked -p fube-transport -p fube-client -p fube-test-host -p fube-ra-store --lib
     - name: Lint all workspace targets and features
       run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
     - name: Build workspace API documentation

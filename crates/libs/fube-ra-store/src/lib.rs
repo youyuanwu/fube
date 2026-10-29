@@ -3,6 +3,22 @@
 //! Accepted operations outlive their callers. Dropping a wait is not rollback.
 //! Keep the [`Operation`] to observe its result, or drain with [`Store::close`].
 //! This crate does not implement RA entities, recovery or lease scheduling.
+//!
+//! ```
+//! use fube_ra_store::{Record, RecordId, Request, Settings, Store};
+//!
+//! #[tokio::main(flavor = "current_thread")]
+//! async fn main() -> fube_ra_store::Result<()> {
+//!     let store = Store::memory(Settings::default()).await?;
+//!     let ticket = store.submit(Request::Insert(Record {
+//!         key: RecordId::new("example/v1", "entity-1"),
+//!         value: b"opaque payload".to_vec(),
+//!     }))?;
+//!     ticket.wait().await?;
+//!     assert!(store.close().await?.is_clean());
+//!     Ok(())
+//! }
+//! ```
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("fube-ra-store supports Linux only");

@@ -1,6 +1,7 @@
 # Rust RA port and SQLite state-store design
 
-**Status: proposed design, not an implemented RA or SQLite backend.**
+**Status: proposed RA design. The [P1 store seam](RaStore.md) is implemented;
+P2–P5 and RA/runtime recovery are not.**
 
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's
@@ -34,7 +35,8 @@ SQLite through the usual Rust bindings includes the **C SQLite engine**.
 The RA logic is Rust and needs no native SF libraries, but this backend is not
 an all-Rust dependency stack. Keep the interface backend-independent if a
 strictly Rust-only storage implementation is later required. No dependency or
-Cargo manifest change is made by this document.
+Cargo manifest change is made by this design document; the separate P1
+implementation uses bundled SQLite through `tokio-rusqlite`.
 
 ## 2. Native implementation baseline
 
@@ -106,9 +108,10 @@ Keep the following semantics explicit:
 | Close | Stop new admission, account for queued/in-flight work, and report errors/uncertain outcomes explicitly. Dropping a caller future does not prove a worker stopped. |
 
 IDs and record types have stable encodings; do not persist a Rust enum's
-incidental ordinal or silently normalize identifiers. Values are bounded bytes
-inside a versioned envelope. The store does not reinterpret roles, epochs or
-application payloads.
+incidental ordinal or silently normalize identifiers. P1 uses bounded opaque
+bytes and versioned **store** metadata. A future versioned RA entity envelope
+belongs to P2, not the storage backend. The store does not reinterpret roles,
+epochs or application payloads.
 
 Keep the native-compatible single-record operation as the minimum interface.
 For initial partition work, place tightly coupled replica state, accepted
@@ -135,7 +138,7 @@ The minimal logical layout is:
 
 ```sql
 CREATE TABLE records (
-    record_type INTEGER NOT NULL,
+    record_type TEXT NOT NULL COLLATE BINARY,
     record_id TEXT NOT NULL COLLATE BINARY,
     value BLOB NOT NULL,
     PRIMARY KEY (record_type, record_id)
@@ -148,8 +151,9 @@ creation is an explicit bootstrap operation; opening an existing deployment
 with a missing, empty, corrupt or incompatible store fails rather than silently
 creating an empty node.
 
-The schema is not an operational CLI or already implemented migration.
-Choose the exact Rust binding and row-envelope codec during implementation.
+The schema is not an operational CLI or implemented migration. See the
+[P1 profile](RaStore.md) for the exact strict schema, metadata and selected
+binding. Future RA entity-envelope codecs belong to P2.
 Native failover-unit records are the source model, not a requirement to use
 native disk serialization. Cluster-specific command/ownership records are
 extensions, not fields that vanilla RA is claimed to persist.
@@ -303,7 +307,8 @@ rebound to the new authority.
 
 ## 9. Port sequence and evidence gates
 
-These are proposed delivery gates, not completed implementation or test results.
+These define delivery gates. P1's implementation/evidence is described in the
+[store profile](RaStore.md); P2–P5 remain proposed, not completed test results.
 They refine the [cluster milestones](PureRustCluster.md#12-delivery-milestones-and-acceptance-evidence).
 
 | Stage | Deliverable and required evidence |
@@ -346,16 +351,17 @@ SQLite solves local transactions, not state-machine correctness, app-data
 durability, distributed fencing, FM recovery or cluster consensus. Do not use
 its success to weaken runtime leases, quorum rules or native profile admission.
 
-Before implementation, select the Rust binding/build policy, stable record
-codec, schema migration procedure, finite budgets and supervised writer-failure
-policy. Add atomic batch semantics only where real cross-record invariants
+P1 selects the binding/build policy, opaque record format, finite budgets and
+supervised writer-failure policy in the [store profile](RaStore.md). Entity
+codecs and any future explicit migration procedure remain unimplemented.
+Add atomic batch semantics only where real cross-record invariants
 require them. Complete native RA parity, persisted service storage, warm app
 adoption, transparent FM restart and native database migration remain separate
 projects.
 
-The next step is a scoped implementation plan for P1/P2 plus the cluster M1
-interfaces. This document contains no runnable cluster commands, code changes,
-dependency additions or new qualification claims.
+The next work beyond P1 is P2 entity infrastructure and the cluster M1 interfaces.
+This design document itself supplies no runnable cluster commands or evidence
+of those unimplemented stages.
 
 [native-store]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Storage.Api.IKeyValueStore.h#L16-L64
 [native-adapter]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Storage.LocalStoreAdapter.cpp#L205-L245

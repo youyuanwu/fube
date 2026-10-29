@@ -307,6 +307,7 @@ impl Store {
         Ok(store)
     }
 
+    /// Fail-fast bounded admission. Once accepted, work outlives this call/ticket.
     pub fn submit(&self, request: Request) -> Result<Operation> {
         let bytes = request.charge(&self.client.settings)?;
         let mut state = lock(&self.client.shared.state);
@@ -367,6 +368,8 @@ impl Store {
         }
     }
 
+    /// Drain and observe cleanup finitely, without cancelling the owned cleanup.
+    /// Inspect the report's first failure even when this method returns Ok.
     pub async fn close(&self) -> Result<CloseReport> {
         self.client.shared.request_close();
         let mut done = self.client.shared.done.subscribe();
