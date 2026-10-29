@@ -144,6 +144,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fube-client"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "fube-transport",
+ "openapi-service-fabric",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "fube-data"
 version = "0.1.0"
 dependencies = [
@@ -151,6 +166,48 @@ dependencies = [
  "fube-transport",
  "serde",
  "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "fube-ra-store"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "fube-runtime"
+version = "0.1.0"
+dependencies = [
+ "fube-transport",
+ "libc",
+ "roxmltree",
+ "serde",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "fube-test-host"
+version = "0.1.0"
+dependencies = [
+ "fube-transport",
+ "libc",
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
+name = "fube-transport"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "serde",
  "tokio",
  "uuid",
 ]
@@ -500,21 +557,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fube-client"
-version = "0.1.0"
-dependencies = [
- "bitflags",
- "fube-transport",
- "openapi-service-fabric",
- "reqwest",
- "serde",
- "serde_json",
- "time",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "mssf-com"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -549,41 +591,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b79bdb2a3e2aa02f21b59880c1408b9c402331b0e30db69d67bbe3f4541347d"
 dependencies = [
  "windows-core 0.100.0",
-]
-
-[[package]]
-name = "fube-runtime"
-version = "0.1.0"
-dependencies = [
- "libc",
- "fube-transport",
- "roxmltree",
- "serde",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "fube-test-host"
-version = "0.1.0"
-dependencies = [
- "libc",
- "fube-transport",
- "roxmltree",
- "serde",
- "serde_json",
- "sha2",
- "uuid",
-]
-
-[[package]]
-name = "fube-transport"
-version = "0.1.0"
-dependencies = [
- "bitflags",
- "serde",
- "tokio",
- "uuid",
 ]
 
 [[package]]

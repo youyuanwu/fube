@@ -1,0 +1,9 @@
+[package]
+name = "fube-ra-store"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded logical RA typed-record storage"
+
+[dependencies]
+tokio.workspace = true
