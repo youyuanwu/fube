@@ -140,11 +140,11 @@ class ProofFiles(fixtures.ProjectFiles):
                 })
             placed = replicas[primary]
             return {
-                "observer": "mssf-client", "service": name, "partition": part,
+                "observer": "fube-client", "service": name, "partition": part,
                 "native_partition": {"target": len(members), "minimum": 1 if len(members) == 1 else 2,
                                      "status": "Ready", "epoch": {"data_loss": 1, "configuration": configuration}},
                 "replicas": replicas, "primary": {
-                    "resolver": "mssf-client", "endpoint": placed["address"],
+                    "resolver": "fube-client", "endpoint": placed["address"],
                     "native_pid": placed["rpc"]["pid"], "rpc": copy.deepcopy(placed["rpc"])},
             }
 
@@ -269,7 +269,7 @@ class ProofFiles(fixtures.ProjectFiles):
                 "observation": failed_over, "workload": workload(failure_results, len(failure_results) - (not reject_quorum)),
                 "unrelated_before": failed_over, "unrelated_after": failed_over, "auxiliary_before": auxiliary,
                 "old_auxiliary_http_status": 404, "native_departure": {
-                    "observer": "mssf-client", "node": new["node"], "service": auxiliary["service"],
+                    "observer": "fube-client", "node": new["node"], "service": auxiliary["service"],
                     "fixture_contacted": False, "deployed": []}},
             "ledger_capacity_backpressure": {
                 "observation": full, "workload": workload(capacity_results, 4096 - (not reject_quorum)),

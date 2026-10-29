@@ -6,7 +6,7 @@
 //! Current/previous apply-quorum and receive-release calculations. Missing
 //! members are missing votes, never a smaller manufactured configuration.
 
-use mssf_runtime::ReplicaSetConfiguration;
+use fube_runtime::ReplicaSetConfiguration;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PeerProgress {
@@ -89,7 +89,7 @@ pub fn configuration_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mssf_runtime::{Epoch, ReplicaInformation, ReplicaRole, ReplicationProgress};
+    use fube_runtime::{Epoch, ReplicaInformation, ReplicaRole, ReplicationProgress};
     fn config(local: bool, quorum: usize, n: usize) -> ReplicaSetConfiguration {
         ReplicaSetConfiguration {
             epoch: Epoch::INVALID,

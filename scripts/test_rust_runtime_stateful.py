@@ -19,7 +19,7 @@ def snapshot():
          "stateful":True,"persisted":False,"epoch":epoch,"service_address":"http://127.0.0.1:1/service",
          "replication_address":"http://127.0.0.1:2/control","read_status":"Granted","write_status":"Granted",
          "replicator":{"application_writes":False,"durability":False}}
-    return {"observer":"mssf-client","service":service,"partition":"partition",
+    return {"observer":"fube-client","service":service,"partition":"partition",
             "native_partition":{"target":1,"minimum":1,"status":"Ready","epoch":{"data_loss":1,"configuration":1<<32}},
             "replicas":[{"replica":7,"role":"Primary","status":"Ready","node":"node","address":rpc["service_address"],
                          "service_http_status":200,"rpc":rpc,
@@ -27,7 +27,7 @@ def snapshot():
                          "control":{"version":1,"state":"empty","partition":"partition","replica":7,"incarnation":8,
                                     "first":0,"last":0,"role":"Primary",
                                     "epoch":{"data_loss":1,"configuration":1<<32}}}],
-            "primary":{"resolver":"mssf-client","rpc":copy.deepcopy(rpc),"native_pid":11,
+            "primary":{"resolver":"fube-client","rpc":copy.deepcopy(rpc),"native_pid":11,
                        "endpoint":rpc["service_address"]}}
 
 
@@ -62,7 +62,7 @@ class StatefulEvidenceTests(unittest.TestCase):
 
     def test_native_departure_requires_independent_inventory_not_route_counters(self):
         import json
-        value={"observer":"mssf-client","node":"N0010","service":"fabric:/Owned/Stateful",
+        value={"observer":"fube-client","node":"N0010","service":"fabric:/Owned/Stateful",
                "fixture_contacted":False,"deployed":[{"replica_id":7}]}
         def once(check,*_):return check()
         with patch.object(runtime,"wait_condition",side_effect=once),patch.object(runtime,"run",side_effect=lambda *_args,**_kwargs:json.dumps(value)):

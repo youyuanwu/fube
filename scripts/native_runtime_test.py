@@ -133,10 +133,10 @@ def main():
     missing = [line.strip() for line in checked.stdout.splitlines() if "not found" in line]
     if missing:
         raise ValueError(f"missing native ABI prerequisites: {', '.join(missing)}")
-    subprocess.run(["cargo", "build", "--locked", "-p", "mssf-test-host",
+    subprocess.run(["cargo", "build", "--locked", "-p", "fube-test-host",
                     "-p", "stateless-test-app"], cwd=repo, check=True, timeout=180)
     if args.action.startswith("manifest-"):
-        subprocess.run(["cargo", "build", "--locked", "-p", "mssf-test-host",
+        subprocess.run(["cargo", "build", "--locked", "-p", "fube-test-host",
                         "--example", "manifest_acceptance"],
                        cwd=repo, check=True, timeout=180)
         package = manifest_fixture(repo, root)
@@ -146,7 +146,7 @@ def main():
             args.action.removeprefix("manifest-"),
         ], repo, args.diagnostics_directory, args.action)
     return run_host([
-        str(repo / "target/debug/mssf-test-host"), str(native), str(dependencies),
+        str(repo / "target/debug/fube-test-host"), str(native), str(dependencies),
         str(repo / "target/debug/stateless-test-app"), str(root), args.action,
     ], repo, args.diagnostics_directory, args.action)
 

@@ -673,7 +673,7 @@ def replica_identity(rpc):
 
 
 def data_snapshot(value, profile, service=None, target=3, minimum=2):
-    require(value.get("observer") == "mssf-client" and text(value.get("service"))
+    require(value.get("observer") == "fube-client" and text(value.get("service"))
             and text(value.get("partition")) and (service is None or value["service"] == service),
             "independent native data observation identity")
     native = value["native_partition"]
@@ -720,7 +720,7 @@ def data_snapshot(value, profile, service=None, target=3, minimum=2):
     primary, placed = value["primary"], primaries[0]
     # The resolver's HTTP observation is taken after the placed-replica poll.
     # ACK/completion progress may advance between them without a new mutation.
-    require(primary.get("resolver") == "mssf-client" and primary.get("endpoint") == placed["address"]
+    require(primary.get("resolver") == "fube-client" and primary.get("endpoint") == placed["address"]
             and same(primary.get("native_pid"), placed["rpc"]["pid"])
             and replica_identity(primary["rpc"]) == replica_identity(placed["rpc"])
             and all(same(primary["rpc"].get(key), placed["rpc"][key])
@@ -1074,7 +1074,7 @@ def validate_essential_data(value, profile, built):
                             snapshot["primary"]["rpc"]]),
             "per-unit disposal must preserve the unrelated main provider boundary and retained results")
     departure = close["native_departure"]
-    require(departure.get("observer") == "mssf-client" and departure.get("fixture_contacted") is False
+    require(departure.get("observer") == "fube-client" and departure.get("fixture_contacted") is False
             and departure.get("service") == auxiliary["service"] and departure.get("node") == aux["node"]
             and type(departure.get("deployed")) is list
             and all(integer(item.get("replica_id"), 1) and item["replica_id"] != aux["replica"]

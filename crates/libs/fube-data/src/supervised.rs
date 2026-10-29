@@ -11,7 +11,7 @@
 use crate::{
     Cancellation, Epoch, OperationData, OperationDataStream, ReplayOperation, Result, StateProvider,
 };
-use mssf_runtime::{ServiceFuture, StatefulCallbackGuard, StatefulPartition};
+use fube_runtime::{ServiceFuture, StatefulCallbackGuard, StatefulPartition};
 use std::{
     future::Future,
     pin::Pin,

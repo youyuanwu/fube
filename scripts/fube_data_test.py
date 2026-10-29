@@ -172,7 +172,7 @@ def build_bundle(directory: Path) -> None:
         "native-replicator-oracle": ROOT / "target/debug/native-replicator-oracle",
     }
     graphs = {name: runtime.run("cargo", "tree", "--locked", "-p",
-                               "mssf-client" if name == "runtime_observer" else name)
+                               "fube-client" if name == "runtime_observer" else name)
               for name in ENGINES}
     validate_graphs(graphs)
     for name, source in sources.items():
@@ -543,7 +543,7 @@ def native_snapshot(bundle: Bundle, service: str) -> dict:
     text = runtime.run(str(bundle.observer), "127.0.0.1:19000", service, "--stateful", timeout=60)
     require(len(text) <= MAX_RESPONSE and len(text.splitlines()) == 1, "bounded native data observation")
     value = strict_json(text)
-    require(isinstance(value, dict) and value.get("observer") == "mssf-client"
+    require(isinstance(value, dict) and value.get("observer") == "fube-client"
             and value.get("service") == service and value.get("partition"), "native observer service identity")
     return value
 
@@ -555,7 +555,7 @@ def identity(replica: dict) -> tuple:
 
 def assert_data(value: dict, service: str, mixed: bool, target: int = 3, minimum: int = 2,
                 *, require_full: bool = True) -> dict:
-    require(value.get("observer") == "mssf-client" and value.get("service") == service,
+    require(value.get("observer") == "fube-client" and value.get("service") == service,
             "native data service identity")
     native = value["native_partition"]
     require(native["target"] == target and native["minimum"] == minimum and native["status"] == "Ready",
@@ -628,7 +628,7 @@ def assert_data(value: dict, service: str, mixed: bool, target: int = 3, minimum
             "actual partition is not mixed")
     primary = value["primary"]
     placed = next(r for r in ready if r["role"] == "Primary")
-    require(primary["resolver"] == "mssf-client"
+    require(primary["resolver"] == "fube-client"
             and primary["endpoint"] == placed["address"] and primary["native_pid"] == placed["rpc"]["pid"]
             and all(primary["rpc"][key] == placed["rpc"][key]
                     for key in ("partition", "replica", "incarnation", "node", "host", "pid")),

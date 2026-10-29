@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/libs/mssf-transport",
-  "crates/libs/mssf-client",
-  "crates/libs/mssf-test-host",
-  "crates/libs/mssf-runtime",
+  "crates/libs/fube-transport",
+  "crates/libs/fube-client",
+  "crates/libs/fube-test-host",
+  "crates/libs/fube-runtime",
   "crates/libs/fube-data",
   "crates/samples/stateless-test-app",
   "crates/samples/rust-runtime-app",
@@ -12,9 +12,9 @@ members = [
 ]
 
 [workspace.dependencies]
-mssf-transport = { path = "./crates/libs/mssf-transport" }
-mssf-client = { path = "./crates/libs/mssf-client" }
-mssf-runtime = { path = "./crates/libs/mssf-runtime" }
+fube-transport = { path = "./crates/libs/fube-transport" }
+fube-client = { path = "./crates/libs/fube-client" }
+fube-runtime = { path = "./crates/libs/fube-runtime" }
 fube-data = { path = "./crates/libs/fube-data" }
 mssf-core = "0.10"
 mssf-util = "0.10"

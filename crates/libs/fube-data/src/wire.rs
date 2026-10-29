@@ -18,7 +18,7 @@
 //!
 //! These are payload/header codecs, not a connection, security handshake, or
 //! replication engine. Framing and security-provider rejection belong to
-//! `mssf_transport::frame::Frame`. Native interoperability requires execution
+//! `fube_transport::frame::Frame`. Native interoperability requires execution
 //! against an independently built native peer; these codecs alone do not prove it.
 //!
 //! Bounds are 1 MiB and 1024 buffers per operation, 1024 operations per batch,
@@ -28,8 +28,8 @@
 
 use std::{fmt, net::Ipv6Addr, str::FromStr};
 
-use mssf_runtime::Epoch;
-use mssf_transport::{
+use fube_runtime::Epoch;
+use fube_transport::{
     frame::MAX_FRAME_SIZE,
     message::{Header, Message, MessageId, ACTION, MESSAGE_ID},
     serialization::{Decoder, Encoder, MAX_COLLECTION_COUNT, MAX_STRING_UNITS},

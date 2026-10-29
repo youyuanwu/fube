@@ -89,13 +89,13 @@ Propose two workspace crates under the existing `crates/libs/*` member pattern:
 ```text
 Application
     |
-mssf-client
+fube-client
     public owned models and async APIs
     FabricClient / ServiceNotificationClient (independent owners)
     operation schemas / query result dispatch
     gateway manager / uncached resolution / notification sessions
     |
-mssf-transport
+fube-transport
     Fabric serialization / native headers / message IDs
     TCP frame codec / request correlation / control-message dispatch
     Tokio connection driver / rustls security state machine
@@ -105,19 +105,19 @@ Tokio TcpStream + rustls ClientConnection
 Native Service Fabric gateway
 ```
 
-`mssf-transport` owns the common native messaging protocol, not the public
-`IFabricTransportClient` API. `mssf-client` adds gateway operations directly.
+`fube-transport` owns the common native messaging protocol, not the public
+`IFabricTransportClient` API. `fube-client` adds gateway operations directly.
 This preserves the native architecture's sibling relationship between
 FabricClient and FabricTransport without implementing application service
 paths, logical service `Connect`, or application-header splitting.
 [Source: [native client transport adapter][native-tcp-adapter].]
 
-Keep serialization and framing as pure modules inside `mssf-transport`; do not
+Keep serialization and framing as pure modules inside `fube-transport`; do not
 introduce a separate crate or code-generation tool until reuse warrants it.
 Initially use this structure:
 
 ```text
-crates/libs/mssf-transport/src/
+crates/libs/fube-transport/src/
     serialization/       typed primitives, objects, scopes, limits
     headers/             records, known schemas, unknown records
     frame.rs             fixed framing and CRCs
@@ -126,7 +126,7 @@ crates/libs/mssf-transport/src/
     security.rs          rustls driver and certificate policy
     request_reply.rs     pending requests and duplex routing
 
-crates/libs/mssf-client/src/
+crates/libs/fube-client/src/
     client.rs            cloneable public handle and builder
     gateway.rs           endpoint selection and establishment
     protocol/            versioned operation bodies and envelopes

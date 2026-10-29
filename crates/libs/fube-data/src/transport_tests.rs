@@ -674,13 +674,13 @@ async fn malformed_security_and_identity_only_retire_the_offending_session() {
         } else if attack == 2 {
             message
                 .headers
-                .push(mssf_transport::message::Header::actor(7).unwrap());
+                .push(fube_transport::message::Header::actor(7).unwrap());
         } else if attack == 3 {
             message.headers.push(message.headers[0].clone());
         } else if attack == 4 {
             message
                 .headers
-                .push(mssf_transport::message::Header::boolean(0x8029, true).unwrap());
+                .push(fube_transport::message::Header::boolean(0x8029, true).unwrap());
         }
         let mut bytes = message.to_frame().unwrap().encode().unwrap();
         if attack == 0 {

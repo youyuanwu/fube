@@ -1,7 +1,7 @@
 # Fube Data: volatile classic V1 replication
 
 `fube-data` is an owned Rust replication engine, separate from the SF-facing
-control contract in `mssf-runtime`. It implements a **qualified subset** of
+control contract in `fube-runtime`. It implements a **qualified subset** of
 classic V1: ordered nonzero sequences, explicit application acknowledgments,
 current/previous configuration quorums, epoch reconciliation, bounded copy and
 replication streams, retries and native Fabric TCP peers. Native SF nodes remain
@@ -16,7 +16,7 @@ universal V1 parity is promised. Acknowledgment is not disk durability.
 ## Components and selection
 
 ```text
-native node -- Hosting/RAP control --> mssf-runtime
+native node -- Hosting/RAP control --> fube-runtime
                                       |
                          fube-data Engine (owned Rust)
                          |                         |
@@ -24,7 +24,7 @@ native node -- Hosting/RAP control --> mssf-runtime
               copy/apply + explicit ACK     Rust or native classic V1
 ```
 
-`fube-data` depends on `mssf-runtime` and `mssf-transport`, not the reverse.
+`fube-data` depends on `fube-runtime` and `fube-transport`, not the reverse.
 It reuses bounded framing/serialization but owns peer listener/session policy,
 not the gateway client's connection assumptions. Production engine/runtime/app
 have no FabricRuntime, FabricCommon, COM or native replicator dependency.

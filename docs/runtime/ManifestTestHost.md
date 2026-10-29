@@ -19,10 +19,10 @@ package/
       <Program and regular dependencies>
 ```
 
-After building `mssf-test-host`, supply existing native/dependency/run directories:
+After building `fube-test-host`, supply existing native/dependency/run directories:
 
 ```sh
-target/debug/mssf-test-host manifest \
+target/debug/fube-test-host manifest \
   NATIVE_DIRECTORY DEPENDENCY_DIRECTORY PACKAGE_DIRECTORY RUN_PARENT \
   close fabric:/MyApplication Count=1
 ```
@@ -45,11 +45,11 @@ not an interactive host that leaves the service running for external clients.
 
 ## Small library API
 
-[`run_manifest`](../../crates/libs/mssf-test-host/src/lib.rs#L402) accepts
+[`run_manifest`](../../crates/libs/fube-test-host/src/lib.rs#L402) accepts
 `ManifestOptions`, `Scenario::{Close, Abort}` and a synchronous observer returning
 the host's `Result<()>`. Options contain native/dependency/package/run-parent
 directories, application URI and an ordered vector of parameter pairs.
-[`validate_manifest`](../../crates/libs/mssf-test-host/src/lib.rs#L31) validates
+[`validate_manifest`](../../crates/libs/fube-test-host/src/lib.rs#L31) validates
 the package without native libraries, materialization or process creation.
 
 Observers receive `LifecycleEvent { stage, endpoint, pid }` first at `Opened`, then
@@ -58,7 +58,7 @@ liveness is checked before and after. The endpoint is an opaque application stri
 including possibly empty. Observers may independently probe the application while
 Open and prove shutdown after the terminal callback; the host imposes no IP:port,
 ping or diagnostic-marker convention. The
-[acceptance example](../../crates/libs/mssf-test-host/examples/manifest_acceptance.rs)
+[acceptance example](../../crates/libs/fube-test-host/examples/manifest_acceptance.rs)
 shows fixture-specific ping/refusal, intentionally outside general host admission.
 
 Observers are trusted synchronous code and **must enforce their own I/O/work
@@ -137,7 +137,7 @@ The stateful kvmap and guest/placement smoke packages do **not** run unchanged.
 
 ## Native materialization and readiness
 
-The [materializer](../../crates/libs/mssf-test-host/src/deployment.rs#L96) writes:
+The [materializer](../../crates/libs/fube-test-host/src/deployment.rs#L96) writes:
 
 ```text
 deployment/<ApplicationTypeName>_App1/

@@ -12,7 +12,7 @@ use crate::{
     Cancellation, Epoch, Error, OperationData, OperationDataStream, ReplayOperation, Result,
     StateProvider,
 };
-use mssf_runtime::ServiceFuture;
+use fube_runtime::ServiceFuture;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,

@@ -12,9 +12,9 @@ and does not support TLS or authentication.
 
 ## 1. What is implemented
 
-`mssf-transport` implements bounded Fabric serialization, clear frames and CRCs,
+`fube-transport` implements bounded Fabric serialization, clear frames and CRCs,
 ordered native headers, client-only ListenInstance establishment, and
-continuously driven, bounded concurrent Tokio request/reply I/O. `mssf-client`
+continuously driven, bounded concurrent Tokio request/reply I/O. `fube-client`
 adds native gateway ping, NameExists, typed node/application/service pages, node health and
 single-name creation/deletion, with owned results and explicit errors. Additional
 typed pages cover service partitions, partition replicas/stateless instances and
@@ -67,13 +67,13 @@ Run from the repository root:
 just onebox-build
 just onebox create poc
 
-cargo run -p mssf-client --example onebox -- \
+cargo run -p fube-client --example onebox -- \
   --clear 127.0.0.1:19000 ping
 
-cargo run -p mssf-client --example onebox -- \
+cargo run -p fube-client --example onebox -- \
   --clear 127.0.0.1:19000 node-list
 
-cargo run -p mssf-client --example onebox -- \
+cargo run -p fube-client --example onebox -- \
   --clear 127.0.0.1:19000 node-health N0020 \
   --events-filter 8 --warning-as-error true
 ```
@@ -93,10 +93,10 @@ curl --noproxy '*' --fail --silent --show-error \
   --data '{"Name":"fabric:/rust-poc-existing"}' \
   'http://127.0.0.1:19080/Names/$/Create?api-version=6.0'
 
-cargo run -p mssf-client --example onebox -- \
+cargo run -p fube-client --example onebox -- \
   --clear 127.0.0.1:19000 name-exists fabric:/rust-poc-existing
 
-cargo run -p mssf-client --example onebox -- \
+cargo run -p fube-client --example onebox -- \
   --clear 127.0.0.1:19000 name-exists fabric:/rust-poc-absent
 ```
 
@@ -111,14 +111,14 @@ that belongs only to you on your disposable allocation:
 
 ```sh
 owned_name="fabric:/rust-poc-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
-cargo run -p mssf-client --example onebox -- \
+cargo run -p fube-client --example onebox -- \
   --clear 127.0.0.1:19000 name-exists "$owned_name"
 # Proceed only after confirming absence; never adopt an existing name.
-cargo run -p mssf-client --example onebox -- \
+cargo run -p fube-client --example onebox -- \
   --clear 127.0.0.1:19000 create-name "$owned_name" --timeout-seconds 5
-cargo run -p mssf-client --example onebox -- \
+cargo run -p fube-client --example onebox -- \
   --clear 127.0.0.1:19000 name-exists "$owned_name"
-cargo run -p mssf-client --example onebox -- \
+cargo run -p fube-client --example onebox -- \
   --clear 127.0.0.1:19000 delete-name "$owned_name" --timeout-seconds 5
 ```
 
@@ -143,9 +143,9 @@ just onebox destroy poc --confirm poc
 ## 3. Rust API and lifecycle
 
 ```rust,no_run
-use mssf_client::{FabricClient, DEFAULT_TIMEOUT};
+use fube_client::{FabricClient, DEFAULT_TIMEOUT};
 
-# async fn example() -> mssf_client::Result<()> {
+# async fn example() -> fube_client::Result<()> {
 let endpoint = "127.0.0.1:19000".parse().expect("IP socket endpoint");
 let client = FabricClient::connect_clear(endpoint, DEFAULT_TIMEOUT).await?;
 let clone = client.clone();
@@ -176,7 +176,7 @@ shared driver; the supported URI grammar is unchanged.
 For example, with a unique caller-owned name on a disposable cluster:
 
 ```rust,no_run
-# async fn write(client: &mssf_client::FabricClient, owned_name: &str) -> mssf_client::Result<()> {
+# async fn write(client: &fube_client::FabricClient, owned_name: &str) -> fube_client::Result<()> {
 client.create_name(owned_name, Some(std::time::Duration::from_secs(5))).await?;
 client.delete_name(owned_name, None).await?;
 # Ok(())
@@ -197,8 +197,8 @@ disconnect after sending **does not establish that the write failed to execute**
 replication may commit after local waiting stops. Dropping the future or closing
 the connection does not roll back a sent write.
 
-Implementation: [write facade](../../crates/libs/mssf-client/src/lib.rs#L85-L136)
-and [empty-success decoder](../../crates/libs/mssf-client/src/protocol.rs#L165-L171).
+Implementation: [write facade](../../crates/libs/fube-client/src/lib.rs#L85-L136)
+and [empty-success decoder](../../crates/libs/fube-client/src/protocol.rs#L165-L171).
 Native contract: [public request construction](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/client/FabricClientImpl.cpp#L6881-L6976)
 and [gateway create reply](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/EntreeService.CreateNameAsyncOperation.cpp#L24-L49).
 
@@ -346,11 +346,11 @@ the emitted native request bytes, validation and CLI arguments are unchanged.
 
 ```rust,no_run
 use std::num::NonZeroU64;
-use mssf_client::{
+use fube_client::{
     FabricClient, NodeQueryDescription, NodeQueryParameters, NodeStatusFilter, Paging,
 };
 
-# async fn pages(client: &FabricClient) -> mssf_client::Result<()> {
+# async fn pages(client: &FabricClient) -> fube_client::Result<()> {
 let mut query = NodeQueryDescription {
     parameters: NodeQueryParameters {
         status_filter: NodeStatusFilter::UP | NodeStatusFilter::DOWN,
@@ -404,12 +404,12 @@ stream. Nonempty deactivation/safety variants have source/model coverage only.
 ### Native node health
 
 ```rust,no_run
-use mssf_client::{
+use fube_client::{
     FabricClient, HealthEventsFilter, NodeHealthPolicy, NodeHealthQueryDescription,
     NodeHealthQueryParameters,
 };
 
-# async fn health(client: &FabricClient) -> mssf_client::Result<()> {
+# async fn health(client: &FabricClient) -> fube_client::Result<()> {
 let mut query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("N0020"));
 query.parameters.events_filter = Some(HealthEventsFilter::ERROR.into());
 query.parameters.health_policy = Some(NodeHealthPolicy { consider_warning_as_error: true });
@@ -448,7 +448,7 @@ No raw JSON/arguments, node-ID selector, paging, health-statistics, child filter
 or full cluster-health policy API is exposed. Policy/filter arguments are JSON
 **strings within the native binary query map**, not an HTTP request.
 See the public types in
-[`health.rs`](../../crates/libs/mssf-client/src/health.rs).
+[`health.rs`](../../crates/libs/fube-client/src/health.rs).
 
 Each `HealthEvent` includes source/property, signed TTL ticks, reported state,
 description, signed sequence, source/modified timestamps, expiry/removal flags,
@@ -479,12 +479,12 @@ public C API pointer layout or safety-check-style derived scope.
 
 ```rust,no_run
 use std::{num::NonZeroU64, time::Duration};
-use mssf_client::{
+use fube_client::{
     ApplicationListFilter, ApplicationQueryDescription, ApplicationQueryParameters, FabricClient,
     Paging, ServiceListFilter, ServiceQueryDescription, ServiceQueryParameters,
 };
 
-# async fn workloads(client: &FabricClient) -> mssf_client::Result<()> {
+# async fn workloads(client: &FabricClient) -> fube_client::Result<()> {
 let mut applications = ApplicationQueryDescription {
     parameters: ApplicationQueryParameters {
         filter: ApplicationListFilter::TypeName("MyApplicationType".into()),
@@ -580,10 +580,10 @@ invented empty page.
 CLI commands print exactly one owned page, including continuation:
 
 ```sh
-cargo run -p mssf-client --example onebox -- \
+cargo run -p fube-client --example onebox -- \
   --clear 127.0.0.1:19000 application-list --type MyApplicationType \
   --exclude-parameters true --max-results 1 --timeout-seconds 5
-cargo run -p mssf-client --example onebox -- \
+cargo run -p fube-client --example onebox -- \
   --clear 127.0.0.1:19000 service-list fabric:/MyApplication \
   --type MyServiceType --max-results 1
 ```
@@ -621,13 +621,13 @@ to service names and application selectors.
 
 ```rust,no_run
 use std::time::Duration;
-use mssf_client::{
+use fube_client::{
     DeployedApplicationQueryDescription, DeployedApplicationQueryParameters,
     FabricClient, PartitionQueryDescription, PartitionQueryParameters,
     ReplicaQueryDescription, ReplicaQueryParameters,
 };
 
-# async fn topology(client: &FabricClient, partition_id: uuid::Uuid) -> mssf_client::Result<()> {
+# async fn topology(client: &FabricClient, partition_id: uuid::Uuid) -> fube_client::Result<()> {
 let mut partitions = PartitionQueryDescription::new(PartitionQueryParameters::new(
     "fabric:/MyApplication/MyService".parse()?,
 ));
@@ -745,14 +745,14 @@ rather than ignoring unsupported controls. This also tightens the shared
 
 ```rust,no_run
 use std::time::Duration;
-use mssf_client::{
+use fube_client::{
     FabricClient, DeployedServicePackageQueryDescription,
     DeployedServicePackageQueryParameters, DeployedCodePackageQueryDescription,
     DeployedCodePackageQueryParameters, DeployedReplicaQueryDescription,
     DeployedReplicaQueryParameters,
 };
 
-# async fn inspect(client: &FabricClient) -> mssf_client::Result<()> {
+# async fn inspect(client: &FabricClient) -> fube_client::Result<()> {
 let application = "fabric:/MyApplication".parse()?;
 let packages = DeployedServicePackageQueryDescription::new(
     DeployedServicePackageQueryParameters::new("N0010", application),
@@ -835,18 +835,18 @@ live. No TLS or cross-release compatibility is claimed.
 
 ### Uncached resolution and independent notifications
 
-Both clients live in `mssf-client`, but neither owns the other or shares its
+Both clients live in `fube-client`, but neither owns the other or shares its
 socket/session. Notification-only applications need no `FabricClient`; multiple
 notification clients can coexist. Each connection duration sets that client's
 remote-operation default. `None` uses that default, not infinity.
 
 ```rust
-use mssf_client::{
+use fube_client::{
     FabricClient, NamingUri, PartitionKey, ServiceNotificationClient,
     ServiceNotificationFilter, DEFAULT_TIMEOUT,
 };
 
-# async fn example() -> mssf_client::NotificationResult<()> {
+# async fn example() -> fube_client::NotificationResult<()> {
 let endpoint = "127.0.0.1:19000".parse().unwrap();
 let ordinary = FabricClient::connect_clear(endpoint, DEFAULT_TIMEOUT).await?;
 let mut changes =
@@ -995,13 +995,13 @@ explicitly. General native forward compatibility is not claimed.
 
 ### 4.1 Native Serde payloads
 
-`mssf_transport::serialization::serde` provides `to_vec` / `from_slice` over
+`fube_transport::serialization::serde` provides `to_vec` / `from_slice` over
 the existing bounded native codec, not a JSON, bincode or postcard encoding.
 Ordered native-shaped models use ordinary Serde derives and explicit field
 adapters without parallel wire records:
 
 ```rust
-use mssf_transport::{
+use fube_transport::{
     message::ListenInstance,
     serialization::serde::{from_slice, to_vec},
 };
@@ -1019,7 +1019,7 @@ assert_eq!(from_slice::<ListenInstance>(&bytes).unwrap(), value);
 | Named struct / multi-field tuple struct | One ordered native object. Fields follow declaration order; field names/renames do not appear on the wire. |
 | Newtype struct | Transparent; `struct Wrapper(T)` does **not** add an object. Use a named one-field struct when an object wrapper is required. |
 | `Guid([u8; 16])` | Native GUID metadata and Windows field-order bytes, e.g. `Uuid::to_bytes_le()`, not UUID network order or byte-array metadata. |
-| `#[serde(with = "mssf_transport::serialization::serde::guid")]` | The same explicit GUID mapping on an existing `[u8; 16]` field, without a parallel record or changing its public type. |
+| `#[serde(with = "fube_transport::serialization::serde::guid")]` | The same explicit GUID mapping on an existing `[u8; 16]` field, without a parallel record or changing its public type. |
 | `ByteArray<T>` | Native byte-array metadata; encode Vec/slice/array bytes, decode `ByteArray<Vec<u8>>`. |
 | `ObjectArray<T>` | Native object-array metadata even when empty; encode a Vec/slice of struct-shaped elements, decode `ObjectArray<Vec<Row>>`. |
 | `EmptyObjectArray` | A required object-array slot that must have zero elements; rejects nonempty arrays and wrong metadata. |
@@ -1233,11 +1233,11 @@ See the [backend contract and compiling example][native-serde],
 [transport payloads][serde-messages], [query DTOs][serde-query],
 [health reply declaration][serde-health] and [list validation][serde-lists].
 
-[native-serde]: ../../crates/libs/mssf-transport/src/serialization/serde.rs
-[serde-messages]: ../../crates/libs/mssf-transport/src/message.rs#L12-L123
-[serde-query]: ../../crates/libs/mssf-client/src/query_protocol.rs
-[serde-health]: ../../crates/libs/mssf-client/src/health_protocol.rs
-[serde-lists]: ../../crates/libs/mssf-client/src/list_protocol.rs
+[native-serde]: ../../crates/libs/fube-transport/src/serialization/serde.rs
+[serde-messages]: ../../crates/libs/fube-transport/src/message.rs#L12-L123
+[serde-query]: ../../crates/libs/fube-client/src/query_protocol.rs
+[serde-health]: ../../crates/libs/fube-client/src/health_protocol.rs
+[serde-lists]: ../../crates/libs/fube-client/src/list_protocol.rs
 
 ## 5. Offline and native qualification
 
@@ -1246,10 +1246,10 @@ test-group filters. Ordinary checks need neither onebox nor native client
 libraries:
 
 ```sh
-cargo nextest run --locked -p mssf-transport -p mssf-client \
+cargo nextest run --locked -p fube-transport -p fube-client \
   -E 'not group(onebox)' --no-tests fail
-cargo clippy --locked -p mssf-transport -p mssf-client --all-targets -- -D warnings
-cargo doc --locked -p mssf-transport -p mssf-client --no-deps
+cargo clippy --locked -p fube-transport -p fube-client --all-targets -- -D warnings
+cargo doc --locked -p fube-transport -p fube-client --no-deps
 ```
 
 **Live onebox exchanges are the wire-compatibility authority.** Offline tests
@@ -1319,7 +1319,7 @@ export MSSF_NAME_OWNER="poc-unique-task-id"
 export MSSF_LIST_CONFIG="$PWD/build/poc-native/list-config.json"
 export MSSF_LIST_REPORT="$PWD/build/poc-native/list-report.json"
 export MSSF_LIST_OWNER="poc-unique-task-id"
-cargo nextest archive --locked -p mssf-transport -p mssf-client \
+cargo nextest archive --locked -p fube-transport -p fube-client \
   --archive-file build/poc-native/native-client-tests.tar.zst
 export MSSF_TEST_ARCHIVE_SHA256="$(sha256sum build/poc-native/native-client-tests.tar.zst | cut -d ' ' -f 1)"
 cargo nextest run --archive-file build/poc-native/native-client-tests.tar.zst \
@@ -1572,7 +1572,7 @@ The Linux Rust job compiles the selected packages' test binaries, including
 ignored onebox cases, into a Zstandard-compressed tar archive:
 
 ```sh
-cargo nextest archive --locked -p mssf-transport -p mssf-client \
+cargo nextest archive --locked -p fube-transport -p fube-client \
   --archive-file build/native-client-tests.tar.zst
 cargo nextest run --archive-file build/native-client-tests.tar.zst \
   -E 'not group(onebox)' --no-tests fail
@@ -1630,7 +1630,7 @@ It requires a new disposable onebox, an explicit absolute
 `allocation`, exact controller `allocation_owner`, `endpoint`, `runtime`,
 workload `owner`, and absolute fresh `journal`/`report` paths. The allocation's
 private state must match owner/name/runtime and be ready.
-The [Rust fixture setup](../../crates/libs/mssf-client/tests/support/notification_setup.rs)
+The [Rust fixture setup](../../crates/libs/fube-client/tests/support/notification_setup.rs)
 can generate a new profile when `MSSF_NOTIFICATION_ALLOCATION` explicitly names
 the owned allocation and `MSSF_NOTIFICATION_JOURNAL`/`MSSF_NOTIFICATION_REPORT`
 provide absolute fresh output paths. It reads the allocation's actual owner and
@@ -1642,7 +1642,7 @@ Never select these mutating fixture tests against a shared or pre-existing
 allocation that you do not exclusively own.
 
 ```sh
-cargo nextest archive --locked -p mssf-transport -p mssf-client \
+cargo nextest archive --locked -p fube-transport -p fube-client \
   --archive-file build/native-client-tests.tar.zst
 export MSSF_TEST_ARCHIVE_SHA256="$(sha256sum build/native-client-tests.tar.zst | cut -d ' ' -f 1)"
 mkdir -p build/notification-evidence

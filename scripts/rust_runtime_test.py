@@ -4,7 +4,7 @@
 Default: create/qualify/destroy one exact owned onebox. --existing-owner is an
 explicit capability for a caller-owned allocation; it never destroys that box.
 Only normal management deployment is performed through sfctl. All application
-hosting/lifecycle is Rust IPC; resolution is independently mssf-client.
+hosting/lifecycle is Rust IPC; resolution is independently fube-client.
 """
 from __future__ import annotations
 
@@ -106,7 +106,7 @@ def digest(path: Path) -> str:
 
 def build_binaries() -> Binaries:
     run("cargo", "build", "--locked", "-p", "rust-runtime-app")
-    run("cargo", "build", "--locked", "-p", "mssf-client", "--example", "runtime_observer")
+    run("cargo", "build", "--locked", "-p", "fube-client", "--example", "runtime_observer")
     graph = run("cargo", "tree", "--locked", "-p", "rust-runtime-app")
     validate_dependency_graph(graph)
     return Binaries(DEFAULT_APP, DEFAULT_OBSERVER, graph)
@@ -330,7 +330,7 @@ def observe(service: str, key: str | None = None, *, observer: Path = DEFAULT_OB
     if len(lines) != 1:
         raise RuntimeError("singleton acceptance requires exactly one endpoint")
     observed = json.loads(lines[0])
-    if observed["resolver"] != "mssf-client" or observed["rpc"]["service"] != service:
+    if observed["resolver"] != "fube-client" or observed["rpc"]["service"] != service:
         raise RuntimeError("independent observation identity mismatch")
     if observed["rpc"]["pid"] != observed["native_pid"]:
         raise RuntimeError("native query did not confirm serving process")
@@ -346,7 +346,7 @@ def stateful_observe(service: str, *, observer: Path = DEFAULT_OBSERVER) -> dict
 
 def assert_stateful(value: dict, service: str, count: int, minimum: int) -> dict:
     """Native placement/discovery/deployment and actual HTTP must all agree."""
-    if value.get("observer") != "mssf-client" or value.get("service") != service:
+    if value.get("observer") != "fube-client" or value.get("service") != service:
         raise RuntimeError("stateful observer/service mismatch")
     partition = value["native_partition"]
     if partition["target"] != count or partition["minimum"] != minimum or partition["status"] != "Ready":
@@ -385,7 +385,7 @@ def assert_stateful(value: dict, service: str, count: int, minimum: int) -> dict
             raise RuntimeError("secondary incorrectly serves the primary route")
     primary = value["primary"]
     placed = next(replica for replica in ready if replica["role"] == "Primary")
-    if (primary["resolver"] != "mssf-client" or primary["rpc"]["pid"] != primary["native_pid"]
+    if (primary["resolver"] != "fube-client" or primary["rpc"]["pid"] != primary["native_pid"]
         or primary["rpc"]["role"] != "Primary"
         or any(primary["rpc"][field] != placed["rpc"][field] for field in ("service","partition","replica","incarnation","node","host","pid"))
         or primary["endpoint"] not in {replica["address"] for replica in ready if replica["role"] == "Primary"}):
@@ -421,7 +421,7 @@ def observe_many(service: str, *, observer: Path = DEFAULT_OBSERVER) -> list[dic
     values=[json.loads(line) for line in text.splitlines()]
     if not 1<=len(values)<=5 or len({v["rpc"]["node"] for v in values})!=len(values):
         raise RuntimeError("mixed stateless endpoint/node cardinality")
-    if any(v["resolver"]!="mssf-client" or v["rpc"]["service"]!=service
+    if any(v["resolver"]!="fube-client" or v["rpc"]["service"]!=service
            or v["native_pid"]!=v["rpc"]["pid"] for v in values):
         raise RuntimeError("mixed native discovery/deployment/HTTP mismatch")
     return values
@@ -462,7 +462,7 @@ def wait_native_replica_absent(observer: Path, service: str, node: str, replica:
     """RA inventory is independent of route teardown and callback counters."""
     def check():
         value=json.loads(run(str(observer),"127.0.0.1:19000",service,"--deployed-replicas",node,timeout=30))
-        if (value.get("observer")!="mssf-client" or value.get("node")!=node
+        if (value.get("observer")!="fube-client" or value.get("node")!=node
             or value.get("service")!=service or value.get("fixture_contacted") is not False
             or not isinstance(value.get("deployed"),list)
             or any(not isinstance(v,dict) or type(v.get("replica_id")) is not int for v in value.get("deployed",[]))):

@@ -36,7 +36,7 @@ components. Absence of a cluster does not remove those dependencies.
 
 ### 2.1 Supported boundary
 
-[`mssf-test-host`](../../crates/libs/mssf-test-host/src/lib.rs) is a native-free
+[`fube-test-host`](../../crates/libs/fube-test-host/src/lib.rs) is a native-free
 Rust library and thin CLI. It controls
 [`stateless-test-app`](../../crates/samples/stateless-test-app/src/main.rs),
 which uses **mssf-core 0.10 and the real native FabricRuntime**. It also accepts
@@ -316,7 +316,7 @@ See [node-side architecture](FabricRuntimeHost.md) for the complete responsibili
 
 ## 4. Proposed implementation shape
 
-Use one `mssf-test-host` crate with a Rust library and a thin CLI initially:
+Use one `fube-test-host` crate with a Rust library and a thin CLI initially:
 
 ```text
 test scenario / optional CLI
@@ -330,14 +330,14 @@ TestHost: scenario state, owned resources, deadlines and event journal
       +-- local report sink: load/fault/health outcomes
       +-- application probe: real RPC, separate from protocol decoding
       |
-generic Fabric IPC server over mssf-transport primitives
+generic Fabric IPC server over fube-transport primitives
       |
 real app process: native FabricRuntime + service implementation
 ```
 
 Keep protocol and scenario state in the library; a CLI must not be the only
 way tests observe an ordered event or own the child lifetime. Reuse serialization,
-frames, message/header primitives and bounded I/O from `mssf-transport`.
+frames, message/header primitives and bounded I/O from `fube-transport`.
 Its current connection driver is client-only and its reverse path is
 NamingGateway-notification-specific, so it is **not already the required server**.
 [Existing transport limitations](RustFabricRuntime.md#3-what-this-repository-can-actually-reuse).

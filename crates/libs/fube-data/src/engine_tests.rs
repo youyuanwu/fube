@@ -2371,8 +2371,8 @@ impl NativeControlView for SourceNativeView {
     }
     fn report_fault(
         &self,
-        _: mssf_runtime::FaultType,
-    ) -> ServiceFuture<'_, mssf_runtime::FaultDelivery> {
+        _: fube_runtime::FaultType,
+    ) -> ServiceFuture<'_, fube_runtime::FaultDelivery> {
         Box::pin(async { Err(Error::Closed) })
     }
 }
@@ -2393,7 +2393,7 @@ fn prewrite_status() -> ReplicaStatus {
             ..EPOCH
         },
         configuration_stage: ConfigurationStage::PreWriteRevoke,
-        catch_up: mssf_runtime::CatchUpResult::NotStarted,
+        catch_up: fube_runtime::CatchUpResult::NotStarted,
         minimum_replica_set_size: 1,
         configuration: vec![],
         service_address: String::new(),
@@ -2408,7 +2408,7 @@ fn primary_status() -> ReplicaStatus {
         current_epoch: EPOCH,
         previous_epoch: Epoch::INVALID,
         configuration_stage: ConfigurationStage::Current,
-        catch_up: mssf_runtime::CatchUpResult::Completed,
+        catch_up: fube_runtime::CatchUpResult::Completed,
         ..prewrite_status()
     }
 }
@@ -2451,7 +2451,7 @@ async fn native_singleton_requires_stable_runtime_membership_not_primary_role_al
     let variants: &[fn(&mut ReplicaStatus)] = &[
         |s: &mut ReplicaStatus| s.lifecycle = ReplicaLifecycle::Closing,
         |s: &mut ReplicaStatus| s.configuration_stage = ConfigurationStage::CatchUp,
-        |s: &mut ReplicaStatus| s.catch_up = mssf_runtime::CatchUpResult::NotStarted,
+        |s: &mut ReplicaStatus| s.catch_up = fube_runtime::CatchUpResult::NotStarted,
         |s: &mut ReplicaStatus| s.current_epoch = NEXT_EPOCH,
         |s: &mut ReplicaStatus| s.replicator_open = false,
         |s: &mut ReplicaStatus| s.service_role = ReplicaRole::Secondary,
@@ -2719,7 +2719,7 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
     status.configuration_stage = ConfigurationStage::CatchUp;
     assert_eq!(
         status.access().1,
-        mssf_runtime::AccessStatus::ReconfigurationPending
+        fube_runtime::AccessStatus::ReconfigurationPending
     );
     *view.0.lock().unwrap() = Ok(status);
     p.update_epoch(NEXT_EPOCH, cancel()).await.unwrap();
@@ -2728,7 +2728,7 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
     // Engine readiness after UpdateEpoch is not the independent native gate.
     assert_eq!(
         view.status().unwrap().access().1,
-        mssf_runtime::AccessStatus::ReconfigurationPending
+        fube_runtime::AccessStatus::ReconfigurationPending
     );
     p.update_catch_up_configuration(current, previous, cancel())
         .await
@@ -2737,7 +2737,7 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
         .await
         .unwrap();
     let mut status = view.status().unwrap();
-    status.catch_up = mssf_runtime::CatchUpResult::Completed;
+    status.catch_up = fube_runtime::CatchUpResult::Completed;
     *view.0.lock().unwrap() = Ok(status);
     p.change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
         .await
@@ -2968,7 +2968,7 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
     status.current_epoch = NEXT_EPOCH;
     status.previous_epoch = EPOCH;
     status.configuration_stage = ConfigurationStage::CatchUp;
-    status.catch_up = mssf_runtime::CatchUpResult::NotStarted;
+    status.catch_up = fube_runtime::CatchUpResult::NotStarted;
     status.configuration = vec![descriptor(&old)];
     *view.0.lock().unwrap() = Ok(status);
     let mut current = configuration(vec![], true, 1);
@@ -3444,7 +3444,7 @@ impl StateProvider for ControlledProvider {
 }
 
 struct FaultNativeView {
-    faults: Mutex<Vec<mssf_runtime::FaultType>>,
+    faults: Mutex<Vec<fube_runtime::FaultType>>,
     pending: bool,
     active: Arc<AtomicUsize>,
     disposed: Arc<AtomicUsize>,
@@ -3467,8 +3467,8 @@ impl NativeControlView for FaultNativeView {
     }
     fn report_fault(
         &self,
-        fault: mssf_runtime::FaultType,
-    ) -> ServiceFuture<'_, mssf_runtime::FaultDelivery> {
+        fault: fube_runtime::FaultType,
+    ) -> ServiceFuture<'_, fube_runtime::FaultDelivery> {
         Box::pin(async move {
             self.faults.lock().unwrap().push(fault);
             self.active.fetch_add(1, Ordering::AcqRel);
@@ -3479,7 +3479,7 @@ impl NativeControlView for FaultNativeView {
             if self.pending {
                 std::future::pending::<()>().await;
             }
-            Ok(mssf_runtime::FaultDelivery {
+            Ok(fube_runtime::FaultDelivery {
                 fault,
                 attempts: 1,
                 last_error: None,
@@ -3568,7 +3568,7 @@ async fn internal_provider_fault_notifies_once_and_pending_receipt_cannot_block_
             .unwrap();
             assert_eq!(
                 *view.faults.lock().unwrap(),
-                vec![mssf_runtime::FaultType::Transient]
+                vec![fube_runtime::FaultType::Transient]
             );
             assert_eq!(view.active.load(Ordering::Acquire), 0);
             assert_eq!(view.disposed.load(Ordering::Acquire), 1);

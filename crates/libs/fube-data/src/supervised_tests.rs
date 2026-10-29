@@ -3,7 +3,7 @@
 
 //! Public provider/stream contracts, with a private accounting probe instead of
 //! manufacturing a native partition. The real public guard/process fence is
-//! tested by mssf-runtime; neither set of tests claims native Node execution.
+//! tested by fube-runtime; neither set of tests claims native Node execution.
 
 use super::*;
 use crate::Error;
