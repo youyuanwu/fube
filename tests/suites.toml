@@ -1,0 +1,143 @@
+version = 1
+
+[scenario_groups]
+common = [
+  "deployment_identity", "writes_100", "identified_retry", "planned_move",
+  "replacement_copy", "copy_cancellation_recovery", "apply_ack_delay",
+  "unavailable_quorum", "lost_reply_dedup", "abrupt_primary_loss",
+  "per_unit_close", "stale_wire_receipts", "authoritative_data_loss",
+  "ledger_capacity_backpressure",
+]
+mixed = [
+  "rust_primary_native_secondary", "native_primary_rust_secondary",
+  "native_interrupted_copy_epoch",
+]
+legacy = ["legacy_full"]
+
+[profiles]
+rust = ["common"]
+mixed = ["common", "mixed"]
+full = ["common", "mixed", "legacy"]
+native-data = ["common", "mixed"]
+
+[suites.offline]
+kind = "unittest"
+resource = "none"
+timeout = 900
+start = "tests/offline"
+pattern = "test_*.py"
+
+[suites.cluster_models]
+kind = "unittest"
+resource = "none"
+timeout = 300
+start = "tests/offline/cluster"
+pattern = "test_*.py"
+
+[suites.native_runtime_models]
+kind = "unittest"
+resource = "none"
+timeout = 300
+start = "tests/offline/native_runtime"
+pattern = "test_*.py"
+
+[suites.runtime_models]
+kind = "unittest"
+resource = "none"
+timeout = 300
+start = "tests/offline/onebox/client_runtime"
+pattern = "test_*.py"
+
+[suites.data_models]
+kind = "unittest"
+resource = "none"
+timeout = 900
+start = "tests/offline/onebox/native_data"
+pattern = "test_*.py"
+
+[suites.ci_models]
+kind = "unittest"
+resource = "none"
+timeout = 600
+start = "tests/offline/onebox/shared"
+pattern = "test_*.py"
+
+[suites.native_free]
+kind = "nextest"
+resource = "none"
+timeout = 900
+filter = "not group(onebox)"
+ignored = false
+reports = []
+
+[suites.native_clients]
+kind = "nextest"
+resource = "onebox"
+timeout = 1800
+filter = "group(onebox)"
+ignored = true
+reports = [
+  "client/native-client-report.json", "client/native-health-report.json",
+  "client/native-name-report.json", "client/native-list-report.json",
+  "client/native-notification-report.json",
+]
+
+[suites.rust_data]
+kind = "data"
+resource = "onebox"
+timeout = 4500
+profile = "rust"
+report = "rust-report.json"
+
+[suites.legacy]
+kind = "legacy"
+resource = "onebox"
+timeout = 4500
+report = "legacy-report.json"
+
+[suites.native_data]
+kind = "data"
+resource = "onebox"
+timeout = 9000
+profile = "native-data"
+report = "native-data-report.json"
+
+[suites.native_bootstrap]
+kind = "native-runtime"
+resource = "native-runtime"
+timeout = 360
+action = "bootstrap"
+
+[suites.native_close]
+kind = "native-runtime"
+resource = "native-runtime"
+timeout = 360
+action = "close"
+
+[suites.native_abort]
+kind = "native-runtime"
+resource = "native-runtime"
+timeout = 360
+action = "abort"
+
+[suites.native_manifest_close]
+kind = "native-runtime"
+resource = "native-runtime"
+timeout = 360
+action = "manifest-close"
+
+[suites.native_manifest_abort]
+kind = "native-runtime"
+resource = "native-runtime"
+timeout = 360
+action = "manifest-abort"
+
+[partitions.client-runtime]
+id = "cr"
+timeout_minutes = 180
+suites = ["native_clients", "rust_data", "legacy"]
+
+[partitions.native-data]
+id = "nd"
+timeout_minutes = 180
+suites = ["native_data"]

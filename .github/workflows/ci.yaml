@@ -27,22 +27,15 @@ jobs:
     name: Linux onebox (${{ matrix.route }})
     needs: rust-native-client-linux
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: ${{ matrix.timeout }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
-      matrix:
-        include:
-        - route: client-runtime
-          id: cr
-        - route: native-data
-          id: nd
+      matrix: ${{ fromJSON(needs.rust-native-client-linux.outputs.onebox-matrix) }}
     env:
       WORKER_ROUTE: ${{ matrix.route }}
       CLUSTER_NAME: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
-      CLUSTER_CTL: scripts/onebox_ctl.py
-      CLUSTER_STATE_ROOT: build/oneboxes
       FUBE_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
       FUBE_CI_MERGE: ${{ github.event_name == 'pull_request' && github.sha || '' }}
       FUBE_CI_RUN_ID: ${{ github.run_id }}
@@ -71,7 +64,7 @@ jobs:
         path: ${{ runner.temp }}/onebox-inputs
 
     - name: Download native-client test archive
-      if: matrix.route == 'client-runtime'
+      if: matrix.archive
       uses: actions/download-artifact@v8
       with:
         name: native-client-tests
@@ -79,36 +72,17 @@ jobs:
 
     - name: Extract strict inputs into a new directory
       run: |
-        python3 -c 'import os,tarfile; from pathlib import Path; root=Path(os.environ["RUNNER_TEMP"]); target=root/"fube-data-binaries"; target.mkdir(); tarfile.open(root/"fube-data-artifact/fube-data-binaries.tar").extractall(target,filter="data"); (root/"onebox-proof"/os.environ["WORKER_ROUTE"]).mkdir(parents=True); (root/"onebox-proof"/os.environ["WORKER_ROUTE"]/"client").mkdir() if os.environ["WORKER_ROUTE"]=="client-runtime" else None'
-
-    - name: Validate strict current-attempt inputs before allocation
-      id: validate_inputs
-      run: |
-        if [ "$WORKER_ROUTE" = client-runtime ]; then
-          python3 scripts/onebox_ci.py validate --route "$WORKER_ROUTE" \
-            --receipt "$RUNNER_TEMP/onebox-inputs/onebox-input-receipt.json" \
-            --bundle-tar "$RUNNER_TEMP/fube-data-artifact/fube-data-binaries.tar" \
-            --bundle-dir "$RUNNER_TEMP/fube-data-binaries" \
-            --archive "$RUNNER_TEMP/native-client-tests/native-client-tests.tar.zst" \
-            --out "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/validated-input.json"
-        else
-          python3 scripts/onebox_ci.py validate --route "$WORKER_ROUTE" \
-            --receipt "$RUNNER_TEMP/onebox-inputs/onebox-input-receipt.json" \
-            --bundle-tar "$RUNNER_TEMP/fube-data-artifact/fube-data-binaries.tar" \
-            --bundle-dir "$RUNNER_TEMP/fube-data-binaries" \
-            --out "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/validated-input.json"
-        fi
+        python3 -c 'import os,tarfile; from pathlib import Path; root=Path(os.environ["RUNNER_TEMP"]); target=root/"fube-data-binaries"; target.mkdir(); tarfile.open(root/"fube-data-artifact/fube-data-binaries.tar").extractall(target,filter="data"); (root/"onebox-proof"/os.environ["WORKER_ROUTE"]).mkdir(parents=True)'
 
     - name: Install pinned nextest
       id: install_nextest
-      if: matrix.route == 'client-runtime'
+      if: matrix.archive
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-nextest@${{ needs.rust-native-client-linux.outputs.nextest-version }}
         fallback: none
 
     - name: Check runner prerequisites
-      if: always() && steps.validate_inputs.outcome == 'success'
       run: |
         docker info
         docker compose version
@@ -118,122 +92,53 @@ jobs:
 
     - name: Test Linux lifecycle harnesses
       id: lifecycle
-      if: always() && steps.validate_inputs.outcome == 'success'
-      run: python3 -m unittest discover -s scripts -p "test_linux*.py"
+      run: python3 -m tests.run --suite cluster_models
 
     - name: Build pinned Ubuntu image
       id: image
-      if: always() && steps.validate_inputs.outcome == 'success' && steps.lifecycle.outcome == 'success'
       run: docker build --tag sf-apps-onebox:11.8.121.4 --file docker/onebox/Dockerfile docker
 
-    - name: Create native development cluster
-      id: create_cluster
-      if: always() && steps.validate_inputs.outcome == 'success' && steps.image.outcome == 'success'
-      run: python3 "$CLUSTER_CTL" create "$CLUSTER_NAME" --github-output "$GITHUB_OUTPUT"
-
-    - name: Check fresh cluster health
-      id: health
-      if: always() && steps.create_cluster.outcome == 'success'
-      run: python3 "$CLUSTER_CTL" status "$CLUSTER_NAME"
-
-    - name: Exercise real native reads, health, lists and owned fixtures
-      id: native_clients
-      if: always() && matrix.route == 'client-runtime' && steps.validate_inputs.outcome == 'success' && steps.create_cluster.outcome == 'success' && steps.health.outcome == 'success' && steps.install_nextest.outcome == 'success'
+    - name: Run the declared partition with its onebox fixture
+      id: partition
       run: |
-        export MSSF_TEST_ARCHIVE_SHA256="$(sha256sum "$RUNNER_TEMP/native-client-tests/native-client-tests.tar.zst" | cut -d ' ' -f 1)"
-        python3 -c 'import os; f=open(os.environ["GITHUB_OUTPUT"],"a"); f.write("archive_sha256="+os.environ["MSSF_TEST_ARCHIVE_SHA256"]+"\n"); f.close()'
-        cargo-nextest nextest run \
-          --archive-file "$RUNNER_TEMP/native-client-tests/native-client-tests.tar.zst" \
-          --workspace-remap "$GITHUB_WORKSPACE" \
-          --run-ignored all -E 'group(onebox)' --no-tests fail --no-fail-fast
-      env:
-        MSSF_TEST_CONFIG: ${{ runner.temp }}/native-client-config.json
-        MSSF_TEST_REPORT: ${{ runner.temp }}/onebox-proof/client-runtime/client/native-client-report.json
-        MSSF_HEALTH_CONFIG: ${{ runner.temp }}/native-health-config.json
-        MSSF_HEALTH_REPORT: ${{ runner.temp }}/onebox-proof/client-runtime/client/native-health-report.json
-        MSSF_HEALTH_OWNER: ci-${{ github.run_id }}-${{ github.run_attempt }}
-        MSSF_NAME_CONFIG: ${{ runner.temp }}/native-name-config.json
-        MSSF_NAME_REPORT: ${{ runner.temp }}/onebox-proof/client-runtime/client/native-name-report.json
-        MSSF_NAME_OWNER: ci-${{ github.run_id }}-${{ github.run_attempt }}
-        MSSF_LIST_CONFIG: ${{ runner.temp }}/native-list-config.json
-        MSSF_LIST_REPORT: ${{ runner.temp }}/onebox-proof/client-runtime/client/native-list-report.json
-        MSSF_LIST_OWNER: ci-${{ github.run_id }}-${{ github.run_attempt }}
-        MSSF_NOTIFICATION_CONFIG: ${{ runner.temp }}/native-notification-config.json
-        MSSF_NOTIFICATION_ALLOCATION: ${{ env.CLUSTER_NAME }}
-        MSSF_NOTIFICATION_JOURNAL: ${{ runner.temp }}/native-notification-journal.json
-        MSSF_NOTIFICATION_REPORT: ${{ runner.temp }}/onebox-proof/client-runtime/client/native-notification-report.json
+        ARGS=(--partition "$WORKER_ROUTE" --name "$CLUSTER_NAME"
+          --bundle-tar "$RUNNER_TEMP/fube-data-artifact/fube-data-binaries.tar"
+          --prebuilt "$RUNNER_TEMP/fube-data-binaries"
+          --producer "$RUNNER_TEMP/onebox-inputs/onebox-input-receipt.json"
+          --github-output "$GITHUB_OUTPUT"
+          --report-dir "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE")
+        if [ "${{ matrix.archive }}" = true ]; then
+          ARGS+=(--archive "$RUNNER_TEMP/native-client-tests/native-client-tests.tar.zst"
+            --config-dir "$RUNNER_TEMP/onebox-configs"
+            --fixture-owner "ci-${{ github.run_id }}-${{ github.run_attempt }}")
+        fi
+        python3 -m tests.run "${ARGS[@]}"
 
-    - name: Qualify the complete Rust-only data profile
-      id: rust_data
-      if: always() && matrix.route == 'client-runtime' && steps.validate_inputs.outcome == 'success' && steps.create_cluster.outcome == 'success' && steps.health.outcome == 'success'
-      timeout-minutes: 75
-      run: |
-        python3 scripts/fube_data_test.py "$CLUSTER_NAME" --existing-owner "${{ steps.create_cluster.outputs.owner }}" \
-          --prebuilt "$RUNNER_TEMP/fube-data-binaries" --profile rust --summary \
-          --report "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/rust-report.json"
-
-    - name: Qualify the complete hardened legacy runtime profile
-      id: legacy
-      if: always() && matrix.route == 'client-runtime' && steps.validate_inputs.outcome == 'success' && steps.create_cluster.outcome == 'success' && steps.health.outcome == 'success'
-      timeout-minutes: 75
-      run: |
-        python3 scripts/onebox_ci.py legacy --name "$CLUSTER_NAME" --owner "${{ steps.create_cluster.outputs.owner }}" \
-          --prebuilt "$RUNNER_TEMP/fube-data-binaries" \
-          --producer "$RUNNER_TEMP/onebox-inputs/onebox-input-receipt.json" \
-          --report "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/legacy-report.json"
-
-    - name: Qualify the complete baseline native-data chain
-      id: native_data
-      if: always() && matrix.route == 'native-data' && steps.validate_inputs.outcome == 'success' && steps.create_cluster.outcome == 'success' && steps.health.outcome == 'success'
-      timeout-minutes: 150
-      run: |
-        python3 scripts/fube_data_test.py "$CLUSTER_NAME" --existing-owner "${{ steps.create_cluster.outputs.owner }}" \
-          --prebuilt "$RUNNER_TEMP/fube-data-binaries" --profile native-data --summary \
-          --report "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/native-data-report.json"
-
-    - name: Capture credential-safe diagnostics
-      if: always() && steps.create_cluster.outputs.owner != ''
-      timeout-minutes: 2
-      run: |
-        python3 scripts/linux_cluster_diagnostics.py "$CLUSTER_NAME" --onebox \
-          --output "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/diagnostics.json"
-
-    - name: Destroy only this job's cluster
-      id: destroy
-      if: always() && steps.create_cluster.outputs.owner != ''
+    - name: Emergency cleanup of the original allocation
+      if: always() && steps.partition.outputs.owner != '' && steps.partition.outputs.cleaned != 'true'
       timeout-minutes: 4
       run: |
-        python3 scripts/onebox_ci.py cleanup --name "$CLUSTER_NAME" \
-          --owner "${{ steps.create_cluster.outputs.owner }}" --route "$WORKER_ROUTE" \
+        python3 -m tests.onebox.shared.ci cleanup --name "$CLUSTER_NAME" \
+          --owner "${{ steps.partition.outputs.owner }}" --route "$WORKER_ROUTE" \
           --producer "$RUNNER_TEMP/onebox-inputs/onebox-input-receipt.json" \
-          --report "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/cleanup.json"
+          --report "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/emergency-cleanup.json"
 
     - name: Seal actual suite and post-teardown evidence
       if: always()
-      env:
-        VALIDATE_OUTCOME: ${{ steps.validate_inputs.outcome || 'skipped' }}
-        CREATE_OUTCOME: ${{ steps.create_cluster.outcome || 'skipped' }}
-        NATIVE_CLIENTS_OUTCOME: ${{ steps.native_clients.outcome || 'skipped' }}
-        NATIVE_ARCHIVE_SHA256: ${{ steps.native_clients.outputs.archive_sha256 || '' }}
-        RUST_DATA_OUTCOME: ${{ steps.rust_data.outcome || 'skipped' }}
-        LEGACY_OUTCOME: ${{ steps.legacy.outcome || 'skipped' }}
-        NATIVE_DATA_OUTCOME: ${{ steps.native_data.outcome || 'skipped' }}
-        DESTROY_OUTCOME: ${{ steps.destroy.outcome || 'skipped' }}
       run: |
-        OUTCOMES="$(python3 -c 'import os,json; native={"outcome":os.environ["NATIVE_CLIENTS_OUTCOME"],"archive_sha256":os.environ["NATIVE_ARCHIVE_SHA256"],"filter":"group(onebox)","no_tests":"fail"} if os.environ["WORKER_ROUTE"]=="client-runtime" else "skipped"; print(json.dumps({"validate":os.environ["VALIDATE_OUTCOME"],"create":os.environ["CREATE_OUTCOME"],"native_clients":native,"rust_data":os.environ["RUST_DATA_OUTCOME"],"legacy":os.environ["LEGACY_OUTCOME"],"native_data":os.environ["NATIVE_DATA_OUTCOME"],"destroy":os.environ["DESTROY_OUTCOME"]}))')"
-        python3 scripts/onebox_ci.py seal --route "$WORKER_ROUTE" \
+        python3 -m tests.onebox.shared.ci seal --route "$WORKER_ROUTE" \
           --producer "$RUNNER_TEMP/onebox-inputs/onebox-input-receipt.json" \
           --validated-input "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/validated-input.json" \
           --evidence-dir "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE" \
-          --out "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/worker-proof.json" --outcomes "$OUTCOMES"
+          --out "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/worker-proof.json"
 
     - name: Upload this worker's complete evidence after teardown
       if: always()
       timeout-minutes: 4
       uses: actions/upload-artifact@v7
       with:
-        name: onebox-${{ matrix.route }}-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/onebox-proof/${{ matrix.route }}
+        name: onebox-worker-${{ matrix.route }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/onebox-proof
         if-no-files-found: error
         retention-days: 7
 
@@ -269,19 +174,13 @@ jobs:
         name: onebox-inputs-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/onebox-inputs
 
-    - name: Download client and runtime worker proof
+    - name: Download all declared worker proofs
       if: always()
       uses: actions/download-artifact@v8
       with:
-        name: onebox-client-runtime-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/onebox-workers/client-runtime
-
-    - name: Download native-data worker proof
-      if: always()
-      uses: actions/download-artifact@v8
-      with:
-        name: onebox-native-data-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/onebox-workers/native-data
+        pattern: onebox-worker-*-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/onebox-workers
+        merge-multiple: true
 
     - name: Verify complete namespaced coverage and original cleanup
       if: always()
@@ -290,7 +189,7 @@ jobs:
         WORKERS_RESULT: ${{ needs.onebox-workers.result }}
       run: |
         NEEDS_STATUS="$(python3 -c 'import json,os; print(json.dumps({"producer":os.environ["PRODUCER_RESULT"],"workers":os.environ["WORKERS_RESULT"]}))')"
-        python3 scripts/onebox_ci.py aggregate \
+        python3 -m tests.onebox.shared.ci aggregate \
           --producer "$RUNNER_TEMP/onebox-inputs/onebox-input-receipt.json" \
           --worker-root "$RUNNER_TEMP/onebox-workers" --needs-json "$NEEDS_STATUS" \
           --out "$RUNNER_TEMP/onebox-aggregate.json"

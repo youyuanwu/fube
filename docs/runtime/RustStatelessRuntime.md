@@ -94,7 +94,7 @@ Code/profile compatibility compares normalized declared fields plus native
 digested rollout/checksum/sharing/policy metadata, not independently rehashed
 filesystem code bytes. Qualification additionally hashes the running executable
 ([reader:576](../../crates/libs/fube-runtime/src/packages.rs#L576),
-[upgrade harness:662](../../scripts/rust_runtime_test.py#L662)).
+[upgrade harness:662](../../tests/onebox/shared/runtime.py#L662)).
 The reader admits the qualified ordinary ExeHost declarations; setup/external/
 activator/periodic entry points, nonempty custom code-environment declarations and
 unsupported host/security policies fail explicitly rather than being ignored.
@@ -346,8 +346,8 @@ tests are in [transport tests](../../crates/libs/fube-transport/src/connection_i
 Build the [onebox image](../UbuntuOnebox.md), then:
 
 ```sh
-python3 scripts/rust_runtime_test.py --build-bundle build/runtime-binaries
-python3 scripts/rust_runtime_test.py runtime-check --prebuilt build/runtime-binaries \
+python3 -m tests.onebox.shared.runtime --build-bundle build/runtime-binaries
+python3 -m tests.onebox.shared.runtime runtime-check --prebuilt build/runtime-binaries \
   --full --report build/runtime-check.json
 ```
 
@@ -360,7 +360,7 @@ tar -cf build/runtime-binaries.tar -C build/runtime-binaries .
 # On the qualification runner, extract into a new directory:
 mkdir build/runtime-prebuilt
 tar -xf build/runtime-binaries.tar -C build/runtime-prebuilt
-python3 scripts/rust_runtime_test.py runtime-check --prebuilt build/runtime-prebuilt \
+python3 -m tests.onebox.shared.runtime runtime-check --prebuilt build/runtime-prebuilt \
   --full --report build/runtime-prebuilt.json
 ```
 
@@ -382,11 +382,11 @@ every provisioned type version, polling for absence. Upload staging is uniquely
 owned beneath the allocation's data volume and removed after use.
 Ownership drift, failed cleanup or unconfirmed late mutations produce FAIL with
 recovery identities
-([harness ownership](../../scripts/rust_runtime_test.py#L102),
-[cleanup](../../scripts/rust_runtime_test.py#L421)).
+([harness ownership](../../tests/onebox/shared/runtime.py#L102),
+[cleanup](../../tests/onebox/shared/runtime.py#L421)).
 Creation captures its original owner capability under the existing controller
 lock; a later same-name allocation never grants cleanup authority
-([create_owned](../../scripts/rust_runtime_test.py#L471)).
+([create_owned](../../tests/onebox/shared/runtime.py#L471)).
 
 The authority test needs Linux x86-64 pidfd APIs and the existing privileged
 onebox to duplicate **only the verified application's IPC descriptor**, recheck

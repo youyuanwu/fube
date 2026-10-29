@@ -9,6 +9,7 @@ hosting/lifecycle is Rust IPC; resolution is independently fube-client.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import concurrent.futures
@@ -23,12 +24,14 @@ import time
 from typing import Protocol
 import uuid
 import xml.etree.ElementTree as ET
+
+from tests import ROOT
+
 if sys.platform == "linux":
-    import onebox_ctl
+    from scripts import onebox_ctl
 else:
     onebox_ctl = None
 
-ROOT = Path(__file__).resolve().parents[1]
 OWNER_LABEL = "io.github.service-fabric-apps.cluster-owner"
 NS = "http://schemas.microsoft.com/2011/01/fabric"
 ET.register_namespace("", NS)
@@ -1118,13 +1121,20 @@ def cleanup_deployment(allocation: Allocation, result: dict, attempts: dict) -> 
                 result["errors"].append("upload staging cleanup: "+str(error))
 
 
-def destroy_owned(name: str, owner: str) -> dict:
-    """Use the existing lifecycle lock/guards, independent of cluster health."""
+@contextmanager
+def owned_cluster(name: str, owner: str):
+    """Keep original-capability inspection/mutation under the lifecycle lock."""
     with onebox_ctl.ctl.locked(onebox_ctl.STATE_ROOT,name) as directory:
         cluster=onebox_ctl.Onebox(directory,name)
         cluster.load()
         if cluster.state["owner"]!=owner:
             raise RuntimeError("successful-create owner changed; cleanup refused")
+        yield cluster
+
+
+def destroy_owned(name: str, owner: str) -> dict:
+    """Use the existing lifecycle lock/guards, independent of cluster health."""
+    with owned_cluster(name, owner) as cluster:
         containers, volumes, networks = cluster.resources(require_volumes=False)
         original = {"container":[v["Id"] for v in containers],
                     "volume":[v["Name"] for v in volumes],

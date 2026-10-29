@@ -14,7 +14,10 @@ import sys
 import time
 import uuid
 
-from linux_cluster import SHUTDOWN_TIMEOUT, check_subnet, generate
+if __package__:
+    from .linux_cluster import SHUTDOWN_TIMEOUT, check_subnet, generate
+else:
+    from linux_cluster import SHUTDOWN_TIMEOUT, check_subnet, generate
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -591,6 +594,16 @@ def positive_timeout(value):
     return number
 
 
+def publish_owner(path, owner):
+    if not isinstance(owner, str) or not re.fullmatch(r"[a-f0-9]{32}", owner):
+        raise ValueError("Invalid original allocation capability")
+    print("::add-mask::" + owner, flush=True)
+    with path.open("a", encoding="utf-8") as output:
+        output.write("owner=" + owner + "\n")
+        output.flush()
+        os.fsync(output.fileno())
+
+
 def main(*, cluster_type=Cluster, state_root=STATE_ROOT, default_subnet=DEFAULT_SUBNET,
          default_image="sf-apps-node:11.8.121.4", description=__doc__):
     parser = argparse.ArgumentParser(description=description)
@@ -623,9 +636,7 @@ def main(*, cluster_type=Cluster, state_root=STATE_ROOT, default_subnet=DEFAULT_
         cluster = cluster_type(directory, args.name)
         if args.command == "create":
             def allocated(owner):
-                print("::add-mask::" + owner, flush=True)
-                with args.github_output.open("a", encoding="utf-8") as output:
-                    output.write("owner=" + owner + "\n")
+                publish_owner(args.github_output, owner)
             result = cluster.create(
                 args.subnet, args.image, args.timeout,
                 on_allocated=allocated if args.github_output is not None else None,

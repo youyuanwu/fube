@@ -8,7 +8,7 @@ import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
-import rust_runtime_test as runtime
+from tests.onebox.shared import runtime
 
 
 def snapshot():

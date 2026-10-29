@@ -5,8 +5,12 @@ import secrets
 from string import Template
 import sys
 
-import linux_cluster_ctl as ctl
-from linux_cluster import SHUTDOWN_TIMEOUT, check_subnet
+if __package__:
+    from . import linux_cluster_ctl as ctl
+    from .linux_cluster import SHUTDOWN_TIMEOUT, check_subnet
+else:
+    import linux_cluster_ctl as ctl
+    from linux_cluster import SHUTDOWN_TIMEOUT, check_subnet
 
 
 STATE_ROOT = ctl.REPO / "build/oneboxes"

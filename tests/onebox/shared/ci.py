@@ -12,6 +12,7 @@ import json
 import math
 import os
 from pathlib import Path
+from itertools import combinations
 import re
 import stat
 import subprocess
@@ -19,19 +20,21 @@ import sys
 import tarfile
 import time
 
-import fube_data_test as data
+from tests.onebox.shared import data
+from tests import suites
 
 runtime = data.runtime
 ROOT = data.ROOT
 SMALL = 1024 * 1024
 REPORT = 512 * SMALL
 INPUT = 4 * 1024 * SMALL
-ROUTES = ("client-runtime", "native-data")
-OUTCOMES = {"validate", "create", "native_clients", "rust_data", "legacy", "native_data", "destroy"}
-NATIVE_FILES = (
-    "native-client-report.json", "native-health-report.json", "native-name-report.json",
-    "native-list-report.json", "native-notification-report.json",
-)
+ROUTES = tuple(suites.MANIFEST.partitions)
+ONEBOX_SUITES = {name: suite for name, suite in suites.MANIFEST.suites.items()
+                if suite["resource"] == "onebox"}
+OUTCOMES = {"validate", "create", "destroy"} | ONEBOX_SUITES.keys()
+FIXTURE_PHASES = ("validate", "create", "ready", "suites", "diagnostics", "destroy")
+NATIVE_FILES = tuple(Path(report).name for suite in ONEBOX_SUITES.values()
+                     if suite["kind"] == "nextest" for report in suite["reports"])
 CLEAR_CASES = (
     "native_ping", "native_name_exists_existing", "native_name_exists_absent",
     "native_concurrent_mixed", "clone_drop_preserves_original_connection",
@@ -386,8 +389,9 @@ def bundle_identity(tar, directory, archive=None):
         "app": identity(bundle.directory / "bin/rust-runtime-app"),
         "observer": identity(bundle.directory / "bin/runtime_observer"),
         "native_oracle": identity(bundle.directory / "bin/native-replicator-oracle"),
-        "qualification_script": identity(ROOT / "scripts/fube_data_test.py"),
-        "runtime_script": identity(ROOT / "scripts/rust_runtime_test.py"),
+        "qualification_script": identity(ROOT / "tests/onebox/shared/data.py"),
+        "runtime_script": identity(ROOT / "tests/onebox/shared/runtime.py"),
+        "suite_manifest": identity(suites.PATH),
     }
     if archive is not None:
         inputs["native_archive"] = identity(archive)
@@ -408,12 +412,14 @@ def producer(path, current):
     exact(value, {"version", "kind", "status", "errors", "context", "inputs", "created_at"},
           "producer receipt schema")
     exact(value["inputs"], {"bundle_tar", "manifest", "nested_manifest", "app", "observer",
-                           "native_oracle", "native_archive", "qualification_script", "runtime_script"},
+                           "native_oracle", "native_archive", "qualification_script", "runtime_script",
+                           "suite_manifest"},
           "producer input inventory")
     for item in value["inputs"].values():
         exact(item, {"sha256", "bytes"}, "input identity schema")
         require(sha(item["sha256"]) and integer(item["bytes"], 1) and item["bytes"] <= INPUT,
                 "input identity hash/size")
+    require(same(value["inputs"]["suite_manifest"], identity(suites.PATH)), "suite manifest changed")
     require(number(value["created_at"], 1), "producer timestamp")
     return value
 
@@ -429,7 +435,8 @@ def produce(args):
 def validate(args):
     current = context()
     built = producer(args.receipt, current)
-    require(args.route != "client-runtime" or args.archive is not None, "client route requires archive")
+    require(not any(suite["kind"] == "nextest" for suite in suites.MANIFEST.selected(args.route).values())
+            or args.archive is not None, "native-client suite requires archive")
     bundle, inputs = bundle_identity(args.bundle_tar, args.bundle_dir, args.archive)
     require(bundle.source_revision == current["source"], "bundle source mismatch")
     require(all(same(built["inputs"][key], value) for key, value in inputs.items()), "producer/input mismatch")
@@ -1563,27 +1570,24 @@ LEGACY_SPEC = {
 
 
 def inventory(route):
-    common = {"cleanup.json", "validated-input.json"}
-    if route == "client-runtime":
-        return common | {"rust-report.json", "legacy-report.json"} | {
-            "client/" + file for file in NATIVE_FILES}
-    return common | {"native-data-report.json"}
+    result = {"cleanup.json", "validated-input.json", "suite-outcomes.json", "fixture.json", "diagnostics.json"}
+    for suite in suites.MANIFEST.selected(route).values():
+        result.update(suite["reports"] if suite["kind"] == "nextest" else [suite["report"]])
+    return result
 
 
 def outcomes(value, route, archive):
     exact(value, OUTCOMES, "exact worker command outcome keys")
-    active = ({"validate", "create", "native_clients", "rust_data", "legacy", "destroy"}
-              if route == "client-runtime" else {"validate", "create", "native_data", "destroy"})
-    for key in OUTCOMES - {"native_clients"}:
-        require(value[key] == ("success" if key in active else "skipped"),
-                "failed/skipped/unexecuted worker command")
-    if route == "client-runtime":
-        exact(value["native_clients"], {"outcome", "archive_sha256", "filter", "no_tests"},
-              "native archive command receipt")
-        require(value["native_clients"] == {"outcome": "success", "archive_sha256": archive,
-                "filter": "group(onebox)", "no_tests": "fail"}, "native archive execution/nonempty selection")
-    else:
-        require(value["native_clients"] == "skipped", "unexpected native client execution route")
+    active = {"validate", "create", "destroy"} | suites.MANIFEST.selected(route).keys()
+    for key in OUTCOMES:
+        suite = ONEBOX_SUITES.get(key)
+        if key in active and suite is not None and suite["kind"] == "nextest":
+            require(same(value[key], {"outcome": "success", "archive_sha256": archive,
+                                     "filter": suite["filter"], "no_tests": "fail"}),
+                    "native archive execution/nonempty selection")
+        else:
+            require(value[key] == ("success" if key in active else "skipped"),
+                    "failed/skipped/unexecuted worker command")
 
 
 def inspect_worker(route, built, producer_digest, validated_path, directory, command_outcomes):
@@ -1599,7 +1603,7 @@ def inspect_worker(route, built, producer_digest, validated_path, directory, com
                             if parent != Path(".")}
     require({entry.relative_to(directory).as_posix() for entry in entries if entry.is_dir()}
             == expected_directories, "route fixed report directory inventory")
-    require(expected <= actual and actual <= expected | {"diagnostics.json", "worker-proof.json"},
+    require(expected <= actual and actual <= expected | {"worker-proof.json", "emergency-cleanup.json"},
             "route fixed report inventory")
     require(safe_path(validated_path) == directory / "validated-input.json",
             "validated input must be published under fixed worker filename")
@@ -1619,28 +1623,57 @@ def inspect_worker(route, built, producer_digest, validated_path, directory, com
     exact(clean["allocation"], {"name", "owner_sha256"}, "cleanup original allocation schema")
     require(sha(clean["allocation"]["owner_sha256"]), "cleanup original owner digest")
     resources = validate_destroy(clean)
+    execution = read(directory / "suite-outcomes.json", SMALL)
+    exact(execution, {"version", "partition", "manifest_sha256", "suites", "status", "errors"},
+          "suite execution schema")
+    require(type(execution["version"]) is int and execution["version"] == 1
+            and execution["partition"] == route and execution["status"] == "PASS"
+            and execution["errors"] == []
+            and execution["manifest_sha256"] == built["inputs"]["suite_manifest"]["sha256"],
+            "actual partition execution/manifest binding")
+    exact(execution["suites"], suites.MANIFEST.selected(route), "actual selected suite inventory")
+    require(list(execution["suites"]) == list(suites.MANIFEST.selected(route)), "actual suite execution order")
+    require(all(same(result, command_outcomes[name]) for name, result in execution["suites"].items()),
+            "partition/worker execution outcome mismatch")
+    original = {**clean["allocation"], "container_id": resources["container"][0]}
+    lifecycle = receipt(directory / "fixture.json", "onebox-fixture", current)
+    exact(lifecycle, {"version", "kind", "status", "errors", "route", "context", "producer_sha256",
+                      "allocation", "ownership", "outcomes", "started_at", "ready_at", "finished_at"},
+          "onebox fixture schema")
+    exact(lifecycle["outcomes"], FIXTURE_PHASES, "onebox fixture phase inventory")
+    require(lifecycle["route"] == route and lifecycle["producer_sha256"] == producer_digest
+            and lifecycle["ownership"] == "created" and same(lifecycle["allocation"], original)
+            and all(value == "success" for value in lifecycle["outcomes"].values())
+            and all(lifecycle["outcomes"][key] == command_outcomes[key]
+                    for key in ("validate", "create", "destroy")), "owned fixture readiness/lifecycle binding")
+    fixture_window = interval(lifecycle)
+    require(number(lifecycle["ready_at"], 1)
+            and fixture_window[0] <= validated["validated_at"] <= lifecycle["ready_at"]
+            <= clean["started_at"] <= clean["finished_at"] <= fixture_window[1],
+            "fixture validation/readiness/teardown ordering")
+    diagnostic = read(directory / "diagnostics.json", SMALL)
+    require(diagnostic.get("name") == original["name"]
+            and diagnostic.get("project") == "sf-onebox-" + original["name"]
+            and diagnostic.get("errors") == [], "owned credential-safe diagnostics")
     summaries = []
-    if route == "client-runtime":
-        rust = read(directory / "rust-report.json", REPORT, DATA_SPEC)
-        summaries.append(validate_data(rust, "rust", built))
-        preserved = read(directory / "legacy-report.json", REPORT, LEGACY_SPEC)
-        require(preserved.get("status") == "PASS" and same(preserved.get("context"), current)
-                and preserved.get("producer_sha256") == producer_digest, "hardened legacy receipt binding")
-        summaries.append(validate_legacy(preserved, built))
-        native = {file: read(directory / "client" / file, REPORT) for file in NATIVE_FILES}
-        native_assertions, native_windows = validate_native(
-            native, built["inputs"]["native_archive"]["sha256"], summaries[0]["allocation"])
-        health_owner = native["native-health-report.json"].get("owner")
-        require(health_owner == "ci-" + current["run_id"] + "-" + current["attempt"],
-                "native client run/attempt fixture owner")
-    else:
-        native_data = read(directory / "native-data-report.json", REPORT, DATA_SPEC)
-        summaries.append(validate_data(native_data, "native-data", built))
-        native_assertions, native_windows = [], {}
-    original = summaries[0]["allocation"]
-    require(all(same(summary["allocation"], original) for summary in summaries)
-            and same({key: original[key] for key in ("name", "owner_sha256")}, clean["allocation"])
-            and resources["container"] == [original["container_id"]],
+    native_assertions, native_windows = [], {}
+    for suite in suites.MANIFEST.selected(route).values():
+        if suite["kind"] == "data":
+            report = read(directory / suite["report"], REPORT, DATA_SPEC)
+            summaries.append(validate_data(report, suite["profile"], built))
+        elif suite["kind"] == "legacy":
+            preserved = read(directory / suite["report"], REPORT, LEGACY_SPEC)
+            require(preserved.get("status") == "PASS" and same(preserved.get("context"), current)
+                    and preserved.get("producer_sha256") == producer_digest, "hardened legacy receipt binding")
+            summaries.append(validate_legacy(preserved, built))
+        else:
+            native = {Path(file).name: read(directory / file, REPORT) for file in suite["reports"]}
+            assertions, windows = validate_native(native, built["inputs"]["native_archive"]["sha256"], original)
+            native_assertions.extend(assertions)
+            native_windows.update(windows)
+            require(native[NATIVE_FILES[1]].get("owner") == "ci-" + current["run_id"] + "-" + current["attempt"],
+                    "native client run/attempt fixture owner")
+    require(all(same(summary["allocation"], original) for summary in summaries),
             "all suite reports must match independent original cleanup")
     suite_times = {}
     for summary in summaries:
@@ -1650,9 +1683,9 @@ def inspect_worker(route, built, producer_digest, validated_path, directory, com
         else:
             suite_times.update(timing)
         endpoints = [timing] if type(timing) is list else timing.values()
-        require(all(validated["validated_at"] <= start <= end <= clean["started_at"]
+        require(all(lifecycle["ready_at"] <= start <= end <= clean["started_at"]
                     for start, end in endpoints), "suite execution must precede original teardown")
-    require(all(validated["validated_at"] <= start <= end <= clean["started_at"]
+    require(all(lifecycle["ready_at"] <= start <= end <= clean["started_at"]
                 for start, end in native_windows.values()), "native observations must belong to this worker interval")
     hashes = {name: identity(directory / name, REPORT if name.endswith("-report.json") else SMALL)
               for name in sorted(actual - {"worker-proof.json"})}
@@ -1661,7 +1694,8 @@ def inspect_worker(route, built, producer_digest, validated_path, directory, com
         "allocation": original, "resources": resources, "outcomes": command_outcomes, "reports": hashes,
         "assertions": [item for summary in summaries for item in summary["assertions"]],
         "native_tests": native_assertions,
-        "timing": {"validated_at": validated["validated_at"], "suites": suite_times,
+        "timing": {"validated_at": validated["validated_at"], "fixture": fixture_window,
+                   "ready_at": lifecycle["ready_at"], "suites": suite_times,
                    "native_observations": native_windows,
                    "cleanup": interval(clean)},
     }
@@ -1671,10 +1705,18 @@ def seal(args):
     started = time.time()
     current = context()
     built = producer(args.producer, current)
+    if args.outcomes is None:
+        lifecycle = read(args.evidence_dir / "fixture.json", SMALL)
+        command_outcomes = {key: lifecycle["outcomes"][key] for key in ("validate", "create", "destroy")}
+    else:
+        command_outcomes = small_json(args.outcomes)
+    if set(command_outcomes) == {"validate", "create", "destroy"}:
+        execution = read(args.evidence_dir / "suite-outcomes.json", SMALL)
+        command_outcomes = {key: "skipped" for key in OUTCOMES} | command_outcomes | execution["suites"]
     result = inspect_worker(args.route, built, identity(args.producer, SMALL)["sha256"],
-                            args.validated_input, args.evidence_dir, small_json(args.outcomes))
+                            args.validated_input, args.evidence_dir, command_outcomes)
     finished = time.time()
-    require(result["timing"]["cleanup"][1] <= started, "sealing requires completed teardown")
+    require(result["timing"]["fixture"][1] <= started, "sealing requires completed fixture teardown")
     result["timing"].update(sealing=[started, finished],
                             worker_elapsed_seconds=finished - result["timing"]["validated_at"])
     return result
@@ -1689,7 +1731,7 @@ def aggregate(args):
     require(needs == {"producer": "success", "workers": "success"}, "all producer/worker jobs must succeed")
     root = safe_path(args.worker_root)
     require(root.is_dir() and {entry.name for entry in root.iterdir()} == set(ROUTES)
-            and all(safe_path(root / route).is_dir() for route in ROUTES), "exact two worker routes required")
+            and all(safe_path(root / route).is_dir() for route in ROUTES), "exact manifest worker routes required")
     workers, proofs = {}, {}
     for route in ROUTES:
         directory = root / route
@@ -1715,21 +1757,21 @@ def aggregate(args):
                 and timing["worker_elapsed_seconds"] == window[1] - timing["validated_at"],
                 "worker elapsed/sealing timing")
         workers[route], proofs[route] = proof, identity(proof_path, SMALL)
-    first, second = [workers[route] for route in ROUTES]
-    for key in ("name", "owner_sha256", "container_id"):
-        require(first["allocation"][key] != second["allocation"][key], "workers require distinct original allocations")
-    for kind in ("container", "volume", "network"):
-        require(not set(first["resources"][kind]) & set(second["resources"][kind]),
-                "workers require independent original resources")
+    for first, second in combinations(workers.values(), 2):
+        for key in ("name", "owner_sha256", "container_id"):
+            require(first["allocation"][key] != second["allocation"][key],
+                    "workers require distinct original allocations")
+        for kind in ("container", "volume", "network"):
+            require(not set(first["resources"][kind]) & set(second["resources"][kind]),
+                    "workers require independent original resources")
     assertions = [item for route in ROUTES for item in workers[route]["assertions"]]
-    native_tests = first["native_tests"] + second["native_tests"]
-    expected_assertions = ["rust/" + name for name in data.COMMON_SCENARIOS] + ["legacy/legacy_full"] + [
-        "native-data/" + name for name in (*data.COMMON_SCENARIOS, *data.MIXED_SCENARIOS)]
-    require(assertions == expected_assertions and len(assertions) == 32 and len(set(assertions)) == 32
-            and len(native_tests) == 5 and len(set(native_tests)) == 5, "exact namespaced 32+5 whole-suite coverage")
+    native_tests = [item for route in ROUTES for item in workers[route]["native_tests"]]
+    expected_assertions, expected_native = suites.MANIFEST.coverage()
+    require(assertions == expected_assertions and native_tests == expected_native,
+            "exact manifest whole-suite coverage")
     return {"context": current, "producer_sha256": producer_digest, "inputs": built["inputs"],
             "needs": needs, "workers": proofs, "assertions": assertions, "native_tests": native_tests,
-            "coverage": "Rust14 + native-data17 + hardened legacy1; archived native-client5",
+            "coverage": f"{len(assertions)} namespaced profile assertions; archived native-client{len(native_tests)}",
             "timing": {"aggregate": [started, time.time()],
                        "workers": {route: workers[route]["timing"] for route in ROUTES}}}
 
@@ -1760,7 +1802,7 @@ def parser():
         if command == "seal":
             sub.add_argument("--validated-input", required=True, type=Path)
             sub.add_argument("--evidence-dir", required=True, type=Path)
-            sub.add_argument("--outcomes", required=True)
+            sub.add_argument("--outcomes", help="optional explicit outcomes, still checked against fixture evidence")
         if command == "aggregate":
             sub.add_argument("--worker-root", required=True, type=Path)
             sub.add_argument("--needs-json", required=True)

@@ -182,9 +182,9 @@ On 2026-10-25, with the existing extracted pinned Ubuntu22 runtime and private A
 files on Linux x86_64:
 
 ```sh
-python3 scripts/native_runtime_test.py manifest-close \
+python3 -m tests.native_runtime.runner manifest-close \
   --diagnostics-directory build/manifest-test-host-evidence
-python3 scripts/native_runtime_test.py manifest-abort \
+python3 -m tests.native_runtime.runner manifest-abort \
   --diagnostics-directory build/manifest-test-host-evidence
 ```
 

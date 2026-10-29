@@ -13,9 +13,9 @@ from unittest.mock import patch
 if not sys.platform.startswith("linux"):
     raise unittest.SkipTest("Linux cluster lifecycle tests require a Linux host")
 
-import linux_cluster_ctl as ctl
-import linux_cluster_diagnostics as diagnostics
-from linux_cluster import generate
+from scripts import linux_cluster_ctl as ctl
+from scripts import linux_cluster_diagnostics as diagnostics
+from scripts.linux_cluster import generate
 
 
 PROBE = ctl.REPO / "docker/linux-cluster/cluster-probe.py"

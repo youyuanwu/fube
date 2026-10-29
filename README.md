@@ -28,7 +28,7 @@ Protocol Buffers compiler or sibling checkout is needed.
 ```sh
 cargo build --locked --workspace # Linux; runtime profile is Linux-only
 cargo test --locked -p fube-transport -p fube-client -p fube-test-host
-python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 -m tests.run --suite offline
 ```
 
 [Development and test tiers](docs/Development.md) describe native-free tests,

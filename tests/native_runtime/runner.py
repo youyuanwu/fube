@@ -13,6 +13,8 @@ import sys
 import tempfile
 import urllib.request
 
+from tests import ROOT
+
 VERSION = "11.8.121.4"
 PACKAGE_SHA256 = "fbcb0b8d52e84b7e2bf9c336d9e0ece8cb9ff7fa1de53367d56c6ff8ab850c83"
 PACKAGE_URL = (
@@ -103,7 +105,7 @@ def manifest_fixture(repo, root):
 
 
 def main():
-    repo = pathlib.Path(__file__).resolve().parent.parent
+    repo = ROOT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["prepare", *SCENARIOS])
     parser.add_argument("--root", type=pathlib.Path,

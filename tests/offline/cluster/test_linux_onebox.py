@@ -12,9 +12,9 @@ import xml.etree.ElementTree as ET
 if not sys.platform.startswith("linux"):
     raise unittest.SkipTest("Ubuntu onebox lifecycle tests require a Linux host")
 
-import linux_cluster_ctl as ctl
-import linux_cluster_diagnostics as diagnostics
-import onebox_ctl as onebox
+from scripts import linux_cluster_ctl as ctl
+from scripts import linux_cluster_diagnostics as diagnostics
+from scripts import onebox_ctl as onebox
 
 
 def load_module(name, filename):

@@ -12,8 +12,8 @@ import uuid
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
-import fube_data_test as data
-from test_fube_data_test import observation
+from tests.onebox.shared import data
+from tests.offline.onebox.native_data.test_fube_data_test import observation
 
 
 PARTITION = "00000000-0000-0000-0000-000000000123"
