@@ -15,7 +15,6 @@ from tests.onebox.shared import ci, fixture
 from tests.offline.onebox.native_data import test_fube_data_test as fixtures
 
 
-@unittest.skipUnless(ci.sys.platform == "linux", "Linux strict-bundle and onebox receipt models")
 class ProofFiles(fixtures.ProjectFiles):
     def setUp(self):
         super().setUp()
@@ -790,7 +789,6 @@ class CleanupLegacyTests(ProofFiles):
         self.assertIsNone(ci.read(missing)["destroy"])
         self.assertNotIn("secret", missing.read_text())
 
-    @unittest.skipUnless(ci.sys.platform == "linux", "real descriptor-relative policy fixture")
     def test_legacy_actual_hardened_wrapper_real_policy_and_bare_pass_rejection(self):
         preserved = self.real_policy_report()
         self.assertEqual(ci.validate_legacy(preserved, self.built)["assertions"], ["legacy/legacy_full"])
@@ -848,7 +846,6 @@ class CleanupLegacyTests(ProofFiles):
             self.assertTrue(qualify.call_args.kwargs["full"])
 
 
-@unittest.skipUnless(ci.sys.platform == "linux", "uses existing real native policy offline fixture")
 class WorkerTests(ProofFiles):
     def test_seal_merges_lifecycle_with_actual_manifest_execution(self):
         for route in ci.ROUTES:

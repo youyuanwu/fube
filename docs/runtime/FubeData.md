@@ -245,6 +245,9 @@ Executed implementation snapshot:
 `1414adca03635cde661b7e8ec19cf49dfdc113f8`, tree
 `a2145f3d56cd3368cd5737c3f29f34367c70f453`:
 
+Windows producer results below are historical. The current repository supports
+Linux only and no longer runs Windows CI.
+
 - [Two-worker CI 40781117241](https://github.com/youyuanwu/fube/actions/runs/40781117241):
   Linux/Windows portable, both compiler-free workers and strict aggregate
   **SUCCESS**. Rust-only14, baseline native-data17, hardened full legacy1 and

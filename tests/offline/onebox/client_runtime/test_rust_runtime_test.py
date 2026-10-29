@@ -4,7 +4,6 @@ import copy
 import io
 import json
 import shlex
-import sys
 import textwrap
 import unittest
 import subprocess
@@ -19,7 +18,6 @@ def model_binaries():
                             Path("/prebuilt")/"templates","a"*64,"1"*40)
 
 
-@unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class BinaryBundleTests(unittest.TestCase):
     def setUp(self):
         source=patch.object(runtime,"clean_source_revision",return_value="1"*40)
@@ -240,7 +238,6 @@ class ReportingEvidenceTests(unittest.TestCase):
                                        "fabric:/Owned/Concurrent", "int:0", "op=fault", timeout=45)
 
 
-@unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class AllocationTests(unittest.TestCase):
     def setUp(self):
         bundle=patch.object(runtime,"load_bundle",return_value=model_binaries())
@@ -358,7 +355,6 @@ class AllocationTests(unittest.TestCase):
             self.assertIn("owner changed",result["errors"][1])
 
 
-@unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class AllocationCommitTests(unittest.TestCase):
     def setUp(self):
         directory=tempfile.TemporaryDirectory(prefix=".allocation-test-",dir=".")
@@ -589,7 +585,6 @@ class AllocationCommitTests(unittest.TestCase):
         collect.assert_not_called()
 
 
-@unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class AmbiguousUpgradeTests(unittest.TestCase):
     def execute_upgrade_timeout(self, drift=None):
         fixture=AllocationTests()
@@ -678,7 +673,6 @@ class AmbiguousUpgradeTests(unittest.TestCase):
         self.assertFalse(any(v[:2] in {("application","delete"),("application","unprovision")} for v in calls))
 
 
-@unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class VersionOwnershipTests(unittest.TestCase):
     def test_upgraded_application_and_each_owned_version_are_removed_and_verified(self):
         allocation=MagicMock()
@@ -716,7 +710,6 @@ class VersionOwnershipTests(unittest.TestCase):
         self.assertIn("retained_for_recovery",result["cleanup"])
 
 
-@unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class AmbiguousMutationTests(unittest.TestCase):
     def qualify(self,lost,cleanup_failure=False):
         allocation=MagicMock(name="allocation")
@@ -785,7 +778,6 @@ class AmbiguousMutationTests(unittest.TestCase):
             self.assertEqual(json.loads(output.getvalue())["cleanup"]["onebox"],"caller-owned allocation retained")
 
 
-@unittest.skipUnless(sys.platform=="linux","Linux-only application-runtime harness")
 class ProcessTests(unittest.TestCase):
     def fixture(self):
         return {"native_pid": 321, "native_entry_point": "/owned/app/rust-runtime-app",

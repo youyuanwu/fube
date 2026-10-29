@@ -46,7 +46,6 @@ fn defaults_overrides_and_native_layout_are_not_fixture_constants() {
         b"nested content",
     )
     .unwrap();
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(
@@ -78,7 +77,6 @@ fn defaults_overrides_and_native_layout_are_not_fixture_constants() {
         fs::read(bundle.code.join("bin/auxiliary.dat")).unwrap(),
         b"nested content"
     );
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
@@ -286,7 +284,6 @@ fn invalid_uri_missing_files_and_oversize_xml_fail_without_native_prerequisites(
     assert!(fixture.load(&[]).is_err());
 }
 
-#[cfg(unix)]
 #[test]
 fn symlinks_are_rejected_in_manifests_code_and_directories() {
     use std::os::unix::fs::symlink;

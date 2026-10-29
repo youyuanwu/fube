@@ -205,7 +205,7 @@ impl Deployment {
 }
 
 pub fn preflight(runtime: &Path, app: &Path) -> Result<()> {
-    if !cfg!(target_os = "linux") || !cfg!(target_arch = "x86_64") {
+    if !cfg!(target_arch = "x86_64") {
         return Err(HostError(
             "only Linux x86_64 native profile is supported".into(),
         ));
@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     fn invalid_native_library_hash_fails_before_launch() {
         let runtime = std::env::temp_dir().join(format!("native-profile-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&runtime).unwrap();

@@ -134,8 +134,6 @@ impl Journal {
             file.write_all(&serde_json::to_vec_pretty(self)?)?;
             file.sync_all()?;
             std::fs::rename(&temporary, path)?;
-            // Windows cannot open directories as files; retain POSIX rename durability.
-            #[cfg(unix)]
             std::fs::File::open(path.parent().ok_or("journal has no parent")?)?.sync_all()?;
             Ok(())
         })();

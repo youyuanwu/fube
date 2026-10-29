@@ -2,11 +2,6 @@ name: Native-free Rust client
 
 on:
   workflow_call:
-    inputs:
-      os:
-        description: Runner operating system for the native-free checks
-        required: true
-        type: string
     outputs:
       nextest-version:
         description: Pinned nextest version used to build the test archive
@@ -21,8 +16,8 @@ env:
 jobs:
   rust-native-client:
     name: Native-free Rust client
-    runs-on: ${{ inputs.os }}
-    timeout-minutes: ${{ inputs.os == 'ubuntu-24.04' && 30 || 15 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
     outputs:
@@ -57,7 +52,6 @@ jobs:
       run: cargo check --locked -p stateless-test-app
 
     - name: Test Linux Rust runtime, data and native oracle models
-      if: runner.os == 'Linux'
       run: |
         cargo test --locked -p fube-runtime -p fube-data -p rust-runtime-app -p native-replicator-oracle
         cargo clippy --locked -p fube-runtime -p fube-data -p rust-runtime-app -p native-replicator-oracle --all-targets -- -D warnings
@@ -69,13 +63,11 @@ jobs:
 
     - name: Read declarative onebox partitions
       id: suites
-      if: runner.os == 'Linux'
       run: |
         MATRIX="$(python3 -m tests.run --matrix)"
         echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
     - name: Build and archive strict data and legacy runtime bundles
-      if: runner.os == 'Linux'
       run: |
         python3 -m tests.onebox.shared.data --build-bundle "$RUNNER_TEMP/fube-data-binaries"
         tar -cf "$RUNNER_TEMP/fube-data-binaries.tar" -C "$RUNNER_TEMP/fube-data-binaries" .
@@ -83,7 +75,6 @@ jobs:
         tar -cf "$RUNNER_TEMP/rust-runtime-binaries.tar" -C "$RUNNER_TEMP/fube-data-binaries/legacy" .
 
     - name: Upload strict data binary bundle
-      if: runner.os == 'Linux'
       uses: actions/upload-artifact@v7
       with:
         name: fube-data-binaries
@@ -92,7 +83,6 @@ jobs:
         retention-days: 7
 
     - name: Upload Rust runtime binary bundle
-      if: runner.os == 'Linux'
       uses: actions/upload-artifact@v7
       with:
         name: rust-runtime-binaries
@@ -101,7 +91,7 @@ jobs:
         retention-days: 7
 
     - name: Test Python harnesses
-      run: python -m tests.run --suite offline
+      run: python3 -m tests.run --suite offline
 
     - name: Install pinned nextest
       uses: taiki-e/install-action@v2
@@ -116,7 +106,7 @@ jobs:
 
     - name: Test isolated native-free packages
       run: |
-        python -m tests.run --suite native_free --archive "$RUNNER_TEMP/native-client-tests.tar.zst"
+        python3 -m tests.run --suite native_free --archive "$RUNNER_TEMP/native-client-tests.tar.zst"
 
     - name: Lint native-free packages
       run: cargo clippy --locked -p fube-transport -p fube-client -p fube-test-host --all-targets -- -D warnings
@@ -127,7 +117,6 @@ jobs:
         RUSTDOCFLAGS: -D warnings
 
     - name: Upload native-client test archive
-      if: runner.os == 'Linux'
       uses: actions/upload-artifact@v7
       with:
         name: native-client-tests
@@ -138,7 +127,6 @@ jobs:
         retention-days: 7
 
     - name: Bind exact current-attempt compiler-free inputs
-      if: runner.os == 'Linux'
       run: |
         python3 -m tests.onebox.shared.ci produce \
           --bundle-tar "$RUNNER_TEMP/fube-data-binaries.tar" \
@@ -147,7 +135,6 @@ jobs:
           --out "$RUNNER_TEMP/onebox-input-receipt.json"
 
     - name: Upload current-attempt producer receipt
-      if: runner.os == 'Linux'
       uses: actions/upload-artifact@v7
       with:
         name: onebox-inputs-${{ github.run_id }}-${{ github.run_attempt }}

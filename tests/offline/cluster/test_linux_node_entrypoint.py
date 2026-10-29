@@ -15,7 +15,6 @@ ENTRYPOINT = ROOT / "docker/linux-cluster/node-entrypoint.py"
 TEMPLATE = ENTRYPOINT.with_name("ClusterManifest.template.xml")
 
 
-@unittest.skipUnless(sys.platform.startswith("linux"), "Linux node entrypoint")
 class LinuxNodeEntrypointTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

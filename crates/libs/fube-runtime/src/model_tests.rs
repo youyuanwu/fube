@@ -275,7 +275,6 @@ fn control(action: &str, index: u32, actor: i64) -> Message {
 
 async fn scenario(mode: &str, expected: i32) {
     let fixture = crate::packages::tests::Fixture::new();
-    #[cfg(unix)]
     if mode == "fifo-startup" {
         use std::os::unix::ffi::OsStrExt;
         let path = fixture.base.join("RustService.Package.Current.xml");
@@ -685,7 +684,6 @@ async fn stateful_final_participant_destruction_is_fenced_before_ack_with_health
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn nonregular_artifact_open_cannot_block_startup_worker() {
     scenario("fifo-startup", 0).await;

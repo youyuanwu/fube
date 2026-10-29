@@ -10,8 +10,6 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-if not sys.platform.startswith("linux"):
-    raise unittest.SkipTest("Linux cluster lifecycle tests require a Linux host")
 
 from scripts import linux_cluster_ctl as ctl
 from scripts import linux_cluster_diagnostics as diagnostics

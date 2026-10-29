@@ -5,7 +5,6 @@ import io
 import pathlib
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -146,8 +145,7 @@ class ManifestFixtureTests(unittest.TestCase):
                               "EchoPackage/ServiceManifest.xml"])
             copied = first / "EchoPackage/Executables/native-echo"
             self.assertEqual(copied.read_bytes(), binary.read_bytes())
-            if sys.platform != "win32":
-                self.assertEqual(copied.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(copied.stat().st_mode & 0o777, 0o755)
 
 
 if __name__ == "__main__":

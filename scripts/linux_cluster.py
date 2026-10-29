@@ -10,6 +10,8 @@ from string import Template
 import subprocess
 import sys
 
+if sys.platform != "linux":
+    raise RuntimeError("fube cluster tooling supports Linux only")
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "docker/linux-cluster/ClusterManifest.template.xml"
 SHUTDOWN_TIMEOUT = 150

@@ -12,16 +12,6 @@ jobs:
     uses: ./.github/workflows/native-client.yaml
     permissions:
       contents: read
-    with:
-      os: ubuntu-24.04
-
-  rust-native-client-windows:
-    name: Native-free Rust client (windows-latest)
-    uses: ./.github/workflows/native-client.yaml
-    permissions:
-      contents: read
-    with:
-      os: windows-latest
 
   onebox-workers:
     name: Linux onebox (${{ matrix.route }})

@@ -1,4 +1,3 @@
-#[cfg(unix)]
 use std::os::{fd::AsRawFd, unix::process::CommandExt};
 use std::{
     collections::VecDeque,
@@ -17,7 +16,6 @@ use crate::{deployment::Deployment, HostError, Result};
 
 const LOG_LIMIT: usize = 1024 * 1024;
 
-#[cfg(target_os = "linux")]
 fn proc_stat_result(result: std::io::Result<Vec<u8>>) -> std::io::Result<Option<Vec<u8>>> {
     match result {
         Ok(stat) => Ok(Some(stat)),
@@ -160,7 +158,6 @@ impl OwnedApp {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(unix)]
         {
             command.process_group(0);
             // Parent-death containment and no potentially enormous native core.
@@ -197,7 +194,6 @@ impl OwnedApp {
             group_cleaned: false,
             stop_logs: stop_logs.clone(),
         };
-        #[cfg(unix)]
         for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
@@ -270,7 +266,6 @@ impl OwnedApp {
 
     // Keep an exited Linux leader waitable until its group is drained. Reaping
     // early releases the PID/PGID reservation and makes later group kills unsafe.
-    #[cfg(target_os = "linux")]
     fn observed_exit(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         use std::os::unix::process::ExitStatusExt;
         if self.reaped {
@@ -301,14 +296,6 @@ impl OwnedApp {
         Ok(Some(std::process::ExitStatus::from_raw(raw)))
     }
 
-    #[cfg(not(target_os = "linux"))]
-    fn observed_exit(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        let status = self.child.try_wait()?;
-        self.reaped |= status.is_some();
-        Ok(status)
-    }
-
-    #[cfg(target_os = "linux")]
     fn group_running(&self, deadline: Instant) -> Result<bool> {
         for entry in std::fs::read_dir("/proc")? {
             if Instant::now() >= deadline {
@@ -347,7 +334,6 @@ impl OwnedApp {
 
     pub fn cleanup(&mut self) -> Result<serde_json::Value> {
         let deadline = Instant::now() + Duration::from_secs(10);
-        #[cfg(target_os = "linux")]
         let forced = if self.group_cleaned {
             false
         } else {
@@ -376,20 +362,6 @@ impl OwnedApp {
             self.group_cleaned = true;
             running
         };
-        #[cfg(not(target_os = "linux"))]
-        let forced = {
-            let running = !self.reaped && self.child.try_wait()?.is_none();
-            if running {
-                #[cfg(unix)]
-                if unsafe { libc::kill(-(self.pid() as i32), libc::SIGKILL) } != 0 {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-                #[cfg(not(unix))]
-                self.child.kill()?;
-            }
-            self.group_cleaned = true;
-            running
-        };
         loop {
             if let Some(status) = self.child.try_wait()? {
                 self.reaped = true;
@@ -399,7 +371,7 @@ impl OwnedApp {
                 }
                 return Ok(serde_json::json!({"pid":self.pid(), "forced":forced,
                     "reaped":true, "status":status.to_string(),
-                    "process_group_drained":cfg!(target_os = "linux") && self.group_cleaned}));
+                    "process_group_drained":self.group_cleaned}));
             }
             if Instant::now() >= deadline {
                 return Err(HostError("owned-child reap deadline exceeded".into()));
@@ -418,7 +390,6 @@ impl Drop for OwnedApp {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn require_stat(fields: &[&str]) -> Result<()> {
     if fields.len() == 3 && fields[2].parse::<u32>().is_ok() {
         Ok(())
@@ -426,11 +397,10 @@ fn require_stat(fields: &[&str]) -> Result<()> {
         Err(HostError("invalid proc process group fields".into()))
     }
 }
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn proc_scan_skips_disappeared_entries_but_propagates_real_io_failures() {
         for error in [libc::ESRCH, libc::ENOENT, libc::EACCES] {
@@ -547,7 +517,6 @@ mod tests {
         std::fs::remove_dir_all(bundle.root).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn exited_leader_keeps_group_owned_until_helpers_are_terminated() {
         use std::os::unix::process::ExitStatusExt;
@@ -618,7 +587,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn relative_loader_paths_are_absolute_in_the_changed_child_directory() {
         let relative = std::path::PathBuf::from(format!(".launch-input-{}", uuid::Uuid::new_v4()));

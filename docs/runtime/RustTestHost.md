@@ -151,7 +151,7 @@ complete-scenario path without those fixture contracts; see section 2.6.
 |---|---|---|
 | Native-free | `Native-free Rust client` in [`ci.yaml`](../../.github/workflows/ci.yaml) | Rust model/regression tests, including the host; no SF native libraries or node. These are not native interoperability evidence. |
 | Standalone native | `Linux standalone native runtime` in [`native-runtime.yaml`](../../.github/workflows/native-runtime.yaml) | Ubuntu22 x86_64, Python3.12, pinned Rust toolchain and SHA-verified SF 11.8.121.4 libraries. Runs the real `prepare`, `bootstrap`, `close`, `abort`, `manifest-close`, `manifest-abort` commands, directly on Linux. **No SF package installation, node, cluster, onebox or container startup.** |
-| Onebox | `Linux onebox lifecycle` in `ci.yaml` | Real SF nodes and native-client/lifecycle tests. These exercise a different boundary, not the standalone host profile. Windows runs native-free checks only. |
+| Onebox | `Linux onebox lifecycle` in `ci.yaml` | Real SF nodes and native-client/lifecycle tests. These exercise a different boundary, not the standalone host profile. All test tiers are Linux-only. |
 
 The standalone workflow runs on pushes and PRs touching its workflow, native
 runner/tests, crates, Cargo manifest/lock or Rust toolchain; it also supports
@@ -258,7 +258,7 @@ endpoint admission and owned cleanup; they do not self-authenticate the schemas.
 | Initial stateless | Section 2 MVP implements real runtime boot/type registration/lifecycle/RPC; general reporting remains future work |
 | Later singleton stateful | Native default replicator under a deliberately single-replica test configuration; no HA claim |
 | Later multi-process stateful | Several native app processes with real peer replication and scripted RA reconfiguration |
-| Separate extensions | Container/TLS, Windows security, nonactivated/DLL/multicode-package hosts, managed SDK variants, upgrades and service groups |
+| Separate extensions | Container/TLS, nonactivated/DLL/multicode-package hosts, managed SDK variants, upgrades and service groups |
 
 ### 2.6 Implemented manifest-package profile
 

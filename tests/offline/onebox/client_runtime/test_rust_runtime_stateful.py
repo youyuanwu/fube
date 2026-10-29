@@ -4,7 +4,6 @@ import contextlib
 import io
 from pathlib import Path
 import subprocess
-import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -118,7 +117,6 @@ class StatefulEvidenceTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 runtime.assert_stateful(changed,value["service"],1,1)
 
-    @unittest.skipUnless(sys.platform=="linux","native CLI is Linux-only")
     def test_missing_prebuilt_is_rejected_without_cargo_or_resource_mutation(self):
         with patch("sys.argv",["rust_runtime_test.py","owned","--stateful","one"]), \
              patch.object(runtime,"build_binaries") as build, patch.object(runtime,"create_owned") as create, \

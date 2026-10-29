@@ -430,8 +430,9 @@ The source revision remains a research baseline, **not** binary build provenance
 These observations qualify this successful unchanged-code switch profile, not
 unconditional no-restart upgrades, rolling CODE upgrade/rollback, directory
 retention timing or stronger binary-wide callback guarantees. Ordinary workspace
-checks/Rustdoc, 51 runtime tests and 139 Python tests passed on Linux; existing Windows and separate
-ignored native-client fixture groups remain CI coverage, not local Windows claims.
+checks/Rustdoc, 51 runtime tests and 139 Python tests passed on Linux. At that
+revision, Windows and separate ignored native-client fixture groups were CI
+coverage, not local Windows claims. The current repository is Linux-only.
 
 ### Recorded native outcome (2026-10-26)
 

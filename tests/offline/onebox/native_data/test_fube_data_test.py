@@ -141,7 +141,6 @@ class ProjectFiles(unittest.TestCase):
             return json.loads(output.getvalue())
 
 
-@unittest.skipUnless(sys.platform == "linux", "Linux-only data qualification")
 class BundleTests(ProjectFiles):
     def test_roundtrip_exact_artifacts_source_and_native_classification_without_cargo(self):
         directory = self.bundle()
@@ -415,7 +414,6 @@ class BundleTests(ProjectFiles):
                 self.assertEqual((code / "native-replicator-oracle").exists(), mixed)
 
 
-@unittest.skipUnless(sys.platform == "linux", "Linux-only activated selector")
 class SelectorTests(ProjectFiles):
     def setUp(self):
         super().setUp()
@@ -1021,7 +1019,6 @@ class WorkloadTests(unittest.TestCase):
         writes.assert_not_called()
 
 
-@unittest.skipUnless(sys.platform == "linux", "Linux-only pidfd qualification")
 class ProcessBindingTests(unittest.TestCase):
     def test_digest_works_on_native_python310_without_file_digest(self):
         with patch.object(hashlib, "file_digest", side_effect=AssertionError("not on Python 3.10"),
@@ -1186,7 +1183,6 @@ class ProcessBindingTests(unittest.TestCase):
         self.assertEqual(evidence[0]["action"], "resume")
 
 
-@unittest.skipUnless(sys.platform == "linux", "Linux-only onebox ownership")
 class OwnershipTests(ProjectFiles):
     def test_interrupted_readiness_persists_report_and_cleans_only_original_capability(self):
         def create(name, *, on_allocated):
@@ -1539,7 +1535,6 @@ class OwnershipTests(ProjectFiles):
         self.assertEqual(result["status"], "FAIL")
 
 
-@unittest.skipUnless(sys.platform == "linux", "Linux-only descriptor-relative upload cleanup")
 class LegacyDeploymentTests(ProjectFiles):
     """Run the real legacy dispatcher/config-upgrade body against modeled native I/O."""
 
@@ -1832,7 +1827,6 @@ class LegacyDeploymentTests(ProjectFiles):
         self.assertIn("original-owner cleanup", result["scenarios"]["legacy_full"]["error"])
 
 
-@unittest.skipUnless(sys.platform == "linux", "Linux-only descriptor-bound upload")
 class UploadReservationTests(ProjectFiles):
     def run_upload(self, path, action, proof, archive=None, upload=None):
         # Execute the production program against project-local fixtures, not a
@@ -3183,8 +3177,6 @@ class WireDeliveryTests(unittest.TestCase):
                 data.wire_receipt(before, source, "wrong_sender", reply, observation)
 
 
-@unittest.skipUnless(sys.platform == "linux",
-    "Linux-only AF_PACKET, /proc, pidfd and pipe observer; portable wire-delivery models remain enabled")
 class WireCaptureTests(unittest.TestCase):
     def local_capture(self, allowed, evidence, *, protocol_only=False):
         allocation = MagicMock()
@@ -3349,7 +3341,6 @@ os.read(0,16)
 
 
 class ReportingTests(unittest.TestCase):
-    @unittest.skipUnless(sys.platform == "linux", "activated qualification CLI is Linux-only")
     def test_summary_console_retains_complete_report_without_allocating_or_weakening_status(self):
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / "report.json"

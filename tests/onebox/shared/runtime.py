@@ -19,25 +19,19 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-import sys
 import time
 from typing import Protocol
 import uuid
 import xml.etree.ElementTree as ET
 
 from tests import ROOT
-
-if sys.platform == "linux":
-    from scripts import onebox_ctl
-else:
-    onebox_ctl = None
+from scripts import onebox_ctl
 
 OWNER_LABEL = "io.github.service-fabric-apps.cluster-owner"
 NS = "http://schemas.microsoft.com/2011/01/fabric"
 ET.register_namespace("", NS)
-EXE_SUFFIX = ".exe" if os.name == "nt" else ""
-DEFAULT_APP = ROOT / "target" / "debug" / ("rust-runtime-app" + EXE_SUFFIX)
-DEFAULT_OBSERVER = ROOT / "target" / "debug" / "examples" / ("runtime_observer" + EXE_SUFFIX)
+DEFAULT_APP = ROOT / "target/debug/rust-runtime-app"
+DEFAULT_OBSERVER = ROOT / "target/debug/examples/runtime_observer"
 BUNDLE_VERSION = 3
 BUNDLE_PROFILE = "linux-x86_64-volatile-empty-control-v1"
 
@@ -1284,8 +1278,6 @@ def main() -> None:
     parser.add_argument("--stateful", choices=["one","three"], help="qualify empty-state singleton then optional three-replica mixed recovery")
     parser.add_argument("--report",type=Path,help="write a new structured evidence file (never overwrite)")
     args = parser.parse_args()
-    if sys.platform!="linux":
-        parser.error("native application-runtime qualification requires Linux x86-64")
     if args.build_bundle is not None:
         if args.name or args.existing_owner or args.restart_service or args.full or args.stateful or args.report:
             parser.error("--build-bundle cannot be combined with qualification options")
