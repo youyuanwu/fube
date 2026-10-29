@@ -161,6 +161,17 @@ class PrefixSpec:
         self.prefix, self.spec = prefix, spec
 
 
+class DigestSpec:
+    """Hash a bounded selected map locally, never trust a producer-supplied digest."""
+
+    def __init__(self, spec):
+        self.spec = spec
+
+
+def content_digest(value):
+    return {"count": len(value), "sha256": hashlib.sha256(encode(value).encode("utf-8")).hexdigest()}
+
+
 class Projection:
     """Streaming strict JSON projection; even discarded objects reject duplicates.
 
@@ -229,6 +240,15 @@ class Projection:
                     self.eof = True
 
     def value(self, spec, depth=0):
+        if isinstance(spec, DigestSpec):
+            retained = self.retained
+            selected = self.value(spec.spec, depth)
+            result = content_digest(selected)
+            # The selected map is independently bounded during parsing, then
+            # released. Account only its locally computed canonical digest.
+            self.retained = retained + len(encode(result)) + 8
+            require(self.retained <= SMALL, "selected evidence byte bound")
+            return result
         require(depth <= 96, "JSON nesting bound")
         char = self.peek()
         require(char, "truncated JSON")
@@ -832,15 +852,29 @@ def validate_siblings(value, old, process_loss):
                 "recovered data/stateless units must bind the same native host")
 
 
-def validate_post_writes(writes, before, observation, original_results):
+def validate_contents(observation, results):
+    """Bind the selected successful workload to independent provider contents."""
+    values = {"key-" + key: "value-" + key for key in results}
+    for rpc in [*(replica["rpc"] for replica in observation["replicas"]),
+                observation["primary"]["rpc"]]:
+        require(same(rpc["state"].get("results"), content_digest(results))
+                and same(rpc["state"].get("values"), content_digest(values)),
+                "observed providers and primary must preserve selected successful identities/LSNs/values")
+
+
+def validate_post_writes(writes, before, observation, original_results, prefix):
     results = successful_writes(writes, 5)
     boundary = before["primary"]["rpc"]["state"]["last"]
     primary = observation["primary"]["rpc"]
-    require(not set(results) & set(original_results) and min(results.values()) > boundary
+    require(all(key.startswith(prefix) for key in results)
+            and not set(results) & set(original_results) and min(results.values()) > boundary
             and max(results.values()) == primary["state"]["last"]
             and all(primary["engine"]["progress"][key] >= max(results.values())
                     for key in ("assigned", "committed", "completed", "client_completed")),
             "post-movement/failure writes must actually advance successful primary progress")
+    combined = {**original_results, **results}
+    validate_contents(observation, combined)
+    return combined
 
 
 def validate_essential_data(value, profile, built):
@@ -893,7 +927,10 @@ def validate_essential_data(value, profile, built):
             "conflicting retry must reject before admission without changing the workload")
     planned = scenarios["planned_move"]
     validate_move(planned, profile, service, partition)
-    validate_post_writes(planned["post_move_writes"], planned["before"], planned["observation"], results)
+    for key in ("before", "after"):
+        validate_contents(planned[key], results)
+    moved_results = validate_post_writes(planned["post_move_writes"], planned["before"],
+                                        planned["observation"], results, "planned-move-")
 
     lost = scenarios["lost_reply_dedup"]
     validate_move(lost, profile, service, partition)
@@ -982,7 +1019,9 @@ def validate_essential_data(value, profile, built):
             "abrupt failure must kill the bound original process and advance native epoch")
     validate_expected_process(failure["new_primary_native_identity"], new, built)
     validate_process(failure["new_primary_process"], new, built, "inspect")
-    validate_post_writes(failure["post_failure_writes"], quorum["observation"], failure["observation"], results)
+    recovered_results = validate_post_writes(failure["post_failure_writes"], quorum["observation"],
+                                            failure["observation"], {**moved_results, **lost_result},
+                                            "abrupt-primary-loss-")
     replacements = failure["replacement_hosts"]
     require(type(replacements) is list and 1 <= len(replacements) <= 3, "actual replacement hosts required")
     replacement_ids = set()
@@ -998,10 +1037,8 @@ def validate_essential_data(value, profile, built):
     retries = failure["lost_reply_retries_after_recovery_copy"]
     require(type(retries) is list and len(retries) == 1, "lost-reply retry after replacement copy required")
     duplicate_result(retries[0], lost_result)
-    require(all(same(rpc["state"].get("results"), lost_result) for rpc in [
-                *(replica["rpc"] for replica in failure["observation"]["replicas"]),
-                failure["observation"]["primary"]["rpc"]]),
-            "recovered providers and primary must retain the actual lost-response identity/LSN")
+    # validate_post_writes bound every recovered provider's selected content,
+    # including the original lost-response identity and its unchanged value.
 
     close = scenarios["per_unit_close"]
     before = data_snapshot(close["unrelated_before"], profile, service)
@@ -1017,7 +1054,9 @@ def validate_essential_data(value, profile, built):
             and type(close.get("old_auxiliary_http_status")) is int
             and close["old_auxiliary_http_status"] in (404, 503),
             "per-unit close must isolate a real colocated unit without replacing the main replica")
-    preserved = {key: before["state"].get(key) for key in ("last", "results")}
+    preserved = {key: before["state"].get(key) for key in ("last", "results", "values")}
+    for snapshot in (close["unrelated_before"], close["unrelated_after"], close["observation"]):
+        validate_contents(snapshot, recovered_results)
     require(all(same({key: rpc["state"].get(key) for key in preserved}, preserved)
                 for snapshot in (close["unrelated_before"], close["unrelated_after"], close["observation"])
                 for rpc in [*(replica["rpc"] for replica in snapshot["replicas"]),
@@ -1043,7 +1082,7 @@ def validate_essential_data(value, profile, built):
     require(type(full_results) is dict and len(full_results) == 4096
             and all(text(key) and integer(sequence, 1) for key, sequence in full_results.items())
             and len(set(full_results.values())) == 4096
-            and all(same(full_results.get(key), sequence) for key, sequence in results.items()),
+            and all(same(full_results.get(key), sequence) for key, sequence in recovered_results.items()),
             "finite capacity must retain 4096 actual unique identified results including old writes")
     require(capacity["capacity_rejection"]["id"] not in full_results,
             "capacity rejection must concern a genuinely new, unassigned identity")
@@ -1348,6 +1387,11 @@ RECORD_SPEC = {
     }},
 }
 LOST_RESULTS = PrefixSpec("lost-reply-", True)
+# Keep every initial and post-movement success, not large later copy/capacity
+# ledgers. Python's startswith accepts this tuple without changing the parser.
+CONTENT_PREFIXES = ("initial-", "planned-move-", "abrupt-primary-loss-", "lost-reply-")
+CONTENT_RESULTS = DigestSpec(PrefixSpec(CONTENT_PREFIXES, True))
+CONTENT_VALUES = DigestSpec(PrefixSpec(tuple("key-" + prefix for prefix in CONTENT_PREFIXES), True))
 PROGRESS_SPEC = fields("assigned", "received", "applied", "committed", "completed", "client_completed")
 WORKLOAD_SPEC = fields("successful", "accepted", "last")
 WRITES_SPEC = fields("requested", "successful", "ids", "sequences")
@@ -1394,6 +1438,8 @@ def snapshot_spec(results=LOST_RESULTS, values=None, primary_results=LOST_RESULT
 
 
 SNAPSHOT_SPEC = snapshot_spec()
+CONTENT_SNAPSHOT_SPEC = snapshot_spec(results=CONTENT_RESULTS, values=CONTENT_VALUES,
+                                      primary_results=CONTENT_RESULTS)
 MOVE_SPEC = {
     "before": SNAPSHOT_SPEC, "after": SNAPSHOT_SPEC,
     "move_request": fields("constraints", "native_request_completed", "partition", "request", "target"),
@@ -1415,8 +1461,9 @@ ESSENTIAL_SCENARIO_SPECS = {
         "workload": WORKLOAD_SPEC, "observation": SNAPSHOT_SPEC,
     },
     "planned_move": {
-        **MOVE_SPEC, "post_move_writes": WRITES_SPEC,
-        "observation": SNAPSHOT_SPEC, "workload": WORKLOAD_SPEC,
+        **MOVE_SPEC, "before": CONTENT_SNAPSHOT_SPEC, "after": CONTENT_SNAPSHOT_SPEC,
+        "post_move_writes": WRITES_SPEC,
+        "observation": CONTENT_SNAPSHOT_SPEC, "workload": WORKLOAD_SPEC,
     },
     "unavailable_quorum": {
         "before": SNAPSHOT_SPEC, "observation": SNAPSHOT_SPEC, "workload": WORKLOAD_SPEC,
@@ -1433,7 +1480,7 @@ ESSENTIAL_SCENARIO_SPECS = {
         "workload": WORKLOAD_SPEC, **fields("retry_outcome"),
     },
     "abrupt_primary_loss": {
-        "observation": SNAPSHOT_SPEC, "workload": WORKLOAD_SPEC,
+        "observation": CONTENT_SNAPSHOT_SPEC, "workload": WORKLOAD_SPEC,
         "native_identity": EXPECTED_PROCESS_SPEC, "kill": PROCESS_SPEC,
         "new_primary_native_identity": EXPECTED_PROCESS_SPEC, "new_primary_process": PROCESS_SPEC,
         "replacement_hosts": {"*": {"native_identity": EXPECTED_PROCESS_SPEC, "process": PROCESS_SPEC}},
@@ -1443,7 +1490,8 @@ ESSENTIAL_SCENARIO_SPECS = {
         "stateless_siblings_before": SIBLING_SPEC, "stateless_siblings_after": SIBLING_SPEC,
     },
     "per_unit_close": {
-        **{key: SNAPSHOT_SPEC for key in ("observation", "unrelated_before", "unrelated_after", "auxiliary_before")},
+        **{key: CONTENT_SNAPSHOT_SPEC for key in ("observation", "unrelated_before", "unrelated_after")},
+        "auxiliary_before": SNAPSHOT_SPEC,
         "workload": WORKLOAD_SPEC, **fields("old_auxiliary_http_status"),
         "native_departure": {
             **fields("observer", "node", "service", "fixture_contacted"),

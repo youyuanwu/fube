@@ -125,6 +125,8 @@ class ProofFiles(fixtures.ProjectFiles):
                         "Secondary" if rpc["engine_kind"] == "rust" else "ActiveSecondary")
                 rpc.update(role=role, current_role=role, service_address=endpoint,
                            state={"last": max(results.values()), "copy_in_progress": False, "results": results,
+                                  "values": ({"key-" + key: "value-" + key for key in results}
+                                             if len(results) < 1000 else {}),
                                   "history_count": len(results), "retained_bytes": len(results) * 100},
                            engine={"closed": False, "fault": None, "copy_done": True,
                                    "progress": dict.fromkeys(ci.PROGRESS_SPEC, max(results.values()))})
@@ -190,7 +192,7 @@ class ProofFiles(fixtures.ProjectFiles):
             replica["rpc"]["state"]["values"] = values
         baseline["primary"]["rpc"]["state"]["values"] = values
         original_id = next(iter(initial))
-        post_move = {"planned-1-" + str(index): 101 + index for index in range(5)}
+        post_move = {"planned-move-2-" + str(index): 101 + index for index in range(5)}
         moved_results = {**initial, **post_move}
         moved = snapshot(moved_results, primary=1, configuration=2)
         lost_id, lost_sequence = "lost-reply-6", 106
@@ -215,7 +217,8 @@ class ProofFiles(fixtures.ProjectFiles):
         old = recovered["primary"]["rpc"]
         diagnostics = copy.deepcopy(old)
         diagnostics["engine"]["progress"]["committed"] = 106
-        post_failure = {"failure-1-" + str(index): max(recovered_results.values()) + 1 + index for index in range(5)}
+        post_failure = {"abrupt-primary-loss-8-" + str(index): max(recovered_results.values()) + 1 + index
+                        for index in range(5)}
         failure_results = {**recovered_results, **post_failure}
         replaced_rows = copy.deepcopy(rows)
         replaced_rows[0].update(host="replacement-host", pid=4000, engine_incarnation="replacement-engine",
@@ -690,7 +693,9 @@ class WorkerTests(ProofFiles):
                 continue
             directory = self.root / "workers" / route
             path, proof_path = directory / filename, directory / "worker-proof.json"
-            original, proof = ci.read(path, ci.REPORT), ci.read(proof_path)
+            # These are locally generated raw fixtures, not gate input parsing.
+            # Real entry points below must stream them through bounded DATA_SPEC.
+            original, proof = json.loads(path.read_text()), ci.read(proof_path)
             for index, (name, change) in enumerate(changes):
                 with self.subTest(route=route, witness=name):
                     broken = copy.deepcopy(original)
@@ -869,12 +874,53 @@ class WorkerTests(ProofFiles):
             ("unrelated-main-rollback-across-close", close_rollback),
         ])
 
+    def test_selected_committed_contents_and_new_writes_bind_every_provider_through_both_gates(self):
+        def mutate(value, scenario, snapshots, field, key, replacement=None, remove=True, primary_only=False):
+            for name in snapshots:
+                snapshot = value["scenarios"][scenario][name]
+                rpcs = [snapshot["primary"]["rpc"]]
+                if not primary_only:
+                    rpcs += [replica["rpc"] for replica in snapshot["replicas"]]
+                for rpc in rpcs:
+                    if remove:
+                        rpc["state"][field].pop(key, None)
+                    else:
+                        rpc["state"][field][key] = replacement
+
+        changes = []
+        for scenario, snapshots in (
+                ("planned_move", ("after", "observation")),
+                ("abrupt_primary_loss", ("observation",)),
+                ("per_unit_close", ("unrelated_after", "observation"))):
+            for field, key in (("results", "initial-1-0"), ("values", "key-initial-1-0")):
+                for remove in (True, False):
+                    changes.append((f"{scenario}/{field}/{remove}", lambda value, scenario=scenario,
+                                    snapshots=snapshots, field=field, key=key, remove=remove:
+                                    mutate(value, scenario, snapshots, field, key,
+                                           999 if field == "results" else "changed", remove)))
+        for scenario, writes, prefix in (
+                ("planned_move", "post_move_writes", "planned-move-2-"),
+                ("abrupt_primary_loss", "post_failure_writes", "abrupt-primary-loss-8-")):
+            changes.append((scenario + "/unobserved-new-IDs", lambda value, scenario=scenario, writes=writes:
+                            value["scenarios"][scenario][writes].update(
+                                ids=["never-observed-" + str(index) for index in range(5)])))
+            for field, key in (("results", prefix + "0"), ("values", "key-" + prefix + "0")):
+                for remove in (True, False):
+                    changes.append((f"{scenario}/new/{field}/{remove}", lambda value, scenario=scenario,
+                                    field=field, key=key, remove=remove:
+                                    mutate(value, scenario, ("observation",), field, key,
+                                           999 if field == "results" else "changed", remove)))
+            changes.append((scenario + "/primary-view-only", lambda value, scenario=scenario, prefix=prefix:
+                            mutate(value, scenario, ("observation",), "results", prefix + "0",
+                                   primary_only=True)))
+        self.reject_data_mutations(changes)
+
     def test_unavailable_quorum_pre_assignment_rejection_is_valid_without_manufactured_acceptance(self):
         for route, filename, profile in (("client-runtime", "rust-report.json", "rust"),
                                          ("native-data", "native-data-report.json", "native-data")):
             directory = self.worker(route)
             path = directory / filename
-            value = ci.read(path, ci.REPORT)
+            value = json.loads(path.read_text())
             essential, ledger, _ = self.essential_data(profile, reject_quorum=True)
             for case, evidence in essential.items():
                 value["scenarios"][case].update(evidence)
@@ -917,7 +963,7 @@ class WorkerTests(ProofFiles):
     def test_native_data_negative_gates_aux_policy_cleanup_and_exact_17_cases(self):
         directory = self.worker("native-data")
         path = directory / "native-data-report.json"
-        original = ci.read(path, ci.REPORT)
+        original = json.loads(path.read_text())
         mutations = [
             lambda v: v.update(profile="mixed"),
             lambda v: v["scenarios"].pop("native_interrupted_copy_epoch"),
@@ -962,7 +1008,7 @@ class WorkerTests(ProofFiles):
     def test_source_eos_variants_require_typed_payloads_bound_to_actual_held_copy(self):
         directory = self.worker("native-data")
         path = directory / "native-data-report.json"
-        original = ci.read(path, ci.REPORT)
+        original = json.loads(path.read_text())
         for case in ci.data.MIXED_SCENARIOS[:2]:
             changes = [
                 lambda gate: gate.update(source_eos={"kind": False}),
@@ -1003,7 +1049,7 @@ class WorkerTests(ProofFiles):
             self.assertEqual(self.sealing(route, self.worker(route)), 0)
         directory = self.root / "workers/native-data"
         path = directory / "native-data-report.json"
-        report = ci.read(path, ci.REPORT)
+        report = json.loads(path.read_text())
         proof_path = directory / "worker-proof.json"
         proof = ci.read(proof_path)
         for index, variant in enumerate(("wrong_tag", "inconsistent_counts")):
@@ -1105,7 +1151,7 @@ class WorkerTests(ProofFiles):
         self.assertEqual(self.sealing("client-runtime", client), 0)
         native = self.worker("native-data")
         report_path, cleanup_path = native / "native-data-report.json", native / "cleanup.json"
-        report, cleanup = ci.read(report_path), ci.read(cleanup_path)
+        report, cleanup = json.loads(report_path.read_text()), ci.read(cleanup_path)
         for key in ("name", "owner", "container", "network"):
             altered, clean = copy.deepcopy(report), copy.deepcopy(cleanup)
             if key == "name":
@@ -1126,6 +1172,26 @@ class WorkerTests(ProofFiles):
             (native / "worker-proof.json").unlink()
 
 class BoundedParserTests(fixtures.ProjectFiles):
+    def test_selected_content_digest_is_canonical_local_strict_and_bounded(self):
+        path = self.root / "contents.json"
+        selected = {"initial-1": 1, "planned-move-2": 2}
+        spec = {"results": ci.DigestSpec(ci.PrefixSpec(("initial-", "planned-move-"), True))}
+        for records in (selected, dict(reversed(list(selected.items())))):
+            path.write_text(json.dumps({"results": {**records, "discarded": "x" * 1000}}))
+            self.assertEqual(ci.read(path, ci.REPORT, spec), {"results": ci.content_digest(selected)})
+        # A supplied hash is not an attestation; the parser computes over the
+        # selected entries itself and cannot fabricate the missing identities.
+        path.write_text(json.dumps({"results": ci.content_digest(selected)}))
+        self.assertNotEqual(ci.read(path, ci.REPORT, spec)["results"], ci.content_digest(selected))
+        for body in ('{"results":[]}', '{"results":{"discarded":{"x":1,"x":2}}}',
+                     '{"results":{"initial-1":1,"initial-1":2}}'):
+            path.write_text(body)
+            with self.assertRaises(ci.ProofError):
+                ci.read(path, ci.REPORT, spec)
+        path.write_text(json.dumps({"results": {"initial-1": "x" * ci.SMALL}}))
+        with self.assertRaises(ci.ProofError):
+            ci.read(path, ci.REPORT, spec)
+
     def test_lost_reply_prefix_projection_retains_real_attempts_not_the_full_identity_ledger(self):
         path = self.root / "workload.json"
         lost = {"id": "lost-reply-6", "sequence": 106, "committed": True, "attempts": [
