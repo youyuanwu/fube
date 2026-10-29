@@ -15,7 +15,11 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct Directory(pub(crate) PathBuf);
 impl Directory {
     pub(crate) fn new() -> Self {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build/ra-store-tests");
+        // Cargo/nextest supplies the runtime (workspace-remapped) package path.
+        // A compile-time env! would write into the archive producer's checkout.
+        let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("run fixtures through Cargo/nextest with a runtime manifest directory");
+        let root = PathBuf::from(manifest_dir).join("../../../build/ra-store-tests");
         fs::create_dir_all(&root).unwrap();
         let path = root.join(format!(
             "{}-{}",
