@@ -72,6 +72,7 @@ See [onebox prerequisites, lifecycle, and recovery](docs/UbuntuOnebox.md).
 - [Rust volatile empty-state stateful runtime: control-plane semantics and native evidence](docs/runtime/RustStatefulRuntime.md)
 - [Fube Data: volatile classic V1 replication, provider contract and executed native profile](docs/runtime/FubeData.md)
 - [Broader pure-Rust runtime design and capability tiers](docs/runtime/RustFabricRuntime.md)
+- [Basic pure-Rust cluster design: FM, RA/Hosting, authority and qualification milestones](docs/cluster/PureRustCluster.md)
 - [Migration provenance and repository boundaries](docs/Migration.md)
 
 ## License
