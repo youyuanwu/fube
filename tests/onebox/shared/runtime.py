@@ -101,9 +101,10 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(file, "sha256").hexdigest()
 
 
-def build_binaries() -> Binaries:
-    run("cargo", "build", "--locked", "-p", "rust-runtime-app")
-    run("cargo", "build", "--locked", "-p", "fube-client", "--example", "runtime_observer")
+def built_binaries() -> Binaries:
+    for path in (DEFAULT_APP, DEFAULT_OBSERVER):
+        if not path.is_file() or path.is_symlink() or not os.access(path, os.X_OK):
+            raise RuntimeError(f"missing executable build output: {path}; run cargo build upstream")
     graph = run("cargo", "tree", "--locked", "-p", "rust-runtime-app")
     validate_dependency_graph(graph)
     return Binaries(DEFAULT_APP, DEFAULT_OBSERVER, graph)
@@ -120,7 +121,7 @@ def clean_source_revision() -> str:
 
 def build_bundle(directory: Path) -> None:
     revision = clean_source_revision()
-    binaries = build_binaries()
+    binaries = built_binaries()
     directory.mkdir(parents=True, exist_ok=False)
     hashes = {}
     for source, name in ((binaries.app, "rust-runtime-app"), (binaries.observer, "runtime_observer")):
@@ -1270,7 +1271,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("name", nargs="?")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--build-bundle", type=Path, help="build binaries/evidence into a new directory without a onebox")
+    mode.add_argument("--build-bundle", type=Path, help="package existing Cargo outputs/evidence; never compile")
     mode.add_argument("--prebuilt", type=Path, help="use a verified binary bundle; never build or invoke Cargo")
     parser.add_argument("--existing-owner", help="exact owner capability; never destroy caller-owned onebox")
     parser.add_argument("--restart-service", help="qualify replacement of an explicitly named existing owned service")

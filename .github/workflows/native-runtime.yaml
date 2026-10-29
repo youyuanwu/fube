@@ -1,35 +1,7 @@
 name: Standalone native runtime
 
 on:
-  push:
-    paths:
-    - ".github/workflows/native-runtime.yaml"
-    - "tests/__init__.py"
-    - "tests/run.py"
-    - "tests/suites.py"
-    - "tests/suites.toml"
-    - "tests/offline/__init__.py"
-    - "tests/native_runtime/**"
-    - "tests/offline/native_runtime/**"
-    - "crates/**"
-    - "Cargo.toml"
-    - "Cargo.lock"
-    - "rust-toolchain.toml"
-  pull_request:
-    paths:
-    - ".github/workflows/native-runtime.yaml"
-    - "tests/__init__.py"
-    - "tests/run.py"
-    - "tests/suites.py"
-    - "tests/suites.toml"
-    - "tests/offline/__init__.py"
-    - "tests/native_runtime/**"
-    - "tests/offline/native_runtime/**"
-    - "crates/**"
-    - "Cargo.toml"
-    - "Cargo.lock"
-    - "rust-toolchain.toml"
-  workflow_dispatch:
+  workflow_call:
 
 jobs:
   linux-native-runtime:
@@ -41,6 +13,9 @@ jobs:
     env:
       NATIVE_ROOT: build/native-runtime-acceptance-ci
       NATIVE_DIAGNOSTICS: build/native-runtime-acceptance-ci-evidence
+      FUBE_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+      FUBE_CI_MERGE: ${{ github.event_name == 'pull_request' && github.sha || '' }}
+      FUBE_CI_RUN_ID: ${{ github.run_id }}
     defaults:
       run:
         shell: bash
@@ -53,11 +28,25 @@ jobs:
       with:
         python-version: "3.12"
 
-    - name: Install Rust toolchain with cache
-      uses: actions-rust-lang/setup-rust-toolchain@v2
+    - name: Download standalone native runtime bundle
+      uses: actions/download-artifact@v8
       with:
-        cache: true
-        rustflags: ""
+        name: native-runtime-binaries
+        path: ${{ runner.temp }}/native-runtime-artifact
+
+    - name: Download current-attempt producer receipt
+      uses: actions/download-artifact@v8
+      with:
+        name: onebox-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/onebox-inputs
+
+    - name: Verify and extract standalone build inputs
+      run: |
+        python3 -m tests.onebox.shared.ci verify-artifact \
+          --producer "$RUNNER_TEMP/onebox-inputs/onebox-input-receipt.json" \
+          --input standalone_bundle --file "$RUNNER_TEMP/native-runtime-artifact/native-runtime-binaries.tar" \
+          --out "$RUNNER_TEMP/validated-standalone-input.json"
+        python3 -c 'import os,tarfile; from pathlib import Path; root=Path(os.environ["RUNNER_TEMP"]); target=root/"native-runtime-binaries"; target.mkdir(); tarfile.open(root/"native-runtime-artifact/native-runtime-binaries.tar").extractall(target,filter="data")'
 
     - name: Install Ubuntu22 native ABI prerequisites (not Service Fabric)
       timeout-minutes: 5
@@ -68,47 +57,43 @@ jobs:
           libcgroup1 liblttng-ust1 libnuma1 libssh2-1
         dpkg-query --show libcgroup1 liblttng-ust1 libnuma1 libssh2-1
 
-    - name: Test native profile preparation and diagnostics
-      run: python3 -m tests.run --suite native_runtime_models
-
     - name: Extract and verify pinned native libraries (no node installation)
       timeout-minutes: 5
       run: python3 -m tests.native_runtime.runner prepare --root "$NATIVE_ROOT"
-
-    - name: Build locked native app and standalone host
-      timeout-minutes: 8
-      run: |
-        cargo build --locked -p fube-test-host -p stateless-test-app
-        cargo build --locked -p fube-test-host --example manifest_acceptance
 
     - name: Native bootstrap, finite lease polling and unregister
       timeout-minutes: 6
       run: |
         python3 -m tests.run --suite native_bootstrap --root "$NATIVE_ROOT" \
+          --prebuilt "$RUNNER_TEMP/native-runtime-binaries" \
           --diagnostics-directory "$NATIVE_DIAGNOSTICS"
 
     - name: Native Open, ping, Close and graceful reap
       timeout-minutes: 6
       run: |
         python3 -m tests.run --suite native_close --root "$NATIVE_ROOT" \
+          --prebuilt "$RUNNER_TEMP/native-runtime-binaries" \
           --diagnostics-directory "$NATIVE_DIAGNOSTICS"
 
     - name: Native independent Abort and owned forced reap
       timeout-minutes: 6
       run: |
         python3 -m tests.run --suite native_abort --root "$NATIVE_ROOT" \
+          --prebuilt "$RUNNER_TEMP/native-runtime-binaries" \
           --diagnostics-directory "$NATIVE_DIAGNOSTICS"
 
     - name: Native manifest defaults, activation metadata, Open, caller ping and Close
       timeout-minutes: 6
       run: |
         python3 -m tests.run --suite native_manifest_close --root "$NATIVE_ROOT" \
+          --prebuilt "$RUNNER_TEMP/native-runtime-binaries" \
           --diagnostics-directory "$NATIVE_DIAGNOSTICS"
 
     - name: Native manifest overrides, Open, caller ping and independent Abort
       timeout-minutes: 6
       run: |
         python3 -m tests.run --suite native_manifest_abort --root "$NATIVE_ROOT" \
+          --prebuilt "$RUNNER_TEMP/native-runtime-binaries" \
           --diagnostics-directory "$NATIVE_DIAGNOSTICS"
 
     - name: Retain bounded standalone host and native evidence
@@ -117,6 +102,7 @@ jobs:
       with:
         name: standalone-native-runtime-${{ github.run_id }}-${{ github.run_attempt }}
         path: |
+          ${{ runner.temp }}/validated-standalone-input.json
           ${{ env.NATIVE_DIAGNOSTICS }}/bootstrap.log
           ${{ env.NATIVE_DIAGNOSTICS }}/bootstrap.json
           ${{ env.NATIVE_DIAGNOSTICS }}/close.log

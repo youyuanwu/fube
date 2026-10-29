@@ -45,7 +45,8 @@ def command(suite, args):
                 "--name", args.name, "--owner", args.owner, "--prebuilt", str(args.prebuilt),
                 "--producer", str(args.producer), "--report", report]
     result = [sys.executable, "-m", "tests.native_runtime.runner", suite["action"]]
-    for name in ("root", "native_directory", "dependency_directory", "diagnostics_directory"):
+    needed(args, "prebuilt")
+    for name in ("prebuilt", "root", "native_directory", "dependency_directory", "diagnostics_directory"):
         value = getattr(args, name)
         if value is not None:
             result.extend(["--" + name.replace("_", "-"), str(value)])

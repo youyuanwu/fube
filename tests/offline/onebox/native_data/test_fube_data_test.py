@@ -351,7 +351,7 @@ class BundleTests(ProjectFiles):
             load.assert_not_called()
         self.assertEqual(report.read_text(), "original evidence")
 
-    def test_build_only_uses_clean_source_locked_cargo_and_rechecks_after(self):
+    def test_packaging_reads_graphs_without_compiling_and_rechecks_source_after(self):
         native = self.root / "target/debug/native-replicator-oracle"
         native.parent.mkdir(parents=True)
         native.write_bytes(executable("native-replicator-oracle"))
@@ -359,6 +359,7 @@ class BundleTests(ProjectFiles):
             if args[:2] == ("readelf", "-d"):
                 return DYNAMIC
             self.assertEqual(args[0], "cargo")
+            self.assertEqual(args[1], "tree")
             self.assertIn("--locked", args)
             if args[1] == "tree":
                 package = args[-1]
@@ -3392,13 +3393,13 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("steps.partition.outputs.cleaned != 'true'", workflow)
         self.assertNotIn("cargo ", block)
         self.assertNotIn("rustc ", block)
-        self.assertIn("fromJSON(needs.rust-native-client-linux.outputs.onebox-matrix)", workflow)
+        self.assertIn("fromJSON(needs.rust-build.outputs.onebox-matrix)", workflow)
         self.assertIn("pattern: onebox-worker-*-${{ github.run_id }}-${{ github.run_attempt }}", workflow)
         self.assertIn("merge-multiple: true", workflow)
         self.assertNotIn("name: onebox-client-runtime-", workflow)
         self.assertNotIn("name: onebox-native-data-", workflow)
         self.assertIn("name: Linux onebox native client", workflow)
-        self.assertIn("needs: [rust-native-client-linux, onebox-workers]", workflow)
+        self.assertIn("needs: [rust-build, onebox-workers, rust-tests, rust-quality, python-tests, standalone]", workflow)
         self.assertIn("-m tests.onebox.shared.ci aggregate", workflow)
         self.assertIn("-m tests.onebox.shared.ci cleanup", workflow)
         self.assertLess(workflow.index("name: Emergency cleanup"), workflow.index("name: Upload this worker"))

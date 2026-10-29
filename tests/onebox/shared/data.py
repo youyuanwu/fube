@@ -157,7 +157,6 @@ def build_bundle(directory: Path) -> None:
     require(not directory.exists() and not directory.is_symlink(), "bundle destination must be NEW")
     directory.mkdir(parents=True, exist_ok=False)
     runtime.build_bundle(directory / "legacy")
-    runtime.run("cargo", "build", "--locked", "-p", "native-replicator-oracle")
     sources = {
         "rust-runtime-app": directory / "legacy/rust-runtime-app",
         "runtime_observer": directory / "legacy/runtime_observer",
@@ -3976,7 +3975,7 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("name", nargs="?")
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--build-bundle", type=Path, help="upstream-only, NEW directory, clean source")
+    mode.add_argument("--build-bundle", type=Path, help="package existing Cargo outputs; NEW directory, clean source")
     mode.add_argument("--prebuilt", type=Path, help="strict bundle; no Cargo or compiler fallback")
     parser.add_argument("--profile", choices=MANIFEST.profiles)
     parser.add_argument("--existing-owner", help="exact caller-owned allocation capability; retain allocation")

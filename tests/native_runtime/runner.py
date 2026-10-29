@@ -6,8 +6,11 @@ available in the loader or the explicitly selected private dependency directory.
 
 import argparse
 import hashlib
+import json
 import pathlib
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -28,6 +31,63 @@ LIBRARY_HASHES = {
 RELATIVE_NATIVE = pathlib.Path("opt/microsoft/servicefabric/bin/Fabric/Fabric.Code")
 DIAGNOSTIC_LIMIT = 1024 * 1024
 SCENARIOS = ("bootstrap", "close", "abort", "manifest-close", "manifest-abort")
+BINARY_OUTPUTS = {
+    "fube-test-host": "target/debug/fube-test-host",
+    "stateless-test-app": "target/debug/stateless-test-app",
+    "manifest_acceptance": "target/debug/examples/manifest_acceptance",
+}
+
+
+def git(*args):
+    return subprocess.run(["git", *args], cwd=ROOT, check=True, capture_output=True,
+                          text=True, timeout=30).stdout.strip()
+
+
+def package_bundle(directory):
+    if git("status", "--porcelain", "--untracked-files=normal"):
+        raise ValueError("standalone bundle requires a clean source tree")
+    revision = git("rev-parse", "HEAD")
+    directory.mkdir(parents=True, exist_ok=False)
+    artifacts = {}
+    for name, relative in BINARY_OUTPUTS.items():
+        source = ROOT / relative
+        if source.is_symlink() or not source.is_file() or not source.stat().st_mode & 0o111:
+            raise ValueError(f"missing executable build output: {source}; run cargo build upstream")
+        target = directory / name
+        shutil.copyfile(source, target)
+        target.chmod(0o755)
+        artifacts[name] = digest(target)
+    if git("status", "--porcelain", "--untracked-files=normal") or git("rev-parse", "HEAD") != revision:
+        raise ValueError("source changed while packaging standalone bundle")
+    (directory / "build-info.json").write_text(json.dumps({
+        "version": 1, "source_revision": revision, "sha256": artifacts,
+    }, indent=2), encoding="utf-8")
+
+
+def load_bundle(directory):
+    if any(path.is_symlink() for path in (directory, *directory.parents)):
+        raise ValueError("standalone bundle path must not contain symlinks")
+    manifest = directory / "build-info.json"
+    if manifest.is_symlink() or not stat.S_ISREG(manifest.stat().st_mode) or not 0 < manifest.stat().st_size <= 65536:
+        raise ValueError("standalone bundle metadata must be a bounded regular file")
+    metadata = json.loads(manifest.read_text(encoding="utf-8"))
+    if (type(metadata) is not dict or set(metadata) != {"version", "source_revision", "sha256"}
+            or type(metadata["version"]) is not int or metadata["version"] != 1
+            or metadata["source_revision"] != git("rev-parse", "HEAD")
+            or type(metadata["sha256"]) is not dict or set(metadata["sha256"]) != set(BINARY_OUTPUTS)
+            or {path.name for path in directory.iterdir()} != set(BINARY_OUTPUTS) | {"build-info.json"}):
+        raise ValueError("standalone bundle source or inventory mismatch")
+    result = {}
+    for name in BINARY_OUTPUTS:
+        path = directory / name
+        expected = metadata["sha256"][name]
+        if (path.is_symlink() or not stat.S_ISREG(path.stat().st_mode)
+                or stat.S_IMODE(path.stat().st_mode) != 0o755
+                or type(expected) is not str or re.fullmatch(r"[a-f0-9]{64}", expected) is None
+                or digest(path) != expected):
+            raise ValueError(f"standalone bundle executable mismatch: {name}")
+        result[name] = path.resolve()
+    return result
 
 
 def digest(path):
@@ -93,28 +153,38 @@ def run_host(command, repo, diagnostics, scenario):
     return result.returncode
 
 
-def manifest_fixture(repo, root):
+def manifest_fixture(repo, root, app):
     """Fresh ordinary input package; no native/deployment artifacts copied."""
     package = pathlib.Path(tempfile.mkdtemp(prefix="manifest-package-", dir=root))
     shutil.copytree(repo / "crates/samples/stateless-test-app/manifests",
                     package, dirs_exist_ok=True)
     code = package / "EchoPackage/Executables"
     code.mkdir()
-    shutil.copy2(repo / "target/debug/stateless-test-app", code / "native-echo")
+    shutil.copy2(app, code / "native-echo")
     return package
 
 
-def main():
+def main(argv=None):
     repo = ROOT
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["prepare", *SCENARIOS])
+    parser.add_argument("action", choices=["prepare", "package", *SCENARIOS])
+    parser.add_argument("--output", type=pathlib.Path, help="NEW standalone bundle directory for package")
+    parser.add_argument("--prebuilt", type=pathlib.Path, help="verified standalone binary bundle; no compilation")
     parser.add_argument("--root", type=pathlib.Path,
                         default=repo / "build/native-runtime-test-host")
     parser.add_argument("--native-directory", type=pathlib.Path)
     parser.add_argument("--dependency-directory", type=pathlib.Path)
     parser.add_argument("--diagnostics-directory", type=pathlib.Path,
                         help="retain <=1 MiB host/native console tail and raw report per scenario")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.action == "package":
+        if args.output is None:
+            parser.error("package requires --output")
+        package_bundle(args.output)
+        return 0
+    if args.action != "prepare" and args.prebuilt is None:
+        parser.error("native acceptance requires --prebuilt; build and package binaries upstream")
+    binaries = load_bundle(args.prebuilt) if args.action != "prepare" else None
     root = args.root.resolve()
     if args.action == "prepare":
         native = prepare(root)
@@ -135,21 +205,16 @@ def main():
     missing = [line.strip() for line in checked.stdout.splitlines() if "not found" in line]
     if missing:
         raise ValueError(f"missing native ABI prerequisites: {', '.join(missing)}")
-    subprocess.run(["cargo", "build", "--locked", "-p", "fube-test-host",
-                    "-p", "stateless-test-app"], cwd=repo, check=True, timeout=180)
     if args.action.startswith("manifest-"):
-        subprocess.run(["cargo", "build", "--locked", "-p", "fube-test-host",
-                        "--example", "manifest_acceptance"],
-                       cwd=repo, check=True, timeout=180)
-        package = manifest_fixture(repo, root)
+        package = manifest_fixture(repo, root, binaries["stateless-test-app"])
         return run_host([
-            str(repo / "target/debug/examples/manifest_acceptance"),
+            str(binaries["manifest_acceptance"]),
             str(native), str(dependencies), str(package), str(root),
             args.action.removeprefix("manifest-"),
         ], repo, args.diagnostics_directory, args.action)
     return run_host([
-        str(repo / "target/debug/fube-test-host"), str(native), str(dependencies),
-        str(repo / "target/debug/stateless-test-app"), str(root), args.action,
+        str(binaries["fube-test-host"]), str(native), str(dependencies),
+        str(binaries["stateless-test-app"]), str(root), args.action,
     ], repo, args.diagnostics_directory, args.action)
 
 

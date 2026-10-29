@@ -119,7 +119,7 @@ class StatefulEvidenceTests(unittest.TestCase):
 
     def test_missing_prebuilt_is_rejected_without_cargo_or_resource_mutation(self):
         with patch("sys.argv",["rust_runtime_test.py","owned","--stateful","one"]), \
-             patch.object(runtime,"build_binaries") as build, patch.object(runtime,"create_owned") as create, \
+             patch.object(runtime,"built_binaries") as build, patch.object(runtime,"create_owned") as create, \
              contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):runtime.main()
             build.assert_not_called();create.assert_not_called()

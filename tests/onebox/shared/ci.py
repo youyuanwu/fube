@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compiler-free CI receipts for the two whole-suite onebox routes.
+"""CI artifact receipts and compiler-free whole-suite onebox routes.
 
 This adapter does not create allocations or build inputs. Cleanup always uses
 the caller's original capability, including when input validation has failed.
@@ -33,6 +33,7 @@ ONEBOX_SUITES = {name: suite for name, suite in suites.MANIFEST.suites.items()
                 if suite["resource"] == "onebox"}
 OUTCOMES = {"validate", "create", "destroy"} | ONEBOX_SUITES.keys()
 FIXTURE_PHASES = ("validate", "create", "ready", "suites", "diagnostics", "destroy")
+REQUIRED_JOBS = ("producer", "workers", "rust_tests", "rust_quality", "python_tests", "standalone")
 NATIVE_FILES = tuple(Path(report).name for suite in ONEBOX_SUITES.values()
                      if suite["kind"] == "nextest" for report in suite["reports"])
 CLEAR_CASES = (
@@ -409,27 +410,55 @@ def receipt(path, kind, current):
 
 def producer(path, current):
     value = receipt(path, "producer", current)
-    exact(value, {"version", "kind", "status", "errors", "context", "inputs", "created_at"},
+    exact(value, {"version", "kind", "status", "errors", "context", "inputs", "build", "created_at"},
           "producer receipt schema")
     exact(value["inputs"], {"bundle_tar", "manifest", "nested_manifest", "app", "observer",
                            "native_oracle", "native_archive", "qualification_script", "runtime_script",
-                           "suite_manifest"},
+                           "suite_manifest", "standalone_bundle"},
           "producer input inventory")
     for item in value["inputs"].values():
         exact(item, {"sha256", "bytes"}, "input identity schema")
         require(sha(item["sha256"]) and integer(item["bytes"], 1) and item["bytes"] <= INPUT,
                 "input identity hash/size")
     require(same(value["inputs"]["suite_manifest"], identity(suites.PATH)), "suite manifest changed")
+    build = value["build"]
+    exact(build, {"target", "profile", "rustc", "cargo", "nextest", "cargo_lock", "toolchain"},
+          "Rust build metadata")
+    require(build["target"] == "x86_64-unknown-linux-gnu" and build["profile"] == "debug"
+            and all(text(build[key]) for key in ("rustc", "cargo", "nextest"))
+            and same(build["cargo_lock"], identity(ROOT / "Cargo.lock"))
+            and same(build["toolchain"], identity(ROOT / "rust-toolchain.toml")),
+            "Rust build target/toolchain/lockfile mismatch")
     require(number(value["created_at"], 1), "producer timestamp")
     return value
+
+
+def build_metadata():
+    return {
+        "target": "x86_64-unknown-linux-gnu", "profile": "debug",
+        "rustc": runtime.run("rustc", "--version"),
+        "cargo": runtime.run("cargo", "--version"),
+        "nextest": runtime.run("cargo-nextest", "nextest", "--version"),
+        "cargo_lock": identity(ROOT / "Cargo.lock"), "toolchain": identity(ROOT / "rust-toolchain.toml"),
+    }
 
 
 def produce(args):
     current = context()
     bundle, inputs = bundle_identity(args.bundle_tar, args.bundle_dir, args.archive)
+    inputs["standalone_bundle"] = identity(args.standalone_bundle)
+    build = build_metadata()
     require(bundle.source_revision == current["source"], "bundle is not actual checkout source")
     require(same(context(), current), "source changed during input verification")
-    return {"context": current, "inputs": inputs, "created_at": time.time()}
+    return {"context": current, "inputs": inputs, "build": build, "created_at": time.time()}
+
+
+def verify_artifact(args):
+    current = context()
+    built = producer(args.producer, current)
+    require(same(identity(args.file), built["inputs"][args.input]), "producer/artifact mismatch")
+    require(same(context(), current), "source changed during artifact verification")
+    return {"context": current, "input": args.input, "identity": built["inputs"][args.input]}
 
 
 def validate(args):
@@ -1728,7 +1757,7 @@ def aggregate(args):
     built = producer(args.producer, current)
     producer_digest = identity(args.producer, SMALL)["sha256"]
     needs = small_json(args.needs_json)
-    require(needs == {"producer": "success", "workers": "success"}, "all producer/worker jobs must succeed")
+    require(needs == dict.fromkeys(REQUIRED_JOBS, "success"), "all required CI jobs must succeed")
     root = safe_path(args.worker_root)
     require(root.is_dir() and {entry.name for entry in root.iterdir()} == set(ROUTES)
             and all(safe_path(root / route).is_dir() for route in ROUTES), "exact manifest worker routes required")
@@ -1779,15 +1808,20 @@ def aggregate(args):
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
-    for command in ("produce", "validate", "legacy", "cleanup", "seal", "aggregate"):
+    for command in ("produce", "verify-artifact", "validate", "legacy", "cleanup", "seal", "aggregate"):
         sub = commands.add_parser(command)
         if command in ("produce", "validate"):
             sub.add_argument("--bundle-tar", required=True, type=Path)
             sub.add_argument("--bundle-dir", required=True, type=Path)
             sub.add_argument("--archive", required=command == "produce", type=Path)
+        if command == "produce":
+            sub.add_argument("--standalone-bundle", required=True, type=Path)
+        if command == "verify-artifact":
+            sub.add_argument("--input", required=True, choices=("native_archive", "standalone_bundle"))
+            sub.add_argument("--file", required=True, type=Path)
         if command == "validate":
             sub.add_argument("--receipt", required=True, type=Path)
-        if command in ("legacy", "cleanup", "seal", "aggregate"):
+        if command in ("verify-artifact", "legacy", "cleanup", "seal", "aggregate"):
             sub.add_argument("--producer", required=True, type=Path)
         if command in ("legacy", "cleanup"):
             sub.add_argument("--name", required=True)
@@ -1823,7 +1857,7 @@ def main(argv=None):
         result["errors"].append("NEW output reservation failed")
     try:
         if not reservation_error or args.command == "cleanup":
-            value = globals()[args.command](args)
+            value = globals()[args.command.replace("-", "_")](args)
             result.update(value)
             result["status"] = "FAIL" if result["errors"] or reservation_error else "PASS"
     except (Exception, KeyboardInterrupt) as error:

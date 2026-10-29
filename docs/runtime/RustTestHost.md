@@ -112,13 +112,18 @@ Runtime/Common library bytes remain SHA256-pinned. Ubuntu22's default Python
 3.10 is insufficient: supply Python **3.11+** (CI uses 3.12).
 
 ```sh
-python3 -m tests.native_runtime.runner bootstrap
-python3 -m tests.native_runtime.runner close
-python3 -m tests.native_runtime.runner abort
+cargo build --locked --workspace --bins --examples --all-features
+python3 -m tests.native_runtime.runner package --output build/native-runtime-binaries
+python3 -m tests.native_runtime.runner bootstrap --prebuilt build/native-runtime-binaries
+python3 -m tests.native_runtime.runner close --prebuilt build/native-runtime-binaries
+python3 -m tests.native_runtime.runner abort --prebuilt build/native-runtime-binaries
 ```
 
-Each invocation builds the app/host with `--locked` and creates fresh host,
-runtime and partition identities. `--root`, `--native-directory` and
+Build/package once from clean source, then transfer the bundle preserving modes
+if acceptance runs elsewhere. Each scenario requires a source/hash/mode-verified
+`--prebuilt` bundle and never invokes Cargo; missing or changed artifacts fail.
+Each invocation creates fresh host, runtime and partition identities.
+`--root`, `--native-directory` and
 `--dependency-directory` select explicit locations. The default dependency
 directory is `build/native-runtime-test-host/deps`. Containers are not needed
 to execute the host/app; no cluster/onebox is used.
@@ -149,16 +154,15 @@ complete-scenario path without those fixture contracts; see section 2.6.
 
 | Tier | Job/workflow | Prerequisites and evidence |
 |---|---|---|
-| Native-free | `Native-free Rust client` in [`ci.yaml`](../../.github/workflows/ci.yaml) | Rust model/regression tests, including the host; no SF native libraries or node. These are not native interoperability evidence. |
-| Standalone native | `Linux standalone native runtime` in [`native-runtime.yaml`](../../.github/workflows/native-runtime.yaml) | Ubuntu22 x86_64, Python3.12, pinned Rust toolchain and SHA-verified SF 11.8.121.4 libraries. Runs the real `prepare`, `bootstrap`, `close`, `abort`, `manifest-close`, `manifest-abort` commands, directly on Linux. **No SF package installation, node, cluster, onebox or container startup.** |
-| Onebox | `Linux onebox lifecycle` in `ci.yaml` | Real SF nodes and native-client/lifecycle tests. These exercise a different boundary, not the standalone host profile. All test tiers are Linux-only. |
+| Native-free | `Rust workspace tests (archived)` in [`ci.yaml`](../../.github/workflows/ci.yaml) | Workspace model/regression tests from the producer's nextest archive; no SF native libraries or node. These are not native interoperability evidence. |
+| Standalone native | `Linux standalone native runtime` in [`native-runtime.yaml`](../../.github/workflows/native-runtime.yaml) | Ubuntu22 x86_64, Python3.12, verified prebuilt executables and SHA-verified SF 11.8.121.4 libraries. Runs the real `prepare`, `bootstrap`, `close`, `abort`, `manifest-close`, `manifest-abort` commands, directly on Linux. **No Rust compilation, SF package installation, node, cluster, onebox or container startup.** |
+| Onebox | `Linux onebox native client` aggregate in `ci.yaml` | Real SF nodes and native-client/lifecycle tests. These exercise a different boundary, not the standalone host profile. All test tiers are Linux-only. |
 
-The standalone workflow runs on pushes and PRs touching its workflow, native
-runner/tests, crates, Cargo manifest/lock or Rust toolchain; it also supports
-manual dispatch once present on the default branch. It does not depend on the
-cluster jobs or launch them. The job has a 20-minute limit, each scenario step
-has a 6-minute limit, and existing runner/host deadlines still apply. A locked
-prebuild avoids spending the scenario build deadline on a cold dependency build.
+The standalone workflow is called by main CI on main pushes, PRs and manual
+dispatch. It depends only on the shared Ubuntu22 Rust producer, not cluster jobs.
+It verifies the exact current-attempt tar against the producer receipt before
+extracting it; no Rust toolchain is installed. The job has a 20-minute limit,
+each scenario step has a 6-minute limit, and existing runner/host deadlines still apply.
 Missing ABI libraries and native errors fail explicitly.
 
 To retain the same host/native evidence locally, add the optional diagnostics
@@ -166,6 +170,7 @@ directory to each scenario command:
 
 ```sh
 python3 -m tests.native_runtime.runner close \
+  --prebuilt build/native-runtime-binaries \
   --diagnostics-directory build/native-runtime-evidence
 ```
 
@@ -174,8 +179,9 @@ when emitted by the real host, `close.json` (the original `MSSF_REPORT` payload,
 at most **1MiB**). Each of bootstrap, close, abort, manifest-close and manifest-abort
 uses its own filenames. Timeout retains
 available partial output and remains failure; nonzero native exits remain
-nonzero. Without this option output streams as before. CI uploads only these
-ten named files on success or failure, at most **10MiB total**, for seven days.
+nonzero. Without this option output streams as before. CI uploads these
+ten named files on success or failure, at most **10MiB total**, plus the bounded
+input-verification receipt, for seven days.
 Early setup/preflight failures may produce no scenario files; use the failing
 Actions step log. Native archives, extracted libraries, deployment trees,
 native disk traces and environment dumps are not uploaded.

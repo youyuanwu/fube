@@ -182,9 +182,13 @@ On 2026-10-25, with the existing extracted pinned Ubuntu22 runtime and private A
 files on Linux x86_64:
 
 ```sh
+cargo build --locked --workspace --bins --examples --all-features
+python3 -m tests.native_runtime.runner package --output build/native-runtime-binaries
 python3 -m tests.native_runtime.runner manifest-close \
+  --prebuilt build/native-runtime-binaries \
   --diagnostics-directory build/manifest-test-host-evidence
 python3 -m tests.native_runtime.runner manifest-abort \
+  --prebuilt build/native-runtime-binaries \
   --diagnostics-directory build/manifest-test-host-evidence
 ```
 
@@ -230,7 +234,9 @@ the native factory service URI independently verify the application identity.
 
 Standalone [CI](../../.github/workflows/native-runtime.yaml) runs both manifest
 scenarios without a node. It retains ten explicitly named log/report files for
-five scenarios, at most 1MiB/file (10MiB total), for seven days; no native packages,
+five scenarios, at most 1MiB/file (10MiB total), plus a bounded producer-input
+verification receipt, for seven days. It consumes verified prebuilt binaries
+without compiling; no native packages,
 deployment trees or environment dumps are uploaded. Rust/parser/state tests and
 Python runner tests are **not** substitutes for these real native executions.
 The implementation push passed standalone CI
