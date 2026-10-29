@@ -341,11 +341,6 @@ impl Scope {
             active.authority.retire();
         }
         let last = self.remaining.fetch_sub(1, Ordering::AcqRel) == 1;
-        if active.children.fetch_sub(1, Ordering::AcqRel) == 1 {
-            if let Some(waker) = active.waiter.lock().unwrap().take() {
-                waker.wake();
-            }
-        }
         let trackers = if last {
             if self.pending_results.load(Ordering::Acquire) == 0 {
                 self.active.lock().unwrap().take();
@@ -362,7 +357,6 @@ impl Scope {
             Vec::new()
         };
         let changed = active.changed.clone();
-        drop(active);
         if last {
             *self.completion.lock().unwrap() = true;
             self.completed.notify_all();
@@ -372,6 +366,8 @@ impl Scope {
                 tracker.changed.notify_waiters();
             }
         }
+        active.children.fetch_sub(1, Ordering::AcqRel);
+        drop(active);
         changed.notify_waiters();
     }
     fn outcome(&self) -> Result<()> {
@@ -604,7 +600,14 @@ impl<T: Send + 'static> Drop for ManagedObject<T> {
             Ok(scope) => {
                 slot.tracker.enroll(slot.receipt.clone(), &scope);
                 slot.receipt.bind(scope);
-                slot.runtime.inner.cleanup.enqueue(slot.clone());
+                let runtime = slot.runtime.clone();
+                runtime.inner.cleanup.spawn(
+                    &runtime.inner.authority,
+                    async move {
+                        tokio::task::block_in_place(|| slot.release());
+                    },
+                    None,
+                );
             }
             Err(_) => {
                 slot.tracker.pending.fetch_add(1, Ordering::AcqRel);
@@ -614,8 +617,8 @@ impl<T: Send + 'static> Drop for ManagedObject<T> {
         }
     }
 }
-impl<T: Send + 'static> Work for ReleaseSlot<T> {
-    fn execute(self: Arc<Self>, _: bool) {
+impl<T: Send + 'static> ReleaseSlot<T> {
+    fn release(self: Arc<Self>) {
         let scope = self
             .receipt
             .0
@@ -654,12 +657,17 @@ impl CleanupPermit {
         let scope = self.scope.take().unwrap();
         let receipt = DisposalReceipt::new();
         receipt.bind(scope.clone());
-        self.runtime.inner.cleanup.enqueue(Arc::new(ClosureWork {
-            runtime: self.runtime.clone(),
-            scope,
-            body: Mutex::new(Some(Box::new(body))),
-            quota: Mutex::new(self.ready.take()),
-        }));
+        let runtime = self.runtime.clone();
+        let quota = self.ready.take();
+        self.runtime.inner.cleanup.spawn(
+            &self.runtime.inner.authority,
+            async move {
+                tokio::task::block_in_place(|| {
+                    run_body(runtime, scope, Box::new(body), quota, true)
+                });
+            },
+            None,
+        );
         receipt
     }
 }
@@ -671,30 +679,25 @@ impl Drop for CleanupPermit {
     }
 }
 type CleanupBody = Box<dyn FnOnce() -> Result<()> + Send>;
-struct ClosureWork {
+fn run_body(
     runtime: ExecutionRuntime,
     scope: Arc<Scope>,
-    body: Mutex<Option<CleanupBody>>,
-    quota: Mutex<Option<OwnedSemaphorePermit>>,
-}
-impl Work for ClosureWork {
-    fn execute(self: Arc<Self>, cleanup_lane: bool) {
-        // Terminal bodies are internal joins only; never install an implicit
-        // application scheduler on the library-only coordinator thread.
-        let _entered = cleanup_lane.then(|| self.runtime.inner.application.enter());
-        let entry = self.scope.enter(self.scope.origin, true);
-        let body = self.body.lock().unwrap().take().unwrap();
-        match catch_unwind(AssertUnwindSafe(body)) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => self.scope.fail(error),
-            Err(_) => self
-                .scope
-                .fail(Error::Protocol("owned disposal/join panicked")),
-        }
-        drop(entry);
-        self.quota.lock().unwrap().take();
-        self.scope.finish();
+    body: CleanupBody,
+    quota: Option<OwnedSemaphorePermit>,
+    cleanup_lane: bool,
+) {
+    // Terminal bodies are internal joins only; never install an implicit
+    // application scheduler on the library-only coordinator thread.
+    let _entered = cleanup_lane.then(|| runtime.inner.application.enter());
+    let entry = scope.enter(scope.origin, true);
+    match catch_unwind(AssertUnwindSafe(body)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => scope.fail(error),
+        Err(_) => scope.fail(Error::Protocol("owned disposal/join panicked")),
     }
+    drop(entry);
+    drop(quota);
+    scope.finish();
 }
 pub struct TerminalPermit {
     runtime: ExecutionRuntime,
@@ -781,12 +784,14 @@ impl TerminalRecord {
         let scope = self.scope.take().unwrap();
         let receipt = DisposalReceipt::new();
         receipt.bind(scope.clone());
-        self.runtime.inner.terminal.enqueue(Arc::new(ClosureWork {
-            runtime: self.runtime.clone(),
-            scope,
-            body: Mutex::new(Some(Box::new(body))),
-            quota: Mutex::new(self.quota.take()),
-        }));
+        let runtime = self.runtime.clone();
+        let quota = self.quota.take();
+        self.runtime
+            .inner
+            .terminal
+            .enqueue(&self.runtime.inner.authority, move || {
+                run_body(runtime, scope, Box::new(body), quota, false);
+            });
         receipt
     }
 }
@@ -829,12 +834,14 @@ impl TerminalPermit {
         };
         let receipt = DisposalReceipt::new();
         receipt.bind(scope.clone());
-        self.runtime.inner.terminal.enqueue(Arc::new(ClosureWork {
-            runtime: self.runtime.clone(),
-            scope,
-            body: Mutex::new(Some(Box::new(body))),
-            quota: Mutex::new(self.quota.take()),
-        }));
+        let runtime = self.runtime.clone();
+        let quota = self.quota.take();
+        self.runtime
+            .inner
+            .terminal
+            .enqueue(&self.runtime.inner.authority, move || {
+                run_body(runtime, scope, Box::new(body), quota, false);
+            });
         Ok(receipt)
     }
     pub fn fence(mut self, body: impl FnOnce() -> Result<()> + Send + 'static) {
@@ -1029,7 +1036,6 @@ impl ExecutionRuntime {
             _record: Some(record),
             _admission: None,
             children: AtomicUsize::new(0),
-            waiter: Mutex::new(None),
             changed: self.inner.changed.clone(),
             lane: None,
             cleanup_owner: Some(self.inner.cleanup_owners.clone()),

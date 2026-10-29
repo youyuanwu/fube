@@ -68,7 +68,7 @@ async fn cancellation_between_result_check_and_commit_disposes_result_before_fin
         resume: Mutex::new(resume),
     });
     *runtime.inner.cleanup_pause.lock().unwrap() = Some(pause.clone());
-    let (dropped, drop_rx) = tokio::sync::oneshot::channel();
+    let (dropped, mut drop_rx) = tokio::sync::oneshot::channel();
     struct Value(Option<tokio::sync::oneshot::Sender<String>>);
     impl Drop for Value {
         fn drop(&mut self) {
@@ -86,18 +86,19 @@ async fn cancellation_between_result_check_and_commit_disposes_result_before_fin
     tokio::time::timeout(Duration::from_secs(1), pause.entered.notified())
         .await
         .unwrap();
-    let task = call.task.clone();
-    task.schedule(true);
-    assert!(task.state.lock().unwrap().canceled);
+    let disposition = call.disposition();
+    disposition.cancel();
+    assert!(!disposition.is_finished());
+    assert!(matches!(
+        drop_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
     release.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(1), call.cancel_and_wait())
         .await
         .unwrap();
     assert_eq!(drop_rx.await.unwrap(), "fube-owned-cleanup");
-    let state = task.state.lock().unwrap();
-    assert!(state.finished && state.result.is_none());
-    drop(state);
-    drop(task);
+    assert!(disposition.is_finished());
     runtime.shutdown().await.unwrap();
 }
 
@@ -329,6 +330,32 @@ async fn root_result_waits_for_its_managed_child_actual_destructor() {
     runtime.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn cancellation_drops_child_owning_result_before_waiting_for_its_child() {
+    let runtime = runtime();
+    let owner = runtime.clone();
+    let (returned, returned_rx) = tokio::sync::oneshot::channel();
+    let mut call = runtime.try_reserve().unwrap().run_owned(move || {
+        let child = owner.reserve_cleanup(Duration::from_secs(30))?;
+        returned.send(()).unwrap();
+        Ok(child)
+    });
+    let disposition = call.disposition();
+    returned_rx.await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut call)
+        .await
+        .is_err());
+    drop(call);
+    tokio::time::timeout(Duration::from_secs(1), disposition.wait())
+        .await
+        .unwrap();
+    assert!(disposition.is_finished());
+    tokio::time::timeout(Duration::from_secs(1), runtime.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_native_workers_do_not_occupy_provider_or_reserved_cleanup_workers() {
     let runtime = runtime();
@@ -399,6 +426,141 @@ async fn full_native_workers_do_not_occupy_provider_or_reserved_cleanup_workers(
         call.await.unwrap();
     }
     runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn queued_cancellation_disposes_captures_without_readmitting_stale_tasks() {
+    let runtime = runtime();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let (entered, mut entered_rx) = tokio::sync::mpsc::channel(32);
+    let mut running = Vec::new();
+    for _ in 0..32 {
+        let release = release.clone();
+        let entered = entered.clone();
+        running.push(
+            runtime
+                .reserve(
+                    CallLane::Provider,
+                    CallOrigin::default(),
+                    Duration::from_secs(30),
+                    false,
+                )
+                .unwrap()
+                .run_owned(move || {
+                    entered.try_send(()).unwrap();
+                    let ready = release.0.lock().unwrap();
+                    let (ready, _) = release
+                        .1
+                        .wait_timeout_while(ready, Duration::from_secs(5), |ready| !*ready)
+                        .unwrap();
+                    assert!(*ready);
+                    Ok(())
+                }),
+        );
+    }
+    for _ in 0..32 {
+        tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let (dropped, mut drop_rx) = tokio::sync::mpsc::channel(32);
+    struct Capture(tokio::sync::mpsc::Sender<()>);
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            assert_eq!(std::thread::current().name(), Some("fube-owned-cleanup"));
+            self.0.try_send(()).unwrap();
+        }
+    }
+    let mut queued = Vec::new();
+    for _ in 0..32 {
+        let capture = Capture(dropped.clone());
+        queued.push(
+            runtime
+                .reserve(
+                    CallLane::Provider,
+                    CallOrigin::default(),
+                    Duration::from_secs(30),
+                    false,
+                )
+                .unwrap()
+                .run_future(async move {
+                    let _capture = capture;
+                    panic!("canceled queued application root was polled");
+                    #[allow(unreachable_code)]
+                    Ok(())
+                }),
+        );
+    }
+    let dispositions: Vec<_> = queued.iter().map(OwnedCall::disposition).collect();
+    drop(queued);
+    for disposition in dispositions {
+        tokio::time::timeout(Duration::from_secs(2), disposition.wait())
+            .await
+            .unwrap();
+    }
+    for _ in 0..32 {
+        tokio::time::timeout(Duration::from_secs(2), drop_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            runtime.try_reserve(),
+            Err(Error::ResourceLimit(_))
+        ));
+    }
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    for call in running {
+        call.await.unwrap();
+    }
+    let permits: Vec<_> = (0..64)
+        .map(|_| {
+            runtime
+                .reserve(
+                    CallLane::Provider,
+                    CallOrigin::default(),
+                    Duration::from_secs(30),
+                    false,
+                )
+                .unwrap()
+        })
+        .collect();
+    drop(permits);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn canceled_shutdown_observer_retains_tasks_and_can_resume_real_joins() {
+    let runtime = runtime();
+    let (entered, entered_rx) = tokio::sync::oneshot::channel();
+    let call = runtime.try_reserve().unwrap().run_future(async {
+        entered.send(()).unwrap();
+        std::future::pending::<Result<()>>().await
+    });
+    entered_rx.await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), runtime.shutdown())
+            .await
+            .is_err()
+    );
+    call.cancel_and_wait().await;
+    tokio::time::timeout(Duration::from_secs(2), runtime.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        *runtime.inner.joins.lock().await,
+        ShutdownJoins::Complete
+    ));
+    for tasks in [
+        &runtime.inner.native,
+        &runtime.inner.provider,
+        &runtime.inner.cleanup,
+    ] {
+        let state = tasks.state.lock().unwrap();
+        assert!(state.runtime.is_none() && state.joins.is_empty() && state.tickets.is_empty());
+    }
 }
 
 #[test]

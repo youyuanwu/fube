@@ -2,7 +2,7 @@ use crate::lease::{Authority, CallbackDeadline, OwnedThread};
 use fube_transport::{Error, Result};
 use std::{
     cell::RefCell,
-    collections::VecDeque,
+    collections::HashMap,
     future::Future,
     panic::{catch_unwind, AssertUnwindSafe},
     pin::Pin,
@@ -10,10 +10,13 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
     },
-    task::{Context, Poll, Wake, Waker},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore},
+    task::{AbortHandle, Id, JoinSet},
+};
 
 const WORKERS: usize = 32;
 const RECORDS: usize = 64;
@@ -96,7 +99,6 @@ struct Active {
     _record: Option<OwnedSemaphorePermit>,
     _admission: Option<OwnedSemaphorePermit>,
     children: AtomicUsize,
-    waiter: Mutex<Option<Waker>>,
     changed: Arc<Notify>,
     lane: Option<CallLane>,
     cleanup_owner: Option<Arc<AtomicUsize>>,
@@ -124,89 +126,122 @@ impl Active {
         })
     }
 }
-trait Work: Send + Sync {
-    fn execute(self: Arc<Self>, cleanup_lane: bool);
+struct Tasks {
+    name: &'static str,
+    state: Mutex<TaskSet>,
+}
+#[derive(Default)]
+struct TaskSet {
+    runtime: Option<tokio::runtime::Runtime>,
+    joins: JoinSet<()>,
+    tickets: HashMap<Id, OwnedSemaphorePermit>,
+    panicked: bool,
+}
+impl TaskSet {
+    fn collect(
+        &mut self,
+        result: std::result::Result<(Id, ()), tokio::task::JoinError>,
+        authority: &Authority,
+    ) {
+        let id = match result {
+            Ok((id, ())) => id,
+            Err(error) => {
+                if !error.is_cancelled() {
+                    authority.retire();
+                    self.panicked = true;
+                }
+                error.id()
+            }
+        };
+        self.tickets.remove(&id);
+    }
+    fn drain(&mut self, authority: &Authority) {
+        while let Some(result) = self.joins.try_join_next_with_id() {
+            self.collect(result, authority);
+        }
+    }
+}
+impl Tasks {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            state: Mutex::new(TaskSet::default()),
+        }
+    }
+    fn spawn(
+        &self,
+        authority: &Authority,
+        future: impl Future<Output = ()> + Send + 'static,
+        ticket: Option<OwnedSemaphorePermit>,
+    ) -> AbortHandle {
+        let mut state = self.state.lock().unwrap();
+        state.drain(authority);
+        if state.runtime.is_none() {
+            state.runtime = Some(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .max_blocking_threads(WORKERS - 1)
+                    .thread_name(self.name)
+                    .build()
+                    .expect("execution runtime creation failed"),
+            );
+        }
+        let handle = state.runtime.as_ref().unwrap().handle().clone();
+        let task = state.joins.spawn_on(future, &handle);
+        if let Some(ticket) = ticket {
+            state.tickets.insert(task.id(), ticket);
+        }
+        task
+    }
+    async fn finish(&self, authority: &Authority) -> Result<()> {
+        std::future::poll_fn(|cx| {
+            let mut state = self.state.lock().unwrap();
+            loop {
+                match state.joins.poll_join_next_with_id(cx) {
+                    Poll::Ready(Some(result)) => state.collect(result, authority),
+                    Poll::Ready(None) => {
+                        return Poll::Ready(if state.panicked {
+                            Err(Error::Protocol("execution task panicked"))
+                        } else {
+                            Ok(())
+                        })
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        })
+        .await
+    }
 }
 
-struct PoolState {
-    ready: VecDeque<Arc<dyn Work>>,
-    idle: usize,
-    stop: bool,
-    threads: Vec<Arc<OwnedThread>>,
-}
-struct Pool {
-    name: &'static str,
-    state: Mutex<PoolState>,
-    changed: Condvar,
-    authority: std::sync::Weak<Authority>,
-    maximum: usize,
-}
-impl Pool {
-    fn new(name: &'static str, authority: &Arc<Authority>) -> Arc<Self> {
-        Self::with_maximum(name, authority, WORKERS)
-    }
-    fn with_maximum(name: &'static str, authority: &Arc<Authority>, maximum: usize) -> Arc<Self> {
-        Arc::new(Self {
-            name,
-            state: Mutex::new(PoolState {
-                ready: VecDeque::new(),
-                idle: 0,
-                stop: false,
-                threads: Vec::new(),
-            }),
-            changed: Condvar::new(),
-            authority: Arc::downgrade(authority),
-            maximum,
-        })
-    }
-    fn enqueue(self: &Arc<Self>, work: Arc<dyn Work>) {
-        let mut state = self.state.lock().unwrap();
-        // Every entry is backed by an admitted record or dormant release ticket.
-        // Queue storage is not a second source of admission.
-        assert!(!state.stop);
-        state.ready.push_back(work);
-        if state.idle == 0 && state.threads.len() < self.maximum {
-            let pool = self.clone();
+type TerminalBody = Box<dyn FnOnce() + Send>;
+type TerminalWorker = (std::sync::mpsc::SyncSender<TerminalBody>, Arc<OwnedThread>);
+#[derive(Default)]
+struct TerminalQueue(Mutex<Option<TerminalWorker>>);
+impl TerminalQueue {
+    fn enqueue(&self, authority: &Authority, body: impl FnOnce() + Send + 'static) {
+        let mut worker = self.0.lock().unwrap();
+        let (sender, _) = worker.get_or_insert_with(|| {
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<TerminalBody>(32);
             let thread = std::thread::Builder::new()
-                .name(self.name.into())
-                .spawn(move || loop {
-                    let work = {
-                        let mut state = pool.state.lock().unwrap();
-                        loop {
-                            if let Some(work) = state.ready.pop_front() {
-                                break Some(work);
-                            }
-                            if state.stop {
-                                break None;
-                            }
-                            state.idle += 1;
-                            state = pool.changed.wait(state).unwrap();
-                            state.idle -= 1;
-                        }
-                    };
-                    let Some(work) = work else { return };
-                    work.execute(pool.name == "fube-owned-cleanup");
+                .name("fube-terminal-join".into())
+                .spawn(move || {
+                    while let Ok(body) = receiver.recv() {
+                        body();
+                    }
                 })
-                .expect("execution worker creation failed");
-            state
-                .threads
-                .push(self.authority.upgrade().unwrap().own_thread(thread));
-        }
-        self.changed.notify_one();
+                .expect("terminal worker creation failed");
+            (sender, authority.own_thread(thread))
+        });
+        assert!(sender.try_send(Box::new(body)).is_ok());
     }
     fn stop(&self) -> Vec<Arc<OwnedThread>> {
-        let mut state = self.state.lock().unwrap();
-        assert!(state.ready.is_empty());
-        state.stop = true;
-        self.changed.notify_all();
-        std::mem::take(&mut state.threads)
-    }
-    fn remove(&self, work: &Arc<dyn Work>) {
-        self.state
+        self.0
             .lock()
             .unwrap()
-            .ready
-            .retain(|queued| !Arc::ptr_eq(queued, work));
+            .take()
+            .map(|(_, thread)| vec![thread])
+            .unwrap_or_default()
     }
 }
 
@@ -216,10 +251,10 @@ struct Inner {
     native_host: bool,
     authority: Arc<Authority>,
     application: tokio::runtime::Handle,
-    native: Arc<Pool>,
-    provider: Arc<Pool>,
-    cleanup: Arc<Pool>,
-    terminal: Arc<Pool>,
+    native: Tasks,
+    provider: Tasks,
+    cleanup: Tasks,
+    terminal: TerminalQueue,
     terminal_tickets: Arc<Semaphore>,
     factory_quota: ObjectQuota,
     service_quota: ObjectQuota,
@@ -227,6 +262,7 @@ struct Inner {
     native_records: Arc<Semaphore>,
     provider_records: Arc<Semaphore>,
     outstanding: Arc<Semaphore>,
+    scheduled: Arc<Semaphore>,
     dormant: Arc<Semaphore>,
     cleanup_owners: Arc<AtomicUsize>,
     changed: Arc<Notify>,
@@ -248,30 +284,17 @@ struct CleanupPause {
 }
 impl Drop for Inner {
     fn drop(&mut self) {
-        let mut retain = false;
-        for pool in [&self.native, &self.provider, &self.cleanup, &self.terminal] {
-            let mut state = pool.state.lock().unwrap();
-            if !state.threads.is_empty() {
-                // Failed/abandoned lifecycle is terminal, never joined cleanup.
-                // Native Authority retains the OS handles until its process
-                // fence; stopping idle workers cannot release user captures.
-                self.authority.retire();
-                retain = true;
-                state.stop = true;
-                pool.changed.notify_all();
-            }
-        }
-        if retain {
-            // Abandoned owners are not successful shutdown. Native fencing
-            // retains every OS handle; standalone callers supply that fence.
+        let runtimes: Vec<_> = [&self.native, &self.provider, &self.cleanup]
+            .into_iter()
+            .filter_map(|tasks| tasks.state.lock().unwrap().runtime.take())
+            .collect();
+        let threads = self.terminal.stop();
+        if !runtimes.is_empty() || !threads.is_empty() {
+            self.authority.retire();
             let retained = Arc::new(RetiredExecution {
                 _authority: self.authority.clone(),
-                _pools: vec![
-                    self.native.clone(),
-                    self.provider.clone(),
-                    self.cleanup.clone(),
-                    self.terminal.clone(),
-                ],
+                _runtimes: runtimes,
+                _threads: threads,
                 keep: Mutex::new(None),
             });
             *retained.keep.lock().unwrap() = Some(retained.clone());
@@ -280,7 +303,8 @@ impl Drop for Inner {
 }
 struct RetiredExecution {
     _authority: Arc<Authority>,
-    _pools: Vec<Arc<Pool>>,
+    _runtimes: Vec<tokio::runtime::Runtime>,
+    _threads: Vec<Arc<OwnedThread>>,
     keep: Mutex<Option<Arc<RetiredExecution>>>,
 }
 
@@ -322,10 +346,10 @@ impl ExecutionRuntime {
                 callbacks_running: AtomicUsize::new(0),
                 native_host,
                 application,
-                native: Pool::new("fube-native-call", &authority),
-                provider: Pool::new("fube-provider-call", &authority),
-                cleanup: Pool::new("fube-owned-cleanup", &authority),
-                terminal: Pool::with_maximum("fube-terminal-join", &authority, 1),
+                native: Tasks::new("fube-native-call"),
+                provider: Tasks::new("fube-provider-call"),
+                cleanup: Tasks::new("fube-owned-cleanup"),
+                terminal: TerminalQueue::default(),
                 terminal_tickets: Arc::new(Semaphore::new(32)),
                 factory_quota: ObjectQuota::new(32).unwrap(),
                 service_quota: ObjectQuota::new(32).unwrap(),
@@ -334,6 +358,7 @@ impl ExecutionRuntime {
                 native_records: Arc::new(Semaphore::new(32)),
                 provider_records: Arc::new(Semaphore::new(64)),
                 outstanding: Arc::new(Semaphore::new(RECORDS)),
+                scheduled: Arc::new(Semaphore::new(RECORDS)),
                 dormant: Arc::new(Semaphore::new(DORMANT_TICKETS)),
                 cleanup_owners: Arc::new(AtomicUsize::new(0)),
                 changed: Arc::new(Notify::new()),
@@ -363,6 +388,9 @@ impl ExecutionRuntime {
         let _admission = self.inner.admission.lock().unwrap();
         if self.inner.stopping.load(Ordering::Acquire) {
             return Err(Error::Closed);
+        }
+        for tasks in [&self.inner.native, &self.inner.provider] {
+            tasks.state.lock().unwrap().drain(&self.inner.authority);
         }
         if timeout.is_zero() || timeout > Duration::from_secs(30) {
             return Err(Error::InvalidInput(
@@ -400,10 +428,17 @@ impl ExecutionRuntime {
             .try_acquire_owned()
             .map_err(|_| Error::ResourceLimit("execution records"))?;
         let deadline = self.inner.authority.reserve_callback_deadline(cleanup)?;
+        let scheduled = self
+            .inner
+            .scheduled
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::ResourceLimit("execution scheduled tasks"))?;
         Ok(OwnedCallPermit {
             runtime: self.clone(),
             lane,
             origin,
+            scheduled,
             active: Arc::new(Active {
                 origin,
                 generation: std::sync::atomic::AtomicU64::new(origin.generation),
@@ -415,7 +450,6 @@ impl ExecutionRuntime {
                 _record: Some(record),
                 _admission: Some(admission),
                 children: AtomicUsize::new(0),
-                waiter: Mutex::new(None),
                 changed: self.inner.changed.clone(),
                 lane: Some(lane),
                 cleanup_owner: None,
@@ -493,19 +527,24 @@ impl ExecutionRuntime {
         }
         let mut joins = self.inner.joins.lock().await;
         if matches!(*joins, ShutdownJoins::Open) {
-            let handles = self
-                .inner
-                .native
-                .stop()
-                .into_iter()
-                .chain(self.inner.provider.stop())
-                .chain(self.inner.cleanup.stop())
-                .collect::<Vec<_>>();
+            for tasks in [
+                &self.inner.native,
+                &self.inner.provider,
+                &self.inner.cleanup,
+            ] {
+                tasks.finish(&self.inner.authority).await?;
+            }
             let terminal = self.reserve_terminal_for_shutdown(CallOrigin::default())?;
+            let runtimes: Vec<_> = [
+                &self.inner.native,
+                &self.inner.provider,
+                &self.inner.cleanup,
+            ]
+            .into_iter()
+            .filter_map(|tasks| tasks.state.lock().unwrap().runtime.take())
+            .collect();
             let receipt = terminal.run(move || {
-                for handle in handles {
-                    handle.join()?;
-                }
+                drop(runtimes);
                 Ok(())
             })?;
             *joins = ShutdownJoins::Pools(receipt);
@@ -530,6 +569,7 @@ pub struct OwnedCallPermit {
     lane: CallLane,
     origin: CallOrigin,
     active: Arc<Active>,
+    scheduled: OwnedSemaphorePermit,
 }
 impl OwnedCallPermit {
     pub fn run_owned<T: Send + 'static>(
@@ -542,62 +582,50 @@ impl OwnedCallPermit {
         self,
         future: impl Future<Output = Result<T>> + Send + 'static,
     ) -> OwnedCall<T> {
-        let cell = Arc::new(Cell {
-            value: Mutex::new(CellState {
-                result: None,
-                waker: None,
-            }),
-            ready: Condvar::new(),
-        });
         let until = self.active.until();
-        let activity = Arc::downgrade(&self.active);
+        let (cleanup, cleanup_rx) = oneshot::channel();
+        let (decision, decision_rx) = oneshot::channel();
+        let (ready, ready_rx) = oneshot::channel();
+        let (blocking, blocking_rx) = std::sync::mpsc::sync_channel(1);
+        let runtime = self.runtime.clone();
+        let lane = self.lane;
         let task = Arc::new(Task {
-            activity,
-            runtime: self.runtime.clone(),
+            activity: Arc::downgrade(&self.active),
+            runtime: runtime.clone(),
+            abort: std::sync::OnceLock::new(),
             state: Mutex::new(TaskState {
                 future: Some(Box::pin(future)),
                 result: None,
-                permit: Some(self),
-                running: false,
-                queued: true,
-                wake: false,
+                active: Some(self.active),
+                cleanup: Some(cleanup),
+                decision: Some(decision),
                 canceled: false,
-                cleanup: false,
-                completed: false,
                 finished: false,
-                cell: Some(cell.clone()),
             }),
         });
-        let pool = task.pool();
-        pool.enqueue(task.clone());
+        let cleanup_task = task.clone();
+        runtime.inner.cleanup.spawn(
+            &runtime.inner.authority,
+            async move {
+                cleanup_task
+                    .cleanup(cleanup_rx, decision_rx, ready, blocking)
+                    .await;
+            },
+            None,
+        );
+        let driver = Root(task.clone());
+        let tasks = match lane {
+            CallLane::Native => &runtime.inner.native,
+            CallLane::Provider => &runtime.inner.provider,
+        };
+        let abort = tasks.spawn(&runtime.inner.authority, driver, Some(self.scheduled));
+        task.abort.set(abort).unwrap();
         OwnedCall {
             task,
-            cell,
+            ready: ready_rx,
+            blocking: blocking_rx,
             until,
             consumed: false,
-        }
-    }
-}
-
-struct CellState<T> {
-    result: Option<Result<T>>,
-    waker: Option<Waker>,
-}
-struct Cell<T> {
-    value: Mutex<CellState<T>>,
-    ready: Condvar,
-}
-impl<T> Cell<T> {
-    fn complete(&self, value: Result<T>) {
-        let waker = {
-            let mut state = self.value.lock().unwrap();
-            assert!(state.result.is_none());
-            state.result = Some(value);
-            state.waker.take()
-        };
-        self.ready.notify_all();
-        if let Some(waker) = waker {
-            waker.wake();
         }
     }
 }
@@ -606,146 +634,87 @@ type OwnedFuture<T> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
 struct TaskState<T> {
     future: Option<OwnedFuture<T>>,
     result: Option<Result<T>>,
-    permit: Option<OwnedCallPermit>,
-    running: bool,
-    queued: bool,
-    wake: bool,
+    active: Option<Arc<Active>>,
+    cleanup: Option<oneshot::Sender<OwnedFuture<T>>>,
+    decision: Option<oneshot::Sender<()>>,
     canceled: bool,
-    cleanup: bool,
-    completed: bool,
     finished: bool,
-    cell: Option<Arc<Cell<()>>>,
 }
 struct Task<T> {
     activity: std::sync::Weak<Active>,
     runtime: ExecutionRuntime,
+    abort: std::sync::OnceLock<AbortHandle>,
     state: Mutex<TaskState<T>>,
 }
 impl<T: Send + 'static> Task<T> {
-    fn pool(&self) -> Arc<Pool> {
-        let state = self.state.lock().unwrap();
-        if state.cleanup {
-            return self.runtime.inner.cleanup.clone();
-        }
-        match state.permit.as_ref().unwrap().lane {
-            CallLane::Native => self.runtime.inner.native.clone(),
-            CallLane::Provider => self.runtime.inner.provider.clone(),
-        }
-    }
-    fn schedule(self: &Arc<Self>, cancel: bool) {
-        let (pool, previous) = {
+    fn release_future(&self) {
+        let transfer = {
             let mut state = self.state.lock().unwrap();
-            if state.finished {
-                return;
-            }
-            state.canceled |= cancel;
-            if state.running {
-                state.wake = true;
-                return;
-            }
-            if state.queued {
-                if !state.canceled || state.cleanup {
-                    return;
-                }
-                let previous = match state.permit.as_ref().unwrap().lane {
-                    CallLane::Native => self.runtime.inner.native.clone(),
-                    CallLane::Provider => self.runtime.inner.provider.clone(),
-                };
-                state.cleanup = true;
-                (self.runtime.inner.cleanup.clone(), Some(previous))
-            } else {
-                state.queued = true;
-                if state.cleanup || state.canceled {
-                    state.cleanup = true;
-                    (self.runtime.inner.cleanup.clone(), None)
-                } else {
-                    (
-                        match state.permit.as_ref().unwrap().lane {
-                            CallLane::Native => self.runtime.inner.native.clone(),
-                            CallLane::Provider => self.runtime.inner.provider.clone(),
-                        },
-                        None,
-                    )
-                }
-            }
+            state
+                .future
+                .take()
+                .map(|future| (state.cleanup.take().unwrap(), future))
         };
-        if let Some(previous) = previous {
-            let erased: Arc<dyn Work> = self.clone();
-            previous.remove(&erased);
+        if let Some((sender, future)) = transfer {
+            // The reserved cleanup task lives until this transfer and is never
+            // aborted. Failure would otherwise drop arbitrary captures here.
+            if let Err(future) = sender.send(future) {
+                std::mem::forget(future);
+                self.runtime.retire();
+            }
         }
-        pool.enqueue(self.clone());
     }
-}
-impl<T: Send + 'static> Wake for Task<T> {
-    fn wake(self: Arc<Self>) {
-        self.schedule(false);
+    fn cancel(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.finished {
+            return;
+        }
+        state.canceled = true;
+        if let Some(decision) = state.decision.take() {
+            let _ = decision.send(());
+        }
+        drop(state);
+        self.abort.get().unwrap().abort();
+        self.release_future();
     }
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.schedule(false);
-    }
-}
-impl<T: Send + 'static> Work for Task<T> {
-    fn execute(self: Arc<Self>, cleanup_lane: bool) {
-        let (mut future, cleanup, canceled, origin, active) = {
-            let mut state = self.state.lock().unwrap();
-            if state.finished || state.running || !state.queued || (state.cleanup && !cleanup_lane)
-            {
-                return;
-            }
-            if !state.cleanup
-                && !state.permit.as_ref().unwrap().active.allow_cleanup
-                && self.runtime.inner.authority.check().is_err()
-            {
-                state.canceled = true;
-                state.cleanup = true;
-                state.queued = false;
-                drop(state);
-                self.schedule(true);
-                return;
-            }
-            state.running = true;
-            state.queued = false;
-            let permit = state.permit.as_ref().unwrap();
-            let mut origin = permit.origin;
-            origin.generation = permit.active.generation.load(Ordering::Acquire);
-            let active = permit.active.clone();
-            let cleanup = state.cleanup || state.canceled;
-            let canceled = state.canceled;
-            (state.future.take(), cleanup, canceled, origin, active)
-        };
+    fn entered<R>(&self, active: &Arc<Active>, cleanup: bool, body: impl FnOnce() -> R) -> R {
         let _entered = self.runtime.inner.application.enter();
+        let mut origin = active.origin;
+        origin.generation = active.generation.load(Ordering::Acquire);
         let _entry = Entry::enter(origin, active.clone(), cleanup);
-        if cleanup {
-            let disposed = catch_unwind(AssertUnwindSafe(|| {
-                drop(future.take());
-            }));
-            if disposed.is_err() {
-                self.runtime.inner.authority.retire();
+        body()
+    }
+    async fn children(&self, active: &Active) {
+        loop {
+            let changed = active.changed.notified();
+            if active.children.load(Ordering::Acquire) == 0 {
+                return;
             }
-            if disposed.is_err() {
-                let old = {
-                    let mut state = self.state.lock().unwrap();
-                    state
+            changed.await;
+        }
+    }
+    async fn cleanup(
+        &self,
+        future: oneshot::Receiver<OwnedFuture<T>>,
+        mut decision: oneshot::Receiver<()>,
+        ready: oneshot::Sender<()>,
+        blocking: std::sync::mpsc::SyncSender<()>,
+    ) {
+        let future = future.await.expect("root cleanup transfer lost");
+        let active = self.state.lock().unwrap().active.as_ref().unwrap().clone();
+        tokio::task::block_in_place(|| {
+            self.entered(&active, true, || {
+                if catch_unwind(AssertUnwindSafe(|| drop(future))).is_err() {
+                    self.runtime.retire();
+                    let old = self
+                        .state
+                        .lock()
+                        .unwrap()
                         .result
-                        .replace(Err(Error::Protocol("owned callback destruction panicked")))
-                };
-                if catch_unwind(AssertUnwindSafe(|| drop(old))).is_err() {
-                    self.runtime.inner.authority.retire();
-                }
-            }
-            // Cancellation is monotonic. At most one extra pass is needed
-            // when it races the result transfer; this never polls a future.
-            loop {
-                let abandoned = {
-                    let mut state = self.state.lock().unwrap();
-                    if state.canceled || canceled {
-                        state.result.take()
-                    } else {
-                        None
+                        .replace(Err(Error::Protocol("owned callback destruction panicked")));
+                    if catch_unwind(AssertUnwindSafe(|| drop(old))).is_err() {
+                        self.runtime.retire();
                     }
-                };
-                if catch_unwind(AssertUnwindSafe(|| drop(abandoned))).is_err() {
-                    self.runtime.inner.authority.retire();
                 }
                 #[cfg(test)]
                 if let Some(pause) = self.runtime.inner.cleanup_pause.lock().unwrap().take() {
@@ -757,74 +726,80 @@ impl<T: Send + 'static> Work for Task<T> {
                         .recv_timeout(Duration::from_secs(2))
                         .unwrap();
                 }
-                let mut waiter = active.waiter.lock().unwrap();
-                *waiter = Some(Waker::from(self.clone()));
-                let mut state = self.state.lock().unwrap();
-                if state.canceled && state.result.is_some() {
-                    // Cancellation won after the first extraction. Keep the
-                    // record running/guarded, transfer the value next pass.
-                    drop(state);
-                    waiter.take();
-                    drop(waiter);
-                    continue;
-                }
-                state.running = false;
-                if active.children.load(Ordering::Acquire) != 0 {
-                    return;
-                }
-                let canceled = state.canceled || canceled;
-                let notify = (!state.completed).then(|| state.cell.as_ref().unwrap().clone());
-                state.completed = true;
-                let permit = if canceled {
-                    state.finished = true;
-                    state.permit.take()
-                } else {
-                    None
-                };
-                drop(state);
-                waiter.take();
-                drop(waiter);
-                drop(permit);
-                drop(_entry);
-                drop(active);
-                if let Some(cell) = notify {
-                    cell.complete(if canceled { Err(Error::Closed) } else { Ok(()) });
-                }
-                self.runtime.inner.changed.notify_waiters();
+            })
+        });
+        let children_done = tokio::select! {
+            _ = self.children(&active) => true,
+            _ = &mut decision => false,
+        };
+        drop(active);
+        if children_done {
+            let _ = ready.send(());
+            let _ = blocking.try_send(());
+            let _ = decision.await;
+        }
+        let (result, active) = {
+            let mut state = self.state.lock().unwrap();
+            if !state.canceled {
                 return;
             }
-        }
-        let waker = Waker::from(self.clone());
-        let polled = catch_unwind(AssertUnwindSafe(|| {
-            future
-                .as_mut()
-                .unwrap()
-                .as_mut()
-                .poll(&mut Context::from_waker(&waker))
-        }));
-        let enqueue = {
-            let mut state = self.state.lock().unwrap();
-            state.future = future;
-            state.running = false;
-            match polled {
-                Ok(Poll::Pending) => {}
-                Ok(Poll::Ready(result)) => {
-                    state.result = Some(result);
-                    state.cleanup = true;
+            (state.result.take(), state.active.as_ref().unwrap().clone())
+        };
+        tokio::task::block_in_place(|| {
+            self.entered(&active, true, || {
+                if catch_unwind(AssertUnwindSafe(|| drop(result))).is_err() {
+                    self.runtime.retire();
                 }
-                Err(_) => {
-                    self.runtime.inner.authority.retire();
-                    state.result = Some(Err(Error::Protocol("owned callback panicked")));
-                    state.cleanup = true;
+            })
+        });
+        self.children(&active).await;
+        drop(active);
+        let mut state = self.state.lock().unwrap();
+        drop(state.active.take());
+        state.finished = true;
+        drop(state);
+        self.runtime.inner.changed.notify_waiters();
+    }
+}
+struct Root<T: Send + 'static>(Arc<Task<T>>);
+impl<T: Send + 'static> Future for Root<T> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        tokio::task::block_in_place(|| {
+            let (mut future, active) = {
+                let mut state = self.0.state.lock().unwrap();
+                let Some(future) = state.future.take() else {
+                    return Poll::Ready(());
+                };
+                (future, state.active.as_ref().unwrap().clone())
+            };
+            let polled = self.0.entered(&active, false, || {
+                if !active.allow_cleanup && active.authority.check().is_err() {
+                    return Poll::Ready(Err(Error::Closed));
+                }
+                match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+                    Ok(polled) => polled,
+                    Err(_) => {
+                        self.0.runtime.retire();
+                        Poll::Ready(Err(Error::Protocol("owned callback panicked")))
+                    }
+                }
+            });
+            let mut state = self.0.state.lock().unwrap();
+            state.future = Some(future);
+            match polled {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => {
+                    state.result = Some(result);
+                    Poll::Ready(())
                 }
             }
-            let enqueue = state.cleanup || state.canceled || state.wake;
-            state.wake = false;
-            enqueue
-        };
-        if enqueue {
-            self.schedule(false);
-        }
+        })
+    }
+}
+impl<T: Send + 'static> Drop for Root<T> {
+    fn drop(&mut self) {
+        self.0.release_future();
     }
 }
 
@@ -832,7 +807,8 @@ impl<T: Send + 'static> Work for Task<T> {
 /// the observer. Blocking timeout is uncertain and leaves the task accounted.
 pub struct OwnedCall<T: Send + 'static> {
     task: Arc<Task<T>>,
-    cell: Arc<Cell<()>>,
+    ready: oneshot::Receiver<()>,
+    blocking: std::sync::mpsc::Receiver<()>,
     until: Instant,
     consumed: bool,
 }
@@ -846,7 +822,7 @@ impl<T: Send + 'static> Disposition for Task<T> {
         self.state.lock().unwrap().finished && self.activity.upgrade().is_none()
     }
     fn cancel(self: Arc<Self>) {
-        self.schedule(true);
+        Task::cancel(&self);
     }
     fn runtime(&self) -> ExecutionRuntime {
         self.runtime.clone()
@@ -877,7 +853,7 @@ impl<T: Send + 'static> OwnedCall<T> {
         OwnedDisposition(self.task.clone())
     }
     pub async fn cancel_and_wait(mut self) {
-        self.task.schedule(true);
+        Task::cancel(&self.task);
         loop {
             let changed = self.task.runtime.inner.changed.notified();
             if self.task.state.lock().unwrap().finished {
@@ -889,37 +865,34 @@ impl<T: Send + 'static> OwnedCall<T> {
     }
     fn take_result(&mut self) -> Result<T> {
         if Instant::now() >= self.until {
-            self.task.schedule(true);
+            Task::cancel(&self.task);
             return Err(Error::Timeout);
         }
-        let (result, permit) = {
+        let (result, active) = {
             let mut state = self.task.state.lock().unwrap();
-            assert!(state.completed && !state.finished);
+            if state.canceled {
+                return Err(Error::Closed);
+            }
+            assert!(!state.finished);
             state.finished = true;
-            (state.result.take().unwrap(), state.permit.take())
+            if let Some(decision) = state.decision.take() {
+                let _ = decision.send(());
+            }
+            (state.result.take().unwrap(), state.active.take())
         };
         self.consumed = true;
-        drop(permit);
+        drop(active);
         self.task.runtime.inner.changed.notify_waiters();
         result
     }
     pub fn wait(mut self) -> Result<T> {
         ExecutionRuntime::check_entry(None)?;
-        let result = {
-            let mut state = self.cell.value.lock().unwrap();
-            loop {
-                if let Some(result) = state.result.take() {
-                    break result;
-                }
-                let remaining = self.until.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(Error::Timeout);
-                }
-                let (next, _) = self.cell.ready.wait_timeout(state, remaining).unwrap();
-                state = next;
-            }
-        };
-        result?;
+        self.blocking
+            .recv_timeout(self.until.saturating_duration_since(Instant::now()))
+            .map_err(|error| match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => Error::Timeout,
+                std::sync::mpsc::RecvTimeoutError::Disconnected => Error::Closed,
+            })?;
         self.take_result()
     }
 }
@@ -927,30 +900,17 @@ impl<T: Send + 'static> Future for OwnedCall<T> {
     type Output = Result<T>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let result = {
-            let mut state = this.cell.value.lock().unwrap();
-            match state.result.take() {
-                Some(result) => Some(result),
-                None => {
-                    state.waker = Some(cx.waker().clone());
-                    None
-                }
-            }
-        };
-        match result {
-            Some(Ok(())) => Poll::Ready(this.take_result()),
-            Some(Err(error)) => {
-                this.consumed = true;
-                Poll::Ready(Err(error))
-            }
-            None => Poll::Pending,
+        match Pin::new(&mut this.ready).poll(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(this.take_result()),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(Error::Closed)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 impl<T: Send + 'static> Drop for OwnedCall<T> {
     fn drop(&mut self) {
         if !self.consumed {
-            self.task.schedule(true);
+            Task::cancel(&self.task);
         }
     }
 }

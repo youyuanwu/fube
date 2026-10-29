@@ -1170,6 +1170,19 @@ async fn retired_authority_cannot_republish_cached_duplicate_endpoint() {
     let request = h.request(1, 1, 0);
     h.send("ReplicaOpen", &request).await;
     h.receive("ReplicaOpenReply").await;
+    // Receipt of the frame can precede the original dispatch releasing its
+    // operation permit. Exercise the cached endpoint path, not busy rejection.
+    let operation = h
+        .engine
+        .shared
+        .units
+        .lock()
+        .unwrap()
+        .get(&request.unit.id.id.0)
+        .unwrap()
+        .operation
+        .clone();
+    drop(operation.acquire_owned().await.unwrap());
     // Model an operation already admitted but not yet polled by its task.
     h.engine.shared.authority.check().unwrap();
     let admitted = IpcRequest {
@@ -1188,10 +1201,8 @@ async fn retired_authority_cannot_republish_cached_duplicate_endpoint() {
         reply: None,
     };
     h.engine.shared.authority.retire();
-    assert!(matches!(
-        dispatch(h.engine.shared.clone(), admitted).await,
-        Err(Error::Closed)
-    ));
+    let result = dispatch(h.engine.shared.clone(), admitted).await;
+    assert!(matches!(result, Err(Error::Closed)), "{result:?}");
     h.no_reply().await;
     assert_eq!(h.calls.opens.load(Ordering::SeqCst), 1);
     h.engine.quiesce().await.unwrap();

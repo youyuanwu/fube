@@ -95,19 +95,6 @@ impl OwnedThread {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
-    pub(crate) fn join(&self) -> Result<()> {
-        let thread = self.0.lock().unwrap().take();
-        if let Some(thread) = thread {
-            if thread.thread().id() == std::thread::current().id() {
-                *self.0.lock().unwrap() = Some(thread);
-                return Err(Error::Protocol("terminal self join"));
-            }
-            thread
-                .join()
-                .map_err(|_| Error::Protocol("owned thread panicked"))?;
-        }
-        Ok(())
-    }
 }
 impl Authority {
     pub(crate) fn new(sent: Instant, ticks: i64) -> Result<Arc<Self>> {
