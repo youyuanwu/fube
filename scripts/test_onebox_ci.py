@@ -125,8 +125,7 @@ class ProofFiles(fixtures.ProjectFiles):
                         "Secondary" if rpc["engine_kind"] == "rust" else "ActiveSecondary")
                 rpc.update(role=role, current_role=role, service_address=endpoint,
                            state={"last": max(results.values()), "copy_in_progress": False, "results": results,
-                                  "values": ({"key-" + key: "value-" + key for key in results}
-                                             if len(results) < 1000 else {}),
+                                  "values": {"key-" + key: "value-" + key for key in results},
                                   "history_count": len(results), "retained_bytes": len(results) * 100},
                            engine={"closed": False, "fault": None, "copy_done": True,
                                    "progress": dict.fromkeys(ci.PROGRESS_SPEC, max(results.values()))})
@@ -889,15 +888,22 @@ class WorkerTests(ProofFiles):
 
         changes = []
         for scenario, snapshots in (
+                ("identified_retry", ("observation",)),
                 ("planned_move", ("after", "observation")),
+                ("lost_reply_dedup", ("after", "observation")),
+                ("unavailable_quorum", ("before", "observation")),
                 ("abrupt_primary_loss", ("observation",)),
-                ("per_unit_close", ("unrelated_after", "observation"))):
+                ("per_unit_close", ("unrelated_after", "observation")),
+                ("ledger_capacity_backpressure", ("observation",))):
             for field, key in (("results", "initial-1-0"), ("values", "key-initial-1-0")):
                 for remove in (True, False):
                     changes.append((f"{scenario}/{field}/{remove}", lambda value, scenario=scenario,
                                     snapshots=snapshots, field=field, key=key, remove=remove:
                                     mutate(value, scenario, snapshots, field, key,
                                            999 if field == "results" else "changed", remove)))
+        changes.append(("baseline-primary-view-content", lambda value:
+                        mutate(value, "writes_100", ("observation",), "results", "initial-1-0",
+                               primary_only=True)))
         for scenario, writes, prefix in (
                 ("planned_move", "post_move_writes", "planned-move-2-"),
                 ("abrupt_primary_loss", "post_failure_writes", "abrupt-primary-loss-8-")):
@@ -914,6 +920,34 @@ class WorkerTests(ProofFiles):
                             mutate(value, scenario, ("observation",), "results", prefix + "0",
                                    primary_only=True)))
         self.reject_data_mutations(changes)
+
+    def test_quorum_success_all_completion_lag_and_later_primary_poll_are_valid(self):
+        for route, filename in (("client-runtime", "rust-report.json"), ("native-data", "native-data-report.json")):
+            directory = self.worker(route)
+            path = directory / filename
+            value = json.loads(path.read_text())
+            for name in ("writes_100", "abrupt_primary_loss"):
+                snapshot = value["scenarios"][name]["observation"]
+                placed = next(replica["rpc"] for replica in snapshot["replicas"] if replica["role"] == "Primary")
+                if placed["engine_kind"] != "rust":
+                    continue
+                placed["engine"]["progress"]["completed"] -= 1
+                snapshot["primary"]["rpc"]["engine"]["progress"]["completed"] -= 1
+            # A subsequent HTTP poll can then observe an additional ACK.
+            primary = value["scenarios"]["abrupt_primary_loss"]["observation"]["primary"]["rpc"]
+            if primary["engine_kind"] == "rust":
+                primary["engine"]["progress"]["completed"] += 1
+            self.emit(path, value)
+            self.assertEqual(self.sealing(route, directory), 0, self.last_stdout)
+        self.assertEqual(self.aggregating(), 0, self.last_stdout)
+
+    def test_primary_poll_progress_regression_and_noninteger_counters_reject_both_gates(self):
+        self.reject_data_mutations([
+            ("primary-completion-regression", lambda value: value["scenarios"]["abrupt_primary_loss"]
+                ["observation"]["primary"]["rpc"]["engine"]["progress"].update(completed=0)),
+            ("primary-completion-bool", lambda value: value["scenarios"]["abrupt_primary_loss"]
+                ["observation"]["primary"]["rpc"]["engine"]["progress"].update(completed=True)),
+        ])
 
     def test_unavailable_quorum_pre_assignment_rejection_is_valid_without_manufactured_acceptance(self):
         for route, filename, profile in (("client-runtime", "rust-report.json", "rust"),

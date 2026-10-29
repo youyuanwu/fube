@@ -718,11 +718,18 @@ def data_snapshot(value, profile, service=None, target=3, minimum=2):
             primaries.append(replica)
     require(len(primaries) == 1, "one actual native primary")
     primary, placed = value["primary"], primaries[0]
+    # The resolver's HTTP observation is taken after the placed-replica poll.
+    # ACK/completion progress may advance between them without a new mutation.
     require(primary.get("resolver") == "mssf-client" and primary.get("endpoint") == placed["address"]
             and same(primary.get("native_pid"), placed["rpc"]["pid"])
             and replica_identity(primary["rpc"]) == replica_identity(placed["rpc"])
             and all(same(primary["rpc"].get(key), placed["rpc"][key])
-                    for key in placed["rpc"] if key != "state")
+                    for key in placed["rpc"] if key not in ("state", "engine"))
+            and all(same(primary["rpc"]["engine"].get(key), item)
+                    for key, item in placed["rpc"]["engine"].items() if key != "progress")
+            and all(integer(primary["rpc"]["engine"]["progress"].get(key))
+                    and primary["rpc"]["engine"]["progress"][key] >= placed["rpc"]["engine"]["progress"][key]
+                    for key in PROGRESS_SPEC)
             and all(same(primary["rpc"]["state"].get(key), item)
                     for key, item in placed["rpc"]["state"].items() if key not in ("results", "values")),
             "native resolver must bind the actual primary")
@@ -866,11 +873,13 @@ def validate_post_writes(writes, before, observation, original_results, prefix):
     results = successful_writes(writes, 5)
     boundary = before["primary"]["rpc"]["state"]["last"]
     primary = observation["primary"]["rpc"]
+    # Client success is quorum commitment, not the independent ALL-target
+    # completion frontier, which can still await a peer's asynchronous ACK.
     require(all(key.startswith(prefix) for key in results)
             and not set(results) & set(original_results) and min(results.values()) > boundary
             and max(results.values()) == primary["state"]["last"]
             and all(primary["engine"]["progress"][key] >= max(results.values())
-                    for key in ("assigned", "committed", "completed", "client_completed")),
+                    for key in ("assigned", "committed", "client_completed")),
             "post-movement/failure writes must actually advance successful primary progress")
     combined = {**original_results, **results}
     validate_contents(observation, combined)
@@ -897,7 +906,7 @@ def validate_essential_data(value, profile, built):
             and workload["last"] == max(results.values()) and same(workload.get("results"), results)
             and workload.get("values") == {"key-" + key: "value-" + key for key in results},
             "100 successful writes must bind the independently converged workload")
-    for replica in observation["replicas"]:
+    for replica in [*observation["replicas"], {"rpc": observation["primary"]["rpc"], "role": "Primary"}]:
         state, progress = replica["rpc"]["state"], replica["rpc"]["engine"]["progress"]
         require(same(state.get("results"), results) and same(state.get("values"), workload["values"])
                 and same(state["last"], workload["last"])
@@ -905,7 +914,7 @@ def validate_essential_data(value, profile, built):
                 and (replica["role"] == "Primary" or progress["applied"] >= state["last"]),
                 "independent provider state/order/receive/apply must match successful writes")
     require(all(primary["engine"]["progress"][key] >= workload["last"]
-                for key in ("assigned", "committed", "completed", "client_completed")),
+                for key in ("assigned", "committed", "client_completed")),
             "primary progress must substantiate actual successful commitments")
     for name in ESSENTIAL_SCENARIO_SPECS:
         scenario = scenarios[name]
@@ -925,6 +934,7 @@ def validate_essential_data(value, profile, built):
             and conflict["reply"].get("request_id") == retry["identical_retry"]["request_id"]
             and same(retry["workload"], {key: workload[key] for key in WORKLOAD_SPEC}),
             "conflicting retry must reject before admission without changing the workload")
+    validate_contents(retry["observation"], results)
     planned = scenarios["planned_move"]
     validate_move(planned, profile, service, partition)
     for key in ("before", "after"):
@@ -955,11 +965,12 @@ def validate_essential_data(value, profile, built):
     require(lost.get("retry_outcome") == attempts[1]["reply"]["outcome"], "lost-reply retry outcome binding")
     for key in ("before_move", "before", "after", "observation"):
         data_snapshot(lost[key], profile, service)
-        require(lost[key]["partition"] == partition
-                and all(same(r["rpc"]["state"].get("results"), lost_result) for r in lost[key]["replicas"]),
-                "lost reply must actually replicate before movement and deduplicate after it")
+        require(lost[key]["partition"] == partition, "lost-reply observation partition binding")
+        validate_contents(lost[key], {**moved_results, **lost_result})
 
     quorum = scenarios["unavailable_quorum"]
+    for key in ("before", "observation"):
+        validate_contents(quorum[key], {**moved_results, **lost_result})
     old = data_snapshot(quorum["before"], profile, service)
     replicas = quorum["before"]["replicas"]
     require(old["partition"] == partition and len({r["rpc"]["pid"] for r in replicas}) == 3,
@@ -1091,6 +1102,13 @@ def validate_essential_data(value, profile, built):
         require(type(state.get("history_count")) is int and state["history_count"] == 4096
                 and integer(state.get("retained_bytes"), 1) and state["retained_bytes"] <= 16 * SMALL,
                 "independently observed finite 4096-entry/16-MiB provider capacity")
+        require(same(state.get("results"), content_digest(recovered_results))
+                and same(state.get("values"), content_digest(
+                    {"key-" + key: "value-" + key for key in recovered_results})),
+                "every capacity provider must retain selected earlier successful contents")
+    require(same(full.get("values"), content_digest(
+                {"key-" + key: "value-" + key for key in recovered_results})),
+            "capacity primary view must preserve selected successful values")
     duplicate_result(capacity["old_identity_retry_at_capacity"], results)
 
 
@@ -1437,9 +1455,9 @@ def snapshot_spec(results=LOST_RESULTS, values=None, primary_results=LOST_RESULT
     }
 
 
-SNAPSHOT_SPEC = snapshot_spec()
-CONTENT_SNAPSHOT_SPEC = snapshot_spec(results=CONTENT_RESULTS, values=CONTENT_VALUES,
-                                      primary_results=CONTENT_RESULTS)
+SNAPSHOT_SPEC = snapshot_spec(results=CONTENT_RESULTS, values=CONTENT_VALUES,
+                              primary_results=CONTENT_RESULTS)
+CONTENT_SNAPSHOT_SPEC = SNAPSHOT_SPEC
 MOVE_SPEC = {
     "before": SNAPSHOT_SPEC, "after": SNAPSHOT_SPEC,
     "move_request": fields("constraints", "native_request_completed", "partition", "request", "target"),
@@ -1453,7 +1471,7 @@ ESSENTIAL_SCENARIO_SPECS = {
     "writes_100": {
         "writes": WRITES_SPEC,
         "workload": {**WORKLOAD_SPEC, **fields("results", "values")},
-        "observation": snapshot_spec(results=True, values=True),
+        "observation": snapshot_spec(results=True, values=True, primary_results=True),
     },
     "identified_retry": {
         "identical_retry": REPLY_SPEC,
@@ -1500,7 +1518,8 @@ ESSENTIAL_SCENARIO_SPECS = {
         "stateless_siblings_before": SIBLING_SPEC, "stateless_siblings_after": SIBLING_SPEC,
     },
     "ledger_capacity_backpressure": {
-        "observation": snapshot_spec(primary_results=True), "workload": WORKLOAD_SPEC,
+        "observation": snapshot_spec(results=CONTENT_RESULTS, values=CONTENT_VALUES, primary_results=True),
+        "workload": WORKLOAD_SPEC,
         "capacity_rejection": RECORD_SPEC,
         "old_identity_retry_at_capacity": REPLY_SPEC, **fields("new_successful_writes"),
     },
