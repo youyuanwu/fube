@@ -6,4 +6,5 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("fube-ra supports Linux only");
 
+pub mod entity;
 pub mod protocol;
