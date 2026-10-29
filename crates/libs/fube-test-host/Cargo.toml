@@ -1,0 +1,13 @@
+[package]
+name = "fube-test-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+fube-transport.workspace = true
+roxmltree = "0.21"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11"
+uuid.workspace = true

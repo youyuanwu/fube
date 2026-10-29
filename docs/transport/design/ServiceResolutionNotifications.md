@@ -1,7 +1,7 @@
 # Uncached service resolution and notifications
 
-**Status:** implemented as an experimental clear-TCP subset in `mssf-client`
-and `mssf-transport`, with native qualification on SF 11.8.121.4. See
+**Status:** implemented as an experimental clear-TCP subset in `fube-client`
+and `fube-transport`, with native qualification on SF 11.8.121.4. See
 [usage, measured coverage and limitations](../RustFabricClient.md#owned-resolution-and-notification-qualification).
 This design extends the current [Rust FabricClient](../RustFabricClient.md);
 it does not claim TLS, automatic recovery, or native-client feature parity.
@@ -178,7 +178,7 @@ independent notification clients when they need separate lifecycles, each with
 its own bounded resources and native client ID. There is no per-`FabricClient`
 session reservation or factory method.
 
-Both public clients live in `mssf-client` and reuse transport, serialization,
+Both public clients live in `fube-client` and reuse transport, serialization,
 endpoint/version models, and security configuration machinery. They do not own
 or retain one another and do not share sockets or mutable session state.
 Notification-only applications need not construct a `FabricClient`. Native
@@ -378,7 +378,7 @@ Native notification gateway descriptions intentionally omit a public address;
 retain their node identity/name without requiring or inventing an address.
 [Source: [gateway description][notification-gateway-description].]
 
-Extend `mssf-transport` with explicit duplex capability for this connection role.
+Extend `fube-transport` with explicit duplex capability for this connection role.
 Normal request-only connections continue to reject unsupported reverse traffic.
 After controls, route the uncorrelated-notification marker before ordinary
 `RelatesTo` lookup. Only the supported action, envelope, and body can enter the

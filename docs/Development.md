@@ -8,9 +8,9 @@ not require `protoc`, app packaging tools, or a sibling repository.
 ```sh
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
-cargo test --locked -p mssf-transport -p mssf-client -p mssf-test-host
+cargo test --locked -p fube-transport -p fube-client -p fube-test-host
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo doc --locked -p mssf-transport -p mssf-client -p mssf-test-host --no-deps
+cargo doc --locked -p fube-transport -p fube-client -p fube-test-host --no-deps
 python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
@@ -58,9 +58,9 @@ This is separate from the native-backed `stateless-test-app` and standalone
 node-side test host. It deploys a normal ExeHost to real SF nodes:
 
 ```sh
-cargo test --locked -p mssf-runtime -p rust-runtime-app -p mssf-transport
-cargo clippy --locked -p mssf-runtime -p rust-runtime-app --all-targets -- -D warnings
-cargo doc --locked -p mssf-runtime --no-deps
+cargo test --locked -p fube-runtime -p rust-runtime-app -p fube-transport
+cargo clippy --locked -p fube-runtime -p rust-runtime-app --all-targets -- -D warnings
+cargo doc --locked -p fube-runtime --no-deps
 python3 -m unittest discover -s scripts -p 'test_*.py'
 just onebox-build
 python3 scripts/rust_runtime_test.py --build-bundle build/runtime-binaries
@@ -70,7 +70,7 @@ python3 scripts/rust_runtime_test.py runtime-check --prebuilt build/runtime-bina
 Use new bundle/report paths and a unique allocation name. The last command
 creates and destroys only its exact owned onebox, using the
 existing lifecycle controller. It verifies native placement, independent
-mssf-client resolution/RPC, exact pidfd-based application termination/replacement,
+fube-client resolution/RPC, exact pidfd-based application termination/replacement,
 native lifecycle/query/update/failure traffic, concurrent shared-process
 partitions, a real config-only application upgrade, retained old package/settings
 snapshots and ordered subscription/unregistration behavior, runtime
@@ -125,7 +125,7 @@ default empty-state fixture above. It uses real Fabric TCP peer replication;
 HTTP is only its client/observer interface.
 
 ```sh
-cargo test --locked -p fube-data -p mssf-runtime -p rust-runtime-app -p native-replicator-oracle
+cargo test --locked -p fube-data -p fube-runtime -p rust-runtime-app -p native-replicator-oracle
 # Upstream build from clean source; use a NEW bundle directory:
 python3 scripts/fube_data_test.py --build-bundle build/data-binaries
 # Compiler-free consumer; use unique allocation/report paths:
@@ -149,7 +149,7 @@ empty-state bundle. Missing/tampered inputs fail before allocation; qualificatio
 never invokes Cargo. CI builds the native-backed oracle upstream. Linux/Windows
 portable checks and the separate standalone native job remain independent.
 
-Only the named oracle loads native SF libraries; `fube-data`, `mssf-runtime` and
+Only the named oracle loads native SF libraries; `fube-data`, `fube-runtime` and
 the Rust app do not. Packaging validates exact fixed-name regular non-symlink
 files and hashes. Already-executable files run under actual SF application
 credentials without ownership/mode changes; adding needed owner-execute is

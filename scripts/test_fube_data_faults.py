@@ -36,7 +36,7 @@ def primary(value, index):
         if rpc["engine_kind"] == "rust":
             rpc["replicator_role"] = service_role
     chosen = value["replicas"][index]
-    value["primary"] = {"resolver": "mssf-client", "endpoint": chosen["address"],
+    value["primary"] = {"resolver": "fube-client", "endpoint": chosen["address"],
                         "native_pid": chosen["rpc"]["pid"], "rpc": copy.deepcopy(chosen["rpc"])}
     return value
 

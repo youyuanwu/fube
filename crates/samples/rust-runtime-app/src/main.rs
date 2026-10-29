@@ -1,5 +1,5 @@
 //! Real SF-activated sample. It never constructs activation identity itself.
-use mssf_runtime::*;
+use fube_runtime::*;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{

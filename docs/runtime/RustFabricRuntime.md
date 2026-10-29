@@ -10,7 +10,7 @@ Stateful replication is a separate, substantially larger compatibility tier.
 The companion [native architecture](FabricRuntime.md) explains those boundaries.
 
 **Current status:** the Linux stateless application-side slice is implemented in
-`mssf-runtime` and qualified against real 11.8.121.4 nodes. See the
+`fube-runtime` and qualified against real 11.8.121.4 nodes. See the
 [as-built API, supported profile and evidence](RustStatelessRuntime.md).
 The same runtime now also qualifies a **volatile empty-state stateful subset**
 with real reconfiguration/peer readiness and mixed-host recovery; see the
@@ -76,10 +76,10 @@ not reasons to assume liveness is already solved.
 
 | Existing component | Reusable part | Work still required |
 |---|---|---|
-| [`mssf-transport` frames][rust-frame] | Bounded clear Fabric frames, CRCs and native header records | IPC-appropriate negotiated/admitted limits and secure profiles; current frame cap is 4 MiB |
+| [`fube-transport` frames][rust-frame] | Bounded clear Fabric frames, CRCs and native header records | IPC-appropriate negotiated/admitted limits and secure profiles; current frame cap is 4 MiB |
 | [Native serializer][rust-serde] | Ordered objects, GUIDs, explicit pointer/tag/scope/suffix adapters and allocation bounds | Hosting/RAP schemas, nested native records, enum validation and source-version policy |
 | [Connection driver][rust-connection] | Continuous bounded I/O, correlation, deadlines, cancellation and failure fan-out | Generic incoming actor dispatch, one-way sends, IPC identity and runtime-specific reply policies |
-| [`mssf-client`][rust-client] | Optional independent management/qualification observer | It is a gateway client, not an application host or RAP |
+| [`fube-client`][rust-client] | Optional independent management/qualification observer | It is a gateway client, not an application host or RAP |
 | [`mssf-ext`][rust-ext] | Examples of replication-facing application concepts | It wraps native `IFabricStateReplicator2`; it is not a native-free engine |
 | [`mssf-rplctr`][rust-replicator] | Experimental Rust custom-replicator vocabulary and tonic transport | Epoch, progress, abort, quorum, configuration, build/remove and streams contain TODO/dummy behavior |
 | [`kvmap`][rust-sample] | Deployed application packaging and workload ideas | It uses `mssf-core` runtime/context and calls native partition `CreateReplicator` |
@@ -110,7 +110,7 @@ not host registration, RAP or replication.
 
 ## 4. Proposed component structure
 
-Add a single `mssf-runtime` crate initially, using `mssf-transport`. Split crates
+Add a single `fube-runtime` crate initially, using `fube-transport`. Split crates
 only when a separately usable boundary emerges. Keep wire DTOs private rather
 than exporting node-internal records as the service programming model.
 Do not depend on the existing native runtime/COM adapters just to reuse their
@@ -512,15 +512,15 @@ Native facts and the detailed source map are in
 [FabricRuntime architecture](FabricRuntime.md). Repository links below refer to
 the inspected implementation; line anchors identify the relevant surfaces.
 
-[rust-frame]: ../../crates/libs/mssf-transport/src/frame.rs#L1-L85
-[rust-serde]: ../../crates/libs/mssf-transport/src/serialization/serde.rs#L1-L28
-[rust-connection]: ../../crates/libs/mssf-transport/src/connection.rs#L265-L554
-[rust-client]: ../../crates/libs/mssf-client/Cargo.toml
+[rust-frame]: ../../crates/libs/fube-transport/src/frame.rs#L1-L85
+[rust-serde]: ../../crates/libs/fube-transport/src/serialization/serde.rs#L1-L28
+[rust-connection]: ../../crates/libs/fube-transport/src/connection.rs#L265-L554
+[rust-client]: ../../crates/libs/fube-client/Cargo.toml
 [rust-ext]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/libs/mssf-ext/src/state_replicator.rs#L17-L69
 [rust-replicator]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/libs/mssf-rplctr/src/rplctr.rs#L73-L138
 [rust-sample]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/samples/kvmap/src/kvmap.rs#L210-L259
-[rust-reverse]: ../../crates/libs/mssf-transport/src/connection.rs#L119-L164
-[rust-reverse-dispatch]: ../../crates/libs/mssf-transport/src/connection.rs#L579-L639
-[rust-limits]: ../../crates/libs/mssf-transport/src/serialization.rs#L5-L8
+[rust-reverse]: ../../crates/libs/fube-transport/src/connection.rs#L119-L164
+[rust-reverse-dispatch]: ../../crates/libs/fube-transport/src/connection.rs#L579-L639
+[rust-limits]: ../../crates/libs/fube-transport/src/serialization.rs#L5-L8
 [client-status]: ../transport/RustFabricClient.md
 [native-ipc-config]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/TransportConfig.h#L90-L115

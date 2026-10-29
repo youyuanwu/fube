@@ -41,7 +41,7 @@ are not a correctness oracle and a native fixture build is not a prerequisite.
 
 This plan creates no crates, starts no cluster, and changes no runtime settings.
 Paths, test targets, and commands below describe future implementation work.
-In phase descriptions, `mssf-transport/...` and `mssf-client/...` abbreviate
+In phase descriptions, `fube-transport/...` and `fube-client/...` abbreviate
 paths under `crates/libs/`.
 
 ## 2. Current state and constraints
@@ -144,7 +144,7 @@ These are deferred follow-up work, not requirements for the first slice:
 ### 5.1 Onebox test configuration
 
 Add test-only configuration loading in
-`crates/libs/mssf-client/tests/common/mod.rs`. Use one explicit
+`crates/libs/fube-client/tests/common/mod.rs`. Use one explicit
 `MSSF_TEST_CONFIG` path to a private JSON file, not hard-coded local endpoints or
 credentials. Its contract includes:
 
@@ -196,19 +196,19 @@ keys, or sensitive operation bodies or become a substitute for live proof.
 
 ### Changes required
 
-- **`crates/libs/mssf-transport/Cargo.toml`, `src/lib.rs`**: Create the shared
+- **`crates/libs/fube-transport/Cargo.toml`, `src/lib.rs`**: Create the shared
   transport crate with the existing workspace edition/style and minimal
   dependencies. No native Service Fabric/COM/OpenSSL protocol dependencies.
-- **`crates/libs/mssf-client/Cargo.toml`, `src/lib.rs`**: Create the client
+- **`crates/libs/fube-client/Cargo.toml`, `src/lib.rs`**: Create the client
   facade crate depending on the new transport crate.
 - **Root `Cargo.toml` and lockfile**: Register needed shared path dependencies,
   retain the existing member glob, and let Cargo resolve only the required
   dependency changes without unrelated upgrades.
 - **`.github/workflows/ci.yaml`**: Add the narrow Linux offline package job as
   soon as the crates exist; phase 9 extends its qualification coverage.
-- **`crates/libs/mssf-client/tests/common/mod.rs`**: Define the explicit
+- **`crates/libs/fube-client/tests/common/mod.rs`**: Define the explicit
   test-profile contract and sanitized report schema.
-- **`crates/libs/mssf-client/tests/onebox_clear.rs`**: Start with an ignored
+- **`crates/libs/fube-client/tests/onebox_clear.rs`**: Start with an ignored
   preflight test that checks configured prerequisites and TCP reachability.
   Report that reachability alone is not gateway-protocol readiness.
 - **Package tests**: Ensure the crates compile/test without loading a native
@@ -223,10 +223,10 @@ implicit approved relaxation.
 
 Automated:
 
-- [ ] `cargo test -p mssf-transport -p mssf-client` passes without a cluster.
-- [ ] `cargo tree -p mssf-client` shows no production path to native-backed
+- [ ] `cargo test -p fube-transport -p fube-client` passes without a cluster.
+- [ ] `cargo tree -p fube-client` shows no production path to native-backed
   `mssf-core`, `mssf-com`, `mssf-pal`, or a native TLS protocol backend.
-- [ ] `cargo test -p mssf-client --test onebox_clear -- --ignored` fails when
+- [ ] `cargo test -p fube-client --test onebox_clear -- --ignored` fails when
   required configuration is absent and produces a sanitized preflight report
   when configured correctly.
 
@@ -242,13 +242,13 @@ Operator verification:
 
 ### Changes required
 
-- **`mssf-transport/src/serialization/`**: Add bounded cursors, explicit
+- **`fube-transport/src/serialization/`**: Add bounded cursors, explicit
   `FabricEncode`/`FabricDecode` traits, metadata, object extents/scopes,
   compressed integers, arrays, pointers, and unknown-data handling.
 - **Wire value types in that module**: Represent UTF-16 code units, GUID layout,
   TimeSpan ticks, enum codes, inline MessageId, nested ActivityId, and exact
   container specializations. Avoid deriving the native format through Serde.
-- **`mssf-transport/tests/codec.rs`**: Exercise scalar/container/object
+- **`fube-transport/tests/codec.rs`**: Exercise scalar/container/object
   consistency, boundary values, malformed input, and resource limits.
 
 Implement the profiled eight-byte object header explicitly, not through Rust
@@ -259,7 +259,7 @@ unsupported external/no-copy buffer transport.
 
 Automated:
 
-- [ ] `cargo test -p mssf-transport --test codec` covers both encoding and decoding.
+- [ ] `cargo test -p fube-transport --test codec` covers both encoding and decoding.
 - [ ] Boolean metadata, sign boundaries including signed 64, UTF-16 surrogate
   pairs, GUID byte order, empty string/vector/array distinctions, inline versus
   nested IDs, and TimeSpan sentinels preserve internal values and reject
@@ -280,10 +280,10 @@ Review verification:
 
 ### Changes required
 
-- **`mssf-transport/src/frame.rs`, `message.rs`, `headers/`**: Add fixed framing,
+- **`fube-transport/src/frame.rs`, `message.rs`, `headers/`**: Add fixed framing,
   CRCs, ordered header records, known schemas, unknown/deleted record handling,
   and immutable owned message buffers.
-- **`mssf-transport/tests/headers_frames.rs`**: Exercise generated messages,
+- **`fube-transport/tests/headers_frames.rs`**: Exercise generated messages,
   header/frame boundaries, malformed input, and checked extent handling.
 - **Control schemas**: Add SecurityNegotiation, ServerAuth, ListenInstance,
   ConnectionAuth, and the claims indication/body needed by later TLS work.
@@ -294,7 +294,7 @@ Review verification:
 
 Automated:
 
-- [ ] `cargo test -p mssf-transport --test headers_frames` passes.
+- [ ] `cargo test -p fube-transport --test headers_frames` passes.
 - [ ] All split positions, byte-at-a-time input, concatenated frames, and EOF
   cases preserve boundaries; invalid lengths/CRCs are rejected.
 - [ ] Header area lengths at the 65,535-byte boundary are validated; the encoder
@@ -313,25 +313,25 @@ Review verification:
 
 ### Changes required
 
-- **`mssf-transport/src/connection.rs`**: Implement the Tokio-owned socket driver,
+- **`fube-transport/src/connection.rs`**: Implement the Tokio-owned socket driver,
   bounded ordered output, partial writes, buffering, and control dispatch.
-- **`mssf-transport/src/request_reply.rs`**: Add bootstrap correlation and a
+- **`fube-transport/src/request_reply.rs`**: Add bootstrap correlation and a
   pending-request entry registered before any request bytes can be sent.
-- **`mssf-client/src/gateway.rs`, `protocol/`**: Implement native client-only
+- **`fube-client/src/gateway.rs`, `protocol/`**: Implement native client-only
   ListenInstance behavior, protocol 1.1, PingRequest, correlated reply handling,
   and GatewayDescription decoding.
-- **`mssf-transport/tests/connection.rs`**: Exercise stream fragmentation,
+- **`fube-transport/tests/connection.rs`**: Exercise stream fragmentation,
   control ordering, backpressure, deadlines, and shutdown with a model peer.
-- **`mssf-client/tests/onebox_clear.rs`**: Extend the live target from socket
+- **`fube-client/tests/onebox_clear.rs`**: Extend the live target from socket
   reachability to real transport setup and gateway ping.
 
 ### Success criteria
 
 Automated:
 
-- [ ] `cargo test -p mssf-transport --test connection` passes with controlled
+- [ ] `cargo test -p fube-transport --test connection` passes with controlled
   time and no dependency on a real cluster.
-- [ ] `cargo test -p mssf-client --test onebox_clear -- --ignored` obtains a
+- [ ] `cargo test -p fube-client --test onebox_clear -- --ignored` obtains a
   correctly correlated native ping reply on the configured onebox.
 - [ ] Protocol-version and nested gateway/node identity fields decode correctly;
   reply handling does not require the action literal `"PingReply"`.
@@ -349,13 +349,13 @@ Operator verification:
 
 ### Changes required
 
-- **`mssf-client/src/client.rs`, `naming.rs`, `error.rs`, `protocol/`**: Add the
+- **`fube-client/src/client.rs`, `naming.rs`, `error.rs`, `protocol/`**: Add the
   builder, explicit security selection, `connect`, `close`, request options,
   native NamingUri encoding, and `NameExists`.
 - **`gateway.rs` and `request_reply.rs`**: Complete bounded admission,
   end-to-end monotonic deadlines, connection generations, ID allocation,
   recovery/backoff, cancellation, and conservative delivery outcomes.
-- **`mssf-client/tests/naming.rs`, `lifecycle.rs`**: Add semantic and concurrency
+- **`fube-client/tests/naming.rs`, `lifecycle.rs`**: Add semantic and concurrency
   tests; inject ClientOperationFailure and Fault model-peer cases for internal
   behavior. Their native error-path qualification requires live onebox cases.
 - **`onebox_clear.rs`**: Add known-existing and guaranteed-absent names using the
@@ -365,7 +365,7 @@ Operator verification:
 
 Automated:
 
-- [ ] `cargo test -p mssf-client --test naming --test lifecycle` passes.
+- [ ] `cargo test -p fube-client --test naming --test lifecycle` passes.
 - [ ] The live clear target returns true and false for the expected fixtures,
   without converting a remote failure into false.
 - [ ] Concurrent/out-of-order replies complete only their intended requests;
@@ -394,28 +394,28 @@ tests can proceed without a secured onebox, but its live exit gate cannot.
 - **Workspace/new crate manifests**: Add rustls with an explicitly reviewed
   crypto provider and compatible versions/features. Keep experimental provider
   use restricted to isolated test credentials until production approval.
-- **`mssf-transport/src/security.rs`, `connection.rs`**: Implement Fabric-wrapped
+- **`fube-transport/src/security.rs`, `connection.rs`**: Implement Fabric-wrapped
   handshake output, independent receive/transmit handoff, whole-frame TLS,
   repeated negotiation verification, and promised authorization-status gates.
 - **Trust configuration**: Implement mutual-certificate TLS 1.2 and CA plus
   expected server identity first. Unsupported certificate/revocation policies
   fail explicitly. Keep resumption and early data disabled.
-- **`mssf-transport/tests/security.rs`**: Use a test-only Rust TLS peer and
+- **`fube-transport/tests/security.rs`**: Use a test-only Rust TLS peer and
   runtime-generated synthetic keys/certificates; this is not a production
   FabricTransport listener or a native interoperability oracle.
-- **`mssf-client/tests/onebox_tls.rs`**: Add a dedicated ignored live target
+- **`fube-client/tests/onebox_tls.rs`**: Add a dedicated ignored live target
   requiring an `x509` profile and an actually secured native gateway.
 
 ### Success criteria
 
 Automated:
 
-- [ ] `cargo test -p mssf-transport --test security` covers final wrapped
+- [ ] `cargo test -p fube-transport --test security` covers final wrapped
   handshake output, adjacent raw TLS bytes in the same read, multi-record tokens,
   partial writes, alerts/close_notify, and bounded receive/output buffers.
 - [ ] No normal operation bypasses certificate validation, first-protected
   verification, or a promised connection-status gate.
-- [ ] `cargo test -p mssf-client --test onebox_tls -- --ignored` completes native
+- [ ] `cargo test -p fube-client --test onebox_tls -- --ignored` completes native
   TLS setup, controls, ping, and NameExists.
 - [ ] Wrong server identity, untrusted/expired certificates, absent/wrong client
   certificate, and missing required revocation support fail as specified.
@@ -435,12 +435,12 @@ Operator verification:
 
 ### Changes required
 
-- **`mssf-client/src/query.rs`, `protocol/`**: Add a typed node-list query,
+- **`fube-client/src/query.rs`, `protocol/`**: Add a typed node-list query,
   exact argument-map encoding, polymorphic results, processing errors, and paging.
 - **`resolution.rs`**: Add uncached partition resolution with native partition
   key/previous-version semantics and owned results. Do not add an endpoint cache;
   follow the [focused design](ServiceResolutionNotifications.md).
-- **`mssf-client/tests/query_resolution.rs`**: Test wrapper discrimination,
+- **`fube-client/tests/query_resolution.rs`**: Test wrapper discrimination,
   paging, unknown variants, stale updates, deletion, and partition-key cases.
 - **Live targets**: Add read-only cases to the matching clear/TLS onebox profiles.
   Use an existing disposable test service or explicitly prepared fixtures.
@@ -449,7 +449,7 @@ Operator verification:
 
 Automated:
 
-- [ ] `cargo test -p mssf-client --test query_resolution` passes.
+- [ ] `cargo test -p fube-client --test query_resolution` passes.
 - [ ] Live node results match management observations on the same runtime.
 - [ ] Result processing failures and a verified invalid-query-argument case are
   surfaced rather than returned as successful empty lists.
@@ -491,8 +491,8 @@ Complete and qualify each independently before publishing its API as supported.
 
 Automated:
 
-- [ ] `cargo test -p mssf-client --test claims_notifications` passes.
-- [ ] `cargo test -p mssf-client --test onebox_claims -- --ignored` proves valid,
+- [ ] `cargo test -p fube-client --test claims_notifications` passes.
+- [ ] `cargo test -p fube-client --test onebox_claims -- --ignored` proves valid,
   invalid, and expired-token behavior on a configured claims-enabled gateway.
 - [ ] Initial connection success is not mistaken for token acceptance.
 - [ ] Notification-only construction works without a `FabricClient`, and
@@ -534,9 +534,9 @@ Operator verification:
 
 Automated:
 
-- [ ] `cargo test -p mssf-transport -p mssf-client` passes with no native runtime.
+- [ ] `cargo test -p fube-transport -p fube-client` passes with no native runtime.
 - [ ] `cargo fmt --all -- --check` passes.
-- [ ] `cargo clippy -p mssf-transport -p mssf-client --all-targets -- -D warnings`
+- [ ] `cargo clippy -p fube-transport -p fube-client --all-targets -- -D warnings`
   passes.
 - [ ] Every configured release profile runs its explicit onebox test target;
   missing prerequisites or zero matched/required cases fail qualification.
@@ -574,7 +574,7 @@ Operator verification:
 
 Automated:
 
-- [ ] `cargo doc -p mssf-transport -p mssf-client --no-deps` succeeds.
+- [ ] `cargo doc -p fube-transport -p fube-client --no-deps` succeeds.
 - [ ] Package tests include public doctests where examples are executable.
 - [ ] Relative Markdown links resolve. There is currently no dedicated Markdown
   documentation build; do not invent a passing docs-build command.

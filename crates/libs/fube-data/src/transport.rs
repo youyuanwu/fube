@@ -4,7 +4,7 @@
 // Source-guided peer exchange: Service Fabric Transport/TcpConnection.cpp and
 // Transport/ListenInstance.{h,cpp}, revision
 // 3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d. Framing/serialization are reused
-// from mssf-transport, not reimplemented here.
+// from fube-transport, not reimplemented here.
 
 //! Bounded clear-TCP classic peer sessions. Admission is not delivery or commit.
 //!
@@ -25,7 +25,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mssf_transport::{
+use fube_transport::{
     connection::{read_message, write_message},
     frame::{validate_fixed, Frame, FIXED_HEADER_SIZE},
     message::{ListenInstance, Message, MessageId, ACTOR, IPC, MESSAGE_ID},

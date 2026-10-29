@@ -1,6 +1,6 @@
 # Rust stateless application runtime
 
-`mssf-runtime` is an experimental **application-side** Rust hosting/RAP runtime.
+`fube-runtime` is an experimental **application-side** Rust hosting/RAP runtime.
 Real Service Fabric nodes start the executable, authorize registration, place
 stateless instances and replace failed application processes. It does not load
 FabricRuntime/FabricCommon, adapt COM or call a native helper for runtime work.
@@ -18,7 +18,7 @@ The native SF node, deployment tools and OS libraries are still expected.
 | Controls | Correlated stateless RAPQuery; service-description updates |
 | Packages | Owned config/data metadata/settings; real unchanged-code configuration upgrade and package notifications |
 | Reporting | Native FM load/move retention; HM instance health with sequencing/expiry; runtime transient-fault replacement |
-| Discovery | Separate mssf-client resolution, then real RPC to that returned endpoint |
+| Discovery | Separate fube-client resolution, then real RPC to that returned endpoint |
 | Recovery | Exact owned-process termination, new native host/PID/incarnation, usable endpoint |
 | Authority | Fresh node lease poll before serving; terminal IPC/lease/host authority |
 
@@ -37,7 +37,7 @@ turn this stateless profile into replicated storage.
 Implement `StatelessFactory::create` and `StatelessService::{open,close,abort}`.
 The API uses owned identities/initialization bytes, `Arc`, `Result` and boxed
 `Send` futures rather than COM lifetimes
-([api.rs:13-49](../../crates/libs/mssf-runtime/src/api.rs#L13-L49)).
+([api.rs:13-49](../../crates/libs/fube-runtime/src/api.rs#L13-L49)).
 
 1. `Runtime::attach()` consumes actual SF-injected activation identity and
    completes host/runtime registration plus a fresh lease poll.
@@ -60,7 +60,7 @@ in both listener/main to prove independent hard process fencing.
 
 The activation snapshot contains real host/package/incarnation, work/log/temp
 directories, node IP, deployed endpoint ports and owned configuration/data state
-([context.rs:9-52](../../crates/libs/mssf-runtime/src/context.rs#L9-L52)).
+([context.rs:9-52](../../crates/libs/fube-runtime/src/context.rs#L9-L52)).
 Node context comes from the actual Start registration reply. No missing-runtime-
 access fallback discovers a node address or invents host identity.
 
@@ -81,8 +81,8 @@ metadata/settings. `ServiceContext.activation` remains the creation-time owned
 snapshot; later service creation/type registration uses the current context.
 The environment-only parser is bootstrap, not a loaded package context:
 `packages()` explicitly errors before loading
-([context.rs:29](../../crates/libs/mssf-runtime/src/context.rs#L29),
-[current provider:90](../../crates/libs/mssf-runtime/src/package_context.rs#L90)).
+([context.rs:29](../../crates/libs/fube-runtime/src/context.rs#L29),
+[current provider:90](../../crates/libs/fube-runtime/src/package_context.rs#L90)).
 
 The reader uses registration's deployment directory and native application/package
 identity, validates `App.<rollout>.xml`, `<service>.Package.Current.xml`, its
@@ -93,7 +93,7 @@ not empty-default substitutes. Shared packages retain the native `.lk` path.
 Code/profile compatibility compares normalized declared fields plus native
 digested rollout/checksum/sharing/policy metadata, not independently rehashed
 filesystem code bytes. Qualification additionally hashes the running executable
-([reader:576](../../crates/libs/mssf-runtime/src/packages.rs#L576),
+([reader:576](../../crates/libs/fube-runtime/src/packages.rs#L576),
 [upgrade harness:662](../../scripts/rust_runtime_test.py#L662)).
 The reader admits the qualified ordinary ExeHost declarations; setup/external/
 activator/periodic entry points, nonempty custom code-environment declarations and
@@ -107,7 +107,7 @@ MustOverride, IsEncrypted and Type. `plaintext()` refuses encrypted or unresolve
 typed values; no decryption or secret-reference resolution is supplied.
 Native override application changes Name/Value/nonempty Type, **not** base
 IsEncrypted/MustOverride, even when the override XML contains its own encryption
-flag ([packages.rs:84](../../crates/libs/mssf-runtime/src/packages.rs#L84)).
+flag ([packages.rs:84](../../crates/libs/fube-runtime/src/packages.rs#L84)).
 
 **A retained path is not a directory lease.** Old descriptions/settings remain
 readable from owned memory; native deployment dependencies and garbage collection
@@ -121,7 +121,7 @@ Callbacks receive `PackageChange::{Added,Removed,Modified}` with owned packages;
 Modified carries previous/current packages. Drop or explicit `unregister()`
 removes the registration from future category-list snapshots; repeated unregister
 is harmless. There is no initial replay, veto, callback-drain or remote undo
-([subscriptions:46-130](../../crates/libs/mssf-runtime/src/package_context.rs#L46-L130)).
+([subscriptions:46-130](../../crates/libs/fube-runtime/src/package_context.rs#L46-L130)).
 
 Publication precedes synchronous callbacks. Configuration runs before data,
 with a separately copied registration list at each category's start. For each
@@ -132,7 +132,7 @@ Self-unregister cannot recall further events already copied for that dispatch;
 a configuration callback can register a handler for the subsequent data category.
 Getters, registration/unregistration and captured-handle destructors run without
 publication/registration locks held across user code
-([updater:17](../../crates/libs/mssf-runtime/src/package_context_update.rs#L17)).
+([updater:17](../../crates/libs/fube-runtime/src/package_context_update.rs#L17)).
 
 One local update worker serializes refreshes; this is stronger than a claim of
 native global callback FIFO. User callbacks run on a blocking worker, not the
@@ -142,7 +142,7 @@ shutdown or authority failure prevents applied-success reply admission and
 terminally retires/aborts the host. A blocked callback cannot evade the independent
 hard fence through healthy lease renewal. Shutdown cannot disarm the fence while
 a package worker is active
-([lib.rs:322](../../crates/libs/mssf-runtime/src/lib.rs#L322)).
+([lib.rs:322](../../crates/libs/fube-runtime/src/lib.rs#L322)).
 
 Successful updates require the original host/application/package/code/service
 incarnation and a newer native version-instance counter; conflicting/stale input
@@ -156,7 +156,7 @@ Success is replied only after publication and callbacks, with deadline/cancellat
 authority checked again at the transport writer's pre-frame boundary. Sender
 cancellation is not remotely observable, and local failure does not roll back an
 already-published snapshot or revoke delivered callbacks/already-started frames
-([reply fencing:156](../../crates/libs/mssf-transport/src/connection.rs#L156)).
+([reply fencing:156](../../crates/libs/fube-transport/src/connection.rs#L156)).
 
 ## Wire and ownership invariants
 
@@ -164,28 +164,28 @@ Generic IPC is an explicit transport role, separate from the gateway notificatio
 exception. Requests and one-way sends carry host/PID IPC identity; consuming
 correlated replies do not. Lifecycle RA actor **12** is used in both directions;
 Open/Close semantic replies are one-way, not `RelatesTo` responses
-([connection.rs:349](../../crates/libs/mssf-transport/src/connection.rs#L349),
-[connection.rs:509](../../crates/libs/mssf-transport/src/connection.rs#L509)).
+([connection.rs:349](../../crates/libs/fube-transport/src/connection.rs#L349),
+[connection.rs:509](../../crates/libs/fube-transport/src/connection.rs#L509)).
 
 Each service unit has independent operation ownership; callbacks never run on
 the socket reader or under registry/state locks. Duplicate Open reuses the
 stored endpoint; duplicate Close acknowledges a disposed unit. Stale epochs and
 incarnations are fenced. All successful Open replies, including cached duplicates,
 check terminal authority at the common publication boundary
-([lifecycle.rs:346](../../crates/libs/mssf-runtime/src/lifecycle.rs#L346)).
+([lifecycle.rs:346](../../crates/libs/fube-runtime/src/lifecycle.rs#L346)).
 Incompatible operations follow native retry/drop
 semantics; Abort/Drop can cancel an opening instance, followed by abort cleanup.
 Graceful Close errors become successful native Close only **after** cleanup,
 while internal failure counters remain observable
-([lifecycle.rs:252](../../crates/libs/mssf-runtime/src/lifecycle.rs#L252),
-[lifecycle.rs:574](../../crates/libs/mssf-runtime/src/lifecycle.rs#L574)).
+([lifecycle.rs:252](../../crates/libs/fube-runtime/src/lifecycle.rs#L252),
+[lifecycle.rs:574](../../crates/libs/fube-runtime/src/lifecycle.rs#L574)).
 
 RAPQuery uses the common DTO but a **default service description**, not Open's
 manifest identity. Query validation is operation-specific and replies reflect
 actual local operation/state. Equal-version description updates acknowledge
 without changing stored data; only newer versions apply
-([lifecycle.rs:615](../../crates/libs/mssf-runtime/src/lifecycle.rs#L615),
-[lifecycle.rs:651](../../crates/libs/mssf-runtime/src/lifecycle.rs#L651)).
+([lifecycle.rs:615](../../crates/libs/fube-runtime/src/lifecycle.rs#L615),
+[lifecycle.rs:651](../../crates/libs/fube-runtime/src/lifecycle.rs#L651)).
 Unknown required actions/schema fail the host, never silently succeed.
 
 ## Authority and process-wide failure
@@ -194,7 +194,7 @@ Lease renewal is anchored to monotonic **request send time plus native TTL**,
 not reply receipt. Initial registration TTL is retained as diagnostic data but
 does not grant serving authority; a fresh correlated poll does. Retired authority
 cannot be renewed. Poll failures leave the previous deadline, not a new lease
-([lease.rs:46](../../crates/libs/mssf-runtime/src/lease.rs#L46)).
+([lease.rs:46](../../crates/libs/fube-runtime/src/lease.rs#L46)).
 
 **Dropping the attached runtime, failed/cancelled shutdown, IPC loss, invalidation
 or lease expiry is process-wide and terminal.** An independently owned OS thread
@@ -203,8 +203,8 @@ cleanup. Nominal hard termination is 500 ms after retirement/expiry, checked
 every 10 ms; the qualified acceptance allowance is one second. There is no
 reconnect/revival. This can stop unrelated services sharing that application
 process, by design
-([lease.rs:88](../../crates/libs/mssf-runtime/src/lease.rs#L88),
-[lib.rs:372](../../crates/libs/mssf-runtime/src/lib.rs#L372)).
+([lease.rs:88](../../crates/libs/fube-runtime/src/lease.rs#L88),
+[lib.rs:372](../../crates/libs/fube-runtime/src/lib.rs#L372)).
 
 Cancellation is advisory. Service callbacks must own and dispose their resources.
 Blocking executor code is unsupported callback behavior; authority fencing is
@@ -237,8 +237,8 @@ All report calls are asynchronous; `Partition.identity` is only a public snapsho
 never routing authority. The runtime binds private wire records to the original
 partition/public instance/RAP incarnation and checks terminal authority and
 generation validity at admission and at the writer's pre-frame boundary
-([API](../../crates/libs/mssf-runtime/src/api.rs#L77-L144),
-[reporting](../../crates/libs/mssf-runtime/src/reporting.rs#L137-L149)).
+([API](../../crates/libs/fube-runtime/src/api.rs#L77-L144),
+[reporting](../../crates/libs/fube-runtime/src/reporting.rs#L137-L149)).
 
 | API | Native application path | Successful completion |
 | --- | --- | --- |
@@ -260,7 +260,7 @@ partition-keyed and can outlive
 an instance. Its native query returns stateless secondary reports in the primary
 load array. `_MoveCost_` retention proves receipt, not that effective PLB policy
 uses the cost in placement decisions
-([load implementation](../../crates/libs/mssf-runtime/src/reporting.rs#L150-L256)).
+([load implementation](../../crates/libs/fube-runtime/src/reporting.rs#L150-L256)).
 
 Health supports only Ok/Warning/Error. Source/property are nonempty, bounded
 UTF-16 text without NUL; `System*` sources and `DeleteProperty` are reserved.
@@ -275,7 +275,7 @@ not the source timestamp or enqueue time. With `remove_when_expired=false`,
 the event retains its reported state but becomes expired and evaluates Error;
 with `true`, it disappears from health query evaluation before eventual physical
 cleanup. Sequence history after deletion is not promised
-([health implementation](../../crates/libs/mssf-runtime/src/reporting.rs#L257-L355)).
+([health implementation](../../crates/libs/fube-runtime/src/reporting.rs#L257-L355)).
 
 Health is one request/report with no hidden batching or retries. A timeout does
 not prove the report was never applied; retry with the same explicit sequence
@@ -296,7 +296,7 @@ Already-completed initial results are immutable. Even an **initial write error**
 can leave the stage pending for retry: inspect `fault_delivery()` for current
 attempt count, latest write error, supersession and lifecycle cancellation.
 There is no fabricated fault acknowledgment or retry history collection
-([fault implementation](../../crates/libs/mssf-runtime/src/reporting.rs#L356-L516)).
+([fault implementation](../../crates/libs/fube-runtime/src/reporting.rs#L356-L516)).
 
 **Fencing limit:** obsolete unsent frames are cancelled at the writer validity
 boundary and never retargeted to a replacement. A frame that has passed that
@@ -337,9 +337,9 @@ new reports; load/move have no automatic retry.
 | Sample retained package notifications | 32; overflow explicitly fails the fixture |
 
 Queues do not silently discard required replies. Source/model limits and resource
-tests are in [transport tests](../../crates/libs/mssf-transport/src/connection_ipc_tests.rs),
-[runtime models](../../crates/libs/mssf-runtime/src/model_tests.rs) and
-[lifecycle models](../../crates/libs/mssf-runtime/src/lifecycle_tests.rs).
+tests are in [transport tests](../../crates/libs/fube-transport/src/connection_ipc_tests.rs),
+[runtime models](../../crates/libs/fube-runtime/src/model_tests.rs) and
+[lifecycle models](../../crates/libs/fube-runtime/src/lifecycle_tests.rs).
 
 ## Reproduce native acceptance
 
@@ -483,7 +483,7 @@ Compiler-free prebuilt run `6bc5933d7071` on SF 11.8.121.4 passed the full suite
   `134375374383572350` → `134375374484938620` for partition
   `1482d521-857c-9649-8839-6318066a4c13`, while PID23240/host
   `14724700-b548-42f9-8a13-0d79d096df1a` and the sibling stayed unchanged.
-  Separate mssf-client resolution reached usable replacement RPC.
+  Separate fube-client resolution reached usable replacement RPC.
 - All four old-handle report calls returned Closed; the active replacement's
   distinct load947 subsequently appeared in FM. Retained pre-replacement load
   was not counted as successor evidence.

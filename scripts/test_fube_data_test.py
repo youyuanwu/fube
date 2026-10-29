@@ -27,8 +27,8 @@ import fube_data_test as data
 
 
 GRAPHS = {
-    "rust-runtime-app": "rust-runtime-app\n fube-data\n mssf-runtime",
-    "runtime_observer": "mssf-client\n mssf-transport",
+    "rust-runtime-app": "rust-runtime-app\n fube-data\n fube-runtime",
+    "runtime_observer": "fube-client\n fube-transport",
     "native-replicator-oracle": "native-replicator-oracle\n mssf-core v0.10.0\n mssf-com v0.10.0\n fube-data",
 }
 DYNAMIC = "\nDynamic section:\n (NEEDED) Shared library: [libc.so.6]\n"
@@ -206,8 +206,8 @@ class BundleTests(ProjectFiles):
     def test_dependency_graphs_never_relax_rust_or_observer_native_boundary(self):
         for index, (name, graph) in enumerate([
             ("rust-runtime-app", GRAPHS["rust-runtime-app"] + "\n mssf-core"),
-            ("runtime_observer", "mssf-client\n mssf-com"),
-            ("runtime_observer", "mssf-client\n FabricClient"),
+            ("runtime_observer", "fube-client\n mssf-com"),
+            ("runtime_observer", "fube-client\n FabricClient"),
             ("native-replicator-oracle", "native-replicator-oracle\n fube-data"),
             ("rust-runtime-app", ""),
         ]):
@@ -363,7 +363,7 @@ class BundleTests(ProjectFiles):
             self.assertIn("--locked", args)
             if args[1] == "tree":
                 package = args[-1]
-                return GRAPHS["runtime_observer" if package == "mssf-client" else package]
+                return GRAPHS["runtime_observer" if package == "fube-client" else package]
             return ""
         with patch.object(data, "ROOT", self.root), \
              patch.object(data.runtime, "build_bundle", side_effect=self.make_legacy), \
@@ -635,9 +635,9 @@ def observation(mixed=True, target=3):
             "rpc": rpc, "deployed": {"host_process_id": 100 + index, "service_type_name": "RustStatefulRuntimeType"},
             "address": rpc["service_address"], "service_http_status": 200 if index == 0 else 503})
     return {
-        "observer": "mssf-client", "service": "fabric:/Owned/Data", "partition": "partition",
+        "observer": "fube-client", "service": "fabric:/Owned/Data", "partition": "partition",
         "native_partition": {"target": target, "minimum": 2 if target == 3 else 1, "status": "Ready", "epoch": epoch},
-        "replicas": replicas, "primary": {"resolver": "mssf-client", "endpoint": replicas[0]["address"],
+        "replicas": replicas, "primary": {"resolver": "fube-client", "endpoint": replicas[0]["address"],
             "native_pid": 100, "rpc": copy.deepcopy(replicas[0]["rpc"])},
     }
 

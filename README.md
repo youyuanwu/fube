@@ -5,17 +5,17 @@ and standalone test host in Rust.
 
 | Component | Purpose |
 | --- | --- |
-| [`mssf-client`](crates/libs/mssf-client) | Native clear-TCP FabricClient queries, naming, health, resolution, and notifications; no native SF library dependency. |
-| [`mssf-transport`](crates/libs/mssf-transport) | Bounded Fabric framing, serialization, and concurrent TCP messaging. |
-| [`mssf-test-host`](crates/libs/mssf-test-host) | Node-side stateless test-host subset, including manifest-based SharedProcess activation. |
-| [`mssf-runtime`](crates/libs/mssf-runtime) | Owned async stateless/stateful application runtime; real SF placement/reconfiguration without native SF libraries in the application. Linux x86-64 only. |
+| [`fube-client`](crates/libs/fube-client) | Native clear-TCP FabricClient queries, naming, health, resolution, and notifications; no native SF library dependency. |
+| [`fube-transport`](crates/libs/fube-transport) | Bounded Fabric framing, serialization, and concurrent TCP messaging. |
+| [`fube-test-host`](crates/libs/fube-test-host) | Node-side stateless test-host subset, including manifest-based SharedProcess activation. |
+| [`fube-runtime`](crates/libs/fube-runtime) | Owned async stateless/stateful application runtime; real SF placement/reconfiguration without native SF libraries in the application. Linux x86-64 only. |
 | [`fube-data`](crates/libs/fube-data) | Owned volatile classic V1 replication, explicit acknowledgments, copy streams and native Fabric TCP peers. |
 | [`rust-runtime-app`](crates/samples/rust-runtime-app) | Listener-backed pure-Rust ExeHost fixture deployed by real SF nodes. |
 | [`stateless-test-app`](crates/samples/stateless-test-app) | Acceptance fixture using the **real native FabricRuntime** through published `mssf` bindings. |
 | [`native-replicator-oracle`](crates/samples/native-replicator-oracle) | Isolated test-only native classic V1 reference peer; not a production dependency. |
 
-The node-side `mssf-test-host` is not an application runtime or a full SF node.
-`mssf-runtime` is a separate application-side component. Native qualification is
+The node-side `fube-test-host` is not an application runtime or a full SF node.
+`fube-runtime` is a separate application-side component. Native qualification is
 Linux x86-64, SF 11.8.121.4, trusted clear IPC, without TLS. See the
 [application runtime profile](docs/runtime/RustStatelessRuntime.md) and
 [standalone host profile](docs/runtime/ManifestTestHost.md).
@@ -27,7 +27,7 @@ Protocol Buffers compiler or sibling checkout is needed.
 
 ```sh
 cargo build --locked --workspace # Linux; runtime profile is Linux-only
-cargo test --locked -p mssf-transport -p mssf-client -p mssf-test-host
+cargo test --locked -p fube-transport -p fube-client -p fube-test-host
 python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 

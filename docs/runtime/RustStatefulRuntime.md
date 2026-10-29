@@ -1,6 +1,6 @@
 # Rust volatile empty-state runtime
 
-`mssf-runtime` hosts owned stateful replicas with custom replicators, beside
+`fube-runtime` hosts owned stateful replicas with custom replicators, beside
 stateless instances in the **same executable, code package and Runtime**.
 This document describes the **default empty-state lifecycle/control-plane
 profile, not replicated storage**. That profile has no application write API
@@ -46,9 +46,9 @@ rejected.
    diagnostics and authority/lifetime checks. A published address or a cached
    role alone is not permission to serve. Shutdown is explicit and awaited.
 
-API: [stateful_api.rs:18-202](../../crates/libs/mssf-runtime/src/stateful_api.rs#L18-L202),
-[partition handles:357-393](../../crates/libs/mssf-runtime/src/stateful_api.rs#L357-L393),
-[registration:405](../../crates/libs/mssf-runtime/src/lib.rs#L405).
+API: [stateful_api.rs:18-202](../../crates/libs/fube-runtime/src/stateful_api.rs#L18-L202),
+[partition handles:357-393](../../crates/libs/fube-runtime/src/stateful_api.rs#L357-L393),
+[registration:405](../../crates/libs/fube-runtime/src/lib.rs#L405).
 Stateful load/health/write/storage APIs are not supplied by this seam.
 
 `StatefulPartition::report_fault(FaultType)` reuses the runtime's existing
@@ -88,8 +88,8 @@ subject to the independent OS watchdog. Its 64 atomic callback-deadline slots
 are separate from the send-relative native host lease. Healthy lease polls
 cannot renew a stuck callback deadline; pending ownership prevents normal
 watchdog disarm
-([lease.rs:14-113](../../crates/libs/mssf-runtime/src/lease.rs#L14-L113),
-[disarm:158-173](../../crates/libs/mssf-runtime/src/lease.rs#L158-L173)).
+([lease.rs:14-113](../../crates/libs/fube-runtime/src/lease.rs#L14-L113),
+[disarm:158-173](../../crates/libs/fube-runtime/src/lease.rs#L158-L173)).
 Shared process authority loss fences **both** service kinds; replica disposal
 removes only that generation's routes/operations.
 Final runtime-owned service/replicator references, including local callback
@@ -140,8 +140,8 @@ endpoint notification/retry and stateful RAP query observations. Applied
 configuration receipts are separate from mere native observations, retaining
 down/Dropped descriptors in proof keys. Stale epochs/incarnations, removed peer
 receipts and canceled overlap cannot reinstall success
-([adapter](../../crates/libs/mssf-runtime/src/stateful_reconfiguration.rs),
-[review regressions](../../crates/libs/mssf-runtime/src/stateful_review_tests.rs)).
+([adapter](../../crates/libs/fube-runtime/src/stateful_reconfiguration.rs),
+[review regressions](../../crates/libs/fube-runtime/src/stateful_review_tests.rs)).
 
 Successful still-current configuration application transfers matching Ready
 idle-build records to retired bookkeeping according to native CC/applicable PC
@@ -163,7 +163,7 @@ replicator roles. Access uses native role/stage/minimum/PC/CC availability rules
 then the partition overlays lifetime and host authority. Pre-write revocation
 cannot be undone by a same-epoch retry. Granted diagnostics **do not introduce
 an application write operation**
-([access:245-353](../../crates/libs/mssf-runtime/src/stateful_api.rs#L245-L353)).
+([access:245-353](../../crates/libs/fube-runtime/src/stateful_api.rs#L245-L353)).
 
 The sample's service route requires live authority, matching desired/service/
 replicator Primary roles and granted read access; its diagnostic route is
@@ -187,7 +187,7 @@ Install the repository toolchain on the **build** machine, build/reuse the
 uniquely owned allocation name:
 
 ```sh
-cargo test --locked -p mssf-runtime -p rust-runtime-app -p mssf-transport -p mssf-client
+cargo test --locked -p fube-runtime -p rust-runtime-app -p fube-transport -p fube-client
 python3 -m unittest discover -s scripts -p 'test_*.py'
 python3 scripts/rust_runtime_test.py --build-bundle build/stateful-binaries
 # Transfer the complete bundle preserving executable modes when using another runner.
@@ -204,7 +204,7 @@ no Cargo fallback. Version **3**, profile
 dependency graph, both executables and both versioned package templates with
 strict hashes/inventory/schema/modes. Build source must be clean.
 
-The independent `runtime_observer` uses native mssf-client partition/replica/
+The independent `runtime_observer` uses native fube-client partition/replica/
 deployment/code-package queries, primary discovery and actual HTTP. Its
 constraint-respecting native `MovePrimary` query has **no force/ignore option**;
 it never implements runtime membership. RA departure queries make no fixture
@@ -213,7 +213,7 @@ and pidfd exit proof, not a process-name kill. Original creation capabilities
 govern cleanup; application/type/upload and each original container/volume/
 network absence are checked independently
 ([harness](../../scripts/rust_runtime_test.py),
-[observer](../../crates/libs/mssf-client/examples/runtime_observer.rs)).
+[observer](../../crates/libs/fube-client/examples/runtime_observer.rs)).
 The controller publishes the newly committed original owner capability before
 fallible startup/readiness; both the harness and CI retain it for teardown on
 partial creation failure. Rejected pre-existing/colliding names grant no

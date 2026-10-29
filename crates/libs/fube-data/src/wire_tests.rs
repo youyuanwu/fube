@@ -11,7 +11,7 @@
 // src/prod/src/prebuilt/sdk/FabricTypes.h:2203-2216.
 
 use super::*;
-use mssf_transport::frame::Frame;
+use fube_transport::frame::Frame;
 
 const PARTITION: &str = "00112233-4455-6677-8899-aabbccddeeff";
 const INCARNATION: &str = "10213243-5465-7687-98a9-bacbdcedfe0f";

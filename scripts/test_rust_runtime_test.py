@@ -33,7 +33,7 @@ class BinaryBundleTests(unittest.TestCase):
         for binary in (self.app, self.observer):
             binary.write_bytes(binary.name.encode())
             binary.chmod(0o755)
-        self.binaries = runtime.Binaries(self.app, self.observer, "rust-runtime-app\n  mssf-runtime")
+        self.binaries = runtime.Binaries(self.app, self.observer, "rust-runtime-app\n  fube-runtime")
 
     def bundle(self, name="bundle"):
         directory = self.root / name
@@ -124,7 +124,7 @@ class BinaryBundleTests(unittest.TestCase):
         self.assertEqual(controls.call_args.kwargs["observer"], binaries.observer)
         self.assertEqual(result["dependency_graph"], binaries.dependency_graph)
         self.assertEqual(result["binary_sha256"]["rust-runtime-app"], runtime.digest(binaries.app))
-        observed = {"resolver": "mssf-client", "rpc": {"service": "fabric:/Owned/Singleton", "pid": 7},
+        observed = {"resolver": "fube-client", "rpc": {"service": "fabric:/Owned/Singleton", "pid": 7},
                     "native_pid": 7}
         with patch.object(runtime, "run", return_value=json.dumps(observed)) as command:
             runtime.observe("fabric:/Owned/Singleton", observer=binaries.observer)
@@ -230,7 +230,7 @@ class ReportingEvidenceTests(unittest.TestCase):
                 runtime.require_same_instance(changed, before)
 
     def test_report_command_uses_prebuilt_independent_observer(self):
-        observed = {"resolver": "mssf-client", "native_pid": 7,
+        observed = {"resolver": "fube-client", "native_pid": 7,
                     "rpc": {"pid": 7, "service": "fabric:/Owned/Concurrent", "report": {"ok": True}}}
         observer = Path("/bundle") / "runtime_observer"
         with patch.object(runtime, "run", return_value=json.dumps(observed)) as command:

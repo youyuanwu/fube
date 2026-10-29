@@ -1,7 +1,7 @@
 use super::*;
 #[path = "stateful_peer_tests.rs"]
 mod peer_tests;
-use mssf_runtime::CatchUpResult;
+use fube_runtime::CatchUpResult;
 
 struct NativeModel {
     alive: AtomicBool,

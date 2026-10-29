@@ -66,8 +66,8 @@ jobs:
     - name: Build locked native app and standalone host
       timeout-minutes: 8
       run: |
-        cargo build --locked -p mssf-test-host -p stateless-test-app
-        cargo build --locked -p mssf-test-host --example manifest_acceptance
+        cargo build --locked -p fube-test-host -p stateless-test-app
+        cargo build --locked -p fube-test-host --example manifest_acceptance
 
     - name: Native bootstrap, finite lease polling and unregister
       timeout-minutes: 6

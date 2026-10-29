@@ -22,7 +22,7 @@ commit or license. For example:
 
 ```sh
 git log --all --grep='Source-Commit: f06e8b28f3e6930c8f336c645843f0c634c8aa49'
-git log --follow -- crates/libs/mssf-client/src/lib.rs
+git log --follow -- crates/libs/fube-client/src/lib.rs
 ```
 
 Post-import integration removes unrelated workspace members/dependencies,

@@ -147,8 +147,8 @@ dependencies = [
 name = "fube-data"
 version = "0.1.0"
 dependencies = [
- "mssf-runtime",
- "mssf-transport",
+ "fube-runtime",
+ "fube-transport",
  "serde",
  "serde_json",
  "tokio",
@@ -500,11 +500,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "mssf-client"
+name = "fube-client"
 version = "0.1.0"
 dependencies = [
  "bitflags",
- "mssf-transport",
+ "fube-transport",
  "openapi-service-fabric",
  "reqwest",
  "serde",
@@ -552,11 +552,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "mssf-runtime"
+name = "fube-runtime"
 version = "0.1.0"
 dependencies = [
  "libc",
- "mssf-transport",
+ "fube-transport",
  "roxmltree",
  "serde",
  "tokio",
@@ -564,11 +564,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "mssf-test-host"
+name = "fube-test-host"
 version = "0.1.0"
 dependencies = [
  "libc",
- "mssf-transport",
+ "fube-transport",
  "roxmltree",
  "serde",
  "serde_json",
@@ -577,7 +577,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mssf-transport"
+name = "fube-transport"
 version = "0.1.0"
 dependencies = [
  "bitflags",
@@ -777,7 +777,7 @@ name = "rust-runtime-app"
 version = "0.1.0"
 dependencies = [
  "fube-data",
- "mssf-runtime",
+ "fube-runtime",
  "serde_json",
  "tokio",
  "uuid",

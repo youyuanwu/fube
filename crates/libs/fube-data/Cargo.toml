@@ -10,8 +10,8 @@ description = "Owned volatile Service Fabric classic V1 replication engine"
 qualification = []
 
 [dependencies]
-mssf-runtime.workspace = true
-mssf-transport.workspace = true
+fube-runtime.workspace = true
+fube-transport.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 serde.workspace = true

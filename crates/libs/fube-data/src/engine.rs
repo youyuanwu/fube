@@ -47,7 +47,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use mssf_runtime::{
+use fube_runtime::{
     CatchUpMode, ConfigurationStage, ReplicaInformation, ReplicaLifecycle, ReplicaRemoval,
     ReplicaSetConfiguration, ReplicaStatus, ReplicationProgress, Replicator, ServiceFuture,
 };
@@ -233,8 +233,8 @@ trait NativeControlView: Send + Sync {
     fn status(&self) -> Result<ReplicaStatus>;
     fn report_fault(
         &self,
-        fault: mssf_runtime::FaultType,
-    ) -> ServiceFuture<'_, mssf_runtime::FaultDelivery>;
+        fault: fube_runtime::FaultType,
+    ) -> ServiceFuture<'_, fube_runtime::FaultDelivery>;
 }
 
 impl NativeControlView for StatefulPartition {
@@ -243,8 +243,8 @@ impl NativeControlView for StatefulPartition {
     }
     fn report_fault(
         &self,
-        fault: mssf_runtime::FaultType,
-    ) -> ServiceFuture<'_, mssf_runtime::FaultDelivery> {
+        fault: fube_runtime::FaultType,
+    ) -> ServiceFuture<'_, fube_runtime::FaultDelivery> {
         Box::pin(StatefulPartition::report_fault(self, fault))
     }
 }
@@ -1091,7 +1091,7 @@ impl Owner {
                 // Never wait for our own native disposal to release a receipt.
                 tokio::select! {
                     biased;
-                    _ = view.report_fault(mssf_runtime::FaultType::Transient) => {},
+                    _ = view.report_fault(fube_runtime::FaultType::Transient) => {},
                     _ = async {
                         if !*stop.borrow_and_update() {
                             let _ = stop.changed().await;
@@ -2993,7 +2993,7 @@ impl Owner {
                     && status.service_role == ReplicaRole::Primary
                     && status.replicator_role == ReplicaRole::Primary
                     && status.configuration_stage == ConfigurationStage::Current
-                    && status.catch_up == mssf_runtime::CatchUpResult::Completed
+                    && status.catch_up == fube_runtime::CatchUpResult::Completed
                     && status.minimum_replica_set_size == 1
                     && status.configuration.is_empty()
                     && Some(status.current_epoch.primary()) == self.epoch
