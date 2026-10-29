@@ -1,0 +1,12 @@
+[package]
+name = "fube-ra"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded reliability protocol and RA entity foundation; not a running RA"
+
+[dependencies]
+fube-transport.workspace = true
+fube-ra-store = { path = "../fube-ra-store" }
+serde.workspace = true
+tokio.workspace = true
