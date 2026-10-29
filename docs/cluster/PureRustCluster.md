@@ -14,6 +14,11 @@ This is not a plan to reproduce a full Service Fabric node. In particular,
 omit Federation and native distributed node-to-node leases, **not** the finite
 lease between each application runtime and its local RA/Hosting.
 
+The companion [Rust RA port and SQLite state-store design](RustRaPort.md)
+describes the native storage seam, reliability-code port and durable local
+recovery extension. It does not change this document's initial fresh-RA or
+ephemeral-FM restart policy.
+
 ## 1. Decisions and initial profile
 
 | Area | Decision |
@@ -694,6 +699,10 @@ implementation choices remain open without changing those decisions:
   a reasonable starting point; decide whether reusable host mechanics live in
   `fube-test-host` or a shared internal module. No dependency direction should
   pull native test libraries into production runtime/data.
+- **RA port and persistence:** follow the [companion design](RustRaPort.md)
+  for the store abstraction, SQLite backend and incremental native-state-machine
+  port. Durable RA history is not durable application state or automatic FM
+  recovery; it does not restore old runtime leases or serving authority.
 - **Resource budgets:** choose finite profile values for inventory, retries,
   tombstones, packages and logs, with negative tests at each bound. These cannot
   be resolved by silently evicting safety fences or extending callback deadlines.
