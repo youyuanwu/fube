@@ -998,6 +998,10 @@ def validate_essential_data(value, profile, built):
     retries = failure["lost_reply_retries_after_recovery_copy"]
     require(type(retries) is list and len(retries) == 1, "lost-reply retry after replacement copy required")
     duplicate_result(retries[0], lost_result)
+    require(all(same(rpc["state"].get("results"), lost_result) for rpc in [
+                *(replica["rpc"] for replica in failure["observation"]["replicas"]),
+                failure["observation"]["primary"]["rpc"]]),
+            "recovered providers and primary must retain the actual lost-response identity/LSN")
 
     close = scenarios["per_unit_close"]
     before = data_snapshot(close["unrelated_before"], profile, service)
@@ -1013,6 +1017,12 @@ def validate_essential_data(value, profile, built):
             and type(close.get("old_auxiliary_http_status")) is int
             and close["old_auxiliary_http_status"] in (404, 503),
             "per-unit close must isolate a real colocated unit without replacing the main replica")
+    preserved = {key: before["state"].get(key) for key in ("last", "results")}
+    require(all(same({key: rpc["state"].get(key) for key in preserved}, preserved)
+                for snapshot in (close["unrelated_before"], close["unrelated_after"], close["observation"])
+                for rpc in [*(replica["rpc"] for replica in snapshot["replicas"]),
+                            snapshot["primary"]["rpc"]]),
+            "per-unit disposal must preserve the unrelated main provider boundary and retained results")
     departure = close["native_departure"]
     require(departure.get("observer") == "mssf-client" and departure.get("fixture_contacted") is False
             and departure.get("service") == auxiliary["service"] and departure.get("node") == aux["node"]
@@ -1035,6 +1045,8 @@ def validate_essential_data(value, profile, built):
             and len(set(full_results.values())) == 4096
             and all(same(full_results.get(key), sequence) for key, sequence in results.items()),
             "finite capacity must retain 4096 actual unique identified results including old writes")
+    require(capacity["capacity_rejection"]["id"] not in full_results,
+            "capacity rejection must concern a genuinely new, unassigned identity")
     for replica in capacity["observation"]["replicas"]:
         state = replica["rpc"]["state"]
         require(type(state.get("history_count")) is int and state["history_count"] == 4096

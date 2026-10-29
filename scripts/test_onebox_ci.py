@@ -829,6 +829,46 @@ class WorkerTests(ProofFiles):
                     ["stateless_siblings_before"][0]["native_entry_point_instance"])),
         ], routes=("client-runtime",))
 
+    def test_cross_field_capacity_recovery_and_close_rollbacks_reject_resealed_proofs(self):
+        def reject_committed_id(value):
+            capacity = value["scenarios"]["ledger_capacity_backpressure"]
+            original = capacity["old_identity_retry_at_capacity"]["request_id"]
+            capacity["capacity_rejection"]["id"] = original
+            for attempt in capacity["capacity_rejection"]["attempts"]:
+                attempt["reply"]["request_id"] = original
+
+        def lost_from_recovery(value, wrong=False):
+            snapshot = value["scenarios"]["abrupt_primary_loss"]["observation"]
+            request_id, record = next(iter(value["identified_workload"].items()))
+            for rpc in [*(replica["rpc"] for replica in snapshot["replicas"]), snapshot["primary"]["rpc"]]:
+                if wrong:
+                    rpc["state"]["results"][request_id] = record["sequence"] - 1
+                else:
+                    rpc["state"]["results"].pop(request_id, None)
+
+        def close_rollback(value):
+            snapshot = value["scenarios"]["per_unit_close"]["unrelated_before"]
+            last = snapshot["primary"]["rpc"]["state"]["last"] + 1
+            for replica in snapshot["replicas"]:
+                rpc = replica["rpc"]
+                rpc["state"].update(last=last, history_count=last,
+                                    retained_bytes=rpc["state"]["retained_bytes"] + 32)
+                rpc["state"]["results"]["close-survival-canary"] = last
+                rpc["engine"]["progress"]["received"] = last
+                if replica["role"] == "Primary":
+                    rpc["engine"]["progress"].update(assigned=last, committed=last,
+                                                     completed=last, client_completed=last)
+                    snapshot["primary"]["rpc"] = copy.deepcopy(rpc)
+                else:
+                    rpc["engine"]["progress"]["applied"] = last
+
+        self.reject_data_mutations([
+            ("capacity-rejects-committed-ID", reject_committed_id),
+            ("recovered-providers-omit-lost-ID", lost_from_recovery),
+            ("recovered-providers-change-lost-LSN", lambda value: lost_from_recovery(value, True)),
+            ("unrelated-main-rollback-across-close", close_rollback),
+        ])
+
     def test_unavailable_quorum_pre_assignment_rejection_is_valid_without_manufactured_acceptance(self):
         for route, filename, profile in (("client-runtime", "rust-report.json", "rust"),
                                          ("native-data", "native-data-report.json", "native-data")):
