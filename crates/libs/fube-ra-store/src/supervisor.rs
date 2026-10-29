@@ -5,7 +5,55 @@ use std::{
     thread::JoinHandle,
     time::Instant,
 };
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::{mpsc, watch, Notify};
+
+pub(crate) enum BackendKind {
+    Memory,
+    Sqlite {
+        path: PathBuf,
+        identity: Identity,
+        create: bool,
+    },
+}
+
+pub(crate) struct Config {
+    pub(crate) kind: BackendKind,
+    #[cfg(test)]
+    pub(crate) hooks: Arc<crate::tests::Hooks>,
+}
+
+impl Config {
+    pub(crate) fn new(kind: BackendKind) -> Self {
+        Self {
+            kind,
+            #[cfg(test)]
+            hooks: Arc::default(),
+        }
+    }
+}
+
+enum Backend {
+    Memory(memory::Worker),
+    Sqlite(sqlite::Sqlite),
+}
+impl Backend {
+    async fn execute(&mut self, request: Request, shared: &Arc<Shared>) -> Result<Output> {
+        match self {
+            Self::Memory(b) => b.execute(request, shared).await,
+            Self::Sqlite(b) => b.execute(request, shared).await,
+        }
+    }
+    async fn close(&mut self, shared: &Arc<Shared>) -> Result<()> {
+        match self {
+            Self::Memory(b) => b.close().await,
+            Self::Sqlite(b) => b.close(shared).await,
+        }
+    }
+}
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -42,8 +90,10 @@ pub(crate) struct Shared {
     join_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     // Kept independently of the connection task until a positive disk-close witness.
     pub(crate) resource: Mutex<Option<Box<dyn Send>>>,
+    pub(crate) pressure: AtomicBool,
+    pub(crate) worker_lost: AtomicBool,
     #[cfg(test)]
-    pub(crate) hooks: crate::tests::Hooks,
+    pub(crate) hooks: Arc<crate::tests::Hooks>,
 }
 
 struct Client {
@@ -65,6 +115,9 @@ pub struct Store {
 }
 
 impl Shared {
+    pub(crate) fn failure(&self, error: Error) {
+        lock(&self.state).report.first_failure.get_or_insert(error);
+    }
     fn request_close(&self) {
         let mut state = lock(&self.state);
         if matches!(state.lifecycle, Lifecycle::Starting | Lifecycle::Open) {
@@ -119,10 +172,46 @@ impl Shared {
 
 impl Store {
     pub async fn memory(settings: Settings) -> Result<Self> {
-        Self::start(settings).await
+        Self::start(settings, Config::new(BackendKind::Memory)).await
     }
 
-    async fn start(settings: Settings) -> Result<Self> {
+    /// Atomically reserve a new database path. Never opens an existing file.
+    pub async fn create_new(
+        path: impl AsRef<Path>,
+        identity: Identity,
+        settings: Settings,
+    ) -> Result<Self> {
+        identity.validate()?;
+        Self::start(
+            settings,
+            Config::new(BackendKind::Sqlite {
+                path: path.as_ref().to_owned(),
+                identity,
+                create: true,
+            }),
+        )
+        .await
+    }
+
+    /// Require a compatible initialized store; never creates/reinitializes one.
+    pub async fn open_existing(
+        path: impl AsRef<Path>,
+        identity: Identity,
+        settings: Settings,
+    ) -> Result<Self> {
+        identity.validate()?;
+        Self::start(
+            settings,
+            Config::new(BackendKind::Sqlite {
+                path: path.as_ref().to_owned(),
+                identity,
+                create: false,
+            }),
+        )
+        .await
+    }
+
+    pub(crate) async fn start(settings: Settings, config: Config) -> Result<Self> {
         settings.validate()?;
         let (sender, receiver) = mpsc::channel(settings.max_outstanding);
         let (boot, _) = watch::channel(None);
@@ -143,8 +232,10 @@ impl Store {
             joined,
             join_task: Mutex::new(None),
             resource: Mutex::new(None),
+            pressure: AtomicBool::new(false),
+            worker_lost: AtomicBool::new(false),
             #[cfg(test)]
-            hooks: crate::tests::Hooks::default(),
+            hooks: config.hooks.clone(),
         });
         let store = Self {
             client: Arc::new(Client {
@@ -162,7 +253,7 @@ impl Store {
                         .enable_time()
                         .build()
                         .map_err(|e| Error::new(ErrorKind::Io, e.to_string()))?;
-                    runtime.block_on(run(owner.clone(), receiver, settings))
+                    runtime.block_on(run(owner.clone(), receiver, settings, config))
                 }));
                 let error = match result {
                     Ok(Ok(report)) => {
@@ -205,7 +296,7 @@ impl Store {
                     .map_err(|_| Error::new(ErrorKind::Unknown, "bootstrap owner lost"))?;
             }
         };
-        tokio::time::timeout(store.client.settings.operation_timeout, wait)
+        tokio::time::timeout(store.client.settings.bootstrap_timeout, wait)
             .await
             .map_err(|_| {
                 Error::new(
@@ -223,6 +314,16 @@ impl Store {
             Lifecycle::Open => {}
             Lifecycle::Fenced => return Err(Error::new(ErrorKind::Fenced, "store fenced")),
             _ => return Err(Error::new(ErrorKind::Closed, "admission closed")),
+        }
+        if matches!(
+            request,
+            Request::Insert(_) | Request::Update(_) | Request::Delete(_)
+        ) && self.client.shared.pressure.load(Ordering::Acquire)
+        {
+            return Err(Error::new(
+                ErrorKind::Capacity,
+                "storage pressure; Maintain required",
+            ));
         }
         if state.pending.len() >= self.client.settings.max_outstanding
             || bytes
@@ -338,8 +439,18 @@ async fn run(
     shared: Arc<Shared>,
     mut receiver: mpsc::Receiver<Envelope>,
     settings: Settings,
+    config: Config,
 ) -> Result<CloseReport> {
-    let mut backend = memory::Worker::new(settings)?;
+    let mut backend = match config.kind {
+        BackendKind::Memory => Backend::Memory(memory::Worker::new(settings)?),
+        BackendKind::Sqlite {
+            path,
+            identity,
+            create,
+        } => {
+            Backend::Sqlite(sqlite::Sqlite::open(path, identity, create, settings, &shared).await?)
+        }
+    };
     {
         let mut state = lock(&shared.state);
         if state.lifecycle == Lifecycle::Starting {
@@ -380,6 +491,10 @@ async fn run(
             );
             continue;
         }
+        #[cfg(test)]
+        if shared.hooks.supervisor_panic.swap(false, Ordering::SeqCst) {
+            panic!("injected supervisor loss");
+        }
         let execution = backend.execute(envelope.request, &shared);
         tokio::pin!(execution);
         let result = tokio::select! {
@@ -396,9 +511,25 @@ async fn run(
         if result.as_ref().is_err_and(|e| e.kind == ErrorKind::Unknown) {
             shared.fence(envelope.id);
         }
+        if shared.worker_lost.load(Ordering::Acquire) {
+            // Transport loss does not prove disposal/quiescence. Keep this charge.
+            while let Ok(queued) = receiver.try_recv() {
+                shared.finish(
+                    queued.id,
+                    Err(Error::new(
+                        ErrorKind::NotExecuted,
+                        "worker lost before dispatch",
+                    )),
+                );
+            }
+            return Err(Error::new(
+                ErrorKind::Unknown,
+                "worker lost; lease and outstanding ownership quarantined",
+            ));
+        }
         shared.finish(envelope.id, result);
     }
-    backend.close().await?;
+    backend.close(&shared).await?;
     lock(&shared.state).lifecycle = Lifecycle::Closed;
     let report = lock(&shared.state).report.clone();
     Ok(report)

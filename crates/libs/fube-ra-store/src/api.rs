@@ -71,6 +71,8 @@ pub enum Request {
     Update(Record),
     Delete(RecordId),
     Enumerate(String),
+    /// Bounded checkpoint/pressure recheck; a logical no-op on memory.
+    Maintain,
 }
 
 impl Request {
@@ -78,7 +80,7 @@ impl Request {
         match self {
             Self::Insert(r) | Self::Update(r) => Some(&r.key),
             Self::Delete(k) => Some(k),
-            Self::Enumerate(_) => None,
+            Self::Enumerate(_) | Self::Maintain => None,
         }
     }
 
@@ -115,9 +117,32 @@ impl Request {
                     .checked_add(t.capacity())
                     .ok_or_else(|| invalid("request accounting overflow"))?;
             }
-            Self::Delete(_) => {}
+            Self::Delete(_) | Self::Maintain => {}
         }
+
         Ok(bytes)
+    }
+}
+
+/// Exact deployment/node binding. No runtime incarnation/recovery model is implied.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Identity {
+    pub deployment: String,
+    pub node: String,
+}
+
+impl Identity {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if [&self.deployment, &self.node]
+            .iter()
+            .any(|s| s.is_empty() || s.len() > 512 || s.contains('\0'))
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "identity must be nonempty NUL-free UTF-8, at most 512 bytes",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -199,6 +224,7 @@ pub struct Settings {
     pub max_outstanding: usize,
     pub max_queued_bytes: usize,
     pub operation_timeout: Duration,
+    pub bootstrap_timeout: Duration,
     pub close_timeout: Duration,
     pub busy_timeout: Duration,
     pub max_database_bytes: u64,
@@ -217,6 +243,7 @@ impl Default for Settings {
             max_outstanding: 64,
             max_queued_bytes: 8 * 1024 * 1024,
             operation_timeout: Duration::from_secs(5),
+            bootstrap_timeout: Duration::from_secs(10),
             close_timeout: Duration::from_secs(10),
             busy_timeout: Duration::from_millis(100),
             max_database_bytes: 64 * 1024 * 1024,
@@ -239,6 +266,7 @@ impl Settings {
         ];
         let timers = [
             self.operation_timeout,
+            self.bootstrap_timeout,
             self.close_timeout,
             self.busy_timeout,
         ];

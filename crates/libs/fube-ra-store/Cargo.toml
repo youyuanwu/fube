@@ -7,3 +7,8 @@ description = "Bounded logical RA typed-record storage"
 
 [dependencies]
 tokio.workspace = true
+tokio-rusqlite = { version = "0.8.0", features = ["bundled", "limits"] }
+libc = "0.2"
+
+[dev-dependencies]
+tokio-rusqlite = { version = "0.8.0", features = ["hooks"] }

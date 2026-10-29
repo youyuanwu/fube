@@ -9,10 +9,13 @@ compile_error!("fube-ra-store supports Linux only");
 
 mod api;
 mod memory;
+mod sqlite;
 mod supervisor;
 
 pub use api::*;
 pub use supervisor::Store;
 
+#[cfg(test)]
+mod sqlite_tests;
 #[cfg(test)]
 mod tests;

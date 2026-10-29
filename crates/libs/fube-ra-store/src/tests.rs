@@ -9,11 +9,17 @@ use tokio::sync::oneshot;
 pub(crate) struct Hooks {
     gate: Mutex<Option<Gate>>,
     cleanup: Mutex<Option<Gate>>,
-    fail: AtomicBool,
+    pub(crate) fail: AtomicBool,
+    pub(crate) bootstrap: Mutex<Option<Gate>>,
+    pub(crate) commit_veto: AtomicBool,
+    pub(crate) panic_after_commit: AtomicBool,
+    pub(crate) lose_worker: AtomicBool,
+    pub(crate) fail_close: AtomicBool,
+    pub(crate) supervisor_panic: AtomicBool,
 }
-struct Gate {
-    entered: oneshot::Sender<()>,
-    release: oneshot::Receiver<()>,
+pub(crate) struct Gate {
+    pub(crate) entered: oneshot::Sender<()>,
+    pub(crate) release: oneshot::Receiver<()>,
 }
 impl Hooks {
     pub(crate) fn before_blocking(&self) -> Result<()> {
@@ -33,7 +39,14 @@ impl Hooks {
             let _ = gate.release.blocking_recv();
         }
     }
-    fn pause(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pub(crate) async fn bootstrap_async(&self) {
+        let gate = supervisor::lock(&self.bootstrap).take();
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate.release.await;
+        }
+    }
+    pub(crate) fn pause(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (entered, reached) = oneshot::channel();
         let (release, released) = oneshot::channel();
         *supervisor::lock(&self.gate) = Some(Gate {
@@ -43,19 +56,22 @@ impl Hooks {
         (reached, release)
     }
 }
-fn key(t: &str, id: &str) -> RecordId {
+pub(crate) fn key(t: &str, id: &str) -> RecordId {
     RecordId::new(t, id)
 }
-fn insert(t: &str, id: &str, bytes: &[u8]) -> Request {
+pub(crate) fn insert(t: &str, id: &str, bytes: &[u8]) -> Request {
     Request::Insert(Record {
         key: key(t, id),
         value: bytes.to_vec(),
     })
 }
-async fn execute(store: &dyn KeyValueStore, request: Request) -> Result<std::sync::Arc<Output>> {
+pub(crate) async fn execute(
+    store: &dyn KeyValueStore,
+    request: Request,
+) -> Result<std::sync::Arc<Output>> {
     store.submit(request)?.wait().await
 }
-async fn snapshot(store: &dyn KeyValueStore, t: &str) -> Vec<Record> {
+pub(crate) async fn snapshot(store: &dyn KeyValueStore, t: &str) -> Vec<Record> {
     match execute(store, Request::Enumerate(t.into()))
         .await
         .unwrap()
@@ -65,7 +81,7 @@ async fn snapshot(store: &dyn KeyValueStore, t: &str) -> Vec<Record> {
         _ => panic!("not snapshot"),
     }
 }
-async fn contract(store: &Store) {
+pub(crate) async fn contract(store: &Store) {
     assert!(snapshot(store, "a").await.is_empty());
     execute(store, insert("a", "1", b"first")).await.unwrap();
     assert_eq!(

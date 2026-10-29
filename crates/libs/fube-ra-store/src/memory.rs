@@ -56,6 +56,9 @@ impl Worker {
         request: Request,
         shared: &Arc<supervisor::Shared>,
     ) -> Result<Output> {
+        if matches!(request, Request::Maintain) {
+            return Ok(Output::Written);
+        }
         let (reply, result) = oneshot::channel();
         self.sender
             .send(Command::Execute(request, shared.clone(), reply))
@@ -163,7 +166,7 @@ impl Memory {
             Request::Delete(key) => {
                 self.rows.remove(&key);
             }
-            Request::Enumerate(_) => unreachable!(),
+            Request::Enumerate(_) | Request::Maintain => unreachable!(),
         }
         self.bytes = bytes;
         Ok(Output::Written)
