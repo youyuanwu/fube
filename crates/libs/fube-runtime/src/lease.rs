@@ -2,7 +2,7 @@ use fube_transport::{Error, Result};
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -16,17 +16,40 @@ mod callback_tests;
 pub(crate) struct CallbackDeadline {
     authority: Arc<Authority>,
     slot: usize,
-    deadline: u64,
+    deadline: AtomicU64,
+    original: AtomicU64,
+}
+impl CallbackDeadline {
+    pub(crate) fn arm_until(&self, until: Instant) {
+        let value = self.authority.elapsed(until);
+        if self
+            .original
+            .compare_exchange(u64::MAX - 1, value, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.deadline.store(value, Ordering::SeqCst);
+            self.authority.callbacks[self.slot].store(value, Ordering::SeqCst);
+        }
+    }
+    /// The one armed slot represents the original root and its live bounded
+    /// child budgets. Removing a disposed child cannot extend the root.
+    pub(crate) fn set_effective_until(&self, until: Instant) {
+        let value = self
+            .authority
+            .elapsed(until)
+            .min(self.original.load(Ordering::SeqCst));
+        self.deadline.store(value, Ordering::SeqCst);
+        self.authority.callbacks[self.slot].store(value, Ordering::SeqCst);
+    }
 }
 impl Drop for CallbackDeadline {
     fn drop(&mut self) {
-        if self.authority.elapsed(Instant::now()) >= self.deadline {
-            self.authority
-                .retired
-                .fetch_min(self.deadline, Ordering::SeqCst);
+        let deadline = self.deadline.load(Ordering::SeqCst);
+        if self.authority.elapsed(Instant::now()) >= deadline {
+            self.authority.retired.fetch_min(deadline, Ordering::SeqCst);
         }
         let _ = self.authority.callbacks[self.slot].compare_exchange(
-            self.deadline,
+            deadline,
             u64::MAX,
             Ordering::SeqCst,
             Ordering::SeqCst,
@@ -43,6 +66,48 @@ pub(crate) struct Authority {
     disarmed: AtomicBool,
     disarming: AtomicBool,
     callbacks: [AtomicU64; CALLBACK_DEADLINE_SLOTS],
+    threads: Mutex<Vec<Arc<OwnedThread>>>,
+    watchdog_thread: Mutex<Option<Arc<OwnedThread>>>,
+    shutdown_hold: Mutex<Option<Arc<Authority>>>,
+}
+#[derive(Debug)]
+pub(crate) struct OwnedThread(Mutex<Option<std::thread::JoinHandle<()>>>);
+impl OwnedThread {
+    /// Only used for library-only core/coordinator threads after their owned
+    /// tasks have drained. Never waits for a live thread on an async executor.
+    pub(crate) async fn join_finished(&self) -> Result<()> {
+        loop {
+            let finished = {
+                let mut slot = self.0.lock().unwrap();
+                match slot.as_ref() {
+                    None => return Ok(()),
+                    Some(thread) if thread.is_finished() => slot.take(),
+                    Some(_) => None,
+                }
+            };
+            if let Some(thread) = finished {
+                return thread
+                    .join()
+                    .map_err(|_| Error::Protocol("owned thread panicked"));
+            }
+            // Bounded by the enclosing original shutdown deadline. This is an
+            // asynchronous OS-completion probe, not cleanup-admission retry.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    pub(crate) fn join(&self) -> Result<()> {
+        let thread = self.0.lock().unwrap().take();
+        if let Some(thread) = thread {
+            if thread.thread().id() == std::thread::current().id() {
+                *self.0.lock().unwrap() = Some(thread);
+                return Err(Error::Protocol("terminal self join"));
+            }
+            thread
+                .join()
+                .map_err(|_| Error::Protocol("owned thread panicked"))?;
+        }
+        Ok(())
+    }
 }
 impl Authority {
     pub(crate) fn new(sent: Instant, ticks: i64) -> Result<Arc<Self>> {
@@ -54,7 +119,15 @@ impl Authority {
             disarmed: AtomicBool::new(false),
             disarming: AtomicBool::new(false),
             callbacks: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
+            threads: Mutex::new(Vec::new()),
+            watchdog_thread: Mutex::new(None),
+            shutdown_hold: Mutex::new(None),
         }))
+    }
+    pub(crate) fn own_thread(&self, thread: std::thread::JoinHandle<()>) -> Arc<OwnedThread> {
+        let owned = Arc::new(OwnedThread(Mutex::new(Some(thread))));
+        self.threads.lock().unwrap().push(owned.clone());
+        owned
     }
     fn elapsed(&self, now: Instant) -> u64 {
         now.saturating_duration_since(self.origin)
@@ -73,9 +146,29 @@ impl Authority {
             .map(|deadline| deadline.load(Ordering::SeqCst))
             .fold(self.expires.load(Ordering::SeqCst), u64::min)
     }
+    pub(crate) fn callback_expired(&self) -> bool {
+        let now = self.elapsed(Instant::now());
+        self.callbacks
+            .iter()
+            .any(|deadline| deadline.load(Ordering::SeqCst) <= now)
+    }
     pub(crate) fn callback_deadline(
         self: &Arc<Self>,
         timeout: Duration,
+        cleanup: bool,
+    ) -> Result<CallbackDeadline> {
+        if timeout.is_zero() {
+            return Err(Error::InvalidInput("zero callback deadline"));
+        }
+        let guard = self.reserve_callback_deadline(cleanup)?;
+        let until = Instant::now()
+            .checked_add(timeout)
+            .ok_or(Error::Protocol("callback deadline overflow"))?;
+        guard.arm_until(until);
+        Ok(guard)
+    }
+    pub(crate) fn reserve_callback_deadline(
+        self: &Arc<Self>,
         cleanup: bool,
     ) -> Result<CallbackDeadline> {
         if !cleanup {
@@ -84,16 +177,7 @@ impl Authority {
         if self.disarming.load(Ordering::SeqCst) {
             return Err(Error::Closed);
         }
-        let budget = u64::try_from(timeout.as_nanos())
-            .map_err(|_| Error::Protocol("callback deadline overflow"))?;
-        if budget == 0 {
-            return Err(Error::InvalidInput("zero callback deadline"));
-        }
-        let deadline = self
-            .elapsed(Instant::now())
-            .checked_add(budget)
-            .filter(|value| *value < u64::MAX)
-            .ok_or(Error::Protocol("callback deadline overflow"))?;
+        let deadline = u64::MAX - 1;
         for (slot, value) in self.callbacks.iter().enumerate() {
             if value
                 .compare_exchange(u64::MAX, deadline, Ordering::SeqCst, Ordering::SeqCst)
@@ -102,7 +186,8 @@ impl Authority {
                 let guard = CallbackDeadline {
                     authority: self.clone(),
                     slot,
-                    deadline,
+                    deadline: AtomicU64::new(deadline),
+                    original: AtomicU64::new(deadline),
                 };
                 if self.disarming.load(Ordering::SeqCst) {
                     return Err(Error::Closed);
@@ -157,7 +242,7 @@ impl Authority {
                 .saturating_sub(self.elapsed(Instant::now())),
         ))
     }
-    pub(crate) fn disarm(&self) -> Result<()> {
+    pub(crate) fn disarm(self: &Arc<Self>) -> Result<()> {
         self.disarming.store(true, Ordering::SeqCst);
         if self
             .callbacks
@@ -167,6 +252,11 @@ impl Authority {
             self.retire();
             return Err(Error::Protocol("callback ownership remains at shutdown"));
         }
+        // Quiescence is already proven. Retain the last OS handle even if the
+        // shutdown observer is canceled between this commit and its join.
+        if self.watchdog_thread.lock().unwrap().is_some() {
+            *self.shutdown_hold.lock().unwrap() = Some(self.clone());
+        }
         self.disarmed.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -174,7 +264,11 @@ impl Authority {
         // Strong ownership deliberately survives Runtime drop, task cancellation
         // and failed shutdown. Only proven cleanup may disarm it.
         let authority = self.clone();
-        std::thread::Builder::new()
+        let mut owner = self.watchdog_thread.lock().unwrap();
+        if owner.is_some() {
+            return Err(Error::InvalidInput("authority watchdog already started"));
+        }
+        let thread = std::thread::Builder::new()
             .name("sf-authority".into())
             .spawn(move || loop {
                 if authority.disarmed.load(Ordering::SeqCst) {
@@ -190,6 +284,15 @@ impl Authority {
                 }
                 std::thread::sleep(Duration::from_millis(10));
             })?;
+        *owner = Some(self.own_thread(thread));
+        Ok(())
+    }
+    pub(crate) async fn join_watchdog(&self) -> Result<()> {
+        let thread = self.watchdog_thread.lock().unwrap().clone();
+        if let Some(thread) = thread {
+            thread.join_finished().await?;
+        }
+        self.shutdown_hold.lock().unwrap().take();
         Ok(())
     }
 }

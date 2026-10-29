@@ -612,6 +612,9 @@ async fn reporting_bounds_and_current_description_validation() {
 }
 impl Harness {
     async fn new() -> Self {
+        Self::new_with_application(None).await
+    }
+    async fn new_with_application(application: Option<tokio::runtime::Handle>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let env = [
@@ -672,12 +675,14 @@ impl Harness {
             }
         );
         let authority = Authority::new(std::time::Instant::now(), 3_000_000_000).unwrap();
-        let engine = Engine::start(
-            crate::ActivationContextHandle::new(activation),
-            authority,
-            client.unwrap(),
-            rx,
-        );
+        let current = crate::ActivationContextHandle::new(activation);
+        let engine = if let Some(application) = application {
+            let execution =
+                crate::extensions::ExecutionRuntime::new(authority.clone(), application);
+            Engine::start_with_execution(current, authority, client.unwrap(), rx, execution)
+        } else {
+            Engine::start(current, authority, client.unwrap(), rx)
+        };
         let calls = Arc::new(Calls::default());
         peer.set_nodelay(true).unwrap();
         engine

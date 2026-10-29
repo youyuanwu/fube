@@ -115,6 +115,7 @@ impl Reporting {
         request: ProxyRequest,
         cancel: crate::Cancellation,
         global: Arc<Semaphore>,
+        executor: tokio::runtime::Handle,
     ) -> Arc<Self> {
         Arc::new(Self {
             connection,
@@ -127,7 +128,7 @@ impl Reporting {
             cancel,
             global,
             fault_changed: tokio::sync::Notify::new(),
-            executor: tokio::runtime::Handle::try_current().ok(),
+            executor: Some(executor),
         })
     }
     pub(crate) fn update(&self, request: &ProxyRequest) {

@@ -1,4 +1,6 @@
 use super::*;
+#[path = "stateful_binding_tests.rs"]
+mod binding_tests;
 #[path = "stateful_overlap_tests.rs"]
 mod overlap_tests;
 #[path = "stateful_review_tests.rs"]
@@ -348,7 +350,44 @@ async fn newer_built_incarnation_removes_old_resource_then_retries_and_fences_ol
 
 #[tokio::test]
 async fn promotion_notifies_original_endpoint_until_exact_ack_then_current_configuration() {
-    let mut h = Harness::new().await;
+    promotion_endpoint_scenario(None).await;
+}
+
+#[tokio::test]
+async fn native_endpoint_notification_retry_and_quiescence_do_not_need_application_scheduler_progress(
+) {
+    let (handle, handle_rx) = std::sync::mpsc::sync_channel(1);
+    let (release, stalled) = std::sync::mpsc::sync_channel(1);
+    let application = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        handle.send(runtime.handle().clone()).unwrap();
+        // The application runtime is deliberately never driven. Only its
+        // scheduler/driver handle is supplied to user callback workers.
+        stalled.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    struct JoinApplication(
+        Option<std::sync::mpsc::SyncSender<()>>,
+        Option<std::thread::JoinHandle<()>>,
+    );
+    impl Drop for JoinApplication {
+        fn drop(&mut self) {
+            self.0.take().unwrap().send(()).unwrap();
+            self.1.take().unwrap().join().unwrap();
+        }
+    }
+    let _application = JoinApplication(Some(release), Some(application));
+    promotion_endpoint_scenario(Some(
+        handle_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+    ))
+    .await;
+}
+
+async fn promotion_endpoint_scenario(application: Option<tokio::runtime::Handle>) {
+    let application_stalled = application.is_some();
+    let mut h = Harness::new_with_application(application).await;
     let calls = register(&h);
     let mut open = request(&h, 2, 1, 20);
     open.local.current_role = 2;
@@ -393,6 +432,21 @@ async fn promotion_notifies_original_endpoint_until_exact_ack_then_current_confi
         calls.partitions.lock().unwrap()[0].access_status().unwrap(),
         (G, T)
     );
+    if application_stalled {
+        // Leave the retry pending and prove native Close/quiescence observes
+        // its cancellation without ever driving the application scheduler.
+        // The companion same-clock fixture below exercises the actual30s retry.
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        let mut close = open.clone();
+        close.unit = promote.unit.clone();
+        close.local = promote.local.clone();
+        h.send("ReplicaClose", &close).await;
+        h.receive("ReplicaCloseReply").await;
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        h.engine.quiesce().await.unwrap();
+        h.engine.shared.execution.shutdown().await.unwrap();
+        return;
+    }
     let mut ack = control(&promote, "ProxyReplicaEndpointUpdatedReply", vec![]);
     ack.runtime = open.runtime.clone();
     ack.local = body.local.clone();
@@ -445,6 +499,9 @@ async fn promotion_notifies_original_endpoint_until_exact_ack_then_current_confi
     tokio::time::advance(Duration::from_secs(30)).await;
     h.no_reply().await;
     tokio::time::resume();
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    h.engine.quiesce().await.unwrap();
+    h.engine.shared.execution.shutdown().await.unwrap();
 }
 
 #[tokio::test]

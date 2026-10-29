@@ -26,11 +26,11 @@ enum RemotePhase {
     Dropped,
 }
 pub(super) struct Remote {
-    descriptor: w::Replica,
+    pub(super) descriptor: w::Replica,
     phase: RemotePhase,
     pub(super) busy: bool,
     pub(super) cancel: Cancellation,
-    sequence: u64,
+    pub(super) sequence: u64,
 }
 impl Remote {
     pub(super) fn building(&self) -> bool {
@@ -259,30 +259,9 @@ impl Registry {
             state.role_changing = true;
             state.error_api = (12, 4);
         }
-        let progress = tokio::time::timeout(CALLBACK_TIMEOUT, {
-            let guard = self.authority.callback_deadline(CALLBACK_TIMEOUT, false)?;
-            tokio::task::spawn_blocking(move || {
-                let result = replicator.progress();
-                drop(guard);
-                result
-            })
-        })
-        .await;
-        let progress = match progress {
-            Ok(Ok(result)) => {
-                unit.state.lock().unwrap().role_changing = false;
-                result?
-            }
-            failed => {
-                self.authority.retire();
-                self.connection.abort();
-                return Err(if failed.is_err() {
-                    Error::Timeout
-                } else {
-                    Error::Protocol("replicator progress callback panicked")
-                });
-            }
-        };
+        let progress = self.complete(async move { replicator.progress() }).await;
+        unit.state.lock().unwrap().role_changing = false;
+        let progress = progress?;
         progress.ensure_initialized()?;
         let mut state = unit.state.lock().unwrap();
         if !state.valid.load(Ordering::Acquire) {
@@ -761,21 +740,44 @@ impl Registry {
             receipt.revision = revision;
             revision
         };
-        let replicator = replicator.clone();
+        let revision_token = unit.state.lock().unwrap().full_revision.clone();
+        let bound = super::binding::issue(
+            unit,
+            request,
+            if current_only {
+                super::binding::NativeInvocationKind::CurrentConfiguration
+            } else {
+                super::binding::NativeInvocationKind::CatchUpConfiguration
+            },
+            Some(current.clone()),
+            (!current_only).then(|| previous.clone()),
+            None,
+            (revision_token, revision),
+            None,
+            cancel.clone(),
+        )
+        .and_then(|invocation| {
+            super::binding::bind(invocation.clone(), replicator.clone())
+                .map(|control| (invocation, control))
+        });
         let operation_cancel = cancel.clone();
-        let result = self
-            .complete(async move {
-                if current_only {
-                    replicator
-                        .update_current_configuration(current, operation_cancel)
-                        .await
-                } else {
-                    replicator
-                        .update_catch_up_configuration(current, previous, operation_cancel)
-                        .await
-                }
-            })
-            .await;
+        let result = match bound {
+            Err(error) => Err(error),
+            Ok((invocation, replicator)) => self
+                .complete(async move {
+                    if current_only {
+                        replicator
+                            .update_current_configuration(current, operation_cancel)
+                            .await
+                    } else {
+                        replicator
+                            .update_catch_up_configuration(current, previous, operation_cancel)
+                            .await
+                    }
+                })
+                .await
+                .and_then(|()| invocation.validate()),
+        };
         let mut state = unit.state.lock().unwrap();
         state.configuring = false;
         if cancel.is_cancelled()
@@ -1112,13 +1114,32 @@ impl Registry {
         };
         let operation_cancel = cancel.clone();
         let operation_info = info.clone();
-        let result = self
-            .complete(async move {
-                replicator
-                    .build_replica(operation_info, operation_cancel)
-                    .await
-            })
-            .await;
+        let bound = super::binding::issue(
+            unit,
+            &request,
+            super::binding::NativeInvocationKind::Build,
+            None,
+            None,
+            Some(info.clone()),
+            (revision.0.clone(), revision.1),
+            Some((info.node_id, sequence)),
+            cancel.clone(),
+        )
+        .and_then(|invocation| {
+            super::binding::bind(invocation.clone(), replicator)
+                .map(|control| (invocation, control))
+        });
+        let result = match bound {
+            Err(error) => Err(error),
+            Ok((invocation, replicator)) => self
+                .complete(async move {
+                    replicator
+                        .build_replica(operation_info, operation_cancel)
+                        .await
+                })
+                .await
+                .and_then(|()| invocation.validate()),
+        };
         {
             let mut state = unit.state.lock().unwrap();
             if let Some(remote) = state.remotes.get_mut(&info.node_id) {
@@ -1285,21 +1306,45 @@ impl Registry {
         unit.state.lock().unwrap().error_api = (11, 4);
         let operation_cancel = cancel.clone();
         let operation_info = info.clone();
-        let result = self
-            .complete(async move {
-                replicator
-                    .remove_replica(
-                        operation_info,
-                        if emit_reply {
-                            crate::ReplicaRemoval::Idle
-                        } else {
-                            crate::ReplicaRemoval::BuildRetryCleanup
-                        },
-                        operation_cancel,
-                    )
-                    .await
-            })
-            .await;
+        let purpose = if emit_reply {
+            ReplicaRemoval::Idle
+        } else {
+            ReplicaRemoval::BuildRetryCleanup
+        };
+        let bound = super::binding::issue(
+            unit,
+            &request,
+            super::binding::NativeInvocationKind::Remove(purpose),
+            None,
+            None,
+            Some(info.clone()),
+            (revision.0.clone(), revision.1),
+            Some((info.node_id, sequence)),
+            cancel.clone(),
+        )
+        .and_then(|invocation| {
+            super::binding::bind(invocation.clone(), replicator)
+                .map(|control| (invocation, control))
+        });
+        let result = match bound {
+            Err(error) => Err(error),
+            Ok((invocation, replicator)) => self
+                .complete(async move {
+                    replicator
+                        .remove_replica(
+                            operation_info,
+                            if emit_reply {
+                                crate::ReplicaRemoval::Idle
+                            } else {
+                                crate::ReplicaRemoval::BuildRetryCleanup
+                            },
+                            operation_cancel,
+                        )
+                        .await
+                })
+                .await
+                .and_then(|()| invocation.validate()),
+        };
         {
             let mut state = unit.state.lock().unwrap();
             state.removing = false;
@@ -1380,7 +1425,11 @@ impl Registry {
         };
         let connection = self.connection.clone();
         let authority = self.authority.clone();
-        let task = tokio::spawn(async move {
+        let mut retries = self.retries.lock().unwrap();
+        if retries.len() >= crate::MAX_SERVICE_UNITS * 2 {
+            return Err(Error::ResourceLimit("endpoint retry owners"));
+        }
+        let task = self.core.spawn(async move {
             loop {
                 let fence_authority = Arc::downgrade(&authority);
                 let fence_valid = valid.clone();
@@ -1418,11 +1467,6 @@ impl Registry {
                 }
             }
         });
-        let mut retries = self.retries.lock().unwrap();
-        if retries.len() >= crate::MAX_SERVICE_UNITS * 2 {
-            task.abort();
-            return Err(Error::ResourceLimit("endpoint retry owners"));
-        }
         retries.push(task);
         Ok(())
     }

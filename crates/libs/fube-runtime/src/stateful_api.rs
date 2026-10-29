@@ -379,6 +379,8 @@ pub struct StatefulPartition {
     pub(crate) authority: Arc<crate::lease::Authority>,
     pub(crate) status: Arc<Mutex<ReplicaStatus>>,
     pub(crate) reporting: Option<Arc<crate::reporting::Reporting>>,
+    pub(crate) execution: Option<crate::extensions::ExecutionRuntime>,
+    pub(crate) native: Option<crate::stateful::binding::NativeRuntimeIntegration>,
 }
 impl StatefulPartition {
     pub fn identity(&self) -> &ReplicaIdentity {

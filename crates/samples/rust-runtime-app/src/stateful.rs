@@ -648,6 +648,7 @@ pub(super) struct PeerServer {
     ip: String,
     port: u16,
     listener: OnceCell<SocketAddr>,
+    listener_tasks: task_ownership::Listener,
     routes: Mutex<HashMap<String, Weak<EmptyReplicator>>>,
 }
 impl PeerServer {
@@ -656,6 +657,7 @@ impl PeerServer {
             ip,
             port,
             listener: OnceCell::new(),
+            listener_tasks: task_ownership::Listener::default(),
             routes: Mutex::new(HashMap::new()),
         })
     }
@@ -668,31 +670,25 @@ impl PeerServer {
                     return Err(failure("unspecified replication/control address"));
                 }
                 let server = self.clone();
-                tokio::spawn(async move {
-                    let capacity = Arc::new(Semaphore::new(64));
-                    loop {
-                        let Ok((stream, _)) = listener.accept().await else {
-                            return;
-                        };
-                        let Ok(permit) = capacity.clone().try_acquire_owned() else {
-                            drop(stream);
-                            continue;
-                        };
+                self.listener_tasks
+                    .start(listener, Duration::from_secs(2), move |stream| {
                         let server = server.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let _ = tokio::time::timeout(
-                                Duration::from_secs(2),
-                                server.request(stream),
-                            )
-                            .await;
-                        });
-                    }
-                });
+                        async move {
+                            let _ = server.request(stream).await;
+                        }
+                    })?;
                 Ok(address)
             })
             .await
             .copied()
+    }
+    // Shared across replicas; retiring a replica removes its route and drains
+    // incoming requests without stopping this application's listener.
+    pub(super) fn stop(&self) {
+        self.listener_tasks.stop();
+    }
+    pub(super) async fn join(&self) -> RuntimeResult<()> {
+        self.listener_tasks.join().await
     }
     async fn request(&self, mut stream: TcpStream) -> RuntimeResult<()> {
         let header = read_header(&mut stream).await?;
@@ -717,6 +713,30 @@ impl PeerServer {
         } else {
             response(&mut stream, 404, "{}").await
         }
+    }
+}
+#[cfg(test)]
+mod listener_ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn peer_listener_shutdown_joins_incomplete_requests_and_releases_server() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let server = PeerServer::new("127.0.0.1".into(), 0);
+            let retained = Arc::downgrade(&server);
+            let address = server.listen().await.unwrap();
+            let mut client = TcpStream::connect(address).await.unwrap();
+            client.write_all(b"GET /incomplete").await.unwrap();
+            server.stop();
+            server.join().await.unwrap();
+            // A connection still queued at stop may be reset rather than EOF.
+            assert!(!matches!(client.read(&mut [0]).await, Ok(n) if n != 0));
+            let _rebound = TcpListener::bind(address).await.unwrap();
+            drop(server);
+            assert!(retained.upgrade().is_none());
+        })
+        .await
+        .expect("peer listener joined cleanup deadline");
     }
 }
 async fn read_header(stream: &mut TcpStream) -> RuntimeResult<String> {

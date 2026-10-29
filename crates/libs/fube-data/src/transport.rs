@@ -491,6 +491,14 @@ impl PeerTransport {
     pub fn shutdown(&self) {
         self.handle.shutdown();
     }
+    pub(crate) fn shutdown_checked(&self) -> Result<()> {
+        self.handle.shutdown_checked()
+    }
+    pub(crate) fn request_stop(&self) {
+        let _admission = self.handle.admission.lock().unwrap();
+        self.handle.stopped.store(true, Ordering::Release);
+        self.handle.stop.send_replace(true);
+    }
 }
 
 impl Handle {
@@ -503,6 +511,10 @@ impl Handle {
     }
 
     fn shutdown(&self) {
+        let _ = self.shutdown_checked();
+    }
+
+    fn shutdown_checked(&self) -> Result<()> {
         {
             let _admission = self.admission.lock().unwrap();
             self.stopped.store(true, Ordering::Release);
@@ -512,8 +524,11 @@ impl Handle {
         // must not return merely because another caller took the handle.
         let mut thread = self.thread.lock().unwrap();
         if let Some(thread) = thread.take() {
-            let _ = thread.join();
+            thread
+                .join()
+                .map_err(|_| Error::Protocol("peer reactor panicked"))?;
         }
+        Ok(())
     }
 }
 

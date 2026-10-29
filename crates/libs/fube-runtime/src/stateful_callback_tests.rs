@@ -11,6 +11,8 @@ use std::{
 
 fn partition() -> StatefulPartition {
     StatefulPartition {
+        execution: None,
+        native: None,
         identity: ReplicaIdentity {
             service_name: "fabric:/app/service".into(),
             service_type: "StatefulType".into(),

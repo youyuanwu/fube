@@ -12,6 +12,7 @@ use crate::{
 struct StatefulCalls {
     events: Mutex<Vec<&'static str>>,
     partitions: Mutex<Vec<StatefulPartition>>,
+    open_entered: Notify,
     release: Notify,
     catch_up_release: Notify,
     build_release: Notify,
@@ -100,6 +101,7 @@ impl StatefulService for StatefulFixture {
         Box::pin(async move {
             self.calls.record("serviceOpen");
             self.calls.partitions.lock().unwrap().push(partition);
+            self.calls.open_entered.notify_one();
             if self.mode == 28
                 && self
                     .calls
@@ -528,6 +530,9 @@ async fn stateful_fault_retry_outlives_callers_executor_and_stops_with_unit() {
     drop(permit);
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(31)).await;
+    // Native callback polls now use owned OS workers; virtual-time auto
+    // advancement must not expire I/O/Close observation before they can run.
+    tokio::time::resume();
     let message = h.receive("RAReportFault").await;
     let body: FaultBody = from_slice(&message.body).unwrap();
     assert_eq!(
@@ -547,6 +552,7 @@ async fn stateful_fault_retry_outlives_callers_executor_and_stops_with_unit() {
     }
     assert_eq!(Arc::strong_count(backend), running_references - 1);
     let attempts = partition.fault_delivery().unwrap().attempts;
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(61)).await;
     assert_eq!(partition.fault_delivery().unwrap().attempts, attempts);
     assert!(partition.fault_delivery().unwrap().cancelled);
@@ -732,12 +738,9 @@ async fn stateful_abort_cancels_open_owner_and_fences_old_incarnation() {
     let calls = register(&h);
     let mut request = request(&h, 2, 1, 8);
     h.send("ReplicaOpen", &request).await;
-    for _ in 0..100 {
-        if !calls.partitions.lock().unwrap().is_empty() {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(Duration::from_secs(2), calls.open_entered.notified())
+        .await
+        .unwrap();
     request.flags = 4;
     h.send("ReplicaClose", &request).await;
     let failed: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
@@ -837,13 +840,9 @@ async fn active_stateful_callback_prevents_successful_host_quiescence() {
     let calls = register(&h);
     let request = request(&h, 2, 1, 8);
     h.send("ReplicaOpen", &request).await;
-    for _ in 0..100 {
-        if !calls.partitions.lock().unwrap().is_empty() {
-            break;
-        }
-
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(Duration::from_secs(2), calls.open_entered.notified())
+        .await
+        .unwrap();
     assert!(!calls.partitions.lock().unwrap().is_empty());
     h.engine.shared.authority.retire(); // Runtime::shutdown's first action.
     assert!(h.engine.quiesce().await.is_err());

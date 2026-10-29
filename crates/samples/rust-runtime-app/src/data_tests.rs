@@ -1,4 +1,31 @@
 use super::*;
+async fn shutdown_route(route: &Arc<Route>) {
+    if route.engine.snapshot().closed {
+        // A terminal write path may already have awaited Close and joined its
+        // standalone executor. Repeating the actual idempotent shutdown must
+        // not submit new work to that stopped executor.
+        route.shutdown();
+        route.engine.close(Cancellation::default()).await.unwrap();
+        return;
+    }
+    let execution = route.engine.execution_runtime();
+    let owner = route.clone();
+    execution
+        .reserve(
+            fube_runtime::extensions::CallLane::Native,
+            fube_runtime::extensions::CallOrigin::default(),
+            Duration::from_secs(30),
+            true,
+        )
+        .unwrap()
+        .run_owned(move || {
+            owner.shutdown();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    route.engine.close(Cancellation::default()).await.unwrap();
+}
 use fube_data::{Acknowledgment, OperationData, OperationDataStream, StateProvider};
 use std::sync::atomic::AtomicUsize;
 
@@ -388,7 +415,7 @@ async fn authority_requires_native_access_all_roles_epoch_lifetime_and_engine_re
         Outcome::Rejected
     );
     native.alive.store(true, Ordering::Release);
-    route.shutdown();
+    shutdown_route(&route).await;
     assert!(route.lifetime().is_err());
     assert_eq!(
         route.write(mutation("retired")).await.outcome,
@@ -442,7 +469,7 @@ async fn concurrent_writes_apply_before_waiting_and_deduplicate_before_assigning
             .operation_for_epoch(EPOCH.primary())
             .unwrap()
     );
-    route.shutdown();
+    shutdown_route(&route).await;
 }
 
 #[tokio::test]
@@ -472,7 +499,7 @@ async fn native_primary_epoch_change_between_authority_reads_rejects_before_admi
     assert_eq!(result.outcome, Outcome::Rejected);
     assert_eq!(route.engine.snapshot().progress.assigned, 0);
     assert_eq!(route.provider.snapshot().last, 0);
-    route.shutdown();
+    shutdown_route(&route).await;
 }
 
 #[tokio::test]
@@ -517,7 +544,7 @@ async fn authority_is_rechecked_before_engine_admission_and_before_local_apply()
             assert_eq!(result.sequence, None);
             assert_eq!(route.engine.snapshot().progress.assigned, 0);
         }
-        route.shutdown();
+        shutdown_route(&route).await;
     }
 }
 
@@ -575,7 +602,7 @@ async fn disconnected_http_waiter_cannot_drop_admission_before_local_apply() {
     assert!(duplicate.duplicate);
     assert_eq!(duplicate.sequence, Some(1));
     assert_eq!(route.engine.snapshot().progress.assigned, 1);
-    route.shutdown();
+    shutdown_route(&route).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -650,8 +677,8 @@ async fn build_waits_for_accepted_primary_local_apply_at_the_exact_horizon() {
     );
     assert!(primary.engine.snapshot().fault.is_none());
     drop(build);
-    primary.shutdown();
-    secondary.shutdown();
+    shutdown_route(&primary).await;
+    shutdown_route(&secondary).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -856,9 +883,9 @@ async fn real_copy_pumps_copy_ack_hold_after_receive_eos_then_replication_ack_an
     );
     assert_eq!(secondary.engine.snapshot().progress.assigned, 105);
     assert_eq!(secondary.provider.snapshot().history_count, 105);
-    primary.shutdown();
-    secondary.shutdown();
-    replacement.shutdown();
+    shutdown_route(&primary).await;
+    shutdown_route(&secondary).await;
+    shutdown_route(&replacement).await;
 }
 
 #[tokio::test]
@@ -892,7 +919,7 @@ async fn cancellation_after_acceptance_is_ambiguous_never_undo_and_terminal_owne
     assert!(duplicate.duplicate);
     assert_eq!(duplicate.sequence, Some(1));
     assert_eq!(primary.engine.snapshot().progress.assigned, 1);
-    primary.shutdown();
+    shutdown_route(&primary).await;
     let result = write.await;
     assert_eq!(result.outcome, Outcome::Ambiguous);
     assert_eq!(result.sequence, Some(1));
@@ -903,8 +930,8 @@ async fn cancellation_after_acceptance_is_ambiguous_never_undo_and_terminal_owne
         control.write(mutation("unrelated")).await.outcome,
         Outcome::Committed
     );
-    secondary.shutdown();
-    control.shutdown();
+    shutdown_route(&secondary).await;
+    shutdown_route(&control).await;
 }
 
 #[tokio::test]
@@ -942,8 +969,8 @@ async fn native_authority_revoked_while_waiting_fences_committed_publication() {
         Outcome::Rejected
     );
     assert_eq!(primary.engine.snapshot().progress.assigned, 1);
-    primary.shutdown();
-    secondary.shutdown();
+    shutdown_route(&primary).await;
+    shutdown_route(&secondary).await;
 }
 
 #[tokio::test]
@@ -953,7 +980,7 @@ async fn stale_route_cleanup_cannot_remove_replacement_and_stale_handle_cannot_w
     let mut routes = HashMap::from([("/data/owner".to_string(), new.clone())]);
     remove_owned(&mut routes, "/data/owner", &old);
     assert!(Arc::ptr_eq(&routes["/data/owner"], &new));
-    old.shutdown();
+    shutdown_route(&old).await;
     assert_eq!(
         old.write(mutation("stale")).await.outcome,
         Outcome::Rejected
@@ -964,7 +991,7 @@ async fn stale_route_cleanup_cannot_remove_replacement_and_stale_handle_cannot_w
     );
     remove_owned(&mut routes, "/data/owner", &new);
     assert!(routes.is_empty());
-    new.shutdown();
+    shutdown_route(&new).await;
 }
 
 type PumpFixture = (

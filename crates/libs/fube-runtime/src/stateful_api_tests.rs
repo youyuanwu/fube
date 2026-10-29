@@ -228,6 +228,8 @@ fn stateful_partition_snapshot_cannot_grant_or_revive_owner_authority() {
     let authority = crate::lease::Authority::new(std::time::Instant::now(), 1_000_000_000).unwrap();
     let valid = Arc::new(AtomicBool::new(true));
     let partition = StatefulPartition {
+        execution: Option::None,
+        native: Option::None,
         identity: ReplicaIdentity {
             service_name: "fabric:/app/service".into(),
             service_type: "StatefulType".into(),

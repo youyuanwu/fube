@@ -4,6 +4,38 @@
 // Rust-only Fabric TCP source-contract fixtures; not native interoperability.
 
 use super::*;
+#[path = "engine_disposal_tests.rs"]
+mod disposal_tests;
+async fn abort_owned(engine: &Arc<Engine>) {
+    if engine
+        .disposal_done
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(DisposalReceipt::is_complete)
+    {
+        return;
+    }
+    let execution = engine.shared.execution.clone();
+    let owner = engine.clone();
+    execution
+        .reserve(
+            CallLane::Native,
+            CallOrigin::default(),
+            std::time::Duration::from_secs(30),
+            true,
+        )
+        .unwrap()
+        .run_owned(move || {
+            owner.abort();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    if engine.owns_execution {
+        execution.finish_standalone().await.unwrap();
+    }
+}
 use crate::{MemoryProvider, Mutation};
 use std::sync::atomic::{AtomicI64, AtomicUsize};
 use uuid::Uuid;
@@ -136,7 +168,7 @@ async fn promoted_prefix_without_retained_suffix_accepts_bounded_existing_peer_r
         .wait_for_catch_up(CatchUpMode::All, cancel())
         .await
         .unwrap();
-    primary.abort();
+    abort_owned(&primary).await;
     transport.shutdown();
 }
 
@@ -238,8 +270,8 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
     operation.acknowledge().unwrap();
     drop(operation);
     assert_eq!(write.wait(cancel()).await.unwrap(), 1);
-    primary.abort();
-    secondary.abort();
+    abort_owned(&primary).await;
+    abort_owned(&secondary).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -350,8 +382,8 @@ async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
         .wait_for_catch_up(CatchUpMode::All, cancel())
         .await
         .unwrap();
-    primary.abort();
-    target.abort();
+    abort_owned(&primary).await;
+    abort_owned(&target).await;
 }
 
 struct SnapshotProvider {
@@ -620,10 +652,10 @@ async fn nonempty_live_copy_uses_previous_quorum_horizon_and_applied_finish_fenc
             .any(|peer| peer.replica == 4 && peer.applied == 110)
     })
     .await;
-    p.abort();
-    slow.abort();
-    fast.abort();
-    target.abort();
+    abort_owned(&p).await;
+    abort_owned(&slow).await;
+    abort_owned(&fast).await;
+    abort_owned(&target).await;
 }
 
 struct FailureStream {
@@ -733,8 +765,8 @@ async fn copy_provider_error_panic_deadline_and_unavailable_history_fence_and_di
             stream.disposed.load(Ordering::Acquire),
             usize::from(mode != 4)
         );
-        p.abort();
-        s.abort();
+        abort_owned(&p).await;
+        abort_owned(&s).await;
     }
 }
 
@@ -814,7 +846,13 @@ async fn all_sixty_four_copy_callbacks_are_bounded_cancel_cleanup_joins_and_cont
     excess.replica_id = 66;
     excess.address = endpoint(&network, partition, 66).to_string();
     assert!(p.build_replica(excess, cancel()).await.is_err());
-    assert!(!p.on_data_loss(cancel()).await.unwrap());
+    // The new shared execution budget cannot admit a 65th independent user
+    // callback. Reject before owner mutation; reserved owner/control processing
+    // must still cancel and dispose one of the existing 64 callbacks.
+    assert!(matches!(
+        p.on_data_loss(cancel()).await,
+        Err(Error::ResourceLimit(_))
+    ));
     assert_eq!(stream.active.load(Ordering::Acquire), 64);
     cancellations[0].cancel();
     p.remove_replica(
@@ -826,7 +864,8 @@ async fn all_sixty_four_copy_callbacks_are_bounded_cancel_cleanup_joins_and_cont
     .unwrap();
     until(|| stream.active.load(Ordering::Acquire) == 63).await;
     assert_eq!(stream.disposed.load(Ordering::Acquire), 1);
-    p.abort();
+    assert!(!p.on_data_loss(cancel()).await.unwrap());
+    abort_owned(&p).await;
     assert_eq!(stream.active.load(Ordering::Acquire), 0);
     assert_eq!(stream.disposed.load(Ordering::Acquire), 64);
     assert_eq!(
@@ -881,8 +920,8 @@ async fn unfinished_copy_rejects_epoch_update_and_promotion_without_success() {
         p.remove_replica(descriptor(&s), ReplicaRemoval::BuildRetryCleanup, cancel())
             .await
             .unwrap();
-        p.abort();
-        s.abort();
+        abort_owned(&p).await;
+        abort_owned(&s).await;
     }
 }
 
@@ -980,7 +1019,7 @@ async fn promotion_drains_contiguous_received_before_discarding_only_out_of_orde
         .await
         .unwrap();
     assert_eq!(write.sequence, 67);
-    secondary.abort();
+    abort_owned(&secondary).await;
     network.shutdown();
     drainer.abort();
     let _ = drainer.await;
@@ -1025,7 +1064,7 @@ async fn promotion_preserves_an_old_quorum_acknowledged_but_undispatched_write()
     assert_eq!(old.wait(cancel()).await.unwrap(), 2);
     until(|| b.snapshot().progress.received == 2).await;
     assert_eq!(bp.snapshot().last, 1);
-    a.abort();
+    abort_owned(&a).await;
     c.update_epoch(NEXT_EPOCH, cancel()).await.unwrap();
     let promotion = b.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel());
     tokio::pin!(promotion);
@@ -1053,8 +1092,8 @@ async fn promotion_preserves_an_old_quorum_acknowledged_but_undispatched_write()
     assert_eq!(new.wait(cancel()).await.unwrap(), 3);
     assert_eq!(bp.snapshot().values, cp.snapshot().values);
     assert_eq!(bp.snapshot().results, cp.snapshot().results);
-    b.abort();
-    c.abort();
+    abort_owned(&b).await;
+    abort_owned(&c).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1136,7 +1175,7 @@ async fn configuration_captures_preexisting_assigned_fence_but_not_later_writes(
                 .await
                 .is_err()
         );
-        p.abort();
+        abort_owned(&p).await;
         network.shutdown();
     }
 }
@@ -1189,7 +1228,7 @@ async fn configured_peer_retirement_releases_session_capacity_before_replacement
         .await
         .unwrap();
     until(|| p.snapshot().peers.is_empty()).await;
-    p.abort();
+    abort_owned(&p).await;
     for (network, _) in networks {
         network.shutdown();
     }
@@ -1252,7 +1291,7 @@ async fn promotion_total_deadline_covers_receive_drain_and_final_callback_public
     until(|| secondary.snapshot().closed).await;
     assert!(started.elapsed() < std::time::Duration::from_millis(350));
     assert_ne!(secondary.snapshot().role, ReplicaRole::Primary);
-    secondary.abort();
+    abort_owned(&secondary).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1314,7 +1353,7 @@ async fn quiet_promotion_drain_wakes_on_absolute_deadline_or_cancellation_withou
         assert_eq!(secondary.snapshot().progress.applied, 0);
         assert!(held.acknowledge().is_err());
         drop(held);
-        secondary.abort();
+        abort_owned(&secondary).await;
     }
 }
 
@@ -1349,7 +1388,7 @@ async fn copied_primary_replays_only_authentic_prefix_to_an_unbound_native_behav
     pp.apply_replication(1, &original).unwrap();
     write.wait(cancel()).await.unwrap();
     build_memory(&p, &s, &sp).await;
-    p.abort();
+    abort_owned(&p).await;
     s.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
         .await
         .unwrap();
@@ -1451,7 +1490,7 @@ async fn copied_primary_replays_only_authentic_prefix_to_an_unbound_native_behav
     .unwrap();
     let accepted = s.submit_in_epoch(NEXT_EPOCH, next, cancel()).await.unwrap();
     assert_eq!(accepted.sequence, 2);
-    s.abort();
+    abort_owned(&s).await;
     network.shutdown();
 }
 
@@ -1490,7 +1529,7 @@ async fn epoch_fenced_submission_rejects_before_assignment_or_checkpoint_restamp
         .unwrap();
     assert_eq!(checkpoint.epoch, EPOCH);
     assert_eq!(checkpoint.data, operation);
-    p.abort();
+    abort_owned(&p).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1590,7 +1629,7 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
             "replay cannot permanently monopolize the sole operation slot"
         );
         assert_eq!(provider.checkpoint_calls.load(Ordering::Acquire), 2);
-        p.abort();
+        abort_owned(&p).await;
         network.shutdown();
     }
 }
@@ -1678,7 +1717,7 @@ async fn replay_cooldown_starts_after_slow_publication_releases_producer_admissi
     .unwrap();
     assert_eq!(write.sequence, 2);
     assert_eq!(provider.checkpoint_calls.load(Ordering::Acquire), 1);
-    p.abort();
+    abort_owned(&p).await;
     network.shutdown();
 }
 
@@ -1712,7 +1751,7 @@ async fn adopted_copy_retirement_does_not_pin_completed_writes_as_idle_history()
     p.update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
-    s.abort();
+    abort_owned(&s).await;
     until(|| p.snapshot().peers.is_empty()).await;
     for sequence in 2..20 {
         let data = mutation(&format!("write-{sequence}"), &sequence.to_string());
@@ -1722,7 +1761,7 @@ async fn adopted_copy_retirement_does_not_pin_completed_writes_as_idle_history()
     }
     until(|| p.snapshot().owned_operations == 0).await;
     assert_eq!(p.snapshot().progress.completed, 19);
-    p.abort();
+    abort_owned(&p).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1888,7 +1927,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
         old_primary = new_primary;
     }
     for engine in &engines {
-        engine.abort();
+        abort_owned(&engine).await;
     }
 }
 
@@ -1956,7 +1995,7 @@ async fn native_completed_prefix_attestation_is_not_a_new_write_or_all_ack() {
     );
     assert_eq!(p.snapshot().progress.committed, 20);
     assert_eq!(p.snapshot().peers[0].applied, 0);
-    p.abort();
+    abort_owned(&p).await;
     network.shutdown();
 }
 
@@ -2036,8 +2075,8 @@ async fn native_directed_planned_swap_preserves_stream_and_reconciled_sequence()
     pp.last.store(11, Ordering::Release);
     operation.acknowledge().unwrap();
     assert_eq!(write.wait(cancel()).await.unwrap(), 11);
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2090,8 +2129,8 @@ async fn failed_build_cleanup_allows_retry_but_actual_remove_tombstones_native_i
     p.remove_replica(descriptor(&s), ReplicaRemoval::Idle, cancel())
         .await
         .unwrap();
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2171,7 +2210,7 @@ async fn copy_gap_empty_data_duplicate_and_legacy_eos_require_every_explicit_app
     );
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert!(secondary.snapshot().fault.is_none());
-    secondary.abort();
+    abort_owned(&secondary).await;
     network.shutdown();
 }
 
@@ -2229,8 +2268,8 @@ async fn missing_service_apply_deadline_fences_without_receipt_as_commit_and_dis
     drop(operation);
     assert_eq!(s.shared.callbacks.available_permits(), 64);
     assert_eq!(s.snapshot().owned_operations, 0);
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 struct Empty;
@@ -2471,7 +2510,7 @@ async fn native_singleton_requires_stable_runtime_membership_not_primary_role_al
         .unwrap();
     provider.last.store(write.sequence, Ordering::Release);
     assert_eq!(write.wait(cancel()).await.unwrap(), 1);
-    node.abort();
+    abort_owned(&node).await;
 }
 
 async fn until(mut condition: impl FnMut() -> bool) {
@@ -2595,9 +2634,9 @@ async fn three_loopback_engines_require_explicit_apply_for_one_hundred_writes() 
     })
     .await;
     assert_eq!(p.snapshot().progress.committed, 100);
-    p.abort();
-    s1.abort();
-    s2.abort();
+    abort_owned(&p).await;
+    abort_owned(&s1).await;
+    abort_owned(&s2).await;
 }
 
 async fn pair() -> (Arc<Engine>, Arc<Engine>, Arc<Provider>) {
@@ -2778,8 +2817,8 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
     drop(operation);
     assert_eq!(write.wait(cancel()).await.unwrap(), 2);
     assert!(!p.snapshot().ready);
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2908,8 +2947,8 @@ async fn native_prewrite_rejects_wrong_views_future_pc_and_stale_cc_without_muta
     assert_eq!(p.snapshot().epoch, Some(EPOCH));
     assert_eq!(provider.epochs.lock().unwrap().as_slice(), epochs);
     assert_eq!(p.shared.revision.load(Ordering::Acquire), revision);
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2947,7 +2986,7 @@ async fn unqualified_configuration_cannot_advance_or_rewind_native_epoch() {
         assert_eq!(p.snapshot().epoch, Some(EPOCH));
         assert_eq!(p.snapshot().progress.assigned, 0);
     }
-    p.abort();
+    abort_owned(&p).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3061,8 +3100,8 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
     operation.acknowledge().unwrap();
     drop(operation);
     assert_eq!(accepted.wait(cancel()).await.unwrap(), 1);
-    p.abort();
-    old.abort();
+    abort_owned(&p).await;
+    abort_owned(&old).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3154,8 +3193,8 @@ async fn joint_quorums_previous_one_excludes_primary_and_catchup_is_not_write_co
     p.wait_for_catch_up(CatchUpMode::All, cancel())
         .await
         .unwrap();
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3199,7 +3238,7 @@ async fn accepted_cancel_is_ambiguous_resource_rejection_consumes_no_lsn_and_old
     let late = stream.next(cancel()).await.unwrap().unwrap();
     let before = s.shared.callbacks.available_permits();
     assert!(before < s.settings.provider_operations);
-    s.abort();
+    abort_owned(&s).await;
     assert!(late.acknowledge().is_err());
     assert_eq!(s.shared.callbacks.available_permits(), before);
     drop(late);
@@ -3212,7 +3251,7 @@ async fn accepted_cancel_is_ambiguous_resource_rejection_consumes_no_lsn_and_old
         s.settings.queue_operations
     );
     drop(three);
-    p.abort();
+    abort_owned(&p).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3279,8 +3318,8 @@ async fn bounded_admission_and_callback_capture_exhaustion_preserve_control_capa
         .unwrap();
     assert_eq!(c.sequence, 3);
     assert_eq!(p.progress().unwrap().last, 2);
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 fn endpoint(transport: &PeerTransport, partition: Uuid, replica: i64) -> Endpoint {
@@ -3559,13 +3598,9 @@ async fn internal_provider_fault_notifies_once_and_pending_receipt_cannot_block_
             let disposed = provider.disposed.clone();
             drop(provider);
             let closing = secondary.clone();
-            timeout(
-                std::time::Duration::from_secs(2),
-                tokio::task::spawn_blocking(move || closing.abort()),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            timeout(std::time::Duration::from_secs(2), abort_owned(&closing))
+                .await
+                .unwrap();
             assert_eq!(
                 *view.faults.lock().unwrap(),
                 vec![fube_runtime::FaultType::Transient]
@@ -3600,7 +3635,7 @@ async fn normal_shutdown_never_notifies_fault_and_standalone_has_no_native_view(
         )
         .unwrap();
         if abort {
-            engine.abort();
+            abort_owned(&engine).await;
         } else {
             engine.close(cancel()).await.unwrap();
         }
@@ -3609,7 +3644,7 @@ async fn normal_shutdown_never_notifies_fault_and_standalone_has_no_native_view(
     }
     let standalone = engine(Uuid::new_v4(), 1, Arc::new(Provider::default()));
     assert!(standalone.native_control.is_none());
-    standalone.abort();
+    abort_owned(&standalone).await;
     let view = Arc::new(FaultNativeView::new(true));
     let startup_error = Engine::bind_with_native_control(
         Actor {
@@ -3683,7 +3718,7 @@ async fn original_epoch_barrier_waits_for_explicit_apply_then_provider_disposal(
     provider.base.last.store(2, Ordering::Release);
     second.acknowledge().unwrap();
     until(|| secondary.snapshot().progress.applied == 2).await;
-    secondary.abort();
+    abort_owned(&secondary).await;
     transport.shutdown();
 }
 
@@ -3737,7 +3772,7 @@ async fn provider_epoch_and_data_loss_errors_panics_deadlines_are_terminal_and_d
                 .submit(OperationData::new(vec![vec![1]]).unwrap(), cancel())
                 .await
                 .is_err());
-            e.abort();
+            abort_owned(&e).await;
         }
     }
 }
@@ -3769,7 +3804,7 @@ async fn canceled_epoch_drain_faults_and_changed_data_loss_resets_assignment_fro
     assert!(update.await.is_err());
     until(|| s.snapshot().closed).await;
     assert!(outstanding.acknowledge().is_err());
-    s.abort();
+    abort_owned(&s).await;
     transport.shutdown();
 
     let provider = Arc::new(ControlledProvider::default());
@@ -3804,7 +3839,7 @@ async fn canceled_epoch_drain_faults_and_changed_data_loss_resets_assignment_fro
         .await
         .unwrap();
     assert_eq!(write.sequence, 2);
-    p.abort();
+    abort_owned(&p).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3856,7 +3891,7 @@ async fn retransmission_recovers_after_actual_tcp_disconnect_without_send_as_com
         },
     );
     assert_eq!(write.wait(cancel()).await.unwrap(), 1);
-    p.abort();
+    abort_owned(&p).await;
     replacement.shutdown();
 }
 
@@ -3890,7 +3925,7 @@ async fn real_wire_gaps_duplicates_stale_epochs_actors_and_impossible_receipts()
     provider.last.store(2, Ordering::Release);
     first.acknowledge().unwrap();
     until(|| s.snapshot().progress.applied == 2).await;
-    s.abort();
+    abort_owned(&s).await;
     transport.shutdown();
 
     let (p, s, _) = pair().await;
@@ -3936,8 +3971,8 @@ async fn real_wire_gaps_duplicates_stale_epochs_actors_and_impossible_receipts()
     assert_eq!(p.snapshot().progress.committed, 0);
     assert_eq!(p.snapshot().peers[0].received, 1);
     drop(accepted);
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 // R1-R5 regressions promoted from reviews/phase2_repros.rs. The unsafe swap
@@ -4086,8 +4121,8 @@ async fn rejected_demotion_then_promotion_drains_the_pending_tail_without_sequen
     assert!(b.snapshot().progress.committed <= 2);
     assert_eq!(b.snapshot().progress.client_completed, 2);
     assert_eq!(ap.snapshot().values["key"], "old");
-    a.abort();
-    b.abort();
+    abort_owned(&a).await;
+    abort_owned(&b).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4128,8 +4163,8 @@ async fn rejected_demotion_preserves_accepted_completion_for_drain_and_retry() {
     assert_eq!(a.snapshot().progress.applied, 1);
     assert_eq!(ap.snapshot().values, bp.snapshot().values);
     assert_eq!(ap.snapshot().results, bp.snapshot().results);
-    a.abort();
-    b.abort();
+    abort_owned(&a).await;
+    abort_owned(&b).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4186,9 +4221,9 @@ async fn continuing_third_secondary_accepts_the_new_primary() {
     until(|| a.snapshot().progress.applied == 2 && c.snapshot().progress.applied == 2).await;
     assert_eq!(a.snapshot().progress.applied, 2);
     assert_eq!(c.snapshot().progress.applied, 2);
-    a.abort();
-    b.abort();
-    c.abort();
+    abort_owned(&a).await;
+    abort_owned(&b).await;
+    abort_owned(&c).await;
 }
 
 async fn copying_raw_secondary(
@@ -4393,7 +4428,7 @@ async fn primary_rebinding_requires_node_accepted_newer_epoch_and_fences_old_act
     assert_eq!(op.sequence, 2);
     assert_eq!(op.data.to_segments(), vec![vec![3]]);
     assert!(s.snapshot().fault.is_none());
-    s.abort();
+    abort_owned(&s).await;
     old_network.shutdown();
     new_network.shutdown();
 }
@@ -4504,7 +4539,7 @@ async fn original_operation_epoch_may_precede_start_copy_primary_epoch() {
         until(|| s.snapshot().progress.applied == 2).await;
         assert_eq!(provider.snapshot().values["key"], "two");
         assert!(s.snapshot().fault.is_none());
-        s.abort();
+        abort_owned(&s).await;
         network.shutdown();
     }
 }
@@ -4548,7 +4583,7 @@ async fn staged_replication_cannot_starve_copy_eos_forever() {
         .unwrap()
         .unwrap();
     assert_eq!(op.sequence, 1);
-    s.abort();
+    abort_owned(&s).await;
     network.shutdown();
 }
 
@@ -4630,7 +4665,7 @@ async fn staged_replication_cannot_starve_copy_items_under_operation_or_byte_exh
         assert!(s.snapshot().owned_operations <= settings.queue_operations);
         assert!(s.snapshot().owned_bytes <= settings.queue_bytes);
         assert!(s.snapshot().fault.is_none());
-        s.abort();
+        abort_owned(&s).await;
         assert_eq!(s.snapshot().owned_operations, 0);
         assert_eq!(s.snapshot().owned_bytes, 0);
         network.shutdown();
@@ -4662,7 +4697,7 @@ async fn aggregate_copy_snapshot(settings: Settings, bytes: usize) -> EngineSnap
     assert!(!snapshot.copy_done);
     assert_eq!(snapshot.progress.applied, 0);
     drop(capture);
-    secondary.abort();
+    abort_owned(&secondary).await;
     assert_eq!(secondary.snapshot().owned_operations, 0);
     assert_eq!(secondary.snapshot().owned_bytes, 0);
     network.shutdown();
@@ -4789,7 +4824,7 @@ async fn concurrent_submit_attempts_cannot_consume_incoming_copy_reservation_or_
         );
         drop(copy);
         retry_raw_eos(&s, &network, &primary, 2).await;
-        s.abort();
+        abort_owned(&s).await;
         assert_eq!(s.snapshot().owned_operations, 0);
         assert_eq!(s.snapshot().owned_bytes, 0);
         network.shutdown();
@@ -4935,7 +4970,7 @@ async fn outgoing_budget_repro_requires_eos_or_explicit_preassignment_write_reje
     );
     source.record(next.sequence);
     assert_eq!(next.wait(cancel()).await.unwrap(), assigned + 1);
-    p.abort();
+    abort_owned(&p).await;
     assert_eq!(p.snapshot().owned_bytes, 0);
     network.shutdown();
 }
@@ -5063,8 +5098,8 @@ async fn outgoing_copy_and_real_idle_ack_progress_with_admitted_or_rejected_live
         target_provider.last.store(op.sequence, Ordering::Release);
         op.acknowledge().unwrap();
         drop(op);
-        p.abort();
-        s.abort();
+        abort_owned(&p).await;
+        abort_owned(&s).await;
         assert_eq!(p.snapshot().owned_bytes, 0);
         assert_eq!(s.snapshot().owned_bytes, 0);
     }
@@ -5233,9 +5268,9 @@ async fn outgoing_future_copy_headroom_survives_concurrent_build_and_write_admis
     op.acknowledge().unwrap();
     drop(op);
     assert_eq!(next.wait(cancel()).await.unwrap(), 2);
-    p.abort();
-    follower.abort();
-    target.abort();
+    abort_owned(&p).await;
+    abort_owned(&follower).await;
+    abort_owned(&target).await;
     for owner in [&p, &follower, &target] {
         assert_eq!(owner.snapshot().owned_operations, 0);
         assert_eq!(owner.snapshot().owned_bytes, 0);
@@ -5274,7 +5309,11 @@ async fn outgoing_build_admission_counts_pending_writes_before_installing_any_pe
             // These are already-charged, not-yet-assigned Submit messages, just
             // as if producers won admission while the owner selected Build.
             p.commands
-                .try_send(Command::Build(descriptor(&s), cancel(), reply))
+                .try_send(AuthorizedCommand {
+                    command: Command::Build(descriptor(&s), cancel(), reply.into()),
+                    proof: None,
+                    cleanup: None,
+                })
                 .unwrap_or_else(|_| panic!("build command queue unexpectedly full"));
             for _ in 0..if byte_limit { 1 } else { 2 } {
                 let charge = p
@@ -5297,7 +5336,7 @@ async fn outgoing_build_admission_counts_pending_writes_before_installing_any_pe
                         data: data.clone(),
                         charge,
                         cancellation: cancel(),
-                        reply,
+                        reply: reply.into(),
                     })
                     .unwrap_or_else(|_| panic!("pending write queue unexpectedly full"));
                 replies.push(result);
@@ -5338,8 +5377,8 @@ async fn outgoing_build_admission_counts_pending_writes_before_installing_any_pe
         assert_eq!(next.sequence, sequence + 1);
         provider.last.store(next.sequence, Ordering::Release);
         next.wait(cancel()).await.unwrap();
-        p.abort();
-        s.abort();
+        abort_owned(&p).await;
+        abort_owned(&s).await;
         assert_eq!(p.snapshot().owned_bytes, 0);
     }
 }
@@ -5423,9 +5462,9 @@ async fn outgoing_build_on_retained_write_budget_fails_without_losing_write_or_c
     .unwrap();
     assert_eq!(p.snapshot().peers.len(), 2);
     assert_eq!(p.snapshot().progress.assigned, 1);
-    p.abort();
-    follower.abort();
-    target.abort();
+    abort_owned(&p).await;
+    abort_owned(&follower).await;
+    abort_owned(&target).await;
     assert_eq!(p.snapshot().owned_bytes, 0);
 }
 
@@ -5445,13 +5484,13 @@ async fn shutdown_disposes_operations_still_owned_by_stream_channels() {
         .unwrap();
     until(|| b.snapshot().operation_captures == 2).await;
     let stream = b.replication_stream();
-    b.abort();
+    abort_owned(&b).await;
     let snapshot = b.snapshot();
     assert_eq!(snapshot.operation_captures, 0, "{snapshot:?}");
     assert_eq!(snapshot.owned_operations, 0);
     assert_eq!(snapshot.owned_bytes, 0);
     assert!(stream.next(cancel()).await.unwrap().is_none());
-    a.abort();
+    abort_owned(&a).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5474,7 +5513,7 @@ async fn copy_stream_shutdown_drains_buffer_but_preserves_application_owned_capt
         } else {
             None
         };
-        s.abort();
+        abort_owned(&s).await;
         let snapshot = s.snapshot();
         assert_eq!(snapshot.operation_captures, usize::from(hold_capture));
         assert_eq!(snapshot.owned_operations, usize::from(hold_capture));
@@ -5519,7 +5558,7 @@ async fn stream_shutdown_wakes_pending_polls_and_linearizes_concurrent_publicati
             until(|| pending.load(Ordering::Acquire)).await;
         }
     }
-    e.abort();
+    abort_owned(&e).await;
     for poll in polls {
         assert!(timeout(std::time::Duration::from_secs(2), poll)
             .await
@@ -5544,7 +5583,7 @@ async fn stream_shutdown_wakes_pending_polls_and_linearizes_concurrent_publicati
         let stream = b.replication_stream();
         polls.push(tokio::spawn(async move { stream.next(cancel()).await }));
     }
-    b.abort();
+    abort_owned(&b).await;
     let mut held = Vec::new();
     for poll in polls {
         if let Some(op) = timeout(std::time::Duration::from_secs(2), poll)
@@ -5569,5 +5608,5 @@ async fn stream_shutdown_wakes_pending_polls_and_linearizes_concurrent_publicati
     assert_eq!(b.snapshot().operation_captures, 0);
     assert_eq!(b.snapshot().owned_operations, 0);
     assert_eq!(b.snapshot().owned_bytes, 0);
-    a.abort();
+    abort_owned(&a).await;
 }

@@ -65,6 +65,8 @@ struct Shared {
     connection: Connection,
     metrics: Arc<RuntimeMetrics>,
     reports: Arc<Semaphore>,
+    execution: crate::extensions::ExecutionRuntime,
+    core: tokio::runtime::Handle,
 }
 pub(crate) struct Engine {
     shared: Arc<Shared>,
@@ -79,11 +81,25 @@ impl Engine {
     pub(crate) fn metrics(&self) -> Arc<RuntimeMetrics> {
         self.shared.metrics.clone()
     }
+    #[cfg(test)]
     pub(crate) fn start(
         current: crate::ActivationContextHandle,
         authority: Arc<Authority>,
         connection: Connection,
+        incoming: mpsc::Receiver<IpcRequest>,
+    ) -> Self {
+        let execution = crate::extensions::ExecutionRuntime::new(
+            authority.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        Self::start_with_execution(current, authority, connection, incoming, execution)
+    }
+    pub(crate) fn start_with_execution(
+        current: crate::ActivationContextHandle,
+        authority: Arc<Authority>,
+        connection: Connection,
         mut incoming: mpsc::Receiver<IpcRequest>,
+        execution: crate::extensions::ExecutionRuntime,
     ) -> Self {
         let activation = (*current.snapshot()).clone();
         let live = Arc::new(Semaphore::new(MAX_SERVICE_UNITS));
@@ -96,6 +112,7 @@ impl Engine {
             live.clone(),
             metrics.clone(),
             reports.clone(),
+            execution.clone(),
         );
         let shared = Arc::new(Shared {
             units: Mutex::new(HashMap::new()),
@@ -111,15 +128,27 @@ impl Engine {
             connection,
             metrics,
             reports,
+            execution,
+            core: tokio::runtime::Handle::current(),
         });
         let (stop, mut stopped) = watch::channel(false);
         let task_shared = shared.clone();
         let task = tokio::spawn(async move {
             let mut work = JoinSet::new();
+            let mut dispositions = Vec::<crate::extensions::OwnedDisposition>::new();
+            let mut deadline_poll = tokio::time::interval(Duration::from_millis(10));
+            deadline_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     biased;
                     _=stopped.changed() => break,
+                    _=deadline_poll.tick(), if !work.is_empty() => {
+                        if task_shared.authority.callback_expired() {
+                            task_shared.authority.retire();
+                            task_shared.connection.abort_with_error(Error::Timeout);
+                            break;
+                        }
+                    }
                     result=work.join_next(), if !work.is_empty() => {
                         task_shared.active.fetch_sub(1,Ordering::SeqCst);
                         if !matches!(result,Some(Ok(Ok(())))) {
@@ -127,7 +156,8 @@ impl Engine {
                                 Some(Ok(Err(error)))=>error,
                                 _=>Error::Protocol("lifecycle callback task panicked"),
                             };
-                            task_shared.authority.retire(); task_shared.connection.abort_with_error(error); break;
+                            task_shared.authority.retire();
+                            task_shared.connection.abort_with_error(error); break;
                         }
                     }
                     request=incoming.recv() => {
@@ -137,15 +167,33 @@ impl Engine {
                             Ok(p)=>p,
                             Err(_)=>{task_shared.authority.retire();task_shared.connection.abort();break}
                         };
+                        let call_permit=match task_shared.execution.reserve(
+                            crate::extensions::CallLane::Native,
+                            crate::extensions::CallOrigin::default(), CALLBACK_TIMEOUT, false) {
+                            Ok(permit)=>permit,
+                            Err(_)=>{task_shared.authority.retire();task_shared.connection.abort();break}
+                        };
                         task_shared.active.fetch_add(1,Ordering::SeqCst);
                         let state=task_shared.clone();
-                        work.spawn(async move { let _permit=permit; dispatch(state,request).await });
+                        let call=call_permit.run_future(async move {
+                            let _permit=permit; dispatch(state,request).await
+                        });
+                        dispositions.retain(|record| !record.is_finished());
+                        dispositions.push(call.disposition());
+                        work.spawn(call);
                     }
                 }
             }
             // Dropping callback futures is never accepted as proof of cleanup.
             // `quiesce` refuses successful cleanup when any were active.
             work.abort_all();
+            while work.join_next().await.is_some() {
+                task_shared.active.fetch_sub(1, Ordering::SeqCst);
+            }
+            for record in dispositions {
+                record.cancel();
+                record.wait().await;
+            }
         });
         Self { shared, stop, task }
     }
@@ -163,6 +211,8 @@ impl Engine {
         if factories.len() + self.shared.stateful.factory_count() >= 32 {
             return Err(Error::ResourceLimit("service factories"));
         }
+        let factory =
+            crate::managed_participants::stateless_factory(&self.shared.execution, factory)?;
         factories.insert(name, factory);
         Ok(())
     }
@@ -184,12 +234,12 @@ impl Engine {
         self.shared.stateful.insert_factory(name, factory)
     }
     pub(crate) async fn quiesce(&mut self) -> Result<()> {
-        let active = self.shared.active.load(Ordering::SeqCst);
+        let active = self.shared.execution.has_running_callbacks();
         self.stop.send_replace(true);
         (&mut self.task)
             .await
             .map_err(|_| Error::Protocol("lifecycle dispatcher panic"))?;
-        if active != 0 || self.shared.active.load(Ordering::SeqCst) != 0 {
+        if active || self.shared.execution.has_running_callbacks() {
             return Err(Error::Protocol(
                 "shutdown with active callbacks requires process fencing",
             ));
@@ -210,11 +260,16 @@ impl Engine {
             })
             .collect();
         for service in services {
-            abort(service).await?;
+            abort(service, self.shared.execution.clone()).await?;
         }
         self.shared.stateful.quiesce().await?;
         let factories = std::mem::take(&mut *self.shared.factories.lock().unwrap());
-        drop(factories);
+        self.shared
+            .execution
+            .reserve_cleanup(Duration::from_millis(250))?
+            .dispose(factories)
+            .wait()
+            .await?;
         Ok(())
     }
 }
@@ -391,6 +446,9 @@ async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
     let Some(unit) = unit(&shared, &request, create)? else {
         return Ok(());
     };
+    shared
+        .execution
+        .set_current_generation(unit.state.lock().unwrap().generation);
     {
         let state = unit.state.lock().unwrap();
         if stale(&state.request, &request) {
@@ -479,15 +537,22 @@ async fn reply(
         )
         .await
 }
-async fn abort(service: Arc<dyn StatelessService>) -> Result<()> {
-    tokio::time::timeout(
-        Duration::from_millis(250),
-        tokio::task::spawn_blocking(move || service.abort()),
-    )
-    .await
-    .map_err(|_| Error::Timeout)?
-    .map_err(|_| Error::Protocol("service abort panicked"))?;
-    Ok(())
+async fn abort(
+    service: Arc<dyn StatelessService>,
+    execution: crate::extensions::ExecutionRuntime,
+) -> Result<()> {
+    let cleanup = execution.clone();
+    execution
+        .invoke_cleanup(Duration::from_millis(250), async move {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| service.abort()))
+                .map_err(|_| Error::Protocol("service abort panicked"))?;
+            cleanup
+                .reserve_cleanup(Duration::from_millis(250))?
+                .dispose(service)
+                .wait()
+                .await
+        })
+        .await
 }
 async fn abort_unit(
     shared: &Shared,
@@ -499,7 +564,7 @@ async fn abort_unit(
         state.operation_kind = 16;
         state.operation_start = filetime();
     }
-    abort(service).await?;
+    abort(service, shared.execution.clone()).await?;
     shared
         .metrics
         .abort_callbacks
@@ -564,6 +629,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
         .unwrap()
         .get(&request.service.service_type.name)
         .cloned();
+    shared.execution.set_current_generation(generation);
     let identity = ServiceIdentity {
         service_name: request.service.name.clone(),
         service_type: request.service.service_type.name.clone(),
@@ -578,6 +644,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
         request.clone(),
         cancel.clone(),
         shared.reports.clone(),
+        shared.core.clone(),
     );
     unit.state.lock().unwrap().reporting = Some(reporting.clone());
     let partition = Partition {
@@ -602,27 +669,40 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
         })?;
         // Do not cancel a factory future and then call that successful cleanup.
         // Deadline/cancellation while creating instead retires the whole host.
-        let service = tokio::time::timeout(
-            CALLBACK_TIMEOUT,
-            factory.create(ServiceContext {
-                identity,
-                initialization_data: request.service.initialization.0.clone(),
-                activation: (*shared.current.snapshot()).clone(),
-            }),
-        )
-        .await
-        .map_err(|_| Error::Timeout)??;
+        let context = ServiceContext {
+            identity,
+            initialization_data: request.service.initialization.0.clone(),
+            activation: (*shared.current.snapshot()).clone(),
+        };
+        let (service, publication) = shared
+            .execution
+            .invoke_creation(
+                CALLBACK_TIMEOUT,
+                async move { factory.create(context).await },
+            )
+            .await?;
         {
-            unit.state.lock().unwrap().service = Some(service.clone());
-        }
-        let result = tokio::time::timeout(CALLBACK_TIMEOUT, async {
-            tokio::select! {
-                result=service.open(partition,cancel.clone())=>result,
-                _=cancel.cancelled()=>Err(Error::Closed),
+            let mut state = unit.state.lock().unwrap();
+            if state.generation != generation
+                || !valid.load(Ordering::Acquire)
+                || cancel.is_cancelled()
+            {
+                return Err(Error::Closed);
             }
-        })
-        .await
-        .map_err(|_| Error::Timeout)?;
+            publication.accept()?;
+            state.service = Some(service.clone());
+        }
+        let service_open = service.clone();
+        let open_cancel = cancel.clone();
+        let result = shared
+            .execution
+            .invoke(CALLBACK_TIMEOUT, async move {
+                tokio::select! {
+                    result=service_open.open(partition,open_cancel.clone())=>result,
+                    _=open_cancel.cancelled()=>Err(Error::Closed),
+                }
+            })
+            .await;
         let endpoint = result?;
         if endpoint.is_empty() {
             return Err(Error::InvalidInput("open returned empty endpoint"));
@@ -696,8 +776,14 @@ async fn close(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()
             if request.flags & 4 != 0 {
                 abort_unit(shared, unit, service).await?;
             } else {
-                let result = tokio::time::timeout(CALLBACK_TIMEOUT, service.close(cancel)).await;
-                if !matches!(result, Ok(Ok(()))) {
+                let close_service = service.clone();
+                let result = shared
+                    .execution
+                    .invoke(CALLBACK_TIMEOUT, async move {
+                        close_service.close(cancel).await
+                    })
+                    .await;
+                if result.is_err() {
                     shared
                         .metrics
                         .close_failures
@@ -709,15 +795,21 @@ async fn close(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()
             return Err(Error::Protocol("open service missing at close"));
         }
     }
-    {
+    let disposed = {
         let mut state = unit.state.lock().unwrap();
         state.phase = Phase::Closed;
         state.endpoint.clear();
-        state.service = None;
         state.live = None;
         state.request = request.clone();
         state.operation_kind = 1;
-    }
+        state.service.take()
+    };
+    shared
+        .execution
+        .reserve_cleanup(Duration::from_millis(250))?
+        .dispose(disposed)
+        .wait()
+        .await?;
     // Native normalizes a graceful-close error only after abort/disposal.
     reply(shared, "ReplicaCloseReply", request, String::new(), None, 2).await
 }

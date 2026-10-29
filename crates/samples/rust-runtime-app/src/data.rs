@@ -306,7 +306,9 @@ async fn admit(
     {
         // Never continue admission with a missing local LSN, or advertise quorum
         // success for state we could not legally apply.
-        engine.abort();
+        if engine.close(Cancellation::default()).await.is_err() {
+            engine.execution_runtime().retire();
+        }
         return Admission::Result(WriteResult::accepted(
             mutation.id.clone(),
             replication.sequence,
@@ -418,7 +420,9 @@ impl Pump {
                         if !stop.is_cancelled() {
                             *fault.lock().unwrap() = Some(error.to_string());
                             if let Some(engine) = engine.upgrade() {
-                                engine.abort();
+                                if engine.close(Cancellation::default()).await.is_err() {
+                                    engine.execution_runtime().retire();
+                                }
                             }
                         }
                     }

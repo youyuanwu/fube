@@ -8,13 +8,16 @@ use std::{
     },
     time::Duration,
 };
+#[cfg(test)]
+use tokio::sync::Semaphore;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{OnceCell, Semaphore},
+    sync::OnceCell,
 };
 mod data;
 mod stateful;
+mod task_ownership;
 
 fn config_evidence(package: &ConfigurationPackage) -> RuntimeResult<serde_json::Value> {
     let description = package.description();
@@ -47,6 +50,7 @@ struct Rpc {
     host: String,
     code_sequence: i64,
     listener: OnceCell<()>,
+    listener_tasks: task_ownership::Listener,
     routes: Mutex<HashMap<String, Arc<Route>>>,
     stateful_routes: Mutex<HashMap<String, Arc<stateful::ReplicaRoute>>>,
     data_routes: Mutex<HashMap<String, Arc<data::Route>>>,
@@ -87,31 +91,26 @@ impl Rpc {
             .get_or_try_init(|| async {
                 let listener = TcpListener::bind((self.ip.as_str(), self.port)).await?;
                 let server = self.clone();
-                tokio::spawn(async move {
-                    let capacity = Arc::new(Semaphore::new(64));
-                    loop {
-                        let Ok((stream, _)) = listener.accept().await else {
-                            return;
-                        };
-                        let Ok(permit) = capacity.clone().try_acquire_owned() else {
-                            drop(stream);
-                            continue;
-                        };
+                self.listener_tasks
+                    .start(listener, Duration::from_secs(35), move |stream| {
                         let server = server.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let _ = tokio::time::timeout(
-                                Duration::from_secs(35),
-                                server.request(stream),
-                            )
-                            .await;
-                        });
-                    }
-                });
+                        async move {
+                            let _ = server.request(stream).await;
+                        }
+                    })?;
                 RuntimeResult::Ok(())
             })
             .await?;
         Ok(())
+    }
+    // Both listeners are shared application resources. Unit Close/Abort removes
+    // only its own route and drains its active requests, not other units' work.
+    async fn shutdown_listeners(&self) -> RuntimeResult<()> {
+        self.listener_tasks.stop();
+        self.peers.stop();
+        let (rpc, peers) = tokio::join!(self.listener_tasks.join(), self.peers.join());
+        rpc?;
+        peers
     }
     async fn request(&self, mut stream: TcpStream) -> RuntimeResult<()> {
         let mut buffer = [0; 4096];
@@ -464,6 +463,7 @@ async fn run() -> RuntimeResult<()> {
         host: activation.host_id.clone(),
         code_sequence: activation.code_sequence,
         listener: OnceCell::new(),
+        listener_tasks: task_ownership::Listener::default(),
         routes: Mutex::new(HashMap::new()),
         stateful_routes: Mutex::new(HashMap::new()),
         data_routes: Mutex::new(HashMap::new()),
@@ -499,32 +499,40 @@ async fn run() -> RuntimeResult<()> {
         rpc.node,
         rpc.code_sequence
     );
-    runtime
-        .register_stateless("RustRuntimeType", Arc::new(Factory(rpc.clone())))
-        .await?;
-    println!("TYPE_REGISTERED RustRuntimeType");
-    runtime
-        .register_stateful(
-            "RustStatefulRuntimeType",
-            Arc::new(stateful::Factory(rpc.clone())),
-        )
-        .await?;
-    println!("TYPE_REGISTERED RustStatefulRuntimeType");
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        _=terminate.recv()=>{},
-        _=tokio::signal::ctrl_c()=>{},
-        error=runtime.closed()=>{
-            if rpc.deliberately_noncooperative.load(Ordering::Acquire) {
-                // Explicit adversarial acceptance fixture: neither application
-                // listener nor main cooperates. Only the independent runtime
-                // watchdog may enforce terminal authority.
-                std::future::pending::<()>().await;
-            }
-            return Err(error)
-        },
+    let result = async {
+        runtime
+            .register_stateless("RustRuntimeType", Arc::new(Factory(rpc.clone())))
+            .await?;
+        println!("TYPE_REGISTERED RustRuntimeType");
+        runtime
+            .register_stateful(
+                "RustStatefulRuntimeType",
+                Arc::new(stateful::Factory(rpc.clone())),
+            )
+            .await?;
+        println!("TYPE_REGISTERED RustStatefulRuntimeType");
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _=terminate.recv()=>{},
+            _=tokio::signal::ctrl_c()=>{},
+            error=runtime.closed()=>{
+                if rpc.deliberately_noncooperative.load(Ordering::Acquire) {
+                    // Explicit adversarial acceptance fixture: neither application
+                    // listener nor main cooperates. Only the independent runtime
+                    // watchdog may enforce terminal authority.
+                    std::future::pending::<()>().await;
+                }
+                return Err(error)
+            },
+        }
+        runtime.shutdown().await
     }
-    runtime.shutdown().await
+    .await;
+    // Cancelling requests neither rolls back accepted data writes nor takes
+    // ownership of their separate data-service pump.
+    let cleanup = rpc.shutdown_listeners().await;
+    result.and(cleanup)
 }
 #[tokio::main]
 async fn main() {

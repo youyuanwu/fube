@@ -4,8 +4,11 @@
 mod api;
 mod context;
 mod diagnostics;
+mod execution;
+pub mod extensions;
 mod lease;
 mod lifecycle;
+mod managed_participants;
 #[cfg(test)]
 mod model_tests;
 mod package_context;
@@ -86,6 +89,8 @@ pub struct Runtime {
     tasks: Vec<JoinHandle<()>>,
     lifecycle: lifecycle::Engine,
     shutdown: bool,
+    core: Option<(tokio::sync::oneshot::Sender<()>, Arc<lease::OwnedThread>)>,
+    execution: extensions::ExecutionRuntime,
 }
 
 fn success(reply: ErrorReply) -> Result<()> {
@@ -151,14 +156,54 @@ impl Runtime {
     /// entire application process within the hard-fence bound. Call `shutdown`
     /// explicitly for successful orderly cleanup.
     pub async fn attach() -> Result<Self> {
-        tokio::time::timeout(Duration::from_secs(120), Self::attach_inner())
+        let application = tokio::runtime::Handle::current();
+        let authority = Authority::new(Monotonic::now(), 1_200_000_000)?;
+        authority.watchdog()?;
+        let startup_authority = authority.clone();
+        let (ready, readiness) = tokio::sync::oneshot::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name("fube-host-core".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready.send(Err(Error::Io(error)));
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    match Self::attach_inner(application, startup_authority.clone()).await {
+                        Ok(host) => {
+                            if ready.send(Ok(host)).is_ok() {
+                                let _ = stopped.await;
+                            }
+                        }
+                        Err(error) => {
+                            startup_authority.retire();
+                            let _ = ready.send(Err(error));
+                        }
+                    }
+                });
+            })?;
+        let thread = authority.own_thread(thread);
+        let mut host = tokio::time::timeout(Duration::from_secs(120), readiness)
             .await
             .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::Closed)??;
+        host.core = Some((stop, thread));
+        Ok(host)
     }
 
-    async fn attach_inner() -> Result<Self> {
+    async fn attach_inner(
+        application: tokio::runtime::Handle,
+        authority: Arc<Authority>,
+    ) -> Result<Self> {
+        let execution = extensions::ExecutionRuntime::new(authority.clone(), application);
         let mut activation = ActivationContext::from_environment()?;
-        let authority = Authority::new(Monotonic::now(), 1_200_000_000)?;
         let ingress_authority = authority.clone();
         let controls_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ingress_ready = controls_ready.clone();
@@ -266,8 +311,8 @@ impl Runtime {
             fresh_poll_ttl_ticks: ttl,
             fresh_poll_elapsed_micros: sent.elapsed().as_micros().min(u64::MAX as u128) as u64,
         };
-        authority.watchdog()?;
-        let current = ActivationContextHandle::new(activation.clone());
+        let current =
+            ActivationContextHandle::with_execution(activation.clone(), execution.clone());
         let monitor_connection = connection.clone();
         let monitor_authority = authority.clone();
         let monitor = tokio::spawn(async move {
@@ -296,6 +341,7 @@ impl Runtime {
         });
         let control_authority = authority.clone();
         let control_connection = connection.clone();
+        let control_execution = execution.clone();
         let updater = Arc::new(package_context::Updater::new(current.clone(), &deployment));
         controls_ready.store(true, std::sync::atomic::Ordering::Release);
         let control = tokio::spawn(async move {
@@ -324,15 +370,18 @@ impl Runtime {
                             let deadline = received.checked_add(duration).ok_or(Error::Timeout)?;
                             control_authority.check()?;
                             if Monotonic::now() >= deadline { return Err(Error::Timeout); }
+                            let call_permit = control_execution.reserve(
+                                extensions::CallLane::Native, extensions::CallOrigin::default(),
+                                deadline.saturating_duration_since(Monotonic::now()), false)?;
                             let worker = updater.clone();
                             let permit = worker.admit()?;
                             let worker_authority = control_authority.clone();
-                            let work = tokio::task::spawn_blocking(move || {
+                            let mut work = call_permit.run_owned(move || {
                                 let _permit = permit;
                                 worker.apply(update,&worker_authority,deadline)
                             });
                             tokio::select! {
-                                result = work => result.map_err(|_| Error::Protocol("package callback/worker panicked"))??,
+                                result = &mut work => result?,
                                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => return Err(Error::Timeout),
                                 _ = control_connection.closed() => return Err(Error::Closed),
                             }
@@ -354,11 +403,12 @@ impl Runtime {
                 }
             }
         });
-        let lifecycle = lifecycle::Engine::start(
+        let lifecycle = lifecycle::Engine::start_with_execution(
             current.clone(),
             authority.clone(),
             connection.clone(),
             incoming,
+            execution.clone(),
         );
         Ok(Self {
             activation,
@@ -369,6 +419,8 @@ impl Runtime {
             tasks: vec![monitor, control],
             lifecycle,
             shutdown: false,
+            core: None,
+            execution,
         })
     }
 
@@ -452,55 +504,81 @@ impl Runtime {
 
     /// Orderly host/runtime unregistration. A failed shutdown remains terminal
     /// and the independent authority watchdog bounds application lifetime.
-    pub async fn shutdown(mut self) -> Result<()> {
+    pub async fn shutdown(self) -> Result<()> {
         self.authority.retire();
-        self.current.close();
-        let outcome = tokio::time::timeout(Duration::from_millis(400), async {
-            self.current.quiescent()?;
-            self.lifecycle.quiesce().await?;
-            success(
-                call(
-                    &self.connection,
-                    9,
-                    "UnregisterFabricRuntimeRequest",
-                    &IdRequest {
-                        id: self.activation.runtime.id.clone(),
-                    },
-                )
-                .await?,
-            )?;
-            success(
-                call(
-                    &self.connection,
-                    7,
-                    "UnregisterApplicationHostRequest",
-                    &UnregisterHost {
-                        activity: Activity {
-                            id: ActivityId {
-                                guid: fube_transport::serialization::serde::Guid(
-                                    uuid::Uuid::new_v4().to_bytes_le(),
-                                ),
-                                index: 0,
-                            },
-                            kind: 0,
-                        },
-                        id: self.activation.host_id.clone(),
-                    },
-                )
-                .await?,
-            )?;
-            Result::Ok(())
+        let execution = self.execution.clone();
+        let permit = execution.reserve(
+            extensions::CallLane::Native,
+            extensions::CallOrigin::default(),
+            Duration::from_millis(400),
+            true,
+        )?;
+        tokio::time::timeout(Duration::from_millis(400), async move {
+            let mut host = permit.run_future(self.shutdown_quiesce()).await?;
+            host.execution.shutdown().await?;
+            if let Some((stop, core)) = host.core.take() {
+                let _ = stop.send(());
+                core.join_finished().await?;
+            }
+            host.authority.disarm()?;
+            host.shutdown = true;
+            host.authority.join_watchdog().await?;
+            Ok(())
         })
         .await
-        .map_err(|_| Error::Timeout)?;
-        outcome?;
+        .map_err(|_| Error::Timeout)?
+    }
+
+    async fn shutdown_quiesce(mut self) -> Result<Self> {
+        if let Some(disposed) = self.current.close() {
+            disposed.wait().await?;
+        }
+        self.current.quiescent()?;
+        self.lifecycle.quiesce().await?;
+        success(
+            call(
+                &self.connection,
+                9,
+                "UnregisterFabricRuntimeRequest",
+                &IdRequest {
+                    id: self.activation.runtime.id.clone(),
+                },
+            )
+            .await?,
+        )?;
+        success(
+            call(
+                &self.connection,
+                7,
+                "UnregisterApplicationHostRequest",
+                &UnregisterHost {
+                    activity: Activity {
+                        id: ActivityId {
+                            guid: fube_transport::serialization::serde::Guid(
+                                uuid::Uuid::new_v4().to_bytes_le(),
+                            ),
+                            index: 0,
+                        },
+                        kind: 0,
+                    },
+                    id: self.activation.host_id.clone(),
+                },
+            )
+            .await?,
+        )?;
         for task in &self.tasks {
             task.abort();
         }
+        for task in &mut self.tasks {
+            match task.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(_) => return Err(Error::Protocol("host core task panicked")),
+            }
+        }
+        self.tasks.clear();
         self.connection.close().await?;
-        self.authority.disarm()?;
-        self.shutdown = true;
-        Ok(())
+        Ok(self)
     }
 }
 
@@ -513,6 +591,6 @@ impl Drop for Runtime {
         for task in &self.tasks {
             task.abort();
         }
-        self.current.close();
+        let _ = self.current.close();
     }
 }

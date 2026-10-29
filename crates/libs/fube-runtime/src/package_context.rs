@@ -33,6 +33,9 @@ struct Registry {
     handlers: Mutex<Handlers>,
     closed: AtomicBool,
     active: AtomicBool,
+    execution: Option<crate::extensions::ExecutionRuntime>,
+    quota: Option<crate::extensions::ObjectQuota>,
+    cleanup: crate::extensions::DisposalTracker,
 }
 
 /// Dropping/unregistering excludes future handler-list snapshots, not callbacks
@@ -80,10 +83,45 @@ pub struct ActivationContextHandle {
     registry: Arc<Registry>,
 }
 impl ActivationContextHandle {
+    #[cfg(test)]
     pub(crate) fn new(activation: ActivationContext) -> Self {
         Self {
             current: Arc::new(RwLock::new(Arc::new(activation))),
             registry: Arc::new(Registry::default()),
+        }
+    }
+    pub(crate) fn with_execution(
+        activation: ActivationContext,
+        execution: crate::extensions::ExecutionRuntime,
+    ) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(Arc::new(activation))),
+            registry: Arc::new(Registry {
+                execution: Some(execution),
+                quota: Some(
+                    crate::extensions::ObjectQuota::new(MAX_PACKAGE_SUBSCRIPTIONS).unwrap(),
+                ),
+                ..Registry::default()
+            }),
+        }
+    }
+    fn own_callback<T: 'static>(
+        &self,
+        callback: impl Fn(PackageChange<T>) + Send + Sync + 'static,
+    ) -> Result<Callback<T>> {
+        if self.registry.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
+        if let Some(execution) = &self.registry.execution {
+            let ticket = execution.reserve_object(
+                self.registry.quota.as_ref().unwrap(),
+                &self.registry.cleanup,
+            )?;
+            let callback: Callback<T> = Arc::new(callback);
+            let owned = ticket.publish(callback);
+            Ok(Arc::new(move |change| owned.get()(change)))
+        } else {
+            Ok(Arc::new(callback))
         }
     }
     /// One complete immutable generation. Retaining it does not pin directories.
@@ -118,15 +156,17 @@ impl ActivationContextHandle {
         &self,
         callback: impl Fn(PackageChange<ConfigurationPackage>) + Send + Sync + 'static,
     ) -> Result<PackageSubscription> {
-        self.register(true, |h, id| h.configuration.push((id, Arc::new(callback))))
+        let callback = self.own_callback(callback)?;
+        self.register(true, |h, id| h.configuration.push((id, callback)))
     }
     pub fn subscribe_data(
         &self,
         callback: impl Fn(PackageChange<DataPackage>) + Send + Sync + 'static,
     ) -> Result<PackageSubscription> {
-        self.register(false, |h, id| h.data.push((id, Arc::new(callback))))
+        let callback = self.own_callback(callback)?;
+        self.register(false, |h, id| h.data.push((id, callback)))
     }
-    pub(crate) fn close(&self) {
+    pub(crate) fn close(&self) -> Option<crate::extensions::DisposalReceipt> {
         let removed = {
             let mut h = self.registry.handlers.lock().unwrap();
             self.registry.closed.store(true, Ordering::Release);
@@ -135,10 +175,17 @@ impl ActivationContextHandle {
                 std::mem::take(&mut h.data),
             )
         };
-        drop(removed); // Captured user destructors may unregister other handles.
+        if let Some(execution) = &self.registry.execution {
+            match execution.reserve_cleanup(std::time::Duration::from_millis(250)) {
+                Ok(permit) => return Some(permit.dispose(removed)),
+                Err(_) => execution.retire(),
+            }
+        }
+        drop(removed); // Managed callbacks retain reserved ownership on overload.
+        None
     }
     pub(crate) fn quiescent(&self) -> Result<()> {
-        if self.registry.active.load(Ordering::Acquire) {
+        if self.registry.active.load(Ordering::Acquire) || !self.registry.cleanup.is_drained() {
             Err(Error::Closed)
         } else {
             Ok(())
