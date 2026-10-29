@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -12,6 +13,21 @@ from unittest.mock import patch
 from tests import run, suites
 from tests.onebox.client_runtime import __main__ as client_runtime
 from tests.onebox.native_data import __main__ as native_data
+
+
+class PlatformTests(unittest.TestCase):
+    def test_non_linux_python_entrypoints_fail_instead_of_skipping(self):
+        for platform in ("win32", "darwin"):
+            for entrypoint, error in (
+                    ("import tests.run", "fube test infrastructure supports Linux only"),
+                    ("import scripts.onebox_ctl", "fube cluster tooling supports Linux only"),
+                    ("sys.path.insert(0, 'scripts'); import onebox_ctl", "fube cluster tooling supports Linux only")):
+                with self.subTest(platform=platform, entrypoint=entrypoint):
+                    result = subprocess.run(
+                        [sys.executable, "-c", f"import sys; sys.platform = {platform!r}; {entrypoint}"],
+                        cwd=run.ROOT, capture_output=True, text=True, timeout=10)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(error, result.stderr)
 
 
 class PartitionTests(unittest.TestCase):

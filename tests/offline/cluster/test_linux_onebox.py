@@ -9,8 +9,6 @@ import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
-if not sys.platform.startswith("linux"):
-    raise unittest.SkipTest("Ubuntu onebox lifecycle tests require a Linux host")
 
 from scripts import linux_cluster_ctl as ctl
 from scripts import linux_cluster_diagnostics as diagnostics

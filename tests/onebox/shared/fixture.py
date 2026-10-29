@@ -51,7 +51,6 @@ def cleanup_owned(args, owner):
 
 
 def run(selected, args, execute):
-    ci.require(sys.platform == "linux", "onebox fixtures require Linux")
     ci.require(re.fullmatch(r"[a-z][a-z0-9-]{0,39}", args.name) is not None, "allocation name")
     if args.owner is not None:
         ci.binding(args.name, args.owner)

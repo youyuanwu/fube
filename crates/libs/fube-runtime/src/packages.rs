@@ -296,7 +296,6 @@ impl Reader {
     fn read(&mut self, path: &Path) -> Result<String> {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
-        #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NONBLOCK);
@@ -1283,10 +1282,7 @@ pub(crate) mod tests {
         .unwrap();
         let source = fixture.base.join("RustService.Config.1");
         let shared = fixture.base.join("RustService.Config.1.lk");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&source, &shared).unwrap();
-        #[cfg(not(unix))]
-        std::fs::rename(&source, &shared).unwrap();
         assert!(fixture
             .read_public()
             .unwrap()
@@ -1294,10 +1290,7 @@ pub(crate) mod tests {
             .unwrap()
             .description()
             .is_shared());
-        #[cfg(unix)]
         std::fs::remove_file(&shared).unwrap();
-        #[cfg(not(unix))]
-        std::fs::rename(&shared, &source).unwrap();
         for target in [
             r#"<Section Name="Main"><Parameter Name="unknown" Value="x"/></Section>"#,
             r#"<Section Name="Main"><Parameter Name="Value" Value="x"/><Parameter Name="VALUE" Value="y"/></Section>"#,

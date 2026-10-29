@@ -3984,7 +3984,7 @@ def main(argv=None) -> None:
     parser.add_argument("--summary", action="store_true",
                         help="print bounded status only; retain complete structured evidence in --report")
     args = parser.parse_args(argv)
-    if sys.platform != "linux" or os.uname().machine != "x86_64":
+    if os.uname().machine != "x86_64":
         parser.error("data/native qualification requires Linux x86-64")
     if args.build_bundle is not None:
         if args.name or args.existing_owner or args.profile or args.report or args.summary:

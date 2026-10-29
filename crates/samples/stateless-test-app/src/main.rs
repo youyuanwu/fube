@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("fube supports Linux only");
+
 use std::{
     io::{BufRead, Read, Write},
     net::{TcpListener, TcpStream},

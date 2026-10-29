@@ -47,7 +47,8 @@ ordinary stateless service factories, and an explicitly qualified local IPC
 security profile**. Multiple service instances in that process are required;
 "single code package" must not become "one partition per process."
 Nonactivated hosts, DLL/multicode-package hosts, guest-service activation,
-containers and Windows security are separate profiles, not implicit fallbacks.
+containers and certificate security are separate profiles, not implicit
+fallbacks. Windows hosts are unsupported.
 
 ## 2. Compatibility tiers
 
@@ -365,7 +366,6 @@ Security is an explicit profile:
 |---|---|
 | Qualified Linux local IPC | Use the actual source/deployed transport policy and correct host/PID context; remain within its local trust boundary |
 | Container/certificate IPC | Provisioned client identity, expected server certificate/thumbprint policy, Fabric-framed security negotiation and protected frames |
-| Windows local IPC | Native Windows authentication/signing semantics and identity/ACL rules; not "TCP is loopback, therefore clear is equivalent" |
 | Replication or application listeners | Independently configured and authenticated peer channel; host IPC credentials do not secure these automatically |
 
 The inspected source's Unix non-TLS Windows-credential path does not construct a
@@ -380,8 +380,8 @@ framing-protected path then encrypts complete Fabric frames. A Rust TLS record
 engine would need an explicit memory-I/O adapter and transition state machine,
 with authorization and buffered-input handling tested against native peers.
 Preserve certificate validation/pinning semantics; do not use an accept-all
-verifier to accommodate self-generated certificates. Windows protection modes
-are a separate implementation target.
+verifier to accommodate self-generated certificates. Native Windows protection
+modes are documented for protocol comparison, not as a supported host target.
 [Protocol detail](../transport/Transport.md#7-security-and-tls-on-the-wire).
 
 ## 8. Stateful design choices
@@ -436,7 +436,7 @@ selected stateful tier.
 | 2: host/runtime attachment | Bootstrap, contexts, host start/finish, runtime register/unregister and required liveness | Real node recognizes the unique Rust host/runtime, rejects bad/stale identity, and cleans it up after exit; no native SF libraries loaded |
 | 3: stateless service | Factory/type registration, open/close/abort, partition/report APIs, endpoint | Native placement creates real instances; independent service resolution and actual RPC agree; close/restart removes/replaces endpoints |
 | 4: stateless resilience | Concurrent partitions, stale/duplicate commands, callback failures, process/node failure and supported upgrades | Relocation/restart/upgrade under load with no stale publication, bounded resources, explicit errors and timely loss-of-authority fencing |
-| 5: broader host/security profiles | Containers/TLS, Windows, nonactivated/multicode-package or dynamic packages, one selected profile at a time | Each advertised profile passes its own identity, negative authorization, liveness, restart and upgrade matrix |
+| 5: broader host/security profiles | Containers/TLS, nonactivated/multicode-package or dynamic packages, one selected profile at a time | Each advertised profile passes its own identity, negative authorization, liveness, restart and upgrade matrix |
 | 6: chosen stateful tier | C first, then N/T only if required | Native-driven role/configuration/failure tests plus independent replicated-state and durability oracles matching the tier |
 
 Milestone 2 is a useful feasibility checkpoint but not a usable stateless runtime.

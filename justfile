@@ -1,5 +1,3 @@
-set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
-
 build: build-rust
 
 build-rust:

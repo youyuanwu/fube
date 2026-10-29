@@ -2,7 +2,6 @@
 
 import argparse
 from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import math
@@ -18,6 +17,8 @@ if __package__:
     from .linux_cluster import SHUTDOWN_TIMEOUT, check_subnet, generate
 else:
     from linux_cluster import SHUTDOWN_TIMEOUT, check_subnet, generate
+
+import fcntl
 
 
 REPO = Path(__file__).resolve().parents[1]

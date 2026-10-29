@@ -420,7 +420,6 @@ impl Package {
             fs::symlink_metadata(&executable)?.is_file(),
             "Program must be a regular code-package file",
         )?;
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             require(

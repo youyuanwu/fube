@@ -1579,8 +1579,7 @@ cargo nextest run --archive-file build/native-client-tests.tar.zst \
 ```
 
 CI uploads that archive after the Linux Rust checks pass. The Linux onebox job
-depends only on that producer and downloads and consumes its archive; Windows
-Rust checks run independently and do not delay or block onebox. Both Linux
+depends only on that producer and downloads and consumes its archive. Both Linux
 runners use Ubuntu 24.04, and the producer exports its pinned nextest version so
 the onebox consumer installs the same version.
 

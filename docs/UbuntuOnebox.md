@@ -54,12 +54,11 @@ The only published ports are loopback-bound:
 
 Keep these mappings loopback-only: the cluster has **no authentication or TLS**.
 Stop any other cluster or process using either host port before starting this
-onebox. A different subnet does not avoid a host-port collision. In WSL with
-localhost forwarding, Windows can also reach these published localhost ports.
+onebox. A different subnet does not avoid a host-port collision.
 Other node gateways and application/service endpoints are not published; use
 the Linux host or an attached container for private bridge endpoints. Publishing
 the native gateway does not make every resolved service address reachable from
-Windows or another host.
+another host.
 
 All five nodes share one IP and use distinct ports:
 
@@ -200,4 +199,4 @@ python3 -m unittest discover -s tests/offline/cluster -t .
 Onebox tests also check five-node port separation, all-five-gateway readiness,
 three-replica placement, a single retained volume, absence of baseline submission
 and artificial stabilization waits, and absence of an auxiliary tools container.
-Linux-only tests skip during Windows test discovery.
+The test infrastructure rejects non-Linux hosts before discovery.

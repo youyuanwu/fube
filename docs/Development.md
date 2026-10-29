@@ -2,6 +2,11 @@
 
 Use the toolchain in `rust-toolchain.toml` and Python 3.11+. The workspace does
 not require `protoc`, app packaging tools, or a sibling repository.
+The workspace and Python test infrastructure support Linux only; non-Linux
+targets fail explicitly instead of compiling portability fallbacks or skipping
+Linux tests. Native Service Fabric qualification remains Linux x86-64 only.
+Windows-named COM/PAL interfaces and native GUID byte ordering are retained
+because the Linux Service Fabric ABI/protocol requires them.
 
 ## Test layout and CI partitions
 
@@ -118,7 +123,8 @@ python3 -m unittest discover -s tests/offline -t . -p 'test_*.py'
 ```
 
 The live tests are ignored by ordinary `cargo test`. Offline model tests do not
-establish native wire compatibility. Linux lifecycle tests skip on Windows.
+establish native wire compatibility. Unsupported host platforms fail before
+Python test discovery.
 
 ## Standalone native runtime
 
@@ -147,7 +153,7 @@ Create a [onebox](UbuntuOnebox.md), install the pinned nextest version from
 CI builds the test archive once, then runs the explicitly owned fixture/setup
 tests and `group(onebox)` against the real native gateway. The two
 [onebox workers and aggregate](#parallel-onebox-ci) depend only on the Linux
-native-free checks; Windows checks run independently and do not delay them.
+native-free checks.
 Each worker always attempts diagnostics and original-owner teardown.
 Retained-data shutdown/restart
 qualification runs in
@@ -249,8 +255,8 @@ console output only; the complete structured report is still written.
 The version-2 strict data bundle includes exact executable, package, launcher,
 source and dependency metadata. It is not interchangeable with the version-3
 empty-state bundle. Missing/tampered inputs fail before allocation; qualification
-never invokes Cargo. CI builds the native-backed oracle upstream. Linux/Windows
-portable checks and the separate standalone native job remain independent.
+never invokes Cargo. CI builds the native-backed oracle upstream. Linux
+native-free checks and the separate standalone native job remain independent.
 
 Only the named oracle loads native SF libraries; `fube-data`, `fube-runtime` and
 the Rust app do not. Packaging validates exact fixed-name regular non-symlink

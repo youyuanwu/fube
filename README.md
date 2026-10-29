@@ -1,6 +1,6 @@
 # fube
 
-Experimental native-wire Service Fabric client, transport, application runtime,
+Linux-only experimental native-wire Service Fabric client, transport, application runtime,
 and standalone test host in Rust.
 
 | Component | Purpose |
@@ -24,20 +24,20 @@ Linux x86-64, SF 11.8.121.4, trusted clear IPC, without TLS. See the
 
 Install the pinned Rust toolchain and Python 3.11+. `just` is optional. No
 Protocol Buffers compiler or sibling checkout is needed.
+Non-Linux Rust builds and Python tooling entrypoints are rejected. Native
+qualification additionally requires Linux x86-64.
 
 ```sh
-cargo build --locked --workspace # Linux; runtime profile is Linux-only
+cargo build --locked --workspace
 cargo test --locked -p fube-transport -p fube-client -p fube-test-host
 python3 -m tests.run --suite offline
 ```
 
 [Development and test tiers](docs/Development.md) describe native-free tests,
 standalone native-runtime acceptance, and live onebox qualification. CI runs
-native-free tests on Linux and Windows, a separate Linux standalone-native job,
+native-free tests on Linux, a separate Linux standalone-native job,
 and two independent compiler-free Linux onebox workers with a strict
-[complete-coverage aggregate](docs/Development.md#parallel-onebox-ci). On Windows, build the existing
-client/transport/test-host packages explicitly; neither native runtime profile
-is qualified there.
+[complete-coverage aggregate](docs/Development.md#parallel-onebox-ci).
 
 ## Simple Linux onebox
 

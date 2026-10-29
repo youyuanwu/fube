@@ -81,7 +81,6 @@ class LinuxClusterHarnessTests(unittest.TestCase):
         self.assertEqual(smoke.find("sf:CodePackage/sf:EntryPoint/sf:ExeHost/sf:Arguments",
                                     namespace).text, str(port))
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux file permissions")
     def test_prepare_pins_image_protects_manifest_and_only_allocates(self):
         responses = [
             "[]", "network-id", '[{"IPAM":{"Config":[]}}]',
