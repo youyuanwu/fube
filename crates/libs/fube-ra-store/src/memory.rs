@@ -2,6 +2,55 @@ use crate::{api::record_bytes, *};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 
+/// Memory-engine configuration. Workers start only when passed to [`Store::new`].
+#[derive(Default)]
+pub struct MemoryBackend {
+    worker: Option<Worker>,
+    context: Option<BackendContext>,
+}
+
+impl MemoryBackend {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Backend for MemoryBackend {
+    fn initialize(&mut self, settings: Settings, context: BackendContext) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            if self.context.is_some() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "backend already initialized",
+                ));
+            }
+            self.context = Some(context);
+            self.worker = Some(Worker::new(settings)?);
+            Ok(())
+        })
+    }
+
+    fn execute(&mut self, request: Request) -> StoreFuture<'_, Output> {
+        Box::pin(async move {
+            self.worker
+                .as_mut()
+                .ok_or_else(|| Error::new(ErrorKind::Closed, "memory backend not initialized"))?
+                .execute(request, &self.context.as_ref().unwrap().shared)
+                .await
+        })
+    }
+
+    fn close(&mut self) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            if let Some(worker) = &mut self.worker {
+                worker.close().await?;
+                self.worker = None;
+            }
+            Ok(())
+        })
+    }
+}
+
 enum Command {
     Execute(
         Request,

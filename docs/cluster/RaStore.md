@@ -11,6 +11,8 @@ replicator. `fube-data` remains volatile; app/Hosting/FM/lease behavior is uncha
 `submit(Request)` admission, caller-owned operation tickets, statistics and
 async close. [`Store`](../../crates/libs/fube-ra-store/src/supervisor.rs) provides:
 
+- `new(backend, settings)`: initialize a caller-selected concrete or boxed
+  `dyn Backend` under the same mandatory supervisor.
 - `memory(settings)`: same logical contract, no disk-durability claim.
 - `create_new(path, identity, settings)`: atomic new-file reservation, never an
   existing-store fallback.
@@ -26,9 +28,10 @@ type or an error, never a partial vector. Returned snapshots are owned, not
 lazy readers. Separate submissions are **not** a multi-record atomic batch.
 
 ```rust
-use fube_ra_store::{Record, RecordId, Request, Settings, Store};
+use fube_ra_store::{Backend, MemoryBackend, Record, RecordId, Request, Settings, Store};
 async fn example() -> fube_ra_store::Result<()> {
-let store = Store::memory(Settings::default()).await?;
+let backend: Box<dyn Backend> = Box::new(MemoryBackend::new());
+let store = Store::new(backend, Settings::default()).await?;
 let operation = store.submit(Request::Insert(Record {
     key: RecordId::new("example/v1", "entity-1"),
     value: b"opaque payload".to_vec(),
@@ -49,6 +52,37 @@ filesystem lock exclude other store owners, independently of SQL locks. Never
 unlink/recreate the lock inode while any owner might exist. Symlink parents are
 canonicalized; database and sidecar symlinks are rejected. This is not a defense
 against hostile administrators, path replacement/aliases or network filesystems.
+
+### Caller-selected backends
+
+Construct `MemoryBackend::new()`, `SqliteBackend::create_new(path, identity)` or
+`SqliteBackend::existing(path, identity)`, then pass it to `Store::new`.
+These constructors hold configuration only: initialization, filesystem ownership
+and workers start inside the owned supervisor, not on the caller's Tokio runtime.
+The existing Store convenience constructors delegate to this same path.
+RA code can receive `Arc<dyn KeyValueStore>` independently of backend selection.
+
+The public [`Backend`](../../crates/libs/fube-ra-store/src/backend.rs) trait is
+object-safe, requires `Send` but not `Sync`, and uses boxed Send futures for
+`initialize`, `execute` and `close`. Store owns one engine, initializes it once,
+serializes operations, and calls close even after partial initialization fails.
+The backend's futures must yield; blocking work belongs on an owned worker.
+Implementations must obey the same logical commit/snapshot and configured
+storage-budget contracts. This is a trusted extension point, not a sandbox for
+arbitrary plugins; Store cannot prove a backend actually committed or stopped.
+
+An opaque `BackendContext` lets an implementation retain one grouped exclusion/
+resource guard independently of engine/task lifetime. Release it only after
+positively witnessed cleanup, never on a cancelled wait or lost channel.
+SQLite uses that single slot for its lease: delegated initialization rejects
+a second registration rather than replacing an already-retained guard.
+`mark_worker_lost` retains unresolved operation ownership and fences the store;
+return Unknown from the affected backend call as well. A retained guard or
+reported worker loss prevents a success-shaped close and causes process-lifetime
+quarantine. Initialization and cleanup errors are both surfaced when both fail.
+The context can also gate writes under storage pressure and record postcommit
+maintenance failures without changing committed success. It does not expose
+internal supervisor state, admission or a bypass around shared limits.
 
 ## Completion, cancellation and close
 

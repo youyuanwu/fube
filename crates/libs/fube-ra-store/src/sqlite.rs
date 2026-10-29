@@ -20,6 +20,83 @@ const APPLICATION_ID: i64 = 0x46524131;
 const RECORD_SCHEMA: &str = "CREATE TABLE records (record_type TEXT NOT NULL, record_id TEXT NOT NULL, value BLOB NOT NULL, PRIMARY KEY(record_type, record_id)) STRICT, WITHOUT ROWID";
 const META_SCHEMA: &str = "CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id = 1), format TEXT NOT NULL, version INTEGER NOT NULL, deployment TEXT NOT NULL, node TEXT NOT NULL) STRICT";
 
+/// SQLite configuration with explicit new-store or existing-store intent.
+/// Construction performs no filesystem IO and starts no connection worker.
+pub struct SqliteBackend {
+    path: PathBuf,
+    identity: Identity,
+    create: bool,
+    engine: Option<Sqlite>,
+    context: Option<BackendContext>,
+}
+
+impl SqliteBackend {
+    /// Reserve a new store during initialization, never open an existing file.
+    pub fn create_new(path: impl AsRef<Path>, identity: Identity) -> Self {
+        Self {
+            path: path.as_ref().to_owned(),
+            identity,
+            create: true,
+            engine: None,
+            context: None,
+        }
+    }
+
+    /// Require an initialized compatible store; never create/reinitialize one.
+    pub fn existing(path: impl AsRef<Path>, identity: Identity) -> Self {
+        Self {
+            create: false,
+            ..Self::create_new(path, identity)
+        }
+    }
+}
+
+impl Backend for SqliteBackend {
+    fn initialize(&mut self, settings: Settings, context: BackendContext) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            if self.context.is_some() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "backend already initialized",
+                ));
+            }
+            self.identity.validate()?;
+            self.context = Some(context);
+            self.engine = Some(
+                Sqlite::open(
+                    self.path.clone(),
+                    self.identity.clone(),
+                    self.create,
+                    settings,
+                    &self.context.as_ref().unwrap().shared,
+                )
+                .await?,
+            );
+            Ok(())
+        })
+    }
+
+    fn execute(&mut self, request: Request) -> StoreFuture<'_, Output> {
+        Box::pin(async move {
+            self.engine
+                .as_mut()
+                .ok_or_else(|| Error::new(ErrorKind::Closed, "SQLite backend not initialized"))?
+                .execute(request, &self.context.as_ref().unwrap().shared)
+                .await
+        })
+    }
+
+    fn close(&mut self) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            if let Some(engine) = &mut self.engine {
+                engine.close(&self.context.as_ref().unwrap().shared).await?;
+                self.engine = None;
+            }
+            Ok(())
+        })
+    }
+}
+
 pub(crate) struct Sqlite {
     connection: Option<Connection>,
     path: PathBuf,
@@ -149,7 +226,10 @@ impl Sqlite {
     ) -> Result<Self> {
         // This function runs on the owned non-Tokio-application supervisor thread.
         let (path, lease) = reserve(path, create, &settings)?;
-        *lock(&shared.resource) = Some(Box::new(lease));
+        BackendContext {
+            shared: shared.clone(),
+        }
+        .retain_resource(lease)?;
         #[cfg(test)]
         shared.hooks.bootstrap_async().await;
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE

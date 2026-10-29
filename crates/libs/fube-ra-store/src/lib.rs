@@ -5,11 +5,14 @@
 //! This crate does not implement RA entities, recovery or lease scheduling.
 //!
 //! ```
-//! use fube_ra_store::{Record, RecordId, Request, Settings, Store};
+//! use fube_ra_store::{Backend, KeyValueStore, MemoryBackend, Record, RecordId, Request, Settings, Store};
+//! use std::sync::Arc;
 //!
 //! #[tokio::main(flavor = "current_thread")]
 //! async fn main() -> fube_ra_store::Result<()> {
-//!     let store = Store::memory(Settings::default()).await?;
+//!     let backend: Box<dyn Backend> = Box::new(MemoryBackend::new());
+//!     let store: Arc<dyn KeyValueStore> =
+//!         Arc::new(Store::new(backend, Settings::default()).await?);
 //!     let ticket = store.submit(Request::Insert(Record {
 //!         key: RecordId::new("example/v1", "entity-1"),
 //!         value: b"opaque payload".to_vec(),
@@ -24,11 +27,15 @@
 compile_error!("fube-ra-store supports Linux only");
 
 mod api;
+mod backend;
 mod memory;
 mod sqlite;
 mod supervisor;
 
 pub use api::*;
+pub use backend::{Backend, BackendContext};
+pub use memory::MemoryBackend;
+pub use sqlite::SqliteBackend;
 pub use supervisor::Store;
 
 #[cfg(test)]

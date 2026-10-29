@@ -6,51 +6,23 @@ use std::{
     time::Instant,
 };
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::{mpsc, watch, Notify};
 
-pub(crate) enum BackendKind {
-    Memory,
-    Sqlite {
-        path: PathBuf,
-        identity: Identity,
-        create: bool,
-    },
-}
-
 pub(crate) struct Config {
-    pub(crate) kind: BackendKind,
+    backend: Box<dyn Backend>,
     #[cfg(test)]
     pub(crate) hooks: Arc<crate::tests::Hooks>,
 }
 
 impl Config {
-    pub(crate) fn new(kind: BackendKind) -> Self {
+    pub(crate) fn new(backend: impl Backend + 'static) -> Self {
         Self {
-            kind,
+            backend: Box::new(backend),
             #[cfg(test)]
             hooks: Arc::default(),
-        }
-    }
-}
-
-enum Backend {
-    Memory(memory::Worker),
-    Sqlite(sqlite::Sqlite),
-}
-impl Backend {
-    async fn execute(&mut self, request: Request, shared: &Arc<Shared>) -> Result<Output> {
-        match self {
-            Self::Memory(b) => b.execute(request, shared).await,
-            Self::Sqlite(b) => b.execute(request, shared).await,
-        }
-    }
-    async fn close(&mut self, shared: &Arc<Shared>) -> Result<()> {
-        match self {
-            Self::Memory(b) => b.close().await,
-            Self::Sqlite(b) => b.close(shared).await,
         }
     }
 }
@@ -118,6 +90,21 @@ impl Shared {
     pub(crate) fn failure(&self, error: Error) {
         lock(&self.state).report.first_failure.get_or_insert(error);
     }
+
+    pub(crate) fn mark_worker_lost(&self) {
+        self.worker_lost.store(true, Ordering::Release);
+        let mut state = lock(&self.state);
+        state.lifecycle = Lifecycle::Fenced;
+        state.report.first_failure.get_or_insert_with(|| {
+            Error::new(
+                ErrorKind::Unknown,
+                "backend worker lost; ownership quarantined",
+            )
+        });
+        drop(state);
+        self.wake.notify_one();
+    }
+
     fn request_close(&self) {
         let mut state = lock(&self.state);
         if matches!(state.lifecycle, Lifecycle::Starting | Lifecycle::Open) {
@@ -171,8 +158,15 @@ impl Shared {
 }
 
 impl Store {
+    /// Initialize and exclusively own a caller-selected backend under supervision.
+    /// Accepts concrete engines or `Box<dyn Backend>`; initialization outlives
+    /// cancellation of this constructor, just like the convenience constructors.
+    pub async fn new(backend: impl Backend + 'static, settings: Settings) -> Result<Self> {
+        Self::start(settings, Config::new(backend)).await
+    }
+
     pub async fn memory(settings: Settings) -> Result<Self> {
-        Self::start(settings, Config::new(BackendKind::Memory)).await
+        Self::new(MemoryBackend::new(), settings).await
     }
 
     /// Atomically reserve a new database path. Never opens an existing file.
@@ -181,16 +175,7 @@ impl Store {
         identity: Identity,
         settings: Settings,
     ) -> Result<Self> {
-        identity.validate()?;
-        Self::start(
-            settings,
-            Config::new(BackendKind::Sqlite {
-                path: path.as_ref().to_owned(),
-                identity,
-                create: true,
-            }),
-        )
-        .await
+        Self::new(SqliteBackend::create_new(path, identity), settings).await
     }
 
     /// Require a compatible initialized store; never creates/reinitializes one.
@@ -199,16 +184,7 @@ impl Store {
         identity: Identity,
         settings: Settings,
     ) -> Result<Self> {
-        identity.validate()?;
-        Self::start(
-            settings,
-            Config::new(BackendKind::Sqlite {
-                path: path.as_ref().to_owned(),
-                identity,
-                create: false,
-            }),
-        )
-        .await
+        Self::new(SqliteBackend::existing(path, identity), settings).await
     }
 
     pub(crate) async fn start(settings: Settings, config: Config) -> Result<Self> {
@@ -277,7 +253,7 @@ impl Store {
                     owner.boot.send_replace(Some(Err(error.clone())));
                     owner.done.send_replace(Some(Err(error)));
                 }
-                if lock(&owner.resource).is_some() {
+                if lock(&owner.resource).is_some() || owner.worker_lost.load(Ordering::Acquire) {
                     // Unjoined/unwitnessed engine loss must not release the cooperative lease.
                     // This bounded failed-store quarantine lasts until process exit.
                     std::mem::forget(owner);
@@ -438,22 +414,35 @@ impl KeyValueStore for Store {
     }
 }
 
+fn verify_cleanup(shared: &Shared) -> Result<()> {
+    if shared.worker_lost.load(Ordering::Acquire) || lock(&shared.resource).is_some() {
+        return Err(Error::new(
+            ErrorKind::Unknown,
+            "backend close did not witness release of owned resources",
+        ));
+    }
+    Ok(())
+}
+
 async fn run(
     shared: Arc<Shared>,
     mut receiver: mpsc::Receiver<Envelope>,
     settings: Settings,
     config: Config,
 ) -> Result<CloseReport> {
-    let mut backend = match config.kind {
-        BackendKind::Memory => Backend::Memory(memory::Worker::new(settings)?),
-        BackendKind::Sqlite {
-            path,
-            identity,
-            create,
-        } => {
-            Backend::Sqlite(sqlite::Sqlite::open(path, identity, create, settings, &shared).await?)
-        }
+    let mut backend = config.backend;
+    let context = BackendContext {
+        shared: shared.clone(),
     };
+    if let Err(error) = backend.initialize(settings, context).await {
+        if let Err(cleanup) = backend.close().await.and_then(|()| verify_cleanup(&shared)) {
+            return Err(Error::new(
+                cleanup.kind,
+                format!("backend initialization failed: {error}; cleanup failed: {cleanup}"),
+            ));
+        }
+        return Err(error);
+    }
     {
         let mut state = lock(&shared.state);
         if state.lifecycle == Lifecycle::Starting {
@@ -498,7 +487,7 @@ async fn run(
         if shared.hooks.supervisor_panic.swap(false, Ordering::SeqCst) {
             panic!("injected supervisor loss");
         }
-        let execution = backend.execute(envelope.request, &shared);
+        let execution = backend.execute(envelope.request);
         tokio::pin!(execution);
         let result = tokio::select! {
             result = &mut execution => result,
@@ -532,7 +521,8 @@ async fn run(
         }
         shared.finish(envelope.id, result);
     }
-    backend.close(&shared).await?;
+    backend.close().await?;
+    verify_cleanup(&shared)?;
     lock(&shared.state).lifecycle = Lifecycle::Closed;
     let report = lock(&shared.state).report.clone();
     Ok(report)

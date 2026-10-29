@@ -46,12 +46,12 @@ fn identity() -> Identity {
     }
 }
 async fn create(dir: &Directory, settings: Settings) -> Store {
-    Store::create_new(dir.db(), identity(), settings)
+    Store::new(SqliteBackend::create_new(dir.db(), identity()), settings)
         .await
         .unwrap()
 }
 async fn open(dir: &Directory, settings: Settings) -> Store {
-    Store::open_existing(dir.db(), identity(), settings)
+    Store::new(SqliteBackend::existing(dir.db(), identity()), settings)
         .await
         .unwrap()
 }
@@ -64,7 +64,10 @@ enum Backend {
 impl Backend {
     async fn store(self, settings: Settings) -> (Store, Option<Directory>) {
         match self {
-            Self::Memory => (Store::memory(settings).await.unwrap(), None),
+            Self::Memory => (
+                Store::new(MemoryBackend::new(), settings).await.unwrap(),
+                None,
+            ),
             Self::Sqlite => {
                 let dir = Directory::new();
                 let store = create(&dir, settings).await;
@@ -666,11 +669,7 @@ async fn sqlite_database_page_budget_refuses_growth_without_losing_committed_byt
 #[tokio::test]
 async fn sqlite_cancelled_bootstrap_retains_lease_and_cleans_up() {
     let dir = Directory::new();
-    let mut config = supervisor::Config::new(supervisor::BackendKind::Sqlite {
-        path: dir.db(),
-        identity: identity(),
-        create: true,
-    });
+    let mut config = supervisor::Config::new(SqliteBackend::create_new(dir.db(), identity()));
     let hooks = Arc::get_mut(&mut config.hooks).unwrap();
     let (entered, reached) = tokio::sync::oneshot::channel();
     let (release, released) = tokio::sync::oneshot::channel();
@@ -867,11 +866,7 @@ fn sqlite_accepted_work_survives_caller_runtime_destruction() {
 #[tokio::test]
 async fn sqlite_bootstrap_timeout_reports_unknown_without_releasing_owner() {
     let dir = Directory::new();
-    let config = supervisor::Config::new(supervisor::BackendKind::Sqlite {
-        path: dir.db(),
-        identity: identity(),
-        create: true,
-    });
+    let config = supervisor::Config::new(SqliteBackend::create_new(dir.db(), identity()));
     let (entered, reached) = tokio::sync::oneshot::channel();
     let (release, released) = tokio::sync::oneshot::channel();
     *supervisor::lock(&config.hooks.bootstrap) = Some(Gate {
