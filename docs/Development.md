@@ -111,6 +111,34 @@ Direct `unittest discover -s tests/offline -t .` remains available for targeted
 Python debugging. The shared harness commands below retain local whole-profile
 qualification and upstream bundle production.
 
+## Rust producer and compiler-free consumers
+
+The [Rust producer](../.github/workflows/rust-build.yaml) builds all workspace
+binaries/examples and a workspace-wide, all-target/all-feature nextest archive.
+It uses Ubuntu 22.04 x86-64 so its native executables also run on the oldest
+acceptance runner, rather than depending on Ubuntu 24.04's newer glibc.
+It publishes `rust-tests`, `fube-data-binaries`, `rust-runtime-binaries` and
+`native-runtime-binaries`. Tar bundles preserve executable permissions.
+
+The current-attempt producer receipt binds the archive and native bundles to
+the actual checkout/tree, PR identity, run/attempt, target, debug profile,
+Rust/Cargo/nextest versions, lockfile and toolchain file. Archive-only Rust tests,
+standalone native acceptance and onebox workers depend only on this producer
+and run without building Rust. Standalone acceptance verifies the bundle before
+native preflight; missing, changed or wrong-source binaries fail without a
+compiler fallback.
+
+Python offline tests and Rust quality checks run independently of the producer.
+Quality covers formatting, production-only native-free library checks,
+workspace Clippy/docs and doctests. Nextest does not include doctests.
+The existing **Linux onebox native client** aggregate also requires successful
+archived Rust tests, Rust quality, Python tests and standalone acceptance;
+failed, skipped or cancelled checks cannot pass the final gate.
+
+The Python `--build-bundle` commands below now only package existing Cargo
+outputs and record dependency graphs with `cargo tree --locked`; they never
+compile. Build the required binaries/examples explicitly first.
+
 ## Native-free checks
 
 ```sh
@@ -131,29 +159,32 @@ Python test discovery.
 Follow [native ABI prerequisites and commands](runtime/RustTestHost.md#22-prerequisites-and-commands):
 
 ```sh
+cargo build --locked --workspace --bins --examples --all-features
+python3 -m tests.native_runtime.runner package --output build/native-runtime-binaries
 python3 -m tests.native_runtime.runner prepare
-python3 -m tests.native_runtime.runner bootstrap
-python3 -m tests.native_runtime.runner close
-python3 -m tests.native_runtime.runner abort
-python3 -m tests.native_runtime.runner manifest-close
-python3 -m tests.native_runtime.runner manifest-abort
+python3 -m tests.native_runtime.runner bootstrap --prebuilt build/native-runtime-binaries
+python3 -m tests.native_runtime.runner close --prebuilt build/native-runtime-binaries
+python3 -m tests.native_runtime.runner abort --prebuilt build/native-runtime-binaries
+python3 -m tests.native_runtime.runner manifest-close --prebuilt build/native-runtime-binaries
+python3 -m tests.native_runtime.runner manifest-abort --prebuilt build/native-runtime-binaries
 ```
 
 The helper extracts SHA256-pinned libraries under ignored `build/`; it does not
 install/start a node or cluster. The app still needs compatible OS ABI libraries.
 Use `--dependency-directory PATH` for private ABI dependencies.
-The separate [native workflow](../.github/workflows/native-runtime.yaml)
-qualifies all five scenarios on Ubuntu 22.04.
+The reusable [native workflow](../.github/workflows/native-runtime.yaml), called
+by the main CI after artifact production, qualifies all five scenarios on Ubuntu
+22.04 without installing a Rust toolchain.
 
 ## Live native client
 
 Create a [onebox](UbuntuOnebox.md), install the pinned nextest version from
-[the native-client workflow](../.github/workflows/native-client.yaml), and follow the
+[the Rust producer](../.github/workflows/rust-build.yaml), and follow the
 [client qualification instructions](transport/RustFabricClient.md).
 CI builds the test archive once, then runs the explicitly owned fixture/setup
 tests and `group(onebox)` against the real native gateway. The two
-[onebox workers and aggregate](#parallel-onebox-ci) depend only on the Linux
-native-free checks.
+[onebox workers](#parallel-onebox-ci) depend only on artifact production; the
+aggregate additionally gates all independent checks.
 Each worker always attempts diagnostics and original-owner teardown.
 Retained-data shutdown/restart
 qualification runs in
@@ -172,6 +203,7 @@ cargo clippy --locked -p fube-runtime -p rust-runtime-app --all-targets -- -D wa
 cargo doc --locked -p fube-runtime --no-deps
 python3 -m unittest discover -s tests/offline -t . -p 'test_*.py'
 just onebox-build
+cargo build --locked --workspace --bins --examples --all-features
 python3 -m tests.onebox.shared.runtime --build-bundle build/runtime-binaries
 python3 -m tests.onebox.shared.runtime runtime-check --prebuilt build/runtime-binaries --full --stateful three
 ```
@@ -193,9 +225,9 @@ It requires Linux pidfd APIs and the existing privileged development container
 for the exact-owned-IPC shutdown test; unavailable capabilities fail qualification.
 There is no security fallback.
 
-The explicit build step builds the app and independent observer with `--locked`
-from clean source; native qualification always requires `--prebuilt`.
-CI builds them in the Linux native-free job and transfers a tar bundle containing
+The explicit Cargo step builds the app and independent observer with `--locked`;
+packaging requires clean source and existing outputs. Native qualification always
+requires `--prebuilt`. CI builds them in the Rust producer and transfers a tar bundle containing
 both executables, both versioned package templates, their SHA256 hashes and the
 dependency graph (bundle format 3, `linux-x86_64-volatile-empty-control-v1`). Its native consumer
 uses `--prebuilt DIRECTORY`: it verifies the bundle and ELF dependencies, then
@@ -235,7 +267,8 @@ HTTP is only its client/observer interface.
 
 ```sh
 cargo test --locked -p fube-data -p fube-runtime -p rust-runtime-app -p native-replicator-oracle
-# Upstream build from clean source; use a NEW bundle directory:
+# Upstream build and packaging from clean source; use a NEW bundle directory:
+cargo build --locked --workspace --bins --examples --all-features
 python3 -m tests.onebox.shared.data --build-bundle build/data-binaries
 # Compiler-free consumer; use unique allocation/report paths:
 python3 -m tests.onebox.shared.data data-rust-01 --prebuilt build/data-binaries --profile rust --report build/data-rust-01.json --summary
@@ -256,7 +289,7 @@ The version-2 strict data bundle includes exact executable, package, launcher,
 source and dependency metadata. It is not interchangeable with the version-3
 empty-state bundle. Missing/tampered inputs fail before allocation; qualification
 never invokes Cargo. CI builds the native-backed oracle upstream. Linux
-native-free checks and the separate standalone native job remain independent.
+quality checks run independently; standalone acceptance consumes the same producer.
 
 Only the named oracle loads native SF libraries; `fube-data`, `fube-runtime` and
 the Rust app do not. Packaging validates exact fixed-name regular non-symlink
@@ -295,6 +328,8 @@ capability through partial failure, verifies logical app/type/upload absence,
 then publishes a structured original container/volume/network absence receipt
 **after teardown**. The aggregate revalidates report bytes and typed evidence;
 missing/failed/skipped work or cleanup cannot become green.
+The final aggregate also requires all independent Rust/Python checks and
+standalone native acceptance to succeed.
 
 Legacy dispatch reuses the strict outer/nested loaders and
 `NativeDataDeploymentPolicy`, including both package versions. The direct

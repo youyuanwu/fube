@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 from tests import ROOT
@@ -137,8 +137,8 @@ class ManifestFixtureTests(unittest.TestCase):
             binary.chmod(0o755)
             shutil.copytree(repo / "crates/samples/stateless-test-app/manifests",
                             fake_repo / "crates/samples/stateless-test-app/manifests")
-            first = profile.manifest_fixture(fake_repo, root)
-            second = profile.manifest_fixture(fake_repo, root)
+            first = profile.manifest_fixture(fake_repo, root, binary)
+            second = profile.manifest_fixture(fake_repo, root, binary)
             self.assertNotEqual(first, second)
             self.assertEqual(sorted(p.relative_to(first).as_posix() for p in first.rglob("*") if p.is_file()),
                              ["ApplicationManifest.xml", "EchoPackage/Executables/native-echo",
@@ -146,6 +146,90 @@ class ManifestFixtureTests(unittest.TestCase):
             copied = first / "EchoPackage/Executables/native-echo"
             self.assertEqual(copied.read_bytes(), binary.read_bytes())
             self.assertEqual(copied.stat().st_mode & 0o777, 0o755)
+
+
+class PrebuiltTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        self.repo = self.root / "repo"
+        for name, relative in profile.BINARY_OUTPUTS.items():
+            path = self.repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(name.encode())
+            path.chmod(0o755)
+        shutil.copytree(ROOT / "crates/samples/stateless-test-app/manifests",
+                        self.repo / "crates/samples/stateless-test-app/manifests")
+        git = patch.object(profile, "git", side_effect=lambda *args: "" if args[0] == "status" else "a" * 40)
+        git.start()
+        self.addCleanup(git.stop)
+        repo = patch.object(profile, "ROOT", self.repo)
+        repo.start()
+        self.addCleanup(repo.stop)
+        self.bundle = self.root / "bundle"
+        with patch.object(profile.subprocess, "run", side_effect=AssertionError("must not compile")):
+            profile.package_bundle(self.bundle)
+
+    def test_every_scenario_uses_prebuilt_executables_without_compiling(self):
+        for scenario in profile.SCENARIOS:
+            with self.subTest(scenario=scenario), \
+                    patch.object(profile, "qualify_libraries"), \
+                    patch.object(profile.subprocess, "run",
+                                 return_value=subprocess.CompletedProcess(["ldd"], 0, stdout="")) as run, \
+                    patch.object(profile, "run_host", return_value=17) as host:
+                root = self.root / scenario
+                self.assertEqual(profile.main([
+                    scenario, "--root", str(root), "--prebuilt", str(self.bundle)]), 17)
+                self.assertEqual([call.args[0][0] for call in run.call_args_list], ["ldd"])
+                command = host.call_args.args[0]
+                executable = "manifest_acceptance" if scenario.startswith("manifest-") else "fube-test-host"
+                self.assertEqual(command[0], str(self.bundle / executable))
+                if scenario.startswith("manifest-"):
+                    package = pathlib.Path(command[3])
+                    self.assertEqual((package / "EchoPackage/Executables/native-echo").read_bytes(),
+                                     (self.bundle / "stateless-test-app").read_bytes())
+                else:
+                    self.assertEqual(command[3], str(self.bundle / "stateless-test-app"))
+
+    def test_missing_prebuilt_fails_before_preparing_or_compiling(self):
+        with patch.object(profile.subprocess, "run") as run, redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                profile.main(["close", "--root", str(self.root / "not-created")])
+            self.assertEqual(error.exception.code, 2)
+            run.assert_not_called()
+        self.assertFalse((self.root / "not-created").exists())
+
+    def test_changed_bundle_fails_before_native_preflight_without_fallback(self):
+        for failure in ("bytes", "mode", "missing", "extra", "symlink", "source"):
+            directory = self.root / failure
+            shutil.copytree(self.bundle, directory)
+            binary = directory / "fube-test-host"
+            if failure == "bytes":
+                binary.write_bytes(b"tampered")
+            elif failure == "mode":
+                binary.chmod(0o644)
+            elif failure == "missing":
+                binary.unlink()
+            elif failure == "extra":
+                (directory / "unexpected").write_bytes(b"x")
+            elif failure == "symlink":
+                binary.unlink()
+                binary.symlink_to(self.bundle / "fube-test-host")
+            else:
+                metadata = (directory / "build-info.json").read_text()
+                (directory / "build-info.json").write_text(metadata.replace("a" * 40, "b" * 40))
+            with self.subTest(failure=failure), patch.object(profile.subprocess, "run") as run:
+                with self.assertRaises((ValueError, OSError)):
+                    profile.main(["close", "--prebuilt", str(directory)])
+                run.assert_not_called()
+
+    def test_missing_build_output_does_not_invoke_cargo(self):
+        (self.repo / profile.BINARY_OUTPUTS["fube-test-host"]).unlink()
+        with patch.object(profile.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "missing executable build output"):
+                profile.package_bundle(self.root / "missing-output")
+            run.assert_not_called()
 
 
 if __name__ == "__main__":

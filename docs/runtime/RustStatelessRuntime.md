@@ -346,14 +346,16 @@ tests are in [transport tests](../../crates/libs/fube-transport/src/connection_i
 Build the [onebox image](../UbuntuOnebox.md), then:
 
 ```sh
+cargo build --locked --workspace --bins --examples --all-features
 python3 -m tests.onebox.shared.runtime --build-bundle build/runtime-binaries
 python3 -m tests.onebox.shared.runtime runtime-check --prebuilt build/runtime-binaries \
   --full --report build/runtime-check.json
 ```
 
-The explicit build mode builds the application and its independent observer
-with `--locked` from clean source. Native qualification requires `--prebuilt`;
-it never builds implicitly. To transfer that bundle and qualify without Rust/Cargo:
+The explicit Cargo command builds the application and its independent observer.
+`--build-bundle` packages existing outputs and locked dependency graphs from clean
+source; it never compiles. Native qualification requires `--prebuilt`.
+To transfer that bundle and qualify without Rust/Cargo:
 
 ```sh
 tar -cf build/runtime-binaries.tar -C build/runtime-binaries .

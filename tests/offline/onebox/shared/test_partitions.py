@@ -115,6 +115,18 @@ class PartitionTests(unittest.TestCase):
             self.assertEqual(run.main(["--suite", "cluster_models"]), 1)
         execute.assert_not_called()
 
+    def test_standalone_suite_requires_and_forwards_prebuilt_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(run.subprocess, "run",
+                             return_value=subprocess.CompletedProcess([], 0)) as execute, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(run.main(["--suite", "native_close"]), 1)
+            execute.assert_not_called()
+            self.assertEqual(run.main(["--suite", "native_close", "--prebuilt", temporary]), 0)
+            command = execute.call_args.args[0]
+            self.assertEqual(command[2:4], ["tests.native_runtime.runner", "close"])
+            self.assertEqual(command[command.index("--prebuilt") + 1], temporary)
+
 
 class ManifestTests(unittest.TestCase):
     def source(self):

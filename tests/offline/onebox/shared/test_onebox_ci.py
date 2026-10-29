@@ -37,12 +37,25 @@ class ProofFiles(fixtures.ProjectFiles):
             archive.add(self.directory, arcname=".")
         self.archive = self.root / "native.tar.zst"
         self.archive.write_bytes(b"modeled upstream nextest archive")
+        self.standalone = self.root / "standalone.tar"
+        self.standalone.write_bytes(b"modeled upstream standalone bundle")
+        metadata = patch.object(ci, "build_metadata", return_value={
+            "target": "x86_64-unknown-linux-gnu", "profile": "debug",
+            "rustc": "rustc fixture", "cargo": "cargo fixture", "nextest": "cargo-nextest fixture",
+            "cargo_lock": ci.identity(ci.ROOT / "Cargo.lock"),
+            "toolchain": ci.identity(ci.ROOT / "rust-toolchain.toml"),
+        })
+        metadata.start()
+        self.addCleanup(metadata.stop)
         self.producer = self.root / "producer.json"
         self.assertEqual(self.cli("produce", "--bundle-tar", self.tar, "--bundle-dir", self.directory,
-                                  "--archive", self.archive, "--out", self.producer), 0)
+                                  "--archive", self.archive, "--standalone-bundle", self.standalone,
+                                  "--out", self.producer), 0)
         self.built = ci.read(self.producer)
 
     def cli(self, *args):
+        if args[0] == "produce" and "--standalone-bundle" not in args:
+            args = (*args, "--standalone-bundle", self.standalone)
         with contextlib.redirect_stdout(io.StringIO()) as output:
             result = ci.main([str(arg) for arg in args])
         self.last_stdout = output.getvalue()
@@ -514,7 +527,7 @@ class ProofFiles(fixtures.ProjectFiles):
 
     def aggregating(self, output=None, needs=None):
         return self.cli("aggregate", "--producer", self.producer, "--worker-root", self.root / "workers",
-                        "--needs-json", json.dumps(needs or {"producer": "success", "workers": "success"}),
+                        "--needs-json", json.dumps(needs or dict.fromkeys(ci.REQUIRED_JOBS, "success")),
                         "--out", output or self.root / "aggregate.json")
 
 
@@ -539,7 +552,8 @@ class InputTests(ProofFiles):
                 self.assertEqual(value["context"], self.current)
         self.assertEqual(set(self.built["inputs"]), {
             "bundle_tar", "manifest", "nested_manifest", "app", "observer",
-            "native_oracle", "native_archive", "qualification_script", "runtime_script", "suite_manifest"})
+            "native_oracle", "native_archive", "qualification_script", "runtime_script", "suite_manifest",
+            "standalone_bundle"})
         self.assertEqual(ci.data.load_bundle(self.directory).source_revision, self.current["source"])
 
     def test_tamper_tar_archive_and_source_rejected_before_allocation(self):
@@ -568,6 +582,24 @@ class InputTests(ProofFiles):
                         path.write_bytes(content)
                     if not originals:
                         self.current[target] = old
+
+    def test_artifact_consumers_reject_changed_bytes_and_attempt_without_running_compilers(self):
+        for key, path in (("native_archive", self.archive), ("standalone_bundle", self.standalone)):
+            original = path.read_bytes()
+            for change in ("none", "bytes", "attempt"):
+                with self.subTest(input=key, change=change), \
+                        patch.object(ci.runtime, "run", side_effect=AssertionError("compiler invocation")):
+                    if change == "bytes":
+                        path.write_bytes(original + b"changed")
+                    if change == "attempt":
+                        self.current["attempt"] = "2"
+                    output = self.root / f"verify-{key}-{change}.json"
+                    self.assertEqual(self.cli(
+                        "verify-artifact", "--producer", self.producer, "--input", key,
+                        "--file", path, "--out", output), 0 if change == "none" else 1)
+                    self.assertEqual(ci.read(output)["status"], "PASS" if change == "none" else "FAIL")
+                    path.write_bytes(original)
+                    self.current["attempt"] = "1"
 
     def test_producer_rejects_mismatched_tar_content_links_and_extra_inventory(self):
         cases = ("extra", "link", "different")
@@ -1359,8 +1391,8 @@ class WorkerTests(ProofFiles):
         for route in ci.ROUTES:
             self.assertEqual(self.sealing(route, self.worker(route)), 0)
         for index, result in enumerate(("failure", "skipped", "cancelled", "success-extra")):
-            for job in ("producer", "workers"):
-                needs = {"producer": "success", "workers": "success", job: result}
+            for job in ci.REQUIRED_JOBS:
+                needs = dict.fromkeys(ci.REQUIRED_JOBS, "success") | {job: result}
                 self.assertEqual(self.aggregating(self.root / (job + str(index) + ".json"), needs), 1)
         path = self.root / "workers/native-data/worker-proof.json"
         original = ci.read(path)

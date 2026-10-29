@@ -62,7 +62,7 @@ timeout = 600
 start = "tests/offline/onebox/shared"
 pattern = "test_*.py"
 
-[suites.native_free]
+[suites.rust_tests]
 kind = "nextest"
 resource = "none"
 timeout = 900

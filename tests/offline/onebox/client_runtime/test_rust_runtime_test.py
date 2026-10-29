@@ -35,7 +35,7 @@ class BinaryBundleTests(unittest.TestCase):
 
     def bundle(self, name="bundle"):
         directory = self.root / name
-        with patch.object(runtime, "build_binaries", return_value=self.binaries):
+        with patch.object(runtime, "built_binaries", return_value=self.binaries):
             runtime.build_bundle(directory)
         return directory
 
@@ -49,14 +49,14 @@ class BinaryBundleTests(unittest.TestCase):
 
     def test_dirty_source_is_rejected_before_build_or_allocation(self):
         with patch.object(runtime,"clean_source_revision",side_effect=RuntimeError("dirty source")), \
-             patch.object(runtime,"build_binaries") as build:
+             patch.object(runtime,"built_binaries") as build:
             with self.assertRaises(RuntimeError):runtime.build_bundle(self.root/"dirty")
             build.assert_not_called()
 
     def test_build_only_produces_verified_executables_without_allocation(self):
         directory = self.root / "bundle"
         with patch("sys.argv", ["rust_runtime_test.py", "--build-bundle", str(directory)]), \
-             patch.object(runtime, "build_binaries", return_value=self.binaries), \
+             patch.object(runtime, "built_binaries", return_value=self.binaries), \
              patch.object(runtime, "create_owned") as create, \
              contextlib.redirect_stdout(io.StringIO()):
             runtime.main()
@@ -85,7 +85,7 @@ class BinaryBundleTests(unittest.TestCase):
                     metadata["dependency_graph"] = "" if failure == "missing-graph" else "mssf-core"
                     path.write_text(json.dumps(metadata))
                 with patch("sys.argv", ["rust_runtime_test.py", "owned", "--prebuilt", str(directory)]), \
-                     patch.object(runtime, "build_binaries") as build, \
+                     patch.object(runtime, "built_binaries") as build, \
                      patch.object(runtime, "create_owned") as create, \
                      patch.object(runtime, "Allocation") as allocation, \
                      contextlib.redirect_stdout(io.StringIO()) as output:
@@ -107,7 +107,7 @@ class BinaryBundleTests(unittest.TestCase):
             self.assertNotEqual(args[0], "cargo")
             return ""
         with patch.object(runtime, "run", side_effect=run), \
-             patch.object(runtime, "build_binaries", side_effect=AssertionError("must not build")), \
+             patch.object(runtime, "built_binaries", side_effect=AssertionError("must not build")), \
              patch.object(runtime, "package", return_value=(self.root, "minted-type", "1.1")) as package, \
              patch.object(runtime, "restart", return_value={"native": "model observation"}) as restart, \
              patch.object(runtime, "configuration_upgrade", side_effect=lambda a,b,result,attempts:
@@ -184,17 +184,24 @@ class BinaryBundleTests(unittest.TestCase):
         self.assertIn("before-upgrade",(first/"RustRuntimeService/Config/Settings.xml").read_text())
         self.assertIn("after-upgrade",(second/"RustRuntimeService/Config/Settings.xml").read_text())
 
-    def test_default_build_is_locked_and_checks_native_dependencies(self):
-        with patch.object(runtime, "run", return_value=self.binaries.dependency_graph) as command:
-            binaries = runtime.build_binaries()
+    def test_packaging_requires_outputs_and_only_reads_locked_dependency_graph(self):
+        with patch.object(runtime, "DEFAULT_APP", self.app), \
+                patch.object(runtime, "DEFAULT_OBSERVER", self.observer), \
+                patch.object(runtime, "run", return_value=self.binaries.dependency_graph) as command:
+            binaries = runtime.built_binaries()
         self.assertEqual(binaries.dependency_graph, self.binaries.dependency_graph)
         commands = [call.args for call in command.call_args_list]
-        self.assertTrue(any(args[:2] == ("cargo", "build") and "rust-runtime-app" in args for args in commands))
-        self.assertTrue(any("--example" in args and "runtime_observer" in args for args in commands))
-        self.assertTrue(all("--locked" in args for args in commands))
-        with patch.object(runtime, "run", return_value="rust-runtime-app\n  mssf-core"):
+        self.assertEqual(commands, [("cargo", "tree", "--locked", "-p", "rust-runtime-app")])
+        with patch.object(runtime, "DEFAULT_APP", self.app), \
+                patch.object(runtime, "DEFAULT_OBSERVER", self.observer), \
+                patch.object(runtime, "run", return_value="rust-runtime-app\n  mssf-core"):
             with self.assertRaisesRegex(RuntimeError, "native SF adapters"):
-                runtime.build_binaries()
+                runtime.built_binaries()
+        self.app.unlink()
+        with patch.object(runtime, "DEFAULT_APP", self.app), patch.object(runtime, "run") as command:
+            with self.assertRaisesRegex(RuntimeError, "missing executable build output"):
+                runtime.built_binaries()
+            command.assert_not_called()
 
 
 class ReportingEvidenceTests(unittest.TestCase):
