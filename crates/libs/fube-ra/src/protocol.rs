@@ -144,6 +144,23 @@ impl VersionInstance {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedServiceType {
+    pub id: ServiceType,
+    pub version: VersionInstance,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceTypeInfo {
+    pub versioned: VersionedServiceType,
+    pub code_package: String,
+}
+/// Native request and reply bodies both contain a vector of ServiceTypeInfo.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceTypeNotification {
+    pub infos: ObjectArray<Vec<ServiceTypeInfo>>,
+}
+pub type ServiceTypeNotificationReply = ServiceTypeNotification;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Replica {
     pub node: NodeInstance,
@@ -419,12 +436,13 @@ fn reliability_message<T: Serialize>(
     body: &T,
     action: &str,
     actor: i64,
+    priority: bool,
     generation: Option<&GenerationHeader>,
 ) -> Result<Message> {
     let mut headers = vec![
         Header::actor(actor)?,
         Header::action(action)?,
-        Header::boolean(HIGH_PRIORITY, true)?,
+        Header::boolean(HIGH_PRIORITY, priority)?,
     ];
     if let Some(generation) = generation {
         headers.push(generation.header()?);
@@ -438,19 +456,34 @@ pub fn remove_instance_message(
     body: &RemoveInstance,
     generation: &GenerationHeader,
 ) -> Result<Message> {
-    reliability_message(body, "RemoveInstance", RA_ACTOR, Some(generation))
+    reliability_message(body, "RemoveInstance", RA_ACTOR, true, Some(generation))
 }
 pub fn remove_instance_reply_message(body: &RemoveInstanceReply, owner: Owner) -> Result<Message> {
-    reliability_message(body, "RemoveInstanceReply", owner_actor(owner), None)
+    reliability_message(body, "RemoveInstanceReply", owner_actor(owner), true, None)
 }
 pub fn replica_up_message(body: &ReplicaUp, owner: Owner) -> Result<Message> {
-    reliability_message(body, "ReplicaUp", owner_actor(owner), None)
+    reliability_message(body, "ReplicaUp", owner_actor(owner), true, None)
 }
 pub fn replica_up_reply_message(
     body: &ReplicaUp,
     generation: &GenerationHeader,
 ) -> Result<Message> {
-    reliability_message(body, "ReplicaUpReply", RA_ACTOR, Some(generation))
+    reliability_message(body, "ReplicaUpReply", RA_ACTOR, true, Some(generation))
+}
+pub fn service_type_notification_message(body: &ServiceTypeNotification) -> Result<Message> {
+    reliability_message(body, "ServiceTypeNotification", FM_ACTOR, false, None)
+}
+pub fn service_type_notification_reply_message(
+    body: &ServiceTypeNotificationReply,
+    generation: &GenerationHeader,
+) -> Result<Message> {
+    reliability_message(
+        body,
+        "ServiceTypeNotificationReply",
+        RA_ACTOR,
+        false,
+        Some(generation),
+    )
 }
 fn owner_actor(owner: Owner) -> i64 {
     match owner {
@@ -532,6 +565,19 @@ pub fn decode_replica_up(message: &Message) -> Result<(ReplicaUp, Owner)> {
 }
 pub fn decode_replica_up_reply(message: &Message) -> Result<(ReplicaUp, GenerationHeader)> {
     check_factory(message, "ReplicaUpReply", &[RA_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+    ))
+}
+pub fn decode_service_type_notification(message: &Message) -> Result<ServiceTypeNotification> {
+    check_factory(message, "ServiceTypeNotification", &[FM_ACTOR])?;
+    from_slice(&message.body)
+}
+pub fn decode_service_type_notification_reply(
+    message: &Message,
+) -> Result<(ServiceTypeNotificationReply, GenerationHeader)> {
+    check_factory(message, "ServiceTypeNotificationReply", &[RA_ACTOR])?;
     Ok((
         from_slice(&message.body)?,
         from_slice(&unique(message, GENERATION_HEADER)?.value)?,

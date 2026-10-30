@@ -93,7 +93,8 @@ class CatalogTests(unittest.TestCase):
     def test_no_enabled_capability_claim_from_inventory(self):
         records = {r["symbol"]: r for r in rows()}
         for action in ["AddInstance", "AddInstanceReply", "RemoveInstance",
-                       "RemoveInstanceReply", "ReplicaUp", "ReplicaUpReply"]:
+                       "RemoveInstanceReply", "ReplicaUp", "ReplicaUpReply",
+                       "ServiceTypeNotification", "ServiceTypeNotificationReply"]:
             self.assertIn("selected", records[action]["status"])
         for action in ["RemoveReplica", "DeleteReplica", "ReplicaDropped", "ReplicaDown"]:
             self.assertNotIn("selected", records[action]["status"])
@@ -103,8 +104,8 @@ class CatalogTests(unittest.TestCase):
         removal = (ROOT / "docs/cluster/RaStatelessRemoval.md").read_text()
         for term in [REVISION, "Obliterate", "ReplicaUp", "ForceDelete", "StaleRequest",
                      "not execution", "trusted", "format 2", "volatile",
-                     "queued/in-flight Open", "33 files"]:
-            if term == "33 files":
+                     "queued/in-flight Open", "40 files"]:
+            if term == "40 files":
                 self.assertIn(term, (ROOT / "tests/ra_protocol/README.md").read_text())
             else:
                 self.assertIn(term, removal)

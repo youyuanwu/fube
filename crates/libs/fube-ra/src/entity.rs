@@ -16,6 +16,9 @@ use tokio::sync::{mpsc, watch, Notify};
 #[path = "lifecycle.rs"]
 mod lifecycle;
 pub use lifecycle::*;
+#[path = "notification.rs"]
+mod notification;
+pub use notification::ServiceTypeEntry;
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -106,6 +109,12 @@ pub struct Settings {
     pub registration_drop: u64,
     /// Outstanding acquired-result obligations retained even across recreation.
     pub max_registration_lookups: usize,
+    pub max_service_types: usize,
+    pub notification_batch_count: usize,
+    pub notification_batch_bytes: usize,
+    pub notification_node_ms: u64,
+    pub notification_type_ms: u64,
+    pub notification_retry_ms: u64,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -122,6 +131,12 @@ impl Default for Settings {
             registration_warning: 240,
             registration_drop: 1920,
             max_registration_lookups: 64,
+            max_service_types: 64,
+            notification_batch_count: 100,
+            notification_batch_bytes: 256 * 1024,
+            notification_node_ms: 5_000,
+            notification_type_ms: 45_000,
+            notification_retry_ms: 30_000,
         }
     }
 }
@@ -146,6 +161,13 @@ impl Settings {
             || self.registration_drop == 0
             || self.max_registration_lookups == 0
             || self.max_registration_lookups > 65536
+            || self.max_service_types == 0
+            || self.max_service_types > 65536
+            || self.notification_batch_count == 0
+            || self.notification_batch_count > 10000
+            || self.notification_batch_bytes == 0
+            || self.notification_batch_bytes > 4 * 1024 * 1024
+            || self.notification_retry_ms == 0
         {
             return Err(Failure::Admission("invalid finite executor settings"));
         }
@@ -186,6 +208,14 @@ pub enum Command {
     HostDown(Box<HostDown>),
     RetryClose(PartitionId),
     RetryReport(PartitionId),
+    RetryServiceTypes {
+        now_ms: u64,
+    },
+    ServiceTypeReply {
+        body: Box<ServiceTypeNotification>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
 }
 enum Kind {
     Add {
@@ -207,6 +237,11 @@ enum Kind {
     HostDown,
     RetryClose,
     RetryReport,
+    NotificationRetry,
+    NotificationReply {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +313,10 @@ pub enum Effect {
     RequestReportRetry,
     ReplicaUp(Box<ReplicaUp>),
     RemoveReply(Box<RemoveInstanceReply>),
+    ServiceTypeNotification(Box<ServiceTypeNotification>),
+    RequestServiceTypeRetry {
+        after_ms: u64,
+    },
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dispatched {
@@ -301,6 +340,7 @@ struct View {
     stats: Statistics,
     reserved_effects: usize,
     accepting: bool,
+    notification: notification::Coordinator,
 }
 struct Shared {
     view: Mutex<View>,
@@ -429,6 +469,18 @@ impl Executor {
             Command::HostDown(body) => (body.unit.guid.0, Kind::HostDown, to_vec(&body)),
             Command::RetryClose(unit) => (unit.guid.0, Kind::RetryClose, to_vec(&unit)),
             Command::RetryReport(unit) => (unit.guid.0, Kind::RetryReport, to_vec(&unit)),
+            Command::RetryServiceTypes { now_ms } => {
+                ([0; 16], Kind::NotificationRetry, to_vec(&now_ms))
+            }
+            Command::ServiceTypeReply {
+                body,
+                source,
+                generation,
+            } => (
+                [0; 16],
+                Kind::NotificationReply { source, generation },
+                to_vec(&body),
+            ),
         };
         // Add may report a closed replica then return StaleRequest. Lifecycle
         // commands may release, clear warnings, report health, schedule FM work
@@ -438,6 +490,10 @@ impl Executor {
             Kind::Complete | Kind::Retry | Kind::RetryReport => 1,
             _ => 8,
         };
+        let node_work = matches!(
+            kind,
+            Kind::NotificationRetry | Kind::NotificationReply { .. }
+        );
         let bytes = bytes
             .map_err(|_| Failure::Admission("unsupported/oversized native shape"))?
             .into_boxed_slice();
@@ -450,7 +506,7 @@ impl Executor {
         if !view.accepting {
             return Err(Failure::Closed);
         }
-        let new_entity = !view.entities.contains_key(&entity);
+        let new_entity = !node_work && !view.entities.contains_key(&entity);
         if view.stats.outstanding >= settings.max_outstanding
             || view.stats.queued_bytes + charge > settings.max_queued_bytes
             || view.effects.len() + view.reserved_effects + reserved_effects > settings.max_effects
@@ -475,7 +531,9 @@ impl Executor {
             mpsc::error::TrySendError::Full(_) => Failure::Capacity,
             mpsc::error::TrySendError::Closed(_) => Failure::Closed,
         })?;
-        view.entities.entry(entity).or_default();
+        if !node_work {
+            view.entities.entry(entity).or_default();
+        }
         view.stats.accepted = id;
         view.stats.outstanding += 1;
         view.stats.queued_bytes += charge;
@@ -492,6 +550,9 @@ impl Executor {
     }
     pub fn statistics(&self) -> Statistics {
         lock(&self.shared.view).stats.clone()
+    }
+    pub fn service_types(&self) -> Vec<ServiceTypeEntry> {
+        lock(&self.shared.view).notification.snapshot()
     }
     /// Transfer each dispatched action once. Sending/ack/retry policy is separate.
     pub fn take_effects(&self) -> Vec<Dispatched> {
@@ -533,6 +594,10 @@ async fn supervise(
         tokio::select! {
             work = receiver.recv() => {
                 let Some(work) = work else { break; };
+                if matches!(work.kind, Kind::NotificationRetry | Kind::NotificationReply { .. }) {
+                    finish_node(&shared, work, &admission);
+                    continue;
+                }
                 let worker = entities.entry(work.entity).or_insert_with(|| {
                     // This internal channel is bounded by global outstanding count
                     // AND retained-byte admission, held through actual completion.
@@ -557,6 +622,58 @@ async fn supervise(
         return Err(Failure::Unknown);
     }
     Ok(view.stats.clone())
+}
+
+fn finish_node(shared: &Shared, work: Submission, admission: &Admission) {
+    let mut view = lock(&shared.view);
+    let outcome = if !admission.owner_ready {
+        Ok(vec![])
+    } else {
+        match &work.kind {
+            Kind::NotificationRetry => from_slice::<u64>(&work.bytes)
+                .map_err(|_| Failure::Admission("invalid notification timer"))
+                .and_then(|now| view.notification.retry(now, &shared.settings)),
+            Kind::NotificationReply { source, generation } => {
+                if source != &admission.fm_source || generation.for_fm_replica {
+                    Err(Failure::Admission(
+                        "notification requires configured normal FM",
+                    ))
+                } else {
+                    // This is node-scoped. The native handler does not apply an
+                    // FT-generation predicate to the notification acknowledgment.
+                    from_slice::<ServiceTypeNotification>(&work.bytes)
+                        .map_err(|_| Failure::Admission("invalid notification reply"))
+                        .and_then(|body| view.notification.acknowledge(&body))
+                        .map(|()| vec![])
+                }
+            }
+            _ => unreachable!(),
+        }
+    };
+    let result = match outcome {
+        Ok(effects) => {
+            assert!(effects.len() <= work.reserved_effects);
+            for effect in effects {
+                view.effects.push_back(Dispatched {
+                    operation: work.id,
+                    entity: [0; 16],
+                    effect,
+                });
+            }
+            view.stats.succeeded += 1;
+            Ok(Disposition::Applied)
+        }
+        Err(error) => {
+            view.stats.failed += 1;
+            Err(error)
+        }
+    };
+    view.stats.outstanding -= 1;
+    view.stats.queued_bytes -= work.charge;
+    view.reserved_effects -= work.reserved_effects;
+    view.stats.effects = view.effects.len();
+    drop(view);
+    work.result.send_replace(Status::Complete(result));
 }
 
 enum Update {
@@ -960,6 +1077,26 @@ async fn entity_worker(
         {
             outcome = Err(Failure::Capacity);
         }
+        // Reserve the shared key BEFORE any durable write. Unknown holds this
+        // exact reservation with the original operation, not a second enqueue.
+        let mut type_reservation = None;
+        if let Ok(Transition {
+            update: Update::Memory(state) | Update::Durable(state),
+            ..
+        }) = &outcome
+        {
+            if state.runtime.is_some()
+                && committed.as_ref().and_then(|s| s.runtime.as_ref()) != state.runtime.as_ref()
+            {
+                match lock(&shared.view)
+                    .notification
+                    .reserve(&notification::info(state), &shared.settings)
+                {
+                    Ok(key) => type_reservation = Some(key),
+                    Err(error) => outcome = Err(error),
+                }
+            }
+        }
 
         if let Ok(Transition {
             update: Update::Durable(state),
@@ -973,14 +1110,36 @@ async fn entity_worker(
         let mut view = lock(&shared.view);
         let result = match outcome {
             Ok(transition) => {
+                let mut effects = transition.effects;
                 match transition.update {
                     Update::None => {}
                     Update::Memory(state) | Update::Durable(state) => {
+                        let before = committed.as_ref().and_then(|s| s.runtime.as_ref());
+                        if before != state.runtime.as_ref() {
+                            if before.is_some() {
+                                view.notification
+                                    .remove(&committed.as_ref().unwrap().body.service.service_type);
+                            }
+                            if let Some(key) = &type_reservation {
+                                if view
+                                    .notification
+                                    .add(key.clone(), notification::info(&state))
+                                {
+                                    effects.insert(
+                                        0,
+                                        Effect::RequestServiceTypeRetry {
+                                            after_ms: shared.settings.notification_node_ms,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        assert!(effects.len() <= work.reserved_effects);
                         committed = Some(Arc::new(state));
                         view.entities.get_mut(&work.entity).unwrap().committed = committed.clone();
                     }
                 }
-                for effect in transition.effects {
+                for effect in effects {
                     view.effects.push_back(Dispatched {
                         operation: work.id,
                         entity: work.entity,
@@ -995,6 +1154,9 @@ async fn entity_worker(
                 Err(error)
             }
         };
+        if let Some(key) = &type_reservation {
+            view.notification.unreserve(key);
+        }
         view.entities.get_mut(&work.entity).unwrap().fenced = false;
         view.stats.outstanding -= 1;
         view.stats.queued_bytes -= work.charge;

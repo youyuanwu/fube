@@ -132,6 +132,8 @@ fn main() {
         "RemoveInstanceReply",
         "ReplicaUp",
         "ReplicaUpReply",
+        "ServiceTypeNotification",
+        "ServiceTypeNotificationReply",
     ] {
         check(
             input,
@@ -141,6 +143,40 @@ fn main() {
                 value: action.to_string(),
             },
         );
+    }
+    check(
+        input,
+        output,
+        "empty-service-type-notification",
+        ServiceTypeNotification::default(),
+    );
+    check(
+        input,
+        output,
+        "rich-service-type-notification",
+        support::rich_notification(),
+    );
+    check(
+        input,
+        output,
+        "empty-service-type-notification-reply",
+        ServiceTypeNotificationReply::default(),
+    );
+    check(
+        input,
+        output,
+        "partial-service-type-notification-reply",
+        support::partial_notification_reply(),
+    );
+    check(input, output, "priority-false", Scalar { value: false });
+    for name in [
+        "rich-service-type-notification",
+        "partial-service-type-notification-reply",
+    ] {
+        let bytes = fs::read(input.join(format!("{name}.bin"))).unwrap();
+        for end in 0..bytes.len() {
+            assert!(from_slice::<ServiceTypeNotification>(&bytes[..end]).is_err());
+        }
     }
     for force in [false, true] {
         let bytes = fs::read(input.join(format!("rich-remove-{}.bin", u8::from(force)))).unwrap();
@@ -158,5 +194,5 @@ fn main() {
             }
         }
     }
-    println!("29 cases verified; all selected-body proper prefixes rejected");
+    println!("36 cases verified; all selected-body proper prefixes rejected");
 }

@@ -10,8 +10,9 @@ The producer compiles the **unmodified** native `FabricStream.cpp`,
 `FabricSerializable.cpp`, `FabricSerializableStream.cpp`,
 `FabricSerializationTypes.cpp`, `ByteCompressor.h` and
 `Common/FabricSerializationHelper.h`. It mechanically extracts field macros
-and member declarations for 39 schema types/123 members, including the selected
-Add, inherited DeleteReplica, reply and ReplicaUp/Reply bodies.
+and member declarations for 43 schema types/129 members, including the selected
+Add, inherited DeleteReplica, reply, ReplicaUp/Reply and service-type
+notification request/reply bodies.
 The native helper macros generate their actual Write/Read methods. Nested
 fields are not inferred from Rust or encoded as handwritten wire bytes.
 
@@ -29,18 +30,23 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 29 inputs:
+The C++ producer independently constructs expected values and emits 36 inputs:
 default/rich AddInstance, default/error AddInstanceReply, default/rich Remove
 (force false/true), default/rich removal reply, explicit-empty/rich ReplicaUp
 (both nonempty lists, all last/fromFMM combinations), FM/FMM generation,
-actor/action/priority headers. The two reply actions share a native body type.
+actor/action/priority headers. The seven notification cases add empty/two-info
+requests, empty/one-info partial replies, both literal actions and priority=false.
+The notification factories target normal FM=11 for the request without
+GenerationHeader and RA=12 for the reply with the actual FM generation;
+both use false priority. The Add/removal replies share a native body type.
 Rust decodes and checks every field, then encodes
 independently constructed expected values; the actual native decoder compares
 all fields, not just bytes. Native object padding need not be canonical.
 Nondefault cases cover GUID/raw NodeId, high-bit instances, negative LSN/epochs,
 UTF-16/surrogates, enums/errors, all service collections and null/Invalid/both
 derived scaling variants. Rust rejects every proper prefix of rich body
-fixtures including both rich force bodies; native rejects four truncated bodies.
+fixtures including both rich force bodies and the rich/partial notification
+bodies; native rejects six truncated bodies.
 Non-polymorphic Delete inheritance invokes base rich traversal and native
 base/derived scopes, not a flattened or nested replacement. ReplicaUp's empty
 native constructor leaves scalar booleans uninitialized; the empty fixture
@@ -55,8 +61,8 @@ Compile the Rust example with the current source identity; the producer
 rejects an unbound/stale executable:
 
 ```sh
-mkdir -p build/ra-stateless-removal-tmp
-export TMPDIR="$PWD/build/ra-stateless-removal-tmp"
+mkdir -p build/ra-stateless-opening-tmp
+export TMPDIR="$PWD/build/ra-stateless-opening-tmp"
 FUBE_RA_SOURCE_DIGEST=$(python3 -c 'from tests.ra_protocol.producer import source_digest; print(source_digest()[0])') \
   cargo build --locked -p fube-ra --example ra_conformance
 python3 -m tests.ra_protocol.producer \
@@ -83,8 +89,8 @@ env PATH=/nonexistent /usr/bin/python3 -m tests.ra_protocol.consumer \
   --expected-head COMMIT --expected-source SOURCE_DIGEST
 ```
 
-The bundle has exactly 29 `native/*.bin`, `schema.h`, `native-oracle`,
-`ra-conformance` and `manifest.json` (33 files total). No other files are
+The bundle has exactly 36 `native/*.bin`, `schema.h`, `native-oracle`,
+`ra-conformance` and `manifest.json` (40 files total). No other files are
 accepted. The consumer verifies exact coverage/type/member counts, regular files, hashes,
 provenance and both compiled source identities **before** execution. Missing,
 modified, wrong-source and symlink inputs fail; it imports no producer and
@@ -98,7 +104,7 @@ python3 -m unittest tests.offline.cluster.test_ra_protocol_inputs -v
 cargo test --locked -p fube-ra
 ```
 
-Current-removal production must use a fresh bundle bound to the current
+Current-opening production must use a fresh bundle bound to the current
 implementation HEAD/source digest. `build/ra-native-final-v2` was produced for
 previous work and is not this slice's production. The producer's HEAD names the
 commit base and source digest also binds dirty sources during development;

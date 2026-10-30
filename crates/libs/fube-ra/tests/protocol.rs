@@ -3,7 +3,7 @@ mod support;
 
 use fube_ra::protocol::*;
 use fube_transport::{
-    message::{Header, ACTOR, HIGH_PRIORITY},
+    message::{Header, ACTION, ACTOR, HIGH_PRIORITY},
     serialization::serde::{from_slice, to_vec, ByteArray, NativeEnum, Pointer},
 };
 use serde::Serialize;
@@ -185,4 +185,140 @@ fn replica_up_full_lists_flags_and_reply_factory_are_distinct() {
             assert!(decode_replica_up_reply(&bad).is_err());
         }
     }
+}
+
+#[test]
+fn notifications_preserve_nested_values_partial_replies_and_factory_asymmetry() {
+    let body = support::rich_notification();
+    assert_eq!(body.infos.0.len(), 2);
+    assert_ne!(body.infos.0[0], body.infos.0[1]);
+    let partial = support::partial_notification_reply();
+    assert_eq!(partial.infos.0.as_slice(), &body.infos.0[1..]);
+    for request in [ServiceTypeNotification::default(), body] {
+        let message = service_type_notification_message(&request).unwrap();
+        assert_eq!(decode_service_type_notification(&message).unwrap(), request);
+        assert_eq!(
+            message
+                .headers
+                .iter()
+                .find(|h| h.id == ACTOR)
+                .unwrap()
+                .read(|d| d.i64())
+                .unwrap(),
+            FM_ACTOR
+        );
+        assert!(!message.headers.iter().any(|h| h.id == GENERATION_HEADER));
+        assert!(!message
+            .headers
+            .iter()
+            .find(|h| h.id == HIGH_PRIORITY)
+            .unwrap()
+            .read(|d| d.boolean())
+            .unwrap());
+        assert!(decode_service_type_notification_reply(&message).is_err());
+    }
+    for reply in [ServiceTypeNotificationReply::default(), partial] {
+        for from_fmm in [false, true] {
+            let generation = support::rich_generation(from_fmm);
+            let message = service_type_notification_reply_message(&reply, &generation).unwrap();
+            assert_eq!(
+                decode_service_type_notification_reply(&message).unwrap(),
+                (reply.clone(), generation)
+            );
+            assert!(!message
+                .headers
+                .iter()
+                .find(|h| h.id == HIGH_PRIORITY)
+                .unwrap()
+                .read(|d| d.boolean())
+                .unwrap());
+            assert!(decode_service_type_notification(&message).is_err());
+        }
+    }
+}
+
+#[test]
+fn notification_headers_reject_wrong_actions_destinations_and_missing_or_duplicate_values() {
+    let request = service_type_notification_message(&support::rich_notification()).unwrap();
+    let reply = service_type_notification_reply_message(
+        &support::partial_notification_reply(),
+        &support::rich_generation(false),
+    )
+    .unwrap();
+    for (original, is_reply) in [(request, false), (reply, true)] {
+        let decode = |message: &fube_transport::message::Message| {
+            if is_reply {
+                decode_service_type_notification_reply(message).map(|_| ())
+            } else {
+                decode_service_type_notification(message).map(|_| ())
+            }
+        };
+        let mut required = vec![ACTOR, ACTION, HIGH_PRIORITY];
+        if is_reply {
+            required.push(GENERATION_HEADER);
+        }
+        for id in required {
+            let mut missing = original.clone();
+            missing.headers.retain(|h| h.id != id);
+            assert!(decode(&missing).is_err());
+            let mut duplicate = original.clone();
+            duplicate.headers.push(
+                original
+                    .headers
+                    .iter()
+                    .find(|h| h.id == id)
+                    .unwrap()
+                    .clone(),
+            );
+            assert!(decode(&duplicate).is_err());
+            let mut malformed = original.clone();
+            malformed
+                .headers
+                .iter_mut()
+                .find(|h| h.id == id)
+                .unwrap()
+                .value
+                .clear();
+            assert!(decode(&malformed).is_err());
+        }
+        for actor in [FMM_ACTOR, if is_reply { FM_ACTOR } else { RA_ACTOR }] {
+            let mut wrong = original.clone();
+            wrong.headers[0] = Header::actor(actor).unwrap();
+            assert!(decode(&wrong).is_err());
+        }
+        let mut wrong = original.clone();
+        wrong.headers[1] = Header::action(if is_reply {
+            "ServiceTypeNotification"
+        } else {
+            "ServiceTypeNotificationReply"
+        })
+        .unwrap();
+        assert!(decode(&wrong).is_err());
+        // Priority is factory metadata, not a notification acknowledgment guard.
+        let mut high = original;
+        high.headers[2] = Header::boolean(HIGH_PRIORITY, true).unwrap();
+        assert!(decode(&high).is_ok());
+    }
+}
+
+#[test]
+fn notification_collections_reject_truncation_trailing_data_and_codec_bound_overflow() {
+    for body in [
+        support::rich_notification(),
+        support::partial_notification_reply(),
+    ] {
+        let bytes = to_vec(&body).unwrap();
+        for end in 0..bytes.len() {
+            assert!(from_slice::<ServiceTypeNotification>(&bytes[..end]).is_err());
+        }
+        let mut bad = bytes.clone();
+        bad.push(0);
+        assert!(from_slice::<ServiceTypeNotification>(&bad).is_err());
+        let mut bad = bytes;
+        bad[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(from_slice::<ServiceTypeNotification>(&bad).is_err());
+    }
+    let mut body = ServiceTypeNotification::default();
+    body.infos.0 = vec![ServiceTypeInfo::default(); 4097];
+    assert!(service_type_notification_message(&body).is_err());
 }

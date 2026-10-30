@@ -13,6 +13,7 @@ pub struct RuntimeRegistration {
     pub runtime: String,
     /// Reference acquisition identity, equal to the issued lookup ID.
     pub acquisition: u64,
+    pub code_package: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistrationCompletion {

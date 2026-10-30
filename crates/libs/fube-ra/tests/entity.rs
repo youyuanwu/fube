@@ -162,6 +162,7 @@ fn registration() -> RuntimeRegistration {
         host: "trusted-host".into(),
         runtime: "trusted-runtime".into(),
         acquisition: 1,
+        code_package: "Code".into(),
     }
 }
 async fn registered(executor: &Executor, request: &AddInstance, token: u64) {
@@ -190,7 +191,16 @@ async fn registered(executor: &Executor, request: &AddInstance, token: u64) {
         .unwrap();
     assert!(matches!(
         executor.take_effects().as_slice(),
-        [Dispatched {
+        [
+            Dispatched {
+                effect: Effect::RequestServiceTypeRetry { .. },
+                ..
+            },
+            Dispatched {
+                effect: Effect::RuntimeOpen { .. },
+                ..
+            }
+        ] | [Dispatched {
             effect: Effect::RuntimeOpen { .. },
             ..
         }]
@@ -1727,11 +1737,12 @@ async fn registration_retry_thresholds_warning_precedence_and_reacquire_are_nati
             event.registration.acquisition = event.lookup;
             run(&executor, Command::Registered(Box::new(event))).await;
             let actions = effects(&executor);
+            assert!(matches!(actions[0], Effect::RequestServiceTypeRetry { .. }));
             assert_eq!(
-                actions[0],
+                actions[1],
                 Effect::Health(HealthEvent::ClearServiceTypeRegistrationWarning)
             );
-            assert_close(&actions[1..], 8, &state(&executor));
+            assert_close(&actions[2..], 8, &state(&executor));
             close_done(&executor, 0).await;
         } else {
             run(&executor, Command::Registered(Box::new(event))).await;
@@ -1935,7 +1946,10 @@ async fn overlapping_lookup_results_dispose_unused_acquisition_and_callback_repl
         run(&executor, Command::Registered(Box::new(one.clone()))).await;
         assert!(matches!(
             effects(&executor).as_slice(),
-            [Effect::RuntimeOpen { .. }]
+            [
+                Effect::RequestServiceTypeRetry { .. },
+                Effect::RuntimeOpen { .. }
+            ]
         ));
         run(&executor, Command::Registered(Box::new(two.clone()))).await;
         assert_eq!(
@@ -1953,6 +1967,222 @@ async fn overlapping_lookup_results_dispose_unused_acquisition_and_callback_repl
     }
 }
 
+#[tokio::test]
+async fn node_notification_aggregates_partitions_and_consumes_only_instance_matched_partial_ack() {
+    // Native ServiceTypeNotification.cpp:158-287 uses SP1; map helpers are
+    // state-independent. This is a stateless source-derived translation.
+    let (store, executor, hooks) = setup(WAIT).await;
+    for id in 1..=3 {
+        let mut request = body(id);
+        if id == 3 {
+            request.service.service_type.name = "Other".into();
+        }
+        make_ready(&executor, &request).await;
+    }
+    let entries = executor.service_types();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.iter().map(|e| e.references).sum::<usize>(), 3);
+    let writes = hooks.calls.load(Ordering::SeqCst);
+    run(&executor, Command::RetryServiceTypes { now_ms: 0 }).await;
+    let actions = effects(&executor);
+    let [Effect::ServiceTypeNotification(sent), Effect::RequestServiceTypeRetry { after_ms: 30000 }] =
+        actions.as_slice()
+    else {
+        panic!("{actions:?}");
+    };
+    assert_eq!(sent.infos.0.len(), 2);
+    assert!(executor.service_types().iter().all(|e| e.pending));
+    let mut ack = sent.infos.0[0].clone();
+    ack.code_package = "FM can return a different name".into();
+    ack.versioned.version.version.value.minor += 1; // instance alone matches
+    run(
+        &executor,
+        Command::ServiceTypeReply {
+            body: Box::new(ServiceTypeNotification {
+                infos: fube_transport::serialization::serde::ObjectArray(vec![ack]),
+            }),
+            source: admission().fm_source,
+            generation: GenerationHeader::default(), // no invented FT-generation gate
+        },
+    )
+    .await;
+    assert!(effects(&executor).is_empty());
+    assert_eq!(
+        executor
+            .service_types()
+            .iter()
+            .filter(|e| e.pending)
+            .count(),
+        1
+    );
+    run(&executor, Command::RetryServiceTypes { now_ms: 44999 }).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::RequestServiceTypeRetry { .. }]
+    ));
+    run(&executor, Command::RetryServiceTypes { now_ms: 50000 }).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::ServiceTypeNotification(b), Effect::RequestServiceTypeRetry { .. }] if b.infos.0.len()==1)
+    );
+    assert_eq!(hooks.calls.load(Ordering::SeqCst), writes); // node work never inserts FT
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn node_attachment_capacity_veto_preserves_acquired_callback_obligation() {
+    let store = Store::new(MemoryBackend::new(), StoreSettings::default())
+        .await
+        .unwrap();
+    let executor = Executor::new(
+        Arc::new(store.clone()),
+        admission(),
+        Settings {
+            max_service_types: 1,
+            ..Settings::default()
+        },
+    )
+    .unwrap();
+    make_ready(&executor, &body(1)).await;
+    let mut request = body(2);
+    request.service.service_type.name = "Other".into();
+    let add_ticket = executor.submit(add(request.clone())).unwrap();
+    add_ticket.wait(WAIT).await.unwrap();
+    effects(&executor);
+    let result = acquired(&request, add_ticket.id, add_ticket.id, false);
+    let before = executor.snapshot([2; 16]).committed.unwrap();
+    assert_eq!(
+        executor
+            .submit(Command::Registered(Box::new(result.clone())))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Capacity)
+    );
+    assert!(Arc::ptr_eq(
+        &before,
+        &executor.snapshot([2; 16]).committed.unwrap()
+    ));
+    assert!(effects(&executor).is_empty());
+    assert!(before.registration_lookups.contains_key(&add_ticket.id));
+    run(&executor, remove(body(1), false)).await;
+    effects(&executor);
+    close_done(&executor, 0).await;
+    effects(&executor);
+    assert!(executor.service_types().is_empty());
+    run(&executor, Command::Registered(Box::new(result.clone()))).await;
+    assert_eq!(executor.service_types()[0].references, 1);
+    effects(&executor);
+    run(&executor, Command::Registered(Box::new(result))).await;
+    assert!(effects(&executor).is_empty()); // replay cannot add a second map ref
+    assert_eq!(executor.service_types()[0].references, 1);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn node_projected_payload_veto_does_not_consume_lookup_or_change_prior_entry() {
+    let store = Store::new(MemoryBackend::new(), StoreSettings::default())
+        .await
+        .unwrap();
+    let executor = Executor::new(
+        Arc::new(store.clone()),
+        admission(),
+        Settings {
+            notification_batch_bytes: 590,
+            ..Settings::default()
+        },
+    )
+    .unwrap();
+    let mut first = body(1);
+    first.service.service_type.package.name = "P".repeat(200);
+    make_ready(&executor, &first).await;
+    let before = executor.service_types();
+    let mut second = body(2);
+    second.service.version.instance = 2;
+    second.replica.version = second.service.version.clone();
+    let ticket = executor.submit(add(second.clone())).unwrap();
+    ticket.wait(WAIT).await.unwrap();
+    effects(&executor);
+    let mut candidate = acquired(&second, ticket.id, ticket.id, false);
+    candidate.registration.code_package = "C".repeat(200);
+    assert_eq!(
+        executor
+            .submit(Command::Registered(Box::new(candidate)))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Capacity)
+    );
+    assert_eq!(executor.service_types(), before);
+    assert!(executor
+        .snapshot([2; 16])
+        .committed
+        .unwrap()
+        .registration_lookups
+        .contains_key(&ticket.id));
+    assert!(effects(&executor).is_empty());
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn node_detachment_is_atomic_with_definite_unknown_and_cancelled_entity_completion() {
+    // Rust P1/ownership adaptation, not original native fault-test execution.
+    for uncertain in [false, true] {
+        for fail in [false, true] {
+            let (store, executor, hooks) = setup(if uncertain {
+                Duration::from_millis(20)
+            } else {
+                WAIT
+            })
+            .await;
+            make_ready(&executor, &body(1)).await;
+            run(&executor, remove(body(1), false)).await;
+            effects(&executor);
+            let previous = state(&executor);
+            let node_before = executor.service_types();
+            let event = close_completion(&executor, 0);
+            let (entered, release) = hooks.pause(fail);
+            let ticket = executor
+                .submit(Command::CompleteClose(Box::new(event)))
+                .unwrap();
+            entered.await.unwrap();
+            if uncertain {
+                assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+            }
+            assert!(Arc::ptr_eq(&previous, &state(&executor)));
+            assert_eq!(executor.service_types(), node_before);
+            assert!(effects(&executor).is_empty());
+            // Drop this observer; a queued node retry cannot lose the attachment.
+            drop(ticket);
+            run(&executor, Command::RetryServiceTypes { now_ms: 0 }).await;
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [
+                    Effect::ServiceTypeNotification(_),
+                    Effect::RequestServiceTypeRetry { .. }
+                ]
+            ));
+            release.send(()).unwrap();
+            // Same-entity sentinel proves publication/reservation release completed.
+            run(&executor, remove(body(1), false)).await;
+            effects(&executor);
+            if fail {
+                assert_eq!(state(&executor).phase, Phase::Closing);
+                assert_eq!(executor.service_types()[0].references, 1);
+            } else {
+                assert_eq!(state(&executor).phase, Phase::Closed);
+                assert!(executor.service_types().is_empty());
+            }
+            assert_eq!(
+                operations(&hooks)
+                    .iter()
+                    .filter(|&&s| s == "Update")
+                    .count(),
+                3
+            );
+            finish(&store, &executor).await;
+        }
+    }
+}
 #[tokio::test]
 async fn outstanding_lookup_obligations_have_finite_capacity_and_release_only_on_real_result() {
     let store = Store::memory(StoreSettings::default()).await.unwrap();
