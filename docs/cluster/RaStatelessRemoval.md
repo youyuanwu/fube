@@ -6,6 +6,8 @@ execution, deployed SF interoperability or full algorithm-parity claim.
 Native baseline: `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
 The subsequent [opening port](RaStatelessOpening.md) adds native creation policy,
 separate retained package usage and a shared node notification coordinator.
+The subsequent [replacement port](RaStatelessReplacement.md) adds old-identity
+Drop/FM resend and direct Add/one-FT-ack description helpers.
 The source mappings here describe the preserved removal slice; current code
 line numbers have advanced with that addition.
 
@@ -158,8 +160,9 @@ opening slice, including registration-version selection for Close reacquisition.
 Cleanup releases registration, then separately retained package usage before
 report scheduling/health/reply; discarded acquired callbacks also dispose their
 own unused usage lease. Termination remains distinct from host-down.
-Disabled unfinished capabilities: open higher-ID replacement Drop; service/package
-description update; stateful/StandBy/reopen/queued-delete; FMM/system-host
+Ready greater-ID replacement Drop and direct description helpers are now enabled
+by the linked replacement slice. Disabled unfinished capabilities: broader
+description/upgrade protocols; stateful/StandBy/reopen/queued-delete; FMM/system-host
 termination; multi-FT/last-upload acknowledgment and initial upload bookkeeping;
 physical tombstone GC; live registration/health/runtime transport; restart,
 replay/adoption, durable outbox and process/power-loss guarantees.

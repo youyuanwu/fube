@@ -110,6 +110,18 @@ class CatalogTests(unittest.TestCase):
             else:
                 self.assertIn(term, removal)
 
+    def test_replacement_status_keeps_resend_adapter_and_eventual_wire_boundaries(self):
+        replacement = (ROOT / "docs/cluster/RaStatelessReplacement.md").read_text()
+        for term in [REVISION, "FM resend", "not a second replacement state machine",
+                     "processing time", "TESTASSERT", "absent application-upgrade",
+                     "not new enabled IPC wire codecs", "unchanged",
+                     "36 bidirectional", "43 types/129 fields", "65,536",
+                     "commit-before-effects", "capability-disabled does not mean omitted"]:
+            self.assertIn(term, replacement)
+        records = {r["symbol"]: r for r in rows()}
+        self.assertIn("drop-resend-replacement", records["AddInstance"]["status"])
+        self.assertEqual(sum("selected" in r["status"] for r in records.values()), 8)
+
 
 if __name__ == "__main__":
     unittest.main()

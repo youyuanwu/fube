@@ -16,6 +16,7 @@ No inference of sender, recipient, or completeness is made from action names.
 **Status:** source inventory complete. The [foundation codecs and bounded
 entity seam](RaProtocolFoundation.md) plus [stateless removal/close/reporting](RaStatelessRemoval.md)
 and [opening/node registration reporting](RaStatelessOpening.md)
+plus [stateless Drop/FM-resend replacement/direct description helpers](RaStatelessReplacement.md)
 are implemented with source-baseline
 native-stream evidence; complete handlers/runtime/traces remain staged.
 The inventory alone does not establish protocol implementation.
@@ -100,7 +101,7 @@ FT failover checks at
 [infrastructure.FailoverUnitEntityTraits.cpp:17–35,135–283][traits]:
 
 * No existing FT: permit the creating handler to decide.
-* Open/close pending rejects ordinary traffic; RemoveInstance/DeleteReplica
+* Open/close pending rejects ordinary traffic; RemoveInstance/DeleteReplica/ReplicaUpReply
   are exceptions to pending-open/pending-close checks. This is separate from
   **node closing** metadata: both remain `FC`, close=false.
 * Closed+locally-deleted create intent (`AddInstance`, `AddPrimary`,
@@ -111,7 +112,7 @@ FT failover checks at
 * CreateReplicaReply compares primary epoch.
 * RemoveInstance/DeleteReplica skip generic epoch/instance comparison and
   have their own force/identity/epoch checks in DeleteLocalReplica.
-* A newer instance for the same replica ID is a test assertion except for
+* A newer instance for the same replica ID is a coding assertion except for
   CreateReplica, AddPrimary, GetLSNReply.
 
 Source is the transport context `FromInstance` (:237 in [MessageHandler][handler]),
@@ -151,7 +152,7 @@ the other contracts remain staged.
 
 | Inventory class | Rust mapping at catalog delivery | Required delivery/admission gate |
 |---|---|---|
-| C1: AddInstance/AddInstanceReply | Public schemas/headers: [protocol.rs](../../crates/libs/fube-ra/src/protocol.rs); selected [entity execution](../../crates/libs/fube-ra/src/entity.rs#L733-L1148) and [native opening policy/scenario mappings](RaStatelessOpening.md). [Protocol tests](../../crates/libs/fube-ra/tests/protocol.rs), [entity tests](../../crates/libs/fube-ra/tests/entity.rs), [native source-stream gate](../../tests/ra_protocol/README.md). | 36 total bidirectional native-stream/schema-adapter cases (43 types/129 fields), including all prior 29 cases, and selected entity barriers. Full Hosting/transport/native trace qualification and excluded lifecycle branches remain required; no deployed capability admission. |
+| C1: AddInstance/AddInstanceReply | Public schemas/headers: [protocol.rs](../../crates/libs/fube-ra/src/protocol.rs); selected [entity execution](../../crates/libs/fube-ra/src/entity.rs), [native opening policy](RaStatelessOpening.md) and [Drop/FM-resend replacement/direct description helpers](RaStatelessReplacement.md). [Protocol tests](../../crates/libs/fube-ra/tests/protocol.rs), [entity tests](../../crates/libs/fube-ra/tests/entity.rs), [native source-stream gate](../../tests/ra_protocol/README.md). | Unchanged 36 total bidirectional native-stream/schema-adapter cases (43 types/129 fields), including all prior 29 cases, and selected entity barriers. No new IPC wire codec; description work is a trusted local RAP obligation. Full Hosting/transport/native trace qualification and excluded lifecycle branches remain required; no deployed capability admission. |
 | C2: RemoveInstance/RemoveInstanceReply, ReplicaUp/ReplicaUpReply | [Native-shaped schemas](../../crates/libs/fube-ra/src/protocol.rs), [native helper closure:93–747](../../crates/libs/fube-ra/src/lifecycle.rs#L93-L747), [exact native/scenario mappings and limits](RaStatelessRemoval.md). | Stateless Delete/Obliterate/close and one-FT non-last FM report/ack profile only. Trusted simulated Hosting/RAP cleanup; initial/last upload, batching, FMM, live delivery, GC/restart and broad stateful lifecycle remain staged. RemoveReplica/DeleteReplica actions are not enabled by shared schema/helpers. |
 | C3: ServiceTypeNotification/ServiceTypeNotificationReply | [VersionedServiceType, ServiceTypeInfo, ServiceTypeNotification and distinct factories/decoders](../../crates/libs/fube-ra/src/protocol.rs), [bounded node ledger](../../crates/libs/fube-ra/src/notification.rs#L1-L421), [behavior/evidence limits](RaStatelessOpening.md#shared-node-registration-notifications), [protocol tests](../../crates/libs/fube-ra/tests/protocol.rs), [independent native-stream/helper cases](../../tests/ra_protocol/README.md). | Request Actor FM=11/no generation; reply Actor RA=12/actual FM GenerationHeader; both priority=false. Generic receive-generation lower-bound admission precedes key+instance-only ack. Native UTF-16-unit startup-C-locale identity accepts non-ASCII names and retains actual returned spelling. Dynamic work/retry timers and captured sends preserve native-visible histories. Schema/helper evidence does not establish live Hosting/FM delivery or full original-handler execution. |
 | S: all other active boundary contracts | No Rust codec/handler/trace implementation asserted. The CSV's per-action body, direction and evidence map each missing implementation individually. | Port exact referenced schema and sender/receiver semantics, corresponding native tests and normalized traces before capability admission. No successful stubs or permanent omission. |
@@ -616,7 +617,9 @@ first codec must cover.
    epoch/service-version checks merely because no Hosting adapter exists.
 5. If local FT **Open**:
    * incoming replica ID greater than local: start Drop close of old replica,
-     **no AddInstance success**;
+     **no AddInstance success**, retained replacement payload or automatic reopen.
+     Actual close finish consumer [RA:671–706][ra-main] does not reopen Drop;
+     a later FM resend is required;
    * same instance: if local **Ready**, enqueue Success reply using local
      FT/replica; if not ready, no success; return;
    * other cases do not gain a newly invented success path.
@@ -636,8 +639,9 @@ first codec must cover.
 8. Native success sets local state **Ready** for stateless and clears open
    pending after actual RAP open success
    [FT:5250–5335][ft]. FinishOpenLocalReplica selects AddInstanceReply for
-   stateless [RA:883–902][ra-main]. The bounded foundation has no RAP/Hosting
-   completion, therefore must not turn its own store commit into this success.
+   stateless [RA:883–902][ra-main]. The bounded seam accepts trusted simulated
+   raw RAP completion, not live Hosting/RAP proof; its own Add store commit
+   must not turn into this success.
    Fatal open errors propagate the native error path; retry-threshold behavior
    is at [FT:5209–5279][ft], not a fixed “any error is StaleRequest” rule.
 9. FM receives ReplicaReplyMessageBody, ignores if replica missing/not
