@@ -77,6 +77,7 @@ See [onebox prerequisites, lifecycle, and recovery](docs/UbuntuOnebox.md).
 - [Basic pure-Rust cluster design: FM, RA/Hosting, authority and qualification milestones](docs/cluster/PureRustCluster.md)
 - [RA store P1: API, SQLite profile, cancellation and operational limits](docs/cluster/RaStore.md)
 - [RA protocol foundation: catalog, native codec evidence and minimal P2 execution](docs/cluster/RaProtocolFoundation.md)
+- [Native-derived RA stateless removal: close/report stages, tests and limits](docs/cluster/RaStatelessRemoval.md)
 - [Migration provenance and repository boundaries](docs/Migration.md)
 
 ## License

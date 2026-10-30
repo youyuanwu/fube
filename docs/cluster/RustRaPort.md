@@ -1,7 +1,8 @@
 # Rust RA port and SQLite state-store design
 
 **Status: proposed RA design. The [P1 store seam](RaStore.md) and
-[protocol/minimal P2 foundation](RaProtocolFoundation.md) are implemented;
+[protocol/bounded P2 foundation](RaProtocolFoundation.md) and
+[native-derived stateless removal/close](RaStatelessRemoval.md) are implemented;
 full P2 infrastructure, P3–P5 and RA/runtime recovery are not.**
 
 This is the persistence and porting companion to the
@@ -112,9 +113,11 @@ active use solely from an action name or registry entry.
 
 The [source-pinned catalog](NativeRaProtocol.md) now reconciles 119 initialized
 actions, 66 boundary actions/67 actual directions and two declaration-only
-legacy names. [AddInstance/AddInstanceReply codecs and native source-stream
+legacy names. [Addition/removal/ReplicaUp codecs and native source-stream
 evidence](RaProtocolFoundation.md#codec-evidence) are implemented; all remaining
-codec/handler/trace obligations stay explicitly staged. Catalog completeness
+codec/handler/trace obligations stay explicitly staged. Removal runs against
+trusted simulated registration/RAP/host-down events, not live Hosting.
+Catalog completeness
 is not complete native protocol implementation.
 
 For every exchange, record:

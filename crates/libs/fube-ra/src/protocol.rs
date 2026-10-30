@@ -6,7 +6,7 @@
 use fube_transport::{
     message::{Header, Message, ACTION, ACTOR, HIGH_PRIORITY},
     serialization::serde::{
-        from_slice, to_vec, ByteArray, Derived, Guid, NativeEnum, ObjectArray, Pointer,
+        from_slice, to_vec, ByteArray, Derived, Guid, Inline, NativeEnum, ObjectArray, Pointer,
     },
     Error, Result,
 };
@@ -315,6 +315,54 @@ pub struct AddInstanceReply {
     pub error: i64,
 }
 
+/// DeleteReplicaMessageBody inherits ReplicaMessageBody's scope, then adds force.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoveInstance {
+    pub replica: Inline<AddInstance>,
+    pub deletion: Derived<DeleteOptions>,
+}
+impl Default for RemoveInstance {
+    fn default() -> Self {
+        Self::new(AddInstance::default(), false)
+    }
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteOptions {
+    pub force: bool,
+}
+impl RemoveInstance {
+    pub fn new(body: AddInstance, force: bool) -> Self {
+        Self {
+            replica: Inline(body),
+            deletion: Derived(DeleteOptions { force }),
+        }
+    }
+}
+pub type RemoveInstanceReply = AddInstanceReply;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaInfo {
+    pub description: Replica,
+    pub intermediate_role: i64,
+}
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FailoverUnitInfo {
+    pub service: Service,
+    pub unit: FailoverUnit,
+    pub intermediate: Epoch,
+    pub report_from_primary: bool,
+    pub replicas: ObjectArray<Vec<ReplicaInfo>>,
+    pub local_deleted: bool,
+}
+/// Native ReplicaUpMessageBody, also used by ReplicaUpReply.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplicaUp {
+    pub replicas: ObjectArray<Vec<FailoverUnitInfo>>,
+    pub dropped: ObjectArray<Vec<FailoverUnitInfo>>,
+    pub last: bool,
+    pub from_fmm: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationNumber {
     pub generation: i64,
@@ -367,6 +415,50 @@ pub fn add_instance_reply_message(body: &AddInstanceReply, owner: Owner) -> Resu
     })
 }
 
+fn reliability_message<T: Serialize>(
+    body: &T,
+    action: &str,
+    actor: i64,
+    generation: Option<&GenerationHeader>,
+) -> Result<Message> {
+    let mut headers = vec![
+        Header::actor(actor)?,
+        Header::action(action)?,
+        Header::boolean(HIGH_PRIORITY, true)?,
+    ];
+    if let Some(generation) = generation {
+        headers.push(generation.header()?);
+    }
+    Ok(Message {
+        headers,
+        body: to_vec(body)?,
+    })
+}
+pub fn remove_instance_message(
+    body: &RemoveInstance,
+    generation: &GenerationHeader,
+) -> Result<Message> {
+    reliability_message(body, "RemoveInstance", RA_ACTOR, Some(generation))
+}
+pub fn remove_instance_reply_message(body: &RemoveInstanceReply, owner: Owner) -> Result<Message> {
+    reliability_message(body, "RemoveInstanceReply", owner_actor(owner), None)
+}
+pub fn replica_up_message(body: &ReplicaUp, owner: Owner) -> Result<Message> {
+    reliability_message(body, "ReplicaUp", owner_actor(owner), None)
+}
+pub fn replica_up_reply_message(
+    body: &ReplicaUp,
+    generation: &GenerationHeader,
+) -> Result<Message> {
+    reliability_message(body, "ReplicaUpReply", RA_ACTOR, Some(generation))
+}
+fn owner_actor(owner: Owner) -> i64 {
+    match owner {
+        Owner::Fm => FM_ACTOR,
+        Owner::Fmm => FMM_ACTOR,
+    }
+}
+
 fn unique(message: &Message, id: u16) -> Result<&Header> {
     let mut headers = message.headers.iter().filter(|h| h.id == id);
     let header = headers
@@ -406,5 +498,42 @@ pub fn decode_add_instance_reply(message: &Message) -> Result<(AddInstanceReply,
         } else {
             Owner::Fmm
         },
+    ))
+}
+
+pub fn decode_remove_instance(message: &Message) -> Result<(RemoveInstance, GenerationHeader)> {
+    check_factory(message, "RemoveInstance", &[RA_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+    ))
+}
+pub fn decode_remove_instance_reply(message: &Message) -> Result<(RemoveInstanceReply, Owner)> {
+    let actor = check_factory(message, "RemoveInstanceReply", &[FM_ACTOR, FMM_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        if actor == FM_ACTOR {
+            Owner::Fm
+        } else {
+            Owner::Fmm
+        },
+    ))
+}
+pub fn decode_replica_up(message: &Message) -> Result<(ReplicaUp, Owner)> {
+    let actor = check_factory(message, "ReplicaUp", &[FM_ACTOR, FMM_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        if actor == FM_ACTOR {
+            Owner::Fm
+        } else {
+            Owner::Fmm
+        },
+    ))
+}
+pub fn decode_replica_up_reply(message: &Message) -> Result<(ReplicaUp, GenerationHeader)> {
+    check_factory(message, "ReplicaUpReply", &[RA_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
     ))
 }

@@ -43,7 +43,11 @@ MODELS = [
     ("ServiceScalingPolicyDescription", FAILOVER + "ServiceScalingPolicyDescription.h", ""),
     ("ServiceDescription", FAILOVER + "ServiceDescription.h", ""),
     ("ReplicaMessageBody", COMMON + "ReplicaMessageBody.h", ""),
+    ("DeleteReplicaMessageBody", COMMON + "DeleteReplicaMessageBody.h", "ReplicaMessageBody"),
     ("ReplicaReplyMessageBody", COMMON + "ReplicaReplyMessageBody.h", ""),
+    ("ReplicaInfo", COMMON + "ReplicaInfo.h", ""),
+    ("FailoverUnitInfo", COMMON + "FailoverUnitInfo.h", ""),
+    ("ReplicaUpMessageBody", COMMON + "ReplicaUpMessageBody.h", ""),
     ("GenerationNumber", "Reliability/Failover/GenerationNumber.h", ""),
     ("GenerationHeader", COMMON + "GenerationHeader.h", ""),
     ("ActorHeader", "Transport/ActorHeader.h", ""),
@@ -166,7 +170,7 @@ def generate(native, destination):
                 " info.buffer=reinterpret_cast<const UCHAR*>(&kind_); info.length=sizeof(kind_); return 0; }",
                 f" virtual bool matches(const {name}& other) const {{ return kind_==other.kind_; }}",
             ]
-        if base:
+        if base in {"ScalingTrigger", "ScalingMechanism"}:
             output += [
                 f" bool matches(const {base}& other) const override {{",
                 f" auto p=dynamic_cast<const {name}*>(&other); return p && *this==*p; }}",
@@ -187,6 +191,8 @@ def generate(native, destination):
         if name.startswith(("Scaling", "Average", "InstanceCount", "AddRemove")):
             continue
         output.append(f"inline void rich({name}& v, int& c) {{")
+        if base:
+            output.append(f" rich(static_cast<{base}&>(v), c);")
         for field, _, _ in fields:
             if name == "ServiceDescription" and field == "scalingPolicies_":
                 output.append(f" rich_scaling(v.{field}, c);")

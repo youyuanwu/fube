@@ -114,6 +114,9 @@ rich!(AddInstance: unit, replica, service);
 rich!(AddInstanceReply: unit, replica, [error]);
 rich!(GenerationNumber: generation, owner);
 rich!(GenerationHeader: number, for_fm_replica);
+rich!(ReplicaInfo: description, [intermediate_role]);
+rich!(FailoverUnitInfo: service, unit, intermediate, report_from_primary, replicas, local_deleted);
+rich!(ReplicaUp: replicas, dropped, last, from_fmm);
 
 fn filled<T: Default + Rich>(c: &mut i32) -> T {
     let mut value = T::default();
@@ -122,6 +125,15 @@ fn filled<T: Default + Rich>(c: &mut i32) -> T {
 }
 pub fn rich_request() -> AddInstance {
     filled(&mut 0)
+}
+pub fn rich_remove(force: bool) -> RemoveInstance {
+    RemoveInstance::new(rich_request(), force)
+}
+pub fn rich_replica_up(last: bool, from_fmm: bool) -> ReplicaUp {
+    let mut value: ReplicaUp = filled(&mut 0);
+    value.last = last;
+    value.from_fmm = from_fmm;
+    value
 }
 pub fn rich_reply(error: i64) -> AddInstanceReply {
     let mut value: AddInstanceReply = filled(&mut 0);

@@ -13,6 +13,9 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{mpsc, watch, Notify};
+#[path = "lifecycle.rs"]
+mod lifecycle;
+pub use lifecycle::*;
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -96,6 +99,13 @@ pub struct Settings {
     pub max_queued_bytes: usize,
     pub max_effects: usize,
     pub resolution_poll: Duration,
+    pub close_warning: u64,
+    pub delete_drop: u64,
+    pub close_drop: u64,
+    pub registration_warning: u64,
+    pub registration_drop: u64,
+    /// Outstanding acquired-result obligations retained even across recreation.
+    pub max_registration_lookups: usize,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -106,6 +116,12 @@ impl Default for Settings {
             max_queued_bytes: 8 * 1024 * 1024,
             max_effects: 64,
             resolution_poll: Duration::from_millis(20),
+            close_warning: 10,
+            delete_drop: 40,
+            close_drop: 40320,
+            registration_warning: 240,
+            registration_drop: 1920,
+            max_registration_lookups: 64,
         }
     }
 }
@@ -123,6 +139,13 @@ impl Settings {
             || self.max_effects > 65536
             || self.resolution_poll.is_zero()
             || self.resolution_poll > Duration::from_secs(60)
+            || self.close_warning == 0
+            || self.delete_drop == 0
+            || self.close_drop == 0
+            || self.registration_warning == 0
+            || self.registration_drop == 0
+            || self.max_registration_lookups == 0
+            || self.max_registration_lookups > 65536
         {
             return Err(Failure::Admission("invalid finite executor settings"));
         }
@@ -148,6 +171,21 @@ pub enum Command {
     CompleteOpen(Box<OpenCompletion>),
     /// Explicit new retry work, not an automatic duplicate dispatch.
     RetryOpen(PartitionId),
+    Remove {
+        body: Box<RemoveInstance>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    ReplicaUpReply {
+        body: Box<ReplicaUp>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    Registered(Box<RegistrationCompletion>),
+    CompleteClose(Box<CloseCompletion>),
+    HostDown(Box<HostDown>),
+    RetryClose(PartitionId),
+    RetryReport(PartitionId),
 }
 enum Kind {
     Add {
@@ -156,12 +194,27 @@ enum Kind {
     },
     Complete,
     Retry,
+    Remove {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    ReplicaUpReply {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    Registered,
+    CompleteClose,
+    HostDown,
+    RetryClose,
+    RetryReport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Opening,
     Ready,
+    Closing,
+    Closed,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityState {
@@ -171,6 +224,20 @@ pub struct EntityState {
     /// Volatile retry bookkeeping; not a native disk record or durable outbox.
     pub retry_attempts: u64,
     pub last_retry_error: i64,
+    pub runtime: Option<RuntimeRegistration>,
+    pub close_mode: Option<CloseMode>,
+    pub close_token: u64,
+    pub local_deleted: bool,
+    pub cleanup_pending: bool,
+    pub close_failures: u64,
+    pub registration_failures: u64,
+    pub close_warning: bool,
+    pub registration_warning: bool,
+    pub fm_stage: FmStage,
+    pub report_sequence: u64,
+    /// lookup ID -> (owning lifecycle token, close rather than open lookup).
+    /// Consumed once by Registered; callback replay acquires no second reference.
+    pub registration_lookups: BTreeMap<u64, (u64, bool)>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
@@ -179,8 +246,38 @@ pub struct Snapshot {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
-    Open { token: u64, body: Arc<AddInstance> },
+    /// Resolve service-type registration. RAP Open may run only after Registered
+    /// has published RuntimeOpen for this token.
+    Open {
+        token: u64,
+        lookup: u64,
+        body: Arc<AddInstance>,
+    },
     Reply(Box<AddInstanceReply>),
+    RuntimeOpen {
+        token: u64,
+        body: Arc<AddInstance>,
+        registration: RuntimeRegistration,
+    },
+    Close {
+        token: u64,
+        body: Arc<AddInstance>,
+        registration: RuntimeRegistration,
+        flags: i64,
+    },
+    FindRegistration {
+        token: u64,
+        lookup: u64,
+        body: Arc<AddInstance>,
+    },
+    TerminateHost {
+        registration: RuntimeRegistration,
+    },
+    ReleaseRegistration(RuntimeRegistration),
+    Health(HealthEvent),
+    RequestReportRetry,
+    ReplicaUp(Box<ReplicaUp>),
+    RemoveReply(Box<RemoveInstanceReply>),
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dispatched {
@@ -221,6 +318,7 @@ struct Submission {
     kind: Kind,
     bytes: Box<[u8]>,
     charge: usize,
+    reserved_effects: usize,
     result: watch::Sender<Status>,
 }
 
@@ -293,6 +391,52 @@ impl Executor {
             }
             Command::CompleteOpen(body) => (body.unit.id.guid.0, Kind::Complete, to_vec(&body)),
             Command::RetryOpen(unit) => (unit.guid.0, Kind::Retry, to_vec(&unit)),
+            Command::Remove {
+                body,
+                source,
+                generation,
+            } => (
+                body.replica.0.unit.id.guid.0,
+                Kind::Remove { source, generation },
+                to_vec(&body),
+            ),
+            Command::ReplicaUpReply {
+                body,
+                source,
+                generation,
+            } => {
+                if body.last || body.from_fmm || body.replicas.0.len() + body.dropped.0.len() != 1 {
+                    return Err(Failure::Unsupported(
+                        "only one-FT non-last FM ReplicaUpReply is enabled",
+                    ));
+                }
+                let info = body
+                    .replicas
+                    .0
+                    .first()
+                    .or_else(|| body.dropped.0.first())
+                    .unwrap();
+                (
+                    info.unit.id.guid.0,
+                    Kind::ReplicaUpReply { source, generation },
+                    to_vec(&body),
+                )
+            }
+            Command::Registered(body) => (body.unit.guid.0, Kind::Registered, to_vec(&body)),
+            Command::CompleteClose(body) => {
+                (body.unit.id.guid.0, Kind::CompleteClose, to_vec(&body))
+            }
+            Command::HostDown(body) => (body.unit.guid.0, Kind::HostDown, to_vec(&body)),
+            Command::RetryClose(unit) => (unit.guid.0, Kind::RetryClose, to_vec(&unit)),
+            Command::RetryReport(unit) => (unit.guid.0, Kind::RetryReport, to_vec(&unit)),
+        };
+        // Add may report a closed replica then return StaleRequest. Lifecycle
+        // commands may release, clear warnings, report health, schedule FM work
+        // and reply. Bounds are checked again before any persistence/effects.
+        let reserved_effects = match &kind {
+            Kind::Add { .. } => 2,
+            Kind::Complete | Kind::Retry | Kind::RetryReport => 1,
+            _ => 8,
         };
         let bytes = bytes
             .map_err(|_| Failure::Admission("unsupported/oversized native shape"))?
@@ -309,7 +453,7 @@ impl Executor {
         let new_entity = !view.entities.contains_key(&entity);
         if view.stats.outstanding >= settings.max_outstanding
             || view.stats.queued_bytes + charge > settings.max_queued_bytes
-            || view.effects.len() + view.reserved_effects >= settings.max_effects
+            || view.effects.len() + view.reserved_effects + reserved_effects > settings.max_effects
             || (new_entity && view.entities.len() >= settings.max_entities)
             || view.stats.accepted == u64::MAX
         {
@@ -323,6 +467,7 @@ impl Executor {
             kind,
             bytes,
             charge,
+            reserved_effects,
             result,
         };
         // Reservation and enqueue are atomic with all other submitters.
@@ -334,7 +479,7 @@ impl Executor {
         view.stats.accepted = id;
         view.stats.outstanding += 1;
         view.stats.queued_bytes += charge;
-        view.reserved_effects += 1; // every supported operation emits at most one action
+        view.reserved_effects += reserved_effects;
         Ok(Ticket { id, receiver })
     }
 
@@ -421,14 +566,14 @@ enum Update {
 }
 struct Transition {
     update: Update,
-    effect: Option<Effect>,
+    effects: Vec<Effect>,
     disposition: Disposition,
 }
 impl Transition {
     fn ignored(disposition: Disposition) -> Self {
         Self {
             update: Update::None,
-            effect: None,
+            effects: Vec::new(),
             disposition,
         }
     }
@@ -444,6 +589,7 @@ fn transition(
     work: &Submission,
     state: Option<&EntityState>,
     admission: &Admission,
+    settings: &Settings,
 ) -> Result<Transition> {
     let decode_error = |_| Failure::Admission("invalid native command payload");
     match &work.kind {
@@ -486,11 +632,15 @@ fn transition(
             if !admission.node_activated {
                 return Ok(Transition {
                     update: Update::None,
-                    effect: Some(reply(&body, RA_NOT_READY)),
+                    effects: vec![reply(&body, RA_NOT_READY)],
                     disposition: Disposition::Applied,
                 });
             }
+            let body = lifecycle::create_body(body);
             if let Some(current) = state {
+                if let Some(result) = lifecycle::add_existing(work, current, &body) {
+                    return result;
+                }
                 let local = &current.body;
                 if body.unit.current.older_than(local.unit.current)
                     || body.replica.instance < local.replica.instance
@@ -513,7 +663,7 @@ fn transition(
                 return Ok(if current.phase == Phase::Ready {
                     Transition {
                         update: Update::None,
-                        effect: Some(reply(local, 0)),
+                        effects: vec![reply(local, 0)],
                         disposition: Disposition::Applied,
                     }
                 } else {
@@ -528,11 +678,24 @@ fn transition(
                     open_token: work.id,
                     retry_attempts: 0,
                     last_retry_error: 0,
+                    runtime: None,
+                    close_mode: None,
+                    close_token: 0,
+                    local_deleted: false,
+                    cleanup_pending: false,
+                    close_failures: 0,
+                    registration_failures: 0,
+                    close_warning: false,
+                    registration_warning: false,
+                    fm_stage: FmStage::None,
+                    report_sequence: 0,
+                    registration_lookups: BTreeMap::new(),
                 }),
-                effect: Some(Effect::Open {
+                effects: vec![Effect::Open {
                     token: work.id,
+                    lookup: 0, // assigned atomically by track_lookups before persistence
                     body,
-                }),
+                }],
                 disposition: Disposition::Applied,
             })
         }
@@ -551,16 +714,26 @@ fn transition(
             }
             let mut proposed = current.clone();
             if completion.error == SERVICE_TYPE_NOT_REGISTERED {
+                if current.runtime.is_some() {
+                    return Err(Failure::Admission(
+                        "registration result cannot revoke an active runtime",
+                    ));
+                }
                 proposed.last_retry_error = completion.error;
                 return Ok(Transition {
                     update: Update::Memory(proposed),
-                    effect: None,
+                    effects: vec![],
                     disposition: Disposition::Applied,
                 });
             }
             if completion.error != 0 {
                 return Err(Failure::Unsupported(
                     "native retry/terminal-open error policy is staged",
+                ));
+            }
+            if current.runtime.is_none() {
+                return Err(Failure::Admission(
+                    "Open success requires committed registration handoff",
                 ));
             }
             if completion.replica.state != 2
@@ -576,7 +749,7 @@ fn transition(
             proposed.body = Arc::new(body);
             proposed.phase = Phase::Ready;
             Ok(Transition {
-                effect: Some(reply(&proposed.body, 0)),
+                effects: vec![reply(&proposed.body, 0)],
                 update: Update::Durable(proposed),
                 disposition: Disposition::Applied,
             })
@@ -592,14 +765,24 @@ fn transition(
                 .checked_add(1)
                 .ok_or(Failure::Capacity)?;
             Ok(Transition {
-                effect: Some(Effect::Open {
-                    token: current.open_token,
-                    body: current.body.clone(),
-                }),
+                effects: vec![if let Some(registration) = &current.runtime {
+                    Effect::RuntimeOpen {
+                        token: current.open_token,
+                        body: current.body.clone(),
+                        registration: registration.clone(),
+                    }
+                } else {
+                    Effect::Open {
+                        token: current.open_token,
+                        lookup: 0,
+                        body: current.body.clone(),
+                    }
+                }],
                 update: Update::Memory(proposed),
                 disposition: Disposition::Applied,
             })
         }
+        _ => lifecycle::transition(work, state, admission, settings),
     }
 }
 
@@ -609,6 +792,11 @@ struct Stored<'a> {
     body: &'a AddInstance,
     phase: i64,
     open_token: u64,
+    deleted: bool,
+    cleanup_pending: bool,
+    close_mode: i64,
+    close_token: u64,
+    fm_stage: i64,
 }
 async fn persist(
     store: &dyn KeyValueStore,
@@ -618,10 +806,20 @@ async fn persist(
     insert: bool,
 ) -> Result<()> {
     let value = to_vec(&Stored {
-        format: 1,
+        format: 2,
         body: &state.body,
-        phase: if state.phase == Phase::Opening { 0 } else { 1 },
+        phase: match state.phase {
+            Phase::Opening => 0,
+            Phase::Ready => 1,
+            Phase::Closing => 2,
+            Phase::Closed => 3,
+        },
         open_token: state.open_token,
+        deleted: state.local_deleted,
+        cleanup_pending: state.cleanup_pending,
+        close_mode: state.close_mode.map_or(0, |mode| mode as i64),
+        close_token: state.close_token,
+        fm_stage: state.fm_stage as i64,
     })
     .map_err(|_| Failure::Capacity)?;
     let record = Record {
@@ -700,6 +898,46 @@ async fn persist(
     }
 }
 
+/// Bind every issued lookup to a unique accepted operation. Tracking is private
+/// with the same proposal, survives removal/recreation, and is logically bounded.
+fn track_lookups(
+    work: &Submission,
+    current: Option<&EntityState>,
+    transition: &mut Transition,
+    settings: &Settings,
+) -> Result<()> {
+    let mut purpose = None;
+    for effect in &mut transition.effects {
+        let (token, lookup, close) = match effect {
+            Effect::Open { token, lookup, .. } => (*token, lookup, false),
+            Effect::FindRegistration { token, lookup, .. } => (*token, lookup, true),
+            _ => continue,
+        };
+        if purpose.replace((token, close)).is_some() {
+            return Err(Failure::Capacity);
+        }
+        *lookup = work.id;
+    }
+    let Some(purpose) = purpose else {
+        return Ok(());
+    };
+    if matches!(transition.update, Update::None) {
+        transition.update = Update::Memory(
+            current
+                .ok_or(Failure::Admission("lookup needs an entity"))?
+                .clone(),
+        );
+    }
+    let (Update::Memory(state) | Update::Durable(state)) = &mut transition.update else {
+        unreachable!()
+    };
+    if state.registration_lookups.len() >= settings.max_registration_lookups {
+        return Err(Failure::Capacity);
+    }
+    state.registration_lookups.insert(work.id, purpose);
+    Ok(())
+}
+
 async fn entity_worker(
     shared: Arc<Shared>,
     mut receiver: mpsc::UnboundedReceiver<Submission>,
@@ -708,7 +946,21 @@ async fn entity_worker(
 ) {
     let mut committed: Option<Arc<EntityState>> = None;
     while let Some(work) = receiver.recv().await {
-        let mut outcome = transition(&work, committed.as_deref(), &admission);
+        let mut outcome = transition(&work, committed.as_deref(), &admission, &shared.settings);
+        if let Ok(transition) = &mut outcome {
+            if let Err(error) =
+                track_lookups(&work, committed.as_deref(), transition, &shared.settings)
+            {
+                outcome = Err(error);
+            }
+        }
+        if outcome
+            .as_ref()
+            .is_ok_and(|t| t.effects.len() > work.reserved_effects)
+        {
+            outcome = Err(Failure::Capacity);
+        }
+
         if let Ok(Transition {
             update: Update::Durable(state),
             ..
@@ -728,7 +980,7 @@ async fn entity_worker(
                         view.entities.get_mut(&work.entity).unwrap().committed = committed.clone();
                     }
                 }
-                if let Some(effect) = transition.effect {
+                for effect in transition.effects {
                     view.effects.push_back(Dispatched {
                         operation: work.id,
                         entity: work.entity,
@@ -746,7 +998,7 @@ async fn entity_worker(
         view.entities.get_mut(&work.entity).unwrap().fenced = false;
         view.stats.outstanding -= 1;
         view.stats.queued_bytes -= work.charge;
-        view.reserved_effects -= 1;
+        view.reserved_effects -= work.reserved_effects;
         view.stats.effects = view.effects.len();
         drop(view);
         work.result.send_replace(Status::Complete(result));
