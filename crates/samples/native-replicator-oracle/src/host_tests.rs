@@ -3,8 +3,8 @@ use super::*;
 use std::sync::atomic::AtomicUsize;
 
 const FIXTURE_EPOCH: fube_data::Epoch = fube_data::Epoch {
-    data_loss: 1,
-    configuration: 3 << 32,
+    data_loss_number: 1,
+    configuration_number: 3 << 32,
 };
 
 #[test]

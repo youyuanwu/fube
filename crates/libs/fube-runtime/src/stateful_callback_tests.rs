@@ -2,7 +2,8 @@
 // Licensed under the MIT License.
 
 use super::*;
-use crate::{lease::Authority, StatefulCallbackGuard};
+use crate::extensions::StatefulCallbackGuard;
+use crate::lease::Authority;
 use std::{
     io::{Read, Write},
     process::{Command, Stdio},
@@ -11,8 +12,6 @@ use std::{
 
 fn partition() -> StatefulPartition {
     StatefulPartition {
-        execution: None,
-        native: None,
         identity: ReplicaIdentity {
             service_name: "fabric:/app/service".into(),
             service_type: "StatefulType".into(),

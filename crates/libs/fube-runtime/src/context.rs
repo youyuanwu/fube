@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
-use fube_transport::{serialization::serde::Guid, Error, Result};
+use crate::{Error, Result};
+use fube_transport::serialization::serde::Guid;
 
 use crate::wire::*;
 
@@ -53,6 +54,12 @@ impl ActivationContext {
     }
     pub fn from_environment() -> Result<Self> {
         Self::parse(&std::env::vars().collect())
+    }
+    /// Validate an owned node-injected environment without mutating process
+    /// globals. This is bootstrap data, not a lease, partition or native
+    /// invocation grant; attachment still performs the real registration path.
+    pub fn from_node_environment(env: &BTreeMap<String, String>) -> Result<Self> {
+        Self::parse(env)
     }
 
     pub(crate) fn parse(env: &BTreeMap<String, String>) -> Result<Self> {

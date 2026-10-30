@@ -1,8 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-use fube_runtime::{Cancellation, Epoch, ServiceFuture};
-use fube_transport::{Error, Result};
+use fube_runtime::{ApiFuture as ServiceFuture, Cancellation, Epoch, Error, Result};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,

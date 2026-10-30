@@ -7,6 +7,11 @@ pub struct ReplicaBinding {
     pub identity: ReplicaIdentity,
     pub generation: u64,
 }
+/// Optional private-integration progress sampling for a built-in engine. It
+/// grants no authority and is not an SDK discovery/control member.
+pub trait NativeProgressSource: Send + Sync {
+    fn sample_progress(&self) -> Result<ReplicationProgress>;
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeInvocationKind {
     CatchUpConfiguration,
@@ -42,25 +47,68 @@ pub struct NativeReplicaSet {
     pub write_quorum: usize,
     pub local_member: bool,
 }
+impl NativeReplica {
+    pub fn descriptor(&self) -> Result<NativeReplicaDescriptor> {
+        Ok(NativeReplicaDescriptor {
+            node_id: self.node_id,
+            node_instance: self.node_instance,
+            replica_id: self.replica_id,
+            incarnation: self.incarnation,
+            role: role(self.role)?,
+            previous_role: role(self.previous_role)?,
+            up: self.up,
+            ready: self.ready,
+            address: self.address.clone(),
+            progress: ReplicationProgress {
+                first: self.first_lsn,
+                last: self.last_lsn,
+            },
+            must_catch_up: self.must_catch_up,
+        })
+    }
+    pub fn sdk(&self) -> Result<crate::ReplicaInformation> {
+        Ok(self.descriptor()?.sdk())
+    }
+}
+impl NativeReplicaSet {
+    pub fn descriptor(&self) -> Result<NativeReplicaSetConfiguration> {
+        Ok(NativeReplicaSetConfiguration {
+            epoch: Epoch {
+                data_loss_number: self.epoch.data_loss,
+                configuration_number: self.epoch.configuration,
+            },
+            replicas: self
+                .replicas
+                .iter()
+                .map(NativeReplica::descriptor)
+                .collect::<Result<_>>()?,
+            write_quorum: self.write_quorum,
+            local_member: self.local_member,
+        })
+    }
+    pub fn sdk(&self) -> Result<crate::ReplicaSetConfig> {
+        self.descriptor()?.sdk()
+    }
+}
 fn native_role(role: ReplicaRole) -> i64 {
     match role {
         ReplicaRole::Unknown => 0,
         ReplicaRole::None => 1,
-        ReplicaRole::Idle => 2,
-        ReplicaRole::Secondary => 3,
+        ReplicaRole::IdleSecondary => 2,
+        ReplicaRole::ActiveSecondary => 3,
         ReplicaRole::Primary => 4,
     }
 }
 impl From<&Epoch> for NativeEpoch {
     fn from(epoch: &Epoch) -> Self {
         Self {
-            data_loss: epoch.data_loss,
-            configuration: epoch.configuration,
+            data_loss: epoch.data_loss_number,
+            configuration: epoch.configuration_number,
         }
     }
 }
-impl From<&ReplicaInformation> for NativeReplica {
-    fn from(replica: &ReplicaInformation) -> Self {
+impl From<&NativeReplicaDescriptor> for NativeReplica {
+    fn from(replica: &NativeReplicaDescriptor) -> Self {
         Self {
             node_id: replica.node_id,
             node_instance: replica.node_instance,
@@ -77,8 +125,8 @@ impl From<&ReplicaInformation> for NativeReplica {
         }
     }
 }
-impl From<&ReplicaSetConfiguration> for NativeReplicaSet {
-    fn from(config: &ReplicaSetConfiguration) -> Self {
+impl From<&NativeReplicaSetConfiguration> for NativeReplicaSet {
+    fn from(config: &NativeReplicaSetConfiguration) -> Self {
         Self {
             epoch: NativeEpoch::from(&config.epoch),
             replicas: config.replicas.iter().map(NativeReplica::from).collect(),
@@ -89,7 +137,7 @@ impl From<&ReplicaSetConfiguration> for NativeReplicaSet {
 }
 /// Binding only, never an alternative configuration/build/removal interface.
 pub trait NativeControlBinding: Send + Sync {
-    fn bind_invocation(&self, invocation: NativeInvocation) -> Result<Arc<dyn Replicator>>;
+    fn bind_invocation(&self, invocation: NativeInvocation) -> Result<Arc<dyn IPrimaryReplicator>>;
 }
 struct NativeUnit {
     binding: ReplicaBinding,
@@ -100,11 +148,32 @@ struct NativeUnit {
     engine_claimed: AtomicBool,
     actor: Mutex<Option<uuid::Uuid>>,
     binder: Mutex<Option<Weak<dyn NativeControlBinding>>>,
+    progress: Mutex<Option<Weak<dyn NativeProgressSource>>>,
     ledger: Mutex<Vec<Arc<Issued>>>,
 }
 /// Explicit non-SDK construction/integration capability. Only Runtime issues it.
 #[derive(Clone)]
 pub struct NativeRuntimeIntegration(Arc<NativeUnit>);
+/// Factory-owned explicit integration lookup. This is not a partition/SDK
+/// discovery member. Capture it synchronously during canonical creation.
+#[derive(Clone)]
+pub struct NativeIntegrationProvider(
+    Arc<dyn Fn(uuid::Uuid, i64) -> Result<NativeRuntimeIntegration> + Send + Sync>,
+);
+impl NativeIntegrationProvider {
+    pub(crate) fn new(
+        lookup: impl Fn(uuid::Uuid, i64) -> Result<NativeRuntimeIntegration> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(lookup))
+    }
+    pub fn capture(
+        &self,
+        partition: uuid::Uuid,
+        replica_id: i64,
+    ) -> Result<NativeRuntimeIntegration> {
+        (self.0)(partition, replica_id)
+    }
+}
 struct Issued {
     kind: NativeInvocationKind,
     request: w::ProxyRequest,
@@ -127,6 +196,9 @@ pub struct NativeInvocation {
     entered: Arc<AtomicBool>,
 }
 impl NativeInvocation {
+    pub fn cancellation(&self) -> Cancellation {
+        self.issued.cancellation.clone()
+    }
     pub fn kind(&self) -> NativeInvocationKind {
         self.issued.kind
     }
@@ -150,8 +222,14 @@ impl NativeInvocation {
     }
     pub fn full_epochs(&self) -> (NativeEpoch, NativeEpoch) {
         (
-            NativeEpoch::from(&api_epoch(&self.issued.request.unit.current)),
-            NativeEpoch::from(&api_epoch(&self.issued.request.unit.previous)),
+            NativeEpoch {
+                data_loss: self.issued.request.unit.current.data_loss,
+                configuration: self.issued.request.unit.current.configuration,
+            },
+            NativeEpoch {
+                data_loss: self.issued.request.unit.previous.data_loss,
+                configuration: self.issued.request.unit.previous.configuration,
+            },
         )
     }
     pub fn validate(&self) -> Result<()> {
@@ -166,6 +244,9 @@ impl NativeInvocation {
         let state = self.unit.state.upgrade().ok_or(Error::Closed)?;
         let state = state.lock().unwrap();
         if state.generation != self.binding().generation {
+            return Err(Error::Closed);
+        }
+        if *self.unit.actor.lock().unwrap() != self.issued.actor {
             return Err(Error::Closed);
         }
         if let Some((node, sequence)) = self.issued.remote {
@@ -188,19 +269,188 @@ impl NativeInvocation {
     }
 }
 impl NativeRuntimeIntegration {
+    pub fn install_progress_source(&self, source: &Arc<dyn NativeProgressSource>) -> Result<()> {
+        self.execution().check_constructor()?;
+        self.validate()?;
+        let mut current = self.0.progress.lock().unwrap();
+        if current
+            .as_ref()
+            .is_some_and(|source| source.strong_count() != 0)
+        {
+            return Err(Error::new(
+                crate::ErrorKind::InvalidState,
+                "native progress source already installed",
+            ));
+        }
+        *current = Some(Arc::downgrade(source));
+        Ok(())
+    }
+    pub(crate) fn progress_source(&self) -> Result<Option<Arc<dyn NativeProgressSource>>> {
+        self.validate()?;
+        let source = self
+            .0
+            .progress
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade);
+        self.validate()?;
+        Ok(source)
+    }
+    #[cfg(test)]
+    pub(crate) fn reporting_for_test(&self) -> Arc<crate::reporting::Reporting> {
+        self.0
+            .state
+            .upgrade()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .reporting
+            .clone()
+            .unwrap()
+    }
+    pub fn identity(&self) -> &ReplicaIdentity {
+        &self.0.binding.identity
+    }
     pub(super) fn retire_ledger(&self) {
         self.0.ledger.lock().unwrap().clear();
         self.0.binder.lock().unwrap().take();
-    }
-    pub fn from_partition(partition: &StatefulPartition) -> Result<Self> {
-        partition.ensure_valid()?;
-        partition
-            .native
-            .clone()
-            .ok_or(Error::InvalidInput("partition has no native issuer"))
+        self.0.progress.lock().unwrap().take();
     }
     pub fn binding(&self) -> &ReplicaBinding {
         &self.0.binding
+    }
+    pub fn status(&self) -> Result<ReplicaDiagnostics> {
+        self.validate()?;
+        let state = self.0.state.upgrade().ok_or(Error::Closed)?;
+        let status = state.lock().unwrap().status.lock().unwrap().clone();
+        self.validate()?;
+        Ok(status)
+    }
+    pub fn access_status(
+        &self,
+    ) -> Result<(ServicePartitionAccessStatus, ServicePartitionAccessStatus)> {
+        Ok(self.status()?.access())
+    }
+    pub fn authority_remaining(&self) -> Result<Duration> {
+        self.validate()?;
+        self.0.authority.remaining()
+    }
+    pub fn supervise_owned_callback(&self, timeout: Duration) -> Result<StatefulCallbackGuard> {
+        if timeout.is_zero() || timeout > Duration::from_secs(30) {
+            return Err(Error::InvalidInput(
+                "owned callback deadline must be >0 and <=30 seconds",
+            ));
+        }
+        Ok(StatefulCallbackGuard {
+            _deadline: self.0.authority.callback_deadline(timeout, true)?,
+        })
+    }
+    pub fn fault_delivery(&self) -> Option<crate::FaultDelivery> {
+        self.0
+            .state
+            .upgrade()?
+            .lock()
+            .unwrap()
+            .reporting
+            .as_ref()?
+            .fault_status()
+    }
+    pub fn report_fault(
+        &self,
+        fault: crate::FaultType,
+    ) -> crate::ApiFuture<'_, crate::FaultDelivery> {
+        Box::pin(async move {
+            self.validate()?;
+            let reporting = self
+                .0
+                .state
+                .upgrade()
+                .ok_or(Error::Closed)?
+                .lock()
+                .unwrap()
+                .reporting
+                .clone()
+                .ok_or(Error::Closed)?;
+            reporting.fault(fault).await
+        })
+    }
+    pub fn capture_configuration(
+        &self,
+        current: &crate::ReplicaSetConfig,
+        previous: Option<&crate::ReplicaSetConfig>,
+    ) -> Result<NativeInvocation> {
+        let kind = if previous.is_some() {
+            NativeInvocationKind::CatchUpConfiguration
+        } else {
+            NativeInvocationKind::CurrentConfiguration
+        };
+        let invocation = self.lookup_record(kind, None, None)?;
+        let (cc, pc) = invocation
+            .configuration()
+            .ok_or(Error::InvalidInput("missing native configuration"))?;
+        if cc.sdk()? != *current || pc.map(NativeReplicaSet::sdk).transpose()?.as_ref() != previous
+        {
+            return Err(Error::InvalidInput(
+                "configuration differs from native projection",
+            ));
+        }
+        Ok(invocation)
+    }
+    /// Captures the exact native target before an async Build future is returned.
+    pub fn capture_build(&self, replica: &crate::ReplicaInformation) -> Result<NativeInvocation> {
+        let invocation = self.lookup_record(NativeInvocationKind::Build, Some(replica.id), None)?;
+        if invocation
+            .replica()
+            .map(NativeReplica::sdk)
+            .transpose()?
+            .as_ref()
+            != Some(replica)
+        {
+            return Err(Error::InvalidInput("build differs from native projection"));
+        }
+        Ok(invocation)
+    }
+    pub fn capture_removal(&self, replica_id: i64) -> Result<NativeInvocation> {
+        self.lookup_record(
+            NativeInvocationKind::Remove(ReplicaRemoval::Idle),
+            Some(replica_id),
+            None,
+        )
+    }
+    /// Native-aware custom controls may observe the currently issued cleanup
+    /// purpose. This does not select a new target or authorize a later retry.
+    pub fn capture_pending_removal(&self, replica_id: i64) -> Result<NativeInvocation> {
+        let ledger = self.0.ledger.lock().unwrap().clone();
+        let mut valid = Vec::new();
+        for issued in ledger.into_iter().rev() {
+            if matches!(issued.kind, NativeInvocationKind::Remove(_))
+                && issued
+                    .replica
+                    .as_ref()
+                    .is_some_and(|r| r.replica_id == replica_id)
+            {
+                let invocation = NativeInvocation {
+                    unit: self.0.clone(),
+                    issued,
+                    entered: Arc::new(AtomicBool::new(false)),
+                };
+                if invocation.validate().is_ok() {
+                    valid.push(invocation);
+                }
+            }
+        }
+        let selected = valid
+            .first()
+            .ok_or(Error::InvalidInput("native removal is not authorized"))?
+            .clone();
+        if valid
+            .iter()
+            .any(|other| other.replica() != selected.replica())
+        {
+            return Err(Error::InvalidInput("ambiguous native removal"));
+        }
+        Ok(selected)
     }
     pub fn execution(&self) -> crate::extensions::ExecutionRuntime {
         self.0.execution.clone()
@@ -245,7 +495,10 @@ impl NativeRuntimeIntegration {
             return Err(Error::InvalidInput("native control actor mismatch"));
         }
         let mut current = self.0.binder.lock().unwrap();
-        if current.as_ref().and_then(Weak::upgrade).is_some() {
+        if current
+            .as_ref()
+            .is_some_and(|binding| binding.strong_count() != 0)
+        {
             return Err(Error::InvalidInput("native binding already installed"));
         }
         *current = Some(Arc::downgrade(binder));
@@ -260,50 +513,55 @@ impl NativeRuntimeIntegration {
         node: Option<[u8; 16]>,
     ) -> Result<NativeInvocation> {
         self.validate()?;
-        let ledger = self.0.ledger.lock().unwrap();
-        let mut candidates = ledger.iter().filter(|issued| {
-            if issued.kind != kind {
-                return false;
-            }
-            if node.is_some_and(|node| {
-                !issued
-                    .replica
-                    .as_ref()
-                    .is_some_and(|replica| replica.node_id == node)
-            }) {
-                return false;
-            }
-            match kind {
-                NativeInvocationKind::CurrentConfiguration
-                | NativeInvocationKind::CatchUpConfiguration => issued.kind == kind,
-                NativeInvocationKind::Build => {
-                    issued.kind == kind
-                        && issued
-                            .replica
-                            .as_ref()
-                            .is_some_and(|replica| Some(replica.replica_id) == replica_id)
+        // Never hold the ledger while validating against State: issue uses
+        // State -> ledger order. Revoked records cannot shadow a replacement.
+        let ledger = self.0.ledger.lock().unwrap().clone();
+        let mut candidates = ledger
+            .iter()
+            .filter(|issued| {
+                if issued.kind != kind {
+                    return false;
                 }
-                NativeInvocationKind::Remove(_) => issued
-                    .replica
-                    .as_ref()
-                    .is_some_and(|replica| Some(replica.replica_id) == replica_id),
-            }
-        });
+                if node.is_some_and(|node| {
+                    !issued
+                        .replica
+                        .as_ref()
+                        .is_some_and(|replica| replica.node_id == node)
+                }) {
+                    return false;
+                }
+                match kind {
+                    NativeInvocationKind::CurrentConfiguration
+                    | NativeInvocationKind::CatchUpConfiguration => issued.kind == kind,
+                    NativeInvocationKind::Build => {
+                        issued.kind == kind
+                            && issued
+                                .replica
+                                .as_ref()
+                                .is_some_and(|replica| Some(replica.replica_id) == replica_id)
+                    }
+                    NativeInvocationKind::Remove(_) => issued
+                        .replica
+                        .as_ref()
+                        .is_some_and(|replica| Some(replica.replica_id) == replica_id),
+                }
+            })
+            .filter_map(|issued| {
+                let invocation = NativeInvocation {
+                    unit: self.0.clone(),
+                    issued: issued.clone(),
+                    entered: Arc::new(AtomicBool::new(false)),
+                };
+                invocation.validate().ok().map(|()| invocation)
+            });
         let selected = candidates
             .next()
-            .ok_or(Error::InvalidInput("native operation is not authorized"))?
-            .clone();
-        if candidates.any(|other| other.replica != selected.replica) {
+            .ok_or(Error::InvalidInput("native operation is not authorized"))?;
+        if candidates.any(|other| other.replica() != selected.replica()) {
             return Err(Error::InvalidInput("ambiguous native replica authority"));
         }
-        drop(ledger);
-        let invocation = NativeInvocation {
-            unit: self.0.clone(),
-            issued: selected,
-            entered: Arc::new(AtomicBool::new(false)),
-        };
-        invocation.validate()?;
-        Ok(invocation)
+        selected.validate()?;
+        Ok(selected)
     }
     pub(super) fn new(
         unit: &Unit,
@@ -325,27 +583,40 @@ impl NativeRuntimeIntegration {
             engine_claimed: AtomicBool::new(false),
             actor: Mutex::new(None),
             binder: Mutex::new(None),
+            progress: Mutex::new(None),
             ledger: Mutex::new(Vec::new()),
         }))
     }
 }
+pub(super) struct IssueInput {
+    pub kind: NativeInvocationKind,
+    pub current: Option<NativeReplicaSetConfiguration>,
+    pub previous: Option<NativeReplicaSetConfiguration>,
+    pub replica: Option<NativeReplicaDescriptor>,
+    pub revision: (Arc<AtomicU64>, u64),
+    pub remote: Option<([u8; 16], u64)>,
+    pub cancellation: Cancellation,
+}
 pub(super) fn issue(
     unit: &Unit,
     request: &w::ProxyRequest,
-    kind: NativeInvocationKind,
-    current: Option<ReplicaSetConfiguration>,
-    previous: Option<ReplicaSetConfiguration>,
-    replica: Option<ReplicaInformation>,
-    revision: (Arc<AtomicU64>, u64),
-    remote: Option<([u8; 16], u64)>,
-    cancellation: Cancellation,
+    input: IssueInput,
 ) -> Result<NativeInvocation> {
+    let IssueInput {
+        kind,
+        current,
+        previous,
+        replica,
+        revision,
+        remote,
+        cancellation,
+    } = input;
     let state = unit.state.lock().unwrap();
     let native = state.native.as_ref().ok_or(Error::Closed)?;
     let status = state.status.lock().unwrap();
     let prewrite = (status.lifecycle == ReplicaLifecycle::Open
         && status.replicator_open
-        && status.current_role == ReplicaRole::Secondary
+        && status.current_role == ReplicaRole::ActiveSecondary
         && status.service_role == ReplicaRole::Primary
         && status.replicator_role == ReplicaRole::Primary
         && status.configuration_stage == ConfigurationStage::PreWriteRevoke)
@@ -386,8 +657,8 @@ pub(super) fn issue(
 }
 pub(super) fn bind(
     invocation: NativeInvocation,
-    fallback: Arc<dyn Replicator>,
-) -> Result<Arc<dyn Replicator>> {
+    fallback: Arc<dyn IPrimaryReplicator>,
+) -> Result<Arc<dyn IPrimaryReplicator>> {
     invocation.validate()?;
     let integration = NativeRuntimeIntegration(invocation.unit.clone());
     let selected = integration.lookup_record(

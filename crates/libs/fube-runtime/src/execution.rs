@@ -1,5 +1,5 @@
 use crate::lease::{Authority, CallbackDeadline, OwnedThread};
-use fube_transport::{Error, Result};
+use crate::{Error, Result};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -324,12 +324,6 @@ impl ExecutionRuntime {
             Authority::new(Instant::now(), i64::MAX / 100)?,
             application,
             false,
-        ))
-    }
-    pub fn from_partition(partition: &crate::StatefulPartition) -> Result<Self> {
-        partition.ensure_valid()?;
-        partition.execution.clone().ok_or(Error::InvalidInput(
-            "partition has no execution integration",
         ))
     }
     pub(crate) fn new(authority: Arc<Authority>, application: tokio::runtime::Handle) -> Self {
@@ -778,7 +772,8 @@ impl<T: Send + 'static> Future for Root<T> {
                     return Poll::Ready(Err(Error::Closed));
                 }
                 match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
-                    Ok(polled) => polled,
+                    Ok(polled) => polled
+                        .map(|result| result.map_err(|error| error.supervised(&self.0.runtime))),
                     Err(_) => {
                         self.0.runtime.retire();
                         Poll::Ready(Err(Error::Protocol("owned callback panicked")))

@@ -11,7 +11,7 @@ from tests.onebox.shared import runtime
 
 
 def snapshot():
-    epoch={"data_loss":1,"configuration":(1<<32)+1}
+    epoch={"data_loss_number":1,"configuration_number":(1<<32)+1}
     service="fabric:/Owned/Stateful"
     rpc={"service":service,"partition":"partition","replica":7,"incarnation":8,"node":"node","host":"host",
          "pid":11,"role":"Primary","replicator_role":"Primary","current_role":"Primary",
@@ -25,7 +25,7 @@ def snapshot():
                          "deployed":{"host_process_id":11,"service_type_name":"RustStatefulRuntimeType"},
                          "control":{"version":1,"state":"empty","partition":"partition","replica":7,"incarnation":8,
                                     "first":0,"last":0,"role":"Primary",
-                                    "epoch":{"data_loss":1,"configuration":1<<32}}}],
+                                    "epoch":{"data_loss_number":1,"configuration_number":1<<32}}}],
             "primary":{"resolver":"fube-client","rpc":copy.deepcopy(rpc),"native_pid":11,
                        "endpoint":rpc["service_address"]}}
 
@@ -81,17 +81,23 @@ class StatefulEvidenceTests(unittest.TestCase):
             secondary=copy.deepcopy(value["replicas"][0])
             secondary.update(node=node,replica=replica,role="ActiveSecondary",address=f"http://127.0.0.1:{pid}/service",service_http_status=503)
             secondary["rpc"].update(node=node,replica=replica,pid=pid,host=node,
-                role="Secondary",replicator_role="Secondary",current_role="Secondary",
+                role="ActiveSecondary",replicator_role="ActiveSecondary",current_role="ActiveSecondary",
                 service_address=secondary["address"],replication_address=f"http://127.0.0.1:{pid+100}/control",
                 read_status="NotPrimary",write_status="NotPrimary")
             secondary["deployed"]["host_process_id"]=pid
-            secondary["control"].update(replica=replica,role="Secondary")
+            secondary["control"].update(replica=replica,role="ActiveSecondary")
             value["replicas"].append(secondary)
         runtime.assert_stateful(value,value["service"],3,2)
         for mutate in [
             lambda v:v["replicas"][1].update(node="node"),
             lambda v:v["replicas"][1].update(service_http_status=200),
             lambda v:v["replicas"][1]["rpc"].update(read_status="Granted"),
+            lambda v:v["replicas"][1]["rpc"].update(role="Secondary"),
+            lambda v:v["replicas"][1]["rpc"].update(replicator_role="Secondary"),
+            lambda v:v["replicas"][1]["rpc"].update(current_role="Secondary"),
+            lambda v:v["replicas"][1]["control"].update(role="Secondary"),
+            lambda v:v["replicas"][1]["rpc"].update(role="IdleSecondary"),
+            lambda v:v["replicas"][1]["rpc"].update(role="Idle"),
         ]:
             bad=copy.deepcopy(value);mutate(bad)
             with self.assertRaises(RuntimeError):runtime.assert_stateful(bad,value["service"],3,2)
@@ -107,9 +113,10 @@ class StatefulEvidenceTests(unittest.TestCase):
             lambda v:v["replicas"][0]["rpc"].update(incarnation=9),
             lambda v:v["replicas"][0]["rpc"].update(read_status="ReconfigurationPending"),
             lambda v:v["replicas"][0]["rpc"].update(replication_address=v["replicas"][0]["address"]),
-            lambda v:v["replicas"][0]["rpc"].update(epoch={"data_loss":2,"configuration":(1<<32)+1}),
+            lambda v:v["replicas"][0]["rpc"].update(epoch={"data_loss_number":2,"configuration_number":(1<<32)+1}),
             lambda v:v["replicas"][0]["control"].update(last=1),
-            lambda v:v["replicas"][0]["control"].update(epoch={"data_loss":1,"configuration":2<<32}),
+            lambda v:v["replicas"][0]["control"].update(epoch={"data_loss_number":1,"configuration_number":2<<32}),
+            lambda v:v["replicas"][0]["control"].update(epoch={"data_loss":1,"configuration":1<<32}),
             lambda v:v["replicas"][0]["rpc"]["replicator"].update(durability=True),
         ]
         for mutate in mutations:

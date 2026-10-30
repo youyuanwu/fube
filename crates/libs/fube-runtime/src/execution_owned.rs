@@ -936,6 +936,27 @@ impl ExecutionRuntime {
                 .is_some_and(|entry| Arc::ptr_eq(&entry.active.authority, &self.inner.authority))
         })
     }
+    /// Absolute deadline for a canonical synchronous waiting operation. This
+    /// accepts only this owner's supervised entry, never an arbitrary async
+    /// worker. It neither reserves recursively nor extends the enclosing budget.
+    pub fn blocking_deadline(&self) -> Result<Instant> {
+        Self::blocking_deadline_for(&self.inner.authority)
+    }
+    pub(crate) fn blocking_deadline_for(authority: &Arc<Authority>) -> Result<Instant> {
+        ENTRY.with(|entry| match entry.borrow().as_ref() {
+            Some(entry) if Arc::ptr_eq(&entry.active.authority, authority) && !entry.cleanup => {
+                authority.check()?;
+                Ok(entry
+                    .scope
+                    .as_ref()
+                    .map_or_else(|| entry.active.until(), |scope| scope.until))
+            }
+            _ => Err(Error::new(
+                crate::ErrorKind::InvalidExecutionContext,
+                "canonical synchronous wait requires a reserved runtime execution entry",
+            )),
+        })
+    }
     pub(crate) fn set_current_generation(&self, generation: u64) {
         ENTRY.with(|entry| {
             if let Some(entry) = entry.borrow_mut().as_mut() {

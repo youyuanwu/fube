@@ -41,12 +41,12 @@ use std::sync::atomic::{AtomicI64, AtomicUsize};
 use uuid::Uuid;
 
 const EPOCH: Epoch = Epoch {
-    data_loss: 1,
-    configuration: 0x1_0000_0000,
+    data_loss_number: 1,
+    configuration_number: 0x1_0000_0000,
 };
 const NEXT_EPOCH: Epoch = Epoch {
-    data_loss: 1,
-    configuration: 0x2_0000_0000,
+    data_loss_number: 1,
+    configuration_number: 0x2_0000_0000,
 };
 
 #[tokio::test]
@@ -72,8 +72,8 @@ async fn promoted_prefix_without_retained_suffix_accepts_bounded_existing_peer_r
         node_instance: 1,
         replica_id: 2,
         incarnation: 1,
-        role: ReplicaRole::Secondary,
-        previous_role: ReplicaRole::Secondary,
+        role: ReplicaRole::ActiveSecondary,
+        previous_role: ReplicaRole::ActiveSecondary,
         up: true,
         ready: true,
         address: remote.to_string(),
@@ -125,7 +125,7 @@ async fn promoted_prefix_without_retained_suffix_accepts_bounded_existing_peer_r
     assert_eq!(primary.snapshot().peers[0].applied, 20);
     assert_eq!(primary.snapshot().progress.assigned, 20);
     primary
-        .change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     primary
@@ -203,7 +203,7 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
         .await
         .unwrap();
     secondary
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     primary
@@ -211,11 +211,11 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
         .await
         .unwrap();
     secondary
-        .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     let mut member = descriptor(&secondary);
-    member.role = ReplicaRole::Secondary;
+    member.role = ReplicaRole::ActiveSecondary;
     member.ready = true;
     primary
         .update_current_configuration(configuration(vec![member], true, 2), cancel())
@@ -290,7 +290,7 @@ async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
         .await
         .unwrap();
     target
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     let completed_build = cancel();
@@ -368,10 +368,10 @@ async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
         primary.transport.diagnostics()
     );
     let mut member = descriptor(&target);
-    member.role = ReplicaRole::Secondary;
+    member.role = ReplicaRole::ActiveSecondary;
     member.ready = true;
     target
-        .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     primary
@@ -507,7 +507,7 @@ async fn nonempty_live_copy_uses_previous_quorum_horizon_and_applied_finish_fenc
         .unwrap();
     for secondary in [&slow, &fast] {
         secondary
-            .change_role(EPOCH, ReplicaRole::Idle, cancel())
+            .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
         p.build_replica(descriptor(secondary), cancel())
@@ -549,7 +549,7 @@ async fn nonempty_live_copy_uses_previous_quorum_horizon_and_applied_finish_fenc
     assert_eq!(p.snapshot().progress.committed, 0);
     source.snapshots.store(true, Ordering::Release);
     target
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     let build = p.build_replica(descriptor(&target), cancel());
@@ -754,7 +754,7 @@ async fn copy_provider_error_panic_deadline_and_unavailable_history_fence_and_di
         p.update_current_configuration(configuration(vec![], true, 1), cancel())
             .await
             .unwrap();
-        s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+        s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
         assert!(p.build_replica(descriptor(&s), cancel()).await.is_err());
@@ -892,7 +892,7 @@ async fn unfinished_copy_rejects_epoch_update_and_promotion_without_success() {
         p.update_current_configuration(configuration(vec![], true, 1), cancel())
             .await
             .unwrap();
-        s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+        s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
         let cancellation = cancel();
@@ -903,7 +903,7 @@ async fn unfinished_copy_rejects_epoch_update_and_promotion_without_success() {
             .is_err());
         let pending = s.copy_stream().next(cancel()).await.unwrap().unwrap();
         let next = Epoch {
-            configuration: EPOCH.configuration * 2,
+            configuration_number: EPOCH.configuration_number * 2,
             ..EPOCH
         };
         let result = if promote {
@@ -978,7 +978,7 @@ async fn promotion_drains_contiguous_received_before_discarding_only_out_of_orde
     until(|| secondary.snapshot().progress.assigned == 68).await;
     assert_eq!(secondary.snapshot().progress.received, 66);
     let next = Epoch {
-        configuration: EPOCH.configuration * 2,
+        configuration_number: EPOCH.configuration_number * 2,
         ..EPOCH
     };
     let promotion = secondary.change_role(next, ReplicaRole::Primary, cancel());
@@ -1125,7 +1125,7 @@ async fn configuration_captures_preexisting_assigned_fence_but_not_later_writes(
         } else {
             p.update_current_configuration(cc, cancel()).await.unwrap();
         }
-        let wait = p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel());
+        let wait = p.wait_for_catch_up(CatchUpMode::Write, cancel());
         tokio::pin!(wait);
         assert!(timeout(std::time::Duration::from_millis(80), &mut wait)
             .await
@@ -1159,7 +1159,7 @@ async fn configuration_captures_preexisting_assigned_fence_but_not_later_writes(
         provider.last.store(2, Ordering::Release);
         timeout(
             std::time::Duration::from_secs(1),
-            p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel()),
+            p.wait_for_catch_up(CatchUpMode::Write, cancel()),
         )
         .await
         .unwrap()
@@ -1255,7 +1255,7 @@ async fn promotion_total_deadline_covers_receive_drain_and_final_callback_public
     );
     until(|| secondary.snapshot().copy_done).await;
     secondary
-        .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     raw_send(
@@ -1313,7 +1313,7 @@ async fn quiet_promotion_drain_wakes_on_absolute_deadline_or_cancellation_withou
         );
         until(|| secondary.snapshot().copy_done).await;
         secondary
-            .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+            .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
             .await
             .unwrap();
         raw_send(
@@ -1821,11 +1821,11 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
     let mut old_primary = 0;
     for (round, new_primary) in [1, 2, 0].into_iter().enumerate() {
         let epoch = Epoch {
-            configuration: EPOCH.configuration * (round as i64 + 2),
+            configuration_number: EPOCH.configuration_number * (round as i64 + 2),
             ..EPOCH
         };
         engines[old_primary]
-            .change_role(epoch, ReplicaRole::Secondary, cancel())
+            .change_role(epoch, ReplicaRole::ActiveSecondary, cancel())
             .await
             .unwrap();
         for (index, engine) in engines.iter().enumerate() {
@@ -1842,7 +1842,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
             let role = if index == new_primary {
                 ReplicaRole::Primary
             } else {
-                ReplicaRole::Secondary
+                ReplicaRole::ActiveSecondary
             };
             status.current_epoch = epoch;
             status.current_role = role;
@@ -1858,7 +1858,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
                     peer.role = if other == new_primary {
                         ReplicaRole::Primary
                     } else {
-                        ReplicaRole::Secondary
+                        ReplicaRole::ActiveSecondary
                     };
                     // Deliberately no native progress attestation: this regression
                     // must get actual fresh network ACKs, not catch-up-only proof.
@@ -1927,7 +1927,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
         old_primary = new_primary;
     }
     for engine in &engines {
-        abort_owned(&engine).await;
+        abort_owned(engine).await;
     }
 }
 
@@ -1970,7 +1970,7 @@ async fn native_completed_prefix_attestation_is_not_a_new_write_or_all_ack() {
         .unwrap();
     timeout(
         std::time::Duration::from_secs(1),
-        p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel()),
+        p.wait_for_catch_up(CatchUpMode::Write, cancel()),
     )
     .await
     .unwrap()
@@ -2012,11 +2012,11 @@ async fn native_directed_planned_swap_preserves_stream_and_reconciled_sequence()
     p.update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
-    s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+    s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     p.build_replica(descriptor(&s), cancel()).await.unwrap();
-    s.change_role(EPOCH, ReplicaRole::Secondary, cancel())
+    s.change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     p.update_current_configuration(configuration(vec![descriptor(&s)], true, 2), cancel())
@@ -2042,10 +2042,10 @@ async fn native_directed_planned_swap_preserves_stream_and_reconciled_sequence()
         write.wait(cancel()).await.unwrap();
     }
     let next = Epoch {
-        configuration: EPOCH.configuration * 2,
+        configuration_number: EPOCH.configuration_number * 2,
         ..EPOCH
     };
-    p.change_role(next, ReplicaRole::Secondary, cancel())
+    p.change_role(next, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     s.change_role(next, ReplicaRole::Primary, cancel())
@@ -2099,7 +2099,7 @@ async fn failed_build_cleanup_allows_retry_but_actual_remove_tombstones_native_i
     p.update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
-    s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+    s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     for reason in [ReplicaRemoval::BuildRetryCleanup, ReplicaRemoval::Idle] {
@@ -2138,7 +2138,7 @@ async fn copy_gap_empty_data_duplicate_and_legacy_eos_require_every_explicit_app
     let partition = Uuid::new_v4();
     let secondary = engine(partition, 2, Arc::new(Provider::default()));
     secondary
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     let (network, mut incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
@@ -2239,7 +2239,7 @@ async fn missing_service_apply_deadline_fences_without_receipt_as_commit_and_dis
     p.update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
-    s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+    s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     p.build_replica(descriptor(&s), cancel()).await.unwrap();
@@ -2377,8 +2377,8 @@ fn descriptor(engine: &Engine) -> ReplicaInformation {
         node_instance: 1,
         replica_id: engine.endpoint.actor.replica,
         incarnation: 1,
-        role: ReplicaRole::Secondary,
-        previous_role: ReplicaRole::Secondary,
+        role: ReplicaRole::ActiveSecondary,
+        previous_role: ReplicaRole::ActiveSecondary,
         up: true,
         ready: true,
         address: engine.endpoint.to_string(),
@@ -2411,7 +2411,7 @@ impl NativeControlView for SourceNativeView {
     fn report_fault(
         &self,
         _: fube_runtime::FaultType,
-    ) -> ServiceFuture<'_, fube_runtime::FaultDelivery> {
+    ) -> ServiceFuture<'_, fube_runtime::extensions::FaultDelivery> {
         Box::pin(async { Err(Error::Closed) })
     }
 }
@@ -2422,17 +2422,17 @@ fn prewrite_status() -> ReplicaStatus {
         service_role: ReplicaRole::Primary,
         replicator_role: ReplicaRole::Primary,
         replicator_open: true,
-        current_role: ReplicaRole::Secondary,
+        current_role: ReplicaRole::ActiveSecondary,
         current_epoch: Epoch {
-            configuration: NEXT_EPOCH.configuration + 7,
+            configuration_number: NEXT_EPOCH.configuration_number + 7,
             ..NEXT_EPOCH
         },
         previous_epoch: Epoch {
-            configuration: EPOCH.configuration + 3,
+            configuration_number: EPOCH.configuration_number + 3,
             ..EPOCH
         },
         configuration_stage: ConfigurationStage::PreWriteRevoke,
-        catch_up: fube_runtime::CatchUpResult::NotStarted,
+        catch_up: fube_runtime::extensions::CatchUpResult::NotStarted,
         minimum_replica_set_size: 1,
         configuration: vec![],
         service_address: String::new(),
@@ -2447,7 +2447,7 @@ fn primary_status() -> ReplicaStatus {
         current_epoch: EPOCH,
         previous_epoch: Epoch::INVALID,
         configuration_stage: ConfigurationStage::Current,
-        catch_up: fube_runtime::CatchUpResult::Completed,
+        catch_up: fube_runtime::extensions::CatchUpResult::Completed,
         ..prewrite_status()
     }
 }
@@ -2490,10 +2490,10 @@ async fn native_singleton_requires_stable_runtime_membership_not_primary_role_al
     let variants: &[fn(&mut ReplicaStatus)] = &[
         |s: &mut ReplicaStatus| s.lifecycle = ReplicaLifecycle::Closing,
         |s: &mut ReplicaStatus| s.configuration_stage = ConfigurationStage::CatchUp,
-        |s: &mut ReplicaStatus| s.catch_up = fube_runtime::CatchUpResult::NotStarted,
+        |s: &mut ReplicaStatus| s.catch_up = fube_runtime::extensions::CatchUpResult::NotStarted,
         |s: &mut ReplicaStatus| s.current_epoch = NEXT_EPOCH,
         |s: &mut ReplicaStatus| s.replicator_open = false,
-        |s: &mut ReplicaStatus| s.service_role = ReplicaRole::Secondary,
+        |s: &mut ReplicaStatus| s.service_role = ReplicaRole::ActiveSecondary,
     ];
     for mutate in variants {
         let mut status = primary_status();
@@ -2575,14 +2575,14 @@ async fn three_loopback_engines_require_explicit_apply_for_one_hundred_writes() 
         .unwrap();
     for secondary in [&s1, &s2] {
         secondary
-            .change_role(EPOCH, ReplicaRole::Idle, cancel())
+            .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
         p.build_replica(descriptor(secondary), cancel())
             .await
             .unwrap();
         secondary
-            .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+            .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
             .await
             .unwrap();
     }
@@ -2662,7 +2662,7 @@ async fn pair_with_native_view(
         .await
         .unwrap();
     secondary
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     primary
@@ -2670,7 +2670,7 @@ async fn pair_with_native_view(
         .await
         .unwrap();
     secondary
-        .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     (primary, secondary, provider)
@@ -2690,11 +2690,11 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
     p.update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
-    s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+    s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     p.build_replica(descriptor(&s), cancel()).await.unwrap();
-    s.change_role(EPOCH, ReplicaRole::Secondary, cancel())
+    s.change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     let previous = configuration(vec![descriptor(&s)], true, 2);
@@ -2758,7 +2758,7 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
     status.configuration_stage = ConfigurationStage::CatchUp;
     assert_eq!(
         status.access().1,
-        fube_runtime::AccessStatus::ReconfigurationPending
+        fube_runtime::ServicePartitionAccessStatus::ReconfigurationPending
     );
     *view.0.lock().unwrap() = Ok(status);
     p.update_epoch(NEXT_EPOCH, cancel()).await.unwrap();
@@ -2767,7 +2767,7 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
     // Engine readiness after UpdateEpoch is not the independent native gate.
     assert_eq!(
         view.status().unwrap().access().1,
-        fube_runtime::AccessStatus::ReconfigurationPending
+        fube_runtime::ServicePartitionAccessStatus::ReconfigurationPending
     );
     p.update_catch_up_configuration(current, previous, cancel())
         .await
@@ -2776,14 +2776,14 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
         .await
         .unwrap();
     let mut status = view.status().unwrap();
-    status.catch_up = fube_runtime::CatchUpResult::Completed;
+    status.catch_up = fube_runtime::extensions::CatchUpResult::Completed;
     *view.0.lock().unwrap() = Ok(status);
-    p.change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+    p.change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     let mut status = view.status().unwrap();
-    status.service_role = ReplicaRole::Secondary;
-    status.replicator_role = ReplicaRole::Secondary;
+    status.service_role = ReplicaRole::ActiveSecondary;
+    status.replicator_role = ReplicaRole::ActiveSecondary;
     status.configuration_stage = ConfigurationStage::Current;
     *view.0.lock().unwrap() = Ok(status);
     s.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
@@ -2845,16 +2845,16 @@ async fn native_prewrite_rejects_wrong_views_future_pc_and_stale_cc_without_muta
         |s| s.configuration_stage = ConfigurationStage::Current,
         |s| s.configuration_stage = ConfigurationStage::CatchUp,
         |s| s.current_role = ReplicaRole::Primary,
-        |s| s.current_role = ReplicaRole::Idle,
-        |s| s.service_role = ReplicaRole::Secondary,
-        |s| s.replicator_role = ReplicaRole::Secondary,
+        |s| s.current_role = ReplicaRole::IdleSecondary,
+        |s| s.service_role = ReplicaRole::ActiveSecondary,
+        |s| s.replicator_role = ReplicaRole::ActiveSecondary,
         |s| s.replicator_open = false,
         |s| s.lifecycle = ReplicaLifecycle::Opening,
         |s| s.lifecycle = ReplicaLifecycle::Closing,
         |s| s.lifecycle = ReplicaLifecycle::Closed,
         |s| s.current_epoch = EPOCH,
-        |s| s.current_epoch.configuration += 0x1_0000_0000,
-        |s| s.current_epoch.data_loss += 1,
+        |s| s.current_epoch.configuration_number += 0x1_0000_0000,
+        |s| s.current_epoch.data_loss_number += 1,
         |s| s.previous_epoch = NEXT_EPOCH,
         |s| s.previous_epoch = Epoch::INVALID,
     ];
@@ -2892,16 +2892,16 @@ async fn native_prewrite_rejects_wrong_views_future_pc_and_stale_cc_without_muta
     for epoch in [
         NEXT_EPOCH,
         Epoch {
-            data_loss: 2,
-            configuration: 0,
+            data_loss_number: 2,
+            configuration_number: 0,
         },
         Epoch {
-            data_loss: -1,
-            configuration: EPOCH.configuration,
+            data_loss_number: -1,
+            configuration_number: EPOCH.configuration_number,
         },
         Epoch {
-            data_loss: 1,
-            configuration: -1,
+            data_loss_number: 1,
+            configuration_number: -1,
         },
         Epoch::INVALID,
     ] {
@@ -2918,7 +2918,7 @@ async fn native_prewrite_rejects_wrong_views_future_pc_and_stale_cc_without_muta
     // The active PC must match native provenance even when it is an older,
     // otherwise valid epoch.
     let mut wrong_pc = previous.clone();
-    wrong_pc.epoch.data_loss = 0;
+    wrong_pc.epoch.data_loss_number = 0;
     assert!(p
         .update_catch_up_configuration(current.clone(), wrong_pc, cancel())
         .await
@@ -2936,7 +2936,7 @@ async fn native_prewrite_rejects_wrong_views_future_pc_and_stale_cc_without_muta
         .await
         .is_err());
     let mut future = current.clone();
-    future.epoch.configuration += 0x1_0000_0000;
+    future.epoch.configuration_number += 0x1_0000_0000;
     assert!(p
         .update_current_configuration(future, cancel())
         .await
@@ -2964,12 +2964,12 @@ async fn unqualified_configuration_cannot_advance_or_rewind_native_epoch() {
     for epoch in [
         NEXT_EPOCH,
         Epoch {
-            data_loss: 2,
-            configuration: 0,
+            data_loss_number: 2,
+            configuration_number: 0,
         },
         Epoch {
-            data_loss: 0,
-            configuration: NEXT_EPOCH.configuration,
+            data_loss_number: 0,
+            configuration_number: NEXT_EPOCH.configuration_number,
         },
     ] {
         let mut current = configuration(vec![], true, 1);
@@ -2992,12 +2992,12 @@ async fn unqualified_configuration_cannot_advance_or_rewind_native_epoch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catchup() {
     let mut status = primary_status();
-    status.service_role = ReplicaRole::Secondary;
-    status.replicator_role = ReplicaRole::Secondary;
-    status.current_role = ReplicaRole::Secondary;
+    status.service_role = ReplicaRole::ActiveSecondary;
+    status.replicator_role = ReplicaRole::ActiveSecondary;
+    status.current_role = ReplicaRole::ActiveSecondary;
     let view = Arc::new(SourceNativeView(Mutex::new(Ok(status))));
     let (old, p, provider) = pair_with_native_view(Some(view.clone())).await;
-    old.change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+    old.change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     p.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
@@ -3007,7 +3007,7 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
     status.current_epoch = NEXT_EPOCH;
     status.previous_epoch = EPOCH;
     status.configuration_stage = ConfigurationStage::CatchUp;
-    status.catch_up = fube_runtime::CatchUpResult::NotStarted;
+    status.catch_up = fube_runtime::extensions::CatchUpResult::NotStarted;
     status.configuration = vec![descriptor(&old)];
     *view.0.lock().unwrap() = Ok(status);
     let mut current = configuration(vec![], true, 1);
@@ -3021,8 +3021,8 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
     // larger configuration number without becoming a future PC.
     let mut older = configuration(vec![], true, 1);
     older.epoch = Epoch {
-        data_loss: 0,
-        configuration: NEXT_EPOCH.configuration + 0x1_0000_0000,
+        data_loss_number: 0,
+        configuration_number: NEXT_EPOCH.configuration_number + 0x1_0000_0000,
     };
     p.update_catch_up_configuration(current.clone(), older, cancel())
         .await
@@ -3052,7 +3052,7 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
     .await
     .is_err());
     // Native catch-up uses CC plus the retained fence, not PC write commitment.
-    p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel())
+    p.wait_for_catch_up(CatchUpMode::Write, cancel())
         .await
         .unwrap();
     let mut required = current.clone();
@@ -3062,7 +3062,7 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
     p.update_catch_up_configuration(required, previous.clone(), cancel())
         .await
         .unwrap();
-    for mode in [CatchUpMode::WriteQuorum, CatchUpMode::All] {
+    for mode in [CatchUpMode::Write, CatchUpMode::All] {
         assert!(timeout(
             std::time::Duration::from_millis(40),
             p.wait_for_catch_up(mode, cancel())
@@ -3081,7 +3081,7 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
         .await
         .is_err());
     assert_eq!(p.snapshot().progress.assigned, 1);
-    p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel())
+    p.wait_for_catch_up(CatchUpMode::Write, cancel())
         .await
         .unwrap();
     p.wait_for_catch_up(CatchUpMode::All, cancel())
@@ -3128,7 +3128,7 @@ async fn joint_quorums_previous_one_excludes_primary_and_catchup_is_not_write_co
     assert_eq!(p.snapshot().progress.committed, 0);
     // Native WRITE_QUORUM uses CC and the prior catch-up fence, not both
     // configurations' write quorums.
-    p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel())
+    p.wait_for_catch_up(CatchUpMode::Write, cancel())
         .await
         .unwrap();
     let mut required = configuration(vec![remote.clone()], true, 1);
@@ -3142,7 +3142,7 @@ async fn joint_quorums_previous_one_excludes_primary_and_catchup_is_not_write_co
     .unwrap();
     assert!(timeout(
         std::time::Duration::from_millis(40),
-        p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel())
+        p.wait_for_catch_up(CatchUpMode::Write, cancel())
     )
     .await
     .is_err());
@@ -3165,7 +3165,7 @@ async fn joint_quorums_previous_one_excludes_primary_and_catchup_is_not_write_co
     .await
     .unwrap();
     until(|| !p.snapshot().ready).await;
-    p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel())
+    p.wait_for_catch_up(CatchUpMode::Write, cancel())
         .await
         .unwrap();
     assert!(p
@@ -3280,7 +3280,7 @@ async fn bounded_admission_and_callback_capture_exhaustion_preserve_control_capa
     p.update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
-    s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+    s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     p.build_replica(descriptor(&s), cancel()).await.unwrap();
@@ -3350,7 +3350,7 @@ async fn initialized_raw_secondary(
     let partition = Uuid::new_v4();
     let secondary = engine(partition, 2, provider);
     secondary
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     let (transport, incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
@@ -3507,7 +3507,7 @@ impl NativeControlView for FaultNativeView {
     fn report_fault(
         &self,
         fault: fube_runtime::FaultType,
-    ) -> ServiceFuture<'_, fube_runtime::FaultDelivery> {
+    ) -> ServiceFuture<'_, fube_runtime::extensions::FaultDelivery> {
         Box::pin(async move {
             self.faults.lock().unwrap().push(fault);
             self.active.fetch_add(1, Ordering::AcqRel);
@@ -3518,7 +3518,7 @@ impl NativeControlView for FaultNativeView {
             if self.pending {
                 std::future::pending::<()>().await;
             }
-            Ok(fube_runtime::FaultDelivery {
+            Ok(fube_runtime::extensions::FaultDelivery {
                 fault,
                 attempts: 1,
                 last_error: None,
@@ -3550,7 +3550,7 @@ async fn internal_provider_fault_notifies_once_and_pending_receipt_cannot_block_
             )
             .unwrap();
             secondary
-                .change_role(EPOCH, ReplicaRole::Idle, cancel())
+                .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
                 .await
                 .unwrap();
             let (transport, _incoming) =
@@ -3670,7 +3670,7 @@ async fn original_epoch_barrier_waits_for_explicit_apply_then_provider_disposal(
     let (secondary, transport, primary, _incoming) =
         initialized_raw_secondary(provider.clone()).await;
     let next = Epoch {
-        configuration: EPOCH.configuration * 2,
+        configuration_number: EPOCH.configuration_number * 2,
         ..EPOCH
     };
     provider.epoch_mode.store(3, Ordering::Release);
@@ -3755,7 +3755,7 @@ async fn provider_epoch_and_data_loss_errors_panics_deadlines_are_terminal_and_d
                 provider.epoch_mode.store(mode, Ordering::Release);
                 e.update_epoch(
                     Epoch {
-                        configuration: EPOCH.configuration * 2,
+                        configuration_number: EPOCH.configuration_number * 2,
                         ..EPOCH
                     },
                     cancel(),
@@ -3791,7 +3791,7 @@ async fn canceled_epoch_drain_faults_and_changed_data_loss_resets_assignment_fro
     let cancellation = cancel();
     let update = s.update_epoch(
         Epoch {
-            configuration: EPOCH.configuration * 2,
+            configuration_number: EPOCH.configuration_number * 2,
             ..EPOCH
         },
         cancellation.clone(),
@@ -3903,7 +3903,7 @@ async fn real_wire_gaps_duplicates_stale_epochs_actors_and_impossible_receipts()
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     assert_eq!(s.snapshot().progress.received, 0);
     let older = Epoch {
-        configuration: 0,
+        configuration_number: 0,
         ..EPOCH
     };
     raw_send(&transport, &primary, &s, replication(older, older, 1, 1));
@@ -3990,7 +3990,7 @@ async fn initial_primary(primary: &Engine) {
 
 async fn build_memory(primary: &Engine, secondary: &Arc<Engine>, provider: &Arc<MemoryProvider>) {
     secondary
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     let target = secondary.clone();
@@ -4007,7 +4007,7 @@ async fn build_memory(primary: &Engine, secondary: &Arc<Engine>, provider: &Arc<
         .unwrap();
     copier.await.unwrap();
     secondary
-        .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
 }
@@ -4077,7 +4077,7 @@ async fn rejected_demotion_then_promotion_drains_the_pending_tail_without_sequen
     assert_eq!(b.snapshot().progress.applied, 1);
     assert_eq!(a.snapshot().progress.committed, 1);
     assert!(a
-        .change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .is_err());
     assert_eq!(a.snapshot().role, ReplicaRole::Primary);
@@ -4142,7 +4142,7 @@ async fn rejected_demotion_preserves_accepted_completion_for_drain_and_retry() {
     ap.apply_replication(1, &one).unwrap();
     until(|| b.snapshot().progress.received == 1).await;
     assert!(a
-        .change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .is_err());
     let canceled = cancel();
@@ -4156,10 +4156,10 @@ async fn rejected_demotion_preserves_accepted_completion_for_drain_and_retry() {
             .unwrap(),
         1
     );
-    a.change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+    a.change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
-    until(|| a.snapshot().role == ReplicaRole::Secondary).await;
+    until(|| a.snapshot().role == ReplicaRole::ActiveSecondary).await;
     assert_eq!(a.snapshot().progress.applied, 1);
     assert_eq!(ap.snapshot().values, bp.snapshot().values);
     assert_eq!(ap.snapshot().results, bp.snapshot().results);
@@ -4191,7 +4191,7 @@ async fn continuing_third_secondary_accepts_the_new_primary() {
     drop(apply_memory(&b, &bp, 1).await);
     drop(apply_memory(&c, &cp, 1).await);
     write.wait(cancel()).await.unwrap();
-    a.change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+    a.change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     b.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
@@ -4244,7 +4244,7 @@ async fn copying_raw_secondary(
     )
     .unwrap();
     secondary
-        .change_role(epoch, ReplicaRole::Idle, cancel())
+        .change_role(epoch, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     let (network, mut incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
@@ -4335,7 +4335,7 @@ async fn primary_rebinding_requires_node_accepted_newer_epoch_and_fences_old_act
     let provider = Arc::new(Provider::default());
     let (s, old_network, old_primary, _old_incoming) =
         initialized_raw_secondary(provider.clone()).await;
-    s.change_role(EPOCH, ReplicaRole::Secondary, cancel())
+    s.change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     let (new_network, _new_incoming) =
@@ -4365,7 +4365,7 @@ async fn primary_rebinding_requires_node_accepted_newer_epoch_and_fences_old_act
         replication(EPOCH, EPOCH, 1, 1),
     );
     let future = Epoch {
-        configuration: NEXT_EPOCH.configuration + EPOCH.configuration,
+        configuration_number: NEXT_EPOCH.configuration_number + EPOCH.configuration_number,
         ..EPOCH
     };
     raw_send(
@@ -4438,7 +4438,7 @@ async fn original_operation_epoch_may_precede_start_copy_primary_epoch() {
     // Exercise the real provider's monotonic epoch check, not a permissive
     // provider that accepts an accidental E2 -> E1 callback regression.
     let future = Epoch {
-        configuration: NEXT_EPOCH.configuration + EPOCH.configuration,
+        configuration_number: NEXT_EPOCH.configuration_number + EPOCH.configuration_number,
         ..EPOCH
     };
     for (original, advance_node) in [
@@ -4496,7 +4496,7 @@ async fn original_operation_epoch_may_precede_start_copy_primary_epoch() {
         assert_eq!(
             provider.snapshot().epoch_configuration,
             if original > NEXT_EPOCH {
-                original.configuration
+                original.configuration_number
             } else {
                 0
             }
@@ -4532,7 +4532,7 @@ async fn original_operation_epoch_may_precede_start_copy_primary_epoch() {
         assert_eq!(second.sequence, 2);
         assert_eq!(
             provider.snapshot().epoch_configuration,
-            future.configuration
+            future.configuration_number
         );
         provider.apply_replication(2, &second.data).unwrap();
         second.acknowledge().unwrap();
@@ -5002,7 +5002,7 @@ async fn outgoing_copy_and_real_idle_ack_progress_with_admitted_or_rejected_live
         p.update_current_configuration(configuration(vec![], true, 1), cancel())
             .await
             .unwrap();
-        s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+        s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
         let owner = p.clone();
@@ -5130,7 +5130,7 @@ async fn outgoing_future_copy_headroom_survives_concurrent_build_and_write_admis
         .unwrap();
     for secondary in [&follower, &target] {
         secondary
-            .change_role(EPOCH, ReplicaRole::Idle, cancel())
+            .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
     }
@@ -5297,7 +5297,7 @@ async fn outgoing_build_admission_counts_pending_writes_before_installing_any_pe
         p.update_current_configuration(configuration(vec![], true, 1), cancel())
             .await
             .unwrap();
-        s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+        s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
         let data = OperationData::new(vec![vec![7; 1800]]).unwrap();
@@ -5407,7 +5407,7 @@ async fn outgoing_build_on_retained_write_budget_fails_without_losing_write_or_c
         .unwrap();
     for secondary in [&follower, &target] {
         secondary
-            .change_role(EPOCH, ReplicaRole::Idle, cancel())
+            .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
     }
@@ -5431,7 +5431,9 @@ async fn outgoing_build_on_retained_write_budget_fails_without_losing_write_or_c
         .unwrap();
     let canceled = cancel();
     canceled.cancel();
-    assert!(matches!(write.wait(canceled).await, Err(Error::Closed)));
+    let error = write.wait(canceled).await.unwrap_err();
+    assert_eq!(error.kind(), fube_runtime::ErrorKind::Canceled);
+    assert!(error.is_uncertain());
     assert!(matches!(
         timeout(
             std::time::Duration::from_secs(2),

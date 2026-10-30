@@ -14,7 +14,7 @@ use crate::{
 use fube_runtime::extensions::{
     DisposalTracker, ExecutionRuntime, ManagedObject, ObjectQuota, ObjectReservation,
 };
-use fube_runtime::ServiceFuture;
+use fube_runtime::ApiFuture as ServiceFuture;
 use std::sync::Arc;
 #[cfg(test)]
 use std::{
@@ -212,6 +212,19 @@ pub(crate) struct OwnedProvider {
     streams: ObjectQuota,
     tracker: DisposalTracker,
 }
+fn provider_error(error: crate::Error) -> crate::Error {
+    if matches!(
+        error.kind(),
+        fube_runtime::ErrorKind::Canceled | fube_runtime::ErrorKind::Timeout
+    ) {
+        return error;
+    }
+    crate::Error::with_cause(
+        fube_runtime::ErrorKind::Provider,
+        format!("provider callback failed: {error}"),
+        error,
+    )
+}
 impl OwnedProvider {
     pub(crate) fn new(
         runtime: ExecutionRuntime,
@@ -250,7 +263,11 @@ impl OwnedProvider {
         let reserved = self
             .runtime
             .reserve_construction(&self.streams, &self.tracker)?;
-        let stream = self.inner.get().copy_state(up_to, None)?;
+        let stream = self
+            .inner
+            .get()
+            .copy_state(up_to, None)
+            .map_err(provider_error)?;
         let stream = reserved.construct(stream);
         let publication = stream.publication();
         Ok((Arc::new(OwnedStream(stream)), publication))
@@ -268,14 +285,20 @@ impl OwnedProvider {
 }
 impl StateProvider for OwnedProvider {
     fn last_committed(&self) -> Result<i64> {
-        self.inner.get().last_committed()
+        self.inner.get().last_committed().map_err(provider_error)
     }
     fn replication_checkpoint(
         &self,
         n: i64,
         cancel: Cancellation,
     ) -> ServiceFuture<'_, Option<ReplayOperation>> {
-        self.inner.get().replication_checkpoint(n, cancel)
+        Box::pin(async move {
+            self.inner
+                .get()
+                .replication_checkpoint(n, cancel)
+                .await
+                .map_err(provider_error)
+        })
     }
     fn update_epoch(
         &self,
@@ -283,14 +306,29 @@ impl StateProvider for OwnedProvider {
         previous: i64,
         cancel: Cancellation,
     ) -> ServiceFuture<'_, ()> {
-        self.inner.get().update_epoch(epoch, previous, cancel)
+        Box::pin(async move {
+            self.inner
+                .get()
+                .update_epoch(epoch, previous, cancel)
+                .await
+                .map_err(provider_error)
+        })
     }
     fn on_data_loss(&self, cancel: Cancellation) -> ServiceFuture<'_, bool> {
-        self.inner.get().on_data_loss(cancel)
+        Box::pin(async move {
+            self.inner
+                .get()
+                .on_data_loss(cancel)
+                .await
+                .map_err(provider_error)
+        })
     }
     fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
         let reserved = self.reserve_stream()?;
-        Ok(self.publish_stream(reserved, self.inner.get().copy_context()?))
+        Ok(self.publish_stream(
+            reserved,
+            self.inner.get().copy_context().map_err(provider_error)?,
+        ))
     }
     fn copy_state(
         &self,
@@ -298,12 +336,18 @@ impl StateProvider for OwnedProvider {
         context: Option<Arc<dyn OperationDataStream>>,
     ) -> Result<Arc<dyn OperationDataStream>> {
         let reserved = self.reserve_stream()?;
-        Ok(self.publish_stream(reserved, self.inner.get().copy_state(up_to, context)?))
+        Ok(self.publish_stream(
+            reserved,
+            self.inner
+                .get()
+                .copy_state(up_to, context)
+                .map_err(provider_error)?,
+        ))
     }
 }
 struct OwnedStream(ManagedObject<Arc<dyn OperationDataStream>>);
 impl OperationDataStream for OwnedStream {
     fn next(&self, cancel: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
-        self.0.get().next(cancel)
+        Box::pin(async move { self.0.get().next(cancel).await.map_err(provider_error) })
     }
 }

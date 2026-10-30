@@ -294,7 +294,7 @@ impl PeerTransport {
                 {
                     Ok(runtime) => runtime,
                     Err(error) => {
-                        let _ = ready.send(Err(Error::Io(error)));
+                        let _ = ready.send(Err(Error::Io(error.into())));
                         return;
                     }
                 };
@@ -303,7 +303,7 @@ impl PeerTransport {
                     let listener = match TcpListener::from_std(listener) {
                         Ok(listener) => listener,
                         Err(error) => {
-                            let _ = ready.send(Err(Error::Io(error)));
+                            let _ = ready.send(Err(Error::Io(error.into())));
                             return;
                         }
                     };

@@ -1,4 +1,4 @@
-use fube_transport::{Error, Result};
+use crate::{Error, Result};
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},

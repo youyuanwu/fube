@@ -1,8 +1,13 @@
 //! Permanently empty application state, with real bounded peer-control checks.
 //! This is not a storage engine or the native FabricReplicator wire protocol.
 use super::*;
+use fube_runtime::extensions::{
+    CallLane, CallOrigin, NativeControlBinding, NativeInvocation, NativeInvocationKind,
+};
 use std::{collections::BTreeMap, net::SocketAddr, sync::Weak, time::Instant};
 
+#[path = "stateful_binding.rs"]
+mod binding;
 #[cfg(test)]
 #[path = "stateful_tests.rs"]
 mod tests;
@@ -28,7 +33,7 @@ fn failure(message: &'static str) -> RuntimeError {
 trait View: Send + Sync {
     fn snapshot(&self) -> RuntimeResult<ReplicaStatus>;
 }
-impl View for StatefulPartition {
+impl View for NativeRuntimeIntegration {
     fn snapshot(&self) -> RuntimeResult<ReplicaStatus> {
         self.status()
     }
@@ -64,6 +69,9 @@ pub(super) struct EmptyReplicator {
     incoming: AtomicUsize,
     probes: AtomicUsize,
     wait_millis: std::sync::atomic::AtomicU64,
+    native: Mutex<Option<NativeRuntimeIntegration>>,
+    native_actor: Mutex<Option<uuid::Uuid>>,
+    binder: Mutex<Option<Arc<dyn NativeControlBinding>>>,
 }
 struct Active<'a>(&'a AtomicUsize);
 impl Drop for Active<'_> {
@@ -102,6 +110,9 @@ impl EmptyReplicator {
             incoming: AtomicUsize::new(0),
             probes: AtomicUsize::new(0),
             wait_millis: std::sync::atomic::AtomicU64::new(8_000),
+            native: Mutex::new(None),
+            native_actor: Mutex::new(None),
+            binder: Mutex::new(None),
         })
     }
     fn operation(&self, primary: bool) -> RuntimeResult<Active<'_>> {
@@ -135,7 +146,7 @@ impl EmptyReplicator {
                 || peer.node_id == self.identity.node_id
                 || !peer.up
                 || !peer.ready
-                || peer.role != ReplicaRole::Secondary
+                || peer.role != ReplicaRole::ActiveSecondary
                 || !ids.insert(peer.replica_id)
                 || !nodes.insert(peer.node_id)
                 || peer.address.is_empty()
@@ -157,7 +168,7 @@ impl EmptyReplicator {
         if current.epoch != native.current_epoch.primary() {
             return Err(failure("configuration is not the native epoch"));
         }
-        let pre_revoke = native.current_role == ReplicaRole::Secondary
+        let pre_revoke = native.current_role == ReplicaRole::ActiveSecondary
             && native.configuration_stage == ConfigurationStage::PreWriteRevoke;
         if state.epoch != Some(current.epoch) && !pre_revoke {
             return Err(failure("configuration precedes replicator epoch update"));
@@ -205,7 +216,7 @@ impl EmptyReplicator {
             || native.service_role != state.role
             || !matches!(
                 state.role,
-                ReplicaRole::Idle | ReplicaRole::Secondary | ReplicaRole::Primary
+                ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary | ReplicaRole::Primary
             )
         {
             return Err(RuntimeError::Closed);
@@ -228,18 +239,18 @@ impl EmptyReplicator {
         let network = async {
             let value = http_peer(&peer.address).await?;
             let observed = Epoch {
-                data_loss: value["epoch"]["data_loss"]
+                data_loss_number: value["epoch"]["data_loss_number"]
                     .as_i64()
                     .ok_or(failure("missing peer epoch"))?,
-                configuration: value["epoch"]["configuration"]
+                configuration_number: value["epoch"]["configuration_number"]
                     .as_i64()
                     .ok_or(failure("missing peer epoch"))?,
             };
             let role = value["role"].as_str().ok_or(failure("missing peer role"))?;
             let role_ok = if build {
-                role == "Idle"
+                role == "IdleSecondary"
             } else {
-                matches!(role, "Idle" | "Secondary")
+                matches!(role, "IdleSecondary" | "ActiveSecondary")
                     || (role == "Primary"
                         && (peer.must_catch_up || peer.previous_role == ReplicaRole::Primary))
             };
@@ -267,7 +278,7 @@ impl EmptyReplicator {
         }
     }
 }
-impl Replicator for EmptyReplicator {
+impl EmptyReplicator {
     fn open(&self, cancellation: Cancellation) -> ServiceFuture<'_, String> {
         Box::pin(async move {
             self.view.snapshot()?;
@@ -397,7 +408,7 @@ impl Replicator for EmptyReplicator {
             }
             self.changed.notify_waiters();
             if self.view.snapshot()?.catch_up == CatchUpResult::Completed {
-                self.wait_for_catch_up(CatchUpMode::WriteQuorum, cancellation)
+                self.wait_for_catch_up(CatchUpMode::Write, cancellation)
                     .await?;
             }
             Ok(())
@@ -430,7 +441,7 @@ impl Replicator for EmptyReplicator {
                     .ok_or(failure("empty control revision exhausted"))?;
             }
             self.changed.notify_waiters();
-            self.wait_for_catch_up(CatchUpMode::WriteQuorum, cancellation)
+            self.wait_for_catch_up(CatchUpMode::Write, cancellation)
                 .await
         })
     }
@@ -465,7 +476,7 @@ impl Replicator for EmptyReplicator {
                 // empty readiness during this transition only, not primary
                 // quorum readiness or application replication.
                 let old_epoch = if mode == CatchUpMode::All
-                    && native.current_role == ReplicaRole::Secondary
+                    && native.current_role == ReplicaRole::ActiveSecondary
                     && native.replicator_role == ReplicaRole::Primary
                     && matches!(
                         native.configuration_stage,
@@ -537,14 +548,26 @@ impl Replicator for EmptyReplicator {
             }
         })
     }
+    #[cfg(test)]
     fn build_replica(
         &self,
         peer: ReplicaInformation,
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, ()> {
+        self.build_frozen(peer, cancellation, None)
+    }
+    fn build_frozen(
+        &self,
+        peer: ReplicaInformation,
+        cancellation: Cancellation,
+        proof: Option<NativeInvocation>,
+    ) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
+            if let Some(proof) = &proof {
+                proof.validate()?;
+            }
             let _active = self.operation(true)?;
-            if peer.role != ReplicaRole::Idle
+            if peer.role != ReplicaRole::IdleSecondary
                 || peer.replica_id == self.identity.replica_id
                 || peer.node_id == self.identity.node_id
             {
@@ -571,6 +594,9 @@ impl Replicator for EmptyReplicator {
                 (epoch, token)
             };
             self.probe(&peer, epoch, None, true, &cancellation).await?;
+            if let Some(proof) = &proof {
+                proof.validate()?;
+            }
             self.view.snapshot()?;
             let mut state = self.state.lock().unwrap();
             if state.phase != Phase::Open
@@ -589,36 +615,43 @@ impl Replicator for EmptyReplicator {
             Ok(())
         })
     }
+    #[cfg(test)]
     fn remove_replica(
         &self,
         peer: ReplicaInformation,
         reason: ReplicaRemoval,
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, ()> {
-        Box::pin(async move {
-            let _active = self.operation(false)?;
-            if cancellation.is_cancelled() {
-                return Err(RuntimeError::Closed);
-            }
-            let mut state = self.state.lock().unwrap();
-            if state.phase != Phase::Open {
-                return Err(RuntimeError::Closed);
-            }
-            if state.removed.len() >= PEER_LIMIT && !state.removed.contains_key(&key(&peer)) {
-                return Err(failure("empty removal tombstone bound"));
-            }
-            let was_built = state.built.remove(&key(&peer)).is_some();
-            state.build_tokens.remove(&key(&peer));
-            let newly_removed = state.removed.insert(key(&peer), reason) != Some(reason);
-            if was_built || newly_removed {
-                state.revision = state
-                    .revision
-                    .checked_add(1)
-                    .ok_or(failure("empty control revision exhausted"))?;
-            }
-            self.changed.notify_waiters();
-            Ok(())
-        })
+        Box::pin(async move { self.remove_frozen(peer, reason, cancellation) })
+    }
+    fn remove_frozen(
+        &self,
+        peer: ReplicaInformation,
+        reason: ReplicaRemoval,
+        cancellation: Cancellation,
+    ) -> RuntimeResult<()> {
+        let _active = self.operation(false)?;
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::Closed);
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.phase != Phase::Open {
+            return Err(RuntimeError::Closed);
+        }
+        if state.removed.len() >= PEER_LIMIT && !state.removed.contains_key(&key(&peer)) {
+            return Err(failure("empty removal tombstone bound"));
+        }
+        let was_built = state.built.remove(&key(&peer)).is_some();
+        state.build_tokens.remove(&key(&peer));
+        let newly_removed = state.removed.insert(key(&peer), reason) != Some(reason);
+        if was_built || newly_removed {
+            state.revision = state
+                .revision
+                .checked_add(1)
+                .ok_or(failure("empty control revision exhausted"))?;
+        }
+        self.changed.notify_waiters();
+        Ok(())
     }
     fn close(&self, _: Cancellation) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
@@ -716,29 +749,8 @@ impl PeerServer {
     }
 }
 #[cfg(test)]
-mod listener_ownership_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn peer_listener_shutdown_joins_incomplete_requests_and_releases_server() {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            let server = PeerServer::new("127.0.0.1".into(), 0);
-            let retained = Arc::downgrade(&server);
-            let address = server.listen().await.unwrap();
-            let mut client = TcpStream::connect(address).await.unwrap();
-            client.write_all(b"GET /incomplete").await.unwrap();
-            server.stop();
-            server.join().await.unwrap();
-            // A connection still queued at stop may be reset rather than EOF.
-            assert!(!matches!(client.read(&mut [0]).await, Ok(n) if n != 0));
-            let _rebound = TcpListener::bind(address).await.unwrap();
-            drop(server);
-            assert!(retained.upgrade().is_none());
-        })
-        .await
-        .expect("peer listener joined cleanup deadline");
-    }
-}
+#[path = "stateful_listener_tests.rs"]
+mod listener_ownership_tests;
 async fn read_header(stream: &mut TcpStream) -> RuntimeResult<String> {
     let mut buffer = vec![0; 4096];
     let mut size = 0;
@@ -802,49 +814,73 @@ async fn http_peer(address: &str) -> RuntimeResult<serde_json::Value> {
     serde_json::from_str(body).map_err(|_| failure("peer JSON"))
 }
 fn epoch_json(epoch: Epoch) -> serde_json::Value {
-    serde_json::json!({"configuration":epoch.configuration,"data_loss":epoch.data_loss})
+    serde_json::json!({"configuration_number":epoch.configuration_number,"data_loss_number":epoch.data_loss_number})
 }
 
 pub(super) struct ReplicaRoute {
-    partition: StatefulPartition,
+    partition: NativeRuntimeIntegration,
     replicator: Arc<EmptyReplicator>,
     active: AtomicUsize,
     generation: u64,
 }
 pub(super) struct Factory(pub(super) Arc<Rpc>);
+pub(super) struct Creation {
+    pub(super) identity: ReplicaIdentity,
+    pub(super) initialization_data: Vec<u8>,
+    pub(super) activation: Arc<ActivationContext>,
+    pub(super) native: NativeRuntimeIntegration,
+}
 struct Service {
     rpc: Arc<Rpc>,
     path: String,
-    context: StatefulServiceContext,
+    context: Creation,
     route: Mutex<Option<Arc<ReplicaRoute>>>,
 }
 static ROUTE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-impl StatefulFactory for Factory {
-    fn create(
+impl IStatefulServiceFactory for Factory {
+    fn create_replica(
         &self,
-        context: StatefulServiceContext,
-    ) -> ServiceFuture<'_, Arc<dyn StatefulService>> {
-        Box::pin(async move {
-            if data::selected(&context.initialization_data) {
-                return Ok(data::Service::new(self.0.clone(), context) as Arc<dyn StatefulService>);
-            }
-            let generation = ROUTE_GENERATION
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
-                .map_err(|_| failure("route generation exhausted"))?;
-            let path = format!(
-                "/stateful/{}/{}/{}/{}-{generation}",
-                context.identity.partition_id,
-                context.identity.replica_id,
-                context.identity.incarnation,
-                context.activation.runtime_id()
+        service_type: String,
+        service_name: String,
+        initialization_data: &[u8],
+        partition_id: uuid::Uuid,
+        replica_id: i64,
+    ) -> RuntimeResult<Box<dyn IStatefulServiceReplica>> {
+        let native = self.0.native.capture(partition_id, replica_id)?;
+        if native.identity().service_type != service_type
+            || native.identity().service_name != service_name
+        {
+            return Err(RuntimeError::InvalidInput(
+                "factory arguments differ from native identity",
+            ));
+        }
+        let context = Creation {
+            identity: native.identity().clone(),
+            initialization_data: initialization_data.to_vec(),
+            activation: self.0.current.snapshot(),
+            native,
+        };
+        if data::selected(&context.initialization_data) {
+            return Ok(
+                data::Service::new(self.0.clone(), context) as Box<dyn IStatefulServiceReplica>
             );
-            Ok(Arc::new(Service {
-                rpc: self.0.clone(),
-                path,
-                context,
-                route: Mutex::new(None),
-            }) as Arc<dyn StatefulService>)
-        })
+        }
+        let generation = ROUTE_GENERATION
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+            .map_err(|_| failure("route generation exhausted"))?;
+        let path = format!(
+            "/stateful/{}/{}/{}/{}-{generation}",
+            context.identity.partition_id,
+            context.identity.replica_id,
+            context.identity.incarnation,
+            context.activation.runtime_id()
+        );
+        Ok(Box::new(Service {
+            rpc: self.0.clone(),
+            path,
+            context,
+            route: Mutex::new(None),
+        }) as Box<dyn IStatefulServiceReplica>)
     }
 }
 impl Service {
@@ -853,24 +889,29 @@ impl Service {
         self.route.lock().unwrap().take()
     }
 }
-impl StatefulService for Service {
+impl IStatefulServiceReplica for Service {
     fn open(
         &self,
-        partition: StatefulPartition,
+        mode: OpenMode,
+        partition: Arc<dyn IStatefulServicePartition>,
         cancellation: Cancellation,
-    ) -> ServiceFuture<'_, Arc<dyn Replicator>> {
+    ) -> ServiceFuture<'_, Box<dyn IPrimaryReplicator>> {
         Box::pin(async move {
-            self.rpc.listen().await?;
+            mode.validate()?;
+            let _ = partition.get_partition_information()?;
+            let partition = self.context.native.clone();
             if cancellation.is_cancelled() || partition.identity() != &self.context.identity {
                 return Err(RuntimeError::Closed);
             }
-            partition.ensure_valid()?;
+            partition.validate()?;
             let replicator = EmptyReplicator::new(
                 Arc::new(partition.clone()),
                 self.context.identity.clone(),
                 self.path.clone(),
                 self.rpc.peers.clone(),
             );
+            replicator.attach_native(partition.clone())?;
+            self.rpc.listen().await?;
             let route = Arc::new(ReplicaRoute {
                 partition,
                 replicator: replicator.clone(),
@@ -883,7 +924,7 @@ impl StatefulService for Service {
                 .unwrap()
                 .insert(self.path.clone(), route.clone());
             *self.route.lock().unwrap() = Some(route);
-            Ok(replicator as Arc<dyn Replicator>)
+            Ok(Box::new(binding::EmptyControl(replicator)) as Box<dyn IPrimaryReplicator>)
         })
     }
     fn change_role(
@@ -902,7 +943,7 @@ impl StatefulService for Service {
                     .unwrap()
                     .clone()
                     .ok_or(RuntimeError::Closed)?;
-                route.partition.ensure_valid()?;
+                route.partition.validate()?;
             }
             println!(
                 "STATEFUL_ROLE partition={} replica={} incarnation={} role={role:?} pid={}",

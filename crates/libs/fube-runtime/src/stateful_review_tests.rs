@@ -207,7 +207,10 @@ async fn unchanged_projected_proof_does_not_hide_changed_native_observations_and
     assert_eq!(reply.error.error, 0);
     let snapshot = calls.partitions.lock().unwrap()[0].status().unwrap();
     assert_eq!(snapshot.configuration.len(), 1);
-    assert_eq!(snapshot.access().1, crate::AccessStatus::NoWriteQuorum);
+    assert_eq!(
+        snapshot.access().1,
+        crate::ServicePartitionAccessStatus::NoWriteQuorum
+    );
     assert_eq!(calls.configurations.lock().unwrap().len(), 2);
 }
 

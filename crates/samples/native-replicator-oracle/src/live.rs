@@ -173,8 +173,8 @@ impl IFabricStateProvider_Impl for Provider_Impl {
                 return Err(com::E_INVALIDARG.into());
             }
             let epoch = Epoch {
-                data_loss: epoch.DataLossNumber,
-                configuration: epoch.ConfigurationNumber,
+                data_loss_number: epoch.DataLossNumber,
+                configuration_number: epoch.ConfigurationNumber,
             };
             let app = self.0.clone();
             self.0

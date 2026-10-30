@@ -7,9 +7,9 @@ const MAX_REMOTE_TOMBSTONES: usize = 256;
 pub(super) struct AppliedConfiguration {
     epoch: Epoch,
     revision: u64,
-    current: ReplicaSetConfiguration,
-    previous: Option<ReplicaSetConfiguration>,
-    observations: Vec<ReplicaInformation>,
+    current: NativeReplicaSetConfiguration,
+    previous: Option<NativeReplicaSetConfiguration>,
+    observations: Vec<NativeReplicaDescriptor>,
 }
 
 pub(super) struct Pending {
@@ -181,7 +181,7 @@ impl Registry {
             state.cancellation_epoch = None;
             let mut status = state.status.lock().unwrap();
             status.configuration_stage =
-                if role(request.local.current_role)? == ReplicaRole::Secondary {
+                if role(request.local.current_role)? == ReplicaRole::ActiveSecondary {
                     ConfigurationStage::PreWriteRevoke
                 } else {
                     ConfigurationStage::CatchUp
@@ -203,7 +203,7 @@ impl Registry {
     async fn update_epoch(
         &self,
         unit: &Unit,
-        replicator: &Arc<dyn Replicator>,
+        replicator: &Arc<dyn IPrimaryReplicator>,
         cancel: &Cancellation,
     ) -> Result<()> {
         let epoch = {
@@ -246,9 +246,9 @@ impl Registry {
     pub(super) async fn progress(
         &self,
         unit: &Unit,
-        replicator: Arc<dyn Replicator>,
+        replicator: Arc<dyn IPrimaryReplicator>,
     ) -> Result<ReplicationProgress> {
-        {
+        let native = {
             let mut state = unit.state.lock().unwrap();
             if state.role_changing
                 || state.configuring
@@ -258,8 +258,23 @@ impl Registry {
             }
             state.role_changing = true;
             state.error_api = (12, 4);
-        }
-        let progress = self.complete(async move { replicator.progress() }).await;
+            state.native.clone()
+        };
+        let progress = self
+            .complete(async move {
+                if let Some(native) = native {
+                    if let Some(source) = native.progress_source()? {
+                        let progress = source.sample_progress()?;
+                        native.validate()?;
+                        return Ok(progress);
+                    }
+                }
+                // Generic SDK implementations need only the separate getters.
+                let first = replicator.get_catch_up_capability()?;
+                let last = replicator.get_current_progress()?;
+                Ok(ReplicationProgress { first, last })
+            })
+            .await;
         unit.state.lock().unwrap().role_changing = false;
         let progress = progress?;
         progress.ensure_initialized()?;
@@ -325,7 +340,10 @@ impl Registry {
             return Ok(());
         }
         let requested = role(request.local.current_role)?;
-        if !matches!(requested, ReplicaRole::Primary | ReplicaRole::Secondary) {
+        if !matches!(
+            requested,
+            ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+        ) {
             return Ok(());
         }
         let (replicator, cancel) = participants(unit)?;
@@ -418,7 +436,7 @@ impl Registry {
         }
         let mut failed_api = (0, 0);
         let result = async {
-            if requested == ReplicaRole::Secondary && old_replicator == ReplicaRole::Primary {
+            if requested == ReplicaRole::ActiveSecondary && old_replicator == ReplicaRole::Primary {
                 {
                     let state = unit.state.lock().unwrap();
                     let mut status = state.status.lock().unwrap();
@@ -430,7 +448,7 @@ impl Registry {
                 self.configuration(unit, &replicator, &request, false, &cancel)
                     .await?;
                 failed_api = (9, 4);
-                self.catch_up(unit, &replicator, CatchUpMode::All, true, &cancel)
+                self.catch_up(unit, &replicator, ReplicaSetQuorumMode::All, true, &cancel)
                     .await?;
                 failed_api = (6, 4);
                 self.update_epoch(unit, &replicator, &cancel).await?;
@@ -438,7 +456,7 @@ impl Registry {
                 self.configuration(unit, &replicator, &request, false, &cancel)
                     .await?;
                 failed_api = (9, 4);
-                self.catch_up(unit, &replicator, CatchUpMode::All, false, &cancel)
+                self.catch_up(unit, &replicator, ReplicaSetQuorumMode::All, false, &cancel)
                     .await?;
                 let changed = self
                     .change_role(
@@ -470,9 +488,15 @@ impl Registry {
                 self.configuration(unit, &replicator, &request, false, &cancel)
                     .await?;
                 failed_api = (9, 4);
-                self.catch_up(unit, &replicator, CatchUpMode::WriteQuorum, false, &cancel)
-                    .await?;
-            } else if requested == ReplicaRole::Secondary {
+                self.catch_up(
+                    unit,
+                    &replicator,
+                    ReplicaSetQuorumMode::Write,
+                    false,
+                    &cancel,
+                )
+                .await?;
+            } else if requested == ReplicaRole::ActiveSecondary {
                 let changed = self
                     .change_role(
                         unit,
@@ -507,8 +531,14 @@ impl Registry {
                 self.configuration(unit, &replicator, &request, false, &cancel)
                     .await?;
                 failed_api = (9, 4);
-                self.catch_up(unit, &replicator, CatchUpMode::WriteQuorum, false, &cancel)
-                    .await?;
+                self.catch_up(
+                    unit,
+                    &replicator,
+                    ReplicaSetQuorumMode::Write,
+                    false,
+                    &cancel,
+                )
+                .await?;
             } else {
                 let current = unit
                     .state
@@ -550,7 +580,7 @@ impl Registry {
     async fn promote(
         &self,
         unit: &Arc<Unit>,
-        replicator: &Arc<dyn Replicator>,
+        replicator: &Arc<dyn IPrimaryReplicator>,
         request: &w::ProxyRequest,
         cancel: &Cancellation,
         failed_api: &mut (i64, i64),
@@ -613,7 +643,8 @@ impl Registry {
         }
         self.notify_endpoint(unit, request).await?;
         let previous = api_epoch(&request.unit.previous);
-        if previous != Epoch::INVALID && previous.data_loss != request.unit.current.data_loss {
+        if previous != Epoch::INVALID && previous.data_loss_number != request.unit.current.data_loss
+        {
             *failed_api = (7, 4);
             if self.data_loss(unit, replicator, cancel).await? {
                 {
@@ -646,7 +677,7 @@ impl Registry {
     pub(super) async fn data_loss(
         &self,
         unit: &Unit,
-        replicator: &Arc<dyn Replicator>,
+        replicator: &Arc<dyn IPrimaryReplicator>,
         cancel: &Cancellation,
     ) -> Result<bool> {
         {
@@ -684,7 +715,7 @@ impl Registry {
     async fn configuration(
         &self,
         unit: &Unit,
-        replicator: &Arc<dyn Replicator>,
+        replicator: &Arc<dyn IPrimaryReplicator>,
         request: &w::ProxyRequest,
         current_only: bool,
         cancel: &Cancellation,
@@ -744,35 +775,35 @@ impl Registry {
         let bound = super::binding::issue(
             unit,
             request,
-            if current_only {
-                super::binding::NativeInvocationKind::CurrentConfiguration
-            } else {
-                super::binding::NativeInvocationKind::CatchUpConfiguration
+            super::binding::IssueInput {
+                kind: if current_only {
+                    super::binding::NativeInvocationKind::CurrentConfiguration
+                } else {
+                    super::binding::NativeInvocationKind::CatchUpConfiguration
+                },
+                current: Some(current.clone()),
+                previous: (!current_only).then(|| previous.clone()),
+                replica: None,
+                revision: (revision_token, revision),
+                remote: None,
+                cancellation: cancel.clone(),
             },
-            Some(current.clone()),
-            (!current_only).then(|| previous.clone()),
-            None,
-            (revision_token, revision),
-            None,
-            cancel.clone(),
         )
         .and_then(|invocation| {
             super::binding::bind(invocation.clone(), replicator.clone())
                 .map(|control| (invocation, control))
         });
-        let operation_cancel = cancel.clone();
         let result = match bound {
             Err(error) => Err(error),
             Ok((invocation, replicator)) => self
                 .complete(async move {
                     if current_only {
-                        replicator
-                            .update_current_configuration(current, operation_cancel)
-                            .await
+                        replicator.update_current_replica_set_configuration(current.sdk()?)
                     } else {
-                        replicator
-                            .update_catch_up_configuration(current, previous, operation_cancel)
-                            .await
+                        replicator.update_catch_up_replica_set_configuration(
+                            current.sdk()?,
+                            previous.sdk()?,
+                        )
                     }
                 })
                 .await
@@ -824,8 +855,8 @@ impl Registry {
     async fn catch_up(
         &self,
         unit: &Unit,
-        replicator: &Arc<dyn Replicator>,
-        mode: CatchUpMode,
+        replicator: &Arc<dyn IPrimaryReplicator>,
+        mode: ReplicaSetQuorumMode,
         pre_revoke: bool,
         lifetime: &Cancellation,
     ) -> Result<()> {
@@ -855,7 +886,11 @@ impl Registry {
         let replicator = replicator.clone();
         let operation_cancel = cancel.clone();
         let result = self
-            .complete(async move { replicator.wait_for_catch_up(mode, operation_cancel).await })
+            .complete(async move {
+                replicator
+                    .wait_for_catch_up_quorum(mode, operation_cancel)
+                    .await
+            })
             .await;
         let mut state = unit.state.lock().unwrap();
         if state
@@ -933,14 +968,15 @@ impl Registry {
             )
         };
         if result == CatchUpResult::Completed
-            && requested == ReplicaRole::Secondary
-            && (replicator_role != ReplicaRole::Secondary || service_role != ReplicaRole::Secondary)
+            && requested == ReplicaRole::ActiveSecondary
+            && (replicator_role != ReplicaRole::ActiveSecondary
+                || service_role != ReplicaRole::ActiveSecondary)
         {
             let (_, cancel) = participants(unit)?;
             let changed = self
                 .change_role(
                     unit,
-                    ReplicaRole::Secondary,
+                    ReplicaRole::ActiveSecondary,
                     api_epoch(&request.unit.current).primary(),
                     cancel,
                 )
@@ -960,7 +996,7 @@ impl Registry {
             .lock()
             .unwrap()
             .service_role
-            == ReplicaRole::Secondary;
+            == ReplicaRole::ActiveSecondary;
         let error = secondary.then(|| Error::Remote {
             code: DEMOTE_COMPLETED,
             message: "demotion completed".into(),
@@ -1117,13 +1153,15 @@ impl Registry {
         let bound = super::binding::issue(
             unit,
             &request,
-            super::binding::NativeInvocationKind::Build,
-            None,
-            None,
-            Some(info.clone()),
-            (revision.0.clone(), revision.1),
-            Some((info.node_id, sequence)),
-            cancel.clone(),
+            super::binding::IssueInput {
+                kind: super::binding::NativeInvocationKind::Build,
+                current: None,
+                previous: None,
+                replica: Some(info.clone()),
+                revision: (revision.0.clone(), revision.1),
+                remote: Some((info.node_id, sequence)),
+                cancellation: cancel.clone(),
+            },
         )
         .and_then(|invocation| {
             super::binding::bind(invocation.clone(), replicator)
@@ -1134,7 +1172,7 @@ impl Registry {
             Ok((invocation, replicator)) => self
                 .complete(async move {
                     replicator
-                        .build_replica(operation_info, operation_cancel)
+                        .build_replica(operation_info.sdk(), operation_cancel)
                         .await
                 })
                 .await
@@ -1304,7 +1342,6 @@ impl Registry {
             return Ok(());
         };
         unit.state.lock().unwrap().error_api = (11, 4);
-        let operation_cancel = cancel.clone();
         let operation_info = info.clone();
         let purpose = if emit_reply {
             ReplicaRemoval::Idle
@@ -1314,13 +1351,15 @@ impl Registry {
         let bound = super::binding::issue(
             unit,
             &request,
-            super::binding::NativeInvocationKind::Remove(purpose),
-            None,
-            None,
-            Some(info.clone()),
-            (revision.0.clone(), revision.1),
-            Some((info.node_id, sequence)),
-            cancel.clone(),
+            super::binding::IssueInput {
+                kind: super::binding::NativeInvocationKind::Remove(purpose),
+                current: None,
+                previous: None,
+                replica: Some(info.clone()),
+                revision: (revision.0.clone(), revision.1),
+                remote: Some((info.node_id, sequence)),
+                cancellation: cancel.clone(),
+            },
         )
         .and_then(|invocation| {
             super::binding::bind(invocation.clone(), replicator)
@@ -1329,19 +1368,7 @@ impl Registry {
         let result = match bound {
             Err(error) => Err(error),
             Ok((invocation, replicator)) => self
-                .complete(async move {
-                    replicator
-                        .remove_replica(
-                            operation_info,
-                            if emit_reply {
-                                crate::ReplicaRemoval::Idle
-                            } else {
-                                crate::ReplicaRemoval::BuildRetryCleanup
-                            },
-                            operation_cancel,
-                        )
-                        .await
-                })
+                .complete(async move { replicator.remove_replica(operation_info.replica_id) })
                 .await
                 .and_then(|()| invocation.validate()),
         };
@@ -1480,7 +1507,7 @@ fn remote_participants(
     node: [u8; 16],
     sequence: u64,
     removing: bool,
-) -> Result<Option<(Arc<dyn Replicator>, Cancellation)>> {
+) -> Result<Option<(Arc<dyn IPrimaryReplicator>, Cancellation)>> {
     match participants(unit) {
         Ok(participants) => Ok(Some(participants)),
         Err(Error::Closed) => {
@@ -1500,7 +1527,7 @@ fn remote_participants(
     }
 }
 
-fn participants(unit: &Unit) -> Result<(Arc<dyn Replicator>, Cancellation)> {
+fn participants(unit: &Unit) -> Result<(Arc<dyn IPrimaryReplicator>, Cancellation)> {
     let state = unit.state.lock().unwrap();
     if !state.valid.load(Ordering::Acquire) || !state.status.lock().unwrap().replicator_open {
         return Err(Error::Closed);
@@ -1539,7 +1566,7 @@ fn role_failure_api(unit: &Unit, requested: ReplicaRole) -> (i64, i64) {
     let role = state.status.lock().unwrap().replicator_role;
     (8, if role == requested { 1 } else { 4 })
 }
-fn information(replica: &w::Replica, must_catch_up: bool) -> Result<ReplicaInformation> {
+fn information(replica: &w::Replica, must_catch_up: bool) -> Result<NativeReplicaDescriptor> {
     if replica.id <= 0
         || replica.instance <= 0
         || replica.node.id.0.len() != 16
@@ -1547,7 +1574,7 @@ fn information(replica: &w::Replica, must_catch_up: bool) -> Result<ReplicaInfor
     {
         return Err(Error::Protocol("invalid remote replica descriptor"));
     }
-    Ok(ReplicaInformation {
+    Ok(NativeReplicaDescriptor {
         node_id: replica
             .node
             .id
@@ -1573,9 +1600,9 @@ fn information(replica: &w::Replica, must_catch_up: bool) -> Result<ReplicaInfor
 fn project(
     request: &w::ProxyRequest,
 ) -> Result<(
-    ReplicaSetConfiguration,
-    ReplicaSetConfiguration,
-    Vec<ReplicaInformation>,
+    NativeReplicaSetConfiguration,
+    NativeReplicaSetConfiguration,
+    Vec<NativeReplicaDescriptor>,
 )> {
     let mut cc = vec![];
     let mut pc = vec![];
@@ -1615,7 +1642,7 @@ fn project(
         if !replica.up || replica.state != 2 {
             continue;
         }
-        info.role = ReplicaRole::Secondary;
+        info.role = ReplicaRole::ActiveSecondary;
         if replica.current_role >= 3 {
             cc.push(info.clone());
         }
@@ -1633,13 +1660,13 @@ fn project(
         return Err(Error::Protocol("configuration omitted local member"));
     }
     Ok((
-        ReplicaSetConfiguration {
+        NativeReplicaSetConfiguration {
             epoch: api_epoch(&request.unit.current).primary(),
             replicas: cc,
             write_quorum: (ncc / 2 + 1).min(ndcc),
             local_member: local_cc,
         },
-        ReplicaSetConfiguration {
+        NativeReplicaSetConfiguration {
             epoch: api_epoch(&request.unit.previous).primary(),
             replicas: pc,
             write_quorum: (npc / 2 + 1).min(ndpc),

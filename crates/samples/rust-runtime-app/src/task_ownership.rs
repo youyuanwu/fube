@@ -2,7 +2,7 @@
 //! Their scheduler lifetime/progress belongs to the application. Shutdown must
 //! stop and join them before that runtime is disposed; a stalled runtime cannot
 //! make progress here.
-use fube_runtime::{Cancellation, RuntimeError, RuntimeResult};
+use fube_runtime::{Cancellation, Error as RuntimeError, Result as RuntimeResult};
 use std::{future::Future, pin::Pin, sync::Mutex, time::Duration};
 use tokio::{
     net::{TcpListener, TcpStream},

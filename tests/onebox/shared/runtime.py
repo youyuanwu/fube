@@ -355,7 +355,7 @@ def assert_stateful(value: dict, service: str, count: int, minimum: int) -> dict
         or sum(replica["role"] == "Primary" for replica in ready) != 1):
         raise RuntimeError("independent native placement/role cardinality mismatch")
     for replica in ready:
-        expected = "Primary" if replica["role"] == "Primary" else "Secondary"
+        expected = replica["role"]
         if replica["role"] not in {"Primary","ActiveSecondary"}:
             raise RuntimeError("native ready replica is not active")
         rpc, deployed, control = replica["rpc"], replica["deployed"], replica["control"]
@@ -364,7 +364,7 @@ def assert_stateful(value: dict, service: str, count: int, minimum: int) -> dict
             or rpc["pid"] != deployed["host_process_id"] or rpc["role"] != expected
             or rpc["replicator_role"] != expected or rpc["current_role"] != expected
             or not rpc["stateful"] or rpc["persisted"]
-            or {"data_loss":rpc["epoch"]["data_loss"],"configuration":rpc["epoch"]["configuration"] & ~0xFFFFFFFF} != partition["epoch"]
+            or {"data_loss":rpc["epoch"]["data_loss_number"],"configuration":rpc["epoch"]["configuration_number"] & ~0xFFFFFFFF} != partition["epoch"]
             or deployed["service_type_name"] != "RustStatefulRuntimeType"):
             raise RuntimeError("native placement/deployment/HTTP stateful identity, role or epoch mismatch")
         if (rpc["replication_address"] == replica["address"] or rpc["service_address"] != replica["address"]
@@ -372,8 +372,8 @@ def assert_stateful(value: dict, service: str, count: int, minimum: int) -> dict
             or control["partition"] != value["partition"] or control["replica"] != replica["replica"]
             or control["incarnation"] != rpc["incarnation"] or control["first"] != 0 or control["last"] != 0
             or control["role"] != expected
-            or control["epoch"] != {"data_loss":partition["epoch"]["data_loss"],
-                                     "configuration":partition["epoch"]["configuration"] & ~0xFFFFFFFF}
+            or control["epoch"] != {"data_loss_number":partition["epoch"]["data_loss"],
+                                     "configuration_number":partition["epoch"]["configuration"] & ~0xFFFFFFFF}
             or rpc["replicator"]["application_writes"] or rpc["replicator"]["durability"]):
             raise RuntimeError("stateful service/control address or empty-frontier evidence mismatch")
         if expected == "Primary":

@@ -710,8 +710,8 @@ fn operation_parts(message: &Message, id: u16) -> Result<(&[u8], &[u8])> {
 fn write_epoch(encoder: &mut Encoder, epoch: Epoch) -> Result<()> {
     validate_epoch(epoch)?;
     let mut bytes = [0; 24];
-    bytes[..8].copy_from_slice(&epoch.data_loss.to_le_bytes());
-    bytes[8..16].copy_from_slice(&epoch.configuration.to_le_bytes());
+    bytes[..8].copy_from_slice(&epoch.data_loss_number.to_le_bytes());
+    bytes[8..16].copy_from_slice(&epoch.configuration_number.to_le_bytes());
     encoder.byte_array(&bytes)
 }
 
@@ -721,15 +721,15 @@ fn read_epoch(decoder: &mut Decoder<'_>) -> Result<Epoch> {
         return Err(Error::Protocol("invalid Linux FABRIC_EPOCH ABI"));
     }
     let epoch = Epoch {
-        data_loss: i64::from_le_bytes(bytes[..8].try_into().unwrap()),
-        configuration: i64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        data_loss_number: i64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        configuration_number: i64::from_le_bytes(bytes[8..16].try_into().unwrap()),
     };
     validate_epoch(epoch)?;
     Ok(epoch)
 }
 
 fn validate_epoch(epoch: Epoch) -> Result<()> {
-    if epoch.data_loss < 0 || epoch.configuration < 0 {
+    if epoch.data_loss_number < 0 || epoch.configuration_number < 0 {
         return Err(Error::Protocol("negative replication epoch"));
     }
     Ok(())

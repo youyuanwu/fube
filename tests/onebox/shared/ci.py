@@ -734,8 +734,7 @@ def data_snapshot(value, profile, service=None, target=3, minimum=2):
                 and same(replica["deployed"].get("host_process_id"), rpc["pid"])
                 and text(replica.get("address")) and replica["address"] == rpc.get("service_address"),
                 "native placement/deployed PID/HTTP data identity binding")
-        role = ("Primary" if replica["role"] == "Primary" else
-                "ActiveSecondary" if kind == "native-classic-v1" else "Secondary")
+        role = replica["role"]
         require(rpc.get("role") == rpc.get("current_role") == role
                 and type(replica.get("service_http_status")) is int
                 and replica["service_http_status"] == (200 if role == "Primary" else 503),

@@ -2,7 +2,7 @@ use crate::{
     lease::Authority, packages::key, wire::UpdateContext, ActivationContext, ConfigurationPackage,
     DataPackage, PackageDescription,
 };
-use fube_transport::{Error, Result};
+use crate::{Error, Result};
 use std::{
     path::{Path, PathBuf},
     sync::{

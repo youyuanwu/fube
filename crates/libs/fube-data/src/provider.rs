@@ -12,7 +12,8 @@ use crate::{
     Cancellation, Epoch, Error, OperationData, OperationDataStream, ReplayOperation, Result,
     StateProvider,
 };
-use fube_runtime::ServiceFuture;
+use fube_runtime::extensions::EpochDomains;
+use fube_runtime::ApiFuture as ServiceFuture;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -58,7 +59,8 @@ impl Mutation {
     /// epoch. Callers must fence submission against this same authority epoch.
     pub fn operation_for_epoch(&self, epoch: Epoch) -> Result<OperationData> {
         self.validate()?;
-        if epoch.data_loss < 0 || epoch.configuration < 0 || epoch != epoch.primary() {
+        if epoch.data_loss_number < 0 || epoch.configuration_number < 0 || epoch != epoch.primary()
+        {
             return Err(Error::InvalidInput("mutation primary operation epoch"));
         }
         let data = encode(&Payload::Mutation {
@@ -135,8 +137,8 @@ impl MemoryProvider {
         // Largest valid epoch has the largest canonical metadata. This also
         // validates copy escaping before either producer submits an operation.
         let data = mutation.operation_for_epoch(Epoch {
-            data_loss: i64::MAX,
-            configuration: i64::MAX & !0xffff_ffff,
+            data_loss_number: i64::MAX,
+            configuration_number: i64::MAX & !0xffff_ffff,
         })?;
         check_admission(&state, mutation, Some(&data))
     }
@@ -153,8 +155,8 @@ impl MemoryProvider {
                 .collect(),
             history_count: state.history.len(),
             retained_bytes: state.budget.load(Ordering::Acquire),
-            epoch_data_loss: state.epoch.map_or(0, |e| e.data_loss),
-            epoch_configuration: state.epoch.map_or(0, |e| e.configuration),
+            epoch_data_loss: state.epoch.map_or(0, |e| e.data_loss_number),
+            epoch_configuration: state.epoch.map_or(0, |e| e.configuration_number),
             data_loss_calls: state.data_loss_calls,
             data_loss_changed_calls: state.data_loss_changed_calls,
             last_data_loss_boundary: state.last_data_loss_boundary,
@@ -392,8 +394,8 @@ struct OriginEpoch {
 impl From<Epoch> for OriginEpoch {
     fn from(epoch: Epoch) -> Self {
         Self {
-            data_loss: epoch.data_loss,
-            configuration: epoch.configuration,
+            data_loss: epoch.data_loss_number,
+            configuration: epoch.configuration_number,
         }
     }
 }
@@ -463,10 +465,13 @@ fn replication_payload(data: &OperationData) -> Result<(Mutation, Option<Epoch>)
             origin_epoch: Some(epoch),
         } => {
             let epoch = Epoch {
-                data_loss: epoch.data_loss,
-                configuration: epoch.configuration,
+                data_loss_number: epoch.data_loss,
+                configuration_number: epoch.configuration,
             };
-            if epoch.data_loss < 0 || epoch.configuration < 0 || epoch != epoch.primary() {
+            if epoch.data_loss_number < 0
+                || epoch.configuration_number < 0
+                || epoch != epoch.primary()
+            {
                 return Err(Error::Protocol("provider original operation epoch"));
             }
             Ok((mutation, Some(epoch)))
@@ -660,8 +665,8 @@ impl StateProvider for MemoryProvider {
 mod tests {
     use super::*;
     const ORIGINAL_EPOCH: Epoch = Epoch {
-        data_loss: 7,
-        configuration: 3 << 32,
+        data_loss_number: 7,
+        configuration_number: 3 << 32,
     };
     fn mutation(n: i64) -> Mutation {
         Mutation {
@@ -718,8 +723,8 @@ mod tests {
         assert!(!p.on_data_loss(Cancellation::default()).await.unwrap());
         p.update_epoch(
             Epoch {
-                data_loss: 1,
-                configuration: 1,
+                data_loss_number: 1,
+                configuration_number: 1,
             },
             7,
             Cancellation::default(),
@@ -734,8 +739,8 @@ mod tests {
         // A node epoch transition cannot silently clear the armed fixture hook.
         p.update_epoch(
             Epoch {
-                data_loss: 2,
-                configuration: 1,
+                data_loss_number: 2,
+                configuration_number: 1,
             },
             8,
             Cancellation::default(),
@@ -778,8 +783,8 @@ mod tests {
         assert_eq!(p.admission(&mutation).unwrap(), None);
         let data = mutation
             .operation_for_epoch(Epoch {
-                data_loss: i64::MAX,
-                configuration: i64::MAX & !0xffff_ffff,
+                data_loss_number: i64::MAX,
+                configuration_number: i64::MAX & !0xffff_ffff,
             })
             .unwrap();
         assert!(data.bytes() > MAX_VALUE * 2);
@@ -812,7 +817,7 @@ mod tests {
         let raw = format!(
             " \n{{\"mutation\":{},\"origin_epoch\":{{\"configuration\":{},\"data_loss\":7}},\"version\":2,\"kind\":\"Mutation\"}}\t",
             serde_json::to_string(&m).unwrap(),
-            ORIGINAL_EPOCH.configuration
+            ORIGINAL_EPOCH.configuration_number
         ).into_bytes();
         let split = raw.windows(3).position(|w| w == "☃".as_bytes()).unwrap() + 1;
         let data = OperationData::new(vec![
@@ -863,8 +868,8 @@ mod tests {
         source
             .update_epoch(
                 Epoch {
-                    data_loss: 8,
-                    configuration: 5 << 32,
+                    data_loss_number: 8,
+                    configuration_number: 5 << 32,
                 },
                 1,
                 Cancellation::default(),

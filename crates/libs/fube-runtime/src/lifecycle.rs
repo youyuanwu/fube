@@ -1,14 +1,14 @@
 use crate::{api::*, lease::Authority, wire::*, ActivationContext, RuntimeMetrics};
+use crate::{Error, Result};
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
 pub(crate) mod tests;
 use fube_transport::{
     connection::{deadline_after, Connection, IpcRequest},
     serialization::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer},
-    Error, Result,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -37,7 +37,7 @@ enum Phase {
 struct Snapshot {
     request: ProxyRequest,
     phase: Phase,
-    service: Option<Arc<dyn StatelessService>>,
+    service: Option<Arc<dyn IStatelessServiceInstance>>,
     endpoint: String,
     valid: Arc<AtomicBool>,
     cancel: Cancellation,
@@ -55,12 +55,12 @@ struct Shared {
     units: Mutex<HashMap<[u8; 16], Arc<Unit>>>,
     owners: Mutex<HashMap<[u8; 16], bool>>,
     stateful: crate::stateful::Registry,
-    factories: Mutex<HashMap<String, Arc<dyn StatelessFactory>>>,
+    factories: Mutex<HashMap<String, Arc<dyn IStatelessServiceFactory>>>,
+    registered_types: Mutex<HashSet<String>>,
     callbacks: Arc<Semaphore>,
     live: Arc<Semaphore>,
     active: AtomicUsize,
     activation: ActivationContext,
-    current: crate::ActivationContextHandle,
     authority: Arc<Authority>,
     connection: Connection,
     metrics: Arc<RuntimeMetrics>,
@@ -73,7 +73,99 @@ pub(crate) struct Engine {
     stop: watch::Sender<bool>,
     task: JoinHandle<()>,
 }
+struct FactorySlot {
+    shared: Arc<Shared>,
+    name: String,
+    committed: bool,
+}
+impl Drop for FactorySlot {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.shared
+                .registered_types
+                .lock()
+                .unwrap()
+                .remove(&self.name);
+        }
+    }
+}
 impl Engine {
+    fn reserve_factory_name(&self, name: &str) -> Result<FactorySlot> {
+        let mut types = self.shared.registered_types.lock().unwrap();
+        if types.contains(name) {
+            return Err(Error::InvalidInput(
+                "service type already registered locally",
+            ));
+        }
+        if types.len() >= 32 {
+            return Err(Error::ResourceLimit("service factories"));
+        }
+        types.insert(name.to_owned());
+        Ok(FactorySlot {
+            shared: self.shared.clone(),
+            name: name.to_owned(),
+            committed: false,
+        })
+    }
+    pub(crate) fn instance_integration_provider(
+        &self,
+    ) -> crate::extensions::InstanceIntegrationProvider {
+        let shared = Arc::downgrade(&self.shared);
+        crate::extensions::InstanceIntegrationProvider::new(move |partition_id, instance_id| {
+            let shared = shared.upgrade().ok_or(Error::Closed)?;
+            let unit = shared
+                .units
+                .lock()
+                .unwrap()
+                .get(&partition_id.to_bytes_le())
+                .cloned()
+                .ok_or(Error::Closed)?;
+            let state = unit.state.lock().unwrap();
+            if state.request.local.id != instance_id {
+                return Err(Error::Closed);
+            }
+            let request = &state.request;
+            let kind = match request.unit.consistency.kind {
+                1 => PartitionKind::Singleton,
+                2 => PartitionKind::Int64Range {
+                    low: request.unit.consistency.low,
+                    high: request.unit.consistency.high,
+                },
+                3 => PartitionKind::Named(request.unit.consistency.name.clone()),
+                _ => return Err(Error::Protocol("invalid native partition kind")),
+            };
+            let integration = crate::extensions::InstanceRuntimeIntegration {
+                partition: Partition {
+                    identity: ServiceIdentity {
+                        service_name: request.service.name.clone(),
+                        service_type: request.service.service_type.name.clone(),
+                        partition_id,
+                        instance_id,
+                        incarnation: request.local.instance,
+                    },
+                    kind,
+                    valid: state.valid.clone(),
+                    authority: shared.authority.clone(),
+                    reporting: state.reporting.clone().ok_or(Error::Closed)?,
+                },
+                execution: shared.execution.clone(),
+            };
+            integration.validate()?;
+            Ok(integration)
+        })
+    }
+    pub(crate) fn native_integration_provider(
+        &self,
+    ) -> crate::extensions::NativeIntegrationProvider {
+        let shared = Arc::downgrade(&self.shared);
+        crate::extensions::NativeIntegrationProvider::new(move |partition, replica_id| {
+            shared
+                .upgrade()
+                .ok_or(Error::Closed)?
+                .stateful
+                .native_integration(partition, replica_id)
+        })
+    }
     #[cfg(test)]
     pub(crate) fn set_stateful_callback_timeout(&self, timeout: Duration) {
         self.shared.stateful.set_callback_timeout(timeout);
@@ -119,11 +211,11 @@ impl Engine {
             owners: Mutex::new(HashMap::new()),
             stateful,
             factories: Mutex::new(HashMap::new()),
+            registered_types: Mutex::new(HashSet::new()),
             callbacks: Arc::new(Semaphore::new(MAX_CALLBACKS)),
             live,
             active: AtomicUsize::new(0),
             activation,
-            current,
             authority,
             connection,
             metrics,
@@ -145,7 +237,7 @@ impl Engine {
                     _=deadline_poll.tick(), if !work.is_empty() => {
                         if task_shared.authority.callback_expired() {
                             task_shared.authority.retire();
-                            task_shared.connection.abort_with_error(Error::Timeout);
+                            task_shared.connection.abort_with_error(Error::Timeout.transport_fault());
                             break;
                         }
                     }
@@ -157,7 +249,7 @@ impl Engine {
                                 _=>Error::Protocol("lifecycle callback task panicked"),
                             };
                             task_shared.authority.retire();
-                            task_shared.connection.abort_with_error(error); break;
+                            task_shared.connection.abort_with_error(error.transport_fault()); break;
                         }
                     }
                     request=incoming.recv() => {
@@ -200,38 +292,24 @@ impl Engine {
     pub(crate) fn insert_factory(
         &self,
         name: String,
-        factory: Arc<dyn StatelessFactory>,
+        factory: Arc<dyn IStatelessServiceFactory>,
     ) -> Result<()> {
-        let mut factories = self.shared.factories.lock().unwrap();
-        if factories.contains_key(&name) || self.shared.stateful.has_factory(&name) {
-            return Err(Error::InvalidInput(
-                "service type already registered locally",
-            ));
-        }
-        if factories.len() + self.shared.stateful.factory_count() >= 32 {
-            return Err(Error::ResourceLimit("service factories"));
-        }
+        let mut slot = self.reserve_factory_name(&name)?;
         let factory =
             crate::managed_participants::stateless_factory(&self.shared.execution, factory)?;
-        factories.insert(name, factory);
+        self.shared.factories.lock().unwrap().insert(name, factory);
+        slot.committed = true;
         Ok(())
     }
     pub(crate) fn insert_stateful_factory(
         &self,
         name: String,
-        factory: Arc<dyn crate::StatefulFactory>,
+        factory: Arc<dyn crate::IStatefulServiceFactory>,
     ) -> Result<()> {
-        // The common lock serializes cross-kind type registration, never callbacks.
-        let factories = self.shared.factories.lock().unwrap();
-        if factories.contains_key(&name) {
-            return Err(Error::InvalidInput(
-                "service type already registered locally",
-            ));
-        }
-        if factories.len() + self.shared.stateful.factory_count() >= 32 {
-            return Err(Error::ResourceLimit("service factories"));
-        }
-        self.shared.stateful.insert_factory(name, factory)
+        let mut slot = self.reserve_factory_name(&name)?;
+        self.shared.stateful.insert_factory(name, factory)?;
+        slot.committed = true;
+        Ok(())
     }
     pub(crate) async fn quiesce(&mut self) -> Result<()> {
         let active = self.shared.execution.has_running_callbacks();
@@ -250,17 +328,22 @@ impl Engine {
             .lock()
             .unwrap()
             .values()
-            .filter_map(|unit| {
+            .map(|unit| {
                 let mut state = unit.state.lock().unwrap();
                 state.valid.store(false, Ordering::Release);
                 state.cancel.cancel();
                 state.phase = Phase::Closed;
                 state.live = None;
-                state.service.take()
+                (state.service.take(), state.reporting.clone())
             })
             .collect();
-        for service in services {
-            abort(service, self.shared.execution.clone()).await?;
+        for (service, reporting) in services {
+            if let Some(reporting) = reporting {
+                reporting.quiesce().await?;
+            }
+            if let Some(service) = service {
+                abort(service, self.shared.execution.clone()).await?;
+            }
         }
         self.shared.stateful.quiesce().await?;
         let factories = std::mem::take(&mut *self.shared.factories.lock().unwrap());
@@ -421,7 +504,8 @@ async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
                 to_vec(&query(&shared, &request)?)?,
                 deadline_after(Duration::from_secs(5))?,
             )
-            .await;
+            .await
+            .map_err(Error::from);
     }
     validate(&shared, &request)?;
     if incoming.reply.is_some() {
@@ -489,12 +573,7 @@ async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
     }
 }
 fn native_error(error: &Error) -> i64 {
-    match error {
-        Error::Remote { code, .. } => *code,
-        Error::Closed => OBJECT_CLOSED,
-        Error::Timeout => 0x80071bffu32 as i32 as i64,
-        _ => 0x80004005u32 as i32 as i64,
-    }
+    error.native_result_code()
 }
 async fn reply(
     shared: &Shared,
@@ -536,9 +615,10 @@ async fn reply(
             deadline_after(Duration::from_secs(5))?,
         )
         .await
+        .map_err(Error::from)
 }
 async fn abort(
-    service: Arc<dyn StatelessService>,
+    service: Arc<dyn IStatelessServiceInstance>,
     execution: crate::extensions::ExecutionRuntime,
 ) -> Result<()> {
     let cleanup = execution.clone();
@@ -557,12 +637,16 @@ async fn abort(
 async fn abort_unit(
     shared: &Shared,
     unit: &Unit,
-    service: Arc<dyn StatelessService>,
+    service: Arc<dyn IStatelessServiceInstance>,
 ) -> Result<()> {
     {
         let mut state = unit.state.lock().unwrap();
         state.operation_kind = 16;
         state.operation_start = filetime();
+    }
+    let reporting = unit.state.lock().unwrap().reporting.clone();
+    if let Some(reporting) = reporting {
+        reporting.quiesce().await?;
     }
     abort(service, shared.execution.clone()).await?;
     shared
@@ -669,17 +753,19 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
         })?;
         // Do not cancel a factory future and then call that successful cleanup.
         // Deadline/cancellation while creating instead retires the whole host.
-        let context = ServiceContext {
-            identity,
-            initialization_data: request.service.initialization.0.clone(),
-            activation: (*shared.current.snapshot()).clone(),
-        };
+        let initialization = request.service.initialization.0.clone();
         let (service, publication) = shared
             .execution
-            .invoke_creation(
-                CALLBACK_TIMEOUT,
-                async move { factory.create(context).await },
-            )
+            .invoke_creation(CALLBACK_TIMEOUT, async move {
+                let service = factory.create_instance(
+                    identity.service_type,
+                    identity.service_name,
+                    &initialization,
+                    identity.partition_id,
+                    identity.instance_id,
+                )?;
+                Ok(Arc::<dyn IStatelessServiceInstance>::from(service))
+            })
             .await?;
         {
             let mut state = unit.state.lock().unwrap();
@@ -698,7 +784,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
             .execution
             .invoke(CALLBACK_TIMEOUT, async move {
                 tokio::select! {
-                    result=service_open.open(partition,open_cancel.clone())=>result,
+                    result=service_open.open(Arc::new(partition),open_cancel.clone())=>result,
                     _=open_cancel.cancelled()=>Err(Error::Closed),
                 }
             })
@@ -719,6 +805,10 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
         // In particular, wake their retained fault worker without a retry delay.
         valid.store(false, Ordering::Release);
         cancel.cancel();
+        let reporting = unit.state.lock().unwrap().reporting.clone();
+        if let Some(reporting) = reporting {
+            reporting.quiesce().await?;
+        }
         shared.metrics.open_failures.fetch_add(1, Ordering::Relaxed);
         let service = unit.state.lock().unwrap().service.take();
         if let Some(service) = service {
@@ -761,7 +851,7 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
     .await
 }
 async fn close(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()> {
-    let (service, cancel, already_closed) = {
+    let (service, cancel, already_closed, reporting) = {
         let mut state = unit.state.lock().unwrap();
         let closed = matches!(state.phase, Phase::Closed | Phase::Absent);
         state.valid.store(false, Ordering::Release);
@@ -769,8 +859,16 @@ async fn close(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()
         state.phase = Phase::Closing;
         state.operation_start = filetime();
         state.operation_kind = if request.flags & 4 != 0 { 16 } else { 8 };
-        (state.service.clone(), Cancellation::default(), closed)
+        (
+            state.service.clone(),
+            Cancellation::default(),
+            closed,
+            state.reporting.clone(),
+        )
     };
+    if let Some(reporting) = reporting {
+        reporting.quiesce().await?;
+    }
     if !already_closed {
         if let Some(service) = service {
             if request.flags & 4 != 0 {
@@ -851,6 +949,7 @@ async fn update(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<(
             deadline_after(Duration::from_secs(5))?,
         )
         .await
+        .map_err(Error::from)
 }
 fn query(shared: &Shared, request: &ProxyRequest) -> Result<QueryReply> {
     let mut error = 0x80071d4au32 as i32 as i64;

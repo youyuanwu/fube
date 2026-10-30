@@ -49,20 +49,20 @@ fn model_child() {
             "core-independent" => {
                 struct Factory;
                 struct Service;
-                impl StatelessFactory for Factory {
-                    fn create(
+                impl IStatelessServiceFactory for Factory {
+                    fn create_instance(
                         &self,
-                        _: ServiceContext,
-                    ) -> ServiceFuture<'_, Arc<dyn StatelessService>> {
+                        _: String,
+                        _: String,
+                        _: &[u8],
+                        _: uuid::Uuid,
+                        _: i64,
+                    ) -> Result<Box<dyn IStatelessServiceInstance>> {
                         assert_eq!(std::thread::current().name(), Some("fube-native-call"));
                         println!("CORE_CONSTRUCTOR_ENTERED");
                         std::io::stdout().flush().unwrap();
                         std::thread::sleep(Duration::from_millis(600));
-                        Box::pin(async {
-                            assert_eq!(std::thread::current().name(), Some("fube-native-call"));
-                            std::thread::sleep(Duration::from_millis(600));
-                            Ok(Arc::new(Service) as Arc<dyn StatelessService>)
-                        })
+                        Ok(Box::new(Service))
                     }
                 }
                 impl Drop for Factory {
@@ -70,11 +70,19 @@ fn model_child() {
                         assert_eq!(std::thread::current().name(), Some("fube-owned-cleanup"));
                     }
                 }
-                impl StatelessService for Service {
-                    fn open(&self, _: Partition, _: Cancellation) -> ServiceFuture<'_, String> {
-                        Box::pin(async { Ok("model://independent".into()) })
+                impl IStatelessServiceInstance for Service {
+                    fn open(
+                        &self,
+                        _: Arc<dyn IStatelessServicePartition>,
+                        _: Cancellation,
+                    ) -> ApiFuture<'_, String> {
+                        Box::pin(async {
+                            assert_eq!(std::thread::current().name(), Some("fube-native-call"));
+                            std::thread::sleep(Duration::from_millis(600));
+                            Ok("model://independent".into())
+                        })
                     }
-                    fn close(&self, _: Cancellation) -> ServiceFuture<'_, ()> {
+                    fn close(&self, _: Cancellation) -> ApiFuture<'_, ()> {
                         Box::pin(async { Ok(()) })
                     }
                     fn abort(&self) {}
@@ -85,10 +93,12 @@ fn model_child() {
                         std::thread::sleep(Duration::from_millis(100));
                     }
                 }
-                runtime
-                    .register_stateless("ModelType", Arc::new(Factory))
-                    .await
-                    .unwrap();
+                runtime = crate::sdk_contracts::recover_and_register(
+                    runtime,
+                    "ModelType",
+                    Box::new(Factory),
+                )
+                .await;
                 // This is the entire attaching application's current-thread
                 // executor, not a blocking helper. IPC/lease/root execution
                 // must independently construct, poll, query and dispose.
@@ -100,11 +110,18 @@ fn model_child() {
                 runtime
                     .lifecycle
                     .set_stateful_callback_timeout(Duration::from_millis(100));
-                runtime
-                    .register_stateful(
-                        "BlockedStateful",
-                        crate::lifecycle::tests::stateful_tests::destructor_model_factory(),
-                    )
+                let provider = runtime.native_integration_provider();
+                let permit = runtime.execution_runtime().try_reserve().unwrap();
+                let _runtime = permit
+                    .run_owned(move || {
+                        runtime.register_stateful_service_factory(
+                            "BlockedStateful",
+                            crate::lifecycle::tests::stateful_tests::destructor_model_factory(
+                                provider,
+                            ),
+                        )?;
+                        Ok(runtime)
+                    })
                     .await
                     .unwrap();
                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -117,7 +134,7 @@ fn model_child() {
                 struct Blocked(u8);
                 struct BlockingFutureDrop;
                 impl std::future::Future for BlockingFutureDrop {
-                    type Output = Result<Arc<dyn StatefulService>>;
+                    type Output = Result<Box<dyn IPrimaryReplicator>>;
                     fn poll(
                         self: std::pin::Pin<&mut Self>,
                         _: &mut std::task::Context<'_>,
@@ -132,16 +149,32 @@ fn model_child() {
                         std::thread::sleep(Duration::from_secs(60));
                     }
                 }
-                impl StatefulFactory for Blocked {
-                    fn create(
+                struct BlockedReplica(u8);
+                impl IStatefulServiceFactory for Blocked {
+                    fn create_replica(
                         &self,
-                        _: StatefulServiceContext,
-                    ) -> ServiceFuture<'_, Arc<dyn StatefulService>> {
-                        if self.0 == 1 {
+                        _: String,
+                        _: String,
+                        _: &[u8],
+                        _: uuid::Uuid,
+                        _: i64,
+                    ) -> Result<Box<dyn IStatefulServiceReplica>> {
+                        if self.0 <= 1 {
                             println!("STATEFUL_FACTORY_ENTERED");
                             std::io::stdout().flush().unwrap();
                             std::thread::sleep(Duration::from_secs(60));
                         }
+                        Ok(Box::new(BlockedReplica(self.0)))
+                    }
+                }
+                impl IStatefulServiceReplica for BlockedReplica {
+                    fn open(
+                        &self,
+                        mode: OpenMode,
+                        _: Arc<dyn IStatefulServicePartition>,
+                        _: Cancellation,
+                    ) -> ApiFuture<'_, Box<dyn IPrimaryReplicator>> {
+                        assert_eq!(mode, OpenMode::New);
                         if self.0 == 2 {
                             return Box::pin(BlockingFutureDrop);
                         }
@@ -154,6 +187,17 @@ fn model_child() {
                             Err(Error::Protocol("stateful factory escaped hard fence"))
                         })
                     }
+                    fn change_role(
+                        &self,
+                        _: ReplicaRole,
+                        _: Cancellation,
+                    ) -> ApiFuture<'_, String> {
+                        Box::pin(async { Err(Error::Protocol("unreachable blocked role")) })
+                    }
+                    fn close(&self, _: Cancellation) -> ApiFuture<'_, ()> {
+                        Box::pin(async { Ok(()) })
+                    }
+                    fn abort(&self) {}
                 }
                 let kind = match mode.as_str() {
                     "stateful-blocked-create-method" => 1,
@@ -166,8 +210,15 @@ fn model_child() {
                         .lifecycle
                         .set_stateful_callback_timeout(Duration::from_millis(50));
                 }
-                runtime
-                    .register_stateful("BlockedStateful", Arc::new(Blocked(kind)))
+                let permit = runtime.execution_runtime().try_reserve().unwrap();
+                let _runtime = permit
+                    .run_owned(move || {
+                        runtime.register_stateful_service_factory(
+                            "BlockedStateful",
+                            Box::new(Blocked(kind)),
+                        )?;
+                        Ok(runtime)
+                    })
                     .await
                     .unwrap();
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -175,12 +226,16 @@ fn model_child() {
             }
             "live-update" => {
                 struct Unplaced;
-                impl StatelessFactory for Unplaced {
-                    fn create(
+                impl IStatelessServiceFactory for Unplaced {
+                    fn create_instance(
                         &self,
-                        _: ServiceContext,
-                    ) -> ServiceFuture<'_, Arc<dyn StatelessService>> {
-                        Box::pin(async { panic!("model type is not placed") })
+                        _: String,
+                        _: String,
+                        _: &[u8],
+                        _: uuid::Uuid,
+                        _: i64,
+                    ) -> Result<Box<dyn IStatelessServiceInstance>> {
+                        panic!("model type is not placed")
                     }
                 }
                 let old = runtime.activation_context();
@@ -211,8 +266,13 @@ fn model_child() {
                         .version(),
                     "2"
                 );
-                runtime
-                    .register_stateless("LaterType", Arc::new(Unplaced))
+                let permit = runtime.execution_runtime().try_reserve().unwrap();
+                runtime = permit
+                    .run_owned(move || {
+                        runtime
+                            .register_stateless_service_factory("LaterType", Box::new(Unplaced))?;
+                        Ok(runtime)
+                    })
                     .await
                     .unwrap();
                 runtime.shutdown().await.unwrap();
@@ -386,6 +446,8 @@ async fn scenario(mode: &str, expected: i32) {
     let child_pid = child.id().unwrap();
     let independent_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let independent_peer_entered = independent_entered.clone();
+    let registration_reply_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peer_registration_reply_sent = registration_reply_sent.clone();
     let mode_owned = mode.to_owned();
     let deployment = fixture.root.to_str().unwrap().to_owned();
     let peer = tokio::spawn(async move {
@@ -585,6 +647,26 @@ async fn scenario(mode: &str, expected: i32) {
                         assert_eq!(registration.context.code.version.instance, 4);
                     } else if mode_owned == "core-independent" {
                         assert_eq!(registration.id.name, "ModelType");
+                        // Keep the real native type-registration result
+                        // blocked while the independent host core renews its
+                        // lease. Insertion/enqueue cannot satisfy the call.
+                        let poll = read_message(&mut reader).await.unwrap();
+                        let poll = poll.properties().unwrap();
+                        assert_eq!(poll.actor, 15);
+                        assert!(poll.action.is_empty());
+                        lease_polls += 1;
+                        write_message(
+                            &mut stream,
+                            &Message {
+                                headers: vec![Header::relates_to(poll.id).unwrap()],
+                                body: to_vec(&LeaseReply { ttl: 300_000_000 }).unwrap(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        peer_registration_reply_sent
+                            .store(true, std::sync::atomic::Ordering::Release);
                     } else {
                         assert!(mode_owned.starts_with("stateful-blocked-"));
                         assert_eq!(registration.id.name, "BlockedStateful");
@@ -760,6 +842,12 @@ async fn scenario(mode: &str, expected: i32) {
                 if line.contains("CORE_CONSTRUCTOR_ENTERED") {
                     independent_entered.store(true, std::sync::atomic::Ordering::Release);
                     return;
+                }
+                if line.contains("SYNC_REG_COMPLETED") {
+                    assert!(
+                        registration_reply_sent.load(std::sync::atomic::Ordering::Acquire),
+                        "canonical registration returned before the actual native reply"
+                    );
                 }
             }
             panic!("constructor marker missing");

@@ -1,12 +1,13 @@
 //! Native stateful RAP lifecycle. Wire records are never the public API.
+use crate::extensions::EpochDomains;
 use crate::{
     lease::Authority, stateful_api::*, wire as w, ActivationContextHandle, Cancellation,
     PartitionKind, RuntimeMetrics,
 };
+use crate::{Error, OpenMode, Result};
 use fube_transport::{
     connection::{deadline_after, Connection, IpcReplyContext, SendStatus},
     serialization::serde::{to_vec, Guid, ObjectArray, Pointer},
-    Error, Result,
 };
 use std::{
     collections::HashMap,
@@ -28,11 +29,11 @@ const CLOSED: i64 = 0x80071bfeu32 as i32 as i64;
 
 struct State {
     request: w::ProxyRequest,
-    status: Arc<Mutex<ReplicaStatus>>,
+    status: Arc<Mutex<ReplicaDiagnostics>>,
     valid: Arc<AtomicBool>,
     cancel: Cancellation,
-    service: Option<Arc<dyn StatefulService>>,
-    replicator: Option<Arc<dyn Replicator>>,
+    service: Option<Arc<dyn IStatefulServiceReplica>>,
+    replicator: Option<Arc<dyn IPrimaryReplicator>>,
     service_open: bool,
     generation: u64,
     live: Option<OwnedSemaphorePermit>,
@@ -73,7 +74,7 @@ type RevisionFence = (Arc<AtomicU64>, u64, Option<Cancellation>);
 
 pub(crate) struct Registry {
     units: Mutex<HashMap<[u8; 16], Arc<Unit>>>,
-    factories: Mutex<HashMap<String, Arc<dyn StatefulFactory>>>,
+    factories: Mutex<HashMap<String, Arc<dyn IStatefulServiceFactory>>>,
     current: ActivationContextHandle,
     authority: Arc<Authority>,
     connection: Connection,
@@ -100,6 +101,32 @@ pub(crate) struct OpenAdmissionHook {
     pub(crate) release: tokio::sync::Notify,
 }
 impl Registry {
+    pub(crate) fn native_integration(
+        &self,
+        partition: uuid::Uuid,
+        replica_id: i64,
+    ) -> Result<binding::NativeRuntimeIntegration> {
+        let unit = self
+            .units
+            .lock()
+            .unwrap()
+            .get(&partition.to_bytes_le())
+            .cloned()
+            .ok_or(Error::Closed)?;
+        let state = unit.state.lock().unwrap();
+        if state.request.local.id != replica_id {
+            return Err(Error::Closed);
+        }
+        let native = state.native.clone().ok_or_else(|| {
+            Error::new(
+                crate::ErrorKind::Unsupported,
+                "native issuer is unavailable",
+            )
+        })?;
+        drop(state);
+        native.validate()?;
+        Ok(native)
+    }
     pub(crate) fn new(
         current: ActivationContextHandle,
         authority: Arc<Authority>,
@@ -256,24 +283,18 @@ impl Registry {
         self.execution.invoke_creation(timeout, operation).await
     }
 
-    pub(crate) fn has_factory(&self, name: &str) -> bool {
-        self.factories.lock().unwrap().contains_key(name)
-    }
-    pub(crate) fn factory_count(&self) -> usize {
-        self.factories.lock().unwrap().len()
-    }
     pub(crate) fn insert_factory(
         &self,
         name: String,
-        factory: Arc<dyn StatefulFactory>,
+        factory: Arc<dyn IStatefulServiceFactory>,
     ) -> Result<()> {
+        let factory = crate::managed_participants::stateful_factory(&self.execution, factory)?;
         let mut factories = self.factories.lock().unwrap();
         if factories.contains_key(&name) {
             return Err(Error::InvalidInput(
                 "service type already registered locally",
             ));
         }
-        let factory = crate::managed_participants::stateful_factory(&self.execution, factory)?;
         factories.insert(name, factory);
         Ok(())
     }
@@ -311,7 +332,8 @@ impl Registry {
                             .is_some_and(|authority| authority.check().is_ok())
                     }),
                 )
-                .await;
+                .await
+                .map_err(Error::from);
         }
         if correlation.is_some() {
             return Err(Error::Protocol(
@@ -524,7 +546,7 @@ impl Registry {
     async fn open(&self, unit: &Unit, request: w::ProxyRequest) -> Result<()> {
         self.metrics.opens.fetch_add(1, Ordering::Relaxed);
         let role = role(request.local.current_role)?;
-        if !matches!(role, ReplicaRole::Primary | ReplicaRole::Idle)
+        if !matches!(role, ReplicaRole::Primary | ReplicaRole::IdleSecondary)
             || request.flags & !4 != 0
             || api_epoch(&request.unit.current) == Epoch::INVALID
         {
@@ -678,8 +700,6 @@ impl Registry {
             authority: self.authority.clone(),
             status: snapshot.clone(),
             reporting: Some(reporting),
-            execution: Some(self.execution.clone()),
-            native: Some(native),
         };
         let factory = self
             .factories
@@ -692,13 +712,18 @@ impl Registry {
                 code: 0x80071bd2u32 as i32 as i64,
                 message: "stateful service type not registered".into(),
             })?;
-            let context = StatefulServiceContext {
-                identity,
-                initialization_data: request.service.initialization.0.clone(),
-                activation: (*self.current.snapshot()).clone(),
-            };
+            let initialization = request.service.initialization.0.clone();
             let (service, publication) = self
-                .complete_creation(async move { factory.create(context).await })
+                .complete_creation(async move {
+                    let service = factory.create_replica(
+                        identity.service_type,
+                        identity.service_name,
+                        &initialization,
+                        identity.partition_id,
+                        identity.replica_id,
+                    )?;
+                    Ok(Arc::<dyn IStatefulServiceReplica>::from(service))
+                })
                 .await?;
             {
                 let mut state = unit.state.lock().unwrap();
@@ -714,7 +739,14 @@ impl Registry {
             let service_open = service.clone();
             let open_cancel = cancel.clone();
             let (replicator, publication) = self
-                .complete_creation(async move { service_open.open(partition, open_cancel).await })
+                .complete_creation(async move {
+                    let mode = OpenMode::New;
+                    mode.validate()?;
+                    let control = service_open
+                        .open(mode, Arc::new(partition), open_cancel)
+                        .await?;
+                    Ok(Arc::<dyn IPrimaryReplicator>::from(control))
+                })
                 .await?;
             {
                 let mut state = unit.state.lock().unwrap();
@@ -757,7 +789,7 @@ impl Registry {
             if role == ReplicaRole::Primary {
                 let previous = api_epoch(&request.unit.previous);
                 if previous != Epoch::INVALID
-                    && previous.data_loss != request.unit.current.data_loss
+                    && previous.data_loss_number != request.unit.current.data_loss
                 {
                     let changed = self.data_loss(unit, &replicator, &cancel).await?;
                     if changed {
@@ -787,6 +819,10 @@ impl Registry {
             if !state_changed {
                 valid.store(false, Ordering::Release);
                 cancel.cancel();
+                let reporting = unit.state.lock().unwrap().reporting.clone();
+                if let Some(reporting) = reporting {
+                    reporting.quiesce().await?;
+                }
                 self.metrics.open_failures.fetch_add(1, Ordering::Relaxed);
                 let (service, replicator) = {
                     let state = unit.state.lock().unwrap();
@@ -937,6 +973,10 @@ impl Registry {
     }
 
     async fn close(&self, unit: &Unit, request: w::ProxyRequest) -> Result<()> {
+        let reporting = unit.state.lock().unwrap().reporting.clone();
+        if let Some(reporting) = reporting {
+            reporting.quiesce().await?;
+        }
         let (service, replicator, open, replicator_open, snapshot) = {
             let mut state = unit.state.lock().unwrap();
             state.operation = if request.flags & 4 != 0 { 16 } else { 8 };
@@ -1115,7 +1155,8 @@ impl Registry {
                             .is_some_and(|authority| authority.check().is_ok())
                 })),
             )
-            .await;
+            .await
+            .map_err(Error::from);
         match sent {
             Err(Error::Closed)
                 if !valid.load(Ordering::Acquire) && self.authority.check().is_ok() =>
@@ -1278,7 +1319,8 @@ impl Registry {
                         )
                 })),
             )
-            .await;
+            .await
+            .map_err(Error::from);
         match sent {
             // A locally revoked queued Open reply is suppressed, not a
             // successful endpoint publication or a process-wide fault.
@@ -1316,10 +1358,17 @@ impl Registry {
                 if let Some(native) = &state.native {
                     native.retire_ledger();
                 }
-                (state.replicator.take(), state.service.take())
+                (
+                    state.replicator.take(),
+                    state.service.take(),
+                    state.reporting.clone(),
+                )
             })
             .collect();
-        for (replicator, service) in participants {
+        for (replicator, service, reporting) in participants {
+            if let Some(reporting) = reporting {
+                reporting.quiesce().await?;
+            }
             dispose(replicator, service, None, self.execution.clone()).await?;
         }
         let retries = std::mem::take(&mut *self.retries.lock().unwrap());
@@ -1349,8 +1398,8 @@ async fn final_release<T: Send + 'static>(
 }
 
 async fn dispose(
-    replicator: Option<Arc<dyn Replicator>>,
-    service: Option<Arc<dyn StatefulService>>,
+    replicator: Option<Arc<dyn IPrimaryReplicator>>,
+    service: Option<Arc<dyn IStatefulServiceReplica>>,
     monitor: Option<Arc<Mutex<State>>>,
     execution: crate::extensions::ExecutionRuntime,
 ) -> Result<()> {
@@ -1387,8 +1436,8 @@ async fn dispose(
         })
         .await
 }
-fn initial_status(request: &w::ProxyRequest) -> ReplicaStatus {
-    ReplicaStatus {
+fn initial_status(request: &w::ProxyRequest) -> ReplicaDiagnostics {
+    ReplicaDiagnostics {
         lifecycle: ReplicaLifecycle::Closed,
         service_role: ReplicaRole::Unknown,
         replicator_role: ReplicaRole::Unknown,
@@ -1405,18 +1454,22 @@ fn initial_status(request: &w::ProxyRequest) -> ReplicaStatus {
         progress: ReplicationProgress::EMPTY,
     }
 }
-fn api_epoch(epoch: &w::Epoch) -> Epoch {
-    Epoch {
-        data_loss: epoch.data_loss,
-        configuration: epoch.configuration,
+pub(crate) fn api_epoch(epoch: &w::Epoch) -> Epoch {
+    if epoch.data_loss == 0 && epoch.configuration == 0 {
+        Epoch::INVALID
+    } else {
+        Epoch {
+            data_loss_number: epoch.data_loss,
+            configuration_number: epoch.configuration,
+        }
     }
 }
 fn role(value: i64) -> Result<ReplicaRole> {
     match value {
         0 => Ok(ReplicaRole::Unknown),
         1 => Ok(ReplicaRole::None),
-        2 => Ok(ReplicaRole::Idle),
-        3 => Ok(ReplicaRole::Secondary),
+        2 => Ok(ReplicaRole::IdleSecondary),
+        3 => Ok(ReplicaRole::ActiveSecondary),
         4 => Ok(ReplicaRole::Primary),
         _ => Err(Error::Protocol("invalid native replica role")),
     }
@@ -1428,10 +1481,5 @@ fn stale(current: &w::ProxyRequest, incoming: &w::ProxyRequest) -> bool {
             && current.local.id != incoming.local.id)
 }
 fn native_error(error: &Error) -> i64 {
-    match error {
-        Error::Remote { code, .. } => *code,
-        Error::Closed => CLOSED,
-        Error::Timeout => 0x80071bffu32 as i32 as i64,
-        _ => 0x80004005u32 as i32 as i64,
-    }
+    error.native_result_code()
 }

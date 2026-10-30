@@ -32,7 +32,7 @@ pub(super) fn selected(initialization_data: &[u8]) -> bool {
 trait NativeView: Send + Sync {
     fn snapshot(&self) -> RuntimeResult<ReplicaStatus>;
 }
-impl NativeView for StatefulPartition {
+impl NativeView for NativeRuntimeIntegration {
     fn snapshot(&self) -> RuntimeResult<ReplicaStatus> {
         self.status()
     }
@@ -556,6 +556,8 @@ pub(super) struct Route {
     fault: Arc<Mutex<Option<String>>>,
     service_address: String,
     generation: u64,
+    #[cfg(test)]
+    native_host: Option<Arc<fube_data::qualification::Host>>,
 }
 impl Route {
     fn start(
@@ -601,6 +603,8 @@ impl Route {
             fault,
             service_address,
             generation,
+            #[cfg(test)]
+            native_host: None,
         }))
     }
     fn shutdown(&self) {
@@ -659,16 +663,16 @@ impl Drop for Route {
 
 pub(super) struct Service {
     rpc: Arc<Rpc>,
-    context: StatefulServiceContext,
+    context: stateful::Creation,
     path: String,
     incarnation: Uuid,
     opened: AtomicBool,
     route: Mutex<Option<Arc<Route>>>,
 }
 impl Service {
-    pub(super) fn new(rpc: Arc<Rpc>, context: StatefulServiceContext) -> Arc<Self> {
+    pub(super) fn new(rpc: Arc<Rpc>, context: stateful::Creation) -> Box<Self> {
         let incarnation = Uuid::new_v4();
-        Arc::new(Self {
+        Box::new(Self {
             path: format!(
                 "/data/{}/{}/{}/{}-{incarnation}",
                 context.identity.partition_id,
@@ -704,20 +708,23 @@ fn remove_owned(routes: &mut HashMap<String, Arc<Route>>, path: &str, owner: &Ar
     }
 }
 
-impl StatefulService for Service {
+impl IStatefulServiceReplica for Service {
     fn open(
         &self,
-        partition: StatefulPartition,
+        mode: OpenMode,
+        partition: Arc<dyn IStatefulServicePartition>,
         cancellation: Cancellation,
-    ) -> ServiceFuture<'_, Arc<dyn Replicator>> {
+    ) -> ServiceFuture<'_, Box<dyn IPrimaryReplicator>> {
         Box::pin(async move {
+            mode.validate()?;
+            let native = self.context.native.clone();
             if self.opened.swap(true, Ordering::SeqCst)
                 || cancellation.is_cancelled()
-                || partition.identity() != &self.context.identity
+                || native.identity() != &self.context.identity
             {
                 return Err(RuntimeError::Closed);
             }
-            partition.ensure_valid()?;
+            native.validate()?;
             self.rpc.listen().await?;
             let provider = MemoryProvider::new();
             let copy_delay = Arc::new(AtomicU64::new(0));
@@ -730,6 +737,7 @@ impl StatefulService for Service {
             );
             let engine = Engine::bind_partition(
                 partition.clone(),
+                native.clone(),
                 Actor {
                     partition: self.context.identity.partition_id,
                     replica: self.context.identity.replica_id,
@@ -743,7 +751,7 @@ impl StatefulService for Service {
                 Settings::default(),
             )?;
             let route = Route::start(
-                Arc::new(partition.clone()),
+                Arc::new(native.clone()),
                 self.context.identity.clone(),
                 engine.clone(),
                 provider,
@@ -755,7 +763,7 @@ impl StatefulService for Service {
                 self.context.activation.generation(),
                 copy_delay,
             )?;
-            if cancellation.is_cancelled() || partition.ensure_valid().is_err() {
+            if cancellation.is_cancelled() || native.validate().is_err() {
                 route.shutdown();
                 return Err(RuntimeError::Closed);
             }
@@ -765,7 +773,7 @@ impl StatefulService for Service {
                 .unwrap()
                 .insert(self.path.clone(), route.clone());
             *self.route.lock().unwrap() = Some(route);
-            Ok(engine as Arc<dyn Replicator>)
+            Ok(engine.get_primary_replicator())
         })
     }
     fn change_role(
@@ -885,7 +893,10 @@ impl Rpc {
             let snapshot = route.engine.snapshot();
             if snapshot.epoch != Some(status.current_epoch.primary())
                 || snapshot.role != status.service_role
-                || !matches!(snapshot.role, ReplicaRole::Primary | ReplicaRole::Secondary)
+                || !matches!(
+                    snapshot.role,
+                    ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+                )
                 || (snapshot.role == ReplicaRole::Primary && route.authority(true).is_err())
             {
                 return response(&mut stream, 503, &serde_json::json!({})).await;
@@ -959,7 +970,7 @@ impl Rpc {
             "node":self.node,"host":self.host,"pid":std::process::id(),
             "service_address":route.service_address,
             "replication_address":route.engine.endpoint().to_string(),
-            "native_epoch":{"data_loss":status.current_epoch.data_loss,"configuration":status.current_epoch.configuration},
+            "native_epoch":{"data_loss_number":status.current_epoch.data_loss_number,"configuration_number":status.current_epoch.configuration_number},
             "read_status":format!("{read:?}"),"write_status":format!("{write:?}"),
             "state":route.provider.snapshot(),"engine":route.engine.snapshot(),
             "peer_transport":route.engine.qualification_transport_snapshot(),

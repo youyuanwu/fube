@@ -1,12 +1,12 @@
 use super::*;
-use fube_runtime::CatchUpResult;
+use fube_runtime::extensions::CatchUpResult;
 
 #[tokio::test]
 async fn actual_owner_and_peer_ack_progress_while_entire_application_executor_is_stalled() {
     let partition = Uuid::new_v4();
     let secondary = engine(partition, 2, Arc::new(Provider::default()));
     secondary
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     let (network, mut incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
@@ -120,7 +120,7 @@ impl NativeControlView for ExecutionView {
     fn report_fault(
         &self,
         _: fube_runtime::FaultType,
-    ) -> ServiceFuture<'_, fube_runtime::FaultDelivery> {
+    ) -> ServiceFuture<'_, fube_runtime::extensions::FaultDelivery> {
         Box::pin(async { Err(Error::Closed) })
     }
 }
@@ -267,7 +267,7 @@ async fn delayed_command_disposal(configure: bool, cancelled: bool, closing: boo
     let mut replica = descriptor(&primary);
     replica.replica_id = 2;
     replica.address = remote.to_string();
-    replica.role = ReplicaRole::Secondary;
+    replica.role = ReplicaRole::ActiveSecondary;
     if configure {
         primary
             .update_current_configuration(configuration(vec![replica.clone()], true, 1), cancel())

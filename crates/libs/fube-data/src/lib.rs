@@ -41,7 +41,14 @@
 
 pub mod api;
 pub mod engine;
+pub mod extensions;
 pub mod provider;
+/// Offline native-RAP model-node tooling, not a standalone Engine authority
+/// and not evidence of deployed Service Fabric qualification. The model still
+/// performs real runtime registration/lease/partition-issued construction.
+#[cfg(any(test, feature = "qualification"))]
+#[path = "../tests/support/rap_model.rs"]
+pub mod qualification;
 pub mod queue;
 pub mod quorum;
 mod supervised;
@@ -50,6 +57,5 @@ pub mod wire;
 
 pub use api::*;
 pub use engine::{Engine, EngineSnapshot, PeerSnapshot, Replication};
-pub use fube_runtime::{Cancellation, Epoch, ReplicaRole, StatefulPartition};
-pub use fube_transport::{Error, Result};
+pub use fube_runtime::{Cancellation, Epoch, Error, ReplicaRole, Result};
 pub use provider::{MemoryProvider, Mutation, ProviderSnapshot};

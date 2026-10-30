@@ -614,13 +614,14 @@ def observation(mixed=True, target=3):
     for index, node in enumerate(("N0010", "N0020", "N0030")[:target]):
         kind = data.NODE_ENGINES[node] if mixed else "rust"
         role = "Primary" if index == 0 else "ActiveSecondary"
-        service_role = role if kind == "native-classic-v1" else ("Primary" if index == 0 else "Secondary")
+        observed_epoch = {"data_loss_number": epoch["data_loss"],
+                          "configuration_number": epoch["configuration"]}
         rpc = {
             "profile": "fube-data-v1", "engine_kind": kind, "partition": "partition", "replica": index + 10,
             "node": node, "host": "host-" + node, "pid": 100 + index, "incarnation": index + 1000,
             "engine_incarnation": "engine-" + node, "service_address": f"http://127.0.0.1:{2000+index}/data/owner/service",
-            "role": service_role, "current_role": service_role, "native_epoch": dict(epoch),
-            "replicator_role": None if kind == "native-classic-v1" else service_role,
+            "role": role, "current_role": role, "native_epoch": observed_epoch,
+            "replicator_role": None if kind == "native-classic-v1" else role,
             "replication_address": None if kind == "native-classic-v1" else "127.0.0.1:3000+actor",
             "engine": {"copy_done": True, "closed": False, "fault": None, "peers": [], "progress": {"committed": 0}},
             "pump_fault": None, "read_status": "Granted" if index == 0 else "NotPrimary",
@@ -642,6 +643,25 @@ def observation(mixed=True, target=3):
 
 
 class NativeIdentityTests(unittest.TestCase):
+    def test_current_oracle_epoch_schema_for_native_primary_and_secondary(self):
+        for target, index in ((1, 0), (3, 2)):
+            with self.subTest(target=target, index=index):
+                value = observation(True, target)
+                rpc = value["replicas"][index]["rpc"]
+                self.assertEqual(rpc["engine_kind"], "native-classic-v1")
+                # Exact host.rs diagnostics shape; FM authority keeps its own
+                # independently obtained data_loss/configuration vocabulary.
+                rpc["native_epoch"] = {
+                    "data_loss_number": 1,
+                    "configuration_number": 2 << 32,
+                }
+                data.assert_data(value, value["service"], True, target,
+                                 1 if target == 1 else 2)
+                rpc["native_epoch"] = {"data_loss": 1, "configuration": 2 << 32}
+                with self.assertRaises(RuntimeError):
+                    data.assert_data(value, value["service"], True, target,
+                                     1 if target == 1 else 2)
+
     def test_native_secondary_callback_epoch_can_remain_unknown_after_real_progress(self):
         value=observation()
         rpc=value["replicas"][2]["rpc"]
@@ -656,9 +676,9 @@ class NativeIdentityTests(unittest.TestCase):
         rpc["engine"]["progress"]["received"]=1
         data.assert_data(value,value["service"],True)
         self.assertIsNone(rpc["native_epoch"])
-        rpc["native_epoch"]={"data_loss":1,"configuration":1 << 32}
+        rpc["native_epoch"]={"data_loss_number":1,"configuration_number":1 << 32}
         data.assert_data(value,value["service"],True)
-        rpc["native_epoch"]={"data_loss":2,"configuration":2 << 32}
+        rpc["native_epoch"]={"data_loss_number":2,"configuration_number":2 << 32}
         with self.assertRaises(RuntimeError):
             data.assert_data(value,value["service"],True)
         for index in (0,1):
@@ -698,7 +718,12 @@ class NativeIdentityTests(unittest.TestCase):
             lambda value: value["replicas"][0]["rpc"].update(replication_address="invented"),
             lambda value: value["replicas"][0]["rpc"]["native_settings"].update(require_service_ack=0),
             lambda value: value["replicas"][0]["rpc"]["native_settings"].update(flags=0),
-            lambda value: value["replicas"][1]["rpc"]["native_epoch"].update(configuration=9 << 32),
+            lambda value: value["replicas"][1]["rpc"]["native_epoch"].update(configuration_number=9 << 32),
+            lambda value: value["replicas"][1]["rpc"].update(role="Secondary"),
+            lambda value: value["replicas"][1]["rpc"].update(current_role="Secondary"),
+            lambda value: value["replicas"][1]["rpc"].update(replicator_role="Secondary"),
+            lambda value: value["replicas"][1]["rpc"].update(role="IdleSecondary"),
+            lambda value: value["replicas"][1]["rpc"].update(role="Idle"),
             lambda value: value["replicas"][1].update(service_http_status=200),
             lambda value: value["replicas"][0]["rpc"].update(write_status="NoWriteQuorum"),
         ]
@@ -3048,7 +3073,7 @@ class WireDeliveryTests(unittest.TestCase):
         source = {"replica": 1, "role": role, "node": "N0020", "rpc": {
             "replication_address": own, "engine_incarnation": self.engine, "incarnation": "runtime",
             "host": "host", "pid": 123, "engine_kind": "rust",
-            "native_epoch": {"data_loss": 1, "configuration": 2**33 + 7},
+            "native_epoch": {"data_loss_number": 1, "configuration_number": 2**33 + 7},
             "engine": {"progress": {"assigned": 10}, "copy_done": True, "peers": [
                 {"address": peer, "configured": True, "building": False, "cleanup_required": False}]},
             "observed_primary": peer}}
@@ -3059,8 +3084,8 @@ class WireDeliveryTests(unittest.TestCase):
         before = {"partition": self.partition, "replicas": [source, destination]}
         reply = {"qualification_only": True, "admission_only": False, "kind": kind, "from": own,
                  "target": peer, "native_selected_peer": peer, "sequence": 11,
-                 "native_epoch": {"data_loss": 1, "configuration": 2**33},
-                 "sent_epoch": {"data_loss": 1, "configuration": 2**33},
+                 "native_epoch": {"data_loss_number": 1, "configuration_number": 2**33},
+                 "sent_epoch": {"data_loss_number": 1, "configuration_number": 2**33},
                  "delivery": {"classification": "socket_write_all_and_flush", "session": 7,
                               "local": "127.0.0.1:40001", "remote": self.peer_address,
                               "remote_listener": self.peer_address, "message_id": self.message_id,
@@ -3070,7 +3095,7 @@ class WireDeliveryTests(unittest.TestCase):
         elif kind == "wrong_target":
             reply["target"] = self.endpoint(2, str(uuid.uuid4()), self.peer_address)
         elif kind == "stale_epoch":
-            reply["sent_epoch"]["configuration"] -= 2**32
+            reply["sent_epoch"]["configuration_number"] -= 2**32
         if role == "ActiveSecondary":
             reply["delivery"].update(local=self.own_address, remote="127.0.0.1:40002")
         packets = [
@@ -3173,7 +3198,7 @@ class WireDeliveryTests(unittest.TestCase):
             elif invalid == "target":
                 reply["target"] = self.endpoint(3, self.peer_engine, self.peer_address)
             else:
-                reply["native_epoch"]["configuration"] = 0
+                reply["native_epoch"]["configuration_number"] = 0
             with self.subTest(invalid=invalid), self.assertRaises(RuntimeError):
                 data.wire_receipt(before, source, "wrong_sender", reply, observation)
 

@@ -1,20 +1,22 @@
 //! Real RAP-admission/issuer fixtures, not a deployed/native qualification.
 use super::*;
-use crate::extensions::{
-    NativeControlBinding, NativeInvocation, NativeInvocationKind, NativeRuntimeIntegration,
-};
+use crate::extensions::{NativeControlBinding, NativeInvocation, NativeInvocationKind};
 
 struct CaptureBinder {
     calls: Arc<StatefulCalls>,
     issued: Arc<Mutex<Vec<NativeInvocation>>>,
 }
 impl NativeControlBinding for CaptureBinder {
-    fn bind_invocation(&self, proof: NativeInvocation) -> Result<Arc<dyn Replicator>> {
+    fn bind_invocation(&self, proof: NativeInvocation) -> Result<Arc<dyn IPrimaryReplicator>> {
         proof.validate()?;
         self.issued.lock().unwrap().push(proof);
         // All fixture control state is in this same Calls backend. No extra
         // engine, listener, provider or executor is constructed by binding.
-        Ok(Arc::new(ReplicatorFixture(self.calls.clone(), 20)))
+        Ok(Arc::new(ReplicatorFixture(
+            self.calls.clone(),
+            20,
+            self.calls.partitions.lock().unwrap()[0].clone(),
+        )))
     }
 }
 
@@ -27,7 +29,7 @@ async fn native_issuer_freezes_full_epochs_memberships_and_fences_old_proofs() {
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let partition = calls.partitions.lock().unwrap()[0].clone();
-    let native = NativeRuntimeIntegration::from_partition(&partition).unwrap();
+    let native = partition.clone();
     assert_eq!(native.binding().identity, *partition.identity());
     assert_eq!(native.binding().generation, 1);
     let actor = uuid::Uuid::new_v4();
@@ -93,7 +95,7 @@ async fn native_issuer_freezes_full_epochs_memberships_and_fences_old_proofs() {
     assert!(proof.clone().enter().is_err());
     let mut observational = partition.status().unwrap();
     observational.configuration.clear();
-    observational.current_epoch.configuration += 100;
+    observational.current_epoch.configuration_number += 100;
     let record = native
         .lookup_record(NativeInvocationKind::CatchUpConfiguration, None, None)
         .unwrap();
@@ -117,7 +119,7 @@ async fn issuer_rejects_ambiguous_id_and_retained_generation_after_close() {
     h.receive("ReplicaOpenReply").await;
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let partition = calls.partitions.lock().unwrap()[0].clone();
-    let native = NativeRuntimeIntegration::from_partition(&partition).unwrap();
+    let native = partition.clone();
     let mut first = peer(&open.local, 2);
     first.current_role = 2;
     first.previous_role = 0;
@@ -155,5 +157,5 @@ async fn issuer_rejects_ambiguous_id_and_retained_generation_after_close() {
     h.receive("ReplicaCloseReply").await;
     assert!(native.validate().is_err());
     assert!(captured.validate().is_err());
-    assert!(NativeRuntimeIntegration::from_partition(&partition).is_err());
+    assert!(partition.validate().is_err());
 }

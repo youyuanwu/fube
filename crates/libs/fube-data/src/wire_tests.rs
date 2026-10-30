@@ -52,15 +52,15 @@ fn actor(replica: i64) -> Actor {
 
 fn primary_epoch() -> Epoch {
     Epoch {
-        data_loss: 1,
-        configuration: 2,
+        data_loss_number: 1,
+        configuration_number: 2,
     }
 }
 
 fn operation_epoch() -> Epoch {
     Epoch {
-        data_loss: 0,
-        configuration: 1,
+        data_loss_number: 0,
+        configuration_number: 1,
     }
 }
 

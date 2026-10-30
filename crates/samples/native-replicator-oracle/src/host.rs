@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use fube_data::extensions::EpochDomains;
 use fube_data::{Cancellation, Mutation, OperationData};
 use mssf_com::{
     FabricCommon::{
@@ -593,7 +594,7 @@ impl Route {
             .native_epoch
             .lock()
             .map_err(|_| com::E_UNEXPECTED)?
-            .map(|epoch| json!({"data_loss":epoch.data_loss,"configuration":epoch.configuration}));
+            .map(|epoch| json!({"data_loss_number":epoch.data_loss_number,"configuration_number":epoch.configuration_number}));
         let ready = self.authority(true).is_ok();
         let native = self.native.lock().map_err(|_| com::E_UNEXPECTED)?;
         let native = native.as_ref().ok_or(E_ABORT)?;

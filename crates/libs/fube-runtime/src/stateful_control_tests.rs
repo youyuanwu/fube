@@ -5,7 +5,9 @@ mod binding_tests;
 mod overlap_tests;
 #[path = "stateful_review_tests.rs"]
 mod review_tests;
-use crate::AccessStatus::{Granted as G, NotPrimary as N, ReconfigurationPending as T};
+use crate::ServicePartitionAccessStatus::{
+    Granted as G, NotPrimary as N, ReconfigurationPending as T,
+};
 
 fn control(request: &ProxyRequest, action: &str, remotes: Vec<Replica>) -> ProxyRequest {
     let mut result = request.clone();
@@ -89,7 +91,7 @@ async fn default_metadata_configuration_projection_and_separate_access_quorums()
     drop(configurations);
     assert_eq!(
         calls.partitions.lock().unwrap()[0].access_status().unwrap(),
-        (G, crate::AccessStatus::NoWriteQuorum)
+        (G, crate::ServicePartitionAccessStatus::NoWriteQuorum)
     ); // Access majority is NOT clamped.
     assert_eq!(
         calls
@@ -127,12 +129,12 @@ async fn same_role_new_primary_epoch_and_status_have_real_initialized_progress()
         *calls.epochs.lock().unwrap(),
         vec![
             crate::Epoch {
-                configuration: 1 << 32,
-                data_loss: 1
+                configuration_number: 1 << 32,
+                data_loss_number: 1
             },
             crate::Epoch {
-                configuration: 2 << 32,
-                data_loss: 1
+                configuration_number: 2 << 32,
+                data_loss_number: 1
             },
         ]
     );
@@ -206,7 +208,7 @@ async fn demotion_orders_pre_revoke_all_epoch_all_role_and_progress() {
     {
         let configs = calls.configurations.lock().unwrap();
         assert!(configs[0].0.replicas[0].must_catch_up);
-        assert_eq!(configs[0].0.replicas[0].role, ReplicaRole::Secondary);
+        assert_eq!(configs[0].0.replicas[0].role, ReplicaRole::ActiveSecondary);
     }
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let cancel = control(&demote, "CancelCatchupReplicaSet", vec![]);
@@ -518,7 +520,7 @@ async fn data_loss_state_change_is_a_control_outcome_not_a_failed_open_cleanup()
     assert_eq!(reply.error.error, 0x80071d28u32 as i32 as i64);
     assert_eq!((reply.error.api.api, reply.error.api.interface), (0, 0));
     assert_eq!((reply.local.first_lsn, reply.local.last_lsn), (0, 0));
-    assert!(calls.partitions.lock().unwrap()[0].ensure_valid().is_ok());
+    assert!(calls.partitions.lock().unwrap()[0].validate().is_ok());
     assert!(!calls.events.lock().unwrap().contains(&"serviceAbort"));
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut update = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
@@ -549,15 +551,15 @@ async fn failed_open_can_retry_same_native_incarnation_without_reviving_old_loca
     let failed: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(failed.error.error, -456);
     let old = calls.partitions.lock().unwrap()[0].clone();
-    assert!(old.ensure_valid().is_err());
+    assert!(old.validate().is_err());
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     h.send("ReplicaOpen", &open).await;
     let retried: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(retried.error.error, 0);
     let new = calls.partitions.lock().unwrap()[1].clone();
     assert_eq!(old.identity(), new.identity());
-    assert!(old.ensure_valid().is_err());
-    assert!(new.ensure_valid().is_ok());
+    assert!(old.validate().is_err());
+    assert!(new.validate().is_ok());
 }
 
 #[tokio::test]
@@ -612,7 +614,7 @@ async fn data_loss_callback_failure_reports_transient_fault_before_failed_open_c
     let failed: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(failed.error.error, -995);
     assert_eq!((failed.error.api.api, failed.error.api.interface), (7, 4));
-    assert!(calls.partitions.lock().unwrap()[0].ensure_valid().is_err());
+    assert!(calls.partitions.lock().unwrap()[0].validate().is_err());
     assert!(calls.events.lock().unwrap().contains(&"replicatorAbort"));
     assert!(calls.events.lock().unwrap().contains(&"serviceAbort"));
 }
