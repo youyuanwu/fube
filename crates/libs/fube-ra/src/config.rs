@@ -35,6 +35,9 @@ pub struct NativeConfig {
 }
 impl NativeConfig {
     pub(super) fn new(settings: &Settings) -> Self {
+        let ticks = |milliseconds: u64| {
+            i64::try_from(u128::from(milliseconds) * 10_000).unwrap_or(i64::MAX)
+        };
         let close = RetryPolicy {
             warning: settings.close_warning as i32,
             drop: settings.close_drop as i32,
@@ -63,10 +66,10 @@ impl NativeConfig {
                 [p.warning, p.drop, p.restart, p.error].map(AtomicI32::new)
             }),
             notification: [
-                settings.notification_batch_count as i64,
-                (settings.notification_node_ms as i64).saturating_mul(10_000),
-                (settings.notification_type_ms as i64).saturating_mul(10_000),
-                (settings.notification_retry_ms as i64).saturating_mul(10_000),
+                i64::from(settings.notification_batch_count as i32),
+                ticks(settings.notification_node_ms),
+                ticks(settings.notification_type_ms),
+                ticks(settings.notification_retry_ms),
             ]
             .map(AtomicI64::new),
         }

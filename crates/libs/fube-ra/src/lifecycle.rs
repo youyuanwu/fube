@@ -9,6 +9,9 @@ pub const STALE_REQUEST: i64 = SERVICE_TYPE_NOT_REGISTERED + 50;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeRegistration {
+    /// Actual Hosting registration identifier, not requested descriptor spelling.
+    /// The trusted lookup adapter certifies semantic matching to its request.
+    pub service_type: ServiceType,
     pub host: String,
     pub runtime: String,
     /// Reference acquisition identity, equal to the issued lookup ID.

@@ -41,7 +41,7 @@ impl RetryPolicy {
             ..Self::registration()
         }
     }
-    pub(super) fn read(mut get: impl FnMut(Threshold) -> i32) -> Self {
+    pub fn read(mut get: impl FnMut(Threshold) -> i32) -> Self {
         Self {
             warning: get(Threshold::Warning),
             drop: get(Threshold::Drop),
@@ -49,7 +49,7 @@ impl RetryPolicy {
             error: get(Threshold::Error),
         }
     }
-    pub(super) fn failure(self, count: &mut u64) -> Result<Action> {
+    pub fn failure(self, count: &mut u64) -> Result<Action> {
         *count = count.checked_add(1).ok_or(Failure::Capacity)?;
         if *count > i32::MAX as u64 {
             return Err(Failure::Capacity);
@@ -62,10 +62,10 @@ impl RetryPolicy {
             Action::None
         }) // Restart/error actions are not consumed by these native handlers.
     }
-    pub(super) fn clear(self, count: u64) -> bool {
+    pub fn clear(self, count: u64) -> bool {
         i128::from(count) >= i128::from(self.warning) || i128::from(count) >= i128::from(self.error)
     }
-    pub(super) fn flags(self, count: u64) -> i64 {
+    pub fn flags(self, count: u64) -> i64 {
         if i128::from(count) == i128::from(self.drop) - 1 {
             ABORT
         } else {
@@ -73,7 +73,7 @@ impl RetryPolicy {
         }
     }
 }
-pub(super) enum Action {
+pub enum Action {
     None,
     Warning,
     Drop,

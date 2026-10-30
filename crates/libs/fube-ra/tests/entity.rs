@@ -5,7 +5,7 @@ use fube_ra_store::{
 };
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -159,6 +159,7 @@ async fn finish(store: &Store, executor: &Executor) {
 }
 fn registration() -> RuntimeRegistration {
     RuntimeRegistration {
+        service_type: body(1).service.service_type,
         host: "trusted-host".into(),
         runtime: "trusted-runtime".into(),
         acquisition: 1,
@@ -166,6 +167,20 @@ fn registration() -> RuntimeRegistration {
     }
 }
 async fn registered(executor: &Executor, request: &AddInstance, token: u64) {
+    let actions = registration_actions(executor, request, token).await;
+    assert!(matches!(
+        actions.as_slice(),
+        [
+            Effect::RequestServiceTypeWork { .. },
+            Effect::RuntimeOpen { .. }
+        ] | [Effect::RuntimeOpen { .. }]
+    ));
+}
+async fn registration_actions(
+    executor: &Executor,
+    request: &AddInstance,
+    token: u64,
+) -> Vec<Effect> {
     let lookup = *executor
         .snapshot(request.unit.id.guid.0)
         .committed
@@ -176,6 +191,7 @@ async fn registered(executor: &Executor, request: &AddInstance, token: u64) {
         .unwrap();
     let mut runtime = registration();
     runtime.acquisition = lookup;
+    runtime.service_type = request.service.service_type.clone();
     executor
         .submit(Command::Registered(Box::new(RegistrationCompletion {
             unit: request.unit.id.clone(),
@@ -197,22 +213,23 @@ async fn registered(executor: &Executor, request: &AddInstance, token: u64) {
         .wait(WAIT)
         .await
         .unwrap();
-    assert!(matches!(
-        executor.take_effects().as_slice(),
-        [
-            Dispatched {
-                effect: Effect::RequestServiceTypeRetry { .. },
-                ..
-            },
-            Dispatched {
-                effect: Effect::RuntimeOpen { .. },
-                ..
-            }
-        ] | [Dispatched {
-            effect: Effect::RuntimeOpen { .. },
-            ..
-        }]
-    ));
+    effects(executor)
+}
+
+const CLOCK_ORIGIN: i64 = 1_000_000_000;
+struct TestClock(AtomicI64);
+impl TestClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(AtomicI64::new(CLOCK_ORIGIN)))
+    }
+    fn set(&self, ticks: i64) {
+        self.0.store(ticks, Ordering::SeqCst);
+    }
+}
+impl NotificationClock for TestClock {
+    fn now_ticks(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 #[tokio::test]
@@ -1766,12 +1783,12 @@ async fn registration_retry_thresholds_warning_precedence_and_reacquire_are_nati
             event.registration.acquisition = event.lookup;
             run(&executor, Command::Registered(Box::new(event))).await;
             let actions = effects(&executor);
-            assert!(matches!(actions[0], Effect::RequestServiceTypeRetry { .. }));
+            // An earlier enqueued node pass coalesces this registration request.
             assert_eq!(
-                actions[1],
+                actions[0],
                 Effect::Health(HealthEvent::ClearServiceTypeRegistrationWarning)
             );
-            assert_close(&actions[2..], 8, &state(&executor));
+            assert_close(&actions[1..], 8, &state(&executor));
             close_done(&executor, 0).await;
         } else {
             run(&executor, Command::Registered(Box::new(event))).await;
@@ -1894,6 +1911,7 @@ fn acquired(
 ) -> RegistrationCompletion {
     let mut runtime = registration();
     runtime.acquisition = lookup;
+    runtime.service_type = request.service.service_type.clone();
     if other_runtime {
         runtime.runtime.push_str("-other");
     }
@@ -1984,7 +2002,7 @@ async fn overlapping_lookup_results_dispose_unused_acquisition_and_callback_repl
         assert!(matches!(
             effects(&executor).as_slice(),
             [
-                Effect::RequestServiceTypeRetry { .. },
+                Effect::RequestServiceTypeWork { .. },
                 Effect::RuntimeOpen { .. }
             ]
         ));
@@ -2013,27 +2031,76 @@ async fn overlapping_lookup_results_dispose_unused_acquisition_and_callback_repl
 async fn node_notification_aggregates_partitions_and_consumes_only_instance_matched_partial_ack() {
     // Native ServiceTypeNotification.cpp:158-287 uses SP1; map helpers are
     // state-independent. This is a stateless source-derived translation.
-    let (store, executor, hooks) = setup(WAIT).await;
+    let hooks = Arc::new(Hooks::default());
+    let store = Store::new(
+        Controlled {
+            inner: MemoryBackend::new(),
+            hooks: hooks.clone(),
+        },
+        StoreSettings::default(),
+    )
+    .await
+    .unwrap();
+    let clock = TestClock::new();
+    let executor = Executor::new_with_clock(
+        Arc::new(store.clone()),
+        admission(),
+        Settings::default(),
+        clock.clone(),
+    )
+    .unwrap();
+    let mut first_work = None;
     for id in 1..=3 {
         let mut request = body(id);
         if id == 3 {
             request.service.service_type.name = "Other".into();
         }
-        make_ready(&executor, &request).await;
+        let token = executor.submit(add(request.clone())).unwrap();
+        token.wait(WAIT).await.unwrap();
+        effects(&executor);
+        let actions = registration_actions(&executor, &request, token.id).await;
+        if let Effect::RequestServiceTypeWork { work, after_ticks } = actions[0] {
+            assert_eq!(after_ticks, 0); // native idle Request is immediately eligible
+            assert!(first_work.replace(work).is_none());
+        }
+        run(
+            &executor,
+            Command::CompleteOpen(Box::new(complete(&request, token.id))),
+        )
+        .await;
+        effects(&executor);
     }
     let entries = executor.service_types();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries.iter().map(|e| e.references).sum::<usize>(), 3);
     let writes = hooks.calls.load(Ordering::SeqCst);
-    run(&executor, Command::RetryServiceTypes { now_ms: 0 }).await;
+    let work = first_work.unwrap();
+    run(&executor, Command::CaptureServiceTypeWork { work }).await;
     let actions = effects(&executor);
-    let [Effect::ServiceTypeNotification(sent), Effect::RequestServiceTypeRetry { after_ms: 30000 }] =
-        actions.as_slice()
+    let [Effect::ServiceTypeWorkCaptured {
+        work: captured,
+        body: Some(sent),
+    }] = actions.as_slice()
     else {
         panic!("{actions:?}");
     };
+    assert_eq!(*captured, work);
     assert_eq!(sent.infos.0.len(), 2);
     assert!(executor.service_types().iter().all(|e| e.pending));
+    run(&executor, Command::CompleteServiceTypeWork { work }).await;
+    let actions = effects(&executor);
+    let [Effect::RequestServiceTypeWork {
+        work: queued,
+        after_ticks: 50_000_000,
+    }, Effect::ArmServiceTypeRetry {
+        timer,
+        after_ticks: 300_000_000,
+    }] = actions.as_slice()
+    else {
+        panic!("{actions:?}");
+    };
+    let queued = *queued;
+    let timer = *timer;
     let mut ack = sent.infos.0[0].clone();
     ack.code_package = "FM can return a different name".into();
     ack.versioned.version.version.value.minor += 1; // instance alone matches
@@ -2060,15 +2127,44 @@ async fn node_notification_aggregates_partitions_and_consumes_only_instance_matc
             .count(),
         1
     );
-    run(&executor, Command::RetryServiceTypes { now_ms: 44999 }).await;
+    clock.set(CLOCK_ORIGIN + 50_000_000);
+    run(&executor, Command::CaptureServiceTypeWork { work: queued }).await;
     assert!(matches!(
         effects(&executor).as_slice(),
-        [Effect::RequestServiceTypeRetry { .. }]
+        [Effect::ServiceTypeWorkCaptured { body: None, .. }]
     ));
-    run(&executor, Command::RetryServiceTypes { now_ms: 50000 }).await;
-    assert!(
-        matches!(effects(&executor).as_slice(), [Effect::ServiceTypeNotification(b), Effect::RequestServiceTypeRetry { .. }] if b.infos.0.len()==1)
-    );
+    run(&executor, Command::CompleteServiceTypeWork { work: queued }).await;
+    assert!(effects(&executor).is_empty()); // Set does not restart an armed timer
+    let mut timer = timer;
+    for (offset, expected) in [(300_000_000, 0), (600_000_000, 1)] {
+        clock.set(CLOCK_ORIGIN + offset);
+        run(&executor, Command::ServiceTypeRetryTimer { timer }).await;
+        let actions = effects(&executor);
+        let [Effect::RequestServiceTypeWork {
+            work,
+            after_ticks: 0,
+        }] = actions.as_slice()
+        else {
+            panic!("{actions:?}");
+        };
+        let work = *work;
+        run(&executor, Command::CaptureServiceTypeWork { work }).await;
+        let actions = effects(&executor);
+        let [Effect::ServiceTypeWorkCaptured { body, .. }] = actions.as_slice() else {
+            panic!("{actions:?}");
+        };
+        assert_eq!(body.as_ref().map_or(0, |b| b.infos.0.len()), expected);
+        run(&executor, Command::CompleteServiceTypeWork { work }).await;
+        let actions = effects(&executor);
+        let [Effect::ArmServiceTypeRetry {
+            timer: next,
+            after_ticks: 300_000_000,
+        }] = actions.as_slice()
+        else {
+            panic!("{actions:?}");
+        };
+        timer = *next;
+    }
     assert_eq!(hooks.calls.load(Ordering::SeqCst), writes); // node work never inserts FT
     finish(&store, &executor).await;
 }
@@ -2169,6 +2265,276 @@ async fn node_projected_payload_veto_does_not_consume_lookup_or_change_prior_ent
 }
 
 #[tokio::test]
+async fn vanilla_actual_registration_spelling_ignored_payload_and_captured_replacement() {
+    // Hosting.ServiceTypeMapEntity.cpp:16-47,77-80; RetryState.h:76-94.
+    let hooks = Arc::new(Hooks::default());
+    let store = Store::new(
+        Controlled {
+            inner: MemoryBackend::new(),
+            hooks: hooks.clone(),
+        },
+        StoreSettings::default(),
+    )
+    .await
+    .unwrap();
+    let clock = TestClock::new();
+    let executor = Executor::new_with_clock(
+        Arc::new(store.clone()),
+        admission(),
+        Settings {
+            notification_batch_bytes: 590,
+            ..Settings::default()
+        },
+        clock.clone(),
+    )
+    .unwrap();
+    executor
+        .config()
+        .set_notification(NotificationProperty::NodeIntervalTicks, 13);
+    let mut request = body(1);
+    request.service.service_type = ServiceType {
+        package: PackageId {
+            application: ApplicationId {
+                type_name: "App".into(),
+                number: 7,
+            },
+            name: "Package".into(),
+        },
+        name: "ÉType\0requested".into(),
+    };
+    let mut old_body = None;
+    let mut first_work = 0;
+    let mut actual = request.service.service_type.clone();
+    actual.package.application.type_name = "aPP".into();
+    actual.package.name = "pACKAGE".into();
+    actual.name = "ÉtYPE\0actual".into();
+    let mut requests = Vec::new();
+    for id in 1..=3 {
+        request.unit.id.guid.0 = [id; 16];
+        request.unit.consistency.id = request.unit.id.clone();
+        if id == 3 {
+            request.service.version.instance = 2;
+            request.replica.version = request.service.version.clone();
+        }
+        let add = executor.submit(add(request.clone())).unwrap();
+        add.wait(WAIT).await.unwrap();
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::Open { .. }]
+        ));
+        let mut event = acquired(&request, add.id, add.id, false);
+        event.registration.service_type = actual.clone();
+        if id == 2 {
+            // Both ignored fields exceed the report budget, not the inbound
+            // ownership budget. The effective native report remains unchanged.
+            event.registration.service_type.name = format!("ÉTYPE\0{}", "ignored".repeat(2000));
+            event.registration.code_package = "C".repeat(20_000);
+        }
+        run(&executor, Command::Registered(Box::new(event.clone()))).await;
+        assert_eq!(
+            executor.snapshot([id; 16]).committed.unwrap().runtime,
+            Some(event.registration),
+        );
+        let actions = effects(&executor);
+        if id == 1 {
+            let [Effect::RequestServiceTypeWork {
+                work,
+                after_ticks: 0,
+            }, Effect::RuntimeOpen { .. }] = actions.as_slice()
+            else {
+                panic!("{actions:?}");
+            };
+            first_work = *work;
+        } else {
+            assert!(matches!(actions.as_slice(), [Effect::RuntimeOpen { .. }]));
+        }
+        let entry = &executor.service_types()[0];
+        assert_eq!(entry.references, usize::from(id));
+        assert_eq!(entry.info.versioned.id, actual);
+        assert_eq!(
+            entry.info.versioned.version.instance,
+            if id == 3 { 2 } else { 0 }
+        );
+        assert_eq!(entry.info.code_package, "Code");
+        if id == 2 {
+            run(
+                &executor,
+                Command::CaptureServiceTypeWork { work: first_work },
+            )
+            .await;
+            let actions = effects(&executor);
+            let [Effect::ServiceTypeWorkCaptured {
+                work,
+                body: Some(body),
+            }] = actions.as_slice()
+            else {
+                panic!("{actions:?}");
+            };
+            assert_eq!(*work, first_work);
+            assert_eq!(body.infos.0[0].versioned.id, actual);
+            assert_eq!(body.infos.0[0].versioned.version.instance, 0);
+            old_body = Some(body.clone());
+        }
+        requests.push(request.clone());
+    }
+    clock.set(CLOCK_ORIGIN + 7);
+    run(
+        &executor,
+        Command::CompleteServiceTypeWork { work: first_work },
+    )
+    .await;
+    assert_eq!(executor.service_types()[0].last_sent_ticks, 0);
+    let actions = effects(&executor);
+    assert!(matches!(
+        actions.as_slice(),
+        [
+            Effect::RequestServiceTypeWork { after_ticks: 6, .. },
+            Effect::ArmServiceTypeRetry { .. }
+        ]
+    ));
+    let old_body = old_body.unwrap(); // still legal to send this after version replacement
+    assert_eq!(old_body.infos.0[0].versioned.version.instance, 0);
+    assert_eq!(operations(&hooks), ["Insert", "Insert", "Insert"]);
+    for request in requests {
+        run(&executor, remove(request.clone(), false)).await;
+        effects(&executor);
+        let current = executor.snapshot(request.unit.id.guid.0).committed.unwrap();
+        run(
+            &executor,
+            Command::CompleteClose(Box::new(CloseCompletion {
+                unit: current.body.unit.clone(),
+                replica: current.body.replica.clone(),
+                error: 0,
+            })),
+        )
+        .await;
+        effects(&executor);
+    }
+    assert!(executor.service_types().is_empty());
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn vanilla_public_work_obligations_are_bounded_and_stale_callbacks_are_idempotent() {
+    let store = Store::memory(StoreSettings::default()).await.unwrap();
+    let clock = TestClock::new();
+    let executor = Executor::new_with_clock(
+        Arc::new(store.clone()),
+        admission(),
+        Settings {
+            max_effects: 8,
+            ..Settings::default()
+        },
+        clock.clone(),
+    )
+    .unwrap();
+    let config = executor.config();
+    config.set_notification(NotificationProperty::BatchCount, 0);
+    config.set_notification(NotificationProperty::RetryIntervalTicks, 7);
+    let request = body(1);
+    let token = executor.submit(add(request.clone())).unwrap();
+    token.wait(WAIT).await.unwrap();
+    effects(&executor);
+    let actions = registration_actions(&executor, &request, token.id).await;
+    let [Effect::RequestServiceTypeWork {
+        work,
+        after_ticks: 0,
+    }, Effect::RuntimeOpen { .. }] = actions.as_slice()
+    else {
+        panic!("{actions:?}");
+    };
+    let work = *work;
+    run(
+        &executor,
+        Command::CompleteOpen(Box::new(complete(&request, token.id))),
+    )
+    .await;
+    assert!(matches!(effects(&executor).as_slice(), [Effect::Reply(_)]));
+    run(&executor, Command::CaptureServiceTypeWork { work }).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::ServiceTypeWorkCaptured { body: None, .. }]
+    ));
+    assert_eq!(
+        run(&executor, Command::CaptureServiceTypeWork { work }).await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    // Requests received while executing retain ONE followup, not unbounded jobs.
+    for _ in 0..10 {
+        run(&executor, Command::RequestServiceTypeWork).await;
+        assert!(effects(&executor).is_empty());
+    }
+    run(&executor, Command::CompleteServiceTypeWork { work }).await;
+    let actions = effects(&executor);
+    let [Effect::RequestServiceTypeWork {
+        work: second,
+        after_ticks: 50_000_000,
+    }, Effect::ArmServiceTypeRetry {
+        timer,
+        after_ticks: 7,
+    }] = actions.as_slice()
+    else {
+        panic!("{actions:?}");
+    };
+    let second = *second;
+    let timer = *timer;
+    assert_eq!(
+        run(&executor, Command::CompleteServiceTypeWork { work }).await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    assert_eq!(executor.service_types()[0].last_sent_ticks, 0);
+    // The timer clears isSet but coalesces into the waiting BGM obligation.
+    clock.set(CLOCK_ORIGIN + 7);
+    run(&executor, Command::ServiceTypeRetryTimer { timer }).await;
+    assert!(effects(&executor).is_empty());
+    assert_eq!(
+        run(&executor, Command::ServiceTypeRetryTimer { timer }).await,
+        Disposition::IgnoredStale
+    );
+    config.set_notification(NotificationProperty::BatchCount, -1);
+    config.set_notification(NotificationProperty::RetryIntervalTicks, 3);
+    clock.set(CLOCK_ORIGIN + 50_000_000);
+    run(&executor, Command::CaptureServiceTypeWork { work: second }).await;
+    let actions = effects(&executor);
+    assert!(
+        matches!(actions.as_slice(), [Effect::ServiceTypeWorkCaptured { body: Some(body), .. }] if body.infos.0.len()==1)
+    );
+    run(&executor, Command::CompleteServiceTypeWork { work: second }).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::ArmServiceTypeRetry { after_ticks: 3, .. }]
+    ));
+    assert_eq!(
+        executor.service_types()[0].last_sent_ticks,
+        CLOCK_ORIGIN + 50_000_000
+    );
+    for _ in 0..7 {
+        run(&executor, add(request.clone())).await;
+    }
+    let before = executor.statistics();
+    let types = executor.service_types();
+    assert!(matches!(
+        executor.submit(Command::RequestServiceTypeWork),
+        Err(Failure::Capacity)
+    ));
+    assert_eq!(executor.statistics(), before);
+    assert_eq!(executor.service_types(), types);
+    let retained = effects(&executor);
+    assert_eq!(retained.len(), 7);
+    assert!(retained
+        .iter()
+        .all(|effect| matches!(effect, Effect::Reply(_))));
+    run(&executor, Command::RequestServiceTypeWork).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::RequestServiceTypeWork { .. }]
+    ));
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
 async fn node_detachment_is_atomic_with_definite_unknown_and_cancelled_entity_completion() {
     // Rust P1/ownership adaptation, not original native fault-test execution.
     for uncertain in [false, true] {
@@ -2179,7 +2545,25 @@ async fn node_detachment_is_atomic_with_definite_unknown_and_cancelled_entity_co
                 WAIT
             })
             .await;
-            make_ready(&executor, &body(1)).await;
+            let request = body(1);
+            let opening = executor.submit(add(request.clone())).unwrap();
+            opening.wait(WAIT).await.unwrap();
+            effects(&executor);
+            let actions = registration_actions(&executor, &request, opening.id).await;
+            let [Effect::RequestServiceTypeWork {
+                work,
+                after_ticks: 0,
+            }, Effect::RuntimeOpen { .. }] = actions.as_slice()
+            else {
+                panic!("{actions:?}");
+            };
+            let work = *work;
+            run(
+                &executor,
+                Command::CompleteOpen(Box::new(complete(&request, opening.id))),
+            )
+            .await;
+            effects(&executor);
             run(&executor, remove(body(1), false)).await;
             effects(&executor);
             let previous = state(&executor);
@@ -2198,13 +2582,15 @@ async fn node_detachment_is_atomic_with_definite_unknown_and_cancelled_entity_co
             assert!(effects(&executor).is_empty());
             // Drop this observer; a queued node retry cannot lose the attachment.
             drop(ticket);
-            run(&executor, Command::RetryServiceTypes { now_ms: 0 }).await;
+            run(&executor, Command::CaptureServiceTypeWork { work }).await;
             assert!(matches!(
                 effects(&executor).as_slice(),
-                [
-                    Effect::ServiceTypeNotification(_),
-                    Effect::RequestServiceTypeRetry { .. }
-                ]
+                [Effect::ServiceTypeWorkCaptured { body: Some(_), .. }]
+            ));
+            run(&executor, Command::CompleteServiceTypeWork { work }).await;
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::ArmServiceTypeRetry { .. }]
             ));
             release.send(()).unwrap();
             // Same-entity sentinel proves publication/reservation release completed.
@@ -2389,7 +2775,7 @@ async fn vanilla_dynamic_registration_signed_thresholds_and_warning_tie() {
     assert!(matches!(
         effects(&executor).as_slice(),
         [
-            Effect::RequestServiceTypeRetry { .. },
+            Effect::RequestServiceTypeWork { .. },
             Effect::RuntimeOpen { .. }
         ]
     ));
@@ -2669,7 +3055,7 @@ async fn native_registration_threshold_warning_clear_true_exhaustion_and_ties() 
         run(&executor, Command::Registered(Box::new(event))).await;
         if complete_success {
             assert!(
-                matches!(effects(&executor).as_slice(), [Effect::RequestServiceTypeRetry { .. }, Effect::OpeningHealth(h), Effect::RuntimeOpen { flags:0,.. }] if h.event==HealthEvent::ClearServiceTypeRegistrationWarning)
+                matches!(effects(&executor).as_slice(), [Effect::RequestServiceTypeWork { .. }, Effect::OpeningHealth(h), Effect::RuntimeOpen { flags:0,.. }] if h.event==HealthEvent::ClearServiceTypeRegistrationWarning)
             );
             assert_eq!(state(&executor).phase, Phase::Opening);
             assert_eq!(state(&executor).registration_failures, 0);
@@ -2894,11 +3280,11 @@ async fn closing_reacquisition_normalizes_version_and_disposes_rejected_mismatch
             assert_eq!(state(&executor).runtime, Some(event.registration.clone()));
             let actions = effects(&executor);
             assert!(
-                matches!(actions.as_slice(),[Effect::RequestServiceTypeRetry {..},Effect::Close {body,flags:8,registration,..}] if body.service.version.instance==9 && body.replica.version==VersionInstance::invalid() && registration==&event.registration)
+                matches!(actions.as_slice(),[Effect::Close {body,flags:8,registration,..}] if body.service.version.instance==9 && body.replica.version==VersionInstance::invalid() && registration==&event.registration)
             );
             // SendReplicaCloseMessage.cpp authority is FailoverUnit.cpp:4760-4778:
             // wire closing replica is canonical, not the local selected version.
-            assert_close(&actions[1..], 8, &state(&executor));
+            assert_close(&actions, 8, &state(&executor));
             assert_eq!(state(&executor).body.replica.version.instance, 9);
             let info = executor.service_types()[0].info.clone();
             assert_eq!(info.versioned.version.instance, 9);
@@ -2976,7 +3362,7 @@ async fn native_usage_increment_failure_and_returned_version_selection_are_disti
     event.required_upgrade = 8;
     run(&executor, Command::Registered(Box::new(event.clone()))).await;
     assert!(
-        matches!(effects(&executor).as_slice(), [Effect::RequestServiceTypeRetry {..}, Effect::OpeningHealth(h), Effect::RuntimeOpen { body,.. }] if h.event==HealthEvent::ClearServiceTypeRegistrationWarning && body.replica.version.instance==9 && body.service.version.instance==9)
+        matches!(effects(&executor).as_slice(), [Effect::RequestServiceTypeWork {..}, Effect::OpeningHealth(h), Effect::RuntimeOpen { body,.. }] if h.event==HealthEvent::ClearServiceTypeRegistrationWarning && body.replica.version.instance==9 && body.service.version.instance==9)
     );
     assert_eq!(state(&executor).usage, Some(event.lookup));
     assert_eq!(
@@ -3044,7 +3430,7 @@ async fn native_opening_host_down_retains_usage_accepts_replacement_and_exhausts
     )
     .await;
     assert!(matches!(effects(&executor).as_slice(),[
-        Effect::RequestServiceTypeRetry {..},Effect::ReleaseUsage {acquisition},Effect::RuntimeOpen {flags:ABORT,..}
+        Effect::ReleaseUsage {acquisition},Effect::RuntimeOpen {flags:ABORT,..}
     ] if *acquisition==replacement.lookup));
     assert_eq!(
         run(&executor, Command::CompleteOpen(Box::new(old_open.clone()))).await,

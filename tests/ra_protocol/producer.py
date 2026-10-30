@@ -34,6 +34,7 @@ def source_inputs():
            for crate in ["fube-ra", "fube-ra-store", "fube-transport"]]
         + list((ROOT / "tests/ra_protocol").glob("*.py"))
         + list(NATIVE.glob("*"))
+        + list((ROOT / "tests/ra_protocol/helpers").glob("*"))
     )
 
 

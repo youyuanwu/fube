@@ -18,7 +18,9 @@ mod lifecycle;
 pub use lifecycle::*;
 #[path = "notification.rs"]
 mod notification;
-pub use notification::ServiceTypeEntry;
+pub use notification::{
+    compare_service_types, native_upper_unit, NotificationClock, ServiceTypeEntry,
+};
 #[path = "opening.rs"]
 mod opening;
 pub use opening::*;
@@ -211,9 +213,22 @@ pub enum Command {
     HostDown(Box<HostDown>),
     RetryClose(PartitionId),
     RetryReport(PartitionId),
-    RetryServiceTypes {
-        now_ms: u64,
+    /// Explicit BGM Request, independent of the periodic retry timer.
+    RequestServiceTypeWork,
+    /// Honor RequestServiceTypeWork's obligation; capture before simulated send.
+    CaptureServiceTypeWork {
+        work: u64,
     },
+    /// Record the send and complete the same captured pass, even for an empty body.
+    CompleteServiceTypeWork {
+        work: u64,
+    },
+    /// Honor the currently armed periodic retry timer.
+    ServiceTypeRetryTimer {
+        timer: u64,
+    },
+    /// Native BackgroundWorkManagerWithRetry::SetTimer, not a work request.
+    SetServiceTypeRetryTimer,
     ServiceTypeReply {
         body: Box<ServiceTypeNotification>,
         source: NodeInstance,
@@ -240,11 +255,28 @@ enum Kind {
     HostDown,
     RetryClose,
     RetryReport,
-    NotificationRetry,
+    NotificationRequest,
+    NotificationCapture,
+    NotificationComplete,
+    NotificationTimer,
+    NotificationSetTimer,
     NotificationReply {
         source: NodeInstance,
         generation: GenerationHeader,
     },
+}
+impl Kind {
+    fn node_work(&self) -> bool {
+        matches!(
+            self,
+            Self::NotificationRequest
+                | Self::NotificationCapture
+                | Self::NotificationComplete
+                | Self::NotificationTimer
+                | Self::NotificationSetTimer
+                | Self::NotificationReply { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,9 +358,25 @@ pub enum Effect {
     RequestReportRetry,
     ReplicaUp(Box<ReplicaUp>),
     RemoveReply(Box<RemoveInstanceReply>),
-    ServiceTypeNotification(Box<ServiceTypeNotification>),
-    RequestServiceTypeRetry {
-        after_ms: u64,
+    /// Zero enqueues immediately; otherwise arm the BGM's remaining-delay timer.
+    RequestServiceTypeWork {
+        work: u64,
+        after_ticks: i64,
+    },
+    /// This owned old body may still be sent after replacement/removal. Always
+    /// complete this work ID once, including when body is None (native count=0).
+    ServiceTypeWorkCaptured {
+        work: u64,
+        body: Option<Box<ServiceTypeNotification>>,
+    },
+    /// Separate one-shot periodic timer. i64::MAX is native TimeSpan::MaxValue
+    /// (disabled); zero/negative configuration due-times have been clamped to 1.
+    ArmServiceTypeRetry {
+        timer: u64,
+        after_ticks: i64,
+    },
+    CancelServiceTypeRetry {
+        timer: u64,
     },
     ReleaseUsage {
         acquisition: u64,
@@ -363,6 +411,7 @@ struct Shared {
     view: Mutex<View>,
     settings: Settings,
     config: Arc<NativeConfig>,
+    notification_clock: Arc<dyn NotificationClock>,
     shutdown: Notify,
     #[cfg(test)]
     resolution_polls: std::sync::atomic::AtomicUsize,
@@ -394,6 +443,15 @@ impl Executor {
         admission: Admission,
         settings: Settings,
     ) -> Result<Self> {
+        Self::new_with_clock(store, admission, settings, notification::native_clock())
+    }
+
+    pub fn new_with_clock(
+        store: Arc<dyn KeyValueStore>,
+        admission: Admission,
+        settings: Settings,
+        notification_clock: Arc<dyn NotificationClock>,
+    ) -> Result<Self> {
         settings.validate()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -403,6 +461,7 @@ impl Executor {
         let (done, closed) = watch::channel(None);
         let shared = Arc::new(Shared {
             config: Arc::new(NativeConfig::new(&settings)),
+            notification_clock,
             view: Mutex::new(View {
                 accepting: true,
                 ..View::default()
@@ -488,8 +547,18 @@ impl Executor {
             Command::HostDown(body) => (body.unit.guid.0, Kind::HostDown, to_vec(&body)),
             Command::RetryClose(unit) => (unit.guid.0, Kind::RetryClose, to_vec(&unit)),
             Command::RetryReport(unit) => (unit.guid.0, Kind::RetryReport, to_vec(&unit)),
-            Command::RetryServiceTypes { now_ms } => {
-                ([0; 16], Kind::NotificationRetry, to_vec(&now_ms))
+            Command::RequestServiceTypeWork => ([0; 16], Kind::NotificationRequest, to_vec(&0_u64)),
+            Command::CaptureServiceTypeWork { work } => {
+                ([0; 16], Kind::NotificationCapture, to_vec(&work))
+            }
+            Command::CompleteServiceTypeWork { work } => {
+                ([0; 16], Kind::NotificationComplete, to_vec(&work))
+            }
+            Command::ServiceTypeRetryTimer { timer } => {
+                ([0; 16], Kind::NotificationTimer, to_vec(&timer))
+            }
+            Command::SetServiceTypeRetryTimer => {
+                ([0; 16], Kind::NotificationSetTimer, to_vec(&0_u64))
             }
             Command::ServiceTypeReply {
                 body,
@@ -507,12 +576,10 @@ impl Executor {
         let reserved_effects = match &kind {
             Kind::Add { .. } => 2,
             Kind::Retry | Kind::RetryReport => 1,
+            kind if kind.node_work() => 2,
             _ => 8,
         };
-        let node_work = matches!(
-            kind,
-            Kind::NotificationRetry | Kind::NotificationReply { .. }
-        );
+        let node_work = kind.node_work();
         let bytes = bytes
             .map_err(|_| Failure::Admission("unsupported/oversized native shape"))?
             .into_boxed_slice();
@@ -616,7 +683,7 @@ async fn supervise(
         tokio::select! {
             work = receiver.recv() => {
                 let Some(work) = work else { break; };
-                if matches!(work.kind, Kind::NotificationRetry | Kind::NotificationReply { .. }) {
+                if work.kind.node_work() {
                     finish_node(&shared, work, &admission);
                     continue;
                 }
@@ -648,13 +715,43 @@ async fn supervise(
 
 fn finish_node(shared: &Shared, work: Submission, admission: &Admission) {
     let mut view = lock(&shared.view);
+    // Work/byte/effect admission is already reserved. A fallible clock/counter/
+    // codec preparation never publishes a partially advanced coordinator.
+    let mut notification = view.notification.clone();
+    let mut disposition = Disposition::Applied;
     let outcome = if !admission.owner_ready {
         Ok(vec![])
     } else {
         match &work.kind {
-            Kind::NotificationRetry => from_slice::<u64>(&work.bytes)
-                .map_err(|_| Failure::Admission("invalid notification timer"))
-                .and_then(|now| view.notification.retry(now, &shared.settings)),
+            Kind::NotificationRequest => {
+                notification.request(&shared.config, &*shared.notification_clock)
+            }
+            Kind::NotificationSetTimer => notification.set_timer(&shared.config),
+            Kind::NotificationCapture | Kind::NotificationComplete | Kind::NotificationTimer => {
+                from_slice::<u64>(&work.bytes)
+                    .map_err(|_| Failure::Admission("invalid notification obligation"))
+                    .and_then(|id| match work.kind {
+                        Kind::NotificationCapture => notification.capture(
+                            id,
+                            &shared.settings,
+                            &shared.config,
+                            &*shared.notification_clock,
+                        ),
+                        Kind::NotificationComplete => {
+                            notification.complete(id, &shared.config, &*shared.notification_clock)
+                        }
+                        Kind::NotificationTimer => {
+                            notification.timer(id, &shared.config, &*shared.notification_clock)
+                        }
+                        _ => unreachable!(),
+                    })
+                    .map(|effects| {
+                        effects.unwrap_or_else(|| {
+                            disposition = Disposition::IgnoredStale;
+                            vec![]
+                        })
+                    })
+            }
             Kind::NotificationReply { source, generation } => {
                 if source != &admission.fm_source || generation.for_fm_replica {
                     Err(Failure::Admission(
@@ -672,8 +769,10 @@ fn finish_node(shared: &Shared, work: Submission, admission: &Admission) {
                 } else {
                     from_slice::<ServiceTypeNotification>(&work.bytes)
                         .map_err(|_| Failure::Admission("invalid notification reply"))
-                        .and_then(|body| view.notification.acknowledge(&body))
-                        .map(|()| vec![])
+                        .map(|body| {
+                            notification.acknowledge(&body);
+                            vec![]
+                        })
                 }
             }
             _ => unreachable!(),
@@ -682,6 +781,7 @@ fn finish_node(shared: &Shared, work: Submission, admission: &Admission) {
     let result = match outcome {
         Ok(effects) => {
             assert!(effects.len() <= work.reserved_effects);
+            view.notification = notification;
             for effect in effects {
                 view.effects.push_back(Dispatched {
                     operation: work.id,
@@ -690,7 +790,7 @@ fn finish_node(shared: &Shared, work: Submission, admission: &Admission) {
                 });
             }
             view.stats.succeeded += 1;
-            Ok(Disposition::Applied)
+            Ok(disposition)
         }
         Err(error) => {
             view.stats.failed += 1;
@@ -1062,24 +1162,21 @@ async fn entity_worker(
         {
             outcome = Err(Failure::Capacity);
         }
-        // Reserve the shared key BEFORE any durable write. Unknown holds this
-        // exact reservation with the original operation, not a second enqueue.
-        let mut type_reservation = None;
+        // All enabled attachments are memory-only. They project the ACTUAL
+        // retained map under the publication lock below, without any await.
+        // A future durable attach must introduce an equivalent precommit
+        // reservation; never discover a fallible capacity check after writing.
         if let Ok(Transition {
-            update: Update::Memory(state) | Update::Durable(state),
+            update: Update::Durable(state),
             ..
         }) = &outcome
         {
             if state.runtime.is_some()
                 && committed.as_ref().and_then(|s| s.runtime.as_ref()) != state.runtime.as_ref()
             {
-                match lock(&shared.view)
-                    .notification
-                    .reserve(&notification::info(state), &shared.settings)
-                {
-                    Ok(key) => type_reservation = Some(key),
-                    Err(error) => outcome = Err(error),
-                }
+                outcome = Err(Failure::Unsupported(
+                    "durable registration attachment requires precommit reservation",
+                ));
             }
         }
 
@@ -1093,30 +1190,47 @@ async fn entity_worker(
             }
         }
         let mut view = lock(&shared.view);
+        let mut prepared_notification = None;
+        if let Ok(Transition {
+            update: Update::Memory(state),
+            effects,
+            ..
+        }) = &mut outcome
+        {
+            let before = committed.as_ref().and_then(|s| s.runtime.as_ref());
+            if before != state.runtime.as_ref() && state.runtime.is_some() {
+                let mut proposed = view.notification.clone();
+                if let Some(before) = before {
+                    proposed.remove(&before.service_type);
+                }
+                match proposed.add(
+                    notification::info(state),
+                    &shared.settings,
+                    &shared.config,
+                    &*shared.notification_clock,
+                ) {
+                    Ok(mut requests) if effects.len() + requests.len() <= work.reserved_effects => {
+                        requests.append(effects);
+                        *effects = requests;
+                        prepared_notification = Some(proposed);
+                    }
+                    Ok(_) => outcome = Err(Failure::Capacity),
+                    Err(error) => outcome = Err(error),
+                }
+            }
+        }
         let result = match outcome {
             Ok(transition) => {
-                let mut effects = transition.effects;
+                let effects = transition.effects;
                 match transition.update {
                     Update::None => {}
                     Update::Memory(state) | Update::Durable(state) => {
                         let before = committed.as_ref().and_then(|s| s.runtime.as_ref());
                         if before != state.runtime.as_ref() {
-                            if before.is_some() {
-                                view.notification
-                                    .remove(&committed.as_ref().unwrap().body.service.service_type);
-                            }
-                            if let Some(key) = &type_reservation {
-                                if view
-                                    .notification
-                                    .add(key.clone(), notification::info(&state))
-                                {
-                                    effects.insert(
-                                        0,
-                                        Effect::RequestServiceTypeRetry {
-                                            after_ms: shared.settings.notification_node_ms,
-                                        },
-                                    );
-                                }
+                            if let Some(proposed) = prepared_notification.take() {
+                                view.notification = proposed;
+                            } else if let Some(before) = before {
+                                view.notification.remove(&before.service_type);
                             }
                         }
                         assert!(effects.len() <= work.reserved_effects);
@@ -1139,9 +1253,6 @@ async fn entity_worker(
                 Err(error)
             }
         };
-        if let Some(key) = &type_reservation {
-            view.notification.unreserve(key);
-        }
         view.entities.get_mut(&work.entity).unwrap().fenced = false;
         view.stats.outstanding -= 1;
         view.stats.queued_bytes -= work.charge;

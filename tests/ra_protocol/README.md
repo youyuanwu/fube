@@ -109,3 +109,61 @@ implementation HEAD/source digest. `build/ra-native-final-v2` was produced for
 previous work and is not this slice's production. The producer's HEAD names the
 commit base and source digest also binds dirty sources during development;
 final delivery produces again at the clean reviewed implementation head.
+
+## Separate actual-native helper evidence
+
+The helper producer is **not part of, and does not change**, the 36-case,
+43-type/129-field wire bundle or its compiler-free consumer. It compiles
+unmodified `pal/wc16.c`, `RetryableErrorState.cpp` and
+`RetryableErrorStateThresholdCollection.cpp`. Identifier, `LargeInteger`,
+`NodeId`, `GenerationNumber`, `CheckGenerationHeader` and `GetGenerationState`
+methods are mechanically extracted verbatim from the same clean pinned source.
+Generated native source stays in the output directory and is never committed.
+
+```sh
+mkdir -p build/ra-helper-tmp
+export TMPDIR="$PWD/build/ra-helper-tmp"
+FUBE_RA_SOURCE_DIGEST=$(python3 -c 'from tests.ra_protocol.producer import source_digest; print(source_digest()[0])') \
+  cargo build --locked -p fube-ra --example ra_helper_conformance
+python3 -m tests.ra_protocol.helper_producer \
+  --native /path/to/clean/service-fabric \
+  --out "$PWD/build/ra-helper-evidence" --cxx /path/to/clang \
+  --rust "$PWD/target/debug/examples/ra_helper_conformance"
+```
+
+Lightweight guard tests: `python3 -m unittest tests.ra_protocol.test_helper_producer`.
+
+For the locally unpacked Clang 18 toolchain, set
+`LD_LIBRARY_PATH="$PWD/build/ra-producer-tools/usr/lib/x86_64-linux-gnu"` and
+use `--cxx "$PWD/build/ra-producer-tools/usr/lib/llvm-18/bin/clang"`.
+`--rust` is optional: omission produces **native-only** evidence and an empty
+`comparisons` object, not a Rust conformance pass. It never implicitly builds
+Rust. The explicit Rust executable must report the current source identity.
+Helper producer/adapters and the Rust example are included in source identity.
+The output manifest records HEAD, current source digest/input hashes, native
+input/method hashes, compiler version, exact compile/run argv/cwd, environment,
+adapter disclosures and every generated/prebuilt file hash.
+
+With `--rust`, both programs independently construct cases and compare exact
+`trace.txt` and `upper-units.bin` hashes. Coverage includes all 65,536 UTF-16
+units under native startup **C locale**, 196 string-name pairs, 144 structured
+identifier pairs (number priority, ad-hoc package omission, signed ordering,
+embedded NUL and non-transitive malformed raw fields), and five retry families:
+Open, registration-at-Open, Close, Delete and registration-at-Drop.
+Policies cover live signed/zero/negative threshold updates, equality precedence,
+lowered drop, last-before-drop, current-threshold clear, shared registration
+restart/error and a deterministic mixed-property read. Native raw action values
+are retained separately in `native/raw-actions.txt`; Restart/Error are mapped to
+None **only for comparison with the enabled Rust handler-consumed action**.
+The Rust side calls production `native_upper_unit`, `compare_service_types`,
+`NativeConfig` and `RetryPolicy`, not local algorithm replicas.
+
+Generation coverage compares 64 signed-generation/unsigned-owner pairs using
+actual native owner and generation methods versus Rust `older_than`. Eight
+normal-FM stale/equal/new generation headers run the actual native
+`CheckGenerationHeader` method and the Rust Executor's notification-reply
+dispatch. UTF-16 storage/type shells, mutable config transport fields, no-op
+locking/tracing and raw-action projection are explicit adapters. This is
+helper/selected-dispatch evidence, **not** complete original handler execution,
+a native RA/Hosting/Federation runtime, FMM support, config-loader qualification,
+arbitrary process locales, or wire compatibility beyond the separate wire gate.
