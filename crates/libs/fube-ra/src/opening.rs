@@ -161,6 +161,7 @@ fn fail(state: &mut EntityState, error: i64, effects: &mut Vec<Effect>) {
     // FailoverUnit.cpp:5212-5235,5610-5657: capture reply before cleanup.
     let captured = state.body.clone();
     state.phase = Phase::Closed;
+    state.service_description_pending = false;
     state.open_failures = 0;
     state.registration_failures = 0;
     state.registration_warning = false;

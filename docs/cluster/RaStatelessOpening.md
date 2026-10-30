@@ -3,7 +3,9 @@
 **Status:** bounded source-derived `fube-ra` execution, with trusted simulated
 Hosting/RAP/health/transport adapters, not a running native RA/FM or process
 proof. Source pin: `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
-[Removal](RaStatelessRemoval.md) and original P1 ownership/fencing remain.
+[Removal](RaStatelessRemoval.md), subsequent
+[replacement/direct description helpers](RaStatelessReplacement.md) and
+original P1 ownership/fencing remain.
 
 ## Native dispatch and raw replies
 
@@ -151,7 +153,7 @@ python3 -m unittest tests.offline.cluster.test_ra_catalog \
   tests.offline.cluster.test_ra_protocol_inputs tests.ra_protocol.test_helper_producer -v
 ```
 
-Current tests: 15 RA units, 55 entity scenarios, 14 protocol tests plus unchanged
+Current tests including replacement: 16 RA units, 69 entity scenarios, 14 protocol tests plus unchanged
 P1 tests. Direct SL source scenarios, shared/stateful helper derivations and
 Rust-specific fault/ownership adaptations are labeled in tests. No arbitrary
 sleep controls ordering. The original C++ RA handlers were not executed.
@@ -165,8 +167,10 @@ That selected helper/dispatch execution is not complete handler/runtime parity.
 Fresh final evidence must bind the clean reviewed correction HEAD/source digest;
 old/development bundles do not qualify it.
 
-Live Hosting/RAP/health/Federation, dynamic node/upgrade/service-description
-protocols, FM-service/FMM, open replacement, broad stateful/peer features, full
+The subsequent replacement slice enables ready greater-ID Drop/FM resend and
+direct Add/one-FT-ack description helpers, not queued opening replacement.
+Live Hosting/RAP/health/Federation, broader dynamic node/upgrade/description
+protocols, FM-service/FMM, broad stateful/peer features, full
 initial/last ReplicaUp upload, physical GC, replay/adoption/outbox and process/
 power-loss/hosted-CI qualification remain unfinished. The data engine remains
 volatile. All RA–FM/RA–RA contracts remain required eventual scope in the

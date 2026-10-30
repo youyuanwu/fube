@@ -22,6 +22,8 @@ ephemeral-FM restart policy.
 **Implementation update (2026-10-30):** the bounded
 [stateless opening port](RaStatelessOpening.md) supplies native-derived retry/
 cleanup semantics and node-wide registration notifications above P1 storage.
+The [replacement slice](RaStatelessReplacement.md) adds old-identity Drop,
+FM-resend recreation and directly required description helpers.
 It uses trusted simulated Hosting/RAP, not the live RA/Hosting/process architecture
 proposed here, and adds no recovery, outbox or process/power-loss guarantee.
 
