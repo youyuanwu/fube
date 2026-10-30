@@ -43,8 +43,8 @@ unused acquisition even when its host/runtime matches the active registration.
 Consumed callback replay is idempotent and cannot release the active reference.
 Unissued results do not transfer reference ownership to RA. The default limit is
 64 outstanding lookups per entity; lost results retain their slots, not a false
-completion. Legacy CompleteOpen service-not-registered only records pending
-status; it does not identify/consume an issued lookup obligation.
+completion. Raw Open replies without a current registration are ignored;
+they cannot update pending lookup status or consume an issued lookup obligation.
 
 Raw native Close success carries the **trusted cleanup proof**, including cancellation/draining of
 queued/in-flight Open, proxy closure and resource cleanup—not just a successful
@@ -86,8 +86,8 @@ P1's terminal fence is not lifted by RA after late success.
 
 [Admission:382–483](../../crates/libs/fube-ra/src/entity.rs#L382-L483) reserves
 two effects for Add (closed report + stale reply), one for
-RetryOpen/RetryReport, eight for Open completion and other lifecycle/node
-commands. The actual count is
+RetryOpen/RetryReport, two for node commands, and eight for Open completion
+and other lifecycle commands. The actual count is
 checked before persistence; retained effects and all outstanding reservations
 share the finite budget. Cancellation does not return accepted work's reservation.
 

@@ -105,7 +105,7 @@ final Abort cleanup and opening host-down are [implemented separately](RaStatele
 [Owned supervision:435–800](../../crates/libs/fube-ra/src/entity.rs#L435-L800)
 uses one independent thread/runtime and bounded per-entity workers. Same-entity
 work serializes. Accepted count, tight encoded bytes and bounded action slots
-(Add 2; open/report retry 1; Open completion/other lifecycle and node work 8)
+(Add 2; open/report retry 1; node work 2; Open completion/other lifecycle work 8)
 are reserved atomically and held through actual completion.
 
 [Commit/publication:992–1257](../../crates/libs/fube-ra/src/entity.rs#L992-L1257)
@@ -191,7 +191,7 @@ emitted work/timer obligations and captured-send interleavings. Separate
 [actual-native helper comparisons](../../tests/ra_protocol/README.md#separate-actual-native-helper-evidence)
 execute original PAL/retry code and extracted identifier/generation methods;
 this is not full original-handler execution.
-New [opening scenario mappings](RaStatelessOpening.md#storage-tests-and-reproducibility)
+New [opening scenario mappings](RaStatelessOpening.md#storage-independent-evidence-and-limits)
 distinguish direct SL evidence, shared/helper-derived cases and Rust-only
 storage-fault adaptations.
 
