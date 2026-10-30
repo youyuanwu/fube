@@ -136,3 +136,53 @@ fn unknown_polymorphic_tag_and_mismatched_kind_are_rejected() {
     bytes[17] = 2;
     assert!(from_slice::<Pointer<NativeEnum<ScalingTrigger>>>(&bytes).is_err());
 }
+
+#[test]
+fn removal_inherits_base_scope_and_has_distinct_action_and_reply() {
+    for force in [false, true] {
+        let body = support::rich_remove(force);
+        let message = remove_instance_message(&body, &support::rich_generation(false)).unwrap();
+        assert_eq!(decode_remove_instance(&message).unwrap().0, body);
+        assert!(decode_add_instance(&message).is_err());
+        for end in 0..message.body.len() {
+            assert!(from_slice::<RemoveInstance>(&message.body[..end]).is_err());
+        }
+        let mut bad = message;
+        bad.body.push(0);
+        assert!(decode_remove_instance(&bad).is_err());
+    }
+    let reply = support::rich_reply(0);
+    for owner in [Owner::Fm, Owner::Fmm] {
+        let message = remove_instance_reply_message(&reply, owner).unwrap();
+        assert_eq!(
+            decode_remove_instance_reply(&message).unwrap(),
+            (reply.clone(), owner)
+        );
+        assert!(decode_add_instance_reply(&message).is_err());
+        assert!(!message.headers.iter().any(|h| h.id == GENERATION_HEADER));
+    }
+}
+
+#[test]
+fn replica_up_full_lists_flags_and_reply_factory_are_distinct() {
+    for last in [false, true] {
+        for from_fmm in [false, true] {
+            let body = support::rich_replica_up(last, from_fmm);
+            assert_eq!(body.replicas.0.len(), 2);
+            assert_eq!(body.dropped.0.len(), 2);
+            assert_ne!(body.replicas, body.dropped);
+            let message = replica_up_message(&body, Owner::Fm).unwrap();
+            assert_eq!(
+                decode_replica_up(&message).unwrap(),
+                (body.clone(), Owner::Fm)
+            );
+            let generation = support::rich_generation(false);
+            let reply = replica_up_reply_message(&body, &generation).unwrap();
+            assert_eq!(decode_replica_up_reply(&reply).unwrap(), (body, generation));
+            assert!(decode_replica_up(&reply).is_err());
+            let mut bad = reply;
+            bad.headers.push(bad.headers[3].clone());
+            assert!(decode_replica_up_reply(&bad).is_err());
+        }
+    }
+}

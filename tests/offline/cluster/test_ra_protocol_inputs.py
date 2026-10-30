@@ -28,7 +28,7 @@ class InputTests(unittest.TestCase):
             "format": 1, "native_revision": REVISION, "head": "a" * 40,
             "source_digest": self.source, "source_inputs": self.inputs,
             "native_sources": {"model-only": "not-execution"},
-            "schema_types": 35, "target": "Linux-x86_64-short-wchar",
+            "schema_types": 39, "schema_fields": 123, "target": "Linux-x86_64-short-wchar",
             "evidence": "source-baseline-native-stream-with-schema-adapters",
             "cases": sorted(CASES),
             "files": {name: hashlib.sha256((self.bundle / name).read_bytes()).hexdigest()
@@ -40,7 +40,20 @@ class InputTests(unittest.TestCase):
         (self.bundle / "manifest.json").write_text(json.dumps(self.manifest))
 
     def test_inventory_model_is_valid_not_an_execution_claim(self):
-        self.assertEqual(len(validate(self.bundle, "a" * 40, self.source)["cases"]), 15)
+        self.assertEqual(len(validate(self.bundle, "a" * 40, self.source)["cases"]), 29)
+
+    def test_exact_schema_counts_and_extra_files_are_rejected(self):
+        for key in ["schema_types", "schema_fields"]:
+            value = self.manifest[key]
+            self.manifest[key] = value + 1
+            self.save()
+            with self.assertRaises(ValueError):
+                validate(self.bundle, "a" * 40, self.source)
+            self.manifest[key] = value
+        self.save()
+        (self.bundle / "unexpected.bin").write_bytes(b"not in inventory")
+        with self.assertRaises(ValueError):
+            validate(self.bundle, "a" * 40, self.source)
 
     def test_wrong_head_or_source_fails_before_execution(self):
         with patch("tests.ra_protocol.consumer.subprocess.run") as execute:

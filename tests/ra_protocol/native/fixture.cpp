@@ -120,6 +120,31 @@ int main(int argc,char** argv) {
         action.action_=text(u"AddInstanceReply"); run(mode,dir,"action-reply",action);
         HighPriorityHeader priority;
         priority.highPriority_=true; run(mode,dir,"priority",priority);
+        DeleteReplicaMessageBody removal;
+        run(mode,dir,"default-remove",removal);
+        c=0; rich(removal,c);
+        for(int force:{0,1}) {
+            removal.isForce_=force!=0;
+            run(mode,dir,"rich-remove-"+std::to_string(force),removal);
+        }
+        ReplicaReplyMessageBody remove_reply;
+        run(mode,dir,"default-remove-reply",remove_reply);
+        c=0; rich(remove_reply,c); remove_reply.errorCode_.value_=Enum(0);
+        run(mode,dir,"rich-remove-reply",remove_reply);
+        // Native empty ctor leaves bools unspecified: explicitly initialize the fixture.
+        ReplicaUpMessageBody up;
+        up.isLastReplicaUpMessage_=false; up.isFromFMM_=false;
+        run(mode,dir,"explicit-empty-replica-up",up);
+        c=0; rich(up,c);
+        for(int last:{0,1}) for(int fmm:{0,1}) {
+            up.isLastReplicaUpMessage_=last!=0; up.isFromFMM_=fmm!=0;
+            run(mode,dir,"rich-replica-up-"+std::to_string(last)+"-"+std::to_string(fmm),up);
+        }
+        for(auto name:{u"RemoveInstance",u"RemoveInstanceReply",u"ReplicaUp",u"ReplicaUpReply"}) {
+            action.action_=text(name);
+            std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
+            run(mode,dir,"action-"+ascii,action);
+        }
         // Native rejection is executed, not inferred from Rust behavior.
         auto bad=encode(request); bad.resize(bad.size()/2);
         ReplicaMessageBody rejected_request;
@@ -127,7 +152,13 @@ int main(int argc,char** argv) {
         bad=encode(reply); bad.resize(5);
         ReplicaReplyMessageBody rejected_reply;
         if(decode(bad,rejected_reply)) throw std::runtime_error("native accepted truncated reply");
-        std::cout << "native rejects 2 truncations OK\n";
+        bad=encode(removal); bad.resize(bad.size()/2);
+        DeleteReplicaMessageBody rejected_removal;
+        if(decode(bad,rejected_removal)) throw std::runtime_error("native accepted truncated removal");
+        bad=encode(up); bad.resize(bad.size()/2);
+        ReplicaUpMessageBody rejected_up;
+        if(decode(bad,rejected_up)) throw std::runtime_error("native accepted truncated report");
+        std::cout << "native rejects 4 truncations OK\n";
         return 0;
     } catch(const std::exception& error) {
         std::cerr << error.what() << "\n"; return 1;

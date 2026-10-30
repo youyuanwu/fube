@@ -95,6 +95,59 @@ fn main() {
         },
     );
     check(input, output, "priority", Scalar { value: true });
+    check(input, output, "default-remove", RemoveInstance::default());
+    for force in [false, true] {
+        check(
+            input,
+            output,
+            &format!("rich-remove-{}", u8::from(force)),
+            support::rich_remove(force),
+        );
+    }
+    check(
+        input,
+        output,
+        "default-remove-reply",
+        RemoveInstanceReply::default(),
+    );
+    check(input, output, "rich-remove-reply", support::rich_reply(0));
+    check(
+        input,
+        output,
+        "explicit-empty-replica-up",
+        ReplicaUp::default(),
+    );
+    for last in [false, true] {
+        for from_fmm in [false, true] {
+            check(
+                input,
+                output,
+                &format!("rich-replica-up-{}-{}", u8::from(last), u8::from(from_fmm)),
+                support::rich_replica_up(last, from_fmm),
+            );
+        }
+    }
+    for action in [
+        "RemoveInstance",
+        "RemoveInstanceReply",
+        "ReplicaUp",
+        "ReplicaUpReply",
+    ] {
+        check(
+            input,
+            output,
+            &format!("action-{action}"),
+            Scalar {
+                value: action.to_string(),
+            },
+        );
+    }
+    for force in [false, true] {
+        let bytes = fs::read(input.join(format!("rich-remove-{}.bin", u8::from(force)))).unwrap();
+        for end in 0..bytes.len() {
+            assert!(from_slice::<RemoveInstance>(&bytes[..end]).is_err());
+        }
+    }
     for name in ["rich-request", "rich-reply-0"] {
         let bytes = fs::read(input.join(format!("{name}.bin"))).unwrap();
         for end in 0..bytes.len() {
@@ -105,5 +158,5 @@ fn main() {
             }
         }
     }
-    println!("15 cases verified; all selected-body proper prefixes rejected");
+    println!("29 cases verified; all selected-body proper prefixes rejected");
 }
