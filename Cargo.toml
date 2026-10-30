@@ -6,6 +6,8 @@ members = [
   "crates/libs/fube-test-host",
   "crates/libs/fube-runtime",
   "crates/libs/fube-data",
+  "crates/libs/fube-ra-store",
+  "crates/libs/fube-ra",
   "crates/samples/stateless-test-app",
   "crates/samples/rust-runtime-app",
   "crates/samples/native-replicator-oracle",
