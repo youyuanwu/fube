@@ -2,6 +2,10 @@ name: Standalone native runtime
 
 on:
   workflow_call:
+    inputs:
+      producer-attempt:
+        required: true
+        type: string
 
 jobs:
   linux-native-runtime:
@@ -16,6 +20,7 @@ jobs:
       FUBE_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
       FUBE_CI_MERGE: ${{ github.event_name == 'pull_request' && github.sha || '' }}
       FUBE_CI_RUN_ID: ${{ github.run_id }}
+      FUBE_CI_PRODUCER_ATTEMPT: ${{ inputs.producer-attempt }}
     defaults:
       run:
         shell: bash
@@ -34,10 +39,10 @@ jobs:
         name: native-runtime-binaries
         path: ${{ runner.temp }}/native-runtime-artifact
 
-    - name: Download current-attempt producer receipt
+    - name: Download selected producer receipt
       uses: actions/download-artifact@v8
       with:
-        name: onebox-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+        name: onebox-inputs-${{ github.run_id }}-${{ inputs.producer-attempt }}
         path: ${{ runner.temp }}/onebox-inputs
 
     - name: Verify and extract standalone build inputs

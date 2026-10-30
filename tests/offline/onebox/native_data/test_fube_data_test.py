@@ -2670,7 +2670,12 @@ class ReportingTests(unittest.TestCase):
         self.assertNotIn("cargo ", block)
         self.assertNotIn("rustc ", block)
         self.assertIn("fromJSON(needs.rust-build.outputs.onebox-matrix)", workflow)
-        self.assertIn("pattern: onebox-worker-*-${{ github.run_id }}-${{ github.run_attempt }}", workflow)
+        self.assertIn("artifact-ids: ${{ needs.onebox-workers.outputs.client-runtime-artifact }},"
+                      "${{ needs.onebox-workers.outputs.native-data-artifact }}", workflow)
+        self.assertNotIn("pattern: onebox-worker-", workflow)
+        self.assertIn('--worker-attempts-json "$WORKER_ATTEMPTS"', workflow)
+        self.assertIn('echo "$WORKER_ROUTE=$ARTIFACT_ID" >> "$GITHUB_OUTPUT"', workflow)
+        self.assertIn('echo "$WORKER_ROUTE-attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"', workflow)
         self.assertIn("merge-multiple: true", workflow)
         self.assertNotIn("name: onebox-client-runtime-", workflow)
         self.assertNotIn("name: onebox-native-data-", workflow)
@@ -2680,6 +2685,24 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("-m tests.onebox.shared.ci cleanup", workflow)
         self.assertLess(workflow.index("name: Emergency cleanup"), workflow.index("name: Upload this worker"))
         self.assertNotIn("continue-on-error", workflow)
+
+    def test_ci_input_downloads_use_the_published_producer_attempt_on_reruns(self):
+        workflow = (data.ROOT / ".github/workflows/ci.yaml").read_text()
+        producer = (data.ROOT / ".github/workflows/rust-build.yaml").read_text()
+        standalone = (data.ROOT / ".github/workflows/native-runtime.yaml").read_text()
+        self.assertIn("producer-attempt: ${{ steps.producer.outputs.attempt }}", producer)
+        self.assertIn('echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"', producer)
+        for name in ("native-runtime-binaries", "fube-data-binaries", "rust-runtime-binaries", "rust-tests"):
+            self.assertIn(f"name: {name}\n        overwrite: true", producer)
+            self.assertNotIn(f"name: {name}-${{{{ github.run_id }}}}", producer)
+        self.assertIn("FUBE_CI_PRODUCER_ATTEMPT: ${{ needs.rust-build.outputs.producer-attempt }}", workflow)
+        self.assertIn("name: onebox-inputs-${{ github.run_id }}-"
+                      "${{ needs.rust-build.outputs.producer-attempt }}", workflow)
+        self.assertNotIn("name: onebox-inputs-${{ github.run_id }}-${{ github.run_attempt }}", workflow)
+        self.assertIn("producer-attempt: ${{ needs.rust-build.outputs.producer-attempt }}", workflow)
+        self.assertIn("FUBE_CI_PRODUCER_ATTEMPT: ${{ inputs.producer-attempt }}", standalone)
+        self.assertIn("name: native-runtime-binaries\n", standalone)
+        self.assertIn("name: onebox-inputs-${{ github.run_id }}-${{ inputs.producer-attempt }}", standalone)
 
     def result(self, profile):
         return {"profile": profile, "status": "FAIL", "errors": [],

@@ -55,7 +55,7 @@ distribution; shared-state scenario implementations and their order remain in
 Python. This is not automatic per-test sharding.
 
 Each partition acquires one onebox fixture. Before allocation the runner checks
-output/config paths and validates the strict current-attempt producer receipt,
+output/config paths and validates the strict selected-producer receipt,
 bundle tar, extracted binaries and any native-client archive. It requires the
 pinned image to be built already; there is no compiler or image-build fallback.
 The existing guarded controller creates the cluster, publishes its immutable
@@ -119,14 +119,20 @@ It uses Ubuntu 22.04 x86-64 so its native executables also run on the oldest
 acceptance runner, rather than depending on Ubuntu 24.04's newer glibc.
 It publishes `rust-tests`, `fube-data-binaries`, `rust-runtime-binaries` and
 `native-runtime-binaries`. Tar bundles preserve executable permissions.
+These stable artifact names are overwritten only when the producer rebuilds;
+consumers verify their bytes against the selected producer receipt.
 
-The current-attempt producer receipt binds the archive and native bundles to
+The selected producer receipt binds the archive and native bundles to
 the actual checkout/tree, PR identity, run/attempt, target, debug profile,
 Rust/Cargo/nextest versions, lockfile and toolchain file. Archive-only Rust tests,
 standalone native acceptance and onebox workers depend only on this producer
 and run without building Rust. Standalone acceptance verifies the bundle before
 native preflight; missing, changed or wrong-source binaries fail without a
 compiler fallback.
+Consumers use the producer attempt exported by the build job, not their own
+execution attempt. Failed-jobs reruns can therefore reuse the exact successful
+build. Full reruns replace the stable binary/archive artifacts without upload
+name collisions and publish a new attempt-bound producer receipt.
 
 Python offline tests and Rust quality checks run independently of the producer.
 Quality covers formatting, production-only native-free library checks,
@@ -380,7 +386,7 @@ assertions**, plus five archived native tests. A partial report cannot label
 itself full. Native-client reports retain their actual heterogeneous schemas;
 seven internal clear-client cases are not seven native tests.
 
-The upstream producer publishes a current-attempt receipt outside the immutable
+The upstream producer publishes its attempt-bound receipt outside the immutable
 bundle. [`shared/ci.py`](../tests/onebox/shared/ci.py) verifies actual checkout/tree,
 PR head versus nullable merge, run/attempt, tar/archive/manifests and executable
 hashes before allocation. Each worker retains its immutable original creation
@@ -399,15 +405,24 @@ CI adapter. Use `--profile full` above for local combined qualification.
 
 Artifact names include run and attempt: `onebox-inputs-*`,
 `onebox-worker-<partition>-*`, `onebox-aggregate-*`. Worker artifacts retain their
-partition subdirectory so the aggregate can download all workers without a
-second hardcoded partition list.
+partition subdirectory. Each matrix worker exports its immutable artifact ID
+and actual execution attempt under partition-specific outputs; these output
+bindings must remain consistent with the declared partitions.
+The aggregate downloads those exact IDs, never a latest-artifact or
+current-attempt wildcard.
 Each worker artifact includes full reports, `validated-input.json`,
 `suite-outcomes.json`, `fixture.json`, `worker-proof.json`, post-teardown
 `cleanup.json` and credential-safe diagnostics. Emergency cleanup, when needed,
 adds a separate `emergency-cleanup.json`. No bootstrap, owner state, journals or
 raw logs are required.
-Do not mix attempts: after partial reruns/missing inputs, start a **fresh
-complete workflow dispatch**, rather than reuse an earlier-attempt receipt.
+Failed-jobs reruns may reuse the explicitly selected same-run producer and
+successful worker executions. Source/tree, PR head/merge, input hashes,
+producer receipt digest, coverage and original cleanup remain mandatory.
+Worker evidence is checked against its exported execution attempt, never
+relabeled as newly executed; aggregate output retains producer and worker
+contexts. Missing selected artifacts/proofs fail instead of falling back to
+older evidence. A rebuilt producer cannot reuse workers bound to its predecessor,
+even when binary bytes happen to match.
 
 [Measured run40781117241](https://github.com/youyuanwu/fube/actions/runs/40781117241)
 passed at source1414adca with all32+5. Compared with successful sequential

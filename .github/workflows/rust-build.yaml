@@ -9,6 +9,9 @@ on:
       onebox-matrix:
         description: Onebox partitions declared in tests/suites.toml
         value: ${{ jobs.rust-build.outputs.onebox-matrix }}
+      producer-attempt:
+        description: Attempt that built and published the immutable inputs
+        value: ${{ jobs.rust-build.outputs.producer-attempt }}
 
 env:
   NEXTEST_VERSION: "0.9.146"
@@ -23,6 +26,7 @@ jobs:
     outputs:
       nextest-version: ${{ env.NEXTEST_VERSION }}
       onebox-matrix: ${{ steps.suites.outputs.matrix }}
+      producer-attempt: ${{ steps.producer.outputs.attempt }}
     env:
       FUBE_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
       FUBE_CI_MERGE: ${{ github.event_name == 'pull_request' && github.sha || '' }}
@@ -70,6 +74,7 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: native-runtime-binaries
+        overwrite: true
         path: ${{ runner.temp }}/native-runtime-binaries.tar
         if-no-files-found: error
         retention-days: 7
@@ -78,6 +83,7 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: fube-data-binaries
+        overwrite: true
         path: ${{ runner.temp }}/fube-data-binaries.tar
         if-no-files-found: error
         retention-days: 7
@@ -86,6 +92,7 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: rust-runtime-binaries
+        overwrite: true
         path: ${{ runner.temp }}/rust-runtime-binaries.tar
         if-no-files-found: error
         retention-days: 7
@@ -105,12 +112,14 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: rust-tests
+        overwrite: true
         path: ${{ runner.temp }}/rust-tests.tar.zst
         if-no-files-found: error
         compression-level: 0
         retention-days: 7
 
     - name: Bind exact current-attempt compiler-free inputs
+      id: producer
       run: |
         python3 -m tests.onebox.shared.ci produce \
           --bundle-tar "$RUNNER_TEMP/fube-data-binaries.tar" \
@@ -118,6 +127,7 @@ jobs:
           --archive "$RUNNER_TEMP/rust-tests.tar.zst" \
           --standalone-bundle "$RUNNER_TEMP/native-runtime-binaries.tar" \
           --out "$RUNNER_TEMP/onebox-input-receipt.json"
+        echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
     - name: Upload current-attempt producer receipt
       uses: actions/upload-artifact@v7

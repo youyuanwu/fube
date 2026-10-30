@@ -26,6 +26,7 @@ jobs:
       FUBE_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
       FUBE_CI_MERGE: ${{ github.event_name == 'pull_request' && github.sha || '' }}
       FUBE_CI_RUN_ID: ${{ github.run_id }}
+      FUBE_CI_PRODUCER_ATTEMPT: ${{ needs.rust-build.outputs.producer-attempt }}
     steps:
     - uses: actions/checkout@v7
       with:
@@ -39,13 +40,13 @@ jobs:
         path: ${{ runner.temp }}/rust-tests
     - uses: actions/download-artifact@v8
       with:
-        name: onebox-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+        name: onebox-inputs-${{ github.run_id }}-${{ needs.rust-build.outputs.producer-attempt }}
         path: ${{ runner.temp }}/onebox-inputs
     - uses: taiki-e/install-action@v2
       with:
         tool: cargo-nextest@${{ needs.rust-build.outputs.nextest-version }}
         fallback: none
-    - name: Verify current-attempt workspace archive
+    - name: Verify selected producer workspace archive
       run: |
         python3 -m tests.onebox.shared.ci verify-artifact \
           --producer "$RUNNER_TEMP/onebox-inputs/onebox-input-receipt.json" \
@@ -101,6 +102,8 @@ jobs:
     name: Standalone native runtime
     needs: rust-build
     uses: ./.github/workflows/native-runtime.yaml
+    with:
+      producer-attempt: ${{ needs.rust-build.outputs.producer-attempt }}
     permissions:
       contents: read
 
@@ -111,6 +114,11 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
     permissions:
       contents: read
+    outputs:
+      client-runtime-artifact: ${{ steps.evidence.outputs.client-runtime }}
+      client-runtime-attempt: ${{ steps.evidence.outputs.client-runtime-attempt }}
+      native-data-artifact: ${{ steps.evidence.outputs.native-data }}
+      native-data-attempt: ${{ steps.evidence.outputs.native-data-attempt }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.rust-build.outputs.onebox-matrix) }}
@@ -120,6 +128,7 @@ jobs:
       FUBE_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
       FUBE_CI_MERGE: ${{ github.event_name == 'pull_request' && github.sha || '' }}
       FUBE_CI_RUN_ID: ${{ github.run_id }}
+      FUBE_CI_PRODUCER_ATTEMPT: ${{ needs.rust-build.outputs.producer-attempt }}
     defaults:
       run:
         shell: bash
@@ -138,10 +147,10 @@ jobs:
         name: fube-data-binaries
         path: ${{ runner.temp }}/fube-data-artifact
 
-    - name: Download current-attempt producer receipt
+    - name: Download selected producer receipt
       uses: actions/download-artifact@v8
       with:
-        name: onebox-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+        name: onebox-inputs-${{ github.run_id }}-${{ needs.rust-build.outputs.producer-attempt }}
         path: ${{ runner.temp }}/onebox-inputs
 
     - name: Download workspace test archive
@@ -210,6 +219,7 @@ jobs:
           --out "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/worker-proof.json"
 
     - name: Upload this worker's complete evidence after teardown
+      id: upload_evidence
       if: always()
       timeout-minutes: 4
       uses: actions/upload-artifact@v7
@@ -218,6 +228,16 @@ jobs:
         path: ${{ runner.temp }}/onebox-proof
         if-no-files-found: error
         retention-days: 7
+
+    - name: Publish this worker's immutable evidence identity
+      id: evidence
+      if: always()
+      env:
+        ARTIFACT_ID: ${{ steps.upload_evidence.outputs.artifact-id }}
+      run: |
+        test -n "$ARTIFACT_ID"
+        echo "$WORKER_ROUTE=$ARTIFACT_ID" >> "$GITHUB_OUTPUT"
+        echo "$WORKER_ROUTE-attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
   linux-onebox:
     # Keep the existing required-check name; only this aggregate claims the
@@ -233,6 +253,7 @@ jobs:
       FUBE_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
       FUBE_CI_MERGE: ${{ github.event_name == 'pull_request' && github.sha || '' }}
       FUBE_CI_RUN_ID: ${{ github.run_id }}
+      FUBE_CI_PRODUCER_ATTEMPT: ${{ needs.rust-build.outputs.producer-attempt }}
     defaults:
       run:
         shell: bash
@@ -248,14 +269,14 @@ jobs:
     - name: Download producer identity
       uses: actions/download-artifact@v8
       with:
-        name: onebox-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+        name: onebox-inputs-${{ github.run_id }}-${{ needs.rust-build.outputs.producer-attempt }}
         path: ${{ runner.temp }}/onebox-inputs
 
     - name: Download all declared worker proofs
       if: always()
       uses: actions/download-artifact@v8
       with:
-        pattern: onebox-worker-*-${{ github.run_id }}-${{ github.run_attempt }}
+        artifact-ids: ${{ needs.onebox-workers.outputs.client-runtime-artifact }},${{ needs.onebox-workers.outputs.native-data-artifact }}
         path: ${{ runner.temp }}/onebox-workers
         merge-multiple: true
 
@@ -268,11 +289,13 @@ jobs:
         RUST_QUALITY_RESULT: ${{ needs.rust-quality.result }}
         PYTHON_TESTS_RESULT: ${{ needs.python-tests.result }}
         STANDALONE_RESULT: ${{ needs.standalone.result }}
+        WORKER_ATTEMPTS: '{"client-runtime":"${{ needs.onebox-workers.outputs.client-runtime-attempt }}","native-data":"${{ needs.onebox-workers.outputs.native-data-attempt }}"}'
       run: |
         NEEDS_STATUS="$(python3 -c 'import json,os; names=("producer","workers","rust_tests","rust_quality","python_tests","standalone"); print(json.dumps({name:os.environ[name.upper()+"_RESULT"] for name in names}))')"
         python3 -m tests.onebox.shared.ci aggregate \
           --producer "$RUNNER_TEMP/onebox-inputs/onebox-input-receipt.json" \
           --worker-root "$RUNNER_TEMP/onebox-workers" --needs-json "$NEEDS_STATUS" \
+          --worker-attempts-json "$WORKER_ATTEMPTS" \
           --out "$RUNNER_TEMP/onebox-aggregate.json"
 
     - name: Upload complete aggregate or explicit failure
