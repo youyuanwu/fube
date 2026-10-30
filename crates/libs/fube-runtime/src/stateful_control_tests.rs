@@ -9,7 +9,7 @@ use crate::ServicePartitionAccessStatus::{
     Granted as G, NotPrimary as N, ReconfigurationPending as T,
 };
 
-fn control(request: &ProxyRequest, action: &str, remotes: Vec<Replica>) -> ProxyRequest {
+pub(super) fn control(request: &ProxyRequest, action: &str, remotes: Vec<Replica>) -> ProxyRequest {
     let mut result = request.clone();
     result.service = native_default_service(result.service);
     if matches!(
@@ -22,7 +22,7 @@ fn control(request: &ProxyRequest, action: &str, remotes: Vec<Replica>) -> Proxy
     result.flags = 0;
     result
 }
-fn peer(local: &Replica, node: u8) -> Replica {
+pub(super) fn peer(local: &Replica, node: u8) -> Replica {
     let mut replica = local.clone();
     replica.node.id.0 = vec![node; 16];
     replica.id = node as i64 * 100;
@@ -35,7 +35,7 @@ fn peer(local: &Replica, node: u8) -> Replica {
     replica.replication_endpoint = format!("model://peer/{node}");
     replica
 }
-async fn wait_event(calls: &StatefulCalls, event: &str, count: usize) {
+pub(super) async fn wait_event(calls: &StatefulCalls, event: &str, count: usize) {
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if calls

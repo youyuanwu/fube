@@ -4,7 +4,9 @@ use crate::{Error, Result};
 use fube_transport::{
     connection::{deadline_after, Connection, SendStatus},
     message::{Header, Message},
-    serialization::serde::{from_slice, to_vec, EmptyObjectArray, FixedTag, ObjectArray, Pointer},
+    serialization::serde::{
+        from_slice, to_vec, EmptyObjectArray, NativeEnum, ObjectArray, Pointer,
+    },
 };
 use std::{
     collections::BTreeMap,
@@ -125,11 +127,20 @@ struct FaultStage {
     current: Arc<AtomicBool>,
     complete: tokio::sync::watch::Sender<Option<Result<FaultDelivery>>>,
 }
+#[derive(Clone, Copy)]
+pub(crate) enum HealthTarget {
+    Partition,
+    Instance,
+    Replica,
+}
 pub(crate) struct Reporting {
     connection: Connection,
     valid: Arc<AtomicBool>,
     authority: Arc<Authority>,
     request: Mutex<ProxyRequest>,
+    // Updated only after native service ChangeRole completes. Neither requested
+    // configuration role nor caller-editable diagnostic snapshots select load.
+    service_role: Mutex<crate::ReplicaRole>,
     admission: Arc<Semaphore>,
     loads: Mutex<BTreeMap<String, ReportedLoad>>,
     fault: Mutex<Option<FaultStage>>,
@@ -204,6 +215,7 @@ impl Reporting {
             valid,
             authority,
             request: Mutex::new(request),
+            service_role: Mutex::new(crate::ReplicaRole::Unknown),
             admission: Arc::new(Semaphore::new(1)),
             loads: Mutex::new(BTreeMap::new()),
             fault: Mutex::new(None),
@@ -216,6 +228,9 @@ impl Reporting {
     }
     pub(crate) fn update(&self, request: &ProxyRequest) {
         *self.request.lock().unwrap() = request.clone();
+    }
+    pub(crate) fn complete_service_role(&self, role: crate::ReplicaRole) {
+        *self.service_role.lock().unwrap() = role;
     }
     pub(crate) fn loads(&self) -> Vec<ReportedLoad> {
         self.loads.lock().unwrap().values().cloned().collect()
@@ -266,6 +281,20 @@ impl Reporting {
             return Err(Error::InvalidInput("report requires 1..=64 metrics"));
         }
         let request = self.request.lock().unwrap().clone();
+        let primary = if request.service.stateful {
+            match *self.service_role.lock().unwrap() {
+                crate::ReplicaRole::Primary => true,
+                crate::ReplicaRole::ActiveSecondary | crate::ReplicaRole::IdleSecondary => false,
+                crate::ReplicaRole::Unknown | crate::ReplicaRole::None => {
+                    return Err(Error::new(
+                        crate::ErrorKind::InvalidState,
+                        "no representable native load role",
+                    ));
+                }
+            }
+        } else {
+            false
+        };
         let mut unique = BTreeMap::new();
         for metric in metrics {
             name(&metric.name)?;
@@ -310,13 +339,17 @@ impl Reporting {
             reports: ObjectArray(vec![LoadDescription {
                 partition: request.unit.id.id,
                 service: request.service.name,
-                stateful: false,
-                primary: ObjectArray(vec![]),
-                secondary: ObjectArray(stats.clone()),
-                nodes: ObjectArray(vec![NodeLoads {
-                    node: request.local.node.id,
-                    loads: ObjectArray(stats),
-                }]),
+                stateful: request.service.stateful,
+                primary: ObjectArray(if primary { stats.clone() } else { vec![] }),
+                secondary: ObjectArray(if primary { vec![] } else { stats.clone() }),
+                nodes: ObjectArray(if primary {
+                    vec![]
+                } else {
+                    vec![NodeLoads {
+                        node: request.local.node.id,
+                        loads: ObjectArray(stats),
+                    }]
+                }),
             }]),
             time: now,
         };
@@ -330,7 +363,7 @@ impl Reporting {
                 body,
                 deadline_after(REPORT_TIMEOUT)?,
                 self.fence(),
-            ) => result?,
+            ) => result.map_err(report_transport_error)?,
         }
         self.check()?;
         let utc = utc();
@@ -348,7 +381,11 @@ impl Reporting {
         }
         Ok(())
     }
-    pub(crate) async fn health(self: &Arc<Self>, report: &HealthReport) -> Result<HealthReceipt> {
+    pub(crate) async fn health(
+        self: &Arc<Self>,
+        report: &HealthReport,
+        target: HealthTarget,
+    ) -> Result<HealthReceipt> {
         self.check()?;
         let _global = self
             .global
@@ -382,19 +419,37 @@ impl Reporting {
             HealthSequence::Auto => auto_sequence()?,
         };
         let request = self.request.lock().unwrap().clone();
-        let entity_property = format!(
-            "{}+{}+{}",
-            uuid::Uuid::from_bytes_le(request.unit.id.id.0),
-            request.local.id,
-            report.property
-        );
-        let body = HealthBody {
-            reports: ObjectArray(vec![InstanceHealth {
-                entity: Pointer(Some(FixedTag(HealthEntity {
-                    kind: 2,
-                    partition: request.unit.id.id,
+        let partition = request.unit.id.id;
+        let id = uuid::Uuid::from_bytes_le(partition.0);
+        let (kind, entity, entity_id) = match target {
+            HealthTarget::Partition => (3, HealthEntity::Partition { partition }, id.to_string()),
+            HealthTarget::Instance if !request.service.stateful => (
+                2,
+                HealthEntity::Instance {
+                    partition,
                     instance: request.local.id,
-                }))),
+                },
+                format!("{id}+{}", request.local.id),
+            ),
+            HealthTarget::Replica if request.service.stateful => (
+                1,
+                HealthEntity::Replica {
+                    partition,
+                    replica: request.local.id,
+                    replica_instance: -1,
+                },
+                format!("{id}+{}", request.local.id),
+            ),
+            _ => {
+                return Err(Error::InvalidInput(
+                    "health target differs from native service kind",
+                ))
+            }
+        };
+        let entity_property = format!("{entity_id}+{}", report.property);
+        let body = HealthBody {
+            reports: ObjectArray(vec![EntityHealth {
+                entity: Pointer(Some(NativeEnum(entity))),
                 source: report.source.clone(),
                 property: report.property.clone(),
                 ttl,
@@ -429,14 +484,14 @@ impl Reporting {
                 deadline_after(REPORT_TIMEOUT)?,
                 |bytes| decode_health(bytes).map_err(|error| error.transport_fault()),
                 self.fence(),
-            ) => result?,
+            ) => result.map_err(report_transport_error)?,
         };
         self.check()?;
         if reply.results.0.len() != 1 || !reply.streams.0.is_empty() {
             return Err(Error::Protocol("unexpected health result cardinality"));
         }
         let result = &reply.results.0[0];
-        if result.kind != 2
+        if result.kind != kind
             || result.source != report.source
             || result.sequence != sequence
             || result.entity_property != entity_property
@@ -633,6 +688,14 @@ fn text(value: &str, empty: bool) -> Result<()> {
         ));
     }
     Ok(())
+}
+fn report_transport_error(error: fube_transport::Error) -> Error {
+    let error = Error::from(error);
+    if matches!(error, Error::Timeout) {
+        error.uncertain()
+    } else {
+        error
+    }
 }
 fn name(value: &str) -> Result<()> {
     text(value, false)

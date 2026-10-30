@@ -886,11 +886,12 @@ impl Registry {
         epoch: Epoch,
         cancel: Cancellation,
     ) -> Result<()> {
-        let (service, status) = {
+        let (service, status, reporting) = {
             let state = unit.state.lock().unwrap();
             (
                 state.service.clone().ok_or(Error::Closed)?,
                 state.status.clone(),
+                state.reporting.clone(),
             )
         };
         self.change_replicator_role(unit, role, epoch, &cancel)
@@ -917,6 +918,9 @@ impl Registry {
             let mut snapshot = status.lock().unwrap();
             snapshot.service_role = role;
             snapshot.service_address = endpoint;
+            if let Some(reporting) = &reporting {
+                reporting.complete_service_role(role);
+            }
         }
         Ok(())
     }

@@ -32,39 +32,59 @@ rejected.
 
 ## Owned programming model
 
-1. Attach `Runtime`, then call `register_stateful(name, Arc<Factory>)`.
-2. `StatefulFactory::create` receives owned service/partition identity, public
-   replica ID, **separate RAP incarnation and node incarnation**, initialization
-   bytes and activation snapshot.
-3. `StatefulService::open` receives a generation-bound `StatefulPartition` and
-   returns an owned `Arc<dyn Replicator>`. Replicator Open returns its control
+1. Attach `Runtime`, then schedule synchronous
+   `register_stateful_service_factory(name, Box<dyn IStatefulServiceFactory>)`
+   through a capture-free execution reservation followed by `run_owned`.
+2. `IStatefulServiceFactory::create_replica` synchronously receives type, URI,
+   borrowed initialization bytes, partition UUID and public replica ID, returning
+   `Result<Box<dyn IStatefulServiceReplica>>`. Factory-owned context and explicit
+   `NativeIntegrationProvider` separately capture activation and native binding.
+3. `IStatefulServiceReplica::open(New, Arc<dyn IStatefulServicePartition>, cancellation)`
+   asynchronously returns `Box<dyn IPrimaryReplicator>`. Existing is explicitly
+   unsupported in this volatile profile; Invalid rejects before activation.
+   Common `IReplicator` Open returns its control
    address; service ChangeRole independently returns its client address.
 4. Implement service/replicator Close and Abort, role/epoch changes, progress,
    data loss, configurations, catch-up, build and removal. There is deliberately
    **no default all-success replicator**.
-5. Use `partition.status()`, `access_status()` and `ensure_valid()` for owned
-   diagnostics and authority/lifetime checks. A published address or a cached
+5. Canonical partitions expose separate `get_read_status`/`get_write_status`.
+   Explicit `NativeRuntimeIntegration` supplies diagnostics and validity.
+   A published address or a cached
    role alone is not permission to serve. Shutdown is explicit and awaited.
 
 API: [stateful_api.rs:18-202](../../crates/libs/fube-runtime/src/stateful_api.rs#L18-L202),
 [partition handles:357-393](../../crates/libs/fube-runtime/src/stateful_api.rs#L357-L393),
 [registration:405](../../crates/libs/fube-runtime/src/lib.rs#L405).
-Stateful load/health/write/storage APIs are not supplied by this seam.
+All selected reporting routes are implemented; storage is the separate data layer.
+Load/move use actor 12/RAPReportLoad with stateful=true and privately completed
+native service role: Primary uses primary entries, ActiveSecondary and
+IdleSecondary use secondary/node entries. Unknown/None have no representable
+load route and fail explicitly. Caller-edited diagnostics do not select bytes.
+Partition health uses actor 7/ReportHealth kind/tag 3 and partition-only entity;
+replica health uses kind/tag 1, public replica ID and invalid replica-instance
+`-1`, **not** RAP incarnation. Base methods borrow only HealthInformation.
+Versioned health2 methods additionally take optional send options after it.
+Both Immediate values directly send; true adds no interval delay. Health waits
+for one exact HM result, not fresh durability, with uncertain timeout and no
+hidden retry. Load/move wait for local complete-frame write, not RA/FM ACK.
+All canonical reports synchronously return Result on the reserved execution
+entry. `NativeRuntimeIntegration::observe_report()` is a fube-specific one-call
+observation wrapper, not native-ported API or a last-receipt slot.
 
-`StatefulPartition::report_fault(FaultType)` reuses the runtime's existing
+`IStatefulServicePartition::report_fault(FaultType)` reuses the runtime's existing
 actor-12 `RAReportFault` path, bound to the full native unit, replica incarnation
 and epochs. Its receipt means an initial local frame write, **not native
 acknowledgment, persistence or replacement**. `fault_delivery()` exposes the
 bounded retry/error/cancellation snapshot. Retries run on the installing Runtime
 executor until unit disposal, not on a calling provider/engine executor; stale
 handles and retired process authority cannot start queued fault frames.
-`fube-data`'s qualified `Engine::bind_partition` reports one transient
+The native-bound `fube-data::FabricReplicator` reports one transient
 notification for a terminal engine fault (including an internal provider
 barrier failure without an active RAP callback), never for normal Close/Abort
 or ordinary write backpressure/cancellation. Close/Abort cancels its receipt
 wait and joins owned cleanup; the Runtime retains only fault DTOs/authority/
 connection state for retries, not service/replicator participants. Standalone
-`Engine::bind` has no native reporting authority. These fault-delivery paths
+out-of-host construction has no native reporting authority. These fault-delivery paths
 have source-contract tests; native recovery validation remains pending.
 
 The data profile's executed native qualification now also covers primary
@@ -72,8 +92,9 @@ failure/replacement, copy and per-unit isolation; see [its exact evidence and
 limits](FubeData.md#executed-qualification). These results do not turn every
 internal fault-report race into an independently observed native scenario.
 
-`Replicator::remove_replica` receives an owned `ReplicaRemoval` purpose:
-`Idle` for native idle-owner removal, or `BuildRetryCleanup` for disposal of
+`IPrimaryReplicator::remove_replica(replica_id)` synchronously completes exact
+captured removal/disposal. Private issued invocation retains `ReplicaRemoval`
+purpose: `Idle` for native idle-owner removal, or `BuildRetryCleanup` for disposal of
 partial/previous resources before another node-authorized Build. Cleanup
 success is never Build success. Failed Build/Remove retains a cleanup obligation
 even for equal-incarnation retries; final native removal remains a distinct

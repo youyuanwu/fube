@@ -290,11 +290,19 @@ pub trait IStatefulServicePartition: Send + Sync + 'static {
     fn get_partition_information(&self) -> Result<ServicePartitionInformation>;
     fn get_read_status(&self) -> Result<ServicePartitionAccessStatus>;
     fn get_write_status(&self) -> Result<ServicePartitionAccessStatus>;
+    /// Local frame-write completion, not RA/FM acknowledgment. Native-bound
+    /// completed service role selects primary or secondary/node arrays.
     fn report_load(&self, metrics: &[crate::LoadMetric]) -> Result<()>;
     fn report_fault(&self, fault: crate::FaultType) -> Result<()>;
     fn report_move_cost(&self, cost: crate::MoveCost) -> Result<()>;
+    /// Partition-only native entity (kind/tag 3); one exact HM result, not fresh
+    /// durability or SDK queue/batching admission. No hidden health retry.
     fn report_partition_health(&self, health: &crate::HealthInformation) -> Result<()>;
+    /// Native kind/tag 1, public replica ID, invalid replica-instance -1.
+    /// Same exact-result completion and uncertain timeout as partition health.
     fn report_replica_health(&self, health: &crate::HealthInformation) -> Result<()>;
+    /// Both Immediate values directly send; true adds no reporting-interval
+    /// delay but does not mean HM success or remote durability.
     fn report_partition_health2(
         &self,
         health: &crate::HealthInformation,
@@ -547,33 +555,26 @@ impl IStatefulServicePartition for StatefulPartition {
         let worker = reporting.clone();
         reporting.complete(async move { worker.fault(fault).await.map(|_| ()) })
     }
-    fn report_load(&self, _: &[crate::LoadMetric]) -> Result<()> {
+    fn report_load(&self, metrics: &[crate::LoadMetric]) -> Result<()> {
         self.ensure_valid()?;
-        Err(Error::new(
-            crate::ErrorKind::Unsupported,
-            "stateful load routing is not enabled",
-        ))
+        let reporting = self.reporting.as_ref().ok_or(Error::Closed)?.clone();
+        let worker = reporting.clone();
+        let metrics = metrics.to_vec();
+        reporting.complete(async move { worker.load(&metrics).await })
     }
-    fn report_move_cost(&self, _: crate::MoveCost) -> Result<()> {
+    fn report_move_cost(&self, cost: crate::MoveCost) -> Result<()> {
         self.ensure_valid()?;
-        Err(Error::new(
-            crate::ErrorKind::Unsupported,
-            "stateful move-cost routing is not enabled",
-        ))
+        let reporting = self.reporting.as_ref().ok_or(Error::Closed)?.clone();
+        let worker = reporting.clone();
+        reporting.complete(async move { worker.move_cost(cost).await })
     }
-    fn report_partition_health(&self, _: &crate::HealthInformation) -> Result<()> {
-        self.ensure_valid()?;
-        Err(Error::new(
-            crate::ErrorKind::Unsupported,
-            "partition health routing is not enabled",
-        ))
+    fn report_partition_health(&self, health: &crate::HealthInformation) -> Result<()> {
+        self.health(health, crate::reporting::HealthTarget::Partition)
+            .map(|_| ())
     }
-    fn report_replica_health(&self, _: &crate::HealthInformation) -> Result<()> {
-        self.ensure_valid()?;
-        Err(Error::new(
-            crate::ErrorKind::Unsupported,
-            "replica health routing is not enabled",
-        ))
+    fn report_replica_health(&self, health: &crate::HealthInformation) -> Result<()> {
+        self.health(health, crate::reporting::HealthTarget::Replica)
+            .map(|_| ())
     }
     fn report_partition_health2(
         &self,
@@ -591,6 +592,17 @@ impl IStatefulServicePartition for StatefulPartition {
     }
 }
 impl StatefulPartition {
+    pub(crate) fn health(
+        &self,
+        health: &crate::HealthInformation,
+        target: crate::reporting::HealthTarget,
+    ) -> Result<crate::reporting::HealthReceipt> {
+        self.ensure_valid()?;
+        let health = crate::HealthReport::try_from(health)?;
+        let reporting = self.reporting.as_ref().ok_or(Error::Closed)?.clone();
+        let worker = reporting.clone();
+        reporting.complete(async move { worker.health(&health, target).await })
+    }
     pub fn status(&self) -> Result<ReplicaDiagnostics> {
         self.ensure_valid()?;
         let status = self.status.lock().unwrap().clone();

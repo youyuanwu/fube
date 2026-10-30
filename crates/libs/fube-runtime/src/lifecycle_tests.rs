@@ -1,4 +1,6 @@
 use super::*;
+#[path = "reporting_tests.rs"]
+mod reporting_tests;
 #[path = "stateful_tests.rs"]
 pub(crate) mod stateful_tests;
 use fube_transport::{
@@ -237,9 +239,9 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
         assert_eq!(report.ttl, i64::MAX);
         assert_eq!(report.state, 2);
         let entity = &report.entity.0.as_ref().unwrap().0;
-        assert_eq!(entity.instance, 100);
-        assert_eq!(entity.kind, 2);
-        assert_eq!(entity.partition, request.unit.id.id);
+        assert!(
+            matches!(entity, HealthEntity::Instance { instance: 100, partition } if *partition == request.unit.id.id)
+        );
         write_message(
             &mut h.peer,
             &Message {

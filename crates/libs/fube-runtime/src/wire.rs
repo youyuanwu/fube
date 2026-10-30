@@ -377,18 +377,25 @@ pub struct FaultBody {
     pub activity: Activity,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealthEntity {
-    pub kind: i64,
-    pub partition: Guid,
-    pub instance: i64,
+pub enum HealthEntity {
+    #[serde(rename = "1")]
+    Replica {
+        partition: Guid,
+        replica: i64,
+        replica_instance: i64,
+    },
+    #[serde(rename = "2")]
+    Instance { partition: Guid, instance: i64 },
+    #[serde(rename = "3")]
+    Partition { partition: Guid },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attributes {
     pub values: fube_transport::serialization::serde::EmptyObjectArray,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InstanceHealth {
-    pub entity: Pointer<fube_transport::serialization::serde::FixedTag<HealthEntity, 2>>,
+pub struct EntityHealth {
+    pub entity: Pointer<fube_transport::serialization::serde::NativeEnum<HealthEntity>>,
     pub source: String,
     pub property: String,
     pub ttl: i64,
@@ -401,7 +408,7 @@ pub struct InstanceHealth {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthBody {
-    pub reports: ObjectArray<Vec<InstanceHealth>>,
+    pub reports: ObjectArray<Vec<EntityHealth>>,
     pub streams: fube_transport::serialization::serde::EmptyObjectArray,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -3,6 +3,8 @@
 use super::*;
 #[path = "stateful_control_tests.rs"]
 mod control_tests;
+#[path = "stateful_reporting_tests.rs"]
+mod reporting_tests;
 use crate::extensions::{NativeIntegrationProvider, NativeRuntimeIntegration};
 use crate::{
     ApiFuture as ServiceFuture, IPrimaryReplicator, IReplicator, IStatefulServiceFactory,
@@ -14,6 +16,7 @@ use crate::{
 struct StatefulCalls {
     events: Mutex<Vec<&'static str>>,
     partitions: Mutex<Vec<NativeRuntimeIntegration>>,
+    sdk_partitions: Mutex<Vec<Arc<dyn crate::IStatefulServicePartition>>>,
     provider: Mutex<Option<NativeIntegrationProvider>>,
     open_entered: Notify,
     release: Notify,
@@ -128,6 +131,7 @@ impl IStatefulServiceReplica for StatefulFixture {
         Box::pin(async move {
             assert_eq!(mode, OpenMode::New);
             let _ = partition.get_partition_information()?;
+            self.calls.sdk_partitions.lock().unwrap().push(partition);
             self.calls.record("serviceOpen");
             self.calls
                 .partitions

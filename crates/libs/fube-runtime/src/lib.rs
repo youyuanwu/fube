@@ -38,6 +38,41 @@
 //! ```compile_fail
 //! let _ = fube_runtime::Epoch::ZERO.primary();
 //! ```
+//! Removed concrete/module-qualified reporting surfaces are not aliases:
+//! ```compile_fail
+//! use fube_runtime::{Partition, StatefulPartition, HealthReport, HealthSequence};
+//! ```
+//! ```compile_fail
+//! use fube_runtime::stateful_api::StatefulFactory;
+//! ```
+//! Base health reports take only borrowed information, not send options:
+//! ```compile_fail
+//! fn old(p: &dyn fube_runtime::IStatelessServicePartition, h: &fube_runtime::HealthInformation) {
+//!     p.report_instance_health(h, None);
+//! }
+//! ```
+//! Reports are completed synchronous Results, not futures:
+//! ```compile_fail
+//! async fn old(p: &dyn fube_runtime::IStatefulServicePartition, h: &fube_runtime::HealthInformation) {
+//!     p.report_replica_health(h).await;
+//! }
+//! ```
+//! Positive health/health2 synchrony and argument-role witness:
+//! ```
+//! use fube_runtime::{IStatelessServicePartition, IStatefulServicePartition,
+//!     HealthInformation, HealthReportSendOption, Result};
+//! fn reports(s: &dyn IStatelessServicePartition, r: &dyn IStatefulServicePartition,
+//!     h: &HealthInformation, o: Option<&HealthReportSendOption>) {
+//!     let _: Result<()> = s.report_partition_health(h);
+//!     let _: Result<()> = s.report_instance_health(h);
+//!     let _: Result<()> = s.report_partition_health2(h, o);
+//!     let _: Result<()> = s.report_instance_health2(h, o);
+//!     let _: Result<()> = r.report_partition_health(h);
+//!     let _: Result<()> = r.report_replica_health(h);
+//!     let _: Result<()> = r.report_partition_health2(h, o);
+//!     let _: Result<()> = r.report_replica_health2(h, o);
+//! }
+//! ```
 
 mod api;
 mod context;

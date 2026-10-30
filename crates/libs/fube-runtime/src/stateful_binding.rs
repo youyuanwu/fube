@@ -269,6 +269,37 @@ impl NativeInvocation {
     }
 }
 impl NativeRuntimeIntegration {
+    /// One generation-bound report record, associated before emission. This is
+    /// a fube observation extension, not SDK admission or remote durability.
+    pub fn observe_report(
+        &self,
+    ) -> Result<(
+        Arc<dyn IStatefulServicePartition>,
+        crate::extensions::ReportingObservation,
+    )> {
+        self.validate()?;
+        let state = self.0.state.upgrade().ok_or(Error::Closed)?;
+        let state = state.lock().unwrap();
+        let kind = match state.request.unit.consistency.kind {
+            1 => PartitionKind::Singleton,
+            2 => PartitionKind::Int64Range {
+                low: state.request.unit.consistency.low,
+                high: state.request.unit.consistency.high,
+            },
+            3 => PartitionKind::Named(state.request.unit.consistency.name.clone()),
+            _ => return Err(Error::Protocol("invalid native partition kind")),
+        };
+        Ok(crate::instance_integration::observe_stateful(
+            StatefulPartition {
+                identity: self.identity().clone(),
+                kind,
+                valid: self.0.valid.clone(),
+                authority: self.0.authority.clone(),
+                status: state.status.clone(),
+                reporting: state.reporting.clone(),
+            },
+        ))
+    }
     pub fn install_progress_source(&self, source: &Arc<dyn NativeProgressSource>) -> Result<()> {
         self.execution().check_constructor()?;
         self.validate()?;

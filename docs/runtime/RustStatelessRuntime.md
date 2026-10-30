@@ -34,19 +34,25 @@ turn this stateless profile into replicated storage.
 
 ## Owned programming model
 
-Implement `StatelessFactory::create` and `StatelessService::{open,close,abort}`.
-The API uses owned identities/initialization bytes, `Arc`, `Result` and boxed
-`Send` futures rather than COM lifetimes
+Implement `IStatelessServiceFactory::create_instance` and
+`IStatelessServiceInstance::{open,close,abort}`. Construction is synchronous
+and fallible; lifecycle Open/Close return boxed `Send` futures. The API uses
+UTF-8/UUID, boxed participants and partition trait objects rather than COM lifetimes
 ([api.rs:13-49](../../crates/libs/fube-runtime/src/api.rs#L13-L49)).
 
 1. `Runtime::attach()` consumes actual SF-injected activation identity and
    completes host/runtime registration plus a fresh lease poll.
-2. `register_stateless(name, Arc<Factory>)` retains the factory for the runtime
-   lifetime. There is no invented type-unregister operation.
-3. Factory creation receives the service URI/type, partition GUID, public
-   stateless instance ID, separate RAP incarnation, initialization bytes and
-   immutable activation snapshot.
-4. Open receives a generation-bound partition and cancellation token. Bind the
+2. `register_stateless_service_factory(name, Box<dyn IStatelessServiceFactory>)`
+   synchronously waits for native registration. Reserve
+   `runtime.execution().try_reserve()` **before** moving the factory, then
+   `run_owned(move || runtime.register_stateless_service_factory(...))` and
+   await that owned observation. Do not block an async executor directly.
+   There is no invented type-unregister operation.
+3. Factory creation receives service type, URI, borrowed initialization bytes,
+   partition GUID and public stateless instance ID. A factory-owned context
+   handle supplies activation snapshots; explicit `InstanceIntegrationProvider`
+   captures native incarnation/integration separately, not as SDK arguments.
+4. Open receives `Arc<dyn IStatelessServicePartition>` and cancellation. Bind the
    real application listener **before returning** its opaque endpoint string.
 5. Close asynchronously disposes resources. Abort synchronously disposes them
    before returning; neither may rely on a dropped future as proof of cleanup.
@@ -77,8 +83,8 @@ let value = config.section("Main")?.parameter("Value")?.plaintext()?;
 ```
 
 Keep the snapshot/package Arc as long as needed; later updates do not alter its
-metadata/settings. `ServiceContext.activation` remains the creation-time owned
-snapshot; later service creation/type registration uses the current context.
+metadata/settings. A factory may retain its own creation-time owned snapshot;
+later service creation/type registration uses the current context.
 The environment-only parser is bootstrap, not a loaded package context:
 `packages()` explicitly errors before loading
 ([context.rs:29](../../crates/libs/fube-runtime/src/context.rs#L29),
@@ -244,7 +250,8 @@ generation validity at admission and at the writer's pre-frame boundary
 | --- | --- | --- |
 | `report_load(&[LoadMetric])` | actor 12, `RAPReportLoad`, partition/service/node metrics | Complete local frame write, **not** RA/FM acknowledgment or persistence |
 | `report_move_cost(MoveCost)` | Same path, `_MoveCost_` value Zero/Low/Medium/High = 0/1/2/3 | Same one-way write semantics; not an imperative move |
-| `report_health(&HealthReport)` | actor 7, `ReportHealth`, originating stateless instance | One correlated, identity/sequence-matched HM **per-report** success |
+| `report_instance_health(&HealthInformation)` | actor 7, `ReportHealth`, kind/tag 2, originating stateless instance | One correlated, identity/sequence-matched HM **per-report** success |
+| `report_partition_health(&HealthInformation)` | actor 7, `ReportHealth`, kind/tag 3, partition-only entity | Same exact-result completion |
 | `report_fault(FaultType)` | actor 12, `RAReportFault`, native FUD/replica identity | Initial local write, or coalescing with that pending stage's initial result; **not** recovery acknowledgment |
 
 Load requires 1–64 unique, currently declared custom metrics with values below
@@ -265,12 +272,11 @@ uses the cost in placement decisions
 Health supports only Ok/Warning/Error. Source/property are nonempty, bounded
 UTF-16 text without NUL; `System*` sources and `DeleteProperty` are reserved.
 Descriptions exceeding 4096 UTF-16 units are rejected, not silently truncated.
-`HealthSequence::Auto` allocates one process-monotonic positive sequence;
-`Explicit(n)` requires `n > 0`. HM requires strictly newer sequences for the same
+`sequence_number: 0` allocates one process-monotonic positive sequence;
+positive values are explicit and negative values invalid. HM requires strictly newer sequences for the same
 instance/source/property: duplicates/older values are errors, not TTL refreshes.
-`time_to_live: None` maps to native infinite TTL, **not zero wire ticks**.
-Finite durations are rounded down to 100ns ticks and must remain positive and
-below the infinite sentinel. HM expiration starts at its last-modified time,
+`time_to_live_seconds: 0` maps to native infinite TTL, **not zero wire ticks**.
+Finite public TTLs are whole seconds. HM expiration starts at its last-modified time,
 not the source timestamp or enqueue time. With `remove_when_expired=false`,
 the event retains its reported state but becomes expired and evaluates Error;
 with `true`, it disappears from health query evaluation before eventual physical
@@ -279,7 +285,13 @@ cleanup. Sequence history after deletion is not promised
 
 Health is one request/report with no hidden batching or retries. A timeout does
 not prove the report was never applied; retry with the same explicit sequence
-when preserving update identity. `HealthReceipt.sequence` is matched to the HM
+when preserving update identity. Both native-versioned `report_*_health2`
+methods take optional borrowed `HealthReportSendOption` **after** information.
+Both Immediate values directly send; true adds no reporting-interval delay,
+but neither value means remote success/durability. All report methods return
+synchronous `Result<()>` on the reserved execution entry. The explicit
+`InstanceRuntimeIntegration::observe_report()` wrapper binds one observation
+before its single call; its health sequence is matched to the HM
 result; outer transport success alone is never reported as health success.
 HM success is not a promise of a fresh durable transaction. Close/Abort cancels
 outstanding load/health waits promptly, releasing local report/RPC work without

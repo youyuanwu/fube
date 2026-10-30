@@ -154,20 +154,22 @@ claim that remote unregistration completed.
 Conceptually:
 
 ```text
-Runtime::attach(options) -> Runtime
+Runtime::attach() -> async Result<Runtime>
 Runtime::activation_context() -> immutable, versioned snapshot
 Runtime::node_context() -> owned node information
-Runtime::register_stateless(type_name, factory) -> Result<()>
-Runtime::shutdown(deadline) -> Result<()>
+Runtime::register_stateless_service_factory(type_name, Box<dyn IStatelessServiceFactory>) -> Result<()>
+Runtime::shutdown(self) -> async Result<()>
 
-StatelessFactory::create(service_identity, initialization_bytes)
-    -> service instance
-StatelessInstance::open(partition, cancellation) -> opaque endpoint string
-StatelessInstance::close(cancellation) -> Result<()>
-StatelessInstance::abort()
+IStatelessServiceFactory::create_instance(type_name, service_uri, initialization_bytes, partition_id, instance_id)
+    -> Result<Box<dyn IStatelessServiceInstance>>
+IStatelessServiceInstance::open(Arc<dyn IStatelessServicePartition>, cancellation) -> async Result<String>
+IStatelessServiceInstance::close(cancellation) -> async Result<()>
+IStatelessServiceInstance::abort()
 ```
 
-These are API sketches, not existing signatures or compilable examples.
+These are conceptual canonical signatures, not compilable examples. Schedule
+waiting synchronous registration/report calls on a reserved ExecutionRuntime
+entry (`try_reserve` before captures, then `run_owned`); never block an async executor.
 Identity includes native partition/instance IDs; initialization bytes stay
 opaque. Return the application's actual listening address, after its listener
 is ready. Do not make the runtime serialize application traffic or assume

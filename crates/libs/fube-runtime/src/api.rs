@@ -100,9 +100,12 @@ pub trait IStatelessServicePartition: Send + Sync + 'static {
     fn report_load(&self, metrics: &[crate::LoadMetric]) -> Result<()>;
     fn report_fault(&self, fault: FaultType) -> Result<()>;
     fn report_move_cost(&self, cost: crate::MoveCost) -> Result<()>;
+    /// Partition-only native entity (kind/tag 3); exact HM-result completion.
     fn report_partition_health(&self, health: &crate::HealthInformation) -> Result<()>;
     /// Exact HM-result wait, unlike SDK default admission/batching.
     fn report_instance_health(&self, health: &crate::HealthInformation) -> Result<()>;
+    /// Both Immediate values directly send. True adds no interval delay, not
+    /// remote success/durability. Timeout may have been applied; no hidden retry.
     fn report_partition_health2(
         &self,
         health: &crate::HealthInformation,
@@ -193,19 +196,13 @@ impl IStatelessServicePartition for Partition {
         self.reporting
             .complete(async move { reporting.move_cost(cost).await })
     }
-    fn report_partition_health(&self, _: &crate::HealthInformation) -> Result<()> {
-        self.ensure_valid()?;
-        Err(Error::new(
-            crate::ErrorKind::Unsupported,
-            "partition health routing is not enabled",
-        ))
+    fn report_partition_health(&self, health: &crate::HealthInformation) -> Result<()> {
+        self.health(health, crate::reporting::HealthTarget::Partition)
+            .map(|_| ())
     }
     fn report_instance_health(&self, health: &crate::HealthInformation) -> Result<()> {
-        self.ensure_valid()?;
-        let health = crate::HealthReport::try_from(health)?;
-        let reporting = self.reporting.clone();
-        self.reporting
-            .complete(async move { reporting.health(&health).await.map(|_| ()) })
+        self.health(health, crate::reporting::HealthTarget::Instance)
+            .map(|_| ())
     }
     fn report_partition_health2(
         &self,
@@ -223,6 +220,17 @@ impl IStatelessServicePartition for Partition {
     }
 }
 impl Partition {
+    pub(crate) fn health(
+        &self,
+        health: &crate::HealthInformation,
+        target: crate::reporting::HealthTarget,
+    ) -> Result<crate::reporting::HealthReceipt> {
+        self.ensure_valid()?;
+        let health = crate::HealthReport::try_from(health)?;
+        let reporting = self.reporting.clone();
+        self.reporting
+            .complete(async move { reporting.health(&health, target).await })
+    }
     pub fn ensure_valid(&self) -> Result<()> {
         self.authority.check()?;
         if self.valid.load(Ordering::Acquire) {
@@ -249,7 +257,9 @@ impl Partition {
         report: &crate::HealthReport,
     ) -> Result<crate::HealthReceipt> {
         self.ensure_valid()?;
-        self.reporting.health(report).await
+        self.reporting
+            .health(report, crate::reporting::HealthTarget::Instance)
+            .await
     }
     /// Await initial local write (or explicitly coalesce a pending stage).
     /// Retries retain the bound native identity until closure. This is not a

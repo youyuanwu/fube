@@ -41,29 +41,35 @@ stateless registration. This is not an environment role override.
 
 ## Owned API and provider obligations
 
-- `Engine::bind_partition` installs the existing runtime's partition authority
-  and callback/destructor supervision. `Engine::bind` is a standalone test seam,
-  not native application authority
+- `FabricReplicator::create` consumes a canonical partition and explicit
+  runtime-issued native integration, provider and endpoint/settings capabilities.
+  Control and state-replicator views share one private engine/listener;
+  no standalone public control authority is supplied
   ([constructors](../../crates/libs/fube-data/src/engine.rs#L313-L355)).
-- `StateProvider` supplies progress, `update_epoch(previous_epoch_last)`,
-  data-loss, copy-context and exact-horizon copy-state callbacks
+- `IStateProvider` supplies synchronous `get_last_committed_sequence_number`,
+  `get_copy_context`/`get_copy_state` factories, async `update_epoch` and
+  bool `on_data_loss` callbacks
   ([contract](../../crates/libs/fube-data/src/api.rs#L135-L170)).
   Provider progress means application state, not quorum knowledge.
-- Optional `StateProvider::replication_checkpoint(sequence, cancellation)` returns
+- Separately optional `extensions::ReplayCheckpointProvider::replication_checkpoint(sequence, cancellation)` returns
   an authentic original operation at exactly that applied/completed-copy
-  sequence: original epoch, bytes **and segment boundaries**. Its default is
-  bounded `None`; unavailable provenance must not be reconstructed from current
+  sequence: original epoch, bytes **and segment boundaries**. An absent capability
+  means unavailable history; a supplied callback may return bounded `None`.
+  Unavailable provenance must not be reconstructed from current
   state or relabeled with the current epoch. Callback/capture supervision is
   unchanged. The engine reserves bounded operation ownership before requesting
   a checkpoint; this is not a permanent extra retained-queue allowance.
-- `Engine::submit` returns an admitted sequence and `Replication` waiter.
+- `IStateReplicator::replicate` asynchronously admits an early sequence and
+  separate `ReplicationCompletion` waiter.
   The primary must apply that sequence locally **before** waiting for quorum.
   Its accepted operation and local apply must outlive a disconnected caller;
   canceling/dropping `wait` does not undo admission
   ([wait](../../crates/libs/fube-data/src/engine.rs#L140-L161),
   [sample owned admission](../../crates/samples/rust-runtime-app/src/data.rs#L258-L325)).
 - Secondary application pumps consume copy then replication; apply before
-  `Operation::acknowledge`. Receipt, polling and Drop do not acknowledge.
+  `IOperation::acknowledge`. Provider `IOperationDataStream::get_next` is
+  payload-only; destination `IOperationStream::get_operation` yields metadata/
+  data/explicit ACK. Receipt, polling and Drop do not acknowledge.
   A late retired-owner ACK fails rather than reviving progress
   ([ACK and stream contract](../../crates/libs/fube-data/src/api.rs#L173-L267)).
 - Provider callbacks run outside engine/transport locks. Returned errors,
@@ -86,7 +92,7 @@ The public `Mutation { id, key, value }` shape is unchanged.
 `Mutation::operation_for_epoch(epoch)` emits version-2 application JSON carrying
 the genuine admitted primary operation epoch. Both sample producers fence this
 against their real authority: Rust uses the native snapshot's primary epoch
-and `Engine::submit_in_epoch`; the native oracle uses its actual provider
+and explicit `extensions::EpochCheckedReplication::replicate_in_epoch`; the native oracle uses its actual provider
 UpdateEpoch callback under the admission gate, returning pre-admission 503 if
 that epoch is unavailable. Native secondary operation metadata has no epoch;
 the opaque application bytes preserve its origin even when that secondary's
@@ -149,7 +155,7 @@ when no peer, application ACK or retry event arrives.
 An already completed native secondary has no primary target immediately after
 demotion; RequestAck deliberately cannot establish one. If the promoted Rust
 primary has no ordinary retained suffix, it requests a bounded
-`StateProvider::replication_checkpoint` and retransmits that **authentic original
+`extensions::ReplayCheckpointProvider::replication_checkpoint` and retransmits that **authentic original
 operation** at the existing LSN with its unchanged original epoch/segments.
 The duplicate establishes the native primary target without applying again or
 assigning a new LSN. Only the resulting real receive/application ACK can satisfy
