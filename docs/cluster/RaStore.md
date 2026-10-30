@@ -151,7 +151,8 @@ open validates exact recognized schema (including absence of foreign triggers),
 limits reject oversized existing contents, never truncate them. Structural
 integrity checks do not detect arbitrary valid-looking payload edits; no
 cryptographic envelope or native migration is claimed. RA entity serialization/
-envelopes remain P2.
+envelopes belong above P1. The [minimal P2 seam](RaProtocolFoundation.md) now
+stores a selected aggregate; restart loading/recovery remains unimplemented.
 
 [`sqlite.rs`](../../crates/libs/fube-ra-store/src/sqlite.rs) configures and queries
 effective **WAL + synchronous=FULL** on the sole writer before any successful

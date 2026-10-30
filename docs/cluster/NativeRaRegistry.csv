@@ -19,8 +19,8 @@ ServiceTypeDisabled,ServiceTypeDisabled,54,FM,true,service-control,RA-to-FM,-,Se
 ServiceTypeDisabledReply,ServiceTypeDisabledReply,55,RA,true,service-control,FM-to-RA,N,ServiceTypeUpdateReplyMessageBody,fm/FailoverManager.cpp:2461|ra/MessageHandler.cpp:281,staged
 ServiceTableRequest,ServiceTableRequest,58,FM,false,resolution,resolver-to-FM,-,ServiceTableRequestMessageBody,ServiceResolverImpl.cpp:72|fm/FailoverManager.cpp:1085,not-RA-boundary
 ServiceTableUpdate,ServiceTableUpdate,59,ServiceResolver,false,resolution,FM-to-resolver,-,ServiceTableUpdateMessageBody,fm/FailoverManager.cpp:2256|fm/FMServiceLookupTable.cpp:224,not-RA-boundary
-AddInstance,AddInstance,62,RA,true,partition-command,FM-to-RA,FC,ReplicaMessageBody,fm/SendMessageAction.cpp:128|ra/MessageHandler.cpp:475|ra/ReconfigurationAgent.cpp:1639,selected-codec-pair
-AddInstanceReply,AddInstanceReply,63,FM,true,partition-command-reply,RA-to-owner,-,ReplicaReplyMessageBody,ra/ReconfigurationAgent.cpp:900;1680;1718|fm/FailoverManager.cpp:960,selected-codec-pair
+AddInstance,AddInstance,62,RA,true,partition-command,FM-to-RA,FC,ReplicaMessageBody,fm/SendMessageAction.cpp:128|ra/MessageHandler.cpp:475|ra/ReconfigurationAgent.cpp:1639,selected-codec-native-stream-verified-partial-entity-runtime-staged
+AddInstanceReply,AddInstanceReply,63,FM,true,partition-command-reply,RA-to-owner,-,ReplicaReplyMessageBody,ra/ReconfigurationAgent.cpp:900;1680;1718|fm/FailoverManager.cpp:960,selected-codec-native-stream-verified-partial-entity-runtime-staged
 RemoveInstance,RemoveInstance,66,RA,true,partition-command,FM-to-RA,FC,DeleteReplicaMessageBody,fm/SendMessageAction.cpp:138;146|ra/MessageHandler.cpp:486,staged
 RemoveInstanceReply,RemoveInstanceReply,67,FM,true,partition-command-reply,RA-to-owner,-,ReplicaReplyMessageBody,ra/ReconfigurationAgent.cpp:704|fm/FailoverManager.cpp:961,staged
 AddPrimary,AddPrimary,70,RA,true,partition-command,owner-to-RA,FC,ReplicaMessageBody,fm/SendMessageAction.cpp:166|ra/MessageHandler.cpp:497,staged

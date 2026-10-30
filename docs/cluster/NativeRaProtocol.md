@@ -13,9 +13,10 @@ All source references below are relative to `src/prod/src/`, unless prefixed
 Links identify files; accompanying line ranges identify the specific evidence.
 No inference of sender, recipient, or completeness is made from action names.
 
-**Status:** source inventory complete; implementations remain staged.
-No native execution or Rust codec/handler is asserted by the inventory alone.
-All rows are **staged native obligations**.
+**Status:** source inventory complete. The [first-pair codecs and minimal
+entity seam](RaProtocolFoundation.md) are implemented with source-baseline
+native-stream evidence; complete handlers/runtime/traces remain staged.
+The inventory alone does not establish protocol implementation.
 `AddInstance` and `AddInstanceReply` are the selected foundation codec pair;
 the bounded entity slice does not implement Hosting or authorize serving.
 The implementation mapping below supplies actual Rust mappings and evidence
@@ -135,13 +136,14 @@ not re-dispatch to the actor advertised in its registry factory.
 All rows retain full native semantics as staged obligations. `C1` denotes the
 selected first codec pair only; `S` means other staged protocol work; `L`
 means retained legacy contract; `D` means native explicit rejection; `G` means
-an observed pinned-source endpoint gap. None is claimed implemented in Rust.
+an observed pinned-source endpoint gap. C1 has the bounded implementation below;
+the other contracts remain staged.
 
 ### Rust implementation and test mapping
 
 | Inventory class | Rust mapping at catalog delivery | Required delivery/admission gate |
 |---|---|---|
-| C1: AddInstance/AddInstanceReply | Selected for phase 2 protocol schemas/codecs and phase 3 stateless entity seam; not yet implemented at catalog delivery. | Bidirectional actual native codec execution, focused entity ordering/staleness tests; Hosting/transport/trace qualification is still separate. |
+| C1: AddInstance/AddInstanceReply | Public schemas/headers: [protocol.rs:41–410](../../crates/libs/fube-ra/src/protocol.rs#L41-L410); selected entity execution: [entity.rs:439–741](../../crates/libs/fube-ra/src/entity.rs#L439-L741). [Protocol tests](../../crates/libs/fube-ra/tests/protocol.rs), [entity tests](../../crates/libs/fube-ra/tests/entity.rs), [native source-stream gate](../../tests/ra_protocol/README.md). | 15 bidirectional native-stream/schema-adapter cases and selected entity barriers pass. Full Hosting/transport/native trace qualification and excluded lifecycle branches remain required; no deployed capability admission. |
 | S: all other active boundary contracts | No Rust codec/handler/trace implementation asserted. The CSV's per-action body, direction and evidence map each missing implementation individually. | Port exact referenced schema and sender/receiver semantics, corresponding native tests and normalized traces before capability admission. No successful stubs or permanent omission. |
 | L: retained legacy | No Rust wire implementation asserted; retained current/native legacy behavior must be tested explicitly. | Preserve source-baseline old action definitions/handling versus current ReplicaUp replacement distinctions. |
 | D: deprecated ChangeConfigurationReply | No Rust dispatcher asserted. | Rejection/deprecation test, not successful no-op. |
@@ -686,7 +688,8 @@ Focused source test anchors:
 **Evidence boundary:** these native tests were read, not executed.
 Unknown store completion, caller cancellation ownership, retaining an
 operation ticket/fence until resolution, and eventual progress after actual
-outcome are **the foundation's staged Rust requirements** from its Spec, not
+outcome are **the foundation's Rust execution requirements**, tested by
+[the selected entity barriers](../../crates/libs/fube-ra/tests/entity.rs), not
 claims established by a similarly named native test. The native definite
 commit-result publication/effect ordering above is the source grounding.
 
@@ -765,24 +768,26 @@ is `objects_FailoverRA`, test subdirectory at
 ([ra/test/CMakeLists.txt:8–10,72–75][ra-test-cmake]). These facts are not a
 request to build the full reference tree.
 
-No native build, native tests, network or publication was run in this
-read-only research activity. Repository docs/build/oracle availability and
-Rust test command discovery are parent-owned and deliberately not duplicated.
+The inventory's native research did not execute full RA/FM native tests.
+The later [codec producer/consumer](../../tests/ra_protocol/README.md) compiles
+and executes only the native serialization subset, with disclosed schema and
+platform adapters. No full SF tree build, running FM/RA or publication is claimed.
 
 ## Explicit remaining evidence limits
 
 1. Source inventory/classification is complete; **protocol implementation is
-   not**. All action rows still require parent-owned Rust implementation/test
-   mapping and staged tracking.
+   not**. C1 has the bounded mappings above; all other boundary codecs/handlers/
+   traces and the rest of C1 lifecycle/runtime behavior remain staged obligations.
 2. PartitionNotification has an actual RA sender and RA reply handler, but no
    evidenced FM receiver/reply producer at the pinned revision. Native RA
    synthetic tests do not establish this missing endpoint.
 3. Base-only closed GetLSNReply versus derived reply deserialization needs
    executed conformance evidence before a byte-level interoperability claim.
-4. Every nested selected-pair type is identified, including polymorphic
-   scaling types; actual native byte fixtures/native decoder execution,
-   malformed-input behavior, and independently pinned binary interoperability
-   were not performed here and remain separate evidence gates.
+4. The selected pair now has executed native-produced inputs and native decoder
+   field comparisons through the source-baseline stream/schema-adapter oracle,
+   including nonempty/inherited scaling and malformed inputs. Full original
+   production C++ RA classes/handlers and independently pinned deployed-binary
+   interoperability remain unverified, separate evidence gates.
 
 [registry]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/common/RSMessage.cpp#L32-L250
 [registry-h]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/common/RSMessage.h

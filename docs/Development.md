@@ -146,10 +146,18 @@ cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo test --locked -p fube-transport -p fube-client -p fube-test-host
 cargo test --locked -p fube-ra-store
+cargo test --locked -p fube-ra
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo doc --locked -p fube-transport -p fube-client -p fube-test-host --no-deps
 python3 -m unittest discover -s tests/offline -t . -p 'test_*.py'
 ```
+
+The [RA protocol foundation](cluster/RaProtocolFoundation.md) adds ordinary
+native-free Rust tests and offline catalog/input-validator tests to these same
+workspace/offline selections. Its separate [native source-baseline codec
+oracle](../tests/ra_protocol/README.md) has explicit Clang/Rust fixture production
+and digest/source-bound, compiler-free consumption. It needs no running SF
+installation or full native build and does not qualify a deployed native FM/RA.
 
 The live tests are ignored by ordinary `cargo test`. Offline model tests do not
 establish native wire compatibility. Unsupported host platforms fail before
