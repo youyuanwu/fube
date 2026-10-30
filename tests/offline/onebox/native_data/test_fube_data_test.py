@@ -2034,6 +2034,7 @@ class UploadReservationTests(ProjectFiles):
         source = self.root / "source"
         (source / "Code").mkdir(parents=True)
         (source / "ApplicationManifest.xml").write_text("manifest")
+        (source / "ApplicationManifest.xml").chmod(0o644)
         (source / "Code/app").write_bytes(b"executable")
         (source / "Code/app").chmod(0o755)
         archive, entries, size = data.upload_archive(source)
@@ -2557,6 +2558,7 @@ class UploadReservationTests(ProjectFiles):
         source = self.root / "source"
         source.mkdir()
         (source / "payload").write_bytes(b"owned payload")
+        (source / "payload").chmod(0o644)
         popen = subprocess.Popen
         processes, commands = [], []
         code = data.UPLOAD.replace('parent=="/var/lib/sf-node"', "parent==" + repr(str(self.root)))
