@@ -15,6 +15,8 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(test)]
+use tokio::sync::oneshot;
 use tokio::{
     sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore},
     task::{JoinHandle, JoinSet},
@@ -52,6 +54,8 @@ struct Unit {
     operation: Arc<Semaphore>,
 }
 struct Shared {
+    #[cfg(test)]
+    query_tail: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     units: Mutex<HashMap<[u8; 16], Arc<Unit>>>,
     owners: Mutex<HashMap<[u8; 16], bool>>,
     stateful: crate::stateful::Registry,
@@ -71,7 +75,9 @@ struct Shared {
 pub(crate) struct Engine {
     shared: Arc<Shared>,
     stop: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    task: JoinHandle<Option<mpsc::Receiver<IpcRequest>>>,
+    retired_incoming: Option<mpsc::Receiver<IpcRequest>>,
+    active_at_stop: bool,
 }
 struct FactorySlot {
     shared: Arc<Shared>,
@@ -207,6 +213,8 @@ impl Engine {
             execution.clone(),
         );
         let shared = Arc::new(Shared {
+            #[cfg(test)]
+            query_tail: Mutex::new(None),
             units: Mutex::new(HashMap::new()),
             owners: Mutex::new(HashMap::new()),
             stateful,
@@ -286,8 +294,15 @@ impl Engine {
                 record.cancel();
                 record.wait().await;
             }
+            (*stopped.borrow()).then_some(incoming)
         });
-        Self { shared, stop, task }
+        Self {
+            shared,
+            stop,
+            task,
+            retired_incoming: None,
+            active_at_stop: false,
+        }
     }
     pub(crate) fn insert_factory(
         &self,
@@ -311,13 +326,18 @@ impl Engine {
         slot.committed = true;
         Ok(())
     }
-    pub(crate) async fn quiesce(&mut self) -> Result<()> {
-        let active = self.shared.execution.has_running_callbacks();
+    pub(crate) fn begin_quiesce(&mut self) {
+        self.active_at_stop |= self.shared.execution.has_running_callbacks();
         self.stop.send_replace(true);
-        (&mut self.task)
+    }
+    pub(crate) async fn quiesce(&mut self) -> Result<()> {
+        self.begin_quiesce();
+        // Late one-way native commands must not poison the connection while
+        // Runtime still needs it for unregistration. The queue stays bounded.
+        self.retired_incoming = (&mut self.task)
             .await
             .map_err(|_| Error::Protocol("lifecycle dispatcher panic"))?;
-        if active || self.shared.execution.has_running_callbacks() {
+        if self.active_at_stop || self.shared.execution.has_running_callbacks() {
             return Err(Error::Protocol(
                 "shutdown with active callbacks requires process fencing",
             ));
@@ -497,7 +517,7 @@ async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
         let reply = incoming
             .reply
             .ok_or(Error::Protocol("RAPQuery requires correlation"))?;
-        return reply
+        let result = reply
             .reply(
                 12,
                 Some("RAPQueryReply"),
@@ -506,6 +526,15 @@ async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
             )
             .await
             .map_err(Error::from);
+        #[cfg(test)]
+        {
+            let tail = shared.query_tail.lock().unwrap().take();
+            if let Some((entered, release)) = tail {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+        }
+        return result;
     }
     validate(&shared, &request)?;
     if incoming.reply.is_some() {

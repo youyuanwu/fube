@@ -131,6 +131,9 @@ impl IStatefulServiceReplica for StatefulFixture {
         Box::pin(async move {
             assert_eq!(mode, OpenMode::New);
             let _ = partition.get_partition_information()?;
+            let released = self.calls.release.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
             self.calls.sdk_partitions.lock().unwrap().push(partition);
             self.calls.record("serviceOpen");
             self.calls
@@ -192,7 +195,7 @@ impl IStatefulServiceReplica for StatefulFixture {
                     })
                 }
                 8 => tokio::select! {
-                    _ = self.calls.release.notified() => {},
+                    _ = &mut released => {},
                     _ = cancellation.cancelled() => return Err(Error::Closed),
                 },
                 _ => {}
@@ -426,6 +429,9 @@ impl IPrimaryReplicator for ReplicatorFixture {
             if self.1 < 20 {
                 return Err(Error::Protocol("unexpected build in lifecycle fixture"));
             }
+            let released = self.0.build_release.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
             self.0.record("build");
             self.0.builds.lock().unwrap().push(replica);
             if matches!(self.1, 40 | 42) && self.0.builds.lock().unwrap().len() == 1 {
@@ -436,7 +442,7 @@ impl IPrimaryReplicator for ReplicatorFixture {
             }
             if self.1 == 22 {
                 tokio::select! {
-                    _ = self.0.build_release.notified() => {},
+                    _ = &mut released => {},
                     _ = cancellation.cancelled() => return Err(Error::Closed),
                 }
             }
@@ -746,7 +752,13 @@ async fn queued_stateful_fault_is_fenced_after_authority_retirement() {
         partition.report_fault(FaultType::Permanent).await,
         Err(Error::Closed)
     ));
-    h.no_reply().await;
+    h.engine.shared.connection.close().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), read_message(&mut h.peer))
+            .await
+            .unwrap()
+            .is_err()
+    );
     assert_eq!(partition.fault_delivery().unwrap().attempts, 1);
 }
 

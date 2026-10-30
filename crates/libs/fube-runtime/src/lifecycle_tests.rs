@@ -19,7 +19,7 @@ struct Calls {
     aborts: AtomicUsize,
     partitions: Mutex<Vec<Partition>>,
     provider: Mutex<Option<crate::extensions::InstanceIntegrationProvider>>,
-    release: Notify,
+    release: Cancellation,
     abort_release: AtomicBool,
     abort_running: AtomicUsize,
 }
@@ -77,7 +77,7 @@ impl IStatelessServiceInstance for Instance {
                 .unwrap()
                 .push(partition.clone());
             if self.mode == 8 {
-                self.calls.release.notified().await;
+                self.calls.release.cancelled().await;
             }
             if self.mode == 1 || self.mode == 5 {
                 return Err(Error::Remote {
@@ -94,7 +94,7 @@ impl IStatelessServiceInstance for Instance {
         Box::pin(async move {
             self.calls.closes.fetch_add(1, Ordering::SeqCst);
             if self.mode == 7 {
-                self.calls.release.notified().await;
+                self.calls.release.cancelled().await;
             }
             if self.mode == 2 || self.mode == 6 {
                 return Err(Error::Remote {
@@ -117,10 +117,7 @@ impl IStatelessServiceInstance for Instance {
         let _running = Running(&self.calls.abort_running);
         assert_ne!(self.mode, 11, "intentional Abort panic");
         if matches!(self.mode, 4..=6 | 12) {
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while !self.calls.abort_release.load(Ordering::Acquire)
-                && std::time::Instant::now() < deadline
-            {
+            while !self.calls.abort_release.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
@@ -131,6 +128,13 @@ pub(crate) struct Harness {
     peer: TcpStream,
     calls: Arc<Calls>,
     index: u32,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        self.calls.release.cancel();
+        self.calls.abort_release.store(true, Ordering::Release);
+    }
 }
 
 #[tokio::test]
@@ -896,13 +900,101 @@ impl Harness {
             msg.properties().unwrap().actor,
             if action == "ReportHealth" { 7 } else { 12 }
         );
+        let identity = match action {
+            "ReplicaOpenReply" | "ReplicaCloseReply" => {
+                let reply: ProxyReply = from_slice(&msg.body).unwrap();
+                Some((reply.unit.id.id.0, reply.local.instance))
+            }
+            "ProxyUpdateServiceDescriptionReply" => {
+                let reply: UpdateServiceReply = from_slice(&msg.body).unwrap();
+                Some((reply.unit.id.id.0, reply.local.instance))
+            }
+            _ => None,
+        };
+        if let Some((id, instance)) = identity {
+            let unit = self.engine.shared.units.lock().unwrap().get(&id).cloned();
+            if let Some(unit) = unit {
+                let same_instance = unit.state.lock().unwrap().request.local.instance == instance;
+                if same_instance {
+                    // Replies precede release of the native dispatch gate.
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while unit.operation.available_permits() == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("stateless dispatch gate released");
+                }
+            } else if matches!(action, "ReplicaOpenReply" | "ReplicaCloseReply") {
+                let stateful = self.engine.shared.owners.lock().unwrap().get(&id) == Some(&true);
+                if stateful {
+                    self.engine.shared.stateful.wait_idle(id).await;
+                }
+            }
+        }
         msg
     }
     async fn no_reply(&mut self) {
         let received =
-            tokio::time::timeout(Duration::from_millis(30), read_message(&mut self.peer)).await;
+            tokio::time::timeout(Duration::from_millis(30), self.peer.peek(&mut [0])).await;
         assert!(received.is_err(), "unexpected model response: {received:?}");
     }
+}
+
+#[tokio::test]
+#[should_panic(expected = "unexpected model response")]
+async fn no_reply_rejects_a_partial_frame() {
+    use tokio::io::AsyncWriteExt;
+    let mut h = Harness::new().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (client, accepted) = tokio::join!(
+        TcpStream::connect(listener.local_addr().unwrap()),
+        listener.accept()
+    );
+    h.peer = client.unwrap();
+    let mut writer = accepted.unwrap().0;
+    let frame = Message {
+        headers: vec![Header::action("partial").unwrap()],
+        body: vec![42; 256],
+    }
+    .to_frame()
+    .unwrap()
+    .encode()
+    .unwrap();
+    writer.write_all(&frame[..3]).await.unwrap();
+    h.peer.readable().await.unwrap();
+    h.no_reply().await;
+}
+
+#[tokio::test]
+async fn stopping_dispatch_before_retirement_preserves_ipc_during_query_cleanup() {
+    let mut h = Harness::new().await;
+    let request = h.request(1, 1, 0);
+    h.send("ReplicaOpen", &request).await;
+    h.receive("ReplicaOpenReply").await;
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *h.engine.shared.query_tail.lock().unwrap() = Some((entered, released));
+    h.send("RAPQuery", &request).await;
+    h.receive("RAPQueryReply").await;
+    tokio::time::timeout(Duration::from_secs(5), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!h.engine.shared.execution.has_running_callbacks());
+    h.engine.begin_quiesce();
+    h.engine.shared.authority.retire();
+    release.send(()).unwrap();
+    h.engine.quiesce().await.unwrap();
+    h.send("RAPQuery", &request).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while h.engine.retired_incoming.as_ref().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!h.engine.shared.connection.is_closed());
 }
 
 #[tokio::test]
@@ -1153,7 +1245,11 @@ async fn query_tracks_actual_abort_cleanup_and_graceful_close_operations() {
                 if let Some(u) = u {
                     let expected = if mode == 7 { 8 } else { 16 };
                     if u.state.lock().unwrap().operation_kind == expected
-                        && (mode == 7 || h.calls.aborts.load(Ordering::SeqCst) > 0)
+                        && if mode == 7 {
+                            h.calls.closes.load(Ordering::SeqCst) > 0
+                        } else {
+                            h.calls.aborts.load(Ordering::SeqCst) > 0
+                        }
                     {
                         break;
                     }
@@ -1162,13 +1258,20 @@ async fn query_tracks_actual_abort_cleanup_and_graceful_close_operations() {
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| {
+            panic!(
+                "mode {mode}: query phase not entered; opens={}, closes={}, aborts={}",
+                h.calls.opens.load(Ordering::SeqCst),
+                h.calls.closes.load(Ordering::SeqCst),
+                h.calls.aborts.load(Ordering::SeqCst)
+            )
+        });
         h.send("RAPQuery", &request).await;
         let query: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
         assert_eq!(query.detail.operation, if mode == 7 { 8 } else { 16 });
         assert!(query.detail.operation_start > 0);
         h.calls.abort_release.store(true, Ordering::Release);
-        h.calls.release.notify_waiters();
+        h.calls.release.cancel();
         h.receive(if mode == 5 {
             "ReplicaOpenReply"
         } else {

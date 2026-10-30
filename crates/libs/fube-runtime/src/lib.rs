@@ -706,7 +706,9 @@ impl Runtime {
 
     /// Orderly host/runtime unregistration. A failed shutdown remains terminal
     /// and the independent authority watchdog bounds application lifetime.
-    pub async fn shutdown(self) -> Result<()> {
+    pub async fn shutdown(mut self) -> Result<()> {
+        // Query cleanup must not fault the IPC needed for unregistration.
+        self.lifecycle.begin_quiesce();
         self.authority.retire();
         let execution = self.execution.clone();
         let permit = execution.reserve(

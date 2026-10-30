@@ -245,6 +245,8 @@ fn maximum_copy_bytes(settings: &Settings) -> usize {
 struct Shared {
     #[cfg(test)]
     copy_job_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
+    #[cfg(test)]
+    replay_probe: Mutex<Option<ReplayProbe>>,
     admission: Mutex<()>,
     stopped: AtomicBool,
     revision: AtomicU64,
@@ -256,6 +258,18 @@ struct Shared {
     engine_id: u64,
     generation: u64,
     shutdown_cleanup: Mutex<(bool, Option<DeferredCleanup>)>,
+}
+
+#[cfg(test)]
+enum ReplayEvent {
+    Publishing,
+    Rearmed(Instant),
+}
+
+#[cfg(test)]
+struct ReplayProbe {
+    events: std_mpsc::Sender<ReplayEvent>,
+    release: Option<std_mpsc::Receiver<()>>,
 }
 
 trait NativeControlView: Send + Sync {
@@ -534,6 +548,8 @@ impl Engine {
         let shared = Arc::new(Shared {
             #[cfg(test)]
             copy_job_pause: Mutex::new(None),
+            #[cfg(test)]
+            replay_probe: Mutex::new(None),
             admission: Mutex::new(()),
             stopped: AtomicBool::new(false),
             revision: AtomicU64::new(1),
@@ -1697,6 +1713,15 @@ impl Owner {
                     self.fail(error);
                 }
             }
+            #[cfg(test)]
+            if self.replay_rearm_pending {
+                if let Some(probe) = self.shared.replay_probe.lock().unwrap().as_mut() {
+                    let _ = probe.events.send(ReplayEvent::Publishing);
+                    if let Some(release) = probe.release.take() {
+                        let _ = release.recv();
+                    }
+                }
+            }
             self.publish();
             drop(_admission);
             self.replies.extend(replies.take());
@@ -1710,6 +1735,10 @@ impl Owner {
                 // publication, AND the producer admission mutex are released.
                 self.replay_next = Instant::now() + self.settings.retry;
                 self.replay_rearm_pending = false;
+                #[cfg(test)]
+                if let Some(probe) = self.shared.replay_probe.lock().unwrap().as_ref() {
+                    let _ = probe.events.send(ReplayEvent::Rearmed(self.replay_next));
+                }
             }
         }
         self.shared.stopped.store(true, Ordering::Release);
