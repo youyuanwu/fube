@@ -50,7 +50,7 @@ prebuilt inputs with no compiler/native installation/build fallback.
 
 ## Entity API and admission
 
-[`Executor::new`:234–278](../../crates/libs/fube-ra/src/entity.rs#L234-L278)
+[`Executor::new`:236–282](../../crates/libs/fube-ra/src/entity.rs#L236-L282)
 accepts `Arc<dyn KeyValueStore>`, immutable trusted session/node admission and
 finite settings. The caller selects/initializes the P1 backend, including its
 correct deployment/node binding. Executor does not infer a storage identity
@@ -63,7 +63,7 @@ from the trait object or recover an existing entity.
   adapter; tests supply it now. It does not create application serving authority.
 - RetryOpen: explicit new retry work for an existing pending open.
 
-[Admission/transition logic:439–600](../../crates/libs/fube-ra/src/entity.rs#L439-L600)
+[Admission/transition logic:443–604](../../crates/libs/fube-ra/src/entity.rs#L443-L604)
 enforces the selected stateless InBuild/up/package profile, configured FM/local
 node incarnation and generation domain. Configured-source validation is an
 additional session gate, not a claim that the generic native dispatcher
@@ -83,12 +83,12 @@ implementation gaps, not permanent omissions or alternate protocol statuses.
 
 ## State, commit and effects
 
-[Owned supervision:234–418](../../crates/libs/fube-ra/src/entity.rs#L234-L418)
+[Owned supervision:236–422](../../crates/libs/fube-ra/src/entity.rs#L236-L422)
 uses one independent thread/runtime and bounded per-entity workers. Same-entity
 work serializes. Accepted count, tight encoded bytes and one potential action
 slot are reserved atomically and held through actual completion.
 
-[Commit/publication:603–741](../../crates/libs/fube-ra/src/entity.rs#L603-L741)
+[Commit/publication:607–754](../../crates/libs/fube-ra/src/entity.rs#L607-L754)
 keeps proposed state private. New entities and Ready updates commit one aggregate
 under record type `ra/entity/v1` and a lowercase hex native-GUID ID. Format 1
 stores the full selected body, phase and open token; it is an internal envelope,
@@ -103,8 +103,11 @@ work until the actual outcome resolves. A P1 deadline leaves P1 terminally
 fenced even after late success: executor never reopens/replaces the store.
 Unrelated permitted memory work can progress; subsequent durable work still
 fails against a fenced store.
+Permanent observation-channel loss and terminal Unknown also retain the fence
+and apply the configured minimum polling interval; immediate resolution errors
+cannot turn uncertainty into a busy loop.
 
-[`take_effects`:348–353](../../crates/libs/fube-ra/src/entity.rs#L348-L353)
+[`take_effects`:352–357](../../crates/libs/fube-ra/src/entity.rs#L352-L357)
 transfers each action record once per accepted execution. Explicit new retry
 commands and native duplicate-ready replies can legitimately emit new actions.
 No arbitrary callback runs under a store lock; transport retransmission,
@@ -113,7 +116,7 @@ external delivery/acknowledgment and crash consistency remain unimplemented.
 [`Ticket`:46–77](../../crates/libs/fube-ra/src/entity.rs#L46-L77) is observation,
 not ownership. Cancelling its future, losing the caller Tokio runtime or dropping
 all executor handles does not retract accepted work.
-[`close`:355–369](../../crates/libs/fube-ra/src/entity.rs#L355-L369) closes only
+[`close`:359–373](../../crates/libs/fube-ra/src/entity.rs#L359-L373) closes only
 executor admission and drains accepted work; it does not close the caller's
 store. Finite timeout reports Unknown, never rollback. Unresolved work may retain
 the supervisor indefinitely; there is no racing replacement or hard IO deadline.
@@ -144,6 +147,9 @@ ownership, per-execution single dispatch and real SQLite aggregate commit.
 [9 schema tests](../../crates/libs/fube-ra/tests/protocol.rs) cover defaults,
 full nested fields, errors, headers, malformed input, bounds and pointer tags.
 Offline validator-model bytes are explicitly **not native fixtures**.
+Additional [real-ticket fault regressions](../../crates/libs/fube-ra/src/entity.rs#L757)
+exercise permanent observation-channel loss and terminal Unknown in bounded
+child processes, asserting explicit polling backoff without releasing ownership.
 
 Broader normalized native behavioral traces, all-message codecs/handlers,
 live FM/Hosting/runtime sessions, actual stateless cluster qualification,

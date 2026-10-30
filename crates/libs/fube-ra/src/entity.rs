@@ -209,6 +209,8 @@ struct Shared {
     view: Mutex<View>,
     settings: Settings,
     shutdown: Notify,
+    #[cfg(test)]
+    resolution_polls: std::sync::atomic::AtomicUsize,
 }
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -250,6 +252,8 @@ impl Executor {
             }),
             settings,
             shutdown: Notify::new(),
+            #[cfg(test)]
+            resolution_polls: std::sync::atomic::AtomicUsize::new(0),
         });
         let owned = shared.clone();
         std::thread::Builder::new()
@@ -679,10 +683,19 @@ async fn persist(
             _ => {}
         }
         // Retain the SAME ticket/fence through supervisor timeout or lost result.
+        let next_poll = tokio::time::Instant::now() + shared.settings.resolution_poll;
+        #[cfg(test)]
+        shared
+            .resolution_polls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _ = operation.resolve(shared.settings.resolution_poll).await;
-        if matches!(operation.status(), store::Status::Complete(Err(e)) if e.kind == store::ErrorKind::Unknown)
-        {
-            tokio::time::sleep(shared.settings.resolution_poll).await;
+        match operation.status() {
+            store::Status::Complete(Ok(_)) => {}
+            store::Status::Complete(Err(error)) if error.kind != store::ErrorKind::Unknown => {}
+            // Observation loss can leave Pending/Unknown with an already closed
+            // channel. Resolve then returns immediately: retain the fence AND
+            // honor the polling interval rather than relying on cooperative yield.
+            _ => tokio::time::sleep_until(next_poll).await,
         }
     }
 }
@@ -737,5 +750,218 @@ async fn entity_worker(
         view.stats.effects = view.effects.len();
         drop(view);
         work.result.send_replace(Status::Complete(result));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use store::{Backend, BackendContext, MemoryBackend, Store, StoreFuture};
+
+    struct FaultBackend {
+        inner: MemoryBackend,
+        fault: Arc<AtomicBool>,
+        terminal: bool,
+    }
+    impl Backend for FaultBackend {
+        fn initialize(
+            &mut self,
+            settings: store::Settings,
+            context: BackendContext,
+        ) -> StoreFuture<'_, ()> {
+            self.inner.initialize(settings, context)
+        }
+        fn execute(&mut self, request: Request) -> StoreFuture<'_, Output> {
+            Box::pin(async move {
+                if self.fault.load(Ordering::SeqCst) {
+                    if self.terminal {
+                        return Err(store::Error::new(
+                            store::ErrorKind::Unknown,
+                            "terminal uncertainty",
+                        ));
+                    }
+                    panic!("injected loss of observation owner");
+                }
+                self.inner.execute(request).await
+            })
+        }
+        fn close(&mut self) -> StoreFuture<'_, ()> {
+            self.inner.close()
+        }
+    }
+    // Return a REAL public store ticket while dropping its last client on fault.
+    // P1 then loses the observation sender on its panic path. No fabricated
+    // Operation or private store constructor is used.
+    struct ReleasedOwner {
+        inner: Mutex<Option<Store>>,
+        fault: Arc<AtomicBool>,
+        observed: Arc<Mutex<Option<store::Operation>>>,
+    }
+    impl KeyValueStore for ReleasedOwner {
+        fn submit(&self, request: Request) -> store::Result<store::Operation> {
+            let mut inner = lock(&self.inner);
+            let operation = inner.as_ref().unwrap().submit(request)?;
+            if self.fault.load(Ordering::SeqCst) {
+                *lock(&self.observed) = Some(operation.clone());
+                inner.take();
+            }
+            Ok(operation)
+        }
+        fn stats(&self) -> store::Stats {
+            store::Stats {
+                lifecycle: store::Lifecycle::Fenced,
+                outstanding: 0,
+                queued_bytes: 0,
+            }
+        }
+        fn close(&self) -> StoreFuture<'_, store::CloseReport> {
+            Box::pin(async {
+                Err(store::Error::new(
+                    store::ErrorKind::Unknown,
+                    "owner released",
+                ))
+            })
+        }
+    }
+    fn body(id: u8, node: &NodeInstance) -> AddInstance {
+        let mut body = AddInstance::default();
+        body.unit.id.guid.0 = [id; 16];
+        body.unit.consistency.id = body.unit.id.clone();
+        body.replica.node = node.clone();
+        body.replica.id = 1;
+        body.replica.instance = 1;
+        body.replica.state = 1;
+        body.replica.version = body.service.version.clone();
+        body
+    }
+
+    #[test]
+    fn permanent_uncertainty_child() {
+        let Ok(mode) = std::env::var("FUBE_RA_UNCERTAINTY_CHILD") else {
+            return;
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let fault = Arc::new(AtomicBool::new(false));
+            let observed = Arc::new(Mutex::new(None));
+            let store = Store::new(
+                FaultBackend {
+                    inner: MemoryBackend::new(),
+                    fault: fault.clone(),
+                    terminal: mode == "terminal",
+                },
+                store::Settings::default(),
+            )
+            .await
+            .unwrap();
+            let local = NodeInstance {
+                id: [4; 16],
+                instance: 1,
+            };
+            let source = NodeInstance {
+                id: [8; 16],
+                instance: 1,
+            };
+            let executor = Executor::new(
+                Arc::new(ReleasedOwner {
+                    inner: Mutex::new(Some(store)),
+                    fault: fault.clone(),
+                    observed: observed.clone(),
+                }),
+                Admission {
+                    local_node: local.clone(),
+                    fm_source: source.clone(),
+                    generation: GenerationNumber::default(),
+                    owner_ready: true,
+                    node_open: true,
+                    node_activated: true,
+                    fabric_upgrading: false,
+                },
+                Settings {
+                    resolution_poll: Duration::from_secs(60),
+                    ..Settings::default()
+                },
+            )
+            .unwrap();
+            let add = |id| Command::Add {
+                body: Box::new(body(id, &local)),
+                source: source.clone(),
+                generation: GenerationHeader::default(),
+            };
+            let budget = Duration::from_secs(3);
+            executor.submit(add(2)).unwrap().wait(budget).await.unwrap();
+            executor.take_effects();
+            fault.store(true, Ordering::SeqCst);
+            let uncertain = executor.submit(add(1)).unwrap();
+            assert_eq!(uncertain.wait(budget).await, Err(Failure::Unknown));
+            let operation = lock(&observed).as_ref().unwrap().clone();
+            let error = operation.resolve(budget).await.unwrap_err();
+            if mode == "closed" {
+                assert_eq!(error.message, "supervisor lost");
+            } else {
+                assert!(matches!(operation.status(), store::Status::Complete(Err(e))
+                    if e.kind == store::ErrorKind::Unknown));
+            }
+            tokio::time::timeout(budget, async {
+                while executor.shared.resolution_polls.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let conflicting = executor
+                .submit(Command::RetryOpen(body(1, &local).unit.id))
+                .unwrap();
+            let unrelated = executor
+                .submit(Command::RetryOpen(body(2, &local).unit.id))
+                .unwrap();
+            unrelated.wait(budget).await.unwrap();
+            assert_eq!(
+                executor.close(Duration::from_millis(10)).await,
+                Err(Failure::Unknown)
+            );
+            assert_eq!(uncertain.status(), Status::Unknown);
+            assert_eq!(conflicting.status(), Status::Pending);
+            let snapshot = executor.snapshot([1; 16]);
+            assert!(snapshot.fenced && snapshot.committed.is_none());
+            assert_eq!(executor.statistics().outstanding, 2);
+            assert!(executor.statistics().queued_bytes > 0);
+            let effects = executor.take_effects();
+            assert_eq!(effects.len(), 1);
+            assert_eq!(effects[0].entity, [2; 16]);
+            // Instrumented backoff assertion, not a CPU-usage threshold:
+            // both immediate-error shapes have polled once and parked for the
+            // configured interval while the unrelated operation completed.
+            assert_eq!(executor.shared.resolution_polls.load(Ordering::SeqCst), 1);
+            assert!(executor.take_effects().is_empty());
+        });
+        // Permanent uncertainty is intentionally retained until process exit.
+        // This bounded child exits; no unknown owner is replaced or "cleaned".
+    }
+
+    #[test]
+    fn permanent_observation_loss_and_terminal_unknown_back_off_without_releasing_ownership() {
+        for mode in ["closed", "terminal"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "entity::tests::permanent_uncertainty_child",
+                    "--nocapture",
+                ])
+                .env("FUBE_RA_UNCERTAINTY_CHILD", mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
+        }
     }
 }
