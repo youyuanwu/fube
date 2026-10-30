@@ -4,6 +4,10 @@
 Hosting/RAP events. Not a running RA/FM, live Hosting adapter, native-handler
 execution, deployed SF interoperability or full algorithm-parity claim.
 Native baseline: `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
+The subsequent [opening port](RaStatelessOpening.md) adds native creation policy,
+separate retained package usage and a shared node notification coordinator.
+The source mappings here describe the preserved removal slice; current code
+line numbers have advanced with that addition.
 
 ## Interface and runtime boundary
 
@@ -39,10 +43,10 @@ unused acquisition even when its host/runtime matches the active registration.
 Consumed callback replay is idempotent and cannot release the active reference.
 Unissued results do not transfer reference ownership to RA. The default limit is
 64 outstanding lookups per entity; lost results retain their slots, not a false
-completion. Legacy CompleteOpen service-not-registered only records pending
-status; it does not identify/consume an issued lookup obligation.
+completion. Raw Open replies without a current registration are ignored;
+they cannot update pending lookup status or consume an issued lookup obligation.
 
-Close success is a **trusted cleanup proof**, including cancellation/draining of
+Raw native Close success carries the **trusted cleanup proof**, including cancellation/draining of
 queued/in-flight Open, proxy closure and resource cleanup—not just a successful
 callback. TerminateHost means native RemoveReplica termination reason; its
 callback is **not** host-down. Obliterate completes only on a matching observed
@@ -81,8 +85,9 @@ supervisor fence; tests observe the public Lifecycle before claiming that fence.
 P1's terminal fence is not lifted by RA after late success.
 
 [Admission:382–483](../../crates/libs/fube-ra/src/entity.rs#L382-L483) reserves
-two effects for Add (closed report + stale reply), one for Open completion,
-RetryOpen/RetryReport, eight for other lifecycle commands. The actual count is
+two effects for Add (closed report + stale reply), one for
+RetryOpen/RetryReport, two for node commands, and eight for Open completion
+and other lifecycle commands. The actual count is
 checked before persistence; retained effects and all outstanding reservations
 share the finite budget. Cancellation does not return accepted work's reservation.
 
@@ -95,16 +100,20 @@ the record type is not a recovery compatibility promise or native disk format.
 This is not a durable outbox; effects transferred with take_effects still need
 an external owner to deliver/retry them.
 
-Default retry policies: close warning 10, Delete drop 40, other close drop 40320,
+Default retry policies: independent Close/Delete warning 10, Delete drop 40, other close drop 40320,
 registration-at-drop warning 240/drop 1920
 (`common/FailoverConfig.h:559–597`). Settings permit finite test thresholds.
+All enabled retry policy properties are dynamically readable signed native
+values; current-threshold success clear is not a remembered warning flag.
+The [opening alignment](RaStatelessOpening.md) documents per-property reads,
+zero/negative behavior and independent Close/Delete/registration-at-drop families.
 RetryClose/RetryReport are **trusted due timer inputs**, not automatic loops or
 proof that delivery succeeded. Tombstone retention is unbounded in this session;
 physical retention-time GC is not enabled.
 
 ## Translated scenario evidence
 
-[The real-executor suite](../../crates/libs/fube-ra/tests/entity.rs) has 33 tests,
+[The original removal real-executor suite](../../crates/libs/fube-ra/tests/entity.rs) had 33 tests,
 with native-source comments and a real Store/MemoryBackend operation journal.
 This count includes existing addition/storage invariants, not 33 native C++
 tests. Selected scenarios:
@@ -120,7 +129,8 @@ tests. Selected scenarios:
 | `native_lookup_failure_and_apphostdown_are_not_generic_close_success` | `ReplicaLifecycle.cpp:1769–1797`; shared persisted-context `Close.cpp:413–464`; actual stateless host-down handler above |
 | `native_closed_add_reports_then_stale_reply_and_tombstone_equal_suppresses_report` | `Test.StateMachine.cpp:3567–3589`; source recreation normalization regression uses helper lines above |
 
-Additional tests cover trusted close token/node/identity/epoch fencing, force
+Additional tests cover native close id/instance/lower-epoch guards (not invented
+token/runtime/incoming-node equality predicates), force
 escalation while opening/deleting, registration retries, exact stored tombstone
 payload, multi-effect reservation, definite/unknown removal and completion
 failures, cancellation and immutable old snapshots. Controlled barriers—not
@@ -137,14 +147,18 @@ python3 -m unittest tests.offline.cluster.test_ra_catalog \
   tests.offline.cluster.test_ra_protocol_inputs -v
 ```
 
-Independent wire evidence is [29 bidirectional source-baseline cases](../../tests/ra_protocol/README.md):
-39 schema types/123 members, actual native stream and field macros, disclosed
+Current independent wire evidence is [36 bidirectional source-baseline cases](../../tests/ra_protocol/README.md):
+43 schema types/129 members, retaining all prior 29 cases, actual native stream and field macros, disclosed
 schema/platform adapters. Fresh bundle HEAD/source identity must be supplied
 independently to compiler-free acceptance. Old `build/ra-native-final-v2` is
 previous-work evidence, **not** production of this slice.
 
-Disabled unfinished capabilities: general open/host-down error handling outside
-the selected removal race; open higher-ID replacement Drop; service/package
+Opening failure/retry and opening host-down are now implemented by the linked
+opening slice, including registration-version selection for Close reacquisition.
+Cleanup releases registration, then separately retained package usage before
+report scheduling/health/reply; discarded acquired callbacks also dispose their
+own unused usage lease. Termination remains distinct from host-down.
+Disabled unfinished capabilities: open higher-ID replacement Drop; service/package
 description update; stateful/StandBy/reopen/queued-delete; FMM/system-host
 termination; multi-FT/last-upload acknowledgment and initial upload bookkeeping;
 physical tombstone GC; live registration/health/runtime transport; restart,

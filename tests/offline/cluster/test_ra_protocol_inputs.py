@@ -28,7 +28,7 @@ class InputTests(unittest.TestCase):
             "format": 1, "native_revision": REVISION, "head": "a" * 40,
             "source_digest": self.source, "source_inputs": self.inputs,
             "native_sources": {"model-only": "not-execution"},
-            "schema_types": 39, "schema_fields": 123, "target": "Linux-x86_64-short-wchar",
+            "schema_types": 43, "schema_fields": 129, "target": "Linux-x86_64-short-wchar",
             "evidence": "source-baseline-native-stream-with-schema-adapters",
             "cases": sorted(CASES),
             "files": {name: hashlib.sha256((self.bundle / name).read_bytes()).hexdigest()
@@ -40,7 +40,7 @@ class InputTests(unittest.TestCase):
         (self.bundle / "manifest.json").write_text(json.dumps(self.manifest))
 
     def test_inventory_model_is_valid_not_an_execution_claim(self):
-        self.assertEqual(len(validate(self.bundle, "a" * 40, self.source)["cases"]), 29)
+        self.assertEqual(len(validate(self.bundle, "a" * 40, self.source)["cases"]), 36)
 
     def test_exact_schema_counts_and_extra_files_are_rejected(self):
         for key in ["schema_types", "schema_fields"]:
@@ -70,6 +70,33 @@ class InputTests(unittest.TestCase):
         (self.bundle / "native/priority.bin").write_bytes(b"changed")
         with self.assertRaises(ValueError):
             validate(self.bundle, "a" * 40, self.source)
+
+    def test_notification_coverage_and_tamper_fail_before_execution(self):
+        names = [
+            "empty-service-type-notification", "rich-service-type-notification",
+            "empty-service-type-notification-reply", "partial-service-type-notification-reply",
+            "action-ServiceTypeNotification", "action-ServiceTypeNotificationReply", "priority-false",
+        ]
+        with patch("tests.ra_protocol.consumer.subprocess.check_output") as identity:
+            for name in names:
+                with self.subTest(case=name):
+                    self.manifest["cases"].remove(name)
+                    self.save()
+                    with self.assertRaises(ValueError):
+                        consume(self.bundle, self.root / "output", "a" * 40, self.source)
+                    self.manifest["cases"] = sorted(CASES)
+                    self.save()
+                    path = self.bundle / f"native/{name}.bin"
+                    original = path.read_bytes()
+                    path.unlink()
+                    with self.assertRaises(ValueError):
+                        consume(self.bundle, self.root / "output", "a" * 40, self.source)
+                    path.write_bytes(b"tampered notification fixture")
+                    with self.assertRaises(ValueError):
+                        consume(self.bundle, self.root / "output", "a" * 40, self.source)
+                    path.write_bytes(original)
+            identity.assert_not_called()
+        self.assertFalse((self.root / "output").exists())
 
     def test_symlink_input_rejected_even_with_matching_digest(self):
         target = self.root / "target"

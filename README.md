@@ -11,7 +11,7 @@ and standalone test host in Rust.
 | [`fube-runtime`](crates/libs/fube-runtime) | Owned async stateless/stateful application runtime; real SF placement/reconfiguration without native SF libraries in the application. Linux x86-64 only. |
 | [`fube-data`](crates/libs/fube-data) | Owned volatile classic V1 replication, explicit acknowledgments, copy streams and native Fabric TCP peers. |
 | [`fube-ra-store`](crates/libs/fube-ra-store) | Bounded typed-record RA store seam with memory and bundled SQLite; no RA runtime/recovery integration. |
-| [`fube-ra`](crates/libs/fube-ra) | Native reliability schema/codec foundation and minimal owned stateless entity executor; not a running RA. |
+| [`fube-ra`](crates/libs/fube-ra) | Native reliability codecs, bounded stateless opening/removal and node registration notifications; trusted simulation, not a running RA. |
 | [`rust-runtime-app`](crates/samples/rust-runtime-app) | Listener-backed pure-Rust ExeHost fixture deployed by real SF nodes. |
 | [`stateless-test-app`](crates/samples/stateless-test-app) | Acceptance fixture using the **real native FabricRuntime** through published `mssf` bindings. |
 | [`native-replicator-oracle`](crates/samples/native-replicator-oracle) | Isolated test-only native classic V1 reference peer; not a production dependency. |
@@ -81,6 +81,7 @@ See [onebox prerequisites, lifecycle, and recovery](docs/UbuntuOnebox.md).
 - [RA store P1: API, SQLite profile, cancellation and operational limits](docs/cluster/RaStore.md)
 - [RA protocol foundation: catalog, native codec evidence and minimal P2 execution](docs/cluster/RaProtocolFoundation.md)
 - [Native-derived RA stateless removal: close/report stages, tests and limits](docs/cluster/RaStatelessRemoval.md)
+- [Native-derived RA stateless opening: retries, ownership and node notifications](docs/cluster/RaStatelessOpening.md)
 - [Migration provenance and repository boundaries](docs/Migration.md)
 
 ## License

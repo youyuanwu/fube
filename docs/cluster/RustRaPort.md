@@ -113,10 +113,21 @@ active use solely from an action name or registry entry.
 
 The [source-pinned catalog](NativeRaProtocol.md) now reconciles 119 initialized
 actions, 66 boundary actions/67 actual directions and two declaration-only
-legacy names. [Addition/removal/ReplicaUp codecs and native source-stream
+legacy names. [Addition/removal/ReplicaUp/notification codecs and native source-stream
 evidence](RaProtocolFoundation.md#codec-evidence) are implemented; all remaining
-codec/handler/trace obligations stay explicitly staged. Removal runs against
-trusted simulated registration/RAP/host-down events, not live Hosting.
+codec/handler/trace obligations stay explicitly staged.
+[Stateless opening failure/retry](RaStatelessOpening.md) now includes native
+classification/threshold/health/cleanup/reply policy, retained usage and bounded
+node-wide registration notifications. Opening/removal run against trusted
+simulated registration/RAP/host-down events, not live Hosting. Eight selected
+action codecs and source-derived tests do not establish original-handler
+execution or deployed parity.
+The enabled surface now includes generic generation lower-bound admission,
+raw request-shaped replies, native Linux identifier comparison/returned spelling,
+per-property dynamic retry configuration and separate notification work/timer/
+captured-send semantics; old ASCII/normalized-Ready/immutable-policy restrictions
+are not preserved as vanilla behavior. Actual native helper comparisons remain
+separate from complete handler/runtime execution.
 Catalog completeness
 is not complete native protocol implementation.
 

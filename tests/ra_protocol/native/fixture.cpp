@@ -145,6 +145,20 @@ int main(int argc,char** argv) {
             std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
             run(mode,dir,"action-"+ascii,action);
         }
+        ServiceTypeNotificationRequestMessageBody notification;
+        run(mode,dir,"empty-service-type-notification",notification);
+        c=0; rich(notification,c);
+        run(mode,dir,"rich-service-type-notification",notification);
+        ServiceTypeNotificationReplyMessageBody notification_reply;
+        run(mode,dir,"empty-service-type-notification-reply",notification_reply);
+        notification_reply.infos_.push_back(notification.infos_[1]);
+        run(mode,dir,"partial-service-type-notification-reply",notification_reply);
+        for(auto name:{u"ServiceTypeNotification",u"ServiceTypeNotificationReply"}) {
+            action.action_=text(name);
+            std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
+            run(mode,dir,"action-"+ascii,action);
+        }
+        priority.highPriority_=false; run(mode,dir,"priority-false",priority);
         // Native rejection is executed, not inferred from Rust behavior.
         auto bad=encode(request); bad.resize(bad.size()/2);
         ReplicaMessageBody rejected_request;
@@ -158,7 +172,13 @@ int main(int argc,char** argv) {
         bad=encode(up); bad.resize(bad.size()/2);
         ReplicaUpMessageBody rejected_up;
         if(decode(bad,rejected_up)) throw std::runtime_error("native accepted truncated report");
-        std::cout << "native rejects 4 truncations OK\n";
+        bad=encode(notification); bad.resize(bad.size()/2);
+        ServiceTypeNotificationRequestMessageBody rejected_notification;
+        if(decode(bad,rejected_notification)) throw std::runtime_error("native accepted truncated notification");
+        bad=encode(notification_reply); bad.resize(bad.size()/2);
+        ServiceTypeNotificationReplyMessageBody rejected_notification_reply;
+        if(decode(bad,rejected_notification_reply)) throw std::runtime_error("native accepted truncated notification reply");
+        std::cout << "native rejects 6 truncations OK\n";
         return 0;
     } catch(const std::exception& error) {
         std::cerr << error.what() << "\n"; return 1;

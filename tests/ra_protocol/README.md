@@ -10,8 +10,9 @@ The producer compiles the **unmodified** native `FabricStream.cpp`,
 `FabricSerializable.cpp`, `FabricSerializableStream.cpp`,
 `FabricSerializationTypes.cpp`, `ByteCompressor.h` and
 `Common/FabricSerializationHelper.h`. It mechanically extracts field macros
-and member declarations for 39 schema types/123 members, including the selected
-Add, inherited DeleteReplica, reply and ReplicaUp/Reply bodies.
+and member declarations for 43 schema types/129 members, including the selected
+Add, inherited DeleteReplica, reply, ReplicaUp/Reply and service-type
+notification request/reply bodies.
 The native helper macros generate their actual Write/Read methods. Nested
 fields are not inferred from Rust or encoded as handwritten wire bytes.
 
@@ -29,18 +30,23 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 29 inputs:
+The C++ producer independently constructs expected values and emits 36 inputs:
 default/rich AddInstance, default/error AddInstanceReply, default/rich Remove
 (force false/true), default/rich removal reply, explicit-empty/rich ReplicaUp
 (both nonempty lists, all last/fromFMM combinations), FM/FMM generation,
-actor/action/priority headers. The two reply actions share a native body type.
+actor/action/priority headers. The seven notification cases add empty/two-info
+requests, empty/one-info partial replies, both literal actions and priority=false.
+The notification factories target normal FM=11 for the request without
+GenerationHeader and RA=12 for the reply with the actual FM generation;
+both use false priority. The Add/removal replies share a native body type.
 Rust decodes and checks every field, then encodes
 independently constructed expected values; the actual native decoder compares
 all fields, not just bytes. Native object padding need not be canonical.
 Nondefault cases cover GUID/raw NodeId, high-bit instances, negative LSN/epochs,
 UTF-16/surrogates, enums/errors, all service collections and null/Invalid/both
 derived scaling variants. Rust rejects every proper prefix of rich body
-fixtures including both rich force bodies; native rejects four truncated bodies.
+fixtures including both rich force bodies and the rich/partial notification
+bodies; native rejects six truncated bodies.
 Non-polymorphic Delete inheritance invokes base rich traversal and native
 base/derived scopes, not a flattened or nested replacement. ReplicaUp's empty
 native constructor leaves scalar booleans uninitialized; the empty fixture
@@ -55,8 +61,8 @@ Compile the Rust example with the current source identity; the producer
 rejects an unbound/stale executable:
 
 ```sh
-mkdir -p build/ra-stateless-removal-tmp
-export TMPDIR="$PWD/build/ra-stateless-removal-tmp"
+mkdir -p build/ra-stateless-opening-tmp
+export TMPDIR="$PWD/build/ra-stateless-opening-tmp"
 FUBE_RA_SOURCE_DIGEST=$(python3 -c 'from tests.ra_protocol.producer import source_digest; print(source_digest()[0])') \
   cargo build --locked -p fube-ra --example ra_conformance
 python3 -m tests.ra_protocol.producer \
@@ -83,8 +89,8 @@ env PATH=/nonexistent /usr/bin/python3 -m tests.ra_protocol.consumer \
   --expected-head COMMIT --expected-source SOURCE_DIGEST
 ```
 
-The bundle has exactly 29 `native/*.bin`, `schema.h`, `native-oracle`,
-`ra-conformance` and `manifest.json` (33 files total). No other files are
+The bundle has exactly 36 `native/*.bin`, `schema.h`, `native-oracle`,
+`ra-conformance` and `manifest.json` (40 files total). No other files are
 accepted. The consumer verifies exact coverage/type/member counts, regular files, hashes,
 provenance and both compiled source identities **before** execution. Missing,
 modified, wrong-source and symlink inputs fail; it imports no producer and
@@ -98,8 +104,66 @@ python3 -m unittest tests.offline.cluster.test_ra_protocol_inputs -v
 cargo test --locked -p fube-ra
 ```
 
-Current-removal production must use a fresh bundle bound to the current
+Current-opening production must use a fresh bundle bound to the current
 implementation HEAD/source digest. `build/ra-native-final-v2` was produced for
 previous work and is not this slice's production. The producer's HEAD names the
 commit base and source digest also binds dirty sources during development;
 final delivery produces again at the clean reviewed implementation head.
+
+## Separate actual-native helper evidence
+
+The helper producer is **not part of, and does not change**, the 36-case,
+43-type/129-field wire bundle or its compiler-free consumer. It compiles
+unmodified `pal/wc16.c`, `RetryableErrorState.cpp` and
+`RetryableErrorStateThresholdCollection.cpp`. Identifier, `LargeInteger`,
+`NodeId`, `GenerationNumber`, `CheckGenerationHeader` and `GetGenerationState`
+methods are mechanically extracted verbatim from the same clean pinned source.
+Generated native source stays in the output directory and is never committed.
+
+```sh
+mkdir -p build/ra-helper-tmp
+export TMPDIR="$PWD/build/ra-helper-tmp"
+FUBE_RA_SOURCE_DIGEST=$(python3 -c 'from tests.ra_protocol.producer import source_digest; print(source_digest()[0])') \
+  cargo build --locked -p fube-ra --example ra_helper_conformance
+python3 -m tests.ra_protocol.helper_producer \
+  --native /path/to/clean/service-fabric \
+  --out "$PWD/build/ra-helper-evidence" --cxx /path/to/clang \
+  --rust "$PWD/target/debug/examples/ra_helper_conformance"
+```
+
+Lightweight guard tests: `python3 -m unittest tests.ra_protocol.test_helper_producer`.
+
+For the locally unpacked Clang 18 toolchain, set
+`LD_LIBRARY_PATH="$PWD/build/ra-producer-tools/usr/lib/x86_64-linux-gnu"` and
+use `--cxx "$PWD/build/ra-producer-tools/usr/lib/llvm-18/bin/clang"`.
+`--rust` is optional: omission produces **native-only** evidence and an empty
+`comparisons` object, not a Rust conformance pass. It never implicitly builds
+Rust. The explicit Rust executable must report the current source identity.
+Helper producer/adapters and the Rust example are included in source identity.
+The output manifest records HEAD, current source digest/input hashes, native
+input/method hashes, compiler version, exact compile/run argv/cwd, environment,
+adapter disclosures and every generated/prebuilt file hash.
+
+With `--rust`, both programs independently construct cases and compare exact
+`trace.txt` and `upper-units.bin` hashes. Coverage includes all 65,536 UTF-16
+units under native startup **C locale**, 196 string-name pairs, 144 structured
+identifier pairs (number priority, ad-hoc package omission, signed ordering,
+embedded NUL and non-transitive malformed raw fields), and five retry families:
+Open, registration-at-Open, Close, Delete and registration-at-Drop.
+Policies cover live signed/zero/negative threshold updates, equality precedence,
+lowered drop, last-before-drop, current-threshold clear, shared registration
+restart/error and a deterministic mixed-property read. Native raw action values
+are retained separately in `native/raw-actions.txt`; Restart/Error are mapped to
+None **only for comparison with the enabled Rust handler-consumed action**.
+The Rust side calls production `native_upper_unit`, `compare_service_types`,
+`NativeConfig` and `RetryPolicy`, not local algorithm replicas.
+
+Generation coverage compares 64 signed-generation/unsigned-owner pairs using
+actual native owner and generation methods versus Rust `older_than`. Eight
+normal-FM stale/equal/new generation headers run the actual native
+`CheckGenerationHeader` method and the Rust Executor's notification-reply
+dispatch. UTF-16 storage/type shells, mutable config transport fields, no-op
+locking/tracing and raw-action projection are explicit adapters. This is
+helper/selected-dispatch evidence, **not** complete original handler execution,
+a native RA/Hosting/Federation runtime, FMM support, config-loader qualification,
+arbitrary process locales, or wire compatibility beyond the separate wire gate.

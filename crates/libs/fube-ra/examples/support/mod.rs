@@ -101,6 +101,9 @@ rich!(Rollout: major, minor);
 rich!(ApplicationVersion: value);
 rich!(PackageVersion: application, value);
 rich!(VersionInstance: version, instance);
+rich!(VersionedServiceType: id, version);
+rich!(ServiceTypeInfo: versioned, code_package);
+rich!(ServiceTypeNotification: infos);
 rich!(NodeInstance: id, instance);
 rich!(Replica: node, id, instance, [current_role], [previous_role], up, last_lsn,
     first_lsn, [state], version, service_endpoint, replication_endpoint);
@@ -125,6 +128,14 @@ fn filled<T: Default + Rich>(c: &mut i32) -> T {
 }
 pub fn rich_request() -> AddInstance {
     filled(&mut 0)
+}
+pub fn rich_notification() -> ServiceTypeNotification {
+    filled(&mut 0)
+}
+pub fn partial_notification_reply() -> ServiceTypeNotificationReply {
+    let mut value = rich_notification();
+    value.infos.0.remove(0);
+    value
 }
 pub fn rich_remove(force: bool) -> RemoveInstance {
     RemoveInstance::new(rich_request(), force)

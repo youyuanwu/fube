@@ -18,6 +18,9 @@ CASES = {
     "default-remove-reply", "rich-remove-reply", "explicit-empty-replica-up",
     "rich-replica-up-0-0", "rich-replica-up-0-1", "rich-replica-up-1-0", "rich-replica-up-1-1",
     "action-RemoveInstance", "action-RemoveInstanceReply", "action-ReplicaUp", "action-ReplicaUpReply",
+    "empty-service-type-notification", "rich-service-type-notification",
+    "empty-service-type-notification-reply", "partial-service-type-notification-reply",
+    "action-ServiceTypeNotification", "action-ServiceTypeNotificationReply", "priority-false",
 }
 
 
@@ -38,8 +41,8 @@ def validate(bundle, expected_head, expected_source):
     calculated_source = hashlib.sha256(
         json.dumps(manifest.get("source_inputs", {}), sort_keys=True).encode()
     ).hexdigest()
-    if (calculated_source != expected_source or manifest.get("schema_types") != 39
-            or manifest.get("schema_fields") != 123
+    if (calculated_source != expected_source or manifest.get("schema_types") != 43
+            or manifest.get("schema_fields") != 129
             or not manifest.get("native_sources")):
         raise ValueError("source/schema manifest mismatch")
     expected_files = {"schema.h", "native-oracle", "ra-conformance"} | {

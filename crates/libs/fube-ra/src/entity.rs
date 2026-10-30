@@ -16,6 +16,17 @@ use tokio::sync::{mpsc, watch, Notify};
 #[path = "lifecycle.rs"]
 mod lifecycle;
 pub use lifecycle::*;
+#[path = "notification.rs"]
+mod notification;
+pub use notification::{
+    compare_service_types, native_upper_unit, NotificationClock, ServiceTypeEntry,
+};
+#[path = "opening.rs"]
+mod opening;
+pub use opening::*;
+#[path = "config.rs"]
+mod config;
+pub use config::*;
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -106,6 +117,14 @@ pub struct Settings {
     pub registration_drop: u64,
     /// Outstanding acquired-result obligations retained even across recreation.
     pub max_registration_lookups: usize,
+    pub max_service_types: usize,
+    pub notification_batch_count: usize,
+    pub notification_batch_bytes: usize,
+    pub notification_node_ms: u64,
+    pub notification_type_ms: u64,
+    pub notification_retry_ms: u64,
+    pub open_retry: RetryPolicy,
+    pub open_registration: RetryPolicy,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -122,6 +141,14 @@ impl Default for Settings {
             registration_warning: 240,
             registration_drop: 1920,
             max_registration_lookups: 64,
+            max_service_types: 64,
+            notification_batch_count: 100,
+            notification_batch_bytes: 256 * 1024,
+            notification_node_ms: 5_000,
+            notification_type_ms: 45_000,
+            notification_retry_ms: 30_000,
+            open_retry: RetryPolicy::open(),
+            open_registration: RetryPolicy::registration(),
         }
     }
 }
@@ -139,13 +166,12 @@ impl Settings {
             || self.max_effects > 65536
             || self.resolution_poll.is_zero()
             || self.resolution_poll > Duration::from_secs(60)
-            || self.close_warning == 0
-            || self.delete_drop == 0
-            || self.close_drop == 0
-            || self.registration_warning == 0
-            || self.registration_drop == 0
             || self.max_registration_lookups == 0
             || self.max_registration_lookups > 65536
+            || self.max_service_types == 0
+            || self.max_service_types > 65536
+            || self.notification_batch_bytes == 0
+            || self.notification_batch_bytes > 4 * 1024 * 1024
         {
             return Err(Failure::Admission("invalid finite executor settings"));
         }
@@ -157,10 +183,11 @@ impl Settings {
 /// It does not itself grant application authority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCompletion {
-    pub token: u64,
     pub unit: FailoverUnit,
     pub replica: Replica,
     pub error: i64,
+    pub flags: i64,
+    pub detail: ProxyErrorDetail,
 }
 pub enum Command {
     Add {
@@ -186,6 +213,27 @@ pub enum Command {
     HostDown(Box<HostDown>),
     RetryClose(PartitionId),
     RetryReport(PartitionId),
+    /// Explicit BGM Request, independent of the periodic retry timer.
+    RequestServiceTypeWork,
+    /// Honor RequestServiceTypeWork's obligation; capture before simulated send.
+    CaptureServiceTypeWork {
+        work: u64,
+    },
+    /// Record the send and complete the same captured pass, even for an empty body.
+    CompleteServiceTypeWork {
+        work: u64,
+    },
+    /// Honor the currently armed periodic retry timer.
+    ServiceTypeRetryTimer {
+        timer: u64,
+    },
+    /// Native BackgroundWorkManagerWithRetry::SetTimer, not a work request.
+    SetServiceTypeRetryTimer,
+    ServiceTypeReply {
+        body: Box<ServiceTypeNotification>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
 }
 enum Kind {
     Add {
@@ -207,6 +255,28 @@ enum Kind {
     HostDown,
     RetryClose,
     RetryReport,
+    NotificationRequest,
+    NotificationCapture,
+    NotificationComplete,
+    NotificationTimer,
+    NotificationSetTimer,
+    NotificationReply {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+}
+impl Kind {
+    fn node_work(&self) -> bool {
+        matches!(
+            self,
+            Self::NotificationRequest
+                | Self::NotificationCapture
+                | Self::NotificationComplete
+                | Self::NotificationTimer
+                | Self::NotificationSetTimer
+                | Self::NotificationReply { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,10 +289,16 @@ pub enum Phase {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityState {
     pub body: Arc<AddInstance>,
+    /// Admitted creation package, distinct from Hosting's selected version.
+    /// Session-only: no restart/adoption loader is provided.
+    pub requested_version: VersionInstance,
     pub phase: Phase,
     pub open_token: u64,
     /// Volatile retry bookkeeping; not a native disk record or durable outbox.
     pub retry_attempts: u64,
+    pub open_failures: u64,
+    /// Separately owned package usage, retained across opening host crashes.
+    pub usage: Option<u64>,
     pub last_retry_error: i64,
     pub runtime: Option<RuntimeRegistration>,
     pub close_mode: Option<CloseMode>,
@@ -252,12 +328,15 @@ pub enum Effect {
         token: u64,
         lookup: u64,
         body: Arc<AddInstance>,
+        /// None requests a new usage lease; Some retains this existing lease.
+        usage: Option<u64>,
     },
     Reply(Box<AddInstanceReply>),
     RuntimeOpen {
         token: u64,
         body: Arc<AddInstance>,
         registration: RuntimeRegistration,
+        flags: i64,
     },
     Close {
         token: u64,
@@ -269,6 +348,7 @@ pub enum Effect {
         token: u64,
         lookup: u64,
         body: Arc<AddInstance>,
+        usage: Option<u64>,
     },
     TerminateHost {
         registration: RuntimeRegistration,
@@ -278,6 +358,30 @@ pub enum Effect {
     RequestReportRetry,
     ReplicaUp(Box<ReplicaUp>),
     RemoveReply(Box<RemoveInstanceReply>),
+    /// Zero enqueues immediately; otherwise arm the BGM's remaining-delay timer.
+    RequestServiceTypeWork {
+        work: u64,
+        after_ticks: i64,
+    },
+    /// This owned old body may still be sent after replacement/removal. Always
+    /// complete this work ID once, including when body is None (native count=0).
+    ServiceTypeWorkCaptured {
+        work: u64,
+        body: Option<Box<ServiceTypeNotification>>,
+    },
+    /// Separate one-shot periodic timer. i64::MAX is native TimeSpan::MaxValue
+    /// (disabled); zero/negative configuration due-times have been clamped to 1.
+    ArmServiceTypeRetry {
+        timer: u64,
+        after_ticks: i64,
+    },
+    CancelServiceTypeRetry {
+        timer: u64,
+    },
+    ReleaseUsage {
+        acquisition: u64,
+    },
+    OpeningHealth(Box<OpeningHealthReport>),
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dispatched {
@@ -301,10 +405,13 @@ struct View {
     stats: Statistics,
     reserved_effects: usize,
     accepting: bool,
+    notification: notification::Coordinator,
 }
 struct Shared {
     view: Mutex<View>,
     settings: Settings,
+    config: Arc<NativeConfig>,
+    notification_clock: Arc<dyn NotificationClock>,
     shutdown: Notify,
     #[cfg(test)]
     resolution_polls: std::sync::atomic::AtomicUsize,
@@ -336,6 +443,15 @@ impl Executor {
         admission: Admission,
         settings: Settings,
     ) -> Result<Self> {
+        Self::new_with_clock(store, admission, settings, notification::native_clock())
+    }
+
+    pub fn new_with_clock(
+        store: Arc<dyn KeyValueStore>,
+        admission: Admission,
+        settings: Settings,
+        notification_clock: Arc<dyn NotificationClock>,
+    ) -> Result<Self> {
         settings.validate()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -344,6 +460,8 @@ impl Executor {
         let (sender, receiver) = mpsc::channel(settings.max_outstanding);
         let (done, closed) = watch::channel(None);
         let shared = Arc::new(Shared {
+            config: Arc::new(NativeConfig::new(&settings)),
+            notification_clock,
             view: Mutex::new(View {
                 accepting: true,
                 ..View::default()
@@ -429,15 +547,39 @@ impl Executor {
             Command::HostDown(body) => (body.unit.guid.0, Kind::HostDown, to_vec(&body)),
             Command::RetryClose(unit) => (unit.guid.0, Kind::RetryClose, to_vec(&unit)),
             Command::RetryReport(unit) => (unit.guid.0, Kind::RetryReport, to_vec(&unit)),
+            Command::RequestServiceTypeWork => ([0; 16], Kind::NotificationRequest, to_vec(&0_u64)),
+            Command::CaptureServiceTypeWork { work } => {
+                ([0; 16], Kind::NotificationCapture, to_vec(&work))
+            }
+            Command::CompleteServiceTypeWork { work } => {
+                ([0; 16], Kind::NotificationComplete, to_vec(&work))
+            }
+            Command::ServiceTypeRetryTimer { timer } => {
+                ([0; 16], Kind::NotificationTimer, to_vec(&timer))
+            }
+            Command::SetServiceTypeRetryTimer => {
+                ([0; 16], Kind::NotificationSetTimer, to_vec(&0_u64))
+            }
+            Command::ServiceTypeReply {
+                body,
+                source,
+                generation,
+            } => (
+                [0; 16],
+                Kind::NotificationReply { source, generation },
+                to_vec(&body),
+            ),
         };
         // Add may report a closed replica then return StaleRequest. Lifecycle
         // commands may release, clear warnings, report health, schedule FM work
         // and reply. Bounds are checked again before any persistence/effects.
         let reserved_effects = match &kind {
             Kind::Add { .. } => 2,
-            Kind::Complete | Kind::Retry | Kind::RetryReport => 1,
+            Kind::Retry | Kind::RetryReport => 1,
+            kind if kind.node_work() => 2,
             _ => 8,
         };
+        let node_work = kind.node_work();
         let bytes = bytes
             .map_err(|_| Failure::Admission("unsupported/oversized native shape"))?
             .into_boxed_slice();
@@ -450,7 +592,7 @@ impl Executor {
         if !view.accepting {
             return Err(Failure::Closed);
         }
-        let new_entity = !view.entities.contains_key(&entity);
+        let new_entity = !node_work && !view.entities.contains_key(&entity);
         if view.stats.outstanding >= settings.max_outstanding
             || view.stats.queued_bytes + charge > settings.max_queued_bytes
             || view.effects.len() + view.reserved_effects + reserved_effects > settings.max_effects
@@ -475,7 +617,9 @@ impl Executor {
             mpsc::error::TrySendError::Full(_) => Failure::Capacity,
             mpsc::error::TrySendError::Closed(_) => Failure::Closed,
         })?;
-        view.entities.entry(entity).or_default();
+        if !node_work {
+            view.entities.entry(entity).or_default();
+        }
         view.stats.accepted = id;
         view.stats.outstanding += 1;
         view.stats.queued_bytes += charge;
@@ -492,6 +636,12 @@ impl Executor {
     }
     pub fn statistics(&self) -> Statistics {
         lock(&self.shared.view).stats.clone()
+    }
+    pub fn config(&self) -> Arc<NativeConfig> {
+        self.shared.config.clone()
+    }
+    pub fn service_types(&self) -> Vec<ServiceTypeEntry> {
+        lock(&self.shared.view).notification.snapshot()
     }
     /// Transfer each dispatched action once. Sending/ack/retry policy is separate.
     pub fn take_effects(&self) -> Vec<Dispatched> {
@@ -533,6 +683,10 @@ async fn supervise(
         tokio::select! {
             work = receiver.recv() => {
                 let Some(work) = work else { break; };
+                if work.kind.node_work() {
+                    finish_node(&shared, work, &admission);
+                    continue;
+                }
                 let worker = entities.entry(work.entity).or_insert_with(|| {
                     // This internal channel is bounded by global outstanding count
                     // AND retained-byte admission, held through actual completion.
@@ -557,6 +711,98 @@ async fn supervise(
         return Err(Failure::Unknown);
     }
     Ok(view.stats.clone())
+}
+
+fn finish_node(shared: &Shared, work: Submission, admission: &Admission) {
+    let mut view = lock(&shared.view);
+    // Work/byte/effect admission is already reserved. A fallible clock/counter/
+    // codec preparation never publishes a partially advanced coordinator.
+    let mut notification = view.notification.clone();
+    let mut disposition = Disposition::Applied;
+    let outcome = if !admission.owner_ready {
+        Ok(vec![])
+    } else {
+        match &work.kind {
+            Kind::NotificationRequest => {
+                notification.request(&shared.config, &*shared.notification_clock)
+            }
+            Kind::NotificationSetTimer => notification.set_timer(&shared.config),
+            Kind::NotificationCapture | Kind::NotificationComplete | Kind::NotificationTimer => {
+                from_slice::<u64>(&work.bytes)
+                    .map_err(|_| Failure::Admission("invalid notification obligation"))
+                    .and_then(|id| match work.kind {
+                        Kind::NotificationCapture => notification.capture(
+                            id,
+                            &shared.settings,
+                            &shared.config,
+                            &*shared.notification_clock,
+                        ),
+                        Kind::NotificationComplete => {
+                            notification.complete(id, &shared.config, &*shared.notification_clock)
+                        }
+                        Kind::NotificationTimer => {
+                            notification.timer(id, &shared.config, &*shared.notification_clock)
+                        }
+                        _ => unreachable!(),
+                    })
+                    .map(|effects| {
+                        effects.unwrap_or_else(|| {
+                            disposition = Disposition::IgnoredStale;
+                            vec![]
+                        })
+                    })
+            }
+            Kind::NotificationReply { source, generation } => {
+                if source != &admission.fm_source || generation.for_fm_replica {
+                    Err(Failure::Admission(
+                        "notification requires configured normal FM",
+                    ))
+                } else if generation.number.older_than(&admission.generation) {
+                    // Generic MessageHandler admission occurs before node routing.
+                    view.stats.succeeded += 1;
+                    view.stats.outstanding -= 1;
+                    view.stats.queued_bytes -= work.charge;
+                    view.reserved_effects -= work.reserved_effects;
+                    work.result
+                        .send_replace(Status::Complete(Ok(Disposition::IgnoredStale)));
+                    return;
+                } else {
+                    from_slice::<ServiceTypeNotification>(&work.bytes)
+                        .map_err(|_| Failure::Admission("invalid notification reply"))
+                        .map(|body| {
+                            notification.acknowledge(&body);
+                            vec![]
+                        })
+                }
+            }
+            _ => unreachable!(),
+        }
+    };
+    let result = match outcome {
+        Ok(effects) => {
+            assert!(effects.len() <= work.reserved_effects);
+            view.notification = notification;
+            for effect in effects {
+                view.effects.push_back(Dispatched {
+                    operation: work.id,
+                    entity: [0; 16],
+                    effect,
+                });
+            }
+            view.stats.succeeded += 1;
+            Ok(disposition)
+        }
+        Err(error) => {
+            view.stats.failed += 1;
+            Err(error)
+        }
+    };
+    view.stats.outstanding -= 1;
+    view.stats.queued_bytes -= work.charge;
+    view.reserved_effects -= work.reserved_effects;
+    view.stats.effects = view.effects.len();
+    drop(view);
+    work.result.send_replace(Status::Complete(result));
 }
 
 enum Update {
@@ -589,7 +835,7 @@ fn transition(
     work: &Submission,
     state: Option<&EntityState>,
     admission: &Admission,
-    settings: &Settings,
+    config: &NativeConfig,
 ) -> Result<Transition> {
     let decode_error = |_| Failure::Admission("invalid native command payload");
     match &work.kind {
@@ -605,12 +851,8 @@ fn transition(
                     "FM-service/FMM is not a stateless profile",
                 ));
             }
-            if generation.number != GenerationNumber::default()
-                && generation.number != admission.generation
-            {
-                return Err(Failure::Admission(
-                    "generation protocol must reconcile before dispatch",
-                ));
+            if generation.number.older_than(&admission.generation) {
+                return Ok(Transition::ignored(Disposition::IgnoredStale));
             }
             if !admission.node_open || !admission.owner_ready || admission.fabric_upgrading {
                 return Ok(Transition::ignored(Disposition::IgnoredNotReady));
@@ -655,7 +897,10 @@ fn transition(
                         "replacement requires native close/drop choreography",
                     ));
                 }
-                if body.unit != local.unit || body.service != local.service {
+                if current.phase == Phase::Opening {
+                    return Ok(Transition::ignored(Disposition::IgnoredPending));
+                }
+                if body.unit != local.unit || !lifecycle::service_matches(current, &body.service) {
                     return Err(Failure::Unsupported(
                         "epoch/service-description update choreography is staged",
                     ));
@@ -674,9 +919,12 @@ fn transition(
             Ok(Transition {
                 update: Update::Durable(EntityState {
                     body: body.clone(),
+                    requested_version: body.service.version.clone(),
                     phase: Phase::Opening,
                     open_token: work.id,
                     retry_attempts: 0,
+                    open_failures: 0,
+                    usage: None,
                     last_retry_error: 0,
                     runtime: None,
                     close_mode: None,
@@ -695,69 +943,19 @@ fn transition(
                     token: work.id,
                     lookup: 0, // assigned atomically by track_lookups before persistence
                     body,
+                    usage: None,
                 }],
                 disposition: Disposition::Applied,
             })
         }
-        Kind::Complete => {
-            let completion: OpenCompletion = from_slice(&work.bytes).map_err(decode_error)?;
-            let current = state.ok_or(Failure::Admission("no opening entity"))?;
-            if current.phase != Phase::Opening
-                || completion.token != current.open_token
-                || completion.unit != current.body.unit
-                || completion.replica.id != current.body.replica.id
-                || completion.replica.instance != current.body.replica.instance
-                || completion.replica.node != current.body.replica.node
-                || completion.replica.version != current.body.replica.version
-            {
-                return Ok(Transition::ignored(Disposition::IgnoredStale));
-            }
-            let mut proposed = current.clone();
-            if completion.error == SERVICE_TYPE_NOT_REGISTERED {
-                if current.runtime.is_some() {
-                    return Err(Failure::Admission(
-                        "registration result cannot revoke an active runtime",
-                    ));
-                }
-                proposed.last_retry_error = completion.error;
-                return Ok(Transition {
-                    update: Update::Memory(proposed),
-                    effects: vec![],
-                    disposition: Disposition::Applied,
-                });
-            }
-            if completion.error != 0 {
-                return Err(Failure::Unsupported(
-                    "native retry/terminal-open error policy is staged",
-                ));
-            }
-            if current.runtime.is_none() {
-                return Err(Failure::Admission(
-                    "Open success requires committed registration handoff",
-                ));
-            }
-            if completion.replica.state != 2
-                || !completion.replica.up
-                || completion.replica.current_role != 1
-            {
-                return Err(Failure::Admission(
-                    "open success must carry native Ready stateless replica",
-                ));
-            }
-            let mut body = (*proposed.body).clone();
-            body.replica = completion.replica;
-            proposed.body = Arc::new(body);
-            proposed.phase = Phase::Ready;
-            Ok(Transition {
-                effects: vec![reply(&proposed.body, 0)],
-                update: Update::Durable(proposed),
-                disposition: Disposition::Applied,
-            })
-        }
+        Kind::Complete => opening::complete(work, state, config),
         Kind::Retry => {
+            if !admission.owner_ready {
+                return Ok(Transition::ignored(Disposition::IgnoredNotReady));
+            }
             let current = state.ok_or(Failure::Admission("memory-only insert is forbidden"))?;
             if current.phase != Phase::Opening {
-                return Err(Failure::Admission("only pending open may retry"));
+                return Ok(Transition::ignored(Disposition::IgnoredPending));
             }
             let mut proposed = current.clone();
             proposed.retry_attempts = proposed
@@ -770,19 +968,23 @@ fn transition(
                         token: current.open_token,
                         body: current.body.clone(),
                         registration: registration.clone(),
+                        flags: config
+                            .policy(RetryState::Opening)
+                            .flags(current.open_failures),
                     }
                 } else {
                     Effect::Open {
                         token: current.open_token,
                         lookup: 0,
                         body: current.body.clone(),
+                        usage: current.usage,
                     }
                 }],
                 update: Update::Memory(proposed),
                 disposition: Disposition::Applied,
             })
         }
-        _ => lifecycle::transition(work, state, admission, settings),
+        _ => lifecycle::transition(work, state, admission, config),
     }
 }
 
@@ -946,7 +1148,7 @@ async fn entity_worker(
 ) {
     let mut committed: Option<Arc<EntityState>> = None;
     while let Some(work) = receiver.recv().await {
-        let mut outcome = transition(&work, committed.as_deref(), &admission, &shared.settings);
+        let mut outcome = transition(&work, committed.as_deref(), &admission, &shared.config);
         if let Ok(transition) = &mut outcome {
             if let Err(error) =
                 track_lookups(&work, committed.as_deref(), transition, &shared.settings)
@@ -960,6 +1162,23 @@ async fn entity_worker(
         {
             outcome = Err(Failure::Capacity);
         }
+        // All enabled attachments are memory-only. They project the ACTUAL
+        // retained map under the publication lock below, without any await.
+        // A future durable attach must introduce an equivalent precommit
+        // reservation; never discover a fallible capacity check after writing.
+        if let Ok(Transition {
+            update: Update::Durable(state),
+            ..
+        }) = &outcome
+        {
+            if state.runtime.is_some()
+                && committed.as_ref().and_then(|s| s.runtime.as_ref()) != state.runtime.as_ref()
+            {
+                outcome = Err(Failure::Unsupported(
+                    "durable registration attachment requires precommit reservation",
+                ));
+            }
+        }
 
         if let Ok(Transition {
             update: Update::Durable(state),
@@ -971,16 +1190,55 @@ async fn entity_worker(
             }
         }
         let mut view = lock(&shared.view);
+        let mut prepared_notification = None;
+        if let Ok(Transition {
+            update: Update::Memory(state),
+            effects,
+            ..
+        }) = &mut outcome
+        {
+            let before = committed.as_ref().and_then(|s| s.runtime.as_ref());
+            if before != state.runtime.as_ref() && state.runtime.is_some() {
+                let mut proposed = view.notification.clone();
+                if let Some(before) = before {
+                    proposed.remove(&before.service_type);
+                }
+                match proposed.add(
+                    notification::info(state),
+                    &shared.settings,
+                    &shared.config,
+                    &*shared.notification_clock,
+                ) {
+                    Ok(mut requests) if effects.len() + requests.len() <= work.reserved_effects => {
+                        requests.append(effects);
+                        *effects = requests;
+                        prepared_notification = Some(proposed);
+                    }
+                    Ok(_) => outcome = Err(Failure::Capacity),
+                    Err(error) => outcome = Err(error),
+                }
+            }
+        }
         let result = match outcome {
             Ok(transition) => {
+                let effects = transition.effects;
                 match transition.update {
                     Update::None => {}
                     Update::Memory(state) | Update::Durable(state) => {
+                        let before = committed.as_ref().and_then(|s| s.runtime.as_ref());
+                        if before != state.runtime.as_ref() {
+                            if let Some(proposed) = prepared_notification.take() {
+                                view.notification = proposed;
+                            } else if let Some(before) = before {
+                                view.notification.remove(&before.service_type);
+                            }
+                        }
+                        assert!(effects.len() <= work.reserved_effects);
                         committed = Some(Arc::new(state));
                         view.entities.get_mut(&work.entity).unwrap().committed = committed.clone();
                     }
                 }
-                for effect in transition.effects {
+                for effect in effects {
                     view.effects.push_back(Dispatched {
                         operation: work.id,
                         entity: work.entity,
