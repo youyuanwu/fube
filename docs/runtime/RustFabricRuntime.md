@@ -9,7 +9,7 @@ speak the node's private binary protocols, and implement the service lifecycle.
 Stateful replication is a separate, substantially larger compatibility tier.
 The companion [native architecture](FabricRuntime.md) explains those boundaries.
 
-**Current status:** the Linux stateless application-side slice is implemented in
+**Implementation and historical qualification:** the Linux stateless application-side slice is implemented in
 `fube-runtime` and qualified against real 11.8.121.4 nodes. See the
 [as-built API, supported profile and evidence](RustStatelessRuntime.md).
 The same runtime now also qualifies a **volatile empty-state stateful subset**
@@ -25,6 +25,12 @@ The implemented slice includes owned configuration/data package snapshots and
 same-incarnation context refresh, qualified by an actual unchanged-code
 configuration-only application upgrade. Rolling code upgrade/rollback remains
 outside that evidence; retained package objects do not pin native directories.
+
+The subsequent coordinated breaking API cleanup is described by the
+[current SF/mssf alignment matrix](SfApiAlignment.md). Dated native records
+qualify their exact old source/profile, not this changed whole implementation;
+current alignment deployed validation is **NOT RUN**. The design tiers below
+do not override current per-method signature/value/completion/support limits.
 
 **Original research status:** proposed design, not an implementation or interoperability claim.
 Research baseline: local Service Fabric source at
@@ -151,27 +157,31 @@ service-type-unregister wire operation to implement a convenient drop guard.
 Explicit shutdown is asynchronous; `Drop` can cancel/retire ownership but cannot
 claim that remote unregistration completed.
 
-Conceptually:
-
-```text
-Runtime::attach(options) -> Runtime
-Runtime::activation_context() -> immutable, versioned snapshot
-Runtime::node_context() -> owned node information
-Runtime::register_stateless(type_name, factory) -> Result<()>
-Runtime::shutdown(deadline) -> Result<()>
-
-StatelessFactory::create(service_identity, initialization_bytes)
-    -> service instance
-StatelessInstance::open(partition, cancellation) -> opaque endpoint string
-StatelessInstance::close(cancellation) -> Result<()>
-StatelessInstance::abort()
-```
-
-These are API sketches, not existing signatures or compilable examples.
+Use the [actual compiling public registration example](../../crates/libs/fube-runtime/src/lib.rs#L12-L31)
+and [public object-safe contract fixture](../../crates/libs/fube-runtime/tests/sdk_contracts.rs#L274-L491)
+instead of a second conceptual API sketch. Factories, registration, reports,
+configuration and removal are synchronous fallible calls; lifecycle/build/
+catch-up are async. Stateful Open explicitly receives New/Existing/Invalid,
+with Existing unsupported in the volatile profile. Partitions expose ID-bearing
+information and independent access getters; common/primary controls are split.
+Schedule
+waiting synchronous registration/report calls on a reserved ExecutionRuntime
+entry (`try_reserve` before captures, then `run_owned`); never block an async executor.
 Identity includes native partition/instance IDs; initialization bytes stay
 opaque. Return the application's actual listening address, after its listener
 is ready. Do not make the runtime serialize application traffic or assume
 every returned address is FabricTransport.
+
+Unknown async execution context is a typed rejection; invalid-context
+registration retains the original boxed factory for once-only recovery. Standard
+Tokio tasks/JoinSets now own scheduling with thin fube deadline/context/disposal
+wrappers. Execution/native-binding/cleanup integration types are **new fube
+code, not SDK ports**; replay/origin/epoch-checked capabilities reorganize
+preexisting behavior. Services own stop/join lifetimes of arbitrary descendants.
+Private native-issued proof is not constructible from public diagnostics/SDK
+descriptors and remains revocable; clear trusted IPC is not cryptographic
+authentication. No issuer-less standalone primary control or SDK discovery
+member is exposed.
 
 Partition handles carry the identity and generation of their owner. Calls after
 close/invalidation fail explicitly. Registration, factory and instance objects
@@ -349,7 +359,7 @@ Qualify only the upgrade behaviors the implementation can honor; unsupported
 updates must not be acknowledged as applied. This does not turn the broader
 upgrade/security capability tiers into established interoperability.
 
-Stateless S includes partition information and source-compatible load, fault,
+Stateless S includes partition information and canonical-shaped load, fault,
 health and move-cost behavior required by its advertised API. Health reporting
 uses correlated IPC through ApplicationHostManager (actor 7) and forwarding to
 Health Manager; the host's separate system-health client uses RA (actor 12).

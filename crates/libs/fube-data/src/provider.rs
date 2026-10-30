@@ -7,12 +7,18 @@
 //! horizon. No identity silently expires. Capacity rejects NEW admission rather
 //! than forgetting a prior request. Whole authoritative volatile-state loss
 //! loses both values and identity protection.
+//! `IStateProvider::get_last_committed_sequence_number` reports locally applied
+//! state, which MAY lead quorum completion. Primary local apply precedes waiting
+//! for quorum; the managed prepare/quorum/local-commit sequence is not claimed.
+//! Authentic replay is a separately supplied `ReplayCheckpointProvider`
+//! capability. Its versioned payload/origin encoding is unchanged.
 
+use crate::extensions::{ReplayCheckpointProvider, ReplayOperation};
 use crate::{
-    Cancellation, Epoch, Error, OperationData, OperationDataStream, ReplayOperation, Result,
-    StateProvider,
+    Cancellation, Epoch, Error, IOperationDataStream, IStateProvider, OperationData, Result,
 };
-use fube_runtime::ServiceFuture;
+use fube_runtime::extensions::EpochDomains;
+use fube_runtime::ApiFuture as ServiceFuture;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -58,7 +64,8 @@ impl Mutation {
     /// epoch. Callers must fence submission against this same authority epoch.
     pub fn operation_for_epoch(&self, epoch: Epoch) -> Result<OperationData> {
         self.validate()?;
-        if epoch.data_loss < 0 || epoch.configuration < 0 || epoch != epoch.primary() {
+        if epoch.data_loss_number < 0 || epoch.configuration_number < 0 || epoch != epoch.primary()
+        {
             return Err(Error::InvalidInput("mutation primary operation epoch"));
         }
         let data = encode(&Payload::Mutation {
@@ -118,6 +125,10 @@ struct State {
 }
 
 #[derive(Default)]
+/// Included volatile map/history/request-result ledger, not durable storage.
+/// Its standard-named last-committed getter reports locally applied history
+/// and may lead quorum. Exact-horizon copy includes history and retry results;
+/// custom providers/applications own their own data and retry policies.
 pub struct MemoryProvider {
     state: Mutex<State>,
 }
@@ -135,8 +146,8 @@ impl MemoryProvider {
         // Largest valid epoch has the largest canonical metadata. This also
         // validates copy escaping before either producer submits an operation.
         let data = mutation.operation_for_epoch(Epoch {
-            data_loss: i64::MAX,
-            configuration: i64::MAX & !0xffff_ffff,
+            data_loss_number: i64::MAX,
+            configuration_number: i64::MAX & !0xffff_ffff,
         })?;
         check_admission(&state, mutation, Some(&data))
     }
@@ -153,8 +164,8 @@ impl MemoryProvider {
                 .collect(),
             history_count: state.history.len(),
             retained_bytes: state.budget.load(Ordering::Acquire),
-            epoch_data_loss: state.epoch.map_or(0, |e| e.data_loss),
-            epoch_configuration: state.epoch.map_or(0, |e| e.configuration),
+            epoch_data_loss: state.epoch.map_or(0, |e| e.data_loss_number),
+            epoch_configuration: state.epoch.map_or(0, |e| e.configuration_number),
             data_loss_calls: state.data_loss_calls,
             data_loss_changed_calls: state.data_loss_changed_calls,
             last_data_loss_boundary: state.last_data_loss_boundary,
@@ -392,8 +403,8 @@ struct OriginEpoch {
 impl From<Epoch> for OriginEpoch {
     fn from(epoch: Epoch) -> Self {
         Self {
-            data_loss: epoch.data_loss,
-            configuration: epoch.configuration,
+            data_loss: epoch.data_loss_number,
+            configuration: epoch.configuration_number,
         }
     }
 }
@@ -463,10 +474,13 @@ fn replication_payload(data: &OperationData) -> Result<(Mutation, Option<Epoch>)
             origin_epoch: Some(epoch),
         } => {
             let epoch = Epoch {
-                data_loss: epoch.data_loss,
-                configuration: epoch.configuration,
+                data_loss_number: epoch.data_loss,
+                configuration_number: epoch.configuration,
             };
-            if epoch.data_loss < 0 || epoch.configuration < 0 || epoch != epoch.primary() {
+            if epoch.data_loss_number < 0
+                || epoch.configuration_number < 0
+                || epoch != epoch.primary()
+            {
                 return Err(Error::Protocol("provider original operation epoch"));
             }
             Ok((mutation, Some(epoch)))
@@ -516,8 +530,8 @@ struct SnapshotStream {
     records: Vec<Arc<Record>>,
     position: Mutex<usize>,
 }
-impl OperationDataStream for SnapshotStream {
-    fn next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+impl IOperationDataStream for SnapshotStream {
+    fn get_next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
         Box::pin(async move {
             if cancellation.is_cancelled() {
                 return Err(Error::Closed);
@@ -550,8 +564,8 @@ impl OperationDataStream for SnapshotStream {
     }
 }
 struct Empty;
-impl OperationDataStream for Empty {
-    fn next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+impl IOperationDataStream for Empty {
+    fn get_next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
         Box::pin(async move {
             if cancellation.is_cancelled() {
                 Err(Error::Closed)
@@ -561,10 +575,7 @@ impl OperationDataStream for Empty {
         })
     }
 }
-impl StateProvider for MemoryProvider {
-    fn last_committed(&self) -> Result<i64> {
-        Ok(self.state.lock().unwrap().last)
-    }
+impl ReplayCheckpointProvider for MemoryProvider {
     fn replication_checkpoint(
         &self,
         sequence: i64,
@@ -583,6 +594,11 @@ impl StateProvider for MemoryProvider {
                 .get(&sequence)
                 .and_then(|record| record.replay.clone()))
         })
+    }
+}
+impl IStateProvider for MemoryProvider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
+        Ok(self.state.lock().unwrap().last)
     }
     fn update_epoch(
         &self,
@@ -628,14 +644,14 @@ impl StateProvider for MemoryProvider {
             }
         })
     }
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
         Ok(Arc::new(Empty))
     }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         up_to: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>> {
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
         if context.is_some() {
             return Err(Error::InvalidInput("volatile copy context must be null"));
         }
@@ -660,8 +676,8 @@ impl StateProvider for MemoryProvider {
 mod tests {
     use super::*;
     const ORIGINAL_EPOCH: Epoch = Epoch {
-        data_loss: 7,
-        configuration: 3 << 32,
+        data_loss_number: 7,
+        configuration_number: 3 << 32,
     };
     fn mutation(n: i64) -> Mutation {
         Mutation {
@@ -678,14 +694,14 @@ mod tests {
                 .apply_replication(n, &mutation(n).operation().unwrap())
                 .unwrap();
         }
-        let stream = source.copy_state(50, None).unwrap();
+        let stream = source.get_copy_state(50, None).unwrap();
         for n in 101..=200 {
             source
                 .apply_replication(n, &mutation(n).operation().unwrap())
                 .unwrap();
         }
         let target = MemoryProvider::new();
-        while let Some(data) = stream.next(Cancellation::default()).await.unwrap() {
+        while let Some(data) = stream.get_next(Cancellation::default()).await.unwrap() {
             target.apply_copy(&data).unwrap();
         }
         assert_eq!(target.snapshot().last, 50);
@@ -697,7 +713,7 @@ mod tests {
         }
         assert_eq!(source.snapshot().values, target.snapshot().values);
         assert_eq!(source.snapshot().results, target.snapshot().results);
-        assert!(source.copy_state(201, None).is_err());
+        assert!(source.get_copy_state(201, None).is_err());
         let mut bad = mutation(30);
         bad.value = "different".into();
         assert!(target.admission(&bad).is_err());
@@ -718,15 +734,15 @@ mod tests {
         assert!(!p.on_data_loss(Cancellation::default()).await.unwrap());
         p.update_epoch(
             Epoch {
-                data_loss: 1,
-                configuration: 1,
+                data_loss_number: 1,
+                configuration_number: 1,
             },
             7,
             Cancellation::default(),
         )
         .await
         .unwrap();
-        assert_eq!(p.last_committed().unwrap(), 7);
+        assert_eq!(p.get_last_committed_sequence_number().unwrap(), 7);
         assert_eq!(p.admission(&mutation(8)).unwrap(), None);
         p.apply_replication(8, &mutation(80).operation().unwrap())
             .unwrap();
@@ -734,8 +750,8 @@ mod tests {
         // A node epoch transition cannot silently clear the armed fixture hook.
         p.update_epoch(
             Epoch {
-                data_loss: 2,
-                configuration: 1,
+                data_loss_number: 2,
+                configuration_number: 1,
             },
             8,
             Cancellation::default(),
@@ -743,10 +759,10 @@ mod tests {
         .await
         .unwrap();
         assert!(p.on_data_loss(Cancellation::default()).await.unwrap());
-        assert_eq!(p.last_committed().unwrap(), 3);
+        assert_eq!(p.get_last_committed_sequence_number().unwrap(), 3);
         p.apply_replication(4, &mutation(90).operation().unwrap())
             .unwrap();
-        assert_eq!(p.last_committed().unwrap(), 4);
+        assert_eq!(p.get_last_committed_sequence_number().unwrap(), 4);
         assert_eq!(p.snapshot().data_loss_calls, 2);
         assert_eq!(p.snapshot().data_loss_changed_calls, 1);
         assert_eq!(p.snapshot().last_data_loss_boundary, Some(3));
@@ -778,16 +794,16 @@ mod tests {
         assert_eq!(p.admission(&mutation).unwrap(), None);
         let data = mutation
             .operation_for_epoch(Epoch {
-                data_loss: i64::MAX,
-                configuration: i64::MAX & !0xffff_ffff,
+                data_loss_number: i64::MAX,
+                configuration_number: i64::MAX & !0xffff_ffff,
             })
             .unwrap();
         assert!(data.bytes() > MAX_VALUE * 2);
         assert!(data.bytes() < 1024 * 1024);
         p.apply_replication(1, &data).unwrap();
-        let copy = p.copy_state(1, None).unwrap();
+        let copy = p.get_copy_state(1, None).unwrap();
         let target = MemoryProvider::new();
-        while let Some(data) = copy.next(Cancellation::default()).await.unwrap() {
+        while let Some(data) = copy.get_next(Cancellation::default()).await.unwrap() {
             target.apply_copy(&data).unwrap();
         }
         assert_eq!(p.snapshot().values, target.snapshot().values);
@@ -812,7 +828,7 @@ mod tests {
         let raw = format!(
             " \n{{\"mutation\":{},\"origin_epoch\":{{\"configuration\":{},\"data_loss\":7}},\"version\":2,\"kind\":\"Mutation\"}}\t",
             serde_json::to_string(&m).unwrap(),
-            ORIGINAL_EPOCH.configuration
+            ORIGINAL_EPOCH.configuration_number
         ).into_bytes();
         let split = raw.windows(3).position(|w| w == "☃".as_bytes()).unwrap() + 1;
         let data = OperationData::new(vec![
@@ -829,13 +845,25 @@ mod tests {
         source
             .apply_replication(2, &mutation(2).operation_for_epoch(ORIGINAL_EPOCH).unwrap())
             .unwrap();
-        let copy = source.copy_state(1, None).unwrap();
+        let copy = source.get_copy_state(1, None).unwrap();
         let copied = MemoryProvider::new();
         copied
-            .apply_copy(&copy.next(Cancellation::default()).await.unwrap().unwrap())
+            .apply_copy(
+                &copy
+                    .get_next(Cancellation::default())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
             .unwrap();
         copied
-            .apply_copy(&copy.next(Cancellation::default()).await.unwrap().unwrap())
+            .apply_copy(
+                &copy
+                    .get_next(Cancellation::default())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
             .unwrap();
         assert!(copied
             .replication_checkpoint(1, Cancellation::default())
@@ -843,11 +871,17 @@ mod tests {
             .unwrap()
             .is_none());
         copied
-            .apply_copy(&copy.next(Cancellation::default()).await.unwrap().unwrap())
+            .apply_copy(
+                &copy
+                    .get_next(Cancellation::default())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
             .unwrap();
-        let second_copy = copied.copy_state(1, None).unwrap();
+        let second_copy = copied.get_copy_state(1, None).unwrap();
         let twice = MemoryProvider::new();
-        while let Some(item) = second_copy.next(Cancellation::default()).await.unwrap() {
+        while let Some(item) = second_copy.get_next(Cancellation::default()).await.unwrap() {
             twice.apply_copy(&item).unwrap();
         }
         for provider in [&source, &copied, &twice] {
@@ -863,8 +897,8 @@ mod tests {
         source
             .update_epoch(
                 Epoch {
-                    data_loss: 8,
-                    configuration: 5 << 32,
+                    data_loss_number: 8,
+                    configuration_number: 5 << 32,
                 },
                 1,
                 Cancellation::default(),
@@ -905,9 +939,9 @@ mod tests {
                 .unwrap()
                 .is_none());
         }
-        let copy = p.copy_state(1, None).unwrap();
+        let copy = p.get_copy_state(1, None).unwrap();
         let target = MemoryProvider::new();
-        while let Some(data) = copy.next(Cancellation::default()).await.unwrap() {
+        while let Some(data) = copy.get_next(Cancellation::default()).await.unwrap() {
             target.apply_copy(&data).unwrap();
         }
         assert!(target
@@ -961,7 +995,7 @@ mod tests {
             }
         }
         let before = p.snapshot();
-        let pinned = p.copy_state(before.last, None).unwrap();
+        let pinned = p.get_copy_state(before.last, None).unwrap();
         p.update_epoch(ORIGINAL_EPOCH, 0, Cancellation::default())
             .await
             .unwrap();

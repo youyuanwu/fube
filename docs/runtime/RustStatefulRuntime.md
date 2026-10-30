@@ -9,6 +9,12 @@ or data copy/replication stream. The separate opt-in
 replication in the same mixed executable; it does not change the default empty
 policy or add persistence/durability.
 
+The [current SF/mssf alignment matrix](SfApiAlignment.md) is authoritative for
+signature, accepted values, completion and supported capabilities. Native
+qualification later in this page is **historical at its exact old source and
+empty-state profile**, not evidence for the changed whole implementation.
+Current API-alignment deployed qualification is **NOT RUN**.
+
 ## Supported profile and ownership
 
 The executed profile is Linux x86-64, native SF **11.8.121.4**, normal activated
@@ -32,39 +38,84 @@ rejected.
 
 ## Owned programming model
 
-1. Attach `Runtime`, then call `register_stateful(name, Arc<Factory>)`.
-2. `StatefulFactory::create` receives owned service/partition identity, public
-   replica ID, **separate RAP incarnation and node incarnation**, initialization
-   bytes and activation snapshot.
-3. `StatefulService::open` receives a generation-bound `StatefulPartition` and
-   returns an owned `Arc<dyn Replicator>`. Replicator Open returns its control
+1. Attach `Runtime`, then schedule synchronous
+   `register_stateful_service_factory(name, Box<dyn IStatefulServiceFactory>)`
+   through a capture-free execution reservation followed by `run_owned`.
+2. `IStatefulServiceFactory::create_replica` synchronously receives type, URI,
+   borrowed initialization bytes, partition UUID and public replica ID, returning
+   `Result<Box<dyn IStatefulServiceReplica>>`. Factory-owned context and explicit
+   `NativeIntegrationProvider` separately capture activation and native binding.
+3. `IStatefulServiceReplica::open(New, Arc<dyn IStatefulServicePartition>, cancellation)`
+   asynchronously returns `Box<dyn IPrimaryReplicator>`. Existing is explicitly
+   unsupported in this volatile profile; Invalid rejects before activation.
+   Common `IReplicator` Open returns its control
    address; service ChangeRole independently returns its client address.
 4. Implement service/replicator Close and Abort, role/epoch changes, progress,
    data loss, configurations, catch-up, build and removal. There is deliberately
    **no default all-success replicator**.
-5. Use `partition.status()`, `access_status()` and `ensure_valid()` for owned
-   diagnostics and authority/lifetime checks. A published address or a cached
+5. Canonical partitions expose separate `get_read_status`/`get_write_status`.
+   Explicit `NativeRuntimeIntegration` supplies diagnostics and validity.
+   A published address or a cached
    role alone is not permission to serve. Shutdown is explicit and awaited.
 
-API: [stateful_api.rs:18-202](../../crates/libs/fube-runtime/src/stateful_api.rs#L18-L202),
-[partition handles:357-393](../../crates/libs/fube-runtime/src/stateful_api.rs#L357-L393),
-[registration:405](../../crates/libs/fube-runtime/src/lib.rs#L405).
-Stateful load/health/write/storage APIs are not supplied by this seam.
+API: [factory/lifecycle/control Rustdoc](../../crates/libs/fube-runtime/src/stateful_api.rs#L117-L232),
+[object-safe partitions](../../crates/libs/fube-runtime/src/stateful_api.rs#L314-L359),
+[registration](../../crates/libs/fube-runtime/src/lib.rs#L595-L623).
+All selected reporting routes are implemented; storage is the separate data layer.
+Canonical sync configuration/removal must run on an owned blocking entry; they
+return only after owner application and required physical disposal, not enqueue
+acceptance. Async lifecycle/build/catch-up remain distinct. Unknown async
+contexts get typed `InvalidExecutionContext`. Registration rejected for context
+retains the original boxed factory for once-only typed recovery.
 
-`StatefulPartition::report_fault(FaultType)` reuses the runtime's existing
+Native integration/binding/cleanup types are newly written fube infrastructure,
+not ported SDK APIs. Functional root and invocation-bound **canonical** controls
+share the same owner. Private issued proofs preserve native node/replica/actor
+incarnations, PC/CC/local votes, epochs/revision and retry-removal purpose;
+public descriptors and editable `ReplicaDiagnostics` cannot mint those proofs.
+Retained proof is revocable. There is no issuer-less out-of-host primary control,
+SDK discovery member or diagnostic grant. Trusted clear IPC is not cryptographic
+host authentication or global unforgeability. Offline runtime/RAP model hosts
+exercise actual issuance paths but are not deployed SF.
+
+Load/move use actor 12/RAPReportLoad with stateful=true and the private native
+current configuration role, snapshotted together with routing identity as in
+vanilla FUP ReportLoad: Primary uses primary entries, ActiveSecondary and
+IdleSecondary use secondary/node entries. Pending demotion already selects
+secondary; initially configured Primary may report before service ChangeRole
+completes. This bucket selection never grants application read/write access.
+Unknown/None and invalid values are explicit stricter profile errors: native
+FUP admits nonclosed reports and downstream load handling filters roles
+separately, so admission/error equivalence is not claimed. Caller-edited
+diagnostics and read-only queries do not select or retarget reporting bytes.
+Source: [FUP ReportLoad](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.cpp#L1780-L1808)
+and [downstream load validation](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/LocalLoadReportingComponent.cpp#L166-L232).
+Partition health uses actor 7/ReportHealth kind/tag 3 and partition-only entity;
+replica health uses kind/tag 1, public replica ID and invalid replica-instance
+`-1`, **not** RAP incarnation. Base methods borrow only HealthInformation.
+Versioned health2 methods additionally take optional send options after it.
+Both Immediate values directly send; true adds no interval delay. Health waits
+for one exact HM result, not fresh durability, with uncertain timeout and no
+hidden retry. Load/move wait for local complete-frame write, not RA/FM ACK.
+All canonical reports synchronously return Result on the reserved execution
+entry. `NativeRuntimeIntegration::observe_report()` is a fube-specific one-call
+observation wrapper, not native-ported API or a last-receipt slot.
+
+`IStatefulServicePartition::report_fault(FaultType)` reuses the runtime's existing
 actor-12 `RAReportFault` path, bound to the full native unit, replica incarnation
 and epochs. Its receipt means an initial local frame write, **not native
-acknowledgment, persistence or replacement**. `fault_delivery()` exposes the
+acknowledgment, persistence or replacement**.
+`NativeRuntimeIntegration::fault_delivery()` exposes the
 bounded retry/error/cancellation snapshot. Retries run on the installing Runtime
 executor until unit disposal, not on a calling provider/engine executor; stale
 handles and retired process authority cannot start queued fault frames.
-`fube-data`'s qualified `Engine::bind_partition` reports one transient
+The native-bound `fube-data::FabricReplicator` reports one transient
 notification for a terminal engine fault (including an internal provider
 barrier failure without an active RAP callback), never for normal Close/Abort
 or ordinary write backpressure/cancellation. Close/Abort cancels its receipt
 wait and joins owned cleanup; the Runtime retains only fault DTOs/authority/
 connection state for retries, not service/replicator participants. Standalone
-`Engine::bind` has no native reporting authority. These fault-delivery paths
+out-of-host construction has no native reporting authority. These fault-delivery paths
 have source-contract tests; native recovery validation remains pending.
 
 The data profile's executed native qualification now also covers primary
@@ -72,8 +123,9 @@ failure/replacement, copy and per-unit isolation; see [its exact evidence and
 limits](FubeData.md#executed-qualification). These results do not turn every
 internal fault-report race into an independently observed native scenario.
 
-`Replicator::remove_replica` receives an owned `ReplicaRemoval` purpose:
-`Idle` for native idle-owner removal, or `BuildRetryCleanup` for disposal of
+`IPrimaryReplicator::remove_replica(replica_id)` synchronously completes exact
+captured removal/disposal. Private issued invocation retains `ReplicaRemoval`
+purpose: `Idle` for native idle-owner removal, or `BuildRetryCleanup` for disposal of
 partial/previous resources before another node-authorized Build. Cleanup
 success is never Build success. Failed Build/Remove retains a cleanup obligation
 even for equal-incarnation retries; final native removal remains a distinct
@@ -158,12 +210,12 @@ until an exact incarnation/role/location acknowledgment or disposal. Volatile
 access revokes locally; persisted-only read/write-revoked notifications are not
 invented.
 
-`ReplicaStatus` retains full RAP current/previous epochs and service versus
+`extensions::ReplicaDiagnostics` retains full RAP current/previous epochs and service versus
 replicator roles. Access uses native role/stage/minimum/PC/CC availability rules,
 then the partition overlays lifetime and host authority. Pre-write revocation
 cannot be undone by a same-epoch retry. Granted diagnostics **do not introduce
-an application write operation**
-([access:245-353](../../crates/libs/fube-runtime/src/stateful_api.rs#L245-L353)).
+an application write operation**; canonical `ReplicaStatus` is only Invalid/Down/Up
+([access state machine](../../crates/libs/fube-runtime/src/stateful_api.rs#L406-L519)).
 
 The sample's service route requires live authority, matching desired/service/
 replicator Primary roles and granted read access; its diagnostic route is
@@ -179,6 +231,13 @@ Native source evidence is read-only baseline
 `Reliability/Failover/fm/QueryHelper.cpp:1075-1085`,
 `ra/ProxyActionsList.cpp:130-142`. This is not a claim that the deployed binaries
 were built from that revision; see [native architecture](FabricRuntime.md).
+
+Public `Epoch::INVALID` is (-1,-1), ZERO is valid (0,0), whereas RAP invalidzero
+is contextual native absence. Unknown remote LSN -1 is not initialized local0.
+Full low configuration bits remain meaningful; exposing the native primary-mask
+rule through `extensions::EpochDomains` is fube's API choice. Public role/fault
+ordinals are not RAP ordinals; version-specific auxiliary roles/VeryHigh and
+reference spelling corrections are individually recorded in the matrix.
 
 ## Reproduce compiler-free native qualification
 

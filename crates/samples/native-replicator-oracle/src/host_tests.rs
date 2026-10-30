@@ -3,8 +3,8 @@ use super::*;
 use std::sync::atomic::AtomicUsize;
 
 const FIXTURE_EPOCH: fube_data::Epoch = fube_data::Epoch {
-    data_loss: 1,
-    configuration: 3 << 32,
+    data_loss_number: 1,
+    configuration_number: 3 << 32,
 };
 
 #[test]
@@ -567,7 +567,7 @@ async fn assigned_lsn_applies_before_delayed_end_and_retries_keep_native_outcome
         .await
         .unwrap();
         assert_eq!(route.app.provider.snapshot().values["key"], "value");
-        let checkpoint = fube_data::StateProvider::replication_checkpoint(
+        let checkpoint = fube_data::extensions::ReplayCheckpointProvider::replication_checkpoint(
             &*route.app.provider,
             1,
             Cancellation::default(),
@@ -635,9 +635,9 @@ async fn dropped_http_waiter_does_not_cancel_accepted_native_write_and_copied_re
     source
         .apply_replication(1, &mutation("copied").operation().unwrap())
         .unwrap();
-    let copy = fube_data::StateProvider::copy_state(&*source, 1, None).unwrap();
+    let copy = fube_data::IStateProvider::get_copy_state(&*source, 1, None).unwrap();
     let copied_route = self::route();
-    while let Some(data) = copy.next(Cancellation::default()).await.unwrap() {
+    while let Some(data) = copy.get_next(Cancellation::default()).await.unwrap() {
         copied_route.app.provider.apply_copy(&data).unwrap();
     }
     let copied_engine = EngineState::new();
@@ -740,16 +740,19 @@ async fn native_secondary_keeps_original_checkpoint_without_update_epoch_callbac
         .unwrap();
     assert_eq!(*route.app.native_epoch.lock().unwrap(), None);
     assert_eq!(acks.load(Ordering::Acquire), 1);
-    let copy = fube_data::StateProvider::copy_state(&*route.app.provider, 1, None).unwrap();
+    let copy = fube_data::IStateProvider::get_copy_state(&*route.app.provider, 1, None).unwrap();
     let target = fube_data::MemoryProvider::new();
-    while let Some(item) = copy.next(Cancellation::default()).await.unwrap() {
+    while let Some(item) = copy.get_next(Cancellation::default()).await.unwrap() {
         target.apply_copy(&item).unwrap();
     }
-    let checkpoint =
-        fube_data::StateProvider::replication_checkpoint(&*target, 1, Cancellation::default())
-            .await
-            .unwrap()
-            .unwrap();
+    let checkpoint = fube_data::extensions::ReplayCheckpointProvider::replication_checkpoint(
+        &*target,
+        1,
+        Cancellation::default(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(checkpoint.epoch, FIXTURE_EPOCH);
     assert_eq!(checkpoint.data, data);
     route.shutdown().await.unwrap();
@@ -785,11 +788,11 @@ async fn native_copy_ack_hold_final_nonempty_receive_release_cancel_deadline_and
                 .unwrap(),
             )
             .unwrap();
-        let stream = fube_data::StateProvider::copy_state(source.as_ref(), 1, None).unwrap();
+        let stream = fube_data::IStateProvider::get_copy_state(source.as_ref(), 1, None).unwrap();
         let acks = Arc::new(AtomicU64::new(0));
         let mut items = Vec::new();
         let mut sequence = 0;
-        while let Some(data) = stream.next(Cancellation::default()).await.unwrap() {
+        while let Some(data) = stream.get_next(Cancellation::default()).await.unwrap() {
             sequence += 1;
             let operation: IFabricOperation = Operation {
                 data: operation_data(data.to_segments()).unwrap(),

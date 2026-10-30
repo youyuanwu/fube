@@ -21,6 +21,8 @@ jobs:
     permissions:
       contents: read
     env:
+      # Runtime model tests own thread pools; avoid cross-test runner contention.
+      NEXTEST_TEST_THREADS: "1"
       FUBE_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
       FUBE_CI_MERGE: ${{ github.event_name == 'pull_request' && github.sha || '' }}
       FUBE_CI_RUN_ID: ${{ github.run_id }}

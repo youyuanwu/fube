@@ -1,5 +1,5 @@
 use crate::{wire::CodeContext, ActivationContext};
-use fube_transport::{Error, Result};
+use crate::{Error, Result};
 use roxmltree::{Document, Node};
 use std::{
     collections::{BTreeMap, BTreeSet},

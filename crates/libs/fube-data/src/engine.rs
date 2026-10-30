@@ -6,7 +6,7 @@
 
 //! Owned volatile, explicit-service-ACK classic replication.
 //!
-//! Only the native [`Replicator`] controls select roles and membership. A
+//! Only the native [`IPrimaryReplicator`] controls select roles and membership. A
 //! listener, a role, a receipt, and an application ACK are different facts.
 //! Loopback tests of this module are not native interoperability qualification.
 //!
@@ -47,9 +47,27 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+use fube_runtime::extensions::{
+    CallLane, CallOrigin, DisposalBatch, DisposalTracker, EpochDomains, ExecutionRuntime,
+};
+use fube_runtime::extensions::{
+    CommandCleanup, DeferredCleanup, DisposalReceipt, OwnedDisposition, TerminalPermit,
+};
+use fube_runtime::extensions::{
+    NativeControlBinding, NativeInvocation, NativeInvocationKind, NativeRuntimeIntegration,
+};
+use fube_runtime::extensions::{OwnedCall, OwnedCallPermit};
+#[path = "engine_binding.rs"]
+mod binding;
+use fube_runtime::extensions::{
+    ConfigurationStage, FaultDelivery, NativeReplicaDescriptor as ReplicaInformation,
+    NativeReplicaSetConfiguration as ReplicaSetConfiguration, ReplicaDiagnostics as ReplicaStatus,
+    ReplicaLifecycle, ReplicaRemoval, ReplicationProgress,
+};
 use fube_runtime::{
-    CatchUpMode, ConfigurationStage, ReplicaInformation, ReplicaLifecycle, ReplicaRemoval,
-    ReplicaSetConfiguration, ReplicaStatus, ReplicationProgress, Replicator, ServiceFuture,
+    ApiFuture as ServiceFuture, IPrimaryReplicator, IReplicator,
+    ReplicaInformation as SdkReplicaInformation, ReplicaSetConfig,
+    ReplicaSetQuorumMode as CatchUpMode,
 };
 use serde::{ser::SerializeStruct, Serialize, Serializer};
 use tokio::{
@@ -58,16 +76,19 @@ use tokio::{
     time::{interval, timeout, Instant, MissedTickBehavior},
 };
 
+use crate::extensions::{ReplayCheckpointProvider, ReplayOperation};
 use crate::{
     queue::OperationQueue,
     quorum::{configuration_progress, ConfigurationProgress, PeerProgress},
     transport::{Incoming, PeerTransport},
     wire::{Actor, Body, Endpoint, Packet, WireOperation},
-    Acknowledgment, Cancellation, Epoch, Error, Operation, OperationData, OperationDataStream,
-    OperationStream, Progress, ReplayOperation, ReplicaRole, Result, Settings, StateProvider,
-    StatefulPartition,
+    Acknowledgment, Cancellation, Epoch, Error, IOperationDataStream, IStateProvider, Operation,
+    OperationData, OperationStream, Progress, ReplicaRole, Result, Settings,
 };
 
+#[cfg(test)]
+#[path = "engine_native_tests.rs"]
+mod native_tests;
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 mod tests;
@@ -118,7 +139,7 @@ impl Serialize for EngineSnapshot {
         out.serialize_field(
             "epoch",
             &self.epoch.map(
-                |e| serde_json::json!({"data_loss": e.data_loss, "configuration": e.configuration}),
+                |e| serde_json::json!({"data_loss_number": e.data_loss_number, "configuration_number": e.configuration_number}),
             ),
         )?;
         out.serialize_field("progress", &self.progress)?;
@@ -140,11 +161,12 @@ impl Serialize for EngineSnapshot {
 /// An admitted write. Dropping this handle cannot undo admission.
 pub struct Replication {
     pub sequence: i64,
-    completion: watch::Receiver<Option<Result<i64>>>,
+    pub(crate) completion: watch::Receiver<Option<Result<i64>>>,
 }
 
 impl Replication {
     /// Canceling this wait is ambiguous: the admitted write remains owned.
+    #[cfg(test)]
     pub async fn wait(&mut self, cancellation: Cancellation) -> Result<i64> {
         loop {
             if let Some(result) = self.completion.borrow_and_update().clone() {
@@ -152,7 +174,7 @@ impl Replication {
             }
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Err(Error::Closed),
+                _ = cancellation.cancelled() => return Err(Error::new(fube_runtime::ErrorKind::Canceled, "replication completion wait canceled").uncertain()),
                 result = self.completion.changed() => result.map_err(|_| Error::Closed)?,
             }
         }
@@ -221,31 +243,44 @@ fn maximum_copy_bytes(settings: &Settings) -> usize {
 }
 
 struct Shared {
+    #[cfg(test)]
+    copy_job_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
     admission: Mutex<()>,
     stopped: AtomicBool,
     revision: AtomicU64,
     snapshot: Mutex<EngineSnapshot>,
     budget: Budget,
     callbacks: Arc<Semaphore>,
+    execution: ExecutionRuntime,
+    disposal: DisposalTracker,
+    engine_id: u64,
+    generation: u64,
+    shutdown_cleanup: Mutex<(bool, Option<DeferredCleanup>)>,
 }
 
 trait NativeControlView: Send + Sync {
+    fn integration(&self) -> Result<Option<NativeRuntimeIntegration>> {
+        Ok(None)
+    }
+    fn execution(&self) -> Result<Option<ExecutionRuntime>> {
+        Ok(None)
+    }
     fn status(&self) -> Result<ReplicaStatus>;
-    fn report_fault(
-        &self,
-        fault: fube_runtime::FaultType,
-    ) -> ServiceFuture<'_, fube_runtime::FaultDelivery>;
+    fn report_fault(&self, fault: fube_runtime::FaultType) -> ServiceFuture<'_, FaultDelivery>;
 }
 
-impl NativeControlView for StatefulPartition {
-    fn status(&self) -> Result<ReplicaStatus> {
-        StatefulPartition::status(self)
+impl NativeControlView for NativeRuntimeIntegration {
+    fn integration(&self) -> Result<Option<NativeRuntimeIntegration>> {
+        Ok(Some(self.clone()))
     }
-    fn report_fault(
-        &self,
-        fault: fube_runtime::FaultType,
-    ) -> ServiceFuture<'_, fube_runtime::FaultDelivery> {
-        Box::pin(StatefulPartition::report_fault(self, fault))
+    fn execution(&self) -> Result<Option<ExecutionRuntime>> {
+        Ok(Some(NativeRuntimeIntegration::execution(self)))
+    }
+    fn status(&self) -> Result<ReplicaStatus> {
+        NativeRuntimeIntegration::status(self)
+    }
+    fn report_fault(&self, fault: fube_runtime::FaultType) -> ServiceFuture<'_, FaultDelivery> {
+        NativeRuntimeIntegration::report_fault(self, fault)
     }
 }
 
@@ -256,10 +291,11 @@ struct NativePreWrite {
 }
 
 impl NativePreWrite {
+    #[cfg(test)]
     fn from_status(status: ReplicaStatus) -> Option<Self> {
         (status.lifecycle == ReplicaLifecycle::Open
             && status.replicator_open
-            && status.current_role == ReplicaRole::Secondary
+            && status.current_role == ReplicaRole::ActiveSecondary
             && status.service_role == ReplicaRole::Primary
             && status.replicator_role == ReplicaRole::Primary
             && status.configuration_stage == ConfigurationStage::PreWriteRevoke)
@@ -287,7 +323,7 @@ impl NativePreWrite {
 pub struct Engine {
     endpoint: Endpoint,
     settings: Settings,
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::Sender<AuthorizedCommand>,
     writes: mpsc::Sender<Submit>,
     stop: watch::Sender<bool>,
     shared: Arc<Shared>,
@@ -295,7 +331,23 @@ pub struct Engine {
     copy: Arc<OperationStream>,
     thread: Mutex<Option<JoinHandle<()>>>,
     transport: PeerTransport,
+    #[cfg(test)]
     native_control: Option<Arc<dyn NativeControlView>>,
+    terminal: Mutex<Option<TerminalPermit>>,
+    owner_done: Mutex<Option<std_mpsc::Receiver<Result<()>>>>,
+    disposal_done: Mutex<Option<DisposalReceipt>>,
+    native_runtime: Option<NativeRuntimeIntegration>,
+    native_binder: Mutex<Option<Arc<dyn NativeControlBinding>>>,
+    native_progress: Mutex<Option<Arc<dyn fube_runtime::extensions::NativeProgressSource>>>,
+    #[cfg(test)]
+    native_root_dispatch: AtomicBool,
+    #[cfg(test)]
+    native_build_pause: Mutex<Option<(oneshot::Sender<NativeInvocation>, oneshot::Receiver<()>)>>,
+    #[cfg(test)]
+    scalar_progress_reads: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    native_remove_pause: Mutex<Option<(oneshot::Sender<NativeInvocation>, std_mpsc::Receiver<()>)>>,
+    owns_execution: bool,
 }
 
 impl Engine {
@@ -311,56 +363,156 @@ impl Engine {
     /// Terminal engine faults report a native transient fault through this same
     /// generation; normal Close/Abort do not. Delivery is not a replacement ack.
     pub fn bind_partition(
-        partition: StatefulPartition,
+        partition: std::sync::Arc<dyn fube_runtime::IStatefulServicePartition>,
+        native: NativeRuntimeIntegration,
         actor: Actor,
         address: &str,
-        provider: Arc<dyn StateProvider>,
+        provider: Arc<dyn IStateProvider>,
+        replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         settings: Settings,
     ) -> Result<Arc<Self>> {
         settings.validate()?;
-        let provider = Arc::new(crate::supervised::SupervisedProvider::new(
-            partition.clone(),
-            settings.callback_timeout,
-            provider,
-        ));
-        partition.ensure_valid()?;
-        if actor.partition != partition.identity().partition_id
-            || actor.replica != partition.identity().replica_id
+        let information = partition.get_partition_information()?;
+        native.validate()?;
+        let partition_id = match information {
+            fube_runtime::ServicePartitionInformation::Singleton(info) => info.id,
+            fube_runtime::ServicePartitionInformation::Int64Range(info) => info.id,
+            fube_runtime::ServicePartitionInformation::Named(info) => info.id,
+            fube_runtime::ServicePartitionInformation::Invalid => {
+                return Err(Error::InvalidInput("invalid partition information"))
+            }
+        };
+        if partition_id != native.binding().identity.partition_id
+            || actor.partition != native.binding().identity.partition_id
+            || actor.replica != native.binding().identity.replica_id
         {
             return Err(Error::InvalidInput(
                 "replication actor does not match native partition",
             ));
         }
-        Self::bind_with_native_control(
+        Self::bind_with_capabilities(
             actor,
             address,
             provider,
+            replay,
             settings,
-            Some(Arc::new(partition)),
+            Some(Arc::new(native)),
         )
     }
 
-    /// Standalone binding for Rust source fixtures or use outside an SF host.
+    /// Standalone binding for internal source/algorithm fixtures. This is not a
+    /// standalone SF primary-control authority: canonical configuration, Build
+    /// and removal require runtime/partition-issued native context and fail
+    /// explicitly without it. Use `bind_partition` for supported SF controls.
     /// The caller is responsible for a blocking callback/destructor fence:
     /// Tokio deadlines alone cannot supervise synchronous provider code.
     /// SF-activated qualification must instead use [`Self::bind_partition`].
+    #[cfg(test)]
     pub fn bind(
         actor: Actor,
         address: &str,
-        provider: Arc<dyn StateProvider>,
+        provider: Arc<dyn IStateProvider>,
         settings: Settings,
     ) -> Result<Arc<Self>> {
         Self::bind_with_native_control(actor, address, provider, settings, None)
     }
 
+    #[cfg(test)]
     fn bind_with_native_control(
         actor: Actor,
         address: &str,
-        provider: Arc<dyn StateProvider>,
+        provider: Arc<dyn IStateProvider>,
+        settings: Settings,
+        native_control: Option<Arc<dyn NativeControlView>>,
+    ) -> Result<Arc<Self>> {
+        Self::bind_with_capabilities(actor, address, provider, None, settings, native_control)
+    }
+
+    fn bind_with_capabilities(
+        actor: Actor,
+        address: &str,
+        provider: Arc<dyn IStateProvider>,
+        replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         settings: Settings,
         native_control: Option<Arc<dyn NativeControlView>>,
     ) -> Result<Arc<Self>> {
         settings.validate()?;
+        let native_runtime = native_control
+            .as_ref()
+            .map(|view| view.integration())
+            .transpose()?
+            .flatten();
+        if let Some(native) = &native_runtime {
+            native.execution().check_constructor()?;
+            native.reserve_engine(actor.partition, actor.replica, actor.incarnation)?;
+        }
+        let supplied_execution = native_control
+            .as_ref()
+            .map(|view| view.execution())
+            .transpose()?
+            .flatten();
+        let owns_execution = supplied_execution.is_none();
+        let execution = match supplied_execution {
+            Some(runtime) => runtime,
+            None => ExecutionRuntime::standalone(tokio::runtime::Handle::current())?,
+        };
+        let disposal = DisposalTracker::default();
+        static NEXT_ENGINE: AtomicU64 = AtomicU64::new(1);
+        let engine_id = NEXT_ENGINE
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+            .map_err(|_| Error::ResourceLimit("engine execution identities"))?;
+        let origin = CallOrigin {
+            engine: engine_id,
+            session: 0,
+            generation: native_runtime
+                .as_ref()
+                .map_or(1, |native| native.binding().generation),
+        };
+        let terminal = execution.reserve_terminal(origin)?;
+        let initial_permit =
+            execution.reserve(CallLane::Provider, origin, settings.callback_timeout, false)?;
+        let construction = if execution.is_current_entry() {
+            None
+        } else {
+            Some(execution.reserve(
+                CallLane::Native,
+                origin,
+                std::time::Duration::from_secs(30),
+                true,
+            )?)
+        };
+        struct ConstructionGuard {
+            receipt: Option<DisposalReceipt>,
+            execution: ExecutionRuntime,
+            committed: bool,
+        }
+        impl Drop for ConstructionGuard {
+            fn drop(&mut self) {
+                if !self.committed {
+                    if let Some(receipt) = &self.receipt {
+                        if !ExecutionRuntime::in_owned_entry() || receipt.wait_blocking().is_err() {
+                            self.execution.retire();
+                        }
+                    }
+                }
+            }
+        }
+        let mut construction_guard = ConstructionGuard {
+            receipt: None,
+            execution: execution.clone(),
+            committed: false,
+        };
+        let provider = Arc::new(crate::supervised::OwnedProvider::new(
+            execution.clone(),
+            provider,
+            replay,
+            settings.connections,
+            disposal.clone(),
+            origin,
+            construction.as_ref(),
+        )?);
+        construction_guard.receipt = Some(provider.disposal_receipt());
+        let provider_publication = provider.publication();
         let (transport, incoming) = PeerTransport::bind(address, settings.clone())?;
         let endpoint = Endpoint {
             actor,
@@ -380,6 +532,8 @@ impl Engine {
         let copy = Arc::new(OperationStream::new(copy_rx));
         let (stop, stop_rx) = watch::channel(false);
         let shared = Arc::new(Shared {
+            #[cfg(test)]
+            copy_job_pause: Mutex::new(None),
             admission: Mutex::new(()),
             stopped: AtomicBool::new(false),
             revision: AtomicU64::new(1),
@@ -404,6 +558,11 @@ impl Engine {
                 bytes: Arc::new(Semaphore::new(settings.queue_bytes)),
             },
             callbacks: Arc::new(Semaphore::new(settings.provider_operations)),
+            execution: execution.clone(),
+            disposal,
+            engine_id,
+            generation: origin.generation,
+            shutdown_cleanup: Mutex::new((false, None)),
         });
         let state_shared = shared.clone();
         let state_endpoint = endpoint.clone();
@@ -413,31 +572,42 @@ impl Engine {
         let state_copy = copy.clone();
         let state_native_control = native_control.clone();
         let (ready, readiness) = std_mpsc::sync_channel(1);
+        let (done, done_rx) = std_mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("fube-engine".into())
             .spawn(move || {
+                struct Done(Option<std_mpsc::SyncSender<Result<()>>>, Result<()>);
+                impl Drop for Done {
+                    fn drop(&mut self) {
+                        if let Some(done) = self.0.take() {
+                            let _ = done.send(self.1.clone());
+                        }
+                    }
+                }
+                let mut done = Done(
+                    Some(done),
+                    Err(Error::Protocol("owner terminated before disposal")),
+                );
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                 {
                     Ok(runtime) => runtime,
                     Err(error) => {
-                        let _ = ready.send(Err(Error::Io(error)));
+                        let _ = ready.send(Err(Error::Io(error.into())));
                         return;
                     }
                 };
-                runtime.block_on(async move {
+                let outcome = runtime.block_on(async move {
                     // Spawn also supervises a synchronous progress callback panic.
                     let initial_provider = provider.clone();
-                    let mut initial =
-                        tokio::spawn(async move { initial_provider.last_committed() });
+                    let mut initial = initial_permit
+                        .run_owned(move || initial_provider.get_last_committed_sequence_number());
                     let initial = match timeout(state_settings.callback_timeout, &mut initial).await
                     {
-                        Ok(Ok(result)) => result,
-                        Ok(Err(_)) => Err(Error::Protocol("provider progress panicked")),
+                        Ok(result) => result,
                         Err(_) => {
-                            initial.abort();
-                            let _ = initial.await;
+                            initial.cancel_and_wait().await;
                             Err(Error::Timeout)
                         }
                     };
@@ -446,8 +616,11 @@ impl Engine {
                     }) {
                         Ok(initial) => initial,
                         Err(error) => {
-                            let _ = ready.send(Err(error));
-                            return;
+                            let capture = state_shared.disposal.capture();
+                            drop(provider);
+                            let error = capture.finish().wait().await.err().unwrap_or(error);
+                            let _ = ready.send(Err(error.clone()));
+                            return Err(error);
                         }
                     };
                     let mut owner = Owner::new(
@@ -463,21 +636,47 @@ impl Engine {
                         state_native_control,
                     );
                     owner.publish();
-                    if ready.send(Ok(())).is_ok() {
+                    let outcome = if ready.send(Ok(())).is_ok() {
                         owner
                             .run(incoming, command_rx, write_rx, ack_rx, stop_rx)
-                            .await;
-                    }
+                            .await
+                    } else {
+                        owner.dispose_provider_resources().await
+                    };
                     state_replication.shutdown();
                     state_copy.shutdown();
+                    outcome
                 });
+                drop(runtime);
+                done.1 = outcome;
             })?;
         if let Err(error) = readiness.recv().unwrap_or(Err(Error::Closed)) {
-            let _ = thread.join();
-            transport.shutdown();
+            if native_runtime.is_some() {
+                let mut terminal = terminal;
+                let record = terminal.begin()?;
+                let receipt = record.run(move || {
+                    let disposed = done_rx.recv().unwrap_or(Err(Error::Closed));
+                    let joined = thread
+                        .join()
+                        .map_err(|_| Error::Protocol("constructor owner panicked"));
+                    let peers = transport.shutdown_checked();
+                    disposed.and(joined).and(peers)
+                });
+                if receipt.wait_blocking().is_err() {
+                    execution.retire();
+                }
+            } else {
+                // Standalone's existing synchronous constructor is called on a
+                // caller-owned blocking entry; it is not an SDK async bridge.
+                let joined = thread.join();
+                let peers = transport.shutdown_checked();
+                if joined.is_err() || peers.is_err() {
+                    execution.retire();
+                }
+            }
             return Err(error);
         }
-        Ok(Arc::new(Self {
+        let engine = Arc::new(Self {
             endpoint,
             settings,
             commands,
@@ -488,10 +687,58 @@ impl Engine {
             copy,
             thread: Mutex::new(Some(thread)),
             transport,
+            #[cfg(test)]
             native_control,
-        }))
+            terminal: Mutex::new(Some(terminal)),
+            owner_done: Mutex::new(Some(done_rx)),
+            disposal_done: Mutex::new(None),
+            native_runtime,
+            native_binder: Mutex::new(None),
+            native_progress: Mutex::new(None),
+            #[cfg(test)]
+            native_root_dispatch: AtomicBool::new(false),
+            #[cfg(test)]
+            native_build_pause: Mutex::new(None),
+            #[cfg(test)]
+            scalar_progress_reads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            native_remove_pause: Mutex::new(None),
+            owns_execution,
+        });
+        if let Some(native) = &engine.native_runtime {
+            let binder: Arc<dyn NativeControlBinding> =
+                Arc::new(binding::NativeBinder(Arc::downgrade(&engine)));
+            if let Err(error) = native.install_binding(actor.incarnation, &binder) {
+                if engine
+                    .shutdown_owned()
+                    .and_then(|receipt| receipt.wait_blocking())
+                    .is_err()
+                {
+                    execution.retire();
+                }
+                return Err(error);
+            }
+            *engine.native_binder.lock().unwrap() = Some(binder);
+            let source: Arc<dyn fube_runtime::extensions::NativeProgressSource> =
+                Arc::new(binding::NativeProgress(Arc::downgrade(&engine)));
+            if let Err(error) = native.install_progress_source(&source) {
+                if engine
+                    .shutdown_owned()
+                    .and_then(|receipt| receipt.wait_blocking())
+                    .is_err()
+                {
+                    execution.retire();
+                }
+                return Err(error);
+            }
+            *engine.native_progress.lock().unwrap() = Some(source);
+        }
+        provider_publication.accept()?;
+        construction_guard.committed = true;
+        Ok(engine)
     }
 
+    #[cfg(test)]
     fn native_prewrite(&self) -> Result<Option<NativePreWrite>> {
         // Capture the runtime-owned view before entering the owner queue and
         // without holding engine locks (the runtime has its own status lock).
@@ -506,6 +753,11 @@ impl Engine {
     pub fn endpoint(&self) -> Endpoint {
         self.endpoint.clone()
     }
+    /// Explicit non-SDK execution capability for scheduling a canonical
+    /// synchronous control from application-owned async code.
+    pub fn execution_runtime(&self) -> ExecutionRuntime {
+        self.shared.execution.clone()
+    }
 
     /// Bounded transport observations for the qualification fixture, not authority.
     #[cfg(feature = "qualification")]
@@ -515,6 +767,9 @@ impl Engine {
 
     pub fn replication_stream(&self) -> Arc<OperationStream> {
         self.replication.clone()
+    }
+    pub(crate) fn ensure_open(&self) -> Result<()> {
+        self.check()
     }
 
     pub fn copy_stream(&self) -> Arc<OperationStream> {
@@ -599,12 +854,17 @@ impl Engine {
         Box::pin(async move {
             self.check()?;
             if expected_epoch.is_some_and(|epoch| {
-                epoch.data_loss < 0 || epoch.configuration < 0 || epoch != epoch.primary()
+                epoch.data_loss_number < 0
+                    || epoch.configuration_number < 0
+                    || epoch != epoch.primary()
             }) {
                 return Err(Error::InvalidInput("invalid admission epoch"));
             }
             if cancellation.is_cancelled() {
-                return Err(Error::Closed);
+                return Err(Error::new(
+                    fube_runtime::ErrorKind::Canceled,
+                    "replication canceled before admission",
+                ));
             }
             if data.bytes() > self.settings.operation_bytes
                 || data.segments().len() > self.settings.operation_segments
@@ -645,7 +905,7 @@ impl Engine {
                         data,
                         charge,
                         cancellation,
-                        reply,
+                        reply: reply.into(),
                     })
                     .map_err(|error| match error {
                         mpsc::error::TrySendError::Full(_) => {
@@ -668,22 +928,61 @@ impl Engine {
         }
     }
 
-    async fn request<T>(
+    async fn request<T: Send + 'static>(
         &self,
-        make: impl FnOnce(oneshot::Sender<Result<T>>) -> Command,
+        make: impl FnOnce(Reply<T>) -> Command,
+    ) -> Result<T> {
+        self.request_authorized(None, make).await
+    }
+    async fn request_authorized<T: Send + 'static>(
+        &self,
+        proof: Option<NativeInvocation>,
+        make: impl FnOnce(Reply<T>) -> Command,
     ) -> Result<T> {
         self.check()?;
+        ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
+        if let Some(proof) = &proof {
+            proof.validate()?;
+        }
         let (reply, result) = oneshot::channel();
-        let command = make(reply);
+        let cleanup = self.shared.execution.command_cleanup().map(Arc::new);
+        let mut command = make(Reply {
+            sender: ReplySender::Async(reply),
+            cleanup: cleanup.clone(),
+            disposal: self.shared.disposal.clone(),
+        });
+        let execution = match &mut command {
+            Command::Epoch { execution, .. } | Command::Loss(_, _, execution) => Some(execution),
+            _ => None,
+        };
+        if let Some(execution) = execution {
+            *execution = Some(self.shared.execution.reserve(
+                CallLane::Provider,
+                CallOrigin {
+                    engine: self.shared.engine_id,
+                    session: 0,
+                    generation: self.shared.generation,
+                },
+                self.settings.callback_timeout,
+                false,
+            )?);
+        }
         #[cfg(feature = "qualification")]
         let kind = std::mem::discriminant(&command);
         self.commands
-            .try_send(command)
+            .try_send(AuthorizedCommand {
+                command,
+                proof: proof.clone(),
+                cleanup,
+            })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => Error::ResourceLimit("control admission"),
                 mpsc::error::TrySendError::Closed(_) => Error::Closed,
             })?;
         let result = result.await.map_err(|_| Error::Closed)?;
+        if let Some(proof) = &proof {
+            proof.validate().map_err(Error::uncertain)?;
+        }
         #[cfg(feature = "qualification")]
         if let Err(error) = &result {
             eprintln!("FUBE_CONTROL_ERROR {kind:?}: {error}");
@@ -691,7 +990,77 @@ impl Engine {
         result
     }
 
-    fn shutdown(&self) {
+    fn request_blocking<T: Send + 'static>(
+        &self,
+        proof: Option<NativeInvocation>,
+        make: impl FnOnce(Reply<T>) -> Command,
+    ) -> Result<T> {
+        let deadline = self
+            .shared
+            .execution
+            .blocking_deadline()?
+            .min(std::time::Instant::now() + self.settings.callback_timeout);
+        ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
+        self.check()?;
+        if let Some(proof) = &proof {
+            proof.validate()?;
+        }
+        let (sender, receiver) = std_mpsc::sync_channel(1);
+        let closed = Arc::new(AtomicBool::new(false));
+        let cleanup = self.shared.execution.command_cleanup().map(Arc::new);
+        let command = make(Reply {
+            sender: ReplySender::Sync(sender, closed.clone()),
+            cleanup: cleanup.clone(),
+            disposal: self.shared.disposal.clone(),
+        });
+        self.commands
+            .try_send(AuthorizedCommand {
+                command,
+                proof: proof.clone(),
+                cleanup,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => Error::ResourceLimit("control admission"),
+                mpsc::error::TrySendError::Closed(_) => Error::Closed,
+            })?;
+        let result =
+            receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+        closed.store(true, Ordering::Release);
+        let result = result.map_err(|error| match error {
+            std_mpsc::RecvTimeoutError::Timeout => Error::Timeout.uncertain(),
+            std_mpsc::RecvTimeoutError::Disconnected => Error::Closed.uncertain(),
+        })?;
+        if let Some(proof) = &proof {
+            proof.validate().map_err(Error::uncertain)?;
+        }
+        result.map_err(|error| {
+            if error.kind() == fube_runtime::ErrorKind::Timeout {
+                error.uncertain()
+            } else {
+                error
+            }
+        })
+    }
+
+    fn shutdown(&self) -> Result<DisposalReceipt> {
+        ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
+        self.shutdown_owned()
+    }
+
+    fn shutdown_owned(&self) -> Result<DisposalReceipt> {
+        let mut disposed = self.disposal_done.lock().unwrap();
+        if let Some(disposed) = &*disposed {
+            return Ok(disposed.clone());
+        }
+        let mut terminal = self.terminal.lock().unwrap();
+        let record = terminal.as_mut().unwrap().begin()?;
+        {
+            let mut cleanup = self.shared.shutdown_cleanup.lock().unwrap();
+            if !cleanup.0 {
+                cleanup.1 =
+                    Some(record.cleanup_after_callbacks(std::time::Duration::from_millis(250))?);
+            }
+        }
         let admission = self
             .shared
             .admission
@@ -703,21 +1072,201 @@ impl Engine {
         drop(admission);
         self.replication.shutdown();
         self.copy.shutdown();
-        let mut thread = self.thread.lock().unwrap();
-        if let Some(thread) = thread.take() {
-            let _ = thread.join();
-        }
-        self.transport.shutdown();
+        let thread = self.thread.lock().unwrap().take().unwrap();
+        let done = self.owner_done.lock().unwrap().take().unwrap();
+        let transport = self.transport.clone();
+        let receipt = record.run(move || {
+            // Owner signals only after roots/resources and its reactor are
+            // disposed. No join occupies a cleanup worker needed by that owner.
+            let outcome = done.recv().unwrap_or(Err(Error::Closed));
+            let joined = thread
+                .join()
+                .map_err(|_| Error::Protocol("engine owner panicked"));
+            let peers = transport.shutdown_checked();
+            outcome.and(joined).and(peers)
+        });
+        *disposed = Some(receipt.clone());
+        Ok(receipt)
     }
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        self.shutdown();
+        if self.disposal_done.get_mut().unwrap().is_some() {
+            return;
+        }
+        let reentrant = ExecutionRuntime::reject_engine_reentry(self.shared.engine_id).is_err();
+        if !reentrant && self.shutdown_owned().is_ok() {
+            return;
+        }
+        self.shared.execution.retire();
+        if let (Some(terminal), Some(thread), Some(done)) = (
+            self.terminal.get_mut().unwrap().take(),
+            self.thread.get_mut().unwrap().take(),
+            self.owner_done.get_mut().unwrap().take(),
+        ) {
+            let transport = self.transport.clone();
+            terminal.fence(move || {
+                let outcome = done.recv().unwrap_or(Err(Error::Closed));
+                let joined = thread
+                    .join()
+                    .map_err(|_| Error::Protocol("engine owner panicked"));
+                let peers = transport.shutdown_checked();
+                outcome.and(joined).and(peers)
+            });
+        }
     }
 }
 
-type Reply<T> = oneshot::Sender<Result<T>>;
+thread_local! {
+    // Completion routing only, never native invocation/binding authority.
+    static REPLIES: std::cell::RefCell<Option<Vec<DeferredReply>>> = const { std::cell::RefCell::new(None) };
+}
+struct DeferredReply {
+    ready: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
+    send: Option<Box<dyn FnOnce(Result<()>) + Send>>,
+}
+impl DeferredReply {
+    async fn finish(mut self) {
+        let outcome = self.ready.as_mut().await;
+        self.send.take().unwrap()(outcome);
+    }
+}
+struct ReplyFlush;
+fn defer_reply(send: Box<dyn FnOnce() + Send>) {
+    defer_disposed_reply(DisposalBatch::default(), Box::new(move |_| send()));
+}
+fn defer_disposed_reply(disposal: DisposalBatch, send: Box<dyn FnOnce(Result<()>) + Send>) {
+    let immediate = REPLIES.with(|replies| {
+        let mut replies = replies.borrow_mut();
+        if let Some(replies) = replies.as_mut() {
+            replies.push(DeferredReply {
+                ready: Box::pin(async move { disposal.wait().await }),
+                send: Some(send),
+            });
+            None
+        } else {
+            Some((disposal, send))
+        }
+    });
+    if let Some((disposal, send)) = immediate {
+        assert!(
+            disposal.is_complete(),
+            "owner teardown retained an unobserved disposal receipt"
+        );
+        send(disposal.result());
+    }
+}
+fn complete_replication(sender: &watch::Sender<Option<Result<i64>>>, result: Result<i64>) {
+    let sender = sender.clone();
+    defer_reply(Box::new(move || {
+        sender.send_replace(Some(result));
+    }));
+}
+impl ReplyFlush {
+    fn new() -> Self {
+        REPLIES.with(|replies| {
+            assert!(replies.borrow().is_none());
+            *replies.borrow_mut() = Some(Vec::new());
+        });
+        Self
+    }
+    fn take(&self) -> Vec<DeferredReply> {
+        REPLIES
+            .with(|replies| replies.borrow_mut().take())
+            .unwrap_or_default()
+    }
+}
+impl Drop for ReplyFlush {
+    fn drop(&mut self) {
+        let replies = self.take();
+        if !replies.is_empty() {
+            // Only a terminal owner panic can bypass the normal outside-lock
+            // handoff. Retain the operation's context rather than inline-drop.
+            let retained = Arc::new(FencedReplies {
+                _replies: Mutex::new(replies),
+                keep: Mutex::new(None),
+            });
+            *retained.keep.lock().unwrap() = Some(retained.clone());
+        }
+    }
+}
+struct FencedReplies {
+    _replies: Mutex<Vec<DeferredReply>>,
+    keep: Mutex<Option<Arc<FencedReplies>>>,
+}
+struct Reply<T> {
+    sender: ReplySender<T>,
+    cleanup: Option<Arc<CommandCleanup>>,
+    disposal: DisposalTracker,
+}
+enum ReplySender<T> {
+    Async(oneshot::Sender<Result<T>>),
+    Sync(std_mpsc::SyncSender<Result<T>>, Arc<AtomicBool>),
+}
+impl<T> ReplySender<T> {
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Async(sender) => sender.is_closed(),
+            Self::Sync(_, closed) => closed.load(Ordering::Acquire),
+        }
+    }
+    fn send(self, value: Result<T>) {
+        match self {
+            Self::Async(sender) => {
+                let _ = sender.send(value);
+            }
+            Self::Sync(sender, _) => {
+                let _ = sender.send(value);
+            }
+        }
+    }
+}
+impl<T: Send + 'static> Reply<T> {
+    fn send(self, value: Result<T>) -> std::result::Result<(), Result<T>> {
+        if self.sender.is_closed() {
+            return Err(value);
+        }
+        let disposal = self.disposal.current_batch();
+        let send = Box::new(move |disposed: Result<()>| {
+            self.sender.send(disposed.and(value));
+            drop(self.cleanup);
+        });
+        defer_disposed_reply(disposal, send);
+        Ok(())
+    }
+    fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+}
+impl<T> From<oneshot::Sender<Result<T>>> for Reply<T> {
+    fn from(sender: oneshot::Sender<Result<T>>) -> Self {
+        Self {
+            sender: ReplySender::Async(sender),
+            cleanup: None,
+            disposal: DisposalTracker::default(),
+        }
+    }
+}
+
+fn provider_call<T: Send + 'static>(
+    permit: OwnedCallPermit,
+    starts: &mut Vec<oneshot::Sender<()>>,
+    dispositions: &mut Vec<OwnedDisposition>,
+    future: impl std::future::Future<Output = Result<T>> + Send + 'static,
+) -> OwnedCall<T> {
+    let (start, started) = oneshot::channel();
+    starts.push(start);
+    // Admission and capture transfer are eager. User invocation waits until the
+    // owner has published and released producer admission, as at the baseline.
+    let call = permit.run_future(async move {
+        started.await.map_err(|_| Error::Closed)?;
+        future.await
+    });
+    dispositions.retain(|record| !record.is_finished());
+    dispositions.push(call.disposition());
+    call
+}
 
 fn same_endpoint(left: &Endpoint, right: &Endpoint) -> bool {
     left.actor == right.actor && left.address == right.address
@@ -742,22 +1291,35 @@ enum Command {
         )>,
     },
     Epoch {
+        execution: Option<OwnedCallPermit>,
         epoch: Epoch,
         role: Option<ReplicaRole>,
         cancellation: Cancellation,
         reply: Reply<()>,
     },
-    Loss(Cancellation, Reply<bool>),
+    Loss(Cancellation, Reply<bool>, Option<OwnedCallPermit>),
     Configure {
         current: ReplicaSetConfiguration,
         previous: Option<ReplicaSetConfiguration>,
         native_prewrite: Option<NativePreWrite>,
         cancellation: Cancellation,
         reply: Reply<()>,
+        deadline: Instant,
     },
     CatchUp(CatchUpMode, Cancellation, Reply<()>),
     Build(ReplicaInformation, Cancellation, Reply<()>),
-    Remove(ReplicaInformation, ReplicaRemoval, Cancellation, Reply<()>),
+    Remove(
+        ReplicaInformation,
+        ReplicaRemoval,
+        Cancellation,
+        Reply<()>,
+        Instant,
+    ),
+}
+struct AuthorizedCommand {
+    command: Command,
+    proof: Option<NativeInvocation>,
+    cleanup: Option<Arc<CommandCleanup>>,
 }
 
 #[derive(Clone, Copy)]
@@ -774,11 +1336,12 @@ struct SentCopy {
 }
 
 struct Build {
+    disposal: DisposalBatch,
     epoch: Epoch,
     horizon: i64,
     start_sent: bool,
     established: bool,
-    stream: Option<Arc<dyn OperationDataStream>>,
+    stream: Option<Arc<dyn IOperationDataStream>>,
     job: bool,
     next: i64,
     pending: BTreeMap<i64, SentCopy>,
@@ -841,6 +1404,17 @@ struct Control {
     // A frozen secondary drain can cross original-operation epoch barriers.
     // Run that bounded callback without dropping the pending native control.
     drain_barrier: Option<(Epoch, i64)>,
+    execution: Option<OwnedCallPermit>,
+    disposal: DisposalBatch,
+}
+impl Control {
+    fn cleanup(&self) -> Option<Arc<CommandCleanup>> {
+        match &self.kind {
+            ControlKind::Epoch { reply, .. } => reply.cleanup.clone(),
+            ControlKind::Loss(reply) => reply.cleanup.clone(),
+            ControlKind::Barrier { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -858,15 +1432,21 @@ enum Job {
 enum JobValue {
     Epoch(i64),
     Loss(bool, Option<i64>),
-    CopyOpen(Arc<dyn OperationDataStream>),
+    CopyOpen(
+        Arc<dyn IOperationDataStream>,
+        fube_runtime::extensions::ObjectPublication,
+    ),
     CopyNext(Option<OperationData>, Charge),
     Replay(Option<ReplayOperation>, Charge),
 }
 
+type ReadyReply = (Box<dyn FnOnce(Result<()>) + Send>, Result<()>);
 enum Event {
+    Replies(Vec<ReadyReply>),
+    Cleanup,
     Deadline,
     Ack(ApplyAck),
-    Command(Command),
+    Command(AuthorizedCommand),
     Job(Option<std::result::Result<(Job, Result<JobValue>), tokio::task::JoinError>>),
     Packet(Packet),
     Write(Submit),
@@ -884,12 +1464,22 @@ struct Removal {
     reason: ReplicaRemoval,
     cancellation: Cancellation,
     reply: Reply<()>,
+    disposal: DisposalBatch,
+    result: Option<Result<()>>,
+    deadline: Instant,
+}
+struct ConfigurationReceipt {
+    reply: Reply<()>,
+    disposal: DisposalBatch,
+    cancellation: Cancellation,
+    deadline: Instant,
+    result: Result<()>,
 }
 
 struct Owner {
     endpoint: Endpoint,
     transport: PeerTransport,
-    provider: Arc<dyn StateProvider>,
+    provider: Option<Arc<crate::supervised::OwnedProvider>>,
     settings: Settings,
     shared: Arc<Shared>,
     queue: OperationQueue,
@@ -915,6 +1505,7 @@ struct Owner {
     control: Option<Control>,
     catchups: Vec<CatchUp>,
     removals: Vec<Removal>,
+    configurations: Vec<ConfigurationReceipt>,
     jobs: JoinSet<(Job, Result<JobValue>)>,
     replay_job: bool,
     replay_next: Instant,
@@ -924,6 +1515,9 @@ struct Owner {
     copy_tx: Option<mpsc::Sender<Operation>>,
     fault: Option<Error>,
     native_control: Option<Arc<dyn NativeControlView>>,
+    starts: Vec<oneshot::Sender<()>>,
+    dispositions: Vec<OwnedDisposition>,
+    replies: Vec<DeferredReply>,
 }
 
 impl Drop for Owner {
@@ -944,7 +1538,7 @@ impl Owner {
     fn new(
         endpoint: Endpoint,
         transport: PeerTransport,
-        provider: Arc<dyn StateProvider>,
+        provider: Arc<crate::supervised::OwnedProvider>,
         settings: Settings,
         shared: Arc<Shared>,
         queue: OperationQueue,
@@ -957,7 +1551,7 @@ impl Owner {
         Self {
             endpoint,
             transport,
-            provider,
+            provider: Some(provider),
             settings,
             shared,
             queue,
@@ -983,6 +1577,7 @@ impl Owner {
             control: None,
             catchups: Vec::new(),
             removals: Vec::new(),
+            configurations: Vec::new(),
             jobs: JoinSet::new(),
             replay_job: false,
             replay_next: Instant::now(),
@@ -992,17 +1587,20 @@ impl Owner {
             copy_tx: Some(copy_tx),
             fault: None,
             native_control,
+            starts: Vec::new(),
+            dispositions: Vec::new(),
+            replies: Vec::new(),
         }
     }
 
     async fn run(
         &mut self,
         mut incoming: Incoming,
-        mut commands: mpsc::Receiver<Command>,
+        mut commands: mpsc::Receiver<AuthorizedCommand>,
         mut writes: mpsc::Receiver<Submit>,
         mut acks: mpsc::Receiver<ApplyAck>,
         mut stop: watch::Receiver<bool>,
-    ) {
+    ) -> Result<()> {
         let mut retry = interval(self.settings.retry);
         retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
@@ -1028,6 +1626,23 @@ impl Owner {
             let event = tokio::select! {
                 biased;
                 _ = stop.changed() => break,
+                replies = std::future::poll_fn(|cx| {
+                    let mut ready = Vec::new();
+                    let mut index = 0;
+                    while index < self.replies.len() {
+                        match self.replies[index].ready.as_mut().poll(cx) {
+                            std::task::Poll::Ready(result) => {
+                                let mut reply = self.replies.swap_remove(index);
+                                ready.push((reply.send.take().unwrap(), result));
+                            }
+                            std::task::Poll::Pending => index += 1,
+                        }
+                    }
+                    if ready.is_empty() { std::task::Poll::Pending } else { std::task::Poll::Ready(ready) }
+                }), if !self.replies.is_empty() => Event::Replies(replies),
+                _ = self.shared.disposal.changed(),
+                    if !self.removals.is_empty() || !self.configurations.is_empty() ||
+                        self.control.as_ref().is_some_and(|control| !control.disposal.is_complete()) => Event::Cleanup,
                 _ = async {
                     if let Some(deadline) = deadline { tokio::time::sleep_until(deadline).await; }
                     else { std::future::pending::<()>().await; }
@@ -1044,14 +1659,23 @@ impl Owner {
                 Some(write) = writes.recv() => Event::Write(write),
                 _ = retry.tick() => Event::Retry,
             };
+            if let Event::Replies(replies) = event {
+                for (send, outcome) in replies {
+                    send(outcome);
+                }
+                continue;
+            }
             // Stop/Abort and successful publication have one linearization
             // boundary. No provider future is constructed or polled under it.
             let shared = self.shared.clone();
+            let replies = ReplyFlush::new();
             let _admission = shared.admission.lock().unwrap();
             if shared.stopped.load(Ordering::Acquire) {
                 break;
             }
             match event {
+                Event::Replies(_) => unreachable!(),
+                Event::Cleanup => {}
                 Event::Deadline => {}
                 Event::Ack(ack) => {
                     if let Err(error) = self.apply_ack(ack) {
@@ -1075,6 +1699,12 @@ impl Owner {
             }
             self.publish();
             drop(_admission);
+            self.replies.extend(replies.take());
+            for start in self.starts.drain(..) {
+                if self.fault.is_none() {
+                    let _ = start.send(());
+                }
+            }
             if self.replay_rearm_pending {
                 // Start cooldown only after payload/charge disposal, fanout,
                 // publication, AND the producer admission mutex are released.
@@ -1108,13 +1738,23 @@ impl Owner {
                 build.cancellation.cancel();
             }
         }
+        self.starts.clear();
+        for record in &self.dispositions {
+            record.cancel();
+        }
         self.jobs.abort_all();
         while self.jobs.join_next().await.is_some() {}
+        for record in self.dispositions.drain(..) {
+            record.wait().await;
+        }
+        for reply in self.replies.drain(..) {
+            reply.finish().await;
+        }
         self.replication_tx.take();
         self.copy_tx.take();
         let error = self.fault.clone().unwrap_or(Error::Closed);
         for (_, sender) in std::mem::take(&mut self.completions) {
-            sender.send_replace(Some(Err(error.clone())));
+            complete_replication(&sender, Err(error.clone()));
         }
         if let Some(control) = self.control.take() {
             match control.kind {
@@ -1131,10 +1771,15 @@ impl Owner {
             let _ = waiter.reply.send(Err(error.clone()));
         }
         for waiter in self.removals.drain(..) {
+            waiter.disposal.wait().await?;
             let _ = waiter.reply.send(Err(error.clone()));
         }
+        for configuration in self.configurations.drain(..) {
+            configuration.disposal.wait().await?;
+            let _ = configuration.reply.send(Err(error.clone()));
+        }
         for peer in self.peers.values_mut() {
-            if let Some(mut build) = peer.build.take() {
+            if let Some(build) = peer.build.as_mut() {
                 if let Some(reply) = build.reply.take() {
                     let _ = reply.send(Err(error.clone()));
                 }
@@ -1151,8 +1796,38 @@ impl Owner {
         self.queue
             .reset(self.queue.progress().applied)
             .expect("an applied boundary is an initialized LSN");
-        self.transport.shutdown();
+        self.dispose_provider_resources().await?;
+        self.transport.request_stop();
         self.publish();
+        Ok(())
+    }
+
+    async fn dispose_provider_resources(&mut self) -> Result<()> {
+        let resources = (self.provider.take(), std::mem::take(&mut self.peers));
+        let cleanup = {
+            let mut cleanup = self.shared.shutdown_cleanup.lock().unwrap();
+            cleanup.0 = true;
+            cleanup.1.take()
+        };
+        let receipt = if let Some(cleanup) = cleanup {
+            cleanup.dispose(resources)
+        } else {
+            match self
+                .shared
+                .execution
+                .reserve_cleanup(std::time::Duration::from_millis(250))
+            {
+                Ok(permit) => permit.dispose(resources),
+                Err(error) => {
+                    self.shared.execution.retire();
+                    // Every actual user resource is already managed and
+                    // retains its reserved release entry on full64 overload.
+                    drop(resources);
+                    return Err(error);
+                }
+            }
+        };
+        receipt.wait().await
     }
 
     fn fail(&mut self, error: Error) {
@@ -1257,13 +1932,31 @@ impl Owner {
 
     fn submit(&mut self, write: Submit) {
         if write.cancellation.is_cancelled() {
-            let _ = write.reply.send(Err(Error::Closed));
+            let _ = write.reply.send(Err(Error::new(
+                fube_runtime::ErrorKind::Canceled,
+                "replication canceled before sequence assignment",
+            )));
             return;
         }
         if !self.ready() {
+            let kind = if self.role != ReplicaRole::Primary {
+                fube_runtime::ErrorKind::NotPrimary
+            } else if self.fault.is_some() || self.shared.stopped.load(Ordering::Acquire) {
+                fube_runtime::ErrorKind::ObjectClosed
+            } else if !self.reconciled
+                || !self.copy_done
+                || self.control.is_some()
+                || self.current.as_ref().is_none_or(|c| {
+                    !c.local_member || c.write_quorum == 0 || Some(c.epoch.primary()) != self.epoch
+                })
+            {
+                fube_runtime::ErrorKind::ReconfigurationPending
+            } else {
+                fube_runtime::ErrorKind::NoWriteQuorum
+            };
             let _ = write
                 .reply
-                .send(Err(Error::InvalidInput("primary is not write ready")));
+                .send(Err(Error::new(kind, "primary is not write ready")));
             return;
         }
         if write
@@ -1298,7 +1991,13 @@ impl Owner {
 }
 
 impl Owner {
-    fn command(&mut self, command: Command) {
+    fn command(&mut self, envelope: AuthorizedCommand) {
+        let AuthorizedCommand {
+            command,
+            proof,
+            cleanup,
+        } = envelope;
+        let _enrollment = cleanup.as_ref().map(|cleanup| cleanup.enter());
         match command {
             #[cfg(feature = "qualification")]
             Command::Probe {
@@ -1313,6 +2012,7 @@ impl Owner {
                 let _ = reply.send(result);
             }
             Command::Epoch {
+                execution,
                 epoch,
                 role,
                 cancellation,
@@ -1326,8 +2026,8 @@ impl Owner {
                     let _ = reply.send(Err(Error::ResourceLimit("provider control callback")));
                     return;
                 }
-                if epoch.data_loss < 0
-                    || epoch.configuration < 0
+                if epoch.data_loss_number < 0
+                    || epoch.configuration_number < 0
                     || self
                         .epoch
                         .is_some_and(|old| epoch.primary() < old.primary())
@@ -1398,9 +2098,11 @@ impl Owner {
                     running: false,
                     started: Instant::now(),
                     drain_barrier: None,
+                    execution,
+                    disposal: DisposalBatch::default(),
                 });
             }
-            Command::Loss(cancellation, reply) => {
+            Command::Loss(cancellation, reply, execution) => {
                 if cancellation.is_cancelled() {
                     let _ = reply.send(Err(Error::Closed));
                 } else if self.role != ReplicaRole::Primary || self.control.is_some() {
@@ -1415,6 +2117,8 @@ impl Owner {
                         running: false,
                         started: Instant::now(),
                         drain_barrier: None,
+                        execution,
+                        disposal: DisposalBatch::default(),
                     });
                 }
             }
@@ -1424,13 +2128,31 @@ impl Owner {
                 native_prewrite,
                 cancellation,
                 reply,
+                deadline,
             } => {
-                let result = if cancellation.is_cancelled() {
-                    Err(Error::Closed)
+                let capture = self.shared.disposal.capture();
+                let result =
+                    if let Some(error) = proof.as_ref().and_then(|proof| proof.validate().err()) {
+                        Err(error)
+                    } else if cancellation.is_cancelled() {
+                        Err(Error::Closed)
+                    } else if self.configurations.len() >= self.settings.control_messages {
+                        Err(Error::ResourceLimit("configuration disposal receipts"))
+                    } else {
+                        self.configure(current, previous, native_prewrite)
+                    };
+                let disposal = capture.finish();
+                if !disposal.is_complete() {
+                    self.configurations.push(ConfigurationReceipt {
+                        reply,
+                        disposal,
+                        cancellation,
+                        deadline,
+                        result,
+                    });
                 } else {
-                    self.configure(current, previous, native_prewrite)
-                };
-                let _ = reply.send(result);
+                    let _ = reply.send(result.and(disposal.result()));
+                }
             }
             Command::CatchUp(mode, cancellation, reply) => {
                 if self.role != ReplicaRole::Primary || self.current.is_none() {
@@ -1448,27 +2170,49 @@ impl Owner {
                 }
             }
             Command::Build(replica, cancellation, reply) => {
-                self.build(replica, cancellation, reply);
-            }
-            Command::Remove(replica, reason, cancellation, reply) => {
-                let result = if cancellation.is_cancelled() {
-                    Err(Error::Closed)
+                if let Some(error) = proof.as_ref().and_then(|proof| proof.validate().err()) {
+                    let _ = reply.send(Err(error));
                 } else {
-                    self.remove(replica.clone(), reason)
-                };
+                    self.build(replica, cancellation, reply);
+                }
+            }
+            Command::Remove(replica, reason, cancellation, reply, deadline) => {
+                let capture = self.shared.disposal.capture();
+                let result =
+                    if let Some(error) = proof.as_ref().and_then(|proof| proof.validate().err()) {
+                        Err(error)
+                    } else if cancellation.is_cancelled() {
+                        Err(Error::Closed)
+                    } else if self.removals.len() >= self.settings.control_messages {
+                        Err(Error::ResourceLimit("removal disposal receipts"))
+                    } else {
+                        self.remove(replica.clone(), reason)
+                    };
+                let disposal = capture.finish();
                 if matches!(
                     result,
                     Err(Error::ResourceLimit("enumeration disposal still pending"))
-                ) && self.removals.len() < self.settings.control_messages
+                ) || !disposal.is_complete()
                 {
+                    let result = if matches!(
+                        result,
+                        Err(Error::ResourceLimit("enumeration disposal still pending"))
+                    ) {
+                        None
+                    } else {
+                        Some(result)
+                    };
                     self.removals.push(Removal {
                         replica,
                         reason,
                         cancellation,
                         reply,
+                        disposal,
+                        result,
+                        deadline,
                     });
                 } else {
-                    let _ = reply.send(result);
+                    let _ = reply.send(result.and(disposal.result()));
                 }
             }
         }
@@ -1496,7 +2240,7 @@ impl Owner {
                         && target.is_none_or(|id| peer.endpoint.actor.replica == id)
                 })
                 .map(|peer| peer.endpoint.clone())
-        } else if self.role == ReplicaRole::Secondary {
+        } else if self.role == ReplicaRole::ActiveSecondary {
             self.secondary
                 .as_ref()
                 .map(|copy| copy.primary.clone())
@@ -1519,14 +2263,14 @@ impl Owner {
         let mut sent_epoch = epoch;
         let body = match kind {
             "stale_epoch" if primary => {
-                sent_epoch = if epoch.configuration >= 0x1_0000_0000 {
+                sent_epoch = if epoch.configuration_number >= 0x1_0000_0000 {
                     Epoch {
-                        configuration: epoch.configuration - 0x1_0000_0000,
+                        configuration_number: epoch.configuration_number - 0x1_0000_0000,
                         ..epoch
                     }
-                } else if epoch.data_loss > 0 {
+                } else if epoch.data_loss_number > 0 {
                     Epoch {
-                        data_loss: epoch.data_loss - 1,
+                        data_loss_number: epoch.data_loss_number - 1,
                         ..epoch
                     }
                 } else {
@@ -1595,8 +2339,8 @@ impl Owner {
             serde_json::json!({"qualification_only":true,"kind":kind,
                 "from":from.to_string(),"target":destination.to_string(),"admission_only":false,
                 "native_selected_peer":peer.to_string(),"sequence":sequence,
-                "native_epoch":{"data_loss":epoch.data_loss,"configuration":epoch.configuration},
-                "sent_epoch":{"data_loss":sent_epoch.data_loss,"configuration":sent_epoch.configuration}}),
+                "native_epoch":{"data_loss_number":epoch.data_loss_number,"configuration_number":epoch.configuration_number},
+                "sent_epoch":{"data_loss_number":sent_epoch.data_loss_number,"configuration_number":sent_epoch.configuration_number}}),
             completion,
         ))
     }
@@ -1670,8 +2414,8 @@ impl Owner {
         // installs CC before UpdateEpoch, but only in PreWriteRevoke.
         let prewrite = current_epoch > epoch
             && native_prewrite.is_some_and(|proof| proof.matches(&current, previous.as_ref()));
-        if current.epoch.data_loss < 0
-            || current.epoch.configuration < 0
+        if current.epoch.data_loss_number < 0
+            || current.epoch.configuration_number < 0
             || (current_epoch != epoch && !prewrite)
             || self
                 .current
@@ -1681,10 +2425,12 @@ impl Owner {
             return Err(Error::InvalidInput("configuration epoch"));
         }
         if let Some(pc) = &previous {
-            if pc.epoch.data_loss < 0
-                || pc.epoch.configuration < 0
-                || pc.epoch.primary() > current_epoch
-                || (pc.write_quorum != 0 && pc.epoch.primary() == Epoch::INVALID)
+            let absent = pc.write_quorum == 0 && pc.epoch == Epoch::INVALID;
+            if !absent
+                && (pc.epoch.data_loss_number < 0
+                    || pc.epoch.configuration_number < 0
+                    || pc.epoch.primary() > current_epoch
+                    || (pc.write_quorum != 0 && pc.epoch.primary() == Epoch::INVALID))
             {
                 return Err(Error::InvalidInput("previous configuration epoch"));
             }
@@ -1747,7 +2493,11 @@ impl Owner {
         // reject this configuration until the tracked job has actually joined.
         for id in &retiring {
             let peer = self.peers.get_mut(id).unwrap();
-            if let Some(build) = peer.build.as_mut().filter(|build| build.job) {
+            if let Some(build) = peer
+                .build
+                .as_mut()
+                .filter(|build| build.job || !build.disposal.is_complete())
+            {
                 build.cancellation.cancel();
                 peer.cleanup_required = true;
                 return Err(Error::ResourceLimit(
@@ -1981,6 +2731,7 @@ impl Owner {
         peer.copy_applied = 0;
         peer.maximum_copy_sent = 0;
         peer.build = Some(Build {
+            disposal: DisposalBatch::default(),
             epoch: self.epoch.unwrap(),
             horizon,
             start_sent: false,
@@ -2030,7 +2781,7 @@ impl Owner {
             }
             if let Some(build) = peer.build.as_mut() {
                 build.cancellation.cancel();
-                if build.job {
+                if build.job || !build.disposal.is_complete() {
                     peer.cleanup_required = true;
                     return Err(Error::ResourceLimit("enumeration disposal still pending"));
                 }
@@ -2165,6 +2916,9 @@ impl Owner {
     }
 
     fn start_prefix_replay(&mut self) {
+        if !self.provider.as_ref().unwrap().has_replay() {
+            return;
+        }
         let progress = self.queue.progress();
         if self.replay_job || Instant::now() < self.replay_next || !self.prefix_replay_needed() {
             return;
@@ -2177,21 +2931,48 @@ impl Owner {
             self.replay_rearm_pending = true;
             return;
         };
-        let provider = self.provider.clone();
+        let permit = match self.shared.execution.reserve(
+            CallLane::Provider,
+            CallOrigin {
+                engine: self.shared.engine_id,
+                generation: self.shared.generation,
+                session: 0,
+            },
+            self.settings.callback_timeout,
+            false,
+        ) {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.replay_rearm_pending = true;
+                return;
+            }
+        };
+        let provider = self.provider.as_ref().unwrap().clone();
         let sequence = progress.assigned;
         let epoch = self.epoch.unwrap();
         let revision = self.shared.revision.load(Ordering::Acquire);
         let deadline = self.settings.callback_timeout;
         self.replay_job = true;
         self.replay_next = Instant::now() + self.settings.retry;
+        let mut call = provider_call(
+            permit,
+            &mut self.starts,
+            &mut self.dispositions,
+            async move {
+                provider
+                    .replication_checkpoint(sequence, Cancellation::default())
+                    .await
+                    .map(|operation| JobValue::Replay(operation, charge))
+            },
+        );
         self.jobs.spawn(async move {
-            let result = timeout(
-                deadline,
-                provider.replication_checkpoint(sequence, Cancellation::default()),
-            )
-            .await
-            .unwrap_or(Err(Error::Timeout))
-            .map(|operation| JobValue::Replay(operation, charge));
+            let result = match timeout(deadline, &mut call).await {
+                Ok(result) => result,
+                Err(_) => {
+                    call.cancel_and_wait().await;
+                    Err(Error::Timeout)
+                }
+            };
             (
                 Job::Replay {
                     revision,
@@ -2205,7 +2986,10 @@ impl Owner {
 
     fn prefix_replay_needed(&self) -> bool {
         let progress = self.queue.progress();
-        self.role == ReplicaRole::Primary
+        self.provider
+            .as_ref()
+            .is_some_and(|provider| provider.has_replay())
+            && self.role == ReplicaRole::Primary
             && !self.replay_rearm_pending
             && self.control.is_none()
             && self.reconciled
@@ -2285,7 +3069,10 @@ impl Owner {
             } => {
                 if target != self.endpoint.actor.replica
                     || start <= 0
-                    || !matches!(self.role, ReplicaRole::Idle | ReplicaRole::Secondary)
+                    || !matches!(
+                        self.role,
+                        ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+                    )
                     || self.control.is_some()
                     || self.epoch.is_none_or(|minimum| epoch < minimum)
                 {
@@ -2355,7 +3142,7 @@ impl Owner {
                 {
                     return;
                 }
-                if self.role == ReplicaRole::Secondary
+                if self.role == ReplicaRole::ActiveSecondary
                     && self.copy_done
                     && self.secondary.is_none()
                     && self.control.is_none()
@@ -2374,7 +3161,7 @@ impl Owner {
                     });
                     self.copy_tx.take();
                 }
-                if self.role == ReplicaRole::Secondary
+                if self.role == ReplicaRole::ActiveSecondary
                     && self.copy_done
                     && self.control.is_none()
                     && self.epoch == Some(primary_epoch)
@@ -2455,7 +3242,10 @@ impl Owner {
                 // Copy retains StartCopy's epoch even when the same sender
                 // pipelines replication in a newer primary epoch.
                 if target != self.endpoint.actor.replica
-                    || !matches!(self.role, ReplicaRole::Idle | ReplicaRole::Secondary)
+                    || !matches!(
+                        self.role,
+                        ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+                    )
                     || self.epoch.is_none_or(|minimum| epoch < minimum)
                     || self
                         .secondary
@@ -2555,8 +3345,10 @@ impl Owner {
     }
 
     fn valid_primary(&self, from: &Endpoint, epoch: Epoch) -> bool {
-        matches!(self.role, ReplicaRole::Idle | ReplicaRole::Secondary)
-            && self.epoch.is_some_and(|minimum| epoch >= minimum)
+        matches!(
+            self.role,
+            ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+        ) && self.epoch.is_some_and(|minimum| epoch >= minimum)
             && self
                 .secondary
                 .as_ref()
@@ -2765,7 +3557,10 @@ impl Owner {
     }
 
     fn dispatch(&mut self) -> Result<()> {
-        if !matches!(self.role, ReplicaRole::Idle | ReplicaRole::Secondary) {
+        if !matches!(
+            self.role,
+            ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+        ) {
             return Ok(());
         }
         loop {
@@ -2869,6 +3664,8 @@ impl Owner {
                     running: false,
                     started: Instant::now(),
                     drain_barrier: None,
+                    execution: None,
+                    disposal: DisposalBatch::default(),
                 });
                 break;
             }
@@ -2898,7 +3695,7 @@ impl Owner {
 
 impl Owner {
     fn project_native_primary(&mut self) -> Result<()> {
-        if self.role != ReplicaRole::Secondary || !self.copy_done || self.control.is_some() {
+        if self.role != ReplicaRole::ActiveSecondary || !self.copy_done || self.control.is_some() {
             return Ok(());
         }
         let Some(status) = self
@@ -2910,9 +3707,9 @@ impl Owner {
         };
         if status.lifecycle != ReplicaLifecycle::Open
             || !status.replicator_open
-            || status.current_role != ReplicaRole::Secondary
-            || status.replicator_role != ReplicaRole::Secondary
-            || status.service_role != ReplicaRole::Secondary
+            || status.current_role != ReplicaRole::ActiveSecondary
+            || status.replicator_role != ReplicaRole::ActiveSecondary
+            || status.service_role != ReplicaRole::ActiveSecondary
             || Some(status.current_epoch.primary()) != self.epoch
         {
             return Ok(());
@@ -2993,7 +3790,7 @@ impl Owner {
                     && status.service_role == ReplicaRole::Primary
                     && status.replicator_role == ReplicaRole::Primary
                     && status.configuration_stage == ConfigurationStage::Current
-                    && status.catch_up == fube_runtime::CatchUpResult::Completed
+                    && status.catch_up == fube_runtime::extensions::CatchUpResult::Completed
                     && status.minimum_replica_set_size == 1
                     && status.configuration.is_empty()
                     && Some(status.current_epoch.primary()) == self.epoch
@@ -3024,19 +3821,54 @@ impl Owner {
             }
         }
         self.start_control();
+        let mut configurations = Vec::new();
+        for pending in std::mem::take(&mut self.configurations) {
+            if pending.disposal.is_complete() {
+                let result = if pending.cancellation.is_cancelled() {
+                    Err(Error::Closed)
+                } else if Instant::now() >= pending.deadline {
+                    Err(Error::Timeout)
+                } else {
+                    pending.result.and(pending.disposal.result())
+                };
+                let _ = pending.reply.send(result);
+            } else {
+                configurations.push(pending);
+            }
+        }
+        self.configurations = configurations;
         let mut removals = Vec::new();
-        for removal in std::mem::take(&mut self.removals) {
-            let result = self.remove(removal.replica.clone(), removal.reason);
+        for mut removal in std::mem::take(&mut self.removals) {
+            let cleanup = removal.reply.cleanup.clone();
+            let _enrollment = cleanup.as_ref().map(|cleanup| cleanup.enter());
+            if !removal.disposal.is_complete() {
+                removals.push(removal);
+                continue;
+            }
+            let result = match removal.result.take() {
+                Some(result) => result,
+                None => {
+                    let capture = self.shared.disposal.capture();
+                    let result = self.remove(removal.replica.clone(), removal.reason);
+                    removal.disposal.append(capture.finish());
+                    result
+                }
+            };
             if matches!(
                 result,
                 Err(Error::ResourceLimit("enumeration disposal still pending"))
             ) {
                 removals.push(removal);
+            } else if !removal.disposal.is_complete() {
+                removal.result = Some(result);
+                removals.push(removal);
             } else {
                 let result = if removal.cancellation.is_cancelled() {
                     Err(Error::Closed)
+                } else if Instant::now() >= removal.deadline {
+                    Err(Error::Timeout)
                 } else {
-                    result
+                    result.and(removal.disposal.result())
                 };
                 let _ = removal.reply.send(result);
             }
@@ -3108,7 +3940,8 @@ impl Owner {
                     .send(Err(Error::InvalidInput("catch-up role retired")));
             } else if match waiter.mode {
                 CatchUpMode::All => ready_all,
-                CatchUpMode::WriteQuorum => ready_quorum,
+                CatchUpMode::Write => ready_quorum,
+                CatchUpMode::Invalid => false,
             } {
                 let _ = waiter.reply.send(Ok(()));
             } else if !waiter.reply.is_closed() {
@@ -3120,6 +3953,8 @@ impl Owner {
     }
 
     fn start_control(&mut self) {
+        let cleanup = self.control.as_ref().and_then(Control::cleanup);
+        let _enrollment = cleanup.as_ref().map(|cleanup| cleanup.enter());
         let Some(control) = &mut self.control else {
             return;
         };
@@ -3138,13 +3973,14 @@ impl Owner {
         if matches!(&control.kind, ControlKind::Epoch { role, .. } if *role != ReplicaRole::Primary)
             && self.role == ReplicaRole::Primary
         {
-            if self
-                .peers
-                .values()
-                .any(|peer| peer.build.as_ref().is_some_and(|build| build.job))
-            {
+            if self.peers.values().any(|peer| {
+                peer.build
+                    .as_ref()
+                    .is_some_and(|build| build.job || !build.disposal.is_complete())
+            }) {
                 return;
             }
+            let capture = self.shared.disposal.capture();
             for peer in self.peers.values_mut() {
                 if let Some(build) = peer.build.as_mut() {
                     build.stream = None;
@@ -3154,6 +3990,10 @@ impl Owner {
                     }
                 }
             }
+            control.disposal.append(capture.finish());
+        }
+        if !control.disposal.is_complete() {
+            return;
         }
         if self.role != ReplicaRole::Primary && self.queue.progress().applied < boundary {
             return;
@@ -3173,39 +4013,86 @@ impl Owner {
         };
         let admission_only = control.drain_barrier.is_none()
             && matches!(&control.kind, ControlKind::Epoch { role, .. } if *role != ReplicaRole::Primary);
+        let permit = match control.execution.take().map(Ok).unwrap_or_else(|| {
+            self.shared.execution.reserve(
+                CallLane::Provider,
+                CallOrigin {
+                    engine: self.shared.engine_id,
+                    generation: self.shared.generation,
+                    session: 0,
+                },
+                self.settings
+                    .callback_timeout
+                    .saturating_sub(control.started.elapsed()),
+                false,
+            )
+        }) {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
         control.running = true;
-        let provider = self.provider.clone();
+        let provider = self.provider.as_ref().unwrap().clone();
         let cancellation = control.cancellation.clone();
         let deadline = self
             .settings
             .callback_timeout
             .saturating_sub(control.started.elapsed());
-        self.jobs.spawn(async move {
-            let result = timeout(deadline, async {
+        let mut call = provider_call(
+            permit,
+            &mut self.starts,
+            &mut self.dispositions,
+            async move {
                 tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => Err(Error::Closed),
                     result = async {
                         if admission_only {
-                            Ok(JobValue::Epoch(provider.last_committed()?))
+                            Ok(JobValue::Epoch(provider.get_last_committed_sequence_number()?))
                         } else if let Some(epoch) = epoch {
                             provider.update_epoch(epoch, boundary, cancellation.clone()).await?;
-                            Ok(JobValue::Epoch(provider.last_committed()?))
+                            Ok(JobValue::Epoch(provider.get_last_committed_sequence_number()?))
                         } else {
                             let changed = provider.on_data_loss(cancellation.clone()).await?;
-                            let progress = if changed { Some(provider.last_committed()?) } else { None };
+                            let progress = if changed { Some(provider.get_last_committed_sequence_number()?) } else { None };
                             Ok(JobValue::Loss(changed, progress))
                         }
                     } => result,
                 }
-            })
-            .await
-            .unwrap_or(Err(Error::Timeout));
+            },
+        );
+        self.jobs.spawn(async move {
+            let result = match timeout(deadline, &mut call).await {
+                Ok(result) => result,
+                Err(_) => {
+                    call.cancel_and_wait().await;
+                    Err(Error::Timeout)
+                }
+            };
             (Job::Control, result)
         });
     }
 
     fn job_done(&mut self, job: Job, result: Result<JobValue>) {
+        #[cfg(test)]
+        if matches!(job, Job::CopyNext(..)) {
+            if let Some((entered, release)) = self.shared.copy_job_pause.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                release
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+            }
+        }
+        let cleanup = match job {
+            Job::CopyOpen(actor, _) | Job::CopyNext(actor, _) => self
+                .peers
+                .get(&actor.replica)
+                .and_then(|peer| peer.build.as_ref())
+                .and_then(|build| build.reply.as_ref())
+                .and_then(|reply| reply.cleanup.clone()),
+            Job::Control => self.control.as_ref().and_then(Control::cleanup),
+            Job::Replay { .. } => None,
+        };
+        let _enrollment = cleanup.as_ref().map(|cleanup| cleanup.enter());
         match job {
             Job::Replay {
                 revision,
@@ -3226,8 +4113,8 @@ impl Owner {
                 match result {
                     Ok(JobValue::Replay(Some(operation), charge)) => {
                         if operation.epoch > epoch
-                            || operation.epoch.data_loss < 0
-                            || operation.epoch.configuration < 0
+                            || operation.epoch.data_loss_number < 0
+                            || operation.epoch.configuration_number < 0
                             || operation.epoch != operation.epoch.primary()
                             || operation.data.bytes() > self.settings.operation_bytes
                             || operation.data.segments().len() > self.settings.operation_segments
@@ -3296,10 +4183,19 @@ impl Owner {
                 if peer.cleanup_required || build.cancellation.is_cancelled() {
                     // This join is the point at which the callback capture was
                     // actually disposed. Keep the cleanup obligation itself.
+                    let capture = self.shared.disposal.capture();
+                    drop(result);
+                    build.disposal.append(capture.finish());
                     return;
                 }
                 match result {
-                    Ok(JobValue::CopyOpen(stream)) => build.stream = Some(stream),
+                    Ok(JobValue::CopyOpen(stream, publication)) => {
+                        if let Err(error) = publication.accept() {
+                            self.fail(error);
+                            return;
+                        }
+                        build.stream = Some(stream);
+                    }
                     Ok(JobValue::CopyNext(data, mut charge)) => {
                         let last = data.is_none();
                         let data = data.unwrap_or_else(|| OperationData::new(Vec::new()).unwrap());
@@ -3341,6 +4237,9 @@ impl Owner {
     }
 
     fn finish_control(&mut self, result: Result<JobValue>) -> Result<()> {
+        let _capture = self.shared.disposal.capture();
+        let cleanup = self.control.as_ref().and_then(Control::cleanup);
+        let _enrollment = cleanup.as_ref().map(|cleanup| cleanup.enter());
         // Preserve the reply until disposal/terminal cleanup when a callback
         // fails, rather than accidentally dropping it as a successful barrier.
         if self
@@ -3420,7 +4319,7 @@ impl Owner {
                 }
                 if role != ReplicaRole::Primary && self.role == ReplicaRole::Primary {
                     for (_, completion) in std::mem::take(&mut self.completions) {
-                        completion.send_replace(Some(Err(Error::Closed)));
+                        complete_replication(&completion, Err(Error::Closed));
                     }
                     self.current = None;
                     self.previous = None;
@@ -3463,7 +4362,7 @@ impl Owner {
             (ControlKind::Loss(reply), JobValue::Loss(changed, authoritative)) => {
                 if let Some(authoritative) = authoritative {
                     for (_, completion) in std::mem::take(&mut self.completions) {
-                        completion.send_replace(Some(Err(Error::Closed)));
+                        complete_replication(&completion, Err(Error::Closed));
                     }
                     self.shared.revision.fetch_add(1, Ordering::AcqRel);
                     self.queue.reset(authoritative)?;
@@ -3531,7 +4430,7 @@ impl Owner {
             .collect();
         for sequence in completed {
             if let Some(completion) = self.completions.remove(&sequence) {
-                completion.send_replace(Some(Ok(sequence)));
+                complete_replication(&completion, Ok(sequence));
             }
         }
         let mut release = commit
@@ -3569,6 +4468,8 @@ impl Owner {
             let Some(build) = peer.build.as_mut() else {
                 continue;
             };
+            let cleanup = build.reply.as_ref().and_then(|reply| reply.cleanup.clone());
+            let _enrollment = cleanup.as_ref().map(|cleanup| cleanup.enter());
             if build.cancellation.is_cancelled() {
                 peer.cleanup_required = true;
                 if let Some(reply) = build.reply.take() {
@@ -3577,8 +4478,10 @@ impl Owner {
             }
             if peer.cleanup_required {
                 if !build.job {
+                    let capture = self.shared.disposal.capture();
                     build.stream = None;
                     build.pending.clear();
+                    build.disposal.append(capture.finish());
                 }
                 continue;
             }
@@ -3603,6 +4506,20 @@ impl Owner {
             let session = peer.session;
             let deadline = self.settings.callback_timeout;
             let cancellation = build.cancellation.clone();
+            let permit = match self.shared.execution.reserve(
+                CallLane::Provider,
+                CallOrigin {
+                    engine: self.shared.engine_id,
+                    session,
+                    generation: self.shared.generation,
+                },
+                deadline,
+                false,
+            ) {
+                Ok(permit) => permit,
+                Err(Error::ResourceLimit(_)) => continue,
+                Err(error) => return Err(error),
+            };
             if let Some(stream) = &build.stream {
                 // Reserve the largest legal result BEFORE invoking the provider.
                 // One enumeration per copy, and all retained data share budgets.
@@ -3614,26 +4531,39 @@ impl Owner {
                 };
                 let stream = stream.clone();
                 build.job = true;
-                self.jobs.spawn(async move {
-                    let result = timeout(deadline, async {
+                let mut call = provider_call(
+                    permit,
+                    &mut self.starts,
+                    &mut self.dispositions,
+                    async move {
                         tokio::select! {
                             biased;
                             _ = cancellation.cancelled() => Err(Error::Closed),
-                            result = stream.next(cancellation.clone()) => {
+                            result = stream.get_next(cancellation.clone()) => {
                                 result.map(|data| JobValue::CopyNext(data, charge))
                             }
                         }
-                    })
-                    .await
-                    .unwrap_or(Err(Error::Timeout));
+                    },
+                );
+                self.jobs.spawn(async move {
+                    let result = match timeout(deadline, &mut call).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            call.cancel_and_wait().await;
+                            Err(Error::Timeout)
+                        }
+                    };
                     (Job::CopyNext(actor, session), result)
                 });
             } else {
-                let provider = self.provider.clone();
+                let provider = self.provider.as_ref().unwrap().clone();
                 let horizon = build.horizon;
                 build.job = true;
-                self.jobs.spawn(async move {
-                    let result = timeout(deadline, async {
+                let mut call = provider_call(
+                    permit,
+                    &mut self.starts,
+                    &mut self.dispositions,
+                    async move {
                         if cancellation.is_cancelled() {
                             return Err(Error::Closed);
                         }
@@ -3643,16 +4573,25 @@ impl Owner {
                         // callback deadline before consuming provider history.
                         // Never turn this normal scheduling window into a
                         // fabricated lower snapshot or a premature source fault.
-                        while provider.last_committed()? < horizon {
+                        while provider.get_last_committed_sequence_number()? < horizon {
                             tokio::select! {
                                 _ = cancellation.cancelled() => return Err(Error::Closed),
                                 _ = tokio::time::sleep(std::time::Duration::from_millis(2)) => {},
                             }
                         }
-                        provider.copy_state(horizon, None).map(JobValue::CopyOpen)
-                    })
-                    .await
-                    .unwrap_or(Err(Error::Timeout));
+                        provider
+                            .copy_state_constructed(horizon)
+                            .map(|(stream, publication)| JobValue::CopyOpen(stream, publication))
+                    },
+                );
+                self.jobs.spawn(async move {
+                    let result = match timeout(deadline, &mut call).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            call.cancel_and_wait().await;
+                            Err(Error::Timeout)
+                        }
+                    };
                     (Job::CopyOpen(actor, session), result)
                 });
             }
@@ -3663,7 +4602,7 @@ impl Owner {
     }
 }
 
-impl Replicator for Engine {
+impl Engine {
     fn open(&self, cancellation: Cancellation) -> ServiceFuture<'_, String> {
         Box::pin(async move {
             self.check()?;
@@ -3682,6 +4621,7 @@ impl Replicator for Engine {
     ) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
             self.request(|reply| Command::Epoch {
+                execution: None,
                 epoch,
                 role: Some(role),
                 cancellation,
@@ -3694,6 +4634,7 @@ impl Replicator for Engine {
     fn update_epoch(&self, epoch: Epoch, cancellation: Cancellation) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
             self.request(|reply| Command::Epoch {
+                execution: None,
                 epoch,
                 role: None,
                 cancellation,
@@ -3732,46 +4673,28 @@ impl Replicator for Engine {
 
     fn on_data_loss(&self, cancellation: Cancellation) -> ServiceFuture<'_, bool> {
         Box::pin(async move {
-            self.request(|reply| Command::Loss(cancellation, reply))
+            self.request(|reply| Command::Loss(cancellation, reply, None))
                 .await
         })
     }
 
+    #[cfg(test)]
     fn update_catch_up_configuration(
         &self,
         current: ReplicaSetConfiguration,
         previous: ReplicaSetConfiguration,
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, ()> {
-        Box::pin(async move {
-            let native_prewrite = self.native_prewrite()?;
-            self.request(|reply| Command::Configure {
-                current,
-                previous: Some(previous),
-                native_prewrite,
-                cancellation,
-                reply,
-            })
-            .await
-        })
+        self.configure_authorized(current, Some(previous), cancellation, Ok(None))
     }
 
+    #[cfg(test)]
     fn update_current_configuration(
         &self,
         current: ReplicaSetConfiguration,
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, ()> {
-        Box::pin(async move {
-            let native_prewrite = self.native_prewrite()?;
-            self.request(|reply| Command::Configure {
-                current,
-                previous: None,
-                native_prewrite,
-                cancellation,
-                reply,
-            })
-            .await
-        })
+        self.configure_authorized(current, None, cancellation, Ok(None))
     }
 
     fn wait_for_catch_up(
@@ -3785,32 +4708,31 @@ impl Replicator for Engine {
         })
     }
 
+    #[cfg(test)]
     fn build_replica(
         &self,
         replica: ReplicaInformation,
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, ()> {
-        Box::pin(async move {
-            self.request(|reply| Command::Build(replica, cancellation, reply))
-                .await
-        })
+        self.build_authorized(replica, cancellation, Ok(None))
     }
 
+    #[cfg(test)]
     fn remove_replica(
         &self,
         replica: ReplicaInformation,
         reason: ReplicaRemoval,
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, ()> {
-        Box::pin(async move {
-            self.request(|reply| Command::Remove(replica, reason, cancellation, reply))
-                .await
-        })
+        self.remove_authorized(replica, reason, cancellation, Ok(None))
     }
 
     fn close(&self, cancellation: Cancellation) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
-            self.shutdown();
+            self.shutdown()?.wait().await?;
+            if self.owns_execution && !self.shared.execution.is_current_entry() {
+                self.shared.execution.finish_standalone().await?;
+            }
             if cancellation.is_cancelled() {
                 Err(Error::Closed)
             } else {
@@ -3820,6 +4742,26 @@ impl Replicator for Engine {
     }
 
     fn abort(&self) {
-        self.shutdown();
+        if self
+            .disposal_done
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(DisposalReceipt::is_complete)
+        {
+            return;
+        }
+        if !ExecutionRuntime::in_owned_entry() || ExecutionRuntime::is_cleanup_entry() {
+            self.shared.execution.retire();
+            return;
+        }
+        match self.shutdown() {
+            Ok(receipt) => {
+                if receipt.wait_blocking().is_err() {
+                    self.shared.execution.retire();
+                }
+            }
+            Err(_) => self.shared.execution.retire(),
+        }
     }
 }

@@ -46,15 +46,82 @@ fn model_child() {
         }
         let mut runtime = attached.unwrap();
         match mode.as_str() {
+            "core-independent" => {
+                struct Factory;
+                struct Service;
+                impl IStatelessServiceFactory for Factory {
+                    fn create_instance(
+                        &self,
+                        _: String,
+                        _: String,
+                        _: &[u8],
+                        _: uuid::Uuid,
+                        _: i64,
+                    ) -> Result<Box<dyn IStatelessServiceInstance>> {
+                        assert_eq!(std::thread::current().name(), Some("fube-native-call"));
+                        println!("CORE_CONSTRUCTOR_ENTERED");
+                        std::io::stdout().flush().unwrap();
+                        std::thread::sleep(Duration::from_millis(600));
+                        Ok(Box::new(Service))
+                    }
+                }
+                impl Drop for Factory {
+                    fn drop(&mut self) {
+                        assert_eq!(std::thread::current().name(), Some("fube-owned-cleanup"));
+                    }
+                }
+                impl IStatelessServiceInstance for Service {
+                    fn open(
+                        &self,
+                        _: Arc<dyn IStatelessServicePartition>,
+                        _: Cancellation,
+                    ) -> ApiFuture<'_, String> {
+                        Box::pin(async {
+                            assert_eq!(std::thread::current().name(), Some("fube-native-call"));
+                            std::thread::sleep(Duration::from_millis(600));
+                            Ok("model://independent".into())
+                        })
+                    }
+                    fn close(&self, _: Cancellation) -> ApiFuture<'_, ()> {
+                        Box::pin(async { Ok(()) })
+                    }
+                    fn abort(&self) {}
+                }
+                impl Drop for Service {
+                    fn drop(&mut self) {
+                        assert_eq!(std::thread::current().name(), Some("fube-owned-cleanup"));
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+                runtime = crate::sdk_contracts::recover_and_register(
+                    runtime,
+                    "ModelType",
+                    Box::new(Factory),
+                )
+                .await;
+                // This is the entire attaching application's current-thread
+                // executor, not a blocking helper. IPC/lease/root execution
+                // must independently construct, poll, query and dispose.
+                std::thread::sleep(Duration::from_millis(2200));
+                runtime.authority.check().unwrap();
+                runtime.shutdown().await.unwrap();
+            }
             mode if mode.starts_with("stateful-blocked-final-") => {
                 runtime
                     .lifecycle
                     .set_stateful_callback_timeout(Duration::from_millis(100));
-                runtime
-                    .register_stateful(
-                        "BlockedStateful",
-                        crate::lifecycle::tests::stateful_tests::destructor_model_factory(),
-                    )
+                let provider = runtime.native_integration_provider();
+                let permit = runtime.execution_runtime().try_reserve().unwrap();
+                let _runtime = permit
+                    .run_owned(move || {
+                        runtime.register_stateful_service_factory(
+                            "BlockedStateful",
+                            crate::lifecycle::tests::stateful_tests::destructor_model_factory(
+                                provider,
+                            ),
+                        )?;
+                        Ok(runtime)
+                    })
                     .await
                     .unwrap();
                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -62,11 +129,12 @@ fn model_child() {
             }
             "stateful-blocked-factory"
             | "stateful-blocked-create-method"
+            | "stateful-blocked-future-poll"
             | "stateful-blocked-future-drop" => {
                 struct Blocked(u8);
                 struct BlockingFutureDrop;
                 impl std::future::Future for BlockingFutureDrop {
-                    type Output = Result<Arc<dyn StatefulService>>;
+                    type Output = Result<Box<dyn IPrimaryReplicator>>;
                     fn poll(
                         self: std::pin::Pin<&mut Self>,
                         _: &mut std::task::Context<'_>,
@@ -81,16 +149,32 @@ fn model_child() {
                         std::thread::sleep(Duration::from_secs(60));
                     }
                 }
-                impl StatefulFactory for Blocked {
-                    fn create(
+                struct BlockedReplica(u8);
+                impl IStatefulServiceFactory for Blocked {
+                    fn create_replica(
                         &self,
-                        _: StatefulServiceContext,
-                    ) -> ServiceFuture<'_, Arc<dyn StatefulService>> {
-                        if self.0 == 1 {
+                        _: String,
+                        _: String,
+                        _: &[u8],
+                        _: uuid::Uuid,
+                        _: i64,
+                    ) -> Result<Box<dyn IStatefulServiceReplica>> {
+                        if self.0 <= 1 {
                             println!("STATEFUL_FACTORY_ENTERED");
                             std::io::stdout().flush().unwrap();
                             std::thread::sleep(Duration::from_secs(60));
                         }
+                        Ok(Box::new(BlockedReplica(self.0)))
+                    }
+                }
+                impl IStatefulServiceReplica for BlockedReplica {
+                    fn open(
+                        &self,
+                        mode: OpenMode,
+                        _: Arc<dyn IStatefulServicePartition>,
+                        _: Cancellation,
+                    ) -> ApiFuture<'_, Box<dyn IPrimaryReplicator>> {
+                        assert_eq!(mode, OpenMode::New);
                         if self.0 == 2 {
                             return Box::pin(BlockingFutureDrop);
                         }
@@ -103,10 +187,22 @@ fn model_child() {
                             Err(Error::Protocol("stateful factory escaped hard fence"))
                         })
                     }
+                    fn change_role(
+                        &self,
+                        _: ReplicaRole,
+                        _: Cancellation,
+                    ) -> ApiFuture<'_, String> {
+                        Box::pin(async { Err(Error::Protocol("unreachable blocked role")) })
+                    }
+                    fn close(&self, _: Cancellation) -> ApiFuture<'_, ()> {
+                        Box::pin(async { Ok(()) })
+                    }
+                    fn abort(&self) {}
                 }
                 let kind = match mode.as_str() {
                     "stateful-blocked-create-method" => 1,
                     "stateful-blocked-future-drop" => 2,
+                    "stateful-blocked-future-poll" => 3,
                     _ => 0,
                 };
                 if kind != 0 {
@@ -114,8 +210,15 @@ fn model_child() {
                         .lifecycle
                         .set_stateful_callback_timeout(Duration::from_millis(50));
                 }
-                runtime
-                    .register_stateful("BlockedStateful", Arc::new(Blocked(kind)))
+                let permit = runtime.execution_runtime().try_reserve().unwrap();
+                let _runtime = permit
+                    .run_owned(move || {
+                        runtime.register_stateful_service_factory(
+                            "BlockedStateful",
+                            Box::new(Blocked(kind)),
+                        )?;
+                        Ok(runtime)
+                    })
                     .await
                     .unwrap();
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -123,12 +226,16 @@ fn model_child() {
             }
             "live-update" => {
                 struct Unplaced;
-                impl StatelessFactory for Unplaced {
-                    fn create(
+                impl IStatelessServiceFactory for Unplaced {
+                    fn create_instance(
                         &self,
-                        _: ServiceContext,
-                    ) -> ServiceFuture<'_, Arc<dyn StatelessService>> {
-                        Box::pin(async { panic!("model type is not placed") })
+                        _: String,
+                        _: String,
+                        _: &[u8],
+                        _: uuid::Uuid,
+                        _: i64,
+                    ) -> Result<Box<dyn IStatelessServiceInstance>> {
+                        panic!("model type is not placed")
                     }
                 }
                 let old = runtime.activation_context();
@@ -159,8 +266,13 @@ fn model_child() {
                         .version(),
                     "2"
                 );
-                runtime
-                    .register_stateless("LaterType", Arc::new(Unplaced))
+                let permit = runtime.execution_runtime().try_reserve().unwrap();
+                runtime = permit
+                    .run_owned(move || {
+                        runtime
+                            .register_stateless_service_factory("LaterType", Box::new(Unplaced))?;
+                        Ok(runtime)
+                    })
                     .await
                     .unwrap();
                 runtime.shutdown().await.unwrap();
@@ -202,6 +314,10 @@ fn model_child() {
                     .unwrap();
                 tokio::time::sleep(Duration::from_millis(600)).await;
                 drop(runtime);
+                // Drop now transfers managed captures nonblockingly. The
+                // unchanged independent fatal fence, not inline destruction,
+                // must still terminate this bounded child.
+                tokio::time::sleep(Duration::from_secs(2)).await;
                 panic!("blocking capture escaped owner-drop hard fence");
             }
             "executor-stall" => {
@@ -230,7 +346,10 @@ fn model_child() {
         }
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert!(
-            matches!(mode.as_str(), "shutdown-ok" | "live-update"),
+            matches!(
+                mode.as_str(),
+                "shutdown-ok" | "live-update" | "core-independent"
+            ),
             "armed fence failed"
         );
     });
@@ -294,7 +413,7 @@ async fn scenario(mode: &str, expected: i32) {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if mode.starts_with("stateful-blocked-") {
+    if mode.starts_with("stateful-blocked-") || mode == "core-independent" {
         command.stdout(Stdio::piped());
     }
     for (k, v) in [
@@ -325,6 +444,10 @@ async fn scenario(mode: &str, expected: i32) {
         .env_remove("Fabric_ServicePackageActivationId");
     let mut child = command.spawn().unwrap();
     let child_pid = child.id().unwrap();
+    let independent_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let independent_peer_entered = independent_entered.clone();
+    let registration_reply_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peer_registration_reply_sent = registration_reply_sent.clone();
     let mode_owned = mode.to_owned();
     let deployment = fixture.root.to_str().unwrap().to_owned();
     let peer = tokio::spawn(async move {
@@ -350,8 +473,15 @@ async fn scenario(mode: &str, expected: i32) {
         let mut close_retry = None::<crate::wire::ProxyRequest>;
         let mut close_index = 102;
         let mut close_tick = tokio::time::interval(Duration::from_millis(25));
+        close_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let (mut reader, mut stream) = stream.into_split();
         let mut update_sent = false;
+        let mut independent_open = None::<crate::wire::ProxyRequest>;
+        let mut independent_started = None::<Monotonic>;
+        let mut independent_query_sent = false;
+        let mut independent_query_seen = false;
+        let mut independent_close_seen = false;
+        let mut lease_polls = 0;
         loop {
             let request = {
                 // Keep a partially read frame alive across retry ticks.
@@ -360,19 +490,35 @@ async fn scenario(mode: &str, expected: i32) {
                 loop {
                     tokio::select! {
                         result=&mut next=>break match result {Ok(r)=>r,Err(_)=>return},
-                        _=close_tick.tick(),if close_retry.is_some()=>{
-                            close_index+=1;
-                            if write_message(&mut stream,&Message {
+                        _=close_tick.tick(),if close_retry.is_some() ||
+                            (independent_open.is_some() && !independent_query_sent)=>{
+                            if independent_peer_entered.load(std::sync::atomic::Ordering::Acquire) && !independent_query_sent {
+                                let mut query=control("RAPQuery",103,12);
+                                query.body=to_vec(independent_open.as_ref().unwrap()).unwrap();
+                                write_message(&mut stream,&query).await.unwrap();
+                                independent_query_sent=true;
+                            }
+                            if let Some(close) = &close_retry {
+                              close_index+=1;
+                              if write_message(&mut stream,&Message {
                                 headers:vec![Header::actor(12).unwrap(),Header::action("ReplicaClose").unwrap(),
                                     Header::message_id(MessageId {guid:[9;16],index:close_index}).unwrap()],
-                                body:to_vec(close_retry.as_ref().unwrap()).unwrap(),
+                                body:to_vec(close).unwrap(),
                             }).await.is_err() {return;}
+                            }
                         }
                     }
                 }
             };
             let p = request.properties().unwrap();
             if p.relates_to != MessageId::default() {
+                if mode_owned == "core-independent" && p.relates_to.index == 103 {
+                    assert!(
+                        independent_started.unwrap().elapsed() < Duration::from_millis(900),
+                        "query stalled behind user constructor/poll or caller executor"
+                    );
+                    independent_query_seen = true;
+                }
                 if p.relates_to.index == 99
                     && matches!(
                         mode_owned.as_str(),
@@ -417,6 +563,7 @@ async fn scenario(mode: &str, expected: i32) {
                     to_vec(&ErrorReply { error: 0 }).unwrap()
                 }
                 "" if p.actor == 15 => {
+                    lease_polls += 1;
                     assert!(step >= 3);
                     step = 4;
                     to_vec(&LeaseReply {
@@ -432,8 +579,18 @@ async fn scenario(mode: &str, expected: i32) {
                     .unwrap()
                 }
                 "UnregisterFabricRuntimeRequest" | "UnregisterApplicationHostRequest" => {
-                    if !matches!(mode_owned.as_str(), "shutdown-ok" | "live-update") {
+                    if !matches!(
+                        mode_owned.as_str(),
+                        "shutdown-ok" | "live-update" | "core-independent"
+                    ) {
                         continue;
+                    }
+                    if mode_owned == "core-independent" {
+                        assert!(independent_query_seen && independent_close_seen);
+                        assert!(
+                            lease_polls >= 3,
+                            "lease core did not poll while caller was stalled"
+                        );
                     }
                     to_vec(&ErrorReply { error: 0 }).unwrap()
                 }
@@ -467,6 +624,20 @@ async fn scenario(mode: &str, expected: i32) {
                     .unwrap();
                     continue;
                 }
+                "ReplicaOpenReply" if mode_owned == "core-independent" => {
+                    assert!(independent_query_seen);
+                    let reply: ProxyReply = from_slice(&request.body).unwrap();
+                    assert_eq!(reply.error.error, 0);
+                    close_retry = independent_open.clone();
+                    continue;
+                }
+                "ReplicaCloseReply" if mode_owned == "core-independent" => {
+                    let reply: ProxyReply = from_slice(&request.body).unwrap();
+                    assert_eq!(reply.error.error, 0);
+                    independent_close_seen = true;
+                    close_retry = None;
+                    continue;
+                }
                 "ReplicaCloseReply" if mode_owned.starts_with("stateful-blocked-final-") => {
                     panic!("Close acknowledged before final destructor completed");
                 }
@@ -474,6 +645,28 @@ async fn scenario(mode: &str, expected: i32) {
                     let registration: TypeRequest = from_slice(&request.body).unwrap();
                     if mode_owned == "live-update" {
                         assert_eq!(registration.context.code.version.instance, 4);
+                    } else if mode_owned == "core-independent" {
+                        assert_eq!(registration.id.name, "ModelType");
+                        // Keep the real native type-registration result
+                        // blocked while the independent host core renews its
+                        // lease. Insertion/enqueue cannot satisfy the call.
+                        let poll = read_message(&mut reader).await.unwrap();
+                        let poll = poll.properties().unwrap();
+                        assert_eq!(poll.actor, 15);
+                        assert!(poll.action.is_empty());
+                        lease_polls += 1;
+                        write_message(
+                            &mut stream,
+                            &Message {
+                                headers: vec![Header::relates_to(poll.id).unwrap()],
+                                body: to_vec(&LeaseReply { ttl: 300_000_000 }).unwrap(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        peer_registration_reply_sent
+                            .store(true, std::sync::atomic::Ordering::Release);
                     } else {
                         assert!(mode_owned.starts_with("stateful-blocked-"));
                         assert_eq!(registration.id.name, "BlockedStateful");
@@ -553,6 +746,29 @@ async fn scenario(mode: &str, expected: i32) {
                 };
                 write_message(&mut stream, &message).await.unwrap();
             }
+            if p.action == "RegisterServiceTypeRequest" && mode_owned == "core-independent" {
+                let context = runtime_context.as_ref().unwrap();
+                let mut open =
+                    crate::lifecycle::tests::Harness::request_with_context(context, 9, 1, 0);
+                open.service.application = context.code.application_name.clone();
+                open.service.name = format!("{}/Independent", context.code.application_name);
+                open.service.service_type.name = "ModelType".into();
+                let message = Message {
+                    headers: vec![
+                        Header::actor(12).unwrap(),
+                        Header::action("ReplicaOpen").unwrap(),
+                        Header::message_id(MessageId {
+                            guid: [7; 16],
+                            index: 101,
+                        })
+                        .unwrap(),
+                    ],
+                    body: to_vec(&open).unwrap(),
+                };
+                independent_open = Some(open);
+                independent_started = Some(Monotonic::now());
+                write_message(&mut stream, &message).await.unwrap();
+            }
             if step == 4 && !update_sent {
                 update_sent = true;
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -609,6 +825,36 @@ async fn scenario(mode: &str, expected: i32) {
         }
     });
     let started = Monotonic::now();
+    use tokio::io::AsyncBufReadExt;
+    let mut independent_stdout = if mode == "core-independent" {
+        Some(tokio::io::BufReader::new(child.stdout.take().unwrap()).lines())
+    } else {
+        None
+    };
+    if let Some(lines) = independent_stdout.as_mut() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            for _ in 0..16 {
+                let line = lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("constructor entry missing");
+                if line.contains("CORE_CONSTRUCTOR_ENTERED") {
+                    independent_entered.store(true, std::sync::atomic::Ordering::Release);
+                    return;
+                }
+                if line.contains("SYNC_REG_COMPLETED") {
+                    assert!(
+                        registration_reply_sent.load(std::sync::atomic::Ordering::Acquire),
+                        "canonical registration returned before the actual native reply"
+                    );
+                }
+            }
+            panic!("constructor marker missing");
+        })
+        .await
+        .unwrap();
+    }
     if mode.starts_with("stateful-blocked-") {
         use tokio::io::AsyncBufReadExt;
         let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
@@ -638,7 +884,18 @@ async fn scenario(mode: &str, expected: i32) {
         .await
         .unwrap_or_else(|_| panic!("model {mode} exceeded process bound"))
         .unwrap();
-    assert_eq!(status.code(), Some(expected), "scenario {mode}");
+    let mut diagnostics = String::new();
+    if status.code() != Some(expected) {
+        use tokio::io::AsyncReadExt;
+        if let Some(mut stderr) = child.stderr.take() {
+            stderr.read_to_string(&mut diagnostics).await.unwrap();
+        }
+    }
+    assert_eq!(
+        status.code(),
+        Some(expected),
+        "scenario {mode}: {diagnostics}"
+    );
     if expected == 70 && mode != "lease-zero" {
         assert!(started.elapsed() < Duration::from_millis(1500), "{mode}");
     }
@@ -656,6 +913,11 @@ async fn successful_native_shaped_update_refreshes_later_registration() {
 }
 
 #[tokio::test]
+async fn host_core_progresses_ipc_lease_and_owned_callbacks_while_attaching_executor_is_stalled() {
+    scenario("core-independent", 0).await;
+}
+
+#[tokio::test]
 async fn blocking_subscription_capture_destruction_cannot_delay_owner_drop_fence() {
     scenario("drop-capture", 70).await;
 }
@@ -668,6 +930,7 @@ async fn blocked_stateful_factory_cannot_delay_independent_process_fence() {
 #[tokio::test]
 async fn stateful_callback_invocation_and_future_drop_are_supervised_with_unexpired_lease() {
     scenario("stateful-blocked-create-method", 70).await;
+    scenario("stateful-blocked-future-poll", 70).await;
     scenario("stateful-blocked-future-drop", 70).await;
 }
 

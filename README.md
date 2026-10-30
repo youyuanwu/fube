@@ -17,8 +17,10 @@ and standalone test host in Rust.
 | [`native-replicator-oracle`](crates/samples/native-replicator-oracle) | Isolated test-only native classic V1 reference peer; not a production dependency. |
 
 The node-side `fube-test-host` is not an application runtime or a full SF node.
-`fube-runtime` is a separate application-side component. Native qualification is
-Linux x86-64, SF 11.8.121.4, trusted clear IPC, without TLS. See the
+`fube-runtime` is a separate application-side component. The supported profile is
+Linux x86-64, SF 11.8.121.4, trusted clear IPC, without TLS. Historical native
+qualification covers its recorded source/profile only; the current breaking
+SDK alignment has offline verification, **no new deployed qualification**. See the
 [application runtime profile](docs/runtime/RustStatelessRuntime.md) and
 [standalone host profile](docs/runtime/ManifestTestHost.md).
 
@@ -74,6 +76,7 @@ See [onebox prerequisites, lifecycle, and recovery](docs/UbuntuOnebox.md).
 - [Rust volatile empty-state stateful runtime: control-plane semantics and native evidence](docs/runtime/RustStatefulRuntime.md)
 - [Fube Data: volatile classic V1 replication, provider contract and executed native profile](docs/runtime/FubeData.md)
 - [Broader pure-Rust runtime design and capability tiers](docs/runtime/RustFabricRuntime.md)
+- [Current SF/mssf API alignment: per-method shape, values, completion and limits](docs/runtime/SfApiAlignment.md)
 - [Basic pure-Rust cluster design: FM, RA/Hosting, authority and qualification milestones](docs/cluster/PureRustCluster.md)
 - [RA store P1: API, SQLite profile, cancellation and operational limits](docs/cluster/RaStore.md)
 - [RA protocol foundation: catalog, native codec evidence and minimal P2 execution](docs/cluster/RaProtocolFoundation.md)

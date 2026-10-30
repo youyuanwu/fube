@@ -4,17 +4,49 @@
 // Rust-only Fabric TCP source-contract fixtures; not native interoperability.
 
 use super::*;
+#[path = "engine_disposal_tests.rs"]
+mod disposal_tests;
+async fn abort_owned(engine: &Arc<Engine>) {
+    if engine
+        .disposal_done
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(DisposalReceipt::is_complete)
+    {
+        return;
+    }
+    let execution = engine.shared.execution.clone();
+    let owner = engine.clone();
+    execution
+        .reserve(
+            CallLane::Native,
+            CallOrigin::default(),
+            std::time::Duration::from_secs(30),
+            true,
+        )
+        .unwrap()
+        .run_owned(move || {
+            owner.abort();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    if engine.owns_execution {
+        execution.finish_standalone().await.unwrap();
+    }
+}
 use crate::{MemoryProvider, Mutation};
 use std::sync::atomic::{AtomicI64, AtomicUsize};
 use uuid::Uuid;
 
 const EPOCH: Epoch = Epoch {
-    data_loss: 1,
-    configuration: 0x1_0000_0000,
+    data_loss_number: 1,
+    configuration_number: 0x1_0000_0000,
 };
 const NEXT_EPOCH: Epoch = Epoch {
-    data_loss: 1,
-    configuration: 0x2_0000_0000,
+    data_loss_number: 1,
+    configuration_number: 0x2_0000_0000,
 };
 
 #[tokio::test]
@@ -40,8 +72,8 @@ async fn promoted_prefix_without_retained_suffix_accepts_bounded_existing_peer_r
         node_instance: 1,
         replica_id: 2,
         incarnation: 1,
-        role: ReplicaRole::Secondary,
-        previous_role: ReplicaRole::Secondary,
+        role: ReplicaRole::ActiveSecondary,
+        previous_role: ReplicaRole::ActiveSecondary,
         up: true,
         ready: true,
         address: remote.to_string(),
@@ -93,7 +125,7 @@ async fn promoted_prefix_without_retained_suffix_accepts_bounded_existing_peer_r
     assert_eq!(primary.snapshot().peers[0].applied, 20);
     assert_eq!(primary.snapshot().progress.assigned, 20);
     primary
-        .change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     primary
@@ -136,7 +168,7 @@ async fn promoted_prefix_without_retained_suffix_accepts_bounded_existing_peer_r
         .wait_for_catch_up(CatchUpMode::All, cancel())
         .await
         .unwrap();
-    primary.abort();
+    abort_owned(&primary).await;
     transport.shutdown();
 }
 
@@ -171,7 +203,7 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
         .await
         .unwrap();
     secondary
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     primary
@@ -179,11 +211,11 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
         .await
         .unwrap();
     secondary
-        .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     let mut member = descriptor(&secondary);
-    member.role = ReplicaRole::Secondary;
+    member.role = ReplicaRole::ActiveSecondary;
     member.ready = true;
     primary
         .update_current_configuration(configuration(vec![member], true, 2), cancel())
@@ -238,8 +270,8 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
     operation.acknowledge().unwrap();
     drop(operation);
     assert_eq!(write.wait(cancel()).await.unwrap(), 1);
-    primary.abort();
-    secondary.abort();
+    abort_owned(&primary).await;
+    abort_owned(&secondary).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -258,7 +290,7 @@ async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
         .await
         .unwrap();
     target
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     let completed_build = cancel();
@@ -336,10 +368,10 @@ async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
         primary.transport.diagnostics()
     );
     let mut member = descriptor(&target);
-    member.role = ReplicaRole::Secondary;
+    member.role = ReplicaRole::ActiveSecondary;
     member.ready = true;
     target
-        .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     primary
@@ -350,8 +382,8 @@ async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
         .wait_for_catch_up(CatchUpMode::All, cancel())
         .await
         .unwrap();
-    primary.abort();
-    target.abort();
+    abort_owned(&primary).await;
+    abort_owned(&target).await;
 }
 
 struct SnapshotProvider {
@@ -390,8 +422,8 @@ struct SnapshotStream {
     eos: Arc<Semaphore>,
 }
 
-impl OperationDataStream for SnapshotStream {
-    fn next(&self, _: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+impl IOperationDataStream for SnapshotStream {
+    fn get_next(&self, _: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
         Box::pin(async move {
             if self.next.fetch_add(1, Ordering::AcqRel) == 0 {
                 Ok(Some(self.snapshot.clone()))
@@ -408,8 +440,8 @@ impl OperationDataStream for SnapshotStream {
     }
 }
 
-impl StateProvider for SnapshotProvider {
-    fn last_committed(&self) -> Result<i64> {
+impl IStateProvider for SnapshotProvider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
         Ok(self.last.load(Ordering::Acquire))
     }
     fn update_epoch(&self, _: Epoch, previous: i64, _: Cancellation) -> ServiceFuture<'_, ()> {
@@ -425,14 +457,14 @@ impl StateProvider for SnapshotProvider {
     fn on_data_loss(&self, _: Cancellation) -> ServiceFuture<'_, bool> {
         Box::pin(async { Ok(false) })
     }
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
         Ok(Arc::new(Empty))
     }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         up_to: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>> {
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
         assert!(context.is_none());
         self.requested.lock().unwrap().push(up_to);
         if !self.snapshots.load(Ordering::Acquire) {
@@ -475,7 +507,7 @@ async fn nonempty_live_copy_uses_previous_quorum_horizon_and_applied_finish_fenc
         .unwrap();
     for secondary in [&slow, &fast] {
         secondary
-            .change_role(EPOCH, ReplicaRole::Idle, cancel())
+            .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
         p.build_replica(descriptor(secondary), cancel())
@@ -517,7 +549,7 @@ async fn nonempty_live_copy_uses_previous_quorum_horizon_and_applied_finish_fenc
     assert_eq!(p.snapshot().progress.committed, 0);
     source.snapshots.store(true, Ordering::Release);
     target
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     let build = p.build_replica(descriptor(&target), cancel());
@@ -620,10 +652,10 @@ async fn nonempty_live_copy_uses_previous_quorum_horizon_and_applied_finish_fenc
             .any(|peer| peer.replica == 4 && peer.applied == 110)
     })
     .await;
-    p.abort();
-    slow.abort();
-    fast.abort();
-    target.abort();
+    abort_owned(&p).await;
+    abort_owned(&slow).await;
+    abort_owned(&fast).await;
+    abort_owned(&target).await;
 }
 
 struct FailureStream {
@@ -632,8 +664,8 @@ struct FailureStream {
     disposed: Arc<AtomicUsize>,
 }
 
-impl OperationDataStream for FailureStream {
-    fn next(&self, _: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+impl IOperationDataStream for FailureStream {
+    fn get_next(&self, _: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
         Box::pin(async move {
             self.active.fetch_add(1, Ordering::AcqRel);
             let _guard = CallbackGuard {
@@ -654,9 +686,9 @@ struct CopyFailureProvider {
     stream: Arc<FailureStream>,
 }
 
-impl StateProvider for CopyFailureProvider {
-    fn last_committed(&self) -> Result<i64> {
-        self.base.last_committed()
+impl IStateProvider for CopyFailureProvider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
+        self.base.get_last_committed_sequence_number()
     }
     fn update_epoch(
         &self,
@@ -669,14 +701,14 @@ impl StateProvider for CopyFailureProvider {
     fn on_data_loss(&self, cancellation: Cancellation) -> ServiceFuture<'_, bool> {
         self.base.on_data_loss(cancellation)
     }
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
-        self.base.copy_context()
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
+        self.base.get_copy_context()
     }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         _: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>> {
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
         assert!(context.is_none());
         if self.stream.mode == 4 {
             return Err(Error::ResourceLimit(
@@ -722,7 +754,7 @@ async fn copy_provider_error_panic_deadline_and_unavailable_history_fence_and_di
         p.update_current_configuration(configuration(vec![], true, 1), cancel())
             .await
             .unwrap();
-        s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+        s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
         assert!(p.build_replica(descriptor(&s), cancel()).await.is_err());
@@ -733,8 +765,8 @@ async fn copy_provider_error_panic_deadline_and_unavailable_history_fence_and_di
             stream.disposed.load(Ordering::Acquire),
             usize::from(mode != 4)
         );
-        p.abort();
-        s.abort();
+        abort_owned(&p).await;
+        abort_owned(&s).await;
     }
 }
 
@@ -814,7 +846,13 @@ async fn all_sixty_four_copy_callbacks_are_bounded_cancel_cleanup_joins_and_cont
     excess.replica_id = 66;
     excess.address = endpoint(&network, partition, 66).to_string();
     assert!(p.build_replica(excess, cancel()).await.is_err());
-    assert!(!p.on_data_loss(cancel()).await.unwrap());
+    // The new shared execution budget cannot admit a 65th independent user
+    // callback. Reject before owner mutation; reserved owner/control processing
+    // must still cancel and dispose one of the existing 64 callbacks.
+    assert!(matches!(
+        p.on_data_loss(cancel()).await,
+        Err(Error::ResourceLimit(_))
+    ));
     assert_eq!(stream.active.load(Ordering::Acquire), 64);
     cancellations[0].cancel();
     p.remove_replica(
@@ -826,7 +864,8 @@ async fn all_sixty_four_copy_callbacks_are_bounded_cancel_cleanup_joins_and_cont
     .unwrap();
     until(|| stream.active.load(Ordering::Acquire) == 63).await;
     assert_eq!(stream.disposed.load(Ordering::Acquire), 1);
-    p.abort();
+    assert!(!p.on_data_loss(cancel()).await.unwrap());
+    abort_owned(&p).await;
     assert_eq!(stream.active.load(Ordering::Acquire), 0);
     assert_eq!(stream.disposed.load(Ordering::Acquire), 64);
     assert_eq!(
@@ -853,7 +892,7 @@ async fn unfinished_copy_rejects_epoch_update_and_promotion_without_success() {
         p.update_current_configuration(configuration(vec![], true, 1), cancel())
             .await
             .unwrap();
-        s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+        s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
         let cancellation = cancel();
@@ -864,7 +903,7 @@ async fn unfinished_copy_rejects_epoch_update_and_promotion_without_success() {
             .is_err());
         let pending = s.copy_stream().next(cancel()).await.unwrap().unwrap();
         let next = Epoch {
-            configuration: EPOCH.configuration * 2,
+            configuration_number: EPOCH.configuration_number * 2,
             ..EPOCH
         };
         let result = if promote {
@@ -881,8 +920,8 @@ async fn unfinished_copy_rejects_epoch_update_and_promotion_without_success() {
         p.remove_replica(descriptor(&s), ReplicaRemoval::BuildRetryCleanup, cancel())
             .await
             .unwrap();
-        p.abort();
-        s.abort();
+        abort_owned(&p).await;
+        abort_owned(&s).await;
     }
 }
 
@@ -939,7 +978,7 @@ async fn promotion_drains_contiguous_received_before_discarding_only_out_of_orde
     until(|| secondary.snapshot().progress.assigned == 68).await;
     assert_eq!(secondary.snapshot().progress.received, 66);
     let next = Epoch {
-        configuration: EPOCH.configuration * 2,
+        configuration_number: EPOCH.configuration_number * 2,
         ..EPOCH
     };
     let promotion = secondary.change_role(next, ReplicaRole::Primary, cancel());
@@ -965,7 +1004,7 @@ async fn promotion_drains_contiguous_received_before_discarding_only_out_of_orde
     drop(operation);
     promotion.await.unwrap();
     until(|| secondary.snapshot().role == ReplicaRole::Primary).await;
-    assert_eq!(provider.last_committed().unwrap(), 66);
+    assert_eq!(provider.get_last_committed_sequence_number().unwrap(), 66);
     assert!(provider.epochs.lock().unwrap().contains(&(next, 66)));
     assert_eq!(secondary.snapshot().progress.assigned, 66);
     assert_eq!(secondary.snapshot().progress.received, 66);
@@ -980,7 +1019,7 @@ async fn promotion_drains_contiguous_received_before_discarding_only_out_of_orde
         .await
         .unwrap();
     assert_eq!(write.sequence, 67);
-    secondary.abort();
+    abort_owned(&secondary).await;
     network.shutdown();
     drainer.abort();
     let _ = drainer.await;
@@ -1025,7 +1064,7 @@ async fn promotion_preserves_an_old_quorum_acknowledged_but_undispatched_write()
     assert_eq!(old.wait(cancel()).await.unwrap(), 2);
     until(|| b.snapshot().progress.received == 2).await;
     assert_eq!(bp.snapshot().last, 1);
-    a.abort();
+    abort_owned(&a).await;
     c.update_epoch(NEXT_EPOCH, cancel()).await.unwrap();
     let promotion = b.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel());
     tokio::pin!(promotion);
@@ -1053,8 +1092,8 @@ async fn promotion_preserves_an_old_quorum_acknowledged_but_undispatched_write()
     assert_eq!(new.wait(cancel()).await.unwrap(), 3);
     assert_eq!(bp.snapshot().values, cp.snapshot().values);
     assert_eq!(bp.snapshot().results, cp.snapshot().results);
-    b.abort();
-    c.abort();
+    abort_owned(&b).await;
+    abort_owned(&c).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1086,7 +1125,7 @@ async fn configuration_captures_preexisting_assigned_fence_but_not_later_writes(
         } else {
             p.update_current_configuration(cc, cancel()).await.unwrap();
         }
-        let wait = p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel());
+        let wait = p.wait_for_catch_up(CatchUpMode::Write, cancel());
         tokio::pin!(wait);
         assert!(timeout(std::time::Duration::from_millis(80), &mut wait)
             .await
@@ -1120,7 +1159,7 @@ async fn configuration_captures_preexisting_assigned_fence_but_not_later_writes(
         provider.last.store(2, Ordering::Release);
         timeout(
             std::time::Duration::from_secs(1),
-            p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel()),
+            p.wait_for_catch_up(CatchUpMode::Write, cancel()),
         )
         .await
         .unwrap()
@@ -1136,7 +1175,7 @@ async fn configuration_captures_preexisting_assigned_fence_but_not_later_writes(
                 .await
                 .is_err()
         );
-        p.abort();
+        abort_owned(&p).await;
         network.shutdown();
     }
 }
@@ -1189,7 +1228,7 @@ async fn configured_peer_retirement_releases_session_capacity_before_replacement
         .await
         .unwrap();
     until(|| p.snapshot().peers.is_empty()).await;
-    p.abort();
+    abort_owned(&p).await;
     for (network, _) in networks {
         network.shutdown();
     }
@@ -1216,7 +1255,7 @@ async fn promotion_total_deadline_covers_receive_drain_and_final_callback_public
     );
     until(|| secondary.snapshot().copy_done).await;
     secondary
-        .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     raw_send(
@@ -1252,7 +1291,7 @@ async fn promotion_total_deadline_covers_receive_drain_and_final_callback_public
     until(|| secondary.snapshot().closed).await;
     assert!(started.elapsed() < std::time::Duration::from_millis(350));
     assert_ne!(secondary.snapshot().role, ReplicaRole::Primary);
-    secondary.abort();
+    abort_owned(&secondary).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1274,7 +1313,7 @@ async fn quiet_promotion_drain_wakes_on_absolute_deadline_or_cancellation_withou
         );
         until(|| secondary.snapshot().copy_done).await;
         secondary
-            .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+            .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
             .await
             .unwrap();
         raw_send(
@@ -1314,7 +1353,7 @@ async fn quiet_promotion_drain_wakes_on_absolute_deadline_or_cancellation_withou
         assert_eq!(secondary.snapshot().progress.applied, 0);
         assert!(held.acknowledge().is_err());
         drop(held);
-        secondary.abort();
+        abort_owned(&secondary).await;
     }
 }
 
@@ -1324,7 +1363,7 @@ async fn copied_primary_replays_only_authentic_prefix_to_an_unbound_native_behav
     let pp = MemoryProvider::new();
     let sp = MemoryProvider::new();
     let p = engine(partition, 1, pp.clone());
-    let s = engine_with_settings(
+    let s = engine_with_replay(
         partition,
         2,
         sp.clone(),
@@ -1349,7 +1388,7 @@ async fn copied_primary_replays_only_authentic_prefix_to_an_unbound_native_behav
     pp.apply_replication(1, &original).unwrap();
     write.wait(cancel()).await.unwrap();
     build_memory(&p, &s, &sp).await;
-    p.abort();
+    abort_owned(&p).await;
     s.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
         .await
         .unwrap();
@@ -1451,7 +1490,7 @@ async fn copied_primary_replays_only_authentic_prefix_to_an_unbound_native_behav
     .unwrap();
     let accepted = s.submit_in_epoch(NEXT_EPOCH, next, cancel()).await.unwrap();
     assert_eq!(accepted.sequence, 2);
-    s.abort();
+    abort_owned(&s).await;
     network.shutdown();
 }
 
@@ -1490,7 +1529,7 @@ async fn epoch_fenced_submission_rejects_before_assignment_or_checkpoint_restamp
         .unwrap();
     assert_eq!(checkpoint.epoch, EPOCH);
     assert_eq!(checkpoint.data, operation);
-    p.abort();
+    abort_owned(&p).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1513,7 +1552,7 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
             ..Provider::default()
         });
         let partition = Uuid::new_v4();
-        let p = engine_with_settings(
+        let p = engine_with_replay(
             partition,
             1,
             provider.clone(),
@@ -1590,7 +1629,7 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
             "replay cannot permanently monopolize the sole operation slot"
         );
         assert_eq!(provider.checkpoint_calls.load(Ordering::Acquire), 2);
-        p.abort();
+        abort_owned(&p).await;
         network.shutdown();
     }
 }
@@ -1612,7 +1651,7 @@ async fn replay_cooldown_starts_after_slow_publication_releases_producer_admissi
         ..Provider::default()
     });
     let partition = Uuid::new_v4();
-    let p = engine_with_settings(
+    let p = engine_with_replay(
         partition,
         1,
         provider.clone(),
@@ -1678,7 +1717,7 @@ async fn replay_cooldown_starts_after_slow_publication_releases_producer_admissi
     .unwrap();
     assert_eq!(write.sequence, 2);
     assert_eq!(provider.checkpoint_calls.load(Ordering::Acquire), 1);
-    p.abort();
+    abort_owned(&p).await;
     network.shutdown();
 }
 
@@ -1712,7 +1751,7 @@ async fn adopted_copy_retirement_does_not_pin_completed_writes_as_idle_history()
     p.update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
-    s.abort();
+    abort_owned(&s).await;
     until(|| p.snapshot().peers.is_empty()).await;
     for sequence in 2..20 {
         let data = mutation(&format!("write-{sequence}"), &sequence.to_string());
@@ -1722,7 +1761,7 @@ async fn adopted_copy_retirement_does_not_pin_completed_writes_as_idle_history()
     }
     until(|| p.snapshot().owned_operations == 0).await;
     assert_eq!(p.snapshot().progress.completed, 19);
-    p.abort();
+    abort_owned(&p).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1742,7 +1781,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
         initial_status.service_role = ReplicaRole::None;
         initial_status.replicator_role = ReplicaRole::None;
         let view = Arc::new(SourceNativeView(Mutex::new(Ok(initial_status))));
-        let engine = Engine::bind_with_native_control(
+        let engine = Engine::bind_with_capabilities(
             Actor {
                 partition,
                 replica: index as i64 + 1,
@@ -1750,6 +1789,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
             },
             "127.0.0.1:0",
             provider.clone(),
+            Some(provider.clone()),
             Settings::default(),
             Some(view.clone()),
         )
@@ -1782,11 +1822,11 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
     let mut old_primary = 0;
     for (round, new_primary) in [1, 2, 0].into_iter().enumerate() {
         let epoch = Epoch {
-            configuration: EPOCH.configuration * (round as i64 + 2),
+            configuration_number: EPOCH.configuration_number * (round as i64 + 2),
             ..EPOCH
         };
         engines[old_primary]
-            .change_role(epoch, ReplicaRole::Secondary, cancel())
+            .change_role(epoch, ReplicaRole::ActiveSecondary, cancel())
             .await
             .unwrap();
         for (index, engine) in engines.iter().enumerate() {
@@ -1803,7 +1843,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
             let role = if index == new_primary {
                 ReplicaRole::Primary
             } else {
-                ReplicaRole::Secondary
+                ReplicaRole::ActiveSecondary
             };
             status.current_epoch = epoch;
             status.current_role = role;
@@ -1819,7 +1859,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
                     peer.role = if other == new_primary {
                         ReplicaRole::Primary
                     } else {
-                        ReplicaRole::Secondary
+                        ReplicaRole::ActiveSecondary
                     };
                     // Deliberately no native progress attestation: this regression
                     // must get actual fresh network ACKs, not catch-up-only proof.
@@ -1888,7 +1928,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
         old_primary = new_primary;
     }
     for engine in &engines {
-        engine.abort();
+        abort_owned(engine).await;
     }
 }
 
@@ -1931,7 +1971,7 @@ async fn native_completed_prefix_attestation_is_not_a_new_write_or_all_ack() {
         .unwrap();
     timeout(
         std::time::Duration::from_secs(1),
-        p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel()),
+        p.wait_for_catch_up(CatchUpMode::Write, cancel()),
     )
     .await
     .unwrap()
@@ -1956,7 +1996,7 @@ async fn native_completed_prefix_attestation_is_not_a_new_write_or_all_ack() {
     );
     assert_eq!(p.snapshot().progress.committed, 20);
     assert_eq!(p.snapshot().peers[0].applied, 0);
-    p.abort();
+    abort_owned(&p).await;
     network.shutdown();
 }
 
@@ -1973,11 +2013,11 @@ async fn native_directed_planned_swap_preserves_stream_and_reconciled_sequence()
     p.update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
-    s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+    s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     p.build_replica(descriptor(&s), cancel()).await.unwrap();
-    s.change_role(EPOCH, ReplicaRole::Secondary, cancel())
+    s.change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     p.update_current_configuration(configuration(vec![descriptor(&s)], true, 2), cancel())
@@ -2003,10 +2043,10 @@ async fn native_directed_planned_swap_preserves_stream_and_reconciled_sequence()
         write.wait(cancel()).await.unwrap();
     }
     let next = Epoch {
-        configuration: EPOCH.configuration * 2,
+        configuration_number: EPOCH.configuration_number * 2,
         ..EPOCH
     };
-    p.change_role(next, ReplicaRole::Secondary, cancel())
+    p.change_role(next, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     s.change_role(next, ReplicaRole::Primary, cancel())
@@ -2036,8 +2076,8 @@ async fn native_directed_planned_swap_preserves_stream_and_reconciled_sequence()
     pp.last.store(11, Ordering::Release);
     operation.acknowledge().unwrap();
     assert_eq!(write.wait(cancel()).await.unwrap(), 11);
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2060,7 +2100,7 @@ async fn failed_build_cleanup_allows_retry_but_actual_remove_tombstones_native_i
     p.update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
-    s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+    s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     for reason in [ReplicaRemoval::BuildRetryCleanup, ReplicaRemoval::Idle] {
@@ -2090,8 +2130,8 @@ async fn failed_build_cleanup_allows_retry_but_actual_remove_tombstones_native_i
     p.remove_replica(descriptor(&s), ReplicaRemoval::Idle, cancel())
         .await
         .unwrap();
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2099,7 +2139,7 @@ async fn copy_gap_empty_data_duplicate_and_legacy_eos_require_every_explicit_app
     let partition = Uuid::new_v4();
     let secondary = engine(partition, 2, Arc::new(Provider::default()));
     secondary
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     let (network, mut incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
@@ -2171,7 +2211,7 @@ async fn copy_gap_empty_data_duplicate_and_legacy_eos_require_every_explicit_app
     );
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert!(secondary.snapshot().fault.is_none());
-    secondary.abort();
+    abort_owned(&secondary).await;
     network.shutdown();
 }
 
@@ -2200,7 +2240,7 @@ async fn missing_service_apply_deadline_fences_without_receipt_as_commit_and_dis
     p.update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
-    s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+    s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     p.build_replica(descriptor(&s), cancel()).await.unwrap();
@@ -2229,13 +2269,13 @@ async fn missing_service_apply_deadline_fences_without_receipt_as_commit_and_dis
     drop(operation);
     assert_eq!(s.shared.callbacks.available_permits(), 64);
     assert_eq!(s.snapshot().owned_operations, 0);
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 struct Empty;
-impl OperationDataStream for Empty {
-    fn next(&self, _: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+impl IOperationDataStream for Empty {
+    fn get_next(&self, _: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
         Box::pin(async { Ok(None) })
     }
 }
@@ -2251,7 +2291,7 @@ struct Provider {
     checkpoint_gate: Mutex<Option<Arc<Semaphore>>>,
 }
 
-impl StateProvider for Provider {
+impl ReplayCheckpointProvider for Provider {
     fn replication_checkpoint(
         &self,
         _: i64,
@@ -2275,7 +2315,9 @@ impl StateProvider for Provider {
             }
         })
     }
-    fn last_committed(&self) -> Result<i64> {
+}
+impl IStateProvider for Provider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
         Ok(self.last.load(Ordering::Acquire))
     }
     fn update_epoch(&self, epoch: Epoch, previous: i64, _: Cancellation) -> ServiceFuture<'_, ()> {
@@ -2291,14 +2333,14 @@ impl StateProvider for Provider {
     fn on_data_loss(&self, _: Cancellation) -> ServiceFuture<'_, bool> {
         Box::pin(async { Ok(false) })
     }
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
         Ok(Arc::new(Empty))
     }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         up_to: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>> {
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
         assert!(context.is_none());
         self.horizons.lock().unwrap().push(up_to);
         Ok(Arc::new(Empty))
@@ -2309,14 +2351,34 @@ fn cancel() -> Cancellation {
     Cancellation::default()
 }
 
-fn engine(partition: Uuid, id: i64, provider: Arc<dyn StateProvider>) -> Arc<Engine> {
+fn engine(partition: Uuid, id: i64, provider: Arc<dyn IStateProvider>) -> Arc<Engine> {
     engine_with_settings(partition, id, provider, Settings::default())
+}
+fn engine_with_replay<T: IStateProvider + ReplayCheckpointProvider>(
+    partition: Uuid,
+    id: i64,
+    provider: Arc<T>,
+    settings: Settings,
+) -> Arc<Engine> {
+    Engine::bind_with_capabilities(
+        Actor {
+            partition,
+            replica: id,
+            incarnation: Uuid::new_v4(),
+        },
+        "127.0.0.1:0",
+        provider.clone(),
+        Some(provider),
+        settings,
+        None,
+    )
+    .unwrap()
 }
 
 fn engine_with_settings(
     partition: Uuid,
     id: i64,
-    provider: Arc<dyn StateProvider>,
+    provider: Arc<dyn IStateProvider>,
     settings: Settings,
 ) -> Arc<Engine> {
     Engine::bind(
@@ -2338,8 +2400,8 @@ fn descriptor(engine: &Engine) -> ReplicaInformation {
         node_instance: 1,
         replica_id: engine.endpoint.actor.replica,
         incarnation: 1,
-        role: ReplicaRole::Secondary,
-        previous_role: ReplicaRole::Secondary,
+        role: ReplicaRole::ActiveSecondary,
+        previous_role: ReplicaRole::ActiveSecondary,
         up: true,
         ready: true,
         address: engine.endpoint.to_string(),
@@ -2372,7 +2434,7 @@ impl NativeControlView for SourceNativeView {
     fn report_fault(
         &self,
         _: fube_runtime::FaultType,
-    ) -> ServiceFuture<'_, fube_runtime::FaultDelivery> {
+    ) -> ServiceFuture<'_, fube_runtime::extensions::FaultDelivery> {
         Box::pin(async { Err(Error::Closed) })
     }
 }
@@ -2383,17 +2445,17 @@ fn prewrite_status() -> ReplicaStatus {
         service_role: ReplicaRole::Primary,
         replicator_role: ReplicaRole::Primary,
         replicator_open: true,
-        current_role: ReplicaRole::Secondary,
+        current_role: ReplicaRole::ActiveSecondary,
         current_epoch: Epoch {
-            configuration: NEXT_EPOCH.configuration + 7,
+            configuration_number: NEXT_EPOCH.configuration_number + 7,
             ..NEXT_EPOCH
         },
         previous_epoch: Epoch {
-            configuration: EPOCH.configuration + 3,
+            configuration_number: EPOCH.configuration_number + 3,
             ..EPOCH
         },
         configuration_stage: ConfigurationStage::PreWriteRevoke,
-        catch_up: fube_runtime::CatchUpResult::NotStarted,
+        catch_up: fube_runtime::extensions::CatchUpResult::NotStarted,
         minimum_replica_set_size: 1,
         configuration: vec![],
         service_address: String::new(),
@@ -2408,7 +2470,7 @@ fn primary_status() -> ReplicaStatus {
         current_epoch: EPOCH,
         previous_epoch: Epoch::INVALID,
         configuration_stage: ConfigurationStage::Current,
-        catch_up: fube_runtime::CatchUpResult::Completed,
+        catch_up: fube_runtime::extensions::CatchUpResult::Completed,
         ..prewrite_status()
     }
 }
@@ -2416,7 +2478,7 @@ fn primary_status() -> ReplicaStatus {
 fn engine_with_native_view(
     partition: Uuid,
     id: i64,
-    provider: Arc<dyn StateProvider>,
+    provider: Arc<dyn IStateProvider>,
     view: Arc<SourceNativeView>,
 ) -> Arc<Engine> {
     Engine::bind_with_native_control(
@@ -2451,10 +2513,10 @@ async fn native_singleton_requires_stable_runtime_membership_not_primary_role_al
     let variants: &[fn(&mut ReplicaStatus)] = &[
         |s: &mut ReplicaStatus| s.lifecycle = ReplicaLifecycle::Closing,
         |s: &mut ReplicaStatus| s.configuration_stage = ConfigurationStage::CatchUp,
-        |s: &mut ReplicaStatus| s.catch_up = fube_runtime::CatchUpResult::NotStarted,
+        |s: &mut ReplicaStatus| s.catch_up = fube_runtime::extensions::CatchUpResult::NotStarted,
         |s: &mut ReplicaStatus| s.current_epoch = NEXT_EPOCH,
         |s: &mut ReplicaStatus| s.replicator_open = false,
-        |s: &mut ReplicaStatus| s.service_role = ReplicaRole::Secondary,
+        |s: &mut ReplicaStatus| s.service_role = ReplicaRole::ActiveSecondary,
     ];
     for mutate in variants {
         let mut status = primary_status();
@@ -2471,7 +2533,7 @@ async fn native_singleton_requires_stable_runtime_membership_not_primary_role_al
         .unwrap();
     provider.last.store(write.sequence, Ordering::Release);
     assert_eq!(write.wait(cancel()).await.unwrap(), 1);
-    node.abort();
+    abort_owned(&node).await;
 }
 
 async fn until(mut condition: impl FnMut() -> bool) {
@@ -2536,14 +2598,14 @@ async fn three_loopback_engines_require_explicit_apply_for_one_hundred_writes() 
         .unwrap();
     for secondary in [&s1, &s2] {
         secondary
-            .change_role(EPOCH, ReplicaRole::Idle, cancel())
+            .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
         p.build_replica(descriptor(secondary), cancel())
             .await
             .unwrap();
         secondary
-            .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+            .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
             .await
             .unwrap();
     }
@@ -2595,9 +2657,9 @@ async fn three_loopback_engines_require_explicit_apply_for_one_hundred_writes() 
     })
     .await;
     assert_eq!(p.snapshot().progress.committed, 100);
-    p.abort();
-    s1.abort();
-    s2.abort();
+    abort_owned(&p).await;
+    abort_owned(&s1).await;
+    abort_owned(&s2).await;
 }
 
 async fn pair() -> (Arc<Engine>, Arc<Engine>, Arc<Provider>) {
@@ -2623,7 +2685,7 @@ async fn pair_with_native_view(
         .await
         .unwrap();
     secondary
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     primary
@@ -2631,7 +2693,7 @@ async fn pair_with_native_view(
         .await
         .unwrap();
     secondary
-        .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     (primary, secondary, provider)
@@ -2651,11 +2713,11 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
     p.update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
-    s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+    s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     p.build_replica(descriptor(&s), cancel()).await.unwrap();
-    s.change_role(EPOCH, ReplicaRole::Secondary, cancel())
+    s.change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     let previous = configuration(vec![descriptor(&s)], true, 2);
@@ -2719,7 +2781,7 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
     status.configuration_stage = ConfigurationStage::CatchUp;
     assert_eq!(
         status.access().1,
-        fube_runtime::AccessStatus::ReconfigurationPending
+        fube_runtime::ServicePartitionAccessStatus::ReconfigurationPending
     );
     *view.0.lock().unwrap() = Ok(status);
     p.update_epoch(NEXT_EPOCH, cancel()).await.unwrap();
@@ -2728,7 +2790,7 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
     // Engine readiness after UpdateEpoch is not the independent native gate.
     assert_eq!(
         view.status().unwrap().access().1,
-        fube_runtime::AccessStatus::ReconfigurationPending
+        fube_runtime::ServicePartitionAccessStatus::ReconfigurationPending
     );
     p.update_catch_up_configuration(current, previous, cancel())
         .await
@@ -2737,14 +2799,14 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
         .await
         .unwrap();
     let mut status = view.status().unwrap();
-    status.catch_up = fube_runtime::CatchUpResult::Completed;
+    status.catch_up = fube_runtime::extensions::CatchUpResult::Completed;
     *view.0.lock().unwrap() = Ok(status);
-    p.change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+    p.change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     let mut status = view.status().unwrap();
-    status.service_role = ReplicaRole::Secondary;
-    status.replicator_role = ReplicaRole::Secondary;
+    status.service_role = ReplicaRole::ActiveSecondary;
+    status.replicator_role = ReplicaRole::ActiveSecondary;
     status.configuration_stage = ConfigurationStage::Current;
     *view.0.lock().unwrap() = Ok(status);
     s.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
@@ -2778,8 +2840,8 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
     drop(operation);
     assert_eq!(write.wait(cancel()).await.unwrap(), 2);
     assert!(!p.snapshot().ready);
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2806,16 +2868,16 @@ async fn native_prewrite_rejects_wrong_views_future_pc_and_stale_cc_without_muta
         |s| s.configuration_stage = ConfigurationStage::Current,
         |s| s.configuration_stage = ConfigurationStage::CatchUp,
         |s| s.current_role = ReplicaRole::Primary,
-        |s| s.current_role = ReplicaRole::Idle,
-        |s| s.service_role = ReplicaRole::Secondary,
-        |s| s.replicator_role = ReplicaRole::Secondary,
+        |s| s.current_role = ReplicaRole::IdleSecondary,
+        |s| s.service_role = ReplicaRole::ActiveSecondary,
+        |s| s.replicator_role = ReplicaRole::ActiveSecondary,
         |s| s.replicator_open = false,
         |s| s.lifecycle = ReplicaLifecycle::Opening,
         |s| s.lifecycle = ReplicaLifecycle::Closing,
         |s| s.lifecycle = ReplicaLifecycle::Closed,
         |s| s.current_epoch = EPOCH,
-        |s| s.current_epoch.configuration += 0x1_0000_0000,
-        |s| s.current_epoch.data_loss += 1,
+        |s| s.current_epoch.configuration_number += 0x1_0000_0000,
+        |s| s.current_epoch.data_loss_number += 1,
         |s| s.previous_epoch = NEXT_EPOCH,
         |s| s.previous_epoch = Epoch::INVALID,
     ];
@@ -2853,16 +2915,16 @@ async fn native_prewrite_rejects_wrong_views_future_pc_and_stale_cc_without_muta
     for epoch in [
         NEXT_EPOCH,
         Epoch {
-            data_loss: 2,
-            configuration: 0,
+            data_loss_number: 2,
+            configuration_number: 0,
         },
         Epoch {
-            data_loss: -1,
-            configuration: EPOCH.configuration,
+            data_loss_number: -1,
+            configuration_number: EPOCH.configuration_number,
         },
         Epoch {
-            data_loss: 1,
-            configuration: -1,
+            data_loss_number: 1,
+            configuration_number: -1,
         },
         Epoch::INVALID,
     ] {
@@ -2879,7 +2941,7 @@ async fn native_prewrite_rejects_wrong_views_future_pc_and_stale_cc_without_muta
     // The active PC must match native provenance even when it is an older,
     // otherwise valid epoch.
     let mut wrong_pc = previous.clone();
-    wrong_pc.epoch.data_loss = 0;
+    wrong_pc.epoch.data_loss_number = 0;
     assert!(p
         .update_catch_up_configuration(current.clone(), wrong_pc, cancel())
         .await
@@ -2897,7 +2959,7 @@ async fn native_prewrite_rejects_wrong_views_future_pc_and_stale_cc_without_muta
         .await
         .is_err());
     let mut future = current.clone();
-    future.epoch.configuration += 0x1_0000_0000;
+    future.epoch.configuration_number += 0x1_0000_0000;
     assert!(p
         .update_current_configuration(future, cancel())
         .await
@@ -2908,8 +2970,8 @@ async fn native_prewrite_rejects_wrong_views_future_pc_and_stale_cc_without_muta
     assert_eq!(p.snapshot().epoch, Some(EPOCH));
     assert_eq!(provider.epochs.lock().unwrap().as_slice(), epochs);
     assert_eq!(p.shared.revision.load(Ordering::Acquire), revision);
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2925,12 +2987,12 @@ async fn unqualified_configuration_cannot_advance_or_rewind_native_epoch() {
     for epoch in [
         NEXT_EPOCH,
         Epoch {
-            data_loss: 2,
-            configuration: 0,
+            data_loss_number: 2,
+            configuration_number: 0,
         },
         Epoch {
-            data_loss: 0,
-            configuration: NEXT_EPOCH.configuration,
+            data_loss_number: 0,
+            configuration_number: NEXT_EPOCH.configuration_number,
         },
     ] {
         let mut current = configuration(vec![], true, 1);
@@ -2947,18 +3009,18 @@ async fn unqualified_configuration_cannot_advance_or_rewind_native_epoch() {
         assert_eq!(p.snapshot().epoch, Some(EPOCH));
         assert_eq!(p.snapshot().progress.assigned, 0);
     }
-    p.abort();
+    abort_owned(&p).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catchup() {
     let mut status = primary_status();
-    status.service_role = ReplicaRole::Secondary;
-    status.replicator_role = ReplicaRole::Secondary;
-    status.current_role = ReplicaRole::Secondary;
+    status.service_role = ReplicaRole::ActiveSecondary;
+    status.replicator_role = ReplicaRole::ActiveSecondary;
+    status.current_role = ReplicaRole::ActiveSecondary;
     let view = Arc::new(SourceNativeView(Mutex::new(Ok(status))));
     let (old, p, provider) = pair_with_native_view(Some(view.clone())).await;
-    old.change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+    old.change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     p.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
@@ -2968,7 +3030,7 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
     status.current_epoch = NEXT_EPOCH;
     status.previous_epoch = EPOCH;
     status.configuration_stage = ConfigurationStage::CatchUp;
-    status.catch_up = fube_runtime::CatchUpResult::NotStarted;
+    status.catch_up = fube_runtime::extensions::CatchUpResult::NotStarted;
     status.configuration = vec![descriptor(&old)];
     *view.0.lock().unwrap() = Ok(status);
     let mut current = configuration(vec![], true, 1);
@@ -2982,8 +3044,8 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
     // larger configuration number without becoming a future PC.
     let mut older = configuration(vec![], true, 1);
     older.epoch = Epoch {
-        data_loss: 0,
-        configuration: NEXT_EPOCH.configuration + 0x1_0000_0000,
+        data_loss_number: 0,
+        configuration_number: NEXT_EPOCH.configuration_number + 0x1_0000_0000,
     };
     p.update_catch_up_configuration(current.clone(), older, cancel())
         .await
@@ -3013,7 +3075,7 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
     .await
     .is_err());
     // Native catch-up uses CC plus the retained fence, not PC write commitment.
-    p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel())
+    p.wait_for_catch_up(CatchUpMode::Write, cancel())
         .await
         .unwrap();
     let mut required = current.clone();
@@ -3023,7 +3085,7 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
     p.update_catch_up_configuration(required, previous.clone(), cancel())
         .await
         .unwrap();
-    for mode in [CatchUpMode::WriteQuorum, CatchUpMode::All] {
+    for mode in [CatchUpMode::Write, CatchUpMode::All] {
         assert!(timeout(
             std::time::Duration::from_millis(40),
             p.wait_for_catch_up(mode, cancel())
@@ -3042,7 +3104,7 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
         .await
         .is_err());
     assert_eq!(p.snapshot().progress.assigned, 1);
-    p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel())
+    p.wait_for_catch_up(CatchUpMode::Write, cancel())
         .await
         .unwrap();
     p.wait_for_catch_up(CatchUpMode::All, cancel())
@@ -3061,8 +3123,8 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
     operation.acknowledge().unwrap();
     drop(operation);
     assert_eq!(accepted.wait(cancel()).await.unwrap(), 1);
-    p.abort();
-    old.abort();
+    abort_owned(&p).await;
+    abort_owned(&old).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3089,7 +3151,7 @@ async fn joint_quorums_previous_one_excludes_primary_and_catchup_is_not_write_co
     assert_eq!(p.snapshot().progress.committed, 0);
     // Native WRITE_QUORUM uses CC and the prior catch-up fence, not both
     // configurations' write quorums.
-    p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel())
+    p.wait_for_catch_up(CatchUpMode::Write, cancel())
         .await
         .unwrap();
     let mut required = configuration(vec![remote.clone()], true, 1);
@@ -3103,7 +3165,7 @@ async fn joint_quorums_previous_one_excludes_primary_and_catchup_is_not_write_co
     .unwrap();
     assert!(timeout(
         std::time::Duration::from_millis(40),
-        p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel())
+        p.wait_for_catch_up(CatchUpMode::Write, cancel())
     )
     .await
     .is_err());
@@ -3126,7 +3188,7 @@ async fn joint_quorums_previous_one_excludes_primary_and_catchup_is_not_write_co
     .await
     .unwrap();
     until(|| !p.snapshot().ready).await;
-    p.wait_for_catch_up(CatchUpMode::WriteQuorum, cancel())
+    p.wait_for_catch_up(CatchUpMode::Write, cancel())
         .await
         .unwrap();
     assert!(p
@@ -3154,8 +3216,8 @@ async fn joint_quorums_previous_one_excludes_primary_and_catchup_is_not_write_co
     p.wait_for_catch_up(CatchUpMode::All, cancel())
         .await
         .unwrap();
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3199,7 +3261,7 @@ async fn accepted_cancel_is_ambiguous_resource_rejection_consumes_no_lsn_and_old
     let late = stream.next(cancel()).await.unwrap().unwrap();
     let before = s.shared.callbacks.available_permits();
     assert!(before < s.settings.provider_operations);
-    s.abort();
+    abort_owned(&s).await;
     assert!(late.acknowledge().is_err());
     assert_eq!(s.shared.callbacks.available_permits(), before);
     drop(late);
@@ -3212,7 +3274,7 @@ async fn accepted_cancel_is_ambiguous_resource_rejection_consumes_no_lsn_and_old
         s.settings.queue_operations
     );
     drop(three);
-    p.abort();
+    abort_owned(&p).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3241,7 +3303,7 @@ async fn bounded_admission_and_callback_capture_exhaustion_preserve_control_capa
     p.update_current_configuration(configuration(vec![], true, 1), cancel())
         .await
         .unwrap();
-    s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+    s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     p.build_replica(descriptor(&s), cancel()).await.unwrap();
@@ -3279,8 +3341,8 @@ async fn bounded_admission_and_callback_capture_exhaustion_preserve_control_capa
         .unwrap();
     assert_eq!(c.sequence, 3);
     assert_eq!(p.progress().unwrap().last, 2);
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 fn endpoint(transport: &PeerTransport, partition: Uuid, replica: i64) -> Endpoint {
@@ -3306,12 +3368,12 @@ fn raw_send(transport: &PeerTransport, from: &Endpoint, to: &Engine, body: Body)
 }
 
 async fn initialized_raw_secondary(
-    provider: Arc<dyn StateProvider>,
+    provider: Arc<dyn IStateProvider>,
 ) -> (Arc<Engine>, PeerTransport, Endpoint, Incoming) {
     let partition = Uuid::new_v4();
     let secondary = engine(partition, 2, provider);
     secondary
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     let (transport, incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
@@ -3405,9 +3467,9 @@ impl ControlledProvider {
     }
 }
 
-impl StateProvider for ControlledProvider {
-    fn last_committed(&self) -> Result<i64> {
-        self.base.last_committed()
+impl IStateProvider for ControlledProvider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
+        self.base.get_last_committed_sequence_number()
     }
     fn update_epoch(&self, epoch: Epoch, previous: i64, _: Cancellation) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
@@ -3431,15 +3493,15 @@ impl StateProvider for ControlledProvider {
             Ok(changed)
         })
     }
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
-        self.base.copy_context()
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
+        self.base.get_copy_context()
     }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         up_to: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>> {
-        self.base.copy_state(up_to, context)
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
+        self.base.get_copy_state(up_to, context)
     }
 }
 
@@ -3468,7 +3530,7 @@ impl NativeControlView for FaultNativeView {
     fn report_fault(
         &self,
         fault: fube_runtime::FaultType,
-    ) -> ServiceFuture<'_, fube_runtime::FaultDelivery> {
+    ) -> ServiceFuture<'_, fube_runtime::extensions::FaultDelivery> {
         Box::pin(async move {
             self.faults.lock().unwrap().push(fault);
             self.active.fetch_add(1, Ordering::AcqRel);
@@ -3479,7 +3541,7 @@ impl NativeControlView for FaultNativeView {
             if self.pending {
                 std::future::pending::<()>().await;
             }
-            Ok(fube_runtime::FaultDelivery {
+            Ok(fube_runtime::extensions::FaultDelivery {
                 fault,
                 attempts: 1,
                 last_error: None,
@@ -3511,7 +3573,7 @@ async fn internal_provider_fault_notifies_once_and_pending_receipt_cannot_block_
             )
             .unwrap();
             secondary
-                .change_role(EPOCH, ReplicaRole::Idle, cancel())
+                .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
                 .await
                 .unwrap();
             let (transport, _incoming) =
@@ -3559,13 +3621,9 @@ async fn internal_provider_fault_notifies_once_and_pending_receipt_cannot_block_
             let disposed = provider.disposed.clone();
             drop(provider);
             let closing = secondary.clone();
-            timeout(
-                std::time::Duration::from_secs(2),
-                tokio::task::spawn_blocking(move || closing.abort()),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            timeout(std::time::Duration::from_secs(2), abort_owned(&closing))
+                .await
+                .unwrap();
             assert_eq!(
                 *view.faults.lock().unwrap(),
                 vec![fube_runtime::FaultType::Transient]
@@ -3600,7 +3658,7 @@ async fn normal_shutdown_never_notifies_fault_and_standalone_has_no_native_view(
         )
         .unwrap();
         if abort {
-            engine.abort();
+            abort_owned(&engine).await;
         } else {
             engine.close(cancel()).await.unwrap();
         }
@@ -3609,7 +3667,7 @@ async fn normal_shutdown_never_notifies_fault_and_standalone_has_no_native_view(
     }
     let standalone = engine(Uuid::new_v4(), 1, Arc::new(Provider::default()));
     assert!(standalone.native_control.is_none());
-    standalone.abort();
+    abort_owned(&standalone).await;
     let view = Arc::new(FaultNativeView::new(true));
     let startup_error = Engine::bind_with_native_control(
         Actor {
@@ -3635,7 +3693,7 @@ async fn original_epoch_barrier_waits_for_explicit_apply_then_provider_disposal(
     let (secondary, transport, primary, _incoming) =
         initialized_raw_secondary(provider.clone()).await;
     let next = Epoch {
-        configuration: EPOCH.configuration * 2,
+        configuration_number: EPOCH.configuration_number * 2,
         ..EPOCH
     };
     provider.epoch_mode.store(3, Ordering::Release);
@@ -3683,7 +3741,7 @@ async fn original_epoch_barrier_waits_for_explicit_apply_then_provider_disposal(
     provider.base.last.store(2, Ordering::Release);
     second.acknowledge().unwrap();
     until(|| secondary.snapshot().progress.applied == 2).await;
-    secondary.abort();
+    abort_owned(&secondary).await;
     transport.shutdown();
 }
 
@@ -3720,7 +3778,7 @@ async fn provider_epoch_and_data_loss_errors_panics_deadlines_are_terminal_and_d
                 provider.epoch_mode.store(mode, Ordering::Release);
                 e.update_epoch(
                     Epoch {
-                        configuration: EPOCH.configuration * 2,
+                        configuration_number: EPOCH.configuration_number * 2,
                         ..EPOCH
                     },
                     cancel(),
@@ -3737,7 +3795,7 @@ async fn provider_epoch_and_data_loss_errors_panics_deadlines_are_terminal_and_d
                 .submit(OperationData::new(vec![vec![1]]).unwrap(), cancel())
                 .await
                 .is_err());
-            e.abort();
+            abort_owned(&e).await;
         }
     }
 }
@@ -3756,7 +3814,7 @@ async fn canceled_epoch_drain_faults_and_changed_data_loss_resets_assignment_fro
     let cancellation = cancel();
     let update = s.update_epoch(
         Epoch {
-            configuration: EPOCH.configuration * 2,
+            configuration_number: EPOCH.configuration_number * 2,
             ..EPOCH
         },
         cancellation.clone(),
@@ -3769,7 +3827,7 @@ async fn canceled_epoch_drain_faults_and_changed_data_loss_resets_assignment_fro
     assert!(update.await.is_err());
     until(|| s.snapshot().closed).await;
     assert!(outstanding.acknowledge().is_err());
-    s.abort();
+    abort_owned(&s).await;
     transport.shutdown();
 
     let provider = Arc::new(ControlledProvider::default());
@@ -3804,7 +3862,7 @@ async fn canceled_epoch_drain_faults_and_changed_data_loss_resets_assignment_fro
         .await
         .unwrap();
     assert_eq!(write.sequence, 2);
-    p.abort();
+    abort_owned(&p).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3856,7 +3914,7 @@ async fn retransmission_recovers_after_actual_tcp_disconnect_without_send_as_com
         },
     );
     assert_eq!(write.wait(cancel()).await.unwrap(), 1);
-    p.abort();
+    abort_owned(&p).await;
     replacement.shutdown();
 }
 
@@ -3868,7 +3926,7 @@ async fn real_wire_gaps_duplicates_stale_epochs_actors_and_impossible_receipts()
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     assert_eq!(s.snapshot().progress.received, 0);
     let older = Epoch {
-        configuration: 0,
+        configuration_number: 0,
         ..EPOCH
     };
     raw_send(&transport, &primary, &s, replication(older, older, 1, 1));
@@ -3890,7 +3948,7 @@ async fn real_wire_gaps_duplicates_stale_epochs_actors_and_impossible_receipts()
     provider.last.store(2, Ordering::Release);
     first.acknowledge().unwrap();
     until(|| s.snapshot().progress.applied == 2).await;
-    s.abort();
+    abort_owned(&s).await;
     transport.shutdown();
 
     let (p, s, _) = pair().await;
@@ -3936,8 +3994,8 @@ async fn real_wire_gaps_duplicates_stale_epochs_actors_and_impossible_receipts()
     assert_eq!(p.snapshot().progress.committed, 0);
     assert_eq!(p.snapshot().peers[0].received, 1);
     drop(accepted);
-    p.abort();
-    s.abort();
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 // R1-R5 regressions promoted from reviews/phase2_repros.rs. The unsafe swap
@@ -3955,7 +4013,7 @@ async fn initial_primary(primary: &Engine) {
 
 async fn build_memory(primary: &Engine, secondary: &Arc<Engine>, provider: &Arc<MemoryProvider>) {
     secondary
-        .change_role(EPOCH, ReplicaRole::Idle, cancel())
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     let target = secondary.clone();
@@ -3972,7 +4030,7 @@ async fn build_memory(primary: &Engine, secondary: &Arc<Engine>, provider: &Arc<
         .unwrap();
     copier.await.unwrap();
     secondary
-        .change_role(EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
 }
@@ -4042,7 +4100,7 @@ async fn rejected_demotion_then_promotion_drains_the_pending_tail_without_sequen
     assert_eq!(b.snapshot().progress.applied, 1);
     assert_eq!(a.snapshot().progress.committed, 1);
     assert!(a
-        .change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .is_err());
     assert_eq!(a.snapshot().role, ReplicaRole::Primary);
@@ -4086,8 +4144,8 @@ async fn rejected_demotion_then_promotion_drains_the_pending_tail_without_sequen
     assert!(b.snapshot().progress.committed <= 2);
     assert_eq!(b.snapshot().progress.client_completed, 2);
     assert_eq!(ap.snapshot().values["key"], "old");
-    a.abort();
-    b.abort();
+    abort_owned(&a).await;
+    abort_owned(&b).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4107,7 +4165,7 @@ async fn rejected_demotion_preserves_accepted_completion_for_drain_and_retry() {
     ap.apply_replication(1, &one).unwrap();
     until(|| b.snapshot().progress.received == 1).await;
     assert!(a
-        .change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+        .change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .is_err());
     let canceled = cancel();
@@ -4121,15 +4179,15 @@ async fn rejected_demotion_preserves_accepted_completion_for_drain_and_retry() {
             .unwrap(),
         1
     );
-    a.change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+    a.change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
-    until(|| a.snapshot().role == ReplicaRole::Secondary).await;
+    until(|| a.snapshot().role == ReplicaRole::ActiveSecondary).await;
     assert_eq!(a.snapshot().progress.applied, 1);
     assert_eq!(ap.snapshot().values, bp.snapshot().values);
     assert_eq!(ap.snapshot().results, bp.snapshot().results);
-    a.abort();
-    b.abort();
+    abort_owned(&a).await;
+    abort_owned(&b).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4156,7 +4214,7 @@ async fn continuing_third_secondary_accepts_the_new_primary() {
     drop(apply_memory(&b, &bp, 1).await);
     drop(apply_memory(&c, &cp, 1).await);
     write.wait(cancel()).await.unwrap();
-    a.change_role(NEXT_EPOCH, ReplicaRole::Secondary, cancel())
+    a.change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     b.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
@@ -4186,14 +4244,14 @@ async fn continuing_third_secondary_accepts_the_new_primary() {
     until(|| a.snapshot().progress.applied == 2 && c.snapshot().progress.applied == 2).await;
     assert_eq!(a.snapshot().progress.applied, 2);
     assert_eq!(c.snapshot().progress.applied, 2);
-    a.abort();
-    b.abort();
-    c.abort();
+    abort_owned(&a).await;
+    abort_owned(&b).await;
+    abort_owned(&c).await;
 }
 
 async fn copying_raw_secondary(
     epoch: Epoch,
-    provider: Arc<dyn StateProvider>,
+    provider: Arc<dyn IStateProvider>,
     settings: Settings,
 ) -> (Arc<Engine>, PeerTransport, Endpoint, Incoming) {
     let partition = Uuid::new_v4();
@@ -4209,7 +4267,7 @@ async fn copying_raw_secondary(
     )
     .unwrap();
     secondary
-        .change_role(epoch, ReplicaRole::Idle, cancel())
+        .change_role(epoch, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
     let (network, mut incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
@@ -4300,7 +4358,7 @@ async fn primary_rebinding_requires_node_accepted_newer_epoch_and_fences_old_act
     let provider = Arc::new(Provider::default());
     let (s, old_network, old_primary, _old_incoming) =
         initialized_raw_secondary(provider.clone()).await;
-    s.change_role(EPOCH, ReplicaRole::Secondary, cancel())
+    s.change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
     let (new_network, _new_incoming) =
@@ -4330,7 +4388,7 @@ async fn primary_rebinding_requires_node_accepted_newer_epoch_and_fences_old_act
         replication(EPOCH, EPOCH, 1, 1),
     );
     let future = Epoch {
-        configuration: NEXT_EPOCH.configuration + EPOCH.configuration,
+        configuration_number: NEXT_EPOCH.configuration_number + EPOCH.configuration_number,
         ..EPOCH
     };
     raw_send(
@@ -4393,7 +4451,7 @@ async fn primary_rebinding_requires_node_accepted_newer_epoch_and_fences_old_act
     assert_eq!(op.sequence, 2);
     assert_eq!(op.data.to_segments(), vec![vec![3]]);
     assert!(s.snapshot().fault.is_none());
-    s.abort();
+    abort_owned(&s).await;
     old_network.shutdown();
     new_network.shutdown();
 }
@@ -4403,7 +4461,7 @@ async fn original_operation_epoch_may_precede_start_copy_primary_epoch() {
     // Exercise the real provider's monotonic epoch check, not a permissive
     // provider that accepts an accidental E2 -> E1 callback regression.
     let future = Epoch {
-        configuration: NEXT_EPOCH.configuration + EPOCH.configuration,
+        configuration_number: NEXT_EPOCH.configuration_number + EPOCH.configuration_number,
         ..EPOCH
     };
     for (original, advance_node) in [
@@ -4461,7 +4519,7 @@ async fn original_operation_epoch_may_precede_start_copy_primary_epoch() {
         assert_eq!(
             provider.snapshot().epoch_configuration,
             if original > NEXT_EPOCH {
-                original.configuration
+                original.configuration_number
             } else {
                 0
             }
@@ -4497,14 +4555,14 @@ async fn original_operation_epoch_may_precede_start_copy_primary_epoch() {
         assert_eq!(second.sequence, 2);
         assert_eq!(
             provider.snapshot().epoch_configuration,
-            future.configuration
+            future.configuration_number
         );
         provider.apply_replication(2, &second.data).unwrap();
         second.acknowledge().unwrap();
         until(|| s.snapshot().progress.applied == 2).await;
         assert_eq!(provider.snapshot().values["key"], "two");
         assert!(s.snapshot().fault.is_none());
-        s.abort();
+        abort_owned(&s).await;
         network.shutdown();
     }
 }
@@ -4548,7 +4606,7 @@ async fn staged_replication_cannot_starve_copy_eos_forever() {
         .unwrap()
         .unwrap();
     assert_eq!(op.sequence, 1);
-    s.abort();
+    abort_owned(&s).await;
     network.shutdown();
 }
 
@@ -4630,7 +4688,7 @@ async fn staged_replication_cannot_starve_copy_items_under_operation_or_byte_exh
         assert!(s.snapshot().owned_operations <= settings.queue_operations);
         assert!(s.snapshot().owned_bytes <= settings.queue_bytes);
         assert!(s.snapshot().fault.is_none());
-        s.abort();
+        abort_owned(&s).await;
         assert_eq!(s.snapshot().owned_operations, 0);
         assert_eq!(s.snapshot().owned_bytes, 0);
         network.shutdown();
@@ -4662,7 +4720,7 @@ async fn aggregate_copy_snapshot(settings: Settings, bytes: usize) -> EngineSnap
     assert!(!snapshot.copy_done);
     assert_eq!(snapshot.progress.applied, 0);
     drop(capture);
-    secondary.abort();
+    abort_owned(&secondary).await;
     assert_eq!(secondary.snapshot().owned_operations, 0);
     assert_eq!(secondary.snapshot().owned_bytes, 0);
     network.shutdown();
@@ -4789,7 +4847,7 @@ async fn concurrent_submit_attempts_cannot_consume_incoming_copy_reservation_or_
         );
         drop(copy);
         retry_raw_eos(&s, &network, &primary, 2).await;
-        s.abort();
+        abort_owned(&s).await;
         assert_eq!(s.snapshot().owned_operations, 0);
         assert_eq!(s.snapshot().owned_bytes, 0);
         network.shutdown();
@@ -4935,7 +4993,7 @@ async fn outgoing_budget_repro_requires_eos_or_explicit_preassignment_write_reje
     );
     source.record(next.sequence);
     assert_eq!(next.wait(cancel()).await.unwrap(), assigned + 1);
-    p.abort();
+    abort_owned(&p).await;
     assert_eq!(p.snapshot().owned_bytes, 0);
     network.shutdown();
 }
@@ -4967,7 +5025,7 @@ async fn outgoing_copy_and_real_idle_ack_progress_with_admitted_or_rejected_live
         p.update_current_configuration(configuration(vec![], true, 1), cancel())
             .await
             .unwrap();
-        s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+        s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
         let owner = p.clone();
@@ -5063,8 +5121,8 @@ async fn outgoing_copy_and_real_idle_ack_progress_with_admitted_or_rejected_live
         target_provider.last.store(op.sequence, Ordering::Release);
         op.acknowledge().unwrap();
         drop(op);
-        p.abort();
-        s.abort();
+        abort_owned(&p).await;
+        abort_owned(&s).await;
         assert_eq!(p.snapshot().owned_bytes, 0);
         assert_eq!(s.snapshot().owned_bytes, 0);
     }
@@ -5095,7 +5153,7 @@ async fn outgoing_future_copy_headroom_survives_concurrent_build_and_write_admis
         .unwrap();
     for secondary in [&follower, &target] {
         secondary
-            .change_role(EPOCH, ReplicaRole::Idle, cancel())
+            .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
     }
@@ -5233,9 +5291,9 @@ async fn outgoing_future_copy_headroom_survives_concurrent_build_and_write_admis
     op.acknowledge().unwrap();
     drop(op);
     assert_eq!(next.wait(cancel()).await.unwrap(), 2);
-    p.abort();
-    follower.abort();
-    target.abort();
+    abort_owned(&p).await;
+    abort_owned(&follower).await;
+    abort_owned(&target).await;
     for owner in [&p, &follower, &target] {
         assert_eq!(owner.snapshot().owned_operations, 0);
         assert_eq!(owner.snapshot().owned_bytes, 0);
@@ -5262,7 +5320,7 @@ async fn outgoing_build_admission_counts_pending_writes_before_installing_any_pe
         p.update_current_configuration(configuration(vec![], true, 1), cancel())
             .await
             .unwrap();
-        s.change_role(EPOCH, ReplicaRole::Idle, cancel())
+        s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
         let data = OperationData::new(vec![vec![7; 1800]]).unwrap();
@@ -5274,7 +5332,11 @@ async fn outgoing_build_admission_counts_pending_writes_before_installing_any_pe
             // These are already-charged, not-yet-assigned Submit messages, just
             // as if producers won admission while the owner selected Build.
             p.commands
-                .try_send(Command::Build(descriptor(&s), cancel(), reply))
+                .try_send(AuthorizedCommand {
+                    command: Command::Build(descriptor(&s), cancel(), reply.into()),
+                    proof: None,
+                    cleanup: None,
+                })
                 .unwrap_or_else(|_| panic!("build command queue unexpectedly full"));
             for _ in 0..if byte_limit { 1 } else { 2 } {
                 let charge = p
@@ -5297,7 +5359,7 @@ async fn outgoing_build_admission_counts_pending_writes_before_installing_any_pe
                         data: data.clone(),
                         charge,
                         cancellation: cancel(),
-                        reply,
+                        reply: reply.into(),
                     })
                     .unwrap_or_else(|_| panic!("pending write queue unexpectedly full"));
                 replies.push(result);
@@ -5338,8 +5400,8 @@ async fn outgoing_build_admission_counts_pending_writes_before_installing_any_pe
         assert_eq!(next.sequence, sequence + 1);
         provider.last.store(next.sequence, Ordering::Release);
         next.wait(cancel()).await.unwrap();
-        p.abort();
-        s.abort();
+        abort_owned(&p).await;
+        abort_owned(&s).await;
         assert_eq!(p.snapshot().owned_bytes, 0);
     }
 }
@@ -5368,7 +5430,7 @@ async fn outgoing_build_on_retained_write_budget_fails_without_losing_write_or_c
         .unwrap();
     for secondary in [&follower, &target] {
         secondary
-            .change_role(EPOCH, ReplicaRole::Idle, cancel())
+            .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
             .await
             .unwrap();
     }
@@ -5392,7 +5454,9 @@ async fn outgoing_build_on_retained_write_budget_fails_without_losing_write_or_c
         .unwrap();
     let canceled = cancel();
     canceled.cancel();
-    assert!(matches!(write.wait(canceled).await, Err(Error::Closed)));
+    let error = write.wait(canceled).await.unwrap_err();
+    assert_eq!(error.kind(), fube_runtime::ErrorKind::Canceled);
+    assert!(error.is_uncertain());
     assert!(matches!(
         timeout(
             std::time::Duration::from_secs(2),
@@ -5423,9 +5487,9 @@ async fn outgoing_build_on_retained_write_budget_fails_without_losing_write_or_c
     .unwrap();
     assert_eq!(p.snapshot().peers.len(), 2);
     assert_eq!(p.snapshot().progress.assigned, 1);
-    p.abort();
-    follower.abort();
-    target.abort();
+    abort_owned(&p).await;
+    abort_owned(&follower).await;
+    abort_owned(&target).await;
     assert_eq!(p.snapshot().owned_bytes, 0);
 }
 
@@ -5445,13 +5509,13 @@ async fn shutdown_disposes_operations_still_owned_by_stream_channels() {
         .unwrap();
     until(|| b.snapshot().operation_captures == 2).await;
     let stream = b.replication_stream();
-    b.abort();
+    abort_owned(&b).await;
     let snapshot = b.snapshot();
     assert_eq!(snapshot.operation_captures, 0, "{snapshot:?}");
     assert_eq!(snapshot.owned_operations, 0);
     assert_eq!(snapshot.owned_bytes, 0);
     assert!(stream.next(cancel()).await.unwrap().is_none());
-    a.abort();
+    abort_owned(&a).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5474,7 +5538,7 @@ async fn copy_stream_shutdown_drains_buffer_but_preserves_application_owned_capt
         } else {
             None
         };
-        s.abort();
+        abort_owned(&s).await;
         let snapshot = s.snapshot();
         assert_eq!(snapshot.operation_captures, usize::from(hold_capture));
         assert_eq!(snapshot.owned_operations, usize::from(hold_capture));
@@ -5519,7 +5583,7 @@ async fn stream_shutdown_wakes_pending_polls_and_linearizes_concurrent_publicati
             until(|| pending.load(Ordering::Acquire)).await;
         }
     }
-    e.abort();
+    abort_owned(&e).await;
     for poll in polls {
         assert!(timeout(std::time::Duration::from_secs(2), poll)
             .await
@@ -5544,7 +5608,7 @@ async fn stream_shutdown_wakes_pending_polls_and_linearizes_concurrent_publicati
         let stream = b.replication_stream();
         polls.push(tokio::spawn(async move { stream.next(cancel()).await }));
     }
-    b.abort();
+    abort_owned(&b).await;
     let mut held = Vec::new();
     for poll in polls {
         if let Some(op) = timeout(std::time::Duration::from_secs(2), poll)
@@ -5569,5 +5633,5 @@ async fn stream_shutdown_wakes_pending_polls_and_linearizes_concurrent_publicati
     assert_eq!(b.snapshot().operation_captures, 0);
     assert_eq!(b.snapshot().owned_operations, 0);
     assert_eq!(b.snapshot().owned_bytes, 0);
-    a.abort();
+    abort_owned(&a).await;
 }

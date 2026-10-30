@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use fube_data::{Cancellation, Epoch, MemoryProvider, OperationDataStream, StateProvider};
+use fube_data::{Cancellation, Epoch, IOperationDataStream, IStateProvider, MemoryProvider};
 use mssf_com::{
     FabricCommon::{IFabricAsyncOperationCallback, IFabricAsyncOperationContext},
     FabricRuntime::{
@@ -94,7 +94,7 @@ impl Application {
         let observation = Arc::new(CopyObservation {
             value: Mutex::new(json!({
                 "requested_horizon": horizon,
-                "provider_progress_at_request": self.provider.last_committed().map_err(application_error)?,
+                "provider_progress_at_request": self.provider.get_last_committed_sequence_number().map_err(application_error)?,
                 "build_context": null,
                 "provider_progress_at_end": null,
                 "enumeration_end": false,
@@ -121,7 +121,7 @@ impl Application {
         // copy requests at that LSN must wait, not lower the requested horizon.
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
-                if self.provider.last_committed().map_err(application_error)? >= horizon {
+                if self.provider.get_last_committed_sequence_number().map_err(application_error)? >= horizon {
                     return Ok(());
                 }
                 tokio::select! {
@@ -155,7 +155,7 @@ impl IFabricStateProvider_Impl for Provider_Impl {
         com::guard(|| {
             self.0
                 .provider
-                .last_committed()
+                .get_last_committed_sequence_number()
                 .map(FABRIC_SEQUENCE_NUMBER)
                 .map_err(application_error)
         })
@@ -173,8 +173,8 @@ impl IFabricStateProvider_Impl for Provider_Impl {
                 return Err(com::E_INVALIDARG.into());
             }
             let epoch = Epoch {
-                data_loss: epoch.DataLossNumber,
-                configuration: epoch.ConfigurationNumber,
+                data_loss_number: epoch.DataLossNumber,
+                configuration_number: epoch.ConfigurationNumber,
             };
             let app = self.0.clone();
             self.0
@@ -222,7 +222,11 @@ impl IFabricStateProvider_Impl for Provider_Impl {
     }
     fn GetCopyContext(&self) -> Result<IFabricOperationDataStream> {
         com::guard(|| {
-            let empty = self.0.provider.copy_context().map_err(application_error)?;
+            let empty = self
+                .0
+                .provider
+                .get_copy_context()
+                .map_err(application_error)?;
             stream(self.0.clone(), Source::Ready(empty), None)
         })
     }
@@ -248,7 +252,7 @@ impl IFabricStateProvider_Impl for Provider_Impl {
 
 enum Source {
     Horizon(i64),
-    Ready(Arc<dyn OperationDataStream>),
+    Ready(Arc<dyn IOperationDataStream>),
 }
 
 struct CopyObservation {
@@ -338,7 +342,7 @@ impl NullableDataStream_Impl for CopyStream_Impl {
                             let _gate = app.gate.lock().await;
                             *source = Source::Ready(
                                 app.provider
-                                    .copy_state(horizon, None)
+                                    .get_copy_state(horizon, None)
                                     .map_err(application_error)?,
                             );
                             if let Some(observation) = &observation {
@@ -355,7 +359,7 @@ impl NullableDataStream_Impl for CopyStream_Impl {
                         let Source::Ready(ref source) = *source else {
                             return Err(com::E_UNEXPECTED.into());
                         };
-                        match source.next(cancel).await {
+                        match source.get_next(cancel).await {
                             Ok(Some(data)) => {
                                 tokio::time::sleep(Duration::from_millis(
                                     app.copy_delay.load(Ordering::Acquire),
@@ -375,7 +379,7 @@ impl NullableDataStream_Impl for CopyStream_Impl {
                                         value["enumeration_end"] = true.into();
                                         value["provider_progress_at_end"] = app
                                             .provider
-                                            .last_committed()
+                                            .get_last_committed_sequence_number()
                                             .map_err(application_error)?
                                             .into();
                                     }

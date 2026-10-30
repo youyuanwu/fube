@@ -1,10 +1,12 @@
 //! Application-runtime reports, not management-client operations.
 use crate::{api::FaultType, lease::Authority, wire::*};
+use crate::{Error, Result};
 use fube_transport::{
     connection::{deadline_after, Connection, SendStatus},
     message::{Header, Message},
-    serialization::serde::{from_slice, to_vec, EmptyObjectArray, FixedTag, ObjectArray, Pointer},
-    Error, Result,
+    serialization::serde::{
+        from_slice, to_vec, EmptyObjectArray, NativeEnum, ObjectArray, Pointer,
+    },
 };
 use std::{
     collections::BTreeMap,
@@ -32,6 +34,7 @@ pub struct LoadMetric {
     pub value: u32,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Pinned native costs 0–3. Newer mssf VeryHigh is intentionally unavailable.
 pub enum MoveCost {
     Zero,
     Low,
@@ -40,19 +43,64 @@ pub enum MoveCost {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthState {
+    Invalid,
     Ok,
     Warning,
     Error,
 }
+/// UTF-8 health values. TTL is in seconds; zero is infinite. Sequence zero is
+/// process-auto; negative values are invalid. This profile directly sends both
+/// Immediate values and awaits an exact HM result, not SDK batching admission.
+/// Only Ok/Warning/Error are accepted. Source/property are nonempty bounded
+/// UTF-16-compatible text without NUL; System* and DeleteProperty are reserved.
+/// Descriptions above 4096 UTF-16 units are rejected, not truncated.
+#[derive(Debug, Clone)]
+pub struct HealthInformation {
+    pub source_id: String,
+    pub property: String,
+    pub time_to_live_seconds: u32,
+    pub state: HealthState,
+    pub description: String,
+    pub sequence_number: i64,
+    pub remove_when_expired: bool,
+}
+#[derive(Debug, Clone)]
+/// Both values directly send, with no intentional reporting-interval delay.
+/// This is not SDK default batching/retry parity or guaranteed HM delivery.
+pub struct HealthReportSendOption {
+    pub immediate: bool,
+}
+impl TryFrom<&HealthInformation> for HealthReport {
+    type Error = Error;
+    fn try_from(value: &HealthInformation) -> Result<Self> {
+        if value.sequence_number < 0 || value.state == HealthState::Invalid {
+            return Err(Error::InvalidInput("invalid health state or sequence"));
+        }
+        Ok(Self {
+            source: value.source_id.clone(),
+            property: value.property.clone(),
+            state: value.state,
+            description: value.description.clone(),
+            time_to_live: (value.time_to_live_seconds != 0)
+                .then(|| Duration::from_secs(value.time_to_live_seconds.into())),
+            sequence: if value.sequence_number == 0 {
+                HealthSequence::Auto
+            } else {
+                HealthSequence::Explicit(value.sequence_number)
+            },
+            remove_when_expired: value.remove_when_expired,
+        })
+    }
+}
 #[derive(Debug, Clone, Copy)]
-pub enum HealthSequence {
+pub(crate) enum HealthSequence {
     Auto,
     /// Must be strictly positive. HM requires a strictly increasing sequence
     /// for the same instance/source/property; stale results are returned errors.
     Explicit(i64),
 }
 #[derive(Debug, Clone)]
-pub struct HealthReport {
+pub(crate) struct HealthReport {
     pub source: String,
     pub property: String,
     pub state: HealthState,
@@ -85,6 +133,12 @@ struct FaultStage {
     current: Arc<AtomicBool>,
     complete: tokio::sync::watch::Sender<Option<Result<FaultDelivery>>>,
 }
+#[derive(Clone, Copy)]
+pub(crate) enum HealthTarget {
+    Partition,
+    Instance,
+    Replica,
+}
 pub(crate) struct Reporting {
     connection: Connection,
     valid: Arc<AtomicBool>,
@@ -96,7 +150,8 @@ pub(crate) struct Reporting {
     cancel: crate::Cancellation,
     global: Arc<Semaphore>,
     fault_changed: tokio::sync::Notify,
-    executor: Option<tokio::runtime::Handle>,
+    executor: tokio::runtime::Handle,
+    tasks: Mutex<tokio::task::JoinSet<()>>,
 }
 impl std::fmt::Debug for Reporting {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -104,6 +159,47 @@ impl std::fmt::Debug for Reporting {
     }
 }
 impl Reporting {
+    fn track(&self, future: impl std::future::Future<Output = ()> + Send + 'static) -> Result<()> {
+        let mut tasks = self.tasks.lock().unwrap();
+        while let Some(joined) = tasks.try_join_next() {
+            if joined.is_err() {
+                return Err(Error::Protocol("report driver task failed"));
+            }
+        }
+        self.check()?;
+        // 64 accepted callback roots, one finishing core record and the
+        // existing one-per-partition fault worker; payload permits stay 16/1.
+        if tasks.len() >= 2 * crate::MAX_CALLBACKS + 2 {
+            return Err(Error::ResourceLimit("report driver records"));
+        }
+        tasks.spawn_on(future, &self.executor);
+        Ok(())
+    }
+    pub(crate) async fn quiesce(&self) -> Result<()> {
+        let mut tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+        while let Some(joined) = tasks.join_next().await {
+            joined.map_err(|_| Error::Protocol("report driver task failed"))?;
+        }
+        Ok(())
+    }
+    pub(crate) fn complete<T: Send + 'static>(
+        &self,
+        future: impl std::future::Future<Output = Result<T>> + Send + 'static,
+    ) -> Result<T> {
+        let deadline = crate::extensions::ExecutionRuntime::blocking_deadline_for(&self.authority)?
+            .min(std::time::Instant::now() + REPORT_TIMEOUT);
+        self.check()?;
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        self.track(async move {
+            let _ = send.send(future.await);
+        })?;
+        receive
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .map_err(|error| match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => Error::Timeout.uncertain(),
+                std::sync::mpsc::RecvTimeoutError::Disconnected => Error::Closed.uncertain(),
+            })?
+    }
     #[cfg(test)]
     pub(crate) fn admission_for_test(&self) -> tokio::sync::SemaphorePermit<'_> {
         self.admission.try_acquire().unwrap()
@@ -115,6 +211,7 @@ impl Reporting {
         request: ProxyRequest,
         cancel: crate::Cancellation,
         global: Arc<Semaphore>,
+        executor: tokio::runtime::Handle,
     ) -> Arc<Self> {
         Arc::new(Self {
             connection,
@@ -127,7 +224,8 @@ impl Reporting {
             cancel,
             global,
             fault_changed: tokio::sync::Notify::new(),
-            executor: tokio::runtime::Handle::try_current().ok(),
+            executor,
+            tasks: Mutex::new(tokio::task::JoinSet::new()),
         })
     }
     pub(crate) fn update(&self, request: &ProxyRequest) {
@@ -181,7 +279,24 @@ impl Reporting {
         if metrics.is_empty() || metrics.len() > MAX_REPORT_METRICS {
             return Err(Error::InvalidInput("report requires 1..=64 metrics"));
         }
+        // FUP ReportLoad snapshots CurrentConfigurationRole together with the
+        // native routing identity, not completed currentServiceRole_. Only
+        // accepted native context updates replace this private request.
         let request = self.request.lock().unwrap().clone();
+        let primary = if request.service.stateful {
+            match request.local.current_role {
+                4 => true,      // RAP Primary
+                2 | 3 => false, // RAP Idle / Secondary -> PLB Secondary
+                _ => {
+                    return Err(Error::new(
+                        crate::ErrorKind::InvalidState,
+                        "no representable native load role",
+                    ));
+                }
+            }
+        } else {
+            false
+        };
         let mut unique = BTreeMap::new();
         for metric in metrics {
             name(&metric.name)?;
@@ -226,13 +341,17 @@ impl Reporting {
             reports: ObjectArray(vec![LoadDescription {
                 partition: request.unit.id.id,
                 service: request.service.name,
-                stateful: false,
-                primary: ObjectArray(vec![]),
-                secondary: ObjectArray(stats.clone()),
-                nodes: ObjectArray(vec![NodeLoads {
-                    node: request.local.node.id,
-                    loads: ObjectArray(stats),
-                }]),
+                stateful: request.service.stateful,
+                primary: ObjectArray(if primary { stats.clone() } else { vec![] }),
+                secondary: ObjectArray(if primary { vec![] } else { stats.clone() }),
+                nodes: ObjectArray(if primary {
+                    vec![]
+                } else {
+                    vec![NodeLoads {
+                        node: request.local.node.id,
+                        loads: ObjectArray(stats),
+                    }]
+                }),
             }]),
             time: now,
         };
@@ -246,7 +365,7 @@ impl Reporting {
                 body,
                 deadline_after(REPORT_TIMEOUT)?,
                 self.fence(),
-            ) => result?,
+            ) => result.map_err(report_transport_error)?,
         }
         self.check()?;
         let utc = utc();
@@ -264,7 +383,11 @@ impl Reporting {
         }
         Ok(())
     }
-    pub(crate) async fn health(self: &Arc<Self>, report: &HealthReport) -> Result<HealthReceipt> {
+    pub(crate) async fn health(
+        self: &Arc<Self>,
+        report: &HealthReport,
+        target: HealthTarget,
+    ) -> Result<HealthReceipt> {
         self.check()?;
         let _global = self
             .global
@@ -298,23 +421,44 @@ impl Reporting {
             HealthSequence::Auto => auto_sequence()?,
         };
         let request = self.request.lock().unwrap().clone();
-        let entity_property = format!(
-            "{}+{}+{}",
-            uuid::Uuid::from_bytes_le(request.unit.id.id.0),
-            request.local.id,
-            report.property
-        );
-        let body = HealthBody {
-            reports: ObjectArray(vec![InstanceHealth {
-                entity: Pointer(Some(FixedTag(HealthEntity {
-                    kind: 2,
-                    partition: request.unit.id.id,
+        let partition = request.unit.id.id;
+        let id = uuid::Uuid::from_bytes_le(partition.0);
+        let (kind, entity, entity_id) = match target {
+            HealthTarget::Partition => (3, HealthEntity::Partition { partition }, id.to_string()),
+            HealthTarget::Instance if !request.service.stateful => (
+                2,
+                HealthEntity::Instance {
+                    partition,
                     instance: request.local.id,
-                }))),
+                },
+                format!("{id}+{}", request.local.id),
+            ),
+            HealthTarget::Replica if request.service.stateful => (
+                1,
+                HealthEntity::Replica {
+                    partition,
+                    replica: request.local.id,
+                    replica_instance: -1,
+                },
+                format!("{id}+{}", request.local.id),
+            ),
+            _ => {
+                return Err(Error::InvalidInput(
+                    "health target differs from native service kind",
+                ))
+            }
+        };
+        let entity_property = format!("{entity_id}+{}", report.property);
+        let body = HealthBody {
+            reports: ObjectArray(vec![EntityHealth {
+                entity: Pointer(Some(NativeEnum(entity))),
                 source: report.source.clone(),
                 property: report.property.clone(),
                 ttl,
                 state: match report.state {
+                    HealthState::Invalid => {
+                        return Err(Error::InvalidInput("invalid health state"))
+                    }
                     HealthState::Ok => 1,
                     HealthState::Warning => 2,
                     HealthState::Error => 3,
@@ -340,16 +484,16 @@ impl Reporting {
                 headers,
                 body,
                 deadline_after(REPORT_TIMEOUT)?,
-                decode_health,
+                |bytes| decode_health(bytes).map_err(|error| error.transport_fault()),
                 self.fence(),
-            ) => result?,
+            ) => result.map_err(report_transport_error)?,
         };
         self.check()?;
         if reply.results.0.len() != 1 || !reply.streams.0.is_empty() {
             return Err(Error::Protocol("unexpected health result cardinality"));
         }
         let result = &reply.results.0[0];
-        if result.kind != 2
+        if result.kind != kind
             || result.source != report.source
             || result.sequence != sequence
             || result.entity_property != entity_property
@@ -373,6 +517,11 @@ impl Reporting {
     }
     pub(crate) async fn fault(self: &Arc<Self>, fault: FaultType) -> Result<FaultDelivery> {
         self.check()?;
+        let native_fault = match fault {
+            FaultType::Invalid => return Err(Error::InvalidInput("invalid fault type")),
+            FaultType::Transient => 1,
+            FaultType::Permanent => 2,
+        };
         let (first, changed, receiver) = {
             let mut stage = self.fault.lock().unwrap();
             if let Some(existing) = stage
@@ -386,10 +535,7 @@ impl Reporting {
                 let body = to_vec(&FaultBody {
                     unit: request.unit,
                     local: request.local,
-                    fault: match fault {
-                        FaultType::Transient => 1,
-                        FaultType::Permanent => 2,
-                    },
+                    fault: native_fault,
                     activity: Activity {
                         id: ActivityId {
                             guid: fube_transport::serialization::serde::Guid(
@@ -429,12 +575,19 @@ impl Reporting {
             let this = self.clone();
             // Participant executors may stop immediately after a terminal fault.
             // Retries belong to the runtime that installed this native unit.
-            self.executor
-                .clone()
-                .unwrap_or_else(tokio::runtime::Handle::current)
-                .spawn(async move {
-                    this.fault_worker().await;
-                });
+            if let Err(error) = self.track(async move {
+                this.fault_worker().await;
+            }) {
+                if let Some(stage) = self.fault.lock().unwrap().as_mut() {
+                    stage.delivery.cancelled = true;
+                    stage.delivery.last_error = Some(error.to_string());
+                    stage.error = Some(error.clone());
+                    if stage.complete.borrow().is_none() {
+                        stage.complete.send_replace(Some(Err(error.clone())));
+                    }
+                }
+                return Err(error);
+            }
         } else if changed {
             self.fault_changed.notify_one();
         }
@@ -492,6 +645,7 @@ impl Reporting {
                         sent,
                     )
                     .await
+                    .map_err(Error::from)
             };
             let result = tokio::select! {
                 _ = self.cancel.cancelled() => break,
@@ -536,6 +690,14 @@ fn text(value: &str, empty: bool) -> Result<()> {
         ));
     }
     Ok(())
+}
+fn report_transport_error(error: fube_transport::Error) -> Error {
+    let error = Error::from(error);
+    if matches!(error, Error::Timeout) {
+        error.uncertain()
+    } else {
+        error
+    }
 }
 fn name(value: &str) -> Result<()> {
     text(value, false)
@@ -583,7 +745,7 @@ fn decode_health(message: Message) -> Result<HealthReply> {
     if properties.actor != 16 || properties.action != "OperationSuccessAction" {
         return Err(Error::Protocol("unexpected health reply envelope"));
     }
-    from_slice(&message.body)
+    Ok(from_slice(&message.body)?)
 }
 
 #[cfg(test)]

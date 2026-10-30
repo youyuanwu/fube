@@ -1,7 +1,7 @@
 use super::*;
 #[path = "stateful_peer_tests.rs"]
 mod peer_tests;
-use fube_runtime::CatchUpResult;
+use fube_runtime::extensions::CatchUpResult;
 
 struct NativeModel {
     alive: AtomicBool,
@@ -17,8 +17,8 @@ impl View for NativeModel {
 }
 fn epoch() -> Epoch {
     Epoch {
-        data_loss: 1,
-        configuration: 1 << 32,
+        data_loss_number: 1,
+        configuration_number: 1 << 32,
     }
 }
 async fn replica(
@@ -37,8 +37,8 @@ async fn replica(
             replicator_open: true,
             current_role: role,
             current_epoch: Epoch {
-                configuration: (1 << 32) + 1,
-                data_loss: 1,
+                configuration_number: (1 << 32) + 1,
+                data_loss_number: 1,
             },
             previous_epoch: Epoch::INVALID,
             configuration_stage: ConfigurationStage::Current,
@@ -86,9 +86,9 @@ fn information(
         replica_id: id,
         incarnation,
         role,
-        previous_role: ReplicaRole::Secondary,
+        previous_role: ReplicaRole::ActiveSecondary,
         up: true,
-        ready: role != ReplicaRole::Idle,
+        ready: role != ReplicaRole::IdleSecondary,
         address,
         progress: EMPTY,
         must_catch_up: false,
@@ -121,8 +121,8 @@ fn server() -> Arc<PeerServer> {
 #[tokio::test]
 async fn actual_peer_build_and_empty_quorum_progress_are_not_control_counters() {
     let (primary, _, _) = replica(1, 100, 1, ReplicaRole::Primary, server()).await;
-    let (secondary, view, address) = replica(2, 200, 1, ReplicaRole::Idle, server()).await;
-    let target = information(2, 200, 1, address.clone(), ReplicaRole::Idle);
+    let (secondary, view, address) = replica(2, 200, 1, ReplicaRole::IdleSecondary, server()).await;
+    let target = information(2, 200, 1, address.clone(), ReplicaRole::IdleSecondary);
     primary
         .build_replica(target, Cancellation::default())
         .await
@@ -130,16 +130,26 @@ async fn actual_peer_build_and_empty_quorum_progress_are_not_control_counters() 
     assert_eq!(primary.state.lock().unwrap().built.len(), 1);
     {
         let mut status = view.status.lock().unwrap();
-        status.current_role = ReplicaRole::Secondary;
-        status.service_role = ReplicaRole::Secondary;
-        status.replicator_role = ReplicaRole::Secondary;
+        status.current_role = ReplicaRole::ActiveSecondary;
+        status.service_role = ReplicaRole::ActiveSecondary;
+        status.replicator_role = ReplicaRole::ActiveSecondary;
     }
     secondary
-        .change_role(epoch(), ReplicaRole::Secondary, Cancellation::default())
+        .change_role(
+            epoch(),
+            ReplicaRole::ActiveSecondary,
+            Cancellation::default(),
+        )
         .await
         .unwrap();
     let cc = config(
-        vec![information(2, 200, 1, address, ReplicaRole::Secondary)],
+        vec![information(
+            2,
+            200,
+            1,
+            address,
+            ReplicaRole::ActiveSecondary,
+        )],
         2,
         true,
     );
@@ -148,7 +158,7 @@ async fn actual_peer_build_and_empty_quorum_progress_are_not_control_counters() 
         .await
         .unwrap();
     primary
-        .wait_for_catch_up(CatchUpMode::WriteQuorum, Cancellation::default())
+        .wait_for_catch_up(CatchUpMode::Write, Cancellation::default())
         .await
         .unwrap();
     primary
@@ -167,34 +177,39 @@ async fn actual_peer_build_and_empty_quorum_progress_are_not_control_counters() 
 #[tokio::test]
 async fn foreign_incarnation_role_and_epoch_peers_never_build_successfully() {
     let (primary, _, _) = replica(1, 100, 1, ReplicaRole::Primary, server()).await;
-    let (_wrong_role_peer, _, address) = replica(2, 200, 1, ReplicaRole::Secondary, server()).await;
-    let wrong_role = information(2, 200, 1, address, ReplicaRole::Idle);
+    let (_wrong_role_peer, _, address) =
+        replica(2, 200, 1, ReplicaRole::ActiveSecondary, server()).await;
+    let wrong_role = information(2, 200, 1, address, ReplicaRole::IdleSecondary);
     assert!(primary
         .build_replica(wrong_role, Cancellation::default())
         .await
         .is_err());
-    let (peer, view, address) = replica(2, 200, 1, ReplicaRole::Idle, server()).await;
-    let wrong_incarnation = information(2, 200, 2, address.clone(), ReplicaRole::Idle);
+    let (peer, view, address) = replica(2, 200, 1, ReplicaRole::IdleSecondary, server()).await;
+    let wrong_incarnation = information(2, 200, 2, address.clone(), ReplicaRole::IdleSecondary);
     assert!(primary
         .build_replica(wrong_incarnation, Cancellation::default())
         .await
         .is_err());
-    let foreign = information(3, 300, 1, address.clone(), ReplicaRole::Idle);
+    let foreign = information(3, 300, 1, address.clone(), ReplicaRole::IdleSecondary);
     assert!(primary
         .build_replica(foreign, Cancellation::default())
         .await
         .is_err());
     let next = Epoch {
-        data_loss: 1,
-        configuration: 2 << 32,
+        data_loss_number: 1,
+        configuration_number: 2 << 32,
     };
-    view.status.lock().unwrap().current_epoch.configuration = (2 << 32) + 1;
+    view.status
+        .lock()
+        .unwrap()
+        .current_epoch
+        .configuration_number = (2 << 32) + 1;
     peer.update_epoch(next, Cancellation::default())
         .await
         .unwrap();
     assert!(primary
         .build_replica(
-            information(2, 200, 1, address, ReplicaRole::Idle),
+            information(2, 200, 1, address, ReplicaRole::IdleSecondary),
             Cancellation::default()
         )
         .await
@@ -205,18 +220,19 @@ async fn foreign_incarnation_role_and_epoch_peers_never_build_successfully() {
 #[tokio::test]
 async fn quorum_all_and_required_target_have_distinct_real_peer_obligations() {
     let (primary, _, _) = replica(1, 100, 1, ReplicaRole::Primary, server()).await;
-    let (_good_peer, _, good) = replica(2, 200, 1, ReplicaRole::Secondary, server()).await;
-    let (unavailable, _, missing) = replica(3, 300, 1, ReplicaRole::Secondary, server()).await;
+    let (_good_peer, _, good) = replica(2, 200, 1, ReplicaRole::ActiveSecondary, server()).await;
+    let (unavailable, _, missing) =
+        replica(3, 300, 1, ReplicaRole::ActiveSecondary, server()).await;
     unavailable.abort();
-    let a = information(2, 200, 1, good, ReplicaRole::Secondary);
-    let b = information(3, 300, 1, missing, ReplicaRole::Secondary);
+    let a = information(2, 200, 1, good, ReplicaRole::ActiveSecondary);
+    let b = information(3, 300, 1, missing, ReplicaRole::ActiveSecondary);
     let cc = config(vec![a.clone(), b.clone()], 2, true);
     primary
         .update_catch_up_configuration(cc, no_previous(), Cancellation::default())
         .await
         .unwrap();
     primary
-        .wait_for_catch_up(CatchUpMode::WriteQuorum, Cancellation::default())
+        .wait_for_catch_up(CatchUpMode::Write, Cancellation::default())
         .await
         .unwrap();
     assert!(primary
@@ -234,7 +250,7 @@ async fn quorum_all_and_required_target_have_distinct_real_peer_obligations() {
         .await
         .unwrap();
     assert!(primary
-        .wait_for_catch_up(CatchUpMode::WriteQuorum, Cancellation::default())
+        .wait_for_catch_up(CatchUpMode::Write, Cancellation::default())
         .await
         .is_err());
 }
@@ -243,13 +259,13 @@ async fn quorum_all_and_required_target_have_distinct_real_peer_obligations() {
 async fn previous_configuration_cannot_invent_a_local_vote() {
     let (primary, view, _) = replica(1, 100, 1, ReplicaRole::Primary, server()).await;
     view.status.lock().unwrap().previous_epoch = epoch();
-    let (_good_peer, _, good) = replica(2, 200, 1, ReplicaRole::Secondary, server()).await;
-    let (gone, _, missing) = replica(3, 300, 1, ReplicaRole::Secondary, server()).await;
+    let (_good_peer, _, good) = replica(2, 200, 1, ReplicaRole::ActiveSecondary, server()).await;
+    let (gone, _, missing) = replica(3, 300, 1, ReplicaRole::ActiveSecondary, server()).await;
     gone.abort();
     let pc = config(
         vec![
-            information(2, 200, 1, good, ReplicaRole::Secondary),
-            information(3, 300, 1, missing, ReplicaRole::Secondary),
+            information(2, 200, 1, good, ReplicaRole::ActiveSecondary),
+            information(3, 300, 1, missing, ReplicaRole::ActiveSecondary),
         ],
         2,
         false,
@@ -259,7 +275,7 @@ async fn previous_configuration_cannot_invent_a_local_vote() {
         .await
         .unwrap();
     assert!(primary
-        .wait_for_catch_up(CatchUpMode::WriteQuorum, Cancellation::default())
+        .wait_for_catch_up(CatchUpMode::Write, Cancellation::default())
         .await
         .is_err());
 }
@@ -268,16 +284,16 @@ async fn previous_configuration_cannot_invent_a_local_vote() {
 async fn epochs_only_advance_under_native_selection_and_never_advance_the_empty_frontier() {
     let (primary, view, _) = replica(1, 100, 1, ReplicaRole::Primary, server()).await;
     let next = Epoch {
-        data_loss: 2,
-        configuration: 2 << 32,
+        data_loss_number: 2,
+        configuration_number: 2 << 32,
     };
     assert!(primary
         .update_epoch(next, Cancellation::default())
         .await
         .is_err());
     view.status.lock().unwrap().current_epoch = Epoch {
-        data_loss: 2,
-        configuration: (2 << 32) + 9,
+        data_loss_number: 2,
+        configuration_number: (2 << 32) + 9,
     };
     primary
         .update_epoch(next, Cancellation::default())
@@ -298,8 +314,8 @@ async fn epochs_only_advance_under_native_selection_and_never_advance_the_empty_
 #[tokio::test]
 async fn remove_tombstone_fences_old_instance_but_not_new_instance() {
     let (primary, _, _) = replica(1, 100, 1, ReplicaRole::Primary, server()).await;
-    let (old, _, address) = replica(2, 200, 1, ReplicaRole::Idle, server()).await;
-    let old_info = information(2, 200, 1, address.clone(), ReplicaRole::Idle);
+    let (old, _, address) = replica(2, 200, 1, ReplicaRole::IdleSecondary, server()).await;
+    let old_info = information(2, 200, 1, address.clone(), ReplicaRole::IdleSecondary);
     primary
         .remove_replica(
             old_info.clone(),
@@ -312,17 +328,18 @@ async fn remove_tombstone_fences_old_instance_but_not_new_instance() {
         .build_replica(old_info, Cancellation::default())
         .await
         .is_err());
-    let (_new_peer, _, new_address) = replica(2, 200, 2, ReplicaRole::Idle, server()).await;
+    let (_new_peer, _, new_address) =
+        replica(2, 200, 2, ReplicaRole::IdleSecondary, server()).await;
     assert!(primary
         .build_replica(
-            information(2, 200, 2, address, ReplicaRole::Idle),
+            information(2, 200, 2, address, ReplicaRole::IdleSecondary),
             Cancellation::default()
         )
         .await
         .is_err());
     primary
         .build_replica(
-            information(2, 200, 2, new_address, ReplicaRole::Idle),
+            information(2, 200, 2, new_address, ReplicaRole::IdleSecondary),
             Cancellation::default(),
         )
         .await
@@ -350,8 +367,11 @@ async fn cancellation_and_close_drain_real_pending_network_work() {
     let token = cancel.clone();
     let p = primary.clone();
     let work = tokio::spawn(async move {
-        p.build_replica(information(2, 200, 1, address, ReplicaRole::Idle), token)
-            .await
+        p.build_replica(
+            information(2, 200, 1, address, ReplicaRole::IdleSecondary),
+            token,
+        )
+        .await
     });
     entered.notified().await;
     cancel.cancel();
@@ -366,8 +386,8 @@ async fn cancellation_and_close_drain_real_pending_network_work() {
 #[tokio::test]
 async fn close_and_abort_remove_only_owned_control_routes_from_shared_listener() {
     let shared = server();
-    let (a, _, address_a) = replica(2, 200, 1, ReplicaRole::Idle, shared.clone()).await;
-    let (b, _, address_b) = replica(3, 300, 1, ReplicaRole::Idle, shared).await;
+    let (a, _, address_a) = replica(2, 200, 1, ReplicaRole::IdleSecondary, shared.clone()).await;
+    let (b, _, address_b) = replica(3, 300, 1, ReplicaRole::IdleSecondary, shared).await;
     assert_eq!(http_peer(&address_a).await.unwrap()["replica"], 200);
     assert_eq!(http_peer(&address_b).await.unwrap()["replica"], 300);
     a.close(Cancellation::default()).await.unwrap();
@@ -383,7 +403,7 @@ async fn service_route_requires_current_primary_access_and_live_lifetime() {
     let (_, view, _) = replica(1, 100, 1, ReplicaRole::Primary, server()).await;
     let mut snapshot = view.snapshot().unwrap();
     assert!(readable(&snapshot));
-    snapshot.current_role = ReplicaRole::Secondary;
+    snapshot.current_role = ReplicaRole::ActiveSecondary;
     assert!(!readable(&snapshot)); // Never role==Primary alone.
     snapshot.current_role = ReplicaRole::Primary;
     snapshot.lifecycle = ReplicaLifecycle::Closing;

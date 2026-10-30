@@ -1,11 +1,111 @@
 //! Experimental Rust-native application hosting for SF-activated Linux ExeHost.
 //! Hosting registration is not, by itself, stateless runtime qualification.
+//!
+//! The supported SDK contracts use UTF-8/UUID/boxed-future Rust representations,
+//! not COM/source interchangeability. Potentially waiting synchronous operations
+//! require a reserved `extensions::ExecutionRuntime` entry; the sample reserves
+//! before moving factories/captures. Registration waits for a real native reply,
+//! and configuration/removal include required owner disposal, not enqueue ACKs.
+//! Canonical names do not promise whole-code, mssf source or COM ABI parity.
+//! See the repository's `docs/runtime/SfApiAlignment.md` for per-method signature,
+//! value, completion and supported-capability classifications and provenance.
+//!
+//! # Scheduling a synchronous SDK call
+//! Reserve before transferring captures. Await the owned observation, **not**
+//! the synchronous SDK Result. This function type-checks without attaching SF:
+//! ```
+//! use fube_runtime::{IStatelessServiceFactory, Result, Runtime};
+//! async fn register(runtime: Runtime, factory: Box<dyn IStatelessServiceFactory>)
+//!     -> Result<Runtime>
+//! {
+//!     let permit = runtime.execution_runtime().try_reserve()?;
+//!     let (runtime, registered) = permit.run_owned(move || {
+//!         let registered = runtime.register_stateless_service_factory("MyType", factory);
+//!         Ok((runtime, registered))
+//!     }).await?;
+//!     registered?;
+//!     Ok(runtime)
+//! }
+//! ```
+//!
+//! Removed contracts and implementation modules are not compatibility paths:
+//! ```compile_fail
+//! use fube_runtime::StatelessFactory;
+//! ```
+//! ```compile_fail
+//! use fube_runtime::StatefulServiceContext;
+//! ```
+//! ```compile_fail
+//! use fube_runtime::ServiceFuture;
+//! ```
+//! ```compile_fail
+//! use fube_runtime::Replicator;
+//! ```
+//! ```compile_fail
+//! use fube_runtime::api::IStatelessServiceFactory;
+//! ```
+//! Native discovery is deliberately not an SDK trait member:
+//! ```compile_fail
+//! fn discover(control: &dyn fube_runtime::IPrimaryReplicator) {
+//!     let _ = control.native_binding();
+//! }
+//! ```
+//! ```compile_fail
+//! fn discover(partition: &dyn fube_runtime::IStatefulServicePartition) {
+//!     let _ = partition.replication_runtime();
+//! }
+//! ```
+//! Epoch-domain masking is an explicit extension, not an old inherent SDK path:
+//! ```compile_fail
+//! let _ = fube_runtime::Epoch::ZERO.primary();
+//! ```
+//! Removed concrete/module-qualified reporting surfaces are not aliases:
+//! ```compile_fail
+//! use fube_runtime::{Partition, StatefulPartition, HealthReport, HealthSequence};
+//! ```
+//! ```compile_fail
+//! use fube_runtime::stateful_api::StatefulFactory;
+//! ```
+//! Base health reports take only borrowed information, not send options:
+//! ```compile_fail
+//! fn old(p: &dyn fube_runtime::IStatelessServicePartition, h: &fube_runtime::HealthInformation) {
+//!     p.report_instance_health(h, None);
+//! }
+//! ```
+//! Reports are completed synchronous Results, not futures:
+//! ```compile_fail
+//! async fn old(p: &dyn fube_runtime::IStatefulServicePartition, h: &fube_runtime::HealthInformation) {
+//!     p.report_replica_health(h).await;
+//! }
+//! ```
+//! Positive health/health2 synchrony and argument-role witness (uncalled
+//! functions; actual waiting calls require the reserved entry shown above):
+//! ```
+//! use fube_runtime::{IStatelessServicePartition, IStatefulServicePartition,
+//!     HealthInformation, HealthReportSendOption, Result};
+//! fn reports(s: &dyn IStatelessServicePartition, r: &dyn IStatefulServicePartition,
+//!     h: &HealthInformation, o: Option<&HealthReportSendOption>) {
+//!     let _: Result<()> = s.report_partition_health(h);
+//!     let _: Result<()> = s.report_instance_health(h);
+//!     let _: Result<()> = s.report_partition_health2(h, o);
+//!     let _: Result<()> = s.report_instance_health2(h, o);
+//!     let _: Result<()> = r.report_partition_health(h);
+//!     let _: Result<()> = r.report_replica_health(h);
+//!     let _: Result<()> = r.report_partition_health2(h, o);
+//!     let _: Result<()> = r.report_replica_health2(h, o);
+//! }
+//! ```
 
 mod api;
 mod context;
 mod diagnostics;
+mod error;
+mod execution;
+pub mod extensions;
+mod instance_integration;
 mod lease;
 mod lifecycle;
+mod managed_participants;
 #[cfg(test)]
 mod model_tests;
 mod package_context;
@@ -14,26 +114,32 @@ mod reporting;
 mod stateful;
 mod stateful_api;
 mod wire;
+#[cfg(test)]
+extern crate self as fube_runtime;
+#[cfg(test)]
+#[path = "../tests/sdk_contracts.rs"]
+mod sdk_contracts;
 
 use std::{
     sync::Arc,
     time::{Duration, Instant as Monotonic},
 };
 
+pub use error::{Error, ErrorKind, RejectedRegistrationInput, Result};
 use fube_transport::{
     connection::{deadline_after, Connection, IpcRequest},
     serialization::serde::{from_slice, to_vec},
-    Error, Result,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 
+pub(crate) use api::PartitionKind;
 pub use api::{
-    Cancellation, FaultType, Partition, PartitionKind, ServiceContext, ServiceFuture,
-    ServiceIdentity, StatelessFactory, StatelessService,
+    ApiFuture, Cancellation, FaultType, IStatelessServiceFactory, IStatelessServiceInstance,
+    IStatelessServicePartition, Int64PartitionInformation, NamedPartitionInformation,
+    ServicePartitionInformation, SingletonPartitionInformation,
 };
 pub use context::ActivationContext;
 pub use diagnostics::{RuntimeCounters, RuntimeMetrics};
-pub use fube_transport::{Error as RuntimeError, Result as RuntimeResult};
 use lease::Authority;
 pub use lifecycle::{MAX_CALLBACKS, MAX_SERVICE_UNITS, MAX_TOMBSTONES};
 pub use package_context::{
@@ -43,15 +149,19 @@ pub use packages::{
     ConfigurationPackage, ConfigurationParameter, ConfigurationSection, DataPackage,
     PackageDescription, PackageSnapshot,
 };
+pub(crate) use reporting::{FaultDelivery, HealthReport};
 pub use reporting::{
-    FaultDelivery, HealthReceipt, HealthReport, HealthSequence, HealthState, LoadMetric, MoveCost,
+    HealthInformation, HealthReportSendOption, HealthState, LoadMetric, MoveCost,
     MAX_REPORT_METRICS, MAX_REPORT_NAME_UNITS,
 };
+#[cfg(test)]
+pub(crate) use reporting::{HealthReceipt, HealthSequence};
+#[cfg(test)]
+pub(crate) use stateful_api::{CatchUpResult, NativeReplicaSetConfiguration, ReplicaRemoval};
 pub use stateful_api::{
-    AccessStatus, CatchUpMode, CatchUpResult, ConfigurationStage, Epoch, ReplicaIdentity,
-    ReplicaInformation, ReplicaLifecycle, ReplicaRemoval, ReplicaRole, ReplicaSetConfiguration,
-    ReplicaStatus, ReplicationProgress, Replicator, StatefulCallbackGuard, StatefulFactory,
-    StatefulPartition, StatefulService, StatefulServiceContext, MAX_REPLICA_SET_SIZE,
+    Epoch, IPrimaryReplicator, IReplicator, IStatefulServiceFactory, IStatefulServicePartition,
+    IStatefulServiceReplica, OpenMode, ReplicaInformation, ReplicaRole, ReplicaSetConfig,
+    ReplicaSetQuorumMode, ReplicaStatus, ServicePartitionAccessStatus, MAX_REPLICA_SET_SIZE,
 };
 use wire::*;
 
@@ -86,6 +196,10 @@ pub struct Runtime {
     tasks: Vec<JoinHandle<()>>,
     lifecycle: lifecycle::Engine,
     shutdown: bool,
+    core: Option<(tokio::sync::oneshot::Sender<()>, Arc<lease::OwnedThread>)>,
+    execution: extensions::ExecutionRuntime,
+    executor: tokio::runtime::Handle,
+    registrations: std::sync::Mutex<tokio::task::JoinSet<()>>,
 }
 
 fn success(reply: ErrorReply) -> Result<()> {
@@ -121,7 +235,7 @@ async fn call<T: serde::Serialize, R: serde::de::DeserializeOwned>(
             message: "hosting transport fault".into(),
         });
     }
-    from_slice(&reply.body)
+    Ok(from_slice(&reply.body)?)
 }
 
 async fn poll_lease(connection: &Connection) -> Result<(Monotonic, i64)> {
@@ -151,14 +265,64 @@ impl Runtime {
     /// entire application process within the hard-fence bound. Call `shutdown`
     /// explicitly for successful orderly cleanup.
     pub async fn attach() -> Result<Self> {
-        tokio::time::timeout(Duration::from_secs(120), Self::attach_inner())
-            .await
-            .map_err(|_| Error::Timeout)?
+        Self::attach_context(None).await
     }
 
-    async fn attach_inner() -> Result<Self> {
-        let mut activation = ActivationContext::from_environment()?;
+    pub(crate) async fn attach_context(activation: Option<ActivationContext>) -> Result<Self> {
+        let application = tokio::runtime::Handle::current();
         let authority = Authority::new(Monotonic::now(), 1_200_000_000)?;
+        authority.watchdog()?;
+        let startup_authority = authority.clone();
+        let (ready, readiness) = tokio::sync::oneshot::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name("fube-host-core".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready.send(Err(Error::Io(error.into())));
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    match Self::attach_inner(application, startup_authority.clone(), activation)
+                        .await
+                    {
+                        Ok(host) => {
+                            if ready.send(Ok(host)).is_ok() {
+                                let _ = stopped.await;
+                            }
+                        }
+                        Err(error) => {
+                            startup_authority.retire();
+                            let _ = ready.send(Err(error));
+                        }
+                    }
+                });
+            })?;
+        let thread = authority.own_thread(thread);
+        let mut host = tokio::time::timeout(Duration::from_secs(120), readiness)
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::Closed)??;
+        host.core = Some((stop, thread));
+        Ok(host)
+    }
+
+    async fn attach_inner(
+        application: tokio::runtime::Handle,
+        authority: Arc<Authority>,
+        activation: Option<ActivationContext>,
+    ) -> Result<Self> {
+        let execution = extensions::ExecutionRuntime::new(authority.clone(), application);
+        let mut activation = match activation {
+            Some(activation) => activation,
+            None => ActivationContext::from_environment()?,
+        };
         let ingress_authority = authority.clone();
         let controls_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ingress_ready = controls_ready.clone();
@@ -176,12 +340,16 @@ impl Runtime {
                     }
                     control_tx
                         .try_send((Monotonic::now(), request))
-                        .map_err(|_| Error::ResourceLimit("runtime control ingress"))
+                        .map_err(|_| {
+                            fube_transport::Error::ResourceLimit("runtime control ingress")
+                        })
                 }
                 12 => command_tx
                     .try_send(request)
-                    .map_err(|_| Error::ResourceLimit("runtime ingress")),
-                _ => Err(Error::Protocol("unsupported application IPC actor")),
+                    .map_err(|_| fube_transport::Error::ResourceLimit("runtime ingress")),
+                _ => Err(fube_transport::Error::Protocol(
+                    "unsupported application IPC actor",
+                )),
             }
         });
         let connection = Connection::connect_ipc_clear(
@@ -266,8 +434,8 @@ impl Runtime {
             fresh_poll_ttl_ticks: ttl,
             fresh_poll_elapsed_micros: sent.elapsed().as_micros().min(u64::MAX as u128) as u64,
         };
-        authority.watchdog()?;
-        let current = ActivationContextHandle::new(activation.clone());
+        let current =
+            ActivationContextHandle::with_execution(activation.clone(), execution.clone());
         let monitor_connection = connection.clone();
         let monitor_authority = authority.clone();
         let monitor = tokio::spawn(async move {
@@ -296,6 +464,7 @@ impl Runtime {
         });
         let control_authority = authority.clone();
         let control_connection = connection.clone();
+        let control_execution = execution.clone();
         let updater = Arc::new(package_context::Updater::new(current.clone(), &deployment));
         controls_ready.store(true, std::sync::atomic::Ordering::Release);
         let control = tokio::spawn(async move {
@@ -315,7 +484,7 @@ impl Runtime {
                                     to_vec(&ErrorReply { error: 0 })?,
                                     deadline_after(Duration::from_millis(250))?,
                                 )
-                                .await
+                                .await.map_err(Error::from)
                         }
                         "UpdateCodePackageContextRequest" => {
                             let update: UpdateContext = from_slice(&request.message.body)?;
@@ -324,22 +493,25 @@ impl Runtime {
                             let deadline = received.checked_add(duration).ok_or(Error::Timeout)?;
                             control_authority.check()?;
                             if Monotonic::now() >= deadline { return Err(Error::Timeout); }
+                            let call_permit = control_execution.reserve(
+                                extensions::CallLane::Native, extensions::CallOrigin::default(),
+                                deadline.saturating_duration_since(Monotonic::now()), false)?;
                             let worker = updater.clone();
                             let permit = worker.admit()?;
                             let worker_authority = control_authority.clone();
-                            let work = tokio::task::spawn_blocking(move || {
+                            let mut work = call_permit.run_owned(move || {
                                 let _permit = permit;
                                 worker.apply(update,&worker_authority,deadline)
                             });
                             tokio::select! {
-                                result = work => result.map_err(|_| Error::Protocol("package callback/worker panicked"))??,
+                                result = &mut work => result?,
                                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => return Err(Error::Timeout),
                                 _ = control_connection.closed() => return Err(Error::Closed),
                             }
                             let authority = control_authority.clone();
                             reply.reply_fenced(8,to_vec(&ErrorReply {error:0})?,
                                 tokio::time::Instant::from_std(deadline),
-                                Arc::new(move || authority.check().is_ok())).await
+                                Arc::new(move || authority.check().is_ok())).await.map_err(Error::from)
                         }
                         _ => Err(Error::Protocol("unsupported host control")),
                     }
@@ -354,11 +526,12 @@ impl Runtime {
                 }
             }
         });
-        let lifecycle = lifecycle::Engine::start(
+        let lifecycle = lifecycle::Engine::start_with_execution(
             current.clone(),
             authority.clone(),
             connection.clone(),
             incoming,
+            execution.clone(),
         );
         Ok(Self {
             activation,
@@ -369,6 +542,10 @@ impl Runtime {
             tasks: vec![monitor, control],
             lifecycle,
             shutdown: false,
+            core: None,
+            execution,
+            executor: tokio::runtime::Handle::current(),
+            registrations: std::sync::Mutex::new(tokio::task::JoinSet::new()),
         })
     }
 
@@ -387,120 +564,230 @@ impl Runtime {
 
     /// Keep factory ownership until runtime shutdown. There is no invented
     /// per-service-type unregister operation. Register before placement begins.
-    pub async fn register_stateless(
-        &mut self,
+    ///
+    /// Call through a reserved execution entry. A direct invalid-context call
+    /// does not accept or destroy the box: recover it with the error's typed
+    /// `take_rejected_registration_input` accessor, then reserve/resubmit.
+    /// Before acceptance and after deliberate recovery/drop, destruction is
+    /// caller-owned. After admission, timeout is uncertain and retires the host;
+    /// the retained factory is not unsafely rolled back.
+    pub fn register_stateless_service_factory(
+        &self,
         name: &str,
-        factory: Arc<dyn StatelessFactory>,
+        factory: Box<dyn IStatelessServiceFactory>,
     ) -> Result<()> {
-        self.authority.check()?;
-        if name.is_empty() || name.encode_utf16().count() > 32_768 {
-            return Err(Error::InvalidInput("invalid service type name"));
+        if let Err(error) = self.execution.blocking_deadline() {
+            if error.kind() == ErrorKind::InvalidExecutionContext {
+                return Err(Error::rejected(RejectedRegistrationInput::Stateless(
+                    factory,
+                )));
+            }
+            return Err(error);
         }
-        self.lifecycle.insert_factory(name.to_owned(), factory)?;
-        self.register_type(name).await
-    }
-
-    /// Register a volatile stateful factory on this same host/runtime. Native
-    /// placement remains the only source of replica membership and roles.
-    pub async fn register_stateful(
-        &mut self,
-        name: &str,
-        factory: Arc<dyn StatefulFactory>,
-    ) -> Result<()> {
         self.authority.check()?;
         if name.is_empty() || name.encode_utf16().count() > 32_768 {
             return Err(Error::InvalidInput("invalid service type name"));
         }
         self.lifecycle
-            .insert_stateful_factory(name.to_owned(), factory)?;
-        self.register_type(name).await
+            .insert_factory(name.to_owned(), Arc::from(factory))?;
+        self.register_type(name)
     }
 
-    async fn register_type(&self, name: &str) -> Result<()> {
-        let activation = self.current.snapshot();
-        let reply: Result<ErrorReply> = call(
-            &self.connection,
-            9,
-            "RegisterServiceTypeRequest",
-            &TypeRequest {
-                context: activation.runtime.clone(),
-                id: TypeId {
-                    package: activation.runtime.code.id.package.clone(),
-                    name: name.to_owned(),
-                },
-            },
-        )
-        .await;
-        match reply {
-            Ok(reply) if reply.error == 0 || reply.error == 0x80071d31u32 as i32 as i64 => {
-                self.authority.check()
+    /// Register a volatile stateful factory on this same host/runtime. Native
+    /// placement remains the only source of replica membership and roles.
+    /// Like [`Self::register_stateless_service_factory`], this synchronously
+    /// waits for native registration on a reserved entry. An invalid-context
+    /// rejection retains the original boxed factory in
+    /// [`Error::take_rejected_registration_input`], recoverable exactly once.
+    /// Accepted timeout is uncertain/terminal, not safe rollback.
+    pub fn register_stateful_service_factory(
+        &self,
+        name: &str,
+        factory: Box<dyn IStatefulServiceFactory>,
+    ) -> Result<()> {
+        if let Err(error) = self.execution.blocking_deadline() {
+            if error.kind() == ErrorKind::InvalidExecutionContext {
+                return Err(Error::rejected(RejectedRegistrationInput::Stateful(
+                    factory,
+                )));
             }
-            other => {
+            return Err(error);
+        }
+        self.authority.check()?;
+        if name.is_empty() || name.encode_utf16().count() > 32_768 {
+            return Err(Error::InvalidInput("invalid service type name"));
+        }
+        self.lifecycle
+            .insert_stateful_factory(name.to_owned(), Arc::from(factory))?;
+        self.register_type(name)
+    }
+
+    fn register_type(&self, name: &str) -> Result<()> {
+        let deadline = self
+            .execution
+            .blocking_deadline()?
+            .min(Monotonic::now() + REGISTRATION_TIMEOUT);
+        let activation = self.current.snapshot();
+        let connection = self.connection.clone();
+        let authority = self.authority.clone();
+        let name = name.to_owned();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let mut registrations = self.registrations.lock().unwrap();
+        while let Some(joined) = registrations.try_join_next() {
+            if joined.is_err() {
                 self.authority.retire();
                 self.connection.abort();
-                match other {
-                    Ok(reply) => success(reply),
-                    Err(error) => Err(error),
-                }
+                return Err(Error::Protocol("registration driver task failed"));
+            }
+        }
+        if registrations.len() >= MAX_CALLBACKS {
+            return Err(Error::ResourceLimit("registration driver records"));
+        }
+        registrations.spawn_on(
+            async move {
+                let reply: Result<ErrorReply> = call(
+                    &connection,
+                    9,
+                    "RegisterServiceTypeRequest",
+                    &TypeRequest {
+                        context: activation.runtime.clone(),
+                        id: TypeId {
+                            package: activation.runtime.code.id.package.clone(),
+                            name,
+                        },
+                    },
+                )
+                .await;
+                let result = match reply {
+                    Ok(reply) if reply.error == 0 || reply.error == 0x80071d31u32 as i32 as i64 => {
+                        authority.check()
+                    }
+                    other => {
+                        authority.retire();
+                        connection.abort();
+                        match other {
+                            Ok(reply) => success(reply),
+                            Err(error) => Err(error),
+                        }
+                    }
+                };
+                let _ = send.send(result);
+            },
+            &self.executor,
+        );
+        drop(registrations);
+        match receive.recv_timeout(deadline.saturating_duration_since(Monotonic::now())) {
+            Ok(result) => result,
+            Err(error) => {
+                self.authority.retire();
+                self.connection.abort();
+                Err(match error {
+                    std::sync::mpsc::RecvTimeoutError::Timeout => Error::Timeout.uncertain(),
+                    std::sync::mpsc::RecvTimeoutError::Disconnected => Error::Closed.uncertain(),
+                })
             }
         }
     }
+    /// Fube-owned safe synchronous-call scheduling, not an SDK execution API.
+    /// Reserve before captures, then run_owned and await its observation.
+    pub fn execution_runtime(&self) -> extensions::ExecutionRuntime {
+        self.execution.clone()
+    }
+    pub fn native_integration_provider(&self) -> extensions::NativeIntegrationProvider {
+        self.lifecycle.native_integration_provider()
+    }
+    pub fn instance_integration_provider(&self) -> extensions::InstanceIntegrationProvider {
+        self.lifecycle.instance_integration_provider()
+    }
 
     pub async fn closed(&self) -> Error {
-        self.connection.closed().await
+        self.connection.closed().await.into()
     }
 
     /// Orderly host/runtime unregistration. A failed shutdown remains terminal
     /// and the independent authority watchdog bounds application lifetime.
-    pub async fn shutdown(mut self) -> Result<()> {
+    pub async fn shutdown(self) -> Result<()> {
         self.authority.retire();
-        self.current.close();
-        let outcome = tokio::time::timeout(Duration::from_millis(400), async {
-            self.current.quiescent()?;
-            self.lifecycle.quiesce().await?;
-            success(
-                call(
-                    &self.connection,
-                    9,
-                    "UnregisterFabricRuntimeRequest",
-                    &IdRequest {
-                        id: self.activation.runtime.id.clone(),
-                    },
-                )
-                .await?,
-            )?;
-            success(
-                call(
-                    &self.connection,
-                    7,
-                    "UnregisterApplicationHostRequest",
-                    &UnregisterHost {
-                        activity: Activity {
-                            id: ActivityId {
-                                guid: fube_transport::serialization::serde::Guid(
-                                    uuid::Uuid::new_v4().to_bytes_le(),
-                                ),
-                                index: 0,
-                            },
-                            kind: 0,
-                        },
-                        id: self.activation.host_id.clone(),
-                    },
-                )
-                .await?,
-            )?;
-            Result::Ok(())
+        let execution = self.execution.clone();
+        let permit = execution.reserve(
+            extensions::CallLane::Native,
+            extensions::CallOrigin::default(),
+            Duration::from_millis(400),
+            true,
+        )?;
+        tokio::time::timeout(Duration::from_millis(400), async move {
+            let mut host = permit.run_future(self.shutdown_quiesce()).await?;
+            host.execution.shutdown().await?;
+            if let Some((stop, core)) = host.core.take() {
+                let _ = stop.send(());
+                core.join_finished().await?;
+            }
+            host.authority.disarm()?;
+            host.shutdown = true;
+            host.authority.join_watchdog().await?;
+            Ok(())
         })
         .await
-        .map_err(|_| Error::Timeout)?;
-        outcome?;
+        .map_err(|_| Error::Timeout)?
+    }
+
+    async fn shutdown_quiesce(mut self) -> Result<Self> {
+        let mut registrations = std::mem::take(self.registrations.get_mut().unwrap());
+        registrations.abort_all(); // library-only request captures; factories stay registry-owned
+        while let Some(joined) = registrations.join_next().await {
+            if joined.is_err_and(|error| !error.is_cancelled()) {
+                return Err(Error::Protocol("registration driver task failed"));
+            }
+        }
+        if let Some(disposed) = self.current.close() {
+            disposed.wait().await?;
+        }
+        self.current.quiescent()?;
+        self.lifecycle.quiesce().await?;
+        success(
+            call(
+                &self.connection,
+                9,
+                "UnregisterFabricRuntimeRequest",
+                &IdRequest {
+                    id: self.activation.runtime.id.clone(),
+                },
+            )
+            .await?,
+        )?;
+        success(
+            call(
+                &self.connection,
+                7,
+                "UnregisterApplicationHostRequest",
+                &UnregisterHost {
+                    activity: Activity {
+                        id: ActivityId {
+                            guid: fube_transport::serialization::serde::Guid(
+                                uuid::Uuid::new_v4().to_bytes_le(),
+                            ),
+                            index: 0,
+                        },
+                        kind: 0,
+                    },
+                    id: self.activation.host_id.clone(),
+                },
+            )
+            .await?,
+        )?;
         for task in &self.tasks {
             task.abort();
         }
+        for task in &mut self.tasks {
+            match task.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(_) => return Err(Error::Protocol("host core task panicked")),
+            }
+        }
+        self.tasks.clear();
         self.connection.close().await?;
-        self.authority.disarm()?;
-        self.shutdown = true;
-        Ok(())
+        Ok(self)
     }
 }
 
@@ -513,6 +800,6 @@ impl Drop for Runtime {
         for task in &self.tasks {
             task.abort();
         }
-        self.current.close();
+        let _ = self.current.close();
     }
 }

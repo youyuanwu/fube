@@ -4,12 +4,13 @@
 //! application-write API. A custom replicator must justify its build/catch-up
 //! results; returning success merely because the application is empty is not a
 //! replication policy. The native node, not these objects, chooses membership.
-use crate::{ActivationContext, Cancellation, PartitionKind, ServiceFuture};
-use fube_transport::{Error, Result};
+use crate::extensions::EpochDomains;
+use crate::{ApiFuture, Cancellation, Error, PartitionKind, Result, ServicePartitionInformation};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+#[cfg(test)]
 use std::time::Duration;
 
 /// Bound on native-selected configuration descriptors admitted by this profile.
@@ -26,44 +27,38 @@ pub struct ReplicaIdentity {
     pub node_instance: u64,
 }
 
-#[derive(Debug, Clone)]
-pub struct StatefulServiceContext {
-    pub identity: ReplicaIdentity,
-    pub initialization_data: Vec<u8>,
-    pub activation: ActivationContext,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+/// Public SF role values; RAP's private Idle=2/Secondary=3/Primary=4 differ.
+/// Auxiliary roles in newer mssf are not supported by this native profile.
 pub enum ReplicaRole {
-    Unknown,
-    None,
-    Idle,
-    Secondary,
-    Primary,
+    Unknown = 0,
+    None = 1,
+    Primary = 2,
+    IdleSecondary = 3,
+    ActiveSecondary = 4,
 }
 
-/// Full native epoch. Replicator operations use [`Epoch::primary`]; membership
-/// changes in the low configuration bits are not primary changes.
+/// SDK epoch values, not RAP absence: INVALID is (-1,-1), ZERO is valid (0,0).
+/// Fube's primary-domain masking is an explicit [`EpochDomains`] extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Epoch {
-    pub data_loss: i64,
-    pub configuration: i64,
+    pub data_loss_number: i64,
+    pub configuration_number: i64,
 }
 impl Epoch {
     pub const INVALID: Self = Self {
-        data_loss: 0,
-        configuration: 0,
+        data_loss_number: -1,
+        configuration_number: -1,
     };
-    pub fn primary(self) -> Self {
-        Self {
-            data_loss: self.data_loss,
-            configuration: self.configuration & !0xffff_ffff,
-        }
-    }
+    pub const ZERO: Self = Self {
+        data_loss_number: 0,
+        configuration_number: 0,
+    };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplicaInformation {
+pub struct NativeReplicaDescriptor {
     pub node_id: [u8; 16],
     pub node_instance: u64,
     pub replica_id: i64,
@@ -105,45 +100,53 @@ impl ReplicationProgress {
 /// count its vote only when `local_member` is true. A quorum is not clamped to
 /// the available remote array length.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplicaSetConfiguration {
+pub struct NativeReplicaSetConfiguration {
     pub epoch: Epoch,
-    pub replicas: Vec<ReplicaInformation>,
+    pub replicas: Vec<NativeReplicaDescriptor>,
     pub write_quorum: usize,
     pub local_member: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CatchUpMode {
-    WriteQuorum,
+pub enum ReplicaSetQuorumMode {
+    Invalid,
+    Write,
     All,
 }
 
-pub trait StatefulFactory: Send + Sync + 'static {
-    fn create(
+pub trait IStatefulServiceFactory: Send + Sync + 'static {
+    /// Synchronous fallible construction. UTF-8 names/UUIDs replace mssf's
+    /// WString/URI/GUID representations; native incarnation is not a factory
+    /// argument. Factories own their activation-context provider and snapshot.
+    fn create_replica(
         &self,
-        context: StatefulServiceContext,
-    ) -> ServiceFuture<'_, Arc<dyn StatefulService>>;
+        service_type: String,
+        service_name: String,
+        initialization_data: &[u8],
+        partition_id: uuid::Uuid,
+        replica_id: i64,
+    ) -> Result<Box<dyn IStatefulServiceReplica>>;
 }
 
 /// Callbacks run outside protocol locks/readers. Cancellation is advisory;
 /// their futures must complete only after owned work has quiesced. An ignored
 /// cancellation is not a completed operation. Callback deadlines/panics are
 /// terminal host faults. Abort disposes owned resources synchronously.
-pub trait StatefulService: Send + Sync + 'static {
-    /// New volatile lifetime only. Return an owned, non-null custom replicator.
+pub trait IStatefulServiceReplica: Send + Sync + 'static {
+    /// Runtime dispatches New for this volatile profile. Existing/Invalid are
+    /// rejected before activation, not advertised as recovery/persistence.
+    /// Return owned primary control; application-spawned descendants remain
+    /// service-owned and must be stopped/joined in Close/Abort.
     fn open(
         &self,
-        partition: StatefulPartition,
+        mode: OpenMode,
+        partition: Arc<dyn IStatefulServicePartition>,
         cancellation: Cancellation,
-    ) -> ServiceFuture<'_, Arc<dyn Replicator>>;
+    ) -> ApiFuture<'_, Box<dyn IPrimaryReplicator>>;
     /// Service endpoint and replicator address are independent. An empty service
     /// endpoint is permitted outside Primary; publication is not an access grant.
-    fn change_role(
-        &self,
-        role: ReplicaRole,
-        cancellation: Cancellation,
-    ) -> ServiceFuture<'_, String>;
-    fn close(&self, cancellation: Cancellation) -> ServiceFuture<'_, ()>;
+    fn change_role(&self, role: ReplicaRole, cancellation: Cancellation) -> ApiFuture<'_, String>;
+    fn close(&self, cancellation: Cancellation) -> ApiFuture<'_, ()>;
     fn abort(&self);
 }
 
@@ -159,61 +162,216 @@ pub enum ReplicaRemoval {
 
 /// Custom-replicator control seam. There is deliberately no default all-success
 /// implementation and no application write, storage or built-in-replicator API.
-pub trait Replicator: Send + Sync + 'static {
-    fn open(&self, cancellation: Cancellation) -> ServiceFuture<'_, String>;
+pub trait IReplicator: Send + Sync + 'static {
+    /// Async listener-ready control address, independent of the service endpoint.
+    fn open(&self, cancellation: Cancellation) -> ApiFuture<'_, String>;
+    /// Async native-selected epoch/role barrier, not a peer election.
     fn change_role(
         &self,
         epoch: Epoch,
         role: ReplicaRole,
         cancellation: Cancellation,
-    ) -> ServiceFuture<'_, ()>;
-    fn update_epoch(&self, epoch: Epoch, cancellation: Cancellation) -> ServiceFuture<'_, ()>;
-    fn progress(&self) -> Result<ReplicationProgress>;
+    ) -> ApiFuture<'_, ()>;
+    /// Async epoch barrier. Preserve full public epoch bits; primary-domain
+    /// masking is an explicit integration conversion, not global normalization.
+    fn update_epoch(&self, epoch: Epoch, cancellation: Cancellation) -> ApiFuture<'_, ()>;
+    /// Role-specific validated local observation: a built-in primary reports
+    /// quorum progress, a secondary received progress, not universal durability.
+    fn get_current_progress(&self) -> Result<i64>;
+    /// Local eligible retained-history capability, not a normalization of
+    /// unknown remote LSN (-1). Native built-in publication samples both values
+    /// coherently through private integration, not two public getter calls.
+    fn get_catch_up_capability(&self) -> Result<i64>;
+    /// Async terminal cleanup of owned control resources.
+    fn close(&self, cancellation: Cancellation) -> ApiFuture<'_, ()>;
+    /// Synchronously dispose owned control resources before returning.
+    fn abort(&self);
+}
+/// Primary-only canonical controls. The built-in implementation requires real
+/// runtime/partition-issued authority: SDK descriptors and diagnostics cannot
+/// construct it. Root and invocation-bound controls are functional views over
+/// the same owner, not a separate non-SDK success path.
+pub trait IPrimaryReplicator: IReplicator {
     /// Return whether application state changed, NOT whether the native node
     /// advanced its data-loss epoch.
-    fn on_data_loss(&self, cancellation: Cancellation) -> ServiceFuture<'_, bool>;
-    fn update_catch_up_configuration(
+    fn on_data_loss(&self, cancellation: Cancellation) -> ApiFuture<'_, bool>;
+    /// Synchronous completed owner installation and required physical disposal,
+    /// never enqueue success. Built-in native-bound root and bound views use
+    /// immutable runtime-issued membership/epoch/identity records outside SDK
+    /// descriptors. Invoke on a reserved blocking entry; no executor block_on.
+    /// Post-admission timeout/revocation is uncertain, not rollback.
+    fn update_catch_up_replica_set_configuration(
         &self,
-        current: ReplicaSetConfiguration,
-        previous: ReplicaSetConfiguration,
-        cancellation: Cancellation,
-    ) -> ServiceFuture<'_, ()>;
-    fn update_current_configuration(
+        current: ReplicaSetConfig,
+        previous: ReplicaSetConfig,
+    ) -> Result<()>;
+    /// Same synchronous applied/disposed boundary as catch-up configuration,
+    /// with no previous configuration. Public arrays do not carry local votes,
+    /// node/incarnation or epoch proofs; these remain privately native-issued.
+    fn update_current_replica_set_configuration(&self, current: ReplicaSetConfig) -> Result<()>;
+    /// Async captured-fence catch-up. Write and All/required-target obligations
+    /// differ; a diagnostic progress observation cannot acknowledge new writes.
+    fn wait_for_catch_up_quorum(
         &self,
-        current: ReplicaSetConfiguration,
+        mode: ReplicaSetQuorumMode,
         cancellation: Cancellation,
-    ) -> ServiceFuture<'_, ()>;
-    fn wait_for_catch_up(
-        &self,
-        mode: CatchUpMode,
-        cancellation: Cancellation,
-    ) -> ServiceFuture<'_, ()>;
+    ) -> ApiFuture<'_, ()>;
+    /// Freeze native identity/revision at this call, before returning the future.
+    /// Async Build completion includes required copy/application acknowledgment;
+    /// cancellation of an invocation does not dispose an established peer.
     fn build_replica(
         &self,
         replica: ReplicaInformation,
         cancellation: Cancellation,
-    ) -> ServiceFuture<'_, ()>;
-    fn remove_replica(
-        &self,
-        replica: ReplicaInformation,
-        reason: ReplicaRemoval,
-        cancellation: Cancellation,
-    ) -> ServiceFuture<'_, ()>;
-    fn close(&self, cancellation: Cancellation) -> ServiceFuture<'_, ()>;
-    fn abort(&self);
+    ) -> ApiFuture<'_, ()>;
+    /// ID-only synchronous completion, including required physical disposal.
+    /// Native incarnation and retry-versus-final purpose are captured privately,
+    /// never resolved to a mutable latest ID after waiting. Ordinary root
+    /// removal is final; native retry cleanup uses the same canonical method
+    /// with its separately issued invocation-bound purpose.
+    fn remove_replica(&self, replica_id: i64) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessStatus {
-    ReconfigurationPending,
-    NotPrimary,
-    NoWriteQuorum,
-    Granted,
+/// Explicit open intent. New is supported; Existing is Unsupported and Invalid
+/// is InvalidArgument before activation. Corrects reference mssf `Invald`
+/// spelling without an alias; this does not add persistence/recovery.
+pub enum OpenMode {
+    Invalid,
+    New,
+    Existing,
 }
-impl AccessStatus {
+impl OpenMode {
+    pub fn validate(self) -> Result<()> {
+        match self {
+            Self::New => Ok(()),
+            Self::Existing => Err(Error::new(
+                crate::ErrorKind::Unsupported,
+                "Existing open is unavailable in the volatile profile",
+            )),
+            Self::Invalid => Err(Error::InvalidInput("invalid open mode")),
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// SDK descriptor liveness, distinct from extensions::ReplicaDiagnostics.
+pub enum ReplicaStatus {
+    Invalid,
+    Down,
+    Up,
+}
+/// SDK observations only. Native identity/incarnation and authority live outside
+/// this descriptor. Remote unknown progress (-1) is not initialized local zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaInformation {
+    pub id: i64,
+    pub role: ReplicaRole,
+    pub status: ReplicaStatus,
+    pub replicator_address: String,
+    pub current_progress: i64,
+    pub catch_up_capability: i64,
+    pub must_catch_up: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// SDK remote descriptors/write quorum, not an authority envelope. Missing or
+/// down peers never shrink native current/previous quorum obligations.
+pub struct ReplicaSetConfig {
+    pub replicas: Vec<ReplicaInformation>,
+    pub write_quorum: u32,
+}
+impl NativeReplicaDescriptor {
+    pub fn sdk(&self) -> ReplicaInformation {
+        ReplicaInformation {
+            id: self.replica_id,
+            role: self.role,
+            status: if self.up {
+                ReplicaStatus::Up
+            } else {
+                ReplicaStatus::Down
+            },
+            replicator_address: self.address.clone(),
+            current_progress: self.progress.last,
+            catch_up_capability: self.progress.first,
+            must_catch_up: self.must_catch_up,
+        }
+    }
+}
+impl NativeReplicaSetConfiguration {
+    pub fn sdk(&self) -> Result<ReplicaSetConfig> {
+        Ok(ReplicaSetConfig {
+            replicas: self
+                .replicas
+                .iter()
+                .map(NativeReplicaDescriptor::sdk)
+                .collect(),
+            write_quorum: self
+                .write_quorum
+                .try_into()
+                .map_err(|_| Error::InvalidInput("quorum exceeds u32"))?,
+        })
+    }
+}
+/// Object-safe information/access and synchronous reports. Reports require a
+/// supported reserved execution entry; do not await their Result or block an
+/// async worker. Information/access getters are immediate fallible observations.
+///
+/// Native CreateReplicator and mssf try_get_com have no member here: neither COM
+/// proxy nor runtime-owned native replication is supported. Construction lives
+/// in fube-data's FabricReplicator to preserve data -> runtime dependency.
+pub trait IStatefulServicePartition: Send + Sync + 'static {
+    /// ID-bearing native partition information, not a diagnostic prerequisite.
+    fn get_partition_information(&self) -> Result<ServicePartitionInformation>;
+    /// Check current read access per request; cached Granted is not authority.
+    fn get_read_status(&self) -> Result<ServicePartitionAccessStatus>;
+    /// Independent write status; may change before a subsequent replicate call.
+    fn get_write_status(&self) -> Result<ServicePartitionAccessStatus>;
+    /// Local frame-write completion, not RA/FM acknowledgment. Native-bound
+    /// current configuration role selects primary or secondary/node arrays.
+    /// This does not grant application read/write access. Unknown/None are
+    /// stricter profile errors, not native FUP admission-result parity.
+    fn report_load(&self, metrics: &[crate::LoadMetric]) -> Result<()>;
+    /// Initial immutable local-write/coalescing result, not native recovery ACK.
+    /// Later bounded retries and observations remain explicit runtime behavior.
+    fn report_fault(&self, fault: crate::FaultType) -> Result<()>;
+    /// Load-route local write with the same private configuration-role snapshot.
+    /// Supports Zero/Low/Medium/High, not version-skewed VeryHigh.
+    fn report_move_cost(&self, cost: crate::MoveCost) -> Result<()>;
+    /// Partition-only native entity (kind/tag 3); one exact HM result, not fresh
+    /// durability or SDK queue/batching admission. No hidden health retry.
+    fn report_partition_health(&self, health: &crate::HealthInformation) -> Result<()>;
+    /// Native kind/tag 1, public replica ID, invalid replica-instance -1.
+    /// Same exact-result completion and uncertain timeout as partition health.
+    fn report_replica_health(&self, health: &crate::HealthInformation) -> Result<()>;
+    /// Both Immediate values directly send; true adds no reporting-interval
+    /// delay but does not mean HM success or remote durability.
+    fn report_partition_health2(
+        &self,
+        health: &crate::HealthInformation,
+        options: Option<&crate::HealthReportSendOption>,
+    ) -> Result<()>;
+    /// Replica-health variant; optional borrowed send options follow health.
+    /// Immediate false and true both direct-send, with one matched HM result.
+    fn report_replica_health2(
+        &self,
+        health: &crate::HealthInformation,
+        options: Option<&crate::HealthReportSendOption>,
+    ) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ServicePartitionAccessStatus {
+    Invalid = 0,
+    Granted = 1,
+    ReconfigurationPending = 2,
+    NotPrimary = 3,
+    NoWriteQuorum = 4,
+}
+impl ServicePartitionAccessStatus {
     /// Public FABRIC_SERVICE_PARTITION_ACCESS_STATUS, not RAP's internal enum.
     pub fn native_value(self) -> i64 {
         match self {
+            Self::Invalid => 0,
             Self::Granted => 1,
             Self::ReconfigurationPending => 2,
             Self::NotPrimary => 3,
@@ -245,7 +403,7 @@ pub enum CatchUpResult {
 /// Observational owned snapshot. Only the runtime can publish the snapshot used
 /// by a partition handle; editing a returned copy cannot grant authority.
 #[derive(Debug, Clone)]
-pub struct ReplicaStatus {
+pub struct ReplicaDiagnostics {
     pub lifecycle: ReplicaLifecycle,
     pub service_role: ReplicaRole,
     pub replicator_role: ReplicaRole,
@@ -257,18 +415,20 @@ pub struct ReplicaStatus {
     pub catch_up: CatchUpResult,
     pub minimum_replica_set_size: usize,
     /// Native remote PC/CC descriptors, including down/non-Ready members.
-    pub configuration: Vec<ReplicaInformation>,
+    pub configuration: Vec<NativeReplicaDescriptor>,
     pub service_address: String,
     pub replication_address: String,
     pub progress: ReplicationProgress,
 }
-impl ReplicaStatus {
+impl ReplicaDiagnostics {
     /// Source-corresponding native RAP access calculation. The partition handle
     /// independently overlays its lifetime and process authority; these values
     /// are diagnostic and never enable application writes.
-    pub fn access(&self) -> (AccessStatus, AccessStatus) {
-        use AccessStatus::{Granted as G, NotPrimary as N, ReconfigurationPending as T};
-        use ReplicaRole::{Idle, Primary, Secondary};
+    pub fn access(&self) -> (ServicePartitionAccessStatus, ServicePartitionAccessStatus) {
+        use ReplicaRole::{ActiveSecondary as Secondary, IdleSecondary as Idle, Primary};
+        use ServicePartitionAccessStatus::{
+            Granted as G, NotPrimary as N, ReconfigurationPending as T,
+        };
         let current =
             self.service_role == self.current_role && self.replicator_role == self.current_role;
         match self.lifecycle {
@@ -329,15 +489,18 @@ impl ReplicaStatus {
         (N, N)
     }
 
-    fn quorum_status(&self, include_previous: bool) -> AccessStatus {
+    fn quorum_status(&self, include_previous: bool) -> ServicePartitionAccessStatus {
         let (mut cc, mut cc_ready, mut pc, mut pc_ready) = (1, 1, 1, 1);
         for replica in &self.configuration {
             let ready = usize::from(replica.up && replica.ready);
-            if matches!(replica.role, ReplicaRole::Primary | ReplicaRole::Secondary) {
+            if matches!(
+                replica.role,
+                ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+            ) {
                 cc += 1;
                 cc_ready += ready;
             }
-            if replica.previous_role == ReplicaRole::Secondary {
+            if replica.previous_role == ReplicaRole::ActiveSecondary {
                 pc += 1;
                 pc_ready += ready;
             }
@@ -347,9 +510,9 @@ impl ReplicaStatus {
             && cc_ready > cc / 2
             && (!include_previous || pc_ready > pc / 2)
         {
-            AccessStatus::Granted
+            ServicePartitionAccessStatus::Granted
         } else {
-            AccessStatus::NoWriteQuorum
+            ServicePartitionAccessStatus::NoWriteQuorum
         }
     }
 }
@@ -366,26 +529,24 @@ impl ReplicaStatus {
 /// application operations still require the normal partition/access checks.
 #[must_use = "retain until the owned callback and its captures are actually disposed"]
 pub struct StatefulCallbackGuard {
-    _deadline: crate::lease::CallbackDeadline,
+    pub(crate) _deadline: crate::lease::CallbackDeadline,
 }
 
 /// Generation-bound stateful partition. Fault reporting uses the bound native
 /// replica identity; it never infers readiness from the returned client endpoint.
 #[derive(Clone)]
-pub struct StatefulPartition {
+pub(crate) struct StatefulPartition {
     pub(crate) identity: ReplicaIdentity,
     pub(crate) kind: PartitionKind,
     pub(crate) valid: Arc<AtomicBool>,
     pub(crate) authority: Arc<crate::lease::Authority>,
-    pub(crate) status: Arc<Mutex<ReplicaStatus>>,
+    pub(crate) status: Arc<Mutex<ReplicaDiagnostics>>,
     pub(crate) reporting: Option<Arc<crate::reporting::Reporting>>,
 }
 impl StatefulPartition {
+    #[cfg(test)]
     pub fn identity(&self) -> &ReplicaIdentity {
         &self.identity
-    }
-    pub fn kind(&self) -> &PartitionKind {
-        &self.kind
     }
     pub fn ensure_valid(&self) -> Result<()> {
         self.authority.check()?;
@@ -395,24 +556,6 @@ impl StatefulPartition {
             Err(Error::Closed)
         }
     }
-    /// Await the initial local fault-frame write, not native acknowledgment or
-    /// replacement. Retries retain this generation's native identity until unit
-    /// disposal, even if the caller drops its future or executor.
-    /// Initial errors leave a bounded retry stage; permanent supersedes transient.
-    pub async fn report_fault(&self, fault: crate::FaultType) -> Result<crate::FaultDelivery> {
-        self.ensure_valid()?;
-        self.reporting
-            .as_ref()
-            .ok_or(Error::Closed)?
-            .fault(fault)
-            .await
-    }
-    /// Latest bounded fault-stage status, including retry error/cancellation.
-    pub fn fault_delivery(&self) -> Option<crate::FaultDelivery> {
-        self.reporting
-            .as_ref()
-            .and_then(|reporting| reporting.fault_status())
-    }
     /// Account for an owned callback/capture lifetime, including its destruction.
     ///
     /// This does not authorize invoking new application work. Callers must
@@ -421,6 +564,7 @@ impl StatefulPartition {
     /// reviving terminal process authority or extending any existing deadline.
     /// Enrollment is finite (at most 30 seconds), shares the runtime's 64
     /// callback slots, and is rejected once runtime disarming begins.
+    #[cfg(test)]
     pub fn supervise_owned_callback(&self, timeout: Duration) -> Result<StatefulCallbackGuard> {
         if timeout.is_zero() || timeout > Duration::from_secs(30) {
             return Err(Error::InvalidInput(
@@ -431,17 +575,86 @@ impl StatefulPartition {
             _deadline: self.authority.callback_deadline(timeout, true)?,
         })
     }
+    #[cfg(test)]
     pub fn authority_remaining(&self) -> Result<std::time::Duration> {
         self.ensure_valid()?;
         self.authority.remaining()
     }
-    pub fn status(&self) -> Result<ReplicaStatus> {
+}
+impl IStatefulServicePartition for StatefulPartition {
+    fn get_partition_information(&self) -> Result<ServicePartitionInformation> {
+        self.ensure_valid()?;
+        Ok(self.kind.information(self.identity.partition_id))
+    }
+    fn get_read_status(&self) -> Result<ServicePartitionAccessStatus> {
+        Ok(self.access_status()?.0)
+    }
+    fn get_write_status(&self) -> Result<ServicePartitionAccessStatus> {
+        Ok(self.access_status()?.1)
+    }
+    fn report_fault(&self, fault: crate::FaultType) -> Result<()> {
+        self.ensure_valid()?;
+        let reporting = self.reporting.as_ref().ok_or(Error::Closed)?.clone();
+        let worker = reporting.clone();
+        reporting.complete(async move { worker.fault(fault).await.map(|_| ()) })
+    }
+    fn report_load(&self, metrics: &[crate::LoadMetric]) -> Result<()> {
+        self.ensure_valid()?;
+        let reporting = self.reporting.as_ref().ok_or(Error::Closed)?.clone();
+        let worker = reporting.clone();
+        let metrics = metrics.to_vec();
+        reporting.complete(async move { worker.load(&metrics).await })
+    }
+    fn report_move_cost(&self, cost: crate::MoveCost) -> Result<()> {
+        self.ensure_valid()?;
+        let reporting = self.reporting.as_ref().ok_or(Error::Closed)?.clone();
+        let worker = reporting.clone();
+        reporting.complete(async move { worker.move_cost(cost).await })
+    }
+    fn report_partition_health(&self, health: &crate::HealthInformation) -> Result<()> {
+        self.health(health, crate::reporting::HealthTarget::Partition)
+            .map(|_| ())
+    }
+    fn report_replica_health(&self, health: &crate::HealthInformation) -> Result<()> {
+        self.health(health, crate::reporting::HealthTarget::Replica)
+            .map(|_| ())
+    }
+    fn report_partition_health2(
+        &self,
+        health: &crate::HealthInformation,
+        _: Option<&crate::HealthReportSendOption>,
+    ) -> Result<()> {
+        IStatefulServicePartition::report_partition_health(self, health)
+    }
+    fn report_replica_health2(
+        &self,
+        health: &crate::HealthInformation,
+        _: Option<&crate::HealthReportSendOption>,
+    ) -> Result<()> {
+        IStatefulServicePartition::report_replica_health(self, health)
+    }
+}
+impl StatefulPartition {
+    pub(crate) fn health(
+        &self,
+        health: &crate::HealthInformation,
+        target: crate::reporting::HealthTarget,
+    ) -> Result<crate::reporting::HealthReceipt> {
+        self.ensure_valid()?;
+        let health = crate::HealthReport::try_from(health)?;
+        let reporting = self.reporting.as_ref().ok_or(Error::Closed)?.clone();
+        let worker = reporting.clone();
+        reporting.complete(async move { worker.health(&health, target).await })
+    }
+    pub fn status(&self) -> Result<ReplicaDiagnostics> {
         self.ensure_valid()?;
         let status = self.status.lock().unwrap().clone();
         self.ensure_valid()?;
         Ok(status)
     }
-    pub fn access_status(&self) -> Result<(AccessStatus, AccessStatus)> {
+    pub fn access_status(
+        &self,
+    ) -> Result<(ServicePartitionAccessStatus, ServicePartitionAccessStatus)> {
         Ok(self.status()?.access())
     }
 }

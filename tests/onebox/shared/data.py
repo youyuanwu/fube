@@ -560,36 +560,37 @@ def assert_data(value: dict, service: str, mixed: bool, target: int = 3, minimum
     for replica in ready:
         rpc, deployed = replica["rpc"], replica["deployed"]
         require(replica["role"] in {"Primary", "ActiveSecondary"}, "inactive ready data replica")
-        role = "Primary" if replica["role"] == "Primary" else "Secondary"
+        role = replica["role"]
         kind = NODE_ENGINES.get(replica["node"]) if mixed else "rust"
         require(kind is not None and (not mixed or replica["node"] in MIXED_NODES), "unexpected engine placement")
         kinds.add(kind)
-        service_role = replica["role"] if kind == "native-classic-v1" else role
         require(rpc.get("profile") == "fube-data-v1" and rpc.get("engine_kind") == kind
                 and rpc["partition"] == value["partition"] and rpc["replica"] == replica["replica"]
                 and rpc["node"] == replica["node"] and rpc["pid"] == deployed["host_process_id"]
                 and rpc["service_address"] == replica["address"]
-                and rpc["role"] == service_role and rpc["current_role"] == service_role
+                and rpc["role"] == role and rpc["current_role"] == role
                 and deployed["service_type_name"] == "RustStatefulRuntimeType"
                 and rpc.get("host") and rpc.get("engine_incarnation"), "native deployment/data HTTP identity mismatch")
         if "service" in rpc:
             require(rpc["service"] == service, "HTTP service mismatch")
         epoch = rpc["native_epoch"]
-        if kind == "native-classic-v1" and role == "Secondary":
+        if kind == "native-classic-v1" and role == "ActiveSecondary":
             # This is the last PUBLIC provider callback, not the native
             # replicator's current epoch. Initial same-epoch replication need
             # never call UpdateEpoch; later callbacks may lag FM until a barrier.
             # Preserve null/older observations; never invent a current epoch.
             if epoch is not None:
-                require(isinstance(epoch, dict) and type(epoch.get("data_loss")) is int
-                        and type(epoch.get("configuration")) is int
-                        and epoch["data_loss"] >= 0 and epoch["configuration"] >= 0
-                        and (epoch["data_loss"], epoch["configuration"] & ~0xFFFFFFFF)
+                require(isinstance(epoch, dict) and type(epoch.get("data_loss_number")) is int
+                        and type(epoch.get("configuration_number")) is int
+                        and epoch["data_loss_number"] >= 0 and epoch["configuration_number"] >= 0
+                        and (epoch["data_loss_number"], epoch["configuration_number"] & ~0xFFFFFFFF)
                         <= (native["epoch"]["data_loss"], native["epoch"]["configuration"]),
                         "native provider callback epoch is invalid or ahead of authority")
         else:
-            require(isinstance(epoch, dict) and epoch["data_loss"] == native["epoch"]["data_loss"]
-                    and epoch["configuration"] & ~0xFFFFFFFF == native["epoch"]["configuration"],
+            require(isinstance(epoch, dict) and type(epoch.get("data_loss_number")) is int
+                    and type(epoch.get("configuration_number")) is int
+                    and epoch["data_loss_number"] == native["epoch"]["data_loss"]
+                    and epoch["configuration_number"] & ~0xFFFFFFFF == native["epoch"]["configuration"],
                     "native projected/full epoch mismatch")
         require(not rpc["state"]["copy_in_progress"] and rpc["engine"]["copy_done"]
                 and not rpc["engine"]["closed"] and not rpc["engine"]["fault"] and not rpc["pump_fault"],
@@ -1213,14 +1214,16 @@ def wire_receipt(before: dict, source: dict, kind: str, reply: dict,
             and (target["engine"] != selected["engine"] if kind == "wrong_target"
                  else target["engine"] == selected["engine"]), "wire probe changed the wrong destination fields")
     epoch = source["rpc"]["native_epoch"]
-    projected = {"data_loss": epoch["data_loss"], "configuration": epoch["configuration"] & ~0xFFFFFFFF}
+    projected = {"data_loss_number": epoch["data_loss_number"],
+                 "configuration_number": epoch["configuration_number"] & ~0xFFFFFFFF}
     require(reply.get("native_epoch") == projected and type(reply.get("sequence")) is int
             and reply["sequence"] == source["rpc"]["engine"]["progress"]["assigned"] + 1
             and reply["sequence"] > 0, "wire probe native epoch/nonassigned nonzero candidate mismatch")
     sent = reply.get("sent_epoch")
-    require(type(sent) is dict and set(sent) == {"data_loss", "configuration"}
+    require(type(sent) is dict and set(sent) == {"data_loss_number", "configuration_number"}
             and all(type(value) is int and value >= 0 for value in sent.values())
-            and ((sent["data_loss"], sent["configuration"]) < (projected["data_loss"], projected["configuration"])
+            and ((sent["data_loss_number"], sent["configuration_number"])
+                 < (projected["data_loss_number"], projected["configuration_number"])
                  if kind == "stale_epoch" else sent == projected), "wire probe did not exercise the requested epoch")
     delivery = wire_delivery(reply, own, selected, observation)
     return {"source_identity": identity(source), "destination_identity": identity(destination),

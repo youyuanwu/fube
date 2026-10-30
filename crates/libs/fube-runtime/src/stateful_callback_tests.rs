@@ -2,7 +2,8 @@
 // Licensed under the MIT License.
 
 use super::*;
-use crate::{lease::Authority, StatefulCallbackGuard};
+use crate::extensions::StatefulCallbackGuard;
+use crate::lease::Authority;
 use std::{
     io::{Read, Write},
     process::{Command, Stdio},

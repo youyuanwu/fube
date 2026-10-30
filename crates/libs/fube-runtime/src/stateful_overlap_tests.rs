@@ -150,7 +150,7 @@ async fn abort_cancels_and_drains_build_before_per_replica_disposal_ack() {
     let reply: ProxyReply = from_slice(&h.receive("ReplicaCloseReply").await.body).unwrap();
     assert_eq!(reply.error.error, 0);
     assert!(h.calls.partitions.lock().unwrap()[0].ensure_valid().is_ok());
-    assert!(calls.partitions.lock().unwrap()[0].ensure_valid().is_err());
+    assert!(calls.partitions.lock().unwrap()[0].validate().is_err());
     assert_eq!(
         &calls.events.lock().unwrap()[6..],
         [

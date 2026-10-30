@@ -218,8 +218,8 @@ impl OperationQueue {
 mod tests {
     use super::*;
     const E: Epoch = Epoch {
-        data_loss: 1,
-        configuration: 0x100000000,
+        data_loss_number: 1,
+        configuration_number: 0x100000000,
     };
     fn data(n: u8) -> OperationData {
         OperationData::new(vec![vec![], vec![n]]).unwrap()

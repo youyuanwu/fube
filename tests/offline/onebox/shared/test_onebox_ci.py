@@ -134,15 +134,14 @@ class ProofFiles(fixtures.ProjectFiles):
             for index, member in enumerate(members):
                 rpc = {**member, "profile": "fube-data-v1", "partition": part}
                 endpoint = "http://" + rpc["node"] + "/" + part + "/" + str(rpc["replica"]) + "/service"
-                role = ("Primary" if index == primary else
-                        "Secondary" if rpc["engine_kind"] == "rust" else "ActiveSecondary")
+                role = "Primary" if index == primary else "ActiveSecondary"
                 rpc.update(role=role, current_role=role, service_address=endpoint,
                            state={"last": max(results.values()), "copy_in_progress": False, "results": results,
                                   "values": {"key-" + key: "value-" + key for key in results},
                                   "history_count": len(results), "retained_bytes": len(results) * 100},
                            engine={"closed": False, "fault": None, "copy_done": True,
                                    "progress": dict.fromkeys(ci.PROGRESS_SPEC, max(results.values()))})
-                if role == "ActiveSecondary":
+                if role == "ActiveSecondary" and rpc["engine_kind"] == "native-classic-v1":
                     rpc["engine"]["progress"].update(assigned=0, committed=0, completed=0, client_completed=0)
                 elif role == "Primary" and rpc["engine_kind"] == "rust":
                     rpc["engine"]["progress"]["applied"] = 0

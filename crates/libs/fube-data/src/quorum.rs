@@ -6,7 +6,7 @@
 //! Current/previous apply-quorum and receive-release calculations. Missing
 //! members are missing votes, never a smaller manufactured configuration.
 
-use fube_runtime::ReplicaSetConfiguration;
+use fube_runtime::extensions::NativeReplicaSetConfiguration as ReplicaSetConfiguration;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PeerProgress {
@@ -89,7 +89,10 @@ pub fn configuration_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fube_runtime::{Epoch, ReplicaInformation, ReplicaRole, ReplicationProgress};
+    use fube_runtime::extensions::{
+        NativeReplicaDescriptor as ReplicaInformation, ReplicationProgress,
+    };
+    use fube_runtime::{Epoch, ReplicaRole};
     fn config(local: bool, quorum: usize, n: usize) -> ReplicaSetConfiguration {
         ReplicaSetConfiguration {
             epoch: Epoch::INVALID,
@@ -101,8 +104,8 @@ mod tests {
                     node_instance: 1,
                     replica_id: id as i64,
                     incarnation: 1,
-                    role: ReplicaRole::Secondary,
-                    previous_role: ReplicaRole::Secondary,
+                    role: ReplicaRole::ActiveSecondary,
+                    previous_role: ReplicaRole::ActiveSecondary,
                     up: true,
                     ready: true,
                     address: String::new(),

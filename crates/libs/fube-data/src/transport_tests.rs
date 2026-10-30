@@ -97,12 +97,12 @@ fn operation(address: &str, from: i64, to: i64, bytes: usize) -> Packet {
         to: actor(to),
         body: Body::Replication {
             primary_epoch: Epoch {
-                data_loss: 1,
-                configuration: 2,
+                data_loss_number: 1,
+                configuration_number: 2,
             },
             operation_epoch: Epoch {
-                data_loss: 1,
-                configuration: 2,
+                data_loss_number: 1,
+                configuration_number: 2,
             },
             operations: vec![WireOperation {
                 sequence: 1,

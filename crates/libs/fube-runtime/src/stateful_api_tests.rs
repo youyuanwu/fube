@@ -1,19 +1,19 @@
 use super::*;
-use AccessStatus::{
+use ReplicaRole::{ActiveSecondary as Secondary, IdleSecondary as Idle, None, Primary};
+use ServicePartitionAccessStatus::{
     Granted as G, NoWriteQuorum as Q, NotPrimary as N, ReconfigurationPending as T,
 };
-use ReplicaRole::{Idle, None, Primary, Secondary};
 
-pub(super) fn status() -> ReplicaStatus {
-    ReplicaStatus {
+pub(super) fn status() -> ReplicaDiagnostics {
+    ReplicaDiagnostics {
         lifecycle: ReplicaLifecycle::Open,
         service_role: Primary,
         replicator_role: Primary,
         replicator_open: true,
         current_role: Primary,
         current_epoch: Epoch {
-            data_loss: 1,
-            configuration: 2 << 32,
+            data_loss_number: 1,
+            configuration_number: 2 << 32,
         },
         previous_epoch: Epoch::INVALID,
         configuration_stage: ConfigurationStage::Current,
@@ -25,8 +25,13 @@ pub(super) fn status() -> ReplicaStatus {
         progress: ReplicationProgress::EMPTY,
     }
 }
-fn peer(id: i64, role: ReplicaRole, previous_role: ReplicaRole, ready: bool) -> ReplicaInformation {
-    ReplicaInformation {
+fn peer(
+    id: i64,
+    role: ReplicaRole,
+    previous_role: ReplicaRole,
+    ready: bool,
+) -> NativeReplicaDescriptor {
+    NativeReplicaDescriptor {
         node_id: [id as u8; 16],
         node_instance: 1,
         replica_id: id,
@@ -43,24 +48,34 @@ fn peer(id: i64, role: ReplicaRole, previous_role: ReplicaRole, ready: bool) -> 
 
 #[test]
 fn primary_epoch_masks_membership_bits_and_orders_data_loss_first() {
-    // Native Epoch()/InvalidEpoch() is (0,0), not the -1 LSN sentinel.
+    // Public invalid, public valid zero, and RAP absence are separate domains.
     assert_eq!(
         Epoch::INVALID,
         Epoch {
-            data_loss: 0,
-            configuration: 0
+            data_loss_number: -1,
+            configuration_number: -1
         }
     );
+    assert_ne!(Epoch::ZERO, Epoch::INVALID);
+    assert_eq!(Epoch::ZERO.primary(), Epoch::ZERO);
+    assert_eq!(Epoch::INVALID.primary(), Epoch::INVALID);
+    assert_eq!(
+        crate::stateful::api_epoch(&crate::wire::Epoch {
+            data_loss: 0,
+            configuration: 0
+        }),
+        Epoch::INVALID
+    );
     let epoch = Epoch {
-        data_loss: 7,
-        configuration: (3 << 32) + 99,
+        data_loss_number: 7,
+        configuration_number: (3 << 32) + 99,
     };
-    assert_eq!(epoch.primary().configuration, 3 << 32);
+    assert_eq!(epoch.primary().configuration_number, 3 << 32);
     assert!(
         epoch
             > Epoch {
-                data_loss: 6,
-                configuration: i64::MAX
+                data_loss_number: 6,
+                configuration_number: i64::MAX
             }
     );
     assert_ne!(Epoch::INVALID, epoch);
@@ -119,8 +134,8 @@ fn minimum_is_configured_cc_size_not_ready_count_or_target() {
 fn promotion_access_before_and_after_catchup_and_current_configuration() {
     let mut s = status();
     s.previous_epoch = Epoch {
-        data_loss: 1,
-        configuration: 1 << 32,
+        data_loss_number: 1,
+        configuration_number: 1 << 32,
     };
     s.configuration_stage = ConfigurationStage::CatchUp;
     s.service_role = Secondary;
@@ -139,8 +154,8 @@ fn promotion_access_before_and_after_catchup_and_current_configuration() {
 fn demotion_revokes_after_catchup_before_role_callback_completion() {
     let mut s = status();
     s.previous_epoch = Epoch {
-        data_loss: 1,
-        configuration: 1 << 32,
+        data_loss_number: 1,
+        configuration_number: 1 << 32,
     };
     s.current_role = Secondary;
     s.configuration = vec![peer(2, Primary, Secondary, true)];
@@ -159,8 +174,8 @@ fn demotion_revokes_after_catchup_before_role_callback_completion() {
 fn unchanged_primary_requires_pc_quorum_until_current_configuration() {
     let mut s = status();
     s.previous_epoch = Epoch {
-        configuration: (2 << 32) + 3,
-        data_loss: 1,
+        configuration_number: (2 << 32) + 3,
+        data_loss_number: 1,
     };
     s.configuration = vec![
         peer(2, Secondary, None, true),
@@ -184,8 +199,8 @@ fn idle_secondary_and_native_public_access_values() {
     s.service_role = Secondary;
     assert_eq!(s.access(), (N, N));
     s.previous_epoch = Epoch {
-        configuration: 1 << 32,
-        data_loss: 1,
+        configuration_number: 1 << 32,
+        data_loss_number: 1,
     };
     assert_eq!(s.access(), (N, N)); // empty-remote Idle->Active takes precedence.
     assert_eq!(

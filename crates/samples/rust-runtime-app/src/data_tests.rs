@@ -1,10 +1,60 @@
 use super::*;
-use fube_data::{Acknowledgment, OperationData, OperationDataStream, StateProvider};
+use fube_data::qualification as rap_model;
+fn host(route: &Arc<Route>) -> Arc<rap_model::Host> {
+    route.native_host.as_ref().unwrap().clone()
+}
+async fn set_current(
+    route: &Arc<Route>,
+    configuration: ReplicaSetConfiguration,
+) -> RuntimeResult<()> {
+    host(route).configure(configuration).await
+}
+async fn rap_build(
+    route: &Arc<Route>,
+    peer: ReplicaInformation,
+    cancellation: Cancellation,
+) -> RuntimeResult<()> {
+    host(route).build(peer, cancellation).await
+}
+async fn rap_role(route: &Arc<Route>, role: ReplicaRole) -> RuntimeResult<()> {
+    host(route).change_role(role).await
+}
+async fn shutdown_route(route: &Arc<Route>) {
+    if route.engine.snapshot().closed {
+        // A terminal write path may already have awaited Close and joined its
+        // standalone executor. Repeating the actual idempotent shutdown must
+        // not submit new work to that stopped executor.
+        route.shutdown();
+        route.engine.close(Cancellation::default()).await.unwrap();
+        return;
+    }
+    let execution = route.engine.execution_runtime();
+    let owner = route.clone();
+    execution
+        .reserve(
+            fube_runtime::extensions::CallLane::Native,
+            fube_runtime::extensions::CallOrigin::default(),
+            Duration::from_secs(30),
+            true,
+        )
+        .unwrap()
+        .run_owned(move || {
+            owner.shutdown();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    route.engine.close(Cancellation::default()).await.unwrap();
+}
+use fube_data::extensions::ReplayCheckpointProvider;
+use fube_data::{
+    IOperationDataStream, IStateProvider, OperationData, OperationMetadata, OperationType,
+};
 use std::sync::atomic::AtomicUsize;
 
 const EPOCH: Epoch = Epoch {
-    data_loss: 1,
-    configuration: 1 << 32,
+    data_loss_number: 1,
+    configuration_number: 1 << 32,
 };
 
 struct NativeModel {
@@ -79,33 +129,27 @@ async fn route_using(
     replica: i64,
     role: ReplicaRole,
     provider: Arc<MemoryProvider>,
-    engine_provider: Arc<dyn StateProvider>,
+    engine_provider: Arc<dyn IStateProvider>,
 ) -> Arc<Route> {
     let copy_delay = Arc::new(AtomicU64::new(0));
-    let engine = Engine::bind(
-        Actor {
-            partition,
-            replica,
-            incarnation: Uuid::new_v4(),
-        },
-        "127.0.0.1:0",
-        Arc::new(CopyProvider {
-            inner: engine_provider,
-            delay: copy_delay.clone(),
-        }),
-        Settings::default(),
-    )
-    .unwrap();
-    let identity = ReplicaIdentity {
-        service_name: "fabric:/Fixture/Data".into(),
-        service_type: "RustStatefulRuntimeType".into(),
-        partition_id: partition,
-        replica_id: replica,
-        incarnation: replica + 10,
-        node_id: [replica as u8; 16],
-        node_instance: 1,
-    };
-    let route = Route::start(
+    let (send, receive) = oneshot::channel();
+    let delay = copy_delay.clone();
+    let replay = provider.clone();
+    let model = rap_model::Host::start(partition, replica, role, move |native| {
+        Box::new(ModelFactory {
+            native,
+            provider: Arc::new(CopyProvider {
+                inner: engine_provider,
+                delay,
+            }),
+            replay,
+            result: Arc::new(Mutex::new(Some(send))),
+        })
+    })
+    .await;
+    let (engine, binding) = receive.await.unwrap();
+    let identity = binding.identity().clone();
+    let mut route = Route::start(
         native.clone(),
         identity,
         engine.clone(),
@@ -115,19 +159,83 @@ async fn route_using(
         copy_delay,
     )
     .unwrap();
-    engine.open(Cancellation::default()).await.unwrap();
-    engine
-        .change_role(EPOCH, role, Cancellation::default())
-        .await
-        .unwrap();
+    Arc::get_mut(&mut route).unwrap().native_host = Some(model);
     if role == ReplicaRole::Primary {
-        engine
-            .update_current_configuration(configuration(vec![], 1), Cancellation::default())
-            .await
-            .unwrap();
+        set_current(&route, configuration(vec![], 1)).await.unwrap();
         until(|| engine.snapshot().ready).await;
     }
     route
+}
+type ModelResult =
+    Arc<Mutex<Option<oneshot::Sender<(Arc<FabricReplicator>, NativeRuntimeIntegration)>>>>;
+struct ModelFactory {
+    native: NativeIntegrationProvider,
+    provider: Arc<dyn IStateProvider>,
+    replay: Arc<MemoryProvider>,
+    result: ModelResult,
+}
+struct ModelReplica {
+    native: NativeRuntimeIntegration,
+    provider: Arc<dyn IStateProvider>,
+    replay: Arc<MemoryProvider>,
+    result: ModelResult,
+}
+impl IStatefulServiceFactory for ModelFactory {
+    fn create_replica(
+        &self,
+        _: String,
+        _: String,
+        _: &[u8],
+        partition: Uuid,
+        replica: i64,
+    ) -> RuntimeResult<Box<dyn IStatefulServiceReplica>> {
+        Ok(Box::new(ModelReplica {
+            native: self.native.capture(partition, replica)?,
+            provider: self.provider.clone(),
+            replay: self.replay.clone(),
+            result: self.result.clone(),
+        }))
+    }
+}
+impl IStatefulServiceReplica for ModelReplica {
+    fn open(
+        &self,
+        mode: OpenMode,
+        partition: Arc<dyn IStatefulServicePartition>,
+        _: Cancellation,
+    ) -> ServiceFuture<'_, Box<dyn IPrimaryReplicator>> {
+        Box::pin(async move {
+            mode.validate()?;
+            let engine = FabricReplicator::create(
+                partition,
+                self.native.clone(),
+                self.provider.clone(),
+                Some(self.replay.clone()),
+                ReplicationEndpointOptions {
+                    listen_address: "127.0.0.1:0".into(),
+                    actor_incarnation: Uuid::new_v4(),
+                },
+                Settings::default(),
+            )?;
+            if let Some(send) = self.result.lock().unwrap().take() {
+                let _ = send.send((engine.clone(), self.native.clone()));
+            }
+            Ok(Box::new((*engine).clone()) as Box<dyn IPrimaryReplicator>)
+        })
+    }
+    fn change_role(&self, role: ReplicaRole, _: Cancellation) -> ServiceFuture<'_, String> {
+        Box::pin(async move {
+            Ok(if role == ReplicaRole::Primary {
+                "model://data-service".into()
+            } else {
+                String::new()
+            })
+        })
+    }
+    fn close(&self, _: Cancellation) -> ServiceFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn abort(&self) {}
 }
 
 struct HeldCopy {
@@ -135,13 +243,13 @@ struct HeldCopy {
     eos: Arc<Semaphore>,
 }
 struct HeldStream {
-    stream: Arc<dyn OperationDataStream>,
+    stream: Arc<dyn IOperationDataStream>,
     eos: Arc<Semaphore>,
 }
-impl OperationDataStream for HeldStream {
-    fn next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+impl IOperationDataStream for HeldStream {
+    fn get_next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
         Box::pin(async move {
-            let item = self.stream.next(cancellation.clone()).await?;
+            let item = self.stream.get_next(cancellation.clone()).await?;
             if item.is_none() {
                 tokio::select! {
                     biased;
@@ -153,9 +261,9 @@ impl OperationDataStream for HeldStream {
         })
     }
 }
-impl StateProvider for HeldCopy {
-    fn last_committed(&self) -> RuntimeResult<i64> {
-        self.provider.last_committed()
+impl IStateProvider for HeldCopy {
+    fn get_last_committed_sequence_number(&self) -> RuntimeResult<i64> {
+        self.provider.get_last_committed_sequence_number()
     }
     fn update_epoch(
         &self,
@@ -168,16 +276,16 @@ impl StateProvider for HeldCopy {
     fn on_data_loss(&self, cancellation: Cancellation) -> ServiceFuture<'_, bool> {
         self.provider.on_data_loss(cancellation)
     }
-    fn copy_context(&self) -> RuntimeResult<Arc<dyn OperationDataStream>> {
-        self.provider.copy_context()
+    fn get_copy_context(&self) -> RuntimeResult<Arc<dyn IOperationDataStream>> {
+        self.provider.get_copy_context()
     }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         up_to: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> RuntimeResult<Arc<dyn OperationDataStream>> {
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> RuntimeResult<Arc<dyn IOperationDataStream>> {
         Ok(Arc::new(HeldStream {
-            stream: self.provider.copy_state(up_to, context)?,
+            stream: self.provider.get_copy_state(up_to, context)?,
             eos: self.eos.clone(),
         }))
     }
@@ -196,7 +304,7 @@ fn descriptor(route: &Route) -> ReplicaInformation {
         node_instance: route.identity.node_instance,
         replica_id: route.identity.replica_id,
         incarnation: route.identity.incarnation,
-        role: ReplicaRole::Idle,
+        role: ReplicaRole::IdleSecondary,
         previous_role: ReplicaRole::None,
         up: true,
         ready: false,
@@ -310,29 +418,31 @@ async fn copy_pacing_is_cancelable_and_does_not_consume_or_change_snapshot_data(
     provider.apply_replication(1, &original).unwrap();
     let delay = Arc::new(AtomicU64::new(100));
     let wrapper = CopyProvider {
-        inner: provider,
+        inner: provider.clone(),
         delay: delay.clone(),
     };
-    let checkpoint = wrapper
+    // Replay is a separately supplied authentic capability, never discovered
+    // through the standard-only pacing wrapper.
+    let checkpoint = provider
         .replication_checkpoint(1, Cancellation::default())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(checkpoint.epoch, EPOCH);
     assert_eq!(checkpoint.data, original);
-    let stream = wrapper.copy_state(0, None).unwrap();
+    let stream = wrapper.get_copy_state(0, None).unwrap();
     assert!(tokio::time::timeout(
         Duration::from_millis(10),
-        stream.next(Cancellation::default())
+        stream.get_next(Cancellation::default())
     )
     .await
     .is_err());
     let cancellation = Cancellation::default();
     cancellation.cancel();
-    assert!(stream.next(cancellation).await.is_err());
+    assert!(stream.get_next(cancellation).await.is_err());
     delay.store(0, Ordering::Release);
     let target = MemoryProvider::new();
-    while let Some(data) = stream.next(Cancellation::default()).await.unwrap() {
+    while let Some(data) = stream.get_next(Cancellation::default()).await.unwrap() {
         target.apply_copy(&data).unwrap();
     }
     assert!(!target.snapshot().copy_in_progress);
@@ -348,7 +458,7 @@ async fn authority_requires_native_access_all_roles_epoch_lifetime_and_engine_re
     engine.ready = false;
     assert!(!authoritative(&status(ReplicaRole::Primary), &engine, true));
     engine = ready.clone();
-    engine.role = ReplicaRole::Secondary;
+    engine.role = ReplicaRole::ActiveSecondary;
     assert!(!authoritative(&status(ReplicaRole::Primary), &engine, true));
     engine = ready.clone();
     engine.epoch = Some(Epoch::INVALID);
@@ -365,9 +475,9 @@ async fn authority_requires_native_access_all_roles_epoch_lifetime_and_engine_re
         false
     ));
     for change in [
-        |s: &mut ReplicaStatus| s.current_role = ReplicaRole::Secondary,
-        |s: &mut ReplicaStatus| s.service_role = ReplicaRole::Secondary,
-        |s: &mut ReplicaStatus| s.replicator_role = ReplicaRole::Secondary,
+        |s: &mut ReplicaStatus| s.current_role = ReplicaRole::ActiveSecondary,
+        |s: &mut ReplicaStatus| s.service_role = ReplicaRole::ActiveSecondary,
+        |s: &mut ReplicaStatus| s.replicator_role = ReplicaRole::ActiveSecondary,
         |s: &mut ReplicaStatus| s.lifecycle = ReplicaLifecycle::Closing,
         |s: &mut ReplicaStatus| s.replicator_open = false,
         |s: &mut ReplicaStatus| s.minimum_replica_set_size = 3,
@@ -388,7 +498,7 @@ async fn authority_requires_native_access_all_roles_epoch_lifetime_and_engine_re
         Outcome::Rejected
     );
     native.alive.store(true, Ordering::Release);
-    route.shutdown();
+    shutdown_route(&route).await;
     assert!(route.lifetime().is_err());
     assert_eq!(
         route.write(mutation("retired")).await.outcome,
@@ -442,7 +552,7 @@ async fn concurrent_writes_apply_before_waiting_and_deduplicate_before_assigning
             .operation_for_epoch(EPOCH.primary())
             .unwrap()
     );
-    route.shutdown();
+    shutdown_route(&route).await;
 }
 
 #[tokio::test]
@@ -452,7 +562,7 @@ async fn native_primary_epoch_change_between_authority_reads_rejects_before_admi
         fn snapshot(&self) -> RuntimeResult<ReplicaStatus> {
             let mut view = status(ReplicaRole::Primary);
             if self.0.fetch_add(1, Ordering::AcqRel) > 0 {
-                view.current_epoch.configuration += 1 << 32;
+                view.current_epoch.configuration_number += 1 << 32;
             }
             Ok(view)
         }
@@ -472,7 +582,7 @@ async fn native_primary_epoch_change_between_authority_reads_rejects_before_admi
     assert_eq!(result.outcome, Outcome::Rejected);
     assert_eq!(route.engine.snapshot().progress.assigned, 0);
     assert_eq!(route.provider.snapshot().last, 0);
-    route.shutdown();
+    shutdown_route(&route).await;
 }
 
 #[tokio::test]
@@ -517,7 +627,7 @@ async fn authority_is_rechecked_before_engine_admission_and_before_local_apply()
             assert_eq!(result.sequence, None);
             assert_eq!(route.engine.snapshot().progress.assigned, 0);
         }
-        route.shutdown();
+        shutdown_route(&route).await;
     }
 }
 
@@ -575,7 +685,7 @@ async fn disconnected_http_waiter_cannot_drop_admission_before_local_apply() {
     assert!(duplicate.duplicate);
     assert_eq!(duplicate.sequence, Some(1));
     assert_eq!(route.engine.snapshot().progress.assigned, 1);
-    route.shutdown();
+    shutdown_route(&route).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -616,7 +726,7 @@ async fn build_waits_for_accepted_primary_local_apply_at_the_exact_horizon() {
         released: (Mutex::new(false), std::sync::Condvar::new()),
     });
     let primary = route_on(native.clone(), partition, 1, ReplicaRole::Primary).await;
-    let (secondary, _) = route(partition, 2, ReplicaRole::Idle).await;
+    let (secondary, _) = route(partition, 2, ReplicaRole::IdleSecondary).await;
     let _release = Release(native.clone());
     let mut write = Box::pin(primary.write(mutation("copy-race")));
     assert!(tokio::time::timeout(Duration::from_millis(40), &mut write)
@@ -625,11 +735,11 @@ async fn build_waits_for_accepted_primary_local_apply_at_the_exact_horizon() {
     until(|| native.reached.load(Ordering::Acquire)).await;
     assert_eq!(primary.engine.snapshot().progress.committed, 1);
     assert_eq!(primary.provider.snapshot().last, 0);
-    let mut build = Box::pin(
-        primary
-            .engine
-            .build_replica(descriptor(&secondary), Cancellation::default()),
-    );
+    let mut build = Box::pin(rap_build(
+        &primary,
+        descriptor(&secondary),
+        Cancellation::default(),
+    ));
     assert!(tokio::time::timeout(Duration::from_millis(40), &mut build)
         .await
         .is_err());
@@ -650,8 +760,8 @@ async fn build_waits_for_accepted_primary_local_apply_at_the_exact_horizon() {
     );
     assert!(primary.engine.snapshot().fault.is_none());
     drop(build);
-    primary.shutdown();
-    secondary.shutdown();
+    shutdown_route(&primary).await;
+    shutdown_route(&secondary).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -678,11 +788,9 @@ async fn real_copy_pumps_copy_ack_hold_after_receive_eos_then_replication_ack_an
     for n in 1..=4 {
         assert_eq!(primary.write(mutation(n)).await.outcome, Outcome::Committed);
     }
-    let (secondary, secondary_native) = route(partition, 2, ReplicaRole::Idle).await;
+    let (secondary, secondary_native) = route(partition, 2, ReplicaRole::IdleSecondary).await;
     secondary.copy_ack_hold.set(6000).unwrap();
-    let build = primary
-        .engine
-        .build_replica(descriptor(&secondary), Cancellation::default());
+    let build = rap_build(&primary, descriptor(&secondary), Cancellation::default());
     tokio::pin!(build);
     tokio::select! {
         result = &mut build => panic!("copy completed before release: {result:?}"),
@@ -705,17 +813,13 @@ async fn real_copy_pumps_copy_ack_hold_after_receive_eos_then_replication_ack_an
         secondary.provider.snapshot().results,
         primary.provider.snapshot().results
     );
-    secondary
-        .engine
-        .change_role(EPOCH, ReplicaRole::Secondary, Cancellation::default())
+    rap_role(&secondary, ReplicaRole::ActiveSecondary)
         .await
         .unwrap();
     let mut peer = descriptor(&secondary);
-    peer.role = ReplicaRole::Secondary;
+    peer.role = ReplicaRole::ActiveSecondary;
     peer.ready = true;
-    primary
-        .engine
-        .update_current_configuration(configuration(vec![peer], 2), Cancellation::default())
+    set_current(&primary, configuration(vec![peer], 2))
         .await
         .unwrap();
     until(|| primary.engine.snapshot().ready).await;
@@ -746,30 +850,18 @@ async fn real_copy_pumps_copy_ack_hold_after_receive_eos_then_replication_ack_an
         primary.provider.snapshot().results
     );
     secondary.delay.store(0, Ordering::Release);
-    let (replacement, _) = route(partition, 3, ReplicaRole::Idle).await;
+    let (replacement, _) = route(partition, 3, ReplicaRole::IdleSecondary).await;
     let cancellation = Cancellation::default();
     let build = async {
-        primary
-            .engine
-            .build_replica(descriptor(&replacement), cancellation.clone())
-            .await?;
-        replacement
-            .engine
-            .change_role(EPOCH, ReplicaRole::Secondary, Cancellation::default())
-            .await?;
+        rap_build(&primary, descriptor(&replacement), cancellation.clone()).await?;
+        rap_role(&replacement, ReplicaRole::ActiveSecondary).await?;
         let mut second = descriptor(&secondary);
-        second.role = ReplicaRole::Secondary;
+        second.role = ReplicaRole::ActiveSecondary;
         second.ready = true;
         let mut third = descriptor(&replacement);
-        third.role = ReplicaRole::Secondary;
+        third.role = ReplicaRole::ActiveSecondary;
         third.ready = true;
-        primary
-            .engine
-            .update_current_configuration(
-                configuration(vec![second, third], 2),
-                Cancellation::default(),
-            )
-            .await
+        set_current(&primary, configuration(vec![second, third], 2)).await
     };
     let writes = async {
         // Use the actual joined admission pump, but coordinate on acceptance
@@ -795,7 +887,11 @@ async fn real_copy_pumps_copy_ack_hold_after_receive_eos_then_replication_ack_an
         }
         eos.add_permits(1);
         for mut replication in accepted {
-            replication.wait(Cancellation::default()).await.unwrap();
+            replication
+                .completion
+                .wait(Cancellation::default())
+                .await
+                .unwrap();
         }
     };
     let joined = tokio::time::timeout(Duration::from_secs(30), async {
@@ -825,17 +921,11 @@ async fn real_copy_pumps_copy_ack_hold_after_receive_eos_then_replication_ack_an
     );
     primary
         .engine
-        .wait_for_catch_up(CatchUpMode::All, Cancellation::default())
+        .wait_for_catch_up_quorum(CatchUpMode::All, Cancellation::default())
         .await
         .unwrap();
-    secondary
-        .engine
-        .change_role(EPOCH, ReplicaRole::Primary, Cancellation::default())
-        .await
-        .unwrap();
-    secondary
-        .engine
-        .update_current_configuration(configuration(vec![], 1), Cancellation::default())
+    rap_role(&secondary, ReplicaRole::Primary).await.unwrap();
+    set_current(&secondary, configuration(vec![], 1))
         .await
         .unwrap();
     until(|| secondary.engine.snapshot().ready).await;
@@ -856,27 +946,23 @@ async fn real_copy_pumps_copy_ack_hold_after_receive_eos_then_replication_ack_an
     );
     assert_eq!(secondary.engine.snapshot().progress.assigned, 105);
     assert_eq!(secondary.provider.snapshot().history_count, 105);
-    primary.shutdown();
-    secondary.shutdown();
-    replacement.shutdown();
+    shutdown_route(&primary).await;
+    shutdown_route(&secondary).await;
+    shutdown_route(&replacement).await;
 }
 
 #[tokio::test]
 async fn cancellation_after_acceptance_is_ambiguous_never_undo_and_terminal_owner_isolated() {
     let partition = Uuid::new_v4();
     let (primary, _) = route(partition, 1, ReplicaRole::Primary).await;
-    let (secondary, _) = route(partition, 2, ReplicaRole::Idle).await;
-    primary
-        .engine
-        .build_replica(descriptor(&secondary), Cancellation::default())
+    let (secondary, _) = route(partition, 2, ReplicaRole::IdleSecondary).await;
+    rap_build(&primary, descriptor(&secondary), Cancellation::default())
         .await
         .unwrap();
     let mut peer = descriptor(&secondary);
-    peer.role = ReplicaRole::Secondary;
+    peer.role = ReplicaRole::ActiveSecondary;
     peer.ready = true;
-    primary
-        .engine
-        .update_current_configuration(configuration(vec![peer], 2), Cancellation::default())
+    set_current(&primary, configuration(vec![peer], 2))
         .await
         .unwrap();
     secondary.delay.store(2000, Ordering::Release);
@@ -892,7 +978,7 @@ async fn cancellation_after_acceptance_is_ambiguous_never_undo_and_terminal_owne
     assert!(duplicate.duplicate);
     assert_eq!(duplicate.sequence, Some(1));
     assert_eq!(primary.engine.snapshot().progress.assigned, 1);
-    primary.shutdown();
+    shutdown_route(&primary).await;
     let result = write.await;
     assert_eq!(result.outcome, Outcome::Ambiguous);
     assert_eq!(result.sequence, Some(1));
@@ -903,26 +989,22 @@ async fn cancellation_after_acceptance_is_ambiguous_never_undo_and_terminal_owne
         control.write(mutation("unrelated")).await.outcome,
         Outcome::Committed
     );
-    secondary.shutdown();
-    control.shutdown();
+    shutdown_route(&secondary).await;
+    shutdown_route(&control).await;
 }
 
 #[tokio::test]
 async fn native_authority_revoked_while_waiting_fences_committed_publication() {
     let partition = Uuid::new_v4();
     let (primary, native) = route(partition, 1, ReplicaRole::Primary).await;
-    let (secondary, _) = route(partition, 2, ReplicaRole::Idle).await;
-    primary
-        .engine
-        .build_replica(descriptor(&secondary), Cancellation::default())
+    let (secondary, _) = route(partition, 2, ReplicaRole::IdleSecondary).await;
+    rap_build(&primary, descriptor(&secondary), Cancellation::default())
         .await
         .unwrap();
     let mut peer = descriptor(&secondary);
-    peer.role = ReplicaRole::Secondary;
+    peer.role = ReplicaRole::ActiveSecondary;
     peer.ready = true;
-    primary
-        .engine
-        .update_current_configuration(configuration(vec![peer], 2), Cancellation::default())
+    set_current(&primary, configuration(vec![peer], 2))
         .await
         .unwrap();
     secondary.delay.store(180, Ordering::Release);
@@ -942,8 +1024,8 @@ async fn native_authority_revoked_while_waiting_fences_committed_publication() {
         Outcome::Rejected
     );
     assert_eq!(primary.engine.snapshot().progress.assigned, 1);
-    primary.shutdown();
-    secondary.shutdown();
+    shutdown_route(&primary).await;
+    shutdown_route(&secondary).await;
 }
 
 #[tokio::test]
@@ -953,7 +1035,7 @@ async fn stale_route_cleanup_cannot_remove_replacement_and_stale_handle_cannot_w
     let mut routes = HashMap::from([("/data/owner".to_string(), new.clone())]);
     remove_owned(&mut routes, "/data/owner", &old);
     assert!(Arc::ptr_eq(&routes["/data/owner"], &new));
-    old.shutdown();
+    shutdown_route(&old).await;
     assert_eq!(
         old.write(mutation("stale")).await.outcome,
         Outcome::Rejected
@@ -964,13 +1046,13 @@ async fn stale_route_cleanup_cannot_remove_replacement_and_stale_handle_cannot_w
     );
     remove_owned(&mut routes, "/data/owner", &new);
     assert!(routes.is_empty());
-    new.shutdown();
+    shutdown_route(&new).await;
 }
 
 type PumpFixture = (
     Pump,
-    mpsc::Sender<Operation>,
-    mpsc::Sender<Operation>,
+    mpsc::Sender<TestOperation>,
+    mpsc::Sender<TestOperation>,
     Arc<Mutex<Option<String>>>,
     mpsc::Sender<Submit>,
 );
@@ -988,7 +1070,7 @@ fn pump_fixture_with_hold(
     // Keep request admission open until the test shuts down its fixture.
     let native = Arc::new(NativeModel {
         alive: AtomicBool::new(true),
-        status: Mutex::new(status(ReplicaRole::Secondary)),
+        status: Mutex::new(status(ReplicaRole::ActiveSecondary)),
     });
     let fault = Arc::new(Mutex::new(None));
     let pump = Pump::start(
@@ -996,8 +1078,8 @@ fn pump_fixture_with_hold(
             native,
             engine: Weak::new(),
             provider,
-            copy: Arc::new(OperationStream::new(copy_rx)),
-            replication: Arc::new(OperationStream::new(replication_rx)),
+            copy: Arc::new(TestStream(tokio::sync::Mutex::new(copy_rx))),
+            replication: Arc::new(TestStream(tokio::sync::Mutex::new(replication_rx))),
             requests,
             delay: Arc::new(AtomicU64::new(delay)),
             copy_ack_hold,
@@ -1008,10 +1090,69 @@ fn pump_fixture_with_hold(
     .unwrap();
     (pump, copy_tx, replication_tx, fault, request_tx)
 }
-fn operation(sequence: i64, data: OperationData, ack: Acknowledgment) -> Operation {
-    Operation {
+#[derive(Debug)]
+struct TestOperation {
+    sequence: i64,
+    data: OperationData,
+    acknowledgment: Acknowledgment,
+}
+impl IOperation for TestOperation {
+    fn get_metadata(&self) -> RuntimeResult<OperationMetadata> {
+        Ok(OperationMetadata {
+            operation_type: OperationType::Normal,
+            sequence_number: self.sequence,
+            atomic_group_id: -1,
+        })
+    }
+    fn get_data(&self) -> RuntimeResult<OperationData> {
+        Ok(self.data.clone())
+    }
+    fn acknowledge(&self) -> RuntimeResult<()> {
+        self.acknowledgment.acknowledge()
+    }
+}
+struct TestStream(tokio::sync::Mutex<mpsc::Receiver<TestOperation>>);
+impl IOperationStream for TestStream {
+    fn get_operation(
+        &self,
+        cancel: Cancellation,
+    ) -> ServiceFuture<'_, Option<Arc<dyn IOperation>>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(RuntimeError::Closed),
+                item = async { self.0.lock().await.recv().await } => Ok(item.map(|op| Arc::new(op) as Arc<dyn IOperation>)),
+            }
+        })
+    }
+}
+// App-owned canonical doubles, not data engine implementation constructors.
+struct Acknowledgment {
+    called: AtomicBool,
+    action: Box<dyn Fn() -> RuntimeResult<()> + Send + Sync>,
+}
+impl std::fmt::Debug for Acknowledgment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestAck")
+    }
+}
+impl Acknowledgment {
+    fn new(action: impl Fn() -> RuntimeResult<()> + Send + Sync + 'static) -> Self {
+        Self {
+            called: AtomicBool::new(false),
+            action: Box::new(action),
+        }
+    }
+    fn acknowledge(&self) -> RuntimeResult<()> {
+        if self.called.swap(true, Ordering::AcqRel) {
+            return Err(RuntimeError::InvalidInput("duplicate test ACK"));
+        }
+        (self.action)()
+    }
+}
+fn operation(sequence: i64, data: OperationData, ack: Acknowledgment) -> TestOperation {
+    TestOperation {
         sequence,
-        epoch: EPOCH,
         data,
         acknowledgment: ack,
     }
@@ -1030,10 +1171,10 @@ async fn pump_copy_ack_hold_final_nonempty_receive_release_cancel_deadline_and_e
         source
             .apply_replication(1, &mutation("copied").operation().unwrap())
             .unwrap();
-        let stream = source.copy_state(1, None).unwrap();
+        let stream = source.get_copy_state(1, None).unwrap();
         let acknowledgments = Arc::new(AtomicUsize::new(0));
         let mut sequence = 0;
-        while let Some(data) = stream.next(Cancellation::default()).await.unwrap() {
+        while let Some(data) = stream.get_next(Cancellation::default()).await.unwrap() {
             sequence += 1;
             let acks = acknowledgments.clone();
             copy.send(operation(
@@ -1105,10 +1246,10 @@ async fn pump_copy_eos_does_not_end_replication_and_ack_observes_actual_provider
     let provider = MemoryProvider::new();
     let (mut pump, copy, replication, fault, _requests) = pump_fixture(provider.clone(), 0);
     let source = MemoryProvider::new();
-    let stream = source.copy_state(0, None).unwrap();
+    let stream = source.get_copy_state(0, None).unwrap();
     let acknowledgments = Arc::new(AtomicUsize::new(0));
     let mut sequence = 0;
-    while let Some(data) = stream.next(Cancellation::default()).await.unwrap() {
+    while let Some(data) = stream.get_next(Cancellation::default()).await.unwrap() {
         sequence += 1;
         let acks = acknowledgments.clone();
         let provider = provider.clone();

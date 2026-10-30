@@ -1,11 +1,15 @@
 use super::*;
+#[path = "stateful_binding_tests.rs"]
+mod binding_tests;
 #[path = "stateful_overlap_tests.rs"]
 mod overlap_tests;
 #[path = "stateful_review_tests.rs"]
 mod review_tests;
-use crate::AccessStatus::{Granted as G, NotPrimary as N, ReconfigurationPending as T};
+use crate::ServicePartitionAccessStatus::{
+    Granted as G, NotPrimary as N, ReconfigurationPending as T,
+};
 
-fn control(request: &ProxyRequest, action: &str, remotes: Vec<Replica>) -> ProxyRequest {
+pub(super) fn control(request: &ProxyRequest, action: &str, remotes: Vec<Replica>) -> ProxyRequest {
     let mut result = request.clone();
     result.service = native_default_service(result.service);
     if matches!(
@@ -18,7 +22,7 @@ fn control(request: &ProxyRequest, action: &str, remotes: Vec<Replica>) -> Proxy
     result.flags = 0;
     result
 }
-fn peer(local: &Replica, node: u8) -> Replica {
+pub(super) fn peer(local: &Replica, node: u8) -> Replica {
     let mut replica = local.clone();
     replica.node.id.0 = vec![node; 16];
     replica.id = node as i64 * 100;
@@ -31,7 +35,7 @@ fn peer(local: &Replica, node: u8) -> Replica {
     replica.replication_endpoint = format!("model://peer/{node}");
     replica
 }
-async fn wait_event(calls: &StatefulCalls, event: &str, count: usize) {
+pub(super) async fn wait_event(calls: &StatefulCalls, event: &str, count: usize) {
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if calls
@@ -87,7 +91,7 @@ async fn default_metadata_configuration_projection_and_separate_access_quorums()
     drop(configurations);
     assert_eq!(
         calls.partitions.lock().unwrap()[0].access_status().unwrap(),
-        (G, crate::AccessStatus::NoWriteQuorum)
+        (G, crate::ServicePartitionAccessStatus::NoWriteQuorum)
     ); // Access majority is NOT clamped.
     assert_eq!(
         calls
@@ -125,12 +129,12 @@ async fn same_role_new_primary_epoch_and_status_have_real_initialized_progress()
         *calls.epochs.lock().unwrap(),
         vec![
             crate::Epoch {
-                configuration: 1 << 32,
-                data_loss: 1
+                configuration_number: 1 << 32,
+                data_loss_number: 1
             },
             crate::Epoch {
-                configuration: 2 << 32,
-                data_loss: 1
+                configuration_number: 2 << 32,
+                data_loss_number: 1
             },
         ]
     );
@@ -204,7 +208,7 @@ async fn demotion_orders_pre_revoke_all_epoch_all_role_and_progress() {
     {
         let configs = calls.configurations.lock().unwrap();
         assert!(configs[0].0.replicas[0].must_catch_up);
-        assert_eq!(configs[0].0.replicas[0].role, ReplicaRole::Secondary);
+        assert_eq!(configs[0].0.replicas[0].role, ReplicaRole::ActiveSecondary);
     }
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let cancel = control(&demote, "CancelCatchupReplicaSet", vec![]);
@@ -348,7 +352,44 @@ async fn newer_built_incarnation_removes_old_resource_then_retries_and_fences_ol
 
 #[tokio::test]
 async fn promotion_notifies_original_endpoint_until_exact_ack_then_current_configuration() {
-    let mut h = Harness::new().await;
+    promotion_endpoint_scenario(None).await;
+}
+
+#[tokio::test]
+async fn native_endpoint_notification_retry_and_quiescence_do_not_need_application_scheduler_progress(
+) {
+    let (handle, handle_rx) = std::sync::mpsc::sync_channel(1);
+    let (release, stalled) = std::sync::mpsc::sync_channel(1);
+    let application = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        handle.send(runtime.handle().clone()).unwrap();
+        // The application runtime is deliberately never driven. Only its
+        // scheduler/driver handle is supplied to user callback workers.
+        stalled.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    struct JoinApplication(
+        Option<std::sync::mpsc::SyncSender<()>>,
+        Option<std::thread::JoinHandle<()>>,
+    );
+    impl Drop for JoinApplication {
+        fn drop(&mut self) {
+            self.0.take().unwrap().send(()).unwrap();
+            self.1.take().unwrap().join().unwrap();
+        }
+    }
+    let _application = JoinApplication(Some(release), Some(application));
+    promotion_endpoint_scenario(Some(
+        handle_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+    ))
+    .await;
+}
+
+async fn promotion_endpoint_scenario(application: Option<tokio::runtime::Handle>) {
+    let application_stalled = application.is_some();
+    let mut h = Harness::new_with_application(application).await;
     let calls = register(&h);
     let mut open = request(&h, 2, 1, 20);
     open.local.current_role = 2;
@@ -393,6 +434,21 @@ async fn promotion_notifies_original_endpoint_until_exact_ack_then_current_confi
         calls.partitions.lock().unwrap()[0].access_status().unwrap(),
         (G, T)
     );
+    if application_stalled {
+        // Leave the retry pending and prove native Close/quiescence observes
+        // its cancellation without ever driving the application scheduler.
+        // The companion same-clock fixture below exercises the actual30s retry.
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        let mut close = open.clone();
+        close.unit = promote.unit.clone();
+        close.local = promote.local.clone();
+        h.send("ReplicaClose", &close).await;
+        h.receive("ReplicaCloseReply").await;
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        h.engine.quiesce().await.unwrap();
+        h.engine.shared.execution.shutdown().await.unwrap();
+        return;
+    }
     let mut ack = control(&promote, "ProxyReplicaEndpointUpdatedReply", vec![]);
     ack.runtime = open.runtime.clone();
     ack.local = body.local.clone();
@@ -445,6 +501,9 @@ async fn promotion_notifies_original_endpoint_until_exact_ack_then_current_confi
     tokio::time::advance(Duration::from_secs(30)).await;
     h.no_reply().await;
     tokio::time::resume();
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    h.engine.quiesce().await.unwrap();
+    h.engine.shared.execution.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -461,7 +520,7 @@ async fn data_loss_state_change_is_a_control_outcome_not_a_failed_open_cleanup()
     assert_eq!(reply.error.error, 0x80071d28u32 as i32 as i64);
     assert_eq!((reply.error.api.api, reply.error.api.interface), (0, 0));
     assert_eq!((reply.local.first_lsn, reply.local.last_lsn), (0, 0));
-    assert!(calls.partitions.lock().unwrap()[0].ensure_valid().is_ok());
+    assert!(calls.partitions.lock().unwrap()[0].validate().is_ok());
     assert!(!calls.events.lock().unwrap().contains(&"serviceAbort"));
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     let mut update = control(&open, "UpdateConfiguration", vec![open.local.clone()]);
@@ -492,15 +551,15 @@ async fn failed_open_can_retry_same_native_incarnation_without_reviving_old_loca
     let failed: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(failed.error.error, -456);
     let old = calls.partitions.lock().unwrap()[0].clone();
-    assert!(old.ensure_valid().is_err());
+    assert!(old.validate().is_err());
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     h.send("ReplicaOpen", &open).await;
     let retried: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(retried.error.error, 0);
     let new = calls.partitions.lock().unwrap()[1].clone();
     assert_eq!(old.identity(), new.identity());
-    assert!(old.ensure_valid().is_err());
-    assert!(new.ensure_valid().is_ok());
+    assert!(old.validate().is_err());
+    assert!(new.validate().is_ok());
 }
 
 #[tokio::test]
@@ -555,7 +614,7 @@ async fn data_loss_callback_failure_reports_transient_fault_before_failed_open_c
     let failed: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
     assert_eq!(failed.error.error, -995);
     assert_eq!((failed.error.api.api, failed.error.api.interface), (7, 4));
-    assert!(calls.partitions.lock().unwrap()[0].ensure_valid().is_err());
+    assert!(calls.partitions.lock().unwrap()[0].validate().is_err());
     assert!(calls.events.lock().unwrap().contains(&"replicatorAbort"));
     assert!(calls.events.lock().unwrap().contains(&"serviceAbort"));
 }

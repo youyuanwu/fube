@@ -143,12 +143,13 @@ compile. Build the required binaries/examples explicitly first.
 
 ```sh
 cargo fmt --all -- --check
-cargo check --locked --workspace --all-targets
+cargo check --locked --workspace --all-targets --all-features
 cargo test --locked -p fube-transport -p fube-client -p fube-test-host
 cargo test --locked -p fube-ra-store
 cargo test --locked -p fube-ra
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo doc --locked -p fube-transport -p fube-client -p fube-test-host --no-deps
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --all-features --no-deps
+cargo test --locked --workspace --all-features --doc
 python3 -m unittest discover -s tests/offline -t . -p 'test_*.py'
 ```
 
@@ -170,6 +171,34 @@ SQLite development package). Do not override the bundled build with
 workspace tests are automatically included in the existing `rust-tests` archive
 and resource-free `rust_tests` suite. Acceptance consumers execute that archive
 with standalone nextest; they do not compile Rust, install SQLite/SF, or start SF.
+
+### API alignment documentation gates
+
+The [current per-method alignment/provenance record](runtime/SfApiAlignment.md)
+separates synchronous shape from accepted values, completion and capability.
+After documentation/Rustdoc examples change, run:
+
+```sh
+cargo fmt --all -- --check
+cargo check --locked --workspace --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo build --locked --workspace --bins --examples --all-features
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --all-features --no-deps
+cargo test --locked --workspace --all-features --doc
+git diff --check
+```
+
+Check relative source/document links and pinned public references as well.
+This repository uses plain Markdown and Rustdoc, not a Markdown-site build.
+Repeat affected safety/Python tests if executable examples/fixtures/logic
+change; prose-only changes do not require another full offline suite.
+Doctests are separate from nextest. Local RAP model hosts and oracle ABI doubles
+are **offline evidence**, not deployed SF. Current alignment native qualification
+is **NOT RUN**: future authorization must create fresh immutable bundles from
+clean exact source, then separately run runtime `--full --stateful three` and
+the selected complete data profile below. Never relabel an old archive as
+built from a later documentation tree or add overlapping suite counts as unique
+scenario totals. Historical CI/native outcomes retain their old source identity.
 
 ## Standalone native runtime
 

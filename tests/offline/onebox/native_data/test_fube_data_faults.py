@@ -28,13 +28,11 @@ def primary(value, index):
         role = "Primary" if chosen else "ActiveSecondary"
         replica.update(role=role, service_http_status=200 if chosen else 503)
         rpc = replica["rpc"]
-        service_role = role if rpc["engine_kind"] == "native-classic-v1" else (
-            "Primary" if chosen else "Secondary")
-        rpc.update(role=service_role, current_role=service_role,
+        rpc.update(role=role, current_role=role,
                    read_status="Granted" if chosen else "NotPrimary",
                    write_status="Granted" if chosen else "NotPrimary")
         if rpc["engine_kind"] == "rust":
-            rpc["replicator_role"] = service_role
+            rpc["replicator_role"] = role
     chosen = value["replicas"][index]
     value["primary"] = {"resolver": "fube-client", "endpoint": chosen["address"],
                         "native_pid": chosen["rpc"]["pid"], "rpc": copy.deepcopy(chosen["rpc"])}
@@ -79,12 +77,12 @@ def receipt(value, source, kind):
         address, identity = endpoint.split("/", 1)
         actor, _, suffix = identity.split(";")
         return f"{address}/{actor};00000000-0000-0000-0000-000000000999;{suffix}"
-    epoch = {"data_loss": 1, "configuration": 2 << 32}
+    epoch = {"data_loss_number": 1, "configuration_number": 2 << 32}
     result = {"qualification_only": True, "admission_only": False, "kind": kind,
             "from": wrong(own) if kind == "wrong_sender" else own,
             "target": wrong(selected) if kind == "wrong_target" else selected,
             "native_selected_peer": selected, "sequence": 21, "native_epoch": dict(epoch),
-            "sent_epoch": {"data_loss": 1, "configuration": 1 << 32} if kind == "stale_epoch" else dict(epoch)}
+            "sent_epoch": {"data_loss_number": 1, "configuration_number": 1 << 32} if kind == "stale_epoch" else dict(epoch)}
     # Explicit offline completed-frame fixture, not a native capture.
     message_id = str(uuid.uuid4())
     body = b"offline-wire-fault-model:" + uuid.UUID(message_id).bytes_le
@@ -141,7 +139,7 @@ def loss_model(changed, native=False):
     last = 5 if changed else 20
     for replica in after["replicas"]:
         rpc = replica["rpc"]
-        rpc["native_epoch"]["data_loss"] += 1
+        rpc["native_epoch"]["data_loss_number"] += 1
         rpc["native_current_progress"] = last
         rpc["engine"]["progress"].update(assigned=last, applied=last)
         rpc["state"].update(last=last, history_count=len(retained),
@@ -396,7 +394,7 @@ class WireFaultModels(unittest.TestCase):
         data.stable_data(before, copy.deepcopy(before))
         actions = [
             lambda value: value["native_partition"]["epoch"].update(data_loss=2),
-            lambda value: value["replicas"][0]["rpc"]["native_epoch"].update(configuration=9 << 32),
+            lambda value: value["replicas"][0]["rpc"]["native_epoch"].update(configuration_number=9 << 32),
             lambda value: value["replicas"][0]["rpc"].update(engine_incarnation="different"),
             lambda value: value["replicas"][0].update(role="ActiveSecondary"),
             lambda value: value["replicas"][0]["rpc"]["state"]["results"].update(invalid_probe=21),
@@ -730,7 +728,8 @@ class DataLossCommandModels(unittest.TestCase):
         before = copy.deepcopy(after)
         before["native_partition"]["epoch"]["configuration"] -= 1 << 32
         for replica in before["replicas"]:
-            replica["rpc"]["native_epoch"]["configuration"] -= 1 << 32
+            rpc = replica["rpc"]
+            rpc["native_epoch"]["configuration_number"] -= 1 << 32
         primary(before, 0)
         qualification, original = self.qualification(True, "mixed")
         auxiliary = self.auxiliary(original)
@@ -781,7 +780,7 @@ class DataLossCommandModels(unittest.TestCase):
             if invalid == "membership":
                 after["replicas"].pop()
             elif invalid == "epoch":
-                after["replicas"][0]["rpc"]["native_epoch"]["configuration"] += 1 << 32
+                after["replicas"][0]["rpc"]["native_epoch"]["configuration_number"] += 1 << 32
             elif invalid == "applied":
                 after["replicas"][2]["rpc"]["engine"]["progress"]["applied"] = 19
             elif invalid == "native_progress":
@@ -791,7 +790,11 @@ class DataLossCommandModels(unittest.TestCase):
             else:
                 after["native_partition"]["epoch"] = dict(before["native_partition"]["epoch"])
                 for replica in after["replicas"]:
-                    replica["rpc"]["native_epoch"] = dict(before["native_partition"]["epoch"])
+                    rpc = replica["rpc"]
+                    native_epoch = before["native_partition"]["epoch"]
+                    rpc["native_epoch"] = {
+                        "data_loss_number": native_epoch["data_loss"],
+                        "configuration_number": native_epoch["configuration"]}
                 primary(after, 1)
             with self.subTest(invalid=invalid), \
                  patch.object(qualification, "guard_application"), \
@@ -817,7 +820,8 @@ class DataLossCommandModels(unittest.TestCase):
                         (away, 1 << 32, 0)):
                     value["native_partition"]["epoch"]["configuration"] = configuration
                     for replica in value["replicas"]:
-                        replica["rpc"]["native_epoch"]["configuration"] = configuration
+                        rpc = replica["rpc"]
+                        rpc["native_epoch"]["configuration_number"] = configuration
                     primary(value, selected)
             # Primary application state is authoritative application progress;
             # its queue's applied frontier can still be the reconciliation

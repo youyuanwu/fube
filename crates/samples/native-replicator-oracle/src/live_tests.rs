@@ -100,8 +100,8 @@ async fn null_context_async_eos_cancellation_and_once_only_end() {
 }
 
 struct EmptyThenFailure(std::sync::atomic::AtomicUsize);
-impl OperationDataStream for EmptyThenFailure {
-    fn next(
+impl IOperationDataStream for EmptyThenFailure {
+    fn get_next(
         &self,
         _: Cancellation,
     ) -> std::pin::Pin<

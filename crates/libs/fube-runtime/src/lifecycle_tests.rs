@@ -1,4 +1,6 @@
 use super::*;
+#[path = "reporting_tests.rs"]
+mod reporting_tests;
 #[path = "stateful_tests.rs"]
 pub(crate) mod stateful_tests;
 use fube_transport::{
@@ -16,6 +18,7 @@ struct Calls {
     closes: AtomicUsize,
     aborts: AtomicUsize,
     partitions: Mutex<Vec<Partition>>,
+    provider: Mutex<Option<crate::extensions::InstanceIntegrationProvider>>,
     release: Notify,
     abort_release: AtomicBool,
     abort_running: AtomicUsize,
@@ -24,28 +27,49 @@ struct Factory(Arc<Calls>);
 struct Instance {
     calls: Arc<Calls>,
     mode: u8,
+    partition: Partition,
 }
-impl StatelessFactory for Factory {
-    fn create(&self, context: ServiceContext) -> ServiceFuture<'_, Arc<dyn StatelessService>> {
-        Box::pin(async move {
-            assert_eq!(context.identity.instance_id, 100);
-            let mode = context.initialization_data.first().copied().unwrap_or(0);
-            if mode == 9 {
-                return Err(Error::Remote {
-                    code: -123,
-                    message: "factory failure".into(),
-                });
-            }
-            Ok(Arc::new(Instance {
-                calls: self.0.clone(),
-                mode,
-            }) as Arc<dyn StatelessService>)
-        })
+impl IStatelessServiceFactory for Factory {
+    fn create_instance(
+        &self,
+        _: String,
+        _: String,
+        initialization: &[u8],
+        partition: uuid::Uuid,
+        instance: i64,
+    ) -> Result<Box<dyn IStatelessServiceInstance>> {
+        assert_eq!(instance, 100);
+        let mode = initialization.first().copied().unwrap_or(0);
+        if mode == 9 {
+            return Err(Error::Remote {
+                code: -123,
+                message: "factory failure".into(),
+            });
+        }
+        let binding = self
+            .0
+            .provider
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .capture(partition, instance)?;
+        Ok(Box::new(Instance {
+            calls: self.0.clone(),
+            mode,
+            partition: binding.partition,
+        }) as Box<dyn IStatelessServiceInstance>)
     }
 }
-impl StatelessService for Instance {
-    fn open(&self, partition: Partition, _cancel: Cancellation) -> ServiceFuture<'_, String> {
+impl IStatelessServiceInstance for Instance {
+    fn open(
+        &self,
+        partition: Arc<dyn IStatelessServicePartition>,
+        _cancel: Cancellation,
+    ) -> crate::ApiFuture<'_, String> {
         Box::pin(async move {
+            let _ = partition.get_partition_info()?;
+            let partition = self.partition.clone();
             self.calls.opens.fetch_add(1, Ordering::SeqCst);
             self.calls
                 .partitions
@@ -66,7 +90,7 @@ impl StatelessService for Instance {
             Ok(format!("model://{}", partition.identity.partition_id))
         })
     }
-    fn close(&self, _cancel: Cancellation) -> ServiceFuture<'_, ()> {
+    fn close(&self, _cancel: Cancellation) -> crate::ApiFuture<'_, ()> {
         Box::pin(async move {
             self.calls.closes.fetch_add(1, Ordering::SeqCst);
             if self.mode == 7 {
@@ -107,6 +131,51 @@ pub(crate) struct Harness {
     peer: TcpStream,
     calls: Arc<Calls>,
     index: u32,
+}
+
+#[tokio::test]
+async fn canonical_invalid_fault_after_permanent_is_rejected_without_changing_stage_or_sending() {
+    let mut h = Harness::new().await;
+    let request = h.request(1, 1, 0);
+    h.send("ReplicaOpen", &request).await;
+    h.receive("ReplicaOpenReply").await;
+    let partition = h.calls.partitions.lock().unwrap()[0].clone();
+    let canonical: Arc<dyn IStatelessServicePartition> = Arc::new(partition.clone());
+    let permit = h.engine.shared.execution.try_reserve().unwrap();
+    let reported = permit.run_owned(move || {
+        let result: Result<()> = canonical.report_fault(FaultType::Permanent);
+        result
+    });
+    let (result, message) = tokio::join!(reported, h.receive("RAReportFault"));
+    result.unwrap();
+    assert_eq!(from_slice::<FaultBody>(&message.body).unwrap().fault, 2);
+    let before = partition.fault_delivery().unwrap();
+    let canonical: Arc<dyn IStatelessServicePartition> = Arc::new(partition.clone());
+    h.engine
+        .shared
+        .execution
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || {
+            let invalid: Result<()> = canonical.report_fault(FaultType::Invalid);
+            assert_eq!(
+                invalid.unwrap_err().kind(),
+                crate::ErrorKind::InvalidArgument
+            );
+            // The immutable successful initial result remains successful, and
+            // Permanent still subsumes valid later Transient/Permanent calls.
+            canonical.report_fault(FaultType::Transient)?;
+            canonical.report_fault(FaultType::Permanent)
+        })
+        .await
+        .unwrap();
+    let after = partition.fault_delivery().unwrap();
+    assert_eq!(after.fault, FaultType::Permanent);
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.last_error, before.last_error);
+    assert_eq!(after.cancelled, before.cancelled);
+    assert_eq!(after.superseded_transient, before.superseded_transient);
+    h.no_reply().await;
 }
 
 #[tokio::test]
@@ -170,9 +239,9 @@ async fn reporting_native_paths_identity_health_results_and_close_fences() {
         assert_eq!(report.ttl, i64::MAX);
         assert_eq!(report.state, 2);
         let entity = &report.entity.0.as_ref().unwrap().0;
-        assert_eq!(entity.instance, 100);
-        assert_eq!(entity.kind, 2);
-        assert_eq!(entity.partition, request.unit.id.id);
+        assert!(
+            matches!(entity, HealthEntity::Instance { instance: 100, partition } if *partition == request.unit.id.id)
+        );
         write_message(
             &mut h.peer,
             &Message {
@@ -612,6 +681,9 @@ async fn reporting_bounds_and_current_description_validation() {
 }
 impl Harness {
     async fn new() -> Self {
+        Self::new_with_application(None).await
+    }
+    async fn new_with_application(application: Option<tokio::runtime::Handle>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let env = [
@@ -643,7 +715,7 @@ impl Harness {
         let (tx, rx) = mpsc::channel(32);
         let handler = Arc::new(move |r| {
             tx.try_send(r)
-                .map_err(|_| Error::ResourceLimit("model ingress"))
+                .map_err(|_| fube_transport::Error::ResourceLimit("model ingress"))
         });
         let (client, peer) = tokio::join!(
             Connection::connect_ipc_clear(
@@ -672,13 +744,16 @@ impl Harness {
             }
         );
         let authority = Authority::new(std::time::Instant::now(), 3_000_000_000).unwrap();
-        let engine = Engine::start(
-            crate::ActivationContextHandle::new(activation),
-            authority,
-            client.unwrap(),
-            rx,
-        );
+        let current = crate::ActivationContextHandle::new(activation);
+        let engine = if let Some(application) = application {
+            let execution =
+                crate::extensions::ExecutionRuntime::new(authority.clone(), application);
+            Engine::start_with_execution(current, authority, client.unwrap(), rx, execution)
+        } else {
+            Engine::start(current, authority, client.unwrap(), rx)
+        };
         let calls = Arc::new(Calls::default());
+        *calls.provider.lock().unwrap() = Some(engine.instance_integration_provider());
         peer.set_nodelay(true).unwrap();
         engine
             .insert_factory("ModelType".into(), Arc::new(Factory(calls.clone())))
@@ -1127,9 +1202,12 @@ async fn abort_panic_or_cleanup_timeout_never_acknowledges_disposal() {
         .unwrap();
         let cause = retired.expect("failing Abort must retire the connection");
         assert!(if mode == 12 {
-            matches!(cause, Error::Timeout)
+            matches!(cause, fube_transport::Error::Timeout)
         } else {
-            matches!(cause, Error::Protocol("service abort panicked"))
+            matches!(
+                cause,
+                fube_transport::Error::Protocol("service abort panicked")
+            )
         });
         assert!(h.engine.shared.authority.check().is_err());
         let response = tokio::time::timeout(Duration::from_secs(1), read_message(&mut h.peer))
@@ -1165,6 +1243,19 @@ async fn retired_authority_cannot_republish_cached_duplicate_endpoint() {
     let request = h.request(1, 1, 0);
     h.send("ReplicaOpen", &request).await;
     h.receive("ReplicaOpenReply").await;
+    // Receipt of the frame can precede the original dispatch releasing its
+    // operation permit. Exercise the cached endpoint path, not busy rejection.
+    let operation = h
+        .engine
+        .shared
+        .units
+        .lock()
+        .unwrap()
+        .get(&request.unit.id.id.0)
+        .unwrap()
+        .operation
+        .clone();
+    drop(operation.acquire_owned().await.unwrap());
     // Model an operation already admitted but not yet polled by its task.
     h.engine.shared.authority.check().unwrap();
     let admitted = IpcRequest {
@@ -1183,10 +1274,8 @@ async fn retired_authority_cannot_republish_cached_duplicate_endpoint() {
         reply: None,
     };
     h.engine.shared.authority.retire();
-    assert!(matches!(
-        dispatch(h.engine.shared.clone(), admitted).await,
-        Err(Error::Closed)
-    ));
+    let result = dispatch(h.engine.shared.clone(), admitted).await;
+    assert!(matches!(result, Err(Error::Closed)), "{result:?}");
     h.no_reply().await;
     assert_eq!(h.calls.opens.load(Ordering::SeqCst), 1);
     h.engine.quiesce().await.unwrap();
