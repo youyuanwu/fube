@@ -5,20 +5,10 @@ Build an immutable bundle upstream from clean source. Validate it before acquiri
 any allocation capability. Native SF alone controls membership, roles and epochs.
 Missing scenarios are failures, even when the implemented scenarios pass.
 
-Uploads use the shipped native SDK azurecliproxy apphost, one regular file per
-CopyApplicationPackage/UploadContent call, never sfctl's directory walker. Source
-contract (read-only inspection): microsoft/service-fabric commit
-51a7703a1f83749a9234d3ceb4296d8622e42cca, src/prod/src/managed/azurecliproxy/
-AzureCliProxy.cs:24-40, ImageStore/NativeImageStoreClient.cs:436-456 under the
-managed Api, and Management/ImageStore/NativeImageStore.cpp:619-747,1475-1507.
-UploadContent selects UploadFileAsyncOperation for File::Exists(localSource)
-and preserves the explicit remote-relative filename. NativeImageStore.cpp:496-533
-requires directory _.dir markers; these use one pinned, empty regular-file FD,
-with the package-root marker uploaded last. The pinned 11.8.121.4
-runtime deb (SHA-256 fbcb0b8d52e84b7e2bf9c336d9e0ece8cb9ff7fa1de53367d56c6ff8ab850c83)
-contains Fabric.Code/azurecliproxy and azurecliproxy.dll. Invoke the apphost
-directly: its shell wrapper changes coredump_filter. No wrapper, COM shim,
-directory-upload fallback, permission change, or native qualification is implied.
+Trusted, immutable test packages are copied into an exclusively owned staging
+directory, hash-checked, and uploaded with the container's sfctl. Ownership
+metadata stays outside the package. This is not an inode-pinned uploader for
+hostile concurrent filesystem writers.
 """
 from __future__ import annotations
 
@@ -28,7 +18,6 @@ import contextlib
 from dataclasses import dataclass, replace
 import hashlib
 import http.client
-import io
 import json
 import os
 from pathlib import Path
@@ -40,14 +29,13 @@ import stat
 import struct
 import subprocess
 import sys
-import tarfile
 import threading
 import time
 import uuid
 from urllib.parse import quote, urlencode, urlsplit
 import xml.etree.ElementTree as ET
 
-from tests.onebox.shared import runtime
+from tests.onebox.shared import runtime, staging
 from tests.suites import MANIFEST
 
 ROOT = runtime.ROOT
@@ -996,6 +984,28 @@ finally:
 """
 
 
+STOP_CAPTURE_HELPER = r"""
+import json,os,select,signal,sys
+proof=json.loads(sys.argv[1])
+try: fd=os.pidfd_open(proof["pid"])
+except ProcessLookupError: sys.exit(0)
+try:
+    try:
+        with open("/proc/"+str(proof["pid"])+"/stat") as status:
+            start=status.read().rsplit(") ",1)[1].split()[19]
+        with open("/proc/"+str(proof["pid"])+"/cmdline","rb") as command_file:
+            command=command_file.read().split(b"\0")
+    except FileNotFoundError: sys.exit(0)
+    if start!=proof["start_time"] or (command!=[b""] and command[-2].decode()!=proof["token"]):
+        raise RuntimeError("capture helper incarnation changed; refuse signal")
+    if command!=[b""]: signal.pidfd_send_signal(fd,signal.SIGTERM)
+    ready=select.poll(); ready.register(fd,select.POLLIN)
+    if not ready.poll(10000): raise RuntimeError("original capture helper exit unconfirmed")
+except ProcessLookupError: pass
+finally: os.close(fd)
+"""
+
+
 class WireCapture:
     def __init__(self, allocation, allowed: list, evidence: dict):
         self.allocation, self.allowed, self.evidence = allocation, allowed, evidence
@@ -1064,7 +1074,7 @@ class WireCapture:
         try:
             if self.helper is not None:
                 require(self.allocation.verify() == self.container_id, "original wire observer allocation changed; refuse signal")
-                self.allocation.execute("python3", "-c", STOP_UPLOAD_HELPER, json.dumps(self.helper), timeout=12)
+                self.allocation.execute("python3", "-c", STOP_CAPTURE_HELPER, json.dumps(self.helper), timeout=12)
                 self.evidence["observer_cleanup"] = "original helper pidfd exit confirmed"
             else:
                 self.evidence["observer_cleanup"] = (
@@ -2664,417 +2674,8 @@ def provenance(bundle: Bundle) -> dict:
     }
 
 
-UPLOAD_MAX_BYTES = 512 * 1024 * 1024
-UPLOAD_MAX_ENTRIES = 64
 UPLOAD_SECONDS = 180
-
-UPLOAD = r"""
-import ctypes,hashlib,json,os,re,secrets,signal,stat,subprocess,sys,time
-path,action=sys.argv[1:3]; proof=json.loads(sys.argv[3])
-def require(value,message):
-    if not value: raise RuntimeError(message)
-def recovery_note(error,message):
-    message=message[:16384]
-    if hasattr(error,"add_note"):error.add_note(message)
-    else:print(message,file=sys.stderr,flush=True)
-if action=="transfer":
-    deadline=float(sys.argv[4]); token=sys.argv[5]
-    require(0<deadline-time.time()<=180 and re.fullmatch(r"[a-f0-9]{64}",token),
-            "invalid bounded upload helper lifetime")
-    def expired(*_): raise TimeoutError("descriptor-bound transfer deadline")
-    signal.signal(signal.SIGALRM,expired)
-    # A pidfd-bound stop must unwind subprocess.run, killing/reaping the SDK
-    # apphost before this helper releases its original source descriptors.
-    signal.signal(signal.SIGTERM,expired)
-    signal.setitimer(signal.ITIMER_REAL,deadline-time.time())
-    with open("/proc/self/stat") as status:
-        start_time=status.read().rsplit(") ",1)[1].split()[19]
-    print(json.dumps({"pid":os.getpid(),"start_time":start_time,"token":token}),flush=True)
-parent,name=os.path.split(path)
-require(parent=="/var/lib/sf-node" and re.fullmatch(r"fube-data-[a-f0-9]{32}",name),
-        "invalid data upload reservation path")
-parent_fd=os.open(parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
-directory_fd=None
-owner_fd=None
-private=None
-private_identity=None
-private_created=False
-published=False
-def identity(fd):
-    info=os.fstat(fd)
-    return [info.st_dev,info.st_ino]
-def owner(fd):
-    file=os.open(".fube-upload-owner",os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=fd)
-    try:
-        info=os.fstat(file)
-        require(stat.S_ISREG(info.st_mode) and 64<=info.st_size<=65536 and info.st_nlink==1,
-                "upload owner file is not the original regular capability")
-        return identity(file),os.read(file,64).decode("ascii")
-    finally: os.close(file)
-def verify(entry):
-    info=os.stat(entry,dir_fd=parent_fd,follow_symlinks=False)
-    ancestor=os.stat("..",dir_fd=directory_fd,follow_symlinks=False)
-    parent_info=os.stat(parent,follow_symlinks=False)
-    require(stat.S_ISDIR(info.st_mode) and [info.st_dev,info.st_ino]==proof["directory"]
-            and identity(directory_fd)==proof["directory"]
-            and identity(parent_fd)==proof["parent"]
-            and [parent_info.st_dev,parent_info.st_ino]==proof["parent"]
-            and [ancestor.st_dev,ancestor.st_ino]==proof["parent"],
-            "upload directory incarnation changed; retain")
-    file,capability=owner(directory_fd)
-    require(file==proof["owner_file"] and capability==proof["capability"],
-            "upload owner capability changed; retain")
-def publish(source,destination,source_fd=None,destination_fd=None):
-    libc=ctypes.CDLL(None,use_errno=True)
-    rename=getattr(libc,"renameat2",None)
-    require(rename is not None,"atomic renameat2(RENAME_NOREPLACE) unavailable; retain")
-    rename.argtypes=[ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint]
-    rename.restype=ctypes.c_int
-    if rename(parent_fd if source_fd is None else source_fd,os.fsencode(source),
-              parent_fd if destination_fd is None else destination_fd,os.fsencode(destination),1)!=0:
-        error=ctypes.get_errno()
-        raise OSError(error,os.strerror(error),destination)
-def recorded_owner():
-    file=os.open(".fube-upload-owner",os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=directory_fd)
-    try:
-        require(identity(file)==proof["owner_file"],"upload inventory owner changed; retain")
-        require(owner(directory_fd)==(proof["owner_file"],proof["capability"]),
-                "upload inventory capability changed; retain")
-        return file
-    except BaseException:
-        os.close(file)
-        raise
-def append_record(file,record):
-    data=("\n"+json.dumps(record,separators=(",",":"))).encode("ascii")
-    require(os.fstat(file).st_size+len(data)<=65536,"upload inventory byte bound")
-    os.lseek(file,0,os.SEEK_END)
-    require(os.write(file,data)==len(data),"short upload inventory write")
-    os.fsync(file)
-def inspect_tree(records,directories):
-    expected={entry:set() for entry in directories}
-    expected[""].add(".fube-upload-owner")
-    for record in records:
-        entry=record["path"]; ancestor,_,leaf=entry.rpartition("/")
-        fd=directories[ancestor]
-        info=os.stat(leaf,dir_fd=fd,follow_symlinks=False)
-        require([info.st_dev,info.st_ino]==record["identity"]
-                and (stat.S_ISDIR(info.st_mode) if record["kind"]=="directory"
-                     else stat.S_ISREG(info.st_mode)),
-                "upload child incarnation changed; retain")
-        if record["kind"]=="directory":
-            require(identity(directories[entry])==record["identity"],
-                    "original upload child descriptor changed; retain")
-        expected[ancestor].add(leaf)
-    for entry,fd in directories.items():
-        require(set(os.listdir(fd))==expected[entry],"upload child inventory changed; retain")
-def file_hash(fd):
-    digest=hashlib.sha256(); offset=0
-    while True:
-        chunk=os.pread(fd,65536,offset)
-        if not chunk: return digest.hexdigest()
-        offset+=len(chunk)
-        require(offset<=512*1024*1024,"upload source hash byte bound")
-        digest.update(chunk)
-def transfer():
-    # Only the original root descriptor authorizes writes. Never reopen the
-    # public root/children for capture. Directory creation/capture happens at
-    # unpublished nonces, then RENAME_NOREPLACE publishes the captured inode.
-    directories={"":directory_fd}; files={}; records=[]; held=[]
-    seen=set(); total=0; entries=0
-    stream=sys.stdin.buffer
-    def hold(fd):
-        held.append(fd)
-        require(len(held)<=160,"upload descriptor inventory bound")
-        return fd
-    def read_exact(size):
-        data=stream.read(size)
-        require(len(data)==size,"truncated bounded upload archive")
-        return data
-    def number(field):
-        value=field.rstrip(b"\0 ").lstrip(b" ")
-        require(re.fullmatch(b"[0-7]+",value) is not None,"invalid upload tar number")
-        return int(value,8)
-    try:
-        journal=hold(recorded_owner())
-        require(os.fstat(journal).st_size==64,"upload transfer already attempted; retain")
-        if set(os.listdir(directory_fd))!={".fube-upload-owner"}:
-            raise FileExistsError("preexisting upload child; refuse adoption; retain")
-        while True:
-            block=read_exact(512)
-            if block==b"\0"*512:
-                require(read_exact(512)==b"\0"*512,"invalid upload tar terminator")
-                # The host emits USTAR's bounded final record padding only.
-                padding=stream.read(10241)
-                require(len(padding)<=10240 and not padding.strip(b"\0"),
-                        "upload archive trailing data/bound")
-                break
-            entries+=1
-            require(entries<=64,"upload archive entry bound")
-            require(block[257:265]==b"ustar\x0000"
-                    and not block[345:500].strip(b"\0")
-                    and number(block[148:156])==sum(block[:148])+8*32+sum(block[156:]),
-                    "strict USTAR upload header required")
-            raw=block[:100].split(b"\0",1)[0]
-            entry=raw.decode("ascii")
-            kind=block[156:157]; size=number(block[124:136]); mode=number(block[100:108])
-            if kind==b"5": entry=entry.removesuffix("/")
-            parts=entry.split("/")
-            require(0<len(entry)<=99 and len(parts)<=8
-                    and all(re.fullmatch(r"[A-Za-z0-9_.-]+",part)
-                            and part not in (".","..") for part in parts)
-                    and parts[0] not in (".fube-upload-owner",".fube-upload-marker")
-                    and "_.dir" not in parts and entry not in seen,
-                    "invalid/duplicate upload archive path")
-            require(kind in (b"0",b"\0",b"5") and not block[157:257].strip(b"\0"),
-                    "upload archive permits regular files/directories only")
-            require((kind==b"5" and size==0 and mode==0o700)
-                    or (kind!=b"5" and mode in (0o644,0o755)),
-                    "invalid upload archive size/mode")
-            total+=size
-            require(total<=512*1024*1024,"upload archive byte bound")
-            ancestor="/".join(parts[:-1])
-            require(ancestor in directories,"upload archive ancestor was not created by this transfer")
-            fd=directories[ancestor]; leaf=parts[-1]
-            if kind==b"5":
-                private=".fube-data-child-"+secrets.token_hex(32)
-                os.mkdir(private,0o700,dir_fd=fd)
-                created=os.stat(private,dir_fd=fd,follow_symlinks=False)
-                record={"path":entry,"kind":"directory","identity":[created.st_dev,created.st_ino],
-                        "private":private}
-                append_record(journal,record)
-                child=hold(os.open(private,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd))
-                require(identity(child)==record["identity"] and stat.S_ISDIR(created.st_mode),
-                        "private upload child directory changed; retain")
-                directories[entry]=child; records.append(record)
-                publish(private,leaf,fd,fd)
-                current=os.stat(leaf,dir_fd=fd,follow_symlinks=False)
-                require([current.st_dev,current.st_ino]==record["identity"],
-                        "upload child incarnation changed at publication; retain")
-            else:
-                file=hold(os.open(leaf,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd))
-                require(stat.S_ISREG(os.fstat(file).st_mode),"upload file is not regular")
-                record={"path":entry,"kind":"file","identity":identity(file)}
-                append_record(journal,record); records.append(record)
-                digest=hashlib.sha256(); remaining=size
-                while remaining:
-                    chunk=read_exact(min(remaining,65536))
-                    digest.update(chunk)
-                    view=memoryview(chunk)
-                    while view:
-                        written=os.write(file,view)
-                        require(written>0,"short upload write")
-                        view=view[written:]
-                    remaining-=len(chunk)
-                os.fchmod(file,mode)
-                files[entry]={"fd":file,"identity":record["identity"],"sha256":digest.hexdigest(),
-                              "bytes":size,"mode":mode}
-                require(not read_exact((-size)%512).strip(b"\0"),"invalid upload file padding")
-            seen.add(entry)
-        require(entries>0,"empty upload archive")
-        verify(name)
-        marker=hold(os.open(".fube-upload-marker",os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,
-                            0o600,dir_fd=directory_fd))
-        record={"path":".fube-upload-marker","kind":"file","identity":identity(marker)}
-        append_record(journal,record); records.append(record)
-        marker_item={"fd":marker,"identity":record["identity"],"sha256":hashlib.sha256(b"").hexdigest(),
-                     "bytes":0,"mode":0o600}
-        scoped="/proc/"+str(os.getpid())+"/fd/"+str(directory_fd)
-        require(identity(directory_fd)==proof["directory"]
-                and [os.stat(scoped).st_dev,os.stat(scoped).st_ino]==proof["directory"],
-                "original descriptor-scoped upload source changed")
-        def verify_namespace():
-            verify(name)
-            inspect_tree(records,directories)
-        def verify_file(item):
-            info=os.fstat(item["fd"])
-            require(stat.S_ISREG(info.st_mode) and identity(item["fd"])==item["identity"]
-                    and info.st_size==item["bytes"] and stat.S_IMODE(info.st_mode)==item["mode"]
-                    and file_hash(item["fd"])==item["sha256"],
-                    "original upload file identity/hash changed; retain")
-        verify_namespace()
-        for item in [*files.values(),marker_item]: verify_file(item)
-        uploaded={}; markers={}
-        targets=[(entry,item,uploaded) for entry,item in files.items()]
-        targets.extend(((entry+"/" if entry else "")+"_.dir",marker_item,markers)
-                       for entry in sorted(directories,key=lambda entry:len(entry.split("/")),reverse=True)
-                       if entry)
-        targets.append(("_.dir",marker_item,markers))
-        for entry,item,receipts in targets:
-            verify_namespace(); verify_file(item)
-            source="/proc/"+str(os.getpid())+"/fd/"+str(item["fd"])
-            info=os.stat(source)
-            require([info.st_dev,info.st_ino]==item["identity"],"original upload file procfd changed")
-            # The SDK sees only an ORIGINAL regular-file procfd, never a
-            # directory or mutable child name. Do not use AzureCliProxy.sh.
-            subprocess.run(["/opt/microsoft/servicefabric/bin/Fabric/Fabric.Code/azurecliproxy",
-                "copyapplicationpackage","127.0.0.1:19000",source,"fabric:ImageStore",name+"/"+entry,""],
-                check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-                timeout=min(120,max(0.001,deadline-time.time())))
-            verify_namespace(); verify_file(item)
-            receipts[entry]={"source":source,"identity":item["identity"],"sha256":item["sha256"],
-                            "bytes":item["bytes"]}
-        verify_namespace()
-        for item in [*files.values(),marker_item]: verify_file(item)
-        return {"ownership":proof,"entries":entries,"bytes":total,"source":scoped,
-                "image_store_path":name,"files":uploaded,"markers":markers,
-                "upload_api":"native SDK ImageStore.UploadContent (azurecliproxy; per-file)"}
-    finally:
-        for fd in reversed(held): os.close(fd)
-def remove_contents(detach):
-    # The original owner inode is also the bounded creation journal. A copied
-    # token or an unrecorded/replaced child never grants deletion authority.
-    held=[]; directories={"":directory_fd}; records=[]
-    try:
-        journal=recorded_owner(); held.append(journal)
-        data=os.pread(journal,65537,0)
-        require(data[:64].decode("ascii")==proof["capability"] and len(data)<=65536,
-                "upload inventory capability/byte bound")
-        for line in data[64:].splitlines():
-            if not line: continue
-            require(len(records)<65,"upload cleanup inventory bound")
-            record=json.loads(line)
-            require(type(record) is dict and record.get("kind") in ("file","directory")
-                    and set(record)==({"path","kind","identity","private"} if record["kind"]=="directory"
-                                      else {"path","kind","identity"})
-                    and isinstance(record["path"],str) and len(record["path"])<=99
-                    and len(record["path"].split("/"))<=8
-                    and all(re.fullmatch(r"[A-Za-z0-9_.-]+",part) and part not in (".","..")
-                            for part in record["path"].split("/"))
-                    and record["path"].split("/")[0]!=".fube-upload-owner"
-                    and type(record["identity"]) is list and len(record["identity"])==2
-                    and all(type(value) is int and value>=0 for value in record["identity"]),
-                    "invalid upload cleanup inventory; retain")
-            entry=record["path"]; ancestor,_,leaf=entry.rpartition("/")
-            require(ancestor in directories and entry not in {r["path"] for r in records},
-                    "invalid upload cleanup ancestor/duplicate; retain")
-            fd=directories[ancestor]
-            if record["kind"]=="directory":
-                private=record["private"]
-                require(isinstance(private,str) and re.fullmatch(r"\.fube-data-child-[a-f0-9]{64}",private),
-                        "invalid private upload child; retain")
-                try: info=os.stat(leaf,dir_fd=fd,follow_symlinks=False)
-                except FileNotFoundError:
-                    info=os.stat(private,dir_fd=fd,follow_symlinks=False)
-                    record["path"]=ancestor+"/"+private if ancestor else private
-                    entry=record["path"]; leaf=private
-                require(stat.S_ISDIR(info.st_mode) and [info.st_dev,info.st_ino]==record["identity"],
-                        "upload child incarnation changed; retain")
-                child=os.open(leaf,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd); held.append(child)
-                require(identity(child)==record["identity"],"upload child changed during cleanup capture; retain")
-                directories[entry]=child
-            records.append(record)
-        inspect_tree(records,directories)
-        detach()
-        inspect_tree(records,directories)
-        for record in reversed(records):
-            ancestor,_,leaf=record["path"].rpartition("/")
-            fd=directories[ancestor]
-            info=os.stat(leaf,dir_fd=fd,follow_symlinks=False)
-            require([info.st_dev,info.st_ino]==record["identity"],"upload child changed before removal; retain")
-            if record["kind"]=="directory": os.rmdir(leaf,dir_fd=fd)
-            else: os.unlink(leaf,dir_fd=fd)
-    finally:
-        for fd in reversed(held): os.close(fd)
-try:
-    if action=="reserve":
-        require(type(proof) is dict and set(proof)=={"capability"}
-                and re.fullmatch(r"[a-f0-9]{64}",proof["capability"]),"invalid upload creation capability")
-        # The public/reusable name is never opened to mint ownership. Prepare
-        # an unpublished private nonce in the same trusted parent, retaining
-        # its original directory and owner descriptors through publication.
-        private=".fube-data-reserve-"+secrets.token_hex(32)
-        os.mkdir(private,0o700,dir_fd=parent_fd)
-        private_created=True
-        created=os.stat(private,dir_fd=parent_fd,follow_symlinks=False)
-        private_identity=[created.st_dev,created.st_ino]
-        directory_fd=os.open(private,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent_fd)
-        require(stat.S_ISDIR(created.st_mode) and identity(directory_fd)==private_identity,
-                "private upload directory changed before descriptor capture; retain")
-        owner_fd=os.open(".fube-upload-owner",os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,
-                         0o600,dir_fd=directory_fd)
-        require(os.write(owner_fd,proof["capability"].encode("ascii"))==64,"short upload owner write")
-        os.fsync(owner_fd)
-        proof.update(parent=identity(parent_fd),directory=identity(directory_fd),
-                     owner_file=identity(owner_fd))
-        os.fsync(directory_fd)
-        verify(private)
-        publish(private,name)
-        published=True
-    else:
-        require(action in ("verify","remove","transfer"),"invalid upload reservation action")
-        directory_fd=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent_fd)
-    verify(name)
-    if action=="reserve":
-        os.fsync(parent_fd)
-    if action=="remove":
-        # Detach the checked root from its reusable upload name. Check again
-        # after rename, retaining the already checked child FD inventory.
-        quarantine=".fube-data-remove-"+secrets.token_hex(32)
-        detached=[]
-        def detach():
-            verify(name)
-            os.rename(name,quarantine,src_dir_fd=parent_fd,dst_dir_fd=parent_fd)
-            detached.append(True)
-            verify(quarantine)
-        try:
-            remove_contents(detach)
-            verify(quarantine)
-            os.unlink(".fube-upload-owner",dir_fd=directory_fd)
-            info=os.stat(quarantine,dir_fd=parent_fd,follow_symlinks=False)
-            require([info.st_dev,info.st_ino]==proof["directory"],"detached upload directory changed")
-            os.rmdir(quarantine,dir_fd=parent_fd)
-        except Exception as error:
-            raise RuntimeError("upload retained at "+parent+"/"+(quarantine if detached else name)+": "+str(error)) from error
-        require(not os.path.lexists("/proc/self/fd/"+str(parent_fd)+"/"+quarantine),
-                "upload reservation removal unconfirmed")
-    print(json.dumps(transfer() if action=="transfer" else proof),flush=True)
-except Exception as error:
-    if action=="reserve" and private_created:
-        if not published and directory_fd is not None and set(proof)=={"parent","directory","owner_file","capability"}:
-            try:
-                # Publication collisions grant no authority over the target.
-                # Only the independently captured private original is ours.
-                verify(private)
-                os.unlink(".fube-upload-owner",dir_fd=directory_fd)
-                info=os.stat(private,dir_fd=parent_fd,follow_symlinks=False)
-                require([info.st_dev,info.st_ino]==proof["directory"],
-                        "private upload directory changed; retain")
-                os.rmdir(private,dir_fd=parent_fd)
-            except Exception as cleanup_error:
-                recovery_note(error,"private upload retained: "+str(cleanup_error))
-        recovery_note(error,"original upload recovery (not target adoption): "+json.dumps({
-            "private_path":parent+"/"+private,"private_identity":private_identity,
-            "published_path":path,"proof":proof}))
-    if action=="transfer":
-        recovery_note(error,"original upload recovery (not target adoption): "+json.dumps({
-            "published_path":path,"proof":proof}))
-    raise
-finally:
-    if owner_fd is not None: os.close(owner_fd)
-    if directory_fd is not None: os.close(directory_fd)
-    os.close(parent_fd)
-"""
-
-STOP_UPLOAD_HELPER = r"""
-import json,os,select,signal,sys
-proof=json.loads(sys.argv[1])
-try: fd=os.pidfd_open(proof["pid"])
-except ProcessLookupError: sys.exit(0)
-try:
-    try:
-        with open("/proc/"+str(proof["pid"])+"/stat") as status:
-            start=status.read().rsplit(") ",1)[1].split()[19]
-        with open("/proc/"+str(proof["pid"])+"/cmdline","rb") as command_file:
-            command=command_file.read().split(b"\0")
-    except FileNotFoundError: sys.exit(0)
-    if start!=proof["start_time"] or (command!=[b""] and command[-2].decode()!=proof["token"]):
-        raise RuntimeError("upload helper incarnation changed; refuse signal")
-    if command!=[b""]: signal.pidfd_send_signal(fd,signal.SIGTERM)
-    ready=select.poll(); ready.register(fd,select.POLLIN)
-    if not ready.poll(10000): raise RuntimeError("original upload helper exit unconfirmed")
-except ProcessLookupError: pass
-finally: os.close(fd)
-"""
+STAGING_PROGRAM = Path(staging.__file__).read_text()
 
 
 @dataclass(frozen=True)
@@ -3093,11 +2694,11 @@ class UploadOwnership:
 
 def reserve_upload(allocation, run_id: str) -> UploadOwnership:
     require(re.fullmatch(r"[a-f0-9]{32}", run_id), "invalid upload run ID")
-    path = "/var/lib/sf-node/fube-data-" + run_id
+    path = str(staging.PARENT / ("fube-data-" + run_id))
     capability = secrets.token_hex(32)
     cid = allocation.verify()
-    value = strict_json(allocation.execute("python3", "-c", UPLOAD, path, "reserve",
-                                          json.dumps({"capability": capability})))
+    value = strict_json(allocation.execute("python3", "-c", STAGING_PROGRAM, str(staging.PARENT),
+        path, "reserve", json.dumps({"capability": capability})))
     require(type(value) is dict and set(value) == {"parent", "directory", "owner_file", "capability"}
             and value["capability"] == capability
             and all(type(value[key]) is list and len(value[key]) == 2
@@ -3107,137 +2708,45 @@ def reserve_upload(allocation, run_id: str) -> UploadOwnership:
                            tuple(value["owner_file"]), capability)
 
 
-def check_upload(allocation, proof: UploadOwnership, action: str = "verify") -> None:
+def check_upload(allocation, proof: UploadOwnership, action: str = "verify", *, timeout: float = 120) -> None:
     require(allocation.verify() == proof.container_id, "original upload allocation changed")
-    value = strict_json(allocation.execute("python3", "-c", UPLOAD, proof.path, action,
-                                          json.dumps(proof.evidence())))
+    value = strict_json(allocation.execute("python3", "-c", STAGING_PROGRAM, str(staging.PARENT),
+        proof.path, action, json.dumps(proof.evidence()), timeout=timeout))
     require(value == json.loads(json.dumps(proof.evidence())), "upload reservation receipt changed")
 
 
-def upload_archive(source: Path) -> tuple[bytes, int, int]:
-    """Bounded, regular-file-only USTAR; never use tar's path-based extraction."""
-    inventory = []
-    for entry in source.rglob("*"):
-        require(len(inventory) < UPLOAD_MAX_ENTRIES, "local upload archive entry bound")
-        inventory.append(entry)
-    output = io.BytesIO()
-    total = 0
-    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-        for entry in sorted(inventory):
-            relative = entry.relative_to(source).as_posix()
-            require(len(relative) <= 98 and len(relative.split("/")) <= 8
-                    and all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) and part not in (".", "..")
-                            for part in relative.split("/"))
-                    and relative.split("/")[0] not in (".fube-upload-owner", ".fube-upload-marker")
-                    and "_.dir" not in relative.split("/"),
-                    "invalid local upload archive path")
-            info = entry.lstat()
-            header = tarfile.TarInfo(relative)
-            if stat.S_ISDIR(info.st_mode):
-                header.type, header.mode = tarfile.DIRTYPE, 0o700
-                archive.addfile(header)
-            else:
-                require(stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) in (0o644, 0o755),
-                        "local upload accepts regular package files/directories only")
-                fd = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-                with os.fdopen(fd, "rb") as file:
-                    opened = os.fstat(file.fileno())
-                    require(stat.S_ISREG(opened.st_mode)
-                            and (opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino)
-                            and opened.st_size == info.st_size, "local upload file changed")
-                    total += opened.st_size
-                    require(total <= UPLOAD_MAX_BYTES, "local upload archive byte bound")
-                    header.size, header.mode = opened.st_size, stat.S_IMODE(opened.st_mode)
-                    archive.addfile(header, file)
-    require(inventory, "empty local upload package")
-    return output.getvalue(), len(inventory), total
-
-
 def transfer_upload(allocation, proof: UploadOwnership, source: Path) -> dict:
-    archive, entries, size = upload_archive(source)
-    require(allocation.verify() == proof.container_id, "original upload allocation changed")
-    token = secrets.token_hex(32)
-    process = subprocess.Popen(
-        ["docker", "exec", "-i", proof.container_id, "python3", "-c", UPLOAD,
-         proof.path, "transfer", json.dumps(proof.evidence()), str(time.time() + UPLOAD_SECONDS), token],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT)
-    stdout = b""
+    deadline = time.monotonic() + UPLOAD_SECONDS
+    def remaining():
+        left = deadline - time.monotonic()
+        require(left > 0, "package upload deadline expired")
+        return left
+    def staged_inventory():
+        require(allocation.verify() == proof.container_id, "original upload allocation changed")
+        return strict_json(allocation.execute("python3", "-c", STAGING_PROGRAM, str(staging.PARENT),
+            proof.path, "inventory", json.dumps(proof.evidence()), timeout=remaining()))
     try:
-        stdout, stderr = process.communicate(archive, timeout=UPLOAD_SECONDS + 30)
-        require(process.returncode == 0,
-                f"descriptor-bound upload failed ({process.returncode}): {stderr[-6000:].decode(errors='replace')}")
-        lines = stdout.splitlines()
-        require(len(lines) == 2 and len(stdout) <= 65536, "invalid bounded upload helper receipt")
-        helper, receipt = (strict_json(line.decode()) for line in lines)
-        require(type(helper) is dict and set(helper) == {"pid", "start_time", "token"}
-                and type(helper["pid"]) is int and helper["pid"] > 1
-                and isinstance(helper["start_time"], str) and helper["start_time"].isdigit()
-                and helper["token"] == token, "invalid upload helper process identity")
-        require(type(receipt) is dict and set(receipt) == {
-                    "ownership", "entries", "bytes", "source", "image_store_path", "upload_api",
-                    "files", "markers"}
-                and receipt["ownership"] == json.loads(json.dumps(proof.evidence()))
-                and receipt["entries"] == entries and receipt["bytes"] == size
-                and receipt["image_store_path"] == proof.path.rsplit("/", 1)[1]
-                and receipt["upload_api"] == "native SDK ImageStore.UploadContent (azurecliproxy; per-file)"
-                and isinstance(receipt["source"], str)
-                and re.fullmatch(r"/proc/" + str(helper["pid"]) + r"/fd/[0-9]+", receipt["source"]),
-                "original upload transfer receipt changed")
-        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as contents:
-            expected, markers = {}, {}
-            for entry in contents:
-                if entry.isdir():
-                    markers[entry.name.rstrip("/") + "/_.dir"] = (0, hashlib.sha256(b"").hexdigest())
-                else:
-                    digest = hashlib.sha256()
-                    with contents.extractfile(entry) as file:
-                        for chunk in iter(lambda: file.read(65536), b""):
-                            digest.update(chunk)
-                    expected[entry.name] = (entry.size, digest.hexdigest())
-        markers["_.dir"] = (0, hashlib.sha256(b"").hexdigest())
-        require(type(receipt["files"]) is dict and set(receipt["files"]) == set(expected),
-                "original upload file receipt inventory changed")
-        require(type(receipt["markers"]) is dict and set(receipt["markers"]) == set(markers),
-                "original upload directory marker inventory changed")
-        expected.update(markers)
-        for name, item in {**receipt["files"], **receipt["markers"]}.items():
-            require(type(item) is dict and set(item) == {"source", "identity", "bytes", "sha256"}
-                    and type(item["identity"]) is list and len(item["identity"]) == 2
-                    and all(type(value) is int and value >= 0 for value in item["identity"])
-                    and (item["bytes"], item["sha256"]) == expected[name]
-                    and isinstance(item["source"], str)
-                    and re.fullmatch(r"/proc/" + str(helper["pid"]) + r"/fd/[0-9]+", item["source"]),
-                    "original upload file source/identity/hash receipt changed")
-        return {**receipt, "helper": helper, "container_id": proof.container_id,
-                "copy_api": "docker exec -i python3; strict USTAR; retained original root FD, child/file FDs; "
-                            "private directory capture/RENAME_NOREPLACE; file openat/O_EXCL",
-                "note": "Transfer receipt only; not native deployment/scenario qualification evidence."}
-    except BaseException as error:
-        if isinstance(error, subprocess.TimeoutExpired):
-            stdout = error.output or b""
-        # Killing docker exec's client alone need not stop its container-side
-        # process. Signal only the captured pidfd-bound incarnation; the remote
-        # absolute alarm is a second bound, including before receipt delivery.
-        captured = None
-        try:
-            first = stdout.splitlines()[0] if stdout else b""
-            helper = strict_json(first.decode()) if first else None
-            if (isinstance(helper, dict) and set(helper) == {"pid", "start_time", "token"}
-                    and type(helper["pid"]) is int and helper["pid"] > 1 and helper["token"] == token
-                    and isinstance(helper["start_time"], str) and helper["start_time"].isdigit()):
-                captured = helper
-                require(allocation.verify() == proof.container_id, "original upload allocation changed")
-                allocation.execute("python3", "-c", STOP_UPLOAD_HELPER, json.dumps(helper), timeout=10)
-        except Exception as stop_error:
-            error.add_note("original upload helper stop unconfirmed (absolute deadline remains): " + str(stop_error))
-        error.add_note("original upload helper recovery (not PID/name adoption): " + json.dumps({
-            "container_id": proof.container_id, "helper": captured}))
-        error.add_note("original upload reservation retained for cleanup/recovery: " + json.dumps(proof.evidence()))
+        inventory = staging.inventory(source)
+        check_upload(allocation, proof, timeout=remaining())
+        name = Path(proof.path).name
+        remote = proof.path + "/" + name
+        runtime.run("docker", "cp", str(source), f"{proof.container_id}:{remote}", timeout=remaining())
+        require(staged_inventory() == inventory and staging.inventory(source) == inventory,
+                "copied package inventory/hash changed")
+        seconds = remaining()
+        allocation.execute("timeout", "--signal=TERM", "--kill-after=5s", f"{seconds}s",
+            "sfctl", "application", "upload", "--path", remote, "--timeout", str(max(1, int(seconds))),
+            timeout=seconds + 10)
+        require(staged_inventory() == inventory and staging.inventory(source) == inventory,
+                "uploaded package inventory/hash changed")
+        return {"ownership": json.loads(json.dumps(proof.evidence())), "container_id": proof.container_id,
+                "source": str(source), "staging_path": remote, "image_store_path": name,
+                "inventory": inventory, "copy_api": "docker cp", "upload_api": "sfctl application upload",
+                "note": "Trusted immutable package transfer, not inode-pinned or qualification evidence."}
+    except (Exception, KeyboardInterrupt) as error:
+        error.add_note("original upload reservation retained for cleanup/recovery: " + json.dumps({
+            "path": proof.path, "container_id": proof.container_id, **proof.evidence()}))
         raise
-    finally:
-        if process.poll() is None:
-            process.kill()
-        process.communicate(timeout=10)
 
 
 OWNERSHIP_READ = r"""
@@ -3608,7 +3117,7 @@ class DeploymentVersion:
 
 
 class NativeDataDeploymentPolicy:
-    """Original native identities and pinned uploads for the preserved runtime suite."""
+    """Original native identities and owned sfctl uploads for the preserved runtime suite."""
 
     def __init__(self, bundle: Bundle):
         self.bundle = bundle

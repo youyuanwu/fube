@@ -1,7 +1,6 @@
 """Offline harness-contract tests. These do not claim native qualification."""
 import contextlib
 import copy
-import ctypes
 import hashlib
 import importlib.util
 import io
@@ -13,7 +12,6 @@ import signal
 import struct
 import subprocess
 import sys
-import tarfile
 import tempfile
 import threading
 import time
@@ -1408,7 +1406,7 @@ class OwnershipTests(ProjectFiles):
             if not value:
                 raise RuntimeError(description)
             return value
-        copy_error = RuntimeError("partial descriptor copy failed")
+        copy_error = RuntimeError("partial package copy failed")
         copy_error.add_note("original upload reservation: " + json.dumps(reservation.evidence()))
         with patch.object(data.uuid, "uuid4", return_value=MagicMock(hex=run_id)), \
              patch.object(data, "provenance", return_value={}), \
@@ -1427,7 +1425,7 @@ class OwnershipTests(ProjectFiles):
              patch.object(data.runtime, "wait_condition", side_effect=wait), \
              patch.object(data, "transfer_upload", side_effect=(
                  copy_error if stage == "copy" else None),
-                 return_value={"copy_api": "descriptor-bound model"}) as copy, \
+                 return_value={"copy_api": "docker cp", "upload_api": "sfctl application upload"}) as copy, \
              patch.object(data.runtime, "failure_artifacts", return_value={"diagnostic": "bounded"}):
             result = data.qualify(allocation, MagicMock(), profile)
         allocation.reservation = reserve
@@ -1533,7 +1531,7 @@ class OwnershipTests(ProjectFiles):
         allocation.upload.assert_not_called()
         allocation.copy.assert_not_called()
         result, _, allocation = self.deployment("copy")
-        self.assertIn("partial descriptor copy failed", result["errors"][0])
+        self.assertIn("partial package copy failed", result["errors"][0])
         self.assertIn(result["upload_reservation"]["capability"],
                       "\n".join(result["qualification_recovery_notes"]))
         self.assertEqual(allocation.upload.call_args.args[2], "remove")
@@ -1597,10 +1595,10 @@ class LegacyDeploymentTests(ProjectFiles):
             state["transfers"][proof.path] = expected.version, text
             state["type_name"] = expected.name
             if stage == ("initial-copy" if expected.version == "1.1" else "v2-copy"):
-                error = RuntimeError("partial pinned-FD copy")
+                error = RuntimeError("partial package copy")
                 error.add_note("original upload reservation: " + json.dumps(proof.evidence()))
                 raise error
-            return {"copy_api": "modeled original descriptor-bound upload"}
+            return {"copy_api": "docker cp", "upload_api": "sfctl application upload"}
 
         def sf(*args, **kwargs):
             state["calls"].append(args)
@@ -1640,7 +1638,7 @@ class LegacyDeploymentTests(ProjectFiles):
             elif args[:2] == ("application", "unprovision"):
                 del state["types"][args[-1]]
             else:
-                self.assertEqual(args[:2], ("cluster", "select"), "no directory upload or unsafe fallback")
+                self.assertEqual(args[:2], ("cluster", "select"), "package upload is modeled by transfer_upload")
             return "{}"
         allocation.sf.side_effect = sf
 
@@ -1853,980 +1851,220 @@ class LegacyDeploymentTests(ProjectFiles):
         self.assertIn("original-owner cleanup", result["scenarios"]["legacy_full"]["error"])
 
 
-class UploadReservationTests(ProjectFiles):
-    def run_upload(self, path, action, proof, archive=None, upload=None):
-        # Execute the production program against project-local fixtures, not a
-        # native allocation or the real /var/lib/sf-node mount.
-        code = data.UPLOAD.replace('parent=="/var/lib/sf-node"', "parent==" + repr(str(self.root)))
-        args = ["upload", str(path), action, json.dumps(proof)]
-        if action == "transfer":
-            args += [str(time.time() + data.UPLOAD_SECONDS), "e" * 64]
-        self.native_upload = MagicMock(side_effect=upload)
-        with patch("sys.argv", args), \
-             patch("sys.stdin", types.SimpleNamespace(buffer=io.BytesIO(archive or b""))), \
-             patch.object(subprocess, "run", self.native_upload), \
-             patch.object(signal, "setitimer"), \
-             patch.object(signal, "signal"), \
-             contextlib.redirect_stdout(io.StringIO()) as output:
-            exec(code, {})
-        return json.loads(output.getvalue().splitlines()[-1])
+class UploadTests(ProjectFiles):
+    def setUp(self):
+        super().setUp()
+        parent = patch.object(data.staging, "PARENT", self.root)
+        parent.start()
+        self.addCleanup(parent.stop)
+        self.source = self.root / "source"
+        (self.source / "Code").mkdir(parents=True)
+        (self.source / "ApplicationManifest.xml").write_bytes(b"manifest")
+        (self.source / "ApplicationManifest.xml").chmod(0o644)
+        (self.source / "Code/app").write_bytes(b"executable")
+        (self.source / "Code/app").chmod(0o755)
+        self.allocation = MagicMock()
+        self.allocation.verify.return_value = "original-cid"
+        self.allocation.execute.side_effect = self.execute
+        self.uploads = []
+        self.on_upload = None
+        self.proof = data.reserve_upload(self.allocation, "1" * 32)
+        self.path = Path(self.proof.path)
+        self.remote = self.path / self.path.name
+        copier = patch.object(data.runtime, "run", side_effect=self.copy)
+        self.copier = copier.start()
+        self.addCleanup(copier.stop)
 
-    @staticmethod
-    def archive(*entries):
-        output = io.BytesIO()
-        with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-            for name, kind, content in entries:
-                header = tarfile.TarInfo(name)
-                header.type = kind
-                header.mode = 0o700 if kind == tarfile.DIRTYPE else 0o644
-                header.size = len(content) if kind == tarfile.REGTYPE else 0
-                if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE):
-                    header.linkname = "foreign"
-                archive.addfile(header, io.BytesIO(content) if header.size else None)
-        return output.getvalue()
+    def execute(self, *args, **kwargs):
+        if args[:3] == ("python3", "-c", data.STAGING_PROGRAM):
+            with patch.object(sys, "argv", ["staging", *args[3:]]), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                data.staging.main()
+            return output.getvalue()
+        self.assertEqual(args[:3], ("timeout", "--signal=TERM", "--kill-after=5s"))
+        self.assertEqual(args[4:7], ("sfctl", "application", "upload"))
+        self.assertEqual(args[7:9], ("--path", str(self.remote)))
+        self.assertEqual(args[9], "--timeout")
+        self.assertGreater(int(args[10]), 0)
+        self.assertLessEqual(int(args[10]), data.UPLOAD_SECONDS)
+        self.assertGreater(float(args[3].removesuffix("s")), 0)
+        self.assertLessEqual(float(args[3].removesuffix("s")), data.UPLOAD_SECONDS)
+        self.assertLessEqual(kwargs["timeout"], data.UPLOAD_SECONDS + 10)
+        self.uploads.append(data.staging.inventory(self.remote))
+        if self.on_upload is not None:
+            self.on_upload()
+        return ""
 
-    def reserve(self):
-        path = self.root / ("fube-data-" + "1" * 32)
-        proof = self.run_upload(path, "reserve", {"capability": "a" * 64})
-        return path, proof
+    def copy(self, *args, **kwargs):
+        self.assertEqual(args, ("docker", "cp", str(self.source), f"original-cid:{self.remote}"))
+        self.assertLessEqual(kwargs["timeout"], data.UPLOAD_SECONDS)
+        shutil.copytree(self.source, self.remote)
+        return ""
 
-    def intercept_publish(self, callback):
-        libc = ctypes.CDLL(None, use_errno=True)
-        rename = libc.renameat2
-        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-        rename.restype = ctypes.c_int
-        libc.renameat2 = MagicMock(side_effect=lambda *args: callback(rename, *args))
-        return patch.object(ctypes, "CDLL", return_value=libc)
+    def test_sfctl_uploads_only_exact_package_and_owned_staging_is_removed(self):
+        result = data.transfer_upload(self.allocation, self.proof, self.source)
+        expected = {
+            "ApplicationManifest.xml": {"kind": "file", "mode": 0o644, "bytes": 8,
+                                       "sha256": hashlib.sha256(b"manifest").hexdigest()},
+            "Code": {"kind": "directory", "mode": (self.source / "Code").stat().st_mode & 0o777},
+            "Code/app": {"kind": "file", "mode": 0o755, "bytes": 10,
+                         "sha256": hashlib.sha256(b"executable").hexdigest()},
+        }
+        self.assertEqual(self.uploads, [expected])
+        self.assertEqual(result["inventory"], expected)
+        self.assertEqual(result["image_store_path"], self.path.name)
+        self.assertEqual(result["container_id"], "original-cid")
+        self.assertEqual(result["upload_api"], "sfctl application upload")
+        self.assertEqual(result["copy_api"], "docker cp")
+        self.assertFalse((self.remote / data.staging.OWNER).exists())
+        self.assertTrue((self.path / data.staging.OWNER).is_file())
+        self.copier.assert_called_once()
+        data.check_upload(self.allocation, self.proof, "remove")
+        self.assertFalse(self.path.exists())
 
-    def test_published_path_is_never_reopened_to_mint_a_reservation(self):
-        path = self.root / ("fube-data-" + "1" * 32)
-        original_open = os.open
-        opened = []
-        def substitute_at_public_open(name, *args, **kwargs):
-            if name == path.name:
-                opened.append(name)
-                path.rename(self.root / "actual-created")
-                path.mkdir()
-                (path / "foreign").write_text("replacement between mkdir and descriptor capture")
-            return original_open(name, *args, **kwargs)
-        with patch.object(os, "open", side_effect=substitute_at_public_open):
-            _, proof = self.reserve()
-        self.assertEqual(opened, [], "the review's post-mkdir/open replacement window must not exist")
-        self.assertEqual(proof["directory"], [path.stat().st_dev, path.stat().st_ino])
-        self.run_upload(path, "remove", proof)
+    def test_staging_program_runs_unchanged_in_real_child(self):
+        path = self.root / ("fube-data-" + "2" * 32)
+        proof = {"capability": "a" * 64}
+        for action in ("reserve", "verify", "remove"):
+            result = subprocess.run([sys.executable, "-c", data.STAGING_PROGRAM, str(self.root),
+                str(path), action, json.dumps(proof)], capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            captured = json.loads(result.stdout)
+            if action != "reserve":
+                self.assertEqual(captured, proof)
+            proof = captured
         self.assertFalse(path.exists())
 
-    def test_public_collision_during_private_open_grants_no_authority_and_cleans_only_private_original(self):
-        path = self.root / ("fube-data-" + "1" * 32)
-        original_open = os.open
-        def collide_at_private_open(name, *args, **kwargs):
-            if isinstance(name, str) and name.startswith(".fube-data-reserve-"):
-                path.mkdir()
-                (path / "foreign").write_text("foreign before descriptor capture")
-            return original_open(name, *args, **kwargs)
-        with patch.object(os, "open", side_effect=collide_at_private_open):
-            with self.assertRaises(FileExistsError):
-                self.reserve()
-        self.assertEqual((path / "foreign").read_text(), "foreign before descriptor capture")
-        self.assertFalse((path / ".fube-upload-owner").exists())
-        self.assertFalse(list(self.root.glob(".fube-data-reserve-*")))
-
-    def test_private_open_substitution_cannot_mint_an_owner_in_the_replacement(self):
-        original_open = os.open
-        original = self.root / "created-private"
-        replaced = []
-        def substitute_at_private_open(name, *args, **kwargs):
-            if isinstance(name, str) and name.startswith(".fube-data-reserve-"):
-                private = self.root / name
-                private.rename(original)
-                private.mkdir()
-                (private / "foreign").write_text("foreign before private open")
-                replaced.append(private)
-            return original_open(name, *args, **kwargs)
-        with patch.object(os, "open", side_effect=substitute_at_private_open):
-            with self.assertRaisesRegex(RuntimeError, "changed before descriptor capture"):
-                self.reserve()
-        self.assertEqual(len(replaced), 1)
-        self.assertEqual((replaced[0] / "foreign").read_text(), "foreign before private open")
-        self.assertFalse((replaced[0] / ".fube-upload-owner").exists())
-        self.assertTrue(original.is_dir())
-
-    def test_replacement_at_atomic_publication_cannot_be_adopted_with_a_copied_owner(self):
-        path = self.root / ("fube-data-" + "1" * 32)
-        original = self.root / "original-published"
-        def substitute(rename, *args):
-            result = rename(*args)
-            self.assertEqual(result, 0)
-            path.rename(original)
-            path.mkdir()
-            shutil.copyfile(original / ".fube-upload-owner", path / ".fube-upload-owner")
-            (path / "foreign").write_text("foreign at publication")
-            return result
-        with self.intercept_publish(substitute):
-            with self.assertRaisesRegex(RuntimeError, "incarnation changed") as raised:
-                self.reserve()
-        self.assertEqual((path / "foreign").read_text(), "foreign at publication")
-        self.assertEqual((original / ".fube-upload-owner").read_text(), "a" * 64)
-        self.assertIn("original upload recovery", "\n".join(raised.exception.__notes__))
-
-    def test_private_source_substitution_after_capture_is_rejected_at_publication(self):
-        path = self.root / ("fube-data-" + "1" * 32)
-        original = self.root / "original-private"
-        def substitute(rename, source_fd, source, target_fd, target, flags):
-            source_path = self.root / os.fsdecode(source)
-            source_path.rename(original)
-            source_path.mkdir()
-            (source_path / "foreign").write_text("foreign substituted source")
-            return rename(source_fd, source, target_fd, target, flags)
-        with self.intercept_publish(substitute):
-            with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
-                self.reserve()
-        self.assertEqual((path / "foreign").read_text(), "foreign substituted source")
-        self.assertFalse((path / ".fube-upload-owner").exists())
-        self.assertEqual((original / ".fube-upload-owner").read_text(), "a" * 64)
-
-    def test_unavailable_atomic_publication_has_no_overwriting_fallback(self):
-        path = self.root / ("fube-data-" + "1" * 32)
-        with patch.object(ctypes, "CDLL", return_value=object()):
-            with self.assertRaisesRegex(RuntimeError, "RENAME_NOREPLACE.*unavailable"):
-                self.reserve()
-        self.assertFalse(path.exists())
-        self.assertFalse(list(self.root.glob(".fube-data-reserve-*")))
-
-    def test_existing_directory_file_and_symlinks_refuse_reservation_without_mutating_them(self):
-        path = self.root / ("fube-data-" + "1" * 32)
-        foreign = self.root / "foreign"
-        foreign.mkdir()
-        (foreign / "sentinel").write_text("foreign")
-        for kind in ("directory", "file", "symlink", "dangling-symlink"):
+    def test_existing_paths_are_not_adopted_or_modified(self):
+        for index, kind in enumerate(("directory", "file", "symlink"), 2):
             with self.subTest(kind=kind):
+                run_id = f"{index:032x}"
+                path = self.root / ("fube-data-" + run_id)
                 if kind == "directory":
                     path.mkdir()
                     (path / "sentinel").write_text("foreign")
                 elif kind == "file":
                     path.write_text("foreign")
                 else:
-                    path.symlink_to(foreign if kind == "symlink" else self.root / "absent")
+                    path.symlink_to(self.source)
                 with self.assertRaises(FileExistsError):
-                    self.run_upload(path, "reserve", {"capability": "a" * 64})
-                self.assertEqual((foreign / "sentinel").read_text(), "foreign")
+                    data.reserve_upload(self.allocation, run_id)
                 if kind == "directory":
                     self.assertEqual((path / "sentinel").read_text(), "foreign")
-                    shutil.rmtree(path)
+                    self.assertFalse((path / data.staging.OWNER).exists())
+                elif kind == "file":
+                    self.assertEqual(path.read_text(), "foreign")
                 else:
-                    path.unlink()
+                    self.assertEqual(path.resolve(), self.source)
 
-    def test_partial_copy_into_successfully_reserved_original_is_cleaned(self):
-        path, proof = self.reserve()
-        (self.root / "keep").write_text("not copied")
-        archive = self.archive(("partial", tarfile.DIRTYPE, b""),
-                               ("partial/payload", tarfile.REGTYPE, b"x" * 70000))
-        with self.assertRaisesRegex(RuntimeError, "truncated bounded upload"):
-            self.run_upload(path, "transfer", proof, archive[:68000])
-        self.assertEqual(self.run_upload(path, "verify", proof), proof)
-        self.assertEqual(self.run_upload(path, "remove", proof), proof)
-        self.assertFalse(path.exists())
-        self.assertEqual((self.root / "keep").read_text(), "not copied")
-        self.assertFalse(list(self.root.glob(".fube-data-remove-*")))
-
-    def test_descriptor_transfer_preserves_package_modes_and_uploads_original_scoped_source(self):
-        path, proof = self.reserve()
-        source = self.root / "source"
-        (source / "Code").mkdir(parents=True)
-        (source / "ApplicationManifest.xml").write_text("manifest")
-        (source / "ApplicationManifest.xml").chmod(0o644)
-        (source / "Code/app").write_bytes(b"executable")
-        (source / "Code/app").chmod(0o755)
-        archive, entries, size = data.upload_archive(source)
-        uploaded, markers = {}, []
-        def upload(command, **options):
-            self.assertEqual(command[:3], [
-                "/opt/microsoft/servicefabric/bin/Fabric/Fabric.Code/azurecliproxy",
-                "copyapplicationpackage", "127.0.0.1:19000"])
-            scoped, store, remote, certificate = command[3:]
-            self.assertEqual((store, certificate), ("fabric:ImageStore", ""))
-            self.assertRegex(scoped, f"^/proc/{os.getpid()}/fd/[0-9]+$")
-            file = Path(scoped)
-            self.assertTrue(file.is_file(), "native SDK must never receive a directory")
-            relative = remote.removeprefix(path.name + "/")
-            if relative.endswith("_.dir"):
-                self.assertEqual(file.read_bytes(), b"")
-                markers.append(relative)
-            else:
-                uploaded[relative] = hashlib.sha256(file.read_bytes()).hexdigest()
-                self.assertEqual(file.read_bytes(), (source / relative).read_bytes())
-                self.assertEqual(file.stat().st_mode & 0o777, (source / relative).stat().st_mode & 0o777)
-            self.assertEqual((path / "Code").stat().st_mode & 0o777, 0o700)
-            self.assertTrue(options["check"])
-            self.assertLessEqual(options["timeout"], 120)
-        before = len(os.listdir("/proc/self/fd"))
-        receipt = self.run_upload(path, "transfer", proof, archive, upload)
-        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
-        self.assertEqual(self.native_upload.call_count, 4)
-        self.assertEqual((receipt["entries"], receipt["bytes"]), (entries, size))
-        self.assertEqual(receipt["ownership"], proof)
-        self.assertEqual(receipt["image_store_path"], path.name)
-        self.assertEqual(uploaded, {name: item["sha256"] for name, item in receipt["files"].items()})
-        self.assertEqual(markers, ["Code/_.dir", "_.dir"], "native directory existence markers, root last")
-        self.assertEqual(set(receipt["markers"]), set(markers))
-        with self.assertRaises(FileNotFoundError):
-            os.stat(receipt["source"])
-        for item in receipt["files"].values():
-            with self.assertRaises(FileNotFoundError):
-                os.stat(item["source"])
-        for item in receipt["markers"].values():
-            with self.assertRaises(FileNotFoundError):
-                os.stat(item["source"])
-        self.run_upload(path, "remove", proof)
-
-    def replace_public(self, path, original):
-        path.rename(original)
-        path.mkdir()
-        shutil.copyfile(original / ".fube-upload-owner", path / ".fube-upload-owner")
-        (path / "payload").write_text("foreign must not change")
-        return {entry.name: entry.read_bytes() for entry in path.iterdir()}
-
-    def test_replacement_between_precheck_and_transfer_setup_is_never_written_or_uploaded(self):
-        path, proof = self.reserve()
-        self.run_upload(path, "verify", proof)
-        original = self.root / "original-before-copy"
-        before = self.replace_public(path, original)
-        archive = self.archive(("payload", tarfile.REGTYPE, b"owned payload"))
-        with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
-            self.run_upload(path, "transfer", proof, archive)
-        self.native_upload.assert_not_called()
-        self.assertEqual({entry.name: entry.read_bytes() for entry in path.iterdir()}, before)
-        self.assertEqual(list(original.iterdir()), [original / ".fube-upload-owner"])
-        with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
-            self.run_upload(path, "remove", proof)
-        self.assertTrue(original.exists())
-
-    def test_replacement_during_transfer_writes_only_retained_original_inode_and_retains_recovery(self):
-        path, proof = self.reserve()
-        original = self.root / "original-during-copy"
-        archive = self.archive(("Code", tarfile.DIRTYPE, b""),
-                               ("Code/app", tarfile.REGTYPE, b"x" * 70000),
-                               ("payload", tarfile.REGTYPE, b"owned payload"))
-        write = os.write
-        foreign = []
-        def replace_then_write(fd, value):
-            if not foreign:
-                foreign.append(self.replace_public(path, original))
-            return write(fd, value)
-        before = len(os.listdir("/proc/self/fd"))
-        with patch.object(os, "write", side_effect=replace_then_write):
-            with self.assertRaisesRegex(RuntimeError, "incarnation changed") as raised:
-                self.run_upload(path, "transfer", proof, archive)
-        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
-        self.native_upload.assert_not_called()
-        self.assertEqual({entry.name: entry.read_bytes() for entry in path.iterdir()}, foreign[0])
-        self.assertEqual((original / "Code/app").read_bytes(), b"x" * 70000)
-        self.assertEqual((original / "payload").read_bytes(), b"owned payload")
-        self.assertIn("original upload recovery", "\n".join(raised.exception.__notes__))
-        with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
-            self.run_upload(path, "remove", proof)
-        self.assertTrue(original.exists())
-
-    def test_replacement_during_native_read_cannot_redirect_original_file_source_to_foreign_tree(self):
-        path, proof = self.reserve()
-        original = self.root / "original-during-upload"
-        before = []
-        def read_original(command, **_):
-            before.append(self.replace_public(path, original))
-            scoped = Path(command[3])
-            self.assertEqual(scoped.read_bytes(), b"owned payload")
-            self.assertEqual(scoped.stat().st_ino, (original / "payload").stat().st_ino)
-        archive = self.archive(("payload", tarfile.REGTYPE, b"owned payload"))
-        with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
-            self.run_upload(path, "transfer", proof, archive, read_original)
-        self.native_upload.assert_called_once()
-        self.assertEqual({entry.name: entry.read_bytes() for entry in path.iterdir()}, before[0])
-        self.assertEqual((original / "payload").read_bytes(), b"owned payload")
-
-    def test_replacement_immediately_before_native_upload_fails_closed(self):
-        path, proof = self.reserve()
-        original = self.root / "original-before-upload"
-        stat_call = os.stat
-        before = []
-        def replace_at_scoped_check(entry, *args, **kwargs):
-            if str(entry).startswith(f"/proc/{os.getpid()}/fd/") and not before:
-                before.append(self.replace_public(path, original))
-            return stat_call(entry, *args, **kwargs)
-        archive = self.archive(("payload", tarfile.REGTYPE, b"owned payload"))
-        with patch.object(os, "stat", side_effect=replace_at_scoped_check):
-            with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
-                self.run_upload(path, "transfer", proof, archive)
-        self.native_upload.assert_not_called()
-        self.assertEqual({entry.name: entry.read_bytes() for entry in path.iterdir()}, before[0])
-
-    def test_review_preexisting_foreign_child_is_refused_without_copy_or_cleanup_authority(self):
-        path, proof = self.reserve()
-        foreign = path / "Code"
-        foreign.mkdir()
-        (foreign / "sentinel").write_bytes(b"preexisting foreign content")
-        before = {entry.name: entry.read_bytes() for entry in foreign.iterdir()}
-        descriptors = len(os.listdir("/proc/self/fd"))
-        with self.assertRaisesRegex(FileExistsError, "preexisting upload child"):
-            self.run_upload(path, "transfer", proof, self.archive(
-                ("Code", tarfile.DIRTYPE, b""), ("Code/app", tarfile.REGTYPE, b"owned payload")))
-        self.native_upload.assert_not_called()
-        with self.assertRaisesRegex(RuntimeError, "child inventory changed"):
-            self.run_upload(path, "remove", proof)
-        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
-        self.assertEqual({entry.name: entry.read_bytes() for entry in foreign.iterdir()}, before)
-        self.assertEqual((path / ".fube-upload-owner").read_text(), proof["capability"])
-        self.assertFalse(list(self.root.glob(".fube-data-remove-*")))
-
-    def test_review_child_mkdir_stat_substitution_never_adopts_or_writes_foreign_directory(self):
-        path, proof = self.reserve()
-        original = self.root / "original-created-Code"
-        foreign = self.root / "foreign-Code"
-        foreign.mkdir()
-        (foreign / "sentinel").write_bytes(b"foreign existing content")
-        before = {entry.name: entry.read_bytes() for entry in foreign.iterdir()}
-        stat_call = os.stat
-        swapped = []
-        def substitute_at_first_child_stat(entry, *args, **kwargs):
-            # Exact v4 R2.1: only intercept the first descriptor-relative
-            # stat("Code"). It now follows private capture/publication, not mkdir.
-            if entry == "Code" and "dir_fd" in kwargs and not swapped:
-                swapped.append(True)
-                (path / "Code").rename(original)
-                foreign.rename(path / "Code")
-            return stat_call(entry, *args, **kwargs)
-        descriptors = len(os.listdir("/proc/self/fd"))
-        with patch.object(os, "stat", side_effect=substitute_at_first_child_stat):
-            with self.assertRaisesRegex(RuntimeError, "child incarnation changed") as raised:
-                self.run_upload(path, "transfer", proof, self.archive(
-                    ("Code", tarfile.DIRTYPE, b""), ("Code/app", tarfile.REGTYPE, b"owned payload")))
-        self.assertEqual(swapped, [True], "execute the review's first child-stat mutation")
-        self.native_upload.assert_not_called()
-        self.assertEqual(list(original.iterdir()), [], "capture substitution must fail before payload creation")
-        self.assertIn(proof["capability"], "\n".join(raised.exception.__notes__))
-        with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
-            self.run_upload(path, "remove", proof)
-        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
-        self.assertEqual({entry.name: entry.read_bytes() for entry in (path / "Code").iterdir()}, before)
-        self.assertFalse(list(self.root.glob(".fube-data-remove-*")))
-
-    def test_collision_at_child_publication_never_overwrites_or_cleans_foreign_child(self):
-        path, proof = self.reserve()
-        foreign = path / "Code"
-        def collide(rename, source_fd, source, target_fd, target, flags):
-            if target == b"Code":
-                foreign.mkdir()
-                (foreign / "sentinel").write_bytes(b"foreign at publication")
-            return rename(source_fd, source, target_fd, target, flags)
-        descriptors = len(os.listdir("/proc/self/fd"))
-        with self.intercept_publish(collide):
-            with self.assertRaises(FileExistsError):
-                self.run_upload(path, "transfer", proof, self.archive(
-                    ("Code", tarfile.DIRTYPE, b""), ("Code/app", tarfile.REGTYPE, b"owned payload")))
-        self.native_upload.assert_not_called()
-        private = list(path.glob(".fube-data-child-*"))
-        self.assertEqual(len(private), 1)
-        self.assertEqual(list(private[0].iterdir()), [])
-        with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
-            self.run_upload(path, "remove", proof)
-        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
-        self.assertEqual({entry.name: entry.read_bytes() for entry in foreign.iterdir()},
-                         {"sentinel": b"foreign at publication"})
-        # Once the independently foreign collision is moved aside by its owner,
-        # the recorded private original is still removable with the original proof.
-        foreign.rename(self.root / "foreign-retained")
-        self.run_upload(path, "remove", proof)
-        self.assertFalse(path.exists())
-        self.assertEqual((self.root / "foreign-retained/sentinel").read_bytes(), b"foreign at publication")
-
-    def test_child_replacement_during_copy_writes_only_original_retained_directory_and_files(self):
-        path, proof = self.reserve()
-        original = self.root / "original-copy-Code"
-        foreign = self.root / "foreign-copy-Code"
-        foreign.mkdir()
-        (foreign / "sentinel").write_bytes(b"not owned")
-        before = {entry.name: entry.read_bytes() for entry in foreign.iterdir()}
-        write = os.write
-        swapped = []
-        def swap_during_payload(fd, value):
-            if bytes(value).startswith(b"x") and not swapped:
-                swapped.append(True)
-                (path / "Code").rename(original)
-                foreign.rename(path / "Code")
-            return write(fd, value)
-        descriptors = len(os.listdir("/proc/self/fd"))
-        with patch.object(os, "write", side_effect=swap_during_payload):
-            with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
-                self.run_upload(path, "transfer", proof, self.archive(
-                    ("Code", tarfile.DIRTYPE, b""), ("Code/app", tarfile.REGTYPE, b"x" * 70000),
-                    ("Code/other", tarfile.REGTYPE, b"also original")))
-        self.native_upload.assert_not_called()
-        self.assertEqual(swapped, [True])
-        self.assertEqual((original / "app").read_bytes(), b"x" * 70000)
-        self.assertEqual((original / "other").read_bytes(), b"also original")
-        with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
-            self.run_upload(path, "remove", proof)
-        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
-        self.assertEqual({entry.name: entry.read_bytes() for entry in (path / "Code").iterdir()}, before)
-
-    def test_review_upload_time_child_substitution_reads_only_original_file_fds_and_refuses_success(self):
-        path, proof = self.reserve()
-        original = self.root / "original-upload-Code"
-        uploaded = {}
-        expected = {"Code/app": b"owned executable", "Code/other": b"owned other file"}
-        foreign = {"app": b"foreign executable", "sentinel": b"foreign existing content"}
-        def native_read(command, **_):
-            # Exact v4 R2.2: substitute Code at uploader entry. The existing
-            # SDK is now given a FILE procfd, so it cannot enumerate Code.
-            (path / "Code").rename(original)
-            (path / "Code").mkdir()
-            for name, value in foreign.items():
-                (path / "Code" / name).write_bytes(value)
-            source = Path(command[3])
-            self.assertRegex(str(source), f"^/proc/{os.getpid()}/fd/[0-9]+$")
-            self.assertTrue(source.is_file())
-            relative = command[5].removeprefix(path.name + "/")
-            payload = source.read_bytes()
-            uploaded[relative] = hashlib.sha256(payload).hexdigest()
-            self.assertEqual(payload, expected[relative])
-            self.assertEqual(source.stat().st_ino, (original / Path(relative).name).stat().st_ino)
-        archive = self.archive(("Code", tarfile.DIRTYPE, b""), *(
-            (name, tarfile.REGTYPE, content) for name, content in expected.items()))
-        descriptors = len(os.listdir("/proc/self/fd"))
-        with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
-            self.run_upload(path, "transfer", proof, archive, native_read)
-        self.native_upload.assert_called_once()
-        self.assertEqual(uploaded, {"Code/app": hashlib.sha256(expected["Code/app"]).hexdigest()})
-        self.assertNotIn("Code/sentinel", uploaded)
-        with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
-            self.run_upload(path, "remove", proof)
-        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
-        self.assertEqual({entry.name: entry.read_bytes() for entry in (path / "Code").iterdir()}, foreign)
-        self.assertEqual({f"Code/{entry.name}": entry.read_bytes() for entry in original.iterdir()}, expected)
-
-    def test_upload_file_name_substitution_cannot_redirect_sdk_even_when_original_is_unlinked(self):
-        for replacement in ("regular", "symlink"):
-            with self.subTest(replacement=replacement):
-                path, proof = self.reserve()
-                target = self.root / "foreign-file"
-                target.write_bytes(b"foreign executable")
-                uploaded = []
-                original_inode = []
-                def native_read(command, **_):
-                    source = Path(command[3])
-                    original_inode.append(source.stat().st_ino)
-                    (path / "payload").unlink()
-                    if replacement == "regular":
-                        (path / "payload").write_bytes(target.read_bytes())
-                    else:
-                        (path / "payload").symlink_to(target)
-                    uploaded.append(hashlib.sha256(source.read_bytes()).hexdigest())
-                    self.assertEqual(source.stat().st_ino, original_inode[0])
-                descriptors = len(os.listdir("/proc/self/fd"))
-                with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
-                    self.run_upload(path, "transfer", proof,
-                        self.archive(("payload", tarfile.REGTYPE, b"owned payload")), native_read)
-                self.assertEqual(uploaded, [hashlib.sha256(b"owned payload").hexdigest()])
-                self.assertEqual((path / "payload").read_bytes(), b"foreign executable")
-                self.assertNotEqual((path / "payload").stat().st_ino, original_inode[0])
-                with self.assertRaisesRegex(RuntimeError, "child incarnation changed"):
-                    self.run_upload(path, "remove", proof)
-                self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
-                # Remove the foreign fixture explicitly, never through the helper.
-                (path / "payload").unlink()
-                shutil.rmtree(path)
-
-    def test_all_original_file_descriptors_remain_pinned_through_last_sdk_read_with_finite_inventory(self):
-        path, proof = self.reserve()
-        entries = [(f"file{i}", tarfile.REGTYPE, str(i).encode()) for i in range(data.UPLOAD_MAX_ENTRIES)]
-        descriptors = len(os.listdir("/proc/self/fd"))
-        sources = []
-        def native_read(command, **_):
-            active = os.listdir("/proc/self/fd")
-            self.assertLessEqual(len(active) - descriptors, 160)
-            pinned = set()
-            for fd in active:
-                try:
-                    info = os.fstat(int(fd))
-                    pinned.add((info.st_dev, info.st_ino))
-                except OSError:
-                    pass
-            for name, _, _ in entries:
-                info = (path / name).stat()
-                self.assertIn((info.st_dev, info.st_ino), pinned)
-            for source in sources:
-                self.assertTrue(Path(source).is_file(), "do not close originals between SDK reads")
-            if command[5].endswith("/_.dir"):
-                self.assertEqual(Path(command[3]).read_bytes(), b"")
-            else:
-                sources.append(command[3])
-                self.assertEqual(Path(command[3]).read_bytes(), entries[len(sources) - 1][2])
-        receipt = self.run_upload(path, "transfer", proof, self.archive(*entries), native_read)
-        self.assertEqual(len(receipt["files"]), data.UPLOAD_MAX_ENTRIES)
-        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
-        self.run_upload(path, "remove", proof)
-        self.assertFalse(path.exists())
-
-    def test_native_file_upload_failure_closes_all_original_fds_and_preserves_partial_cleanup_capability(self):
-        path, proof = self.reserve()
-        archive = self.archive(("Code", tarfile.DIRTYPE, b""),
-                               ("Code/app", tarfile.REGTYPE, b"owned executable"),
-                               ("Code/other", tarfile.REGTYPE, b"owned other file"))
-        descriptors = len(os.listdir("/proc/self/fd"))
-        def fail(command, **_):
-            raise subprocess.CalledProcessError(1, command)
-        with self.assertRaises(subprocess.CalledProcessError) as raised:
-            self.run_upload(path, "transfer", proof, archive, fail)
-        self.assertIn(proof["capability"], "\n".join(raised.exception.__notes__))
-        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
-        self.assertEqual((path / "Code/app").read_bytes(), b"owned executable")
-        self.assertEqual((path / "Code/other").read_bytes(), b"owned other file")
-        self.run_upload(path, "remove", proof)
-        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
-        self.assertFalse(path.exists())
-
-    def test_native_python310_upload_failure_preserves_exception_and_recovery_stderr(self):
-        class Python310Error(RuntimeError):
-            @property
-            def add_note(self):
-                raise AttributeError("Python 3.10 has no add_note")
-        path, proof = self.reserve()
-        archive = self.archive(("payload", tarfile.REGTYPE, b"owned executable"))
-        original = Python310Error("native SDK upload failed")
-        def fail(*args, **kwargs):
-            raise original
-        before = len(os.listdir("/proc/self/fd"))
-        with contextlib.redirect_stderr(io.StringIO()) as stderr:
-            with self.assertRaises(Python310Error) as raised:
-                self.run_upload(path, "transfer", proof, archive, fail)
-        self.assertIs(raised.exception, original)
-        self.assertIn("original upload recovery", stderr.getvalue())
-        self.assertIn(proof["capability"], stderr.getvalue())
-        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
-        self.run_upload(path, "remove", proof)
-        self.assertFalse(path.exists())
-
-    def test_source_hash_drift_before_native_upload_is_refused_even_when_file_inode_is_unchanged(self):
-        path, proof = self.reserve()
-        stat_call = os.stat
-        original_inode = []
-        def mutate_at_source_verification(entry, *args, **kwargs):
-            if str(entry).startswith(f"/proc/{os.getpid()}/fd/") and not original_inode:
-                original_inode.append((path / "payload").stat().st_ino)
-                (path / "payload").write_bytes(b"other payload")
-            return stat_call(entry, *args, **kwargs)
-        descriptors = len(os.listdir("/proc/self/fd"))
-        with patch.object(os, "stat", side_effect=mutate_at_source_verification):
-            with self.assertRaisesRegex(RuntimeError, "file identity/hash changed"):
-                self.run_upload(path, "transfer", proof,
-                    self.archive(("payload", tarfile.REGTYPE, b"owned payload")))
-        self.native_upload.assert_not_called()
-        self.assertEqual((path / "payload").stat().st_ino, original_inode[0])
-        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
-        self.run_upload(path, "remove", proof)
-
-    def test_truncated_stream_cleans_only_original_partial_files_and_closes_descriptors(self):
-        path, proof = self.reserve()
-        archive = self.archive(("Code", tarfile.DIRTYPE, b""),
-                               ("Code/complete", tarfile.REGTYPE, b"first"),
-                               ("Code/partial", tarfile.REGTYPE, b"x" * 70000))
-        before = len(os.listdir("/proc/self/fd"))
-        with self.assertRaisesRegex(RuntimeError, "truncated bounded upload"):
-            self.run_upload(path, "transfer", proof, archive[:68000])
-        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
-        self.native_upload.assert_not_called()
-        self.assertEqual((path / "Code/complete").read_bytes(), b"first")
-        self.assertEqual((path / "Code/partial").stat().st_size, 65536)
-        self.run_upload(path, "remove", proof)
-        self.assertFalse(path.exists())
-
-    def test_archive_rejects_links_special_files_traversal_duplicates_and_uncreated_ancestors(self):
-        cases = [
-            [("symlink", tarfile.SYMTYPE, b"")],
-            [("hardlink", tarfile.LNKTYPE, b"")],
-            [("fifo", tarfile.FIFOTYPE, b"")],
-            [("device", tarfile.CHRTYPE, b"")],
-            [("../foreign", tarfile.REGTYPE, b"bad")],
-            [("/foreign", tarfile.REGTYPE, b"bad")],
-            [("./foreign", tarfile.REGTYPE, b"bad")],
-            [("Code/../foreign", tarfile.REGTYPE, b"bad")],
-            [(".fube-upload-owner", tarfile.REGTYPE, b"bad")],
-            [("Code/app", tarfile.REGTYPE, b"bad")],
-            [("payload", tarfile.REGTYPE, b"original"), ("payload", tarfile.REGTYPE, b"bad")],
-        ]
-        for entries in cases:
-            with self.subTest(entries=entries):
-                path, proof = self.reserve()
-                with self.assertRaises(RuntimeError):
-                    self.run_upload(path, "transfer", proof, self.archive(*entries))
-                self.native_upload.assert_not_called()
-                self.assertTrue((path / ".fube-upload-owner").read_text().startswith(proof["capability"]))
-                if (path / "payload").exists():
-                    self.assertEqual((path / "payload").read_bytes(), b"original")
-                self.run_upload(path, "remove", proof)
-                self.assertFalse(path.exists())
-
-    def test_archive_entry_and_byte_bounds_abort_without_upload_and_partial_tree_is_removable(self):
-        path, proof = self.reserve()
-        entries = [(f"dir{i}", tarfile.DIRTYPE, b"") for i in range(data.UPLOAD_MAX_ENTRIES + 1)]
-        with self.assertRaisesRegex(RuntimeError, "entry bound"):
-            self.run_upload(path, "transfer", proof, self.archive(*entries))
-        self.native_upload.assert_not_called()
-        self.run_upload(path, "remove", proof)
-        path, proof = self.reserve()
-        header = tarfile.TarInfo("too-large")
-        header.mode = 0o644
-        header.size = data.UPLOAD_MAX_BYTES + 1
-        with self.assertRaisesRegex(RuntimeError, "byte bound"):
-            self.run_upload(path, "transfer", proof, header.tobuf(format=tarfile.USTAR_FORMAT))
-        self.assertFalse((path / "too-large").exists())
-        self.native_upload.assert_not_called()
-        self.run_upload(path, "remove", proof)
-        self.assertFalse(path.exists())
-
-    def test_existing_file_directory_or_symlink_is_never_overwritten_during_extraction(self):
-        path, proof = self.reserve()
-        target = self.root / "outside"
-        target.write_bytes(b"foreign")
-        for kind in ("file", "symlink", "directory"):
-            entry = path / "payload"
-            if kind == "file":
-                entry.write_bytes(b"foreign")
-            elif kind == "symlink":
-                entry.symlink_to(target)
-            else:
-                entry.mkdir()
-            with self.assertRaises(FileExistsError):
-                self.run_upload(path, "transfer", proof,
-                                self.archive(("payload", tarfile.REGTYPE, b"bad")))
-            self.native_upload.assert_not_called()
-            self.assertEqual(target.read_bytes(), b"foreign")
-            if kind == "directory":
-                entry.rmdir()
-            else:
-                self.assertEqual(entry.read_bytes(), b"foreign")
-                entry.unlink()
-
-    def test_strict_archive_rejects_extended_headers_bad_checksums_modes_and_trailing_data(self):
-        regular = self.archive(("payload", tarfile.REGTYPE, b"owned"))
-        header = tarfile.TarInfo("metadata")
-        header.type = tarfile.XHDTYPE
-        header.mode = 0o644
-        unsafe_mode = tarfile.TarInfo("unsafe-mode")
-        unsafe_mode.mode = 0o4755
-        archives = [
-            header.tobuf(format=tarfile.USTAR_FORMAT),
-            b"x" + regular[1:],
-            unsafe_mode.tobuf(format=tarfile.USTAR_FORMAT),
-            regular + b"hidden archive",
-            regular + b"\0" * 10241,
-        ]
-        for archive in archives:
-            with self.subTest(prefix=archive[:20]):
-                path, proof = self.reserve()
-                with self.assertRaises(RuntimeError):
-                    self.run_upload(path, "transfer", proof, archive)
-                self.native_upload.assert_not_called()
-                self.run_upload(path, "remove", proof)
-
-    def test_local_archive_refuses_symlinks_special_modes_and_inventory_or_size_excess(self):
-        source = self.root / "source"
-        source.mkdir()
-        file = source / "payload"
-        file.symlink_to(self.root / "absent")
-        with self.assertRaisesRegex(RuntimeError, "regular package"):
-            data.upload_archive(source)
-        file.unlink()
-        file.write_bytes(b"payload")
-        file.chmod(0o4755)
-        with self.assertRaisesRegex(RuntimeError, "regular package"):
-            data.upload_archive(source)
-        file.chmod(0o644)
-        with patch.object(data, "UPLOAD_MAX_BYTES", 1):
-            with self.assertRaisesRegex(RuntimeError, "byte bound"):
-                data.upload_archive(source)
-        (source / "other").write_bytes(b"other")
-        with patch.object(data, "UPLOAD_MAX_ENTRIES", 1):
-            with self.assertRaisesRegex(RuntimeError, "entry bound"):
-                data.upload_archive(source)
-
-    def local_helper(self, path, proof, *, interrupt=False, timeout=False, receipt_tamper=None):
-        """Real pipe/child lifetime, with only native network I/O modeled."""
-        ownership = data.UploadOwnership(str(path), "original-cid", tuple(proof["parent"]),
-            tuple(proof["directory"]), tuple(proof["owner_file"]), proof["capability"])
-        allocation = MagicMock()
-        allocation.verify.return_value = ownership.container_id
-        source = self.root / "source"
-        source.mkdir()
-        (source / "payload").write_bytes(b"owned payload")
-        (source / "payload").chmod(0o644)
-        popen = subprocess.Popen
-        processes, commands = [], []
-        code = data.UPLOAD.replace('parent=="/var/lib/sf-node"', "parent==" + repr(str(self.root)))
-        code = code.replace("path,action=sys.argv[1:3]; proof=json.loads(sys.argv[3])", """
-def modeled_native_upload(command,**options):
-    scoped=command[3]
-    require(scoped.startswith("/proc/"+str(os.getpid())+"/fd/"),"model requires original file source")
-    with open(scoped,"rb") as file:
-        expected=b"" if command[5].endswith("/_.dir") else b"owned payload"
-        require(file.read()==expected,"model received a different source")
-subprocess.run=modeled_native_upload
-path,action=sys.argv[1:3]; proof=json.loads(sys.argv[3])
-""")
-        if interrupt:
-            code = code.replace("remaining-=len(chunk)",
-                                'remaining-=len(chunk)\n                    raise RuntimeError("model interrupted copy")')
-        if receipt_tamper:
-            code = code.replace('print(json.dumps(transfer() if action=="transfer" else proof),flush=True)',
-                'receipt=transfer()\n    ' + receipt_tamper + '\n    print(json.dumps(receipt),flush=True)')
-        def launch(command, **kwargs):
-            commands.append(command)
-            self.assertEqual(command[:6], ["docker", "exec", "-i", "original-cid", "python3", "-c"])
-            child = popen([sys.executable, "-c", code, *command[7:]], **kwargs)
-            processes.append(child)
-            if not timeout:
-                return child
-            wrapper = MagicMock()
-            wrapper.poll.side_effect = child.poll
-            wrapper.kill.side_effect = child.kill
-            first = True
-            def communicate(value=None, **options):
-                nonlocal first
-                if first:
-                    first = False
-                    receipt = child.stdout.readline()
-                    self.assertTrue(receipt, "helper must publish a process identity before blocking on stdin")
-                    raise subprocess.TimeoutExpired(command, options["timeout"], output=receipt)
-                return child.communicate(value, **options)
-            wrapper.communicate.side_effect = communicate
-            return wrapper
-        def execute(*args, **kwargs):
-            self.assertEqual(args[:3], ("python3", "-c", data.STOP_UPLOAD_HELPER))
-            stop = popen([sys.executable, *args[1:]], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out, err = stop.communicate(timeout=kwargs["timeout"])
-            self.assertEqual(stop.returncode, 0, err.decode())
-            return out.decode()
-        allocation.execute.side_effect = execute
-        with patch.object(data.subprocess, "Popen", side_effect=launch):
-            if interrupt or timeout or receipt_tamper:
-                with self.assertRaises(subprocess.TimeoutExpired if timeout else RuntimeError) as error:
-                    data.transfer_upload(allocation, ownership, source)
-                result = error.exception
-            else:
-                result = data.transfer_upload(allocation, ownership, source)
-        self.assertEqual(len(processes), 1)
-        self.assertIsNotNone(processes[0].poll(), "the original helper must be reaped")
-        return result, processes[0], allocation, commands[0]
-
-    def test_host_transfer_uses_bounded_docker_exec_stdin_and_captures_original_provenance(self):
-        path, proof = self.reserve()
-        result, process, allocation, command = self.local_helper(path, proof)
-        self.assertEqual(process.returncode, 0)
-        self.assertEqual(result["ownership"], proof)
-        self.assertEqual(result["container_id"], "original-cid")
-        self.assertEqual(result["upload_api"], "native SDK ImageStore.UploadContent (azurecliproxy; per-file)")
-        self.assertEqual(result["helper"]["pid"], process.pid)
-        self.assertEqual(result["helper"]["token"], command[-1])
-        self.assertIn("retained original root FD", result["copy_api"])
-        self.assertEqual((path / "payload").read_bytes(), b"owned payload")
-        allocation.execute.assert_not_called()
-        self.run_upload(path, "remove", proof)
-
-    def test_host_partial_copy_failure_retains_creation_capability_for_original_only_cleanup(self):
-        path, proof = self.reserve()
-        error, _, _, _ = self.local_helper(path, proof, interrupt=True)
-        self.assertIn("model interrupted copy", str(error))
-        self.assertIn("original upload reservation retained", "\n".join(error.__notes__))
-        self.assertIn(proof["capability"], "\n".join(error.__notes__))
-        self.assertEqual((path / "payload").read_bytes(), b"owned payload")
-        self.run_upload(path, "remove", proof)
-        self.assertFalse(path.exists())
-
-    def test_host_rejects_file_hash_foreign_helper_pid_and_missing_native_marker_receipts(self):
-        for mutation in (
-            'receipt["files"]["payload"]["sha256"]="0"*64',
-            'receipt["files"]["payload"]["source"]="/proc/"+str(os.getpid()+1)+"/fd/7"',
-            'receipt["markers"].pop("_.dir")',
-        ):
-            with self.subTest(mutation=mutation):
-                path, proof = self.reserve()
-                error, _, _, _ = self.local_helper(path, proof, receipt_tamper=mutation)
-                self.assertRegex(str(error), "original upload (file|directory marker)")
-                self.assertIn(proof["capability"], "\n".join(error.__notes__))
-                self.run_upload(path, "remove", proof)
-                shutil.rmtree(self.root / "source")
-
-    def test_timeout_stops_exact_captured_helper_incarnation_and_reaps_client(self):
-        path, proof = self.reserve()
-        error, process, allocation, command = self.local_helper(path, proof, timeout=True)
-        self.assertIsInstance(error, subprocess.TimeoutExpired)
-        self.assertNotEqual(process.returncode, 0)
-        allocation.execute.assert_called_once()
-        helper = json.loads(allocation.execute.call_args.args[3])
-        self.assertEqual(helper["pid"], process.pid)
-        self.assertEqual(helper["token"], command[-1])
-        self.assertEqual(list(path.iterdir()), [path / ".fube-upload-owner"])
-        self.run_upload(path, "remove", proof)
-
-    def test_helper_deadline_expires_while_stream_is_blocked_without_leaving_a_process(self):
-        path, proof = self.reserve()
-        code = data.UPLOAD.replace('parent=="/var/lib/sf-node"', "parent==" + repr(str(self.root)))
-        process = subprocess.Popen([sys.executable, "-c", code, str(path), "transfer",
-            json.dumps(proof), str(time.time() + 0.5), "e" * 64],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            helper = json.loads(process.stdout.readline())
-            self.assertEqual(helper["pid"], process.pid)
-            process.wait(timeout=5)
-            _, stderr = process.communicate(timeout=1)
-            self.assertNotEqual(process.returncode, 0)
-            self.assertIn(b"descriptor-bound transfer deadline", stderr)
-        finally:
-            if process.poll() is None:
-                process.kill()
-            process.communicate(timeout=1)
-        self.assertEqual(list(path.iterdir()), [path / ".fube-upload-owner"])
-        self.run_upload(path, "remove", proof)
-
-    def test_deadline_and_verified_pidfd_stop_reap_an_active_uploader_before_releasing_original_fds(self):
-        for stop in (False, True):
-            with self.subTest(pidfd_stop=stop):
-                path, proof = self.reserve()
-                marker = self.root / ("native-child-" + str(stop))
-                child_code = (
-                    "import hashlib,json,os,pathlib,sys,time;"
-                    "source=pathlib.Path(sys.argv[2]);"
-                    "assert source.read_bytes()==b'owned payload';"
-                    "pathlib.Path(sys.argv[1]).write_text(json.dumps({'pid':os.getpid(),"
-                    "'sha256':hashlib.sha256(source.read_bytes()).hexdigest()}));"
-                    "time.sleep(60)"
-                )
-                code = data.UPLOAD.replace('parent=="/var/lib/sf-node"', "parent==" + repr(str(self.root)))
-                code = code.replace("path,action=sys.argv[1:3]; proof=json.loads(sys.argv[3])", f"""
-real_run=subprocess.run
-def local_blocked_uploader(command,**options):
-    require(command[3].startswith("/proc/"+str(os.getpid())+"/fd/"),"original helper source required")
-    return real_run([sys.executable,"-c",{child_code!r},{str(marker)!r},command[3]],**options)
-subprocess.run=local_blocked_uploader
-path,action=sys.argv[1:3]; proof=json.loads(sys.argv[3])
-""")
-                descriptors = len(os.listdir("/proc/self/fd"))
-                process = subprocess.Popen([sys.executable, "-c", code, str(path), "transfer",
-                    json.dumps(proof), str(time.time() + (data.UPLOAD_SECONDS if stop else 2)), "e" * 64],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                native_pidfd = None
-                try:
-                    helper = json.loads(process.stdout.readline())
-                    self.assertEqual(helper["pid"], process.pid)
-                    process.stdin.write(self.archive(("payload", tarfile.REGTYPE, b"owned payload")))
-                    process.stdin.close()
-                    process.stdin = None
-                    for _ in range(150):
-                        if marker.exists():
-                            break
-                        time.sleep(.01)
-                    self.assertTrue(marker.exists(), "execute cancellation during an actual blocked file read")
-                    native = json.loads(marker.read_text())
-                    self.assertEqual(native["sha256"], hashlib.sha256(b"owned payload").hexdigest())
-                    native_pidfd = os.pidfd_open(native["pid"])
-                    if stop:
-                        stopped = subprocess.run([sys.executable, "-c", data.STOP_UPLOAD_HELPER,
-                            json.dumps(helper)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=12)
-                        self.assertEqual(stopped.returncode, 0, stopped.stderr.decode())
-                    _, errors = process.communicate(timeout=5)
-                    self.assertNotEqual(process.returncode, 0)
-                    self.assertTrue(b"descriptor-bound transfer deadline" in errors
-                                    or b"TimeoutExpired" in errors, errors.decode())
-                    self.assertFalse(Path(f"/proc/{native['pid']}").exists(),
-                                     "the uploader must be killed AND reaped, not orphaned by helper stop")
-                finally:
-                    if process.poll() is None:
-                        process.kill()
-                    process.communicate(timeout=5)
-                    if native_pidfd is not None:
-                        with contextlib.suppress(ProcessLookupError):
-                            signal.pidfd_send_signal(native_pidfd, signal.SIGKILL)
-                        os.close(native_pidfd)
-                self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
-                self.assertEqual((path / "payload").read_bytes(), b"owned payload")
-                self.run_upload(path, "remove", proof)
-                self.assertFalse(path.exists())
-
-    def test_stop_helper_cannot_signal_unrelated_process_with_wrong_nonce_or_start_time(self):
-        # A non-child process model is unnecessary: use ourselves, and assert
-        # pidfd_send_signal is unreachable for either mismatching identity.
-        with open("/proc/self/stat") as status:
-            start = status.read().rsplit(") ", 1)[1].split()[19]
-        for start_time in (start, str(int(start) + 1)):
-            proof = {"pid": os.getpid(), "start_time": start_time, "token": "e" * 64}
-            with patch("sys.argv", ["stop", json.dumps(proof)]), \
-                 patch.object(signal, "pidfd_send_signal") as send:
-                with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
-                    exec(data.STOP_UPLOAD_HELPER, {})
-            send.assert_not_called()
-
-    def test_same_name_replacement_with_copied_owner_token_never_gets_rmtree(self):
-        path, proof = self.reserve()
+    def test_same_name_replacement_with_copied_capability_is_retained(self):
         original = self.root / "original"
-        path.rename(original)
-        path.mkdir()
-        shutil.copyfile(original / ".fube-upload-owner", path / ".fube-upload-owner")
-        (path / "foreign").write_text("foreign replacement")
-        with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
-            self.run_upload(path, "remove", proof)
-        self.assertEqual((path / "foreign").read_text(), "foreign replacement")
+        self.path.rename(original)
+        self.path.mkdir()
+        shutil.copyfile(original / data.staging.OWNER, self.path / data.staging.OWNER)
+        (self.path / "sentinel").write_text("foreign")
+        with self.assertRaisesRegex(RuntimeError, "capability changed|incarnation changed"):
+            data.check_upload(self.allocation, self.proof, "remove")
+        self.assertEqual((self.path / "sentinel").read_text(), "foreign")
         self.assertTrue(original.is_dir())
-        self.assertFalse(list(self.root.glob(".fube-data-remove-*")))
 
-    def test_replaced_owner_file_even_with_same_bytes_and_symlinked_root_are_retained(self):
-        path, proof = self.reserve()
-        owner = path / ".fube-upload-owner"
-        owner.rename(path / "original-owner")
-        owner.write_text(proof["capability"])
+    def test_replaced_owner_file_does_not_authorize_cleanup(self):
+        owner = self.path / data.staging.OWNER
+        owner.rename(self.path / "original-owner")
+        owner.write_text(self.proof.capability)
         with self.assertRaisesRegex(RuntimeError, "capability changed"):
-            self.run_upload(path, "remove", proof)
-        original = self.root / "original"
-        path.rename(original)
-        path.symlink_to(original)
-        with self.assertRaises(OSError):
-            self.run_upload(path, "remove", proof)
-        self.assertTrue(path.is_symlink())
-        self.assertTrue(original.is_dir())
+            data.check_upload(self.allocation, self.proof, "remove")
+        self.assertTrue(self.path.is_dir())
 
-    def test_replacement_during_detach_is_rechecked_before_recursive_removal(self):
-        path, proof = self.reserve()
-        original = self.root / "original"
-        rename = os.rename
-        def swap_then_rename(source, destination, **kwargs):
-            rename(path, original)
-            path.mkdir()
-            (path / "foreign").write_text("foreign")
-            return rename(source, destination, **kwargs)
-        with patch.object(os, "rename", side_effect=swap_then_rename):
-            with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
-                self.run_upload(path, "remove", proof)
-        quarantine = list(self.root.glob(".fube-data-remove-*"))
-        self.assertEqual(len(quarantine), 1)
-        self.assertEqual((quarantine[0] / "foreign").read_text(), "foreign")
+    def test_invalid_packages_fail_before_copy_or_upload(self):
+        for kind in ("symlink", "fifo", "mode", "reserved"):
+            with self.subTest(kind=kind):
+                path = self.source / ("_.dir" if kind == "reserved" else "invalid")
+                if kind == "symlink":
+                    path.symlink_to(self.source / "Code/app")
+                elif kind == "fifo":
+                    os.mkfifo(path)
+                else:
+                    path.write_bytes(b"invalid")
+                    path.chmod(0o664 if kind == "mode" else 0o644)
+                with self.assertRaisesRegex(RuntimeError, "regular files|invalid package path"):
+                    data.transfer_upload(self.allocation, self.proof, self.source)
+                path.unlink()
+        for limit in ("MAX_ENTRIES", "MAX_BYTES"):
+            with self.subTest(limit=limit), patch.object(data.staging, limit, 1):
+                with self.assertRaisesRegex(RuntimeError, "package (entry|byte) bound"):
+                    data.transfer_upload(self.allocation, self.proof, self.source)
+        self.copier.assert_not_called()
+        self.assertEqual(self.uploads, [])
 
-    def test_replacement_after_detach_cannot_redirect_descriptor_bound_recursive_removal(self):
-        path, proof = self.reserve()
-        self.run_upload(path, "transfer", proof, self.archive(
-            ("partial", tarfile.DIRTYPE, b""), ("partial/payload", tarfile.REGTYPE, b"own")))
-        unlink = os.unlink
-        moved = self.root / "original-detached"
-        def swap_then_remove(entry, *, dir_fd):
-            if not moved.exists():
-                quarantine = next(self.root.glob(".fube-data-remove-*"))
-                quarantine.rename(moved)
-                quarantine.mkdir()
-                (quarantine / "foreign").write_text("foreign")
-            return unlink(entry, dir_fd=dir_fd)
-        with patch.object(os, "unlink", swap_then_remove):
-            with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
-                self.run_upload(path, "remove", proof)
-        quarantine = next(self.root.glob(".fube-data-remove-*"))
-        self.assertEqual((quarantine / "foreign").read_text(), "foreign")
-        self.assertFalse((moved / "partial").exists())
+    def test_partial_copy_failure_preserves_original_cleanup_and_error(self):
+        error = subprocess.TimeoutExpired("docker cp", 1)
+        def partial(*args, **kwargs):
+            self.copy(*args, **kwargs)
+            raise error
+        self.copier.side_effect = partial
+        with self.assertRaises(subprocess.TimeoutExpired) as raised:
+            data.transfer_upload(self.allocation, self.proof, self.source)
+        self.assertIs(raised.exception, error)
+        self.assertIn(self.proof.capability, "\n".join(error.__notes__))
+        self.assertEqual(self.uploads, [])
+        data.check_upload(self.allocation, self.proof, "remove")
+        self.assertFalse(self.path.exists())
+
+    def test_sfctl_failure_preserves_original_cleanup_and_error(self):
+        error = RuntimeError("sfctl upload failed")
+        def fail():
+            raise error
+        self.on_upload = fail
+        with self.assertRaisesRegex(RuntimeError, "sfctl upload failed") as raised:
+            data.transfer_upload(self.allocation, self.proof, self.source)
+        self.assertIs(raised.exception, error)
+        self.assertIn(self.proof.capability, "\n".join(error.__notes__))
+        self.assertTrue(self.remote.is_dir())
+        data.check_upload(self.allocation, self.proof, "remove")
+        self.assertFalse(self.path.exists())
+
+    def test_allocation_drift_prevents_copy_or_upload_into_replacement(self):
+        self.allocation.verify.return_value = "replacement-cid"
+        with self.assertRaisesRegex(RuntimeError, "allocation changed"):
+            data.transfer_upload(self.allocation, self.proof, self.source)
+        self.copier.assert_not_called()
+        self.assertEqual(self.uploads, [])
+        self.allocation.verify.side_effect = ["original-cid", "replacement-cid"]
+        with self.assertRaisesRegex(RuntimeError, "allocation changed"):
+            data.transfer_upload(self.allocation, self.proof, self.source)
+        self.assertEqual(self.uploads, [])
+
+    def test_changed_staged_hash_prevents_sfctl_upload(self):
+        def changed(*args, **kwargs):
+            self.copy(*args, **kwargs)
+            (self.remote / "Code/app").write_bytes(b"wrong executable")
+        self.copier.side_effect = changed
+        with self.assertRaisesRegex(RuntimeError, "copied package inventory/hash changed"):
+            data.transfer_upload(self.allocation, self.proof, self.source)
+        self.assertEqual(self.uploads, [])
+
+    def test_local_or_staged_drift_during_upload_cannot_report_success(self):
+        for target in (self.source, self.remote):
+            with self.subTest(target=target):
+                self.on_upload = lambda: (target / "Code/app").write_bytes(b"changed")
+                with self.assertRaisesRegex(RuntimeError, "uploaded package inventory/hash changed"):
+                    data.transfer_upload(self.allocation, self.proof, self.source)
+                shutil.rmtree(self.remote)
+                (self.source / "Code/app").write_bytes(b"executable")
+
+    def test_expired_deadline_never_starts_copy_or_upload(self):
+        with patch.object(data.time, "monotonic", side_effect=[0, data.UPLOAD_SECONDS + 1]):
+            with self.assertRaisesRegex(RuntimeError, "upload deadline expired"):
+                data.transfer_upload(self.allocation, self.proof, self.source)
+        self.copier.assert_not_called()
+        self.assertEqual(self.uploads, [])
+
+    def test_fractional_deadline_never_disables_container_timeout_by_rounding_to_zero(self):
+        clock = [0, .1, .2, 179.99999, 179.999991, 179.999992]
+        with patch.object(data.time, "monotonic", side_effect=clock):
+            data.transfer_upload(self.allocation, self.proof, self.source)
+        self.assertEqual(len(self.uploads), 1)
 
 
 class NativeOwnershipIdentityTests(ProjectFiles):
@@ -3231,13 +2469,24 @@ os.read(0,16)
             processes.append(process)
             return process
         def execute(*args, **kwargs):
-            self.assertEqual(args[:3], ("python3", "-c", data.STOP_UPLOAD_HELPER))
+            self.assertEqual(args[:3], ("python3", "-c", data.STOP_CAPTURE_HELPER))
             stopped = original_popen([sys.executable, *args[1:]], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = stopped.communicate(timeout=kwargs["timeout"])
             self.assertEqual(stopped.returncode, 0, stderr.decode())
             return stdout.decode()
         allocation.execute.side_effect = execute
         return allocation, launch, processes, data.WireCapture(allocation, allowed, evidence)
+
+    def test_stop_helper_cannot_signal_unrelated_process_with_wrong_nonce_or_start_time(self):
+        with open("/proc/self/stat") as status:
+            start = status.read().rsplit(") ", 1)[1].split()[19]
+        for start_time in (start, str(int(start) + 1)):
+            proof = {"pid": os.getpid(), "start_time": start_time, "token": "e" * 64}
+            with patch("sys.argv", ["stop", json.dumps(proof)]), \
+                 patch.object(signal, "pidfd_send_signal") as send:
+                with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
+                    exec(data.STOP_CAPTURE_HELPER, {})
+            send.assert_not_called()
 
     def test_original_helper_observes_loopback_destination_bytes_without_sender_receipt_input(self):
         with data.socket.socket() as listener:
