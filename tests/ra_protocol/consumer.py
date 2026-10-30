@@ -33,7 +33,7 @@ def validate(bundle, expected_head, expected_source):
             or manifest.get("source_digest") != expected_source
             or manifest.get("evidence") != "source-baseline-native-stream-with-schema-adapters"
             or manifest.get("target") != "Linux-x86_64-short-wchar"
-            or set(manifest.get("cases", [])) != CASES):
+            or manifest.get("cases") != sorted(CASES)):
         raise ValueError("prebuilt provenance/coverage mismatch")
     calculated_source = hashlib.sha256(
         json.dumps(manifest.get("source_inputs", {}), sort_keys=True).encode()

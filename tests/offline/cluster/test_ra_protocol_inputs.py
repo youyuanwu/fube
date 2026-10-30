@@ -95,3 +95,10 @@ class InputTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 consume(self.bundle, self.root / "output", "a" * 40, self.source)
         self.assertFalse((self.root / "output").exists())
+
+    def test_duplicate_or_reordered_case_inventory_is_rejected(self):
+        for cases in [sorted(CASES) + [sorted(CASES)[0]], sorted(CASES, reverse=True)]:
+            self.manifest["cases"] = cases
+            self.save()
+            with self.assertRaises(ValueError):
+                validate(self.bundle, "a" * 40, self.source)

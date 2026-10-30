@@ -72,7 +72,8 @@ proposed contracts unless explicitly identified as existing behavior.
 | Existing data qualification is a bounded volatile V1 profile, not durable storage or universal native parity: [FubeData.md:3–14](../runtime/FubeData.md?plain=1#L3-L14), [237–287](../runtime/FubeData.md?plain=1#L237-L287). | Pure-Rust cluster tests will be new evidence. They cannot inherit native qualification simply by reusing the engine. |
 
 The workspace also contains the [P1 store](RaStore.md) and
-[RA protocol/minimal P2 foundation](RaProtocolFoundation.md), not a cluster
+[RA protocol/bounded P2 foundation](RaProtocolFoundation.md) and
+[stateless removal/close simulation](RaStatelessRemoval.md), not a cluster
 FM/RA executable ([Cargo.toml:1–15](../../Cargo.toml#L1-L15)).
 Proposed component names below
 describe responsibilities, not already available binaries or CLI commands.
