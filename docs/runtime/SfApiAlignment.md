@@ -154,6 +154,17 @@ The [actual sample][APP-register] calls `Runtime::shutdown()` **before** its
 final shared `rpc.shutdown_listeners()`; unit shutdown retires routes and owned
 work. Do not infer the reverse process-listener ordering.
 
+Accepted cleanup/terminal errors use the same managed-cause release route as
+ordinary callback errors; observing/cloning an error does not transfer its final
+user-cause destructor to the observer. Capacity/shutdown rejection destroys the
+unretained cause under the existing active cleanup fence. Independent cleanup
+or publication obligations do not change an accepted error's kind, typed source
+or native code. Truly cyclic or uncooperative returned ownership remains subject
+to the existing original hard deadline/fence, not a new graceful rejection
+policy. Expired cleanup and pending-result fences keep
+their original absolute timestamp, including completion during terminal grace;
+healthy dormant publication does not keep its construction deadline armed.
+
 ## C2: direct-send reporting is not SDK health-client parity
 
 Both Immediate values work by direct-send; true adds no intentional batching
@@ -242,8 +253,8 @@ in this API-alignment workflow.
 | `c7cf02feddb3ab0015578178da02e1c8fb002ead` (Phase 2 final corrected bytes) | 363 Rust + 8 negative doctests; workspace all-target check/fmt/diff; strict four-crate lint and affected docs; Python runtime44/data197 (196 pass, one AF_PACKET skip) | Later provider/report changes, current docs bytes, deployed SF |
 | `8737eb909bc4311a6633d1f1f73a88c9586a9bf6` (Phase 3 final corrected bytes) | 367 Rust + 17 doctests; workspace all-target/all-feature check; strict four-crate lint/docs/fmt/diff; runtime44/data197 (one skip); oracle build/`--abi-self-test` | ABI self-test used local COM doubles: native_engine_created=false, native_interoperability_qualified=false; not deployment |
 | `34bb3194ce574ab046c2f9dff97a8a59377d3442` (historical Phase 4 before load-role correction) | 373 Rust +22 docs and second310 Rust +17 docs; workspace gates/32 doctests; Python414 (413 pass/one skip); fresh archive SHA256 `872a9be0122e1e827303567631fd4bf7c34d49ffe760744b8294b922bbae57a2`, 798 pass/five native exclusions | Its completed-role bucket policy is **superseded**, not user policy or corrected-source acceptance |
-| `6b397e335b98cf65160a3f8bacb2b30b9b386344` (corrected final implementation) | 374 Rust +22 docs and second311 Rust +17 docs; strict workspace all-target/all-feature check/clippy, build bins/examples, warning-denied docs, fmt/diff and32 workspace doctests PASS; Python414 run,413 pass/one AF_PACKET capability skip under umask022; fresh post-review archive SHA256 **`7924b016eee67120134e6039ab87d50eefb2f8407d0f938f941256071638ff3e`**, **799 pass/five intended native-group exclusions**, unchanged `not group(onebox)` | That archive was built from these implementation bytes, **not later documentation/Rustdoc-edited bytes**; no native/live claim |
-| Phase 5 documentation/Rustdoc changes based on `6b397e3` (2026-10-30, separate current-tree record) | Required format, workspace all-target/all-feature check and strict clippy, workspace bins/examples build, warning-denied workspace docs, diff check **PASS**; **33 workspace doctests PASS** (6 client +9 data +14 runtime +4 transport), including the added public reservation/registration example. Local/source/pinned reference links checked separately; [commands](../Development.md#api-alignment-documentation-gates). | No fresh archive/native outcome inferred from documentation checks; all Rust edits are comments, no executable algorithm/fixture changes; historical archive still belongs to6b397e3 |
+| `6b397e335b98cf65160a3f8bacb2b30b9b386344` (historical corrected Phase 4 implementation) | 374 Rust +22 docs and second311 Rust +17 docs; strict workspace all-target/all-feature check/clippy, build bins/examples, warning-denied docs, fmt/diff and32 workspace doctests PASS; Python414 run,413 pass/one AF_PACKET capability skip under umask022; fresh post-review archive SHA256 **`7924b016eee67120134e6039ab87d50eefb2f8407d0f938f941256071638ff3e`**, **799 pass/five intended native-group exclusions**, unchanged `not group(onebox)` | That archive was built from these implementation bytes, **not later documentation/Rustdoc-edited bytes**; no native/live claim |
+| `29005d09ff63d26831ef993ca08244bbd260f8b6` (historical Phase 5 documentation/Rustdoc changes based on `6b397e3`, 2026-10-30) | Required format, workspace all-target/all-feature check and strict clippy, workspace bins/examples build, warning-denied workspace docs, diff check **PASS**; **33 workspace doctests PASS** (6 client +9 data +14 runtime +4 transport), including the added public reservation/registration example. Local/source/pinned reference links checked separately; [commands](../Development.md#api-alignment-documentation-gates). | No fresh archive/native outcome inferred from documentation checks; all Rust edits are comments, no executable algorithm/fixture changes; historical archive still belongs to6b397e3 |
 | Current API alignment on deployed SF, both runtime three-replica and data profiles | **NOT RUN** | Must use fresh immutable bundles/exact source identities and separately execute both profiles; model/RAP/source/ABI tests do not substitute |
 
 Earlier native qualifications remain historical at the **exact old source and

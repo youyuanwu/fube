@@ -1,5 +1,8 @@
 //! Finite disposal scopes and dormant release entries used by runtime and data.
 use super::*;
+#[cfg(test)]
+#[path = "execution_owned_tests.rs"]
+mod tests;
 
 thread_local! {
     // Accounting capture only: never native invocation authority.
@@ -338,7 +341,7 @@ impl Scope {
         let active = self.active.lock().unwrap().as_ref().unwrap().clone();
         if Instant::now() >= self.until {
             *self.error.lock().unwrap() = Some(Error::Timeout);
-            active.authority.retire();
+            active.authority.retire_at(self.until);
         }
         let last = self.remaining.fetch_sub(1, Ordering::AcqRel) == 1;
         let trackers = if last {
@@ -374,12 +377,17 @@ impl Scope {
         self.error.lock().unwrap().clone().map_or(Ok(()), Err)
     }
     fn release_result(&self) {
+        if Instant::now() >= self.until {
+            if let Some(active) = self.active.lock().unwrap().as_ref() {
+                active.authority.retire_at(self.until);
+            }
+        }
         if self.pending_results.fetch_sub(1, Ordering::AcqRel) == 1
             && self.remaining.load(Ordering::Acquire) == 0
         {
             if let Some(active) = self.active.lock().unwrap().take() {
                 if Instant::now() >= self.until {
-                    active.authority.retire();
+                    active.authority.retire_at(self.until);
                 }
                 active.refresh();
             }
@@ -406,6 +414,11 @@ impl Active {
                 {
                     until = until.min(scope.until);
                     return true;
+                }
+                // A concurrent final result release/finish can make a scope
+                // removable just as it expires. Latch before replacing its slot.
+                if Instant::now() >= scope.until {
+                    self.authority.retire_at(scope.until);
                 }
             }
             false
@@ -690,10 +703,28 @@ fn run_body(
     // application scheduler on the library-only coordinator thread.
     let _entered = cleanup_lane.then(|| runtime.inner.application.enter());
     let entry = scope.enter(scope.origin, true);
-    match catch_unwind(AssertUnwindSafe(body)) {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => scope.fail(error),
-        Err(_) => scope.fail(Error::Protocol("owned disposal/join panicked")),
+    let result = catch_unwind(AssertUnwindSafe(body))
+        .unwrap_or(Err(Error::Protocol("owned disposal/join panicked")));
+    if let Err(error) = result {
+        if !cleanup_lane {
+            // The coordinator owns joins, not arbitrary cause formatting or
+            // destruction. Transfer to the existing cleanup lane with the SAME
+            // scope, deadline and quota; never reserve another active record.
+            drop(entry);
+            let owner = runtime.clone();
+            runtime.inner.cleanup.spawn(
+                &runtime.inner.authority,
+                async move {
+                    tokio::task::block_in_place(|| {
+                        run_body(owner, scope, Box::new(|| Err(error)), quota, true);
+                    });
+                },
+                None,
+            );
+            return;
+        }
+        let error = error.supervised(&runtime);
+        scope.fail(error);
     }
     drop(entry);
     drop(quota);

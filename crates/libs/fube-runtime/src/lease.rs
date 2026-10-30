@@ -222,6 +222,15 @@ impl Authority {
         self.retired
             .fetch_min(self.elapsed(Instant::now()), Ordering::SeqCst);
     }
+    pub(crate) fn retire_at(&self, until: Instant) {
+        self.retired
+            .fetch_min(self.elapsed(until), Ordering::SeqCst);
+    }
+    #[cfg(test)]
+    pub(crate) fn retired_at_for_test(&self) -> Option<Instant> {
+        let retired = self.retired.load(Ordering::SeqCst);
+        (retired != u64::MAX).then(|| self.origin + Duration::from_nanos(retired))
+    }
     pub(crate) fn remaining(&self) -> Result<Duration> {
         self.check()?;
         Ok(Duration::from_nanos(
