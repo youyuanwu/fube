@@ -4,6 +4,10 @@
 Hosting/RAP events. Not a running RA/FM, live Hosting adapter, native-handler
 execution, deployed SF interoperability or full algorithm-parity claim.
 Native baseline: `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
+The subsequent [opening port](RaStatelessOpening.md) adds native creation policy,
+separate retained package usage and a shared node notification coordinator.
+The source mappings here describe the preserved removal slice; current code
+line numbers have advanced with that addition.
 
 ## Interface and runtime boundary
 
@@ -81,8 +85,9 @@ supervisor fence; tests observe the public Lifecycle before claiming that fence.
 P1's terminal fence is not lifted by RA after late success.
 
 [Admission:382–483](../../crates/libs/fube-ra/src/entity.rs#L382-L483) reserves
-two effects for Add (closed report + stale reply), one for Open completion,
-RetryOpen/RetryReport, eight for other lifecycle commands. The actual count is
+two effects for Add (closed report + stale reply), one for
+RetryOpen/RetryReport, eight for Open completion and other lifecycle/node
+commands. The actual count is
 checked before persistence; retained effects and all outstanding reservations
 share the finite budget. Cancellation does not return accepted work's reservation.
 
@@ -104,7 +109,7 @@ physical retention-time GC is not enabled.
 
 ## Translated scenario evidence
 
-[The real-executor suite](../../crates/libs/fube-ra/tests/entity.rs) has 33 tests,
+[The original removal real-executor suite](../../crates/libs/fube-ra/tests/entity.rs) had 33 tests,
 with native-source comments and a real Store/MemoryBackend operation journal.
 This count includes existing addition/storage invariants, not 33 native C++
 tests. Selected scenarios:
@@ -137,14 +142,18 @@ python3 -m unittest tests.offline.cluster.test_ra_catalog \
   tests.offline.cluster.test_ra_protocol_inputs -v
 ```
 
-Independent wire evidence is [29 bidirectional source-baseline cases](../../tests/ra_protocol/README.md):
-39 schema types/123 members, actual native stream and field macros, disclosed
+Current independent wire evidence is [36 bidirectional source-baseline cases](../../tests/ra_protocol/README.md):
+43 schema types/129 members, retaining all prior 29 cases, actual native stream and field macros, disclosed
 schema/platform adapters. Fresh bundle HEAD/source identity must be supplied
 independently to compiler-free acceptance. Old `build/ra-native-final-v2` is
 previous-work evidence, **not** production of this slice.
 
-Disabled unfinished capabilities: general open/host-down error handling outside
-the selected removal race; open higher-ID replacement Drop; service/package
+Opening failure/retry and opening host-down are now implemented by the linked
+opening slice, including registration-version selection for Close reacquisition.
+Cleanup releases registration, then separately retained package usage before
+report scheduling/health/reply; discarded acquired callbacks also dispose their
+own unused usage lease. Termination remains distinct from host-down.
+Disabled unfinished capabilities: open higher-ID replacement Drop; service/package
 description update; stateful/StandBy/reopen/queued-delete; FMM/system-host
 termination; multi-FT/last-upload acknowledgment and initial upload bookkeeping;
 physical tombstone GC; live registration/health/runtime transport; restart,

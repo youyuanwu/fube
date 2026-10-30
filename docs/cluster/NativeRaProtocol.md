@@ -15,6 +15,7 @@ No inference of sender, recipient, or completeness is made from action names.
 
 **Status:** source inventory complete. The [foundation codecs and bounded
 entity seam](RaProtocolFoundation.md) plus [stateless removal/close/reporting](RaStatelessRemoval.md)
+and [opening/node registration reporting](RaStatelessOpening.md)
 are implemented with source-baseline
 native-stream evidence; complete handlers/runtime/traces remain staged.
 The inventory alone does not establish protocol implementation.
@@ -139,7 +140,8 @@ not re-dispatch to the actor advertised in its registry factory.
 
 All rows retain full native semantics as staged obligations. `C1` denotes the
 selected first codec pair; `C2` denotes removal/reporting codecs and bounded
-stateless execution; `C3` denotes service-type notification codecs; `S` means
+stateless execution; `C3` denotes service-type notification codecs and bounded
+node coordination; `S` means
 other staged protocol work; `L`
 means retained legacy contract; `D` means native explicit rejection; `G` means
 an observed pinned-source endpoint gap. C1/C2/C3 have the bounded implementation below;
@@ -149,9 +151,9 @@ the other contracts remain staged.
 
 | Inventory class | Rust mapping at catalog delivery | Required delivery/admission gate |
 |---|---|---|
-| C1: AddInstance/AddInstanceReply | Public schemas/headers: [protocol.rs](../../crates/libs/fube-ra/src/protocol.rs); selected entity execution: [entity.rs:588–1015](../../crates/libs/fube-ra/src/entity.rs#L588-L1015). [Protocol tests](../../crates/libs/fube-ra/tests/protocol.rs), [entity tests](../../crates/libs/fube-ra/tests/entity.rs), [native source-stream gate](../../tests/ra_protocol/README.md). | 36 total bidirectional native-stream/schema-adapter cases (43 types/129 fields), including all prior 29 cases, and selected entity barriers. Full Hosting/transport/native trace qualification and excluded lifecycle branches remain required; no deployed capability admission. |
+| C1: AddInstance/AddInstanceReply | Public schemas/headers: [protocol.rs](../../crates/libs/fube-ra/src/protocol.rs); selected [entity execution](../../crates/libs/fube-ra/src/entity.rs#L733-L1148) and [native opening policy/scenario mappings](RaStatelessOpening.md). [Protocol tests](../../crates/libs/fube-ra/tests/protocol.rs), [entity tests](../../crates/libs/fube-ra/tests/entity.rs), [native source-stream gate](../../tests/ra_protocol/README.md). | 36 total bidirectional native-stream/schema-adapter cases (43 types/129 fields), including all prior 29 cases, and selected entity barriers. Full Hosting/transport/native trace qualification and excluded lifecycle branches remain required; no deployed capability admission. |
 | C2: RemoveInstance/RemoveInstanceReply, ReplicaUp/ReplicaUpReply | [Native-shaped schemas](../../crates/libs/fube-ra/src/protocol.rs), [native helper closure:93–747](../../crates/libs/fube-ra/src/lifecycle.rs#L93-L747), [exact native/scenario mappings and limits](RaStatelessRemoval.md). | Stateless Delete/Obliterate/close and one-FT non-last FM report/ack profile only. Trusted simulated Hosting/RAP cleanup; initial/last upload, batching, FMM, live delivery, GC/restart and broad stateful lifecycle remain staged. RemoveReplica/DeleteReplica actions are not enabled by shared schema/helpers. |
-| C3: ServiceTypeNotification/ServiceTypeNotificationReply | [VersionedServiceType, ServiceTypeInfo, ServiceTypeNotification and distinct factories/decoders](../../crates/libs/fube-ra/src/protocol.rs), [protocol tests](../../crates/libs/fube-ra/tests/protocol.rs), [independent native-stream cases](../../tests/ra_protocol/README.md). | Request Actor FM=11/no generation; reply Actor RA=12/actual FM GenerationHeader; both priority=false. Empty/two-info request, empty/partial reply, literal actions and false priority add seven codec cases. Schema evidence does not establish node coordinator behavior, live Hosting/FM delivery or native-handler execution. |
+| C3: ServiceTypeNotification/ServiceTypeNotificationReply | [VersionedServiceType, ServiceTypeInfo, ServiceTypeNotification and distinct factories/decoders](../../crates/libs/fube-ra/src/protocol.rs), [bounded node ledger](../../crates/libs/fube-ra/src/notification.rs#L7-L232), [behavior/evidence limits](RaStatelessOpening.md#shared-node-registration-notifications), [protocol tests](../../crates/libs/fube-ra/tests/protocol.rs), [independent native-stream cases](../../tests/ra_protocol/README.md). | Request Actor FM=11/no generation; reply Actor RA=12/actual FM GenerationHeader; both priority=false. Empty/two-info request, empty/partial reply, literal actions and false priority add seven codec cases. Shared reference/version/partial-ack/throttle semantics use trusted due inputs and ASCII execution keys. Schema evidence does not establish live Hosting/FM delivery or native-handler execution. |
 | S: all other active boundary contracts | No Rust codec/handler/trace implementation asserted. The CSV's per-action body, direction and evidence map each missing implementation individually. | Port exact referenced schema and sender/receiver semantics, corresponding native tests and normalized traces before capability admission. No successful stubs or permanent omission. |
 | L: retained legacy | No Rust wire implementation asserted; retained current/native legacy behavior must be tested explicitly. | Preserve source-baseline old action definitions/handling versus current ReplicaUp replacement distinctions. |
 | D: deprecated ChangeConfigurationReply | No Rust dispatcher asserted. | Rejection/deprecation test, not successful no-op. |
