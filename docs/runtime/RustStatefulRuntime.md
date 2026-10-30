@@ -56,10 +56,18 @@ API: [stateful_api.rs:18-202](../../crates/libs/fube-runtime/src/stateful_api.rs
 [partition handles:357-393](../../crates/libs/fube-runtime/src/stateful_api.rs#L357-L393),
 [registration:405](../../crates/libs/fube-runtime/src/lib.rs#L405).
 All selected reporting routes are implemented; storage is the separate data layer.
-Load/move use actor 12/RAPReportLoad with stateful=true and privately completed
-native service role: Primary uses primary entries, ActiveSecondary and
-IdleSecondary use secondary/node entries. Unknown/None have no representable
-load route and fail explicitly. Caller-edited diagnostics do not select bytes.
+Load/move use actor 12/RAPReportLoad with stateful=true and the private native
+current configuration role, snapshotted together with routing identity as in
+vanilla FUP ReportLoad: Primary uses primary entries, ActiveSecondary and
+IdleSecondary use secondary/node entries. Pending demotion already selects
+secondary; initially configured Primary may report before service ChangeRole
+completes. This bucket selection never grants application read/write access.
+Unknown/None and invalid values are explicit stricter profile errors: native
+FUP admits nonclosed reports and downstream load handling filters roles
+separately, so admission/error equivalence is not claimed. Caller-edited
+diagnostics and read-only queries do not select or retarget reporting bytes.
+Source: [FUP ReportLoad](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.cpp#L1780-L1808)
+and [downstream load validation](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/LocalLoadReportingComponent.cpp#L166-L232).
 Partition health uses actor 7/ReportHealth kind/tag 3 and partition-only entity;
 replica health uses kind/tag 1, public replica ID and invalid replica-instance
 `-1`, **not** RAP incarnation. Base methods borrow only HealthInformation.

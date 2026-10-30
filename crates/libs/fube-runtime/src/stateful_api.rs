@@ -291,7 +291,9 @@ pub trait IStatefulServicePartition: Send + Sync + 'static {
     fn get_read_status(&self) -> Result<ServicePartitionAccessStatus>;
     fn get_write_status(&self) -> Result<ServicePartitionAccessStatus>;
     /// Local frame-write completion, not RA/FM acknowledgment. Native-bound
-    /// completed service role selects primary or secondary/node arrays.
+    /// current configuration role selects primary or secondary/node arrays.
+    /// This does not grant application read/write access. Unknown/None are
+    /// stricter profile errors, not native FUP admission-result parity.
     fn report_load(&self, metrics: &[crate::LoadMetric]) -> Result<()>;
     fn report_fault(&self, fault: crate::FaultType) -> Result<()>;
     fn report_move_cost(&self, cost: crate::MoveCost) -> Result<()>;

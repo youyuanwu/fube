@@ -640,9 +640,6 @@ impl Registry {
             let mut status = state.status.lock().unwrap();
             status.service_role = ReplicaRole::Primary;
             status.service_address = address;
-            if let Some(reporting) = &state.reporting {
-                reporting.complete_service_role(ReplicaRole::Primary);
-            }
         }
         self.notify_endpoint(unit, request).await?;
         let previous = api_epoch(&request.unit.previous);

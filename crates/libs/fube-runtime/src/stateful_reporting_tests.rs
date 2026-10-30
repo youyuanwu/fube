@@ -25,7 +25,7 @@ async fn opened(mode: u8, role: i64) -> (Harness, Arc<StatefulCalls>, ProxyReque
 }
 
 #[tokio::test]
-async fn stateful_reporting_requested_role_does_not_replace_completed_private_role() {
+async fn stateful_reporting_native_current_role_selects_secondary_during_pending_demotion() {
     let (mut h, calls, open) = opened(21, 4).await;
     let integration = calls.partitions.lock().unwrap()[0].clone();
     let mut local = open.local.clone();
@@ -44,6 +44,33 @@ async fn stateful_reporting_requested_role_does_not_replace_completed_private_ro
     let status = integration.status().unwrap();
     assert_eq!(status.current_role, ReplicaRole::ActiveSecondary);
     assert_eq!(status.service_role, ReplicaRole::Primary);
+    let access = integration.access_status().unwrap();
+    // FUP ReportLoad snapshots replicaDescription_.CurrentConfigurationRole,
+    // not currentServiceRole_. Neither stale controls nor read-only queries
+    // adopt their caller's role/identity into that private configuration.
+    h.send(
+        "UpdateConfiguration",
+        &control_tests::control(&open, "UpdateConfiguration", vec![open.local.clone()]),
+    )
+    .await;
+    for mut query in [open.clone(), demote.clone()] {
+        query.runtime = open.runtime.clone();
+        query.remote = ObjectArray(vec![]);
+        if query.unit.current.configuration == demote.unit.current.configuration {
+            query.unit.current.configuration += 1 << 32;
+            query.local.id = 101;
+            query.local.instance = 18;
+        }
+        query.local.current_role = 4;
+        h.send("RAPQuery", &query).await;
+        let reply: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+        if query.unit.current.configuration > demote.unit.current.configuration {
+            assert_eq!(reply.local.current_role, 3);
+            assert_eq!((reply.local.id, reply.local.instance), (100, 17));
+        } else {
+            assert_ne!(reply.error, 0);
+        }
+    }
     for (cost, value) in [
         (MoveCost::Zero, 0),
         (MoveCost::Low, 1),
@@ -60,7 +87,8 @@ async fn stateful_reporting_requested_role_does_not_replace_completed_private_ro
             .run_owned(move || partition.report_move_cost(cost));
         let (result, message) = tokio::join!(call, h.receive("RAPReportLoad"));
         result.unwrap();
-        assert_load(&message, true, true, "_MoveCost_", value);
+        assert_load(&message, true, false, "_MoveCost_", value);
+        assert_eq!(integration.access_status().unwrap(), access);
     }
     calls.catch_up_release.notify_one();
     control_tests::wait_event(&calls, "waitAll", 2).await;
@@ -91,7 +119,7 @@ async fn stateful_reporting_requested_role_does_not_replace_completed_private_ro
 }
 
 #[tokio::test]
-async fn stateful_reporting_private_completed_primary_secondary_idle_roles_and_native_arrays() {
+async fn stateful_reporting_private_configuration_primary_secondary_idle_roles_and_native_arrays() {
     for initial_role in [4, 2] {
         let (mut h, calls, open) = opened(20, initial_role).await;
         let integration = calls.partitions.lock().unwrap()[0].clone();
@@ -439,11 +467,13 @@ async fn stateful_reporting_verified_ttl_sequence_validation_wrong_kind_and_unce
 }
 
 #[tokio::test]
-async fn stateful_reporting_unknown_role_is_not_invented_primary_before_completed_change_role() {
-    // Hold service ChangeRole(Primary), after native request says Primary.
+async fn stateful_reporting_configured_primary_reports_before_service_change_role_completes() {
+    // Native has configured Primary even though service ChangeRole is held.
     let mut h = Harness::new().await;
     let calls = register(&h);
     let mut open = request(&h, 2, 17, 30);
+    open.unit.id.id = Guid(GUID_BYTES);
+    open.unit.consistency.id.id = Guid(GUID_BYTES);
     open.service.metrics.0.push(Metric {
         name: "Work".into(),
         weight: 1,
@@ -459,35 +489,49 @@ async fn stateful_reporting_unknown_role_is_not_invented_primary_before_complete
     .await
     .unwrap();
     let integration = calls.partitions.lock().unwrap()[0].clone();
-    let (partition, _) = integration.observe_report().unwrap();
-    let error = h
-        .engine
-        .shared
-        .execution
-        .try_reserve()
-        .unwrap()
-        .run_owned(move || partition.report_move_cost(MoveCost::High))
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::InvalidState);
-    let reporting = integration.reporting_for_test();
-    reporting.complete_service_role(ReplicaRole::None);
+    let status = integration.status().unwrap();
+    assert_eq!(status.current_role, ReplicaRole::Primary);
+    assert_eq!(status.service_role, ReplicaRole::Unknown);
+    let access = integration.access_status().unwrap();
     assert_eq!(
-        reporting
-            .load(&[LoadMetric {
-                name: "Work".into(),
-                value: 1
-            }])
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidState
+        access,
+        (
+            crate::ServicePartitionAccessStatus::ReconfigurationPending,
+            crate::ServicePartitionAccessStatus::ReconfigurationPending,
+        )
     );
-    reporting.complete_service_role(ReplicaRole::Unknown);
+    for (name, value) in [("Work", 731), ("_MoveCost_", 3)] {
+        let (partition, record) = integration.observe_report().unwrap();
+        let call = h
+            .engine
+            .shared
+            .execution
+            .try_reserve()
+            .unwrap()
+            .run_owned(move || {
+                if name == "Work" {
+                    partition.report_load(&[LoadMetric {
+                        name: name.into(),
+                        value,
+                    }])
+                } else {
+                    partition.report_move_cost(MoveCost::High)
+                }
+            });
+        let (result, message) = tokio::join!(call, h.receive("RAPReportLoad"));
+        result.unwrap();
+        assert_load(&message, true, true, name, value);
+        assert!(record.result().unwrap().unwrap().health_sequence.is_none());
+        assert_eq!(integration.access_status().unwrap(), access);
+        assert_eq!(
+            integration.status().unwrap().service_role,
+            ReplicaRole::Unknown
+        );
+    }
     h.no_reply().await;
     calls.release.notify_one();
     h.receive("ReplicaOpenReply").await;
-    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    h.engine.shared.stateful.wait_idle(GUID_BYTES).await;
     let (partition, _) = integration.observe_report().unwrap();
     let call = h
         .engine
@@ -498,7 +542,57 @@ async fn stateful_reporting_unknown_role_is_not_invented_primary_before_complete
         .run_owned(move || partition.report_move_cost(MoveCost::Low));
     let (result, message) = tokio::join!(call, h.receive("RAPReportLoad"));
     result.unwrap();
-    let sent: LoadBody = from_slice(&message.body).unwrap();
-    assert!(sent.reports.0[0].stateful);
-    assert_eq!(sent.reports.0[0].primary.0[0].value, 1);
+    assert_load(&message, true, true, "_MoveCost_", 1);
+}
+
+#[tokio::test]
+async fn stateful_reporting_unknown_none_configuration_roles_reject_without_emission_or_fallback() {
+    for native_role in [0, 1] {
+        let (mut h, calls, open) = opened(20, 4).await;
+        let integration = calls.partitions.lock().unwrap()[0].clone();
+        let mut current = open.clone();
+        current.local.current_role = native_role;
+        current.unit.current.configuration += 1 << 32;
+        let current =
+            control_tests::control(&current, "UpdateConfiguration", vec![current.local.clone()]);
+        h.send("UpdateConfiguration", &current).await;
+        h.engine.shared.stateful.wait_idle(GUID_BYTES).await;
+        h.no_reply().await; // unsupported role has no lifecycle work/reply
+        let status = integration.status().unwrap();
+        assert_eq!(
+            status.current_role,
+            if native_role == 0 {
+                ReplicaRole::Unknown
+            } else {
+                ReplicaRole::None
+            }
+        );
+        assert_eq!(status.service_role, ReplicaRole::Primary);
+        let access = integration.access_status().unwrap();
+        for move_cost in [false, true] {
+            let (partition, record) = integration.observe_report().unwrap();
+            let error = h
+                .engine
+                .shared
+                .execution
+                .try_reserve()
+                .unwrap()
+                .run_owned(move || {
+                    if move_cost {
+                        partition.report_move_cost(MoveCost::High)
+                    } else {
+                        partition.report_load(&[LoadMetric {
+                            name: "Work".into(),
+                            value: 1,
+                        }])
+                    }
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidState);
+            assert!(record.result().unwrap().is_err());
+            assert_eq!(integration.access_status().unwrap(), access);
+        }
+        h.no_reply().await;
+    }
 }

@@ -138,9 +138,6 @@ pub(crate) struct Reporting {
     valid: Arc<AtomicBool>,
     authority: Arc<Authority>,
     request: Mutex<ProxyRequest>,
-    // Updated only after native service ChangeRole completes. Neither requested
-    // configuration role nor caller-editable diagnostic snapshots select load.
-    service_role: Mutex<crate::ReplicaRole>,
     admission: Arc<Semaphore>,
     loads: Mutex<BTreeMap<String, ReportedLoad>>,
     fault: Mutex<Option<FaultStage>>,
@@ -215,7 +212,6 @@ impl Reporting {
             valid,
             authority,
             request: Mutex::new(request),
-            service_role: Mutex::new(crate::ReplicaRole::Unknown),
             admission: Arc::new(Semaphore::new(1)),
             loads: Mutex::new(BTreeMap::new()),
             fault: Mutex::new(None),
@@ -228,9 +224,6 @@ impl Reporting {
     }
     pub(crate) fn update(&self, request: &ProxyRequest) {
         *self.request.lock().unwrap() = request.clone();
-    }
-    pub(crate) fn complete_service_role(&self, role: crate::ReplicaRole) {
-        *self.service_role.lock().unwrap() = role;
     }
     pub(crate) fn loads(&self) -> Vec<ReportedLoad> {
         self.loads.lock().unwrap().values().cloned().collect()
@@ -280,12 +273,15 @@ impl Reporting {
         if metrics.is_empty() || metrics.len() > MAX_REPORT_METRICS {
             return Err(Error::InvalidInput("report requires 1..=64 metrics"));
         }
+        // FUP ReportLoad snapshots CurrentConfigurationRole together with the
+        // native routing identity, not completed currentServiceRole_. Only
+        // accepted native context updates replace this private request.
         let request = self.request.lock().unwrap().clone();
         let primary = if request.service.stateful {
-            match *self.service_role.lock().unwrap() {
-                crate::ReplicaRole::Primary => true,
-                crate::ReplicaRole::ActiveSecondary | crate::ReplicaRole::IdleSecondary => false,
-                crate::ReplicaRole::Unknown | crate::ReplicaRole::None => {
+            match request.local.current_role {
+                4 => true,      // RAP Primary
+                2 | 3 => false, // RAP Idle / Secondary -> PLB Secondary
+                _ => {
                     return Err(Error::new(
                         crate::ErrorKind::InvalidState,
                         "no representable native load role",
