@@ -46,7 +46,7 @@ Unissued results do not transfer reference ownership to RA. The default limit is
 completion. Legacy CompleteOpen service-not-registered only records pending
 status; it does not identify/consume an issued lookup obligation.
 
-Close success is a **trusted cleanup proof**, including cancellation/draining of
+Raw native Close success carries the **trusted cleanup proof**, including cancellation/draining of
 queued/in-flight Open, proxy closure and resource cleanup—not just a successful
 callback. TerminateHost means native RemoveReplica termination reason; its
 callback is **not** host-down. Obliterate completes only on a matching observed
@@ -100,9 +100,13 @@ the record type is not a recovery compatibility promise or native disk format.
 This is not a durable outbox; effects transferred with take_effects still need
 an external owner to deliver/retry them.
 
-Default retry policies: close warning 10, Delete drop 40, other close drop 40320,
+Default retry policies: independent Close/Delete warning 10, Delete drop 40, other close drop 40320,
 registration-at-drop warning 240/drop 1920
 (`common/FailoverConfig.h:559–597`). Settings permit finite test thresholds.
+All enabled retry policy properties are dynamically readable signed native
+values; current-threshold success clear is not a remembered warning flag.
+The [opening alignment](RaStatelessOpening.md) documents per-property reads,
+zero/negative behavior and independent Close/Delete/registration-at-drop families.
 RetryClose/RetryReport are **trusted due timer inputs**, not automatic loops or
 proof that delivery succeeded. Tombstone retention is unbounded in this session;
 physical retention-time GC is not enabled.
@@ -125,7 +129,8 @@ tests. Selected scenarios:
 | `native_lookup_failure_and_apphostdown_are_not_generic_close_success` | `ReplicaLifecycle.cpp:1769–1797`; shared persisted-context `Close.cpp:413–464`; actual stateless host-down handler above |
 | `native_closed_add_reports_then_stale_reply_and_tombstone_equal_suppresses_report` | `Test.StateMachine.cpp:3567–3589`; source recreation normalization regression uses helper lines above |
 
-Additional tests cover trusted close token/node/identity/epoch fencing, force
+Additional tests cover native close id/instance/lower-epoch guards (not invented
+token/runtime/incoming-node equality predicates), force
 escalation while opening/deleting, registration retries, exact stored tombstone
 payload, multi-effect reservation, definite/unknown removal and completion
 failures, cancellation and immutable old snapshots. Controlled barriers—not

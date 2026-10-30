@@ -122,6 +122,12 @@ node-wide registration notifications. Opening/removal run against trusted
 simulated registration/RAP/host-down events, not live Hosting. Eight selected
 action codecs and source-derived tests do not establish original-handler
 execution or deployed parity.
+The enabled surface now includes generic generation lower-bound admission,
+raw request-shaped replies, native Linux identifier comparison/returned spelling,
+per-property dynamic retry configuration and separate notification work/timer/
+captured-send semantics; old ASCII/normalized-Ready/immutable-policy restrictions
+are not preserved as vanilla behavior. Actual native helper comparisons remain
+separate from complete handler/runtime execution.
 Catalog completeness
 is not complete native protocol implementation.
 

@@ -25,9 +25,10 @@ pub struct RegistrationCompletion {
     pub lookup: u64,
     pub registration: RuntimeRegistration,
     pub error: i64,
-    /// Hosting FindServiceTypeRegistrationErrorCode.IsRetryable. Exactly one
-    /// result/acquired reference per issued lookup; replaying its callback MUST
-    /// NOT acquire again. Unissued lookup ownership remains with the caller.
+    /// Legacy adapter diagnostic; classification comes from the actual native
+    /// new/existing-replica error lists, not this bool. Exactly one acquired
+    /// result per issued lookup; replay MUST NOT acquire again. Unissued
+    /// lookup ownership remains with the caller.
     pub retryable: bool,
     pub version: VersionInstance,
     /// Native upgrade-version map entry used in mismatch selection, if present.

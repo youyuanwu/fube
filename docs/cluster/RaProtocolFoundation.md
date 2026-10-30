@@ -55,19 +55,20 @@ prebuilt inputs with no compiler/native installation/build fallback.
 
 ## Entity API and admission
 
-[`Executor::new`:402–448](../../crates/libs/fube-ra/src/entity.rs#L402-L448)
+[`Executor::new`:441–499](../../crates/libs/fube-ra/src/entity.rs#L441-L499)
 accepts `Arc<dyn KeyValueStore>`, immutable trusted session/node admission and
 finite settings. The caller selects/initializes the P1 backend, including its
 correct deployment/node binding. Executor does not infer a storage identity
 from the trait object or recover an existing entity.
 
-[`Command`:201–237](../../crates/libs/fube-ra/src/entity.rs#L201-L237) admits:
+[`Command`:192–235](../../crates/libs/fube-ra/src/entity.rs#L192-L235) admits:
 
 - Add: full native body, actual source node incarnation and generation header.
 - CompleteOpen: a matching result supplied by a trusted future Hosting/RAP
   adapter; tests supply it now. It does not create application serving authority.
 - RetryOpen: explicit new retry work for an existing pending open.
-- RetryServiceTypes and ServiceTypeReply: node-wide registration notifications,
+- Request/Capture/CompleteServiceTypeWork, separate retry timer commands and
+  ServiceTypeReply: node-wide registration notifications,
   native shared reference/version semantics, throttled batching and partial
   instance-matched acknowledgments, not one fake FT reply.
 - Remove, one-FT ReplicaUpReply, trusted Registered/CompleteClose/HostDown and
@@ -75,21 +76,23 @@ from the trait object or recover an existing entity.
   `Open` now requests registration; only a committed Registered handoff permits
   RuntimeOpen, and successful Open completion requires that witness.
 
-[Admission/transition logic:733–890](../../crates/libs/fube-ra/src/entity.rs#L733-L890)
+[Admission/transition logic:834–989](../../crates/libs/fube-ra/src/entity.rs#L834-L989)
 enforces the selected stateless InBuild/up/package profile, configured FM/local
 node incarnation and generation domain. Configured-source validation is an
 additional session gate, not a claim that the generic native dispatcher
-cryptographically authenticates current FM. Generation zero means the complete
-zero GenerationNumber; counter zero with another owner is not a bypass.
+cryptographically authenticates current FM. Generic native receive-generation
+lower-bound admission applies before node/FT routing; generation zero is not a
+bypass, and newer generations are admitted rather than requiring exact equality.
 
 The seam distinguishes not-ready/upgrading silence, native deactivated
 RANotReadyForUse, pending duplicate suppression, stale epoch/instance/outcome
-suppression, and identical Ready success reply. A matching trusted Ready
-completion, **not Add receipt/store insertion**, permits semantic success.
+suppression, and identical Ready success reply. A matching raw native-shaped
+completion, **not Add receipt/store insertion**, lets RA establish Ready and
+update endpoints; an adapter need not manufacture a pre-Ready replica.
 Service-type-not-registered remains pending/retryable without success.
 
 Open replacement and general epoch/service-description updates,
-FM-service/FMM execution and non-ASCII service-type execution keys return explicit
+and FM-service/FMM execution return explicit
 Unsupported results without successful wire replies. Those are cataloged
 implementation gaps, not permanent omissions or alternate protocol statuses.
 Selected native close/tombstone, force and report/ack stages are implemented;
@@ -99,19 +102,19 @@ final Abort cleanup and opening host-down are [implemented separately](RaStatele
 
 ## State, commit and effects
 
-[Owned supervision:396–706](../../crates/libs/fube-ra/src/entity.rs#L396-L706)
+[Owned supervision:435–800](../../crates/libs/fube-ra/src/entity.rs#L435-L800)
 uses one independent thread/runtime and bounded per-entity workers. Same-entity
 work serializes. Accepted count, tight encoded bytes and bounded action slots
 (Add 2; open/report retry 1; Open completion/other lifecycle and node work 8)
 are reserved atomically and held through actual completion.
 
-[Commit/publication:893–1148](../../crates/libs/fube-ra/src/entity.rs#L893-L1148)
+[Commit/publication:992–1257](../../crates/libs/fube-ra/src/entity.rs#L992-L1257)
 keeps proposed state private. Durable creation/Ready/close/tombstone updates commit one aggregate
 under record type `ra/entity/v1` and a lowercase hex native-GUID ID. Format 2
 stores the full selected body, phase, deletion/cleanup, tokens/mode and FM stage;
 registration and retry counters remain volatile. It is an internal envelope,
 not native disk migration, a durable outbox or a restart loader.
-Accepted RAP replies/opening host-down always select persistent Update;
+Accepted RAP Open replies/opening host-down select persistent Update;
 registration retry/adoption (including terminal lookup failure) is memory-only
 as selected by native source. Requested version, usage and the node ledger are
 also volatile; an older stored opening envelope is not a recovery promise.
@@ -129,7 +132,7 @@ Permanent observation-channel loss and terminal Unknown also retain the fence
 and apply the configured minimum polling interval; immediate resolution errors
 cannot turn uncertainty into a busy loop.
 
-[`take_effects`:586–591](../../crates/libs/fube-ra/src/entity.rs#L586-L591)
+[`take_effects`:647–652](../../crates/libs/fube-ra/src/entity.rs#L647-L652)
 transfers each action record once per accepted execution. Explicit new retry
 commands and native duplicate-ready replies can legitimately emit new actions.
 No arbitrary callback runs under a store lock; transport delivery, automatic
@@ -139,14 +142,14 @@ retry/semantic acknowledgment events exist for the bounded removal slice.
 [`Ticket`:54–86](../../crates/libs/fube-ra/src/entity.rs#L54-L86) is observation,
 not ownership. Cancelling its future, losing the caller Tokio runtime or dropping
 all executor handles does not retract accepted work.
-[`close`:593–607](../../crates/libs/fube-ra/src/entity.rs#L593-L607) closes only
+[`close`:654–668](../../crates/libs/fube-ra/src/entity.rs#L654-L668) closes only
 executor admission and drains accepted work; it does not close the caller's
 store. Finite timeout reports Unknown, never rollback. Unresolved work may retain
 the supervisor indefinitely; there is no racing replacement or hard IO deadline.
 
 ### Default finite limits
 
-[Settings:100–186](../../crates/libs/fube-ra/src/entity.rs#L100-L186):
+[Settings:106–180](../../crates/libs/fube-ra/src/entity.rs#L106-L180):
 32 entity slots, 64 outstanding operations, 256 KiB encoded command,
 8 MiB queued bytes, 64 retained/reserved actions, 20 ms late-resolution polling.
 Entity slots are retained for the executor lifetime. Snapshots/effects retained
@@ -155,8 +158,11 @@ allocator/RSS quotas or real-time scheduling guarantees.
 An additional 64 outstanding registration lookups per entity are retained across
 removal/recreation until their real result arrives; separate acquisition IDs
 make callback replay idempotent and discarded-reference release explicit.
-Node notifications additionally reserve at most 64 shared live/in-flight type
-slots by default, with a 256 KiB batch-byte bound; see the opening profile.
+Node notifications additionally bound 64 shared types and 256 KiB batch output
+by default. Actual memory-only attachment projection/publication is atomic.
+Semantic knobs are separately mutable signed native properties in
+[config.rs](../../crates/libs/fube-ra/src/config.rs), not immutable resource
+budgets or positivity validators. See the opening profile for read points.
 
 ## Tests and remaining qualification
 
@@ -166,7 +172,7 @@ python3 -m unittest tests.offline.cluster.test_ra_catalog \
   tests.offline.cluster.test_ra_protocol_inputs -v
 ```
 
-[47 deterministic entity tests](../../crates/libs/fube-ra/tests/entity.rs)
+[55 deterministic entity tests](../../crates/libs/fube-ra/tests/entity.rs)
 map to the catalog's native EntityMap/EntityJobItem ordering and selected
 AddInstance preconditions plus selected removal/close/report/native scenarios.
 Real public Store backends and entered/release
@@ -176,11 +182,15 @@ ownership, per-execution single dispatch and real SQLite aggregate commit.
 [14 schema tests](../../crates/libs/fube-ra/tests/protocol.rs) cover defaults,
 full nested fields, errors, headers, malformed input, bounds and pointer tags.
 Offline validator-model bytes are explicitly **not native fixtures**.
-Additional [real-ticket fault regressions](../../crates/libs/fube-ra/src/entity.rs#L1158)
+Additional [real-ticket fault regressions](../../crates/libs/fube-ra/src/entity.rs#L1260)
 exercise permanent observation-channel loss and terminal Unknown in bounded
 child processes, asserting explicit polling backoff without releasing ownership.
-Five coordinator unit tests cover native shared references/version/ack/throttling,
-ASCII identity, reservations and retained-payload/codec-ceiling batch bounds.
+Coordinator/config unit tests cover native shared references/version/ack,
+Unicode UTF-16-unit C-locale identity, actual report projection, dynamic properties,
+emitted work/timer obligations and captured-send interleavings. Separate
+[actual-native helper comparisons](../../tests/ra_protocol/README.md#separate-actual-native-helper-evidence)
+execute original PAL/retry code and extracted identifier/generation methods;
+this is not full original-handler execution.
 New [opening scenario mappings](RaStatelessOpening.md#storage-tests-and-reproducibility)
 distinguish direct SL evidence, shared/helper-derived cases and Rust-only
 storage-fault adaptations.
