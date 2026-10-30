@@ -156,6 +156,7 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
     let mode = state.close_mode.expect("pending close mode");
     let health = state.phase != Phase::Closed && state.body.replica.up;
     state.phase = Phase::Closed;
+    state.service_description_pending = false;
     state.close_mode = None;
     state.close_failures = 0;
     state.open_failures = 0;
@@ -261,6 +262,7 @@ fn start_close_inner(
         mark_deleted(state);
     }
     state.phase = Phase::Closing;
+    state.service_description_pending = false;
     state.close_mode = Some(mode);
     state.close_token = token;
     state.close_failures = 0;
@@ -310,38 +312,29 @@ fn check_stateless(body: &AddInstance, admission: &Admission) -> Result<()> {
     Ok(())
 }
 
-/// Directly dependent native Closed Add branches. Broad replacement of an open
-/// replica/service description remains explicitly disabled.
-pub(super) fn service_matches(state: &EntityState, service: &Service) -> bool {
-    let mut normalized = service.clone();
-    if normalized.version == state.requested_version {
-        normalized.version = state.body.service.version.clone();
-    }
-    normalized == state.body.service
-}
+/// Native Add processor after generic TCP admission. No replacement payload is
+/// retained: Drop's actual finish consumer does not reopen; FM must resend.
 pub(super) fn add_existing(
     work: &Submission,
     current: &EntityState,
     body: &AddInstance,
-) -> Option<Result<Transition>> {
-    if current.phase == Phase::Closing {
-        return Some(Ok(Transition::ignored(Disposition::IgnoredPending)));
-    }
-    if current.phase != Phase::Closed {
-        return None;
-    }
-    Some((|| {
-        if !current.local_deleted && body.unit.current.older_than(current.body.unit.current) {
-            return Ok(Transition::ignored(Disposition::IgnoredStale));
+) -> Result<Transition> {
+    let mut state = current.clone();
+    let mut effects = Vec::new();
+    let mut durable = description::update(&mut state, &body.service, &mut effects);
+    if state.phase == Phase::Ready {
+        if state.body.replica.id < body.replica.id {
+            start_close(&mut state, CloseMode::Drop, work.id, &mut effects);
+            durable = true;
+        } else if state.body.replica.instance == body.replica.instance {
+            effects.push(reply(&state.body, 0));
         }
-        if !service_matches(current, &body.service) {
-            return Err(Failure::Unsupported(
-                "service update choreography is disabled",
-            ));
-        }
+    } else {
+        debug_assert_eq!(state.phase, Phase::Closed);
         if body.replica.instance > current.body.replica.instance {
-            let mut state = current.clone();
             state.requested_version = body.service.version.clone();
+            // No application-upgrade table entry in this bounded profile.
+            // Creation uses THIS resent request, not the old retained description.
             state.body = Arc::new(create_body(body.clone()));
             state.phase = Phase::Opening;
             state.open_token = work.id;
@@ -353,32 +346,40 @@ pub(super) fn add_existing(
             state.fm_stage = FmStage::None;
             state.retry_attempts = 0;
             state.open_failures = 0;
+            state.registration_failures = 0;
+            state.registration_warning = false;
+            state.close_failures = 0;
+            state.close_warning = false;
+            state.service_description_pending = false;
             state.usage = None;
             state.last_retry_error = 0;
-            let effects = vec![Effect::Open {
+            effects.push(Effect::Open {
                 token: work.id,
                 lookup: 0,
                 body: state.body.clone(),
                 usage: None,
-            }];
+            });
             return Ok(changed(state, effects, true));
         }
 
-        let mut effects = Vec::new();
-        if !current.local_deleted {
-            effects.push(Effect::ReplicaUp(Box::new(report(current))));
+        if !state.local_deleted {
+            effects.push(Effect::ReplicaUp(Box::new(report(&state))));
         }
-        if body.replica.instance < current.body.replica.instance {
+        if body.replica.instance < state.body.replica.instance {
             let mut reply_body = body.clone();
-            reply_body.unit = current.body.unit.clone();
+            reply_body.unit = state.body.unit.clone();
             effects.push(reply(&reply_body, STALE_REQUEST));
         }
-        Ok(Transition {
+    }
+    Ok(if durable {
+        changed(state, effects, true)
+    } else {
+        Transition {
             update: Update::None,
             effects,
             disposition: Disposition::Applied,
-        })
-    })())
+        }
+    })
 }
 
 /// StartCreateLocalReplica + InternalSetServiceDescription share this
@@ -452,6 +453,7 @@ pub(super) fn transition(
                 registration_warning: false,
                 fm_stage: FmStage::None,
                 report_sequence: 0,
+                service_description_pending: false,
                 registration_lookups: BTreeMap::new(),
             });
             let mut durable = current.is_none();
@@ -758,12 +760,11 @@ pub(super) fn transition(
             if replica.id != current.body.replica.id {
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             }
-            if info.service != current.body.service {
-                return Err(Failure::Unsupported(
-                    "ack service-description update is disabled",
-                ));
-            }
             let mut state = current.clone();
+            let mut effects = Vec::new();
+            // Same directly required helper as Add. Delayed acknowledgments may
+            // carry an older description; ineligible update is not ack rejection.
+            let description_changed = description::update(&mut state, &info.service, &mut effects);
             if (state.fm_stage == FmStage::ReplicaDropped && replica.state == 3)
                 || (state.fm_stage == FmStage::ReplicaDown
                     && !replica.up
@@ -771,7 +772,6 @@ pub(super) fn transition(
             {
                 state.fm_stage = FmStage::None;
             }
-            let mut effects = Vec::new();
             let before = state.clone();
             let started = if dropped {
                 start_close(&mut state, CloseMode::ForceDelete, work.id, &mut effects)
@@ -780,7 +780,7 @@ pub(super) fn transition(
             } else {
                 false
             };
-            let durable = started && state != before;
+            let durable = description_changed || (started && state != before);
             Ok(changed(state, effects, durable))
         }
         _ => unreachable!("non-lifecycle command"),

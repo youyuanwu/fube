@@ -556,8 +556,7 @@ async fn memory_only_retry_never_inserts_or_writes_and_retryable_error_is_not_su
 }
 
 #[tokio::test]
-async fn stale_identity_epoch_source_generation_and_unsupported_replacement_never_open_or_succeed()
-{
+async fn pending_add_precedes_staleness_while_outer_profile_session_checks_remain() {
     let (store, executor, _) = setup(WAIT).await;
     let request = body(1);
     let first = executor.submit(add(request.clone())).unwrap();
@@ -567,7 +566,7 @@ async fn stale_identity_epoch_source_generation_and_unsupported_replacement_neve
     stale.unit.current.configuration -= 1;
     assert_eq!(
         executor.submit(add(stale)).unwrap().wait(WAIT).await,
-        Ok(Disposition::IgnoredStale)
+        Ok(Disposition::IgnoredPending)
     );
     let mut stale_instance = request.clone();
     stale_instance.replica.instance -= 1;
@@ -577,7 +576,7 @@ async fn stale_identity_epoch_source_generation_and_unsupported_replacement_neve
             .unwrap()
             .wait(WAIT)
             .await,
-        Ok(Disposition::IgnoredStale)
+        Ok(Disposition::IgnoredPending)
     );
     let mut wrong_node = request.clone();
     wrong_node.replica.node.instance += 1;
@@ -593,10 +592,10 @@ async fn stale_identity_epoch_source_generation_and_unsupported_replacement_neve
     ));
     let mut replacement = request.clone();
     replacement.replica.id += 1;
-    assert!(matches!(
+    assert_eq!(
         executor.submit(add(replacement)).unwrap().wait(WAIT).await,
-        Err(Failure::Unsupported(_))
-    ));
+        Ok(Disposition::IgnoredPending)
+    );
     let mut unsupported = request.clone();
     unsupported.service.stateful = true;
     assert!(matches!(
@@ -1446,6 +1445,959 @@ async fn native_closed_add_reports_then_stale_reply_and_tombstone_equal_suppress
     run(&executor, add(older)).await;
     assert!(matches!(effects(&executor).as_slice(), [Effect::Reply(r)] if r.error==STALE_REQUEST));
     finish(&store, &executor).await;
+}
+
+// Replacement combinations below are processor/consumer-derived stateless
+// scenarios, not executions/translations of a named native replacement test.
+// Direct native constituents: Test.StateMachine.cpp:3552–3604 (SL staleness and
+// transitioning); ReplicaLifecycle.cpp:1747–1761,1914–1929 (shared Drop helper);
+// UpdateServiceDescription.cpp:393–485,529–590 (shared description helper).
+#[tokio::test]
+async fn native_replacement_drops_old_identity_and_recreates_only_from_fm_resend() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    let request = body(1);
+    let token = make_ready(&executor, &request).await;
+    let ready = state(&executor);
+    let old_registration = ready.runtime.clone().unwrap();
+    let old_usage = ready.usage.unwrap();
+    let mut replace = request.clone();
+    replace.replica.id += 1;
+    replace.unit.current.configuration += 10;
+    // Equal instance is enough to start Drop, but not enough to recreate.
+    run(&executor, add(replace.clone())).await;
+    assert_eq!(state(&executor).close_mode, Some(CloseMode::Drop));
+    assert_eq!(state(&executor).body.unit, ready.body.unit);
+    assert_eq!(state(&executor).body.replica.id, request.replica.id);
+    assert_eq!(state(&executor).runtime, ready.runtime);
+    assert_eq!(state(&executor).usage, ready.usage);
+    assert!(!state(&executor).local_deleted);
+    assert_close(&effects(&executor), 8, &state(&executor));
+    let writes = operations(&hooks).len();
+    replace.replica.instance += 1;
+    replace.service.update_version = 100;
+    assert_eq!(
+        run(&executor, add(replace.clone())).await,
+        Disposition::IgnoredPending
+    );
+    assert_eq!(
+        run(
+            &executor,
+            Command::CompleteOpen(Box::new(complete(&request, token)))
+        )
+        .await,
+        Disposition::IgnoredStale
+    );
+    assert_eq!(operations(&hooks).len(), writes);
+    assert!(effects(&executor).is_empty());
+    let late_close = close_completion(&executor, 0);
+    close_done(&executor, 0).await;
+    assert_eq!(state(&executor).phase, Phase::Closed);
+    assert_eq!(state(&executor).fm_stage, FmStage::ReplicaDropped);
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::ReleaseRegistration(r), Effect::ReleaseUsage { acquisition },
+         Effect::RequestReportRetry, Effect::Health(HealthEvent::Close)]
+         if *r == old_registration && *acquisition == old_usage
+    ));
+    run(&executor, Command::RetryOpen(request.unit.id.clone())).await;
+    assert!(effects(&executor).is_empty()); // no retained request or automatic Open
+    let mut equal_instance = replace.clone();
+    equal_instance.replica.instance = request.replica.instance;
+    run(&executor, add(equal_instance)).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::ReplicaUp(_)]
+    ));
+    run(&executor, Command::RetryReport(request.unit.id.clone())).await;
+    let Effect::ReplicaUp(old_report) = effects(&executor).remove(0) else {
+        panic!("dropped report");
+    };
+    // No dropped acknowledgment prerequisite; creation uses THIS lower-ID,
+    // greater-instance request and even a lower description update version.
+    replace.replica.id = request.replica.id - 1;
+    replace.service.update_version = 1;
+    replace.service.target = 9;
+    replace.unit.previous.configuration = 99;
+    let created = executor.submit(add(replace.clone())).unwrap();
+    created.wait(WAIT).await.unwrap();
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::Open { .. }]
+    ));
+    assert_eq!(state(&executor).body.replica.id, replace.replica.id);
+    assert_eq!(state(&executor).body.unit.current, replace.unit.current);
+    assert_eq!(state(&executor).body.unit.previous, Epoch::default());
+    assert_eq!(state(&executor).body.service, replace.service);
+    assert_eq!(state(&executor).body.unit.target, 9);
+    assert_eq!(state(&executor).fm_stage, FmStage::None);
+    assert!(state(&executor).runtime.is_none());
+    assert!(state(&executor).usage.is_none());
+    assert_eq!(
+        run(&executor, Command::CompleteClose(Box::new(late_close))).await,
+        Disposition::IgnoredStale
+    );
+    assert_eq!(
+        run(
+            &executor,
+            Command::CompleteOpen(Box::new(complete(&request, token)))
+        )
+        .await,
+        Disposition::IgnoredStale
+    );
+    run(&executor, ack(*old_report, false)).await; // old replica ID cannot delete new one
+    assert_eq!(state(&executor).phase, Phase::Opening);
+    assert!(effects(&executor).is_empty());
+    registered(&executor, &replace, created.id).await;
+    run(
+        &executor,
+        Command::CompleteOpen(Box::new(complete(&replace, created.id))),
+    )
+    .await;
+    assert!(matches!(effects(&executor).as_slice(), [Effect::Reply(r)]
+        if r.error==0 && r.replica.id==replace.replica.id
+        && r.replica.instance==replace.replica.instance));
+    assert_ne!(
+        state(&executor).runtime.as_ref().unwrap().acquisition,
+        old_registration.acquisition
+    );
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn native_ready_add_identity_epoch_matrix_has_no_independent_lower_id_guard() {
+    // RA.cpp:1660–1687; entity traits:253–275.
+    for case in 0..6 {
+        let (store, executor, hooks) = setup(WAIT).await;
+        let request = body(1);
+        make_ready(&executor, &request).await;
+        let old = state(&executor);
+        let writes = operations(&hooks).len();
+        let mut incoming = request.clone();
+        incoming.unit.current.configuration += 1;
+        match case {
+            0 => incoming.unit.current.configuration = 0,
+            1 => {
+                incoming.replica.id += 1;
+                incoming.replica.instance -= 1;
+            }
+            2 => incoming.replica.id -= 1,
+            3 => {
+                incoming.replica.id -= 1;
+                incoming.replica.instance += 1;
+            }
+            4 => incoming.replica.instance += 1,
+            5 => incoming.replica.id += 1,
+            _ => unreachable!(),
+        }
+        let result = executor.submit(add(incoming)).unwrap().wait(WAIT).await;
+        match case {
+            0 | 1 => assert_eq!(result, Ok(Disposition::IgnoredStale)),
+            4 => assert!(matches!(result, Err(Failure::Admission(_)))),
+            _ => assert_eq!(result, Ok(Disposition::Applied)),
+        }
+        let actions = effects(&executor);
+        match case {
+            2 => assert!(matches!(actions.as_slice(), [Effect::Reply(r)]
+                if r.unit==old.body.unit && r.replica==old.body.replica)),
+            5 => {
+                assert_close(&actions, 8, &state(&executor));
+                assert_eq!(state(&executor).body.unit.current, old.body.unit.current);
+            }
+            _ => assert!(actions.is_empty()),
+        }
+        if case != 5 {
+            assert!(Arc::ptr_eq(&old, &state(&executor)));
+            assert_eq!(operations(&hooks).len(), writes);
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+fn description_completion(executor: &Executor) -> ServiceDescriptionCompletion {
+    let current = state(executor);
+    ServiceDescriptionCompletion {
+        error: 0,
+        unit: current.body.unit.clone(),
+        replica: current.body.replica.clone(),
+        service: current.body.service.clone(),
+    }
+}
+
+#[tokio::test]
+async fn native_add_description_update_precedes_drop_or_duplicate_and_preserves_owned_keys() {
+    // FT.cpp:5862–5973; RA.cpp:1660–1684. Key changes are deliberately NOT
+    // extra helper rejection predicates; opaque acquired refs remain exact.
+    for dropping in [false, true] {
+        let (store, executor, hooks) = setup(WAIT).await;
+        let request = body(1);
+        make_ready(&executor, &request).await;
+        let old = state(&executor);
+        let mut incoming = request.clone();
+        incoming.service.update_version = 2;
+        incoming.service.version.instance += 7;
+        incoming.replica.version = incoming.service.version.clone();
+        incoming.service.target = 5;
+        incoming.service.minimum = 2;
+        incoming.service.service_type.name = "ChangedType".into();
+        incoming.service.service_type.package.name = "ChangedPackage".into();
+        incoming.service.activation_mode = 1;
+        incoming.service.constraints = "NodeType == Blue".into();
+        incoming.unit.current.configuration += 1;
+        if dropping {
+            incoming.replica.id += 1;
+        }
+        let (entered, release) = hooks.pause(false);
+        let ticket = executor.submit(add(incoming.clone())).unwrap();
+        entered.await.unwrap();
+        assert!(Arc::ptr_eq(&old, &state(&executor)));
+        assert!(effects(&executor).is_empty());
+        release.send(()).unwrap();
+        ticket.wait(WAIT).await.unwrap();
+        let current = state(&executor);
+        assert_eq!(current.body.service.update_version, 2);
+        assert_eq!(current.body.service.version, old.body.service.version);
+        assert_eq!(current.body.replica.version, old.body.replica.version);
+        assert_eq!(
+            current.body.service.service_type,
+            incoming.service.service_type
+        );
+        assert_eq!(current.body.service.activation_mode, 1);
+        assert_eq!(
+            (current.body.unit.target, current.body.unit.minimum),
+            (5, 2)
+        );
+        assert_eq!(current.body.unit.current, old.body.unit.current);
+        assert_eq!(current.runtime, old.runtime);
+        assert_eq!(current.usage, old.usage);
+        assert_eq!(
+            executor.service_types()[0].info.versioned.id,
+            old.runtime.as_ref().unwrap().service_type
+        );
+        let actions = effects(&executor);
+        let [Effect::UpdateServiceDescription {
+            body: captured,
+            registration,
+        }, second] = actions.as_slice()
+        else {
+            panic!("update before lifecycle effect: {actions:?}");
+        };
+        assert_eq!(captured.service, current.body.service);
+        assert_eq!(captured.replica.state, 2); // captured BEFORE Drop's InDrop
+        assert_eq!(Some(registration), old.runtime.as_ref());
+        if dropping {
+            assert!(matches!(second, Effect::Close { .. }));
+            assert!(!current.service_description_pending);
+            run(
+                &executor,
+                Command::RetryServiceDescription(request.unit.id.clone()),
+            )
+            .await;
+            assert!(effects(&executor).is_empty());
+            close_done(&executor, 0).await;
+            let cleanup = effects(&executor);
+            assert!(matches!(cleanup.as_slice(),
+                [Effect::ReleaseRegistration(r), Effect::ReleaseUsage { acquisition },
+                 Effect::RequestReportRetry, Effect::Health(HealthEvent::Close)]
+                 if Some(r)==old.runtime.as_ref() && Some(*acquisition)==old.usage));
+            assert!(executor.service_types().is_empty());
+        } else {
+            assert!(matches!(second, Effect::Reply(r)
+                if r.replica==old.body.replica && r.unit==current.body.unit && r.error==0));
+            assert!(current.service_description_pending); // success does NOT wait for RAP ack
+            run(
+                &executor,
+                Command::RetryServiceDescription(request.unit.id.clone()),
+            )
+            .await;
+            assert!(
+                matches!(effects(&executor).as_slice(), [Effect::UpdateServiceDescription { body, .. }]
+                if body==captured)
+            );
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn native_ineligible_description_is_helper_noop_not_add_rejection() {
+    // FT.cpp:5862–5883; Add ignores helper's false return, RA.cpp:1660–1684.
+    for case in 0..4 {
+        let (store, executor, _) = setup(WAIT).await;
+        let request = body(1);
+        make_ready(&executor, &request).await;
+        let old = state(&executor);
+        let mut incoming = request;
+        incoming.service.update_version = 2;
+        incoming.service.target = 8;
+        match case {
+            0 => incoming.service.name.push_str("/other"),
+            1 => incoming.service.instance += 1,
+            2 => incoming.service.update_version = 0,
+            3 => incoming.service.name = incoming.service.name.to_uppercase(), // exact name
+            _ => unreachable!(),
+        }
+        incoming.replica.id += 1;
+        run(&executor, add(incoming)).await;
+        assert_eq!(state(&executor).body.service, old.body.service);
+        assert!(!state(&executor).service_description_pending);
+        assert_close(&effects(&executor), 8, &state(&executor));
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn native_raw_description_reply_guards_retry_and_higher_version_diagnostic() {
+    // FT.cpp:5660–5699; generic IPC entity traits:281–410.
+    for higher in [false, true] {
+        let (store, executor, hooks) = setup(WAIT).await;
+        let request = body(1);
+        make_ready(&executor, &request).await;
+        let mut update = request.clone();
+        update.service.update_version = 5;
+        run(&executor, add(update)).await;
+        effects(&executor);
+        let writes = operations(&hooks).len();
+        let raw = description_completion(&executor);
+        for case in 0..5 {
+            let mut bad = raw.clone();
+            match case {
+                0 => bad.error = -1,
+                1 => bad.replica.id += 1,
+                2 => bad.replica.instance -= 1,
+                3 => bad.unit.current.configuration -= 1,
+                4 => bad.service.update_version -= 1,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                run(
+                    &executor,
+                    Command::CompleteServiceDescription(Box::new(bad))
+                )
+                .await,
+                Disposition::IgnoredStale
+            );
+            assert!(state(&executor).service_description_pending);
+            assert!(effects(&executor).is_empty());
+        }
+        run(
+            &executor,
+            Command::RetryServiceDescription(request.unit.id.clone()),
+        )
+        .await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::UpdateServiceDescription { .. }]
+        ));
+        assert!(state(&executor).service_description_pending);
+        let mut accepted = raw;
+        if higher {
+            accepted.service.update_version += 1;
+        }
+        accepted.replica.node = NodeInstance::default();
+        accepted.replica.version = VersionInstance::invalid();
+        accepted.service.name = "not-compared-in-reply".into();
+        accepted.service.service_type.name = "not-compared-in-reply".into();
+        accepted.unit.current.configuration += 1;
+        let old_body = state(&executor).body.clone();
+        run(
+            &executor,
+            Command::CompleteServiceDescription(Box::new(accepted.clone())),
+        )
+        .await;
+        assert!(!state(&executor).service_description_pending);
+        assert_eq!(state(&executor).body, old_body); // no copying reply description
+        assert_eq!(operations(&hooks).len(), writes); // flag clear is memory-only
+        assert_eq!(
+            run(
+                &executor,
+                Command::CompleteServiceDescription(Box::new(accepted))
+            )
+            .await,
+            Disposition::IgnoredStale
+        );
+        run(
+            &executor,
+            Command::RetryServiceDescription(request.unit.id.clone()),
+        )
+        .await;
+        assert!(effects(&executor).is_empty());
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn native_replacement_host_crash_and_late_replies_do_not_replay_add() {
+    // Shared helper-derived SL scenario: RA.cpp:1138–1181,671–706.
+    for during_close in [false, true] {
+        let (store, executor, _) = setup(WAIT).await;
+        let request = body(1);
+        let token = make_ready(&executor, &request).await;
+        let mut incoming = request.clone();
+        incoming.replica.id += 1;
+        incoming.replica.instance += 1;
+        if during_close {
+            run(&executor, add(incoming.clone())).await;
+            effects(&executor);
+        }
+        let late = CloseCompletion {
+            unit: request.unit.clone(),
+            replica: request.replica.clone(),
+            error: 0,
+        };
+        run(
+            &executor,
+            Command::HostDown(Box::new(HostDown {
+                unit: request.unit.id.clone(),
+                host: registration().host,
+            })),
+        )
+        .await;
+        assert_eq!(state(&executor).phase, Phase::Closed);
+        assert_eq!(state(&executor).fm_stage, FmStage::ReplicaDown);
+        let actions = effects(&executor);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|e| matches!(e, Effect::ReleaseRegistration(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|e| matches!(e, Effect::ReleaseUsage { .. }))
+                .count(),
+            1
+        );
+        assert!(actions.iter().all(|e| !matches!(
+            e,
+            Effect::Reply(_) | Effect::RemoveReply(_) | Effect::Open { .. }
+        )));
+        assert_eq!(
+            run(&executor, Command::CompleteClose(Box::new(late))).await,
+            Disposition::IgnoredStale
+        );
+        assert_eq!(
+            run(
+                &executor,
+                Command::CompleteOpen(Box::new(complete(&request, token)))
+            )
+            .await,
+            Disposition::IgnoredStale
+        );
+        assert!(effects(&executor).is_empty());
+        run(&executor, add(incoming)).await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::Open { .. }]
+        ));
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn native_replacement_close_failures_use_drop_retry_and_forceabort_not_delete_reply() {
+    let (store, executor, _) = setup(WAIT).await;
+    let request = body(1);
+    make_ready(&executor, &request).await;
+    executor
+        .config()
+        .set(RetryState::Closing, Threshold::Warning, 1);
+    executor
+        .config()
+        .set(RetryState::Closing, Threshold::Drop, 2);
+    let mut incoming = request.clone();
+    incoming.replica.id += 1;
+    run(&executor, add(incoming)).await;
+    effects(&executor);
+    close_done(&executor, -123).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::Health(HealthEvent::CloseWarning)]
+    ));
+    run(&executor, Command::RetryClose(request.unit.id.clone())).await;
+    assert_close(&effects(&executor), 8, &state(&executor));
+    close_done(&executor, -123).await;
+    assert_eq!(state(&executor).close_mode, Some(CloseMode::ForceAbort));
+    assert!(effects(&executor).is_empty());
+    run(&executor, Command::RetryClose(request.unit.id.clone())).await;
+    assert_close(&effects(&executor), 4, &state(&executor));
+    close_done(&executor, 0).await;
+    assert_eq!(state(&executor).phase, Phase::Closed);
+    assert!(!state(&executor).local_deleted);
+    assert_eq!(state(&executor).fm_stage, FmStage::ReplicaDropped);
+    assert!(effects(&executor).iter().all(|e| !matches!(
+        e,
+        Effect::Reply(_) | Effect::RemoveReply(_) | Effect::Open { .. }
+    )));
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn replacement_private_proposal_definite_and_unknown_outcomes_keep_original_work() {
+    // Rust fault injection, not a native scenario or new store algorithm.
+    for dropping in [false, true] {
+        for (unknown, fail) in [(false, true), (true, false), (true, true)] {
+            let (store, executor, hooks) = setup(if unknown {
+                Duration::from_millis(50)
+            } else {
+                WAIT
+            })
+            .await;
+            let request = body(1);
+            make_ready(&executor, &request).await;
+            let old = state(&executor);
+            let writes = operations(&hooks).len();
+            let mut incoming = request.clone();
+            incoming.service.update_version = 3;
+            incoming.service.target = 8;
+            if dropping {
+                incoming.replica.id += 1;
+            }
+            let (entered, release) = hooks.pause(fail);
+            let ticket = executor.submit(add(incoming)).unwrap();
+            entered.await.unwrap();
+            assert!(Arc::ptr_eq(&old, &state(&executor)));
+            assert!(effects(&executor).is_empty());
+            assert_eq!(executor.service_types()[0].references, 1);
+            if unknown {
+                assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+                tokio::time::timeout(WAIT, async {
+                    while store.stats().lifecycle != fube_ra_store::Lifecycle::Fenced {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                executor
+                    .config()
+                    .set(RetryState::Closing, Threshold::Drop, -1);
+                assert!(executor.snapshot([1; 16]).fenced);
+                assert!(Arc::ptr_eq(&old, &state(&executor)));
+            }
+            assert_eq!(operations(&hooks).len(), writes + 1);
+            release.send(()).unwrap();
+            let result = ticket.resolve(WAIT).await;
+            if fail {
+                assert!(matches!(result, Err(Failure::Store(_))));
+                assert!(Arc::ptr_eq(&old, &state(&executor)));
+                assert!(effects(&executor).is_empty());
+            } else {
+                assert_eq!(result, Ok(Disposition::Applied));
+                let current = state(&executor);
+                assert_eq!(current.body.service.update_version, 3);
+                assert_eq!(current.body.unit.target, 8);
+                let actions = executor.take_effects();
+                assert_eq!(actions.len(), 2);
+                assert!(actions.iter().all(|e| e.operation == ticket.id));
+                assert!(matches!(
+                    actions[0].effect,
+                    Effect::UpdateServiceDescription { .. }
+                ));
+                if dropping {
+                    assert_eq!(current.close_mode, Some(CloseMode::Drop));
+                    assert!(matches!(actions[1].effect, Effect::Close { flags: 8, .. }));
+                } else {
+                    assert!(current.service_description_pending);
+                    assert!(matches!(actions[1].effect, Effect::Reply(_)));
+                }
+            }
+            assert_eq!(operations(&hooks).len(), writes + 1); // never resubmitted
+            finish(&store, &executor).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn queued_replacement_add_uses_state_after_predecessor_commit_not_arrival_snapshot() {
+    for finish_open in [false, true] {
+        let (store, executor, hooks) = setup(WAIT).await;
+        let request = body(1);
+        let initial = executor.submit(add(request.clone())).unwrap();
+        initial.wait(WAIT).await.unwrap();
+        effects(&executor);
+        registered(&executor, &request, initial.id).await;
+        if !finish_open {
+            run(
+                &executor,
+                Command::CompleteOpen(Box::new(complete(&request, initial.id))),
+            )
+            .await;
+            effects(&executor);
+            let mut replace = request.clone();
+            replace.replica.id += 1;
+            run(&executor, add(replace)).await;
+            effects(&executor);
+        }
+        let old = state(&executor);
+        let (entered, release) = hooks.pause(false);
+        let predecessor = executor
+            .submit(if finish_open {
+                Command::CompleteOpen(Box::new(complete(&request, initial.id)))
+            } else {
+                Command::CompleteClose(Box::new(close_completion(&executor, 0)))
+            })
+            .unwrap();
+        entered.await.unwrap();
+        let mut next = request.clone();
+        next.replica.id += 2;
+        next.replica.instance += 1;
+        let queued = executor.submit(add(next)).unwrap();
+        assert_eq!(queued.status(), Status::Pending);
+        assert!(Arc::ptr_eq(&old, &state(&executor)));
+        release.send(()).unwrap();
+        predecessor.wait(WAIT).await.unwrap();
+        queued.wait(WAIT).await.unwrap();
+        let actions = executor.take_effects();
+        let queued_actions: Vec<_> = actions
+            .iter()
+            .filter(|d| d.operation == queued.id)
+            .collect();
+        assert_eq!(queued_actions.len(), 1);
+        if finish_open {
+            assert_eq!(state(&executor).phase, Phase::Closing);
+            assert!(matches!(queued_actions[0].effect, Effect::Close { .. }));
+        } else {
+            assert_eq!(state(&executor).phase, Phase::Opening);
+            assert!(matches!(queued_actions[0].effect, Effect::Open { .. }));
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn description_update_and_replacement_use_two_reserved_effects_without_hidden_growth() {
+    // Rust capacity bookkeeping: maximum Add effects remains two. Ready owns a
+    // runtime, so Drop cannot synchronously dispose its resources in this slice.
+    let store = Store::new(MemoryBackend::new(), StoreSettings::default())
+        .await
+        .unwrap();
+    let executor = Executor::new(
+        Arc::new(store.clone()),
+        admission(),
+        Settings {
+            max_effects: 8, // Registered uses the existing lifecycle reservation.
+            ..Settings::default()
+        },
+    )
+    .unwrap();
+    let request = body(1);
+    make_ready(&executor, &request).await;
+    // Retain six independently owned Open effects, leaving exactly two slots.
+    for id in 2..8 {
+        run(&executor, add(body(id))).await;
+    }
+    let mut next = request.clone();
+    next.service.update_version = 1;
+    next.replica.id += 1;
+    run(&executor, add(next)).await;
+    assert_eq!(executor.statistics().effects, 8);
+    assert!(matches!(
+        executor.submit(add(request)),
+        Err(Failure::Capacity)
+    ));
+    let actions = effects(&executor).split_off(6);
+    assert!(matches!(
+        actions.as_slice(),
+        [
+            Effect::UpdateServiceDescription { .. },
+            Effect::Close { .. }
+        ]
+    ));
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn native_one_ft_ack_reuses_description_helper_and_ignores_old_description_not_ack() {
+    // Actual consumer RA.cpp:3334–3418. Required when Add changes retained SD
+    // after a dropped report was captured; no full-upload support is enabled.
+    let (store, executor, _) = setup(WAIT).await;
+    let request = body(1);
+    make_ready(&executor, &request).await;
+    let mut greater = request.clone();
+    greater.replica.id += 1;
+    run(&executor, add(greater)).await;
+    effects(&executor);
+    close_done(&executor, 0).await;
+    effects(&executor);
+    run(&executor, Command::RetryReport(request.unit.id.clone())).await;
+    let Effect::ReplicaUp(report) = effects(&executor).remove(0) else {
+        panic!("report");
+    };
+    let mut equal = request.clone();
+    equal.service.update_version = 4;
+    equal.service.target = 6;
+    run(&executor, add(equal)).await;
+    effects(&executor);
+    assert_eq!(state(&executor).body.service.update_version, 4);
+    run(&executor, ack(*report, false)).await;
+    assert_eq!(state(&executor).fm_stage, FmStage::None);
+    assert!(state(&executor).local_deleted);
+    assert_eq!(state(&executor).body.service.update_version, 4);
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::RemoveReply(_)]
+    ));
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn native_opening_replacement_is_ignored_before_after_registration_and_host_crash() {
+    // Direct SL transitioning constituent: Test.StateMachine.cpp:3592–3604;
+    // shared opening-host-loss helper: RA.cpp:1138–1160, FT.cpp:5258–5279.
+    let (store, executor, _) = setup(WAIT).await;
+    let request = body(1);
+    let initial = executor.submit(add(request.clone())).unwrap();
+    initial.wait(WAIT).await.unwrap();
+    effects(&executor);
+    let mut incoming = request.clone();
+    incoming.replica.id += 1;
+    incoming.replica.instance += 1;
+    incoming.service.update_version = 9;
+    incoming.service.target = 9;
+    assert_eq!(
+        run(&executor, add(incoming.clone())).await,
+        Disposition::IgnoredPending
+    );
+    assert_eq!(state(&executor).body.service, request.service);
+    registered(&executor, &request, initial.id).await;
+    assert_eq!(
+        run(&executor, add(incoming.clone())).await,
+        Disposition::IgnoredPending
+    );
+    assert!(effects(&executor).is_empty());
+    let usage = state(&executor).usage;
+    run(
+        &executor,
+        Command::HostDown(Box::new(HostDown {
+            unit: request.unit.id.clone(),
+            host: registration().host,
+        })),
+    )
+    .await;
+    assert_eq!(state(&executor).phase, Phase::Opening);
+    assert_eq!(state(&executor).usage, usage);
+    assert!(state(&executor).runtime.is_none());
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::ReleaseRegistration(_)]
+    ));
+    assert_eq!(
+        run(&executor, add(incoming)).await,
+        Disposition::IgnoredPending
+    );
+    assert_eq!(state(&executor).body.service, request.service);
+    assert!(effects(&executor).is_empty());
+    run(&executor, Command::RetryOpen(request.unit.id)).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::Open { usage: retained, .. }]
+        if *retained==usage)
+    );
+    finish(&store, &executor).await;
+}
+
+fn description_ack(executor: &Executor, update: u64) -> Command {
+    let current = state(executor);
+    let mut service = current.body.service.clone();
+    service.update_version = update;
+    service.target += 1;
+    let mut report = ReplicaUp::default();
+    report.dropped.0.push(FailoverUnitInfo {
+        service,
+        unit: current.body.unit.clone(),
+        replicas: fube_transport::serialization::serde::ObjectArray(vec![ReplicaInfo {
+            description: current.body.replica.clone(),
+            intermediate_role: 1,
+        }]),
+        ..FailoverUnitInfo::default()
+    });
+    ack(report, false)
+}
+
+#[tokio::test]
+async fn native_pending_description_survives_opening_host_loss_but_actual_send_requires_runtime() {
+    // Existing one-FT ack consumer RA.cpp:3334–3353; pending/retry helper plus
+    // ACTUAL send consumer RA.cpp:3582–3614 (null STR silently suppresses send).
+    // This is a shared-helper-derived scenario, not new all-message support.
+    for terminal in [false, true] {
+        let (store, executor, _) = setup(WAIT).await;
+        let request = body(1);
+        let initial = executor.submit(add(request.clone())).unwrap();
+        initial.wait(WAIT).await.unwrap();
+        effects(&executor);
+        registered(&executor, &request, initial.id).await;
+        run(&executor, description_ack(&executor, 2)).await;
+        assert!(state(&executor).service_description_pending);
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::UpdateServiceDescription { .. }]
+        ));
+        let late = description_completion(&executor);
+        assert_eq!(
+            run(
+                &executor,
+                Command::CompleteServiceDescription(Box::new(late))
+            )
+            .await,
+            Disposition::IgnoredStale
+        ); // generic IPC excludes Opening
+        if terminal {
+            executor
+                .config()
+                .set(RetryState::Opening, Threshold::Drop, 1);
+        }
+        run(
+            &executor,
+            Command::HostDown(Box::new(HostDown {
+                unit: request.unit.id.clone(),
+                host: registration().host,
+            })),
+        )
+        .await;
+        effects(&executor);
+        assert_eq!(state(&executor).service_description_pending, !terminal);
+        run(
+            &executor,
+            Command::RetryServiceDescription(request.unit.id.clone()),
+        )
+        .await;
+        assert!(effects(&executor).is_empty()); // no fabricated runtime / panic
+        if !terminal {
+            run(&executor, Command::RetryOpen(request.unit.id.clone())).await;
+            effects(&executor);
+            let current = state(&executor).body.clone();
+            registered(&executor, &current, initial.id).await;
+            run(
+                &executor,
+                Command::RetryServiceDescription(request.unit.id.clone()),
+            )
+            .await;
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::UpdateServiceDescription { .. }]
+            ));
+            run(
+                &executor,
+                Command::CompleteOpen(Box::new(complete(&current, initial.id))),
+            )
+            .await;
+            effects(&executor);
+            let accepted = description_completion(&executor);
+            run(
+                &executor,
+                Command::CompleteServiceDescription(Box::new(accepted.clone())),
+            )
+            .await;
+            assert!(!state(&executor).service_description_pending);
+            let mut replace = request.clone();
+            replace.replica.id += 1;
+            run(&executor, add(replace)).await;
+            effects(&executor);
+            assert_eq!(
+                run(
+                    &executor,
+                    Command::CompleteServiceDescription(Box::new(accepted.clone()))
+                )
+                .await,
+                Disposition::IgnoredStale
+            );
+            close_done(&executor, 0).await;
+            effects(&executor);
+            assert_eq!(
+                run(
+                    &executor,
+                    Command::CompleteServiceDescription(Box::new(accepted))
+                )
+                .await,
+                Disposition::IgnoredStale
+            );
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn replacement_close_and_recreation_store_failures_keep_resources_and_proposals_private() {
+    // Rust-only failures in the existing P1 path, now reached via native Drop.
+    for recreating in [false, true] {
+        for (unknown, fail) in [(false, true), (true, false), (true, true)] {
+            let (store, executor, hooks) = setup(if unknown {
+                Duration::from_millis(50)
+            } else {
+                WAIT
+            })
+            .await;
+            let request = body(1);
+            make_ready(&executor, &request).await;
+            let mut next = request.clone();
+            next.replica.id += 1;
+            next.replica.instance += 1;
+            run(&executor, add(next.clone())).await;
+            effects(&executor);
+            if recreating {
+                close_done(&executor, 0).await;
+                effects(&executor);
+            }
+            let old = state(&executor);
+            let node_before = executor.service_types();
+            let writes = operations(&hooks).len();
+            let command = if recreating {
+                add(next)
+            } else {
+                Command::CompleteClose(Box::new(close_completion(&executor, 0)))
+            };
+            let (entered, release) = hooks.pause(fail);
+            let ticket = executor.submit(command).unwrap();
+            entered.await.unwrap();
+            assert!(Arc::ptr_eq(&old, &state(&executor)));
+            assert_eq!(executor.service_types(), node_before);
+            assert!(effects(&executor).is_empty());
+            if unknown {
+                assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+                tokio::time::timeout(WAIT, async {
+                    while store.stats().lifecycle != fube_ra_store::Lifecycle::Fenced {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(Arc::ptr_eq(&old, &state(&executor)));
+                assert_eq!(executor.service_types(), node_before);
+                assert!(effects(&executor).is_empty());
+            }
+            release.send(()).unwrap();
+            let outcome = ticket.resolve(WAIT).await;
+            if fail {
+                assert!(matches!(outcome, Err(Failure::Store(_))));
+                assert!(Arc::ptr_eq(&old, &state(&executor)));
+                assert_eq!(executor.service_types(), node_before);
+                assert!(effects(&executor).is_empty());
+            } else {
+                assert_eq!(outcome, Ok(Disposition::Applied));
+                if recreating {
+                    assert_eq!(state(&executor).phase, Phase::Opening);
+                    assert!(matches!(
+                        effects(&executor).as_slice(),
+                        [Effect::Open { .. }]
+                    ));
+                } else {
+                    assert_eq!(state(&executor).phase, Phase::Closed);
+                    assert!(executor.service_types().is_empty());
+                    assert!(matches!(
+                        effects(&executor).as_slice(),
+                        [
+                            Effect::ReleaseRegistration(_),
+                            Effect::ReleaseUsage { .. },
+                            Effect::RequestReportRetry,
+                            Effect::Health(HealthEvent::Close)
+                        ]
+                    ));
+                }
+            }
+            assert_eq!(operations(&hooks).len(), writes + 1);
+            finish(&store, &executor).await;
+        }
+    }
 }
 
 #[tokio::test]

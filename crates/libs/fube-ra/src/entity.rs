@@ -24,6 +24,9 @@ pub use notification::{
 #[path = "opening.rs"]
 mod opening;
 pub use opening::*;
+#[path = "description.rs"]
+mod description;
+pub use description::ServiceDescriptionCompletion;
 #[path = "config.rs"]
 mod config;
 pub use config::*;
@@ -213,6 +216,9 @@ pub enum Command {
     HostDown(Box<HostDown>),
     RetryClose(PartitionId),
     RetryReport(PartitionId),
+    /// Honor pending Add-carried RAP description work; not an FM replacement retry.
+    RetryServiceDescription(PartitionId),
+    CompleteServiceDescription(Box<ServiceDescriptionCompletion>),
     /// Explicit BGM Request, independent of the periodic retry timer.
     RequestServiceTypeWork,
     /// Honor RequestServiceTypeWork's obligation; capture before simulated send.
@@ -255,6 +261,8 @@ enum Kind {
     HostDown,
     RetryClose,
     RetryReport,
+    RetryServiceDescription,
+    CompleteServiceDescription,
     NotificationRequest,
     NotificationCapture,
     NotificationComplete,
@@ -311,6 +319,8 @@ pub struct EntityState {
     pub registration_warning: bool,
     pub fm_stage: FmStage,
     pub report_sequence: u64,
+    /// Volatile RAP obligation, independent of FM Add reply and cleared by Close.
+    pub service_description_pending: bool,
     /// lookup ID -> (owning lifecycle token, close rather than open lookup).
     /// Consumed once by Registered; callback replay acquires no second reference.
     pub registration_lookups: BTreeMap<u64, (u64, bool)>,
@@ -343,6 +353,12 @@ pub enum Effect {
         body: Arc<AddInstance>,
         registration: RuntimeRegistration,
         flags: i64,
+    },
+    /// Trusted local RAP adapter obligation, NOT an enabled IPC wire codec.
+    /// The captured body remains sendable even if a subsequent Close clears pending.
+    UpdateServiceDescription {
+        body: Arc<AddInstance>,
+        registration: RuntimeRegistration,
     },
     FindRegistration {
         token: u64,
@@ -547,6 +563,14 @@ impl Executor {
             Command::HostDown(body) => (body.unit.guid.0, Kind::HostDown, to_vec(&body)),
             Command::RetryClose(unit) => (unit.guid.0, Kind::RetryClose, to_vec(&unit)),
             Command::RetryReport(unit) => (unit.guid.0, Kind::RetryReport, to_vec(&unit)),
+            Command::RetryServiceDescription(unit) => {
+                (unit.guid.0, Kind::RetryServiceDescription, to_vec(&unit))
+            }
+            Command::CompleteServiceDescription(body) => (
+                body.unit.id.guid.0,
+                Kind::CompleteServiceDescription,
+                to_vec(&body),
+            ),
             Command::RequestServiceTypeWork => ([0; 16], Kind::NotificationRequest, to_vec(&0_u64)),
             Command::CaptureServiceTypeWork { work } => {
                 ([0; 16], Kind::NotificationCapture, to_vec(&work))
@@ -574,8 +598,12 @@ impl Executor {
         // commands may release, clear warnings, report health, schedule FM work
         // and reply. Bounds are checked again before any persistence/effects.
         let reserved_effects = match &kind {
+            // Ready always owns an active runtime in this executor: Add can
+            // capture update + Close (or duplicate reply), but cannot release
+            // resources synchronously. Closed Add reports + stale-replies at most.
             Kind::Add { .. } => 2,
-            Kind::Retry | Kind::RetryReport => 1,
+            Kind::Retry | Kind::RetryReport | Kind::RetryServiceDescription => 1,
+            Kind::CompleteServiceDescription => 0,
             kind if kind.node_work() => 2,
             _ => 8,
         };
@@ -854,7 +882,7 @@ fn transition(
             if generation.number.older_than(&admission.generation) {
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             }
-            if !admission.node_open || !admission.owner_ready || admission.fabric_upgrading {
+            if !admission.node_open || !admission.owner_ready {
                 return Ok(Transition::ignored(Disposition::IgnoredNotReady));
             }
             if body.service.stateful
@@ -871,6 +899,33 @@ fn transition(
                     "not the admitted stateless InBuild package profile",
                 ));
             }
+            // Native locked-entity TCP admission precedes processor prechecks,
+            // description updates and identity decisions. No receipt-time latch.
+            if let Some(current) = state {
+                if matches!(current.phase, Phase::Opening | Phase::Closing) {
+                    return Ok(Transition::ignored(Disposition::IgnoredPending));
+                }
+                if !(current.phase == Phase::Closed && current.local_deleted)
+                    && body.unit.current.older_than(current.body.unit.current)
+                {
+                    return Ok(Transition::ignored(Disposition::IgnoredStale));
+                }
+                if current.phase != Phase::Closed {
+                    if body.replica.instance < current.body.replica.instance {
+                        return Ok(Transition::ignored(Disposition::IgnoredStale));
+                    }
+                    if body.replica.id == current.body.replica.id
+                        && body.replica.instance > current.body.replica.instance
+                    {
+                        return Err(Failure::Admission(
+                            "native impossible newer replica instance",
+                        ));
+                    }
+                }
+            }
+            if admission.fabric_upgrading {
+                return Ok(Transition::ignored(Disposition::IgnoredNotReady));
+            }
             if !admission.node_activated {
                 return Ok(Transition {
                     update: Update::None,
@@ -878,44 +933,10 @@ fn transition(
                     disposition: Disposition::Applied,
                 });
             }
-            let body = lifecycle::create_body(body);
             if let Some(current) = state {
-                if let Some(result) = lifecycle::add_existing(work, current, &body) {
-                    return result;
-                }
-                let local = &current.body;
-                if body.unit.current.older_than(local.unit.current)
-                    || body.replica.instance < local.replica.instance
-                    || body.replica.id < local.replica.id
-                {
-                    return Ok(Transition::ignored(Disposition::IgnoredStale));
-                }
-                if body.replica.id != local.replica.id
-                    || body.replica.instance != local.replica.instance
-                {
-                    return Err(Failure::Unsupported(
-                        "replacement requires native close/drop choreography",
-                    ));
-                }
-                if current.phase == Phase::Opening {
-                    return Ok(Transition::ignored(Disposition::IgnoredPending));
-                }
-                if body.unit != local.unit || !lifecycle::service_matches(current, &body.service) {
-                    return Err(Failure::Unsupported(
-                        "epoch/service-description update choreography is staged",
-                    ));
-                }
-                return Ok(if current.phase == Phase::Ready {
-                    Transition {
-                        update: Update::None,
-                        effects: vec![reply(local, 0)],
-                        disposition: Disposition::Applied,
-                    }
-                } else {
-                    Transition::ignored(Disposition::IgnoredPending)
-                });
+                return lifecycle::add_existing(work, current, &body);
             }
-            let body = Arc::new(body);
+            let body = Arc::new(lifecycle::create_body(body));
             Ok(Transition {
                 update: Update::Durable(EntityState {
                     body: body.clone(),
@@ -937,6 +958,7 @@ fn transition(
                     registration_warning: false,
                     fm_stage: FmStage::None,
                     report_sequence: 0,
+                    service_description_pending: false,
                     registration_lookups: BTreeMap::new(),
                 }),
                 effects: vec![Effect::Open {
@@ -949,6 +971,9 @@ fn transition(
             })
         }
         Kind::Complete => opening::complete(work, state, config),
+        Kind::CompleteServiceDescription | Kind::RetryServiceDescription => {
+            description::transition(work, state, admission)
+        }
         Kind::Retry => {
             if !admission.owner_ready {
                 return Ok(Transition::ignored(Disposition::IgnoredNotReady));
@@ -1344,6 +1369,59 @@ mod tests {
         body.replica.state = 1;
         body.replica.version = body.service.version.clone();
         body
+    }
+
+    #[test]
+    fn pending_add_is_checked_before_processor_deactivation_and_upgrade() {
+        // Native MessageContext.h:109–124; entity traits:166–178; RA:4313–4342.
+        // Pure transition fixture permits changing node context between jobs;
+        // the public executor's configured admission remains immutable.
+        let mut admission = Admission {
+            local_node: NodeInstance::default(),
+            fm_source: NodeInstance::default(),
+            generation: GenerationNumber::default(),
+            owner_ready: true,
+            node_open: true,
+            node_activated: true,
+            fabric_upgrading: false,
+        };
+        let config = NativeConfig::new(&Settings::default());
+        let request = body(1, &admission.local_node);
+        let (result, _) = watch::channel(Status::Pending);
+        let mut work = Submission {
+            id: 1,
+            entity: [1; 16],
+            kind: Kind::Add {
+                source: admission.fm_source.clone(),
+                generation: GenerationHeader::default(),
+            },
+            bytes: to_vec(&request).unwrap().into_boxed_slice(),
+            charge: 0,
+            reserved_effects: 2,
+            result,
+        };
+        let Update::Durable(mut state) =
+            transition(&work, None, &admission, &config).unwrap().update
+        else {
+            panic!("creation");
+        };
+        let mut changed = request;
+        changed.replica.id += 1;
+        changed.replica.instance = 0;
+        changed.unit.current.configuration = -1;
+        changed.service.update_version += 1;
+        work.bytes = to_vec(&changed).unwrap().into_boxed_slice();
+        for phase in [Phase::Opening, Phase::Closing] {
+            state.phase = phase;
+            for upgrading in [false, true] {
+                admission.node_activated = false;
+                admission.fabric_upgrading = upgrading;
+                let result = transition(&work, Some(&state), &admission, &config).unwrap();
+                assert_eq!(result.disposition, Disposition::IgnoredPending);
+                assert!(matches!(result.update, Update::None));
+                assert!(result.effects.is_empty());
+            }
+        }
     }
 
     #[test]
