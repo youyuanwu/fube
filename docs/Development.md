@@ -347,6 +347,20 @@ verifies absence independently, and reports cleanup errors instead of adopting
 same-name replacements. `--existing-owner` explicitly retains the caller's
 allocation; its caller must perform final original-capability teardown.
 
+Data and hardened legacy packages use the container's pinned `sfctl application
+upload`, after `docker cp` into an exclusively reserved per-run staging root.
+The package is a separate subtree: its ownership marker is never uploaded.
+Exact inventories, hashes, and modes are checked before and after upload.
+Both sfctl's timeout and a container-side `timeout` bound execution; failures
+retain original staging recovery information. Native application/type identity,
+ImageStore absence, and staging cleanup checks remain required.
+
+This path assumes trusted, immutable generated packages and no concurrent
+writers to the package or staging namespace. It does not provide the old custom
+uploader's inode-pinned resistance to concurrent root/child replacement. Offline
+tests cover staging, hash checks, command bounds, and failure cleanup; only
+live SF provisioning/activation establishes package acceptance.
+
 ## Parallel onebox CI
 
 The [main workflow](../.github/workflows/ci.yaml) runs two non-fail-fast workers
