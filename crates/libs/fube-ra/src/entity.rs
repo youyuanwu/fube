@@ -104,6 +104,8 @@ pub struct Settings {
     pub close_drop: u64,
     pub registration_warning: u64,
     pub registration_drop: u64,
+    /// Outstanding acquired-result obligations retained even across recreation.
+    pub max_registration_lookups: usize,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -119,6 +121,7 @@ impl Default for Settings {
             close_drop: 40320,
             registration_warning: 240,
             registration_drop: 1920,
+            max_registration_lookups: 64,
         }
     }
 }
@@ -141,6 +144,8 @@ impl Settings {
             || self.close_drop == 0
             || self.registration_warning == 0
             || self.registration_drop == 0
+            || self.max_registration_lookups == 0
+            || self.max_registration_lookups > 65536
         {
             return Err(Failure::Admission("invalid finite executor settings"));
         }
@@ -230,6 +235,9 @@ pub struct EntityState {
     pub registration_warning: bool,
     pub fm_stage: FmStage,
     pub report_sequence: u64,
+    /// lookup ID -> (owning lifecycle token, close rather than open lookup).
+    /// Consumed once by Registered; callback replay acquires no second reference.
+    pub registration_lookups: BTreeMap<u64, (u64, bool)>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
@@ -242,6 +250,7 @@ pub enum Effect {
     /// has published RuntimeOpen for this token.
     Open {
         token: u64,
+        lookup: u64,
         body: Arc<AddInstance>,
     },
     Reply(Box<AddInstanceReply>),
@@ -258,6 +267,7 @@ pub enum Effect {
     },
     FindRegistration {
         token: u64,
+        lookup: u64,
         body: Arc<AddInstance>,
     },
     TerminateHost {
@@ -679,9 +689,11 @@ fn transition(
                     registration_warning: false,
                     fm_stage: FmStage::None,
                     report_sequence: 0,
+                    registration_lookups: BTreeMap::new(),
                 }),
                 effects: vec![Effect::Open {
                     token: work.id,
+                    lookup: 0, // assigned atomically by track_lookups before persistence
                     body,
                 }],
                 disposition: Disposition::Applied,
@@ -762,6 +774,7 @@ fn transition(
                 } else {
                     Effect::Open {
                         token: current.open_token,
+                        lookup: 0,
                         body: current.body.clone(),
                     }
                 }],
@@ -885,6 +898,46 @@ async fn persist(
     }
 }
 
+/// Bind every issued lookup to a unique accepted operation. Tracking is private
+/// with the same proposal, survives removal/recreation, and is logically bounded.
+fn track_lookups(
+    work: &Submission,
+    current: Option<&EntityState>,
+    transition: &mut Transition,
+    settings: &Settings,
+) -> Result<()> {
+    let mut purpose = None;
+    for effect in &mut transition.effects {
+        let (token, lookup, close) = match effect {
+            Effect::Open { token, lookup, .. } => (*token, lookup, false),
+            Effect::FindRegistration { token, lookup, .. } => (*token, lookup, true),
+            _ => continue,
+        };
+        if purpose.replace((token, close)).is_some() {
+            return Err(Failure::Capacity);
+        }
+        *lookup = work.id;
+    }
+    let Some(purpose) = purpose else {
+        return Ok(());
+    };
+    if matches!(transition.update, Update::None) {
+        transition.update = Update::Memory(
+            current
+                .ok_or(Failure::Admission("lookup needs an entity"))?
+                .clone(),
+        );
+    }
+    let (Update::Memory(state) | Update::Durable(state)) = &mut transition.update else {
+        unreachable!()
+    };
+    if state.registration_lookups.len() >= settings.max_registration_lookups {
+        return Err(Failure::Capacity);
+    }
+    state.registration_lookups.insert(work.id, purpose);
+    Ok(())
+}
+
 async fn entity_worker(
     shared: Arc<Shared>,
     mut receiver: mpsc::UnboundedReceiver<Submission>,
@@ -894,12 +947,20 @@ async fn entity_worker(
     let mut committed: Option<Arc<EntityState>> = None;
     while let Some(work) = receiver.recv().await {
         let mut outcome = transition(&work, committed.as_deref(), &admission, &shared.settings);
+        if let Ok(transition) = &mut outcome {
+            if let Err(error) =
+                track_lookups(&work, committed.as_deref(), transition, &shared.settings)
+            {
+                outcome = Err(error);
+            }
+        }
         if outcome
             .as_ref()
             .is_ok_and(|t| t.effects.len() > work.reserved_effects)
         {
             outcome = Err(Failure::Capacity);
         }
+
         if let Ok(Transition {
             update: Update::Durable(state),
             ..

@@ -161,14 +161,26 @@ fn registration() -> RuntimeRegistration {
     RuntimeRegistration {
         host: "trusted-host".into(),
         runtime: "trusted-runtime".into(),
+        acquisition: 1,
     }
 }
 async fn registered(executor: &Executor, request: &AddInstance, token: u64) {
+    let lookup = *executor
+        .snapshot(request.unit.id.guid.0)
+        .committed
+        .unwrap()
+        .registration_lookups
+        .keys()
+        .next_back()
+        .unwrap();
+    let mut runtime = registration();
+    runtime.acquisition = lookup;
     executor
         .submit(Command::Registered(Box::new(RegistrationCompletion {
             unit: request.unit.id.clone(),
             token,
-            registration: registration(),
+            lookup,
+            registration: runtime,
             error: 0,
             retryable: false,
         })))
@@ -828,7 +840,7 @@ fn close_completion(executor: &Executor, error: i64) -> CloseCompletion {
         unit: current.body.unit.clone(),
         replica: current.body.replica.clone(),
         token: current.close_token,
-        registration: registration(),
+        registration: current.runtime.clone().unwrap_or_else(registration),
         error,
     }
 }
@@ -851,7 +863,7 @@ fn assert_close(effects: &[Effect], flags: i64, current: &EntityState) {
     };
     assert_eq!(*actual, flags);
     assert_eq!(*token, current.close_token);
-    assert_eq!(runtime, &registration());
+    assert_eq!(Some(runtime), current.runtime.as_ref());
     assert_eq!(body.unit, current.body.unit);
     assert_eq!(body.service, current.body.service);
     assert_eq!(
@@ -1158,6 +1170,7 @@ async fn native_delete_open_races_before_and_after_registration_are_explicit() {
                 Command::Registered(Box::new(RegistrationCompletion {
                     unit: request.unit.id.clone(),
                     token: first.id,
+                    lookup: first.id,
                     registration: registration(),
                     error: 0,
                     retryable: false,
@@ -1271,11 +1284,17 @@ async fn native_lookup_failure_and_apphostdown_are_not_generic_close_success() {
                 [Effect::FindRegistration { .. }]
             ));
             let token = state(&executor).close_token;
+            let lookup = *state(&executor)
+                .registration_lookups
+                .keys()
+                .next_back()
+                .unwrap();
             run(
                 &executor,
                 Command::Registered(Box::new(RegistrationCompletion {
                     unit: request.unit.id.clone(),
                     token,
+                    lookup,
                     registration: Default::default(),
                     error: -99,
                     retryable: true,
@@ -1284,11 +1303,19 @@ async fn native_lookup_failure_and_apphostdown_are_not_generic_close_success() {
             .await;
             assert_eq!(state(&executor).phase, Phase::Closing);
             assert!(effects(&executor).is_empty());
+            run(&executor, Command::RetryClose(request.unit.id.clone())).await;
+            effects(&executor);
+            let lookup = *state(&executor)
+                .registration_lookups
+                .keys()
+                .next_back()
+                .unwrap();
             run(
                 &executor,
                 Command::Registered(Box::new(RegistrationCompletion {
                     unit: request.unit.id.clone(),
                     token,
+                    lookup,
                     registration: Default::default(),
                     error: -99,
                     retryable: false,
@@ -1420,15 +1447,24 @@ async fn removal_and_finish_close_keep_private_proposals_and_same_unknown_ticket
             }
             let queued_result = queued.resolve(WAIT).await;
             if unknown && fail && !finish_stage {
+                // P1 can finish draining/closing the fenced store between
+                // publishing the failed write and this queued submission.
+                // Both admission states reject it without another backend call.
                 assert!(
-                    matches!(queued_result, Err(Failure::Store(ref e)) if e.kind==ErrorKind::Fenced)
+                    matches!(queued_result, Err(Failure::Store(ref e)) if matches!(e.kind, ErrorKind::Fenced | ErrorKind::Closed)),
+                    "queued removal after witnessed store fence: {queued_result:?}"
                 );
+                assert!(Arc::ptr_eq(&old, &state(&executor)));
+                assert_eq!(operations(&hooks).len(), writes + 1);
             } else {
                 queued_result.unwrap();
             }
             let actions = executor.take_effects();
             if fail {
                 assert!(actions.iter().all(|d| d.operation == queued.id));
+                if unknown && !finish_stage {
+                    assert!(actions.is_empty());
+                }
                 // Finish failed: queued duplicate cannot complete pending close.
                 if finish_stage {
                     assert!(Arc::ptr_eq(&old, &state(&executor)));
@@ -1656,9 +1692,17 @@ async fn registration_retry_thresholds_warning_precedence_and_reacquire_are_nati
         effects(&executor);
         close_done(&executor, APPLICATION_HOST_CRASH).await;
         effects(&executor);
+        run(&executor, Command::RetryClose(request.unit.id.clone())).await;
+        effects(&executor);
+        let lookup = *state(&executor)
+            .registration_lookups
+            .keys()
+            .next_back()
+            .unwrap();
         let event = RegistrationCompletion {
             unit: request.unit.id.clone(),
             token: state(&executor).close_token,
+            lookup,
             registration: RuntimeRegistration::default(),
             error: -99,
             retryable: true,
@@ -1670,9 +1714,17 @@ async fn registration_retry_thresholds_warning_precedence_and_reacquire_are_nati
         );
         assert_eq!(state(&executor).phase, Phase::Closing);
         let mut event = event;
+        run(&executor, Command::RetryClose(request.unit.id.clone())).await;
+        effects(&executor);
+        event.lookup = *state(&executor)
+            .registration_lookups
+            .keys()
+            .next_back()
+            .unwrap();
         if reacquire {
             event.error = 0;
             event.registration = registration();
+            event.registration.acquisition = event.lookup;
             run(&executor, Command::Registered(Box::new(event))).await;
             let actions = effects(&executor);
             assert_eq!(
@@ -1756,7 +1808,8 @@ async fn native_create_normalization_is_shared_by_initial_and_closed_recreation(
         request.unit.target = 9;
         request.unit.minimum = 2;
         run(&executor, add(request.clone())).await;
-        let [Effect::Open { token, body }]: [Effect; 1] = effects(&executor).try_into().unwrap()
+        let [Effect::Open { token, body, .. }]: [Effect; 1] =
+            effects(&executor).try_into().unwrap()
         else {
             panic!("normalized Open")
         };
@@ -1791,4 +1844,149 @@ async fn native_create_normalization_is_shared_by_initial_and_closed_recreation(
         assert_eq!(report.dropped.0[0].intermediate, Epoch::default()); // B1 at both reporting entry points
         finish(&store, &executor).await;
     }
+}
+
+fn acquired(
+    request: &AddInstance,
+    token: u64,
+    lookup: u64,
+    other_runtime: bool,
+) -> RegistrationCompletion {
+    let mut runtime = registration();
+    runtime.acquisition = lookup;
+    if other_runtime {
+        runtime.runtime.push_str("-other");
+    }
+    RegistrationCompletion {
+        unit: request.unit.id.clone(),
+        token,
+        lookup,
+        registration: runtime,
+        error: 0,
+        retryable: false,
+    }
+}
+
+#[tokio::test]
+async fn late_acquired_lookup_after_recreation_releases_its_reference_not_active_same_runtime() {
+    // Rust adapter ownership regression F1; native STR usage ownership is
+    // ServiceTypeRegistrationWrapper.cpp:78–125,135–157. Not live Hosting.
+    for other_runtime in [false, true] {
+        let (store, executor, _) = setup(WAIT).await;
+        let request = body(1);
+        let old = executor.submit(add(request.clone())).unwrap();
+        old.wait(WAIT).await.unwrap();
+        effects(&executor);
+        run(&executor, remove(request.clone(), false)).await;
+        effects(&executor);
+        let mut next = request.clone();
+        next.replica.instance += 1;
+        let new = executor.submit(add(next.clone())).unwrap();
+        new.wait(WAIT).await.unwrap();
+        effects(&executor);
+        registered(&executor, &next, new.id).await;
+        let active = state(&executor).runtime.clone();
+        assert_eq!(active.as_ref().unwrap().acquisition, new.id);
+        let event = acquired(&request, old.id, old.id, other_runtime);
+        assert_eq!(
+            run(&executor, Command::Registered(Box::new(event.clone()))).await,
+            Disposition::IgnoredStale
+        );
+        assert_eq!(
+            effects(&executor),
+            [Effect::ReleaseRegistration(event.registration.clone())]
+        );
+        assert_eq!(state(&executor).runtime, active);
+        assert_eq!(state(&executor).body.replica.instance, 51);
+        assert_eq!(
+            run(&executor, Command::Registered(Box::new(event))).await,
+            Disposition::IgnoredStale
+        );
+        assert!(effects(&executor).is_empty()); // replay is not a new acquisition/release
+        run(
+            &executor,
+            Command::CompleteOpen(Box::new(complete(&next, new.id))),
+        )
+        .await;
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::Reply(r)] if r.replica.instance==51)
+        );
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn overlapping_lookup_results_dispose_unused_acquisition_and_callback_replay_is_idempotent() {
+    for other_runtime in [false, true] {
+        let (store, executor, hooks) = setup(WAIT).await;
+        let request = body(1);
+        let first = executor.submit(add(request.clone())).unwrap();
+        first.wait(WAIT).await.unwrap();
+        effects(&executor);
+        let retry = executor
+            .submit(Command::RetryOpen(request.unit.id.clone()))
+            .unwrap();
+        retry.wait(WAIT).await.unwrap();
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::Open { token, lookup, .. }] if *token==first.id && *lookup==retry.id)
+        );
+        let one = acquired(&request, first.id, first.id, false);
+        let two = acquired(&request, first.id, retry.id, other_runtime);
+        run(&executor, Command::Registered(Box::new(one.clone()))).await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::RuntimeOpen { .. }]
+        ));
+        run(&executor, Command::Registered(Box::new(two.clone()))).await;
+        assert_eq!(
+            effects(&executor),
+            [Effect::ReleaseRegistration(two.registration.clone())]
+        );
+        assert_eq!(state(&executor).runtime, Some(one.registration.clone()));
+        for event in [one, two] {
+            run(&executor, Command::Registered(Box::new(event))).await;
+            assert!(effects(&executor).is_empty());
+        }
+        assert!(state(&executor).registration_lookups.is_empty());
+        assert_eq!(operations(&hooks), ["Insert"]); // lookup bookkeeping is memory-only
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn outstanding_lookup_obligations_have_finite_capacity_and_release_only_on_real_result() {
+    let store = Store::memory(StoreSettings::default()).await.unwrap();
+    let executor = Executor::new(
+        Arc::new(store.clone()),
+        admission(),
+        Settings {
+            max_registration_lookups: 1,
+            ..Settings::default()
+        },
+    )
+    .unwrap();
+    let request = body(1);
+    let first = executor.submit(add(request.clone())).unwrap();
+    first.wait(WAIT).await.unwrap();
+    effects(&executor);
+    let before = state(&executor);
+    let retry = executor
+        .submit(Command::RetryOpen(request.unit.id.clone()))
+        .unwrap();
+    assert_eq!(retry.wait(WAIT).await, Err(Failure::Capacity));
+    assert!(Arc::ptr_eq(&before, &state(&executor)));
+    assert!(effects(&executor).is_empty());
+    // A real failed lookup consumes the obligation without acquiring a ref.
+    let mut failed = acquired(&request, first.id, first.id, false);
+    failed.error = SERVICE_TYPE_NOT_REGISTERED;
+    failed.retryable = true;
+    run(&executor, Command::Registered(Box::new(failed))).await;
+    assert!(state(&executor).registration_lookups.is_empty());
+    run(&executor, Command::RetryOpen(request.unit.id)).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::Open { .. }]
+    ));
+    assert_eq!(state(&executor).registration_lookups.len(), 1);
+    finish(&store, &executor).await;
 }

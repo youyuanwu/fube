@@ -53,13 +53,13 @@ prebuilt inputs with no compiler/native installation/build fallback.
 
 ## Entity API and admission
 
-[`Executor::new`:324–370](../../crates/libs/fube-ra/src/entity.rs#L324-L370)
+[`Executor::new`:334–380](../../crates/libs/fube-ra/src/entity.rs#L334-L380)
 accepts `Arc<dyn KeyValueStore>`, immutable trusted session/node admission and
 finite settings. The caller selects/initializes the P1 backend, including its
 correct deployment/node binding. Executor does not infer a storage identity
 from the trait object or recover an existing entity.
 
-[`Command`:160–183](../../crates/libs/fube-ra/src/entity.rs#L160-L183) admits:
+[`Command`:165–188](../../crates/libs/fube-ra/src/entity.rs#L165-L188) admits:
 
 - Add: full native body, actual source node incarnation and generation header.
 - CompleteOpen: a matching result supplied by a trusted future Hosting/RAP
@@ -70,7 +70,7 @@ from the trait object or recover an existing entity.
   `Open` now requests registration; only a committed Registered handoff permits
   RuntimeOpen, and successful Open completion requires that witness.
 
-[Admission/transition logic:578–774](../../crates/libs/fube-ra/src/entity.rs#L578-L774)
+[Admission/transition logic:588–787](../../crates/libs/fube-ra/src/entity.rs#L588-L787)
 enforces the selected stateless InBuild/up/package profile, configured FM/local
 node incarnation and generation domain. Configured-source validation is an
 additional session gate, not a claim that the generic native dispatcher
@@ -92,13 +92,13 @@ their exclusions and source-derived tests are [documented separately](RaStateles
 
 ## State, commit and effects
 
-[Owned supervision:324–550](../../crates/libs/fube-ra/src/entity.rs#L324-L550)
+[Owned supervision:334–560](../../crates/libs/fube-ra/src/entity.rs#L334-L560)
 uses one independent thread/runtime and bounded per-entity workers. Same-entity
 work serializes. Accepted count, tight encoded bytes and bounded action slots
 (Add 2; Open completion/open/report retry 1; other lifecycle work 8)
 are reserved atomically and held through actual completion.
 
-[Commit/publication:777–954](../../crates/libs/fube-ra/src/entity.rs#L777-L954)
+[Commit/publication:790–1015](../../crates/libs/fube-ra/src/entity.rs#L790-L1015)
 keeps proposed state private. Durable creation/Ready/close/tombstone updates commit one aggregate
 under record type `ra/entity/v1` and a lowercase hex native-GUID ID. Format 2
 stores the full selected body, phase, deletion/cleanup, tokens/mode and FM stage;
@@ -118,7 +118,7 @@ Permanent observation-channel loss and terminal Unknown also retain the fence
 and apply the configured minimum polling interval; immediate resolution errors
 cannot turn uncertainty into a busy loop.
 
-[`take_effects`:487–492](../../crates/libs/fube-ra/src/entity.rs#L487-L492)
+[`take_effects`:497–502](../../crates/libs/fube-ra/src/entity.rs#L497-L502)
 transfers each action record once per accepted execution. Explicit new retry
 commands and native duplicate-ready replies can legitimately emit new actions.
 No arbitrary callback runs under a store lock; transport delivery, automatic
@@ -128,19 +128,22 @@ retry/semantic acknowledgment events exist for the bounded removal slice.
 [`Ticket`:49–81](../../crates/libs/fube-ra/src/entity.rs#L49-L81) is observation,
 not ownership. Cancelling its future, losing the caller Tokio runtime or dropping
 all executor handles does not retract accepted work.
-[`close`:494–508](../../crates/libs/fube-ra/src/entity.rs#L494-L508) closes only
+[`close`:504–518](../../crates/libs/fube-ra/src/entity.rs#L504-L518) closes only
 executor admission and drains accepted work; it does not close the caller's
 store. Finite timeout reports Unknown, never rollback. Unresolved work may retain
 the supervisor indefinitely; there is no racing replacement or hard IO deadline.
 
 ### Default finite limits
 
-[Settings:95–148](../../crates/libs/fube-ra/src/entity.rs#L95-L148):
+[Settings:95–153](../../crates/libs/fube-ra/src/entity.rs#L95-L153):
 32 entity slots, 64 outstanding operations, 256 KiB encoded command,
 8 MiB queued bytes, 64 retained/reserved actions, 20 ms late-resolution polling.
 Entity slots are retained for the executor lifetime. Snapshots/effects retained
 by consumers are outside admission budgets. Limits are logical bounds, not
 allocator/RSS quotas or real-time scheduling guarantees.
+An additional 64 outstanding registration lookups per entity are retained across
+removal/recreation until their real result arrives; separate acquisition IDs
+make callback replay idempotent and discarded-reference release explicit.
 
 ## Tests and remaining qualification
 
@@ -150,7 +153,7 @@ python3 -m unittest tests.offline.cluster.test_ra_catalog \
   tests.offline.cluster.test_ra_protocol_inputs -v
 ```
 
-[30 deterministic entity tests](../../crates/libs/fube-ra/tests/entity.rs)
+[33 deterministic entity tests](../../crates/libs/fube-ra/tests/entity.rs)
 map to the catalog's native EntityMap/EntityJobItem ordering and selected
 AddInstance preconditions plus selected removal/close/report/native scenarios.
 Real public Store backends and entered/release
@@ -160,7 +163,7 @@ ownership, per-execution single dispatch and real SQLite aggregate commit.
 [11 schema tests](../../crates/libs/fube-ra/tests/protocol.rs) cover defaults,
 full nested fields, errors, headers, malformed input, bounds and pointer tags.
 Offline validator-model bytes are explicitly **not native fixtures**.
-Additional [real-ticket fault regressions](../../crates/libs/fube-ra/src/entity.rs#L956)
+Additional [real-ticket fault regressions](../../crates/libs/fube-ra/src/entity.rs#L1017)
 exercise permanent observation-channel loss and terminal Unknown in bounded
 child processes, asserting explicit polling backoff without releasing ownership.
 

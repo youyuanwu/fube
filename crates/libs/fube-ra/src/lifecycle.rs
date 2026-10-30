@@ -11,15 +11,19 @@ pub const STALE_REQUEST: i64 = SERVICE_TYPE_NOT_REGISTERED + 50;
 pub struct RuntimeRegistration {
     pub host: String,
     pub runtime: String,
+    /// Reference acquisition identity, equal to the issued lookup ID.
+    pub acquisition: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistrationCompletion {
     pub unit: PartitionId,
     pub token: u64,
+    pub lookup: u64,
     pub registration: RuntimeRegistration,
     pub error: i64,
-    /// Hosting FindServiceTypeRegistrationErrorCode.IsRetryable, not inferred
-    /// from a successful no-op. On success the reference has been acquired.
+    /// Hosting FindServiceTypeRegistrationErrorCode.IsRetryable. Exactly one
+    /// result/acquired reference per issued lookup; replaying its callback MUST
+    /// NOT acquire again. Unissued lookup ownership remains with the caller.
     pub retryable: bool,
 }
 /// Success certifies matching RAP cleanup INCLUDING queued/in-flight Open:
@@ -184,6 +188,7 @@ fn close_retry(state: &EntityState, effects: &mut Vec<Effect>) {
     } else {
         effects.push(Effect::FindRegistration {
             token: state.close_token,
+            lookup: 0,
             body: state.body.clone(),
         });
     }
@@ -331,6 +336,7 @@ pub(super) fn add_existing(
             state.last_retry_error = 0;
             let effects = vec![Effect::Open {
                 token: work.id,
+                lookup: 0,
                 body: state.body.clone(),
             }];
             return Ok(changed(state, effects, true));
@@ -418,6 +424,7 @@ pub(super) fn transition(
                 registration_warning: false,
                 fm_stage: FmStage::None,
                 report_sequence: 0,
+                registration_lookups: BTreeMap::new(),
             });
             let mut durable = current.is_none();
             // UpdateInstanceForClosedReplica executes BEFORE epoch/ID guards.
@@ -466,36 +473,57 @@ pub(super) fn transition(
         }
         Kind::Registered => {
             let event: RegistrationCompletion = from_slice(&work.bytes).map_err(invalid)?;
-            let valid = current.is_some_and(|s| {
-                (s.phase == Phase::Opening && event.token == s.open_token)
-                    || (s.phase == Phase::Closing
-                        && s.close_mode != Some(CloseMode::Obliterate)
-                        && event.token == s.close_token)
-            });
+            let Some(current) = current else {
+                return Ok(Transition::ignored(Disposition::IgnoredStale));
+            };
+            let Some(&(token, close_lookup)) = current.registration_lookups.get(&event.lookup)
+            else {
+                // Consumed callback replay has no new acquired ownership.
+                // Unissued results are not transferred to this executor.
+                return Ok(Transition::ignored(Disposition::IgnoredStale));
+            };
+            if token != event.token
+                || (event.error == 0
+                    && (event.registration.acquisition != event.lookup
+                        || event.registration.host.is_empty()
+                        || event.registration.runtime.is_empty()))
+            {
+                return Err(Failure::Admission(
+                    "registration result must match issued acquisition",
+                ));
+            }
+            let mut state = current.clone();
+            state.registration_lookups.remove(&event.lookup);
+            let valid =
+                (!close_lookup && state.phase == Phase::Opening && event.token == state.open_token)
+                    || (close_lookup
+                        && state.phase == Phase::Closing
+                        && state.close_mode != Some(CloseMode::Obliterate)
+                        && event.token == state.close_token);
             if !valid {
                 // No RAP Open was authorized for an uncommitted registration.
                 // Release the acquired lookup reference; never open a closed FT.
-                let effects = if event.error == 0
-                    && !current.is_some_and(|s| s.runtime.as_ref() == Some(&event.registration))
-                {
+                let effects = if event.error == 0 {
                     vec![Effect::ReleaseRegistration(event.registration)]
                 } else {
                     vec![]
                 };
                 return Ok(Transition {
-                    update: Update::None,
+                    update: Update::Memory(state),
                     effects,
                     disposition: Disposition::IgnoredStale,
                 });
             }
-            let mut state = current.unwrap().clone();
-            if let Some(existing) = &state.runtime {
-                if event.error == 0 && existing == &event.registration {
-                    return Ok(Transition::ignored(Disposition::IgnoredPending));
-                }
-                return Err(Failure::Admission(
-                    "registration cannot replace active runtime",
-                ));
+            if state.runtime.is_some() {
+                // Even identical host/runtime strings can own a DIFFERENT
+                // acquired reference. Dispose the unused acquisition, never the
+                // adopted reference. Replayed callbacks were filtered above.
+                let effects = if event.error == 0 {
+                    vec![Effect::ReleaseRegistration(event.registration)]
+                } else {
+                    vec![]
+                };
+                return Ok(changed(state, effects, false));
             }
             let mut effects = Vec::new();
             if event.error == 0 {
