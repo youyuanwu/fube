@@ -1,7 +1,8 @@
 # Rust RA port and SQLite state-store design
 
-**Status: proposed RA design. The [P1 store seam](RaStore.md) is implemented;
-P2–P5 and RA/runtime recovery are not.**
+**Status: proposed RA design. The [P1 store seam](RaStore.md) and
+[protocol/minimal P2 foundation](RaProtocolFoundation.md) are implemented;
+full P2 infrastructure, P3–P5 and RA/runtime recovery are not.**
 
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's
@@ -12,22 +13,27 @@ native RA independent of Service Fabric.
 
 The target remains separate FM and RA+Hosting processes, existing application
 Hosting/RAP IPC, finite runtime-to-local-RA leases and volatile `fube-data`.
-Federation and native node-to-node distributed leases remain excluded.
+All native RA–FM and RA–RA message contracts must be preserved and ported.
+Federation routing/membership and native node-to-node distributed leases remain
+excluded; native peer-reliability messages are not excluded with them.
 
 ## 1. Scope and compatibility
 
 Port the native RA's **supported state-machine semantics**, not C++ ownership,
 Begin/End scaffolding or the full native node dependency graph. Native RA
 handles more features than the initial cluster will support. Preserve explicit
-capability boundaries; omitted features must not receive successful no-op
-responses or be mistaken for qualified behavior.
+capability boundaries; features not yet enabled must not receive successful
+no-op responses or be mistaken for qualified behavior. Every RA–FM and RA–RA
+exchange remains required porting scope even when its execution feature is
+temporarily disabled.
 
-Four compatibility goals are distinct:
+Compatibility goals are distinct:
 
 | Boundary | Goal |
 |---|---|
 | Store behavior | Preserve typed records, insert/update/delete outcomes, consistent enumeration and commit-before-effects. Both backends run the same contract tests. |
 | RA behavior | Preserve the selected epoch/incarnation, configuration, lifecycle, retry and recovery invariants; port corresponding native tests. |
+| Reliability messages | Preserve all native RA–FM and RA–RA actions, directions, headers, serialized payloads and processing contracts. Stage delivery explicitly; no exchange may silently disappear from scope. |
 | Application IPC | Reuse the existing Hosting/RAP schemas and runtime programming model. A local database format is not an IPC format. |
 | Native disk migration | Not supported. Do not open/import native ESE/TStore databases or promise identical serialized record bytes. |
 
@@ -62,7 +68,7 @@ The storage interface is only one dependency seam.
 ## 3. Target architecture and dependency adapters
 
 ```text
-FM commands / runtime replies / Hosting observations / timers
+FM/peer RA messages / runtime replies / Hosting observations / timers
                             |
                  per-entity RA executor
           committed state -> proposed state + effects
@@ -73,7 +79,7 @@ FM commands / runtime replies / Hosting observations / timers
                             |
               committed state + permitted effects
                             |
-           FM transport / Hosting / runtime IPC
+         FM/peer RA transport / Hosting / runtime IPC
 ```
 
 Port or adapt responsibilities as follows:
@@ -84,14 +90,82 @@ Port or adapt responsibilities as follows:
 | Entity scheduler and action queue | Implement Rust ownership/concurrency around the same ordering invariants. Serialize conflicting entity work; preserve required multi-entity barriers. |
 | Hosting and process ownership | Integrate the long-running cluster host, package admission, app exits and independently verified cleanup. |
 | Runtime IPC and local lease | Reuse existing codecs and runtime authority semantics. Keep lease service and callback/destructor supervision independent from database progress. |
-| FM communication | Adapt to the cluster's single-FM protocol, retaining generations, idempotence, semantic results and reconnect reconciliation. Do not synthesize native FM/FMM acknowledgments. |
-| Federation types/transport | Replace transport with explicit configured FM/RA sessions. Retain the identity/incarnation/generation checks represented by native types. |
+| FM communication | Port every native RA–FM exchange and its acknowledgment/retry/generation semantics. Single-FM deployment is a profile boundary, not permission to redesign the messages or synthesize FM/FMM acknowledgments. |
+| Peer RA communication | Port every native RA–RA exchange, including replica creation, progress discovery, activation/deactivation and replies. Preserve phase ordering, source checks and stale-message behavior. |
+| Federation types/transport | Replace routing/transport with explicit configured FM–RA and RA–RA sessions. Retain native identity/incarnation/generation fields and checks; do not implement Federation membership or distributed node leases. |
 | Clock, retry and diagnostics | Supply bounded timers, supervised execution and typed observations without exposing user callbacks to storage locks. |
-| Upgrades, deactivation and broader native node features | Port only when explicitly admitted by a later profile, with their tests. Do not claim full RA parity from the initial subset. |
+| Upgrades, deactivation and broader native node features | Preserve all associated RA–FM/RA–RA contracts and assign their handlers/tests to explicit delivery stages. Execution remains capability-gated until qualified; disabled does not mean omitted from the port. |
 
 There is no second data-replication engine in RA or FM. Continue using
 `Engine::bind_partition`, real copy/catch-up and the existing application access
 gate; see [the data profile](../runtime/FubeData.md).
+
+### Native reliability-message preservation
+
+The required scope is **all RA–FM and RA–RA exchanges**, not just the messages
+used by the first stateless/stateful scenarios. Build a catalog pinned to the
+native baseline from [RSMessage actions and actors][native-rs-messages],
+[RA dispatch metadata][native-message-metadata], both FM/RA handlers and actual
+send paths. Include common node-registration exchanges used by RA, separate
+FM/FMM addressing and deprecated native handling; do not infer direction or
+active use solely from an action name or registry entry.
+
+The [source-pinned catalog](NativeRaProtocol.md) now reconciles 119 initialized
+actions, 66 boundary actions/67 actual directions and two declaration-only
+legacy names. [AddInstance/AddInstanceReply codecs and native source-stream
+evidence](RaProtocolFoundation.md#codec-evidence) are implemented; all remaining
+codec/handler/trace obligations stay explicitly staged. Catalog completeness
+is not complete native protocol implementation.
+
+For every exchange, record:
+
+| Contract element | Required preservation/evidence |
+|---|---|
+| Identity and routing | Native action, actor, sender/receiver, generation headers and node/replica instance binding. Replacing Federation delivery does not replace these checks. |
+| Payload | All serialized fields, including inherited/nested descriptions, field order, enum values, widths, defaults, optional values and errors. Native body encoding is not an incidental Rust layout. |
+| Dispatch | Target entity, entity-creation permission, processing during close, source validation and stale-message rules. |
+| Completion | Native request/reply or notification/ack meaning, retransmission, batching and terminal conditions. A transport ACK or generic status cannot substitute for them. |
+| State and effects | Preconditions, committed transition, post-commit actions, duplicate/late handling and permitted follow-up messages, including RA–RA dependencies. |
+| Delivery status | Rust type/codec/handler/test mapping, implementation stage and qualified capability profile. No unclassified exchange or permanently omitted message. |
+
+For example, [ReplicaUp][native-replica-up] carries both replica and dropped
+lists, a final-upload flag and FM/FMM identity. A generic inventory
+acknowledgment loses that contract. `CreateReplica`, `GetLSN`, `Deactivate`,
+`Activate` and their replies are native RA–RA reliability traffic, not
+Federation membership traffic.
+
+Use the native logical messages and serialized body/header contracts inside
+any new bounded session envelope. Extra deployment/session identities may
+strengthen admission, but must not overwrite native generations, conflate
+FM/FMM, require invented fields in native bodies or change acknowledgment
+postconditions. Outer routing/framing may replace Federation; preserving
+payload/header codecs alone does not claim that a native FM can join this
+cluster.
+
+Required conformance gates are:
+
+1. Check the entire catalog against pinned native registry, dispatch and
+   send/receive paths. Every exchange has a mapping and delivery stage;
+   deprecated behavior is explicitly classified, not silently deleted.
+2. For each enabled exchange, use native C++ serialization to produce fixtures
+   that Rust decodes, and validate Rust output with a native decoder. Cover
+   nested/inherited fields, defaults and nondefault values, enum/error values
+   and invalid/truncated inputs. Rust-only round trips are insufficient.
+3. Port native behavioral scenarios and compare normalized state/outgoing
+   message traces under equivalent preconditions. Include duplicate, stale,
+   reordered and lost traffic; retry/ack boundaries; peer phases; and definite
+   or unknown store completion. Do not normalize away safety-relevant fields
+   or ordering.
+4. Make missing catalog entries or missing codec/handler/trace evidence for an
+   enabled capability CI failures. An unfinished feature must fail capability
+   admission rather than receive success-shaped stub replies. It remains an
+   explicit porting obligation.
+
+Protocol preservation is complete only when every required exchange has its
+implementation and evidence. Completing the initial cluster milestones is not
+that claim. Real native interoperability and broader native feature behavior
+also require their independent qualification; neither follows from fixtures
+alone.
 
 ## 4. Logical store contract
 
@@ -153,7 +227,9 @@ creating an empty node.
 
 The schema is not an operational CLI or implemented migration. See the
 [P1 profile](RaStore.md) for the exact strict schema, metadata and selected
-binding. Future RA entity-envelope codecs belong to P2.
+binding. The minimal P2 seam now stores a versioned selected-entity aggregate;
+its [format and limits](RaProtocolFoundation.md#state-commit-and-effects) are
+not a native disk codec, migration or restart/replay protocol.
 Native failover-unit records are the source model, not a requirement to use
 native disk serialization. Cluster-specific command/ownership records are
 extensions, not fields that vanilla RA is claimed to persist.
@@ -308,16 +384,19 @@ rebound to the new authority.
 ## 9. Port sequence and evidence gates
 
 These define delivery gates. P1's implementation/evidence is described in the
-[store profile](RaStore.md); P2–P5 remain proposed, not completed test results.
+[store profile](RaStore.md). The [minimal P2 foundation](RaProtocolFoundation.md)
+demonstrates selected commit/failure/unknown/cancellation invariants; full P2
+and P3–P5 remain incomplete, not completed cluster test results.
 They refine the [cluster milestones](PureRustCluster.md#12-delivery-milestones-and-acceptance-evidence).
 
 | Stage | Deliverable and required evidence |
 |---|---|
 | P1: store seam | Memory and SQLite backends share insert/conflict/update/delete/not-found, snapshot, capacity, concurrency, close and failure tests. Reopen verifies durable content; migration/foreign-store failures are explicit. |
-| P2: entity infrastructure | Port staged entity state, durable/memory-only transitions, serialization and post-commit actions. Inject store failure: no leaked action or uncommitted state publication. Test unknown completion without duplicate effects. |
-| P3: stateless RA | Connect Hosting/FM adapters, registration, Open/Close/Abort, fault/report and endpoint handling. Drive the real Rust runtime through cluster M1, including finite leases and independently observed process cleanup. |
-| P4: stateful control | Port action-specific configuration, build/remove, progress/epoch, catch-up/cancel and endpoint/revocation rules for M2/M3. Require real nonzero data/copy ACKs, separate previous/current quorum evidence and safe primary-transfer barriers. |
+| P2: entity infrastructure | Minimal selected-pair slice implemented: staged state, durable/memory-only transitions, postcommit actions, definite failure/unknown fences and cancellation barriers. Broader lifecycle, multi-entity dependencies and recovery remain staged. |
+| P3: stateless RA | Complete protocol catalog and first-pair source-stream codec oracle now exist. Broader codecs/native traces and all stateless handlers with Hosting, registration, Open/Close/Abort, fault/report and endpoints remain required. Drive the real Rust runtime through M1, including finite leases and independently observed process cleanup. |
+| P4: stateful control | Port the native FM–RA and RA–RA message choreography alongside action-specific configuration, build/remove, progress/epoch, catch-up/cancel and endpoint/revocation rules for M2/M3. Require codec/trace conformance, real nonzero data/copy ACKs, separate previous/current quorum evidence and safe primary-transfer barriers. |
 | P5: durable RA restart | Integrate the recovery protocol with M4: process exit, commit/effect crash windows, replayed commands, fresh incarnation, FM reconciliation and actual volatile rebuild. No saved Primary resurrection or warm adoption. |
+| Protocol completion: cross-cutting | Port and qualify every remaining cataloged RA–FM/RA–RA exchange, including those gated out of initial profiles. Track additional delivery stages explicitly; P3–P5 are not permission to drop the remaining messages or claim complete protocol parity. |
 
 Durable storage can be exercised early without enabling restart recovery.
 Until P5 is qualified, keep the cluster's existing fresh-RA/fenced-cleanup
@@ -352,14 +431,17 @@ durability, distributed fencing, FM recovery or cluster consensus. Do not use
 its success to weaken runtime leases, quorum rules or native profile admission.
 
 P1 selects the binding/build policy, opaque record format, finite budgets and
-supervised writer-failure policy in the [store profile](RaStore.md). Entity
-codecs and any future explicit migration procedure remain unimplemented.
-Add atomic batch semantics only where real cross-record invariants
-require them. Complete native RA parity, persisted service storage, warm app
-adoption, transparent FM restart and native database migration remain separate
-projects.
+supervised writer-failure policy in the [store profile](RaStore.md). The selected
+entity envelope is implemented in [the minimal P2 seam](RaProtocolFoundation.md);
+broader entity codecs, restart loading and explicit migration remain unimplemented.
+Add atomic batch semantics only where real cross-record invariants require
+them. All RA–FM and RA–RA message contracts are required porting scope, not an
+optional later protocol redesign. Broader native RA feature parity, persisted
+service storage, warm app adoption, transparent FM restart and native database
+migration require separate qualification beyond message preservation.
 
-The next work beyond P1 is P2 entity infrastructure and the cluster M1 interfaces.
+The next work is broader P2 lifecycle infrastructure and the cluster M1
+interfaces, including real Hosting/RAP integration and native behavioral traces.
 This design document itself supplies no runnable cluster commands or evidence
 of those unimplemented stages.
 
@@ -375,4 +457,7 @@ of those unimplemented stages.
 [native-fixup]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnit.cpp#L3962-L3996
 [native-dependencies]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/IReconfigurationAgent.h#L68-L80
 [native-store-tests]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Test.Functional.Storage.KeyValueStore.cpp#L24-L35
+[native-rs-messages]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/common/RSMessage.cpp
+[native-message-metadata]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Communication.MessageMetadataTable.cpp
+[native-replica-up]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/common/ReplicaUpMessageBody.h
 [sqlite-wal]: https://www.sqlite.org/wal.html#performance_considerations

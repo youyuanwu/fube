@@ -32,7 +32,8 @@ ephemeral-FM restart policy.
 | Recovery | Prefer unavailability to conflicting primary authority. Initial automatic promotion on connectivity timeout is prohibited. |
 | FM restart | Ephemeral state; confirmed old-deployment teardown/fencing before a fresh cluster identity. No transparent controller recovery. |
 | Discovery | FM's versioned observed endpoint registry and a small cluster API, not native Naming/FabricClient gateway parity. |
-| Compatibility | Preserve the independently qualified native-node/runtime profile. New FM–RA messages need not mimic native wire protocols. |
+| Reliability protocol | Preserve and port all native RA–FM and RA–RA message contracts, including their processing semantics. Replace Federation routing/transport, not the reliability protocol. |
+| Compatibility | Preserve the independently qualified native-node/runtime profile. Native reliability payload/header conformance does not by itself establish interoperability with a native FM or Federation. |
 
 Different replicas of the same partition initially run in **different app
 processes**. Separate RA processes model logical nodes, not independent
@@ -46,6 +47,11 @@ transactional replication, whole-set state preservation, native management
 gateway equivalence, rolling executable upgrades, containers, hostile tenants,
 TLS and remote-machine qualification. The runtime's current rejection of
 unsupported security/host profiles must remain intact.
+
+These initial execution-profile exclusions do not remove RA–FM or RA–RA
+messages from the port. Preserve every exchange's contract and track its
+implementation and qualification; a temporarily disabled feature is unfinished
+work, not permission to omit its messages or return successful no-ops.
 
 ## 2. What exists, and what must be built
 
@@ -65,9 +71,10 @@ proposed contracts unless explicitly identified as existing behavior.
 | `Engine::bind_partition` uses runtime partition authority and provider supervision; standalone `bind` is a different seam: [engine.rs:301–354](../../crates/libs/fube-data/src/engine.rs#L301-L354). Applied quorums are per configuration: [quorum.rs:23–87](../../crates/libs/fube-data/src/quorum.rs#L23-L87). | Reuse `fube-data`, actual copy/catch-up and existing access gates. FM supplies membership/epochs, not data acknowledgments or elections. |
 | Existing data qualification is a bounded volatile V1 profile, not durable storage or universal native parity: [FubeData.md:3–14](../runtime/FubeData.md?plain=1#L3-L14), [237–287](../runtime/FubeData.md?plain=1#L237-L287). | Pure-Rust cluster tests will be new evidence. They cannot inherit native qualification simply by reusing the engine. |
 
-The workspace currently contains transport, client, test-host, runtime, data and
-sample crates, not a cluster FM/RA executable
-([Cargo.toml:1–24](../../Cargo.toml#L1-L24)). Proposed component names below
+The workspace also contains the [P1 store](RaStore.md) and
+[RA protocol/minimal P2 foundation](RaProtocolFoundation.md), not a cluster
+FM/RA executable ([Cargo.toml:1–15](../../Cargo.toml#L1-L15)).
+Proposed component names below
 describe responsibilities, not already available binaries or CLI commands.
 
 ## 3. Process and traffic architecture
@@ -81,7 +88,7 @@ describe responsibilities, not already available binaries or CLI commands.
                           /               \
                 FM–RA control         FM–RA control
                        /                   \
-             RA+Hosting A              RA+Hosting B       ...
+             RA+Hosting A <-- peer --> RA+Hosting B       ...
               |          |                 |
            app A1     app A2             app B1
            runtime    runtime            runtime
@@ -91,10 +98,10 @@ describe responsibilities, not already available binaries or CLI commands.
               +------ app-owned clients ---+
 ```
 
-Four paths remain distinct:
+Five paths remain distinct:
 
-1. **FM–RA control:** new versioned cluster protocol over bounded loopback
-   connections; registration, desired actions and observed state.
+1. **FM–RA control:** ported native reliability messages over bounded loopback
+   connections, with separate deployment/session admission where needed.
 2. **Local RA/Hosting–runtime IPC:** existing app-facing Hosting/RAP actors and
    schemas. Actor 7 handles host registration, actor 9 runtime/type registration,
    actor 15 local lease polls, actor 8 host controls, and actor 12 lifecycle,
@@ -103,10 +110,16 @@ Four paths remain distinct:
    through FM, then contacts the app directly.
 4. **Replication/copy traffic:** direct `fube-data` peer sessions selected by
    configuration. Neither FM nor RA proxies application data or supplies ACKs.
+5. **RA–RA control:** ported native peer-reliability exchanges, including
+   `CreateReplica`, `GetLSN`, `Deactivate`, `Activate` and their replies. These
+   coordinate replica lifecycle/reconfiguration; they are not Federation
+   membership or application-data replication.
 
 RAs do not elect primaries or negotiate membership with one another. The FM
 is authoritative only within its admitted deployment; its assertion alone does
-not revoke previously issued application authority.
+not revoke previously issued application authority. RAs do execute the native
+peer-reliability choreography under FM-authorized configurations; omitting
+Federation does not remove that responsibility.
 
 ## 4. Bootstrap, ownership and restart
 
@@ -191,29 +204,58 @@ owning connection/unit record; do not invent an echoed runtime ID.
 
 ## 6. FM–RA protocol and convergence
 
-Use an explicit version/profile handshake, with supported commands and limits.
-Initially choose bounded, length-prefixed typed messages over a dedicated
-loopback TCP session; no native FM wire compatibility is required. The exact
-serialization codec can be selected before implementation. Unknown versions,
-mandatory fields/actions, oversized frames and contradictory identities fail
-closed rather than receiving synthetic success.
+**All native RA–FM and RA–RA message contracts are mandatory porting scope.**
+Preserve action names, actor/direction, headers, complete body schemas and native
+serialization semantics, including nested/inherited fields, defaults, epochs,
+instances, errors, acknowledgment meaning, retries and stale-message handling.
+Do not replace them with a generic Apply/status protocol or move RA–RA exchanges
+into an invented FM-only sequence.
+
+Use explicit version/profile admission and finite frame/queue limits around
+the ported messages. Initially use configured, bounded loopback TCP sessions
+for FM–RA and RA–RA delivery instead of Federation routing. Any new transport
+envelope is separate from the native reliability message: deployment/session
+identities supplement, not replace, native generation and incarnation checks.
+Do not alias FM/FMM identities or synthesize acknowledgments for an absent
+capability. Native payload/header conformance does not require Federation
+membership, node leases or its routing framing, and does not alone qualify
+end-to-end native-node interoperability.
+
+The [RA port design](RustRaPort.md#native-reliability-message-preservation)
+defines requirements for the complete source-pinned inventory and
+codec/behavioral evidence gates. The [complete pinned catalog](NativeRaProtocol.md)
+and [first-pair source-baseline codec oracle](../../tests/ra_protocol/README.md)
+now exist, alongside a minimal P2 execution seam; they do not enable a deployed
+stateless cluster or qualify full native handlers/traces. Unknown versions,
+malformed messages, oversized frames and contradictory
+identities fail closed. Profiles reject unsupported feature admission before
+execution; unimplemented exchanges are tracked gaps, not completed ports.
 
 ### Exchange inventory
+
+The following are supplementary bootstrap, observation and reconciliation
+responsibilities, not substitutes for native messages such as `NodeUp`,
+`ReplicaUp`, `AddInstance`, `DoReconfiguration` or their acknowledgments.
+Map each responsibility to the native exchanges first; justify any additional
+transport-level exchange separately.
 
 | Exchange | Required meaning |
 |---|---|
 | Register / registration acknowledgment | Match cluster, FM, configured node, RA incarnation and capabilities; establish a new session generation. |
 | Heartbeat | Report liveness of this session plus last applied desired revision/report sequence. It is not a local app lease or fencing certificate. |
 | Inventory snapshot / delta / acknowledgment | Observed hosts, registrations, units, pending operations, errors, endpoints and terminal records. Snapshot carries a barrier sequence; deltas resume after it. |
-| Apply command / command status | Carry target identity, expected prior state/revision, intended transition, immutable payload, operation ID and finite execution budget. |
+| Operation observation | Track the native action/reply and its target, immutable payload and finite execution budget. Local API status must not replace the native reply or its semantic postcondition. |
 | Reconcile request | Compare a consistent inventory with desired state; query unknown outcomes before retrying or compensating. |
 | Drain/retire | Authorize removal, cancel unsafe pending work and report lifecycle plus process cleanup separately. |
 
-Every envelope includes protocol version, cluster/FM identity, node incarnation,
-session generation and message sequence. Per-replica commands additionally bind
-service generation, partition/replica/incarnation, expected epoch/configuration
-revision and command ID. Partition-level reconfiguration records list all
-participants and phase dependencies.
+Every supplementary envelope binds protocol version, cluster identity,
+sender/recipient node incarnations, session generation and message sequence;
+FM–RA sessions also bind the admitted FM identity. Per-replica work additionally
+tracks service generation, partition/replica/incarnation, expected
+epoch/configuration revision and local command identity without requiring new
+fields in native bodies. Partition-level reconfiguration records list all
+participants and phase dependencies. RA–RA connections admit only configured
+peers in the same deployment and fence stale sessions independently.
 
 Local monotonic clocks govern deadlines. A retransmission cannot reset an
 already admitted operation's deadline. Do not compare raw monotonic timestamps
@@ -221,6 +263,10 @@ from different processes; carry bounded budgets and keep the original
 receiver-side admission deadline.
 
 ### Command outcomes and idempotence
+
+The statuses below describe local API/operation bookkeeping. They do not
+replace native action/reply pairs, introduce new native acknowledgment
+postconditions, or assume native bodies echo a new command ID.
 
 `Accepted` means the RA recorded a valid intent. `Executing` means side effects
 may exist. Only `Succeeded` establishes the command's stated semantic
@@ -340,8 +386,9 @@ retires the affected incarnation. Engine fault delivery does not itself prove
 termination or replacement.
 
 Decode and acknowledge only supported load/health routes with their actual
-schemas and sequence rules. Store bounded local observations and forward a
-summary to FM; this is not native Health Manager aggregation. Unsupported
+schemas and sequence rules. Store bounded local observations and preserve
+the complete native RA–FM load-report exchange; do not replace its payload
+with a lossy summary. This is not native Health Manager aggregation. Unsupported
 features fail capability admission instead of entering endless retries.
 
 Separate graceful service close, runtime unregister, forced termination,
@@ -450,7 +497,8 @@ FabricClient or Naming protocols.
 Reuse `fube-data` through `Engine::bind_partition` and runtime-owned callbacks.
 Keep real copy, application apply ACKs, epoch reconciliation, cancellation and
 memory/backpressure bounds. Do not add a competing log/replication engine in FM
-or RA.
+or RA. Port the native RA–RA control path alongside FM–RA commands and RAP actions;
+the phase descriptions below do not replace those peer messages.
 
 1. One FM serializes transitions for each partition. A partition transaction
    records previous/current configurations, local membership, required targets,
@@ -519,7 +567,8 @@ promotion. For primary transfer, step 4 and its intervening protocol operations
 are mandatory. RA expands each transaction into the existing runtime's legal
 action-specific trace, not one universal broadcast ordering. Before qualifying
 each transition, tests must pin its exact command bodies, flags and barriers
-against runtime models and the independent native tier.
+against runtime models and the independent native tier, including the native
+FM–RA and RA–RA message trace.
 
 If a stage fails or its outcome is unknown, stop advancement, retain both
 configuration obligations and reconcile/cancel/clean up the affected operation.
@@ -574,6 +623,11 @@ to an apparently healthy empty service.
 
 These are future qualification gates, **not implementation performed by this
 document**. No acceptance result below is claimed to have run.
+
+Every milestone requires the complete native RA–FM/RA–RA message inventory and
+conformance evidence for its enabled exchanges. Remaining exchanges retain
+explicit implementation stages; completing M1–M4 does not erase those
+obligations or establish complete protocol parity.
 
 ### M1 — Standalone stateless cluster
 
@@ -642,7 +696,8 @@ Retain three complementary tiers:
 
 1. **Deterministic models:** FM desired/observed convergence; RA semantic
    state transitions; duplicate/reordered/lost control; epochs/incarnations;
-   quorum/copy barriers; backpressure and ownership accounting. Keep runtime
+   native FM–RA/RA–RA dispatch, acknowledgments and retries; quorum/copy barriers;
+   backpressure and ownership accounting. Keep runtime
    child-process watchdog tests, including blocked callbacks and destruction:
    [model_tests.rs:658–728](../../crates/libs/fube-runtime/src/model_tests.rs#L658-L728).
 2. **Native-free real-process cluster acceptance:** prebuilt FM, RAs, Rust apps
@@ -654,6 +709,12 @@ Retain three complementary tiers:
    runtime/reconfiguration/data scenarios. Keep the existing required native
    profile intact unless a separate qualification decision changes it.
    Rust-to-Rust success alone cannot establish native parity.
+
+Enforce the [protocol conformance gates](RustRaPort.md#native-reliability-message-preservation)
+in CI: inventory completeness, native-to-Rust and Rust-to-native codec fixtures,
+and state/action trace comparisons for enabled messages. Local round trips,
+successful socket writes and generic command-status tests cannot substitute
+for these checks.
 
 Extend the declarative [tests/suites.toml](../../tests/suites.toml) with explicit
 cluster suite/resource/profile routing when implementing; no new suite exists
@@ -692,9 +753,10 @@ consumers, not the upstream Rust producer.
 Safety decisions above are fixed for the initial profile. These bounded
 implementation choices remain open without changing those decisions:
 
-- **Control codec and API spelling:** select a schema/encoding and HTTP/CLI
-  surface; retain explicit versioning, finite framing, idempotent operation IDs,
-  semantic results and capability rejection.
+- **Control transport and API spelling:** select outer session framing and
+  HTTP/CLI surface without redesigning native RA–FM/RA–RA actions, headers,
+  payload encodings or processing contracts. Retain finite bounds and explicit
+  capability admission; native codec conformance is required, not optional.
 - **Module/crate layout:** a focused cluster library with FM/RA entry points is
   a reasonable starting point; decide whether reusable host mechanics live in
   `fube-test-host` or a shared internal module. No dependency direction should
