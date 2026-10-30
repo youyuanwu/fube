@@ -19,6 +19,9 @@ pub use lifecycle::*;
 #[path = "notification.rs"]
 mod notification;
 pub use notification::ServiceTypeEntry;
+#[path = "opening.rs"]
+mod opening;
+pub use opening::*;
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -115,6 +118,8 @@ pub struct Settings {
     pub notification_node_ms: u64,
     pub notification_type_ms: u64,
     pub notification_retry_ms: u64,
+    pub open_retry: RetryPolicy,
+    pub open_registration: RetryPolicy,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -137,6 +142,8 @@ impl Default for Settings {
             notification_node_ms: 5_000,
             notification_type_ms: 45_000,
             notification_retry_ms: 30_000,
+            open_retry: RetryPolicy::open(),
+            open_registration: RetryPolicy::registration(),
         }
     }
 }
@@ -168,6 +175,8 @@ impl Settings {
             || self.notification_batch_bytes == 0
             || self.notification_batch_bytes > 4 * 1024 * 1024
             || self.notification_retry_ms == 0
+            || !self.open_retry.valid()
+            || !self.open_registration.valid()
         {
             return Err(Failure::Admission("invalid finite executor settings"));
         }
@@ -183,6 +192,11 @@ pub struct OpenCompletion {
     pub unit: FailoverUnit,
     pub replica: Replica,
     pub error: i64,
+    pub registration: RuntimeRegistration,
+    pub flags: i64,
+    /// Abort error certifies proxy/queued Open cleanup, not termination success.
+    pub cleanup: bool,
+    pub detail: ProxyErrorDetail,
 }
 pub enum Command {
     Add {
@@ -254,10 +268,16 @@ pub enum Phase {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityState {
     pub body: Arc<AddInstance>,
+    /// Admitted creation package, distinct from Hosting's selected version.
+    /// Session-only: no restart/adoption loader is provided.
+    pub requested_version: VersionInstance,
     pub phase: Phase,
     pub open_token: u64,
     /// Volatile retry bookkeeping; not a native disk record or durable outbox.
     pub retry_attempts: u64,
+    pub open_failures: u64,
+    /// Separately owned package usage, retained across opening host crashes.
+    pub usage: Option<u64>,
     pub last_retry_error: i64,
     pub runtime: Option<RuntimeRegistration>,
     pub close_mode: Option<CloseMode>,
@@ -287,12 +307,15 @@ pub enum Effect {
         token: u64,
         lookup: u64,
         body: Arc<AddInstance>,
+        /// None requests a new usage lease; Some retains this existing lease.
+        usage: Option<u64>,
     },
     Reply(Box<AddInstanceReply>),
     RuntimeOpen {
         token: u64,
         body: Arc<AddInstance>,
         registration: RuntimeRegistration,
+        flags: i64,
     },
     Close {
         token: u64,
@@ -304,6 +327,7 @@ pub enum Effect {
         token: u64,
         lookup: u64,
         body: Arc<AddInstance>,
+        usage: Option<u64>,
     },
     TerminateHost {
         registration: RuntimeRegistration,
@@ -317,6 +341,10 @@ pub enum Effect {
     RequestServiceTypeRetry {
         after_ms: u64,
     },
+    ReleaseUsage {
+        acquisition: u64,
+    },
+    OpeningHealth(Box<OpeningHealthReport>),
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dispatched {
@@ -487,7 +515,7 @@ impl Executor {
         // and reply. Bounds are checked again before any persistence/effects.
         let reserved_effects = match &kind {
             Kind::Add { .. } => 2,
-            Kind::Complete | Kind::Retry | Kind::RetryReport => 1,
+            Kind::Retry | Kind::RetryReport => 1,
             _ => 8,
         };
         let node_work = matches!(
@@ -772,7 +800,10 @@ fn transition(
                         "replacement requires native close/drop choreography",
                     ));
                 }
-                if body.unit != local.unit || body.service != local.service {
+                if current.phase == Phase::Opening {
+                    return Ok(Transition::ignored(Disposition::IgnoredPending));
+                }
+                if body.unit != local.unit || !lifecycle::service_matches(current, &body.service) {
                     return Err(Failure::Unsupported(
                         "epoch/service-description update choreography is staged",
                     ));
@@ -791,9 +822,12 @@ fn transition(
             Ok(Transition {
                 update: Update::Durable(EntityState {
                     body: body.clone(),
+                    requested_version: body.service.version.clone(),
                     phase: Phase::Opening,
                     open_token: work.id,
                     retry_attempts: 0,
+                    open_failures: 0,
+                    usage: None,
                     last_retry_error: 0,
                     runtime: None,
                     close_mode: None,
@@ -812,69 +846,19 @@ fn transition(
                     token: work.id,
                     lookup: 0, // assigned atomically by track_lookups before persistence
                     body,
+                    usage: None,
                 }],
                 disposition: Disposition::Applied,
             })
         }
-        Kind::Complete => {
-            let completion: OpenCompletion = from_slice(&work.bytes).map_err(decode_error)?;
-            let current = state.ok_or(Failure::Admission("no opening entity"))?;
-            if current.phase != Phase::Opening
-                || completion.token != current.open_token
-                || completion.unit != current.body.unit
-                || completion.replica.id != current.body.replica.id
-                || completion.replica.instance != current.body.replica.instance
-                || completion.replica.node != current.body.replica.node
-                || completion.replica.version != current.body.replica.version
-            {
-                return Ok(Transition::ignored(Disposition::IgnoredStale));
-            }
-            let mut proposed = current.clone();
-            if completion.error == SERVICE_TYPE_NOT_REGISTERED {
-                if current.runtime.is_some() {
-                    return Err(Failure::Admission(
-                        "registration result cannot revoke an active runtime",
-                    ));
-                }
-                proposed.last_retry_error = completion.error;
-                return Ok(Transition {
-                    update: Update::Memory(proposed),
-                    effects: vec![],
-                    disposition: Disposition::Applied,
-                });
-            }
-            if completion.error != 0 {
-                return Err(Failure::Unsupported(
-                    "native retry/terminal-open error policy is staged",
-                ));
-            }
-            if current.runtime.is_none() {
-                return Err(Failure::Admission(
-                    "Open success requires committed registration handoff",
-                ));
-            }
-            if completion.replica.state != 2
-                || !completion.replica.up
-                || completion.replica.current_role != 1
-            {
-                return Err(Failure::Admission(
-                    "open success must carry native Ready stateless replica",
-                ));
-            }
-            let mut body = (*proposed.body).clone();
-            body.replica = completion.replica;
-            proposed.body = Arc::new(body);
-            proposed.phase = Phase::Ready;
-            Ok(Transition {
-                effects: vec![reply(&proposed.body, 0)],
-                update: Update::Durable(proposed),
-                disposition: Disposition::Applied,
-            })
-        }
+        Kind::Complete => opening::complete(work, state, settings),
         Kind::Retry => {
+            if !admission.owner_ready {
+                return Ok(Transition::ignored(Disposition::IgnoredNotReady));
+            }
             let current = state.ok_or(Failure::Admission("memory-only insert is forbidden"))?;
             if current.phase != Phase::Opening {
-                return Err(Failure::Admission("only pending open may retry"));
+                return Ok(Transition::ignored(Disposition::IgnoredPending));
             }
             let mut proposed = current.clone();
             proposed.retry_attempts = proposed
@@ -887,12 +871,14 @@ fn transition(
                         token: current.open_token,
                         body: current.body.clone(),
                         registration: registration.clone(),
+                        flags: settings.open_retry.flags(current.open_failures),
                     }
                 } else {
                     Effect::Open {
                         token: current.open_token,
                         lookup: 0,
                         body: current.body.clone(),
+                        usage: current.usage,
                     }
                 }],
                 update: Update::Memory(proposed),

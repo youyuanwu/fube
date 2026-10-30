@@ -131,6 +131,13 @@ fn complete(value: &AddInstance, token: u64) -> OpenCompletion {
         unit: value.unit.clone(),
         replica,
         error: 0,
+        registration: RuntimeRegistration {
+            acquisition: token,
+            ..registration()
+        },
+        flags: 0,
+        cleanup: false,
+        detail: ProxyErrorDetail::default(),
     }
 }
 async fn setup(timeout: Duration) -> (Store, Executor, Arc<Hooks>) {
@@ -184,6 +191,14 @@ async fn registered(executor: &Executor, request: &AddInstance, token: u64) {
             registration: runtime,
             error: 0,
             retryable: false,
+            usage_acquired: executor
+                .snapshot(request.unit.id.guid.0)
+                .committed
+                .unwrap()
+                .usage
+                .is_none(),
+            version: request.service.version.clone(),
+            ..RegistrationCompletion::default()
         })))
         .unwrap()
         .wait(WAIT)
@@ -596,7 +611,7 @@ async fn stale_identity_epoch_source_generation_and_unsupported_replacement_neve
             .unwrap()
             .wait(WAIT)
             .await,
-        Err(Failure::Unsupported(_))
+        Ok(Disposition::IgnoredStale)
     ));
     for (source, generation) in [
         (
@@ -924,7 +939,7 @@ async fn native_ready_delete_duplicate_retry_and_close_completion_order() {
     assert_close(&effects(&executor), 8, &closing);
     close_done(&executor, 0).await;
     assert!(matches!(effects(&executor).as_slice(), [
-                Effect::ReleaseRegistration(_), Effect::Health(HealthEvent::Close), Effect::RemoveReply(r)
+                Effect::ReleaseRegistration(_), Effect::ReleaseUsage { .. }, Effect::Health(HealthEvent::Close), Effect::RemoveReply(r)
             ] if r.error==0 && r.replica.state==3 && !r.replica.up && r.replica.service_endpoint.is_empty()
                 && r.replica.version==VersionInstance::invalid()));
     assert_eq!(state(&executor).phase, Phase::Closed);
@@ -1073,6 +1088,7 @@ async fn native_obliterate_requires_host_down_reports_replica_up_and_ack_list_se
             effects(&executor).as_slice(),
             [
                 Effect::ReleaseRegistration(_),
+                Effect::ReleaseUsage { .. },
                 Effect::RequestReportRetry,
                 Effect::Health(HealthEvent::Close)
             ]
@@ -1165,6 +1181,7 @@ async fn native_delete_open_races_before_and_after_registration_are_explicit() {
                 effects(&executor).as_slice(),
                 [
                     Effect::ReleaseRegistration(_),
+                    Effect::ReleaseUsage { .. },
                     Effect::Health(HealthEvent::Close),
                     Effect::RemoveReply(_)
                 ]
@@ -1184,13 +1201,20 @@ async fn native_delete_open_races_before_and_after_registration_are_explicit() {
                     registration: registration(),
                     error: 0,
                     retryable: false,
+                    usage_acquired: true,
+                    ..RegistrationCompletion::default()
                 })),
             )
             .await;
             assert_eq!(
                 effects(&executor),
-                [Effect::ReleaseRegistration(registration())]
-            ); // no RuntimeOpen
+                [
+                    Effect::ReleaseRegistration(registration()),
+                    Effect::ReleaseUsage {
+                        acquisition: first.id
+                    }
+                ]
+            ); // no RuntimeOpen, unused separately acquired usage is also disposed
         }
         for error in [0, -5, SERVICE_TYPE_NOT_REGISTERED] {
             let mut completion = complete(&request, first.id);
@@ -1260,6 +1284,7 @@ async fn native_close_failures_warning_forceabort_and_captured_reply_mode() {
         effects(&executor).as_slice(),
         [
             Effect::ReleaseRegistration(_),
+            Effect::ReleaseUsage { .. },
             Effect::Health(HealthEvent::Close)
         ]
     ));
@@ -1308,6 +1333,7 @@ async fn native_lookup_failure_and_apphostdown_are_not_generic_close_success() {
                     registration: Default::default(),
                     error: -99,
                     retryable: true,
+                    ..RegistrationCompletion::default()
                 })),
             )
             .await;
@@ -1329,12 +1355,17 @@ async fn native_lookup_failure_and_apphostdown_are_not_generic_close_success() {
                     registration: Default::default(),
                     error: -99,
                     retryable: false,
+                    ..RegistrationCompletion::default()
                 })),
             )
             .await;
             assert!(matches!(
                 effects(&executor).as_slice(),
-                [Effect::Health(HealthEvent::Close), Effect::RemoveReply(_)]
+                [
+                    Effect::ReleaseUsage { .. },
+                    Effect::Health(HealthEvent::Close),
+                    Effect::RemoveReply(_)
+                ]
             ));
         } else {
             run(
@@ -1349,6 +1380,7 @@ async fn native_lookup_failure_and_apphostdown_are_not_generic_close_success() {
                 effects(&executor).as_slice(),
                 [
                     Effect::ReleaseRegistration(_),
+                    Effect::ReleaseUsage { .. },
                     Effect::Health(HealthEvent::Close)
                 ]
             ));
@@ -1716,6 +1748,7 @@ async fn registration_retry_thresholds_warning_precedence_and_reacquire_are_nati
             registration: RuntimeRegistration::default(),
             error: -99,
             retryable: true,
+            ..RegistrationCompletion::default()
         };
         run(&executor, Command::Registered(Box::new(event.clone()))).await;
         assert_eq!(
@@ -1875,6 +1908,9 @@ fn acquired(
         registration: runtime,
         error: 0,
         retryable: false,
+        usage_acquired: true,
+        version: request.service.version.clone(),
+        ..RegistrationCompletion::default()
     }
 }
 
@@ -1905,7 +1941,12 @@ async fn late_acquired_lookup_after_recreation_releases_its_reference_not_active
         );
         assert_eq!(
             effects(&executor),
-            [Effect::ReleaseRegistration(event.registration.clone())]
+            [
+                Effect::ReleaseRegistration(event.registration.clone()),
+                Effect::ReleaseUsage {
+                    acquisition: event.lookup
+                }
+            ]
         );
         assert_eq!(state(&executor).runtime, active);
         assert_eq!(state(&executor).body.replica.instance, 51);
@@ -1954,7 +1995,12 @@ async fn overlapping_lookup_results_dispose_unused_acquisition_and_callback_repl
         run(&executor, Command::Registered(Box::new(two.clone()))).await;
         assert_eq!(
             effects(&executor),
-            [Effect::ReleaseRegistration(two.registration.clone())]
+            [
+                Effect::ReleaseRegistration(two.registration.clone()),
+                Effect::ReleaseUsage {
+                    acquisition: two.lookup
+                }
+            ]
         );
         assert_eq!(state(&executor).runtime, Some(one.registration.clone()));
         for event in [one, two] {
@@ -2183,6 +2229,782 @@ async fn node_detachment_is_atomic_with_definite_unknown_and_cancelled_entity_co
         }
     }
 }
+async fn setup_open(settings: Settings, timeout: Duration) -> (Store, Executor, Arc<Hooks>) {
+    let hooks = Arc::new(Hooks::default());
+    let store = Store::new(
+        Controlled {
+            inner: MemoryBackend::new(),
+            hooks: hooks.clone(),
+        },
+        StoreSettings {
+            operation_timeout: timeout,
+            ..StoreSettings::default()
+        },
+    )
+    .await
+    .unwrap();
+    let executor = Executor::new(Arc::new(store.clone()), admission(), settings).unwrap();
+    (store, executor, hooks)
+}
+async fn begin_open(executor: &Executor) -> u64 {
+    let ticket = executor.submit(add(body(1))).unwrap();
+    ticket.wait(WAIT).await.unwrap();
+    assert!(matches!(
+        effects(executor).as_slice(),
+        [Effect::Open { .. }]
+    ));
+    ticket.id
+}
+fn lookup_result(executor: &Executor, error: i64) -> RegistrationCompletion {
+    let s = state(executor);
+    let (&lookup, &(token, _)) = s.registration_lookups.last_key_value().unwrap();
+    let mut event = acquired(&s.body, token, lookup, false);
+    event.error = error;
+    event.usage_acquired = error == 0 && s.usage.is_none();
+    event
+}
+fn runtime_result(executor: &Executor, error: i64, flags: i64) -> OpenCompletion {
+    let s = state(executor);
+    let mut event = complete(&s.body, s.open_token);
+    event.registration = s.runtime.clone().unwrap();
+    event.error = error;
+    event.flags = flags;
+    if error != 0 && error != PROXY_STATE_CHANGED_ON_DATA_LOSS {
+        event.replica = s.body.replica.clone();
+    }
+    event
+}
+async fn runtime_reply(executor: &Executor, error: i64, flags: i64) {
+    let event = runtime_result(executor, error, flags);
+    run(executor, Command::CompleteOpen(Box::new(event))).await;
+}
+
+#[tokio::test]
+async fn native_new_registration_allowlist_fatal_and_unknown_errors_preserve_original_reply() {
+    // Direct SL: Test.StateMachine.cpp:2602-2617,2633-2650,3102-3120;
+    // actual classification: Hosting.FindServiceTypeRegistrationErrorList.cpp:35-65.
+    for error in [
+        HOSTING_DEPLOYMENT_IN_PROGRESS,
+        HOSTING_ACTIVATION_IN_PROGRESS,
+        HOSTING_SERVICE_TYPE_NOT_REGISTERED,
+        HOSTING_NOT_FOUND,
+        HOSTING_APPLICATION_VERSION_MISMATCH,
+        HOSTING_PACKAGE_VERSION_MISMATCH,
+        HOSTING_REGISTRATION_VERSION_MISMATCH,
+        HOSTING_RUNTIME_NOT_REGISTERED,
+        HOSTING_SERVICE_TYPE_DISABLED,
+        APPLICATION_INSTANCE_DELETED,
+        -1234567,
+    ] {
+        let (store, executor, hooks) = setup(WAIT).await;
+        begin_open(&executor).await;
+        let captured = state(&executor).body.clone();
+        let mut event = lookup_result(&executor, error);
+        event.registration = RuntimeRegistration::default();
+        event.retryable = !registration_retryable(error); // caller bool cannot override open policy
+        run(&executor, Command::Registered(Box::new(event.clone()))).await;
+        assert!(state(&executor).registration_lookups.is_empty());
+        if registration_retryable(error) {
+            assert_eq!(state(&executor).phase, Phase::Opening);
+            assert_eq!(state(&executor).registration_failures, 1);
+            assert!(effects(&executor).is_empty());
+        } else {
+            assert_eq!(state(&executor).phase, Phase::Closed);
+            assert_eq!(state(&executor).registration_failures, 0);
+            assert_eq!(
+                effects(&executor),
+                vec![
+                    Effect::Health(HealthEvent::Close),
+                    Effect::Reply(Box::new(AddInstanceReply {
+                        unit: captured.unit.clone(),
+                        replica: captured.replica.clone(),
+                        error,
+                    }))
+                ]
+            );
+        }
+        assert_eq!(operations(&hooks), ["Insert"]); // native FSR retry is memory-only
+        run(&executor, Command::Registered(Box::new(event))).await;
+        assert!(effects(&executor).is_empty());
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn native_registration_threshold_warning_clear_true_exhaustion_and_ties() {
+    // Direct SL :2669-2718,3127-3140; true retryable drop is wrapper unit
+    // Test.Unit.ServiceTypeRegistrationWrapper.cpp:613-621, not the misleading
+    // ExceedThresholdAtFSR test which actually injects a fatal error.
+    for complete_success in [false, true] {
+        let settings = Settings {
+            open_registration: RetryPolicy {
+                warning: 2,
+                drop: 3,
+                ..RetryPolicy::registration()
+            },
+            ..Settings::default()
+        };
+        let (store, executor, hooks) = setup_open(settings, WAIT).await;
+        begin_open(&executor).await;
+        for n in 1..=2 {
+            let mut event = lookup_result(&executor, HOSTING_DEPLOYMENT_IN_PROGRESS);
+            event.error_message = "deployment pending".into();
+            run(&executor, Command::Registered(Box::new(event))).await;
+            assert_eq!(state(&executor).registration_failures, n);
+            let expected = if n == 2 {
+                vec![Effect::OpeningHealth(Box::new(OpeningHealthReport {
+                    event: HealthEvent::ServiceTypeRegistrationWarning,
+                    error: HOSTING_DEPLOYMENT_IN_PROGRESS,
+                    detail: ProxyErrorDetail {
+                        message: "deployment pending".into(),
+                        ..ProxyErrorDetail::default()
+                    },
+                }))]
+            } else {
+                vec![]
+            };
+            assert_eq!(effects(&executor), expected);
+            run(&executor, Command::RetryOpen(body(1).unit.id)).await;
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::Open { .. }]
+            ));
+        }
+        let event = lookup_result(
+            &executor,
+            if complete_success {
+                0
+            } else {
+                HOSTING_DEPLOYMENT_IN_PROGRESS
+            },
+        );
+        run(&executor, Command::Registered(Box::new(event))).await;
+        if complete_success {
+            assert!(
+                matches!(effects(&executor).as_slice(), [Effect::RequestServiceTypeRetry { .. }, Effect::OpeningHealth(h), Effect::RuntimeOpen { flags:0,.. }] if h.event==HealthEvent::ClearServiceTypeRegistrationWarning)
+            );
+            assert_eq!(state(&executor).phase, Phase::Opening);
+            assert_eq!(state(&executor).registration_failures, 0);
+        } else {
+            assert_eq!(state(&executor).phase, Phase::Closed);
+            assert!(
+                matches!(effects(&executor).as_slice(), [Effect::Health(HealthEvent::Close), Effect::Reply(r)] if r.error==HOSTING_DEPLOYMENT_IN_PROGRESS && r.replica.state==1)
+            );
+        }
+        assert_eq!(operations(&hooks), ["Insert"]);
+        finish(&store, &executor).await;
+    }
+    let settings = Settings {
+        open_registration: RetryPolicy {
+            warning: 1,
+            drop: 1,
+            restart: 2,
+            error: 3,
+        },
+        ..Settings::default()
+    };
+    let (store, executor, _) = setup_open(settings, WAIT).await;
+    begin_open(&executor).await;
+    for n in 1..=4 {
+        let event = lookup_result(&executor, HOSTING_NOT_FOUND);
+        run(&executor, Command::Registered(Box::new(event))).await;
+        assert_eq!(state(&executor).registration_failures, n);
+        let actions = effects(&executor);
+        assert_eq!(actions.len(), usize::from(n == 1)); // warning wins tie; restart/error ignored
+        assert_eq!(state(&executor).phase, Phase::Opening);
+        run(&executor, Command::RetryOpen(body(1).unit.id)).await;
+        effects(&executor);
+    }
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn native_runtime_warning_abort_guard_terminal_cleanup_and_captured_reply() {
+    // Direct SL :2763-2788,2809-2852,3155-3194; final guard :3400-3437,4569-4576.
+    let settings = Settings {
+        open_retry: RetryPolicy {
+            warning: 1,
+            drop: 3,
+            ..RetryPolicy::open()
+        },
+        ..Settings::default()
+    };
+    let (store, executor, hooks) = setup_open(settings, WAIT).await;
+    let token = begin_open(&executor).await;
+    registered(&executor, &body(1), token).await;
+    let captured = state(&executor).body.clone();
+    let mut event = runtime_result(&executor, -123, 0);
+    event.detail = ProxyErrorDetail {
+        message: "user Open failed".into(),
+        api: ApiNameDescription {
+            api: 3,
+            interface: 2,
+            metadata: "OpenInstance".into(),
+        },
+    };
+    run(&executor, Command::CompleteOpen(Box::new(event.clone()))).await;
+    assert_eq!(state(&executor).open_failures, 1);
+    assert_eq!(state(&executor).registration_failures, 0);
+    assert_eq!(
+        effects(&executor),
+        [Effect::OpeningHealth(Box::new(OpeningHealthReport {
+            event: HealthEvent::OpenWarning,
+            error: -123,
+            detail: event.detail.clone()
+        }))]
+    );
+    runtime_reply(&executor, HOSTING_SERVICE_TYPE_DISABLED, 0).await; // not fatal at RAP layer
+    assert!(effects(&executor).is_empty());
+    assert_eq!(state(&executor).open_failures, 2);
+    let before = state(&executor);
+    run(&executor, Command::RetryOpen(body(1).unit.id)).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::RuntimeOpen { flags: ABORT, .. }]
+    ));
+    assert_eq!(state(&executor).open_failures, 2); // sending is not failing
+    for error in [0, -99] {
+        assert_eq!(
+            run(
+                &executor,
+                Command::CompleteOpen(Box::new(runtime_result(&executor, error, 0)))
+            )
+            .await,
+            Disposition::IgnoredStale
+        );
+        assert!(effects(&executor).is_empty());
+        assert_eq!(state(&executor).open_failures, before.open_failures);
+    }
+    let mut terminal = runtime_result(&executor, -777, ABORT);
+    assert!(matches!(
+        executor
+            .submit(Command::CompleteOpen(Box::new(terminal.clone())))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Admission(_))
+    ));
+    assert!(effects(&executor).is_empty());
+    terminal.cleanup = true;
+    run(&executor, Command::CompleteOpen(Box::new(terminal.clone()))).await;
+    assert_eq!(state(&executor).phase, Phase::Closed);
+    assert!(state(&executor).usage.is_none() && state(&executor).runtime.is_none());
+    assert_eq!(
+        effects(&executor),
+        [
+            Effect::ReleaseRegistration(terminal.registration.clone()),
+            Effect::ReleaseUsage { acquisition: token },
+            Effect::Health(HealthEvent::Close),
+            Effect::Reply(Box::new(AddInstanceReply {
+                unit: captured.unit.clone(),
+                replica: captured.replica.clone(),
+                error: -777
+            })),
+        ]
+    );
+    assert!(executor.service_types().is_empty());
+    assert_eq!(operations(&hooks), ["Insert", "Update", "Update", "Update"]);
+    assert_eq!(
+        run(&executor, Command::CompleteOpen(Box::new(terminal))).await,
+        Disposition::IgnoredStale
+    );
+    assert_eq!(
+        run(&executor, Command::RetryOpen(body(1).unit.id)).await,
+        Disposition::IgnoredPending
+    );
+    assert!(effects(&executor).is_empty());
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn returned_version_keeps_original_add_retry_and_closed_recreation_supported() {
+    // ReconfigurationAgent.cpp:1013-1033,1660-1683; FailoverUnit.cpp:5862-5883.
+    // Version selection is shared source evidence, not a direct SL native test.
+    for remove_after_ready in [false, true] {
+        let settings = Settings {
+            open_retry: RetryPolicy {
+                warning: 10,
+                drop: 1,
+                ..RetryPolicy::open()
+            },
+            ..Settings::default()
+        };
+        let (store, executor, hooks) = setup_open(settings, WAIT).await;
+        begin_open(&executor).await;
+        let mut candidate = lookup_result(&executor, 0);
+        candidate.error = HOSTING_REGISTRATION_VERSION_MISMATCH;
+        candidate.version.instance = 9;
+        run(&executor, Command::Registered(Box::new(candidate))).await;
+        effects(&executor);
+        assert_eq!(
+            run(&executor, add(body(1))).await,
+            Disposition::IgnoredPending
+        );
+        if remove_after_ready {
+            runtime_reply(&executor, 0, ABORT).await;
+            effects(&executor);
+            let writes = operations(&hooks);
+            run(&executor, add(body(1))).await;
+            assert!(
+                matches!(effects(&executor).as_slice(),[Effect::Reply(r)] if r.error==0 && r.replica.version.instance==9 && r.replica.state==2)
+            );
+            assert_eq!(operations(&hooks), writes);
+            run(&executor, remove(body(1), false)).await;
+            effects(&executor);
+            close_done(&executor, 0).await;
+            effects(&executor);
+        } else {
+            let mut failed = runtime_result(&executor, -45, ABORT);
+            failed.cleanup = true;
+            run(&executor, Command::CompleteOpen(Box::new(failed))).await;
+            effects(&executor);
+        }
+        assert!(state(&executor).runtime.is_none() && state(&executor).usage.is_none());
+        assert!(executor.service_types().is_empty());
+        let mut next = body(1);
+        next.replica.instance += 1;
+        run(&executor, add(next)).await;
+        assert!(
+            matches!(effects(&executor).as_slice(),[Effect::Open {body,usage:None,..}] if body.service.version.instance==0 && body.replica.instance==51)
+        );
+        assert_eq!(state(&executor).phase, Phase::Opening);
+        assert_eq!(state(&executor).requested_version.instance, 0);
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn closing_reacquisition_normalizes_version_and_disposes_rejected_mismatch_once() {
+    // Shared helper: ReconfigurationAgent.cpp:987-1033;
+    // FailoverUnit.cpp:5072-5130,5919-5924. Unique acquisitions are a Rust seam.
+    for (error, required) in [
+        (0, None),
+        (HOSTING_REGISTRATION_VERSION_MISMATCH, None),
+        (HOSTING_REGISTRATION_VERSION_MISMATCH, Some(8)),
+        (HOSTING_REGISTRATION_VERSION_MISMATCH, Some(9)),
+        (HOSTING_REGISTRATION_VERSION_MISMATCH, Some(10)),
+    ] {
+        let (store, executor, hooks) = setup(WAIT).await;
+        let token = make_ready(&executor, &body(1)).await;
+        run(&executor, remove(body(1), false)).await;
+        effects(&executor);
+        close_done(&executor, APPLICATION_HOST_CRASH).await;
+        effects(&executor);
+        run(&executor, Command::RetryClose(body(1).unit.id)).await;
+        effects(&executor);
+        let mut event = lookup_result(&executor, 0);
+        event.error = error;
+        event.version.instance = 9;
+        event.registration.code_package = "ActualCode".into();
+        event.upgrade_present = required.is_some();
+        event.required_upgrade = required.unwrap_or_default();
+        event.retryable = true;
+        assert!(!event.usage_acquired);
+        let writes = operations(&hooks);
+        run(&executor, Command::Registered(Box::new(event.clone()))).await;
+        assert_eq!(state(&executor).usage, Some(token));
+        assert!(state(&executor).registration_lookups.is_empty());
+        if required == Some(10) {
+            assert_eq!(
+                effects(&executor),
+                [Effect::ReleaseRegistration(event.registration.clone())]
+            );
+            assert!(state(&executor).runtime.is_none());
+            assert!(executor.service_types().is_empty());
+            assert_eq!(state(&executor).registration_failures, 1);
+        } else {
+            assert_eq!(state(&executor).runtime, Some(event.registration.clone()));
+            let actions = effects(&executor);
+            assert!(
+                matches!(actions.as_slice(),[Effect::RequestServiceTypeRetry {..},Effect::Close {body,flags:8,registration,..}] if body.service.version.instance==9 && body.replica.version==VersionInstance::invalid() && registration==&event.registration)
+            );
+            // SendReplicaCloseMessage.cpp authority is FailoverUnit.cpp:4760-4778:
+            // wire closing replica is canonical, not the local selected version.
+            assert_close(&actions[1..], 8, &state(&executor));
+            assert_eq!(state(&executor).body.replica.version.instance, 9);
+            let info = executor.service_types()[0].info.clone();
+            assert_eq!(info.versioned.version.instance, 9);
+            assert_eq!(info.code_package, "ActualCode");
+            let mut old = info.clone();
+            old.versioned.version.instance = 0;
+            for (ack, pending) in [(old, true), (info, false)] {
+                run(
+                    &executor,
+                    Command::ServiceTypeReply {
+                        body: Box::new(ServiceTypeNotification {
+                            infos: fube_transport::serialization::serde::ObjectArray(vec![ack]),
+                        }),
+                        source: admission().fm_source,
+                        generation: GenerationHeader::default(),
+                    },
+                )
+                .await;
+                assert_eq!(executor.service_types()[0].pending, pending);
+            }
+        }
+        assert_eq!(operations(&hooks), writes);
+        assert_eq!(
+            run(&executor, Command::Registered(Box::new(event))).await,
+            Disposition::IgnoredStale
+        );
+        assert!(effects(&executor).is_empty());
+        if required != Some(10) {
+            close_done(&executor, 0).await;
+            effects(&executor);
+            assert!(state(&executor).usage.is_none());
+            assert!(executor.service_types().is_empty());
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn native_usage_increment_failure_and_returned_version_selection_are_distinct() {
+    // Direct SL usage failure :2619-2631,3112-3115; version mismatch selection
+    // ReconfigurationAgent.cpp:986-1033 is shared/helper-derived, not SL test.
+    let settings = Settings {
+        open_registration: RetryPolicy {
+            warning: 1,
+            ..RetryPolicy::registration()
+        },
+        ..Settings::default()
+    };
+    let (store, executor, hooks) = setup_open(settings, WAIT).await;
+    begin_open(&executor).await;
+    let failure = lookup_result(&executor, HOSTING_NOT_FOUND);
+    run(&executor, Command::Registered(Box::new(failure))).await;
+    effects(&executor);
+    run(&executor, Command::RetryOpen(body(1).unit.id)).await;
+    effects(&executor);
+    let mut usage_fail = lookup_result(&executor, 0);
+    usage_fail.usage_acquired = false;
+    usage_fail.usage_error = -88;
+    run(&executor, Command::Registered(Box::new(usage_fail.clone()))).await;
+    assert_eq!(
+        effects(&executor),
+        [Effect::ReleaseRegistration(usage_fail.registration)]
+    );
+    assert_eq!(state(&executor).registration_failures, 1);
+    assert!(state(&executor).usage.is_none());
+    run(&executor, Command::RetryOpen(body(1).unit.id)).await;
+    effects(&executor);
+    let mut event = lookup_result(&executor, HOSTING_REGISTRATION_VERSION_MISMATCH);
+    event.version.instance = 9;
+    event.usage_acquired = true; // adapter transfers successful increment after version selection
+    event.upgrade_present = true;
+    event.required_upgrade = 8;
+    run(&executor, Command::Registered(Box::new(event.clone()))).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::RequestServiceTypeRetry {..}, Effect::OpeningHealth(h), Effect::RuntimeOpen { body,.. }] if h.event==HealthEvent::ClearServiceTypeRegistrationWarning && body.replica.version.instance==9 && body.service.version.instance==9)
+    );
+    assert_eq!(state(&executor).usage, Some(event.lookup));
+    assert_eq!(
+        executor.service_types()[0].info.versioned.version.instance,
+        9
+    );
+    assert_eq!(
+        run(&executor, add(body(1))).await,
+        Disposition::IgnoredPending
+    );
+    runtime_reply(&executor, PROXY_STATE_CHANGED_ON_DATA_LOSS, 0).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::Reply(r)] if r.error==0 && r.replica.state==2 && !r.replica.service_endpoint.is_empty())
+    );
+    assert_eq!(operations(&hooks), ["Insert", "Update"]);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn native_opening_host_down_retains_usage_invalidates_old_work_and_exhausts_without_abort_reply(
+) {
+    // Handler-derived stateless tuples: ReconfigurationAgent.cpp:1138-1183;
+    // FailoverUnit.cpp:5258-5279. Native late-open tests in Close.cpp:872-889
+    // are SP1 and not an independent direct-SL oracle.
+    let settings = Settings {
+        open_retry: RetryPolicy {
+            warning: 1,
+            drop: 2,
+            ..RetryPolicy::open()
+        },
+        ..Settings::default()
+    };
+    let (store, executor, hooks) = setup_open(settings, WAIT).await;
+    let token = begin_open(&executor).await;
+    run(&executor, Command::RetryOpen(body(1).unit.id)).await;
+    effects(&executor);
+    let stale_lookup = lookup_result(&executor, 0);
+    // Adopt the initial lookup, leaving the pre-crash second lookup outstanding.
+    run(
+        &executor,
+        Command::Registered(Box::new(acquired(&body(1), token, token, false))),
+    )
+    .await;
+    effects(&executor);
+    let old_open = runtime_result(&executor, 0, 0);
+    run(
+        &executor,
+        Command::HostDown(Box::new(HostDown {
+            unit: body(1).unit.id,
+            host: registration().host,
+        })),
+    )
+    .await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::OpeningHealth(h), Effect::ReleaseRegistration(_)] if h.event==HealthEvent::OpenWarning && h.error==APPLICATION_HOST_CRASH)
+    );
+    assert!(state(&executor).runtime.is_none());
+    assert_eq!(state(&executor).usage, Some(token));
+    assert_eq!(state(&executor).open_failures, 1);
+    assert!(executor.service_types().is_empty());
+    run(
+        &executor,
+        Command::Registered(Box::new(stale_lookup.clone())),
+    )
+    .await;
+    assert_eq!(
+        effects(&executor),
+        [
+            Effect::ReleaseRegistration(stale_lookup.registration),
+            Effect::ReleaseUsage {
+                acquisition: stale_lookup.lookup
+            }
+        ]
+    );
+    assert_eq!(
+        run(&executor, Command::CompleteOpen(Box::new(old_open.clone()))).await,
+        Disposition::IgnoredStale
+    );
+    run(&executor, Command::RetryOpen(body(1).unit.id)).await;
+    effects(&executor);
+    let reacquired = lookup_result(&executor, 0);
+    assert!(!reacquired.usage_acquired);
+    run(&executor, Command::Registered(Box::new(reacquired.clone()))).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [
+            Effect::RequestServiceTypeRetry { .. },
+            Effect::RuntimeOpen { flags: ABORT, .. }
+        ]
+    ));
+    assert_eq!(state(&executor).usage, Some(token));
+    assert_eq!(
+        run(&executor, Command::CompleteOpen(Box::new(old_open))).await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    let captured = state(&executor).body.clone();
+    run(
+        &executor,
+        Command::HostDown(Box::new(HostDown {
+            unit: body(1).unit.id,
+            host: registration().host,
+        })),
+    )
+    .await;
+    assert_eq!(
+        effects(&executor),
+        [
+            Effect::ReleaseRegistration(reacquired.registration),
+            Effect::ReleaseUsage { acquisition: token },
+            Effect::Health(HealthEvent::Close),
+            Effect::Reply(Box::new(AddInstanceReply {
+                unit: captured.unit.clone(),
+                replica: captured.replica.clone(),
+                error: APPLICATION_HOST_CRASH
+            })),
+        ]
+    );
+    assert_eq!(state(&executor).phase, Phase::Closed);
+    assert!(executor.service_types().is_empty());
+    assert_eq!(operations(&hooks), ["Insert", "Update", "Update"]);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn opening_intermediate_terminal_and_host_down_updates_keep_state_effects_and_node_ledger_private(
+) {
+    // Rust storage translation of native persistent Open helper selection:
+    // ReconfigurationAgent.cpp:3837-3847, not native power-loss qualification.
+    for kind in 0..3 {
+        for uncertain in [false, true] {
+            for fail in [false, true] {
+                let settings = Settings {
+                    open_retry: RetryPolicy {
+                        warning: 1,
+                        drop: if kind == 2 { 1 } else { 40 },
+                        ..RetryPolicy::open()
+                    },
+                    ..Settings::default()
+                };
+                // Terminal case uses non-tied warning/drop.
+                let settings = if kind == 2 {
+                    Settings {
+                        open_retry: RetryPolicy {
+                            warning: 10,
+                            drop: 1,
+                            ..RetryPolicy::open()
+                        },
+                        ..settings
+                    }
+                } else {
+                    settings
+                };
+                let (store, executor, hooks) = setup_open(
+                    settings,
+                    if uncertain {
+                        Duration::from_millis(20)
+                    } else {
+                        WAIT
+                    },
+                )
+                .await;
+                let token = begin_open(&executor).await;
+                registered(&executor, &body(1), token).await;
+                let before = state(&executor);
+                let node = executor.service_types();
+                let command = if kind == 1 {
+                    Command::HostDown(Box::new(HostDown {
+                        unit: body(1).unit.id,
+                        host: registration().host,
+                    }))
+                } else {
+                    let mut e = runtime_result(&executor, -77, if kind == 2 { ABORT } else { 0 });
+                    e.cleanup = kind == 2;
+                    Command::CompleteOpen(Box::new(e))
+                };
+                let (entered, release) = hooks.pause(fail);
+                let ticket = executor.submit(command).unwrap();
+                entered.await.unwrap();
+                if uncertain {
+                    assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+                }
+                assert!(Arc::ptr_eq(&before, &state(&executor)));
+                assert_eq!(executor.service_types(), node);
+                assert!(effects(&executor).is_empty());
+                let sentinel = executor.submit(add(body(1))).unwrap();
+                assert_eq!(sentinel.status(), Status::Pending);
+                drop(ticket); // accepted operation—not its observer—owns commit and resources
+                release.send(()).unwrap();
+                sentinel.wait(WAIT).await.unwrap();
+                let actions = effects(&executor);
+                if fail {
+                    assert_eq!(*state(&executor), *before);
+                    assert_eq!(executor.service_types(), node);
+                    assert!(actions.is_empty());
+                } else {
+                    assert_eq!(
+                        state(&executor).open_failures,
+                        if kind == 2 { 0 } else { 1 }
+                    );
+                    assert_eq!(
+                        state(&executor).phase,
+                        if kind == 2 {
+                            Phase::Closed
+                        } else {
+                            Phase::Opening
+                        }
+                    );
+                    assert_eq!(executor.service_types().len(), usize::from(kind == 0));
+                    assert_eq!(
+                        actions.len(),
+                        if kind == 0 {
+                            1
+                        } else if kind == 1 {
+                            2
+                        } else {
+                            5
+                        }
+                    ); // closed Add may also report dropped
+                }
+                assert_eq!(operations(&hooks), ["Insert", "Update"]);
+                finish(&store, &executor).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_open_success_clears_warning_or_error_threshold_without_inventing_error_health() {
+    // Direct SL Test.StateMachine.cpp:2821-2828,3181-3184.
+    // Generic ignored restart/error branches: RetryableErrorState.cpp:21-68;
+    // Open consumer FailoverUnit.cpp:5258-5279,5363-5367.
+    for policy in [
+        RetryPolicy {
+            warning: 1,
+            ..RetryPolicy::open()
+        },
+        RetryPolicy {
+            warning: 10,
+            restart: 1,
+            error: 2,
+            ..RetryPolicy::open()
+        },
+    ] {
+        let (store, executor, hooks) = setup_open(
+            Settings {
+                open_retry: policy,
+                ..Settings::default()
+            },
+            WAIT,
+        )
+        .await;
+        let token = begin_open(&executor).await;
+        registered(&executor, &body(1), token).await;
+        let failures = if policy.warning == 1 { 1 } else { 2 };
+        for n in 1..=failures {
+            runtime_reply(&executor, -45, 0).await;
+            let actions = effects(&executor);
+            assert_eq!(actions.len(), usize::from(policy.warning == n));
+            assert_eq!(state(&executor).open_failures, n);
+        }
+        let runtime = state(&executor).runtime.clone();
+        let usage = state(&executor).usage;
+        runtime_reply(&executor, 0, 0).await;
+        assert!(
+            matches!(effects(&executor).as_slice(),[Effect::OpeningHealth(h),Effect::Reply(r)] if h.event==HealthEvent::ClearOpenWarning && r.error==0 && r.replica.state==2 && !r.replica.service_endpoint.is_empty())
+        );
+        assert_eq!(state(&executor).open_failures, 0);
+        assert_eq!(state(&executor).runtime, runtime);
+        assert_eq!(state(&executor).usage, usage);
+        assert_eq!(operations(&hooks).len(), failures as usize + 2);
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn remove_during_opening_reacquisition_releases_retained_usage_and_late_candidate_only() {
+    // Handler-derived required removal race, not mislabeled DeleteReplica.cpp
+    // :388-400 inputs as actual force RemoveInstance tests.
+    let (store, executor, hooks) = setup(WAIT).await;
+    let token = begin_open(&executor).await;
+    registered(&executor, &body(1), token).await;
+    run(
+        &executor,
+        Command::HostDown(Box::new(HostDown {
+            unit: body(1).unit.id,
+            host: registration().host,
+        })),
+    )
+    .await;
+    effects(&executor);
+    run(&executor, Command::RetryOpen(body(1).unit.id)).await;
+    effects(&executor);
+    let late = lookup_result(&executor, 0);
+    run(&executor, remove(body(1), false)).await;
+    assert!(
+        matches!(effects(&executor).as_slice(),[Effect::ReleaseUsage {acquisition},Effect::Health(HealthEvent::Close),Effect::RemoveReply(_)] if *acquisition==token)
+    );
+    assert!(state(&executor).usage.is_none());
+    run(&executor, Command::Registered(Box::new(late.clone()))).await;
+    assert_eq!(
+        effects(&executor),
+        [Effect::ReleaseRegistration(late.registration)]
+    );
+    assert_eq!(state(&executor).phase, Phase::Closed);
+    assert_eq!(operations(&hooks), ["Insert", "Update", "Update"]);
+    finish(&store, &executor).await;
+}
+
 #[tokio::test]
 async fn outstanding_lookup_obligations_have_finite_capacity_and_release_only_on_real_result() {
     let store = Store::memory(StoreSettings::default()).await.unwrap();
@@ -2208,7 +3030,8 @@ async fn outstanding_lookup_obligations_have_finite_capacity_and_release_only_on
     assert!(effects(&executor).is_empty());
     // A real failed lookup consumes the obligation without acquiring a ref.
     let mut failed = acquired(&request, first.id, first.id, false);
-    failed.error = SERVICE_TYPE_NOT_REGISTERED;
+    failed.error = HOSTING_SERVICE_TYPE_NOT_REGISTERED;
+    failed.usage_acquired = false;
     failed.retryable = true;
     run(&executor, Command::Registered(Box::new(failed))).await;
     assert!(state(&executor).registration_lookups.is_empty());

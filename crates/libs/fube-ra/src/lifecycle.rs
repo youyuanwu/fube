@@ -15,7 +15,7 @@ pub struct RuntimeRegistration {
     pub acquisition: u64,
     pub code_package: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RegistrationCompletion {
     pub unit: PartitionId,
     pub token: u64,
@@ -26,6 +26,15 @@ pub struct RegistrationCompletion {
     /// result/acquired reference per issued lookup; replaying its callback MUST
     /// NOT acquire again. Unissued lookup ownership remains with the caller.
     pub retryable: bool,
+    pub version: VersionInstance,
+    /// Native upgrade-version map entry used in mismatch selection, if present.
+    pub required_upgrade: u64,
+    pub upgrade_present: bool,
+    /// A separately acquired usage lease owned by this issued lookup.
+    pub usage_acquired: bool,
+    /// Failed Hosting increment is retryable without incrementing FSR count.
+    pub usage_error: i64,
+    pub error_message: String,
 }
 /// Success certifies matching RAP cleanup INCLUDING queued/in-flight Open:
 /// cancelled/drained operations, closed proxy and resources. A termination
@@ -78,9 +87,11 @@ pub enum HealthEvent {
     ClearCloseWarning,
     ServiceTypeRegistrationWarning,
     ClearServiceTypeRegistrationWarning,
+    OpenWarning,
+    ClearOpenWarning,
 }
 
-fn changed(state: EntityState, effects: Vec<Effect>, durable: bool) -> Transition {
+pub(super) fn changed(state: EntityState, effects: Vec<Effect>, durable: bool) -> Transition {
     Transition {
         update: if durable {
             Update::Durable(state)
@@ -91,7 +102,7 @@ fn changed(state: EntityState, effects: Vec<Effect>, durable: bool) -> Transitio
         disposition: Disposition::Applied,
     }
 }
-fn canonical(state: &EntityState, dropped: bool) -> Replica {
+pub(super) fn canonical(state: &EntityState, dropped: bool) -> Replica {
     Replica {
         node: state.body.replica.node.clone(),
         id: state.body.replica.id,
@@ -101,7 +112,7 @@ fn canonical(state: &EntityState, dropped: bool) -> Replica {
         ..Replica::default()
     }
 }
-fn mutate_body(state: &mut EntityState, f: impl FnOnce(&mut AddInstance)) {
+pub(super) fn mutate_body(state: &mut EntityState, f: impl FnOnce(&mut AddInstance)) {
     let mut body = (*state.body).clone();
     f(&mut body);
     state.body = Arc::new(body);
@@ -145,6 +156,7 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
     state.phase = Phase::Closed;
     state.close_mode = None;
     state.close_failures = 0;
+    state.open_failures = 0;
     state.registration_failures = 0;
     state.close_warning = false;
     state.registration_warning = false;
@@ -154,6 +166,7 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
     if let Some(registration) = state.runtime.take() {
         effects.push(Effect::ReleaseRegistration(registration));
     }
+    opening::release_usage(state, effects);
     if !state.local_deleted {
         state.fm_stage = if mode == CloseMode::AppHostDown {
             FmStage::ReplicaDown
@@ -191,6 +204,7 @@ fn close_retry(state: &EntityState, effects: &mut Vec<Effect>) {
             token: state.close_token,
             lookup: 0,
             body: state.body.clone(),
+            usage: state.usage,
         });
     }
 }
@@ -302,6 +316,13 @@ fn check_stateless(body: &AddInstance, admission: &Admission) -> Result<()> {
 
 /// Directly dependent native Closed Add branches. Broad replacement of an open
 /// replica/service description remains explicitly disabled.
+pub(super) fn service_matches(state: &EntityState, service: &Service) -> bool {
+    let mut normalized = service.clone();
+    if normalized.version == state.requested_version {
+        normalized.version = state.body.service.version.clone();
+    }
+    normalized == state.body.service
+}
 pub(super) fn add_existing(
     work: &Submission,
     current: &EntityState,
@@ -317,13 +338,14 @@ pub(super) fn add_existing(
         if !current.local_deleted && body.unit.current.older_than(current.body.unit.current) {
             return Ok(Transition::ignored(Disposition::IgnoredStale));
         }
-        if body.service != current.body.service {
+        if !service_matches(current, &body.service) {
             return Err(Failure::Unsupported(
                 "service update choreography is disabled",
             ));
         }
         if body.replica.instance > current.body.replica.instance {
             let mut state = current.clone();
+            state.requested_version = body.service.version.clone();
             state.body = Arc::new(create_body(body.clone()));
             state.phase = Phase::Opening;
             state.open_token = work.id;
@@ -334,11 +356,14 @@ pub(super) fn add_existing(
             state.cleanup_pending = false;
             state.fm_stage = FmStage::None;
             state.retry_attempts = 0;
+            state.open_failures = 0;
+            state.usage = None;
             state.last_retry_error = 0;
             let effects = vec![Effect::Open {
                 token: work.id,
                 lookup: 0,
                 body: state.body.clone(),
+                usage: None,
             }];
             return Ok(changed(state, effects, true));
         }
@@ -396,6 +421,7 @@ pub(super) fn transition(
                 }
             }
             let mut state = current.cloned().unwrap_or_else(|| EntityState {
+                requested_version: body.service.version.clone(),
                 // TryCreateFailoverUnit constructs from ID, consistency and
                 // service, NOT the incoming previous epoch/target/minimum.
                 body: Arc::new(AddInstance {
@@ -413,6 +439,8 @@ pub(super) fn transition(
                 phase: Phase::Closed,
                 open_token: 0,
                 retry_attempts: 0,
+                open_failures: 0,
+                usage: None,
                 last_retry_error: 0,
                 runtime: None,
                 close_mode: None,
@@ -483,8 +511,12 @@ pub(super) fn transition(
                 // Unissued results are not transferred to this executor.
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             };
+            let acquired = event.error == 0
+                || (event.error == HOSTING_REGISTRATION_VERSION_MISMATCH
+                    && !event.registration.host.is_empty());
             if token != event.token
-                || (event.error == 0
+                || (!acquired && event.usage_acquired)
+                || (acquired
                     && (event.registration.acquisition != event.lookup
                         || event.registration.host.is_empty()
                         || event.registration.runtime.is_empty()))
@@ -504,11 +536,7 @@ pub(super) fn transition(
             if !valid {
                 // No RAP Open was authorized for an uncommitted registration.
                 // Release the acquired lookup reference; never open a closed FT.
-                let effects = if event.error == 0 {
-                    vec![Effect::ReleaseRegistration(event.registration)]
-                } else {
-                    vec![]
-                };
+                let effects = opening::dispose(&event);
                 return Ok(Transition {
                     update: Update::Memory(state),
                     effects,
@@ -519,20 +547,30 @@ pub(super) fn transition(
                 // Even identical host/runtime strings can own a DIFFERENT
                 // acquired reference. Dispose the unused acquisition, never the
                 // adopted reference. Replayed callbacks were filtered above.
-                let effects = if event.error == 0 {
-                    vec![Effect::ReleaseRegistration(event.registration)]
-                } else {
-                    vec![]
-                };
+                let effects = opening::dispose(&event);
                 return Ok(changed(state, effects, false));
             }
+            if state.phase == Phase::Opening {
+                return opening::registered(state, event, settings);
+            }
             let mut effects = Vec::new();
-            if event.error == 0 {
+            if opening::registration_success(&event) {
                 if event.registration.host.is_empty() || event.registration.runtime.is_empty() {
                     return Err(Failure::Admission(
                         "active registration requires host and runtime IDs",
                     ));
                 }
+                if event.usage_error != 0 {
+                    if event.usage_acquired {
+                        return Err(Failure::Admission("failed usage cannot transfer lease"));
+                    }
+                    return Ok(changed(
+                        state,
+                        vec![Effect::ReleaseRegistration(event.registration)],
+                        false,
+                    ));
+                }
+                opening::adopt_usage(&mut state, &event)?;
                 if state.registration_warning {
                     effects.push(Effect::Health(
                         HealthEvent::ClearServiceTypeRegistrationWarning,
@@ -541,27 +579,14 @@ pub(super) fn transition(
                 state.registration_warning = false;
                 state.registration_failures = 0;
                 state.runtime = Some(event.registration.clone());
-                if state.phase == Phase::Opening {
-                    effects.push(Effect::RuntimeOpen {
-                        token: state.open_token,
-                        body: state.body.clone(),
-                        registration: event.registration,
-                    });
-                } else {
-                    close_retry(&state, &mut effects);
-                }
+                mutate_body(&mut state, |body| {
+                    body.service.version = event.version.clone();
+                    body.replica.version = event.version;
+                });
+                close_retry(&state, &mut effects);
                 return Ok(changed(state, effects, false));
             }
-            if state.phase == Phase::Opening {
-                return if event.error == SERVICE_TYPE_NOT_REGISTERED {
-                    state.last_retry_error = event.error;
-                    Ok(changed(state, effects, false))
-                } else {
-                    Err(Failure::Unsupported(
-                        "general Open lookup error policy is disabled",
-                    ))
-                };
-            }
+            effects.extend(opening::dispose(&event));
             if event.retryable {
                 state.registration_failures = state
                     .registration_failures
@@ -657,9 +682,13 @@ pub(super) fn transition(
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             }
             if current.phase == Phase::Opening {
-                return Err(Failure::Unsupported(
-                    "general opening host-down error policy is disabled",
-                ));
+                return opening::runtime_failure(
+                    current.clone(),
+                    work.id,
+                    APPLICATION_HOST_CRASH,
+                    ProxyErrorDetail::default(),
+                    settings,
+                );
             }
             let mut state = current.clone();
             let mut effects = Vec::new();
