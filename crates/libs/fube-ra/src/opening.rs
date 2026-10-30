@@ -20,18 +20,18 @@ pub const ABORT: i64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
-    pub warning: u64,
-    pub drop: u64,
-    pub restart: u64,
-    pub error: u64,
+    pub warning: i32,
+    pub drop: i32,
+    pub restart: i32,
+    pub error: i32,
 }
 impl RetryPolicy {
     pub const fn registration() -> Self {
         Self {
-            warning: i32::MAX as u64,
-            drop: i32::MAX as u64,
-            restart: i32::MAX as u64,
-            error: i32::MAX as u64,
+            warning: i32::MAX,
+            drop: i32::MAX,
+            restart: i32::MAX,
+            error: i32::MAX,
         }
     }
     pub const fn open() -> Self {
@@ -41,33 +41,39 @@ impl RetryPolicy {
             ..Self::registration()
         }
     }
-    pub(super) fn valid(self) -> bool {
-        [self.warning, self.drop, self.restart, self.error]
-            .iter()
-            .all(|&n| n > 0 && n <= i32::MAX as u64)
+    pub(super) fn read(mut get: impl FnMut(Threshold) -> i32) -> Self {
+        Self {
+            warning: get(Threshold::Warning),
+            drop: get(Threshold::Drop),
+            restart: get(Threshold::Restart),
+            error: get(Threshold::Error),
+        }
     }
-    fn failure(self, count: &mut u64) -> Result<Action> {
+    pub(super) fn failure(self, count: &mut u64) -> Result<Action> {
         *count = count.checked_add(1).ok_or(Failure::Capacity)?;
-        Ok(if *count == self.warning {
+        if *count > i32::MAX as u64 {
+            return Err(Failure::Capacity);
+        }
+        Ok(if i128::from(*count) == i128::from(self.warning) {
             Action::Warning
-        } else if *count == self.drop {
+        } else if i128::from(*count) == i128::from(self.drop) {
             Action::Drop
         } else {
             Action::None
         }) // Restart/error actions are not consumed by these native handlers.
     }
-    fn clear(self, count: u64) -> bool {
-        count >= self.warning || count >= self.error
+    pub(super) fn clear(self, count: u64) -> bool {
+        i128::from(count) >= i128::from(self.warning) || i128::from(count) >= i128::from(self.error)
     }
     pub(super) fn flags(self, count: u64) -> i64 {
-        if count == self.drop - 1 {
+        if i128::from(count) == i128::from(self.drop) - 1 {
             ABORT
         } else {
             0
         }
     }
 }
-enum Action {
+pub(super) enum Action {
     None,
     Warning,
     Drop,
@@ -127,10 +133,17 @@ pub(super) fn dispose(event: &RegistrationCompletion) -> Vec<Effect> {
     }
     effects
 }
-pub(super) fn adopt_usage(state: &mut EntityState, event: &RegistrationCompletion) -> Result<()> {
+pub(super) fn adopt_usage(
+    state: &mut EntityState,
+    event: &RegistrationCompletion,
+    effects: &mut Vec<Effect>,
+) -> Result<()> {
     match (state.usage, event.usage_acquired) {
         (None, true) => state.usage = Some(event.lookup),
         (Some(_), false) => {}
+        (Some(_), true) => effects.push(Effect::ReleaseUsage {
+            acquisition: event.lookup,
+        }),
         _ => {
             return Err(Failure::Admission(
                 "registration must transfer required usage or retain existing lease",
@@ -173,14 +186,14 @@ pub(super) fn registration_success(event: &RegistrationCompletion) -> bool {
 pub(super) fn registered(
     mut state: EntityState,
     event: RegistrationCompletion,
-    settings: &Settings,
+    config: &NativeConfig,
 ) -> Result<Transition> {
     let mut effects = Vec::new();
     // ReconfigurationAgent.cpp:986-1033: use returned version when no upgrade
     // entry exists or its instance is no greater than the returned candidate.
     let success = registration_success(&event);
     if success {
-        if event.usage_error != 0 {
+        if event.usage_error != 0 && state.usage.is_none() {
             if event.usage_acquired {
                 return Err(Failure::Admission(
                     "failed usage increment cannot transfer usage",
@@ -189,9 +202,9 @@ pub(super) fn registered(
             effects.push(Effect::ReleaseRegistration(event.registration));
             return Ok(lifecycle::changed(state, effects, false));
         }
-        adopt_usage(&mut state, &event)?;
-        if settings
-            .open_registration
+        adopt_usage(&mut state, &event, &mut effects)?;
+        if config
+            .policy(RetryState::Registration)
             .clear(state.registration_failures)
         {
             effects.push(health(
@@ -212,15 +225,17 @@ pub(super) fn registered(
             token: state.open_token,
             body: state.body.clone(),
             registration: event.registration,
-            flags: settings.open_retry.flags(state.open_failures),
+            flags: config
+                .policy(RetryState::Opening)
+                .flags(state.open_failures),
         });
         return Ok(lifecycle::changed(state, effects, false));
     }
     effects.extend(dispose(&event));
     state.last_retry_error = event.error;
     if registration_retryable(event.error) {
-        match settings
-            .open_registration
+        match config
+            .policy(RetryState::Registration)
             .failure(&mut state.registration_failures)?
         {
             Action::Warning => {
@@ -245,14 +260,16 @@ pub(super) fn registered(
 }
 pub(super) fn runtime_failure(
     mut state: EntityState,
-    token: u64,
     error: i64,
     detail: ProxyErrorDetail,
-    settings: &Settings,
+    config: &NativeConfig,
 ) -> Result<Transition> {
     state.last_retry_error = error;
     let mut effects = Vec::new();
-    match settings.open_retry.failure(&mut state.open_failures)? {
+    match config
+        .policy(RetryState::Opening)
+        .failure(&mut state.open_failures)?
+    {
         Action::Drop => fail(&mut state, error, &mut effects),
         Action::Warning => effects.push(health(HealthEvent::OpenWarning, error, detail)),
         Action::None => {}
@@ -263,16 +280,13 @@ pub(super) fn runtime_failure(
         ));
         state.registration_failures = 0;
         state.registration_warning = false;
-        // Invalidate pre-crash lookup obligations without dropping ownership.
-        // Their real callbacks are consumed/released through the stale path.
-        state.open_token = token;
     }
     Ok(lifecycle::changed(state, effects, true))
 }
 pub(super) fn complete(
     work: &Submission,
     current: Option<&EntityState>,
-    settings: &Settings,
+    config: &NativeConfig,
 ) -> Result<Transition> {
     let event: OpenCompletion =
         from_slice(&work.bytes).map_err(|_| Failure::Admission("invalid Open completion"))?;
@@ -280,53 +294,39 @@ pub(super) fn complete(
         return Ok(Transition::ignored(Disposition::IgnoredStale));
     };
     if current.phase != Phase::Opening
-        || event.token != current.open_token
-        || event.unit != current.body.unit
-        || event.replica.id != current.body.replica.id
+        || !current.body.replica.up
+        || event.unit.current.older_than(current.body.unit.current)
         || event.replica.instance != current.body.replica.instance
-        || event.replica.node != current.body.replica.node
-        || event.replica.version != current.body.replica.version
+        || event.replica.state == 0
+    // native StandBy, not pre-Ready normalization
     {
         return Ok(Transition::ignored(Disposition::IgnoredStale));
     }
-    // Compatibility input from the foundation: this is NOT a received RAP reply
-    // or an issued lookup result and cannot consume an acquisition obligation.
-    if current.runtime.is_none() && event.error == SERVICE_TYPE_NOT_REGISTERED {
-        let mut state = current.clone();
-        state.last_retry_error = event.error;
-        return Ok(lifecycle::changed(state, vec![], false));
-    }
-    if current.runtime.as_ref() != Some(&event.registration)
-        || event.flags != settings.open_retry.flags(current.open_failures)
+    if current.runtime.is_none()
+        || (config
+            .policy(RetryState::Opening)
+            .flags(current.open_failures)
+            == ABORT
+            && event.flags != ABORT)
     {
         return Ok(Transition::ignored(Disposition::IgnoredStale));
     }
     if event.error != 0 && event.error != PROXY_STATE_CHANGED_ON_DATA_LOSS {
-        if event.flags == ABORT
-            && current.open_failures + 1 == settings.open_retry.drop
-            && settings.open_retry.warning != settings.open_retry.drop
-            && !event.cleanup
-        {
-            return Err(Failure::Admission(
-                "terminal Abort failure requires trusted proxy cleanup",
-            ));
-        }
-        return runtime_failure(
-            current.clone(),
-            work.id,
-            event.error,
-            event.detail,
-            settings,
-        );
-    }
-    if event.replica.state != 2 || !event.replica.up || event.replica.current_role != 1 {
-        return Err(Failure::Admission(
-            "Open success requires native Ready stateless replica",
-        ));
+        return runtime_failure(current.clone(), event.error, event.detail, config);
     }
     let mut state = current.clone();
     let mut effects = Vec::new();
-    if settings.open_retry.clear(state.open_failures) {
+    // Native applies Ready and endpoints before the separate current-policy clear.
+    state.phase = Phase::Ready;
+    lifecycle::mutate_body(&mut state, |body| {
+        body.replica.state = 2;
+        body.replica.service_endpoint = event.replica.service_endpoint;
+        body.replica.replication_endpoint = event.replica.replication_endpoint;
+    });
+    if config
+        .policy(RetryState::Opening)
+        .clear(state.open_failures)
+    {
         effects.push(health(
             HealthEvent::ClearOpenWarning,
             0,
@@ -335,8 +335,6 @@ pub(super) fn complete(
     }
     state.open_failures = 0;
     state.last_retry_error = 0;
-    state.phase = Phase::Ready;
-    lifecycle::mutate_body(&mut state, |body| body.replica = event.replica);
     effects.push(reply(&state.body, 0));
     Ok(lifecycle::changed(state, effects, true))
 }

@@ -386,6 +386,17 @@ pub struct GenerationNumber {
     #[serde(with = "node_id")]
     pub owner: [u8; 16],
 }
+impl GenerationNumber {
+    pub fn older_than(&self, other: &Self) -> bool {
+        let owner = |bytes: &[u8; 16]| {
+            (
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            )
+        };
+        (self.generation, owner(&self.owner)) < (other.generation, owner(&other.owner))
+    }
+}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationHeader {
     pub number: GenerationNumber,

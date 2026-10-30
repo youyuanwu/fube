@@ -43,8 +43,6 @@ pub struct RegistrationCompletion {
 pub struct CloseCompletion {
     pub unit: FailoverUnit,
     pub replica: Replica,
-    pub token: u64,
-    pub registration: RuntimeRegistration,
     pub error: i64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,12 +285,6 @@ fn admit(
     if generation.for_fm_replica {
         return Err(Failure::Unsupported("FMM profile is disabled"));
     }
-    if generation.number != GenerationNumber::default() && generation.number != admission.generation
-    {
-        return Err(Failure::Admission(
-            "generation protocol must reconcile before dispatch",
-        ));
-    }
     Ok(())
 }
 fn check_stateless(body: &AddInstance, admission: &Admission) -> Result<()> {
@@ -398,12 +390,15 @@ pub(super) fn transition(
     work: &Submission,
     current: Option<&EntityState>,
     admission: &Admission,
-    settings: &Settings,
+    config: &NativeConfig,
 ) -> Result<Transition> {
     let invalid = |_| Failure::Admission("invalid native lifecycle payload");
     match &work.kind {
         Kind::Remove { source, generation } => {
             admit(source, generation, admission)?;
+            if generation.number.older_than(&admission.generation) {
+                return Ok(Transition::ignored(Disposition::IgnoredStale));
+            }
             let request: RemoveInstance = from_slice(&work.bytes).map_err(invalid)?;
             let body = request.replica.0;
             check_stateless(&body, admission)?;
@@ -551,7 +546,7 @@ pub(super) fn transition(
                 return Ok(changed(state, effects, false));
             }
             if state.phase == Phase::Opening {
-                return opening::registered(state, event, settings);
+                return opening::registered(state, event, config);
             }
             let mut effects = Vec::new();
             if opening::registration_success(&event) {
@@ -560,7 +555,7 @@ pub(super) fn transition(
                         "active registration requires host and runtime IDs",
                     ));
                 }
-                if event.usage_error != 0 {
+                if event.usage_error != 0 && state.usage.is_none() {
                     if event.usage_acquired {
                         return Err(Failure::Admission("failed usage cannot transfer lease"));
                     }
@@ -570,8 +565,11 @@ pub(super) fn transition(
                         false,
                     ));
                 }
-                opening::adopt_usage(&mut state, &event)?;
-                if state.registration_warning {
+                opening::adopt_usage(&mut state, &event, &mut effects)?;
+                if config
+                    .policy(RetryState::RegistrationAtDrop)
+                    .clear(state.registration_failures)
+                {
                     effects.push(Effect::Health(
                         HealthEvent::ClearServiceTypeRegistrationWarning,
                     ));
@@ -587,15 +585,16 @@ pub(super) fn transition(
                 return Ok(changed(state, effects, false));
             }
             effects.extend(opening::dispose(&event));
-            if event.retryable {
-                state.registration_failures = state
-                    .registration_failures
-                    .checked_add(1)
-                    .ok_or(Failure::Capacity)?;
-                if state.registration_failures == settings.registration_warning {
+            // Existing-replica Hosting policy retries every error except deleted
+            // application, unlike the new-instance closed allowlist.
+            if event.error != APPLICATION_INSTANCE_DELETED {
+                let action = config
+                    .policy(RetryState::RegistrationAtDrop)
+                    .failure(&mut state.registration_failures)?;
+                if matches!(action, opening::Action::Warning) {
                     state.registration_warning = true;
                     effects.push(Effect::Health(HealthEvent::ServiceTypeRegistrationWarning));
-                } else if state.registration_failures == settings.registration_drop {
+                } else if matches!(action, opening::Action::Drop) {
                     let mode = state.close_mode.unwrap();
                     finish_close(&mut state, &mut effects);
                     semantic_reply(&state, mode, &mut effects);
@@ -615,12 +614,10 @@ pub(super) fn transition(
             };
             if current.phase != Phase::Closing
                 || current.close_mode == Some(CloseMode::Obliterate)
-                || event.token != current.close_token
+                || !current.body.replica.up
                 || event.replica.id != current.body.replica.id
                 || event.replica.instance != current.body.replica.instance
-                || event.replica.node != current.body.replica.node
                 || event.unit.current.older_than(current.body.unit.current)
-                || current.runtime.as_ref() != Some(&event.registration)
             {
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             }
@@ -628,7 +625,14 @@ pub(super) fn transition(
             let mode = state.close_mode.unwrap();
             let mut effects = Vec::new();
             if event.error == 0 {
-                if state.close_warning {
+                if config
+                    .policy(if state.local_deleted {
+                        RetryState::Deleting
+                    } else {
+                        RetryState::Closing
+                    })
+                    .clear(state.close_failures)
+                {
                     effects.push(Effect::Health(HealthEvent::ClearCloseWarning));
                 }
                 finish_close(&mut state, &mut effects);
@@ -636,24 +640,23 @@ pub(super) fn transition(
                 return Ok(changed(state, effects, true));
             }
             if event.error == APPLICATION_HOST_CRASH {
-                effects.push(Effect::ReleaseRegistration(state.runtime.take().unwrap()));
+                if let Some(registration) = state.runtime.take() {
+                    effects.push(Effect::ReleaseRegistration(registration));
+                }
                 state.registration_failures = 0;
                 state.registration_warning = false;
             }
-            state.close_failures = state
-                .close_failures
-                .checked_add(1)
-                .ok_or(Failure::Capacity)?;
-            if state.close_failures == settings.close_warning {
+            let action = config
+                .policy(if state.local_deleted {
+                    RetryState::Deleting
+                } else {
+                    RetryState::Closing
+                })
+                .failure(&mut state.close_failures)?;
+            if matches!(action, opening::Action::Warning) {
                 state.close_warning = true;
                 effects.push(Effect::Health(HealthEvent::CloseWarning));
-            } else if state.close_failures
-                == if state.local_deleted {
-                    settings.delete_drop
-                } else {
-                    settings.close_drop
-                }
-            {
+            } else if matches!(action, opening::Action::Drop) {
                 // Native error helper calls StartClose directly, not the RA
                 // CanClose wrapper. RAP Abort is sent by the next close retry.
                 start_close_inner(
@@ -684,10 +687,9 @@ pub(super) fn transition(
             if current.phase == Phase::Opening {
                 return opening::runtime_failure(
                     current.clone(),
-                    work.id,
                     APPLICATION_HOST_CRASH,
                     ProxyErrorDetail::default(),
-                    settings,
+                    config,
                 );
             }
             let mut state = current.clone();
@@ -728,6 +730,9 @@ pub(super) fn transition(
         }
         Kind::ReplicaUpReply { source, generation } => {
             admit(source, generation, admission)?;
+            if generation.number.older_than(&admission.generation) {
+                return Ok(Transition::ignored(Disposition::IgnoredStale));
+            }
             if !admission.owner_ready {
                 return Ok(Transition::ignored(Disposition::IgnoredNotReady));
             }

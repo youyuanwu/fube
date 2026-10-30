@@ -22,6 +22,9 @@ pub use notification::ServiceTypeEntry;
 #[path = "opening.rs"]
 mod opening;
 pub use opening::*;
+#[path = "config.rs"]
+mod config;
+pub use config::*;
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -161,22 +164,12 @@ impl Settings {
             || self.max_effects > 65536
             || self.resolution_poll.is_zero()
             || self.resolution_poll > Duration::from_secs(60)
-            || self.close_warning == 0
-            || self.delete_drop == 0
-            || self.close_drop == 0
-            || self.registration_warning == 0
-            || self.registration_drop == 0
             || self.max_registration_lookups == 0
             || self.max_registration_lookups > 65536
             || self.max_service_types == 0
             || self.max_service_types > 65536
-            || self.notification_batch_count == 0
-            || self.notification_batch_count > 10000
             || self.notification_batch_bytes == 0
             || self.notification_batch_bytes > 4 * 1024 * 1024
-            || self.notification_retry_ms == 0
-            || !self.open_retry.valid()
-            || !self.open_registration.valid()
         {
             return Err(Failure::Admission("invalid finite executor settings"));
         }
@@ -188,14 +181,10 @@ impl Settings {
 /// It does not itself grant application authority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCompletion {
-    pub token: u64,
     pub unit: FailoverUnit,
     pub replica: Replica,
     pub error: i64,
-    pub registration: RuntimeRegistration,
     pub flags: i64,
-    /// Abort error certifies proxy/queued Open cleanup, not termination success.
-    pub cleanup: bool,
     pub detail: ProxyErrorDetail,
 }
 pub enum Command {
@@ -373,6 +362,7 @@ struct View {
 struct Shared {
     view: Mutex<View>,
     settings: Settings,
+    config: Arc<NativeConfig>,
     shutdown: Notify,
     #[cfg(test)]
     resolution_polls: std::sync::atomic::AtomicUsize,
@@ -412,6 +402,7 @@ impl Executor {
         let (sender, receiver) = mpsc::channel(settings.max_outstanding);
         let (done, closed) = watch::channel(None);
         let shared = Arc::new(Shared {
+            config: Arc::new(NativeConfig::new(&settings)),
             view: Mutex::new(View {
                 accepting: true,
                 ..View::default()
@@ -579,6 +570,9 @@ impl Executor {
     pub fn statistics(&self) -> Statistics {
         lock(&self.shared.view).stats.clone()
     }
+    pub fn config(&self) -> Arc<NativeConfig> {
+        self.shared.config.clone()
+    }
     pub fn service_types(&self) -> Vec<ServiceTypeEntry> {
         lock(&self.shared.view).notification.snapshot()
     }
@@ -666,9 +660,16 @@ fn finish_node(shared: &Shared, work: Submission, admission: &Admission) {
                     Err(Failure::Admission(
                         "notification requires configured normal FM",
                     ))
+                } else if generation.number.older_than(&admission.generation) {
+                    // Generic MessageHandler admission occurs before node routing.
+                    view.stats.succeeded += 1;
+                    view.stats.outstanding -= 1;
+                    view.stats.queued_bytes -= work.charge;
+                    view.reserved_effects -= work.reserved_effects;
+                    work.result
+                        .send_replace(Status::Complete(Ok(Disposition::IgnoredStale)));
+                    return;
                 } else {
-                    // This is node-scoped. The native handler does not apply an
-                    // FT-generation predicate to the notification acknowledgment.
                     from_slice::<ServiceTypeNotification>(&work.bytes)
                         .map_err(|_| Failure::Admission("invalid notification reply"))
                         .and_then(|body| view.notification.acknowledge(&body))
@@ -734,7 +735,7 @@ fn transition(
     work: &Submission,
     state: Option<&EntityState>,
     admission: &Admission,
-    settings: &Settings,
+    config: &NativeConfig,
 ) -> Result<Transition> {
     let decode_error = |_| Failure::Admission("invalid native command payload");
     match &work.kind {
@@ -750,12 +751,8 @@ fn transition(
                     "FM-service/FMM is not a stateless profile",
                 ));
             }
-            if generation.number != GenerationNumber::default()
-                && generation.number != admission.generation
-            {
-                return Err(Failure::Admission(
-                    "generation protocol must reconcile before dispatch",
-                ));
+            if generation.number.older_than(&admission.generation) {
+                return Ok(Transition::ignored(Disposition::IgnoredStale));
             }
             if !admission.node_open || !admission.owner_ready || admission.fabric_upgrading {
                 return Ok(Transition::ignored(Disposition::IgnoredNotReady));
@@ -851,7 +848,7 @@ fn transition(
                 disposition: Disposition::Applied,
             })
         }
-        Kind::Complete => opening::complete(work, state, settings),
+        Kind::Complete => opening::complete(work, state, config),
         Kind::Retry => {
             if !admission.owner_ready {
                 return Ok(Transition::ignored(Disposition::IgnoredNotReady));
@@ -871,7 +868,9 @@ fn transition(
                         token: current.open_token,
                         body: current.body.clone(),
                         registration: registration.clone(),
-                        flags: settings.open_retry.flags(current.open_failures),
+                        flags: config
+                            .policy(RetryState::Opening)
+                            .flags(current.open_failures),
                     }
                 } else {
                     Effect::Open {
@@ -885,7 +884,7 @@ fn transition(
                 disposition: Disposition::Applied,
             })
         }
-        _ => lifecycle::transition(work, state, admission, settings),
+        _ => lifecycle::transition(work, state, admission, config),
     }
 }
 
@@ -1049,7 +1048,7 @@ async fn entity_worker(
 ) {
     let mut committed: Option<Arc<EntityState>> = None;
     while let Some(work) = receiver.recv().await {
-        let mut outcome = transition(&work, committed.as_deref(), &admission, &shared.settings);
+        let mut outcome = transition(&work, committed.as_deref(), &admission, &shared.config);
         if let Ok(transition) = &mut outcome {
             if let Err(error) =
                 track_lookups(&work, committed.as_deref(), transition, &shared.settings)
