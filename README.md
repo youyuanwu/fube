@@ -82,6 +82,7 @@ See [onebox prerequisites, lifecycle, and recovery](docs/UbuntuOnebox.md).
 - [RA protocol foundation: catalog, native codec evidence and minimal P2 execution](docs/cluster/RaProtocolFoundation.md)
 - [Native-derived RA stateless removal: close/report stages, tests and limits](docs/cluster/RaStatelessRemoval.md)
 - [Native-derived RA stateless opening: retries, ownership and node notifications](docs/cluster/RaStatelessOpening.md)
+- [Native-derived RA stateless replacement: Drop, FM resend and direct description helpers](docs/cluster/RaStatelessReplacement.md)
 - [Migration provenance and repository boundaries](docs/Migration.md)
 
 ## License

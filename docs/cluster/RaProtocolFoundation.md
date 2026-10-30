@@ -3,7 +3,8 @@
 `fube-ra` provides a complete native boundary **inventory**, the first
 AddInstance/AddInstanceReply plus [stateless removal/reporting](RaStatelessRemoval.md)
 and [opening failure/retry with node notifications](RaStatelessOpening.md)
-schemas/codecs, and a bounded P2 entity-execution
+schemas/codecs, [stateless Drop/FM-resend replacement and direct description
+helpers](RaStatelessReplacement.md), and a bounded P2 entity-execution
 seam above [P1 storage](RaStore.md). It is **not a running RA**, FM, Hosting
 adapter, full P2/P3 implementation or restart protocol.
 
@@ -67,6 +68,8 @@ from the trait object or recover an existing entity.
 - CompleteOpen: a matching result supplied by a trusted future Hosting/RAP
   adapter; tests supply it now. It does not create application serving authority.
 - RetryOpen: explicit new retry work for an existing pending open.
+- CompleteServiceDescription/RetryServiceDescription: direct description
+  acknowledgment/retry through trusted local RAP obligations, not IPC codecs.
 - Request/Capture/CompleteServiceTypeWork, separate retry timer commands and
   ServiceTypeReply: node-wide registration notifications,
   native shared reference/version semantics, throttled batching and partial
@@ -91,8 +94,11 @@ completion, **not Add receipt/store insertion**, lets RA establish Ready and
 update endpoints; an adapter need not manufacture a pre-Ready replica.
 Service-type-not-registered remains pending/retryable without success.
 
-Open replacement and general epoch/service-description updates,
-and FM-service/FMM execution return explicit
+Ready greater-ID Add now starts old-identity Drop; later FM resend recreates.
+Higher admitted epoch does not overwrite the old open epoch. Direct Add and
+one-FT-ack description updates/retries/raw replies are
+[implemented in the replacement slice](RaStatelessReplacement.md).
+Broader description/upgrade protocols and FM-service/FMM execution return explicit
 Unsupported results without successful wire replies. Those are cataloged
 implementation gaps, not permanent omissions or alternate protocol statuses.
 Selected native close/tombstone, force and report/ack stages are implemented;
@@ -105,7 +111,8 @@ final Abort cleanup and opening host-down are [implemented separately](RaStatele
 [Owned supervision:435–800](../../crates/libs/fube-ra/src/entity.rs#L435-L800)
 uses one independent thread/runtime and bounded per-entity workers. Same-entity
 work serializes. Accepted count, tight encoded bytes and bounded action slots
-(Add 2; open/report retry 1; node work 2; Open completion/other lifecycle work 8)
+(Add 2; open/report/description retry 1; description completion 0; node work 2;
+Open completion/other lifecycle work 8)
 are reserved atomically and held through actual completion.
 
 [Commit/publication:992–1257](../../crates/libs/fube-ra/src/entity.rs#L992-L1257)

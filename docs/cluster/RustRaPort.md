@@ -2,7 +2,8 @@
 
 **Status: proposed RA design. The [P1 store seam](RaStore.md) and
 [protocol/bounded P2 foundation](RaProtocolFoundation.md) and
-[native-derived stateless removal/close](RaStatelessRemoval.md) are implemented;
+[native-derived stateless removal/close](RaStatelessRemoval.md), opening and
+[stateless Drop/FM-resend replacement](RaStatelessReplacement.md) are implemented;
 full P2 infrastructure, P3–P5 and RA/runtime recovery are not.**
 
 This is the persistence and porting companion to the
