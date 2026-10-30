@@ -6,6 +6,11 @@ stateless instances and replace failed application processes. It does not load
 FabricRuntime/FabricCommon, adapt COM or call a native helper for runtime work.
 The native SF node, deployment tools and OS libraries are still expected.
 
+Current contracts are a [breaking SF/mssf alignment](SfApiAlignment.md).
+The native outcomes later in this page are **dated historical evidence at their
+recorded source/profile**, not qualification of the changed whole implementation.
+No live/deployed qualification was run in the current alignment workflow.
+
 ## Qualified profile
 
 | Boundary | Qualification |
@@ -38,13 +43,13 @@ Implement `IStatelessServiceFactory::create_instance` and
 `IStatelessServiceInstance::{open,close,abort}`. Construction is synchronous
 and fallible; lifecycle Open/Close return boxed `Send` futures. The API uses
 UTF-8/UUID, boxed participants and partition trait objects rather than COM lifetimes
-([api.rs:13-49](../../crates/libs/fube-runtime/src/api.rs#L13-L49)).
+([factory/lifecycle Rustdoc](../../crates/libs/fube-runtime/src/api.rs#L84-L109)).
 
 1. `Runtime::attach()` consumes actual SF-injected activation identity and
    completes host/runtime registration plus a fresh lease poll.
 2. `register_stateless_service_factory(name, Box<dyn IStatelessServiceFactory>)`
    synchronously waits for native registration. Reserve
-   `runtime.execution().try_reserve()` **before** moving the factory, then
+   `runtime.execution_runtime().try_reserve()` **before** moving the factory, then
    `run_owned(move || runtime.register_stateless_service_factory(...))` and
    await that owned observation. Do not block an async executor directly.
    There is no invented type-unregister operation.
@@ -57,6 +62,19 @@ UTF-8/UUID, boxed participants and partition trait objects rather than COM lifet
 5. Close asynchronously disposes resources. Abort synchronously disposes them
    before returning; neither may rely on a dropped future as proof of cleanup.
 6. Explicitly await `shutdown()` for orderly unregistration.
+
+The [compiling Rustdoc example](../../crates/libs/fube-runtime/src/lib.rs#L12-L31)
+uses the actual public reservation/registration APIs. Direct unknown async
+context returns `InvalidExecutionContext`; invalid-context registration retains
+the exact boxed factory for once-only typed recovery, not hidden destruction.
+Execution/native-binding/cleanup types are newly written fube integration,
+not SDK ports. Ordinary Tokio tasks/JoinSets supply scheduling, with thin
+deadline/context/disposal wrappers. Application-scheduler implicit children stay
+application-owned; services stop/join their tasks, not the runtime on their
+behalf. A stalled external executor has no progress guarantee.
+The [sample main](../../crates/samples/rust-runtime-app/src/main.rs#L628-L672)
+awaits `Runtime::shutdown()` **then** final shared RPC/peer-listener cleanup;
+unit Close/Abort removes routes/work but does not stop those process listeners.
 
 See the actual [listener-backed fixture](../../crates/samples/rust-runtime-app/src/main.rs).
 Its default routes check partition validity per RPC. `/FailOpen`, `/FailClose`,
@@ -213,21 +231,22 @@ process, by design
 [lib.rs:372](../../crates/libs/fube-runtime/src/lib.rs#L372)).
 
 Cancellation is advisory. Service callbacks must own and dispose their resources.
-Blocking executor code is unsupported callback behavior; authority fencing is
-independent of executor progress. Successful normal shutdown requires no active
+Direct blocking of arbitrary async workers is not a supported entry for waiting
+SDK calls; use owned execution. Authority fencing is independent of application
+executor progress. Successful normal shutdown requires no active
 callbacks and proven abort/disposal before watchdog disarming.
 
 ## Capability inventory
 
 | Operation | Behavior |
 | --- | --- |
-| Open/Close/Abort, stateless query, description update | Implemented; real native tests |
-| Lease polling and terminal IPC authority | Implemented; native poll/IPC-loss test and model lease races |
+| Open/Close/Abort, stateless query, description update | Implemented; historical native tests at recorded source, current offline regression |
+| Lease polling and terminal IPC authority | Implemented; historical native poll/IPC-loss test and current model lease races |
 | InvalidateLease | Terminal retirement, correlated acknowledgment; model coverage |
 | UpdateCodePackageContext/upgrade refresh | Same-incarnation unchanged-code refresh; atomic snapshots and config/data events |
 | Instance health/load/fault/move-cost reporting | Bounded native application-runtime paths; completion levels below |
 | Query reported load | Bounded local last-written metrics via native RAPQuery, distinct from independent FM retention |
-| Partition-scoped health | Not exposed; health reports target the originating stateless instance |
+| Partition-scoped health | Implemented distinct kind/tag 3; current source-contract/model coverage, not new deployed qualification |
 | Named partitions | API/codec/model support; not native-qualified by this suite |
 | General stateful/replication/security-required profiles | Out of scope here; separate empty-state stateful subset, no insecure/native fallback |
 
@@ -238,13 +257,15 @@ Abort. Force-remove kills the host and is not accepted as Abort evidence.
 
 ## Partition reporting
 
-The owned public report types replace the initial unsupported stub signatures.
-All report calls are asynchronous; `Partition.identity` is only a public snapshot,
+Canonical reports synchronously return `Result<()>` on a supported reserved
+execution entry; only owned observations are awaited. Information is available
+via object-safe `get_partition_info`; extension identity is only an observation,
 never routing authority. The runtime binds private wire records to the original
 partition/public instance/RAP incarnation and checks terminal authority and
 generation validity at admission and at the writer's pre-frame boundary
-([API](../../crates/libs/fube-runtime/src/api.rs#L77-L144),
-[reporting](../../crates/libs/fube-runtime/src/reporting.rs#L137-L149)).
+([API and Rustdoc](../../crates/libs/fube-runtime/src/api.rs#L84-L150),
+[writer fence](../../crates/libs/fube-runtime/src/reporting.rs#L244-L249),
+[load admission/completion](../../crates/libs/fube-runtime/src/reporting.rs#L269-L383)).
 
 | API | Native application path | Successful completion |
 | --- | --- | --- |
@@ -267,7 +288,7 @@ partition-keyed and can outlive
 an instance. Its native query returns stateless secondary reports in the primary
 load array. `_MoveCost_` retention proves receipt, not that effective PLB policy
 uses the cost in placement decisions
-([load implementation](../../crates/libs/fube-runtime/src/reporting.rs#L150-L256)).
+([load implementation](../../crates/libs/fube-runtime/src/reporting.rs#L269-L383)).
 
 Health supports only Ok/Warning/Error. Source/property are nonempty, bounded
 UTF-16 text without NUL; `System*` sources and `DeleteProperty` are reserved.
@@ -281,7 +302,7 @@ not the source timestamp or enqueue time. With `remove_when_expired=false`,
 the event retains its reported state but becomes expired and evaluates Error;
 with `true`, it disappears from health query evaluation before eventual physical
 cleanup. Sequence history after deletion is not promised
-([health implementation](../../crates/libs/fube-runtime/src/reporting.rs#L257-L355)).
+([health implementation](../../crates/libs/fube-runtime/src/reporting.rs#L386-L511)).
 
 Health is one request/report with no hidden batching or retries. A timeout does
 not prove the report was never applied; retry with the same explicit sequence
@@ -305,10 +326,11 @@ fault stage/worker per generation and retries its bound body every 30 seconds.
 Equal faults coalesce; permanent supersedes transient. Pending transient callers
 receive an explicit superseded error if their initial result is not yet fixed.
 Already-completed initial results are immutable. Even an **initial write error**
-can leave the stage pending for retry: inspect `fault_delivery()` for current
+can leave the stage pending for retry: inspect the explicit
+`InstanceRuntimeIntegration::fault_delivery()` observation for current
 attempt count, latest write error, supersession and lifecycle cancellation.
 There is no fabricated fault acknowledgment or retry history collection
-([fault implementation](../../crates/libs/fube-runtime/src/reporting.rs#L356-L516)).
+([fault implementation](../../crates/libs/fube-runtime/src/reporting.rs#L518-L676)).
 
 **Fencing limit:** obsolete unsent frames are cancelled at the writer validity
 boundary and never retargeted to a replacement. A frame that has passed that

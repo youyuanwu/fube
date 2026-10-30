@@ -311,6 +311,11 @@ struct RetiredExecution {
 /// Execution profile for runtime-accepted roots, not an application executor.
 /// The application supplies and owns the Tokio scheduling/driver context.
 /// Implicit application child tasks are not adopted by this boundary.
+/// Scheduling uses ordinary Tokio tasks/JoinSets with thin fube deadline,
+/// context and disposal wrappers, not a custom task executor or ported SDK API.
+/// A stalled supplied/captured application handle has no progress guarantee.
+/// Native/provider/cleanup ownership is isolated so core IPC and lease work
+/// need not wait for application synchronous polls/destructors.
 #[derive(Clone)]
 pub struct ExecutionRuntime {
     inner: Arc<Inner>,
@@ -566,6 +571,10 @@ pub struct OwnedCallPermit {
     scheduled: OwnedSemaphorePermit,
 }
 impl OwnedCallPermit {
+    /// Eagerly transfer a synchronous call and its captures to owned execution.
+    /// Await the returned observation, not the SDK method's synchronous Result.
+    /// Reserve before captures; dropping the observer cancels, not rollback or
+    /// proof that physical disposal has finished.
     pub fn run_owned<T: Send + 'static>(
         self,
         call: impl FnOnce() -> Result<T> + Send + 'static,

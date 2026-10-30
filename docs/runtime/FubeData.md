@@ -13,6 +13,12 @@ No persistence, transactional replicator/Reliable Collections, TLS/Windows
 replication, rolling executable upgrade, whole-set restart preservation or
 universal V1 parity is promised. Acknowledgment is not disk durability.
 
+The [current SF/mssf four-axis alignment record](SfApiAlignment.md) separates
+canonical signature from values, completion and capability. The deployed
+results in [executed qualification](#executed-qualification) are **historical at
+their exact old source/profile**, not qualification of this breaking migration.
+Current API-alignment deployed/native validation is **NOT RUN**.
+
 ## Components and selection
 
 ```text
@@ -45,12 +51,20 @@ stateless registration. This is not an environment role override.
   runtime-issued native integration, provider and endpoint/settings capabilities.
   Control and state-replicator views share one private engine/listener;
   no standalone public control authority is supplied
-  ([constructors](../../crates/libs/fube-data/src/engine.rs#L313-L355)).
+  ([public construction and Rustdoc](../../crates/libs/fube-data/src/fabric_replicator.rs#L19-L70)).
+  This helper lives in data to preserve data → runtime dependency. Native
+  partition `CreateReplicator`, mssf `try_get_com`, COM proxy/ABI and mutable
+  native settings are not supported SDK members. Canonical root and private
+  bound configuration/build/remove controls are functioning paths to that same
+  owner, not a separate extension authority.
 - `IStateProvider` supplies synchronous `get_last_committed_sequence_number`,
   `get_copy_context`/`get_copy_state` factories, async `update_epoch` and
   bool `on_data_loss` callbacks
-  ([contract](../../crates/libs/fube-data/src/api.rs#L135-L170)).
-  Provider progress means application state, not quorum knowledge.
+  ([contract and Rustdoc](../../crates/libs/fube-data/src/api.rs#L129-L165)).
+  The included `MemoryProvider::get_last_committed_sequence_number` reports
+  **locally applied history**, potentially ahead of quorum. The standard name
+  does not imply network commitment/durability. Custom providers/applications
+  own their data, local-apply and retry policies.
 - Separately optional `extensions::ReplayCheckpointProvider::replication_checkpoint(sequence, cancellation)` returns
   an authentic original operation at exactly that applied/completed-copy
   sequence: original epoch, bytes **and segment boundaries**. An absent capability
@@ -64,8 +78,12 @@ stateless registration. This is not an environment role override.
   The primary must apply that sequence locally **before** waiting for quorum.
   Its accepted operation and local apply must outlive a disconnected caller;
   canceling/dropping `wait` does not undo admission
-  ([wait](../../crates/libs/fube-data/src/engine.rs#L140-L161),
+  ([public completion wait](../../crates/libs/fube-data/src/api.rs#L240-L259),
   [sample owned admission](../../crates/samples/rust-runtime-app/src/data.rs#L258-L325)).
+  Rejection before admission consumes no LSN; cancellation/drop/disconnect
+  **after** admission is ambiguous, not rollback or proof of disposal. This
+  primary local-apply-before-wait policy is not .NET prepare → quorum →
+  ordered local commit parity.
 - Secondary application pumps consume copy then replication; apply before
   `IOperation::acknowledge`. Provider `IOperationDataStream::get_next` is
   payload-only; destination `IOperationStream::get_operation` yields metadata/
@@ -77,6 +95,16 @@ stateless registration. This is not an environment role override.
   readiness. Qualified runtime watchdog guards supervise actual callback and
   capture disposal, not merely future cancellation
   ([supervision](../../crates/libs/fube-data/src/supervised.rs)).
+
+Potentially waiting synchronous control calls require the native/provider owned
+execution entry or an explicit capture-free reservation, not `.await` on a
+Result or `block_on` in arbitrary async context. Unknown async entry returns
+`InvalidExecutionContext`. Execution/native-binding/cleanup integration is
+newly written fube infrastructure using standard Tokio/JoinSets with thin
+deadline/context/disposal wrappers. Replay/origin/epoch-checked capabilities
+reorganize preexisting fube behavior, not SDK ports. App-supplied scheduler
+implicit children remain application-owned; services stop/join their tasks.
+No arbitrary-descendant adoption or stalled external-runtime progress is promised.
 
 `MemoryProvider` is the included bounded map/history/request-result ledger,
 not a storage subsystem. Mutations contain `id`, `key`, `value`.
@@ -118,7 +146,7 @@ are different frontiers. Secondary received progress is not application ACK;
 neither is a global quorum proof. The primary's queue `applied` may remain its
 reconciliation frontier while actual provider state has advanced locally.
 Inspect provider progress separately; socket-write success never means commit
-([progress](../../crates/libs/fube-data/src/api.rs#L270-L283),
+([progress](../../crates/libs/fube-data/src/api.rs#L384-L397),
 [quorum calculation](../../crates/libs/fube-data/src/quorum.rs)).
 
 Current and previous configuration write obligations remain separate, including
@@ -140,6 +168,11 @@ Live replication buffers behind copy and joins at its explicit finish fence;
 unavailable history fails instead of selecting a different boundary. Native
 volatile copy context is null. A successful canceled Build invocation's scope
 is distinct from the lifetime of the established configured peer.
+Provider factories and state stream getters are synchronous; enumeration is
+async. Provider payload enumeration has no ACK. Destination copy **and**
+replication require a once-only fenced service ACK after apply. `Some(empty)`
+is data, `None` is EOS; internal legacy-null EOS retirement cannot fill an
+unapplied data gap or manufacture a new application operation/ACK.
 
 Promotion freezes and drains the contiguous received prefix through actual
 application ACK, including operations not yet dispatched because captures
@@ -172,7 +205,12 @@ authority, agreement of native service/replicator/engine roles and epoch, and
 actual replication readiness
 ([authority gate](../../crates/samples/rust-runtime-app/src/data.rs#L41-L76)).
 No Primary flag, management observation or diagnostic endpoint alone grants
-access. Terminal authority cannot revive. Per-unit Close/Abort removes only its
+access. Public SDK descriptors/diagnostics cannot construct private runtime-issued
+proof; retaining proof cannot prevent revocation. Trusted clear IPC is not
+cryptographic host authentication or global unforgeability. There is no
+issuer-less standalone primary-control support. Offline model hosts drive real
+runtime/RAP issuance but are not native deployment.
+Terminal authority cannot revive. Per-unit Close/Abort removes only its
 owned routes and drains work; actual shared-process termination affects both
 service kinds. Existing lease, callback and destructor watchdog limits remain.
 

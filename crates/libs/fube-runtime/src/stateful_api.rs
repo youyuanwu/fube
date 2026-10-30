@@ -29,6 +29,8 @@ pub struct ReplicaIdentity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
+/// Public SF role values; RAP's private Idle=2/Secondary=3/Primary=4 differ.
+/// Auxiliary roles in newer mssf are not supported by this native profile.
 pub enum ReplicaRole {
     Unknown = 0,
     None = 1,
@@ -161,13 +163,17 @@ pub enum ReplicaRemoval {
 /// Custom-replicator control seam. There is deliberately no default all-success
 /// implementation and no application write, storage or built-in-replicator API.
 pub trait IReplicator: Send + Sync + 'static {
+    /// Async listener-ready control address, independent of the service endpoint.
     fn open(&self, cancellation: Cancellation) -> ApiFuture<'_, String>;
+    /// Async native-selected epoch/role barrier, not a peer election.
     fn change_role(
         &self,
         epoch: Epoch,
         role: ReplicaRole,
         cancellation: Cancellation,
     ) -> ApiFuture<'_, ()>;
+    /// Async epoch barrier. Preserve full public epoch bits; primary-domain
+    /// masking is an explicit integration conversion, not global normalization.
     fn update_epoch(&self, epoch: Epoch, cancellation: Cancellation) -> ApiFuture<'_, ()>;
     /// Role-specific validated local observation: a built-in primary reports
     /// quorum progress, a secondary received progress, not universal durability.
@@ -176,9 +182,15 @@ pub trait IReplicator: Send + Sync + 'static {
     /// unknown remote LSN (-1). Native built-in publication samples both values
     /// coherently through private integration, not two public getter calls.
     fn get_catch_up_capability(&self) -> Result<i64>;
+    /// Async terminal cleanup of owned control resources.
     fn close(&self, cancellation: Cancellation) -> ApiFuture<'_, ()>;
+    /// Synchronously dispose owned control resources before returning.
     fn abort(&self);
 }
+/// Primary-only canonical controls. The built-in implementation requires real
+/// runtime/partition-issued authority: SDK descriptors and diagnostics cannot
+/// construct it. Root and invocation-bound controls are functional views over
+/// the same owner, not a separate non-SDK success path.
 pub trait IPrimaryReplicator: IReplicator {
     /// Return whether application state changed, NOT whether the native node
     /// advanced its data-loss epoch.
@@ -193,13 +205,20 @@ pub trait IPrimaryReplicator: IReplicator {
         current: ReplicaSetConfig,
         previous: ReplicaSetConfig,
     ) -> Result<()>;
+    /// Same synchronous applied/disposed boundary as catch-up configuration,
+    /// with no previous configuration. Public arrays do not carry local votes,
+    /// node/incarnation or epoch proofs; these remain privately native-issued.
     fn update_current_replica_set_configuration(&self, current: ReplicaSetConfig) -> Result<()>;
+    /// Async captured-fence catch-up. Write and All/required-target obligations
+    /// differ; a diagnostic progress observation cannot acknowledge new writes.
     fn wait_for_catch_up_quorum(
         &self,
         mode: ReplicaSetQuorumMode,
         cancellation: Cancellation,
     ) -> ApiFuture<'_, ()>;
     /// Freeze native identity/revision at this call, before returning the future.
+    /// Async Build completion includes required copy/application acknowledgment;
+    /// cancellation of an invocation does not dispose an established peer.
     fn build_replica(
         &self,
         replica: ReplicaInformation,
@@ -214,6 +233,9 @@ pub trait IPrimaryReplicator: IReplicator {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Explicit open intent. New is supported; Existing is Unsupported and Invalid
+/// is InvalidArgument before activation. Corrects reference mssf `Invald`
+/// spelling without an alias; this does not add persistence/recovery.
 pub enum OpenMode {
     Invalid,
     New,
@@ -232,6 +254,7 @@ impl OpenMode {
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// SDK descriptor liveness, distinct from extensions::ReplicaDiagnostics.
 pub enum ReplicaStatus {
     Invalid,
     Down,
@@ -250,6 +273,8 @@ pub struct ReplicaInformation {
     pub must_catch_up: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// SDK remote descriptors/write quorum, not an authority envelope. Missing or
+/// down peers never shrink native current/previous quorum obligations.
 pub struct ReplicaSetConfig {
     pub replicas: Vec<ReplicaInformation>,
     pub write_quorum: u32,
@@ -286,16 +311,30 @@ impl NativeReplicaSetConfiguration {
         })
     }
 }
+/// Object-safe information/access and synchronous reports. Reports require a
+/// supported reserved execution entry; do not await their Result or block an
+/// async worker. Information/access getters are immediate fallible observations.
+///
+/// Native CreateReplicator and mssf try_get_com have no member here: neither COM
+/// proxy nor runtime-owned native replication is supported. Construction lives
+/// in fube-data's FabricReplicator to preserve data -> runtime dependency.
 pub trait IStatefulServicePartition: Send + Sync + 'static {
+    /// ID-bearing native partition information, not a diagnostic prerequisite.
     fn get_partition_information(&self) -> Result<ServicePartitionInformation>;
+    /// Check current read access per request; cached Granted is not authority.
     fn get_read_status(&self) -> Result<ServicePartitionAccessStatus>;
+    /// Independent write status; may change before a subsequent replicate call.
     fn get_write_status(&self) -> Result<ServicePartitionAccessStatus>;
     /// Local frame-write completion, not RA/FM acknowledgment. Native-bound
     /// current configuration role selects primary or secondary/node arrays.
     /// This does not grant application read/write access. Unknown/None are
     /// stricter profile errors, not native FUP admission-result parity.
     fn report_load(&self, metrics: &[crate::LoadMetric]) -> Result<()>;
+    /// Initial immutable local-write/coalescing result, not native recovery ACK.
+    /// Later bounded retries and observations remain explicit runtime behavior.
     fn report_fault(&self, fault: crate::FaultType) -> Result<()>;
+    /// Load-route local write with the same private configuration-role snapshot.
+    /// Supports Zero/Low/Medium/High, not version-skewed VeryHigh.
     fn report_move_cost(&self, cost: crate::MoveCost) -> Result<()>;
     /// Partition-only native entity (kind/tag 3); one exact HM result, not fresh
     /// durability or SDK queue/batching admission. No hidden health retry.
@@ -310,6 +349,8 @@ pub trait IStatefulServicePartition: Send + Sync + 'static {
         health: &crate::HealthInformation,
         options: Option<&crate::HealthReportSendOption>,
     ) -> Result<()>;
+    /// Replica-health variant; optional borrowed send options follow health.
+    /// Immediate false and true both direct-send, with one matched HM result.
     fn report_replica_health2(
         &self,
         health: &crate::HealthInformation,

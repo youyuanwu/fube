@@ -37,6 +37,9 @@
 //! TLS/Windows replication or rolling executable-upgrade guarantee. See
 //! `docs/runtime/FubeData.md` in the repository for the executed profile,
 //! reproducible qualification and the isolated native-only reference peer.
+//! Historical deployed records cover their recorded source/profile only, not
+//! this breaking migration. `docs/runtime/SfApiAlignment.md` separates signature,
+//! values, completion and capability for each affected contract.
 //!
 //! # Breaking SDK contracts
 //! Removed implementation/legacy paths are not compatibility APIs:

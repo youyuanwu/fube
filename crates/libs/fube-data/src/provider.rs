@@ -125,6 +125,10 @@ struct State {
 }
 
 #[derive(Default)]
+/// Included volatile map/history/request-result ledger, not durable storage.
+/// Its standard-named last-committed getter reports locally applied history
+/// and may lead quorum. Exact-horizon copy includes history and retry results;
+/// custom providers/applications own their own data and retry policies.
 pub struct MemoryProvider {
     state: Mutex<State>,
 }

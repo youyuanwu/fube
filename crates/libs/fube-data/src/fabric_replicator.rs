@@ -19,6 +19,9 @@ use std::sync::Arc;
 /// Managed FabricReplicator responsibility, with Rust object-safe control/data
 /// views over ONE private engine, listener and owner. Clones share that owner.
 /// Not a native COM proxy/CreateReplicator or mutable native settings facade.
+/// Canonical root and private invocation-bound primary controls both work with
+/// valid native-issued records; neither public descriptors nor diagnostic
+/// snapshots create those records. No standalone out-of-host primary authority.
 #[derive(Clone)]
 pub struct FabricReplicator {
     pub(crate) engine: Arc<Engine>,
@@ -30,6 +33,9 @@ impl FabricReplicator {
     /// runtime-issued authority fails before listener/provider activation.
     /// Provider and optional replay share one supervised ownership group; no
     /// replay supertrait, implicit discovery or standalone authority is required.
+    /// This helper's location/signature is fube-specific, not native partition
+    /// CreateReplicator source/ABI compatibility. See the production sample
+    /// `crates/samples/rust-runtime-app/src/data.rs` for construction and pumps.
     pub fn create(
         partition: Arc<dyn IStatefulServicePartition>,
         native: NativeRuntimeIntegration,

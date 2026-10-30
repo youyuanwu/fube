@@ -9,6 +9,12 @@ or data copy/replication stream. The separate opt-in
 replication in the same mixed executable; it does not change the default empty
 policy or add persistence/durability.
 
+The [current SF/mssf alignment matrix](SfApiAlignment.md) is authoritative for
+signature, accepted values, completion and supported capabilities. Native
+qualification later in this page is **historical at its exact old source and
+empty-state profile**, not evidence for the changed whole implementation.
+Current API-alignment deployed qualification is **NOT RUN**.
+
 ## Supported profile and ownership
 
 The executed profile is Linux x86-64, native SF **11.8.121.4**, normal activated
@@ -52,10 +58,26 @@ rejected.
    A published address or a cached
    role alone is not permission to serve. Shutdown is explicit and awaited.
 
-API: [stateful_api.rs:18-202](../../crates/libs/fube-runtime/src/stateful_api.rs#L18-L202),
-[partition handles:357-393](../../crates/libs/fube-runtime/src/stateful_api.rs#L357-L393),
-[registration:405](../../crates/libs/fube-runtime/src/lib.rs#L405).
+API: [factory/lifecycle/control Rustdoc](../../crates/libs/fube-runtime/src/stateful_api.rs#L117-L232),
+[object-safe partitions](../../crates/libs/fube-runtime/src/stateful_api.rs#L314-L359),
+[registration](../../crates/libs/fube-runtime/src/lib.rs#L595-L623).
 All selected reporting routes are implemented; storage is the separate data layer.
+Canonical sync configuration/removal must run on an owned blocking entry; they
+return only after owner application and required physical disposal, not enqueue
+acceptance. Async lifecycle/build/catch-up remain distinct. Unknown async
+contexts get typed `InvalidExecutionContext`. Registration rejected for context
+retains the original boxed factory for once-only typed recovery.
+
+Native integration/binding/cleanup types are newly written fube infrastructure,
+not ported SDK APIs. Functional root and invocation-bound **canonical** controls
+share the same owner. Private issued proofs preserve native node/replica/actor
+incarnations, PC/CC/local votes, epochs/revision and retry-removal purpose;
+public descriptors and editable `ReplicaDiagnostics` cannot mint those proofs.
+Retained proof is revocable. There is no issuer-less out-of-host primary control,
+SDK discovery member or diagnostic grant. Trusted clear IPC is not cryptographic
+host authentication or global unforgeability. Offline runtime/RAP model hosts
+exercise actual issuance paths but are not deployed SF.
+
 Load/move use actor 12/RAPReportLoad with stateful=true and the private native
 current configuration role, snapshotted together with routing identity as in
 vanilla FUP ReportLoad: Primary uses primary entries, ActiveSecondary and
@@ -82,7 +104,8 @@ observation wrapper, not native-ported API or a last-receipt slot.
 `IStatefulServicePartition::report_fault(FaultType)` reuses the runtime's existing
 actor-12 `RAReportFault` path, bound to the full native unit, replica incarnation
 and epochs. Its receipt means an initial local frame write, **not native
-acknowledgment, persistence or replacement**. `fault_delivery()` exposes the
+acknowledgment, persistence or replacement**.
+`NativeRuntimeIntegration::fault_delivery()` exposes the
 bounded retry/error/cancellation snapshot. Retries run on the installing Runtime
 executor until unit disposal, not on a calling provider/engine executor; stale
 handles and retired process authority cannot start queued fault frames.
@@ -187,12 +210,12 @@ until an exact incarnation/role/location acknowledgment or disposal. Volatile
 access revokes locally; persisted-only read/write-revoked notifications are not
 invented.
 
-`ReplicaStatus` retains full RAP current/previous epochs and service versus
+`extensions::ReplicaDiagnostics` retains full RAP current/previous epochs and service versus
 replicator roles. Access uses native role/stage/minimum/PC/CC availability rules,
 then the partition overlays lifetime and host authority. Pre-write revocation
 cannot be undone by a same-epoch retry. Granted diagnostics **do not introduce
-an application write operation**
-([access:245-353](../../crates/libs/fube-runtime/src/stateful_api.rs#L245-L353)).
+an application write operation**; canonical `ReplicaStatus` is only Invalid/Down/Up
+([access state machine](../../crates/libs/fube-runtime/src/stateful_api.rs#L406-L519)).
 
 The sample's service route requires live authority, matching desired/service/
 replicator Primary roles and granted read access; its diagnostic route is
@@ -208,6 +231,13 @@ Native source evidence is read-only baseline
 `Reliability/Failover/fm/QueryHelper.cpp:1075-1085`,
 `ra/ProxyActionsList.cpp:130-142`. This is not a claim that the deployed binaries
 were built from that revision; see [native architecture](FabricRuntime.md).
+
+Public `Epoch::INVALID` is (-1,-1), ZERO is valid (0,0), whereas RAP invalidzero
+is contextual native absence. Unknown remote LSN -1 is not initialized local0.
+Full low configuration bits remain meaningful; exposing the native primary-mask
+rule through `extensions::EpochDomains` is fube's API choice. Public role/fault
+ordinals are not RAP ordinals; version-specific auxiliary roles/VeryHigh and
+reference spelling corrections are individually recorded in the matrix.
 
 ## Reproduce compiler-free native qualification
 

@@ -121,6 +121,8 @@ impl OperationData {
 /// COM ABI. In the built-in engine, construction/polls/final owned captures run
 /// on the bounded provider/cleanup lanes under their original deadlines.
 pub trait IOperationDataStream: Send + Sync + 'static {
+    /// Async payload enumeration: Some(empty) is data, None is EOS. No service
+    /// ACK exists on this provider stream; a caller owns direct invocations.
     fn get_next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>>;
 }
 
@@ -132,7 +134,7 @@ pub trait IOperationDataStream: Send + Sync + 'static {
 /// reserves callback/capture ownership before invoking application code; an
 /// application that calls its provider directly owns that invocation itself.
 pub trait IStateProvider: Send + Sync + 'static {
-    /// Application state progress. The supplied MemoryProvider reports local
+    /// Synchronous fallible application state progress. MemoryProvider reports local
     /// application, which may lead quorum completion; this is not durable commit.
     fn get_last_committed_sequence_number(&self) -> Result<i64>;
     /// Reconcile authoritative state to the supplied prior-epoch boundary;
@@ -149,7 +151,9 @@ pub trait IStateProvider: Send + Sync + 'static {
     /// Synchronous payload-stream factory. This volatile engine does not send
     /// a bidirectional/persisted context to get_copy_state; it supplies None.
     fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>>;
-    /// Return coherent state AND request-result history at exactly `up_to`.
+    /// Return coherent application state at exactly `up_to`; the included
+    /// MemoryProvider copies exact history AND its request-result ledger.
+    /// Custom providers own their data, retry and reconciliation policies.
     /// Unavailable history is an error, never a silently different snapshot.
     /// Construction is synchronous but the engine calls it on the provider lane
     /// only after local application reaches the exact requested horizon.
@@ -182,14 +186,22 @@ pub struct OperationMetadata {
 /// Original operation epoch is available only through the explicit origin
 /// stream capability in [`crate::extensions`], not native metadata.
 pub trait IOperation: Send + Sync + 'static {
+    /// Immediate native type/sequence/atomic-group fields. Normal only, group -1;
+    /// original epoch is an explicit extension, not native operation metadata.
     fn get_metadata(&self) -> Result<OperationMetadata>;
+    /// Immutable bounded segmented bytes; empty data does not indicate EOS.
     fn get_data(&self) -> Result<OperationData>;
+    /// Once-only fenced service ACK after application apply, for BOTH copy and
+    /// replication. This advances local protocol progress, not disk durability
+    /// or universal/global network commitment. Drop never acknowledges.
     fn acknowledge(&self) -> Result<()>;
 }
 
 /// Bounded single-consumer destination stream. None is EOS, including internal
 /// legacy-null EOS retirement; no synthetic application operation/ACK is added.
+/// Internal EOS retirement cannot bridge an unapplied data gap.
 pub trait IOperationStream: Send + Sync + 'static {
+    /// Async operation receipt, distinct from application apply and explicit ACK.
     fn get_operation(
         &self,
         cancellation: Cancellation,
@@ -204,6 +216,8 @@ pub trait IOperationStream: Send + Sync + 'static {
 /// take over the application's local-apply responsibility. Finite limits reject
 /// before assignment; cancellation of a completion wait is uncertain.
 pub trait IStateReplicator: Send + Sync + 'static {
+    /// Async bounded admission. Rejection before admission consumes no LSN;
+    /// after admission disconnect/cancel/drop is ambiguous, not rollback.
     fn replicate(
         &self,
         data: OperationData,
@@ -215,7 +229,8 @@ pub trait IStateReplicator: Send + Sync + 'static {
     fn get_replication_stream(&self) -> Result<Arc<dyn IOperationStream>>;
 }
 
-/// Accepted sequence identity, separate from later quorum completion.
+/// Accepted sequence identity, separate from later quorum completion. The
+/// application retains admission/local-apply ownership across client disconnect.
 pub struct ReplicationAdmission {
     pub sequence_number: i64,
     pub completion: ReplicationCompletion,

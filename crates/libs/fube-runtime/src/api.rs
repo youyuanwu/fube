@@ -30,21 +30,28 @@ pub enum PartitionKind {
     Named(String),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// ID-bearing singleton information; UUID replaces the native GUID representation.
 pub struct SingletonPartitionInformation {
     pub id: uuid::Uuid,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Inclusive Int64 key bounds and partition ID. The reference mssf fork spells
+/// this `Int64PartitionInfomation`; no misspelled compatibility alias is kept.
 pub struct Int64PartitionInformation {
     pub id: uuid::Uuid,
     pub low_key: i64,
     pub high_key: i64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Named partition ID/name; UTF-8 replaces mssf WString. The reference spelling
+/// `NamedPartitionInfomation` is intentionally corrected.
 pub struct NamedPartitionInformation {
     pub id: uuid::Uuid,
     pub name: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Object-safe partition information result, not a native authority capability.
+/// `Invalid` is a representable value, not a usable partition identity.
 pub enum ServicePartitionInformation {
     Invalid,
     Singleton(SingletonPartitionInformation),
@@ -74,6 +81,8 @@ impl PartitionKind {
 
 /// UTF-8/UUID and boxed-future representations are not COM/source compatible.
 /// Construction is synchronous and fallible on a supervised native worker.
+/// Type/name, opaque initialization bytes, partition and public instance ID
+/// follow SF/mssf argument responsibilities; RAP incarnation is separate.
 pub trait IStatelessServiceFactory: Send + Sync + 'static {
     fn create_instance(
         &self,
@@ -84,6 +93,8 @@ pub trait IStatelessServiceFactory: Send + Sync + 'static {
         instance_id: i64,
     ) -> Result<Box<dyn IStatelessServiceInstance>>;
 }
+/// Async Open/Close and synchronous Abort. Services own listener/task stop and
+/// join lifetimes; runtime supervision does not adopt arbitrary Tokio children.
 pub trait IStatelessServiceInstance: Send + Sync + 'static {
     /// Return the actual opaque endpoint only after the listener is ready.
     fn open(
@@ -91,18 +102,35 @@ pub trait IStatelessServiceInstance: Send + Sync + 'static {
         partition: Arc<dyn IStatelessServicePartition>,
         cancellation: Cancellation,
     ) -> ApiFuture<'_, String>;
+    /// Complete only after this instance's owned work has quiesced.
     fn close(&self, cancellation: Cancellation) -> ApiFuture<'_, ()>;
+    /// Dispose owned resources before returning; cancellation alone is not disposal.
     fn abort(&self);
 }
+/// Canonical synchronous partition operations. Potentially waiting reports must
+/// run in a reserved [`crate::extensions::ExecutionRuntime`] entry, not directly
+/// on an async worker or under application locks needed by callbacks.
+/// Unknown async context is rejected with [`crate::ErrorKind::InvalidExecutionContext`].
+/// Private generation/routing identity is authoritative, not diagnostics.
 pub trait IStatelessServicePartition: Send + Sync + 'static {
+    /// Immediate fallible ID-bearing information; named partitions have model,
+    /// not current deployed qualification.
     fn get_partition_info(&self) -> Result<ServicePartitionInformation>;
-    /// Local frame-write completion, not native acknowledgment or durability.
+    /// Local complete-frame write plus authority check, not RA/FM acknowledgment
+    /// or durability. Accepts 1–64 unique declared metrics with values < INT_MAX;
+    /// undeclared names are rejected rather than native downstream filtering.
     fn report_load(&self, metrics: &[crate::LoadMetric]) -> Result<()>;
+    /// Initial write/coalesced initial result, not recovery acknowledgment.
+    /// Invalid is rejected; later bounded retries cannot change that result.
     fn report_fault(&self, fault: FaultType) -> Result<()>;
+    /// Zero/Low/Medium/High (0–3), through the load route; not an imperative move.
+    /// No VeryHigh support for the pinned native profile. Completion is local write.
     fn report_move_cost(&self, cost: crate::MoveCost) -> Result<()>;
     /// Partition-only native entity (kind/tag 3); exact HM-result completion.
     fn report_partition_health(&self, health: &crate::HealthInformation) -> Result<()>;
-    /// Exact HM-result wait, unlike SDK default admission/batching.
+    /// Native kind/tag 2 and public instance ID. One exact source/sequence/entity
+    /// HM-result wait, unlike SDK default admission/batching. No hidden retry;
+    /// timeout can mean the report was applied, not a fresh durable transaction.
     fn report_instance_health(&self, health: &crate::HealthInformation) -> Result<()>;
     /// Both Immediate values directly send. True adds no interval delay, not
     /// remote success/durability. Timeout may have been applied; no hidden retry.
@@ -111,6 +139,8 @@ pub trait IStatelessServicePartition: Send + Sync + 'static {
         health: &crate::HealthInformation,
         options: Option<&crate::HealthReportSendOption>,
     ) -> Result<()>;
+    /// Instance-health variant with optional borrowed send options after health.
+    /// Both Immediate values directly send with the same exact-result boundary.
     fn report_instance_health2(
         &self,
         health: &crate::HealthInformation,
@@ -124,6 +154,8 @@ struct CancelState {
     changed: Notify,
 }
 #[derive(Debug, Clone, Default)]
+/// Advisory locally owned signal, not mssf's BoxedCancelToken representation.
+/// Signaling or dropping an observer proves neither rollback nor destruction.
 pub struct Cancellation(Arc<CancelState>);
 impl Cancellation {
     pub fn is_cancelled(&self) -> bool {

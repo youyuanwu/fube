@@ -6,6 +6,27 @@
 //! require a reserved `extensions::ExecutionRuntime` entry; the sample reserves
 //! before moving factories/captures. Registration waits for a real native reply,
 //! and configuration/removal include required owner disposal, not enqueue ACKs.
+//! Canonical names do not promise whole-code, mssf source or COM ABI parity.
+//! See the repository's `docs/runtime/SfApiAlignment.md` for per-method signature,
+//! value, completion and supported-capability classifications and provenance.
+//!
+//! # Scheduling a synchronous SDK call
+//! Reserve before transferring captures. Await the owned observation, **not**
+//! the synchronous SDK Result. This function type-checks without attaching SF:
+//! ```
+//! use fube_runtime::{IStatelessServiceFactory, Result, Runtime};
+//! async fn register(runtime: Runtime, factory: Box<dyn IStatelessServiceFactory>)
+//!     -> Result<Runtime>
+//! {
+//!     let permit = runtime.execution_runtime().try_reserve()?;
+//!     let (runtime, registered) = permit.run_owned(move || {
+//!         let registered = runtime.register_stateless_service_factory("MyType", factory);
+//!         Ok((runtime, registered))
+//!     }).await?;
+//!     registered?;
+//!     Ok(runtime)
+//! }
+//! ```
 //!
 //! Removed contracts and implementation modules are not compatibility paths:
 //! ```compile_fail
@@ -57,7 +78,8 @@
 //!     p.report_replica_health(h).await;
 //! }
 //! ```
-//! Positive health/health2 synchrony and argument-role witness:
+//! Positive health/health2 synchrony and argument-role witness (uncalled
+//! functions; actual waiting calls require the reserved entry shown above):
 //! ```
 //! use fube_runtime::{IStatelessServicePartition, IStatefulServicePartition,
 //!     HealthInformation, HealthReportSendOption, Result};
@@ -573,6 +595,11 @@ impl Runtime {
 
     /// Register a volatile stateful factory on this same host/runtime. Native
     /// placement remains the only source of replica membership and roles.
+    /// Like [`Self::register_stateless_service_factory`], this synchronously
+    /// waits for native registration on a reserved entry. An invalid-context
+    /// rejection retains the original boxed factory in
+    /// [`Error::take_rejected_registration_input`], recoverable exactly once.
+    /// Accepted timeout is uncertain/terminal, not safe rollback.
     pub fn register_stateful_service_factory(
         &self,
         name: &str,
@@ -661,6 +688,8 @@ impl Runtime {
             }
         }
     }
+    /// Fube-owned safe synchronous-call scheduling, not an SDK execution API.
+    /// Reserve before captures, then run_owned and await its observation.
     pub fn execution_runtime(&self) -> extensions::ExecutionRuntime {
         self.execution.clone()
     }

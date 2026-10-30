@@ -1,6 +1,14 @@
 //! Explicit execution-profile capabilities, not SDK trait members.
+//!
+//! Execution ownership, native binding and cleanup integration types were
+//! written for fube; they are not ported SDK APIs. Scheduling uses ordinary
+//! Tokio tasks/JoinSets with thin deadline/context/disposal wrappers, not a
+//! custom executor. A supplied application scheduler's implicit children remain
+//! application-owned. This namespace alone proves neither necessity nor native
+//! support. Diagnostics/accounting never issue native authority.
 /// Fube's explicit full/primary epoch-domain conversion. It is not a member of
-/// the SDK Epoch contract; invalid and valid zero remain distinct.
+/// the SDK Epoch contract; invalid and valid zero remain distinct. The bitmask
+/// follows native ToPrimaryEpoch; exposing this trait is fube's API choice.
 pub trait EpochDomains {
     fn primary(self) -> crate::Epoch;
 }

@@ -152,6 +152,10 @@ struct NativeUnit {
     ledger: Mutex<Vec<Arc<Issued>>>,
 }
 /// Explicit non-SDK construction/integration capability. Only Runtime issues it.
+/// Private issued state cannot be constructed from public SDK descriptors or
+/// editable diagnostics. Retention does not prevent generation/revision/lease
+/// revocation. Trusted clear IPC is not cryptographic host authentication or a
+/// claim of global unforgeability.
 #[derive(Clone)]
 pub struct NativeRuntimeIntegration(Arc<NativeUnit>);
 /// Factory-owned explicit integration lookup. This is not a partition/SDK
@@ -189,6 +193,8 @@ struct Issued {
     actor: Option<uuid::Uuid>,
 }
 /// Opaque immutable issued proof. SDK values or diagnostic snapshots cannot mint it.
+/// Every use revalidates native lifetime, generation, revision and actor identity;
+/// a retained proof can be revoked. No issuer-less primary-control support.
 #[derive(Clone)]
 pub struct NativeInvocation {
     unit: Arc<NativeUnit>,

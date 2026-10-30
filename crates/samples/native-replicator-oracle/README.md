@@ -14,6 +14,15 @@ never constructs `fube_data::Engine`. HTTP is client/observer traffic only;
 native V1 implements all replication, membership, configuration and quorum.
 The node, not environment role hints or a test driver, assigns roles.
 
+The shared provider now implements canonical `IStateProvider` and payload
+`IOperationDataStream::get_next`; the optional replay capability is separate.
+This does **not** replace real native COM controls/state interfaces with the
+Rust engine or make fube source/ABI interchangeable with SF/mssf. See the
+[current API alignment/provenance matrix](../../../docs/runtime/SfApiAlignment.md)
+and [breaking migration](../../../docs/Migration.md#breaking-runtime-and-data-api-migration).
+Historical deployed data results qualify their exact old source/profile;
+the current API-alignment workflow ran no live/native deployment.
+
 ## Build and local validation
 
 ```sh
@@ -83,7 +92,7 @@ accepted but uncertain writes return 202 / `ambiguous`; invalid requests return
 Reads and diagnostics use the shared schema: `profile: fube-data-v1`,
 `engine_kind: native-classic-v1`, `partition`, `replica`, `incarnation`,
 `engine_incarnation`, `node`, `host`, `pid`, `service_address`, `native_epoch`,
-actual partition `read_status` / `write_status`, `state` (the unchanged
+actual partition `read_status` / `write_status`, `state` (the shared
 `MemoryProvider.snapshot()`), and an `engine` diagnostic object.
 
 `role` / `current_role` are the actual native service role callback.
@@ -98,6 +107,8 @@ is substituted.
 `native_epoch` preserves full data-loss/configuration values from the actual
 provider callback, without projecting configuration bits; it is null until a
 successful native epoch callback has been observed.
+Its RPC field names are `data_loss_number` / `configuration_number`, as on the
+Rust fixture; independent native FM query fields remain their native schema.
 The native secondary may replicate nonzero operations without any provider
 epoch callback in its initial epoch; a later last-callback epoch may lag the
 current FM epoch. The qualifier records the authoritative FM epoch separately

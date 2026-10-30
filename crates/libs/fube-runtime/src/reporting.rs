@@ -34,6 +34,7 @@ pub struct LoadMetric {
     pub value: u32,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Pinned native costs 0–3. Newer mssf VeryHigh is intentionally unavailable.
 pub enum MoveCost {
     Zero,
     Low,
@@ -50,6 +51,9 @@ pub enum HealthState {
 /// UTF-8 health values. TTL is in seconds; zero is infinite. Sequence zero is
 /// process-auto; negative values are invalid. This profile directly sends both
 /// Immediate values and awaits an exact HM result, not SDK batching admission.
+/// Only Ok/Warning/Error are accepted. Source/property are nonempty bounded
+/// UTF-16-compatible text without NUL; System* and DeleteProperty are reserved.
+/// Descriptions above 4096 UTF-16 units are rejected, not truncated.
 #[derive(Debug, Clone)]
 pub struct HealthInformation {
     pub source_id: String,
@@ -61,6 +65,8 @@ pub struct HealthInformation {
     pub remove_when_expired: bool,
 }
 #[derive(Debug, Clone)]
+/// Both values directly send, with no intentional reporting-interval delay.
+/// This is not SDK default batching/retry parity or guaranteed HM delivery.
 pub struct HealthReportSendOption {
     pub immediate: bool,
 }

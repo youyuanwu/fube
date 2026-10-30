@@ -1,5 +1,8 @@
 //! Explicit non-SDK capabilities. None grants native membership/access authority
 //! or adds discovery methods to SDK traits.
+//! Replay, operation origin and epoch-checked admission reorganize preexisting
+//! fube behavior; they are not ported SDK callbacks. Execution/native-binding/
+//! cleanup integration is newly written fube infrastructure using standard Tokio.
 use crate::{Cancellation, Epoch, IOperation, OperationData, Result};
 use fube_runtime::ApiFuture;
 use std::sync::Arc;
@@ -62,7 +65,9 @@ impl OperationOriginStream for crate::api::OperationStream {
 }
 
 /// Listener selection and transport actor incarnation, NOT native incarnation.
-/// Native authority is separately runtime/partition-issued and unforgeable.
+/// Native authority is separately runtime/partition-issued with private fields,
+/// not constructible from these options or diagnostics. This is not a claim of
+/// cryptographic authentication on trusted clear IPC or global unforgeability.
 #[derive(Clone, Debug)]
 pub struct ReplicationEndpointOptions {
     pub listen_address: String,
