@@ -25,7 +25,7 @@ impl NativeControlBinding for NativeBinder {
         if engine.native_root_dispatch.load(Ordering::Acquire)
             && proof.kind() != NativeInvocationKind::Remove(ReplicaRemoval::BuildRetryCleanup)
         {
-            return Ok(Arc::new(SharedControl(engine)));
+            return Ok(Arc::new(crate::FabricReplicator { engine }));
         }
         Ok(Arc::new(BoundControl { engine, proof }))
     }
@@ -450,71 +450,5 @@ impl IPrimaryReplicator for BoundControl {
     fn remove_replica(&self, replica_id: i64) -> Result<()> {
         self.engine
             .remove_sync(replica_id, Some(self.proof.clone()))
-    }
-}
-pub(super) struct SharedControl(pub(super) Arc<Engine>);
-impl Engine {
-    pub fn get_primary_replicator(self: &Arc<Self>) -> Box<dyn IPrimaryReplicator> {
-        Box::new(SharedControl(self.clone()))
-    }
-}
-impl IReplicator for SharedControl {
-    fn open(&self, cancel: Cancellation) -> ServiceFuture<'_, String> {
-        IReplicator::open(&*self.0, cancel)
-    }
-    fn close(&self, cancel: Cancellation) -> ServiceFuture<'_, ()> {
-        IReplicator::close(&*self.0, cancel)
-    }
-    fn change_role(
-        &self,
-        epoch: Epoch,
-        role: ReplicaRole,
-        cancel: Cancellation,
-    ) -> ServiceFuture<'_, ()> {
-        IReplicator::change_role(&*self.0, epoch, role, cancel)
-    }
-    fn update_epoch(&self, epoch: Epoch, cancel: Cancellation) -> ServiceFuture<'_, ()> {
-        IReplicator::update_epoch(&*self.0, epoch, cancel)
-    }
-    fn get_current_progress(&self) -> Result<i64> {
-        IReplicator::get_current_progress(&*self.0)
-    }
-    fn get_catch_up_capability(&self) -> Result<i64> {
-        IReplicator::get_catch_up_capability(&*self.0)
-    }
-    fn abort(&self) {
-        IReplicator::abort(&*self.0);
-    }
-}
-impl IPrimaryReplicator for SharedControl {
-    fn on_data_loss(&self, cancel: Cancellation) -> ServiceFuture<'_, bool> {
-        IPrimaryReplicator::on_data_loss(&*self.0, cancel)
-    }
-    fn update_catch_up_replica_set_configuration(
-        &self,
-        cc: ReplicaSetConfig,
-        pc: ReplicaSetConfig,
-    ) -> Result<()> {
-        IPrimaryReplicator::update_catch_up_replica_set_configuration(&*self.0, cc, pc)
-    }
-    fn update_current_replica_set_configuration(&self, cc: ReplicaSetConfig) -> Result<()> {
-        IPrimaryReplicator::update_current_replica_set_configuration(&*self.0, cc)
-    }
-    fn wait_for_catch_up_quorum(
-        &self,
-        mode: CatchUpMode,
-        cancel: Cancellation,
-    ) -> ServiceFuture<'_, ()> {
-        IPrimaryReplicator::wait_for_catch_up_quorum(&*self.0, mode, cancel)
-    }
-    fn build_replica(
-        &self,
-        replica: SdkReplicaInformation,
-        cancel: Cancellation,
-    ) -> ServiceFuture<'_, ()> {
-        IPrimaryReplicator::build_replica(&*self.0, replica, cancel)
-    }
-    fn remove_replica(&self, id: i64) -> Result<()> {
-        IPrimaryReplicator::remove_replica(&*self.0, id)
     }
 }

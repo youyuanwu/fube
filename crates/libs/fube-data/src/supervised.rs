@@ -8,9 +8,8 @@
 //! construction, individual `next` calls/captures, and final disposal enroll;
 //! Runtime's outer participant guard still owns Close/Abort disposal.
 
-use crate::{
-    Cancellation, Epoch, OperationData, OperationDataStream, ReplayOperation, Result, StateProvider,
-};
+use crate::extensions::{ReplayCheckpointProvider, ReplayOperation};
+use crate::{Cancellation, Epoch, IOperationDataStream, IStateProvider, OperationData, Result};
 use fube_runtime::extensions::{
     DisposalTracker, ExecutionRuntime, ManagedObject, ObjectQuota, ObjectReservation,
 };
@@ -55,15 +54,16 @@ mod accounting {
     }
 
     pub(super) struct SupervisedProvider<S: Supervision> {
-        pub(super) inner: Option<Arc<dyn StateProvider>>,
+        pub(super) inner: Option<Arc<dyn IStateProvider>>,
+        pub(super) replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         pub(super) supervision: S,
     }
     impl<S: Supervision> SupervisedProvider<S> {
-        fn inner(&self) -> &dyn StateProvider {
+        fn inner(&self) -> &dyn IStateProvider {
             self.inner.as_deref().unwrap()
         }
 
-        fn stream(&self, inner: Arc<dyn OperationDataStream>) -> Arc<dyn OperationDataStream> {
+        fn stream(&self, inner: Arc<dyn IOperationDataStream>) -> Arc<dyn IOperationDataStream> {
             Arc::new(SupervisedStream {
                 inner: Some(inner),
                 supervision: self.supervision.clone(),
@@ -76,29 +76,14 @@ mod accounting {
             // Take explicitly: automatic field drop after this body would release
             // the cleanup guard before the final application Arc destructor.
             drop(self.inner.take());
+            drop(self.replay.take());
         }
     }
 
-    impl<S: Supervision> StateProvider for SupervisedProvider<S> {
-        fn last_committed(&self) -> Result<i64> {
+    impl<S: Supervision> IStateProvider for SupervisedProvider<S> {
+        fn get_last_committed_sequence_number(&self) -> Result<i64> {
             let _guard = self.supervision.arm()?;
-            self.inner().last_committed()
-        }
-
-        fn replication_checkpoint(
-            &self,
-            sequence: i64,
-            cancellation: Cancellation,
-        ) -> ServiceFuture<'_, Option<ReplayOperation>> {
-            let guard = match self.supervision.arm() {
-                Ok(guard) => guard,
-                Err(error) => return Box::pin(async move { Err(error) }),
-            };
-            let inner = self.inner().replication_checkpoint(sequence, cancellation);
-            Box::pin(SupervisedFuture {
-                inner,
-                _guard: guard,
-            })
+            self.inner().get_last_committed_sequence_number()
         }
 
         fn update_epoch(
@@ -133,16 +118,16 @@ mod accounting {
             })
         }
 
-        fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
+        fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
             let _guard = self.supervision.arm()?;
-            Ok(self.stream(self.inner().copy_context()?))
+            Ok(self.stream(self.inner().get_copy_context()?))
         }
 
-        fn copy_state(
+        fn get_copy_state(
             &self,
             up_to: i64,
-            context: Option<Arc<dyn OperationDataStream>>,
-        ) -> Result<Arc<dyn OperationDataStream>> {
+            context: Option<Arc<dyn IOperationDataStream>>,
+        ) -> Result<Arc<dyn IOperationDataStream>> {
             let _guard = match self.supervision.arm() {
                 Ok(guard) => guard,
                 Err(error) => {
@@ -153,21 +138,41 @@ mod accounting {
                     return Err(error);
                 }
             };
-            Ok(self.stream(self.inner().copy_state(up_to, context)?))
+            Ok(self.stream(self.inner().get_copy_state(up_to, context)?))
         }
     }
-
-    struct SupervisedStream<S: Supervision> {
-        inner: Option<Arc<dyn OperationDataStream>>,
-        supervision: S,
-    }
-    impl<S: Supervision> OperationDataStream for SupervisedStream<S> {
-        fn next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+    impl<S: Supervision> ReplayCheckpointProvider for SupervisedProvider<S> {
+        fn replication_checkpoint(
+            &self,
+            sequence: i64,
+            cancellation: Cancellation,
+        ) -> ServiceFuture<'_, Option<ReplayOperation>> {
             let guard = match self.supervision.arm() {
                 Ok(guard) => guard,
                 Err(error) => return Box::pin(async move { Err(error) }),
             };
-            let inner = self.inner.as_ref().unwrap().next(cancellation);
+            let Some(replay) = self.replay.as_ref() else {
+                return Box::pin(async { Ok(None) });
+            };
+            let inner = replay.replication_checkpoint(sequence, cancellation);
+            Box::pin(SupervisedFuture {
+                inner,
+                _guard: guard,
+            })
+        }
+    }
+
+    struct SupervisedStream<S: Supervision> {
+        inner: Option<Arc<dyn IOperationDataStream>>,
+        supervision: S,
+    }
+    impl<S: Supervision> IOperationDataStream for SupervisedStream<S> {
+        fn get_next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+            let guard = match self.supervision.arm() {
+                Ok(guard) => guard,
+                Err(error) => return Box::pin(async move { Err(error) }),
+            };
+            let inner = self.inner.as_ref().unwrap().get_next(cancellation);
             Box::pin(SupervisedFuture {
                 inner,
                 _guard: guard,
@@ -207,10 +212,16 @@ mod tests;
 /// Engine-owned provider and stream captures. Callback roots are scheduled by
 /// the engine; these proxies reserve dormant disposal before publication.
 pub(crate) struct OwnedProvider {
-    inner: ManagedObject<Arc<dyn StateProvider>>,
+    // One ownership group covers both capabilities, including when both Arcs
+    // point at the same application object. Final release is supervised once.
+    inner: ManagedObject<ProviderCapabilities>,
     runtime: ExecutionRuntime,
     streams: ObjectQuota,
     tracker: DisposalTracker,
+}
+struct ProviderCapabilities {
+    provider: Arc<dyn IStateProvider>,
+    replay: Option<Arc<dyn ReplayCheckpointProvider>>,
 }
 fn provider_error(error: crate::Error) -> crate::Error {
     if matches!(
@@ -228,7 +239,8 @@ fn provider_error(error: crate::Error) -> crate::Error {
 impl OwnedProvider {
     pub(crate) fn new(
         runtime: ExecutionRuntime,
-        provider: Arc<dyn StateProvider>,
+        provider: Arc<dyn IStateProvider>,
+        replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         streams: usize,
         tracker: DisposalTracker,
         origin: fube_runtime::extensions::CallOrigin,
@@ -241,7 +253,7 @@ impl OwnedProvider {
             runtime.reserve_construction_with_origin(&quota, &tracker, origin)?
         };
         Ok(Self {
-            inner: reservation.construct(provider),
+            inner: reservation.construct(ProviderCapabilities { provider, replay }),
             runtime,
             streams: ObjectQuota::new(streams)?,
             tracker,
@@ -257,7 +269,7 @@ impl OwnedProvider {
         &self,
         up_to: i64,
     ) -> Result<(
-        Arc<dyn OperationDataStream>,
+        Arc<dyn IOperationDataStream>,
         fube_runtime::extensions::ObjectPublication,
     )> {
         let reserved = self
@@ -266,39 +278,51 @@ impl OwnedProvider {
         let stream = self
             .inner
             .get()
-            .copy_state(up_to, None)
+            .provider
+            .get_copy_state(up_to, None)
             .map_err(provider_error)?;
         let stream = reserved.construct(stream);
         let publication = stream.publication();
         Ok((Arc::new(OwnedStream(stream)), publication))
     }
-    fn reserve_stream(&self) -> Result<ObjectReservation<Arc<dyn OperationDataStream>>> {
+    fn reserve_stream(&self) -> Result<ObjectReservation<Arc<dyn IOperationDataStream>>> {
         self.runtime.reserve_object(&self.streams, &self.tracker)
     }
     fn publish_stream(
         &self,
-        reservation: ObjectReservation<Arc<dyn OperationDataStream>>,
-        stream: Arc<dyn OperationDataStream>,
-    ) -> Arc<dyn OperationDataStream> {
+        reservation: ObjectReservation<Arc<dyn IOperationDataStream>>,
+        stream: Arc<dyn IOperationDataStream>,
+    ) -> Arc<dyn IOperationDataStream> {
         Arc::new(OwnedStream(reservation.publish(stream)))
     }
 }
-impl StateProvider for OwnedProvider {
-    fn last_committed(&self) -> Result<i64> {
-        self.inner.get().last_committed().map_err(provider_error)
+impl OwnedProvider {
+    pub(crate) fn has_replay(&self) -> bool {
+        self.inner.get().replay.is_some()
     }
-    fn replication_checkpoint(
+    pub(crate) fn replication_checkpoint(
         &self,
         n: i64,
         cancel: Cancellation,
     ) -> ServiceFuture<'_, Option<ReplayOperation>> {
         Box::pin(async move {
-            self.inner
-                .get()
-                .replication_checkpoint(n, cancel)
-                .await
-                .map_err(provider_error)
+            match self.inner.get().replay.as_ref() {
+                Some(replay) => replay
+                    .replication_checkpoint(n, cancel)
+                    .await
+                    .map_err(provider_error),
+                None => Ok(None),
+            }
         })
+    }
+}
+impl IStateProvider for OwnedProvider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
+        self.inner
+            .get()
+            .provider
+            .get_last_committed_sequence_number()
+            .map_err(provider_error)
     }
     fn update_epoch(
         &self,
@@ -309,6 +333,7 @@ impl StateProvider for OwnedProvider {
         Box::pin(async move {
             self.inner
                 .get()
+                .provider
                 .update_epoch(epoch, previous, cancel)
                 .await
                 .map_err(provider_error)
@@ -318,36 +343,42 @@ impl StateProvider for OwnedProvider {
         Box::pin(async move {
             self.inner
                 .get()
+                .provider
                 .on_data_loss(cancel)
                 .await
                 .map_err(provider_error)
         })
     }
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
-        let reserved = self.reserve_stream()?;
-        Ok(self.publish_stream(
-            reserved,
-            self.inner.get().copy_context().map_err(provider_error)?,
-        ))
-    }
-    fn copy_state(
-        &self,
-        up_to: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>> {
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
         let reserved = self.reserve_stream()?;
         Ok(self.publish_stream(
             reserved,
             self.inner
                 .get()
-                .copy_state(up_to, context)
+                .provider
+                .get_copy_context()
+                .map_err(provider_error)?,
+        ))
+    }
+    fn get_copy_state(
+        &self,
+        up_to: i64,
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
+        let reserved = self.reserve_stream()?;
+        Ok(self.publish_stream(
+            reserved,
+            self.inner
+                .get()
+                .provider
+                .get_copy_state(up_to, context)
                 .map_err(provider_error)?,
         ))
     }
 }
-struct OwnedStream(ManagedObject<Arc<dyn OperationDataStream>>);
-impl OperationDataStream for OwnedStream {
-    fn next(&self, cancel: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
-        Box::pin(async move { self.0.get().next(cancel).await.map_err(provider_error) })
+struct OwnedStream(ManagedObject<Arc<dyn IOperationDataStream>>);
+impl IOperationDataStream for OwnedStream {
+    fn get_next(&self, cancel: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+        Box::pin(async move { self.0.get().get_next(cancel).await.map_err(provider_error) })
     }
 }

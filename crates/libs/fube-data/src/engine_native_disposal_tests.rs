@@ -19,21 +19,21 @@ impl Drop for DropGate {
     }
 }
 struct GatedStream {
-    inner: Arc<dyn OperationDataStream>,
+    inner: Arc<dyn IOperationDataStream>,
     _gate: DropGate,
 }
-impl OperationDataStream for GatedStream {
-    fn next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
-        self.inner.next(cancellation)
+impl IOperationDataStream for GatedStream {
+    fn get_next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+        self.inner.get_next(cancellation)
     }
 }
 struct GateProvider {
     memory: Arc<MemoryProvider>,
     gate: Mutex<Option<DropGate>>,
 }
-impl StateProvider for GateProvider {
-    fn last_committed(&self) -> Result<i64> {
-        self.memory.last_committed()
+impl IStateProvider for GateProvider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
+        self.memory.get_last_committed_sequence_number()
     }
     fn update_epoch(&self, e: Epoch, n: i64, c: Cancellation) -> ServiceFuture<'_, ()> {
         self.memory.update_epoch(e, n, c)
@@ -41,22 +41,15 @@ impl StateProvider for GateProvider {
     fn on_data_loss(&self, c: Cancellation) -> ServiceFuture<'_, bool> {
         self.memory.on_data_loss(c)
     }
-    fn replication_checkpoint(
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
+        self.memory.get_copy_context()
+    }
+    fn get_copy_state(
         &self,
         n: i64,
-        c: Cancellation,
-    ) -> ServiceFuture<'_, Option<ReplayOperation>> {
-        self.memory.replication_checkpoint(n, c)
-    }
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
-        self.memory.copy_context()
-    }
-    fn copy_state(
-        &self,
-        n: i64,
-        c: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>> {
-        let inner = self.memory.copy_state(n, c)?;
+        c: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
+        let inner = self.memory.get_copy_state(n, c)?;
         Ok(match self.gate.lock().unwrap().take() {
             Some(gate) => Arc::new(GatedStream { inner, _gate: gate }),
             None => inner,
@@ -198,7 +191,9 @@ async fn issued_canonical_sync_configuration_and_remove_wait_exact_physical_disp
             } else {
                 let current = config(EPOCH, vec![], 1).sdk().unwrap();
                 let control: Arc<dyn IPrimaryReplicator> = if root {
-                    Arc::new(binding::SharedControl(primary.engine.clone()))
+                    Arc::new(crate::FabricReplicator {
+                        engine: primary.engine.clone(),
+                    })
                 } else {
                     binding::NativeBinder(Arc::downgrade(&primary.engine))
                         .bind_invocation(

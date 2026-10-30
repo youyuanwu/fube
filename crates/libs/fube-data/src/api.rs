@@ -117,39 +117,24 @@ impl OperationData {
 
 /// Provider enumeration is distinct from the secondary acknowledged operation
 /// stream. `None` is EOS; an empty operation is still data.
-pub trait OperationDataStream: Send + Sync + 'static {
-    fn next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>>;
-}
-
-/// An authentic operation at the exact sequence requested from a provider.
-/// The payload, segment boundaries and original operation epoch are unchanged.
-#[derive(Clone, Debug)]
-pub struct ReplayOperation {
-    pub epoch: Epoch,
-    pub data: OperationData,
+/// Boxed futures and owned immutable segments are Rust representations, not a
+/// COM ABI. In the built-in engine, construction/polls/final owned captures run
+/// on the bounded provider/cleanup lanes under their original deadlines.
+pub trait IOperationDataStream: Send + Sync + 'static {
+    fn get_next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>>;
 }
 
 /// Author-owned state contract. Calls may fail; no callback runs under a
 /// transport/engine lock. Volatile native builds pass `None` for copy context.
-pub trait StateProvider: Send + Sync + 'static {
-    fn last_committed(&self) -> Result<i64>;
-    /// Return only the original operation at exactly `sequence` in applied or
-    /// completed copied history. Never synthesize a snapshot operation or
-    /// relabel its epoch. Unknown/unavailable metadata returns `None`.
-    /// The caller reserves bounded operation ownership before this callback.
-    fn replication_checkpoint(
-        &self,
-        _sequence: i64,
-        cancellation: Cancellation,
-    ) -> ServiceFuture<'_, Option<ReplayOperation>> {
-        Box::pin(async move {
-            if cancellation.is_cancelled() {
-                Err(Error::Closed)
-            } else {
-                Ok(None)
-            }
-        })
-    }
+/// Native/managed callback responsibilities and synchrony are preserved; Rust
+/// uses fallible scalar getters, owned stream Arcs and object-safe futures.
+/// There is deliberately no replay supertrait or discovery hook. The engine
+/// reserves callback/capture ownership before invoking application code; an
+/// application that calls its provider directly owns that invocation itself.
+pub trait IStateProvider: Send + Sync + 'static {
+    /// Application state progress. The supplied MemoryProvider reports local
+    /// application, which may lead quorum completion; this is not durable commit.
+    fn get_last_committed_sequence_number(&self) -> Result<i64>;
     /// Reconcile authoritative state to the supplied prior-epoch boundary;
     /// ambiguous tail mutations may survive only in the selected history.
     fn update_epoch(
@@ -158,20 +143,108 @@ pub trait StateProvider: Send + Sync + 'static {
         previous_epoch_last: i64,
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, ()>;
+    /// True means authoritative provider state changed, not merely an epoch
+    /// notification. The actual bool reaches canonical primary control.
     fn on_data_loss(&self, cancellation: Cancellation) -> ServiceFuture<'_, bool>;
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>>;
+    /// Synchronous payload-stream factory. This volatile engine does not send
+    /// a bidirectional/persisted context to get_copy_state; it supplies None.
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>>;
     /// Return coherent state AND request-result history at exactly `up_to`.
     /// Unavailable history is an error, never a silently different snapshot.
-    fn copy_state(
+    /// Construction is synchronous but the engine calls it on the provider lane
+    /// only after local application reaches the exact requested horizon.
+    fn get_copy_state(
         &self,
         up_to: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>>;
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>>;
+}
+
+/// Supported native operation kind. Atomic groups and synthetic application EOS
+/// operations are not supported by this volatile, RequireServiceAck profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum OperationType {
+    Normal = 0x0001,
+}
+
+/// Native metadata responsibilities (not origin/epoch or diagnostic authority).
+/// Only normal operations with invalid atomic-group ID (-1) are delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OperationMetadata {
+    pub operation_type: OperationType,
+    pub sequence_number: i64,
+    pub atomic_group_id: i64,
+}
+
+/// Destination copy AND replication items require explicit application-before-
+/// ACK. Poll, drop and cancellation never acknowledge; late ACKs are fenced.
+/// Original operation epoch is available only through the explicit origin
+/// stream capability in [`crate::extensions`], not native metadata.
+pub trait IOperation: Send + Sync + 'static {
+    fn get_metadata(&self) -> Result<OperationMetadata>;
+    fn get_data(&self) -> Result<OperationData>;
+    fn acknowledge(&self) -> Result<()>;
+}
+
+/// Bounded single-consumer destination stream. None is EOS, including internal
+/// legacy-null EOS retirement; no synthetic application operation/ACK is added.
+pub trait IOperationStream: Send + Sync + 'static {
+    fn get_operation(
+        &self,
+        cancellation: Cancellation,
+    ) -> ServiceFuture<'_, Option<Arc<dyn IOperation>>>;
+}
+
+/// Application-facing SDK data boundary. Admission yields an early LSN and a
+/// separate quorum observation, NOT a single quorum-delayed LSN future.
+/// The application must retain accepted admission and locally apply it BEFORE
+/// awaiting completion. This differs from managed prepare/quorum/local-commit
+/// guidance. Dropping/canceling an observer cannot roll back accepted work or
+/// take over the application's local-apply responsibility. Finite limits reject
+/// before assignment; cancellation of a completion wait is uncertain.
+pub trait IStateReplicator: Send + Sync + 'static {
+    fn replicate(
+        &self,
+        data: OperationData,
+        cancellation: Cancellation,
+    ) -> ServiceFuture<'_, ReplicationAdmission>;
+    /// Immediate fallible getter; destination copy items require service ACK.
+    fn get_copy_stream(&self) -> Result<Arc<dyn IOperationStream>>;
+    /// Immediate fallible getter; shares the owner's bounded single consumer.
+    fn get_replication_stream(&self) -> Result<Arc<dyn IOperationStream>>;
+}
+
+/// Accepted sequence identity, separate from later quorum completion.
+pub struct ReplicationAdmission {
+    pub sequence_number: i64,
+    pub completion: ReplicationCompletion,
+}
+
+/// Advisory observation only: dropping this value never undoes admission.
+pub struct ReplicationCompletion {
+    pub(crate) receiver: tokio::sync::watch::Receiver<Option<Result<i64>>>,
+}
+impl ReplicationCompletion {
+    /// A canceled wait is uncertain and leaves the engine's accepted ownership
+    /// and required application local apply unchanged.
+    pub async fn wait(&mut self, cancellation: Cancellation) -> Result<i64> {
+        loop {
+            if let Some(result) = self.receiver.borrow_and_update().clone() {
+                return result;
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(Error::new(fube_runtime::ErrorKind::Canceled, "replication completion wait canceled").uncertain()),
+                result = self.receiver.changed() => result.map_err(|_| Error::Closed)?,
+            }
+        }
+    }
 }
 
 /// An explicit, once-only acknowledgment. Drop/poll does not invoke it.
 /// A retired owner rejects late acknowledgments without reviving progress.
-pub struct Acknowledgment {
+pub(crate) struct Acknowledgment {
     acknowledged: AtomicBool,
     action: Box<dyn Fn() -> Result<()> + Send + Sync>,
 }
@@ -202,7 +275,7 @@ impl Acknowledgment {
 }
 
 #[derive(Debug)]
-pub struct Operation {
+pub(crate) struct Operation {
     pub sequence: i64,
     pub epoch: Epoch,
     pub data: OperationData,
@@ -213,13 +286,41 @@ impl Operation {
         self.acknowledgment.acknowledge()
     }
 }
+impl IOperation for Operation {
+    fn get_metadata(&self) -> Result<OperationMetadata> {
+        Ok(OperationMetadata {
+            operation_type: OperationType::Normal,
+            sequence_number: self.sequence,
+            atomic_group_id: -1,
+        })
+    }
+    fn get_data(&self) -> Result<OperationData> {
+        Ok(self.data.clone())
+    }
+    fn acknowledge(&self) -> Result<()> {
+        Operation::acknowledge(self)
+    }
+}
 
 /// A bounded, single-consumer service stream. Cancellation stops only that poll;
 /// it does not acknowledge the operation or dispose its owning replica.
-pub struct OperationStream {
+pub(crate) struct OperationStream {
     receiver: std::sync::Mutex<tokio::sync::mpsc::Receiver<Operation>>,
     poller: tokio::sync::Semaphore,
     stopped: Cancellation,
+}
+impl IOperationStream for OperationStream {
+    fn get_operation(
+        &self,
+        cancellation: Cancellation,
+    ) -> ServiceFuture<'_, Option<Arc<dyn IOperation>>> {
+        Box::pin(async move {
+            Ok(self
+                .next(cancellation)
+                .await?
+                .map(|operation| Arc::new(operation) as Arc<dyn IOperation>))
+        })
+    }
 }
 impl OperationStream {
     /// Wrap an already-bounded channel owned by an engine/adapter.

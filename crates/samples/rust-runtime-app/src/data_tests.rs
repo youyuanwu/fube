@@ -46,7 +46,10 @@ async fn shutdown_route(route: &Arc<Route>) {
         .unwrap();
     route.engine.close(Cancellation::default()).await.unwrap();
 }
-use fube_data::{Acknowledgment, OperationData, OperationDataStream, StateProvider};
+use fube_data::extensions::ReplayCheckpointProvider;
+use fube_data::{
+    IOperationDataStream, IStateProvider, OperationData, OperationMetadata, OperationType,
+};
 use std::sync::atomic::AtomicUsize;
 
 const EPOCH: Epoch = Epoch {
@@ -126,11 +129,12 @@ async fn route_using(
     replica: i64,
     role: ReplicaRole,
     provider: Arc<MemoryProvider>,
-    engine_provider: Arc<dyn StateProvider>,
+    engine_provider: Arc<dyn IStateProvider>,
 ) -> Arc<Route> {
     let copy_delay = Arc::new(AtomicU64::new(0));
     let (send, receive) = oneshot::channel();
     let delay = copy_delay.clone();
+    let replay = provider.clone();
     let model = rap_model::Host::start(partition, replica, role, move |native| {
         Box::new(ModelFactory {
             native,
@@ -138,6 +142,7 @@ async fn route_using(
                 inner: engine_provider,
                 delay,
             }),
+            replay,
             result: Arc::new(Mutex::new(Some(send))),
         })
     })
@@ -161,15 +166,18 @@ async fn route_using(
     }
     route
 }
-type ModelResult = Arc<Mutex<Option<oneshot::Sender<(Arc<Engine>, NativeRuntimeIntegration)>>>>;
+type ModelResult =
+    Arc<Mutex<Option<oneshot::Sender<(Arc<FabricReplicator>, NativeRuntimeIntegration)>>>>;
 struct ModelFactory {
     native: NativeIntegrationProvider,
-    provider: Arc<dyn StateProvider>,
+    provider: Arc<dyn IStateProvider>,
+    replay: Arc<MemoryProvider>,
     result: ModelResult,
 }
 struct ModelReplica {
     native: NativeRuntimeIntegration,
-    provider: Arc<dyn StateProvider>,
+    provider: Arc<dyn IStateProvider>,
+    replay: Arc<MemoryProvider>,
     result: ModelResult,
 }
 impl IStatefulServiceFactory for ModelFactory {
@@ -184,6 +192,7 @@ impl IStatefulServiceFactory for ModelFactory {
         Ok(Box::new(ModelReplica {
             native: self.native.capture(partition, replica)?,
             provider: self.provider.clone(),
+            replay: self.replay.clone(),
             result: self.result.clone(),
         }))
     }
@@ -197,23 +206,21 @@ impl IStatefulServiceReplica for ModelReplica {
     ) -> ServiceFuture<'_, Box<dyn IPrimaryReplicator>> {
         Box::pin(async move {
             mode.validate()?;
-            let identity = self.native.identity();
-            let engine = Engine::bind_partition(
+            let engine = FabricReplicator::create(
                 partition,
                 self.native.clone(),
-                Actor {
-                    partition: identity.partition_id,
-                    replica: identity.replica_id,
-                    incarnation: Uuid::new_v4(),
-                },
-                "127.0.0.1:0",
                 self.provider.clone(),
+                Some(self.replay.clone()),
+                ReplicationEndpointOptions {
+                    listen_address: "127.0.0.1:0".into(),
+                    actor_incarnation: Uuid::new_v4(),
+                },
                 Settings::default(),
             )?;
             if let Some(send) = self.result.lock().unwrap().take() {
                 let _ = send.send((engine.clone(), self.native.clone()));
             }
-            Ok(engine.get_primary_replicator())
+            Ok(Box::new((*engine).clone()) as Box<dyn IPrimaryReplicator>)
         })
     }
     fn change_role(&self, role: ReplicaRole, _: Cancellation) -> ServiceFuture<'_, String> {
@@ -236,13 +243,13 @@ struct HeldCopy {
     eos: Arc<Semaphore>,
 }
 struct HeldStream {
-    stream: Arc<dyn OperationDataStream>,
+    stream: Arc<dyn IOperationDataStream>,
     eos: Arc<Semaphore>,
 }
-impl OperationDataStream for HeldStream {
-    fn next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+impl IOperationDataStream for HeldStream {
+    fn get_next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
         Box::pin(async move {
-            let item = self.stream.next(cancellation.clone()).await?;
+            let item = self.stream.get_next(cancellation.clone()).await?;
             if item.is_none() {
                 tokio::select! {
                     biased;
@@ -254,9 +261,9 @@ impl OperationDataStream for HeldStream {
         })
     }
 }
-impl StateProvider for HeldCopy {
-    fn last_committed(&self) -> RuntimeResult<i64> {
-        self.provider.last_committed()
+impl IStateProvider for HeldCopy {
+    fn get_last_committed_sequence_number(&self) -> RuntimeResult<i64> {
+        self.provider.get_last_committed_sequence_number()
     }
     fn update_epoch(
         &self,
@@ -269,16 +276,16 @@ impl StateProvider for HeldCopy {
     fn on_data_loss(&self, cancellation: Cancellation) -> ServiceFuture<'_, bool> {
         self.provider.on_data_loss(cancellation)
     }
-    fn copy_context(&self) -> RuntimeResult<Arc<dyn OperationDataStream>> {
-        self.provider.copy_context()
+    fn get_copy_context(&self) -> RuntimeResult<Arc<dyn IOperationDataStream>> {
+        self.provider.get_copy_context()
     }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         up_to: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> RuntimeResult<Arc<dyn OperationDataStream>> {
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> RuntimeResult<Arc<dyn IOperationDataStream>> {
         Ok(Arc::new(HeldStream {
-            stream: self.provider.copy_state(up_to, context)?,
+            stream: self.provider.get_copy_state(up_to, context)?,
             eos: self.eos.clone(),
         }))
     }
@@ -411,29 +418,31 @@ async fn copy_pacing_is_cancelable_and_does_not_consume_or_change_snapshot_data(
     provider.apply_replication(1, &original).unwrap();
     let delay = Arc::new(AtomicU64::new(100));
     let wrapper = CopyProvider {
-        inner: provider,
+        inner: provider.clone(),
         delay: delay.clone(),
     };
-    let checkpoint = wrapper
+    // Replay is a separately supplied authentic capability, never discovered
+    // through the standard-only pacing wrapper.
+    let checkpoint = provider
         .replication_checkpoint(1, Cancellation::default())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(checkpoint.epoch, EPOCH);
     assert_eq!(checkpoint.data, original);
-    let stream = wrapper.copy_state(0, None).unwrap();
+    let stream = wrapper.get_copy_state(0, None).unwrap();
     assert!(tokio::time::timeout(
         Duration::from_millis(10),
-        stream.next(Cancellation::default())
+        stream.get_next(Cancellation::default())
     )
     .await
     .is_err());
     let cancellation = Cancellation::default();
     cancellation.cancel();
-    assert!(stream.next(cancellation).await.is_err());
+    assert!(stream.get_next(cancellation).await.is_err());
     delay.store(0, Ordering::Release);
     let target = MemoryProvider::new();
-    while let Some(data) = stream.next(Cancellation::default()).await.unwrap() {
+    while let Some(data) = stream.get_next(Cancellation::default()).await.unwrap() {
         target.apply_copy(&data).unwrap();
     }
     assert!(!target.snapshot().copy_in_progress);
@@ -878,7 +887,11 @@ async fn real_copy_pumps_copy_ack_hold_after_receive_eos_then_replication_ack_an
         }
         eos.add_permits(1);
         for mut replication in accepted {
-            replication.wait(Cancellation::default()).await.unwrap();
+            replication
+                .completion
+                .wait(Cancellation::default())
+                .await
+                .unwrap();
         }
     };
     let joined = tokio::time::timeout(Duration::from_secs(30), async {
@@ -1038,8 +1051,8 @@ async fn stale_route_cleanup_cannot_remove_replacement_and_stale_handle_cannot_w
 
 type PumpFixture = (
     Pump,
-    mpsc::Sender<Operation>,
-    mpsc::Sender<Operation>,
+    mpsc::Sender<TestOperation>,
+    mpsc::Sender<TestOperation>,
     Arc<Mutex<Option<String>>>,
     mpsc::Sender<Submit>,
 );
@@ -1065,8 +1078,8 @@ fn pump_fixture_with_hold(
             native,
             engine: Weak::new(),
             provider,
-            copy: Arc::new(OperationStream::new(copy_rx)),
-            replication: Arc::new(OperationStream::new(replication_rx)),
+            copy: Arc::new(TestStream(tokio::sync::Mutex::new(copy_rx))),
+            replication: Arc::new(TestStream(tokio::sync::Mutex::new(replication_rx))),
             requests,
             delay: Arc::new(AtomicU64::new(delay)),
             copy_ack_hold,
@@ -1077,10 +1090,69 @@ fn pump_fixture_with_hold(
     .unwrap();
     (pump, copy_tx, replication_tx, fault, request_tx)
 }
-fn operation(sequence: i64, data: OperationData, ack: Acknowledgment) -> Operation {
-    Operation {
+#[derive(Debug)]
+struct TestOperation {
+    sequence: i64,
+    data: OperationData,
+    acknowledgment: Acknowledgment,
+}
+impl IOperation for TestOperation {
+    fn get_metadata(&self) -> RuntimeResult<OperationMetadata> {
+        Ok(OperationMetadata {
+            operation_type: OperationType::Normal,
+            sequence_number: self.sequence,
+            atomic_group_id: -1,
+        })
+    }
+    fn get_data(&self) -> RuntimeResult<OperationData> {
+        Ok(self.data.clone())
+    }
+    fn acknowledge(&self) -> RuntimeResult<()> {
+        self.acknowledgment.acknowledge()
+    }
+}
+struct TestStream(tokio::sync::Mutex<mpsc::Receiver<TestOperation>>);
+impl IOperationStream for TestStream {
+    fn get_operation(
+        &self,
+        cancel: Cancellation,
+    ) -> ServiceFuture<'_, Option<Arc<dyn IOperation>>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(RuntimeError::Closed),
+                item = async { self.0.lock().await.recv().await } => Ok(item.map(|op| Arc::new(op) as Arc<dyn IOperation>)),
+            }
+        })
+    }
+}
+// App-owned canonical doubles, not data engine implementation constructors.
+struct Acknowledgment {
+    called: AtomicBool,
+    action: Box<dyn Fn() -> RuntimeResult<()> + Send + Sync>,
+}
+impl std::fmt::Debug for Acknowledgment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestAck")
+    }
+}
+impl Acknowledgment {
+    fn new(action: impl Fn() -> RuntimeResult<()> + Send + Sync + 'static) -> Self {
+        Self {
+            called: AtomicBool::new(false),
+            action: Box::new(action),
+        }
+    }
+    fn acknowledge(&self) -> RuntimeResult<()> {
+        if self.called.swap(true, Ordering::AcqRel) {
+            return Err(RuntimeError::InvalidInput("duplicate test ACK"));
+        }
+        (self.action)()
+    }
+}
+fn operation(sequence: i64, data: OperationData, ack: Acknowledgment) -> TestOperation {
+    TestOperation {
         sequence,
-        epoch: EPOCH,
         data,
         acknowledgment: ack,
     }
@@ -1099,10 +1171,10 @@ async fn pump_copy_ack_hold_final_nonempty_receive_release_cancel_deadline_and_e
         source
             .apply_replication(1, &mutation("copied").operation().unwrap())
             .unwrap();
-        let stream = source.copy_state(1, None).unwrap();
+        let stream = source.get_copy_state(1, None).unwrap();
         let acknowledgments = Arc::new(AtomicUsize::new(0));
         let mut sequence = 0;
-        while let Some(data) = stream.next(Cancellation::default()).await.unwrap() {
+        while let Some(data) = stream.get_next(Cancellation::default()).await.unwrap() {
             sequence += 1;
             let acks = acknowledgments.clone();
             copy.send(operation(
@@ -1174,10 +1246,10 @@ async fn pump_copy_eos_does_not_end_replication_and_ack_observes_actual_provider
     let provider = MemoryProvider::new();
     let (mut pump, copy, replication, fault, _requests) = pump_fixture(provider.clone(), 0);
     let source = MemoryProvider::new();
-    let stream = source.copy_state(0, None).unwrap();
+    let stream = source.get_copy_state(0, None).unwrap();
     let acknowledgments = Arc::new(AtomicUsize::new(0));
     let mut sequence = 0;
-    while let Some(data) = stream.next(Cancellation::default()).await.unwrap() {
+    while let Some(data) = stream.get_next(Cancellation::default()).await.unwrap() {
         sequence += 1;
         let acks = acknowledgments.clone();
         let provider = provider.clone();

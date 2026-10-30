@@ -422,8 +422,8 @@ struct SnapshotStream {
     eos: Arc<Semaphore>,
 }
 
-impl OperationDataStream for SnapshotStream {
-    fn next(&self, _: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+impl IOperationDataStream for SnapshotStream {
+    fn get_next(&self, _: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
         Box::pin(async move {
             if self.next.fetch_add(1, Ordering::AcqRel) == 0 {
                 Ok(Some(self.snapshot.clone()))
@@ -440,8 +440,8 @@ impl OperationDataStream for SnapshotStream {
     }
 }
 
-impl StateProvider for SnapshotProvider {
-    fn last_committed(&self) -> Result<i64> {
+impl IStateProvider for SnapshotProvider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
         Ok(self.last.load(Ordering::Acquire))
     }
     fn update_epoch(&self, _: Epoch, previous: i64, _: Cancellation) -> ServiceFuture<'_, ()> {
@@ -457,14 +457,14 @@ impl StateProvider for SnapshotProvider {
     fn on_data_loss(&self, _: Cancellation) -> ServiceFuture<'_, bool> {
         Box::pin(async { Ok(false) })
     }
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
         Ok(Arc::new(Empty))
     }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         up_to: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>> {
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
         assert!(context.is_none());
         self.requested.lock().unwrap().push(up_to);
         if !self.snapshots.load(Ordering::Acquire) {
@@ -664,8 +664,8 @@ struct FailureStream {
     disposed: Arc<AtomicUsize>,
 }
 
-impl OperationDataStream for FailureStream {
-    fn next(&self, _: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+impl IOperationDataStream for FailureStream {
+    fn get_next(&self, _: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
         Box::pin(async move {
             self.active.fetch_add(1, Ordering::AcqRel);
             let _guard = CallbackGuard {
@@ -686,9 +686,9 @@ struct CopyFailureProvider {
     stream: Arc<FailureStream>,
 }
 
-impl StateProvider for CopyFailureProvider {
-    fn last_committed(&self) -> Result<i64> {
-        self.base.last_committed()
+impl IStateProvider for CopyFailureProvider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
+        self.base.get_last_committed_sequence_number()
     }
     fn update_epoch(
         &self,
@@ -701,14 +701,14 @@ impl StateProvider for CopyFailureProvider {
     fn on_data_loss(&self, cancellation: Cancellation) -> ServiceFuture<'_, bool> {
         self.base.on_data_loss(cancellation)
     }
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
-        self.base.copy_context()
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
+        self.base.get_copy_context()
     }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         _: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>> {
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
         assert!(context.is_none());
         if self.stream.mode == 4 {
             return Err(Error::ResourceLimit(
@@ -1004,7 +1004,7 @@ async fn promotion_drains_contiguous_received_before_discarding_only_out_of_orde
     drop(operation);
     promotion.await.unwrap();
     until(|| secondary.snapshot().role == ReplicaRole::Primary).await;
-    assert_eq!(provider.last_committed().unwrap(), 66);
+    assert_eq!(provider.get_last_committed_sequence_number().unwrap(), 66);
     assert!(provider.epochs.lock().unwrap().contains(&(next, 66)));
     assert_eq!(secondary.snapshot().progress.assigned, 66);
     assert_eq!(secondary.snapshot().progress.received, 66);
@@ -1363,7 +1363,7 @@ async fn copied_primary_replays_only_authentic_prefix_to_an_unbound_native_behav
     let pp = MemoryProvider::new();
     let sp = MemoryProvider::new();
     let p = engine(partition, 1, pp.clone());
-    let s = engine_with_settings(
+    let s = engine_with_replay(
         partition,
         2,
         sp.clone(),
@@ -1552,7 +1552,7 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
             ..Provider::default()
         });
         let partition = Uuid::new_v4();
-        let p = engine_with_settings(
+        let p = engine_with_replay(
             partition,
             1,
             provider.clone(),
@@ -1651,7 +1651,7 @@ async fn replay_cooldown_starts_after_slow_publication_releases_producer_admissi
         ..Provider::default()
     });
     let partition = Uuid::new_v4();
-    let p = engine_with_settings(
+    let p = engine_with_replay(
         partition,
         1,
         provider.clone(),
@@ -1781,7 +1781,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
         initial_status.service_role = ReplicaRole::None;
         initial_status.replicator_role = ReplicaRole::None;
         let view = Arc::new(SourceNativeView(Mutex::new(Ok(initial_status))));
-        let engine = Engine::bind_with_native_control(
+        let engine = Engine::bind_with_capabilities(
             Actor {
                 partition,
                 replica: index as i64 + 1,
@@ -1789,6 +1789,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
             },
             "127.0.0.1:0",
             provider.clone(),
+            Some(provider.clone()),
             Settings::default(),
             Some(view.clone()),
         )
@@ -2273,8 +2274,8 @@ async fn missing_service_apply_deadline_fences_without_receipt_as_commit_and_dis
 }
 
 struct Empty;
-impl OperationDataStream for Empty {
-    fn next(&self, _: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+impl IOperationDataStream for Empty {
+    fn get_next(&self, _: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
         Box::pin(async { Ok(None) })
     }
 }
@@ -2290,7 +2291,7 @@ struct Provider {
     checkpoint_gate: Mutex<Option<Arc<Semaphore>>>,
 }
 
-impl StateProvider for Provider {
+impl ReplayCheckpointProvider for Provider {
     fn replication_checkpoint(
         &self,
         _: i64,
@@ -2314,7 +2315,9 @@ impl StateProvider for Provider {
             }
         })
     }
-    fn last_committed(&self) -> Result<i64> {
+}
+impl IStateProvider for Provider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
         Ok(self.last.load(Ordering::Acquire))
     }
     fn update_epoch(&self, epoch: Epoch, previous: i64, _: Cancellation) -> ServiceFuture<'_, ()> {
@@ -2330,14 +2333,14 @@ impl StateProvider for Provider {
     fn on_data_loss(&self, _: Cancellation) -> ServiceFuture<'_, bool> {
         Box::pin(async { Ok(false) })
     }
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
         Ok(Arc::new(Empty))
     }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         up_to: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>> {
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
         assert!(context.is_none());
         self.horizons.lock().unwrap().push(up_to);
         Ok(Arc::new(Empty))
@@ -2348,14 +2351,34 @@ fn cancel() -> Cancellation {
     Cancellation::default()
 }
 
-fn engine(partition: Uuid, id: i64, provider: Arc<dyn StateProvider>) -> Arc<Engine> {
+fn engine(partition: Uuid, id: i64, provider: Arc<dyn IStateProvider>) -> Arc<Engine> {
     engine_with_settings(partition, id, provider, Settings::default())
+}
+fn engine_with_replay<T: IStateProvider + ReplayCheckpointProvider>(
+    partition: Uuid,
+    id: i64,
+    provider: Arc<T>,
+    settings: Settings,
+) -> Arc<Engine> {
+    Engine::bind_with_capabilities(
+        Actor {
+            partition,
+            replica: id,
+            incarnation: Uuid::new_v4(),
+        },
+        "127.0.0.1:0",
+        provider.clone(),
+        Some(provider),
+        settings,
+        None,
+    )
+    .unwrap()
 }
 
 fn engine_with_settings(
     partition: Uuid,
     id: i64,
-    provider: Arc<dyn StateProvider>,
+    provider: Arc<dyn IStateProvider>,
     settings: Settings,
 ) -> Arc<Engine> {
     Engine::bind(
@@ -2455,7 +2478,7 @@ fn primary_status() -> ReplicaStatus {
 fn engine_with_native_view(
     partition: Uuid,
     id: i64,
-    provider: Arc<dyn StateProvider>,
+    provider: Arc<dyn IStateProvider>,
     view: Arc<SourceNativeView>,
 ) -> Arc<Engine> {
     Engine::bind_with_native_control(
@@ -3345,7 +3368,7 @@ fn raw_send(transport: &PeerTransport, from: &Endpoint, to: &Engine, body: Body)
 }
 
 async fn initialized_raw_secondary(
-    provider: Arc<dyn StateProvider>,
+    provider: Arc<dyn IStateProvider>,
 ) -> (Arc<Engine>, PeerTransport, Endpoint, Incoming) {
     let partition = Uuid::new_v4();
     let secondary = engine(partition, 2, provider);
@@ -3444,9 +3467,9 @@ impl ControlledProvider {
     }
 }
 
-impl StateProvider for ControlledProvider {
-    fn last_committed(&self) -> Result<i64> {
-        self.base.last_committed()
+impl IStateProvider for ControlledProvider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
+        self.base.get_last_committed_sequence_number()
     }
     fn update_epoch(&self, epoch: Epoch, previous: i64, _: Cancellation) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
@@ -3470,15 +3493,15 @@ impl StateProvider for ControlledProvider {
             Ok(changed)
         })
     }
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
-        self.base.copy_context()
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
+        self.base.get_copy_context()
     }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         up_to: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>> {
-        self.base.copy_state(up_to, context)
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
+        self.base.get_copy_state(up_to, context)
     }
 }
 
@@ -4228,7 +4251,7 @@ async fn continuing_third_secondary_accepts_the_new_primary() {
 
 async fn copying_raw_secondary(
     epoch: Epoch,
-    provider: Arc<dyn StateProvider>,
+    provider: Arc<dyn IStateProvider>,
     settings: Settings,
 ) -> (Arc<Engine>, PeerTransport, Endpoint, Incoming) {
     let partition = Uuid::new_v4();

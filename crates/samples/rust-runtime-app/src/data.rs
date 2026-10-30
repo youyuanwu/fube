@@ -1,8 +1,11 @@
 //! Opt-in, volatile qualification fixture; HTTP is never the replication wire.
 use super::*;
+use fube_data::extensions::{
+    EngineSnapshot, EpochCheckedReplication, ReplicationEndpointOptions, ReplicatorDiagnostics,
+};
 use fube_data::{
-    wire::Actor, Engine, EngineSnapshot, MemoryProvider, Mutation, Operation, OperationData,
-    OperationDataStream, OperationStream, ReplayOperation, Replication, Settings, StateProvider,
+    FabricReplicator, IOperation, IOperationDataStream, IOperationStream, IStateProvider,
+    MemoryProvider, Mutation, OperationData, ReplicationAdmission, Settings,
 };
 use std::{
     net::{IpAddr, SocketAddr},
@@ -59,7 +62,7 @@ fn authoritative(native: &ReplicaStatus, engine: &EngineSnapshot, write: bool) -
 
 fn check_authority(
     native: &dyn NativeView,
-    engine: &Engine,
+    engine: &FabricReplicator,
     stopped: &Cancellation,
     write: bool,
 ) -> RuntimeResult<ReplicaStatus> {
@@ -248,7 +251,7 @@ impl WriteResult {
 
 enum Admission {
     Result(WriteResult),
-    Accepted(Replication),
+    Accepted(ReplicationAdmission),
 }
 struct Submit {
     mutation: Mutation,
@@ -259,7 +262,7 @@ struct Submit {
 // starts, disconnect/cancellation cannot drop its accepted LSN before local apply.
 async fn admit(
     native: &dyn NativeView,
-    engine: &Engine,
+    engine: &FabricReplicator,
     provider: &MemoryProvider,
     stopped: &Cancellation,
     mutation: &Mutation,
@@ -293,7 +296,7 @@ async fn admit(
         Err(error) => return reject(error),
     }
     let replication = match engine
-        .submit_in_epoch(expected_epoch, data.clone(), stopped.clone())
+        .replicate_in_epoch(expected_epoch, data.clone(), stopped.clone())
         .await
     {
         Ok(replication) => replication,
@@ -301,7 +304,7 @@ async fn admit(
     };
     if check_authority(native, engine, stopped, true).is_err()
         || provider
-            .apply_replication(replication.sequence, &data)
+            .apply_replication(replication.sequence_number, &data)
             .is_err()
     {
         // Never continue admission with a missing local LSN, or advertise quorum
@@ -311,7 +314,7 @@ async fn admit(
         }
         return Admission::Result(WriteResult::accepted(
             mutation.id.clone(),
-            replication.sequence,
+            replication.sequence_number,
             false,
             false,
         ));
@@ -327,15 +330,15 @@ struct Pump {
 /// Qualification-only copy pacing. The engine owns enumeration/deadlines; this
 /// wrapper never delays transport/control callbacks or changes snapshot data.
 struct CopyProvider {
-    inner: Arc<dyn StateProvider>,
+    inner: Arc<dyn IStateProvider>,
     delay: Arc<AtomicU64>,
 }
 struct CopyStream {
-    inner: Arc<dyn OperationDataStream>,
+    inner: Arc<dyn IOperationDataStream>,
     delay: Arc<AtomicU64>,
 }
-impl OperationDataStream for CopyStream {
-    fn next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+impl IOperationDataStream for CopyStream {
+    fn get_next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
         Box::pin(async move {
             let delay = self.delay.load(Ordering::Acquire);
             if delay > 0 {
@@ -344,20 +347,13 @@ impl OperationDataStream for CopyStream {
                     _=tokio::time::sleep(Duration::from_millis(delay))=>{},
                 }
             }
-            self.inner.next(cancellation).await
+            self.inner.get_next(cancellation).await
         })
     }
 }
-impl StateProvider for CopyProvider {
-    fn last_committed(&self) -> RuntimeResult<i64> {
-        self.inner.last_committed()
-    }
-    fn replication_checkpoint(
-        &self,
-        sequence: i64,
-        cancellation: Cancellation,
-    ) -> ServiceFuture<'_, Option<ReplayOperation>> {
-        self.inner.replication_checkpoint(sequence, cancellation)
+impl IStateProvider for CopyProvider {
+    fn get_last_committed_sequence_number(&self) -> RuntimeResult<i64> {
+        self.inner.get_last_committed_sequence_number()
     }
     fn update_epoch(
         &self,
@@ -370,26 +366,26 @@ impl StateProvider for CopyProvider {
     fn on_data_loss(&self, cancellation: Cancellation) -> ServiceFuture<'_, bool> {
         self.inner.on_data_loss(cancellation)
     }
-    fn copy_context(&self) -> RuntimeResult<Arc<dyn OperationDataStream>> {
-        self.inner.copy_context()
+    fn get_copy_context(&self) -> RuntimeResult<Arc<dyn IOperationDataStream>> {
+        self.inner.get_copy_context()
     }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         up_to: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> RuntimeResult<Arc<dyn OperationDataStream>> {
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> RuntimeResult<Arc<dyn IOperationDataStream>> {
         Ok(Arc::new(CopyStream {
-            inner: self.inner.copy_state(up_to, context)?,
+            inner: self.inner.get_copy_state(up_to, context)?,
             delay: self.delay.clone(),
         }))
     }
 }
 struct PumpInput {
     native: Arc<dyn NativeView>,
-    engine: Weak<Engine>,
+    engine: Weak<FabricReplicator>,
     provider: Arc<MemoryProvider>,
-    copy: Arc<OperationStream>,
-    replication: Arc<OperationStream>,
+    copy: Arc<dyn IOperationStream>,
+    replication: Arc<dyn IOperationStream>,
     requests: mpsc::Receiver<Submit>,
     delay: Arc<AtomicU64>,
     copy_ack_hold: Arc<CopyAckHold>,
@@ -458,7 +454,7 @@ impl Drop for Pump {
 async fn apply_ack(
     native: &dyn NativeView,
     provider: &MemoryProvider,
-    operation: Operation,
+    operation: Arc<dyn IOperation>,
     copy: bool,
     delay: &AtomicU64,
     copy_ack_hold: &CopyAckHold,
@@ -468,21 +464,18 @@ async fn apply_ack(
         return Err(RuntimeError::Closed);
     }
     native.snapshot()?;
+    let data = operation.get_data()?;
+    let sequence = operation.get_metadata()?.sequence_number;
     if copy {
-        provider.apply_copy(&operation.data)?;
+        provider.apply_copy(&data)?;
     } else {
-        provider.apply_replication(operation.sequence, &operation.data)?;
+        provider.apply_replication(sequence, &data)?;
     }
     // Only the nonempty final CopyEnd switches the provider out of copy mode.
     // Keep the real operation owned by this joined pump until explicit release.
     let held = if copy && !provider.snapshot().copy_in_progress && provider.snapshot().last > 0 {
         copy_ack_hold
-            .wait(
-                operation.sequence,
-                provider.snapshot().last,
-                stopped,
-                stopped,
-            )
+            .wait(sequence, provider.snapshot().last, stopped, stopped)
             .await?
     } else {
         false
@@ -515,13 +508,13 @@ async fn pump(mut input: PumpInput, stopped: Cancellation) -> RuntimeResult<()> 
         tokio::select! {
             biased;
             _ = stopped.cancelled() => return Ok(()),
-            item = input.copy.next(stopped.clone()), if !copy_done => {
+            item = input.copy.get_operation(stopped.clone()), if !copy_done => {
                 match item? {
                     Some(operation) => apply_ack(input.native.as_ref(), &input.provider, operation, true, &input.delay, &input.copy_ack_hold, &stopped).await?,
                     None => copy_done = true,
                 }
             }
-            item = input.replication.next(stopped.clone()), if !replication_done => {
+            item = input.replication.get_operation(stopped.clone()), if !replication_done => {
                 match item? {
                     Some(operation) => apply_ack(input.native.as_ref(), &input.provider, operation, false, &input.delay, &input.copy_ack_hold, &stopped).await?,
                     None => replication_done = true,
@@ -544,7 +537,7 @@ async fn pump(mut input: PumpInput, stopped: Cancellation) -> RuntimeResult<()> 
 pub(super) struct Route {
     native: Arc<dyn NativeView>,
     identity: ReplicaIdentity,
-    engine: Arc<Engine>,
+    engine: Arc<FabricReplicator>,
     provider: Arc<MemoryProvider>,
     active: AtomicUsize,
     stopped: Cancellation,
@@ -563,7 +556,7 @@ impl Route {
     fn start(
         native: Arc<dyn NativeView>,
         identity: ReplicaIdentity,
-        engine: Arc<Engine>,
+        engine: Arc<FabricReplicator>,
         provider: Arc<MemoryProvider>,
         service_address: String,
         generation: u64,
@@ -574,13 +567,14 @@ impl Route {
         let delay = Arc::new(AtomicU64::new(0));
         let fault = Arc::new(Mutex::new(None));
         let copy_ack_hold = Arc::new(CopyAckHold::default());
+        let state = engine.get_state_replicator();
         let pump = Pump::start(
             PumpInput {
                 native: native.clone(),
                 engine: Arc::downgrade(&engine),
                 provider: provider.clone(),
-                copy: engine.copy_stream(),
-                replication: engine.replication_stream(),
+                copy: state.get_copy_stream()?,
+                replication: state.get_replication_stream()?,
                 requests: receiver,
                 delay: delay.clone(),
                 copy_ack_hold: copy_ack_hold.clone(),
@@ -639,10 +633,14 @@ impl Route {
             Ok(Admission::Result(result)) => result,
             Ok(Admission::Accepted(mut replication)) => {
                 let committed = matches!(
-                    tokio::time::timeout(WRITE_WAIT, replication.wait(self.stopped.clone())).await,
+                    tokio::time::timeout(
+                        WRITE_WAIT,
+                        replication.completion.wait(self.stopped.clone())
+                    )
+                    .await,
                     Ok(Ok(_))
                 );
-                WriteResult::accepted(id, replication.sequence, false, committed)
+                WriteResult::accepted(id, replication.sequence_number, false, committed)
             }
             Err(error) => WriteResult::rejected(id, error),
         };
@@ -735,19 +733,18 @@ impl IStatefulServiceReplica for Service {
                     .map_err(|_| RuntimeError::InvalidInput("invalid data listener IP"))?,
                 0,
             );
-            let engine = Engine::bind_partition(
+            let engine = FabricReplicator::create(
                 partition.clone(),
                 native.clone(),
-                Actor {
-                    partition: self.context.identity.partition_id,
-                    replica: self.context.identity.replica_id,
-                    incarnation: self.incarnation,
-                },
-                &address.to_string(),
                 Arc::new(CopyProvider {
                     inner: provider.clone(),
                     delay: copy_delay.clone(),
                 }),
+                Some(provider.clone()),
+                ReplicationEndpointOptions {
+                    listen_address: address.to_string(),
+                    actor_incarnation: self.incarnation,
+                },
                 Settings::default(),
             )?;
             let route = Route::start(
@@ -773,7 +770,7 @@ impl IStatefulServiceReplica for Service {
                 .unwrap()
                 .insert(self.path.clone(), route.clone());
             *self.route.lock().unwrap() = Some(route);
-            Ok(engine.get_primary_replicator())
+            Ok(Box::new((*engine).clone()) as Box<dyn IPrimaryReplicator>)
         })
     }
     fn change_role(

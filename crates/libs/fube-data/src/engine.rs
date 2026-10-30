@@ -76,13 +76,14 @@ use tokio::{
     time::{interval, timeout, Instant, MissedTickBehavior},
 };
 
+use crate::extensions::{ReplayCheckpointProvider, ReplayOperation};
 use crate::{
     queue::OperationQueue,
     quorum::{configuration_progress, ConfigurationProgress, PeerProgress},
     transport::{Incoming, PeerTransport},
     wire::{Actor, Body, Endpoint, Packet, WireOperation},
-    Acknowledgment, Cancellation, Epoch, Error, Operation, OperationData, OperationDataStream,
-    OperationStream, Progress, ReplayOperation, ReplicaRole, Result, Settings, StateProvider,
+    Acknowledgment, Cancellation, Epoch, Error, IOperationDataStream, IStateProvider, Operation,
+    OperationData, OperationStream, Progress, ReplicaRole, Result, Settings,
 };
 
 #[cfg(test)]
@@ -160,11 +161,12 @@ impl Serialize for EngineSnapshot {
 /// An admitted write. Dropping this handle cannot undo admission.
 pub struct Replication {
     pub sequence: i64,
-    completion: watch::Receiver<Option<Result<i64>>>,
+    pub(crate) completion: watch::Receiver<Option<Result<i64>>>,
 }
 
 impl Replication {
     /// Canceling this wait is ambiguous: the admitted write remains owned.
+    #[cfg(test)]
     pub async fn wait(&mut self, cancellation: Cancellation) -> Result<i64> {
         loop {
             if let Some(result) = self.completion.borrow_and_update().clone() {
@@ -365,7 +367,8 @@ impl Engine {
         native: NativeRuntimeIntegration,
         actor: Actor,
         address: &str,
-        provider: Arc<dyn StateProvider>,
+        provider: Arc<dyn IStateProvider>,
+        replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         settings: Settings,
     ) -> Result<Arc<Self>> {
         settings.validate()?;
@@ -387,7 +390,14 @@ impl Engine {
                 "replication actor does not match native partition",
             ));
         }
-        Self::bind_with_native_control(actor, address, provider, settings, Some(Arc::new(native)))
+        Self::bind_with_capabilities(
+            actor,
+            address,
+            provider,
+            replay,
+            settings,
+            Some(Arc::new(native)),
+        )
     }
 
     /// Standalone binding for internal source/algorithm fixtures. This is not a
@@ -397,19 +407,32 @@ impl Engine {
     /// The caller is responsible for a blocking callback/destructor fence:
     /// Tokio deadlines alone cannot supervise synchronous provider code.
     /// SF-activated qualification must instead use [`Self::bind_partition`].
+    #[cfg(test)]
     pub fn bind(
         actor: Actor,
         address: &str,
-        provider: Arc<dyn StateProvider>,
+        provider: Arc<dyn IStateProvider>,
         settings: Settings,
     ) -> Result<Arc<Self>> {
         Self::bind_with_native_control(actor, address, provider, settings, None)
     }
 
+    #[cfg(test)]
     fn bind_with_native_control(
         actor: Actor,
         address: &str,
-        provider: Arc<dyn StateProvider>,
+        provider: Arc<dyn IStateProvider>,
+        settings: Settings,
+        native_control: Option<Arc<dyn NativeControlView>>,
+    ) -> Result<Arc<Self>> {
+        Self::bind_with_capabilities(actor, address, provider, None, settings, native_control)
+    }
+
+    fn bind_with_capabilities(
+        actor: Actor,
+        address: &str,
+        provider: Arc<dyn IStateProvider>,
+        replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         settings: Settings,
         native_control: Option<Arc<dyn NativeControlView>>,
     ) -> Result<Arc<Self>> {
@@ -482,6 +505,7 @@ impl Engine {
         let provider = Arc::new(crate::supervised::OwnedProvider::new(
             execution.clone(),
             provider,
+            replay,
             settings.connections,
             disposal.clone(),
             origin,
@@ -577,8 +601,8 @@ impl Engine {
                 let outcome = runtime.block_on(async move {
                     // Spawn also supervises a synchronous progress callback panic.
                     let initial_provider = provider.clone();
-                    let mut initial =
-                        initial_permit.run_owned(move || initial_provider.last_committed());
+                    let mut initial = initial_permit
+                        .run_owned(move || initial_provider.get_last_committed_sequence_number());
                     let initial = match timeout(state_settings.callback_timeout, &mut initial).await
                     {
                         Ok(result) => result,
@@ -743,6 +767,9 @@ impl Engine {
 
     pub fn replication_stream(&self) -> Arc<OperationStream> {
         self.replication.clone()
+    }
+    pub(crate) fn ensure_open(&self) -> Result<()> {
+        self.check()
     }
 
     pub fn copy_stream(&self) -> Arc<OperationStream> {
@@ -1314,7 +1341,7 @@ struct Build {
     horizon: i64,
     start_sent: bool,
     established: bool,
-    stream: Option<Arc<dyn OperationDataStream>>,
+    stream: Option<Arc<dyn IOperationDataStream>>,
     job: bool,
     next: i64,
     pending: BTreeMap<i64, SentCopy>,
@@ -1406,7 +1433,7 @@ enum JobValue {
     Epoch(i64),
     Loss(bool, Option<i64>),
     CopyOpen(
-        Arc<dyn OperationDataStream>,
+        Arc<dyn IOperationDataStream>,
         fube_runtime::extensions::ObjectPublication,
     ),
     CopyNext(Option<OperationData>, Charge),
@@ -2889,6 +2916,9 @@ impl Owner {
     }
 
     fn start_prefix_replay(&mut self) {
+        if !self.provider.as_ref().unwrap().has_replay() {
+            return;
+        }
         let progress = self.queue.progress();
         if self.replay_job || Instant::now() < self.replay_next || !self.prefix_replay_needed() {
             return;
@@ -2956,7 +2986,10 @@ impl Owner {
 
     fn prefix_replay_needed(&self) -> bool {
         let progress = self.queue.progress();
-        self.role == ReplicaRole::Primary
+        self.provider
+            .as_ref()
+            .is_some_and(|provider| provider.has_replay())
+            && self.role == ReplicaRole::Primary
             && !self.replay_rearm_pending
             && self.control.is_none()
             && self.reconciled
@@ -4014,13 +4047,13 @@ impl Owner {
                     _ = cancellation.cancelled() => Err(Error::Closed),
                     result = async {
                         if admission_only {
-                            Ok(JobValue::Epoch(provider.last_committed()?))
+                            Ok(JobValue::Epoch(provider.get_last_committed_sequence_number()?))
                         } else if let Some(epoch) = epoch {
                             provider.update_epoch(epoch, boundary, cancellation.clone()).await?;
-                            Ok(JobValue::Epoch(provider.last_committed()?))
+                            Ok(JobValue::Epoch(provider.get_last_committed_sequence_number()?))
                         } else {
                             let changed = provider.on_data_loss(cancellation.clone()).await?;
-                            let progress = if changed { Some(provider.last_committed()?) } else { None };
+                            let progress = if changed { Some(provider.get_last_committed_sequence_number()?) } else { None };
                             Ok(JobValue::Loss(changed, progress))
                         }
                     } => result,
@@ -4506,7 +4539,7 @@ impl Owner {
                         tokio::select! {
                             biased;
                             _ = cancellation.cancelled() => Err(Error::Closed),
-                            result = stream.next(cancellation.clone()) => {
+                            result = stream.get_next(cancellation.clone()) => {
                                 result.map(|data| JobValue::CopyNext(data, charge))
                             }
                         }
@@ -4540,7 +4573,7 @@ impl Owner {
                         // callback deadline before consuming provider history.
                         // Never turn this normal scheduling window into a
                         // fabricated lower snapshot or a premature source fault.
-                        while provider.last_committed()? < horizon {
+                        while provider.get_last_committed_sequence_number()? < horizon {
                             tokio::select! {
                                 _ = cancellation.cancelled() => return Err(Error::Closed),
                                 _ = tokio::time::sleep(std::time::Duration::from_millis(2)) => {},

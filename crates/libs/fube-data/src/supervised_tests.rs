@@ -165,11 +165,7 @@ impl<T> Drop for Callback<T> {
         }
     }
 }
-impl StateProvider for Provider {
-    fn last_committed(&self) -> Result<i64> {
-        self.0.event("last");
-        Ok(0)
-    }
+impl ReplayCheckpointProvider for Provider {
     fn replication_checkpoint(
         &self,
         _: i64,
@@ -183,6 +179,12 @@ impl StateProvider for Provider {
             probe: self.0.clone(),
             output: Some(None),
         })
+    }
+}
+impl IStateProvider for Provider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
+        self.0.event("last");
+        Ok(0)
     }
     fn update_epoch(&self, _: Epoch, _: i64, _: Cancellation) -> ServiceFuture<'_, ()> {
         self.0.event("update-constructor");
@@ -201,22 +203,22 @@ impl StateProvider for Provider {
             output: Some(false),
         })
     }
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
         self.0.event("context");
-        let stream: Arc<dyn OperationDataStream> = Arc::new(Stream(self.0.clone()));
+        let stream: Arc<dyn IOperationDataStream> = Arc::new(Stream(self.0.clone()));
         match self.0.mode.load(Ordering::SeqCst) {
             7 => panic!("controlled stream creation panic"),
             8 => Err(Error::Closed),
             _ => Ok(stream),
         }
     }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         _: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>> {
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
         self.0.event("state");
-        let stream: Arc<dyn OperationDataStream> = Arc::new(Stream(self.0.clone()));
+        let stream: Arc<dyn IOperationDataStream> = Arc::new(Stream(self.0.clone()));
         let result = match self.0.mode.load(Ordering::SeqCst) {
             7 => panic!("controlled stream creation panic"),
             8 => Err(Error::Closed),
@@ -226,8 +228,8 @@ impl StateProvider for Provider {
         result
     }
 }
-impl OperationDataStream for Stream {
-    fn next(&self, _: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+impl IOperationDataStream for Stream {
+    fn get_next(&self, _: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
         self.0.event("next-constructor");
         if self.0.mode.load(Ordering::SeqCst) == 3 {
             panic!("controlled next constructor panic");
@@ -245,9 +247,11 @@ impl OperationDataStream for Stream {
 
 fn provider() -> (SupervisedProvider<Accounting>, Arc<Probe>) {
     let probe = Arc::new(Probe::default());
+    let provider = Arc::new(Provider(probe.clone()));
     (
         SupervisedProvider {
-            inner: Some(Arc::new(Provider(probe.clone()))),
+            inner: Some(provider.clone()),
+            replay: Some(provider),
             supervision: Accounting(probe.clone()),
         },
         probe,
@@ -263,7 +267,7 @@ fn poll<T>(future: &mut ServiceFuture<'_, T>) -> Poll<Result<T>> {
 #[test]
 fn all_callbacks_enroll_before_construction_and_hold_through_actual_future_disposal() {
     let (provider, probe) = provider();
-    assert_eq!(provider.last_committed().unwrap(), 0);
+    assert_eq!(provider.get_last_committed_sequence_number().unwrap(), 0);
     assert_eq!(probe.count(), 0);
     let mut epoch = provider.update_epoch(Epoch::INVALID, 0, Cancellation::default());
     assert_eq!(probe.count(), 1);
@@ -296,12 +300,12 @@ fn all_callbacks_enroll_before_construction_and_hold_through_actual_future_dispo
 fn returned_enumerators_are_idle_until_next_and_guard_final_arc_disposal() {
     let (provider, probe) = provider();
     for stream in [
-        provider.copy_context().unwrap(),
-        provider.copy_state(0, None).unwrap(),
+        provider.get_copy_context().unwrap(),
+        provider.get_copy_state(0, None).unwrap(),
     ] {
         let clone = stream.clone();
         assert_eq!(probe.count(), 0);
-        let mut next = stream.next(Cancellation::default());
+        let mut next = stream.get_next(Cancellation::default());
         assert_eq!(probe.count(), 1);
         assert!(matches!(poll(&mut next), Poll::Ready(Ok(None))));
         assert_eq!(probe.count(), 1);
@@ -314,7 +318,7 @@ fn returned_enumerators_are_idle_until_next_and_guard_final_arc_disposal() {
     }
     assert_eq!(probe.count(), 0);
     let stream = provider
-        .copy_state(0, Some(Arc::new(Stream(probe.clone()))))
+        .get_copy_state(0, Some(Arc::new(Stream(probe.clone()))))
         .unwrap();
     drop(stream);
     drop(provider);
@@ -346,17 +350,18 @@ fn progressing_nonempty_enumerators_can_outlive_many_callback_budgets_and_idle_i
         retired: Arc::default(),
     };
     let provider = SupervisedProvider {
+        replay: None,
         inner: Some(Arc::new(Provider(probe.clone()))),
         supervision: supervision.clone(),
     };
     probe.mode.store(9, Ordering::SeqCst);
     for stream in [
-        provider.copy_context().unwrap(),
-        provider.copy_state(0, None).unwrap(),
+        provider.get_copy_context().unwrap(),
+        provider.get_copy_state(0, None).unwrap(),
     ] {
         assert_eq!(probe.count(), 0);
         for record in 0..1_000 {
-            let mut next = stream.next(Cancellation::default());
+            let mut next = stream.get_next(Cancellation::default());
             assert_eq!(probe.count(), 1);
             supervision.now.fetch_add(20, Ordering::SeqCst);
             assert!(matches!(poll(&mut next), Poll::Ready(Ok(Some(_)))));
@@ -383,7 +388,7 @@ fn progressing_nonempty_enumerators_can_outlive_many_callback_budgets_and_idle_i
 fn blocked_next_construction_poll_and_actual_destructors_each_hold_one_guard() {
     for name in ["next-constructor", "poll", "future-drop", "stream-drop"] {
         let (provider, probe) = provider();
-        let stream = provider.copy_state(0, None).unwrap();
+        let stream = provider.get_copy_state(0, None).unwrap();
         assert_eq!(probe.count(), 0);
         let (entered, waiting) = mpsc::channel();
         let (release, blocked) = mpsc::channel();
@@ -393,7 +398,7 @@ fn blocked_next_construction_poll_and_actual_destructors_each_hold_one_guard() {
             release: blocked,
         });
         let worker = std::thread::spawn(move || {
-            let mut next = stream.next(Cancellation::default());
+            let mut next = stream.get_next(Cancellation::default());
             assert!(matches!(poll(&mut next), Poll::Ready(Ok(None))));
             drop(next);
             drop(stream);
@@ -421,10 +426,10 @@ fn cancellation_and_abandoned_unpolled_stream_future_do_not_disarm_early() {
     assert_eq!(probe.count(), 1);
     drop(callback);
     assert_eq!(probe.count(), 0);
-    let stream = provider.copy_context().unwrap();
+    let stream = provider.get_copy_context().unwrap();
     assert_eq!(probe.count(), 0);
     let cancellation = Cancellation::default();
-    let mut next = stream.next(cancellation.clone());
+    let mut next = stream.get_next(cancellation.clone());
     assert!(poll(&mut next).is_pending());
     cancellation.cancel();
     assert!(poll(&mut next).is_pending());
@@ -447,7 +452,7 @@ fn cancellation_and_abandoned_unpolled_stream_future_do_not_disarm_early() {
     );
     drop(next);
     assert_eq!(probe.count(), 0);
-    let unpolled = stream.next(cancellation);
+    let unpolled = stream.get_next(cancellation);
     assert_eq!(probe.count(), 1);
     drop(unpolled);
     assert_eq!(probe.count(), 0);
@@ -474,26 +479,26 @@ fn constructor_poll_and_stream_destructor_unwind_keep_capture_destruction_accoun
     drop(callback);
     assert_eq!(probe.count(), 0);
     probe.mode.store(3, Ordering::SeqCst);
-    let stream = provider.copy_context().unwrap();
+    let stream = provider.get_copy_context().unwrap();
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drop(stream.next(Cancellation::default()));
+        drop(stream.get_next(Cancellation::default()));
     }))
     .is_err());
     assert_eq!(probe.count(), 0);
     probe.mode.store(2, Ordering::SeqCst);
-    let mut next = stream.next(Cancellation::default());
+    let mut next = stream.get_next(Cancellation::default());
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poll(&mut next))).is_err());
     assert_eq!(probe.count(), 1);
     drop(next);
     assert_eq!(probe.count(), 0);
     probe.mode.store(6, Ordering::SeqCst);
-    let callback = stream.next(Cancellation::default());
+    let callback = stream.get_next(Cancellation::default());
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(callback))).is_err());
     assert_eq!(probe.count(), 0);
     drop(stream);
     assert_eq!(probe.count(), 0);
     probe.mode.store(4, Ordering::SeqCst);
-    let stream = provider.copy_context().unwrap();
+    let stream = provider.get_copy_context().unwrap();
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(stream))).is_err());
     assert_eq!(probe.count(), 0);
     probe.mode.store(5, Ordering::SeqCst);
@@ -509,9 +514,9 @@ fn stream_creation_panic_and_error_dispose_results_and_context_under_creation_gu
             probe.mode.store(mode, Ordering::SeqCst);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if with_context {
-                    provider.copy_state(0, Some(Arc::new(Stream(probe.clone()))))
+                    provider.get_copy_state(0, Some(Arc::new(Stream(probe.clone()))))
                 } else {
-                    provider.copy_context()
+                    provider.get_copy_context()
                 }
             }));
             if mode == 7 {
@@ -538,18 +543,21 @@ fn stream_creation_panic_and_error_dispose_results_and_context_under_creation_gu
 #[test]
 fn disarming_rejection_uses_existing_outer_runtime_cleanup_ownership() {
     let (provider, probe) = provider();
-    let stream = provider.copy_context().unwrap();
+    let stream = provider.get_copy_context().unwrap();
     assert_eq!(probe.count(), 0);
     // Native Runtime joins Engine shutdown/final participant destruction under
     // its own guard before disarming. A rejected nested guard must not pretend
     // to grant fresh ownership or access.
     let outer = provider.supervision.arm().unwrap();
     probe.closed.store(true, Ordering::SeqCst);
-    assert!(matches!(provider.last_committed(), Err(Error::Closed)));
+    assert!(matches!(
+        provider.get_last_committed_sequence_number(),
+        Err(Error::Closed)
+    ));
     assert!(provider
-        .copy_state(0, Some(Arc::new(Stream(probe.clone()))))
+        .get_copy_state(0, Some(Arc::new(Stream(probe.clone()))))
         .is_err());
-    let mut next = stream.next(Cancellation::default());
+    let mut next = stream.get_next(Cancellation::default());
     assert!(matches!(poll(&mut next), Poll::Ready(Err(Error::Closed))));
     drop(next);
     drop(stream);
@@ -573,7 +581,7 @@ fn admission_failure_never_invokes_user_code_and_rejected_capture_cleanup_waits_
     let (provider, probe) = provider();
     probe.reject.store(1, Ordering::SeqCst);
     assert!(matches!(
-        provider.last_committed(),
+        provider.get_last_committed_sequence_number(),
         Err(Error::ResourceLimit(_))
     ));
     probe.reject.store(1, Ordering::SeqCst);
@@ -591,11 +599,11 @@ fn admission_failure_never_invokes_user_code_and_rejected_capture_cleanup_waits_
     ));
     drop(checkpoint);
     probe.reject.store(1, Ordering::SeqCst);
-    assert!(provider.copy_context().is_err());
+    assert!(provider.get_copy_context().is_err());
     assert!(probe.events.lock().unwrap().is_empty());
     probe.reject.store(2, Ordering::SeqCst);
     assert!(provider
-        .copy_state(0, Some(Arc::new(Stream(probe.clone()))))
+        .get_copy_state(0, Some(Arc::new(Stream(probe.clone()))))
         .is_err());
     assert_eq!(*probe.events.lock().unwrap(), vec![("stream-drop", 1)]);
     probe.reject.store(1, Ordering::SeqCst);
@@ -610,10 +618,10 @@ fn admission_failure_never_invokes_user_code_and_rejected_capture_cleanup_waits_
 #[test]
 fn exhausted_slots_reject_next_without_user_code_and_final_stream_cleanup_waits_for_an_owner() {
     let (provider, probe) = provider();
-    let stream = provider.copy_context().unwrap();
+    let stream = provider.get_copy_context().unwrap();
     probe.limit.store(1, Ordering::SeqCst);
     let owner = provider.supervision.arm().unwrap();
-    let mut next = stream.next(Cancellation::default());
+    let mut next = stream.get_next(Cancellation::default());
     assert!(matches!(
         poll(&mut next),
         Poll::Ready(Err(Error::ResourceLimit(_)))

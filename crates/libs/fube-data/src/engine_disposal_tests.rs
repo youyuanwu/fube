@@ -95,6 +95,80 @@ async fn actual_owner_and_peer_ack_progress_while_entire_application_executor_is
 }
 
 struct ExecutionView(ExecutionRuntime);
+
+struct ReplayFinalDrop {
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    release: Mutex<std_mpsc::Receiver<()>>,
+}
+impl ReplayCheckpointProvider for ReplayFinalDrop {
+    fn replication_checkpoint(
+        &self,
+        _: i64,
+        _: Cancellation,
+    ) -> ServiceFuture<'_, Option<ReplayOperation>> {
+        Box::pin(async { Ok(None) })
+    }
+}
+impl Drop for ReplayFinalDrop {
+    fn drop(&mut self) {
+        assert_eq!(thread::current().name(), Some("fube-owned-cleanup"));
+        self.entered
+            .get_mut()
+            .unwrap()
+            .take()
+            .unwrap()
+            .send(())
+            .unwrap();
+        self.release
+            .get_mut()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn separately_optional_replay_final_arc_is_owned_until_actual_cleanup_not_close_admission() {
+    let execution = ExecutionRuntime::standalone(tokio::runtime::Handle::current()).unwrap();
+    let (entered, dropped) = oneshot::channel();
+    let (release, wait) = std_mpsc::channel();
+    let engine = Engine::bind_with_capabilities(
+        Actor {
+            partition: Uuid::new_v4(),
+            replica: 1,
+            incarnation: Uuid::new_v4(),
+        },
+        "127.0.0.1:0",
+        Arc::new(Provider::default()),
+        Some(Arc::new(ReplayFinalDrop {
+            entered: Mutex::new(Some(entered)),
+            release: Mutex::new(wait),
+        })),
+        Settings::default(),
+        Some(Arc::new(ExecutionView(execution.clone()))),
+    )
+    .unwrap();
+    let owner = engine.clone();
+    let mut close = tokio::spawn(async move { owner.close(cancel()).await });
+    timeout(std::time::Duration::from_secs(1), dropped)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(timeout(std::time::Duration::from_millis(30), &mut close)
+        .await
+        .is_err());
+    execution
+        .try_reserve()
+        .unwrap()
+        .run_owned(|| Ok(()))
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    close.await.unwrap().unwrap();
+    drop(engine);
+    execution.finish_standalone().await.unwrap();
+}
+
 impl NativeControlView for ExecutionView {
     fn execution(&self) -> Result<Option<ExecutionRuntime>> {
         Ok(Some(self.0.clone()))
@@ -130,8 +204,8 @@ struct DropStream {
     entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     release: Mutex<std_mpsc::Receiver<()>>,
 }
-impl OperationDataStream for DropStream {
-    fn next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
+impl IOperationDataStream for DropStream {
+    fn get_next(&self, cancellation: Cancellation) -> ServiceFuture<'_, Option<OperationData>> {
         self.polled.store(true, Ordering::Release);
         if self.immediate {
             return Box::pin(async { Ok(Some(OperationData::new(vec![vec![1]])?)) });
@@ -161,11 +235,11 @@ impl Drop for DropStream {
 }
 struct DropProvider {
     base: Provider,
-    stream: Mutex<Option<Arc<dyn OperationDataStream>>>,
+    stream: Mutex<Option<Arc<dyn IOperationDataStream>>>,
 }
-impl StateProvider for DropProvider {
-    fn last_committed(&self) -> Result<i64> {
-        self.base.last_committed()
+impl IStateProvider for DropProvider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
+        self.base.get_last_committed_sequence_number()
     }
     fn update_epoch(&self, e: Epoch, n: i64, c: Cancellation) -> ServiceFuture<'_, ()> {
         self.base.update_epoch(e, n, c)
@@ -173,21 +247,14 @@ impl StateProvider for DropProvider {
     fn on_data_loss(&self, c: Cancellation) -> ServiceFuture<'_, bool> {
         self.base.on_data_loss(c)
     }
-    fn replication_checkpoint(
-        &self,
-        n: i64,
-        c: Cancellation,
-    ) -> ServiceFuture<'_, Option<ReplayOperation>> {
-        self.base.replication_checkpoint(n, c)
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
+        self.base.get_copy_context()
     }
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
-        self.base.copy_context()
-    }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         _: i64,
-        context: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>> {
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
         assert!(context.is_none());
         Ok(self.stream.lock().unwrap().take().unwrap())
     }
@@ -493,8 +560,8 @@ async fn deferred_remove_transfers_accepted_cleanup_at_full_shared64_after_enume
     execution.finish_standalone().await.unwrap();
 }
 
-impl StateProvider for ReentryProvider {
-    fn last_committed(&self) -> Result<i64> {
+impl IStateProvider for ReentryProvider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
         Ok(0)
     }
     fn update_epoch(&self, _: Epoch, _: i64, _: Cancellation) -> ServiceFuture<'_, ()> {
@@ -515,14 +582,14 @@ impl StateProvider for ReentryProvider {
             Ok(false)
         })
     }
-    fn copy_context(&self) -> Result<Arc<dyn OperationDataStream>> {
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
         Err(Error::Closed)
     }
-    fn copy_state(
+    fn get_copy_state(
         &self,
         _: i64,
-        _: Option<Arc<dyn OperationDataStream>>,
-    ) -> Result<Arc<dyn OperationDataStream>> {
+        _: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
         Err(Error::Closed)
     }
 }

@@ -12,13 +12,13 @@ use crate::qualification as rap;
 type Created = Arc<Mutex<Option<oneshot::Sender<(Arc<Engine>, NativeRuntimeIntegration)>>>>;
 struct Factory {
     native: NativeIntegrationProvider,
-    provider: Arc<dyn StateProvider>,
+    provider: Arc<dyn IStateProvider>,
     settings: Settings,
     created: Created,
 }
 struct Replica {
     native: NativeRuntimeIntegration,
-    provider: Arc<dyn StateProvider>,
+    provider: Arc<dyn IStateProvider>,
     settings: Settings,
     created: Created,
 }
@@ -48,23 +48,21 @@ impl IStatefulServiceReplica for Replica {
     ) -> ServiceFuture<'_, Box<dyn IPrimaryReplicator>> {
         Box::pin(async move {
             mode.validate()?;
-            let id = self.native.identity();
-            let engine = Engine::bind_partition(
+            let fabric = crate::FabricReplicator::create(
                 partition,
                 self.native.clone(),
-                Actor {
-                    partition: id.partition_id,
-                    replica: id.replica_id,
-                    incarnation: uuid::Uuid::new_v4(),
-                },
-                "127.0.0.1:0",
                 self.provider.clone(),
+                None,
+                crate::extensions::ReplicationEndpointOptions {
+                    listen_address: "127.0.0.1:0".into(),
+                    actor_incarnation: uuid::Uuid::new_v4(),
+                },
                 self.settings.clone(),
             )?;
             if let Some(send) = self.created.lock().unwrap().take() {
-                let _ = send.send((engine.clone(), self.native.clone()));
+                let _ = send.send((fabric.engine.clone(), self.native.clone()));
             }
-            Ok(engine.get_primary_replicator())
+            Ok(Box::new((*fabric).clone()) as Box<dyn IPrimaryReplicator>)
         })
     }
     fn change_role(&self, _: ReplicaRole, _: Cancellation) -> ServiceFuture<'_, String> {
@@ -111,7 +109,7 @@ impl Fixture {
         source: rap::ReplicaSource,
         role: ReplicaRole,
         root: bool,
-        storage: (Arc<MemoryProvider>, Arc<dyn StateProvider>, Settings),
+        storage: (Arc<MemoryProvider>, Arc<dyn IStateProvider>, Settings),
     ) -> Self {
         let (provider, supplied, settings) = storage;
         let (send, receive) = oneshot::channel();
