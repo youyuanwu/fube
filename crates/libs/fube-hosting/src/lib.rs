@@ -32,11 +32,19 @@
 //! source assertions become explicit local invariant failures. The public
 //! activation map compares native rendered string keys, including their aliases,
 //! rather than substituting a structured package key.
+//!
+//! # Port contracts
+//!
+//! [`RegistrationLookup`], [`PackageUsage`], [`PackageLifecycle`] and
+//! [`HostingEventSource`] document the narrow native-derived node boundary.
+//! Contract definitions do not enable H2–H4. Usage/lifecycle have no supplied
+//! implementation; H1 model premises are not production operation inputs.
 #![forbid(unsafe_code)]
 #[cfg(not(target_os = "linux"))]
 compile_error!("fube-hosting models the pinned Linux Hosting profile only");
 
 mod collaborators;
+pub mod contracts;
 mod core;
 mod events;
 mod host;
@@ -47,6 +55,7 @@ mod runtime;
 mod types;
 
 pub use collaborators::*;
+pub use contracts::*;
 pub use core::*;
 pub use events::*;
 pub use host::*;

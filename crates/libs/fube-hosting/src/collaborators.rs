@@ -9,8 +9,9 @@ pub enum ActivationOutcome {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeactivationOutcome {
-    /// Underlying Deactivator success: whether a deactivation was scheduled.
-    /// false also covers zero usage with infinite applicable grace.
+    /// Underlying Deactivator success: source scheduling eligibility, not proof
+    /// of timer enqueue or physical deactivation. False also covers zero usage
+    /// with infinite applicable grace. See [`PackageLifecycle::schedule_deactivation_if_unused`].
     Success { scheduled: bool },
     /// ApplicationManager translates every scheduling error to hasReplica=false.
     Failure(Error),
