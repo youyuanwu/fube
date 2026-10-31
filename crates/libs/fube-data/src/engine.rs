@@ -856,8 +856,8 @@ impl Engine {
 
     /// Admit without conflating acceptance with quorum completion. The primary
     /// service applies the returned sequence locally before waiting/publishing.
-    /// ResourceLimit, including outgoing-copy headroom, rejects before assigning
-    /// an LSN. A queued submit is already charged when a build checks admission.
+    /// Permanent sizing/headroom rejection and transient queue fullness reject
+    /// before assigning an LSN. Queued submits are charged before build admission.
     pub fn submit(
         &self,
         data: OperationData,
@@ -921,10 +921,14 @@ impl Engine {
                             && !peer.cleanup_required
                     });
                 let maximum = maximum_copy_bytes(&self.settings);
-                let reserve_bytes = if copying
-                    || (snapshot.role == ReplicaRole::Primary
-                        && maximum < self.settings.queue_bytes)
-                {
+                let primary_headroom =
+                    snapshot.role == ReplicaRole::Primary && maximum < self.settings.queue_bytes;
+                if primary_headroom && data.retained_bytes() > self.settings.queue_bytes - maximum {
+                    return Err(Error::ResourceLimit(
+                        "operation exceeds primary copy headroom",
+                    ));
+                }
+                let reserve_bytes = if copying || primary_headroom {
                     maximum
                 } else {
                     0
@@ -994,11 +998,7 @@ impl Engine {
             cleanup: cleanup.clone(),
             disposal: self.shared.disposal.clone(),
         });
-        let execution = match &mut command {
-            Command::Epoch { execution, .. } | Command::Loss(_, _, execution) => Some(execution),
-            _ => None,
-        };
-        if let Some(execution) = execution {
+        if let Command::Loss(_, _, execution) = &mut command {
             *execution = Some(self.shared.execution.reserve(
                 CallLane::Provider,
                 CallOrigin {
@@ -1474,7 +1474,7 @@ enum Job {
 enum JobValue {
     Retired,
     Admission,
-    Epoch(i64),
+    Epoch,
     Loss(bool, Option<i64>),
     CopyOpen(
         Arc<dyn IOperationDataStream>,
@@ -2079,14 +2079,32 @@ impl Owner {
                     let _ = reply.send(Err(Error::Closed));
                     return;
                 }
+                let admission_epoch = self
+                    .epoch
+                    .max(self.secondary.as_ref().map(|copy| copy.primary_epoch))
+                    .max(
+                        self.control
+                            .as_ref()
+                            .and_then(|control| match &control.kind {
+                                ControlKind::Epoch { epoch, role, .. } if *role == self.role => {
+                                    Some(*epoch)
+                                }
+                                _ => None,
+                            }),
+                    );
+                if epoch.data_loss_number < 0
+                    || epoch.configuration_number < 0
+                    || admission_epoch.is_some_and(|minimum| epoch.primary() < minimum)
+                {
+                    let _ = reply.send(Err(Error::InvalidInput("stale epoch")));
+                    return;
+                }
                 if role.is_none()
                     && matches!(
                         self.role,
                         ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
                     )
-                    && epoch.data_loss_number >= 0
-                    && epoch.configuration_number >= 0
-                    && self.epoch == Some(epoch.primary())
+                    && admission_epoch == Some(epoch.primary())
                 {
                     // Native equal minAllowedEpoch is a no-op, including during
                     // copy or an original-operation provider barrier. It must
@@ -2096,19 +2114,6 @@ impl Owner {
                 }
                 if self.control.is_some() {
                     let _ = reply.send(Err(Error::ResourceLimit("provider control callback")));
-                    return;
-                }
-                if epoch.data_loss_number < 0
-                    || epoch.configuration_number < 0
-                    || self
-                        .epoch
-                        .is_some_and(|old| epoch.primary() < old.primary())
-                    || self
-                        .secondary
-                        .as_ref()
-                        .is_some_and(|copy| epoch.primary() < copy.primary_epoch)
-                {
-                    let _ = reply.send(Err(Error::InvalidInput("stale epoch")));
                     return;
                 }
                 let role = role.unwrap_or(self.role);
@@ -4174,7 +4179,7 @@ impl Owner {
                     result = async {
                         if let Some(epoch) = epoch {
                             provider.update_epoch(epoch, boundary, cancellation.clone()).await?;
-                            Ok(JobValue::Epoch(provider.get_last_committed_sequence_number()?))
+                            Ok(JobValue::Epoch)
                         } else {
                             let changed = provider.on_data_loss(cancellation.clone()).await?;
                             let progress = if changed { Some(provider.get_last_committed_sequence_number()?) } else { None };
@@ -4378,11 +4383,9 @@ impl Owner {
         }
         let value = result?;
         if let Some(control) = self.control.as_mut() {
-            if let Some((epoch, boundary)) = control.drain_barrier {
-                if !matches!(value, JobValue::Epoch(authoritative) if authoritative == boundary) {
-                    return Err(Error::Protocol(
-                        "provider drain barrier reconciliation mismatch",
-                    ));
+            if let Some((epoch, _)) = control.drain_barrier {
+                if !matches!(value, JobValue::Epoch) {
+                    return Err(Error::Protocol("provider drain barrier result mismatch"));
                 }
                 if control.cancellation.is_cancelled() {
                     return Err(Error::Protocol("provider drain barrier canceled"));
@@ -4409,17 +4412,17 @@ impl Owner {
                     boundary,
                     reply,
                 },
-                value @ (JobValue::Epoch(_) | JobValue::Retired | JobValue::Admission),
+                value @ (JobValue::Epoch | JobValue::Retired | JobValue::Admission),
             ) => {
                 if match value {
-                    JobValue::Epoch(authoritative) => authoritative != boundary,
+                    JobValue::Epoch => role != ReplicaRole::Primary,
                     JobValue::Retired => {
                         self.role != ReplicaRole::Primary || role != ReplicaRole::None
                     }
                     JobValue::Admission => role == ReplicaRole::Primary,
                     _ => unreachable!(),
                 } {
-                    let error = Error::Protocol("provider epoch reconciliation boundary mismatch");
+                    let error = Error::Protocol("provider epoch control result mismatch");
                     let _ = reply.send(Err(error.clone()));
                     return Err(error);
                 }
@@ -4512,10 +4515,7 @@ impl Owner {
                 self.reconciled = true;
                 let _ = reply.send(Ok(()));
             }
-            (ControlKind::Barrier { epoch, boundary }, JobValue::Epoch(authoritative)) => {
-                if authoritative != boundary {
-                    return Err(Error::Protocol("provider barrier reconciliation mismatch"));
-                }
+            (ControlKind::Barrier { epoch, .. }, JobValue::Epoch) => {
                 self.provider_epoch = Some(epoch);
             }
             (ControlKind::Loss(reply), JobValue::Loss(changed, authoritative)) => {

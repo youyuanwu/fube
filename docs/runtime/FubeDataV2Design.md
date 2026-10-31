@@ -576,10 +576,13 @@ not a cross-replica application request-deduplication protocol.
 through runtime/data and callers
 ([error kinds](../../crates/libs/fube-runtime/src/error.rs#L31-L43),
 [lower queue stages](../../crates/libs/fube-data/src/queue.rs#L80-L102)).
-Lower capacity-recovery and permanent-oversize regressions pass; this upper
+Lower capacity-recovery and permanent-oversize/headroom regressions pass; this upper
 transaction retry loop/state kernel remains A0/A1. A prevalidated record's actual
 queue-full rejection is retriable; oversize/unsupported records and other
 permanent quota failures must not be mislabeled queue-full.
+An operation unable to fit an empty Primary's permanent future-copy reservation
+is ResourceExhausted rather than transient queue-full; an outstanding-ownership
+shortage for an otherwise admissible record retains the retry classification.
 Do not infer this distinction from display text or a racy diagnostics snapshot.
 Regress capacity recovery followed by successful commit on the same transaction,
 native retry timeout/cancel states, and permanent oversize without endless retry.
@@ -727,7 +730,7 @@ promotion closes dispatch queues and waits for their source drain
 ([SecondaryReplicator.CloseAsyncOperation.cpp:41–104][n-secondary-close]).
 R0 freezes old-generation ingress, dispatches eligible contiguous buffered records,
 closes senders successfully, then waits for actual service ACKs
-([lower dispatch close](../../crates/libs/fube-data/src/engine.rs#L4066-L4103)).
+([lower dispatch close](../../crates/libs/fube-data/src/engine.rs#L4071-L4108)).
 It deliberately does not wait for ACKs before EOS: §5.3 can flush/process after
 observing EOS. Its empty/nonempty role-cycle and 64-capture tests pass.
 A later demotion needs a fresh copy/replication generation in the same engine,
@@ -753,10 +756,13 @@ reconciliation paths, not a speculative extra wrapper UpdateEpoch.
 The lower secondary duplicate-control path also completes without a provider
 callback
 ([SecondaryReplicator.UpdateEpochAsyncOperation.cpp:43–92][n-secondary-epoch]).
-R0 preserves these gates: duplicate secondary controls return before provider
-calls; admission-only controls do not query/equate upper and lower tails.
-Actual original-operation barriers/primary provider controls still preserve
-new-epoch errors and their applicable checks (DD-07, §7.3).
+R0 preserves these gates using the effective secondary admission minimum,
+including epochs established by accepted primary traffic. Older controls fail;
+equal controls return before provider calls. Admission-only controls do not
+query/equate upper and lower tails. Actual original-operation barriers/primary
+provider controls preserve the provider's success/error, including represented
+duplicates, without a post-callback tail comparison. The provider still owns
+its genuine new-epoch validation (DD-07, §7.3).
 
 The reference opens V1 before upper V2, and closes/changes role through V1
 before the upper layer
@@ -828,7 +834,7 @@ This is an existing local provider capability, not a new peer negotiation.
 ([construction](../../crates/libs/fube-data/src/fabric_replicator.rs#L49-L94)).
 Its true flag selects assigned+1 replication start and inclusive assigned
 provider horizon; default classic still selects max(committed,previous quorum)+1
-([selection](../../crates/libs/fube-data/src/engine.rs#L2740-L2750)).
+([selection](../../crates/libs/fube-data/src/engine.rs#L2745-L2755)).
 The provider factory keeps the exact requested argument, volatile null context,
 supervision/bounds and enumeration-EOS finish-tail snapshot. A staged upper
 provider owns checkpoint horizon extension and its metadata, not a fabricated
@@ -901,9 +907,11 @@ before tail equality after its source epoch/progress validation
 ([SecondaryReplicator.UpdateEpochAsyncOperation.cpp:43–92][n-secondary-epoch],
 [LoggingReplicatorImpl.cpp:1368–1401][n-epoch-duplicates]).
 R0's actual-byte upper100/lower90 fixture delays overlap ACKs, proves duplicate
-controls make no provider callback/getter/truncation, then drains overlap; its
+controls make no provider callback/getter/truncation, then drains overlap.
+Copied represented-epoch metadata also lets promotion/original-operation
+callbacks succeed without lower tail comparison, while its
 new incompatible idle-copy/original-epoch negatives preserve failure
-([regressions](../../crates/libs/fube-data/src/engine_tests.rs#L3530-L3675)).
+([regressions](../../crates/libs/fube-data/src/engine_tests.rs#L3521-L3730)).
 The latest-LSN marker alone does not fix this seam. Do not fake progress, truncate a valid copied
 suffix, or disable all epoch-tail checks for providers with the marker.
 

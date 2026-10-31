@@ -811,7 +811,7 @@ async fn copy_provider_error_panic_deadline_and_unavailable_history_fence_and_di
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn all_sixty_four_copy_callbacks_are_bounded_cancel_cleanup_joins_and_control_is_reserved() {
+async fn all_sixty_four_copy_callbacks_allow_callback_free_terminal_retirement_and_join_cleanup() {
     let stream = Arc::new(FailureStream {
         mode: 3,
         active: Arc::new(AtomicUsize::new(0)),
@@ -849,7 +849,6 @@ async fn all_sixty_four_copy_callbacks_are_bounded_cancel_cleanup_joins_and_cont
     let template = descriptor(&p);
     let mut builds = JoinSet::new();
     let mut replicas = Vec::new();
-    let mut cancellations = Vec::new();
     for id in 2..=65 {
         let destination = endpoint(&network, partition, id);
         let mut replica = template.clone();
@@ -861,7 +860,6 @@ async fn all_sixty_four_copy_callbacks_are_bounded_cancel_cleanup_joins_and_cont
         let owned_replica = replica.clone();
         builds.spawn(async move { owner.build_replica(owned_replica, owned_cancellation).await });
         replicas.push((replica, destination));
-        cancellations.push(cancellation);
     }
     timeout(std::time::Duration::from_secs(5), async {
         while stream.active.load(Ordering::Acquire) < 64 {
@@ -886,26 +884,18 @@ async fn all_sixty_four_copy_callbacks_are_bounded_cancel_cleanup_joins_and_cont
     excess.replica_id = 66;
     excess.address = endpoint(&network, partition, 66).to_string();
     assert!(p.build_replica(excess, cancel()).await.is_err());
-    // The new shared execution budget cannot admit a 65th independent user
-    // callback. Reject before owner mutation; reserved owner/control processing
-    // must still cancel and dispose one of the existing 64 callbacks.
+    // Actual provider callbacks still need a slot; callback-free retirement
+    // must cancel and join the callbacks occupying all of those slots.
     assert!(matches!(
         p.on_data_loss(cancel()).await,
         Err(Error::ResourceLimit(_))
     ));
     assert_eq!(stream.active.load(Ordering::Acquire), 64);
-    cancellations[0].cancel();
-    p.remove_replica(
-        replicas[0].0.clone(),
-        ReplicaRemoval::BuildRetryCleanup,
-        cancel(),
-    )
-    .await
-    .unwrap();
-    until(|| stream.active.load(Ordering::Acquire) == 63).await;
-    assert_eq!(stream.disposed.load(Ordering::Acquire), 1);
-    assert!(!p.on_data_loss(cancel()).await.unwrap());
-    abort_owned(&p).await;
+    p.change_role(EPOCH, ReplicaRole::None, cancel())
+        .await
+        .unwrap();
+    assert_eq!(p.snapshot().role, ReplicaRole::None);
+    assert!(p.snapshot().peers.is_empty());
     assert_eq!(stream.active.load(Ordering::Acquire), 0);
     assert_eq!(stream.disposed.load(Ordering::Acquire), 64);
     assert_eq!(
@@ -915,6 +905,7 @@ async fn all_sixty_four_copy_callbacks_are_bounded_cancel_cleanup_joins_and_cont
     while let Some(result) = builds.join_next().await {
         assert!(result.unwrap().is_err());
     }
+    abort_owned(&p).await;
     network.shutdown();
 }
 
@@ -3634,6 +3625,71 @@ async fn extended_upper100_lower90_duplicate_epoch_never_reconciles_or_gets_tail
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn represented_provider_epochs_preserve_upper100_lower90_for_promotion_and_original_barriers()
+{
+    for promotion in [false, true] {
+        let upper = upper_log::UpperLog::new(EPOCH, 1);
+        let source = upper_log::UpperLog::new(NEXT_EPOCH, 100);
+        let (s, network, primary, _incoming) = raw_secondary_started(upper.clone(), 91).await;
+        for (sequence, data, last) in [
+            (1, source.snapshot().to_segments(), false),
+            (2, vec![], true),
+        ] {
+            raw_send(
+                &network,
+                &primary,
+                &s,
+                Body::Copy {
+                    epoch: EPOCH,
+                    target: 2,
+                    sequence,
+                    data,
+                    last,
+                },
+            );
+        }
+        let copy = s.copy_stream().next(cancel()).await.unwrap().unwrap();
+        upper.apply_snapshot(&copy.data);
+        copy.acknowledge().unwrap();
+        drop(copy);
+        until(|| s.snapshot().copy_done).await;
+        let getters = upper.getters.load(Ordering::Acquire);
+        let stream = s.replication_stream();
+        if promotion {
+            s.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
+                .await
+                .unwrap();
+            assert!(stream.next(cancel()).await.unwrap().is_none());
+            assert_eq!(s.snapshot().progress.assigned, 90);
+            assert_eq!(s.snapshot().progress.applied, 90);
+        } else {
+            raw_send(
+                &network,
+                &primary,
+                &s,
+                replication(NEXT_EPOCH, NEXT_EPOCH, 91, 91),
+            );
+            let operation = timeout(std::time::Duration::from_secs(2), stream.next(cancel()))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(operation.sequence, 91);
+            upper.append(operation.sequence, &operation.data);
+            operation.acknowledge().unwrap();
+            drop(operation);
+            until(|| s.snapshot().progress.applied == 91).await;
+        }
+        assert_eq!(upper.updates.load(Ordering::Acquire), 1);
+        assert_eq!(upper.getters.load(Ordering::Acquire), getters);
+        assert_eq!(upper.tail(), 100);
+        assert!(s.snapshot().fault.is_none());
+        abort_owned(&s).await;
+        network.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn genuinely_new_idle_copy_control_and_original_epoch_mismatch_keep_real_errors() {
     for original_barrier in [false, true] {
         let upper = upper_log::UpperLog::new(EPOCH, 1);
@@ -4171,8 +4227,11 @@ async fn original_epoch_barrier_waits_for_explicit_apply_then_provider_disposal(
             .await
             .is_err()
     );
-    // No second epoch/loss callback is admitted behind an active barrier.
-    assert!(secondary.update_epoch(next, cancel()).await.is_err());
+    // The established admission duplicate completes without admitting another
+    // provider callback behind the active original-operation barrier.
+    secondary.update_epoch(next, cancel()).await.unwrap();
+    assert_eq!(provider.active.load(Ordering::Acquire), 1);
+    assert_eq!(provider.entered.load(Ordering::Acquire), initial_calls + 1);
     provider.release.notify_one();
     let second = timeout(std::time::Duration::from_secs(2), stream.next(cancel()))
         .await
@@ -5600,6 +5659,38 @@ async fn outgoing_copy_and_real_idle_ack_progress_with_admitted_or_rejected_live
         assert_eq!(p.snapshot().owned_bytes, 0);
         assert_eq!(s.snapshot().owned_bytes, 0);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_primary_permanent_copy_headroom_rejection_is_not_retriable_queue_full() {
+    let partition = Uuid::new_v4();
+    let provider = Arc::new(Provider::default());
+    let settings = Settings {
+        operation_bytes: 2048,
+        operation_segments: 1,
+        queue_bytes: 4096,
+        ..Settings::default()
+    };
+    let p = engine_with_settings(partition, 1, provider.clone(), settings);
+    initial_primary(&p).await;
+    let data = OperationData::new(vec![vec![7; 2000]]).unwrap();
+    for _ in 0..2 {
+        let error = p
+            .submit(data.clone(), cancel())
+            .await
+            .err()
+            .expect("permanent primary headroom cannot be recovered by retry");
+        assert_eq!(error.kind(), fube_runtime::ErrorKind::ResourceExhausted);
+        assert_eq!(p.snapshot().progress.assigned, 0);
+        assert_eq!(p.snapshot().owned_bytes, 0);
+    }
+    let mut accepted = p
+        .submit(OperationData::new(vec![vec![1]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    provider.last.store(accepted.sequence, Ordering::Release);
+    assert_eq!(accepted.wait(cancel()).await.unwrap(), 1);
+    abort_owned(&p).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

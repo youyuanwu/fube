@@ -147,8 +147,9 @@ pub trait IStateProvider: Send + Sync + 'static {
     fn get_last_committed_sequence_number(&self) -> Result<i64>;
     /// Apply the provider's original-operation/primary epoch boundary. A logging
     /// provider recognizes its represented duplicate before checking tail equality;
-    /// genuine new incompatible epochs must still fail. Secondary admission-only
-    /// controls do not invoke this callback or reconcile an independent upper tail.
+    /// genuine new incompatible epochs must still fail. The lower preserves the
+    /// callback result without querying/equating independent upper and lower tails.
+    /// Secondary admission-only controls do not invoke this callback.
     fn update_epoch(
         &self,
         epoch: Epoch,

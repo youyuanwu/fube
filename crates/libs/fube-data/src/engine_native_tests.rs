@@ -523,6 +523,127 @@ async fn owned_native_bound_duplicate_secondary_epoch_enters_lower_while_copy_ac
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_lower_secondary_controls_use_traffic_admission_epoch_without_provider_slots() {
+    for start_newer in [false, true] {
+        let partition = uuid::Uuid::new_v4();
+        let upper = tests::upper_log::UpperLog::new(EPOCH, 1);
+        let s = Fixture::using(
+            partition,
+            source(2),
+            ReplicaRole::IdleSecondary,
+            false,
+            (MemoryProvider::new(), upper.clone(), Settings::default()),
+        )
+        .await;
+        let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+        network.register_peer(&s.engine.endpoint()).unwrap();
+        let primary = Endpoint {
+            address: network.address().to_owned(),
+            actor: Actor {
+                partition,
+                replica: 1,
+                incarnation: uuid::Uuid::new_v4(),
+            },
+            transport_id: None,
+        };
+        let send = |body| {
+            network
+                .send(Packet {
+                    from: primary.clone(),
+                    to: s.engine.endpoint().actor,
+                    body,
+                })
+                .unwrap();
+        };
+        send(Body::StartCopy {
+            epoch: if start_newer { NEXT } else { EPOCH },
+            target: 2,
+            start: 1,
+        });
+        until(|| s.engine.snapshot().observed_primary.is_some()).await;
+        if !start_newer {
+            send(Body::Replication {
+                primary_epoch: NEXT,
+                operation_epoch: EPOCH,
+                operations: vec![WireOperation {
+                    sequence: 1,
+                    kind: 1,
+                    atomic_group: -1,
+                    data: vec![vec![1]],
+                }],
+                batch_end: 1,
+                completed: 0,
+            });
+            until(|| s.engine.snapshot().progress.received == 1).await;
+        }
+        assert!(!s.engine.snapshot().copy_done);
+        let getters = upper.getters.load(Ordering::Acquire);
+        let updates = upper.updates.load(Ordering::Acquire);
+        let entries = s.engine.shared.epoch_entries.load(Ordering::Acquire);
+        let execution = s.native.execution();
+        let call = execution
+            .reserve(
+                CallLane::Native,
+                CallOrigin {
+                    engine: 0,
+                    generation: s.native.binding().generation,
+                    session: 0,
+                },
+                std::time::Duration::from_secs(2),
+                false,
+            )
+            .unwrap();
+        // One native entry and 63 provider reservations exhaust the shared
+        // record budget. Neither lower control below invokes application code.
+        let slots: Vec<_> = (0..63)
+            .map(|_| {
+                execution
+                    .reserve(
+                        CallLane::Provider,
+                        CallOrigin::default(),
+                        std::time::Duration::from_secs(2),
+                        false,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert!(execution
+            .reserve(
+                CallLane::Provider,
+                CallOrigin::default(),
+                std::time::Duration::from_secs(2),
+                false,
+            )
+            .is_err());
+        let engine = s.engine.clone();
+        call.run_future(async move {
+            for epoch in [NEXT, EPOCH] {
+                let result =
+                    IReplicator::update_epoch(&*engine, epoch, Cancellation::default()).await;
+                if epoch == NEXT {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(result, Err(Error::InvalidInput("stale epoch"))));
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            s.engine.shared.epoch_entries.load(Ordering::Acquire),
+            entries + 2
+        );
+        assert_eq!(upper.getters.load(Ordering::Acquire), getters);
+        assert_eq!(upper.updates.load(Ordering::Acquire), updates);
+        assert!(!s.engine.snapshot().copy_done);
+        assert!(s.engine.snapshot().fault.is_none());
+        drop(slots);
+        network.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn captured_unpolled_build_is_revoked_never_retargets_replacement_native_node_or_actor() {
     for variant in 0..4 {
         let partition = uuid::Uuid::new_v4();

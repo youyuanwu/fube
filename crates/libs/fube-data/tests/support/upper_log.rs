@@ -68,17 +68,28 @@ impl UpperLog {
         records.push((sequence, data.to_segments()));
     }
     pub fn snapshot(&self) -> OperationData {
-        OperationData::new(vec![
-            serde_json::to_vec(&*self.records.lock().unwrap()).unwrap()
-        ])
+        let epoch = self.epoch.lock().unwrap();
+        let records = self.records.lock().unwrap();
+        OperationData::new(vec![serde_json::to_vec(&(
+            [epoch.data_loss_number, epoch.configuration_number],
+            &*records,
+        ))
+        .unwrap()])
         .unwrap()
     }
     pub fn apply_snapshot(&self, data: &OperationData) {
-        let records: Records = serde_json::from_slice(&data.segments()[0]).unwrap();
+        let (epoch, records): ([i64; 2], Records) =
+            serde_json::from_slice(&data.segments()[0]).unwrap();
         assert_eq!(records[0].0, 0);
         assert_eq!(records[1].0, 1);
         assert!(records.windows(2).all(|pair| pair[1].0 == pair[0].0 + 1));
-        *self.records.lock().unwrap() = records;
+        let mut represented = self.epoch.lock().unwrap();
+        let mut destination = self.records.lock().unwrap();
+        *represented = Epoch {
+            data_loss_number: epoch[0],
+            configuration_number: epoch[1],
+        };
+        *destination = records;
     }
 }
 struct Payloads(Mutex<VecDeque<OperationData>>);

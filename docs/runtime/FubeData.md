@@ -286,15 +286,19 @@ queue into a new secondary, not every terminal close
 **R0 correction:** terminal None retires pending observers before session
 cleanup, does not reconcile a provider or reset commitment, and releases owned
 queue storage. Actual secondary demotion still requires commitment
-([control admission](../../crates/libs/fube-data/src/engine.rs#L2107-L2156),
-[terminal completion](../../crates/libs/fube-data/src/engine.rs#L4084-L4100),
+([control admission](../../crates/libs/fube-data/src/engine.rs#L2112-L2161),
+[terminal completion](../../crates/libs/fube-data/src/engine.rs#L4089-L4105),
 [queue retirement](../../crates/libs/fube-data/src/queue.rs#L73-L79)).
-The [pending-write regression](../../crates/libs/fube-data/src/engine_tests.rs#L4618-L4650)
+The [pending-write regression](../../crates/libs/fube-data/src/engine_tests.rs#L4677-L4709)
 observes assigned1/committed0, failed completion and unchanged provider state.
 Terminal retirement also cancels/joins an in-flight optional replay before
 publication
-([ownership gate](../../crates/libs/fube-data/src/engine.rs#L4032-L4050),
-[regression](../../crates/libs/fube-data/src/engine_tests.rs#L6095-L6139)).
+([ownership gate](../../crates/libs/fube-data/src/engine.rs#L4037-L4055),
+[regression](../../crates/libs/fube-data/src/engine_tests.rs#L6186-L6230)).
+Callback-free retirement does not reserve another provider slot before canceling
+the callbacks occupying that budget; the
+[all-64-callback regression](../../crates/libs/fube-data/src/engine_tests.rs#L776-L875)
+observes terminal success and joined physical disposal under saturation.
 Retirement is not rollback.
 
 ### DD-02: native-issued initial progress is excluded from ALL catch-up
@@ -315,7 +319,7 @@ requirement for an already represented prefix
 **R0 correction:** newly created/recreated sessions initialize receive/apply/
 highest from the entered, frozen runtime descriptor's CurrentProgress.
 Repeated descriptors preserve live counters; diagnostics cannot attest a vote
-([issued initialization](../../crates/libs/fube-data/src/engine.rs#L2615-L2632),
+([issued initialization](../../crates/libs/fube-data/src/engine.rs#L2620-L2637),
 [canonical proof](../../crates/libs/fube-data/src/engine_binding.rs#L181-L225)).
 The [issued root/bound regression](../../crates/libs/fube-data/src/engine_native_tests.rs#L225-L332)
 proves ALL at20 with no replay/fresh ACK, repeated and recreated descriptors,
@@ -346,13 +350,13 @@ Idle-build retention remains an independent source obligation.
 tail for commit/release/ALL. Remote-PC-q1 instead uses minimum APPLY for both
 commit and release; idle retention remains independent
 ([quorum rules](../../crates/libs/fube-data/src/quorum.rs#L23-L90),
-[ALL](../../crates/libs/fube-data/src/engine.rs#L3983-L3987),
+[ALL](../../crates/libs/fube-data/src/engine.rs#L3988-L3992),
 [retention](../../crates/libs/fube-data/src/engine.rs#L4547-L4614)).
 ALL uses CC, not combined PC commit or WRITE required-target constraints.
 The [sentinel/PC regression](../../crates/libs/fube-data/src/quorum.rs#L167-L202)
 and [idle retention test](../../crates/libs/fube-data/src/engine_tests.rs#L281-L358)
 cover those separate obligations; the
-[direct configured-lagging CCq1 test](../../crates/libs/fube-data/src/engine_tests.rs#L6142-L6172)
+[direct configured-lagging CCq1 test](../../crates/libs/fube-data/src/engine_tests.rs#L6233-L6263)
 observes released storage/ALL with zero remote receive/apply and no idle owner.
 Joint-configuration tests retain PC APPLY blocking while CC ALL succeeds.
 
@@ -373,10 +377,10 @@ close senders successfully, then await actual service ACKs. EOS does not depend
 on the last ACK, so an upper EOS-triggered flush can finish. Demotion replaces
 views on the same engine with an already-copied transferred prefix; old views
 remain terminal and revision checks fence captures
-([EOS before ACK gate](../../crates/libs/fube-data/src/engine.rs#L4066-L4103),
-[fresh views](../../crates/libs/fube-data/src/engine.rs#L4443-L4479)).
-The [64-capture/gap/epoch-barrier test](../../crates/libs/fube-data/src/engine_tests.rs#L932-L1043)
-and [empty/nonempty cycles](../../crates/libs/fube-data/src/engine_tests.rs#L1046-L1130)
+([EOS before ACK gate](../../crates/libs/fube-data/src/engine.rs#L4071-L4108),
+[fresh views](../../crates/libs/fube-data/src/engine.rs#L4446-L4482)).
+The [64-capture/gap/epoch-barrier test](../../crates/libs/fube-data/src/engine_tests.rs#L923-L1034)
+and [empty/nonempty cycles](../../crates/libs/fube-data/src/engine_tests.rs#L1037-L1121)
 prove EOS-before-ACK ordering. The
 [sample role-cycle test](../../crates/samples/rust-runtime-app/src/data_tests.rs#L1298-L1350)
 proves its pump refresh without recopy or a new engine. Failed/canceled controls
@@ -400,16 +404,20 @@ retriable failure
 and **0x80071c2f operation-too-large**, including causes, native conversion,
 uncertainty and transport round trips
 ([runtime errors](../../crates/libs/fube-runtime/src/error.rs#L31-L41),
-[admission](../../crates/libs/fube-data/src/engine.rs#L882-L945),
+[admission](../../crates/libs/fube-data/src/engine.rs#L882-L949),
 [queue stages](../../crates/libs/fube-data/src/queue.rs#L80-L102)).
 These exact codes come from [FabricTypes.h:119–136,226–236][sf-admission-codes]
 and [EnumOperators.cpp:85–128][sf-admission-conversion].
 The [runtime fidelity test](../../crates/libs/fube-runtime/src/error_tests.rs#L9-L38),
-[capacity-recovery test](../../crates/libs/fube-data/src/engine_tests.rs#L3388-L3453),
+[capacity-recovery test](../../crates/libs/fube-data/src/engine_tests.rs#L3379-L3444),
 and [permanent-sizing test](../../crates/libs/fube-data/src/queue.rs#L275-L294)
 prove lower retry recovery versus permanent rejection without consuming a
 rejected LSN. Upper transaction timeout/cancel retry states are A0/A1 work,
 not claimed implemented by these lower tests.
+An operation that cannot fit even an empty Primary's permanent future-copy
+headroom is ResourceExhausted, not retriable queue-full; the
+[empty-budget regression](../../crates/libs/fube-data/src/engine_tests.rs#L5645-L5676)
+checks repeated classification, unchanged LSN and successful smaller admission.
 
 ### DD-06: local-not-PC quorum greater than one requires an extra vote
 
@@ -448,18 +456,25 @@ truncating that valid copied suffix
 ([SecondaryReplicator.UpdateEpochAsyncOperation.cpp:43–92][sf-secondary-epoch],
 [LoggingReplicatorImpl.cpp:1368–1401][sf-upper-epoch]).
 
-**R0 correction:** duplicate secondary UpdateEpoch returns before copy/control
-gates or provider calls. New secondary/role admission controls drain lower work
-without a provider getter/equality check. Original-operation barriers and primary
-provider controls retain actual callback errors and applicable equality
-([duplicate](../../crates/libs/fube-data/src/engine.rs#L2060-L2082),
-[admission-only completion](../../crates/libs/fube-data/src/engine.rs#L4105-L4126)).
-The [upper100/lower90 overlap test](../../crates/libs/fube-data/src/engine_tests.rs#L3530-L3615)
+**R0 correction:** secondary controls validate the effective admission minimum
+from node controls and accepted primary traffic: older epochs fail before equal
+epochs return without copy/control gates or provider calls. New secondary/role
+admission controls drain lower work without a provider getter/equality check.
+Original-operation barriers and primary provider controls preserve the callback's
+actual success/error without reimposing upper/lower tail equality
+([admission minimum](../../crates/libs/fube-data/src/engine.rs#L2066-L2106),
+[callback result](../../crates/libs/fube-data/src/engine.rs#L4156-L4171)).
+The [upper100/lower90 overlap test](../../crates/libs/fube-data/src/engine_tests.rs#L3521-L3606)
 keeps actual copied bytes, delays real ACKs, observes no duplicate callback/getter
 or truncation, then drains 91–100. The
-[new incompatible epoch negatives](../../crates/libs/fube-data/src/engine_tests.rs#L3618-L3675)
-preserve errors; the [owned canonical lower-entry test](../../crates/libs/fube-data/src/engine_native_tests.rs#L449-L530)
-separately proves RAP's duplicate suppression and actual lower no-op execution.
+[represented-provider duplicate tests](../../crates/libs/fube-data/src/engine_tests.rs#L3608-L3671)
+exercise promotion and original-operation barriers without post-callback getters.
+The [new incompatible epoch negatives](../../crates/libs/fube-data/src/engine_tests.rs#L3673-L3730)
+preserve real provider errors. The [owned canonical lower-entry test](../../crates/libs/fube-data/src/engine_native_tests.rs#L449-L523)
+separately proves RAP's duplicate suppression and actual lower no-op execution;
+[traffic-epoch and saturated-entry regressions](../../crates/libs/fube-data/src/engine_native_tests.rs#L525-L645)
+cover newer StartCopy/replication admission during unfinished copy, equal success,
+stale rejection and callback-free execution under the shared record limit.
 These are offline fixtures, not a V2 log kernel or deployed qualification.
 
 ### Effect on the V2 port
@@ -481,7 +496,7 @@ trait discovery, peer negotiation or type inference
 Latest selects inclusive assigned horizon and replication start assigned+1;
 classic retains max(committed,previous quorum)+1. Provider supervision and the
 enumeration-EOS finish tail remain unchanged. The
-[latest copy regression](../../crates/libs/fube-data/src/engine_tests.rs#L3678-L3772)
+[latest copy regression](../../crates/libs/fube-data/src/engine_tests.rs#L3734-L3828)
 starts at101/horizon100 with committed0 and waits for real finish-tail ACK101.
 
 Initialize the provider before construction, in the runtime-owned service Open
