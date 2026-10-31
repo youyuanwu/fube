@@ -466,7 +466,7 @@ pub trait ITransactionalReplicator:
     fn get_stateful_partition(&self) -> Arc<dyn IStatefulServicePartition>;
     /// Observe configured persistence capability, not checkpoint/durable-commit proof.
     ///
-    /// Does not enable persistence in this API-only crate.
+    /// Does not enable persistence through this contract surface.
     /// [Getter](https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/data/txnreplicator/TransactionalReplicator.cpp#L858-L893).
     fn get_has_persisted_state(&self) -> bool;
     /// API-activity-gated observation of logging checkpoint stable LSN.

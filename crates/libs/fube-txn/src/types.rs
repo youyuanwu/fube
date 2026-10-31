@@ -11,7 +11,7 @@ pub type TransactionId = i64;
 /// Native FABRIC_STATE_PROVIDER_ID/LONG64, not a registry authority.
 pub type StateProviderId = i64;
 
-/// Native common/TransactionState.h values; no state machine is implemented.
+/// Native common/TransactionState.h values, used by the private A0 state kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum TransactionState {

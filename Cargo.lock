@@ -397,6 +397,7 @@ version = "0.1.0"
 dependencies = [
  "fube-data",
  "fube-runtime",
+ "tokio",
  "uuid",
 ]
 

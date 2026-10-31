@@ -2,13 +2,14 @@
 // Licensed under the MIT License.
 
 //! Native aggregate contracts, deliberately not part of the public SDK.
-//! These are forward declarations, not executing state/log managers. Owned
-//! inputs allow future implementations to retain accepted work; lazy futures,
+//! These are aggregate contracts, not a full runtime state/log manager facade.
+//! Private A0 kernels execute supported methods using explicit narrow seams.
+//! Owned inputs allow implementations to retain accepted work; lazy futures,
 //! cancellation and observer drop do not implement native owned completion.
 
 #![allow(
     dead_code,
-    reason = "crate-internal forward contracts have no concrete V2 kernels yet"
+    reason = "full aggregate runtime/lifecycle integration remains outside A0"
 )]
 #![deny(missing_docs)]
 
