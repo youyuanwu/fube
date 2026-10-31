@@ -450,9 +450,14 @@ pub trait PackageLifecycle {
 pub trait HostingEventSource {
     /// Transfer the registration/closure lane without normalizing or retargeting fields.
     ///
-    /// Registered uses **stored entry** type spelling and the selected runtime's
-    /// operational version/host/PID/runtime/code/package sequence; lookup instead
-    /// uses requested spelling. RuntimeClosed retains sequence, supplied host/runtime,
+    /// Registered uses **retained entry** type/activation/public-ID provenance,
+    /// but operational version, host/PID, runtime, code package and numeric package
+    /// sequence come from the runtime context **supplied to Finish**
+    /// ([Finish call sites][finish]). Lookup instead uses requested type spelling
+    /// and the valid **runtime-table** context selected by the retained Start owner.
+    /// Do not reconstruct Registered from that table, normalize its producer spelling,
+    /// or replace the Finish snapshot with Start-owned operational fields.
+    /// RuntimeClosed retains sequence, supplied host/runtime,
     /// first affected type's activation/public ID and affected types; HostClosed
     /// retains host/activity instead of runtime. Empty affected closure retains
     /// initialized empty scope/vector ([event producers][events],
@@ -467,14 +472,31 @@ pub trait HostingEventSource {
     /// ([forwarding][forward], [consumers][consumers]). Rust live consumers remain
     /// gated; do not discard event variants because RA has no live command for them.
     ///
+    /// Native/future-consumer admission is distinct from this H1 drain:
+    /// all three native handlers require FM readiness. Registered also requires an
+    /// activated, nonupgrading node, with queued-job open RA/FT checks. Exclusive
+    /// registration routes first by activation partition GUID; shared read-lock
+    /// selection is only an initial filter before entity-lock revalidation
+    /// ([Registered routing][routing], [readiness][readiness]).
+    /// RuntimeClosed requires nonempty host/runtime IDs and a queued-job nonnull,
+    /// open FT with RA open or closing. HostClosed requires nonempty host ID and
+    /// nonnull FT with RA open or closing, **without RuntimeClosed's additional
+    /// FT-open job flag**; its processor applies current host/state failure policy
+    /// ([closure jobs][jobs]). H1 does not execute these consumers or filter
+    /// queued outputs using these native admission predicates.
+    ///
     /// Native RA source tests cover routing/readiness and runtime-close versus
     /// host-down close choreography ([routing tests][test], [close tests][closetest]).
     /// The latter use persisted replicas, not direct stateless Hosting conformance.
     ///
     /// [events]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Hosting2/ServiceTypeStateManager.cpp#L1581-L1636
+    /// [finish]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Hosting2/ServiceTypeStateManager.cpp#L737-L779
     /// [closure]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Hosting2/ServiceTypeStateManager.cpp#L923-L1068
     /// [forward]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ReliabilitySubsystem.cpp#L500-L529
     /// [consumers]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ReconfigurationAgent.cpp#L1084-L1215
+    /// [routing]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Hosting.HostingEventHandler.cpp#L51-L114
+    /// [readiness]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Hosting.HostingEventHandler.cpp#L229-L254
+    /// [jobs]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Hosting.HostingEventHandler.cpp#L118-L220
     /// [test]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Test.StateMachine.HostingAdapter.cpp#L230-L388
     /// [closetest]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Test.StateMachine.Close.cpp#L729-L756
     fn take_closed_registered_events(&mut self) -> Vec<ClosedRegisteredEvent>;

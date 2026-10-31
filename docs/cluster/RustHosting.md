@@ -627,7 +627,7 @@ above remains evidence at its original revisions.
 | `RegistrationLookup` | Explicit borrowed `H1LookupAdapter`; request-only method, separately supplied `LookupModel` premises. No live production adapter. | [contracts.rs:37–184](../../crates/libs/fube-hosting/src/contracts.rs#L37-L184) |
 | `PackageUsage` | Definition only; no H1/H2 usage engine or acquired-reference bridge. | [contracts.rs:186–298](../../crates/libs/fube-hosting/src/contracts.rs#L186-L298) |
 | `PackageLifecycle` | Definition only; existing activation/scheduling observations remain model premises/obligations, not executed H2. | [contracts.rs:300–420](../../crates/libs/fube-hosting/src/contracts.rs#L300-L420) |
-| `HostingEventSource` | Direct `Hosting` implementation, two owned H1 lanes. No subscriptions, live status/runtime-close routing or delivery ACK. | [contracts.rs:422–509](../../crates/libs/fube-hosting/src/contracts.rs#L422-L509) |
+| `HostingEventSource` | Direct `Hosting` implementation, two owned H1 lanes. No subscriptions, live status/runtime-close routing or delivery ACK. | [contracts.rs:422–531](../../crates/libs/fube-hosting/src/contracts.rs#L422-L531) |
 
 Lookup keeps outer admission versus inner native result/candidate/sequence,
 request identity versus producer runtime fields, full-version/scheduling-derived
