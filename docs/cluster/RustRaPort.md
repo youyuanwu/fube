@@ -18,6 +18,8 @@ Hosting/RAP IPC, finite runtime-to-local-RA leases and volatile `fube-data`.
 All native RA–FM and RA–RA message contracts must be preserved and ported.
 Federation routing/membership and native node-to-node distributed leases remain
 excluded; native peer-reliability messages are not excluded with them.
+The [node-side Hosting design](RustHosting.md) specifies the proposed
+`fube-hosting` dependency boundary and incremental native Hosting port.
 
 ## 1. Scope and compatibility
 

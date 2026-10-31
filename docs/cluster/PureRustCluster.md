@@ -18,6 +18,8 @@ The companion [Rust RA port and SQLite state-store design](RustRaPort.md)
 describes the native storage seam, reliability-code port and durable local
 recovery extension. It does not change this document's initial fresh-RA or
 ephemeral-FM restart policy.
+The [Rust node-side Hosting design](RustHosting.md) defines the incremental
+`fube-hosting` port, test-host extraction and RA integration boundaries.
 
 **Implementation update (2026-10-30):** the bounded
 [stateless opening port](RaStatelessOpening.md) supplies native-derived retry/
