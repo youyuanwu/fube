@@ -51,6 +51,11 @@ struct StandardOnly {
     memory: Arc<MemoryProvider>,
     copies: Mutex<Vec<i64>>,
     epochs: Mutex<Vec<(Epoch, i64)>>,
+    epoch_gate: Mutex<Option<CallbackGate>>,
+}
+struct CallbackGate {
+    entered: oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 impl StandardOnly {
     fn new() -> Arc<Self> {
@@ -58,6 +63,7 @@ impl StandardOnly {
             memory: MemoryProvider::new(),
             copies: Mutex::new(vec![]),
             epochs: Mutex::new(vec![]),
+            epoch_gate: Mutex::new(None),
         })
     }
 }
@@ -67,6 +73,13 @@ impl IStateProvider for StandardOnly {
     }
     fn update_epoch(&self, epoch: Epoch, previous: i64, cancel: Cancellation) -> ApiFuture<'_, ()> {
         Box::pin(async move {
+            let gate = self.epoch_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.send(()).unwrap();
+                gate.release
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .map_err(|_| fube_data::Error::Timeout)?;
+            }
             self.epochs.lock().unwrap().push((epoch, previous));
             self.memory.update_epoch(epoch, previous, cancel).await
         })
@@ -216,6 +229,69 @@ impl Fixture {
             host,
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_stop_observes_actual_close_before_guarded_shutdown_with_active_epoch() {
+    // Local fixture ownership regression. This holds an actually entered
+    // managed provider callback, not a timer/sleep or a fake native Close result.
+    let fixture = Fixture::new(uuid::Uuid::new_v4(), 1, ReplicaRole::Primary).await;
+    let Fixture {
+        fabric,
+        native,
+        provider,
+        host,
+    } = fixture;
+    let (entered, active) = oneshot::channel();
+    let (release, blocked) = std::sync::mpsc::sync_channel(1);
+    *provider.epoch_gate.lock().unwrap() = Some(CallbackGate {
+        entered,
+        release: blocked,
+    });
+    let pending = host
+        .begin_epoch(Epoch {
+            configuration_number: 2 << 32,
+            ..EPOCH
+        })
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), active)
+        .await
+        .unwrap()
+        .unwrap();
+    let close = host.close_submitted();
+    let requested = host.close_requested();
+    let submitted = requested.notified();
+    tokio::pin!(submitted);
+    submitted.as_mut().enable();
+    let stopped = std::thread::spawn(move || drop(host));
+    let retained = tokio::time::timeout(std::time::Duration::from_secs(2), submitted).await;
+    let waited_for_callback = !stopped.is_finished();
+    // Always release the callback, including failed pre-correction probes.
+    let _ = release.send(());
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), pending).await;
+    let sent = tokio::time::timeout(std::time::Duration::from_secs(2), close.notified()).await;
+    let joined = tokio::task::spawn_blocking(move || stopped.join())
+        .await
+        .unwrap();
+    assert!(
+        retained.is_ok(),
+        "model did not retain Close while callback was held"
+    );
+    assert!(
+        waited_for_callback,
+        "model shut down before admitted callback completed"
+    );
+    assert!(
+        sent.is_ok(),
+        "actual Close frame not submitted after callback completion"
+    );
+    assert!(
+        result.unwrap().unwrap().is_ok(),
+        "original callback result was not successful"
+    );
+    assert!(joined.is_ok(), "guarded model runtime shutdown failed");
+    assert!(fabric.snapshot().closed, "actual lower owner did not close");
+    assert_eq!(native.status().unwrap_err().kind(), ErrorKind::ObjectClosed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
