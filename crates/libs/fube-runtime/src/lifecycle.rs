@@ -68,6 +68,26 @@ struct Shared {
     reports: Arc<Semaphore>,
     execution: crate::extensions::ExecutionRuntime,
     core: tokio::runtime::Handle,
+    #[cfg(test)]
+    admission_pause: Mutex<Option<Arc<DispatchPause>>>,
+    #[cfg(test)]
+    dispatch_pause: Mutex<Option<Arc<DispatchPause>>>,
+    #[cfg(test)]
+    completion_pause: Mutex<Option<Arc<DispatchPause>>>,
+}
+/// Bounded one-shot test barrier; never part of production admission or wire state.
+#[cfg(test)]
+#[derive(Default)]
+struct DispatchPause {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+#[cfg(test)]
+impl DispatchPause {
+    async fn wait(&self) {
+        self.reached.notify_one();
+        self.resume.notified().await;
+    }
 }
 pub(crate) struct Engine {
     shared: Arc<Shared>,
@@ -226,6 +246,12 @@ impl Engine {
             reports,
             execution,
             core: tokio::runtime::Handle::current(),
+            #[cfg(test)]
+            admission_pause: Mutex::new(None),
+            #[cfg(test)]
+            dispatch_pause: Mutex::new(None),
+            #[cfg(test)]
+            completion_pause: Mutex::new(None),
         });
         let (stop, mut stopped) = watch::channel(false);
         let task_shared = shared.clone();
@@ -247,6 +273,18 @@ impl Engine {
                     }
                     result=work.join_next(), if !work.is_empty() => {
                         task_shared.active.fetch_sub(1,Ordering::SeqCst);
+                        #[cfg(test)]
+                        let pause=task_shared.completion_pause.lock().unwrap().take();
+                        #[cfg(test)]
+                        if let Some(pause)=pause { pause.wait().await; }
+                        // Stop can be requested after select polled its watch
+                        // branch. A retired normal root then returns Closed at
+                        // its next poll; this is not a successful RAP command.
+                        // Use the existing owned drain and retain unregister IPC.
+                        // Real faults/panics and active-callback fencing remain.
+                        if *stopped.borrow() && matches!(&result,Some(Ok(Err(Error::Closed)))) {
+                            break;
+                        }
                         if !matches!(result,Some(Ok(Ok(())))) {
                             let error=match result {
                                 Some(Ok(Err(error)))=>error,
@@ -258,7 +296,11 @@ impl Engine {
                     }
                     request=incoming.recv() => {
                         let Some(request)=request else { break };
-                        if task_shared.authority.check().is_err() { break }
+                        if *stopped.borrow() || task_shared.authority.check().is_err() { break }
+                        #[cfg(test)]
+                        let pause=task_shared.admission_pause.lock().unwrap().take();
+                        #[cfg(test)]
+                        if let Some(pause)=pause { pause.wait().await; }
                         let permit=match task_shared.callbacks.clone().try_acquire_owned() {
                             Ok(p)=>p,
                             Err(_)=>{task_shared.authority.retire();task_shared.connection.abort();break}
@@ -267,12 +309,26 @@ impl Engine {
                             crate::extensions::CallLane::Native,
                             crate::extensions::CallOrigin::default(), CALLBACK_TIMEOUT, false) {
                             Ok(permit)=>permit,
-                            Err(_)=>{task_shared.authority.retire();task_shared.connection.abort();break}
+                            Err(error)=>{
+                                // The selected request passed admission before
+                                // orderly retirement raced reserve. No callback
+                                // was accepted; do not poison unregister IPC.
+                                if !(*stopped.borrow() && matches!(error,Error::Closed)) {
+                                    task_shared.authority.retire();
+                                    task_shared.connection.abort();
+                                }
+                                break;
+                            }
                         };
                         task_shared.active.fetch_add(1,Ordering::SeqCst);
                         let state=task_shared.clone();
                         let call=call_permit.run_future(async move {
-                            let _permit=permit; dispatch(state,request).await
+                            let _permit=permit;
+                            #[cfg(test)]
+                            let pause=state.dispatch_pause.lock().unwrap().take();
+                            #[cfg(test)]
+                            if let Some(pause)=pause { pause.wait().await; }
+                            dispatch(state,request).await
                         });
                         dispositions.retain(|record| !record.is_finished());
                         dispositions.push(call.disposition());
