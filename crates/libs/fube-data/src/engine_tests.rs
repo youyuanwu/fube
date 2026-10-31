@@ -1950,7 +1950,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_completed_prefix_attestation_is_not_a_new_write_or_all_ack() {
+async fn diagnostic_prefix_cannot_initialize_sender_or_authorize_new_writes() {
     let partition = Uuid::new_v4();
     let view = Arc::new(SourceNativeView(Mutex::new(Err(Error::Closed))));
     let provider = Arc::new(Provider {
@@ -1986,14 +1986,13 @@ async fn native_completed_prefix_attestation_is_not_a_new_write_or_all_ack() {
     p.update_current_configuration(configuration(vec![peer], true, 2), cancel())
         .await
         .unwrap();
-    timeout(
-        std::time::Duration::from_secs(1),
+    assert!(timeout(
+        std::time::Duration::from_millis(50),
         p.wait_for_catch_up(CatchUpMode::Write, cancel()),
     )
     .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(p.snapshot().peers[0].native_catchup_prefix, 20);
+    .is_err());
+    assert_eq!(p.snapshot().peers[0].native_catchup_prefix, 0);
     assert_eq!(p.snapshot().peers[0].applied, 0);
     assert!(timeout(
         std::time::Duration::from_millis(50),
@@ -2298,8 +2297,8 @@ impl IOperationDataStream for Empty {
 }
 
 #[derive(Default)]
-struct Provider {
-    last: AtomicI64,
+pub(super) struct Provider {
+    pub(super) last: AtomicI64,
     epochs: Mutex<Vec<(Epoch, i64)>>,
     horizons: Mutex<Vec<i64>>,
     epoch_delay: std::time::Duration,
@@ -2307,6 +2306,15 @@ struct Provider {
     checkpoint_times: Mutex<Vec<Instant>>,
     checkpoint: Mutex<Option<ReplayOperation>>,
     checkpoint_gate: Mutex<Option<Arc<Semaphore>>>,
+}
+
+impl Provider {
+    pub(super) fn with_initial(last: i64) -> Self {
+        Self {
+            last: AtomicI64::new(last),
+            ..Self::default()
+        }
+    }
 }
 
 impl ReplayCheckpointProvider for Provider {
@@ -3104,7 +3112,7 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
     p.update_catch_up_configuration(required, previous.clone(), cancel())
         .await
         .unwrap();
-    for mode in [CatchUpMode::Write, CatchUpMode::All] {
+    for mode in [CatchUpMode::Write] {
         assert!(timeout(
             std::time::Duration::from_millis(40),
             p.wait_for_catch_up(mode, cancel())
@@ -3112,8 +3120,11 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
         .await
         .is_err());
     }
+    p.wait_for_catch_up(CatchUpMode::All, cancel())
+        .await
+        .unwrap();
     let mut unavailable = previous.clone();
-    unavailable.write_quorum = 2;
+    unavailable.write_quorum = 3;
     p.update_catch_up_configuration(current.clone(), unavailable, cancel())
         .await
         .unwrap();
@@ -3188,12 +3199,9 @@ async fn joint_quorums_previous_one_excludes_primary_and_catchup_is_not_write_co
     )
     .await
     .is_err());
-    assert!(timeout(
-        std::time::Duration::from_millis(40),
-        p.wait_for_catch_up(CatchUpMode::All, cancel())
-    )
-    .await
-    .is_err());
+    p.wait_for_catch_up(CatchUpMode::All, cancel())
+        .await
+        .unwrap();
     // A native idle cleanup cannot remove a configured member to manufacture
     // a smaller PC, nor can a quorum larger than its available PC self-commit.
     p.remove_replica(remote.clone(), ReplicaRemoval::Idle, cancel())
@@ -3201,7 +3209,7 @@ async fn joint_quorums_previous_one_excludes_primary_and_catchup_is_not_write_co
         .unwrap();
     p.update_catch_up_configuration(
         configuration(vec![], true, 1),
-        configuration(vec![remote.clone()], false, 2),
+        configuration(vec![remote.clone()], false, 3),
         cancel(),
     )
     .await
@@ -3340,7 +3348,7 @@ async fn bounded_admission_and_callback_capture_exhaustion_preserve_control_capa
     assert!(matches!(
         p.submit(OperationData::new(vec![vec![3]]).unwrap(), cancel())
             .await,
-        Err(Error::ResourceLimit(_))
+        Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull
     ));
     assert_eq!(p.snapshot().progress.assigned, 2);
     let stream = s.replication_stream();
@@ -4210,6 +4218,36 @@ async fn rejected_demotion_preserves_accepted_completion_for_drain_and_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_primary_none_cancels_pending_without_commit_or_provider_reconciliation() {
+    let (p, s, provider) = pair().await;
+    p.update_current_configuration(configuration(vec![descriptor(&s)], true, 2), cancel())
+        .await
+        .unwrap();
+    let mut accepted = p
+        .submit(OperationData::new(vec![vec![1]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    until(|| s.snapshot().progress.received == 1).await;
+    assert_eq!(p.snapshot().progress.committed, 0);
+    // The local provider has not applied the write either; terminal close must
+    // not impose equality with assigned or call reconciliation to invent it.
+    assert_eq!(provider.last.load(Ordering::Acquire), 0);
+    p.change_role(NEXT_EPOCH, ReplicaRole::None, cancel())
+        .await
+        .unwrap();
+    assert!(accepted.wait(cancel()).await.is_err());
+    let snapshot = p.snapshot();
+    assert_eq!(snapshot.role, ReplicaRole::None);
+    assert_eq!(snapshot.progress.assigned, 1);
+    assert_eq!(snapshot.progress.committed, 0);
+    assert_eq!(snapshot.progress.retained_operations, 0);
+    assert!(snapshot.peers.is_empty());
+    assert_eq!(provider.last.load(Ordering::Acquire), 0);
+    abort_owned(&p).await;
+    abort_owned(&s).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn continuing_third_secondary_accepts_the_new_primary() {
     let partition = Uuid::new_v4();
     let ap = MemoryProvider::new();
@@ -4948,7 +4986,7 @@ async fn outgoing_budget_repro_requires_eos_or_explicit_preassignment_write_reje
             assert_eq!(write.wait(cancel()).await.unwrap(), 1);
             Some(write)
         }
-        Err(Error::ResourceLimit(_)) => {
+        Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull => {
             assert_eq!(p.snapshot().progress.assigned, 0);
             assert_eq!(p.snapshot().progress.committed, 0);
             None
@@ -5076,7 +5114,7 @@ async fn outgoing_copy_and_real_idle_ack_progress_with_admitted_or_rejected_live
                 assert_eq!(p.snapshot().progress.completed, 0);
                 1
             }
-            Err(Error::ResourceLimit(_)) => {
+            Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull => {
                 assert!(!admits);
                 assert_eq!(p.snapshot().progress.assigned, 0);
                 assert_eq!(p.snapshot().progress.committed, 0);
@@ -5198,7 +5236,7 @@ async fn outgoing_future_copy_headroom_survives_concurrent_build_and_write_admis
     // cannot consume the next copy slot, even before a future build is known.
     assert!(matches!(
         p.submit(data.clone(), cancel()).await,
-        Err(Error::ResourceLimit(_))
+        Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull
     ));
     assert_eq!(p.snapshot().progress.assigned, 1);
     assert_eq!(p.snapshot().owned_bytes, data.retained_bytes());
@@ -5215,7 +5253,7 @@ async fn outgoing_future_copy_headroom_survives_concurrent_build_and_write_admis
             for _ in 0..32 {
                 assert!(matches!(
                     owner.submit(data.clone(), cancel()).await,
-                    Err(Error::ResourceLimit(_))
+                    Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull
                 ));
                 let snapshot = owner.snapshot();
                 assert!(snapshot.owned_operations <= settings.queue_operations);

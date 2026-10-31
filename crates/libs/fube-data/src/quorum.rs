@@ -26,7 +26,11 @@ pub fn configuration_progress(
     previous: bool,
     mut peer: impl FnMut(i64) -> Option<PeerProgress>,
 ) -> Option<ConfigurationProgress> {
-    if configuration.write_quorum == 0 {
+    let remote_pc_one =
+        previous && configuration.write_quorum == 1 && !configuration.replicas.is_empty();
+    // Resolve the native NonInitializedLSN sentinel to the assigned tail.
+    // PC q1 with a remote is a distinct APPLY-gated exception below.
+    if configuration.write_quorum <= 1 && !remote_pc_one {
         return Some(ConfigurationProgress {
             quorum: latest,
             all_applied: latest,
@@ -44,9 +48,9 @@ pub fn configuration_progress(
             }
         })
         .collect();
-    let available =
-        remote.iter().filter(|p| p.is_some()).count() + usize::from(configuration.local_member);
-    if available < configuration.write_quorum {
+    let available = remote.iter().filter(|p| p.is_some()).count();
+    // Native assumes an immediately ACKing primary even when not in PC.
+    if available < configuration.write_quorum.saturating_sub(1) {
         return None;
     }
     let mut applies: Vec<_> = remote
@@ -68,21 +72,20 @@ pub fn configuration_progress(
         .min(latest);
     // Native previous quorum=1 with a remote PC member cannot self-commit,
     // including the local-primary-not-in-PC I/P,S/N transition.
-    let quorum = if previous && configuration.write_quorum == 1 && !remote.is_empty() {
+    let quorum = if remote_pc_one {
         all_applied
     } else {
-        let need = configuration.write_quorum - usize::from(configuration.local_member);
-        if need == 0 {
-            latest
-        } else {
-            applies.sort_unstable_by(|a, b| b.cmp(a));
-            *applies.get(need - 1)?
-        }
+        applies.sort_unstable_by(|a, b| b.cmp(a));
+        *applies.get(configuration.write_quorum - 2)?
     };
     Some(ConfigurationProgress {
         quorum,
         all_applied,
-        all_received,
+        all_received: if remote_pc_one {
+            all_applied
+        } else {
+            all_received.min(quorum)
+        },
     })
 }
 
@@ -128,7 +131,7 @@ mod tests {
             ConfigurationProgress {
                 quorum: 3,
                 all_applied: 3,
-                all_received: 10
+                all_received: 3
             }
         );
         assert_eq!(
@@ -149,14 +152,48 @@ mod tests {
                 .quorum,
             3
         );
-        assert!(
-            configuration_progress(&config(false, 2, 2), 10, false, |id| if id == 1 {
+        assert_eq!(
+            configuration_progress(&config(false, 2, 2), 10, true, |id| if id == 1 {
                 peer(id)
             } else {
                 None
             })
-            .is_none()
+            .unwrap()
+            .quorum,
+            3
         );
+    }
+    #[test]
+    fn sentinel_pc_order_statistic_and_apply_release_are_independent() {
+        let cc = configuration_progress(&config(true, 1, 2), 10, false, |_| None).unwrap();
+        assert_eq!(
+            cc,
+            ConfigurationProgress {
+                quorum: 10,
+                all_applied: 10,
+                all_received: 10
+            }
+        );
+        let pc = config(false, 2, 2);
+        let p = configuration_progress(&pc, 10, true, |id| {
+            Some(PeerProgress {
+                received: 10,
+                applied: if id == 1 { 10 } else { 0 },
+            })
+        })
+        .unwrap();
+        assert_eq!(cc.quorum.min(p.quorum), 10);
+        assert_eq!(p.all_received, 10);
+        assert!(!pc.local_member);
+        assert!(configuration_progress(&pc, 10, true, |_| None).is_none());
+        let one = configuration_progress(&config(false, 1, 1), 10, true, |_| {
+            Some(PeerProgress {
+                received: 10,
+                applied: 0,
+            })
+        })
+        .unwrap();
+        assert_eq!((one.quorum, one.all_received), (0, 0));
     }
     #[test]
     fn current_and_previous_are_separate_not_union_majority() {

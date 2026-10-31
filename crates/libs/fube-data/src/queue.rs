@@ -70,13 +70,29 @@ impl OperationQueue {
     pub fn range(&self, from: i64) -> impl Iterator<Item = &Entry> {
         self.entries.range(from..).map(|(_, entry)| entry)
     }
+    /// Release terminal ownership without claiming commitment or rollback.
+    pub fn retire(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+        self.released = self.assigned;
+    }
     fn admit(&self, data: &OperationData) -> Result<()> {
         if data.bytes() > self.settings.operation_bytes
             || data.segments().len() > self.settings.operation_segments
-            || self.entries.len() >= self.settings.queue_operations
+            || data.retained_bytes() > self.settings.queue_bytes
+        {
+            return Err(Error::new(
+                fube_runtime::ErrorKind::ReplicationOperationTooLarge,
+                "replication operation limits",
+            ));
+        }
+        if self.entries.len() >= self.settings.queue_operations
             || data.retained_bytes() > self.settings.queue_bytes.saturating_sub(self.bytes)
         {
-            return Err(Error::ResourceLimit("replication queue"));
+            return Err(Error::new(
+                fube_runtime::ErrorKind::ReplicationQueueFull,
+                "replication queue",
+            ));
         }
         Ok(())
     }
@@ -246,11 +262,34 @@ mod tests {
         };
         let mut q = OperationQueue::new(s, 0).unwrap();
         assert_eq!(q.enqueue(E, data(1)).unwrap(), 1);
-        assert!(q.enqueue(E, data(2)).is_err());
+        let error = q.enqueue(E, data(2)).unwrap_err();
+        assert_eq!(error.kind(), fube_runtime::ErrorKind::ReplicationQueueFull);
+        assert_eq!(error.native_code(), Some(0x80071bcbu32 as i32 as i64));
+        assert_eq!(q.progress().assigned, 1);
         q.commit(1).unwrap();
         q.complete(1).unwrap();
         q.release_through(1).unwrap();
         assert_eq!(q.enqueue(E, data(2)).unwrap(), 2);
+    }
+    #[test]
+    fn permanent_size_rejection_is_not_queue_pressure_even_when_empty() {
+        let settings = Settings {
+            operation_bytes: 1,
+            queue_bytes: 256,
+            ..Settings::default()
+        };
+        let mut q = OperationQueue::new(settings, 0).unwrap();
+        let oversized = OperationData::new(vec![vec![0; 2]]).unwrap();
+        for _ in 0..2 {
+            let error = q.enqueue(E, oversized.clone()).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                fube_runtime::ErrorKind::ReplicationOperationTooLarge
+            );
+            assert_eq!(error.native_code(), Some(0x80071c2fu32 as i32 as i64));
+            assert_eq!(q.progress().assigned, 0);
+        }
+        assert_eq!(q.enqueue(E, data(1)).unwrap(), 1);
     }
     #[test]
     fn rollback_does_not_repeat_callbacks_or_cross_completed() {

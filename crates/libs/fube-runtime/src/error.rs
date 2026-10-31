@@ -29,6 +29,10 @@ pub enum ErrorKind {
     Canceled,
     Timeout,
     ResourceExhausted,
+    /// Temporary replication admission pressure; retry only after capacity recovery.
+    ReplicationQueueFull,
+    /// Permanent rejection by replication operation sizing limits.
+    ReplicationOperationTooLarge,
     Transport,
     Native,
     Provider,
@@ -221,6 +225,8 @@ impl Error {
             ErrorKind::Canceled => 0x80004004,
             ErrorKind::Timeout => 0x80071bff,
             ErrorKind::ResourceExhausted => 0x8007000e,
+            ErrorKind::ReplicationQueueFull => 0x80071bcb,
+            ErrorKind::ReplicationOperationTooLarge => 0x80071c2f,
             _ => 0x80004005,
         };
         code as i32 as i64
@@ -277,7 +283,11 @@ impl Error {
             Self::Timeout => ErrorKind::Timeout,
             Self::Closed => ErrorKind::ObjectClosed,
             Self::ResourceLimit(_) => ErrorKind::ResourceExhausted,
-            Self::Remote { .. } => ErrorKind::Native,
+            Self::Remote { code, .. } => match *code {
+                -2147017781 => ErrorKind::ReplicationQueueFull,
+                -2147017681 => ErrorKind::ReplicationOperationTooLarge,
+                _ => ErrorKind::Native,
+            },
             Self::Classified { kind, .. } => *kind,
             Self::Uncertain(cause) => cause.kind(),
             Self::RejectedRegistration(_) => ErrorKind::InvalidExecutionContext,
@@ -293,6 +303,14 @@ impl Error {
             if let Some(error) = cause.downcast_ref::<Error>() {
                 match error {
                     Self::Remote { code, .. } => return Some(*code),
+                    Self::Classified {
+                        kind: ErrorKind::ReplicationQueueFull,
+                        ..
+                    } => return Some(0x80071bcbu32 as i32 as i64),
+                    Self::Classified {
+                        kind: ErrorKind::ReplicationOperationTooLarge,
+                        ..
+                    } => return Some(0x80071c2fu32 as i32 as i64),
                     Self::Supervised(error) => return error.code,
                     Self::Uncertain(error) => {
                         next = Some(&**error);

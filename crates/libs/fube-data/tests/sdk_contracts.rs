@@ -432,7 +432,8 @@ async fn standard_provider_sync_shapes_one_owner_copy_gap_early_lsn_and_explicit
         Ok(_) => panic!("oversized admission"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), ErrorKind::ResourceExhausted);
+    assert_eq!(error.kind(), ErrorKind::ReplicationOperationTooLarge);
+    assert_eq!(error.native_code(), Some(0x80071c2fu32 as i32 as i64));
     assert_eq!(
         primary.fabric.snapshot().progress.assigned,
         before,

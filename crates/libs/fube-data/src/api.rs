@@ -86,14 +86,20 @@ impl OperationData {
     pub fn with_settings(segments: Vec<Vec<u8>>, settings: &Settings) -> Result<Self> {
         settings.validate()?;
         if segments.len() > settings.operation_segments {
-            return Err(Error::ResourceLimit("operation segments"));
+            return Err(Error::new(
+                fube_runtime::ErrorKind::ReplicationOperationTooLarge,
+                "operation segments",
+            ));
         }
         let bytes = segments.iter().try_fold(0usize, |n, s| {
             n.checked_add(s.len())
                 .ok_or(Error::InvalidInput("operation length overflow"))
         })?;
         if bytes > settings.operation_bytes {
-            return Err(Error::ResourceLimit("operation bytes"));
+            return Err(Error::new(
+                fube_runtime::ErrorKind::ReplicationOperationTooLarge,
+                "operation bytes",
+            ));
         }
         Ok(Self {
             segments: segments.into_iter().map(Arc::from).collect(),

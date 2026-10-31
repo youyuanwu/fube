@@ -966,7 +966,7 @@ mod tests {
         let p = MemoryProvider::new();
         assert!(matches!(
             p.apply_replication(1, &oversized_copy),
-            Err(Error::ResourceLimit("operation bytes"))
+            Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationOperationTooLarge
         ));
         assert_eq!(p.snapshot().last, 0);
         assert_eq!(p.snapshot().retained_bytes, 0);

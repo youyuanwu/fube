@@ -5,6 +5,38 @@ use std::sync::{
     Condvar,
 };
 
+#[test]
+fn replication_pressure_and_sizing_keep_typed_native_codes_and_causes() {
+    for (kind, code) in [
+        (ErrorKind::ReplicationQueueFull, 0x80071bcbu32 as i32 as i64),
+        (
+            ErrorKind::ReplicationOperationTooLarge,
+            0x80071c2fu32 as i32 as i64,
+        ),
+    ] {
+        let error = Error::with_cause(kind, "not parsed", Error::ResourceLimit("retained budget"));
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.native_code(), Some(code));
+        assert_eq!(error.native_result_code(), code);
+        assert!(std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<Error>()
+            .is_some());
+        let uncertain = error.clone().uncertain();
+        assert_eq!(uncertain.kind(), kind);
+        assert_eq!(uncertain.native_result_code(), code);
+        let provider = Error::with_cause(ErrorKind::Provider, "callback", error.clone());
+        assert_eq!(provider.native_result_code(), code);
+        let remote: Error = error.transport_fault().into();
+        assert_eq!(remote.kind(), kind);
+        assert_eq!(remote.native_code(), Some(code));
+    }
+    assert_eq!(
+        Error::ResourceLimit("other exhaustion").kind(),
+        ErrorKind::ResourceExhausted
+    );
+}
+
 #[derive(Debug)]
 struct Cause {
     native: Error,

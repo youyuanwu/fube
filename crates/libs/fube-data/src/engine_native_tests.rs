@@ -222,6 +222,117 @@ async fn until(mut condition: impl FnMut() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issued_new_and_recreated_senders_use_current_progress_but_repeats_keep_live_counters() {
+    for root in [false, true] {
+        let partition = uuid::Uuid::new_v4();
+        let log = Arc::new(tests::Provider::with_initial(20));
+        let p = Fixture::using(
+            partition,
+            source(1),
+            ReplicaRole::Primary,
+            root,
+            (MemoryProvider::new(), log.clone(), Settings::default()),
+        )
+        .await;
+        // A genuine runtime-issued descriptor, no replay extension and no
+        // provider/remote ACK callback, represents an already applied prefix.
+        let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+        let remote = Endpoint {
+            actor: Actor {
+                partition,
+                replica: 2,
+                incarnation: uuid::Uuid::new_v4(),
+            },
+            address: network.address().to_string(),
+            transport_id: None,
+        };
+        let mut descriptor = ReplicaInformation {
+            node_id: source(2).node_id,
+            node_instance: 1,
+            replica_id: 2,
+            incarnation: source(2).native_incarnation,
+            role: ReplicaRole::ActiveSecondary,
+            previous_role: ReplicaRole::ActiveSecondary,
+            up: true,
+            ready: true,
+            address: remote.to_string(),
+            progress: ReplicationProgress { first: 1, last: 20 },
+            must_catch_up: false,
+        };
+        p.host
+            .configure(config(EPOCH, vec![descriptor.clone()], 2))
+            .await
+            .unwrap();
+        p.engine
+            .wait_for_catch_up(CatchUpMode::All, Cancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                p.engine.snapshot().peers[0].received,
+                p.engine.snapshot().peers[0].applied
+            ),
+            (20, 20)
+        );
+        descriptor.progress.last = 0;
+        descriptor.progress.first = -1;
+        p.host
+            .configure(config(EPOCH, vec![descriptor.clone()], 2))
+            .await
+            .unwrap();
+        assert_eq!(
+            p.engine.snapshot().peers[0].applied,
+            20,
+            "repeated descriptor must not reset live sender"
+        );
+        descriptor.incarnation += 1;
+        descriptor.address = Endpoint {
+            actor: Actor {
+                incarnation: uuid::Uuid::new_v4(),
+                ..remote.actor
+            },
+            ..remote
+        }
+        .to_string();
+        descriptor.progress = ReplicationProgress { first: 1, last: 20 };
+        p.host
+            .configure(config(EPOCH, vec![descriptor], 2))
+            .await
+            .unwrap();
+        p.engine
+            .wait_for_catch_up(CatchUpMode::All, Cancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(p.engine.snapshot().peers[0].applied, 20);
+        let mut write = p
+            .engine
+            .submit(
+                OperationData::new(vec![vec![21]]).unwrap(),
+                Cancellation::default(),
+            )
+            .await
+            .unwrap();
+        log.last.store(21, Ordering::Release);
+        assert_eq!(write.sequence, 21);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            write.wait(Cancellation::default())
+        )
+        .await
+        .is_err());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            p.engine
+                .wait_for_catch_up(CatchUpMode::All, Cancellation::default())
+        )
+        .await
+        .is_err());
+        assert_eq!(p.engine.snapshot().progress.committed, 20);
+        network.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issued_root_and_bound_canonical_controls_copy_ack_memberships_remove_and_pair_progress() {
     for root in [false, true] {
         let partition = uuid::Uuid::new_v4();

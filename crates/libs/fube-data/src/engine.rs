@@ -876,8 +876,12 @@ impl Engine {
             }
             if data.bytes() > self.settings.operation_bytes
                 || data.segments().len() > self.settings.operation_segments
+                || data.retained_bytes() > self.settings.queue_bytes
             {
-                return Err(Error::ResourceLimit("operation limits"));
+                return Err(Error::new(
+                    fube_runtime::ErrorKind::ReplicationOperationTooLarge,
+                    "operation limits",
+                ));
             }
             let (reply, result) = oneshot::channel();
             {
@@ -901,11 +905,17 @@ impl Engine {
                 } else {
                     0
                 };
-                let charge = self.shared.budget.acquire_reserved(
-                    data.retained_bytes(),
-                    u32::from(copying),
-                    reserve_bytes,
-                )?;
+                let charge = self
+                    .shared
+                    .budget
+                    .acquire_reserved(data.retained_bytes(), u32::from(copying), reserve_bytes)
+                    .map_err(|cause| {
+                        Error::with_cause(
+                            fube_runtime::ErrorKind::ReplicationQueueFull,
+                            "replication admission budget",
+                            cause,
+                        )
+                    })?;
                 drop(snapshot);
                 self.writes
                     .try_send(Submit {
@@ -916,9 +926,10 @@ impl Engine {
                         reply: reply.into(),
                     })
                     .map_err(|error| match error {
-                        mpsc::error::TrySendError::Full(_) => {
-                            Error::ResourceLimit("write admission")
-                        }
+                        mpsc::error::TrySendError::Full(_) => Error::new(
+                            fube_runtime::ErrorKind::ReplicationQueueFull,
+                            "write admission",
+                        ),
                         mpsc::error::TrySendError::Closed(_) => Error::Closed,
                     })?;
             }
@@ -1438,6 +1449,7 @@ enum Job {
 }
 
 enum JobValue {
+    Retired,
     Epoch(i64),
     Loss(bool, Option<i64>),
     CopyOpen(
@@ -2067,7 +2079,10 @@ impl Owner {
                     return;
                 }
                 if self.role == ReplicaRole::Primary
-                    && role != ReplicaRole::Primary
+                    && matches!(
+                        role,
+                        ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+                    )
                     && self.queue.progress().assigned != self.queue.progress().committed
                 {
                     // Native queue transfer requires no uncommitted tail.
@@ -2087,6 +2102,15 @@ impl Owner {
                     self.queue.progress().received
                 };
                 if self.role == ReplicaRole::Primary && role != ReplicaRole::Primary {
+                    if role == ReplicaRole::None {
+                        // Retire observers before sessions/configuration can
+                        // disappear and accidentally make a quorum of one.
+                        for (_, completion) in std::mem::take(&mut self.completions) {
+                            complete_replication(&completion, Err(Error::Closed));
+                        }
+                        self.current = None;
+                        self.previous = None;
+                    }
                     for peer in self.peers.values_mut() {
                         if peer.copy_applied == -1
                             && peer.build.as_ref().is_some_and(|build| {
@@ -2155,7 +2179,7 @@ impl Owner {
                     } else if self.configurations.len() >= self.settings.control_messages {
                         Err(Error::ResourceLimit("configuration disposal receipts"))
                     } else {
-                        self.configure(current, previous, native_prewrite)
+                        self.configure(current, previous, native_prewrite, proof.is_some())
                     };
                 let disposal = capture.finish();
                 if !disposal.is_complete() {
@@ -2419,6 +2443,7 @@ impl Owner {
         current: ReplicaSetConfiguration,
         previous: Option<ReplicaSetConfiguration>,
         native_prewrite: Option<NativePreWrite>,
+        issued: bool,
     ) -> Result<()> {
         let epoch = self
             .epoch
@@ -2455,19 +2480,6 @@ impl Owner {
         if let Some(previous) = &previous {
             self.validate_configuration(previous)?;
         }
-        let native_status = self
-            .native_control
-            .as_ref()
-            .and_then(|view| view.status().ok())
-            .filter(|status| {
-                status.lifecycle == ReplicaLifecycle::Open
-                    && status.replicator_open
-                    && status.current_role == ReplicaRole::Primary
-                    && status.replicator_role == ReplicaRole::Primary
-                    && status.current_epoch.primary() == current_epoch
-                    && Some(current_epoch) == self.epoch
-            });
-        let completed_prefix = self.queue.progress().completed;
         let mut desired: HashMap<i64, (&ReplicaInformation, Endpoint)> = HashMap::new();
         for replica in current.replicas.iter().chain(
             previous
@@ -2573,37 +2585,22 @@ impl Owner {
                 self.transport.register_peer(&endpoint)?;
             }
             if !self.peers.contains_key(&id) {
-                let peer = self.new_peer(endpoint.clone(), replica.incarnation);
+                let mut peer = self.new_peer(endpoint.clone(), replica.incarnation);
+                if issued {
+                    // This descriptor came from the entered, frozen runtime
+                    // invocation, never from a diagnostic/public projection.
+                    let initial = replica.progress.last.max(0);
+                    peer.received = initial;
+                    peer.applied = initial;
+                    peer.maximum_sent = initial;
+                    peer.native_catchup_prefix = initial;
+                }
                 self.peers.insert(id, peer);
             }
             let peer = self.peers.get_mut(&id).unwrap();
             peer.endpoint = endpoint;
             peer.configured = true;
             peer.adopted = true;
-            // Native ReplicaManager::CreateReplica passes the node-supplied
-            // CurrentProgress into ReliableOperationSender's initial progress.
-            // Be stricter: an exact current native descriptor can attest only
-            // our already-completed prefix, and only for catch-up. Do not turn
-            // received/provider progress into a fresh application/write vote.
-            peer.native_catchup_prefix = native_status
-                .as_ref()
-                .and_then(|status| {
-                    status.configuration.iter().find(|native| {
-                        native.replica_id == id
-                            && native.incarnation == replica.incarnation
-                            && native.up
-                            && native.ready
-                            && native.role == replica.role
-                            && native.progress == replica.progress
-                            && native
-                                .address
-                                .parse::<Endpoint>()
-                                .is_ok_and(|address| same_endpoint(&address, &peer.endpoint))
-                    })
-                })
-                .map_or(0, |native| {
-                    native.progress.last.max(0).min(completed_prefix)
-                });
             if peer.build.as_ref().is_some_and(|build| {
                 !build.job
                     && build.reply.is_none()
@@ -3942,10 +3939,10 @@ impl Owner {
                         })
                     })
         });
-        let ready_all = current.is_some_and(|progress| progress.quorum >= self.catch_up_fence)
-            && ready_quorum
-            && current
-                .is_some_and(|progress| progress.all_applied >= self.queue.progress().assigned);
+        // Native ALL is the CC all-apply frontier, not combined PC commitment
+        // or the WRITE must-catch-up constraint. CC<=1 resolves to latest.
+        let ready_all =
+            current.is_some_and(|progress| progress.all_applied >= self.queue.progress().assigned);
         let mut pending = Vec::new();
         for waiter in self.catchups.drain(..) {
             if waiter.cancellation.is_cancelled() {
@@ -4009,6 +4006,22 @@ impl Owner {
             control.disposal.append(capture.finish());
         }
         if !control.disposal.is_complete() {
+            return;
+        }
+        if self.role == ReplicaRole::Primary
+            && matches!(
+                &control.kind,
+                ControlKind::Epoch {
+                    role: ReplicaRole::None,
+                    ..
+                }
+            )
+        {
+            // Terminal retirement has no secondary queue or provider
+            // reconciliation to construct.
+            if let Err(error) = self.finish_control(Ok(JobValue::Retired)) {
+                self.fail(error);
+            }
             return;
         }
         if self.role != ReplicaRole::Primary && self.queue.progress().applied < boundary {
@@ -4301,9 +4314,15 @@ impl Owner {
                     boundary,
                     reply,
                 },
-                JobValue::Epoch(authoritative),
+                value @ (JobValue::Epoch(_) | JobValue::Retired),
             ) => {
-                if authoritative != boundary {
+                if match value {
+                    JobValue::Epoch(authoritative) => authoritative != boundary,
+                    JobValue::Retired => {
+                        self.role != ReplicaRole::Primary || role != ReplicaRole::None
+                    }
+                    _ => unreachable!(),
+                } {
                     let error = Error::Protocol("provider epoch reconciliation boundary mismatch");
                     let _ = reply.send(Err(error.clone()));
                     return Err(error);
@@ -4339,7 +4358,11 @@ impl Owner {
                     }
                     self.current = None;
                     self.previous = None;
-                    self.queue.reset(boundary)?;
+                    if role == ReplicaRole::None {
+                        self.queue.retire();
+                    } else {
+                        self.queue.reset(boundary)?;
+                    }
                     self.charges.clear();
                     self.dispatched = boundary;
                     self.secondary = None;
@@ -4352,6 +4375,10 @@ impl Owner {
                         self.dispatched = boundary;
                     }
                 } else if matches!(role, ReplicaRole::None) {
+                    let ids: Vec<_> = self.peers.keys().copied().collect();
+                    for id in ids {
+                        self.retire_peer(id, Error::Closed);
+                    }
                     self.replication_tx.take();
                     self.copy_tx.take();
                     self.secondary = None;
