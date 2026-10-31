@@ -412,7 +412,7 @@ class ProofFiles(fixtures.ProjectFiles):
         # Clear really has no archive field; the successful command binds it.
         del clear["archive_sha256"]
         health = {
-            **common, "owner": "ci-100-1", "cases": [{
+            **common, "owner": "ci-" + self.current["run_id"] + "-" + self.current["attempt"], "cases": [{
                 "case": name, "native_start_ms": int(start * 1000) + 11,
                 "native_end_ms": int(start * 1000) + 12} for name in ci.HEALTH_CASES],
             "concurrent_operations": 32, "unknown_node_code": -2147017705,
@@ -524,10 +524,11 @@ class ProofFiles(fixtures.ProjectFiles):
                             "--out", output or directory / "worker-proof.json",
                             "--outcomes", json.dumps(outcomes or self.command_outcomes(route)))
 
-    def aggregating(self, output=None, needs=None):
+    def aggregating(self, output=None, needs=None, attempts=None):
+        extra = ("--worker-attempts-json", json.dumps(attempts)) if attempts is not None else ()
         return self.cli("aggregate", "--producer", self.producer, "--worker-root", self.root / "workers",
                         "--needs-json", json.dumps(needs or dict.fromkeys(ci.REQUIRED_JOBS, "success")),
-                        "--out", output or self.root / "aggregate.json")
+                        "--out", output or self.root / "aggregate.json", *extra)
 
 
 class InputTests(ProofFiles):
@@ -599,6 +600,37 @@ class InputTests(ProofFiles):
                     self.assertEqual(ci.read(output)["status"], "PASS" if change == "none" else "FAIL")
                     path.write_bytes(original)
                     self.current["attempt"] = "1"
+
+    def test_failed_job_rerun_reuses_only_the_explicit_same_run_producer(self):
+        self.current["attempt"] = "2"
+        with patch.dict(os.environ, {"FUBE_CI_PRODUCER_ATTEMPT": "1"}):
+            with patch.object(ci.runtime, "run", side_effect=AssertionError("compiler invocation")):
+                for key, path in (("native_archive", self.archive), ("standalone_bundle", self.standalone)):
+                    output = self.root / f"rerun-{key}.json"
+                    self.assertEqual(self.cli("verify-artifact", "--producer", self.producer,
+                                              "--input", key, "--file", path, "--out", output), 0)
+                    self.assertEqual(ci.read(output)["context"]["attempt"], "2")
+            for route in ci.ROUTES:
+                self.assertEqual(ci.read(self.validated(route))["context"]["attempt"], "2")
+            original = self.archive.read_bytes()
+            self.archive.write_bytes(original + b"changed")
+            self.assertEqual(self.cli("verify-artifact", "--producer", self.producer,
+                                      "--input", "native_archive", "--file", self.archive,
+                                      "--out", self.root / "rerun-tampered.json"), 1)
+            self.archive.write_bytes(original)
+            for field in ("source", "tree", "head", "merge", "run_id"):
+                with self.subTest(field=field):
+                    old = self.current[field]
+                    self.current[field] = "200" if field == "run_id" else "d" * 40
+                    self.assertEqual(self.cli("verify-artifact", "--producer", self.producer,
+                                              "--input", "native_archive", "--file", self.archive,
+                                              "--out", self.root / f"rerun-wrong-{field}.json"), 1)
+                    self.current[field] = old
+        for attempt in ("", "0", "3", "01"):
+            with self.subTest(attempt=attempt), patch.dict(os.environ, {"FUBE_CI_PRODUCER_ATTEMPT": attempt}):
+                self.assertEqual(self.cli("verify-artifact", "--producer", self.producer,
+                                          "--input", "native_archive", "--file", self.archive,
+                                          "--out", self.root / f"rerun-attempt-{attempt}.json"), 1)
 
     def test_producer_rejects_mismatched_tar_content_links_and_extra_inventory(self):
         cases = ("extra", "link", "different")
@@ -878,6 +910,42 @@ class CleanupLegacyTests(ProofFiles):
 
 
 class WorkerTests(ProofFiles):
+    def test_partial_rerun_aggregates_exact_worker_attempts_without_relabeling_evidence(self):
+        native = self.worker("native-data")
+        self.assertEqual(self.sealing("native-data", native), 0, self.last_stdout)
+        self.current["attempt"] = "2"
+        attempts = {"native-data": "1", "client-runtime": "2"}
+        with patch.dict(os.environ, {"FUBE_CI_PRODUCER_ATTEMPT": "1"}):
+            client = self.worker("client-runtime")
+            self.assertEqual(self.sealing("client-runtime", client), 0, self.last_stdout)
+            self.assertEqual(self.aggregating(attempts=attempts), 0, self.last_stdout)
+            result = ci.read(self.root / "aggregate.json")
+            self.assertEqual(result["context"]["attempt"], "2")
+            self.assertEqual(result["producer_context"]["attempt"], "1")
+            self.assertEqual({route: value["attempt"] for route, value in result["worker_contexts"].items()},
+                             attempts)
+            self.assertEqual(self.aggregating(self.root / "implicit-attempts.json"), 1)
+            wrong = dict(attempts, **{"native-data": "2"})
+            self.assertEqual(self.aggregating(self.root / "missing-current-proof.json", attempts=wrong), 1)
+            for index, changed in enumerate((dict(attempts, unexpected="1"),
+                                             {"client-runtime": "2"}, dict(attempts, **{"native-data": "3"}))):
+                self.assertEqual(self.aggregating(self.root / f"invalid-attempts-{index}.json",
+                                                  attempts=changed), 1)
+            proof = ci.read(client / "worker-proof.json")
+            proof["status"], proof["errors"] = "FAIL", ["rerun failed"]
+            self.emit(client / "worker-proof.json", proof)
+            self.assertEqual(self.aggregating(self.root / "failed-rerun-proof.json", attempts=attempts), 1)
+
+    def test_rebuilt_producer_cannot_reuse_previous_worker_proofs(self):
+        for route in ci.ROUTES:
+            self.assertEqual(self.sealing(route, self.worker(route)), 0, self.last_stdout)
+        self.current["attempt"] = "2"
+        rebuilt = self.root / "producer-2.json"
+        self.assertEqual(self.cli("produce", "--bundle-tar", self.tar, "--bundle-dir", self.directory,
+                                  "--archive", self.archive, "--out", rebuilt), 0)
+        self.producer = rebuilt
+        self.assertEqual(self.aggregating(attempts=dict.fromkeys(ci.ROUTES, "1")), 1)
+
     def test_seal_merges_lifecycle_with_actual_manifest_execution(self):
         for route in ci.ROUTES:
             directory = self.worker(route)

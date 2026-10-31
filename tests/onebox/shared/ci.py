@@ -408,8 +408,16 @@ def receipt(path, kind, current):
     return value
 
 
+def attempt_context(current, attempt):
+    require(type(attempt) is str and re.fullmatch(r"[1-9][0-9]{0,9}", attempt)
+            and int(attempt) <= int(current["attempt"]), "invalid or future execution attempt")
+    return {**current, "attempt": attempt}
+
+
 def producer(path, current):
-    value = receipt(path, "producer", current)
+    selected = attempt_context(
+        current, os.environ.get("FUBE_CI_PRODUCER_ATTEMPT", current["attempt"]))
+    value = receipt(path, "producer", selected)
     exact(value, {"version", "kind", "status", "errors", "context", "inputs", "build", "created_at"},
           "producer receipt schema")
     exact(value["inputs"], {"bundle_tar", "manifest", "nested_manifest", "app", "observer",
@@ -1618,7 +1626,7 @@ def outcomes(value, route, archive):
                     "failed/skipped/unexecuted worker command")
 
 
-def inspect_worker(route, built, producer_digest, validated_path, directory, command_outcomes):
+def inspect_worker(route, built, producer_digest, validated_path, directory, command_outcomes, current):
     outcomes(command_outcomes, route, built["inputs"]["native_archive"]["sha256"])
     directory = safe_path(directory)
     require(directory.is_dir(), "worker evidence directory required")
@@ -1635,7 +1643,6 @@ def inspect_worker(route, built, producer_digest, validated_path, directory, com
             "route fixed report inventory")
     require(safe_path(validated_path) == directory / "validated-input.json",
             "validated input must be published under fixed worker filename")
-    current = built["context"]
     validated = receipt(validated_path, "validated-input", current)
     exact(validated, {"version", "kind", "status", "errors", "route", "context", "inputs",
                       "producer_sha256", "validated_at"}, "validated-input schema")
@@ -1742,7 +1749,7 @@ def seal(args):
         execution = read(args.evidence_dir / "suite-outcomes.json", SMALL)
         command_outcomes = {key: "skipped" for key in OUTCOMES} | command_outcomes | execution["suites"]
     result = inspect_worker(args.route, built, identity(args.producer, SMALL)["sha256"],
-                            args.validated_input, args.evidence_dir, command_outcomes)
+                            args.validated_input, args.evidence_dir, command_outcomes, current)
     finished = time.time()
     require(result["timing"]["fixture"][1] <= started, "sealing requires completed fixture teardown")
     result["timing"].update(sealing=[started, finished],
@@ -1757,6 +1764,12 @@ def aggregate(args):
     producer_digest = identity(args.producer, SMALL)["sha256"]
     needs = small_json(args.needs_json)
     require(needs == dict.fromkeys(REQUIRED_JOBS, "success"), "all required CI jobs must succeed")
+    attempts = (small_json(args.worker_attempts_json) if args.worker_attempts_json is not None
+                else dict.fromkeys(ROUTES, current["attempt"]))
+    exact(attempts, ROUTES, "exact manifest worker attempts required")
+    worker_contexts = {route: attempt_context(current, attempts[route]) for route in ROUTES}
+    require(all(int(attempt) >= int(built["context"]["attempt"]) for attempt in attempts.values()),
+            "worker predates selected producer")
     root = safe_path(args.worker_root)
     require(root.is_dir() and {entry.name for entry in root.iterdir()} == set(ROUTES)
             and all(safe_path(root / route).is_dir() for route in ROUTES), "exact manifest worker routes required")
@@ -1764,11 +1777,12 @@ def aggregate(args):
     for route in ROUTES:
         directory = root / route
         proof_path = directory / "worker-proof.json"
-        proof = receipt(proof_path, "worker-proof", current)
+        worker_current = worker_contexts[route]
+        proof = receipt(proof_path, "worker-proof", worker_current)
         require(proof.get("route") == route and proof.get("producer_sha256") == producer_digest,
                 "worker route/producer identity")
         expected = inspect_worker(route, built, producer_digest, directory / "validated-input.json",
-                                  directory, proof["outcomes"])
+                                  directory, proof["outcomes"], worker_current)
         require(set(proof) == set(expected) | {"version", "kind", "status", "errors"},
                 "worker proof exact schema")
         for key in expected:
@@ -1797,7 +1811,8 @@ def aggregate(args):
     expected_assertions, expected_native = suites.MANIFEST.coverage()
     require(assertions == expected_assertions and native_tests == expected_native,
             "exact manifest whole-suite coverage")
-    return {"context": current, "producer_sha256": producer_digest, "inputs": built["inputs"],
+    return {"context": current, "producer_context": built["context"], "worker_contexts": worker_contexts,
+            "producer_sha256": producer_digest, "inputs": built["inputs"],
             "needs": needs, "workers": proofs, "assertions": assertions, "native_tests": native_tests,
             "coverage": f"{len(assertions)} namespaced profile assertions; archived native-client{len(native_tests)}",
             "timing": {"aggregate": [started, time.time()],
@@ -1839,6 +1854,8 @@ def parser():
         if command == "aggregate":
             sub.add_argument("--worker-root", required=True, type=Path)
             sub.add_argument("--needs-json", required=True)
+            sub.add_argument("--worker-attempts-json",
+                             help="exact worker attempts from dependency evidence outputs")
     return result
 
 
