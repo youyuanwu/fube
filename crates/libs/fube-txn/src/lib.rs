@@ -34,6 +34,7 @@
 #![deny(missing_docs)]
 
 mod internal;
+mod kernel;
 mod provider;
 mod replicator;
 mod transaction;
