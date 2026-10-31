@@ -436,6 +436,71 @@ async fn routed_delete_rejection_or_wrong_reply_prevents_file_creation() {
 async fn invalid_source_or_destination_never_deletes_and_keeps_connection() {
     let package = Package::new();
     let (mut client, mut peer) = connected().await;
+    let marker_fits = |destination: &str| {
+        let headers = vec![
+            Header::object(0x8001, |e| {
+                e.i64(26);
+                Ok(())
+            })
+            .unwrap(),
+            Header::object(0x8002, |e| e.string("FileCreate")).unwrap(),
+            Header::object(0x8003, |e| {
+                e.guid(&[255; 16]);
+                e.u32(u32::MAX);
+                Ok(())
+            })
+            .unwrap(),
+            Header::object(0x8020, |e| {
+                e.object(|e| {
+                    e.guid(&[255; 16]);
+                    e.u64(0);
+                    Ok(())
+                })
+            })
+            .unwrap(),
+            Header::object(0x8025, |e| {
+                e.i64(1);
+                e.i64(2);
+                Ok(())
+            })
+            .unwrap(),
+            Header::object(0x804f, |e| {
+                e.string("fabric:/System/ImageStoreService")?;
+                e.string(&format!("{destination}/_.dir"))?;
+                e.boolean(true);
+                e.u64(0);
+                Ok(())
+            })
+            .unwrap(),
+            Header::object(0x8023, |e| {
+                e.i64(i64::MAX);
+                Ok(())
+            })
+            .unwrap(),
+        ];
+        Message {
+            headers,
+            body: vec![],
+        }
+        .to_frame()
+        .and_then(|frame| frame.encode())
+        .is_ok()
+    };
+    let (mut lower, mut upper) = (32_600usize, 32_700usize);
+    while lower < upper {
+        let midpoint = lower + (upper - lower).div_ceil(2);
+        if marker_fits(&"a".repeat(midpoint)) {
+            lower = midpoint;
+        } else {
+            upper = midpoint - 1;
+        }
+    }
+    let boundary = "a".repeat(lower);
+    let over_boundary = "a".repeat(lower + 1);
+    let demonstrated = "a".repeat(32_700);
+    assert!(marker_fits(&boundary));
+    assert!(!marker_fits(&over_boundary));
+    assert!(!marker_fits(&demonstrated));
     for invalid in [
         "",
         "/",
@@ -449,6 +514,22 @@ async fn invalid_source_or_destination_never_deletes_and_keeps_connection() {
         "./windowsfabricstore",
         " Store/child ",
         "pkg\0x",
+        "./ Store/.",
+        "./WindowsFabricStore /.",
+        "./ Store/child",
+        "Store /.",
+        "./ WindowsFabricStore",
+        r".\ Store\.",
+        r".\WindowsFabricStore \.",
+        r".\ Store\child",
+        r"Store \.",
+        r".\ WindowsFabricStore",
+        "./ ./ Store/.",
+        "./ ./WindowsFabricStore /.",
+        "./ ./ /.",
+        "./ ./ .. /.",
+        "./ ./ C:\\.",
+        "./ . /.",
     ] {
         assert!(matches!(
             client
@@ -458,6 +539,39 @@ async fn invalid_source_or_destination_never_deletes_and_keeps_connection() {
         ));
         assert!(!client.is_closed());
     }
+    for invalid in [&demonstrated, &over_boundary] {
+        assert!(matches!(
+            client
+                .copy_application_package(&package.0, invalid, None)
+                .await,
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(!client.is_closed());
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), read_message(&mut peer))
+            .await
+            .is_err()
+    );
+    let accepted = boundary.clone();
+    let server = tokio::spawn(async move {
+        for expected in ["包 space/child space", accepted.as_str()] {
+            delete_success(&mut peer, expected, false).await;
+            let create = read_message(&mut peer).await.unwrap();
+            let (path, bytes, _) = receive_file(&mut peer, create, 4, false).await;
+            assert_eq!(path, format!("{expected}/_.dir"));
+            assert!(bytes.is_empty());
+        }
+        peer
+    });
+    for accepted in [r"./ ./ 包 space\child space\.", boundary.as_str()] {
+        client
+            .copy_application_package(&package.0, accepted, None)
+            .await
+            .unwrap();
+        assert!(!client.is_closed());
+    }
+    peer = server.await.unwrap();
     let file = package.0.join("file");
     std::fs::write(&file, b"").unwrap();
     assert!(matches!(

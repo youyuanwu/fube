@@ -189,3 +189,31 @@ pub(crate) fn decode_delete(message: Message) -> Result<Option<[u8; 16]>> {
     })?;
     Ok(Some(guid.0))
 }
+
+pub(crate) fn preflight_root_marker(destination: &str) -> Result<()> {
+    let preflight = || {
+        // Match the transport-added FileCreate envelope at maximum native
+        // MessageId/TimeSpan widths, then reuse the actual upload headers.
+        let mut complete = vec![
+            Header::actor(26)?,
+            Header::action("FileCreate")?,
+            Header::message_id(MessageId {
+                guid: [255; 16],
+                index: u32::MAX,
+            })?,
+        ];
+        complete.extend(headers([255; 16])?);
+        complete.push(create(&format!("{destination}/_.dir"), 0)?);
+        complete.push(Header::timeout(i64::MAX)?);
+        Message {
+            headers: complete,
+            body: vec![],
+        }
+        .to_frame()?
+        .encode()?;
+        Ok::<_, Error>(())
+    };
+    preflight().map_err(|_| {
+        Error::InvalidInput("ImageStore destination exceeds complete root marker frame limits")
+    })
+}

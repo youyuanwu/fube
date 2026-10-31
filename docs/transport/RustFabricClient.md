@@ -303,7 +303,9 @@ and all directory markers.
 
 Copy matches native **AtomicCopy/Overwrite**, not an in-place merge or one
 server-side atomic transaction. The source root must be a nonsymlink directory;
-destination/root-header validation happens before remote deletion. One routed
+final destination and complete root-marker FileCreate frame validation happen
+before remote deletion. Invalid destinations send nothing and leave a healthy
+client reusable. One routed
 native Delete removes the entire top-level destination, including stale extra
 files. Missing destination is accepted only as native FileNotFound
 **-2147017728**; other native errors propagate. Child recursion does not delete
@@ -312,10 +314,14 @@ again. Files and child directories complete before each directory's empty
 skipped and regenerated, not copied.
 
 Destination names are ImageStore-relative paths, **not** the restricted ASCII
-`NamingUri` grammar. Spaces and Unicode are supported. Validation trims outer
-whitespace, converts backslashes to slashes and collapses empty/`.` components;
-rooted paths, Windows drive-root forms, NUL, exact `..` components, and
-case-insensitive top-level **Store/WindowsFabricStore** are rejected.
+`NamingUri` grammar. Spaces and Unicode are supported. Validation rejects
+initially rooted input, converts backslashes to slashes, and repeats empty/`.`
+component collapse and newly exposed outer-whitespace trimming until the path
+is stable. The final native-effective path is checked for empty/rooted/drive
+forms, NUL, exact `..` components and case-insensitive top-level
+**Store/WindowsFabricStore**, then used unchanged for Delete and every FileCreate.
+Thus whitespace/dot aliases such as `./ Store/.` are rejected, while ordinary
+internal spaces and Unicode remain supported.
 Local non-UTF-8 filenames, backslash-containing names, symlinks and special
 entries are explicitly unsupported. Sources are not snapshotted: a changing
 source can fail or produce mixed-time content.
@@ -325,7 +331,7 @@ source can fail or produce mixed-time content.
 | Outstanding content | **One** negotiated chunk; nonfinal chunks retain the full negotiated size so native sequence-derived offsets remain correct. |
 | Content frame | **4 MiB total**, including the **12-byte** fixed header and every native header. An oversized negotiated threshold fails before content is read/sent; it is never silently shrunk. A zero advertised threshold uses **3 MiB**. |
 | Directory traversal | **128** simultaneously open directory levels, including the source root; **1,000,000** visited entries. No package-sized file or GUID snapshot is retained. |
-| Native path encoding | Each native string is at most **32,768 UTF-16 units** and the serialized FileCreate header must fit **65,535 bytes**, including service/path/size fields. Root validation also checks the generated `/_.dir` path; these are not a promise that every 32,768-unit path fits. |
+| Native path encoding | Each native string is at most **32,768 UTF-16 units**; the complete native header area must fit **65,535 bytes**. Before Delete, the generated `/_.dir` FileCreate is encoded as a complete frame, including Actor/Action/MessageId, Activity/version, upload fields, Timeout and record overhead, with maximum relevant MessageId index/timeout widths. These are encoded-size limits, not a promise that every 32,768-unit path fits. |
 | Reply handoff | **32** validated semantic replies; overflow is terminal. |
 | Stale/duplicate replies | At most **64 consecutive** well-formed obsolete replies per awaited stage; the 65th fails. Wrong future sequences/actions and malformed bodies fail, not count as harmless stale traffic. |
 | Transport capacity | **32** ordinary admitted sends/requests and **32** queued ordinary frames; upload content and controls never use the separately reserved **32** IPC/reply-control slots. |
@@ -357,6 +363,7 @@ work can leave the client usable; successful copies retain a reusable socket.
 
 Implementation: [public API and copy lifecycle](../../crates/libs/fube-client/src/image_store.rs#L59),
 [native codecs](../../crates/libs/fube-client/src/image_store_protocol.rs#L27),
+[complete root-marker preflight](../../crates/libs/fube-client/src/image_store_protocol.rs#L193),
 [strict semantic ACK decoding](../../crates/libs/fube-transport/src/file_transfer.rs#L26)
 and [dedicated transport role](../../crates/libs/fube-transport/src/connection.rs#L420).
 Native copy semantics follow the pinned

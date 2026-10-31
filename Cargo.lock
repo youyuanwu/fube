@@ -295,6 +295,7 @@ dependencies = [
  "clap",
  "fube-client",
  "fube-transport",
+ "libc",
  "tokio",
  "uuid",
 ]

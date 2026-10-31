@@ -17,4 +17,5 @@ tokio.workspace = true
 
 [dev-dependencies]
 fube-transport.workspace = true
+libc = "0.2"
 uuid.workspace = true

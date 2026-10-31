@@ -422,42 +422,52 @@ fn negotiated_size(size: u64) -> Result<u64> {
 }
 
 fn validate_destination(destination: &str) -> Result<String> {
-    let destination = destination.trim();
-    if destination.is_empty()
-        || destination.starts_with(['/', '\\'])
-        || destination.contains('\0')
-        || (destination.as_bytes().get(1) == Some(&b':')
-            && destination.as_bytes()[0].is_ascii_alphabetic())
-    {
-        return Err(Error::InvalidInput(
-            "ImageStore destination must be a nonrooted relative path",
-        ));
-    }
-    let normalized = destination.replace('\\', "/");
-    let mut components = Vec::new();
-    for component in normalized.split('/') {
-        if component == ".." {
+    let check_root = |path: &str| {
+        if path.is_empty()
+            || path.starts_with(['/', '\\'])
+            || path.contains('\0')
+            || (path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic())
+        {
             return Err(Error::InvalidInput(
-                "ImageStore destination cannot traverse parents",
+                "ImageStore destination must be a nonrooted relative path",
             ));
         }
-        if !component.is_empty() && component != "." {
-            components.push(component);
+        Ok(())
+    };
+    let destination = destination.trim();
+    check_root(destination)?;
+    let mut normalized = destination.replace('\\', "/");
+    loop {
+        check_root(&normalized)?;
+        let mut components = Vec::new();
+        for component in normalized.split('/') {
+            if component == ".." {
+                return Err(Error::InvalidInput(
+                    "ImageStore destination cannot traverse parents",
+                ));
+            }
+            if !component.is_empty() && component != "." {
+                components.push(component);
+            }
         }
+        // Collapsing components can expose outer spaces, which native FSS
+        // trims. Trimming can in turn expose another dot/root/parent alias.
+        let next = components.join("/").trim().to_owned();
+        if next == normalized {
+            break;
+        }
+        normalized = next;
     }
-    let top = components
-        .first()
-        .ok_or(Error::InvalidInput("ImageStore destination cannot be root"))?;
+    check_root(&normalized)?;
+    let top = normalized.split('/').next().unwrap();
     if top.eq_ignore_ascii_case("Store") || top.eq_ignore_ascii_case("WindowsFabricStore") {
         return Err(Error::InvalidInput(
             "ImageStore destination is a reserved system directory",
         ));
     }
-    let result = components.join("/");
-    // Validate the native header size before destructive replacement.
-    wire::create(&format!("{result}/_.dir"), 0)?;
-    wire::delete(&result, [1; 16])?;
-    Ok(result)
+    wire::preflight_root_marker(&normalized)?;
+    wire::delete(&normalized, [1; 16])?;
+    Ok(normalized)
 }
 
 #[cfg(test)]
