@@ -154,6 +154,46 @@ The Python `--build-bundle` commands below now only package existing Cargo
 outputs and record dependency graphs with `cargo tree --locked`; they never
 compile. Build the required binaries/examples explicitly first.
 
+## Native application-package upload
+
+Build the native development CLI with `cargo build --locked -p fube-cli`:
+
+```sh
+target/debug/fube --endpoint 127.0.0.1:19000 --unsecured \
+  application upload --path ./MyApp --timeout 300
+```
+
+This uses fube-client's native TCP ImageStore upload, not sfctl/REST or a
+container-side package copy. The destination is the local directory's final
+name. The timeout is in seconds and bounds the whole CLI operation, including
+connection establishment. Native AtomicCopy replaces the destination directory
+and publishes completion markers after its contents; failure is not rollback.
+Only native `fabric:ImageStore` on an explicitly unsecured development cluster
+is supported. See [Rust FabricClient](transport/RustFabricClient.md) for the
+library API, transfer limits and cancellation behavior.
+
+The existing CI uploader remains unchanged. The opt-in live qualification
+compares native SDK and Rust upload inventories, replaces stale content,
+provisions the Rust-uploaded package, independently resolves/contacts the app,
+and checks deployed Data bytes against the source. It needs a healthy
+caller-owned onebox, the original `--github-output` owner file from its creation,
+and prebuilt executables:
+
+```sh
+cargo build --locked -p fube-cli -p rust-runtime-app -p fube-client --bins --examples
+cargo build --locked -p native-replicator-oracle --example image_store_copy
+python3 -m tests.onebox.native_upload --name native-upload \
+  --owner-file /private/native-upload-owner.txt \
+  --cli target/debug/fube --app target/debug/rust-runtime-app \
+  --observer target/debug/examples/runtime_observer \
+  --native-oracle target/debug/examples/image_store_copy
+```
+
+The native SDK reference runs inside the owned SF container and uses real mssf
+bindings; sfctl is used only for management/cleanup. The test removes its unique
+workloads and temporary packages, but retains the caller-owned onebox. It
+prints the outcome rather than writing/uploading success reports.
+
 ## Native-free checks
 
 ```sh
