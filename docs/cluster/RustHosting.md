@@ -1,10 +1,13 @@
 # Rust node-side Hosting design
 
-**Status: H1 in-memory registration/lookup core implemented; H2–H4 remain
-proposed.** [`fube-hosting`](../../crates/libs/fube-hosting/src/lib.rs) provides
+**Status: H1 in-memory registration/lookup core and narrow port contracts
+implemented; H2–H4 remain proposed.**
+[`fube-hosting`](../../crates/libs/fube-hosting/src/lib.rs) provides
 a native-derived, deterministically driven model, not a running node or new
 interoperability qualification. See [implemented H1](#implemented-h1-model)
 for the exact API/source and evidence boundary.
+See [supplied port contracts](#supplied-port-contracts) for the distinction
+between interface definitions, H1 model implementations and gated live work.
 
 **Baselines:** repository `0748b9ab3a39530a57387fda23b5889e6e7a442c`;
 native Service Fabric `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`, inspected
@@ -124,12 +127,14 @@ and dependency adapters. Add package usage, IPC/leases and process/deployment
 modules as their stages land. Do not introduce a separate protocol crate,
 daemon or universal plugin framework merely for this extraction.
 
-The API shape is a small set of typed operations, results and owned events:
-register/unregister, lookup, package acquisition/release, activation and
-termination obligations, and closure/registration observations. These are
-conceptual roles, not committed Rust signatures. Native lookup errors,
-optional returned registration and sequence number remain separately
-representable; an error must not automatically erase its candidate.
+The [supplied port contracts](#supplied-port-contracts) now define request-only
+registration lookup, package residency, lookup-triggered activation/scheduling,
+and two typed owned event lanes. Host/runtime/type registration retains the
+existing H1 inherent/split-step APIs; termination and RAP stay gated rather than
+receiving success-shaped wrapper traits. Package usage/lifecycle definitions
+have **no implementation**. Native lookup errors, optional returned registration
+and sequence number remain independently representable; an error must not
+automatically erase its candidate.
 
 Use explicit injected observations, clocks and controlled dependency outcomes
 for model tests. A test input certifies only its stated premise. A model
@@ -501,7 +506,7 @@ production dependency ([manifest](../../crates/libs/fube-hosting/Cargo.toml#L1-L
 | Host records, held Start timer/state, Finish find/state/reply/proxy receipt, timeout cancel/find/mark/remove | [host.rs:5–379](../../crates/libs/fube-hosting/src/host.rs#L5-L379) | ApplicationHostRegistration.cpp:38–145; ApplicationHostManager.cpp:1292–1299,1766–1816,1966–2053,2266–2286 |
 | Tentative runtime Add/host check/Validate, duplicate errors and original/cleanup receipt | [runtime.rs:4–163](../../crates/libs/fube-hosting/src/runtime.rs#L4-L163) | RuntimeRegistrationTable.cpp:53–266; FabricRuntimeManager.cpp:501–679 |
 | Managed declaration/component/failure entries; six selected statuses, unfenced Finish and grace callback checks | [types.rs:5–624](../../crates/libs/fube-hosting/src/types.rs#L5-L624) | ServiceTypeStateManager.cpp:128–299,425–838,1142–1557 |
-| Candidate/error/optional sequence; native rendered public-map keys; activation and deactivation-if-unused controlled outcomes | [lookup.rs:5–211](../../crates/libs/fube-hosting/src/lookup.rs#L5-L211), [collaborators.rs:5–94](../../crates/libs/fube-hosting/src/collaborators.rs#L5-L94) | FabricRuntimeManager.cpp:117–249,296–458; ApplicationManager.cpp:1079–1093; HostingSubsystem.cpp:165–180 |
+| Candidate/error/optional sequence; native rendered public-map keys; activation and deactivation-if-unused controlled outcomes | [lookup.rs:5–217](../../crates/libs/fube-hosting/src/lookup.rs#L5-L217), [collaborators.rs:5–95](../../crates/libs/fube-hosting/src/collaborators.rs#L5-L95) | FabricRuntimeManager.cpp:117–249,296–458; ApplicationManager.cpp:1079–1093; HostingSubsystem.cpp:165–180 |
 | Owned Registered/RuntimeClosed/HostClosed and separate Enabled/Disabled enqueue lanes; timeout-tracking/source-release obligations | [events.rs:9–294](../../crates/libs/fube-hosting/src/events.rs#L9-L294) | ServiceTypeStateManager.cpp:923–1117,1581–1636; EventDispatcher.cpp:39–197 |
 | Logical count/byte admission, complete output reservation, explicit remaining-work closure | [core.rs:78–220](../../crates/libs/fube-hosting/src/core.rs#L78-L220), [model.rs:94–159](../../crates/libs/fube-hosting/src/model.rs#L94-L159) | Rust ownership adaptation, not native limits or physical shutdown |
 
@@ -586,8 +591,8 @@ non-ASCII text ([identity.rs:1–176](../../crates/libs/fube-hosting/src/identit
 GUID validation accepts native canonical hyphen/hex shape without normalizing
 accepted spelling.
 
-**Executed evidence:** `cargo test --locked -p fube-hosting` currently runs
-72 unit/integration cases plus a model-only Rustdoc example. Test headers
+**Original H1 evidence (unchanged):** the merged H1 delivery recorded 72
+unit/integration cases plus its model-only Rustdoc example. Test headers
 separate narrowly adapted native sort/query/registration/version/disable
 observations from processor-derived exact matrices and Rust admission/ownership
 tests. The source scenario inventory is:
@@ -608,6 +613,69 @@ leases and H4 process/RAP ownership remain unfinished. No complete native
 Hosting handler execution, new codec oracle, wire interoperability or deployed
 process qualification was run. Existing test-host/native evidence is unchanged;
 it is not relabelled for H1.
+
+### Supplied port contracts
+
+The [public contract Rustdoc](../../crates/libs/fube-hosting/src/contracts.rs)
+is the semantic reference, with pinned **implementation and test** links,
+supported-profile and ownership distinctions. Native source inspection is not
+a new native execution PASS. The original H1/RA/native-helper/test-host evidence
+above remains evidence at its original revisions.
+
+| Contract | Supplied implementation/profile | API and semantic comments |
+|---|---|---|
+| `RegistrationLookup` | Explicit borrowed `H1LookupAdapter`; request-only method, separately supplied `LookupModel` premises. No live production adapter. | [contracts.rs:37–184](../../crates/libs/fube-hosting/src/contracts.rs#L37-L184) |
+| `PackageUsage` | Definition only; no H1/H2 usage engine or acquired-reference bridge. | [contracts.rs:186–298](../../crates/libs/fube-hosting/src/contracts.rs#L186-L298) |
+| `PackageLifecycle` | Definition only; existing activation/scheduling observations remain model premises/obligations, not executed H2. | [contracts.rs:300–420](../../crates/libs/fube-hosting/src/contracts.rs#L300-L420) |
+| `HostingEventSource` | Direct `Hosting` implementation, two owned H1 lanes. No subscriptions, live status/runtime-close routing or delivery ACK. | [contracts.rs:422–509](../../crates/libs/fube-hosting/src/contracts.rs#L422-L509) |
+
+Lookup keeps outer admission versus inner native result/candidate/sequence,
+request identity versus producer runtime fields, full-version/scheduling-derived
+mismatch/NotFound and unwritten sequence. The H1 adapter borrows explicit
+observations and invokes the unchanged core path; it does not call external
+package code under projected mutation or treat missing outcomes as success.
+See the [runnable boundary example](../../crates/libs/fube-hosting/src/lib.rs).
+
+Usage's owned acquisition/reconciliation type is a **local ownership adaptation**,
+not a wire/RA-issued lookup ID. Increment distinguishes managed acquisition,
+explicit adhoc no-residency, proven rejection and unresolved partial mutation.
+Release returns exact unresolved ownership; verified local release is stronger
+than native public void. Dropping an observer/token is not async cleanup, and
+retrying an uncertain decrement can underflow. RA still owns reference attachment,
+retained residency, precommit compensation and postcommit disposal policy.
+
+Lifecycle distinguishes synchronous End from owned pending activation and
+consuming final observation, returning ownership on noncompletion. Scheduling
+eligibility, timer admission and physical deactivation are different milestones;
+source-specific grace/sequence checks are not universal event fences. No
+observer-timeout-to-success or cancellation rollback is supplied.
+
+Events preserve all five typed variants, sequences, first affected scope and
+producer spelling; lanes can drain independently. Native subscription removal
+does not drain already snapshotted callbacks, native shutdown may drop callbacks,
+and H1 finite admission is a separately documented safety adaptation. No
+RuntimeClosed-to-HostDown translation or silent Enabled/Disabled drop is enabled.
+
+**Contracts test inventory:** four reusable actual-adapter lookup cases and two
+actual-Hosting event cases are added in existing
+[lookup.rs:10–250](../../crates/libs/fube-hosting/tests/lookup.rs#L10-L250) and
+[events_bounds.rs:8–138](../../crates/libs/fube-hosting/tests/events_bounds.rs#L8-L138).
+They exercise trait dispatch, provenance/candidate-error combinations, absent
+premises/unwritten sequence, pending End, atomic admission and typed owned
+transfer—not mock-success or compile-only conformance. Comments distinguish
+native-test adaptations, processor-derived combinations and Rust ownership/
+admission checks. The suite now contains **78 ordinary cases** (original 72
+preserved) and **two model doctests**. These are native-free contract regressions,
+not H2/H3/H4, native-handler, codec, wire or deployed qualification.
+
+**Contracts validation:** affected H1 tests and examples passed. Locked
+all-feature workspace check, Clippy (warnings denied), binary/example build,
+warning-denied Rustdoc and serial tests passed: 1,040 ordinary cases, five live
+cases ignored, and 38 doctests (including H1's two). The separate doctest gate
+also passed; those counts overlap, not additional unique tests. No new native
+or live execution was performed. The known intermittent demoted-role-stream
+sample test passed on the first workspace run here; it was not modified or
+claimed fixed by this work.
 
 ## 10. Deferred work and invariants
 

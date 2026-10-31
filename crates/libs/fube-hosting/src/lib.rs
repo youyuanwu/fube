@@ -39,6 +39,51 @@
 //! [`HostingEventSource`] document the narrow native-derived node boundary.
 //! Contract definitions do not enable H2–H4. Usage/lifecycle have no supplied
 //! implementation; H1 model premises are not production operation inputs.
+//! Only [`H1LookupAdapter`] supplies lookup and [`Hosting`] supplies typed
+//! owned event drains. Node composition, not this crate, projects outputs to RA.
+//!
+//! # Request-only lookup with explicit H1 observations
+//! ```
+//! use fube_hosting::*;
+//! let mut core = Hosting::new(Limits::default())?;
+//! let id = TypeInstance {
+//!     service_type: ServiceTypeId {
+//!         package: PackageId {
+//!             application: ApplicationId { type_name: "App".into(), number: 1 },
+//!             name: "Pkg".into(),
+//!         },
+//!         name: "Widget".into(),
+//!     },
+//!     activation: Activation::SHARED,
+//!     public_activation: String::new(),
+//! };
+//! core.declare_type(id.clone(), "package-component".into(), Ok(()))?;
+//! let input = LookupRequest {
+//!     service_type: id.service_type.clone(),
+//!     version: VersionInstance::default(),
+//!     activation: id.activation,
+//!     service_name: "fabric:/app/service".into(),
+//!     application_name: "fabric:/app".into(),
+//!     should_activate: true,
+//! };
+//! // A controlled observation, NOT an operational PackageLifecycle implementation.
+//! let model = LookupModel {
+//!     activation: Some(ActivationOutcome::Synchronous(Ok(()))),
+//!     ..LookupModel::default()
+//! };
+//! let result = RegistrationLookup::lookup(
+//!     &mut H1LookupAdapter::new(&mut core, &model), &input,
+//! )?;
+//! assert_eq!(result.result, Err(Error::TypeNotRegistered));
+//! assert!(result.candidate.is_none());
+//! assert!(result.sequence.is_some()); // state read wrote it even on this error
+//! // Modeled activation is an obligation, not a Registered event or residency.
+//! assert!(matches!(core.take_obligations().as_slice(), [Obligation::Activation { .. }]));
+//! assert!(HostingEventSource::take_closed_registered_events(&mut core).is_empty());
+//! assert!(HostingEventSource::take_enabled_disabled_events(&mut core).is_empty());
+//! assert_eq!(core.require_live_composition(), Err(Error::UnsupportedCapability));
+//! # Ok::<(), Error>(())
+//! ```
 #![forbid(unsafe_code)]
 #[cfg(not(target_os = "linux"))]
 compile_error!("fube-hosting models the pinned Linux Hosting profile only");
