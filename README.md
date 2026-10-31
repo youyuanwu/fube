@@ -84,6 +84,7 @@ repeated native SDK copy reliability is not claimed.
 
 - [Rust FabricClient API and native qualification](docs/transport/RustFabricClient.md)
 - [Native transport/TCP/TLS specification](docs/transport/Transport.md)
+- [Shared message/RPC channel API contracts (Rustdoc source; declarations only, not implemented)](crates/libs/fube-transport/src/channel.rs)
 - [FabricClient behavior](docs/transport/FabricClient.md) and [message formats](docs/transport/FabricClientMessageFormat.md)
 - [Native FabricRuntime](docs/runtime/FabricRuntime.md) and [node-side host responsibilities](docs/runtime/FabricRuntimeHost.md)
 - [Standalone test host](docs/runtime/RustTestHost.md) and [manifest execution](docs/runtime/ManifestTestHost.md)
