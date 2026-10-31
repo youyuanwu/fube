@@ -795,6 +795,17 @@ baseline, so a preexisting SDK failure or H2 noncausation is not inferred.
 Earlier failures remain part of local validation history. Neither correction
 enables physical Hosting, live RA/RAP or new native interoperability.
 
+The first callback/shutdown correction's Close sequencing was necessary but
+insufficient: independent acceptance reproduced the original SDK target failure.
+Its isolated first panic was loop-end guarded shutdown returning Closed, after
+the bootstrap/replication/copy assertions, not an assumed earlier bootstrap
+assertion. A subsequent [runtime dispatcher correction](../../crates/libs/fube-runtime/src/lifecycle.rs#L274-L349)
+preserves unregister IPC when exact Closed from already-selected admission/
+owned completion races the requested retirement. It keeps the original owned
+drain, authority retirement, other errors and active-callback fencing intact.
+Controlled old/new race tests and original full/repeated SDK evidence qualify
+that closure; old candidate passes remain historical, not parent acceptance.
+
 ## 10. Deferred work and invariants
 
 This design adds no database, loader, durable Hosting outbox or restart/adoption

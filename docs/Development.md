@@ -223,6 +223,16 @@ semantics are not relaxed. The causal regression uses an actually entered
 UpdateEpoch callback; cached GetStatus alone is not callback-entry evidence.
 These are local ownership/model tests, not new native or deployed qualification.
 
+Close-reply ordering alone proved insufficient for the original SDK target:
+an owned library dispatch can still observe retirement after that reply.
+The [lifecycle dispatcher](../crates/libs/fube-runtime/src/lifecycle.rs#L274-L349)
+now sends only exact `Closed` during requested shutdown through its existing
+owned drain, preserving IPC for unregister. Retirement without stop and all
+other faults, limits, expiry and active-callback fencing remain terminal.
+Controlled admission/result-window tests verify real unregister round trips;
+the original SDK full target and fifty predefined exact bootstrap selections
+are separate regression evidence, not substituted by a newly green cleanup test.
+
 The [RA P1 store](cluster/RaStore.md) uses bundled SQLite C through
 `tokio-rusqlite`; producers need a C compiler and archiver (no SF or system
 SQLite development package). Do not override the bundled build with
