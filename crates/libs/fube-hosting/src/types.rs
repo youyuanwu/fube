@@ -58,6 +58,7 @@ impl State {
         Ok(self.type_sequence)
     }
     pub(crate) fn check_type_identity(&self, id: &TypeInstance) -> Result<()> {
+        validate_package(&id.service_type.package)?;
         validate_public(id.activation, &id.public_activation)?;
         // PackageInstanceIdentifier comparison asserts identical public ID once
         // package/context match, even when the short type names differ.
@@ -122,6 +123,7 @@ impl State {
         e.code_package.clear();
     }
     pub(crate) fn start_type(&mut self, id: &TypeInstance, context: &RuntimeContext) -> Result<()> {
+        validate_package(&context.package.package)?;
         if id.activation != context.package.activation {
             return Err(Error::NativeInvariant(
                 "type/runtime activation disagreement",
@@ -186,6 +188,7 @@ impl State {
         valid: bool,
         context: &RuntimeContext,
     ) -> Result<()> {
+        validate_package(&context.package.package)?;
         let i = self.type_index(id)?;
         let prior = self.types[i].status;
         let status = match (prior, valid) {
@@ -231,6 +234,8 @@ impl State {
         id: &TypeInstance,
         context: &RuntimeContext,
     ) -> Result<()> {
+        validate_package(&id.service_type.package)?;
+        validate_package(&context.package.package)?;
         let actual = self.runtime(&context.runtime_id)?;
         if !compare_names(&actual.runtime_id, &context.runtime_id).is_eq()
             || !compare_names(&actual.host_id, &context.host_id).is_eq()
@@ -249,6 +254,9 @@ impl State {
         Ok(())
     }
     fn remove_source(&mut self, id: &TypeInstance, source: &str) -> Result<()> {
+        if source.is_empty() {
+            return Err(Error::NativeInvariant("empty component removal"));
+        }
         let i = match self.type_index(id) {
             Ok(i) => i,
             Err(Error::NotFound) => return Ok(()),
@@ -461,10 +469,18 @@ impl Hosting {
     ) -> Result<Option<Timer>> {
         let now = clock.now_ticks();
         self.change(|s| {
-            if s.types_closed
-                || !blocklisting
-                || !s.failures.iter().any(|f| compare_names(f, failure).is_eq())
-            {
+            if s.types_closed || !blocklisting {
+                return Ok(None);
+            }
+            validate_package(&id.service_type.package)?;
+            let adhoc = id.service_type.package.application == ApplicationId::default();
+            if failure.is_empty() && !adhoc {
+                return Err(Error::NativeInvariant("empty managed failure"));
+            }
+            if adhoc {
+                return Err(Error::UnsupportedCapability);
+            }
+            if !s.failures.iter().any(|f| compare_names(f, failure).is_eq()) {
                 return Ok(None);
             }
             let i = match s.type_index(id) {

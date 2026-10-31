@@ -45,6 +45,7 @@ impl State {
 }
 impl Hosting {
     pub fn add_runtime(&mut self, context: RuntimeContext) -> Result<()> {
+        validate_package(&context.package.package)?;
         validate_public(
             context.package.activation,
             &context.package.public_activation,
@@ -69,6 +70,7 @@ impl Hosting {
         })
     }
     pub fn check_runtime_host(&self, context: &RuntimeContext) -> Result<()> {
+        validate_package(&context.package.package)?;
         if self.state.host_valid(&context.host_id)? {
             Ok(())
         } else {

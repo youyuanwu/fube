@@ -146,3 +146,99 @@ fn native_guid_shape_rejects_uuid_parser_extensions_and_preserves_spelling() {
     c.package.activation = Activation::from_uuid(uuid::Uuid::from_u128(1));
     assert_eq!(h.add_runtime(c), Err(Error::InvalidInput));
 }
+
+#[test]
+fn native_constructor_preconditions_veto_core_admission_not_raw_comparison_data() {
+    for (package, error) in [
+        (
+            PackageId {
+                application: ApplicationId {
+                    type_name: String::new(),
+                    number: 1,
+                },
+                name: "Pkg".into(),
+            },
+            Error::NativeInvariant("empty application name with nonzero number"),
+        ),
+        (
+            PackageId {
+                application: ApplicationId {
+                    type_name: "App".into(),
+                    number: 1,
+                },
+                name: String::new(),
+            },
+            Error::NativeInvariant("nonempty application with empty package name"),
+        ),
+    ] {
+        let mut h = hosting();
+        completed_host(&mut h, "H");
+        let id = TypeInstance {
+            service_type: ServiceTypeId {
+                package: package.clone(),
+                name: "Widget".into(),
+            },
+            ..TypeInstance::default()
+        };
+        // Raw native comparator probes remain possible even for constructor-invalid triples.
+        assert_eq!(
+            compare_service_types(&id.service_type, &id.service_type),
+            Ordering::Equal
+        );
+        assert_eq!(
+            h.declare_type(id.clone(), "component".into(), Ok(())),
+            Err(error.clone())
+        );
+        let mut c = context("R", "H");
+        c.package.package = package.clone();
+        assert_eq!(h.register_runtime(c.clone()).result, Err(error.clone()));
+        assert!(h.runtime_records().is_empty());
+        assert_eq!(h.register_type(&id, &c).result, Err(error.clone()));
+        assert_eq!(
+            h.lookup(&request(&id, c.version.clone()), &LookupModel::default()),
+            Err(error.clone())
+        );
+        let mapping = PackageInstance {
+            package,
+            activation: Activation::from_uuid(uuid::Uuid::from_u128(1)),
+            public_activation: uuid::Uuid::from_u128(2).to_string(),
+        };
+        assert_eq!(h.bind_public_activation(mapping), Err(error));
+        assert!(h.type_entries().is_empty());
+        assert!(h.closed_registered_events().is_empty());
+        assert!(h.obligations().is_empty());
+        assert_eq!(h.get_type_state(&type_id("Absent")).unwrap().sequence, 1);
+    }
+}
+#[test]
+fn valid_raw_emptiness_non_ascii_and_nul_remain_distinct_from_adhoc_capability() {
+    let mut h = hosting();
+    completed_host(&mut h, "H");
+    let mut id = type_id("Widget");
+    id.service_type.package.application.type_name = "é\0App".into();
+    id.service_type.package.name = "Pkg\0suffix".into();
+    h.declare_type(id.clone(), "component".into(), Ok(()))
+        .unwrap();
+    let mut c = context("R", "H");
+    c.package = id.package_instance();
+    h.register_runtime(c.clone()).result.unwrap();
+    h.register_type(&id, &c).result.unwrap();
+    let result = h
+        .lookup(&request(&id, c.version), &LookupModel::default())
+        .unwrap();
+    assert_eq!(result.result, Ok(()));
+    assert_eq!(result.candidate.unwrap().type_instance, id);
+    let adhoc = TypeInstance::default();
+    assert_eq!(
+        h.declare_type(adhoc.clone(), "component".into(), Ok(())),
+        Err(Error::UnsupportedCapability)
+    );
+    let result = h
+        .lookup(
+            &request(&adhoc, VersionInstance::default()),
+            &LookupModel::default(),
+        )
+        .unwrap();
+    assert_eq!(result.result, Err(Error::UnsupportedCapability));
+    assert!(result.sequence.is_some()); // valid identity, gated producer; not an invalid constructor
+}

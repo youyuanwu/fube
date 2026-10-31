@@ -27,19 +27,27 @@ impl LookupResult {
         }
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublicActivationEntry {
+    pub key: String,
+    pub public_activation: String,
+}
 impl State {
     fn public_activation(
         &mut self,
         request: &LookupRequest,
         model: &LookupModel,
     ) -> Result<Option<String>> {
+        validate_package(&request.service_type.package)?;
         if request.activation == Activation::SHARED {
             return Ok(Some(String::new()));
         }
-        if let Some(p) = self.public_activations.iter().find(|p| {
-            compare_packages(&p.package, &request.service_type.package).is_eq()
-                && p.activation == request.activation
-        }) {
+        let key = public_activation_map_key(&request.service_type.package, request.activation)?;
+        if let Some(p) = self
+            .public_activations
+            .iter()
+            .find(|p| compare_names(&p.key, &key).is_eq())
+        {
             return Ok(Some(p.public_activation.clone()));
         }
         if !request.should_activate {
@@ -61,9 +69,8 @@ impl State {
             .as_ref()
             .ok_or(Error::MissingModelOutcome)?;
         validate_public(request.activation, public)?;
-        self.public_activations.push(PackageInstance {
-            package: request.service_type.package.clone(),
-            activation: request.activation,
+        self.public_activations.push(PublicActivationEntry {
+            key,
             public_activation: public.clone(),
         });
         Ok(Some(public.clone()))
@@ -71,8 +78,10 @@ impl State {
 }
 impl Hosting {
     /// Explicit controlled identity mapping for model-only exclusive scenarios.
-    /// Equal package/context cannot be assigned a second public identity.
+    /// Native rendered-key aliases retain the first identity; conflicting
+    /// explicit assignments cannot create a second independent mapping.
     pub fn bind_public_activation(&mut self, package: PackageInstance) -> Result<()> {
+        let key = public_activation_map_key(&package.package, package.activation)?;
         validate_public(package.activation, &package.public_activation)?;
         if package.activation == Activation::SHARED {
             return Err(Error::InvalidInput); // shared resolver always returns empty
@@ -84,7 +93,7 @@ impl Hosting {
             if let Some(existing) = s
                 .public_activations
                 .iter()
-                .find(|p| compare_package_instances(p, &package).is_eq())
+                .find(|p| compare_names(&p.key, &key).is_eq())
             {
                 return if existing.public_activation == package.public_activation {
                     Ok(())
@@ -94,7 +103,10 @@ impl Hosting {
                     ))
                 };
             }
-            s.public_activations.push(package);
+            s.public_activations.push(PublicActivationEntry {
+                key,
+                public_activation: package.public_activation,
+            });
             Ok(())
         })
     }

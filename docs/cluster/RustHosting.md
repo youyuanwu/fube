@@ -499,9 +499,9 @@ production dependency ([manifest](../../crates/libs/fube-hosting/Cargo.toml#L1-L
 | Implemented surface | Rust source | Native closure |
 |---|---|---|
 | Host records, held Start timer/state, Finish find/state/reply/proxy receipt, timeout cancel/find/mark/remove | [host.rs:5–379](../../crates/libs/fube-hosting/src/host.rs#L5-L379) | ApplicationHostRegistration.cpp:38–145; ApplicationHostManager.cpp:1292–1299,1766–1816,1966–2053,2266–2286 |
-| Tentative runtime Add/host check/Validate, duplicate errors and original/cleanup receipt | [runtime.rs:4–161](../../crates/libs/fube-hosting/src/runtime.rs#L4-L161) | RuntimeRegistrationTable.cpp:53–266; FabricRuntimeManager.cpp:501–679 |
-| Managed declaration/component/failure entries; six selected statuses, unfenced Finish and grace callback checks | [types.rs:5–608](../../crates/libs/fube-hosting/src/types.rs#L5-L608) | ServiceTypeStateManager.cpp:128–299,425–838,1142–1557 |
-| Candidate/error/optional sequence; activation and deactivation-if-unused controlled outcomes | [lookup.rs:5–199](../../crates/libs/fube-hosting/src/lookup.rs#L5-L199), [collaborators.rs:5–94](../../crates/libs/fube-hosting/src/collaborators.rs#L5-L94) | FabricRuntimeManager.cpp:117–249,296–458; ApplicationManager.cpp:1079–1093 |
+| Tentative runtime Add/host check/Validate, duplicate errors and original/cleanup receipt | [runtime.rs:4–163](../../crates/libs/fube-hosting/src/runtime.rs#L4-L163) | RuntimeRegistrationTable.cpp:53–266; FabricRuntimeManager.cpp:501–679 |
+| Managed declaration/component/failure entries; six selected statuses, unfenced Finish and grace callback checks | [types.rs:5–624](../../crates/libs/fube-hosting/src/types.rs#L5-L624) | ServiceTypeStateManager.cpp:128–299,425–838,1142–1557 |
+| Candidate/error/optional sequence; native rendered public-map keys; activation and deactivation-if-unused controlled outcomes | [lookup.rs:5–211](../../crates/libs/fube-hosting/src/lookup.rs#L5-L211), [collaborators.rs:5–94](../../crates/libs/fube-hosting/src/collaborators.rs#L5-L94) | FabricRuntimeManager.cpp:117–249,296–458; ApplicationManager.cpp:1079–1093; HostingSubsystem.cpp:165–180 |
 | Owned Registered/RuntimeClosed/HostClosed and separate Enabled/Disabled enqueue lanes; timeout-tracking/source-release obligations | [events.rs:9–294](../../crates/libs/fube-hosting/src/events.rs#L9-L294) | ServiceTypeStateManager.cpp:923–1117,1581–1636; EventDispatcher.cpp:39–197 |
 | Logical count/byte admission, complete output reservation, explicit remaining-work closure | [core.rs:78–220](../../crates/libs/fube-hosting/src/core.rs#L78-L220), [model.rs:94–159](../../crates/libs/fube-hosting/src/model.rs#L94-L159) | Rust ownership adaptation, not native limits or physical shutdown |
 
@@ -523,6 +523,15 @@ candidate. `LookupModel` requires every applicable outcome; missing premises
 are explicit local failures. Pending activation End consumes its owned result,
 including after core closure, without rewriting a prior lookup or reviving a
 factory. No real package usage/deactivation or successful deployment is implied.
+
+The public-activation map is a native **case-insensitive flat string map** over
+`<ServicePackageIdentifier.ToString()>_<activation GUID text>`, unlike the
+structured package/type tables. Rendering keeps embedded NUL and delimiters;
+comparison can therefore alias different GUIDs after an earlier NUL or
+different structured package identities with the same rendered string.
+TryGet/GetOrAdd preserve the first mapping's public spelling on those aliases;
+no second assignment/private identity is fabricated. Retained rendered keys
+are byte-accounted ([identity.rs:105–149](../../crates/libs/fube-hosting/src/identity.rs#L105-L149)).
 
 The core exposes **enqueue observations**, not native FifoLifo worker execution.
 Each lane can be drained independently; no global cross-event delivery order
@@ -559,24 +568,33 @@ error/success parity:
   held-entry erase and event sequence behavior is preserved.
 - Empty tentative runtime/host owners and conflicting public activation
   provenance are source invariant boundaries, not new character restrictions.
+- Empty application type name with nonzero application number, or a nonempty
+  application with empty package name, violates native constructor assertions
+  (ApplicationIdentifier.cpp:27–34; ServicePackageIdentifier.cpp:42–49).
+  Core admission/consumption rejects these structures before publication while
+  raw comparator probes remain usable. Valid non-ASCII/NUL data is not rejected.
+- Empty component removal is an invariant failure before membership testing.
+  Empty managed failure is an invariant failure after closed/blocklisting
+  checks but before the unknown-failure ignored row
+  (ServiceTypeStateManager.cpp:251–259,1142–1167).
 
 Managed prevalidated declarations are the enabled model producer. Adhoc failure
 creation/recovery and real health/activation producers are not implemented.
 Exclusive GUID records test **identity isolation only**, not exclusive execution.
 Native Linux comparison preserves UTF-16/NUL/signed-short behavior and raw
-non-ASCII text ([identity.rs:1–135](../../crates/libs/fube-hosting/src/identity.rs#L1-L135));
+non-ASCII text ([identity.rs:1–176](../../crates/libs/fube-hosting/src/identity.rs#L1-L176));
 GUID validation accepts native canonical hyphen/hex shape without normalizing
 accepted spelling.
 
 **Executed evidence:** `cargo test --locked -p fube-hosting` currently runs
-64 unit/integration cases plus a model-only Rustdoc example. Test headers
+72 unit/integration cases plus a model-only Rustdoc example. Test headers
 separate narrowly adapted native sort/query/registration/version/disable
 observations from processor-derived exact matrices and Rust admission/ownership
 tests. The source scenario inventory is:
 
 - [host/runtime](../../crates/libs/fube-hosting/tests/host_runtime.rs): reply/state/membership/validity/proxy distinctions, held Start/Finish, timeout interleavings and tentative cleanup.
-- [type state](../../crates/libs/fube-hosting/tests/type_state.rs): declaration prefix failures, Start/Finish matrices, sources, disabled recovery, missing/late work and invariant boundaries.
-- [events/bounds](../../crates/libs/fube-hosting/tests/events_bounds.rs): runtime versus host closure, shared sequence/first scope, independent lanes and complete rollback under queue/byte pressure.
+- [type state](../../crates/libs/fube-hosting/tests/type_state.rs): declaration prefix failures, scoped stored query observations, independent registration during grace, Start/Finish matrices, sources, disabled recovery, missing/late work and invariant boundaries.
+- [events/bounds](../../crates/libs/fube-hosting/tests/events_bounds.rs): runtime versus host closure (including disabled-in-progress failure retention), shared sequence/first scope, independent lanes and complete rollback under queue/byte pressure.
 - [lookup](../../crates/libs/fube-hosting/tests/lookup.rs): full candidate/error/sequence and package-outcome matrices, casing/provenance, scoped identities, pending End and shutdown admission.
 - [RA bridge](../../crates/libs/fube-hosting/tests/ra_bridge.rs): actual H1 completion candidates through issued RA lookup IDs, diagnostic NotFound (unacquired), mismatch policy, exact simulated disposal/replay/recreation, retained simulated usage and actual first-spelling notification payloads.
 - [identity differential](../../crates/libs/fube-hosting/tests/identity.rs): all 65,536 production comparison operands and representative structured pairs agree with RA's already-evidenced helper. This is Rust-to-Rust regression linkage, **not new independent native H1 execution**.

@@ -102,6 +102,47 @@ pub fn compare_type_instances(a: &TypeInstance, b: &TypeInstance) -> Ordering {
         .then_with(|| compare_names(&a.service_type.name, &b.service_type.name))
 }
 
+/// Raw comparison data is unrestricted; admitted/consumed identities must obey
+/// ApplicationIdentifier.cpp:27-34 and ServicePackageIdentifier.cpp:42-49.
+/// These local failures model native constructor assertions, not wire errors.
+pub(crate) fn validate_package(package: &PackageId) -> crate::Result<()> {
+    let app = &package.application;
+    if app.type_name.is_empty() && app.number != 0 {
+        return Err(crate::Error::NativeInvariant(
+            "empty application name with nonzero number",
+        ));
+    }
+    if *app != ApplicationId::default() && package.name.is_empty() {
+        return Err(crate::Error::NativeInvariant(
+            "nonempty application with empty package name",
+        ));
+    }
+    Ok(())
+}
+
+/// HostingSubsystem.cpp:165-180 uses a CI STRING map, not a structured key:
+/// `<ServicePackageIdentifier.ToString()>_<activation GUID text>`.
+/// Preserve raw string length (including NUL and delimiters) before comparison.
+pub fn public_activation_map_key(
+    package: &PackageId,
+    activation: Activation,
+) -> crate::Result<String> {
+    validate_package(package)?;
+    let rendered = if package.application == ApplicationId::default() {
+        package.name.clone()
+    } else {
+        format!(
+            "{}_App{}:{}",
+            package.application.type_name, package.application.number, package.name
+        )
+    };
+    Ok(format!(
+        "{}_{}",
+        rendered,
+        uuid::Uuid::from_bytes(activation.0)
+    ))
+}
+
 /// Public activation is associated provenance, never an extra map dimension.
 pub(crate) fn validate_public(activation: Activation, public: &str) -> crate::Result<()> {
     // Common/Guid.cpp:161-175, stricter than UUID's simple/braced/URN parser.

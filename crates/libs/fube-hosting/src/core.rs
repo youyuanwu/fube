@@ -48,7 +48,7 @@ pub(crate) struct State {
     pub closed_registered: Vec<ClosedRegisteredEvent>,
     pub enabled_disabled: Vec<EnabledDisabledEvent>,
     pub obligations: Vec<Obligation>,
-    pub public_activations: Vec<PackageInstance>,
+    pub public_activations: Vec<PublicActivationEntry>,
     pub pending_activations: Vec<PendingActivation>,
 }
 impl State {
@@ -89,7 +89,7 @@ impl State {
             + self
                 .public_activations
                 .iter()
-                .map(|p| 64 + p.package.bytes() + p.public_activation.len())
+                .map(|p| 64 + p.key.len() + p.public_activation.len())
                 .sum::<usize>()
             + self
                 .pending_activations

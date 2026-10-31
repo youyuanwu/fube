@@ -378,3 +378,41 @@ fn incomplete_tentative_owners_veto_closure_and_destructive_membership() {
         assert_eq!(h.get_type_state(&id).unwrap().sequence, before[0].sequence);
     }
 }
+
+#[test]
+fn valid_in_progress_disabled_runtime_or_host_closure_retains_failure_sources() {
+    for host in [false, true] {
+        let mut h = hosting();
+        completed_host(&mut h, "H");
+        let c = valid_runtime(&mut h, "R", "H");
+        let id = declared(&mut h, "Widget");
+        let timer = disable(&mut h, &id);
+        h.disable_timer_input(&timer).unwrap();
+        h.take_enabled_disabled_events();
+        h.start_type_registration(&id, &c).unwrap();
+        let before = h.type_entries()[0].clone();
+        if host {
+            h.unregister_host("H", "close").unwrap();
+        } else {
+            h.unregister_runtime("R").unwrap();
+        }
+        let e = &h.type_entries()[0];
+        assert_eq!(e.status, TypeStatus::NotRegisteredDisabled);
+        assert!(e.sequence > before.sequence);
+        assert_eq!(e.failure, before.failure);
+        assert_eq!(e.sources, before.sources);
+        assert!(e.runtime_id.is_empty() && e.host_id.is_empty());
+        assert!(h.timers().is_empty());
+        assert!(h.enabled_disabled_events().is_empty());
+        assert!(
+            matches!(h.closed_registered_events(), [ClosedRegisteredEvent::HostClosed { .. }] if host)
+                || matches!(h.closed_registered_events(), [ClosedRegisteredEvent::RuntimeClosed { .. }] if !host)
+        );
+        let mut request = request(&id, c.version);
+        request.should_activate = false;
+        assert_eq!(
+            h.lookup(&request, &LookupModel::default()).unwrap().result,
+            Err(Error::TypeDisabled)
+        );
+    }
+}

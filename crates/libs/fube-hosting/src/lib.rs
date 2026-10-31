@@ -27,6 +27,11 @@
 //! independently from its result. Drain each event lane and obligations under
 //! a separately bounded delivery owner; draining is not external completion.
 //! `close_core` reports retained work, not successful process cleanup.
+//! Raw records/comparison probes are not validated registrations. Core
+//! admission enforces native application/package constructor preconditions;
+//! source assertions become explicit local invariant failures. The public
+//! activation map compares native rendered string keys, including their aliases,
+//! rather than substituting a structured package key.
 #![forbid(unsafe_code)]
 #[cfg(not(target_os = "linux"))]
 compile_error!("fube-hosting models the pinned Linux Hosting profile only");

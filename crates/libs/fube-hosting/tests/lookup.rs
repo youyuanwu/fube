@@ -526,3 +526,117 @@ fn closed_core_rejects_new_get_or_add_before_missing_model_or_assignment() {
         assert!(h.type_entries().is_empty());
     }
 }
+
+#[test]
+fn public_map_nul_before_guid_alias_preserves_first_identity_and_written_sequence() {
+    let mut h = Hosting::new(Limits {
+        packages: 1,
+        ..Limits::default()
+    })
+    .unwrap();
+    let mut first = type_id("Widget").package_instance();
+    first.package.name = "Pkg\0suffix".into();
+    first.activation = Activation::from_uuid(uuid::Uuid::from_u128(1));
+    first.public_activation = uuid::Uuid::from_u128(10).to_string();
+    h.bind_public_activation(first.clone()).unwrap();
+    let mut second = first.clone();
+    second.activation = Activation::from_uuid(uuid::Uuid::from_u128(2));
+    assert_eq!(
+        compare_names(
+            &public_activation_map_key(&first.package, first.activation).unwrap(),
+            &public_activation_map_key(&second.package, second.activation).unwrap(),
+        ),
+        std::cmp::Ordering::Equal
+    );
+    let id = TypeInstance {
+        service_type: ServiceTypeId {
+            package: second.package.clone(),
+            name: "Widget".into(),
+        },
+        activation: second.activation,
+        public_activation: first.public_activation.clone(),
+    };
+    let mut r = request(&id, VersionInstance::default());
+    r.should_activate = false;
+    let absent_type = h.lookup(&r, &LookupModel::default()).unwrap();
+    assert_eq!(absent_type.result, Err(Error::TypeNotRegistered));
+    assert!(absent_type.sequence.is_some()); // alias FOUND mapping before GetState
+    r.should_activate = true;
+    let pending = h
+        .lookup(
+            &r,
+            &LookupModel {
+                activation: Some(ActivationOutcome::Pending),
+                ..LookupModel::default()
+            },
+        )
+        .unwrap(); // no second assignment or map-count admission
+    assert_eq!(pending.result, Err(Error::DeploymentInProgress));
+    assert!(
+        matches!(h.obligations(), [Obligation::Activation { request, .. }]
+        if request.type_instance.public_activation == first.public_activation)
+    );
+    h.bind_public_activation(second.clone()).unwrap(); // same alias/value, no second entry
+    second.public_activation = uuid::Uuid::from_u128(11).to_string();
+    assert_eq!(
+        h.bind_public_activation(second),
+        Err(Error::NativeInvariant(
+            "public activation identity disagreement"
+        ))
+    );
+}
+
+#[test]
+fn public_map_rendered_package_alias_is_not_structured_package_equivalence() {
+    let mut h = Hosting::new(Limits {
+        packages: 1,
+        ..Limits::default()
+    })
+    .unwrap();
+    let first = PackageInstance {
+        package: PackageId {
+            application: ApplicationId {
+                type_name: "A".into(),
+                number: 1,
+            },
+            name: "P_App2:Q".into(),
+        },
+        activation: Activation::from_uuid(uuid::Uuid::from_u128(1)),
+        public_activation: uuid::Uuid::from_u128(8).to_string(),
+    };
+    let second = PackageInstance {
+        package: PackageId {
+            application: ApplicationId {
+                type_name: "A_App1:P".into(),
+                number: 2,
+            },
+            name: "Q".into(),
+        },
+        ..first.clone()
+    };
+    assert_ne!(
+        compare_packages(&first.package, &second.package),
+        std::cmp::Ordering::Equal
+    );
+    assert_eq!(
+        public_activation_map_key(&first.package, first.activation).unwrap(),
+        public_activation_map_key(&second.package, second.activation).unwrap()
+    );
+    h.bind_public_activation(first.clone()).unwrap();
+    h.bind_public_activation(second.clone()).unwrap(); // count=1, native alias
+    let id = TypeInstance {
+        service_type: ServiceTypeId {
+            package: second.package,
+            name: "Widget".into(),
+        },
+        activation: second.activation,
+        public_activation: first.public_activation,
+    };
+    let mut r = request(&id, VersionInstance::default());
+    r.should_activate = false;
+    assert!(h
+        .lookup(&r, &LookupModel::default())
+        .unwrap()
+        .sequence
+        .is_some());
+}

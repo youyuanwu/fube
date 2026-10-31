@@ -80,6 +80,7 @@ fn complete_start_matrix_and_owner_specific_duplicates() {
         assert!(h.closed_registered_events().is_empty());
         assert!(h.enabled_disabled_events().is_empty());
     }
+
     let (mut h, id, mut c) = at(TypeStatus::RegisteredEnabled);
     c.runtime_id = "r".into();
     assert_eq!(
@@ -90,6 +91,161 @@ fn complete_start_matrix_and_owner_specific_duplicates() {
     assert_eq!(
         h.start_type_registration(&id, &c),
         Err(Error::TypeAlreadyRegistered)
+    );
+}
+
+#[test]
+fn source_removal_and_disable_empty_inputs_obey_native_operation_order() {
+    let mut h = hosting();
+    let id = declared(&mut h, "Widget");
+    let before = h.type_entries().to_vec();
+    assert_eq!(
+        h.remove_type_source(&id, ""),
+        Err(Error::NativeInvariant("empty component removal"))
+    );
+    assert_eq!(
+        h.disable_type(&id, "", &ManualClock(0), 1, true),
+        Err(Error::NativeInvariant("empty managed failure"))
+    );
+    assert_eq!(h.type_entries(), before);
+    assert!(h.timers().is_empty());
+    assert!(h.obligations().is_empty());
+    assert_eq!(h.remove_type_source(&id, "missing-nonempty-source"), Ok(()));
+    assert_eq!(
+        h.disable_type(&id, "missing-nonempty-failure", &ManualClock(0), 1, true),
+        Ok(None)
+    );
+    assert_eq!(h.disable_type(&id, "", &ManualClock(0), 1, false), Ok(None));
+    assert_eq!(h.type_entries(), before);
+    h.close_type_manager().unwrap();
+    assert_eq!(h.disable_type(&id, "", &ManualClock(0), 1, true), Ok(None));
+}
+
+#[test]
+fn scoped_declared_selection_counts_order_and_public_identity_adapt_native_query_observations() {
+    let mut h = hosting();
+    let make = |number, package_name: &str, activation, name: &str| {
+        let mut id = type_id(name);
+        id.service_type.package = package(package_name, number);
+        id.activation = Activation::from_uuid(uuid::Uuid::from_u128(activation));
+        if activation != 0 {
+            id.public_activation = uuid::Uuid::from_u128(activation + 10).to_string();
+        }
+        id
+    };
+    for number in [2, 1] {
+        for package_name in ["B", "A"] {
+            for activation in [1, 0] {
+                for name in ["Beta", "Alpha"] {
+                    h.declare_type(
+                        make(number, package_name, activation, name),
+                        "component".into(),
+                        Ok(()),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
+    // NT2's scoped observations via the existing inspection surface, not a new
+    // deployed query API. Expected order/count is independently enumerated.
+    let selected: Vec<_> = h
+        .type_entries()
+        .iter()
+        .filter(|e| {
+            e.id.service_type.package.application.number == 1
+                && e.id.service_type.package.name == "A"
+        })
+        .map(|e| e.id.clone())
+        .collect();
+    assert_eq!(
+        selected,
+        vec![
+            make(1, "A", 0, "Alpha"),
+            make(1, "A", 0, "Beta"),
+            make(1, "A", 1, "Alpha"),
+            make(1, "A", 1, "Beta")
+        ]
+    );
+    let selected: Vec<_> = h
+        .type_entries()
+        .iter()
+        .filter(|e| {
+            e.id.service_type.package.application.number == 2
+                && e.id.service_type.package.name == "B"
+                && e.id.service_type.name == "Beta"
+        })
+        .map(|e| e.id.clone())
+        .collect();
+    assert_eq!(
+        selected,
+        vec![make(2, "B", 0, "Beta"), make(2, "B", 1, "Beta")]
+    );
+    for id in selected {
+        assert_eq!(
+            h.get_type_state(&id).unwrap().status,
+            TypeStatus::NotRegisteredEnabled
+        );
+    }
+}
+
+#[test]
+fn independent_type_registers_during_grace_then_first_disables_without_sleeps() {
+    // Adapted NT5 (NonActivatedApplicationHost.Test.cpp:640-755), with explicit
+    // managed failure premise. Precise callback/sequence assertions are derived.
+    let mut h = hosting();
+    completed_host(&mut h, "H");
+    let c = valid_runtime(&mut h, "R", "H");
+    let first = declared(&mut h, "ST1");
+    let second = declared(&mut h, "ST2");
+    let timer = disable(&mut h, &first);
+    let first_sequence = h.get_type_state(&first).unwrap().sequence;
+    let mut first_request = request(&first, c.version.clone());
+    first_request.should_activate = false;
+    assert_eq!(
+        h.lookup(&first_request, &LookupModel::default())
+            .unwrap()
+            .result,
+        Err(Error::TypeNotRegistered)
+    );
+    h.register_type(&second, &c).result.unwrap();
+    let second_sequence = h.get_type_state(&second).unwrap().sequence;
+    assert_eq!(
+        h.lookup(
+            &request(&second, c.version.clone()),
+            &LookupModel::default()
+        )
+        .unwrap()
+        .result,
+        Ok(())
+    );
+    assert_eq!(h.get_type_state(&first).unwrap().sequence, first_sequence);
+    assert_eq!(
+        h.get_type_state(&first).unwrap().status,
+        TypeStatus::NotRegisteredDisableScheduled
+    );
+    assert!(h.timers().iter().any(|t| t.id == timer.id));
+    assert!(h.disable_timer_input(&timer).unwrap());
+    assert_eq!(
+        h.lookup(&first_request, &LookupModel::default())
+            .unwrap()
+            .result,
+        Err(Error::TypeDisabled)
+    );
+    assert_eq!(
+        h.lookup(&request(&second, c.version), &LookupModel::default())
+            .unwrap()
+            .result,
+        Ok(())
+    );
+    assert_eq!(h.get_type_state(&second).unwrap().sequence, second_sequence);
+    assert!(
+        matches!(h.enabled_disabled_events(), [EnabledDisabledEvent::Disabled { type_instance, .. }]
+            if type_instance == &first)
+    );
+    assert!(
+        matches!(h.closed_registered_events(), [ClosedRegisteredEvent::Registered { registration, .. }]
+            if registration.type_instance == second)
     );
 }
 #[test]
