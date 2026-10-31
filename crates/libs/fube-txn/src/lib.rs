@@ -26,6 +26,7 @@
 //! Native concrete transaction classes are exposed as traits until their
 //! kernels exist. Runtime control remains in fube-runtime/fube-data, not here.
 
+mod internal;
 mod provider;
 mod replicator;
 mod transaction;
