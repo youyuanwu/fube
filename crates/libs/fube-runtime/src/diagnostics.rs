@@ -1,5 +1,19 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub(crate) const EVENT_CAPACITY: usize = 64;
+
+/// Best-effort fube diagnostics, not SF callbacks or native authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RuntimeEvent {
+    /// The reply was written, not necessarily received by the native caller.
+    QueryReplySent {
+        request_id: fube_transport::message::MessageId,
+    },
+    /// Dispatch tasks have drained; service disposal/unregistration may remain.
+    DispatchStopped,
+}
+
 /// Bounded observational counters, not registration or compatibility evidence.
 /// Native acceptance must corroborate these through independent node/RPC data.
 #[derive(Debug, Default)]

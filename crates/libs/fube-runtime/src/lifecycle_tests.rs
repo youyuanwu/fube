@@ -967,25 +967,32 @@ async fn no_reply_rejects_a_partial_frame() {
 }
 
 #[tokio::test]
-async fn stopping_dispatch_before_retirement_preserves_ipc_during_query_cleanup() {
+async fn dispatch_events_and_late_native_commands_preserve_shutdown_ipc() {
     let mut h = Harness::new().await;
+    let mut events = h.engine.subscribe_events();
     let request = h.request(1, 1, 0);
     h.send("ReplicaOpen", &request).await;
     h.receive("ReplicaOpenReply").await;
-    let (entered, reached) = tokio::sync::oneshot::channel();
-    let (release, released) = tokio::sync::oneshot::channel();
-    *h.engine.shared.query_tail.lock().unwrap() = Some((entered, released));
-    h.send("RAPQuery", &request).await;
+    let id = h.send("RAPQuery", &request).await;
     h.receive("RAPQueryReply").await;
-    tokio::time::timeout(Duration::from_secs(5), reached)
-        .await
-        .unwrap()
-        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        crate::RuntimeEvent::QueryReplySent { request_id: id }
+    );
     assert!(!h.engine.shared.execution.has_running_callbacks());
     h.engine.begin_quiesce();
     h.engine.shared.authority.retire();
-    release.send(()).unwrap();
     h.engine.quiesce().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        crate::RuntimeEvent::DispatchStopped
+    );
     h.send("RAPQuery", &request).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         while h.engine.retired_incoming.as_ref().unwrap().is_empty() {
@@ -995,6 +1002,31 @@ async fn stopping_dispatch_before_retirement_preserves_ipc_during_query_cleanup(
     .await
     .unwrap();
     assert!(!h.engine.shared.connection.is_closed());
+}
+
+#[tokio::test]
+async fn slow_event_subscribers_do_not_backpressure_native_queries() {
+    let mut h = Harness::new().await;
+    let mut slow = h.engine.subscribe_events();
+    let mut current = h.engine.subscribe_events();
+    let request = h.request(1, 1, 0);
+    for _ in 0..=crate::diagnostics::EVENT_CAPACITY {
+        let id = h.send("RAPQuery", &request).await;
+        h.receive("RAPQueryReply").await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), current.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            crate::RuntimeEvent::QueryReplySent { request_id: id }
+        );
+    }
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), slow.recv())
+            .await
+            .unwrap(),
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(1))
+    ));
 }
 
 #[tokio::test]

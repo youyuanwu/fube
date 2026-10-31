@@ -67,14 +67,21 @@ const NEXT_EPOCH: Epoch = Epoch {
     configuration_number: 0x2_0000_0000,
 };
 
-fn replay_deadline(observed: &std_mpsc::Receiver<ReplayEvent>) -> Instant {
-    loop {
-        match observed
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("replay publication completed")
-        {
-            ReplayEvent::Publishing => {}
-            ReplayEvent::Rearmed(deadline) => return deadline,
+async fn replay_deadline(
+    observed: &mut broadcast::Receiver<crate::extensions::ReplicationEvent>,
+) -> (std::time::Instant, std::time::Instant) {
+    let event = timeout(std::time::Duration::from_secs(5), observed.recv())
+        .await
+        .expect("replay publication completed")
+        .unwrap();
+    match event {
+        crate::extensions::ReplicationEvent::ReplayRetryScheduled {
+            sequence_number,
+            published_at,
+            retry_at,
+        } => {
+            assert_eq!(sequence_number, 1);
+            (published_at, retry_at)
         }
     }
 }
@@ -1592,11 +1599,9 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
                 ..Settings::default()
             },
         );
-        let (events, observed) = std_mpsc::channel();
-        *p.shared.replay_probe.lock().unwrap() = Some(ReplayProbe {
-            events,
-            release: None,
-        });
+        let replicator = crate::FabricReplicator { engine: p.clone() };
+        let mut observed = replicator.subscribe_events();
+        let mut independent = replicator.clone().subscribe_events();
         initial_primary(&p).await;
         let (network, mut incoming) =
             PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
@@ -1622,7 +1627,12 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
                 Body::Replication { .. }
             ));
         }
-        let deadline = replay_deadline(&observed);
+        let (published_at, deadline) = replay_deadline(&mut observed).await;
+        assert_eq!(
+            replay_deadline(&mut independent).await,
+            (published_at, deadline)
+        );
+        assert!(deadline >= published_at + p.settings.retry);
         assert_eq!(p.snapshot().progress.assigned, 1);
         assert!(timeout(
             std::time::Duration::from_millis(30),
@@ -1634,7 +1644,7 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
         gate.add_permits(1);
         until(|| provider.checkpoint_calls.load(Ordering::Acquire) >= 2).await;
         assert!(
-            provider.checkpoint_times.lock().unwrap()[1] >= deadline,
+            provider.checkpoint_times.lock().unwrap()[1].into_std() >= deadline,
             "replay retried before its published cooldown deadline"
         );
         until(|| p.snapshot().owned_operations == 0).await;
@@ -1670,7 +1680,7 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replay_cooldown_starts_after_slow_publication_releases_producer_admission() {
+async fn replay_cooldown_is_observable_after_provider_completion_and_publication() {
     let data = Mutation {
         id: "original".into(),
         key: "key".into(),
@@ -1696,12 +1706,7 @@ async fn replay_cooldown_starts_after_slow_publication_releases_producer_admissi
             ..Settings::default()
         },
     );
-    let (events, observed) = std_mpsc::channel();
-    let (release, released) = std_mpsc::channel();
-    *p.shared.replay_probe.lock().unwrap() = Some(ReplayProbe {
-        events,
-        release: Some(released),
-    });
+    let mut observed = crate::FabricReplicator { engine: p.clone() }.subscribe_events();
     initial_primary(&p).await;
     let (network, mut incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
     let remote = endpoint(&network, partition, 2);
@@ -1712,27 +1717,21 @@ async fn replay_cooldown_starts_after_slow_publication_releases_producer_admissi
         .await
         .unwrap();
     until(|| provider.checkpoint_calls.load(Ordering::Acquire) == 1).await;
-    gate.add_permits(1);
     assert!(matches!(
-        observed
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap(),
-        ReplayEvent::Publishing
+        observed.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
     ));
+    let releasing = std::time::Instant::now();
+    gate.add_permits(1);
     let replay = timeout(std::time::Duration::from_secs(1), incoming.data.recv())
         .await
         .unwrap()
         .unwrap();
     assert!(matches!(replay.body, Body::Replication { .. }));
+    let (published_at, deadline) = replay_deadline(&mut observed).await;
+    assert!(published_at >= releasing);
     assert!(
-        p.shared.admission.try_lock().is_err(),
-        "publication retains producer admission until it completes"
-    );
-    let releasing = Instant::now();
-    drop(release);
-    let deadline = replay_deadline(&observed);
-    assert!(
-        deadline >= releasing + p.settings.retry,
+        deadline >= published_at + p.settings.retry,
         "publication time must not consume the producer's retry window"
     );
     abort_owned(&p).await;

@@ -139,7 +139,7 @@ pub use api::{
     ServicePartitionInformation, SingletonPartitionInformation,
 };
 pub use context::ActivationContext;
-pub use diagnostics::{RuntimeCounters, RuntimeMetrics};
+pub use diagnostics::{RuntimeCounters, RuntimeEvent, RuntimeMetrics};
 use lease::Authority;
 pub use lifecycle::{MAX_CALLBACKS, MAX_SERVICE_UNITS, MAX_TOMBSTONES};
 pub use package_context::{
@@ -560,6 +560,22 @@ impl Runtime {
     }
     pub fn metrics(&self) -> Arc<RuntimeMetrics> {
         self.lifecycle.metrics()
+    }
+
+    /// Subscribe to best-effort fube diagnostics, not canonical SF callbacks.
+    /// Subscribe before triggering work: no event history is replayed. Slow receivers get
+    /// `RecvError::Lagged`; publishers never wait for subscriber progress. The
+    /// stream is observational, not an execution barrier or shutdown receipt.
+    ///
+    /// ```
+    /// # async fn read_one(runtime: &fube_runtime::Runtime)
+    /// # -> Result<fube_runtime::RuntimeEvent, tokio::sync::broadcast::error::RecvError> {
+    /// let mut events = runtime.subscribe_events();
+    /// events.recv().await // Propagates lag and closure to the caller.
+    /// # }
+    /// ```
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<RuntimeEvent> {
+        self.lifecycle.subscribe_events()
     }
 
     /// Keep factory ownership until runtime shutdown. There is no invented

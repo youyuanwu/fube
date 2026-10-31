@@ -11,6 +11,19 @@ pub use crate::api::Progress;
 pub use crate::engine::{EngineSnapshot, PeerSnapshot};
 pub use fube_runtime::extensions::EpochDomains;
 
+/// Best-effort fube diagnostics, not native control or compatibility evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReplicationEvent {
+    /// A cooldown was scheduled after snapshot publication and admission release.
+    /// Both instants belong to this process's monotonic clock.
+    ReplayRetryScheduled {
+        sequence_number: i64,
+        published_at: std::time::Instant,
+        retry_at: std::time::Instant,
+    },
+}
+
 /// Authentic operation at exactly the requested sequence. Never synthesize a
 /// snapshot mutation, stamp a new epoch, assign an LSN or alter segment layout.
 #[derive(Clone, Debug)]

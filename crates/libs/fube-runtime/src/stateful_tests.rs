@@ -796,8 +796,16 @@ async fn stateful_open_order_endpoints_access_duplicate_and_graceful_isolation()
     h.send("ReplicaOpen", &request).await;
     h.receive("ReplicaOpenReply").await;
     assert_eq!(calls.events.lock().unwrap().len(), 5);
-    h.send("RAPQuery", &request).await;
+    let mut events = h.engine.subscribe_events();
+    let id = h.send("RAPQuery", &request).await;
     let query: QueryReply = from_slice(&h.receive("RAPQueryReply").await.body).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        crate::RuntimeEvent::QueryReplySent { request_id: id }
+    );
     assert_eq!(
         (
             query.detail.kind,
