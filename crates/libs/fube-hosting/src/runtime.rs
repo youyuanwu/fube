@@ -33,6 +33,15 @@ impl State {
         let record = self.runtimes.remove(index);
         Ok(record.valid.then_some(record.context))
     }
+    pub(crate) fn remove_runtimes_for_host(&mut self, host: &str) -> Result<usize> {
+        if self.runtimes_closed {
+            return Err(Error::ObjectClosed);
+        }
+        let prior = self.runtimes.len();
+        self.runtimes
+            .retain(|r| !compare_names(&r.context.host_id, host).is_eq());
+        Ok(prior - self.runtimes.len())
+    }
 }
 impl Hosting {
     pub fn add_runtime(&mut self, context: RuntimeContext) -> Result<()> {
@@ -79,6 +88,13 @@ impl Hosting {
     }
     pub fn runtime_records(&self) -> &[RuntimeRecord] {
         &self.state.runtimes
+    }
+    pub fn close_runtime_table(&mut self) -> Result<()> {
+        self.change(|s| {
+            s.runtimes_closed = true;
+            s.runtimes.clear();
+            Ok(())
+        })
     }
     /// Preflight for the public unregister path. Native Remove returns
     /// `Success + null` on tentative rows, but its public callback dereferences null

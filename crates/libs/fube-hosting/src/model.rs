@@ -164,6 +164,10 @@ impl Clock for ManualClock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimerKind {
     HostFinish(String),
+    DisableType {
+        type_instance: TypeInstance,
+        sequence: u64,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Timer {
@@ -175,6 +179,7 @@ impl Timer {
     pub(crate) fn bytes(&self) -> usize {
         64 + match &self.kind {
             TimerKind::HostFinish(id) => id.len(),
+            TimerKind::DisableType { type_instance, .. } => type_instance.bytes(),
         }
     }
 }

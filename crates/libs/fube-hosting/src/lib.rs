@@ -10,13 +10,17 @@
 compile_error!("fube-hosting models the pinned Linux Hosting profile only");
 
 mod core;
+mod events;
 mod host;
 mod identity;
 mod model;
 mod runtime;
+mod types;
 
 pub use core::*;
+pub use events::*;
 pub use host::*;
 pub use identity::*;
 pub use model::*;
 pub use runtime::*;
+pub use types::*;

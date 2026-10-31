@@ -41,6 +41,13 @@ pub(crate) struct State {
     pub runtimes_closed: bool,
     pub timers: Vec<Timer>,
     pub operations: Vec<Operation>,
+    pub type_sequence: u64,
+    pub types: Vec<TypeEntry>,
+    pub types_closed: bool,
+    pub failures: Vec<String>,
+    pub closed_registered: Vec<ClosedRegisteredEvent>,
+    pub enabled_disabled: Vec<EnabledDisabledEvent>,
+    pub obligations: Vec<Obligation>,
 }
 impl State {
     pub(crate) fn id(&mut self) -> Result<u64> {
@@ -74,12 +81,38 @@ impl State {
                 .map(RuntimeRecord::bytes)
                 .sum::<usize>()
             + self.timers.iter().map(Timer::bytes).sum::<usize>()
-            + self.operations.len() * 64;
+            + self.operations.len() * 64
+            + self.types.iter().map(TypeEntry::bytes).sum::<usize>()
+            + self.failures.iter().map(|f| 32 + f.len()).sum::<usize>();
         if self.hosts.len() > limits.hosts
             || self.runtimes.len() > limits.runtimes
             || self.timers.len() > limits.timers
             || self.operations.len() > limits.operations
+            || self.types.len() > limits.types
+            || self.failures.len() > limits.failures
+            || self.types.iter().map(|e| e.sources.len()).sum::<usize>() > limits.sources
             || bytes > limits.state_bytes
+            || self.closed_registered.len() > limits.events_per_lane
+            || self.enabled_disabled.len() > limits.events_per_lane
+            || self
+                .closed_registered
+                .iter()
+                .map(ClosedRegisteredEvent::bytes)
+                .sum::<usize>()
+                > limits.event_bytes_per_lane
+            || self
+                .enabled_disabled
+                .iter()
+                .map(EnabledDisabledEvent::bytes)
+                .sum::<usize>()
+                > limits.event_bytes_per_lane
+            || self.obligations.len() > limits.obligations
+            || self
+                .obligations
+                .iter()
+                .map(Obligation::bytes)
+                .sum::<usize>()
+                > limits.obligation_bytes
         {
             return Err(Error::Capacity);
         }
@@ -102,6 +135,7 @@ impl Hosting {
             limits,
         })
     }
+
     pub(crate) fn change<T>(&mut self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         let mut next = self.state.clone();
         let result = f(&mut next)?;
@@ -119,6 +153,11 @@ impl Hosting {
     pub fn retained_host_records(&self) -> usize {
         self.state.hosts.len()
     }
+    /// No live usage/RA event consumer/IPC/lease/process capability is supplied
+    /// by H1. Node composition must implement the dependent slices first.
+    pub fn require_live_composition(&self) -> Result<()> {
+        Err(Error::UnsupportedCapability)
+    }
     /// Explicit shutdown of registration tables. This is not a host/process
     /// closure event, and does not assert external resources were cleaned.
     pub fn close_tables(&mut self) -> Result<()> {
@@ -132,5 +171,25 @@ impl Hosting {
             s.timers.clear();
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn operation_and_type_sequence_overflow_veto_without_publication() {
+        let mut h = Hosting::new(Limits::default()).unwrap();
+        h.state.next_id = u64::MAX;
+        let before = h.state.clone();
+        assert_eq!(h.add_host("H".into()), Err(Error::Capacity));
+        assert_eq!(h.state, before);
+        h.state.type_sequence = u64::MAX;
+        let before = h.state.clone();
+        assert_eq!(
+            h.get_type_state(&TypeInstance::default()),
+            Err(Error::Capacity)
+        );
+        assert_eq!(h.state, before);
     }
 }

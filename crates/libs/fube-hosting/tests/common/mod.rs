@@ -47,3 +47,20 @@ pub fn valid_runtime(h: &mut Hosting, runtime: &str, host: &str) -> RuntimeConte
     assert_eq!(h.register_runtime(c.clone()).result, Ok(()));
     c
 }
+pub fn declared(h: &mut Hosting, name: &str) -> TypeInstance {
+    let id = type_id(name);
+    h.declare_type(id.clone(), "package-component".into(), Ok(()))
+        .unwrap();
+    id
+}
+pub fn registered(h: &mut Hosting, name: &str, c: &RuntimeContext) -> TypeInstance {
+    let id = declared(h, name);
+    assert_eq!(h.register_type(&id, c).result, Ok(()));
+    id
+}
+pub fn disable(h: &mut Hosting, id: &TypeInstance) -> Timer {
+    h.register_failure("failure".into()).unwrap();
+    h.disable_type(id, "failure", &ManualClock(0), 30, true)
+        .unwrap()
+        .unwrap()
+}

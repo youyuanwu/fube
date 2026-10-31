@@ -253,7 +253,9 @@ impl Hosting {
     /// by the driver may run after cancellation: native host timeout has no
     /// invented global generation guard.
     pub fn begin_host_timeout(&mut self, timer: &Timer) -> Result<TimeoutHandle> {
-        let TimerKind::HostFinish(host) = &timer.kind;
+        let TimerKind::HostFinish(host) = &timer.kind else {
+            return Err(Error::InvalidInput);
+        };
         self.change(|s| {
             s.cancel_timer(timer.id);
             Ok(())

@@ -126,3 +126,10 @@ impl PackageId {
         self.application.type_name.len() + self.name.len()
     }
 }
+impl TypeInstance {
+    pub(crate) fn bytes(&self) -> usize {
+        self.service_type.package.bytes()
+            + self.service_type.name.len()
+            + self.public_activation.len()
+    }
+}
