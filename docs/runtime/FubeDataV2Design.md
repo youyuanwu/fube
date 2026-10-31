@@ -120,7 +120,9 @@ separate from these phase-reviewed local changes.
 
 ### 2.1 Additional audit findings and design resolutions
 
-The revised upper core is source-derived; its implementation remains A0/A1.
+The revised upper core is source-derived. Private A0 kernels now have offline
+implementation evidence in [FubeTxnA0.md](FubeTxnA0.md); A1 runtime integration
+remains unimplemented. This does not change native qualification claims.
 Detailed pre-R0/native evidence and current correction regressions are recorded
 in the V1 reference. The table retains the original audit resolutions; all four
 lower seams below are corrected by R0, without implementing upper kernels.
@@ -199,6 +201,13 @@ native SF node: membership / role / epoch / reconfiguration / access authority
 
 ### 3.2.1 Public trait boundary before A0
 
+**Current A0 update (2026-10-31):** the API-only baseline below is historical.
+Public signatures remain contract projections, while private kernels now
+execute the supported offline record/transaction/map/version/Apply/Unlock and
+checkpoint/copy paths. [A0 as-built scope and evidence](FubeTxnA0.md) identifies
+the narrow lower/registry/physical-effect seams, point fixture and unsupported
+boundaries. This is neither a public runtime facade nor A1/native qualification.
+
 [`fube-txn`](../../crates/libs/fube-txn/src/lib.rs) now declares the source-backed
 public V2/provider contracts. It contains **traits and signature types only**:
 no replicator/transaction/log/state-manager/provider implementation or lower
@@ -229,8 +238,8 @@ The upper copy stream retains native explicit disposal, rather than silently
 aliasing the classic lower stream's narrower interface. Runtime control still
 uses the existing lower engine/binder; native COM construction/test hooks and
 internal logging/checkpoint-manager interfaces are outside this public boundary.
-Backup/recovery declarations do not enable those capabilities. A0 still must
-implement and verify the kernels; compile-only
+Backup/recovery declarations do not enable those capabilities. A0 kernel
+evidence is now recorded separately; compile-only
 [public contract witnesses](../../crates/libs/fube-txn/tests/sdk_contracts.rs)
 are not semantic or native-interoperability qualification.
 
@@ -1083,7 +1092,7 @@ from this design pass**. No tier can borrow a lower tier's qualification label.
 | Milestone | Work boundary | Required evidence before acceptance |
 |---|---|---|
 | R0: correct V1 foundation | Implemented lower DD-01–DD-07, explicit latest-LSN capability and callback-ready actual-tail construction seam | Offline phase-reviewed regressions pass, including quorum-one release/ALL, EOS-before-ACK role generations, typed retry/sizing, local-not-PC quorum, extended-copy duplicates, latest start/finish and nonempty bootstrap. No A0 kernels or new native qualification claimed |
-| A0: native kernels and test provider | Native records/codecs, transaction states/map, source Apply/Unlock and checkpoint/copy callbacks | Deterministic source-equivalent traces for read-only/single/multi-operation transactions, interleaving, retry/cancel/abort, ID/replay handling and provider visibility |
+| A0: native kernels and test provider | Implemented private supported records/codecs, transaction states/map/version, Apply/Unlock and checkpoint/copy callbacks with narrow offline seams | [Source-derived deterministic traces and limitations](FubeTxnA0.md) for read-only/single/multi, interleaving, retry/cancel/abort, IDs/replay, visibility and failure cleanup; not A1 or native qualification |
 | A1: volatile Rust integration | Current canonical APIs, lower-bound pass-through, lifecycle/log/provider drains, native memory-log/checkpoint/copy | Requires R0 and A0; native copy stages and incremental transaction flow work with one engine/binder and bounded owned execution; no release-gated serial/root/ledger substitute |
 | A2: volatile qualification | Pinned SF binary/environment, pressure and fault campaign | Repeated A scenarios with recorded environment, limits, traces and unsupported modes; only Tier A claim |
 | B: mixed-native qualification | Qualify the already source-derived records, transactions, provider routing and copy in both directions | All B scenarios and exact native provider/version/settings matrix; any unsupported feature is explicit, not implemented by an alternate algorithm |
