@@ -72,6 +72,8 @@ version only after preceding processing completes. Independent transaction
 groups run concurrently, preserving their own record order
 ([processor.rs:787–960](../../crates/libs/fube-txn/src/kernel/processor.rs#L787-L960),
 [native dispatcher][dispatch]).
+The A0 dispatcher profile uses explicit native barriers; the optional native
+commits-as-barriers setting is not enabled by this private profile.
 
 Operation Apply LSN differs from multi commit LSN. Primary Apply may precede
 quorum; completion awaits Apply then replication and invokes Unlock regardless
@@ -141,7 +143,7 @@ CARGO_BUILD_JOBS=1 RUSTDOCFLAGS='-D warnings' cargo doc --locked -p fube-txn --n
 CARGO_BUILD_JOBS=1 RUSTDOCFLAGS='-D warnings' cargo doc --locked -p fube-txn --no-deps --document-private-items
 ```
 
-The suite has 123 deterministic kernel tests at this documentation checkpoint.
+The suite has 125 deterministic kernel tests at the final local checkpoint.
 T01–T21 and S/V/W/K/C source projections are named in trace/callback and adjacent
 tests. They assert caller versus canonical log/map, provider versions, retained
 captures, faults, ACKs and intermediate partial orders. Compile-only SDK/internal
@@ -156,6 +158,11 @@ are unsupported. Negative IDs/redo-only codec recognition and the atomic state
 hook do not enable those APIs; rejected execution never substitutes record kinds.
 Ordinary stale/false-progress provider state is excluded; only DelayDelete takes
 the supported skip/closed paths.
+Active registration is distinct from retaining a deleted provider object.
+Already-deleted providers reject before first-cache/logged admission; a valid
+late DelayDelete Apply can still skip. Replay preflights native named routing
+before append even for covered-prefix records; codec ID advancement remains
+separate from this execution-support gate.
 
 A1 lower lifecycle/engine stream/ACK pump integration and native copy negotiation
 remain absent. Full collections, deployment qualification, mixed-native replicas,

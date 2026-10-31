@@ -227,6 +227,13 @@ impl ProviderDirectory {
             return Ok(());
         }
         let entry = self.entry(id)?;
+        // Native IsRegistered uses the active ID map, not retained deleted
+        // provider inventory (MetadataManager::SoftDelete removes the active ID).
+        match entry.mode {
+            ProviderMode::Active => {}
+            ProviderMode::DelayDelete => return Err(Status::InvalidParameter.error()),
+            ProviderMode::Stale => return Err(Status::NotImplemented.error()),
+        }
         if deleting && entry.deleting_by == Some(transaction) {
             return Err(Status::ObjectClosed.error());
         }

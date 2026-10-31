@@ -3107,3 +3107,140 @@ async fn failed_point_write_never_publishes_rejected_key_or_replaces_accepted_ow
         }
     }
 }
+
+// Native IsRegistered uses active metadata (StateManager.cpp:4566–4620;
+// MetadataManager.cpp:305–323,928–982), not retained deleted providers.
+#[tokio::test(flavor = "current_thread")]
+async fn final_deleted_registration_rejects_before_cache_or_logged_admission() {
+    for (mode, expected) in [
+        (ProviderMode::DelayDelete, Status::InvalidParameter),
+        (ProviderMode::Stale, Status::NotImplemented),
+    ] {
+        let (manager, point) = fixture();
+        let tx = manager.new_transaction().unwrap();
+        manager.directory.set_mode(7, mode, None);
+        code(
+            tx.add_operation(None, None, Some(PointProvider::payload(10, 100)), 7, None),
+            expected,
+        );
+        assert!(!tx.is_write() && !tx.has_cached_first());
+        assert!(manager.lower.attempts().is_empty());
+        assert!(log(&manager).is_empty() && manager.map.pending().is_empty());
+        assert!(point.events().is_empty() && manager.notifications().is_empty());
+        assert!(manager.faults.reported().is_empty());
+        tx.abort().unwrap();
+        tx.dispose().unwrap();
+
+        let (manager, point) = fixture();
+        let tx = manager.new_transaction().unwrap();
+        tx.add_operation(None, None, Some(PointProvider::payload(10, 100)), 7, None)
+            .unwrap();
+        manager.directory.set_mode(7, mode, None);
+        // Logged Begin repeats registration; rejected Begin keeps cached first.
+        code(
+            tx.add_operation(None, None, Some(PointProvider::payload(11, 110)), 7, None),
+            expected,
+        );
+        assert!(tx.has_cached_first() && log(&manager).is_empty());
+        assert!(manager.lower.attempts().is_empty() && manager.map.pending().is_empty());
+        // Single commit has the same source registration gate.
+        code(observe(tx.commit()).await, expected);
+        assert_eq!(tx.get_state(), TransactionState::Faulted);
+        assert!(point.events().is_empty() && manager.notifications().is_empty());
+        assert!(manager.faults.reported().is_empty());
+        tx.dispose().unwrap();
+
+        let (manager, point) = fixture();
+        let tx = manager.new_transaction().unwrap();
+        tx.add_operation(None, None, Some(PointProvider::payload(10, 100)), 7, None)
+            .unwrap();
+        tx.add_operation(None, None, Some(PointProvider::payload(11, 110)), 7, None)
+            .unwrap();
+        let prior = log(&manager);
+        let attempts = manager.lower.attempts().len();
+        manager.directory.set_mode(7, mode, None);
+        code(
+            tx.add_operation(None, None, Some(PointProvider::payload(12, 120)), 7, None),
+            expected,
+        );
+        assert_eq!(log(&manager), prior);
+        assert_eq!(manager.lower.attempts().len(), attempts);
+        assert_eq!(
+            manager.map.latest(tx.get_transaction_id()).unwrap().lsn(),
+            3
+        );
+        assert!(point.events().is_empty() && manager.notifications().is_empty());
+        assert!(manager.faults.reported().is_empty());
+        manager.directory.set_mode(7, ProviderMode::Active, None);
+        tx.abort().unwrap();
+        group_tick(&manager);
+        finish(&manager).await;
+        tx.dispose().unwrap();
+    }
+}
+
+// A0 deliberately excludes native-supported managed named formats. Codec
+// recognition may advance ID high water, but execution rejects before append,
+// even when covered-prefix processing would otherwise avoid provider Apply.
+#[tokio::test(flavor = "current_thread")]
+async fn final_replay_native_profile_gate_precedes_append_even_in_covered_prefix() {
+    for covered in [0, 10] {
+        let (manager, point) = fixture_with(
+            ProcessingRole::Secondary,
+            covered,
+            Arc::new(RetryRuntime::default()),
+        );
+        let mut header = 1i32.to_le_bytes().to_vec();
+        header.extend_from_slice(&7i64.to_le_bytes());
+        header.push(1);
+        let managed = OperationData::new(vec![header]).unwrap();
+        let unsupported = RecordKind::Begin {
+            transaction_id: 5001,
+            single: true,
+            metadata: Some(managed.clone()),
+            redo: Some(PointProvider::payload(10, 100)),
+            undo: None,
+        };
+        assert!(manager
+            .replay_record(replay_wire(unsupported, 2), None)
+            .is_err());
+        assert_eq!(manager.tail(), 1);
+        assert!(log(&manager).is_empty() && manager.map.pending().is_empty());
+        assert!(point.events().is_empty() && manager.notifications().is_empty());
+        assert!(manager.faults.reported().is_empty() && manager.faults.service_error().is_none());
+
+        manager
+            .replay_record(replay_wire(begin_kind(5002, false, 10, 100), 2), None)
+            .unwrap();
+        let original = manager.map.latest(5002).unwrap();
+        let unsupported = RecordKind::Operation {
+            transaction_id: 5002,
+            redo_only: false,
+            metadata: Some(managed),
+            redo: Some(PointProvider::payload(11, 110)),
+            undo: None,
+        };
+        assert!(manager
+            .replay_record(replay_wire(unsupported, 3), None)
+            .is_err());
+        assert_eq!(manager.tail(), 2);
+        assert_eq!(log(&manager).len(), 1);
+        assert!(Arc::ptr_eq(&original, &manager.map.latest(5002).unwrap()));
+        assert!(original.child().is_none());
+        assert!(point.events().is_empty() && manager.notifications().is_empty());
+        assert!(manager.faults.reported().is_empty() && manager.faults.service_error().is_none());
+
+        // Native metadata equivalent continues to admit and link.
+        let native = RecordKind::Operation {
+            transaction_id: 5002,
+            redo_only: false,
+            metadata: Some(named::encode(7, None).unwrap()),
+            redo: Some(PointProvider::payload(11, 110)),
+            undo: None,
+        };
+        manager.replay_record(replay_wire(native, 3), None).unwrap();
+        assert_eq!(manager.tail(), 3);
+        assert_eq!(manager.map.latest(5002).unwrap().lsn(), 3);
+        assert_eq!(original.child().unwrap().lsn(), 3);
+    }
+}

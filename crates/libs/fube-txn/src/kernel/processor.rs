@@ -728,6 +728,20 @@ impl KernelManager {
         {
             return Err(Status::NotImplemented.error());
         }
+        // Logical payloads stay opaque in the codec. Execution, including
+        // covered-prefix replay, must preflight A0's native-only routing format
+        // before append/map mutation. Decode-time ID advancement is separate.
+        if let RecordKind::Begin { metadata, .. } | RecordKind::Operation { metadata, .. } =
+            &record.kind
+        {
+            let metadata = metadata
+                .as_ref()
+                .ok_or(Error::InvalidInput("missing native named metadata"))?;
+            let (provider, _) = super::named::decode(metadata)?;
+            if provider == 0 {
+                return Err(Error::InvalidInput("empty native provider identity"));
+            }
+        }
         let transaction = record
             .transaction_id()
             .map(KernelTransaction::replay)
