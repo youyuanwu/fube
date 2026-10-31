@@ -189,6 +189,14 @@ usage/RAP; they do not execute native Hosting handlers or qualify IPC/deployed
 interoperability. The existing RA native-helper evidence is unchanged, not
 relabelled as new independent H1 evidence.
 
+The [Hosting port contracts](cluster/RustHosting.md#supplied-port-contracts)
+add six behavioral cases in the existing H1 lookup/event targets and a request-only
+lookup Rustdoc example. Only the explicit H1 model adapter and typed owned drains
+are implemented; package usage/lifecycle traits do not enable live H2. Run
+`cargo test --locked -p fube-hosting` for the original 72 plus six contract cases
+and two model doctests. Native implementation/test links document semantics,
+not newly executed native-handler or deployed conformance.
+
 The [RA P1 store](cluster/RaStore.md) uses bundled SQLite C through
 `tokio-rusqlite`; producers need a C compiler and archiver (no SF or system
 SQLite development package). Do not override the bundled build with

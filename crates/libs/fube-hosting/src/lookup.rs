@@ -3,6 +3,8 @@
 use crate::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Immutable lookup inputs; see [`RegistrationLookup`] for native provenance,
+/// comparison and supported activating/nonactivating paths.
 pub struct LookupRequest {
     pub service_type: ServiceTypeId,
     pub version: VersionInstance,
@@ -12,6 +14,10 @@ pub struct LookupRequest {
     pub should_activate: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Independent native semantic outputs, nested inside local admission.
+///
+/// A candidate on error is not necessarily acquired or admissible to RA.
+/// [`RegistrationLookup::lookup`] documents the source-derived output matrix.
 pub struct LookupResult {
     pub result: Result<()>,
     pub candidate: Option<Registration>,
