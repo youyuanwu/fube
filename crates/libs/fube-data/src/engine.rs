@@ -33,7 +33,7 @@
 //! Callback futures are aborted and actually
 //! joined before transport disposal. Uncooperative synchronous user code or
 //! destructors are enrolled in the runtime's independent fatal watchdog by
-//! [`Engine::bind_partition`]. Standalone [`Engine::bind`] callers must supply
+//! [`Engine::bind_partition`]. Standalone test-only `Engine::bind` callers must supply
 //! their own blocking fence; a Tokio timeout cannot fence a blocked executor.
 //! This is the volatile legacy-null-EOS, trusted clear-TCP profile, not durable
 //! storage, persisted copy context, an election system, or a native qualification.
@@ -243,6 +243,12 @@ fn maximum_copy_bytes(settings: &Settings) -> usize {
 }
 
 struct Shared {
+    #[cfg(test)]
+    write_deadline: Mutex<Option<std::time::Instant>>,
+    #[cfg(test)]
+    write_now: Mutex<Option<std::time::Instant>>,
+    #[cfg(test)]
+    write_prelock: Mutex<Option<std_mpsc::SyncSender<()>>>,
     #[cfg(test)]
     epoch_entries: std::sync::atomic::AtomicUsize,
     streams: Mutex<StreamViews>,
@@ -557,6 +563,12 @@ impl Engine {
         let copy = Arc::new(OperationStream::new(copy_rx));
         let (stop, stop_rx) = watch::channel(false);
         let shared = Arc::new(Shared {
+            #[cfg(test)]
+            write_deadline: Mutex::new(None),
+            #[cfg(test)]
+            write_now: Mutex::new(None),
+            #[cfg(test)]
+            write_prelock: Mutex::new(None),
             #[cfg(test)]
             epoch_entries: std::sync::atomic::AtomicUsize::new(0),
             streams: Mutex::new(StreamViews { replication, copy }),
@@ -884,6 +896,7 @@ impl Engine {
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, Replication> {
         Box::pin(async move {
+            ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
             self.check()?;
             if expected_epoch.is_some_and(|epoch| {
                 epoch.data_loss_number < 0
@@ -897,6 +910,11 @@ impl Engine {
                     fube_runtime::ErrorKind::Canceled,
                     "replication canceled before admission",
                 ));
+            }
+            self.check_write_deadline()?;
+            #[cfg(test)]
+            if let Some(entered) = self.shared.write_prelock.lock().unwrap().take() {
+                let _ = entered.send(());
             }
             if data.bytes() > self.settings.operation_bytes
                 || data.segments().len() > self.settings.operation_segments
@@ -912,6 +930,8 @@ impl Engine {
                 // Serialize reservation changes and shutdown with producers,
                 // but never hold admission while awaiting owner/user work.
                 let _admission = self.shared.admission.lock().unwrap();
+                ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
+                self.check_write_deadline()?;
                 self.check()?;
                 let snapshot = self.shared.snapshot.lock().unwrap();
                 let copying = !snapshot.copy_done
@@ -945,6 +965,7 @@ impl Engine {
                         )
                     })?;
                 drop(snapshot);
+                self.check_write_deadline()?;
                 self.writes
                     .try_send(Submit {
                         expected_epoch,
@@ -961,10 +982,37 @@ impl Engine {
                         mpsc::error::TrySendError::Closed(_) => Error::Closed,
                     })?;
             }
+
             // Once queued, learn whether admission happened before reporting
             // cancellation. The separately cancelable wait is intentionally later.
             result.await.map_err(|_| Error::Closed)?
         })
+    }
+
+    pub(crate) fn execution_identity(&self) -> u64 {
+        self.shared.engine_id
+    }
+
+    fn check_write_deadline(&self) -> Result<()> {
+        let now = std::time::Instant::now();
+        #[cfg(test)]
+        let now = self.shared.write_now.lock().unwrap().unwrap_or(now);
+        if self.shared.execution.is_current_entry()
+            && now >= self.shared.execution.blocking_deadline()?
+        {
+            return Err(Error::Timeout);
+        }
+        #[cfg(test)]
+        if self
+            .shared
+            .write_deadline
+            .lock()
+            .unwrap()
+            .is_some_and(|until| now >= until)
+        {
+            return Err(Error::Timeout);
+        }
+        Ok(())
     }
 
     fn check(&self) -> Result<()> {

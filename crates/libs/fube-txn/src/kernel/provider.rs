@@ -308,10 +308,25 @@ impl ITransactionStateManager for ProviderDirectory {
                 metadata,
                 context,
             )?;
-            self.manager()?
-                .admit_operation(transaction, metadata, undo, redo, context, Some(true))
+            Ok(self.manager()?.observe_async(
+                super::record::Record {
+                    lsn: -1,
+                    kind: super::record::RecordKind::Begin {
+                        transaction_id: transaction.get_transaction_id(),
+                        single: true,
+                        metadata: Some(metadata),
+                        undo,
+                        redo,
+                    },
+                },
+                Some(transaction),
+                context,
+            ))
         })();
-        KernelManager::observe_admission(admitted)
+        match admitted {
+            Ok(future) => future,
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
     }
     fn begin_transaction(
         &self,

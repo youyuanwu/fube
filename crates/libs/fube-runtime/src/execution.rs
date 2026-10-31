@@ -55,6 +55,18 @@ struct EntryContext {
 }
 thread_local! {
     static ENTRY: RefCell<Option<EntryContext>> = const { RefCell::new(None) };
+    // Reentry identity only. This grants no execution/native authority and must
+    // retain nested identities rather than allow an inner tag to hide its parent.
+    static ENGINE_CALLBACKS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+struct EngineCallback;
+impl Drop for EngineCallback {
+    fn drop(&mut self) {
+        ENGINE_CALLBACKS.with(|engines| {
+            engines.borrow_mut().pop().expect("engine callback scope");
+        });
+    }
 }
 struct Entry {
     previous: Option<EntryContext>,
@@ -480,6 +492,9 @@ impl ExecutionRuntime {
         })
     }
     pub fn reject_engine_reentry(engine: u64) -> Result<()> {
+        if ENGINE_CALLBACKS.with(|engines| engines.borrow().contains(&engine)) {
+            return Err(Error::InvalidInput("same-engine publication reentry"));
+        }
         ENTRY.with(|entry| {
             if entry.borrow().as_ref().is_some_and(|context| {
                 context.origin.engine == engine
@@ -493,6 +508,24 @@ impl ExecutionRuntime {
                 Ok(())
             }
         })
+    }
+    /// Tag a synchronous trusted log-publication prefix for reentry rejection.
+    /// No provider invocation or awaiting is permitted in this prefix. The tag is
+    /// not native control authority and does not create an execution entry.
+    pub fn engine_publication<T>(engine: u64, publish: impl FnOnce() -> Result<T>) -> Result<T> {
+        if engine == 0 {
+            return Err(Error::InvalidInput("invalid publication engine identity"));
+        }
+        Self::reject_engine_reentry(engine)?;
+        ENGINE_CALLBACKS.with(|engines| {
+            if engines.borrow().len() >= 32 {
+                return Err(Error::ResourceLimit("engine publication nesting"));
+            }
+            engines.borrow_mut().push(engine);
+            Ok(())
+        })?;
+        let _scope = EngineCallback;
+        publish()
     }
     pub fn cleanup_quiescent(&self) -> bool {
         self.inner.cleanup_owners.load(Ordering::Acquire) == 0

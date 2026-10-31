@@ -14,6 +14,7 @@ use super::{
     map::{RecordNode, TransactionMap},
     provider::ProviderDirectory,
     record::{Record, RecordKind},
+    runtime_lower::RuntimeLower,
     status::{self, Status},
     transaction::{own, KernelTransaction, RetryRuntime},
     version::{Completion, VersionManager},
@@ -228,7 +229,7 @@ pub(crate) struct Activity {
 }
 
 impl Activity {
-    fn new(node: Arc<RecordNode>, primary: bool) -> Arc<Self> {
+    pub(crate) fn new(node: Arc<RecordNode>, primary: bool) -> Arc<Self> {
         Arc::new(Self {
             node,
             flush: Completion::new(),
@@ -266,8 +267,16 @@ enum DispatchAction {
 type CommitCallback = Arc<dyn Fn(Arc<dyn TransactionBase>) + Send + Sync>;
 
 pub(crate) struct KernelManager {
+    #[cfg(test)]
+    pub(crate) flush_extracted: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     self_weak: Weak<Self>,
     pub(crate) lower: Arc<ControlledLower>,
+    runtime: Mutex<Option<Arc<RuntimeLower>>>,
     pub(crate) directory: Arc<ProviderDirectory>,
     pub(crate) map: TransactionMap,
     pub(crate) versions: VersionManager,
@@ -305,8 +314,11 @@ impl KernelManager {
         let ordering = Completion::new();
         ordering.complete(Ok(()));
         let manager = Arc::new_cyclic(|self_weak| Self {
+            #[cfg(test)]
+            flush_extracted: Mutex::new(None),
             self_weak: self_weak.clone(),
             lower,
+            runtime: Mutex::new(None),
             directory: directory.clone(),
             map: TransactionMap::new(covered_prefix),
             versions: VersionManager::new(Arc::new(move || {
@@ -346,6 +358,15 @@ impl KernelManager {
         self.self_weak
             .upgrade()
             .expect("manager activity has shared owner")
+    }
+    pub(crate) fn bind_runtime(&self, lower: Arc<RuntimeLower>) {
+        *self.runtime.lock().expect("runtime binding poisoned") = Some(lower);
+    }
+    fn runtime(&self) -> Option<Arc<RuntimeLower>> {
+        self.runtime
+            .lock()
+            .expect("runtime binding poisoned")
+            .clone()
     }
     pub(crate) fn gate(&self) -> Result<()> {
         if self.activity_open.load(Ordering::Acquire) {
@@ -456,12 +477,7 @@ impl KernelManager {
             .expect("admitted LSN exists")
     }
 
-    fn admit(
-        &self,
-        mut record: Record,
-        transaction: Option<Arc<dyn TransactionBase>>,
-        context: Option<Arc<dyn OperationContext>>,
-    ) -> Result<Arc<Activity>> {
+    fn preflight(&self, record: &Record) -> Result<()> {
         self.gate()?;
         if record.transaction_id().is_some_and(|id| id <= 0)
             || matches!(
@@ -490,7 +506,22 @@ impl KernelManager {
         if self.role != ProcessingRole::Primary {
             return Err(Status::NotPrimary.error());
         }
+        Ok(())
+    }
+
+    fn admit(
+        &self,
+        mut record: Record,
+        transaction: Option<Arc<dyn TransactionBase>>,
+        context: Option<Arc<dyn OperationContext>>,
+    ) -> Result<Arc<Activity>> {
+        self.preflight(&record)?;
         record.lsn = -1;
+        if let Some(runtime) = self.runtime() {
+            return runtime
+                .admit(self.shared(), record, transaction, context)
+                .inspect_err(|error| self.faults.replication_error(error));
+        }
         let wire = record.encode()?;
         let lsn = self
             .lower
@@ -504,7 +535,7 @@ impl KernelManager {
         Ok(activity)
     }
 
-    fn append(&self, activity: Arc<Activity>) -> Result<()> {
+    pub(crate) fn append(&self, activity: Arc<Activity>) -> Result<()> {
         let mut log = self.log.lock().expect("log poisoned");
         let epoch = matches!(activity.node.record().kind, RecordKind::UpdateEpoch { .. });
         let lsn = activity.node.lsn();
@@ -594,17 +625,14 @@ impl KernelManager {
         committed: bool,
     ) -> ApiFuture<'static, SequenceNumber> {
         let id = transaction.get_transaction_id();
-        Self::observe_admission(self.admit(
-            Record {
-                lsn: -1,
-                kind: RecordKind::End {
-                    transaction_id: id,
-                    committed,
-                },
+        let record = Record {
+            lsn: -1,
+            kind: RecordKind::End {
+                transaction_id: id,
+                committed,
             },
-            Some(transaction),
-            None,
-        ))
+        };
+        self.observe_async(record, Some(transaction), None)
     }
     pub(crate) fn observe_admission(
         admitted: Result<Arc<Activity>>,
@@ -625,6 +653,32 @@ impl KernelManager {
             None,
             None,
         )
+    }
+
+    pub(crate) fn observe_async(
+        &self,
+        mut record: Record,
+        transaction: Option<Arc<dyn TransactionBase>>,
+        context: Option<Arc<dyn OperationContext>>,
+    ) -> ApiFuture<'static, SequenceNumber> {
+        if let Some(runtime) = self.runtime() {
+            if let Err(error) = self.preflight(&record) {
+                return Box::pin(async move { Err(error) });
+            }
+            record.lsn = -1;
+            let manager = self.shared();
+            let work = runtime.admit_async(manager.clone(), record, transaction, context);
+            return own(Box::pin(async move {
+                match work.await {
+                    Ok(activity) => activity.result.wait().await.as_ref().clone(),
+                    Err(error) => {
+                        manager.faults.replication_error(&error);
+                        Err(error)
+                    }
+                }
+            }));
+        }
+        Self::observe_admission(self.admit(record, transaction, context))
     }
 
     /// Progress-vector monotonicity is a narrow input seam. Same-epoch success
@@ -755,7 +809,7 @@ impl KernelManager {
         Ok(activity)
     }
 
-    fn start_completion(&self, activity: Arc<Activity>) {
+    pub(crate) fn start_completion(&self, activity: Arc<Activity>) {
         if !activity.primary {
             return;
         }
@@ -799,27 +853,37 @@ impl KernelManager {
     /// A successful flush buffers records until an explicit native boundary.
     /// Flush neither admits group-commit barriers nor completes quorum.
     pub(crate) fn flush(&self, result: Result<()>) {
-        let batch = {
+        let launch = {
             let mut log = self.log.lock().expect("log poisoned");
             let batch = log.ordered[log.flushed..].to_vec();
             log.flushed = log.ordered.len();
-            batch
-        };
-        for activity in &batch {
-            activity.flush.complete(result.clone());
-            if let Err(error) = &result {
-                self.faults.process_log_error(self.role, error.clone());
+            #[cfg(test)]
+            if let Some((entered, release)) = self.flush_extracted.lock().unwrap().take() {
+                let _ = entered.send(());
+                release
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("flush probe released");
             }
-        }
-        let mut dispatch = self.dispatch.lock().expect("dispatch poisoned");
-        dispatch
-            .flushed
-            .extend(batch.into_iter().map(|activity| (activity, result.clone())));
-        if dispatch.running {
+            // Native flushed-batch order is one publication boundary. Do not
+            // release log before enqueue: a later Barrier could otherwise
+            // overtake this extracted prefix. No Apply/provider runs here.
+            let mut dispatch = self.dispatch.lock().expect("dispatch poisoned");
+            for activity in &batch {
+                activity.flush.complete(result.clone());
+                if let Err(error) = &result {
+                    self.faults.process_log_error(self.role, error.clone());
+                }
+            }
+            dispatch
+                .flushed
+                .extend(batch.into_iter().map(|activity| (activity, result.clone())));
+            let launch = !dispatch.running;
+            dispatch.running = true;
+            launch
+        };
+        if !launch {
             return;
         }
-        dispatch.running = true;
-        drop(dispatch);
         let manager = self.shared();
         drop(own(Box::pin(async move {
             manager.run_dispatcher().await;
@@ -1069,10 +1133,14 @@ impl KernelManager {
     }
 
     pub(crate) fn replication(&self, lsn: SequenceNumber, result: Result<()>) {
+        self.complete_replication(&self.activity(lsn), result);
+    }
+
+    pub(crate) fn complete_replication(&self, activity: &Arc<Activity>, result: Result<()>) {
         if let Err(error) = &result {
             self.faults.replication_error(error);
         }
-        self.activity(lsn).replication.complete(result);
+        activity.replication.complete(result);
     }
 
     /// Demotion cleanup is operations-only, latest-backwards, status ignored.

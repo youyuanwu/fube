@@ -110,6 +110,8 @@ pub trait EpochCheckedReplication: Send + Sync {
 /// Explicit engine observations and safe canonical-sync scheduling capability.
 /// Snapshots are never native control or application-access grants.
 pub trait ReplicatorDiagnostics {
+    /// Process-local reentry identity, not native authority or transaction LSN.
+    fn execution_identity(&self) -> u64;
     fn snapshot(&self) -> EngineSnapshot;
     fn endpoint(&self) -> crate::wire::Endpoint;
     fn execution_runtime(&self) -> fube_runtime::extensions::ExecutionRuntime;
@@ -125,6 +127,9 @@ pub trait ReplicatorDiagnostics {
     ) -> ApiFuture<'_, serde_json::Value>;
 }
 impl ReplicatorDiagnostics for crate::FabricReplicator {
+    fn execution_identity(&self) -> u64 {
+        self.engine.execution_identity()
+    }
     fn snapshot(&self) -> EngineSnapshot {
         self.snapshot()
     }

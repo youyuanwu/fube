@@ -222,6 +222,145 @@ async fn until(mut condition: impl FnMut() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrective_reserved_deadline_rechecked_after_contended_write_lock() {
+    use std::task::{Context, Poll, Waker};
+    for root in [false, true] {
+        let p = Fixture::using(
+            uuid::Uuid::new_v4(),
+            source(1),
+            ReplicaRole::Primary,
+            root,
+            (
+                MemoryProvider::new(),
+                Arc::new(tests::Provider::with_initial(1)),
+                Settings::default(),
+            ),
+        )
+        .await;
+        p.host.configure(config(EPOCH, vec![], 1)).await.unwrap();
+        let (held, holding) = std_mpsc::sync_channel(1);
+        let (release, resumed) = std_mpsc::sync_channel(1);
+        let shared = p.engine.shared.clone();
+        let lock = std::thread::spawn(move || {
+            let _guard = shared.admission.lock().unwrap();
+            held.send(()).unwrap();
+            resumed
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        });
+        holding
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let (entered, prelock) = std_mpsc::sync_channel(1);
+        *p.engine.shared.write_prelock.lock().unwrap() = Some(entered);
+        // Controlled time boundary avoids expiring native host authority. The
+        // same check also uses the real reserved-entry deadline in production.
+        *p.engine.shared.write_deadline.lock().unwrap() =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(50));
+        let engine = p.engine.clone();
+        let submit = std::thread::spawn(move || {
+            let mut future = engine.submit(
+                OperationData::new(vec![vec![1]]).unwrap(),
+                Cancellation::default(),
+            );
+            match future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            {
+                Poll::Ready(Err(error)) => Some(error),
+                _ => None,
+            }
+        });
+        prelock
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        release.send(()).unwrap();
+        lock.join().unwrap();
+        let error = submit
+            .join()
+            .unwrap()
+            .expect("expired write must not enqueue");
+        assert_eq!(error.kind(), fube_runtime::ErrorKind::Timeout);
+        assert_eq!(p.engine.snapshot().progress.assigned, 1);
+        assert_eq!(p.engine.snapshot().owned_operations, 0);
+        *p.engine.shared.write_deadline.lock().unwrap() = None;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrective_real_reserved_entry_deadline_branch_uses_current_authority() {
+    let p = Fixture::using(
+        uuid::Uuid::new_v4(),
+        source(1),
+        ReplicaRole::Primary,
+        false,
+        (
+            MemoryProvider::new(),
+            Arc::new(tests::Provider::with_initial(1)),
+            Settings::default(),
+        ),
+    )
+    .await;
+    p.host.configure(config(EPOCH, vec![], 1)).await.unwrap();
+    let (held, holding) = std_mpsc::sync_channel(1);
+    let (release, resumed) = std_mpsc::sync_channel(1);
+    let shared = p.engine.shared.clone();
+    let lock = std::thread::spawn(move || {
+        let _guard = shared.admission.lock().unwrap();
+        held.send(()).unwrap();
+        resumed
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+    });
+    holding
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    let (entered, prelock) = std_mpsc::sync_channel(1);
+    *p.engine.shared.write_prelock.lock().unwrap() = Some(entered);
+    let permit = p
+        .native
+        .execution()
+        .reserve(
+            CallLane::Native,
+            CallOrigin::default(),
+            std::time::Duration::from_secs(2),
+            false,
+        )
+        .unwrap();
+    let engine = p.engine.clone();
+    let runtime = p.native.execution().clone();
+    let call = permit.run_future(async move {
+        assert!(runtime.is_current_entry());
+        assert!(runtime.blocking_deadline()? > std::time::Instant::now());
+        engine
+            .submit(
+                OperationData::new(vec![vec![1]]).unwrap(),
+                Cancellation::default(),
+            )
+            .await
+            .map(|a| a.sequence)
+    });
+    prelock
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    // Exercise the REAL reserved-entry deadline predicate with controlled now,
+    // not the synthetic deadline predicate. Hard authority expiry remains
+    // separately covered by isolated runtime process-fence regressions.
+    *p.engine.shared.write_now.lock().unwrap() =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+    release.send(()).unwrap();
+    lock.join().unwrap();
+    assert_eq!(
+        call.await.unwrap_err().kind(),
+        fube_runtime::ErrorKind::Timeout
+    );
+    *p.engine.shared.write_now.lock().unwrap() = None;
+    assert_eq!(p.engine.snapshot().progress.assigned, 1);
+    assert_eq!(p.engine.snapshot().owned_operations, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issued_new_and_recreated_senders_use_current_progress_but_repeats_keep_live_counters() {
     for root in [false, true] {
         let partition = uuid::Uuid::new_v4();
