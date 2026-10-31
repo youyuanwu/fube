@@ -36,6 +36,8 @@ impl FabricReplicator {
     /// This helper's location/signature is fube-specific, not native partition
     /// CreateReplicator source/ABI compatibility. See the production sample
     /// `crates/samples/rust-runtime-app/src/data.rs` for construction and pumps.
+    /// Provider callbacks must already be ready: construction queries the actual
+    /// provider tail before lower Open. This helper retains classic copy defaults.
     pub fn create(
         partition: Arc<dyn IStatefulServicePartition>,
         native: NativeRuntimeIntegration,

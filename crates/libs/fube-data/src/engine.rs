@@ -127,8 +127,8 @@ pub struct PeerSnapshot {
     pub configured: bool,
     pub building: bool,
     pub cleanup_required: bool,
-    /// Node-advertised already-completed prefix, used only for WRITE_QUORUM
-    /// catch-up, never as an application ACK for a new write or ALL catch-up.
+    /// Runtime-issued initial sender prefix, represented by receive/apply/highest
+    /// and usable for CC catch-up, never an ACK for newly assigned beyond-prefix work.
     pub native_catchup_prefix: i64,
 }
 
@@ -2154,6 +2154,9 @@ impl Owner {
                         }
                         self.current = None;
                         self.previous = None;
+                        for record in &self.dispositions {
+                            record.cancel();
+                        }
                     }
                     for peer in self.peers.values_mut() {
                         if peer.copy_applied == -1
@@ -4044,6 +4047,17 @@ impl Owner {
         if matches!(&control.kind, ControlKind::Epoch { role, .. } if *role != ReplicaRole::Primary)
             && self.role == ReplicaRole::Primary
         {
+            if matches!(
+                &control.kind,
+                ControlKind::Epoch {
+                    role: ReplicaRole::None,
+                    ..
+                }
+            ) && (self.replay_job
+                || self.dispositions.iter().any(|record| !record.is_finished()))
+            {
+                return;
+            }
             if self.peers.values().any(|peer| {
                 peer.build
                     .as_ref()

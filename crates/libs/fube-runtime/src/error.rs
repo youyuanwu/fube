@@ -29,9 +29,11 @@ pub enum ErrorKind {
     Canceled,
     Timeout,
     ResourceExhausted,
-    /// Temporary replication admission pressure; retry only after capacity recovery.
+    /// Temporary replication admission pressure (FABRIC_E_REPLICATION_QUEUE_FULL,
+    /// HRESULT 0x80071bcb); retry only after capacity recovery.
     ReplicationQueueFull,
-    /// Permanent rejection by replication operation sizing limits.
+    /// Permanent replication sizing rejection (FABRIC_E_REPLICATION_OPERATION_TOO_LARGE,
+    /// HRESULT 0x80071c2f), not generic resource-exhaustion retry.
     ReplicationOperationTooLarge,
     Transport,
     Native,

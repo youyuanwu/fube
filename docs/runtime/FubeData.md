@@ -18,8 +18,9 @@ canonical signature from values, completion and capability. The deployed
 results in [executed qualification](#executed-qualification) are **historical at
 their exact old source/profile**, not qualification of this breaking migration.
 Current API-alignment deployed/native validation is **NOT RUN**.
-The [known semantic differences](#known-semantic-differences-from-native-v1)
-below are unresolved implementation issues, not intended SF semantics.
+The [source audit and R0 corrections](#known-semantic-differences-from-native-v1)
+below record corrected lower contracts with offline regression evidence.
+They do not qualify R0 against a deployed native cluster.
 
 ## Components and selection
 
@@ -92,6 +93,10 @@ stateless registration. This is not an environment role override.
   data/explicit ACK. Receipt, polling and Drop do not acknowledge.
   A late retired-owner ACK fails rather than reviving progress
   ([ACK and stream contract](../../crates/libs/fube-data/src/api.rs#L173-L267)).
+  Streams are role-generation views: promotion dispatches eligible records,
+  supplies successful EOS, then waits for actual processing ACKs. Reacquire both
+  views on a later secondary role; old views never revive. The sample refreshes
+  after its lower role transition, without replacing the engine.
 - Provider callbacks run outside engine/transport locks. Returned errors,
   panics, cancellation and timeout are explicit; failed barriers cannot grant
   readiness. Qualified runtime watchdog guards supervise actual callback and
@@ -153,19 +158,18 @@ Inspect provider progress separately; socket-write success never means commit
 
 Current and previous configuration write obligations remain separate, including
 the previous-quorum-one case when the new primary was not in that configuration.
-The current local-not-PC quorum calculation nevertheless differs from native
-for previous quorum greater than one (DD-06 below).
+R0's general PC quorum calculation follows the native q-1 remote-session rule
+even when local-not-PC; the q1 remote exception stays APPLY-gated (DD-06 below).
 Required targets and ALL catch-up are not ordinary write quorum. Removal does
 not shrink native membership to manufacture success. Epoch/role revisions,
 replica and engine incarnations, original operation epochs and build sessions
 fence stale data/ACK/copy receipts. Repeated promotion with no intervening write
 binds a secondary session only from the exact current native-selected primary
-descriptor/epoch, never an arbitrary epoch-less RequestAck. **Current fube
-behavior (DD-02 below):** fresh network ACKs drive write commitment and ALL
-catch-up. Native-advertised progress may attest
-only the local already-completed prefix for WRITE_QUORUM catch-up; it is
-separately labeled `native_catchup_prefix`, cannot acknowledge a new write, and
-cannot satisfy ALL.
+descriptor/epoch, never an arbitrary epoch-less RequestAck. **R0 behavior
+(DD-02 below):** runtime-issued new/recreated sender CurrentProgress initializes
+receive/apply/highest and can satisfy ALL at that represented prefix. Repeated
+descriptors do not reset live counters; diagnostics cannot mint that authority.
+New beyond-prefix work still needs its applicable real ACKs.
 
 Copy pins coherent state **and retry ledger** at the native-selected
 `replicationStart - 1` horizon, even while the provider and new writes advance.
@@ -183,9 +187,9 @@ Promotion freezes and drains the contiguous received prefix through actual
 application ACK, including operations not yet dispatched because captures
 exhausted their budget. It does not silently reuse their sequence numbers;
 only a noncontiguous tail can be discarded. Original-operation epoch barriers
-remain ordered during that drain. **Current gap (DD-04 below):** promotion does
-not close the old replication stream generation, so this ACK drain is not
-native stream EOS or completion of an upper V2 drain.
+remain ordered during that drain. Successful dispatch EOS precedes the final
+ACK wait, so an upper consumer can flush/ACK after EOS (DD-04 below).
+Demotion supplies fresh views around the transferred applied prefix.
 Every configuration installation captures the
 latest assigned catch-up fence. Departed adopted sessions are retired when
 absent from both active configurations, without retaining obsolete copy fences
@@ -199,9 +203,10 @@ primary has no ordinary retained suffix, it requests a bounded
 `extensions::ReplayCheckpointProvider::replication_checkpoint` and retransmits that **authentic original
 operation** at the existing LSN with its unchanged original epoch/segments.
 The duplicate establishes the native primary target without applying again or
-assigning a new LSN. Only the resulting real receive/application ACK can satisfy
-ALL. This is a fube-specific compatibility workaround associated with DD-02,
-not an original SF provider callback or a required V2 algorithm.
+assigning a new LSN. This optional path can elicit real ACKs from peers whose
+runtime descriptor did not already represent the prefix. It is not a universal
+ALL prerequisite: authentic issued CurrentProgress satisfies that prefix
+directly. Replay is not an original SF provider callback or required V2 algorithm.
 One temporary charged callback owns this recovery path; there is no
 permanently retained free anchor or unbounded extra queue.
 Cooldown starts only after actual payload/capture disposal, fanout, publication
@@ -244,9 +249,11 @@ can discard an ambiguous tail. Loss of all volatile state loses the ledger too.
 `Settings::validate` rejects inconsistent/out-of-profile settings before opening;
 resource exhaustion is explicit backpressure/rejection, not unlimited tasks.
 See [settings and validation](../../crates/libs/fube-data/src/api.rs#L12-L82).
-The current error surface collapses transient queue fullness and permanent
-operation-size rejection into ResourceExhausted; native transaction retry needs
-the lossless admission distinction specified in DD-05 below.
+`ErrorKind::ReplicationQueueFull` preserves native HRESULT **0x80071bcb**
+(-2147017781); operation sizing uses `ReplicationOperationTooLarge`,
+**0x80071c2f** (-2147017681). Other ResourceExhausted errors remain distinct.
+Retry capacity pressure only after recovery; do not retry every resource failure
+or parse display text. No upper transaction retry kernel is supplied by R0.
 The sample's HTTP request limit is 4096 bytes; its client waiter is five seconds.
 
 ## Known semantic differences from native V1
@@ -254,20 +261,19 @@ The sample's HTTP request limit is 4096 bytes; its client waiter is five seconds
 **Audit date:** 2026-10-30. **Fube source:** `2f28b963b2b55020bb32ac73e7874b37b3a509fc`
 (#19). **Authoritative native source:** local SF checkout
 `51a7703a1f83749a9234d3ceb4296d8622e42cca`, linked immutably below.
-These are source-comparison findings; no implementation correction or new
-native qualification is claimed by this documentation update. Earlier
-qualification records retain their exact historical scope.
+The audit headings below preserve historical differences at that source.
+**R0 correction date: 2026-10-31.** DD-01–DD-07 are corrected in the lower
+implementation and covered by focused offline source-contract regressions.
+Earlier qualification records retain their exact historical scope; no new
+native deployment qualification or upper transaction implementation is claimed.
 An independent Astra source review confirmed DD-01–DD-03 and identified
 DD-04–DD-07. The latter include lower integration gaps exposed by a native V2
 consumer, not a claim that every current classic provider encounters them.
 
 ### DD-01: terminal Primary-to-None incorrectly requires commitment
 
-**Current fube:** the role-change guard requires `assigned == committed` whenever
-a Primary changes to any non-Primary role, including None
-([engine.rs:2054–2063](../../crates/libs/fube-data/src/engine.rs#L2054-L2063)).
-With an admitted uncommitted write and unavailable quorum, this rejects the
-terminal role transition.
+**Pre-R0 audit:** Primary-to-None incorrectly shared the secondary-transfer
+`assigned == committed` prerequisite.
 
 **Native:** the Primary-to-None path closes the primary without creating a
 secondary. Its close takes pending replicate operations before closing sessions
@@ -277,26 +283,24 @@ queue into a new secondary, not every terminal close
 [ReplicaManager.cpp:787–866][sf-terminal-close],
 [ReplicationQueueManager.cpp:97–106][sf-demotion-transfer]).
 
-**Required correction:** separate terminal disposal from planned queue transfer.
-Primary-to-None must retire admission, cancel unresolved completion observers
-and complete owned cleanup without manufacturing quorum commitment.
-Preserve the source's queue-transfer checks for actual demotion to a secondary.
-Required regression: admit a write, lose quorum, request None, and observe
-terminal cleanup plus unsuccessful/uncertain write completion rather than
-a commitment prerequisite. Do not infer rollback of already applied state.
+**R0 correction:** terminal None retires pending observers before session
+cleanup, does not reconcile a provider or reset commitment, and releases owned
+queue storage. Actual secondary demotion still requires commitment
+([control admission](../../crates/libs/fube-data/src/engine.rs#L2107-L2156),
+[terminal completion](../../crates/libs/fube-data/src/engine.rs#L4084-L4100),
+[queue retirement](../../crates/libs/fube-data/src/queue.rs#L73-L79)).
+The [pending-write regression](../../crates/libs/fube-data/src/engine_tests.rs#L4618-L4650)
+observes assigned1/committed0, failed completion and unchanged provider state.
+Terminal retirement also cancels/joins an in-flight optional replay before
+publication
+([ownership gate](../../crates/libs/fube-data/src/engine.rs#L4032-L4050),
+[regression](../../crates/libs/fube-data/src/engine_tests.rs#L6095-L6139)).
+Retirement is not rollback.
 
 ### DD-02: native-issued initial progress is excluded from ALL catch-up
 
-**Current fube:** newly configured peers start with receive/apply progress zero;
-native progress is separately capped to the local completed prefix and used only
-for WRITE catch-up, not ALL or ordinary record-quorum calculation
-([engine.rs:2567–2595](../../crates/libs/fube-data/src/engine.rs#L2567-L2595),
-[2621–2638](../../crates/libs/fube-data/src/engine.rs#L2621-L2638),
-[3900–3940](../../crates/libs/fube-data/src/engine.rs#L3900-L3940)).
-The [existing regression](../../crates/libs/fube-data/src/engine_tests.rs#L1936-L2000)
-deliberately asserts that ALL remains pending despite native-issued completed
-progress. The authentic replay-checkpoint path above compensates for that
-different initial sender state.
+**Pre-R0 audit:** initial native progress was only a capped WRITE attestation;
+ALL unnecessarily required a new ACK or optional replay.
 
 **Native:** `CreateReplica` passes the native descriptor's `CurrentProgress`
 into the replication session. `ReliableOperationSender` initializes receive,
@@ -308,30 +312,20 @@ requirement for an already represented prefix
 [ReliableOperationSender.cpp:28–49][sf-initial-progress],
 [ReplicaManager.cpp:1061–1106][sf-catchup-progress]).
 
-**Required correction:** preserve the native sender initialization and subsequent
-ACK rules using the runtime-issued, incarnation/revision-bound descriptor.
-Do not accept arbitrary public descriptors or diagnostic observations as
-authority, and do not let initial progress acknowledge records assigned after
-that prefix. Initialize new/recreated sender state; do not blindly overwrite an
-existing session's counters from a repeated descriptor. ALL uses the native
-current-configuration apply/latest frontier; WRITE retains its catch-up fence
-and required-target rules. V2 must not require an invented replay callback to
-replace this native rule. Required regressions: no-write promotion and ALL at an already
-reported prefix with a standard-only provider; then a new record beyond that
-prefix still waits for its required real ACKs. Retained old “ALL must wait”
-tests must change with the correction, not define the intended semantics.
+**R0 correction:** newly created/recreated sessions initialize receive/apply/
+highest from the entered, frozen runtime descriptor's CurrentProgress.
+Repeated descriptors preserve live counters; diagnostics cannot attest a vote
+([issued initialization](../../crates/libs/fube-data/src/engine.rs#L2615-L2632),
+[canonical proof](../../crates/libs/fube-data/src/engine_binding.rs#L181-L225)).
+The [issued root/bound regression](../../crates/libs/fube-data/src/engine_native_tests.rs#L225-L332)
+proves ALL at20 with no replay/fresh ACK, repeated and recreated descriptors,
+and LSN21 still pending without a real ACK. The diagnostic-prefix test remains
+a negative authority witness, not the source-conformance path.
 
 ### DD-03: quorum-one primary release waits for remote receive ACKs
 
-**Current fube:** current quorum 1 can commit at the assigned tail, but
-`all_received` still includes remote members and limits release
-([quorum.rs:63–85](../../crates/libs/fube-data/src/quorum.rs#L63-L85),
-[engine.rs:4436–4460](../../crates/libs/fube-data/src/engine.rs#L4436-L4460)).
-With no previous configuration or idle build, a lagging secondary can therefore
-pin already committed operations and exhaust the bounded queue.
-The same remote `all_applied` minimum also holds ALL pending at the latest
-assigned tail
-([engine.rs:3929–3932](../../crates/libs/fube-data/src/engine.rs#L3929-L3932)).
+**Pre-R0 audit:** current quorum1 committed locally but unconditional remote
+minima pinned release and ALL.
 
 **Native:** for `writeQuorum <= 1`, the current-configuration progress helper
 returns the noninitialized sentinel for quorum/all/completed progress. The queue
@@ -348,24 +342,23 @@ PC member's apply ACK must constrain progress
 ([ReplicaManager.cpp:2475–2519][sf-previous-quorum-one]).
 Idle-build retention remains an independent source obligation.
 
-**Required correction:** preserve those distinct current-quorum-one,
-previous-configuration and idle-retention rules rather than applying an
-unconditional remote-minimum release formula. Required regressions: current
-quorum 1 with a lagging configured secondary and no PC/idle owner releases
-committed entries and follows native ALL catch-up rules; a remote
-previous-quorum-one obligation still constrains progress; an active idle build
-still retains its required history.
+**R0 correction:** the helper resolves CC<=1's native sentinel to the assigned
+tail for commit/release/ALL. Remote-PC-q1 instead uses minimum APPLY for both
+commit and release; idle retention remains independent
+([quorum rules](../../crates/libs/fube-data/src/quorum.rs#L23-L90),
+[ALL](../../crates/libs/fube-data/src/engine.rs#L3983-L3987),
+[retention](../../crates/libs/fube-data/src/engine.rs#L4547-L4614)).
+ALL uses CC, not combined PC commit or WRITE required-target constraints.
+The [sentinel/PC regression](../../crates/libs/fube-data/src/quorum.rs#L167-L202)
+and [idle retention test](../../crates/libs/fube-data/src/engine_tests.rs#L281-L358)
+cover those separate obligations; the
+[direct configured-lagging CCq1 test](../../crates/libs/fube-data/src/engine_tests.rs#L6142-L6172)
+observes released storage/ALL with zero remote receive/apply and no idle owner.
+Joint-configuration tests retain PC APPLY blocking while CC ALL succeeds.
 
 ### DD-04: promotion does not finish the secondary stream generation
 
-**Current fube:** copy/replication channels and views are constructed once.
-Secondary-to-Primary clears secondary state but retains the replication sender;
-an empty stream keeps waiting instead of returning EOS
-([engine.rs:529–532](../../crates/libs/fube-data/src/engine.rs#L529-L532),
-[4332–4343](../../crates/libs/fube-data/src/engine.rs#L4332-L4343),
-[api.rs:349–371](../../crates/libs/fube-data/src/api.rs#L349-L371)).
-The current provider's ACK drain therefore does not supply the successful
-stream-completion boundary required by native V2 promotion.
+**Pre-R0 audit:** engine-lifetime replication views stayed open after promotion.
 
 **Native:** secondary close during promotion closes dispatch queues and waits
 for the required drain. The upper `SecondaryDrainManager` observes replication
@@ -375,28 +368,23 @@ processing and outstanding ACKs, and only then signals its drain completion
 [SecondaryDrainManager.cpp:862–889][sf-upper-drain-finished],
 [224–235][sf-upper-drain-completion]).
 
-**Required correction:** preserve role-scoped stream EOS and processing
-completion without discarding the eligible contiguous prefix. Cancellation is
-not successful native drain; do not manufacture an operation or ACK as EOS.
-A later transition back to secondary needs a new stream generation in the same
-engine, preserving native transferred state rather than forcing another copy,
-with old views/captures fenced. Required regressions: empty and nonempty
-secondary-to-primary-to-secondary cycles, delayed ACKs and capture pressure;
-old drains finish, new drains consume only the new generation, and native upper
-promotion cannot wait forever on a live empty channel.
+**R0 correction:** freeze ingress, dispatch the eligible contiguous boundary,
+close senders successfully, then await actual service ACKs. EOS does not depend
+on the last ACK, so an upper EOS-triggered flush can finish. Demotion replaces
+views on the same engine with an already-copied transferred prefix; old views
+remain terminal and revision checks fence captures
+([EOS before ACK gate](../../crates/libs/fube-data/src/engine.rs#L4066-L4103),
+[fresh views](../../crates/libs/fube-data/src/engine.rs#L4443-L4479)).
+The [64-capture/gap/epoch-barrier test](../../crates/libs/fube-data/src/engine_tests.rs#L932-L1043)
+and [empty/nonempty cycles](../../crates/libs/fube-data/src/engine_tests.rs#L1046-L1130)
+prove EOS-before-ACK ordering. The
+[sample role-cycle test](../../crates/samples/rust-runtime-app/src/data_tests.rs#L1298-L1350)
+proves its pump refresh without recopy or a new engine. Failed/canceled controls
+are not successful drain and no synthetic operation/ACK is used.
 
 ### DD-05: admission errors lose the native retry distinction
 
-**Current fube:** permanent operation byte/segment rejection and transient write
-admission fullness both return `Error::ResourceLimit`; the queue uses that
-variant for both size and retained-capacity checks
-([engine.rs:869–915](../../crates/libs/fube-data/src/engine.rs#L869-L915),
-[queue.rs:73–80](../../crates/libs/fube-data/src/queue.rs#L73-L80)).
-They expose ResourceExhausted, with the same fallback native code, rather than
-the native replication-queue-full cause
-([error.rs:213–224](../../crates/libs/fube-runtime/src/error.rs#L213-L224),
-[273–317](../../crates/libs/fube-runtime/src/error.rs#L273-L317)).
-That surface alone cannot drive a source-faithful V2 retry classifier.
+**Pre-R0 audit:** temporary fullness and permanent sizing shared ResourceLimit.
 
 **Native:** queue fullness returns `REQueueFull`, propagated by the replica
 manager. The transaction retry classifier includes replication-queue-full,
@@ -408,24 +396,25 @@ retriable failure
 [TransactionBase.cpp:197–209][sf-transaction-retry],
 [Transaction.cpp:448–477][sf-commit-retry]).
 
-**Required correction:** retain a typed/native-coded cause or provide a tested,
-lossless admission-stage mapping that distinguishes temporary queue pressure
-from permanent invalid sizing and other exhausted resources. New public error
-variants are not mandatory; display-string parsing and blanket ResourceExhausted
-retry are not acceptable. Preserve admitted work and actual transaction state.
-Required regressions: temporary full queue, capacity returned, same transaction
-commit succeeds; timeout/cancellation takes the native retry-state branch;
-oversized records fail without an endless queue-full retry loop.
+**R0 correction:** distinct ErrorKind values preserve **0x80071bcb queue-full**
+and **0x80071c2f operation-too-large**, including causes, native conversion,
+uncertainty and transport round trips
+([runtime errors](../../crates/libs/fube-runtime/src/error.rs#L31-L41),
+[admission](../../crates/libs/fube-data/src/engine.rs#L882-L945),
+[queue stages](../../crates/libs/fube-data/src/queue.rs#L80-L102)).
+These exact codes come from [FabricTypes.h:119–136,226–236][sf-admission-codes]
+and [EnumOperators.cpp:85–128][sf-admission-conversion].
+The [runtime fidelity test](../../crates/libs/fube-runtime/src/error_tests.rs#L9-L38),
+[capacity-recovery test](../../crates/libs/fube-data/src/engine_tests.rs#L3388-L3453),
+and [permanent-sizing test](../../crates/libs/fube-data/src/queue.rs#L275-L294)
+prove lower retry recovery versus permanent rejection without consuming a
+rejected LSN. Upper transaction timeout/cancel retry states are A0/A1 work,
+not claimed implemented by these lower tests.
 
 ### DD-06: local-not-PC quorum greater than one requires an extra vote
 
-**Current fube:** availability and the remote apply order statistic subtract a
-local vote only when the issued configuration has `local_member=true`
-([quorum.rs:47–50,71–79](../../crates/libs/fube-data/src/quorum.rs#L47-L79)).
-Native reconfiguration can legitimately issue `local_member=false` for PC
-([stateful_reconfiguration.rs:1637–1673](../../crates/libs/fube-runtime/src/stateful_reconfiguration.rs#L1637-L1673)).
-With CC satisfied at 10, PC quorum 2, local-not-PC, and remote apply `[10, 0]`,
-fube's PC quorum frontier is 0.
+**Pre-R0 audit:** local-not-PC quorum2 incorrectly needed two remote votes and
+selected the lower of `[10,0]`.
 
 **Native:** the general availability/progress helpers assume an immediately
 ACKing primary and require `writeQuorum - 1` remote sessions/ACKs even in this
@@ -437,24 +426,19 @@ quorum 1 with remote members; PC quorum 2 in the example yields 10
 Independent all-member completion/idle retention still prevents inappropriate
 history release; the source does not strengthen the general commit formula.
 
-**Required correction:** port native PC availability and apply order statistics,
-including the separate remote-PC-quorum-one branch. Do not rewrite issued
-membership, mint a local vote or shrink the configuration to obtain the result.
-Required regressions: local-not-PC with quorum 2 and unequal ACKs, enough and
-insufficient remote sessions under the native rule, the remote-PC-quorum-one
-exception, and independent release/idle ownership.
+**R0 correction:** general quorum>1 needs q-1 remote sessions and selects
+descending remote apply at q-2, irrespective of `local_member`. Issued membership
+is unchanged; the native remote-PC-q1 APPLY exception stays separate
+([implementation](../../crates/libs/fube-data/src/quorum.rs#L29-L90)).
+The [unequal-progress/insufficient-session test](../../crates/libs/fube-data/src/quorum.rs#L167-L202)
+proves CC10/PCq2 remote[10,0] -> PC10, missing required sessions fail,
+and PCq1 release remains APPLY-gated. Independent receive/idle retention still
+constrains storage, not the general commit formula.
 
 ### DD-07: extended-copy tails fail unconditional epoch reconciliation
 
-**Current fube:** secondary admission-only epoch controls query provider progress
-without invoking UpdateEpoch, but publication still requires that value equal
-the lower queue boundary
-([engine.rs:4001–4053](../../crates/libs/fube-data/src/engine.rs#L4001-L4053),
-[4288–4293](../../crates/libs/fube-data/src/engine.rs#L4288-L4293)).
-Native V2 extended copy can leave upper log tail 100 while lower progress is 90;
-with duplicate replication 91–100 delayed, a duplicate epoch control would
-fault despite being a native no-op. This is a V2 integration counterexample,
-not an already implemented V2 failure.
+**Pre-R0 audit:** admission-only controls still queried/equated an independently
+copied upper tail, turning a native duplicate into a fault.
 
 **Native:** duplicate secondary UpdateEpoch returns without a provider callback.
 The upper logging provider also recognizes an already represented epoch before
@@ -464,31 +448,56 @@ truncating that valid copied suffix
 ([SecondaryReplicator.UpdateEpochAsyncOperation.cpp:43–92][sf-secondary-epoch],
 [LoggingReplicatorImpl.cpp:1368–1401][sf-upper-epoch]).
 
-**Required correction:** preserve independent lower and upper frontiers, native
-duplicate-control gating, and role/copy-specific callback validation. Adding the
-copy-until-latest marker alone is insufficient. Do not fabricate lower progress,
-report visible transaction progress instead of the upper log tail, truncate
-valid copied history, or suppress all tail checks for V2 providers.
-Required regressions: extended copy 90→100 with overlapping replication delayed,
-duplicate UpdateEpoch succeeds without a reconciliation callback/truncation,
-overlap is subsequently consumed correctly, and a new incompatible idle-copy
-epoch still fails explicitly. This interleaving has not been deployed/qualified.
+**R0 correction:** duplicate secondary UpdateEpoch returns before copy/control
+gates or provider calls. New secondary/role admission controls drain lower work
+without a provider getter/equality check. Original-operation barriers and primary
+provider controls retain actual callback errors and applicable equality
+([duplicate](../../crates/libs/fube-data/src/engine.rs#L2060-L2082),
+[admission-only completion](../../crates/libs/fube-data/src/engine.rs#L4105-L4126)).
+The [upper100/lower90 overlap test](../../crates/libs/fube-data/src/engine_tests.rs#L3530-L3615)
+keeps actual copied bytes, delays real ACKs, observes no duplicate callback/getter
+or truncation, then drains 91–100. The
+[new incompatible epoch negatives](../../crates/libs/fube-data/src/engine_tests.rs#L3618-L3675)
+preserve errors; the [owned canonical lower-entry test](../../crates/libs/fube-data/src/engine_native_tests.rs#L449-L530)
+separately proves RAP's duplicate suppression and actual lower no-op execution.
+These are offline fixtures, not a V2 log kernel or deployed qualification.
 
 ### Effect on the V2 port
 
-DD-01–DD-07 must be resolved and their source-contract regressions pass before
-accepting the [V2 foundation](FubeDataV2Design.md#10-milestones-and-acceptance-gates).
-The current implementations and historical test expectations are not permission
-to redefine SF behavior. Fixed memory budgets, `RequireServiceAck=true`, trusted
-clear transport and unsupported persisted/TLS modes remain explicit profile
-limits, separate from these semantic mismatches.
+R0 implements DD-01–DD-07 plus explicit latest-copy and truthful constructor
+tail integration. Native transaction/log/state-manager kernels and staged copy
+serialization remain A0/A1, not upper workarounds supplied by R0. Fixed budgets,
+RequireServiceAck, trusted clear transport and unsupported persisted/TLS modes
+remain explicit profile limits.
 
-V2 also needs the native `SupportsCopyUntilLatestLsn` provider capability and
-native staged copy semantics; the current classic-only exact-horizon policy is
-not a replacement for that capability. See the
-[V2 copy integration](FubeDataV2Design.md#7-copy-and-reconciliation).
-This is an additional V2 integration prerequisite; it is not a code fix made
-by this documentation update.
+### R0 copy capability and callback-ready construction
+
+`FabricReplicator::create` remains backwards-compatible classic copy. Opt in with
+`create_with_capabilities(..., StateProviderCapabilities {
+supports_copy_until_latest_lsn: true })`. This is explicit construction, not SDK
+trait discovery, peer negotiation or type inference
+([capability](../../crates/libs/fube-data/src/extensions.rs#L76-L84),
+[helper](../../crates/libs/fube-data/src/fabric_replicator.rs#L49-L92)).
+Latest selects inclusive assigned horizon and replication start assigned+1;
+classic retains max(committed,previous quorum)+1. Provider supervision and the
+enumeration-EOS finish tail remain unchanged. The
+[latest copy regression](../../crates/libs/fube-data/src/engine_tests.rs#L3678-L3772)
+starts at101/horizon100 with committed0 and waits for real finish-tail ACK101.
+
+Initialize the provider before construction, in the runtime-owned service Open
+entry. Lower construction already calls its fallible progress getter before the
+returned lower object's later Open
+([constructor](../../crates/libs/fube-data/src/engine.rs#L629-L660)).
+A logging adapter must return its real log tail, not stable/visible progress or
+temporary zero. The [public bootstrap witness](../../crates/libs/fube-data/tests/sdk_contracts.rs#L222-L297)
+passes actual nonempty fixture records with source-shaped zero/one markers and
+tail1/27 through construction, then assigns2/28. Its markers are **not native
+record serialization or persisted recovery**. R0 neither initializes a real
+transaction log for callers nor supports Existing-open. Native kernels are A0;
+mixed deployment qualification remains unrun.
+
+[sf-admission-codes]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/prebuilt/sdk/FabricTypes.h#L119-L236
+[sf-admission-conversion]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Replication/EnumOperators.cpp#L85-L128
 
 [sf-terminal-role]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Replication/Replicator.ChangeRoleAsyncOperation.cpp#L276-L348
 [sf-terminal-close]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Replication/ReplicaManager.cpp#L787-L866

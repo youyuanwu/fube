@@ -6109,3 +6109,83 @@ async fn stream_shutdown_wakes_pending_polls_and_linearizes_concurrent_publicati
     assert_eq!(b.snapshot().owned_bytes, 0);
     abort_owned(&a).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_none_cancels_and_joins_running_optional_replay_without_committing_pending_tail() {
+    let partition = Uuid::new_v4();
+    let provider = Arc::new(Provider {
+        last: AtomicI64::new(20),
+        checkpoint_gate: Mutex::new(Some(Arc::new(Semaphore::new(0)))),
+        ..Provider::default()
+    });
+    let p = engine_with_replay(partition, 1, provider.clone(), Settings::default());
+    p.change_role(EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let remote = endpoint(&network, partition, 2);
+    let mut descriptor = descriptor(&p);
+    descriptor.replica_id = 2;
+    descriptor.address = remote.to_string();
+    p.update_current_configuration(configuration(vec![descriptor], true, 2), cancel())
+        .await
+        .unwrap();
+    until(|| {
+        provider.checkpoint_calls.load(Ordering::Acquire) == 1
+            && p.snapshot().provider_callbacks == 1
+    })
+    .await;
+    let mut pending = p
+        .submit(OperationData::new(vec![vec![21]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    timeout(
+        std::time::Duration::from_secs(1),
+        p.change_role(NEXT_EPOCH, ReplicaRole::None, cancel()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(pending.wait(cancel()).await.is_err());
+    assert_eq!(p.snapshot().progress.assigned, 21);
+    assert_eq!(p.snapshot().progress.committed, 20);
+    assert_eq!(p.snapshot().provider_callbacks, 0);
+    assert_eq!(p.snapshot().owned_operations, 0);
+    assert_eq!(provider.last.load(Ordering::Acquire), 20);
+    assert!(p.snapshot().fault.is_none());
+    abort_owned(&p).await;
+    network.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn current_quorum_one_releases_and_all_catches_up_without_remote_acks_or_idle_owner() {
+    let partition = Uuid::new_v4();
+    let provider = Arc::new(Provider::default());
+    let p = engine(partition, 1, provider.clone());
+    p.change_role(EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let mut remote = descriptor(&p);
+    remote.replica_id = 2;
+    remote.address = endpoint(&network, partition, 2).to_string();
+    p.update_current_configuration(configuration(vec![remote], true, 1), cancel())
+        .await
+        .unwrap();
+    let mut write = p
+        .submit(OperationData::new(vec![vec![1]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    provider.last.store(1, Ordering::Release);
+    assert_eq!(write.wait(cancel()).await.unwrap(), 1);
+    p.wait_for_catch_up(CatchUpMode::All, cancel())
+        .await
+        .unwrap();
+    until(|| p.snapshot().progress.retained_operations == 0).await;
+    assert_eq!(p.snapshot().progress.completed, 1);
+    assert_eq!(p.snapshot().peers[0].received, 0);
+    assert_eq!(p.snapshot().peers[0].applied, 0);
+    assert_eq!(p.snapshot().peers[0].copy_horizon, None);
+    abort_owned(&p).await;
+    network.shutdown();
+}
