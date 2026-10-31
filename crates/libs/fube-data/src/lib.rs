@@ -14,8 +14,13 @@
 //! Construct a [`FabricReplicator`] with explicit runtime-issued native
 //! integration for authority and callback/destructor supervision. Implement
 //! [`IStateProvider`] to reconcile authoritative history at epoch boundaries and
-//! return an exact-horizon snapshot, including application retry identities.
+//! return coherent inclusive-horizon copy state, including application retry identities.
 //! The provider is application state, not the quorum engine.
+//! Initialize provider/log metadata before lower construction: its synchronous
+//! getter is queried before the returned lower object's Open, and must return the
+//! actual provider tail. [`FabricReplicator::create`] defaults to classic copy;
+//! [`FabricReplicator::create_with_capabilities`] explicitly selects latest-assigned
+//! copy through [`extensions::StateProviderCapabilities`], never SDK discovery.
 //!
 //! [`IStateReplicator::replicate`] admits a nonzero sequence; apply that accepted sequence to
 //! local primary state **before** awaiting [`ReplicationCompletion::wait`]. Admission and
@@ -23,6 +28,8 @@
 //! dropping the waiter is ambiguous and cannot undo admission. Secondary pumps
 //! consume copy/replication streams, apply each item, then explicitly call
 //! [`IOperation::acknowledge`]; polling, receiving or dropping never ACKs.
+//! Successful promotion supplies role-generation EOS before ACK drain completes;
+//! reacquire streams when entering a later secondary role on that same owner.
 //!
 //! [`extensions::Progress`] fields are distinct, role-dependent observations. In particular,
 //! primary application state may lead its queue's reconciliation `applied`
@@ -33,6 +40,10 @@
 //!
 //! [`Settings`] enforces finite payload, queue, peer, copy and callback budgets.
 //! Resource errors are explicit, not unbounded waiting or silent eviction.
+//! [`fube_runtime::ErrorKind::ReplicationQueueFull`] is temporary admission
+//! pressure; [`fube_runtime::ErrorKind::ReplicationOperationTooLarge`] is permanent
+//! sizing rejection. They preserve distinct native HRESULTs; generic resource
+//! exhaustion and display text are not a replication retry classifier.
 //! This Linux volatile profile has no durable restart, transactional stack,
 //! TLS/Windows replication or rolling executable-upgrade guarantee. See
 //! `docs/runtime/FubeData.md` in the repository for the executed profile,

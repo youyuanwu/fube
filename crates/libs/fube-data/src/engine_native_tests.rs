@@ -222,6 +222,117 @@ async fn until(mut condition: impl FnMut() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issued_new_and_recreated_senders_use_current_progress_but_repeats_keep_live_counters() {
+    for root in [false, true] {
+        let partition = uuid::Uuid::new_v4();
+        let log = Arc::new(tests::Provider::with_initial(20));
+        let p = Fixture::using(
+            partition,
+            source(1),
+            ReplicaRole::Primary,
+            root,
+            (MemoryProvider::new(), log.clone(), Settings::default()),
+        )
+        .await;
+        // A genuine runtime-issued descriptor, no replay extension and no
+        // provider/remote ACK callback, represents an already applied prefix.
+        let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+        let remote = Endpoint {
+            actor: Actor {
+                partition,
+                replica: 2,
+                incarnation: uuid::Uuid::new_v4(),
+            },
+            address: network.address().to_string(),
+            transport_id: None,
+        };
+        let mut descriptor = ReplicaInformation {
+            node_id: source(2).node_id,
+            node_instance: 1,
+            replica_id: 2,
+            incarnation: source(2).native_incarnation,
+            role: ReplicaRole::ActiveSecondary,
+            previous_role: ReplicaRole::ActiveSecondary,
+            up: true,
+            ready: true,
+            address: remote.to_string(),
+            progress: ReplicationProgress { first: 1, last: 20 },
+            must_catch_up: false,
+        };
+        p.host
+            .configure(config(EPOCH, vec![descriptor.clone()], 2))
+            .await
+            .unwrap();
+        p.engine
+            .wait_for_catch_up(CatchUpMode::All, Cancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                p.engine.snapshot().peers[0].received,
+                p.engine.snapshot().peers[0].applied
+            ),
+            (20, 20)
+        );
+        descriptor.progress.last = 0;
+        descriptor.progress.first = -1;
+        p.host
+            .configure(config(EPOCH, vec![descriptor.clone()], 2))
+            .await
+            .unwrap();
+        assert_eq!(
+            p.engine.snapshot().peers[0].applied,
+            20,
+            "repeated descriptor must not reset live sender"
+        );
+        descriptor.incarnation += 1;
+        descriptor.address = Endpoint {
+            actor: Actor {
+                incarnation: uuid::Uuid::new_v4(),
+                ..remote.actor
+            },
+            ..remote
+        }
+        .to_string();
+        descriptor.progress = ReplicationProgress { first: 1, last: 20 };
+        p.host
+            .configure(config(EPOCH, vec![descriptor], 2))
+            .await
+            .unwrap();
+        p.engine
+            .wait_for_catch_up(CatchUpMode::All, Cancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(p.engine.snapshot().peers[0].applied, 20);
+        let mut write = p
+            .engine
+            .submit(
+                OperationData::new(vec![vec![21]]).unwrap(),
+                Cancellation::default(),
+            )
+            .await
+            .unwrap();
+        log.last.store(21, Ordering::Release);
+        assert_eq!(write.sequence, 21);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            write.wait(Cancellation::default())
+        )
+        .await
+        .is_err());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            p.engine
+                .wait_for_catch_up(CatchUpMode::All, Cancellation::default())
+        )
+        .await
+        .is_err());
+        assert_eq!(p.engine.snapshot().progress.committed, 20);
+        network.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issued_root_and_bound_canonical_controls_copy_ack_memberships_remove_and_pair_progress() {
     for root in [false, true] {
         let partition = uuid::Uuid::new_v4();
@@ -331,6 +442,204 @@ async fn issued_root_and_bound_canonical_controls_copy_ack_memberships_remove_an
         );
         pump.abort();
         let _ = pump.await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_native_bound_duplicate_secondary_epoch_enters_lower_while_copy_ack_is_pending() {
+    let partition = uuid::Uuid::new_v4();
+    let source = tests::upper_log::UpperLog::new(EPOCH, 100);
+    let upper = tests::upper_log::UpperLog::new(EPOCH, 1);
+    let p = Fixture::using(
+        partition,
+        self::source(1),
+        ReplicaRole::Primary,
+        false,
+        (MemoryProvider::new(), source.clone(), Settings::default()),
+    )
+    .await;
+    let s = Fixture::using(
+        partition,
+        self::source(2),
+        ReplicaRole::IdleSecondary,
+        false,
+        (MemoryProvider::new(), upper.clone(), Settings::default()),
+    )
+    .await;
+    p.host.configure(config(EPOCH, vec![], 1)).await.unwrap();
+    let build = p.host.build(
+        s.descriptor(ReplicaRole::IdleSecondary),
+        Cancellation::default(),
+    );
+    tokio::pin!(build);
+    let stream = s.engine.copy_stream();
+    let operation = tokio::select! {
+        result = &mut build => panic!("build before actual copy apply: {result:?}"),
+        operation = stream.next(Cancellation::default()) => operation.unwrap().unwrap(),
+    };
+    upper.apply_snapshot(&operation.data);
+    let updates = upper.updates.load(Ordering::Acquire);
+    let getters = upper.getters.load(Ordering::Acquire);
+    assert!(!s.engine.snapshot().copy_done);
+    let entries = s.engine.shared.epoch_entries.load(Ordering::Acquire);
+    // RAP legitimately suppresses a duplicate before calling lower. Verify
+    // that optimization, then exercise the canonical lower method itself.
+    s.host.change_epoch(EPOCH).await.unwrap();
+    assert_eq!(
+        s.engine.shared.epoch_entries.load(Ordering::Acquire),
+        entries
+    );
+    let permit = s
+        .native
+        .execution()
+        .reserve(
+            CallLane::Native,
+            CallOrigin {
+                engine: 0,
+                generation: s.native.binding().generation,
+                session: 0,
+            },
+            std::time::Duration::from_secs(2),
+            false,
+        )
+        .unwrap();
+    let engine = s.engine.clone();
+    permit
+        .run_future(async move {
+            IReplicator::update_epoch(&*engine, EPOCH, Cancellation::default()).await
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        s.engine.shared.epoch_entries.load(Ordering::Acquire),
+        entries + 1
+    );
+    assert_eq!(upper.updates.load(Ordering::Acquire), updates);
+    assert_eq!(upper.getters.load(Ordering::Acquire), getters);
+    assert_eq!(upper.tail(), 100);
+    operation.acknowledge().unwrap();
+    drop(operation);
+    build.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_lower_secondary_controls_use_traffic_admission_epoch_without_provider_slots() {
+    for start_newer in [false, true] {
+        let partition = uuid::Uuid::new_v4();
+        let upper = tests::upper_log::UpperLog::new(EPOCH, 1);
+        let s = Fixture::using(
+            partition,
+            source(2),
+            ReplicaRole::IdleSecondary,
+            false,
+            (MemoryProvider::new(), upper.clone(), Settings::default()),
+        )
+        .await;
+        let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+        network.register_peer(&s.engine.endpoint()).unwrap();
+        let primary = Endpoint {
+            address: network.address().to_owned(),
+            actor: Actor {
+                partition,
+                replica: 1,
+                incarnation: uuid::Uuid::new_v4(),
+            },
+            transport_id: None,
+        };
+        let send = |body| {
+            network
+                .send(Packet {
+                    from: primary.clone(),
+                    to: s.engine.endpoint().actor,
+                    body,
+                })
+                .unwrap();
+        };
+        send(Body::StartCopy {
+            epoch: if start_newer { NEXT } else { EPOCH },
+            target: 2,
+            start: 1,
+        });
+        until(|| s.engine.snapshot().observed_primary.is_some()).await;
+        if !start_newer {
+            send(Body::Replication {
+                primary_epoch: NEXT,
+                operation_epoch: EPOCH,
+                operations: vec![WireOperation {
+                    sequence: 1,
+                    kind: 1,
+                    atomic_group: -1,
+                    data: vec![vec![1]],
+                }],
+                batch_end: 1,
+                completed: 0,
+            });
+            until(|| s.engine.snapshot().progress.received == 1).await;
+        }
+        assert!(!s.engine.snapshot().copy_done);
+        let getters = upper.getters.load(Ordering::Acquire);
+        let updates = upper.updates.load(Ordering::Acquire);
+        let entries = s.engine.shared.epoch_entries.load(Ordering::Acquire);
+        let execution = s.native.execution();
+        let call = execution
+            .reserve(
+                CallLane::Native,
+                CallOrigin {
+                    engine: 0,
+                    generation: s.native.binding().generation,
+                    session: 0,
+                },
+                std::time::Duration::from_secs(2),
+                false,
+            )
+            .unwrap();
+        // One native entry and 63 provider reservations exhaust the shared
+        // record budget. Neither lower control below invokes application code.
+        let slots: Vec<_> = (0..63)
+            .map(|_| {
+                execution
+                    .reserve(
+                        CallLane::Provider,
+                        CallOrigin::default(),
+                        std::time::Duration::from_secs(2),
+                        false,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert!(execution
+            .reserve(
+                CallLane::Provider,
+                CallOrigin::default(),
+                std::time::Duration::from_secs(2),
+                false,
+            )
+            .is_err());
+        let engine = s.engine.clone();
+        call.run_future(async move {
+            for epoch in [NEXT, EPOCH] {
+                let result =
+                    IReplicator::update_epoch(&*engine, epoch, Cancellation::default()).await;
+                if epoch == NEXT {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(result, Err(Error::InvalidInput("stale epoch"))));
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            s.engine.shared.epoch_entries.load(Ordering::Acquire),
+            entries + 2
+        );
+        assert_eq!(upper.getters.load(Ordering::Acquire), getters);
+        assert_eq!(upper.updates.load(Ordering::Acquire), updates);
+        assert!(!s.engine.snapshot().copy_done);
+        assert!(s.engine.snapshot().fault.is_none());
+        drop(slots);
+        network.shutdown();
     }
 }
 

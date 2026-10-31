@@ -36,7 +36,7 @@ tests/
     shared/
       data.py                     replication harness and bundle producer
       runtime.py                  runtime harness and bundle producer
-      ci.py                       input validation, cleanup, evidence aggregate
+      ci.py                       input validation, local behavioral checks, cleanup
       fixture.py                  partition-owned onebox startup and finalization
 ```
 
@@ -65,15 +65,15 @@ ownership/health check gates suite execution.
 Partition execution is ordered and non-fail-fast: a failed/timed-out suite stays
 failed while later suites still run. Suites continue owning only their minted
 applications/services, not the cluster. In `finally`, the fixture collects
-credential-safe diagnostics under the original-owner guard and destroys its
-owned allocation, independently verifying resource absence. Partial startup,
+credential-safe diagnostics on failure under the original-owner guard and
+destroys its owned allocation, independently verifying resource absence. Partial startup,
 suite interruption and diagnostic failure still attempt teardown. Replacement
 owners and colliding allocations are never adopted or deleted.
 
 `--existing-owner OWNER` (also accepted as `--owner`) explicitly reuses a
 caller-owned healthy allocation and **retains it**, including after failure.
-It publishes no emergency-destroy capability. Such retained runs cannot satisfy
-the CI aggregate's original-allocation teardown requirement. Normal partition
+It publishes no emergency-destroy capability. CI instead creates and destroys
+its own allocation. Normal partition
 commands require `--name`, `--bundle-tar`, `--prebuilt`, `--producer` and a new
 `--report-dir`; native-client partitions also require their archive, private
 config directory and fixture owner. The shared whole-profile commands below
@@ -88,11 +88,20 @@ prevent all cleanup; no in-process fixture guarantees recovery from host loss.
 
 The five native-client tests remain crate-local and execute
 through nextest, with `--no-tests fail`, before Rust data and legacy in their
-current partition. Private fixture configs/journals stay outside uploaded proof
-directories. The aggregate independently revalidates typed reports, exact
-manifest-derived coverage, `suite-outcomes.json`, its manifest hash, actual
-`fixture.json` readiness/ownership/phase evidence and original-resource cleanup.
-A command-success receipt alone cannot pass.
+current partition. Private fixture configs/journals stay outside uploaded
+diagnostic directories. Before teardown, the worker checks the actual typed
+suite reports, complete manifest-derived scenario coverage, source/binary
+identity, original allocation and execution interval. A successful child exit
+without valid behavioral results cannot pass. Cleanup independently verifies
+absence of the original resources and affects the worker's exit status.
+
+Reports are local intermediate results, not success artifacts. A successful
+partition prints its outcome and removes its new report directory. Failed runs
+retain suite reports, fixture/input/cleanup details and credential-safe cluster
+diagnostics; diagnostics are collected before teardown when possible. Cleanup
+failure also retains diagnostics. CI uploads these files only on failure or
+cancellation. It does not seal reports or download/revalidate them in a later
+job.
 
 Offline groups mirror these responsibilities and are selected by suite name:
 
@@ -246,8 +255,9 @@ Create a [onebox](UbuntuOnebox.md), install the pinned nextest version from
 CI builds the test archive once, then runs the explicitly owned fixture/setup
 tests and `group(onebox)` against the real native gateway. The two
 [onebox workers](#parallel-onebox-ci) depend only on artifact production; the
-aggregate additionally gates all independent checks.
-Each worker always attempts diagnostics and original-owner teardown.
+required check additionally gates all independent job outcomes.
+Each worker always attempts original-owner teardown and collects diagnostics
+on failure.
 Retained-data shutdown/restart
 qualification runs in
 [service-fabric-apps-rs](https://github.com/youyuanwu/service-fabric-apps-rs/blob/main/docs/UbuntuOnebox.md),
@@ -390,8 +400,8 @@ application or port namespace:
   moves, stale-frame ingress, failures and the original full-data auxiliary
   policy. No dependent scenario is sliced across workers.
 
-The existing **Linux onebox native client** check name now belongs to the strict
-aggregate: **Rust14 + native-data17 + hardened legacy1 =32 namespaced profile
+The existing **Linux onebox native client** check requires every build/test job
+to succeed: **Rust14 + native-data17 + hardened legacy1 =32 namespaced profile
 assertions**, plus five archived native tests. A partial report cannot label
 itself full. Native-client reports retain their actual heterogeneous schemas;
 seven internal clear-client cases are not seven native tests.
@@ -400,39 +410,35 @@ The upstream producer publishes its attempt-bound receipt outside the immutable
 bundle. [`shared/ci.py`](../tests/onebox/shared/ci.py) verifies actual checkout/tree,
 PR head versus nullable merge, run/attempt, tar/archive/manifests and executable
 hashes before allocation. Each worker retains its immutable original creation
-capability through partial failure, verifies logical app/type/upload absence,
-then publishes a structured original container/volume/network absence receipt
-**after teardown**. The aggregate revalidates report bytes and typed evidence;
-missing/failed/skipped work or cleanup cannot become green.
-The final aggregate also requires all independent Rust/Python checks and
-standalone native acceptance to succeed.
+capability through partial failure, checks behavioral results locally, verifies
+logical app/type/upload absence, then independently verifies original
+container/volume/network absence during teardown. Missing/failed/skipped work
+or cleanup cannot become green. The final gate checks job outcomes, including
+all independent Rust/Python checks and standalone native acceptance.
 
 Legacy dispatch reuses the strict outer/nested loaders and
 `NativeDataDeploymentPolicy`, including both package versions. The direct
 nested-bundle `tests.onebox.shared.runtime` CLI is not a substitute for this hardened
 CI adapter. Use `--profile full` above for local combined qualification.
-`python3 -m tests.onebox.shared.ci --help` describes the CI-only receipt commands.
+`python3 -m tests.onebox.shared.ci --help` describes input verification, legacy
+execution and cleanup commands. The old `seal` and `aggregate` commands have
+been removed.
 
-Artifact names include run and attempt: `onebox-inputs-*`,
-`onebox-worker-<partition>-*`, `onebox-aggregate-*`. Worker artifacts retain their
-partition subdirectory. Each matrix worker exports its immutable artifact ID
-and actual execution attempt under partition-specific outputs; these output
-bindings must remain consistent with the declared partitions.
-The aggregate downloads those exact IDs, never a latest-artifact or
-current-attempt wildcard.
-Each worker artifact includes full reports, `validated-input.json`,
-`suite-outcomes.json`, `fixture.json`, `worker-proof.json`, post-teardown
+Build inputs remain artifacts on every successful producer run, including the
+attempt-bound `onebox-inputs-*` receipt and binary/test archives. Failed-jobs
+reruns may reuse only the explicitly selected same-run producer; source/tree,
+PR head/merge, input hashes and toolchain binding are still checked before
+execution.
+
+Failure artifacts are named `onebox-worker-<partition>-<run>-<attempt>` and
+retain their partition subdirectory for seven days. They contain available
+suite reports, `validated-input.json`, `suite-outcomes.json`, `fixture.json`,
 `cleanup.json` and credential-safe diagnostics. Emergency cleanup, when needed,
-adds a separate `emergency-cleanup.json`. No bootstrap, owner state, journals or
-raw logs are required.
-Failed-jobs reruns may reuse the explicitly selected same-run producer and
-successful worker executions. Source/tree, PR head/merge, input hashes,
-producer receipt digest, coverage and original cleanup remain mandatory.
-Worker evidence is checked against its exported execution attempt, never
-relabeled as newly executed; aggregate output retains producer and worker
-contexts. Missing selected artifacts/proofs fail instead of falling back to
-older evidence. A rebuilt producer cannot reuse workers bound to its predecessor,
-even when binary bytes happen to match.
+adds a separate `emergency-cleanup.json` and cannot turn the failed run green.
+Failures before fixture startup may have no report files; normal CI logs still
+show the failed step. Standalone native-runtime diagnostics are likewise
+uploaded only on failure or cancellation. No worker-proof or aggregate
+artifacts are produced.
 
 [Measured run40781117241](https://github.com/youyuanwu/fube/actions/runs/40781117241)
 passed at source1414adca with all32+5. Compared with successful sequential

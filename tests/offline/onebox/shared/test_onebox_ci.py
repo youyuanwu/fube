@@ -1,4 +1,4 @@
-"""Offline receipt/route models, not native or CI qualification."""
+"""Offline input, runner and behavioral-check models, not native qualification."""
 import contextlib
 from argparse import Namespace
 import copy
@@ -65,9 +65,6 @@ class ProofFiles(fixtures.ProjectFiles):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value))
         return path
-
-    def wrapped(self, kind, value):
-        return {"version": 1, "kind": kind, "status": "PASS", "errors": [], **value}
 
     def validated(self, route):
         path = self.root / "workers" / route / "validated-input.json"
@@ -459,18 +456,6 @@ class ProofFiles(fixtures.ProjectFiles):
             "allocation": ci.binding("owned", "a" * 32, "original-cid"),
         }
 
-    def command_outcomes(self, route):
-        values = {key: "success" for key in ci.OUTCOMES}
-        if route == "client-runtime":
-            values["native_data"] = "skipped"
-            values["native_clients"] = {
-                "outcome": "success", "archive_sha256": self.built["inputs"]["native_archive"]["sha256"],
-                "filter": "group(onebox)", "no_tests": "fail",
-            }
-        else:
-            values.update(native_clients="skipped", rust_data="skipped", legacy="skipped")
-        return values
-
     def worker(self, route):
         validated = self.validated(route)
         directory = validated.parent
@@ -479,9 +464,6 @@ class ProofFiles(fixtures.ProjectFiles):
             start = ci.read(validated)["validated_at"]
             self.emit(directory / "rust-report.json", self.data_report("rust", name, owner, container, start))
             preserved = self.real_policy_report()
-            # The real modeled policy ran later than validation, but fixture
-            # suite endpoints are intentionally ordered within this same worker.
-            clean_start = max(ci.time.time(), start + 1)
             self.emit(directory / "legacy-report.json", preserved)
             for file, value in self.native_reports(name, start).items():
                 self.emit(directory / "client" / file, value)
@@ -489,47 +471,21 @@ class ProofFiles(fixtures.ProjectFiles):
             name, owner, container = "native-owned", "b" * 32, "native-original-cid"
             start = ci.read(validated)["validated_at"]
             self.emit(directory / "native-data-report.json", self.data_report("native-data", name, owner, container, start))
-            clean_start = start + 1
-        self.emit(directory / "cleanup.json", self.wrapped("cleanup", {
-            "context": self.current, "route": route, "producer_sha256": ci.identity(self.producer)["sha256"],
-            "allocation": ci.binding(name, owner), "started_at": clean_start, "finished_at": clean_start + 1,
-            "destroy": {"name": name, "phase": "destroyed", "data_deleted": True, "absence_verified": True,
-                        "independent_absence": {"container": [container],
-                                               "volume": ["sf-onebox-" + name + "_data"],
-                                               "network": ["network-" + name]}},
-        }))
-        self.emit(directory / "fixture.json", self.wrapped("onebox-fixture", {
-            "context": self.current, "route": route, "producer_sha256": ci.identity(self.producer)["sha256"],
-            "allocation": ci.binding(name, owner, container), "ownership": "created",
-            "outcomes": dict.fromkeys(ci.FIXTURE_PHASES, "success"),
-            "started_at": start - 1, "ready_at": start, "finished_at": clean_start + 1,
-        }))
-        self.emit(directory / "diagnostics.json", {
-            "name": name, "project": "sf-onebox-" + name, "errors": [],
-        })
-        commands = self.command_outcomes(route)
-        self.emit(directory / "suite-outcomes.json", {
-            "version": 1, "partition": route, "status": "PASS", "errors": [],
-            "manifest_sha256": self.built["inputs"]["suite_manifest"]["sha256"],
-            "suites": {name: commands[name] for name in ci.suites.MANIFEST.selected(route)},
-        })
         return directory
 
-    def sealing(self, route, directory, output=None, outcomes=None):
-        clean = (ci.read(directory / "cleanup.json") if (directory / "cleanup.json").exists()
-                 else {"finished_at": ci.time.time()})
-        with patch.object(ci.time, "time", return_value=clean["finished_at"] + 1):
-            return self.cli("seal", "--route", route, "--producer", self.producer,
-                            "--validated-input", directory / "validated-input.json", "--evidence-dir", directory,
-                            "--out", output or directory / "worker-proof.json",
-                            "--outcomes", json.dumps(outcomes or self.command_outcomes(route)))
-
-    def aggregating(self, output=None, needs=None, attempts=None):
-        extra = ("--worker-attempts-json", json.dumps(attempts)) if attempts is not None else ()
-        return self.cli("aggregate", "--producer", self.producer, "--worker-root", self.root / "workers",
-                        "--needs-json", json.dumps(needs or dict.fromkeys(ci.REQUIRED_JOBS, "success")),
-                        "--out", output or self.root / "aggregate.json", *extra)
-
+    def checking(self, route, directory):
+        args = Namespace(producer=self.producer, report_dir=directory, fixture_owner="ci-100-1")
+        allocation = (ci.binding("owned", "a" * 32, "original-cid") if route == "client-runtime"
+                      else ci.binding("native-owned", "b" * 32, "native-original-cid"))
+        start = ci.read(directory / "validated-input.json")["validated_at"]
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            try:
+                ci.check_suites(ci.suites.MANIFEST.selected(route), args, allocation, start, ci.time.time() + 2)
+            except (ci.ProofError, KeyError, TypeError, FileNotFoundError) as error:
+                self.last_stdout = str(error)
+                return 1
+        self.last_stdout = output.getvalue()
+        return 0
 
 class InputTests(ProofFiles):
     def test_changed_manifest_rejected_before_allocation(self):
@@ -715,6 +671,9 @@ class FixtureTests(ProofFiles):
             mocker = patch.object(target, name, side_effect=effect)
             setattr(self, attribute, mocker.start())
             self.addCleanup(mocker.stop)
+        checks = patch.object(ci, "check_suites")
+        self.checks = checks.start()
+        self.addCleanup(checks.stop)
 
     def exercise(self, execute=None):
         def passed(selected, args, manifest_hash):
@@ -724,18 +683,31 @@ class FixtureTests(ProofFiles):
         with contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(output):
             status = fixture.run(ci.suites.MANIFEST.selected(self.args.partition), self.args, execute or passed)
         self.console = output.getvalue()
-        return status, ci.read(self.args.report_dir / "fixture.json")
+        report = self.args.report_dir / "fixture.json"
+        return status, ci.read(report) if report.exists() else None
 
     def test_owned_partition_creates_waits_and_cleans_once(self):
         status, result = self.exercise()
         self.assertEqual(status, 0)
-        self.assertEqual(self.events, ["allocate", "healthy", "ready", "suites", "diagnostics", "destroy"])
-        self.assertEqual(result["ownership"], "created")
-        self.assertEqual(result["outcomes"], dict.fromkeys(ci.FIXTURE_PHASES, "success"))
+        self.assertEqual(self.events, ["allocate", "healthy", "ready", "suites", "destroy"])
+        self.assertIsNone(result)
+        self.assertFalse(self.args.report_dir.exists())
+        self.diagnostics.assert_not_called()
+        self.checks.assert_called_once()
+        self.assertEqual(self.checks.call_args.args[2],
+                         ci.binding("fixture-owned", "a" * 32, "fixture-container"))
         self.destroy.assert_called_once_with("fixture-owned", "a" * 32)
-        self.assertEqual(result["allocation"], ci.binding("fixture-owned", "a" * 32, "fixture-container"))
         self.assertIn("owner=" + "a" * 32, self.args.github_output.read_text())
         self.assertIn("cleaned=true", self.args.github_output.read_text())
+
+    def test_local_behavioral_check_failure_keeps_diagnostics_and_fails_before_cleanup(self):
+        self.checks.side_effect = ci.ProofError("provider contents differ")
+        status, result = self.exercise()
+        self.assertEqual(status, 1)
+        self.assertEqual(result["outcomes"]["suites"], "failure")
+        self.assertIn("provider contents differ", self.console)
+        self.assertEqual(self.events, ["allocate", "healthy", "ready", "suites", "diagnostics", "destroy"])
+        self.assertTrue((self.args.report_dir / "diagnostics.json").is_file())
         self.assertNotIn('"' + "a" * 32 + '"', (self.args.report_dir / "fixture.json").read_text())
 
     def test_invalid_inputs_never_allocate_or_attach(self):
@@ -773,9 +745,13 @@ class FixtureTests(ProofFiles):
             self.assertEqual(status, 0 if case == "success" else 1)
             self.create.assert_not_called()
             self.destroy.assert_not_called()
-            self.assertEqual(result["ownership"], "reused")
-            self.assertEqual(result["outcomes"]["create"], "reused")
-            self.assertEqual(result["outcomes"]["destroy"], "retained")
+            if case == "success":
+                self.assertIsNone(result)
+                self.assertFalse(self.args.report_dir.exists())
+            else:
+                self.assertEqual(result["ownership"], "reused")
+                self.assertEqual(result["outcomes"]["create"], "reused")
+                self.assertEqual(result["outcomes"]["destroy"], "retained")
             self.assertFalse(self.args.github_output.exists())
 
     def test_cleanup_failure_keeps_emergency_capability_and_failure(self):
@@ -787,10 +763,27 @@ class FixtureTests(ProofFiles):
         self.assertIn("owner=" + "a" * 32, self.args.github_output.read_text())
         self.assertNotIn("cleaned=", self.args.github_output.read_text())
         self.assertNotIn("private detail", (self.args.report_dir / "cleanup.json").read_text())
+        self.diagnostics.assert_called_once()
+
+    def test_cleanup_rejects_replaced_or_missing_original_resources(self):
+        destroy = self.destroy.side_effect
+        for field in ("container", "volume", "network"):
+            with self.subTest(field=field):
+                self.args.owner = None
+                self.args.report_dir = self.root / ("bad-cleanup-" + field)
+                def changed(name, owner):
+                    result = destroy(name, owner)
+                    result["independent_absence"][field] = ["replacement"] if field == "container" else []
+                    return result
+                self.destroy.side_effect = changed
+                status, result = self.exercise()
+                self.assertEqual(status, 1)
+                self.assertEqual(result["outcomes"]["destroy"], "failure")
+                self.assertNotIn("cleaned=", self.args.github_output.read_text())
 
     def test_diagnostics_failure_cannot_skip_cleanup(self):
         self.diagnostics.side_effect = OSError("collector unavailable")
-        status, result = self.exercise()
+        status, result = self.exercise(unittest.mock.Mock(return_value=1))
         self.assertEqual(status, 1)
         self.assertEqual(result["outcomes"]["diagnostics"], "failure")
         self.assertEqual(result["outcomes"]["destroy"], "success")
@@ -808,8 +801,9 @@ class FixtureTests(ProofFiles):
             return 0
         status, result = self.exercise(changed)
         self.assertEqual(status, 0)
+        self.assertIsNone(result)
         self.destroy.assert_called_once_with("fixture-owned", "a" * 32)
-        self.assertEqual(result["allocation"]["name"], "fixture-owned")
+        self.assertEqual(self.checks.call_args.args[2]["name"], "fixture-owned")
 
 
 class CleanupLegacyTests(ProofFiles):
@@ -910,120 +904,25 @@ class CleanupLegacyTests(ProofFiles):
 
 
 class WorkerTests(ProofFiles):
-    def test_partial_rerun_aggregates_exact_worker_attempts_without_relabeling_evidence(self):
-        native = self.worker("native-data")
-        self.assertEqual(self.sealing("native-data", native), 0, self.last_stdout)
-        self.current["attempt"] = "2"
-        attempts = {"native-data": "1", "client-runtime": "2"}
-        with patch.dict(os.environ, {"FUBE_CI_PRODUCER_ATTEMPT": "1"}):
-            client = self.worker("client-runtime")
-            self.assertEqual(self.sealing("client-runtime", client), 0, self.last_stdout)
-            self.assertEqual(self.aggregating(attempts=attempts), 0, self.last_stdout)
-            result = ci.read(self.root / "aggregate.json")
-            self.assertEqual(result["context"]["attempt"], "2")
-            self.assertEqual(result["producer_context"]["attempt"], "1")
-            self.assertEqual({route: value["attempt"] for route, value in result["worker_contexts"].items()},
-                             attempts)
-            self.assertEqual(self.aggregating(self.root / "implicit-attempts.json"), 1)
-            wrong = dict(attempts, **{"native-data": "2"})
-            self.assertEqual(self.aggregating(self.root / "missing-current-proof.json", attempts=wrong), 1)
-            for index, changed in enumerate((dict(attempts, unexpected="1"),
-                                             {"client-runtime": "2"}, dict(attempts, **{"native-data": "3"}))):
-                self.assertEqual(self.aggregating(self.root / f"invalid-attempts-{index}.json",
-                                                  attempts=changed), 1)
-            proof = ci.read(client / "worker-proof.json")
-            proof["status"], proof["errors"] = "FAIL", ["rerun failed"]
-            self.emit(client / "worker-proof.json", proof)
-            self.assertEqual(self.aggregating(self.root / "failed-rerun-proof.json", attempts=attempts), 1)
-
-    def test_rebuilt_producer_cannot_reuse_previous_worker_proofs(self):
-        for route in ci.ROUTES:
-            self.assertEqual(self.sealing(route, self.worker(route)), 0, self.last_stdout)
-        self.current["attempt"] = "2"
-        rebuilt = self.root / "producer-2.json"
-        self.assertEqual(self.cli("produce", "--bundle-tar", self.tar, "--bundle-dir", self.directory,
-                                  "--archive", self.archive, "--out", rebuilt), 0)
-        self.producer = rebuilt
-        self.assertEqual(self.aggregating(attempts=dict.fromkeys(ci.ROUTES, "1")), 1)
-
-    def test_seal_merges_lifecycle_with_actual_manifest_execution(self):
-        for route in ci.ROUTES:
-            directory = self.worker(route)
-            finished = ci.read(directory / "fixture.json")["finished_at"]
-            with patch.object(ci.time, "time", return_value=finished + 1):
-                self.assertEqual(self.cli(
-                    "seal", "--route", route, "--producer", self.producer,
-                    "--validated-input", directory / "validated-input.json", "--evidence-dir", directory,
-                    "--out", directory / "worker-proof.json"), 0, self.last_stdout)
-
-    def test_fixture_readiness_and_original_ownership_cannot_be_forged(self):
-        directory = self.worker("native-data")
-        path = directory / "fixture.json"
-        original = ci.read(path)
-        mutations = (
-            lambda value: value.update(ownership="reused"),
-            lambda value: value["allocation"].update(owner_sha256="b" * 64),
-            lambda value: value["outcomes"].update(ready="failure"),
-            lambda value: value.update(ready_at=value["finished_at"] + 1),
-        )
-        for index, mutation in enumerate(mutations):
-            value = copy.deepcopy(original)
-            mutation(value)
-            self.emit(path, value)
-            self.assertEqual(self.sealing("native-data", directory,
-                                          output=self.root / f"bad-fixture-{index}.json"), 1)
-
-    def test_missing_failed_or_mismatched_execution_cannot_pass(self):
-        directory = self.worker("native-data")
-        path = directory / "suite-outcomes.json"
-        original = ci.read(path)
-        mutations = (
-            lambda value: value.update(manifest_sha256="f" * 64),
-            lambda value: value.update(status="FAIL"),
-            lambda value: value["suites"].clear(),
-            lambda value: value["suites"].update(native_data="skipped"),
-        )
-        for index, mutation in enumerate(mutations):
-            value = copy.deepcopy(original)
-            mutation(value)
-            self.emit(path, value)
-            self.assertEqual(self.sealing("native-data", directory,
-                                          output=self.root / f"bad-execution-{index}.json"), 1)
-        path.unlink()
-        self.assertEqual(self.sealing("native-data", directory,
-                                      output=self.root / "missing-execution.json"), 1)
-
     def reject_data_mutations(self, changes, routes=ci.ROUTES):
         for route in ci.ROUTES:
-            self.assertEqual(self.sealing(route, self.worker(route)), 0, self.last_stdout)
+            self.assertEqual(self.checking(route, self.worker(route)), 0, self.last_stdout)
         for route, filename in (("client-runtime", "rust-report.json"), ("native-data", "native-data-report.json")):
             if route not in routes:
                 continue
             directory = self.root / "workers" / route
-            path, proof_path = directory / filename, directory / "worker-proof.json"
-            # These are locally generated raw fixtures, not gate input parsing.
-            # Real entry points below must stream them through bounded DATA_SPEC.
-            original, proof = json.loads(path.read_text()), ci.read(proof_path)
-            for index, (name, change) in enumerate(changes):
+            path = directory / filename
+            original = json.loads(path.read_text())
+            for name, change in changes:
                 with self.subTest(route=route, witness=name):
                     broken = copy.deepcopy(original)
                     change(broken)
                     self.emit(path, broken)
-                    output = self.root / (route + "-seal-" + str(index) + ".json")
-                    self.assertEqual(self.sealing(route, directory, output), 1, self.last_stdout)
-                    forged = copy.deepcopy(proof)
-                    forged["reports"][filename] = ci.identity(path, ci.REPORT)
-                    self.emit(proof_path, forged)
-                    output = self.root / (route + "-aggregate-" + str(index) + ".json")
-                    self.assertEqual(self.aggregating(output), 1, self.last_stdout)
-                    result = ci.read(output)
-                    self.assertEqual(result["status"], "FAIL")
-                    self.assertNotIn("sealed worker report hash/proof mismatch", str(result["errors"]))
+                    self.assertEqual(self.checking(route, directory), 1, self.last_stdout)
             self.emit(path, original)
-            self.emit(proof_path, proof)
-        self.assertEqual(self.aggregating(self.root / "restored-aggregate.json"), 0, self.last_stdout)
+            self.assertEqual(self.checking(route, directory), 0, self.last_stdout)
 
-    def test_essential_witness_absence_rejected_by_seal_and_rehashed_aggregate(self):
+    def test_essential_witness_absence_rejected_by_local_checks(self):
         fields = {
             "writes_100": ("writes", "workload", "observation"),
             "identified_retry": ("identical_retry", "conflicting_retry"),
@@ -1046,7 +945,7 @@ class WorkerTests(ProofFiles):
         changes.append(("root/identified_workload", lambda v: v.pop("identified_workload")))
         self.reject_data_mutations(changes)
 
-    def test_contradictory_typed_witnesses_rejected_by_seal_and_rehashed_aggregate(self):
+    def test_contradictory_typed_witnesses_rejected_by_local_checks(self):
         self.reject_data_mutations([
             ("zero-writes", lambda v: v["scenarios"]["writes_100"]["writes"].update(
                 requested=0, successful=0, ids=[], sequences=[])),
@@ -1142,7 +1041,7 @@ class WorkerTests(ProofFiles):
                     ["stateless_siblings_before"][0]["native_entry_point_instance"])),
         ], routes=("client-runtime",))
 
-    def test_cross_field_capacity_recovery_and_close_rollbacks_reject_resealed_proofs(self):
+    def test_cross_field_capacity_recovery_and_close_rollbacks_are_rejected(self):
         def reject_committed_id(value):
             capacity = value["scenarios"]["ledger_capacity_backpressure"]
             original = capacity["old_identity_retry_at_capacity"]["request_id"]
@@ -1182,7 +1081,7 @@ class WorkerTests(ProofFiles):
             ("unrelated-main-rollback-across-close", close_rollback),
         ])
 
-    def test_selected_committed_contents_and_new_writes_bind_every_provider_through_both_gates(self):
+    def test_selected_committed_contents_and_new_writes_bind_every_provider(self):
         def mutate(value, scenario, snapshots, field, key, replacement=None, remove=True, primary_only=False):
             for name in snapshots:
                 snapshot = value["scenarios"][scenario][name]
@@ -1247,10 +1146,9 @@ class WorkerTests(ProofFiles):
             if primary["engine_kind"] == "rust":
                 primary["engine"]["progress"]["completed"] += 1
             self.emit(path, value)
-            self.assertEqual(self.sealing(route, directory), 0, self.last_stdout)
-        self.assertEqual(self.aggregating(), 0, self.last_stdout)
+            self.assertEqual(self.checking(route, directory), 0, self.last_stdout)
 
-    def test_primary_poll_progress_regression_and_noninteger_counters_reject_both_gates(self):
+    def test_primary_poll_progress_regression_and_noninteger_counters_are_rejected(self):
         self.reject_data_mutations([
             ("primary-completion-regression", lambda value: value["scenarios"]["abrupt_primary_loss"]
                 ["observation"]["primary"]["rpc"]["engine"]["progress"].update(completed=0)),
@@ -1269,39 +1167,15 @@ class WorkerTests(ProofFiles):
                 value["scenarios"][case].update(evidence)
             value["identified_workload"] = ledger
             self.emit(path, value)
-            self.assertEqual(self.sealing(route, directory), 0, self.last_stdout)
-        self.assertEqual(self.aggregating(), 0, self.last_stdout)
+            self.assertEqual(self.checking(route, directory), 0, self.last_stdout)
 
-    def test_exact_two_routes_namespaced_32_plus_5_and_hashes_after_teardown(self):
-        for route in ci.ROUTES:
-            directory = self.worker(route)
-            self.assertEqual(self.sealing(route, directory), 0, self.last_stdout)
-        with patch.object(ci.runtime, "destroy_owned", side_effect=AssertionError("not aggregate daemon")), \
-                patch.object(ci.runtime, "Allocation", side_effect=AssertionError("not aggregate daemon")):
-            self.assertEqual(self.aggregating(), 0, self.last_stdout)
-        result = ci.read(self.root / "aggregate.json")
-        self.assertEqual(len(result["assertions"]), 32)
-        self.assertEqual(len(set(result["assertions"])), 32)
-        self.assertEqual(len(result["native_tests"]), 5)
-        self.assertIn("rust/writes_100", result["assertions"])
-        self.assertIn("native-data/writes_100", result["assertions"])
-        self.assertNotIn("full", result["coverage"])
-
-    def test_failed_skipped_or_omitted_independent_commands_never_seal_green(self):
-        directory = self.worker("client-runtime")
-        for command in ci.OUTCOMES:
-            values = self.command_outcomes("client-runtime")
-            values[command] = "failure" if command != "native_data" else "success"
-            self.assertEqual(self.sealing("client-runtime", directory,
-                                          self.root / ("failed-" + command + ".json"), values), 1, command)
-        values = self.command_outcomes("client-runtime")
-        values["legacy"] = "skipped"
-        self.assertEqual(self.sealing("client-runtime", directory, self.root / "skipped.json", values), 1)
-        values = self.command_outcomes("client-runtime")
-        values["native_clients"]["no_tests"] = "pass"
-        self.assertEqual(self.sealing("client-runtime", directory, self.root / "empty-native.json", values), 1)
-        del values["legacy"]
-        self.assertEqual(self.sealing("client-runtime", directory, self.root / "omitted-command.json", values), 1)
+    def test_all_declared_suites_pass_local_checks_without_reconnecting(self):
+        with patch.object(ci.runtime, "destroy_owned", side_effect=AssertionError("unexpected cleanup")), \
+                patch.object(ci.runtime, "Allocation", side_effect=AssertionError("unexpected attach")):
+            for route in ci.ROUTES:
+                directory = self.worker(route)
+                self.assertEqual(self.checking(route, directory), 0, self.last_stdout)
+                self.assertFalse((directory / "worker-proof.json").exists())
 
     def test_native_data_negative_gates_aux_policy_cleanup_and_exact_17_cases(self):
         directory = self.worker("native-data")
@@ -1332,10 +1206,9 @@ class WorkerTests(ProofFiles):
             value = copy.deepcopy(original)
             mutate(value)
             self.emit(path, value)
-            self.assertEqual(self.sealing("native-data", directory, self.root / ("bad-data-" + str(index) + ".json")),
-                             1, index)
+            self.assertEqual(self.checking("native-data", directory), 1, index)
         self.emit(path, original)
-        self.assertEqual(self.sealing("native-data", directory), 0)
+        self.assertEqual(self.checking("native-data", directory), 0)
 
     def test_heterogeneous_native_proofs_no_five_fake_pass_statuses(self):
         directory = self.worker("client-runtime")
@@ -1343,10 +1216,9 @@ class WorkerTests(ProofFiles):
             path = directory / "client" / file
             original = ci.read(path)
             self.emit(path, {"status": "PASS"})
-            self.assertEqual(self.sealing("client-runtime", directory,
-                                          self.root / ("fake-native-" + str(index) + ".json")), 1)
+            self.assertEqual(self.checking("client-runtime", directory), 1)
             self.emit(path, original)
-        self.assertEqual(self.sealing("client-runtime", directory), 0)
+        self.assertEqual(self.checking("client-runtime", directory), 0)
 
     def test_source_eos_variants_require_typed_payloads_bound_to_actual_held_copy(self):
         directory = self.worker("native-data")
@@ -1382,35 +1254,9 @@ class WorkerTests(ProofFiles):
                 broken = copy.deepcopy(original)
                 change(broken["scenarios"][case]["replacement_copy"]["destination_copy_ack"])
                 self.emit(path, broken)
-                self.assertEqual(self.sealing("native-data", directory,
-                    self.root / (case + "-eos-" + str(index) + ".json")), 1, (case, index))
+                self.assertEqual(self.checking("native-data", directory), 1, (case, index))
         self.emit(path, original)
-        self.assertEqual(self.sealing("native-data", directory), 0)
-
-    def test_aggregate_rechecks_source_eos_even_when_tampered_report_hash_is_resealed(self):
-        for route in ci.ROUTES:
-            self.assertEqual(self.sealing(route, self.worker(route)), 0)
-        directory = self.root / "workers/native-data"
-        path = directory / "native-data-report.json"
-        report = json.loads(path.read_text())
-        proof_path = directory / "worker-proof.json"
-        proof = ci.read(proof_path)
-        for index, variant in enumerate(("wrong_tag", "inconsistent_counts")):
-            broken = copy.deepcopy(report)
-            if variant == "wrong_tag":
-                broken["scenarios"]["rust_primary_native_secondary"]["replacement_copy"][
-                    "destination_copy_ack"]["source_eos"] = {"kind": False}
-            else:
-                broken["scenarios"]["native_primary_rust_secondary"]["replacement_copy"][
-                    "destination_copy_ack"]["source_eos"]["observation"].update(
-                        begin_count=1, end_count=1, callback_count=1)
-            self.emit(path, broken)
-            forged = copy.deepcopy(proof)
-            forged["reports"]["native-data-report.json"] = ci.identity(path, ci.REPORT)
-            self.emit(proof_path, forged)
-            output = self.root / ("aggregate-eos-" + str(index) + ".json")
-            self.assertEqual(self.aggregating(output), 1)
-            self.assertEqual(ci.read(output)["status"], "FAIL")
+        self.assertEqual(self.checking("native-data", directory), 0)
 
     def test_each_archived_native_digest_and_essential_boolean_is_enforced(self):
         directory = self.worker("client-runtime")
@@ -1420,8 +1266,7 @@ class WorkerTests(ProofFiles):
             broken = copy.deepcopy(original)
             broken["archive_sha256"] = "f" * 64
             self.emit(path, broken)
-            self.assertEqual(self.sealing("client-runtime", directory,
-                                          self.root / ("native-digest-" + str(index) + ".json")), 1)
+            self.assertEqual(self.checking("client-runtime", directory), 1)
             self.emit(path, original)
         path = directory / "client" / ci.NATIVE_FILES[0]
         original = ci.read(path)
@@ -1429,99 +1274,8 @@ class WorkerTests(ProofFiles):
             broken = copy.deepcopy(original)
             broken["executed_cases"][0]["passed"] = value
             self.emit(path, broken)
-            self.assertEqual(self.sealing("client-runtime", directory,
-                                          self.root / ("native-case-" + str(index) + ".json")), 1)
+            self.assertEqual(self.checking("client-runtime", directory), 1)
         self.emit(path, original)
-
-    def test_missing_post_cleanup_original_owner_and_resource_id_drift(self):
-        directory = self.worker("native-data")
-        path = directory / "cleanup.json"
-        original = ci.read(path)
-        path.unlink()
-        self.assertEqual(self.sealing("native-data", directory, self.root / "missing-cleanup.json"), 1)
-        changes = [
-            lambda v: v["allocation"].update(owner_sha256="f" * 64),
-            lambda v: v["destroy"]["independent_absence"].update(container=["replacement"]),
-            lambda v: v["destroy"]["independent_absence"].update(volume=[]),
-            lambda v: v["destroy"].update(absence_verified=False),
-            lambda v: v["destroy"].update(data_deleted=1),
-            lambda v: v.update(status="FAIL", errors=["actual cleanup failed"]),
-        ]
-        for index, change in enumerate(changes):
-            value = copy.deepcopy(original)
-            change(value)
-            self.emit(path, value)
-            self.assertEqual(self.sealing("native-data", directory,
-                                          self.root / ("cleanup-drift-" + str(index) + ".json")), 1)
-
-    def test_aggregate_rejects_job_results_missing_extra_stale_tamper_and_wrong_proofs(self):
-        for route in ci.ROUTES:
-            self.assertEqual(self.sealing(route, self.worker(route)), 0)
-        for index, result in enumerate(("failure", "skipped", "cancelled", "success-extra")):
-            for job in ci.REQUIRED_JOBS:
-                needs = dict.fromkeys(ci.REQUIRED_JOBS, "success") | {job: result}
-                self.assertEqual(self.aggregating(self.root / (job + str(index) + ".json"), needs), 1)
-        path = self.root / "workers/native-data/worker-proof.json"
-        original = ci.read(path)
-        for index, mutation in enumerate((
-                lambda v: v["context"].update(attempt="0"),
-                lambda v: v.update(route="client-runtime"),
-                lambda v: v.update(version=True),
-                lambda v: v.update(status="FAIL", errors=["suite failed"]),
-                lambda v: v["reports"]["cleanup.json"].update(sha256="f" * 64),
-                lambda v: v.update(assertions=["native-data/writes_100"]),
-                lambda v: v["timing"].update(worker_elapsed_seconds=True),
-                lambda v: v.update(extra="unexpected proof"),
-        )):
-            broken = copy.deepcopy(original)
-            mutation(broken)
-            self.emit(path, broken)
-            self.assertEqual(self.aggregating(self.root / ("bad-proof-" + str(index) + ".json")), 1, index)
-        self.emit(path, original)
-        report_path = path.parent / "native-data-report.json"
-        content = report_path.read_bytes()
-        report_path.write_bytes(content + b" ")
-        self.assertEqual(self.aggregating(self.root / "tampered-report.json"), 1)
-        report_path.write_bytes(content)
-        extra = self.emit(path.parent / "unexpected.json", {})
-        self.assertEqual(self.aggregating(self.root / "extra-report.json"), 1)
-        extra.unlink()
-        path.unlink()
-        self.assertEqual(self.aggregating(self.root / "missing-worker.json"), 1)
-
-    def test_aggregate_rejects_shared_original_names_owners_containers_and_networks(self):
-        client = self.worker("client-runtime")
-        self.assertEqual(self.sealing("client-runtime", client), 0)
-        native = self.worker("native-data")
-        report_path, cleanup_path = native / "native-data-report.json", native / "cleanup.json"
-        report, cleanup = json.loads(report_path.read_text()), ci.read(cleanup_path)
-        lifecycle = ci.read(native / "fixture.json")
-        for key in ("name", "owner", "container", "network"):
-            altered, clean = copy.deepcopy(report), copy.deepcopy(cleanup)
-            if key == "name":
-                altered["onebox"] = clean["allocation"]["name"] = clean["destroy"]["name"] = "owned"
-                clean["destroy"]["independent_absence"]["volume"] = ["sf-onebox-owned_data"]
-            elif key == "owner":
-                altered["owner"] = "a" * 32
-                clean["allocation"]["owner_sha256"] = ci.owner_hash("a" * 32)
-            elif key == "container":
-                altered["container_id"] = "original-cid"
-                clean["destroy"]["independent_absence"]["container"] = ["original-cid"]
-            else:
-                clean["destroy"]["independent_absence"]["network"] = ["network-owned"]
-            self.emit(report_path, altered)
-            self.emit(cleanup_path, clean)
-            changed = copy.deepcopy(lifecycle)
-            changed["allocation"] = {**clean["allocation"],
-                                     "container_id": clean["destroy"]["independent_absence"]["container"][0]}
-            self.emit(native / "fixture.json", changed)
-            self.emit(native / "diagnostics.json", {
-                "name": clean["allocation"]["name"],
-                "project": "sf-onebox-" + clean["allocation"]["name"], "errors": [],
-            })
-            self.assertEqual(self.sealing("native-data", native), 0, key)
-            self.assertEqual(self.aggregating(self.root / ("shared-" + key + ".json")), 1, key)
-            (native / "worker-proof.json").unlink()
 
 class BoundedParserTests(fixtures.ProjectFiles):
     def test_selected_content_digest_is_canonical_local_strict_and_bounded(self):

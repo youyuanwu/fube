@@ -17,7 +17,14 @@ async fn rap_build(
     host(route).build(peer, cancellation).await
 }
 async fn rap_role(route: &Arc<Route>, role: ReplicaRole) -> RuntimeResult<()> {
-    host(route).change_role(role).await
+    host(route).change_role(role).await?;
+    if matches!(
+        role,
+        ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+    ) {
+        route.stream_refresh.send_replace(());
+    }
+    Ok(())
 }
 async fn shutdown_route(route: &Arc<Route>) {
     if route.engine.snapshot().closed {
@@ -1073,6 +1080,7 @@ fn pump_fixture_with_hold(
     let fault = Arc::new(Mutex::new(None));
     let pump = Pump::start(
         PumpInput {
+            stream_refresh: watch::channel(()).1,
             native,
             engine: Weak::new(),
             provider,
@@ -1282,6 +1290,52 @@ async fn pump_copy_eos_does_not_end_replication_and_ack_observes_actual_provider
         1,
         "thread dropped every provider capture before join"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sample_pump_refreshes_demoted_role_streams_without_recopy_or_new_engine() {
+    let partition = Uuid::new_v4();
+    let (a, a_native) = route(partition, 1, ReplicaRole::Primary).await;
+    set_current(&a, configuration(vec![], 1)).await.unwrap();
+    until(|| a.engine.snapshot().ready).await;
+    assert_eq!(a.write(mutation(1)).await.outcome, Outcome::Committed);
+    let (b, b_native) = route(partition, 2, ReplicaRole::IdleSecondary).await;
+    rap_build(&a, descriptor(&b), Cancellation::default())
+        .await
+        .unwrap();
+    rap_role(&b, ReplicaRole::ActiveSecondary).await.unwrap();
+    let mut peer = descriptor(&b);
+    peer.role = ReplicaRole::ActiveSecondary;
+    peer.ready = true;
+    set_current(&a, configuration(vec![peer], 2)).await.unwrap();
+    assert_eq!(a.write(mutation(2)).await.outcome, Outcome::Committed);
+    rap_role(&b, ReplicaRole::Primary).await.unwrap();
+    *b_native.status.lock().unwrap() = status(ReplicaRole::Primary);
+    let old = a
+        .engine
+        .get_state_replicator()
+        .get_replication_stream()
+        .unwrap();
+    rap_role(&a, ReplicaRole::ActiveSecondary).await.unwrap();
+    *a_native.status.lock().unwrap() = status(ReplicaRole::ActiveSecondary);
+    let fresh = a
+        .engine
+        .get_state_replicator()
+        .get_replication_stream()
+        .unwrap();
+    assert!(!Arc::ptr_eq(&old, &fresh));
+    let mut peer = descriptor(&a);
+    peer.role = ReplicaRole::ActiveSecondary;
+    peer.ready = true;
+    peer.progress = ReplicationProgress { first: 1, last: 2 };
+    set_current(&b, configuration(vec![peer], 2)).await.unwrap();
+    until(|| b.engine.snapshot().ready).await;
+    assert_eq!(b.write(mutation(3)).await.outcome, Outcome::Committed);
+    until(|| a.provider.snapshot().last == 3).await;
+    assert_eq!(a.provider.snapshot().values, b.provider.snapshot().values);
+    assert!(a.fault.lock().unwrap().is_none());
+    shutdown_route(&a).await;
+    shutdown_route(&b).await;
 }
 
 #[tokio::test]

@@ -110,19 +110,20 @@ The subsequent source audit found that those mechanisms were not SF's
 algorithms. This revision supersedes them rather than merely labeling their
 differences; the earlier review is not approval of the new port.
 
-**V1 prerequisites:** [FubeData.md's known semantic differences][f-v1-differences]
-records DD-01 terminal Primary-to-None, DD-02 native-issued progress/ALL catch-up,
-and DD-03 current-quorum-one release/ALL as unresolved implementation corrections.
-The Astra review confirmed those findings and added DD-04–DD-07 below. None is
-fixed by editing this design. R0 must resolve all seven plus the native V2
-copy capability and bootstrap mapping before A1 acceptance.
+**R0 lower implementation (2026-10-31):** [FubeData.md's audit/corrections][f-v1-differences]
+records corrected DD-01–DD-07, explicit latest-assigned copy capability and the
+callback-ready truthful constructor-tail seam with offline regressions. The
+Astra findings remain historical audit context, not unresolved lower semantics.
+This is implementation evidence, not a native deployment qualification or an
+A0 transaction/log/state-manager kernel. Final independent review/publication is
+separate from these phase-reviewed local changes.
 
 ### 2.1 Additional audit findings and design resolutions
 
-The revised upper core is source-derived, but native kernels cannot compensate
-for these lower seams. Detailed current/native evidence and required regressions
-are recorded in the V1 reference; these are design prerequisites, not implemented
-V2 defects or new qualification results.
+The revised upper core is source-derived; its implementation remains A0/A1.
+Detailed pre-R0/native evidence and current correction regressions are recorded
+in the V1 reference. The table retains the original audit resolutions; all four
+lower seams below are corrected by R0, without implementing upper kernels.
 
 | Finding | Priority | Required design resolution |
 |---|---|---|
@@ -241,7 +242,7 @@ source-required copy completion is missing, represent that existing stage/
 completion locally (§7), not a new protocol or control-routing redesign.
 A1 must exercise bound and
 root control paths and show that neither bypasses the relevant provider/drain
-guarantees. R0 must resolve DD-01–DD-07 through the shared lower behavior and
+guarantees. R0 corrects DD-01–DD-07 through shared lower behavior and
 explicitly tested seam mappings; an upper wrapper must not hide them with a new
 commitment, catch-up, copy or promotion policy.
 
@@ -279,7 +280,7 @@ These observations support the mapping; they do not prove the adapter exists.
 
 Replay and origin are deliberately **not** members of the canonical SDK traits.
 The existing optional `ReplayCheckpointProvider` is a classic fube workaround,
-not a required native V2 callback. After DD-02 is corrected, V2 must establish
+not a required native V2 callback. With DD-02 corrected, V2 establishes
 the native no-write/catch-up behavior without requiring that hook; construct
 the lower facade with no replay provider for the source-conformance path.
 If a legacy fixture still supplies it, preserve its original-byte/epoch/segment
@@ -569,15 +570,19 @@ Map these actual conditions/native codes, not every ResourceExhausted error or
 display-string match, into the Rust retry path. Retrying a transaction object is
 not a cross-replica application request-deduplication protocol.
 
-**Required admission mapping (DD-05):** current fube uses `ResourceLimit` for
-both permanent operation-size rejection and transient admission/queue fullness,
-with a common ResourceExhausted/native-code fallback
-([engine.rs:869–915][f-admission-errors],
-[queue.rs:73–80][f-queue-errors], [error.rs:213–224][f-resource-code]).
-R0 must preserve a typed/native-coded cause or prove a lossless admission-stage
-mapping before this retry loop is accepted. A prevalidated record's actual
-queue-full rejection must remain retriable; oversize/unsupported records and
-other permanent quota failures must not be mislabeled queue-full.
+**Implemented lower admission mapping (DD-05):** R0 exposes
+`ErrorKind::ReplicationQueueFull` (HRESULT 0x80071bcb) versus
+`ReplicationOperationTooLarge` (0x80071c2f), retaining causes/native conversion
+through runtime/data and callers
+([error kinds](../../crates/libs/fube-runtime/src/error.rs#L31-L43),
+[lower queue stages](../../crates/libs/fube-data/src/queue.rs#L80-L102)).
+Lower capacity-recovery and permanent-oversize/headroom regressions pass; this upper
+transaction retry loop/state kernel remains A0/A1. A prevalidated record's actual
+queue-full rejection is retriable; oversize/unsupported records and other
+permanent quota failures must not be mislabeled queue-full.
+An operation unable to fit an empty Primary's permanent future-copy reservation
+is ResourceExhausted rather than transient queue-full; an outstanding-ownership
+shortage for an otherwise admissible record retains the retry classification.
 Do not infer this distinction from display text or a racy diagnostics snapshot.
 Regress capacity recovery followed by successful commit on the same transaction,
 native retry timeout/cancel states, and permanent oversize without endless retry.
@@ -647,12 +652,13 @@ collection semantics.
 Use synchronous `IStatefulServiceFactory::create_replica` and capture the
 factory-supplied `NativeIntegrationProvider` separately from SDK identity
 arguments. In runtime-owned `IStatefulServiceReplica::open`, validate
-`OpenMode::New` and call `FabricReplicator::create` with:
+`OpenMode::New` and call `FabricReplicator::create_with_capabilities` with:
 `Arc<dyn IStatefulServicePartition>`, captured `NativeRuntimeIntegration`,
 `Arc<dyn IStateProvider>` for the upper log, no replay workaround for the
 source-conformance path, `ReplicationEndpointOptions`, and `Settings`.
-Add the native V2 copy-until-latest capability through explicit construction
-integration (§7), not a new SDK discovery member. Keep its
+Supply `StateProviderCapabilities { supports_copy_until_latest_lsn: true }`,
+the implemented explicit native-equivalent construction capability (§7),
+not a new SDK discovery member. `create` retains classic defaults. Keep its
 `Arc<FabricReplicator>` and state view in the upper owner; return a boxed
 `IPrimaryReplicator` lifecycle wrapper over that same instance
 ([stateful_api.rs:118–148][f-factory],
@@ -666,14 +672,18 @@ CreateReplicator method, SDK discovery hook, or second lower owner.
 For A, construct callback-ready empty log/registry metadata before lower
 creation: the current engine invokes the provider's initial progress getter
 while constructing the owner, not only after the wrapper's later Open
-([engine.rs:601–626][f-initial-progress]).
+([engine.rs:629–660][f-initial-progress]).
 Do not return a fabricated zero while a nonempty log is still initializing.
 The native factory likewise initializes its lower state-provider bridge with
 the upper logging provider before exposing the composed replicator
 ([ComTransactionalReplicator.cpp:280–295][n-provider-init]).
-The foundation must reconcile the source bootstrap/log tail with this Rust
-construction boundary before accepting A. This is not a claim that C's
-persisted bootstrap/recovery ordering has already been implemented.
+R0 proves this construction boundary passes nonempty actual fixture record tails
+1/27 (including source-shaped zero/one markers) through to lower initial progress,
+with the getter called before the lower facade is returned
+([public witness](../../crates/libs/fube-data/tests/sdk_contracts.rs#L222-L297)).
+The fixture is not native record serialization or a transaction log kernel.
+Native zero/one records, registry/log initialization and persisted recovery still
+belong to A0/A1/C as applicable; callers must initialize them before lower creation.
 
 Preserve native status/access checks, cancellation, watchdogs, capture disposal
 and incarnation fencing; cancellation alone does not establish quiescence
@@ -715,14 +725,14 @@ remain governed by the source drain/reconciliation state. Invalid canonical
 history fails explicitly; it is not permission to invent a committed boundary
 from visible state or transaction ID.
 
-**Required stream lifecycle (DD-04):** native lower secondary close during
+**Implemented lower stream lifecycle (DD-04):** native lower secondary close during
 promotion closes dispatch queues and waits for their source drain
 ([SecondaryReplicator.CloseAsyncOperation.cpp:41–104][n-secondary-close]).
-Current fube leaves its old replication sender open on promotion
-([engine.rs:4332–4343][f-promotion-stream]); upper native drain can then wait
-forever for EOS. R0 must freeze old-generation admission, preserve/drain eligible
-buffered operations while closing dispatch to new records, and retain the
-source ACK-drain boundary so §5.3 can finish native processing after EOS.
+R0 freezes old-generation ingress, dispatches eligible contiguous buffered records,
+closes senders successfully, then waits for actual service ACKs
+([lower dispatch close](../../crates/libs/fube-data/src/engine.rs#L4087-L4124)).
+It deliberately does not wait for ACKs before EOS: §5.3 can flush/process after
+observing EOS. Its empty/nonempty role-cycle and 64-capture tests pass.
 A later demotion needs a fresh copy/replication generation in the same engine,
 preserving native transferred state rather than forcing another copy; old views
 remain terminal and old captures fenced. Do not replace
@@ -746,8 +756,13 @@ reconciliation paths, not a speculative extra wrapper UpdateEpoch.
 The lower secondary duplicate-control path also completes without a provider
 callback
 ([SecondaryReplicator.UpdateEpochAsyncOperation.cpp:43–92][n-secondary-epoch]).
-R0 must preserve these role/control-specific gates; current fube's unconditional
-post-getter equality is not valid for an extended-copy upper tail (DD-07, §7.3).
+R0 preserves these gates using the effective secondary admission minimum,
+including epochs established by accepted primary traffic. Older controls fail;
+equal controls return before provider calls. Admission-only controls do not
+query/equate upper and lower tails. Actual original-operation barriers/primary
+provider controls preserve the provider's success/error, including represented
+duplicates, without a post-callback tail comparison. The provider still owns
+its genuine new-epoch validation (DD-07, §7.3).
 
 The reference opens V1 before upper V2, and closes/changes role through V1
 before the upper layer
@@ -814,18 +829,21 @@ the committed/previous-configuration boundary
 [ReplicationQueueManager.cpp:165–193][n-latest-start]).
 This is an existing local provider capability, not a new peer negotiation.
 
-**Current gap:** fube has no supplied equivalent of that capability and always
-chooses `max(committed, previous_quorum)`
-([engine.rs:2693–2702][f-classic-copy-start]).
-Its provider factory currently enforces exact `up_to` with null context
-([api.rs:136–165][f-data-provider],
-[supervised.rs:268–286][f-copy-factory]).
-Add the semantic equivalent of the native marker as explicit data-layer
-construction integration for V2, with the source latest-assigned start rule.
+**Implemented R0 capability:** `StateProviderCapabilities` is supplied to
+`FabricReplicator::create_with_capabilities`
+([construction](../../crates/libs/fube-data/src/fabric_replicator.rs#L53-L98)).
+Its true flag selects assigned+1 replication start and inclusive assigned
+provider horizon; default classic still selects max(committed,previous quorum)+1
+([selection](../../crates/libs/fube-data/src/engine.rs#L2761-L2771)).
+The provider factory keeps the exact requested argument, volatile null context,
+supervision/bounds and enumeration-EOS finish-tail snapshot. A staged upper
+provider owns checkpoint horizon extension and its metadata, not a fabricated
+lower prefix. The latest-copy test proves horizon100/start101/finish101 with
+committed0 and real finish-tail ACK.
 Do not add discovery to SDK traits or infer V2 support from a type name.
 Classic providers without the capability retain their current copy policy.
-This lower integration is required in the foundation, not deferred while a
-different custom snapshot protocol is shipped.
+Native staged copy serialization is A0/A1; this implemented construction seam
+is not a substitute custom snapshot protocol.
 
 Native volatile copy can have null context; persisted/rejoin paths use
 progress-vector/head/tail context. Fube's current volatile receiver ignores
@@ -881,18 +899,20 @@ epoch path explicitly detects an incompatible tail rather than silently
 relabeling it
 ([LoggingReplicatorImpl.cpp:1385–1405][n-copy-epoch]).
 
-**Required epoch seam (DD-07):** after copy extends requested 90 to upper tail
+**Implemented lower epoch seam (DD-07):** after copy extends requested 90 to upper tail
 100, lower progress may remain 90 until overlapping replication 91–100 drains.
 Keep those real frontiers distinct. Native duplicate secondary UpdateEpoch
 does not invoke the provider; the upper duplicate-epoch branch also returns
 before tail equality after its source epoch/progress validation
 ([SecondaryReplicator.UpdateEpochAsyncOperation.cpp:43–92][n-secondary-epoch],
 [LoggingReplicatorImpl.cpp:1368–1401][n-epoch-duplicates]).
-Current lower control publication instead requires provider tail equal boundary
-([engine.rs:4288–4293][f-epoch-equality]).
-R0 must support the native no-op while overlap is delayed and preserve explicit
-failure for a genuinely new incompatible idle-copy epoch. The latest-LSN marker
-alone does not fix this seam. Do not fake progress, truncate a valid copied
+R0's actual-byte upper100/lower90 fixture delays overlap ACKs, proves duplicate
+controls make no provider callback/getter/truncation, then drains overlap.
+Copied represented-epoch metadata also lets promotion/original-operation
+callbacks succeed without lower tail comparison, while its
+new incompatible idle-copy/original-epoch negatives preserve failure
+([regressions](../../crates/libs/fube-data/src/engine_tests.rs#L3540-L3749)).
+The latest-LSN marker alone does not fix this seam. Do not fake progress, truncate a valid copied
 suffix, or disable all epoch-tail checks for providers with the marker.
 
 Port source copy-log completion/rename, progress-vector reconciliation and
@@ -955,7 +975,7 @@ the queue
 Do not require `completed == assigned`, one partition-wide write lease, a
 whole-request reservation or release of each predecessor before admitting the
 next record. Port interleaved transaction/LSN ordering and source backpressure.
-DD-02, DD-03 and DD-06 must be fixed instead of compensating with a lower-availability
+R0 corrected DD-02, DD-03 and DD-06 instead of compensating with a lower-availability
 upper scheduler. Quorum can progress while a lagging member retains history;
 ordinary bounded queue exhaustion remains backpressure, not an invented
 “fault because release did not follow quorum” rule.
@@ -1027,7 +1047,7 @@ from this design pass**. No tier can borrow a lower tier's qualification label.
 
 | Milestone | Work boundary | Required evidence before acceptance |
 |---|---|---|
-| R0: correct V1 foundation | Resolve DD-01–DD-07; native V2 copy capability and bootstrap/log-tail integration | All seven source-contract regressions, including quorum-one ALL, role-scoped EOS, lossless admission retry mapping, local-not-PC general quorum and extended-copy duplicate epochs; latest-assigned start/bootstrap proved without upper workarounds |
+| R0: correct V1 foundation | Implemented lower DD-01–DD-07, explicit latest-LSN capability and callback-ready actual-tail construction seam | Offline phase-reviewed regressions pass, including quorum-one release/ALL, EOS-before-ACK role generations, typed retry/sizing, local-not-PC quorum, extended-copy duplicates, latest start/finish and nonempty bootstrap. No A0 kernels or new native qualification claimed |
 | A0: native kernels and test provider | Native records/codecs, transaction states/map, source Apply/Unlock and checkpoint/copy callbacks | Deterministic source-equivalent traces for read-only/single/multi-operation transactions, interleaving, retry/cancel/abort, ID/replay handling and provider visibility |
 | A1: volatile Rust integration | Current canonical APIs, lower-bound pass-through, lifecycle/log/provider drains, native memory-log/checkpoint/copy | Requires R0 and A0; native copy stages and incremental transaction flow work with one engine/binder and bounded owned execution; no release-gated serial/root/ledger substitute |
 | A2: volatile qualification | Pinned SF binary/environment, pressure and fault campaign | Repeated A scenarios with recorded environment, limits, traces and unsupported modes; only Tier A claim |
@@ -1189,7 +1209,7 @@ relative to this document; native references are pinned to the baseline in §2.
 [f-capabilities]: ../../crates/libs/fube-data/src/extensions.rs#L14-L95
 [f-diagnostics]: ../../crates/libs/fube-data/src/extensions.rs#L88-L103
 [f-native-install]: ../../crates/libs/fube-data/src/engine.rs#L708-L735
-[f-initial-progress]: ../../crates/libs/fube-data/src/engine.rs#L601-L626
+[f-initial-progress]: ../../crates/libs/fube-data/src/engine.rs#L629-L660
 [f-native-dispatch]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L695-L720
 [f-native-progress]: ../../crates/libs/fube-runtime/src/stateful_reconfiguration.rs#L245-L280
 [f-progress-install]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L309-L323

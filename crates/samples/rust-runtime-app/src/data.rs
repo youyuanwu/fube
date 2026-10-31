@@ -13,7 +13,7 @@ use std::{
     thread::JoinHandle,
     time::Instant,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -387,6 +387,7 @@ struct PumpInput {
     copy: Arc<dyn IOperationStream>,
     replication: Arc<dyn IOperationStream>,
     requests: mpsc::Receiver<Submit>,
+    stream_refresh: watch::Receiver<()>,
     delay: Arc<AtomicU64>,
     copy_ack_hold: Arc<CopyAckHold>,
     fault: Arc<Mutex<Option<String>>>,
@@ -503,11 +504,29 @@ async fn pump(mut input: PumpInput, stopped: Cancellation) -> RuntimeResult<()> 
     // Both streams have independent EOS. In particular copy EOS never stops
     // the replication consumer. No task/capture is detached from this thread.
     let (mut copy_done, mut replication_done) = (false, false);
+    let mut refresh_open = true;
     // Only this loop receives from requests, serializing admission + local apply.
     loop {
         tokio::select! {
             biased;
             _ = stopped.cancelled() => return Ok(()),
+            refresh = input.stream_refresh.changed(), if refresh_open => {
+                if refresh.is_err() {
+                    refresh_open = false;
+                } else if let Some(engine) = input.engine.upgrade() {
+                    let state = engine.get_state_replicator();
+                    let copy = state.get_copy_stream()?;
+                    let replication = state.get_replication_stream()?;
+                    if !Arc::ptr_eq(&copy, &input.copy) {
+                        input.copy = copy;
+                        copy_done = false;
+                    }
+                    if !Arc::ptr_eq(&replication, &input.replication) {
+                        input.replication = replication;
+                        replication_done = false;
+                    }
+                }
+            }
             item = input.copy.get_operation(stopped.clone()), if !copy_done => {
                 match item? {
                     Some(operation) => apply_ack(input.native.as_ref(), &input.provider, operation, true, &input.delay, &input.copy_ack_hold, &stopped).await?,
@@ -543,6 +562,7 @@ pub(super) struct Route {
     stopped: Cancellation,
     pump: Mutex<Option<Pump>>,
     requests: mpsc::Sender<Submit>,
+    stream_refresh: watch::Sender<()>,
     delay: Arc<AtomicU64>,
     copy_delay: Arc<AtomicU64>,
     copy_ack_hold: Arc<CopyAckHold>,
@@ -563,6 +583,7 @@ impl Route {
         copy_delay: Arc<AtomicU64>,
     ) -> RuntimeResult<Arc<Self>> {
         let (sender, receiver) = mpsc::channel(64);
+        let (stream_refresh, refresh) = watch::channel(());
         let stopped = Cancellation::default();
         let delay = Arc::new(AtomicU64::new(0));
         let fault = Arc::new(Mutex::new(None));
@@ -576,6 +597,7 @@ impl Route {
                 copy: state.get_copy_stream()?,
                 replication: state.get_replication_stream()?,
                 requests: receiver,
+                stream_refresh: refresh,
                 delay: delay.clone(),
                 copy_ack_hold: copy_ack_hold.clone(),
                 fault: fault.clone(),
@@ -591,6 +613,7 @@ impl Route {
             stopped,
             pump: Mutex::new(Some(pump)),
             requests: sender,
+            stream_refresh,
             delay,
             copy_delay,
             copy_ack_hold,
@@ -790,6 +813,14 @@ impl IStatefulServiceReplica for Service {
                 .ok_or(RuntimeError::Closed)?;
             if role != ReplicaRole::None {
                 route.lifetime()?;
+            }
+            if matches!(
+                role,
+                ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+            ) {
+                // Runtime invokes the lower role transition before this
+                // service callback. Refresh only after new views exist.
+                route.stream_refresh.send_replace(());
             }
             Ok(route.service_address.clone())
         })

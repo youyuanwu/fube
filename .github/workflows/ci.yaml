@@ -114,11 +114,6 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
     permissions:
       contents: read
-    outputs:
-      client-runtime-artifact: ${{ steps.evidence.outputs.client-runtime }}
-      client-runtime-attempt: ${{ steps.evidence.outputs.client-runtime-attempt }}
-      native-data-artifact: ${{ steps.evidence.outputs.native-data }}
-      native-data-attempt: ${{ steps.evidence.outputs.native-data-attempt }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.rust-build.outputs.onebox-matrix) }}
@@ -162,7 +157,7 @@ jobs:
 
     - name: Extract strict inputs into a new directory
       run: |
-        python3 -c 'import os,tarfile; from pathlib import Path; root=Path(os.environ["RUNNER_TEMP"]); target=root/"fube-data-binaries"; target.mkdir(); tarfile.open(root/"fube-data-artifact/fube-data-binaries.tar").extractall(target,filter="data"); (root/"onebox-proof"/os.environ["WORKER_ROUTE"]).mkdir(parents=True)'
+        python3 -c 'import os,tarfile; from pathlib import Path; root=Path(os.environ["RUNNER_TEMP"]); target=root/"fube-data-binaries"; target.mkdir(); tarfile.open(root/"fube-data-artifact/fube-data-binaries.tar").extractall(target,filter="data")'
 
     - name: Install pinned nextest
       id: install_nextest
@@ -209,100 +204,34 @@ jobs:
           --producer "$RUNNER_TEMP/onebox-inputs/onebox-input-receipt.json" \
           --report "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/emergency-cleanup.json"
 
-    - name: Seal actual suite and post-teardown evidence
-      if: always()
-      run: |
-        python3 -m tests.onebox.shared.ci seal --route "$WORKER_ROUTE" \
-          --producer "$RUNNER_TEMP/onebox-inputs/onebox-input-receipt.json" \
-          --validated-input "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/validated-input.json" \
-          --evidence-dir "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE" \
-          --out "$RUNNER_TEMP/onebox-proof/$WORKER_ROUTE/worker-proof.json"
-
-    - name: Upload this worker's complete evidence after teardown
-      id: upload_evidence
-      if: always()
+    - name: Retain failed or cancelled worker diagnostics
+      if: failure() || cancelled()
       timeout-minutes: 4
       uses: actions/upload-artifact@v7
       with:
         name: onebox-worker-${{ matrix.route }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/onebox-proof
-        if-no-files-found: error
+        if-no-files-found: warn
         retention-days: 7
 
-    - name: Publish this worker's immutable evidence identity
-      id: evidence
-      if: always()
-      env:
-        ARTIFACT_ID: ${{ steps.upload_evidence.outputs.artifact-id }}
-      run: |
-        test -n "$ARTIFACT_ID"
-        echo "$WORKER_ROUTE=$ARTIFACT_ID" >> "$GITHUB_OUTPUT"
-        echo "$WORKER_ROUTE-attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-
   linux-onebox:
-    # Keep the existing required-check name; only this aggregate claims the
-    # complete 32 namespaced profile assertions plus five archived native tests.
+    # Keep the existing required-check name; each worker validates its own tests.
     name: Linux onebox native client
     needs: [rust-build, onebox-workers, rust-tests, rust-quality, python-tests, standalone]
     if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 5
     permissions:
       contents: read
-    env:
-      FUBE_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-      FUBE_CI_MERGE: ${{ github.event_name == 'pull_request' && github.sha || '' }}
-      FUBE_CI_RUN_ID: ${{ github.run_id }}
-      FUBE_CI_PRODUCER_ATTEMPT: ${{ needs.rust-build.outputs.producer-attempt }}
-    defaults:
-      run:
-        shell: bash
     steps:
-    - uses: actions/checkout@v7
-      with:
-        persist-credentials: false
-
-    - uses: actions/setup-python@v7
-      with:
-        python-version: "3.12"
-
-    - name: Download producer identity
-      uses: actions/download-artifact@v8
-      with:
-        name: onebox-inputs-${{ github.run_id }}-${{ needs.rust-build.outputs.producer-attempt }}
-        path: ${{ runner.temp }}/onebox-inputs
-
-    - name: Download all declared worker proofs
-      if: always()
-      uses: actions/download-artifact@v8
-      with:
-        artifact-ids: ${{ needs.onebox-workers.outputs.client-runtime-artifact }},${{ needs.onebox-workers.outputs.native-data-artifact }}
-        path: ${{ runner.temp }}/onebox-workers
-        merge-multiple: true
-
-    - name: Verify complete namespaced coverage and original cleanup
-      if: always()
+    - name: Require every test and build job to succeed
       env:
-        PRODUCER_RESULT: ${{ needs.rust-build.result }}
-        WORKERS_RESULT: ${{ needs.onebox-workers.result }}
-        RUST_TESTS_RESULT: ${{ needs.rust-tests.result }}
-        RUST_QUALITY_RESULT: ${{ needs.rust-quality.result }}
-        PYTHON_TESTS_RESULT: ${{ needs.python-tests.result }}
-        STANDALONE_RESULT: ${{ needs.standalone.result }}
-        WORKER_ATTEMPTS: '{"client-runtime":"${{ needs.onebox-workers.outputs.client-runtime-attempt }}","native-data":"${{ needs.onebox-workers.outputs.native-data-attempt }}"}'
+        NEEDS_JSON: ${{ toJSON(needs) }}
       run: |
-        NEEDS_STATUS="$(python3 -c 'import json,os; names=("producer","workers","rust_tests","rust_quality","python_tests","standalone"); print(json.dumps({name:os.environ[name.upper()+"_RESULT"] for name in names}))')"
-        python3 -m tests.onebox.shared.ci aggregate \
-          --producer "$RUNNER_TEMP/onebox-inputs/onebox-input-receipt.json" \
-          --worker-root "$RUNNER_TEMP/onebox-workers" --needs-json "$NEEDS_STATUS" \
-          --worker-attempts-json "$WORKER_ATTEMPTS" \
-          --out "$RUNNER_TEMP/onebox-aggregate.json"
-
-    - name: Upload complete aggregate or explicit failure
-      if: always()
-      uses: actions/upload-artifact@v7
-      with:
-        name: onebox-aggregate-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/onebox-aggregate.json
-        if-no-files-found: error
-        retention-days: 7
+        python3 - <<'PY'
+        import json, os, sys
+        results = {name: job["result"] for name, job in json.loads(os.environ["NEEDS_JSON"]).items()}
+        for name, result in results.items():
+            print(f"{name}: {result}")
+        sys.exit(0 if results and all(result == "success" for result in results.values()) else 1)
+        PY

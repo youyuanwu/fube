@@ -3,7 +3,7 @@ use crate::{
     engine::{Engine, Replication},
     extensions::{
         EpochCheckedReplication, OperationOriginStream, ReplayCheckpointProvider,
-        ReplicationEndpointOptions,
+        ReplicationEndpointOptions, StateProviderCapabilities,
     },
     wire::Actor,
     Cancellation, Epoch, IOperationStream, IStateProvider, IStateReplicator, OperationData,
@@ -36,6 +36,8 @@ impl FabricReplicator {
     /// This helper's location/signature is fube-specific, not native partition
     /// CreateReplicator source/ABI compatibility. See the production sample
     /// `crates/samples/rust-runtime-app/src/data.rs` for construction and pumps.
+    /// Provider callbacks must already be ready: construction queries the actual
+    /// provider tail before lower Open. This helper retains classic copy defaults.
     pub fn create(
         partition: Arc<dyn IStatefulServicePartition>,
         native: NativeRuntimeIntegration,
@@ -43,6 +45,30 @@ impl FabricReplicator {
         replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         endpoint: ReplicationEndpointOptions,
         settings: Settings,
+    ) -> Result<Arc<Self>> {
+        Self::create_with_capabilities(
+            partition,
+            native,
+            provider,
+            replay,
+            endpoint,
+            settings,
+            StateProviderCapabilities::default(),
+        )
+    }
+
+    /// Explicit provider-copy capability; `create` retains classic defaults.
+    /// The provider must already be callback-ready: construction queries its
+    /// actual log/application tail before the returned lower object's Open.
+    /// This does not open/recover/bootstrap an upper transaction log for callers.
+    pub fn create_with_capabilities(
+        partition: Arc<dyn IStatefulServicePartition>,
+        native: NativeRuntimeIntegration,
+        provider: Arc<dyn IStateProvider>,
+        replay: Option<Arc<dyn ReplayCheckpointProvider>>,
+        endpoint: ReplicationEndpointOptions,
+        settings: Settings,
+        capabilities: StateProviderCapabilities,
     ) -> Result<Arc<Self>> {
         let identity = native.identity();
         let actor = Actor {
@@ -59,6 +85,7 @@ impl FabricReplicator {
                 provider,
                 replay,
                 settings,
+                capabilities,
             )?,
         }))
     }

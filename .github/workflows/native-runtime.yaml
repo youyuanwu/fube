@@ -101,8 +101,8 @@ jobs:
           --prebuilt "$RUNNER_TEMP/native-runtime-binaries" \
           --diagnostics-directory "$NATIVE_DIAGNOSTICS"
 
-    - name: Retain bounded standalone host and native evidence
-      if: always()
+    - name: Retain failed or cancelled standalone diagnostics
+      if: failure() || cancelled()
       uses: actions/upload-artifact@v7
       with:
         name: standalone-native-runtime-${{ github.run_id }}-${{ github.run_attempt }}
