@@ -3,6 +3,7 @@
 import os
 from copy import copy
 import re
+import shutil
 import sys
 import time
 
@@ -22,8 +23,6 @@ def validate_inputs(args):
                        "private config/output must be outside uploaded evidence")
     if args.config_dir is not None:
         ci.require(not args.config_dir.exists(), "NEW private fixture config directory required")
-    for filename in ci.inventory(args.partition) - {"fixture.json"}:
-        ci.require(not ci.safe_path(args.report_dir / filename).exists(), "NEW partition evidence required")
     command = ["validate", "--route", args.partition, "--receipt", str(args.producer),
                "--bundle-tar", str(args.bundle_tar), "--bundle-dir", str(args.prebuilt),
                "--out", str(args.report_dir / "validated-input.json")]
@@ -64,6 +63,8 @@ def run(selected, args, execute):
         if path is not None:
             setattr(args, name, ci.safe_path(path))
     scope = copy(args)
+    ci.outside_bundle(scope.report_dir, scope.prebuilt)
+    scope.report_dir.mkdir(parents=True, exist_ok=False)
     reused, original = scope.owner is not None, scope.owner
     result = {
         "version": 1, "kind": "onebox-fixture", "route": args.partition, "status": "FAIL", "errors": [],
@@ -74,7 +75,8 @@ def run(selected, args, execute):
 
     def failed(phase, error):
         result["outcomes"][phase] = "failure"
-        message = phase + " failed: " + type(error).__name__
+        detail = str(error) if isinstance(error, ci.ProofError) else type(error).__name__
+        message = phase + " failed: " + detail
         result["errors"].append(message)
         print("onebox fixture: " + message, file=sys.stderr)
 
@@ -88,7 +90,7 @@ def run(selected, args, execute):
         if scope.github_output is not None:
             runtime.onebox_ctl.ctl.publish_owner(scope.github_output, owner)
 
-    with ci.reserve(scope.report_dir / "fixture.json", scope.prebuilt) as output:
+    try:
         phase = "validate"
         try:
             validated = validate_inputs(scope)
@@ -109,12 +111,13 @@ def run(selected, args, execute):
             result["outcomes"]["ready"] = "success"
             phase = "suites"
             ci.require(execute(selected, args, ci.suites.digest()) == 0, "partition suites failed")
+            ci.check_suites(selected, scope, result["allocation"], result["ready_at"], time.time())
             result["outcomes"]["suites"] = "success"
         except (Exception, KeyboardInterrupt) as error:
             failed(phase, error)
         finally:
             if original is not None:
-                if not reused or result["outcomes"]["validate"] == "success":
+                if result["errors"] and (not reused or result["outcomes"]["validate"] == "success"):
                     try:
                         diagnostics(scope, original)
                         result["outcomes"]["diagnostics"] = "success"
@@ -125,6 +128,11 @@ def run(selected, args, execute):
                 else:
                     try:
                         ci.require(cleanup_owned(scope, original) == 0, "original allocation cleanup failed")
+                        cleanup = ci.read(scope.report_dir / "cleanup.json")
+                        resources = ci.validate_destroy(cleanup, successful=result["ready_at"] is not None)
+                        if result["ready_at"] is not None:
+                            ci.require(resources["container"] == [result["allocation"]["container_id"]],
+                                       "cleanup must remove the original container")
                         result["outcomes"]["destroy"] = "success"
                         if scope.github_output is not None:
                             with scope.github_output.open("a", encoding="utf-8") as github:
@@ -133,11 +141,24 @@ def run(selected, args, execute):
                                 os.fsync(github.fileno())
                     except (Exception, KeyboardInterrupt) as error:
                         failed("destroy", error)
+                        if result["outcomes"]["diagnostics"] == "skipped":
+                            try:
+                                diagnostics(scope, original)
+                                result["outcomes"]["diagnostics"] = "success"
+                            except (Exception, KeyboardInterrupt) as diagnostic_error:
+                                failed("diagnostics", diagnostic_error)
             expected = {phase: "success" for phase in PHASES}
+            expected["diagnostics"] = "skipped"
             if reused:
                 expected.update(create="reused", destroy="retained")
             if not result["errors"] and result["outcomes"] == expected:
                 result["status"] = "PASS"
             result["finished_at"] = time.time()
-            ci.write(output, result)
+            if result["status"] != "PASS":
+                with ci.reserve(scope.report_dir / "fixture.json", scope.prebuilt) as output:
+                    ci.write(output, result)
+    finally:
+        if result["status"] == "PASS":
+            shutil.rmtree(scope.report_dir)
+    print("partition=" + scope.partition + " outcome=" + result["status"], flush=True)
     return 0 if result["status"] == "PASS" else 1

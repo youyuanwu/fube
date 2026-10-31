@@ -43,15 +43,12 @@ class PreparationTests(unittest.TestCase):
 
 
 class DiagnosticTests(unittest.TestCase):
-    def test_every_scenario_has_bounded_explicit_workflow_uploads(self):
-        workflow = (ROOT / ".github/workflows/native-runtime.yaml").read_text()
+    def test_every_scenario_writes_bounded_diagnostics(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             for scenario in profile.SCENARIOS:
                 profile.save_diagnostics(root, scenario, b'MSSF_REPORT {"real":"payload"}\n')
                 for suffix in ("log", "json"):
-                    self.assertIn(f"${{{{ env.NATIVE_DIAGNOSTICS }}}}/{scenario}.{suffix}",
-                                  workflow)
                     self.assertLessEqual((root / f"{scenario}.{suffix}").stat().st_size,
                                          profile.DIAGNOSTIC_LIMIT)
             self.assertEqual(len(list(root.iterdir())), len(profile.SCENARIOS) * 2)

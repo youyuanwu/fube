@@ -2,10 +2,12 @@ import contextlib
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import textwrap
 import tomllib
 import unittest
 from unittest.mock import patch
@@ -31,6 +33,20 @@ class PlatformTests(unittest.TestCase):
 
 
 class PartitionTests(unittest.TestCase):
+    def test_required_check_rejects_unsuccessful_jobs_without_reading_artifacts(self):
+        workflow = (run.ROOT / ".github/workflows/ci.yaml").read_text().split("\n  linux-onebox:\n", 1)[1]
+        script = textwrap.dedent(workflow.split("      run: |\n", 1)[1])
+        jobs = ("rust-build", "onebox-workers", "rust-tests", "rust-quality", "python-tests", "standalone")
+        cases = [(None, "success"), *((job, "failure") for job in jobs),
+                 ("onebox-workers", "skipped"), ("standalone", "cancelled")]
+        for job, outcome in cases:
+            results = {name: {"result": outcome if name == job else "success"} for name in jobs}
+            with self.subTest(job=job, outcome=outcome):
+                result = subprocess.run(
+                    ["bash", "-c", script], env={**os.environ, "NEEDS_JSON": json.dumps(results)},
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0 if job is None else 1, result.stderr)
+
     def invoke(self, runner, results=None):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
