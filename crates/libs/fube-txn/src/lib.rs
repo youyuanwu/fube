@@ -5,9 +5,11 @@
 //! boundary. There is no replicator, transaction, log, state manager or provider
 //! implementation in this crate.
 //!
-//! Source authority is the native `data/txnreplicator` headers at
+//! Source authority is the native `data/txnreplicator` headers and implementations at
 //! [SF commit 51a7703](https://github.com/microsoft/service-fabric/tree/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/data/txnreplicator).
-//! Each trait documents its source interface or concrete-class projection.
+//! Each trait and method documents its source interface/concrete-class projection
+//! and pinned implementation or caller evidence. Contracts describe native
+//! semantics and requirements for future Rust implementations, not executed behavior.
 //! These declarations are not COM ABI, native wire-format interoperability,
 //! persisted-state support or evidence of implemented V2 semantics.
 //!
@@ -25,6 +27,11 @@
 //! Apply/replication/Unlock ordering and synchronous Abort's owned async work.
 //! Native concrete transaction classes are exposed as traits until their
 //! kernels exist. Runtime control remains in fube-runtime/fube-data, not here.
+//!
+//! The four aggregate state/log manager interfaces are crate-internal and are not
+//! SDK exports. Private-item Rustdoc exposes those contracts to maintainers only.
+
+#![deny(missing_docs)]
 
 mod internal;
 mod provider;

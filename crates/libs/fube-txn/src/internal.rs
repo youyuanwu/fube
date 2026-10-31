@@ -90,11 +90,13 @@ pub(crate) trait IStateProviderManager: Send + Sync + 'static {
     /// Release a nonnull aggregate named capture by provider ID, synchronously.
     ///
     /// Local registry captures take the local path; provider exceptions become
-    /// status failures and logging faults the service. Primary invokes unlock
+    /// status failures and logging records a service error (faulting outside recovery).
+    /// Primary invokes unlock
     /// after apply and replication waits even on failure, not only successful commit.
     /// [Routing](https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/data/txnreplicator/statemanager/StateManager.cpp#L1347-L1387);
     /// [completion](https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/data/txnreplicator/loggingreplicator/TransactionManager.cpp#L480-L527);
     /// [unlock failure](https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/data/txnreplicator/loggingreplicator/OperationProcessor.cpp#L365-L616).
+    /// [recovery fault gate](https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/data/txnreplicator/loggingreplicator/OperationProcessor.cpp#L969-L990).
     fn unlock(&self, operation_context: &dyn OperationContext) -> Result<()>;
 
     /// Snapshot registry metadata, then synchronously prepare providers at nonnegative LSN.
@@ -132,7 +134,8 @@ pub(crate) trait IStateProviderManager: Send + Sync + 'static {
         cancellation: Cancellation,
     ) -> ApiFuture<'_, ()>;
 
-    /// Replace aggregate registry/providers, reset role Unknown, restore/open/recover.
+    /// Replace registry/providers and reset role Unknown; restore registry first,
+    /// then open, restore and recover providers.
     ///
     /// Stronger than per-provider file installation; coordinator subsequently
     /// recovers logging and restores role. Owned path/token may outlive observation;
