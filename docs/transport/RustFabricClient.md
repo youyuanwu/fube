@@ -10,6 +10,11 @@ have been demonstrated against the repository's Ubuntu onebox running
 Service Fabric **11.8.121.4**. This is not a complete FabricClient replacement
 and does not support TLS or authentication.
 
+Native ImageStore v1.2 package copy has also qualified on **11.8.121.4**:
+native SDK predecessor/Rust replacement comparison, completion markers,
+provisioning/creation, independent live application contact and deployed Data
+SHA256 comparison passed. Repeated native SDK copy reliability is not claimed.
+
 ## 1. What is implemented
 
 `fube-transport` implements bounded Fabric serialization, clear frames and CRCs,
@@ -22,6 +27,8 @@ node-local deployed applications. Unpaged node/application-scoped lists inspect
 service packages, code packages and deployed replicas.
 Uncached resolution and independent notification sessions add endpoint discovery
 without an endpoint-result cache.
+An independently owned `ImageStoreClient` adds native application-package copy
+without sharing the ordinary management or notification client's connection.
 
 Neither package calls the native Service Fabric client or COM libraries.
 Neither uses HTTP to execute client operations. "Clear TCP" still carries the
@@ -44,12 +51,14 @@ Neither uses HTTP to execute client operations. "Clear TCP" still carries the
 | GetDeployedReplicaList | Sends **GetServiceReplicaListDeployedOnNode**, wrapper tag 12. Twenty-two stateful/stateless observations independently compared live, including partition selectors, host process IDs, activation and stateful reconfiguration details. Reply actor is RS (13), not RA (12) or NamingGateway (5). No paging. |
 | ResolveServicePartition | Uncached native gateway request with singleton, named or signed-int64 selection and optional previous-result metadata. Owned partition details, endpoints/roles and identity-scoped generation/lookup versions. All three key kinds, refreshes, missing-service errors and independent endpoint/role comparisons qualified on 11.8.121.4. |
 | Service notifications | Standalone noncloneable `ServiceNotificationClient`, independent connection/session/receiver, many owning RAII filter guards. Exact/prefix/primary-only registration, native updates, endpoint-count changes, primary replacement, empty invalidations, unregister and independent close qualified on 11.8.121.4. A lost successful ACK caused a real native retry without duplicate delivery. Distinct-address primary-only delivery remains separately unqualified. |
+| Native ImageStore package copy | Dedicated `ImageStoreClient`, v1.2 session/chunk/commit protocol and native AtomicCopy root replacement. Rust's complete inventory matched one native SDK predecessor minus a deliberate obsolete file, and independently matched local files/zero-byte postorder `_.dir` markers. Nested Unicode/space paths, empty files/directories, 7 MiB data, a 132 MiB binary, stale removal, provisioning/creation, independent live application contact and deployed Data SHA256 comparison passed on 11.8.121.4. Repeated native SDK copy reliability is not claimed. |
 | Native faults/errors | Retains native signed error codes and available diagnostics. Malformed GetNodeList continuation produced live `E_INVALIDARG` (-2147024809) or `FMFailoverUnitNotFound` (-2147017462); the same connection remained usable. Other fault forms have offline model-peer coverage. |
 | Concurrent operations | Mixed ping, NameExists, node-list and node-health queries on clones sharing one connection; real onebox coverage. Deterministic cancellation/late-reply safety remains model-covered. |
 | Idle disconnect | Real native ping through a test-owned proxy, followed by proxy cutoff; closure detected without another operation. |
 | Controls and stream lifecycle | Idle ListenInstance, deadlines, fragmentation, backpressure, correlation, cancellation, and close/drop; offline model-peer coverage. |
 
-The client advertises protocol **1.1**. The demonstrated gateway replies with
+Ordinary management requests advertise protocol **1.1**; native ImageStore
+uploads use canonical **1.2**, without legacy fallback. The demonstrated gateway replies with
 protocol **1.2** for ping. The observed GetNodeList aggregate success has no
 actor, action or client-version header; correlation and typed body validation
 remain mandatory. Coverage is qualified only for the observed runtime,
@@ -244,6 +253,121 @@ fault code; native delayed security-session draining is not implemented.
 `Reconnect`, authorization/security controls, and unknown control actions are
 unsupported in this clear-only profile and terminate explicitly. This is not
 qualification of native secure-session recovery or service notifications.
+
+### Native ImageStore application-package copy
+
+`ImageStoreClient` is a noncloneable owner of a dedicated native upload
+connection. It does not borrow a `FabricClient` or notification session.
+Production upload uses no native SDK, COM library, HTTP gateway or subprocess.
+Only native `fabric:ImageStore`, canonical protocol **1.2**, and explicitly
+unsecured development gateways are supported; there is no TLS, authentication,
+backend selection or v1.1 fallback.
+
+Build the thin CLI and put `target/debug` on your PATH, or invoke that binary
+directly:
+
+```sh
+cargo build --locked -p fube-cli
+fube --endpoint 127.0.0.1:19000 --unsecured application upload --path ./MyApp --timeout 300
+```
+
+`--endpoint` is a native IP socket address, not a DNS name or HTTP URL.
+`--unsecured` is required. The destination is the resolved local directory's
+final name (`MyApp` here); the CLI has no destination, provisioning, application
+creation, compression or checksum options. Timeout is positive integer seconds,
+defaults to **300**, and covers the **whole CLI operation**, including local path
+resolution, connection establishment, copy and close. Failures exit nonzero;
+the success message is printed only after package completion.
+
+```rust,no_run
+use std::{path::Path, time::Duration};
+use fube_client::ImageStoreClient;
+
+# async fn upload() -> fube_client::Result<()> {
+let endpoint = "127.0.0.1:19000".parse().expect("native IP socket endpoint");
+let mut client = ImageStoreClient::connect_clear(endpoint, Duration::from_secs(300)).await?;
+client.copy_application_package(Path::new("./MyApp"), "MyApp", None).await?;
+client.close().await?;
+# Ok(())
+# }
+```
+
+`copy_application_package(&mut self, source: &Path, destination: &str,
+timeout: Option<Duration>) -> Result<()>` serializes copies through its mutable
+receiver and uses the existing `fube_transport::Error`/`Result`.
+`None` uses the configured connection duration; `Some(duration)` overrides the
+copy budget, never meaning infinity. Unlike the CLI's enclosing deadline,
+library connection establishment and a later copy each have their own deadline.
+The copy deadline spans local preparation, root Delete, content, file commits
+and all directory markers.
+
+Copy matches native **AtomicCopy/Overwrite**, not an in-place merge or one
+server-side atomic transaction. The source root must be a nonsymlink directory;
+final destination and complete root-marker FileCreate frame validation happen
+before remote deletion. Invalid destinations send nothing and leave a healthy
+client reusable. One routed
+native Delete removes the entire top-level destination, including stale extra
+files. Missing destination is accepted only as native FileNotFound
+**-2147017728**; other native errors propagate. Child recursion does not delete
+again. Files and child directories complete before each directory's empty
+**`_.dir`** marker; the root marker is last. Exact source `_.dir` entries are
+skipped and regenerated, not copied.
+
+Destination names are ImageStore-relative paths, **not** the restricted ASCII
+`NamingUri` grammar. Spaces and Unicode are supported. Validation rejects
+initially rooted input, converts backslashes to slashes, and repeats empty/`.`
+component collapse and newly exposed outer-whitespace trimming until the path
+is stable. The final native-effective path is checked for empty/rooted/drive
+forms, NUL, exact `..` components and case-insensitive top-level
+**Store/WindowsFabricStore**, then used unchanged for Delete and every FileCreate.
+Thus whitespace/dot aliases such as `./ Store/.` are rejected, while ordinary
+internal spaces and Unicode remain supported.
+Local non-UTF-8 filenames, backslash-containing names, symlinks and special
+entries are explicitly unsupported. Sources are not snapshotted: a changing
+source can fail or produce mixed-time content.
+
+| Upload resource | Limit and behavior |
+|---|---|
+| Outstanding content | **One** negotiated chunk; nonfinal chunks retain the full negotiated size so native sequence-derived offsets remain correct. |
+| Content frame | **4 MiB total**, including the **12-byte** fixed header and every native header. An oversized negotiated threshold fails before content is read/sent; it is never silently shrunk. A zero advertised threshold uses **3 MiB**. |
+| Directory traversal | **128** simultaneously open directory levels, including the source root; **1,000,000** visited entries. No package-sized file or GUID snapshot is retained. |
+| Native path encoding | Each native string is at most **32,768 UTF-16 units**; the complete native header area must fit **65,535 bytes**. Before Delete, the generated `/_.dir` FileCreate is encoded as a complete frame, including Actor/Action/MessageId, Activity/version, upload fields, Timeout and record overhead, with maximum relevant MessageId index/timeout widths. These are encoded-size limits, not a promise that every 32,768-unit path fits. |
+| Reply handoff | **32** validated semantic replies; overflow is terminal. |
+| Stale/duplicate replies | At most **64 consecutive** well-formed obsolete replies per awaited stage; the 65th fails. Wrong future sequences/actions and malformed bodies fail, not count as harmless stale traffic. |
+| Transport capacity | **32** ordinary admitted sends/requests and **32** queued ordinary frames; upload content and controls never use the separately reserved **32** IPC/reply-control slots. |
+
+Every file uses FileCreate, acknowledged raw content chunks, then actor-27
+commit success followed by a flushed FileUploadCommitAck. Even an empty file
+sends **one empty chunk** before commit. Content/chunk ACKs alone cannot report
+file success. Native semantic ACKs can omit MessageId/RelatesTo: strict actor
+25/27, action, version, Activity GUID and sequence/body checks are required.
+Late prior-file cleanup results and duplicate commits cannot complete a later
+file. OperationsPending can resend the **same GUID's commit** within the original
+deadline; there is no reconnect or whole-package replay.
+
+**Failure is not rollback.** Root replacement has already removed the previous
+package; partial new files and completed child markers can remain. A normal
+transfer error may flush best-effort native DeleteSession only while the
+original deadline and socket permit it, without replacing the primary error.
+It never deletes the remote directory as failure recovery. File success does
+not wait for the later native session-cleanup result.
+
+Once remote work is guarded, dropping the upload future synchronously aborts
+the dedicated connection. **No asynchronous remote cleanup is spawned after
+future drop**, and no rollback or remote-session removal is promised; native
+expiry may eventually reclaim staged data. Uncertain errors/deadlines also
+retire the client. `is_closed()`/`terminal_error()` expose terminal state and
+reuse fails rather than reconnecting. Validation failures before guarded remote
+work can leave the client usable; successful copies retain a reusable socket.
+`close(&self) -> Result<()>` awaits socket-driver release.
+
+Implementation: [public API and copy lifecycle](../../crates/libs/fube-client/src/image_store.rs#L59),
+[native codecs](../../crates/libs/fube-client/src/image_store_protocol.rs#L27),
+[complete root-marker preflight](../../crates/libs/fube-client/src/image_store_protocol.rs#L193),
+[strict semantic ACK decoding](../../crates/libs/fube-transport/src/file_transfer.rs#L26)
+and [dedicated transport role](../../crates/libs/fube-transport/src/connection.rs#L420).
+Native copy semantics follow the pinned
+[NativeImageStore directory path](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Management/ImageStore/NativeImageStore.cpp#L1139-L1369).
 
 ### Query parameters, paging, and serialization
 
@@ -960,6 +1084,9 @@ Naming methods accept `impl AsRef<str>`, so both existing string calls and
 | Notification page queue / processing | 32 pages and one worker; pages share the delivery memory budget |
 | Notification reply/control / cleanup queues | 32 each, admitted independently of application delivery |
 
+Native ImageStore's separate chunk, traversal, path and stale-reply limits are
+listed in [its API section](#native-imagestore-application-package-copy).
+
 The ordinary request writer queue is a count bound, not an aggregate memory
 limit of one frame: 32 maximum-sized queued frames can occupy 128 MiB.
 Memory also includes active
@@ -977,6 +1104,8 @@ typed version lookup remains first-match. Supported appended values/scopes
 are typed-skipped, not found by searching for delimiter bytes. The bounded codec
 supports nullable object pointers, typed objects, object arrays, UInt16 and
 base/derived scopes needed by node results.
+Native upload semantic ACKs additionally reject duplicate visible header IDs;
+they do not inherit the common last-occurrence acceptance policy.
 
 Notification memory accounting includes queue backing storage, input pages,
 decoded strings/vectors, conversion copies and prospective progress copies.
@@ -1682,6 +1811,36 @@ is not. No persisted application-data replication, TLS, authentication,
 cross-release compatibility, automatic recovery or transparent failover is
 claimed. Profiles, journals, reports and packet-free diagnostic artifacts stay
 local/ignored.
+
+### Native ImageStore upload evidence
+
+The focused library run passed **419 tests, with 5 live tests ignored**;
+production library check and strict all-target Clippy passed. The CLI's two
+subprocess/controlled-native-peer tests also passed. Upload tests cover empty
+and full-size/multichunk content, exact routed Delete schemas, postorder markers,
+native errors, wrong envelopes, bounded handoff/stale replies, prior-file cleanup
+and duplicate commits, and retained-client cancellation/deadline retirement.
+
+**End-to-end qualification passed on an owned SF 11.8.121.4 onebox.** One real
+native mssf SDK copy established the predecessor inventory, including a deliberate
+obsolete file. Rust CLI replacement matched that inventory minus the obsolete
+file and independently matched every local file size and generated zero-byte
+`_.dir` marker. Coverage included nested Unicode/space paths, empty
+files/directories, **7 MiB** multichunk data and a **132 MiB** sample binary.
+sfctl provision/create then succeeded; an independent native runtime observer
+resolved/contacted the live application, and deployed Data **SHA256 hashes
+matched the local source**. Exact owned-workload cleanup passed.
+The SDK adapter invokes the real native CopyApplicationPackage API; sfctl
+remains provisioning/observation tooling, not production upload or fallback.
+
+The final scenario uses **one SDK predecessor copy**, not a redundant second SDK
+copy/reference root. That earlier redundant native-only call intermittently
+exited **139**, with no cause established by source inspection. No SDK fallback,
+retry, delay or destructor workaround was added. The successful final scenario
+does **not** establish repeated native SDK copy reliability.
+The opt-in scenario is
+[`tests.onebox.native_upload`](../../tests/onebox/native_upload.py); it does not
+replace the existing CI uploader or join the existing live test group.
 
 ## 6. Deliberate exclusions
 

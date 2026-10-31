@@ -5,7 +5,8 @@ and standalone test host in Rust.
 
 | Component | Purpose |
 | --- | --- |
-| [`fube-client`](crates/libs/fube-client) | Native clear-TCP FabricClient queries, naming, health, resolution, and notifications; no native SF library dependency. |
+| [`fube-client`](crates/libs/fube-client) | Native clear-TCP FabricClient queries, naming, health, resolution, notifications, and ImageStore upload; no native SF library dependency. |
+| [`fube-cli`](crates/tools/fube-cli) | Thin native application-package upload CLI with explicit unsecured-development opt-in. |
 | [`fube-transport`](crates/libs/fube-transport) | Bounded Fabric framing, serialization, and concurrent TCP messaging. |
 | [`fube-test-host`](crates/libs/fube-test-host) | Node-side stateless test-host subset, including manifest-based SharedProcess activation. |
 | [`fube-runtime`](crates/libs/fube-runtime) | Owned async stateless/stateful application runtime; real SF placement/reconfiguration without native SF libraries in the application. Linux x86-64 only. |
@@ -65,10 +66,26 @@ and **unsecured loopback-only** gateways at `127.0.0.1:19000` (native TCP) and
 `http://127.0.0.1:19080` (HTTP/Explorer). No app is implicitly deployed.
 See [onebox prerequisites, lifecycle, and recovery](docs/UbuntuOnebox.md).
 
+Upload a local package to native `fabric:ImageStore` on your own disposable
+onebox:
+
+```sh
+cargo build --locked -p fube-cli
+target/debug/fube --endpoint 127.0.0.1:19000 --unsecured application upload --path ./MyApp --timeout 300
+```
+
+Copy replaces the entire destination named `MyApp`; it does not provision or
+create an application. [API, cancellation and evidence limits](docs/transport/RustFabricClient.md#native-imagestore-application-package-copy)
+describe the native v1.2-only profile. Native SDK/Rust replacement, provisioning,
+live application contact and deployed Data hashes qualified on SF 11.8.121.4;
+repeated native SDK copy reliability is not claimed.
+
 ## Documentation
 
 - [Rust FabricClient API and native qualification](docs/transport/RustFabricClient.md)
 - [Native transport/TCP/TLS specification](docs/transport/Transport.md)
+- [Shared message/RPC channel API contracts (Rustdoc source; declarations only, not implemented)](crates/libs/fube-transport/src/channel.rs)
+- [Native actor/action router and registry API contracts (Rustdoc source; declarations only, not implemented)](crates/libs/fube-transport/src/routing.rs)
 - [FabricClient behavior](docs/transport/FabricClient.md) and [message formats](docs/transport/FabricClientMessageFormat.md)
 - [Native FabricRuntime](docs/runtime/FabricRuntime.md) and [node-side host responsibilities](docs/runtime/FabricRuntimeHost.md)
 - [Standalone test host](docs/runtime/RustTestHost.md) and [manifest execution](docs/runtime/ManifestTestHost.md)

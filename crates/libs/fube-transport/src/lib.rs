@@ -3,10 +3,13 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("fube supports Linux only");
 
+pub mod channel;
 pub mod connection;
 pub mod error;
+pub mod file_transfer;
 pub mod frame;
 pub mod message;
+pub mod routing;
 pub mod serialization;
 
 pub use error::{Error, Result};
