@@ -1,0 +1,14 @@
+[package]
+name = "fube-hosting"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded native-derived in-memory Hosting2 registration model; not a live Hosting service"
+
+[dependencies]
+uuid.workspace = true
+
+[dev-dependencies]
+fube-ra = { path = "../fube-ra" }
+fube-ra-store = { path = "../fube-ra-store" }
+tokio.workspace = true
