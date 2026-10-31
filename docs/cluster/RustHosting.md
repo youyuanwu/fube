@@ -1,11 +1,13 @@
 # Rust node-side Hosting design
 
-**Status: H1 in-memory registration/lookup core and narrow port contracts
-implemented; H2–H4 remain proposed.**
+**Status: H1 registration/lookup and H2 admitted accounting/scheduling implemented;
+H3/H4 and live composition remain gated.**
 [`fube-hosting`](../../crates/libs/fube-hosting/src/lib.rs) provides
 a native-derived, deterministically driven model, not a running node or new
 interoperability qualification. See [implemented H1](#implemented-h1-model)
 for the exact API/source and evidence boundary.
+See [implemented H2](#implemented-h2-accounting-and-scheduling) for actual
+residency and the separate real-accounting RA test profile.
 See [supplied port contracts](#supplied-port-contracts) for the distinction
 between interface definitions, H1 model implementations and gated live work.
 
@@ -131,8 +133,9 @@ The [supplied port contracts](#supplied-port-contracts) now define request-only
 registration lookup, package residency, lookup-triggered activation/scheduling,
 and two typed owned event lanes. Host/runtime/type registration retains the
 existing H1 inherent/split-step APIs; termination and RAP stay gated rather than
-receiving success-shaped wrapper traits. Package usage/lifecycle definitions
-have **no implementation**. Native lookup errors, optional returned registration
+receiving success-shaped wrapper traits. PackageUsage and narrow PackageScheduling
+have deterministic H2 implementations; physical PackageLifecycle remains
+definition-only. Native lookup errors, optional returned registration
 and sequence number remain independently representable; an error must not
 automatically erase its candidate.
 
@@ -311,9 +314,11 @@ H2 implements package usage and deactivation, not a second RA retry engine:
 - Bind release to the actual acquired package/activation. Semantic description
   changes cannot retarget an outstanding reference.
 
-H1 integration tests may reuse the RA suite's explicitly simulated usage/RAP
-adapters. They qualify the registration bridge only. No new live RA attachment
-is enabled until H2 proves real usage ownership and the required event consumers.
+H1 integration tests retain explicitly simulated usage/RAP adapters. H2's
+separate [real-accounting profile](../../crates/libs/fube-hosting/tests/ra_residency.rs)
+uses actual residency and RA/store completion ownership; RAP observations remain
+controlled. Required live event consumers are still absent, so live admission
+remains rejected even though H2 accounting is implemented.
 Unknown P1 writes retain their original proposal/ticket/fence; Hosting cannot
 replace a fenced RA executor or infer rollback from observer cancellation.
 
@@ -438,7 +443,7 @@ These are Rust execution/ownership adaptations, not extra native wire fields.
 | Slice | Deliverable | Completion boundary |
 |---|---|---|
 | **H1: registration and lookup core** | New crate; native-derived host/runtime/type records, registration transitions, scoped lookup decisions, events and explicit package/clock adapters. | Deterministic source-derived scenarios and RA registration-bridge tests cover producer-specific spelling and separate host Finish/timeout reply/state outcomes. No IPC, process launch, real usage or deployed-parity claim. |
-| **H2: usage and deactivation** | Native package usage/residency, deactivation-if-unused results, grace/cancellation/timer behavior and RA acquired-reference integration. | Tests prove version-mismatch decisions, exact release, retained usage and failed/unknown-store ordering. Required native event consumers are present before live use. |
+| **H2: usage and deactivation** | Implemented admitted package/application accounting, exact residual ownership, deterministic grace/sequence scheduling and real-accounting RA test composition. | Tests cover mismatch disposition, exact release, retention and definite/unknown-store ordering. Physical final work remains owned; required live event consumers are still gated. |
 | **H3: IPC and local leases** | Extract/adapt accepted sessions and Hosting handlers; long-running bounded dispatch and finite local authority. | Actual protocol/lease tests and standalone native-host regression qualify the enabled profile. H3 is not yet a real Rust RA deployment. |
 | **H4: process activation and RA/RAP** | Dependent empty-endpoint `fube-runtime` alignment; shared validated deployment/process mechanics, native-free launch and selected native activation policy; real stateless Open/Close/Drop/resend. | Empty-endpoint Open/duplicate/Close passes runtime and real RA/RAP qualification. Independent app/resource observations, actual replies and separate exit/drain/reap evidence qualify the combined path, including crashes and lease loss. |
 
@@ -506,7 +511,7 @@ production dependency ([manifest](../../crates/libs/fube-hosting/Cargo.toml#L1-L
 | Host records, held Start timer/state, Finish find/state/reply/proxy receipt, timeout cancel/find/mark/remove | [host.rs:5–379](../../crates/libs/fube-hosting/src/host.rs#L5-L379) | ApplicationHostRegistration.cpp:38–145; ApplicationHostManager.cpp:1292–1299,1766–1816,1966–2053,2266–2286 |
 | Tentative runtime Add/host check/Validate, duplicate errors and original/cleanup receipt | [runtime.rs:4–163](../../crates/libs/fube-hosting/src/runtime.rs#L4-L163) | RuntimeRegistrationTable.cpp:53–266; FabricRuntimeManager.cpp:501–679 |
 | Managed declaration/component/failure entries; six selected statuses, unfenced Finish and grace callback checks | [types.rs:5–624](../../crates/libs/fube-hosting/src/types.rs#L5-L624) | ServiceTypeStateManager.cpp:128–299,425–838,1142–1557 |
-| Candidate/error/optional sequence; native rendered public-map keys; activation and deactivation-if-unused controlled outcomes | [lookup.rs:5–217](../../crates/libs/fube-hosting/src/lookup.rs#L5-L217), [collaborators.rs:5–95](../../crates/libs/fube-hosting/src/collaborators.rs#L5-L95) | FabricRuntimeManager.cpp:117–249,296–458; ApplicationManager.cpp:1079–1093; HostingSubsystem.cpp:165–180 |
+| Candidate/error/optional sequence; native rendered public-map keys; activation and deactivation-if-unused controlled outcomes | [lookup.rs:5–237](../../crates/libs/fube-hosting/src/lookup.rs#L5-L237), [collaborators.rs:5–95](../../crates/libs/fube-hosting/src/collaborators.rs#L5-L95) | FabricRuntimeManager.cpp:117–249,296–458; ApplicationManager.cpp:1079–1093; HostingSubsystem.cpp:165–180 |
 | Owned Registered/RuntimeClosed/HostClosed and separate Enabled/Disabled enqueue lanes; timeout-tracking/source-release obligations | [events.rs:9–294](../../crates/libs/fube-hosting/src/events.rs#L9-L294) | ServiceTypeStateManager.cpp:923–1117,1581–1636; EventDispatcher.cpp:39–197 |
 | Logical count/byte admission, complete output reservation, explicit remaining-work closure | [core.rs:78–220](../../crates/libs/fube-hosting/src/core.rs#L78-L220), [model.rs:94–159](../../crates/libs/fube-hosting/src/model.rs#L94-L159) | Rust ownership adaptation, not native limits or physical shutdown |
 
@@ -527,7 +532,8 @@ ApplicationManager intentionally maps them to NotFound with a retained
 candidate. `LookupModel` requires every applicable outcome; missing premises
 are explicit local failures. Pending activation End consumes its owned result,
 including after core closure, without rewriting a prior lookup or reviving a
-factory. No real package usage/deactivation or successful deployment is implied.
+factory. H1 controlled observations alone imply neither H2 accounting nor
+successful deployment.
 
 The public-activation map is a native **case-insensitive flat string map** over
 `<ServicePackageIdentifier.ToString()>_<activation GUID text>`, unlike the
@@ -608,8 +614,9 @@ The test-only event-derived candidate still fulfills an issued RA completion;
 it does not port unsolicited native Hosting event routing. Missing live RA
 RuntimeClosed/Enabled/Disabled consumers remain gated, and RuntimeClosed is
 never silently translated to HostDown. `require_live_composition` rejects live
-admission. Actual package acquisition/release, H2 scheduling, H3 wire handlers/
-leases and H4 process/RAP ownership remain unfinished. No complete native
+admission. H2 now supplies actual admitted acquisition/release and scheduling
+in its separate ledger below; H3 wire handlers/leases and H4 process/RAP ownership
+remain unfinished. No complete native
 Hosting handler execution, new codec oracle, wire interoperability or deployed
 process qualification was run. Existing test-host/native evidence is unchanged;
 it is not relabelled for H1.
@@ -624,10 +631,11 @@ above remains evidence at its original revisions.
 
 | Contract | Supplied implementation/profile | API and semantic comments |
 |---|---|---|
-| `RegistrationLookup` | Explicit borrowed `H1LookupAdapter`; request-only method, separately supplied `LookupModel` premises. No live production adapter. | [contracts.rs:37–184](../../crates/libs/fube-hosting/src/contracts.rs#L37-L184) |
-| `PackageUsage` | Definition only; no H1/H2 usage engine or acquired-reference bridge. | [contracts.rs:186–298](../../crates/libs/fube-hosting/src/contracts.rs#L186-L298) |
-| `PackageLifecycle` | Definition only; existing activation/scheduling observations remain model premises/obligations, not executed H2. | [contracts.rs:300–420](../../crates/libs/fube-hosting/src/contracts.rs#L300-L420) |
-| `HostingEventSource` | Direct `Hosting` implementation, two owned H1 lanes. No subscriptions, live status/runtime-close routing or delivery ACK. | [contracts.rs:422–531](../../crates/libs/fube-hosting/src/contracts.rs#L422-L531) |
+| `RegistrationLookup` | Borrowed H1 controlled adapter or H2 actual scheduling adapter; activation still controlled, no live adapter. | [contracts.rs:94–215](../../crates/libs/fube-hosting/src/contracts.rs#L94-L215) |
+| `PackageUsage` | Actual admitted `Residency`; exact nonclone full/residual acquisition. | [contracts.rs:219–328](../../crates/libs/fube-hosting/src/contracts.rs#L219-L328), [residency.rs:1341–1358](../../crates/libs/fube-hosting/src/residency.rs#L1341-L1358) |
+| `PackageScheduling` | Narrow H2 implementation and closed bounded disposition; separate from physical activation. | [contracts.rs:414–491](../../crates/libs/fube-hosting/src/contracts.rs#L414-L491) |
+| `PackageLifecycle` | Definition-only activation/End, extends scheduling; **not** implemented by H2. | [contracts.rs:333–412](../../crates/libs/fube-hosting/src/contracts.rs#L333-L412) |
+| `HostingEventSource` | Direct `Hosting` implementation, two owned H1 lanes. No subscriptions, live status/runtime-close routing or delivery ACK. | [contracts.rs:493–600](../../crates/libs/fube-hosting/src/contracts.rs#L493-L600) |
 
 Lookup keeps outer admission versus inner native result/candidate/sequence,
 request identity versus producer runtime fields, full-version/scheduling-derived
@@ -664,11 +672,11 @@ They exercise trait dispatch, provenance/candidate-error combinations, absent
 premises/unwritten sequence, pending End, atomic admission and typed owned
 transfer—not mock-success or compile-only conformance. Comments distinguish
 native-test adaptations, processor-derived combinations and Rust ownership/
-admission checks. The suite now contains **78 ordinary cases** (original 72
+admission checks. The original contracts delivery recorded **78 ordinary cases** (original 72
 preserved) and **two model doctests**. These are native-free contract regressions,
 not H2/H3/H4, native-handler, codec, wire or deployed qualification.
 
-**Contracts validation:** affected H1 tests and examples passed. Locked
+**Original contracts validation (historical):** affected H1 tests and examples passed. Locked
 all-feature workspace check, Clippy (warnings denied), binary/example build,
 warning-denied Rustdoc and serial tests passed: 1,040 ordinary cases, five live
 cases ignored, and 38 doctests (including H1's two). The separate doctest gate
@@ -676,6 +684,116 @@ also passed; those counts overlap, not additional unique tests. No new native
 or live execution was performed. The known intermittent demoted-role-stream
 sample test passed on the first workspace run here; it was not modified or
 claimed fixed by this work.
+
+### Implemented H2 accounting and scheduling
+
+H2 starts from merged H1/contracts base
+`f3bb6a045e4b01770563fc925953c4fe5e72ff4d`. Native source/test bodies remain
+pinned to `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`; they were inspected,
+**not executed**. This is real in-memory accounting, not package materialization,
+physical activation or a running RA/RAP node.
+
+| Implemented surface | Rust source | Pinned native authority |
+|---|---|---|
+| Admitted application/package/context identity, first public-map metadata, frozen full version/numeric instance | [residency.rs:490–621](../../crates/libs/fube-hosting/src/residency.rs#L490-L621) | Deactivator.cpp:293–328,1148–1178; HostingSubsystem.cpp:22–180; ServicePackageInstanceIdentifier.cpp:74–109 |
+| Package-first split increment and exact residual, application-first pair release, locally verified package-only compensation | [residency.rs:657–910](../../crates/libs/fube-hosting/src/residency.rs#L657-L910) | Deactivator.cpp:37–103,330–394; HostingSubsystem.cpp:1349–1392 |
+| Full current grace, timer escrow, strict newer replacement and ≤ removal; independent scan/guards/final ownership | [residency.rs:913–1223](../../crates/libs/fube-hosting/src/residency.rs#L913-L1223) | Deactivator.cpp:113–166,445–527,735–815,912–969,1078–1100,1264–1394 |
+| Actual scheduling-derived mismatch/NotFound with pre-reserved closed result | [lookup.rs:253–305](../../crates/libs/fube-hosting/src/lookup.rs#L253-L305), [contracts.rs:466–491](../../crates/libs/fube-hosting/src/contracts.rs#L466-L491) | FabricRuntimeManager.cpp:381–429; ApplicationManager.cpp:1079–1093 |
+| Real acquired-reference **test composition**, original completion/tickets, exact correction/withdrawal and retained disposal batches | [residency_bridge.rs:139–619](../../crates/libs/fube-hosting/tests/support/residency_bridge.rs#L139-L619) | ServiceTypeRegistrationWrapper.cpp:78–162; Hosting.HostingAdapter.cpp:83–203; EntityJobItem.h:228–278; local ownership adaptation |
+
+**Supported profile:** driver-admitted managed application/package entries begin
+unused at count/sequence zero and injected Now. Shared and exclusive partition
+contexts support **accounting**, not exclusive execution. Increment never
+creates a missing record. Different full versions or numeric instances cannot
+replace an admitted record. Native package/context comparisons, rendered-CI
+public-map aliases, UTF-16/NUL and first spelling remain intact. Adhoc usage is
+explicitly unmanaged. Admissions are not physical deployment certificates.
+
+Package increment changes count/sequence before application increment. The split
+begin/finish seam exposes application closing after package mutation:
+`Unresolved` retains the exact package-only owner, rather than pretending a
+mutation-free rejection or rollback. Normal release verifies application-first
+pair decrement. Explicit package-only compensation requires that residual's
+unchanged sequence, nonclosing package and verified ownership counts; otherwise
+the same owner remains unresolved. These are **local verification/ownership
+rules**, not native opaque tokens or a native reconciliation algorithm. Public
+native decrement is void; internal diagnostics and local `Released` are distinct.
+Drop never performs asynchronous release; shutdown retains unresolved owners.
+
+Shared/application grace defaults to 60 seconds, exclusive package grace to one
+second, unused scan to 600 seconds. Each is explicitly finite or infinite.
+First use sets unused-since MaxValue (represented by None); last use records
+Now. Ordinary last application release does not schedule application work.
+Independent scan selects old-enough unused applications first, otherwise
+packages; matching application work can enter closing while packages remain.
+Changing grace/debug observations affects new attempts, not old deadlines or
+callback guards. Debug suppression applies to package scheduling only.
+
+Eligibility is not timer admission: zero usage with infinite grace gives
+successful ineligibility/mismatch; finite eligibility plus debug/closed-queue/
+budget suppression still gives NotFound with a candidate. Closing accounting
+returns an error, not successful ineligibility. Strictly newer timer sequences
+replace; removal/cancellation accepts stored sequence ≤ incoming. Dequeued
+callbacks separately require exact current sequence, zero usage and not closing;
+package access additionally requires an open/nonclosing application. Successful
+guard retains **final-deactivation obligations only**. No physical End, package
+removal, retry after physical failure or successful process teardown is supplied.
+
+`H2LookupAdapter` reserves the maximum fixed-payload scheduling outcome and all
+H1 outputs before one external call. No fallible publication follows that call.
+Controlled H1 lookup remains available; H2 does not fake an entire lifecycle to
+obtain scheduling. First request ServiceName/ApplicationName/PublicActivationId
+are byte-accounted and preserved; explicit bindings without names leave them absent.
+
+**Finite ownership:** defaults are 128 applications, 256 packages, 1,024
+acquisitions, 256 timers, 256 callbacks, 512 final obligations and 4 MiB logical
+state. Timer admission reserves downstream callback/final capacity and work
+bytes conservatively. Latest-attempt diagnostics occupy preallocated entry
+slots, not an audit log/retry worker. Shutdown stops new accounting/work admission
+without erasing earlier tokens, callbacks or finals. Logical budgets are not RSS
+or allocator promises; composition separately budgets drained work.
+
+The new [RA residency target](../../crates/libs/fube-hosting/tests/ra_residency.rs)
+uses actual `Residency`, `Executor`, `RegistrationCompletion` and `Store` with
+real `MemoryBackend` under controlled gates. Its bounded owner reserves original
+targets/snapshots/completions/tickets, terminal IDs and downstream effects before
+acquisition/submit/drain. Fresh issued lookups acquire once; retained reopen
+usage reuses its exact owner. Ticket success alone is not adoption: committed
+usage and exact RA disposal are authoritative. Consumed-issuance evidence survives
+pre-collection replay; delayed disposal cannot be locally abandoned. Failed memory
+publication retains correction ownership; explicit abandonment withdraws the same
+offer before exact compensation. Drained actions stay owned even on classification
+or release errors.
+
+FSR attachment remains **memory-only**, unchanged RA policy/store format.
+Definite/unknown **durable close** tests use original CompleteClose work and an
+already adopted owner: late Written releases postcommit; late definite failure
+retains usage. Observer cancellation cannot infer rollback. This is not failed
+durable-attachment evidence or a production node adapter. RAP/host observations
+remain controlled, live event consumers remain gated, and the original
+[ra_bridge](../../crates/libs/fube-hosting/tests/ra_bridge.rs) still simulates usage.
+
+**Current H2 scenario inventory:** 24 [residency](../../crates/libs/fube-hosting/tests/residency.rs)
+cases plus two private sequence-overflow cases, six
+[actual lookup](../../crates/libs/fube-hosting/tests/lookup_residency.rs) cases and
+17 real-accounting RA cases. Headers distinguish native-test adaptations
+(wrapper add/down/close assertions) from processor-derived partial/race/scheduling
+combinations and local Rust ownership/admission/unknown-store tests. No native
+handlers, new codecs, live IPC/leases, process launch or deployed interoperability
+are qualified. H3/H4, successful-empty-endpoint runtime alignment and live
+consumer routing remain prerequisites, not H2 successes.
+
+**Qualification-blocker correction:** a separately approved narrow correction
+preserves the oracle's direct synchronous COM Invoke/once-only End while
+[handing off its owned multithread worker](../../crates/samples/native-replicator-oracle/src/async_context.rs#L340-L357).
+The bounded [data model host](../../crates/libs/fube-data/tests/support/rap_model.rs#L264-L417)
+now retains original pending callback results, then observes exact ReplicaClose
+before unchanged guarded runtime shutdown. Its causal test holds an actual
+provider epoch callback, not a cached-status read or sleep. Archived baseline
+execution reproduced the oracle hang; the original SDK selector passed in that
+baseline, so a preexisting SDK failure or H2 noncausation is not inferred.
+Earlier failures remain part of local validation history. Neither correction
+enables physical Hosting, live RA/RAP or new native interoperability.
 
 ## 10. Deferred work and invariants
 

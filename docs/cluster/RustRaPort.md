@@ -19,10 +19,11 @@ All native RA–FM and RA–RA message contracts must be preserved and ported.
 Federation routing/membership and native node-to-node distributed leases remain
 excluded; native peer-reliability messages are not excluded with them.
 The [node-side Hosting design](RustHosting.md#implemented-h1-model) now includes
-the native-derived in-memory `fube-hosting` H1 registration/lookup core and
-test-only RA completion bridge. Real package usage, live event consumers,
-IPC/leases and processes remain dependent work; this does not enable a live
-RA/Hosting adapter or alter the existing RA ownership contract.
+the native-derived H1 registry and [H2 admitted residency/scheduling](RustHosting.md#implemented-h2-accounting-and-scheduling).
+A separate real-accounting RA test composition exercises original completion/
+ticket ownership and definite/unknown durable close; FSR remains memory-only.
+Live event consumers, IPC/leases and processes remain dependent work; this
+does not enable a production RA/Hosting adapter or alter native RA policy.
 
 ## 1. Scope and compatibility
 
