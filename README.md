@@ -78,7 +78,7 @@ See [onebox prerequisites, lifecycle, and recovery](docs/UbuntuOnebox.md).
 - [Broader pure-Rust runtime design and capability tiers](docs/runtime/RustFabricRuntime.md)
 - [Current SF/mssf API alignment: per-method shape, values, completion and limits](docs/runtime/SfApiAlignment.md)
 - [Basic pure-Rust cluster design: FM, RA/Hosting, authority and qualification milestones](docs/cluster/PureRustCluster.md)
-- [Rust node-side Hosting design: native porting map, RA compatibility and incremental delivery](docs/cluster/RustHosting.md)
+- [Rust node-side Hosting: implemented H1 registration model, native map and remaining integration gates](docs/cluster/RustHosting.md)
 - [RA store P1: API, SQLite profile, cancellation and operational limits](docs/cluster/RaStore.md)
 - [RA protocol foundation: catalog, native codec evidence and minimal P2 execution](docs/cluster/RaProtocolFoundation.md)
 - [Native-derived RA stateless removal: close/report stages, tests and limits](docs/cluster/RaStatelessRemoval.md)

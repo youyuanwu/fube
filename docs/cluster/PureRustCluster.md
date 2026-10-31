@@ -29,6 +29,12 @@ FM-resend recreation and directly required description helpers.
 It uses trusted simulated Hosting/RAP, not the live RA/Hosting/process architecture
 proposed here, and adds no recovery, outbox or process/power-loss guarantee.
 
+**Hosting update (2026-10-31):** [H1](RustHosting.md#implemented-h1-model)
+implements an in-memory native-derived host/runtime/declared-type registry,
+scoped lookup, typed enqueue observations and explicit modeled package/clock
+premises. Its RA bridge tests still simulate usage/RAP. No live RA/Hosting node,
+package residency, IPC/lease or process capability is established.
+
 ## 1. Decisions and initial profile
 
 | Area | Decision |
@@ -70,6 +76,7 @@ proposed contracts unless explicitly identified as existing behavior.
 
 | Existing evidence | Reuse boundary / missing work |
 |---|---|
+| `fube-hosting` supplies the [H1 registration/lookup model](RustHosting.md#implemented-h1-model), [split host operations](../../crates/libs/fube-hosting/src/host.rs#L64-L352) and [typed enqueue lanes](../../crates/libs/fube-hosting/src/events.rs#L9-L55). | Model-only package outcomes and test-only RA composition; real usage, missing event consumers, IPC/leases and process ownership remain H2–H4. |
 | `fube-runtime` performs activated host/runtime registration, package loading and fresh lease establishment: [lib.rs:153–253](../../crates/libs/fube-runtime/src/lib.rs#L153-L253). Its context parser rejects unsupported host/security settings and nonloopback IPC: [context.rs:58–104](../../crates/libs/fube-runtime/src/context.rs#L58-L104). | Keep `Runtime::attach` and the app programming model. Hosting must supply genuine, matching activation metadata, not introduce an unactivated fallback. |
 | Local authority renews using correlated, send-relative actor-15 TTLs: [lib.rs:250–295](../../crates/libs/fube-runtime/src/lib.rs#L250-L295). Terminal authority and independent callback/watchdog fencing live in [lease.rs:14–193](../../crates/libs/fube-runtime/src/lease.rs#L14-L193). | Reuse unchanged authority semantics. Implement the long-running node-side lease owner and terminal host records. |
 | `fube-test-host` admits owned host/PID, runtime, type and lease traffic: [lib.rs:174–338](../../crates/libs/fube-test-host/src/lib.rs#L174-L338). | Useful registration/IPC patterns, not a general RA. Replace hardcoded node identity and one-runtime/type assumptions with explicit admitted records. |
