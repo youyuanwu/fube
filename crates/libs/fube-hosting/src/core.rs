@@ -89,7 +89,12 @@ impl State {
             + self
                 .public_activations
                 .iter()
-                .map(|p| 64 + p.key.len() + p.public_activation.len())
+                .map(|p| {
+                    64 + p.key.len()
+                        + p.public_activation.len()
+                        + p.service_name.as_ref().map_or(0, String::len)
+                        + p.application_name.as_ref().map_or(0, String::len)
+                })
                 .sum::<usize>()
             + self
                 .pending_activations
@@ -166,8 +171,8 @@ impl Hosting {
     pub fn retained_host_records(&self) -> usize {
         self.state.hosts.len()
     }
-    /// No live usage/RA event consumer/IPC/lease/process capability is supplied
-    /// by H1. Node composition must implement the dependent slices first.
+    /// No live RA event consumer/IPC/lease/process capability is supplied.
+    /// H2 accounting alone does not satisfy node composition admission.
     pub fn require_live_composition(&self) -> Result<()> {
         Err(Error::UnsupportedCapability)
     }

@@ -184,6 +184,35 @@ impl RegistrationLookup for H1LookupAdapter<'_> {
     }
 }
 
+/// Request-only lookup with real H2 scheduling and explicitly controlled H4 activation.
+///
+/// Supplying [`Residency`] replaces the deactivation/accounting premise only.
+/// This adapter does not acquire usage, launch a process or route live RA events.
+/// H1's outer admission reserves the entire projection before one scheduling call.
+pub struct H2LookupAdapter<'a, S: PackageScheduling> {
+    core: &'a mut Hosting,
+    model: &'a LookupModel,
+    scheduling: &'a mut S,
+}
+
+impl<'a, S: PackageScheduling> H2LookupAdapter<'a, S> {
+    /// Borrow independent registration and accounting owners; no default activation.
+    pub fn new(core: &'a mut Hosting, model: &'a LookupModel, scheduling: &'a mut S) -> Self {
+        Self {
+            core,
+            model,
+            scheduling,
+        }
+    }
+}
+
+impl<S: PackageScheduling> RegistrationLookup for H2LookupAdapter<'_, S> {
+    fn lookup(&mut self, request: &LookupRequest) -> Result<LookupResult> {
+        self.core
+            .lookup_with_scheduling(request, self.model, self.scheduling)
+    }
+}
+
 /// Increment observation with explicit residual ownership.
 ///
 /// This is a Rust ownership adaptation, not a native result DTO. In particular

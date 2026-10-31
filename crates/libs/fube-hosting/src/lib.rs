@@ -41,8 +41,10 @@
 //! H2 usage and [`PackageScheduling`] have a deterministic implementation;
 //! physical lifecycle remains definition-only. H1 model premises are not
 //! production operation inputs.
-//! Only [`H1LookupAdapter`] supplies lookup and [`Hosting`] supplies typed
-//! owned event drains. Node composition, not this crate, projects outputs to RA.
+//! [`H1LookupAdapter`] preserves controlled lookup; [`H2LookupAdapter`] replaces
+//! scheduling with actual admitted accounting while activation stays controlled.
+//! [`Hosting`] supplies typed owned event drains. Node composition, not this
+//! crate, projects outputs to RA.
 //!
 //! # Request-only lookup with explicit H1 observations
 //! ```

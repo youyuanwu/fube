@@ -37,6 +37,19 @@ impl LookupResult {
 pub(crate) struct PublicActivationEntry {
     pub key: String,
     pub public_activation: String,
+    pub service_name: Option<String>,
+    pub application_name: Option<String>,
+}
+
+/// First-inserted rendered-CI mapping provenance, not package deployment evidence.
+///
+/// Controlled bindings without request names leave those fields absent.
+#[derive(Debug)]
+pub struct LookupPublicActivation<'a> {
+    pub rendered_key: &'a str,
+    pub public_activation: &'a str,
+    pub service_name: Option<&'a str>,
+    pub application_name: Option<&'a str>,
 }
 impl State {
     fn public_activation(
@@ -78,6 +91,8 @@ impl State {
         self.public_activations.push(PublicActivationEntry {
             key,
             public_activation: public.clone(),
+            service_name: Some(request.service_name.clone()),
+            application_name: Some(request.application_name.clone()),
         });
         Ok(Some(public.clone()))
     }
@@ -112,6 +127,8 @@ impl Hosting {
             s.public_activations.push(PublicActivationEntry {
                 key,
                 public_activation: package.public_activation,
+                service_name: None,
+                application_name: None,
             });
             Ok(())
         })
@@ -213,5 +230,76 @@ impl Hosting {
                 }
             }
         })
+    }
+
+    /// Observe first request spelling for an exclusive rendered-CI public key.
+    ///
+    /// Shared resolution has no map entry; aliases retain the first inserted
+    /// public ID and names (HostingSubsystem.cpp:22–180 at the pinned revision).
+    pub fn lookup_public_activation(
+        &self,
+        package: &PackageId,
+        activation: Activation,
+    ) -> Result<Option<LookupPublicActivation<'_>>> {
+        let key = public_activation_map_key(package, activation)?;
+        Ok(self
+            .state
+            .public_activations
+            .iter()
+            .find(|p| compare_names(&p.key, &key).is_eq())
+            .map(|p| LookupPublicActivation {
+                rendered_key: &p.key,
+                public_activation: &p.public_activation,
+                service_name: p.service_name.as_deref(),
+                application_name: p.application_name.as_deref(),
+            }))
+    }
+
+    /// One pre-admitted lookup projection with actual bounded H2 scheduling.
+    ///
+    /// Activation/GUID assignment remain explicit controlled observations.
+    /// On unequal registered versions, reserve the maximum closed scheduling
+    /// outcome before invoking the dependency once. All H1 state/output limits
+    /// are checked before that call; replacing its fixed-payload outcome and
+    /// publishing thereafter is infallible. External mutation is never claimed
+    /// rolled back by H1 admission. Equal versions and early admission failures
+    /// do not invoke scheduling. Eligibility, timer admission and physical End
+    /// remain separate; candidate and optional sequence survive native errors.
+    ///
+    /// Native disposition: FabricRuntimeManager.cpp:381–429 and
+    /// ApplicationManager.cpp:1079–1093 at pin
+    /// `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`. Pre-reservation is local safety.
+    pub fn lookup_with_scheduling(
+        &mut self,
+        request: &LookupRequest,
+        model: &LookupModel,
+        scheduling: &mut impl PackageScheduling,
+    ) -> Result<LookupResult> {
+        let previous_outputs = self.state.obligations.len();
+        let mut prepared = Self {
+            state: self.state.clone(),
+            limits: self.limits.clone(),
+        };
+        let mut observations = model.clone();
+        // Closed enum's largest representable outcome, not a success fallback.
+        observations.deactivation = Some(SchedulingDisposition::SequenceOverflow.outcome());
+        let mut result = prepared.lookup(request, &observations)?;
+        if let Some(Obligation::DeactivationIfUnused { package, outcome }) =
+            prepared.state.obligations.get_mut(previous_outputs)
+        {
+            let actual = scheduling
+                .schedule_deactivation_if_unused(package)
+                .outcome();
+            result.result = Err(if actual.has_replica() {
+                Error::RegistrationVersionMismatch
+            } else {
+                Error::NotFound
+            });
+            *outcome = actual;
+        }
+        // No fallible operation after the external call; the closed result fits
+        // the already checked max-size obligation. Core is serialized, not locked.
+        self.state = prepared.state;
+        Ok(result)
     }
 }
