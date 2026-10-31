@@ -197,7 +197,42 @@ native SF node: membership / role / epoch / reconfiguration / access authority
 | Upper provider | Transactional Apply/Unlock, source-compatible isolation/version contexts and checkpoint/copy state; first a small test provider | Lower transport ACK policy or a partition-wide root-swap requirement |
 | Runtime wrapper | Compose lower/upper Open, ChangeRole, Close and Abort; gate application access and own cleanup | Intercept every native configuration/build/removal or replace lower progress |
 
-The names and crate split are proposals, not existing APIs.
+### 3.2.1 Public trait boundary before A0
+
+[`fube-txn`](../../crates/libs/fube-txn/src/lib.rs) now declares the source-backed
+public V2/provider contracts. It contains **traits and signature types only**:
+no replicator/transaction/log/state-manager/provider implementation or lower
+adapter, no native serialization, and no new qualification or persisted support.
+The ownership split above remains the implementation proposal.
+
+| Native contract | Rust declaration |
+|---|---|
+| `ITransactionalReplicator` and inherited `IStateProviderMap`, `ITransactionManager`, `ITransactionVersionManager`, `IVersionManager` | [Replicator/registry/version traits](../../crates/libs/fube-txn/src/replicator.rs) |
+| `ITransaction`; required public `TransactionBase`, `Transaction`, `AtomicOperation`, `AtomicRedoOperation` instance surfaces | [Transaction traits](../../crates/libs/fube-txn/src/transaction.rs); native concrete types projected as traits, not placeholder kernels |
+| `IStateProvider2`, `IStateProvider2Factory`, native disposable copy stream and state-provider enumerator | [Provider traits](../../crates/libs/fube-txn/src/provider.rs) |
+| Transaction/state-manager change handlers, backup/data-loss callbacks and visibility completion observations | [Callback/notification traits](../../crates/libs/fube-txn/src/replicator.rs) |
+| Native transaction/apply enums, signed IDs/LSNs, provider factory/child metadata, version-removal results and backup metadata/options | [Signature types](../../crates/libs/fube-txn/src/types.rs) |
+
+The declarations follow the pinned native headers, using the existing Rust SDK
+`Result`/`ApiFuture`, `Cancellation`, epoch/role/partition representations and
+owned segmented `fube-data::OperationData`. Native status and throwing callbacks
+map to fallible results; synchronous Abort remains synchronous. Async inputs
+own Arc transaction/context handles, paths and UTF-8 names so future accepted
+work can retain them independently of observer futures. Nullable provider data,
+copy streams, Apply contexts and version sets remain distinguishable from empty
+values. Explicit overload names retain parameterless and option-bearing native
+Commit/Backup/Restore paths; `None` timeout means native infinite timeout.
+
+`Apply` retains operation LSN versus transaction commit LSN and has no invented
+cancellation argument. `Unlock` is a separate synchronous fallible callback.
+The upper copy stream retains native explicit disposal, rather than silently
+aliasing the classic lower stream's narrower interface. Runtime control still
+uses the existing lower engine/binder; native COM construction/test hooks and
+internal logging/checkpoint-manager interfaces are outside this public boundary.
+Backup/recovery declarations do not enable those capabilities. A0 still must
+implement and verify the kernels; compile-only
+[public contract witnesses](../../crates/libs/fube-txn/tests/sdk_contracts.rs)
+are not semantic or native-interoperability qualification.
 
 ### 3.3 Native control composition: preserve pass-through
 
