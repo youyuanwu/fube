@@ -3,7 +3,7 @@ use crate::{
     engine::{Engine, Replication},
     extensions::{
         EpochCheckedReplication, OperationOriginStream, ReplayCheckpointProvider,
-        ReplicationEndpointOptions,
+        ReplicationEndpointOptions, StateProviderCapabilities,
     },
     wire::Actor,
     Cancellation, Epoch, IOperationStream, IStateProvider, IStateReplicator, OperationData,
@@ -44,6 +44,30 @@ impl FabricReplicator {
         endpoint: ReplicationEndpointOptions,
         settings: Settings,
     ) -> Result<Arc<Self>> {
+        Self::create_with_capabilities(
+            partition,
+            native,
+            provider,
+            replay,
+            endpoint,
+            settings,
+            StateProviderCapabilities::default(),
+        )
+    }
+
+    /// Explicit provider-copy capability; `create` retains classic defaults.
+    /// The provider must already be callback-ready: construction queries its
+    /// actual log/application tail before the returned lower object's Open.
+    /// This does not open/recover/bootstrap an upper transaction log for callers.
+    pub fn create_with_capabilities(
+        partition: Arc<dyn IStatefulServicePartition>,
+        native: NativeRuntimeIntegration,
+        provider: Arc<dyn IStateProvider>,
+        replay: Option<Arc<dyn ReplayCheckpointProvider>>,
+        endpoint: ReplicationEndpointOptions,
+        settings: Settings,
+        capabilities: StateProviderCapabilities,
+    ) -> Result<Arc<Self>> {
         let identity = native.identity();
         let actor = Actor {
             partition: identity.partition_id,
@@ -59,6 +83,7 @@ impl FabricReplicator {
                 provider,
                 replay,
                 settings,
+                capabilities,
             )?,
         }))
     }

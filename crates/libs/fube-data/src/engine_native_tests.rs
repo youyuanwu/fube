@@ -446,6 +446,83 @@ async fn issued_root_and_bound_canonical_controls_copy_ack_memberships_remove_an
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_native_bound_duplicate_secondary_epoch_enters_lower_while_copy_ack_is_pending() {
+    let partition = uuid::Uuid::new_v4();
+    let source = tests::upper_log::UpperLog::new(EPOCH, 100);
+    let upper = tests::upper_log::UpperLog::new(EPOCH, 1);
+    let p = Fixture::using(
+        partition,
+        self::source(1),
+        ReplicaRole::Primary,
+        false,
+        (MemoryProvider::new(), source.clone(), Settings::default()),
+    )
+    .await;
+    let s = Fixture::using(
+        partition,
+        self::source(2),
+        ReplicaRole::IdleSecondary,
+        false,
+        (MemoryProvider::new(), upper.clone(), Settings::default()),
+    )
+    .await;
+    p.host.configure(config(EPOCH, vec![], 1)).await.unwrap();
+    let build = p.host.build(
+        s.descriptor(ReplicaRole::IdleSecondary),
+        Cancellation::default(),
+    );
+    tokio::pin!(build);
+    let stream = s.engine.copy_stream();
+    let operation = tokio::select! {
+        result = &mut build => panic!("build before actual copy apply: {result:?}"),
+        operation = stream.next(Cancellation::default()) => operation.unwrap().unwrap(),
+    };
+    upper.apply_snapshot(&operation.data);
+    let updates = upper.updates.load(Ordering::Acquire);
+    let getters = upper.getters.load(Ordering::Acquire);
+    assert!(!s.engine.snapshot().copy_done);
+    let entries = s.engine.shared.epoch_entries.load(Ordering::Acquire);
+    // RAP legitimately suppresses a duplicate before calling lower. Verify
+    // that optimization, then exercise the canonical lower method itself.
+    s.host.change_epoch(EPOCH).await.unwrap();
+    assert_eq!(
+        s.engine.shared.epoch_entries.load(Ordering::Acquire),
+        entries
+    );
+    let permit = s
+        .native
+        .execution()
+        .reserve(
+            CallLane::Native,
+            CallOrigin {
+                engine: 0,
+                generation: s.native.binding().generation,
+                session: 0,
+            },
+            std::time::Duration::from_secs(2),
+            false,
+        )
+        .unwrap();
+    let engine = s.engine.clone();
+    permit
+        .run_future(async move {
+            IReplicator::update_epoch(&*engine, EPOCH, Cancellation::default()).await
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        s.engine.shared.epoch_entries.load(Ordering::Acquire),
+        entries + 1
+    );
+    assert_eq!(upper.updates.load(Ordering::Acquire), updates);
+    assert_eq!(upper.getters.load(Ordering::Acquire), getters);
+    assert_eq!(upper.tail(), 100);
+    operation.acknowledge().unwrap();
+    drop(operation);
+    build.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn captured_unpolled_build_is_revoked_never_retargets_replacement_native_node_or_actor() {
     for variant in 0..4 {
         let partition = uuid::Uuid::new_v4();

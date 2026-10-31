@@ -1,8 +1,9 @@
 //! Public-only, offline native-RAP model witnesses, not live qualification.
+use fube_data as data_contract;
 use fube_data::{
     extensions::{
         EpochDomains, OperationOriginStream, ReplayCheckpointProvider, ReplicationEndpointOptions,
-        ReplicatorDiagnostics,
+        ReplicatorDiagnostics, StateProviderCapabilities,
     },
     Cancellation, Epoch, FabricReplicator, IOperation, IOperationDataStream, IOperationStream,
     IStateProvider, IStateReplicator, MemoryProvider, Mutation, OperationData, OperationType,
@@ -22,6 +23,8 @@ use std::{
     time::Duration,
 };
 use tokio::sync::oneshot;
+#[path = "support/upper_log.rs"]
+mod upper_log;
 
 #[path = "support/rap_model.rs"]
 mod rap;
@@ -96,12 +99,16 @@ struct Factory {
     provider: Arc<dyn IStateProvider>,
     replay: Option<Arc<dyn ReplayCheckpointProvider>>,
     created: Created,
+    capabilities: Option<StateProviderCapabilities>,
+    bootstrap: Option<Arc<upper_log::UpperLog>>,
 }
 struct Replica {
     native: NativeRuntimeIntegration,
     provider: Arc<dyn IStateProvider>,
     replay: Option<Arc<dyn ReplayCheckpointProvider>>,
     created: Created,
+    capabilities: Option<StateProviderCapabilities>,
+    bootstrap: Option<Arc<upper_log::UpperLog>>,
 }
 impl IStatefulServiceFactory for Factory {
     fn create_replica(
@@ -117,6 +124,8 @@ impl IStatefulServiceFactory for Factory {
             provider: self.provider.clone(),
             replay: self.replay.clone(),
             created: self.created.clone(),
+            capabilities: self.capabilities,
+            bootstrap: self.bootstrap.clone(),
         }))
     }
 }
@@ -129,20 +138,39 @@ impl IStatefulServiceReplica for Replica {
     ) -> ApiFuture<'_, Box<dyn IPrimaryReplicator>> {
         Box::pin(async move {
             mode.validate()?;
-            let fabric = FabricReplicator::create(
-                partition,
-                self.native.clone(),
-                self.provider.clone(),
-                self.replay.clone(),
-                ReplicationEndpointOptions {
-                    listen_address: "127.0.0.1:0".into(),
-                    actor_incarnation: uuid::Uuid::new_v4(),
-                },
-                Settings {
-                    operation_bytes: 4096,
-                    ..Settings::default()
-                },
-            )?;
+            let endpoint = ReplicationEndpointOptions {
+                listen_address: "127.0.0.1:0".into(),
+                actor_incarnation: uuid::Uuid::new_v4(),
+            };
+            let settings = Settings {
+                operation_bytes: 4096,
+                ..Settings::default()
+            };
+            let fabric = if let Some(capabilities) = self.capabilities {
+                FabricReplicator::create_with_capabilities(
+                    partition,
+                    self.native.clone(),
+                    self.provider.clone(),
+                    self.replay.clone(),
+                    endpoint,
+                    settings,
+                    capabilities,
+                )?
+            } else {
+                FabricReplicator::create(
+                    partition,
+                    self.native.clone(),
+                    self.provider.clone(),
+                    self.replay.clone(),
+                    endpoint,
+                    settings,
+                )?
+            };
+            if let Some(bootstrap) = &self.bootstrap {
+                bootstrap
+                    .constructed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
             if let Some(send) = self.created.lock().unwrap().take() {
                 let _ = send.send((fabric.clone(), self.native.clone()));
             }
@@ -175,6 +203,8 @@ impl Fixture {
                 provider: supplied,
                 replay: None,
                 created: Arc::new(Mutex::new(Some(send))),
+                capabilities: None,
+                bootstrap: None,
             })
         })
         .await;
@@ -186,6 +216,74 @@ impl Fixture {
             host,
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callback_ready_upper_log_bootstrap_passes_actual_nonempty_tail_before_lower_open() {
+    use std::sync::atomic::Ordering;
+    for (tail, latest) in [(1, false), (27, true)] {
+        let partition = uuid::Uuid::new_v4();
+        let upper = upper_log::UpperLog::new(EPOCH, tail);
+        let supplied = upper.clone();
+        let marker = upper.clone();
+        let (send, receive) = oneshot::channel();
+        let host = rap::Host::start(partition, 1, ReplicaRole::Primary, move |native| {
+            Box::new(Factory {
+                native,
+                provider: supplied,
+                replay: None,
+                created: Arc::new(Mutex::new(Some(send))),
+                capabilities: Some(StateProviderCapabilities {
+                    supports_copy_until_latest_lsn: latest,
+                }),
+                bootstrap: Some(marker),
+            })
+        })
+        .await;
+        let (fabric, native) = receive.await.unwrap();
+        assert!(upper.queried_before_return.load(Ordering::Acquire));
+        assert!(upper.constructed.load(Ordering::Acquire));
+        assert_eq!(upper.tail(), tail);
+        assert_eq!(fabric.snapshot().progress.assigned, tail);
+        assert_eq!(fabric.snapshot().progress.committed, tail);
+        host.get_status().await.unwrap();
+        assert_eq!(native.status().unwrap().progress.last, tail);
+        host.configure(config(vec![], 1)).await.unwrap();
+        let data = OperationData::new(vec![vec![28]]).unwrap();
+        let mut admitted = fabric
+            .get_state_replicator()
+            .replicate(data.clone(), Cancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(admitted.sequence_number, tail + 1);
+        upper.append(tail + 1, &data);
+        assert_eq!(
+            admitted
+                .completion
+                .wait(Cancellation::default())
+                .await
+                .unwrap(),
+            tail + 1
+        );
+        // The same initialized standard provider supplies actual bytes, not an
+        // inferred transaction visibility/stability tail or fabricated zero.
+        let copy = upper.get_copy_state(tail + 1, None).unwrap();
+        let image = copy
+            .get_next(Cancellation::default())
+            .await
+            .unwrap()
+            .unwrap();
+        let imported = upper_log::UpperLog::new(EPOCH, 1);
+        imported.apply_snapshot(&image);
+        assert_eq!(imported.tail(), tail + 1);
+        assert_eq!(upper.horizons.lock().unwrap().as_slice(), [tail + 1]);
+        assert_eq!(
+            OpenMode::Existing.validate().unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+    }
+}
+impl Fixture {
     fn descriptor(&self, role: ReplicaRole) -> NativeReplicaDescriptor {
         let identity = self.native.identity();
         NativeReplicaDescriptor {

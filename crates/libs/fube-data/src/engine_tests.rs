@@ -4,8 +4,11 @@
 // Rust-only Fabric TCP source-contract fixtures; not native interoperability.
 
 use super::*;
+use crate as data_contract;
 #[path = "engine_disposal_tests.rs"]
 mod disposal_tests;
+#[path = "../tests/support/upper_log.rs"]
+pub(super) mod upper_log;
 async fn abort_owned(engine: &Arc<Engine>) {
     if engine
         .disposal_done
@@ -1903,6 +1906,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
             Some(provider.clone()),
             Settings::default(),
             Some(view.clone()),
+            crate::extensions::StateProviderCapabilities::default(),
         )
         .unwrap();
         engines.push(engine);
@@ -2492,6 +2496,7 @@ fn engine_with_replay<T: IStateProvider + ReplayCheckpointProvider>(
         Some(provider),
         settings,
         None,
+        crate::extensions::StateProviderCapabilities::default(),
     )
     .unwrap()
 }
@@ -3491,26 +3496,7 @@ fn raw_send(transport: &PeerTransport, from: &Endpoint, to: &Engine, body: Body)
 async fn initialized_raw_secondary(
     provider: Arc<dyn IStateProvider>,
 ) -> (Arc<Engine>, PeerTransport, Endpoint, Incoming) {
-    let partition = Uuid::new_v4();
-    let secondary = engine(partition, 2, provider);
-    secondary
-        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
-        .await
-        .unwrap();
-    let (transport, incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
-    let primary = endpoint(&transport, partition, 1);
-    transport.register_peer(&secondary.endpoint()).unwrap();
-    raw_send(
-        &transport,
-        &primary,
-        &secondary,
-        Body::StartCopy {
-            epoch: EPOCH,
-            target: 2,
-            start: 1,
-        },
-    );
-    until(|| secondary.snapshot().epoch == Some(EPOCH)).await;
+    let (secondary, transport, primary, incoming) = raw_secondary_started(provider, 1).await;
     // The independently sequenced empty EOS is not delivered as provider data.
     raw_send(
         &transport,
@@ -3528,6 +3514,283 @@ async fn initialized_raw_secondary(
     (secondary, transport, primary, incoming)
 }
 
+async fn raw_secondary_started(
+    provider: Arc<dyn IStateProvider>,
+    start: i64,
+) -> (Arc<Engine>, PeerTransport, Endpoint, Incoming) {
+    let partition = Uuid::new_v4();
+    let secondary = engine(partition, 2, provider);
+    secondary
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
+        .await
+        .unwrap();
+    let (transport, incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let primary = endpoint(&transport, partition, 1);
+    transport.register_peer(&secondary.endpoint()).unwrap();
+    raw_send(
+        &transport,
+        &primary,
+        &secondary,
+        Body::StartCopy {
+            epoch: EPOCH,
+            target: 2,
+            start,
+        },
+    );
+    until(|| {
+        secondary.snapshot().observed_primary.is_some()
+            && secondary.snapshot().progress.received == start - 1
+    })
+    .await;
+    (secondary, transport, primary, incoming)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extended_upper100_lower90_duplicate_epoch_never_reconciles_or_gets_tail_and_overlap_drains(
+) {
+    let upper = upper_log::UpperLog::new(EPOCH, 1);
+    let source = upper_log::UpperLog::new(EPOCH, 100);
+    let (s, network, primary, _incoming) = raw_secondary_started(upper.clone(), 91).await;
+    raw_send(
+        &network,
+        &primary,
+        &s,
+        Body::Copy {
+            epoch: EPOCH,
+            target: 2,
+            sequence: 1,
+            data: source.snapshot().to_segments(),
+            last: false,
+        },
+    );
+    raw_send(
+        &network,
+        &primary,
+        &s,
+        Body::Copy {
+            epoch: EPOCH,
+            target: 2,
+            sequence: 2,
+            data: vec![],
+            last: true,
+        },
+    );
+    let copy = s.copy_stream().next(cancel()).await.unwrap().unwrap();
+    upper.apply_snapshot(&copy.data);
+    assert_eq!(upper.tail(), 100);
+    assert_eq!(s.snapshot().progress.received, 90);
+    assert_eq!(
+        s.snapshot().progress.applied,
+        0,
+        "copy-in-progress diagnostics do not expose an applied prefix yet"
+    );
+    let getters = upper.getters.load(Ordering::Acquire);
+    let updates = upper.updates.load(Ordering::Acquire);
+    assert!(!s.snapshot().copy_done);
+    s.update_epoch(EPOCH, cancel()).await.unwrap();
+    assert_eq!(upper.getters.load(Ordering::Acquire), getters);
+    assert_eq!(upper.updates.load(Ordering::Acquire), updates);
+    assert_eq!(upper.tail(), 100);
+    copy.acknowledge().unwrap();
+    drop(copy);
+    until(|| s.snapshot().copy_done).await;
+    s.change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
+        .await
+        .unwrap();
+    assert_eq!(
+        upper.getters.load(Ordering::Acquire),
+        getters,
+        "role admission must not equate independent tails"
+    );
+    let stream = s.replication_stream();
+    let mut held = Vec::new();
+    for sequence in 91..=100 {
+        raw_send(
+            &network,
+            &primary,
+            &s,
+            replication(EPOCH, EPOCH, sequence, sequence as u8),
+        );
+        let operation = stream.next(cancel()).await.unwrap().unwrap();
+        upper.append(sequence, &operation.data); // validates the copied bytes, not a new log record
+        held.push(operation);
+    }
+    assert_eq!(
+        s.snapshot().progress.applied,
+        90,
+        "upper copy is not a lower service ACK"
+    );
+    s.update_epoch(EPOCH, cancel()).await.unwrap();
+    assert_eq!(upper.getters.load(Ordering::Acquire), getters);
+    assert_eq!(upper.updates.load(Ordering::Acquire), updates);
+    for operation in held {
+        operation.acknowledge().unwrap();
+    }
+    until(|| s.snapshot().progress.applied == 100).await;
+    assert_eq!(upper.tail(), 100);
+    assert!(s.snapshot().fault.is_none());
+    abort_owned(&s).await;
+    network.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn genuinely_new_idle_copy_control_and_original_epoch_mismatch_keep_real_errors() {
+    for original_barrier in [false, true] {
+        let upper = upper_log::UpperLog::new(EPOCH, 1);
+        let (s, network, primary, _incoming) = raw_secondary_started(upper.clone(), 91).await;
+        let image = upper_log::UpperLog::new(EPOCH, 100).snapshot();
+        raw_send(
+            &network,
+            &primary,
+            &s,
+            Body::Copy {
+                epoch: EPOCH,
+                target: 2,
+                sequence: 1,
+                data: image.to_segments(),
+                last: false,
+            },
+        );
+        raw_send(
+            &network,
+            &primary,
+            &s,
+            Body::Copy {
+                epoch: EPOCH,
+                target: 2,
+                sequence: 2,
+                data: vec![],
+                last: true,
+            },
+        );
+        let operation = s.copy_stream().next(cancel()).await.unwrap().unwrap();
+        upper.apply_snapshot(&operation.data);
+        if original_barrier {
+            operation.acknowledge().unwrap();
+            until(|| s.snapshot().copy_done).await;
+            raw_send(
+                &network,
+                &primary,
+                &s,
+                replication(NEXT_EPOCH, NEXT_EPOCH, 91, 91),
+            );
+            until(|| s.snapshot().fault.is_some()).await;
+            assert_eq!(upper.updates.load(Ordering::Acquire), 1);
+            assert!(s
+                .snapshot()
+                .fault
+                .unwrap()
+                .contains("upper epoch boundary mismatch"));
+        } else {
+            assert!(s.update_epoch(NEXT_EPOCH, cancel()).await.is_err());
+            assert_eq!(upper.updates.load(Ordering::Acquire), 0);
+            assert!(operation.acknowledge().is_err());
+        }
+        assert_eq!(upper.tail(), 100);
+        drop(operation);
+        abort_owned(&s).await;
+        network.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn latest_copy_capability_uses_assigned_horizon_and_real_finish_tail_ack() {
+    let partition = Uuid::new_v4();
+    let source = Arc::new(SnapshotProvider::default());
+    let p = Engine::bind_with_capabilities(
+        Actor {
+            partition,
+            replica: 1,
+            incarnation: Uuid::new_v4(),
+        },
+        "127.0.0.1:0",
+        source.clone(),
+        None,
+        Settings::default(),
+        None,
+        crate::extensions::StateProviderCapabilities {
+            supports_copy_until_latest_lsn: true,
+        },
+    )
+    .unwrap();
+    let target = Arc::new(Provider::default());
+    let s = engine(partition, 2, target.clone());
+    p.change_role(EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
+        .await
+        .unwrap();
+    let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let mut remote = descriptor(&s);
+    remote.replica_id = 3;
+    remote.address = endpoint(&network, partition, 3).to_string();
+    p.update_current_configuration(configuration(vec![remote], true, 2), cancel())
+        .await
+        .unwrap();
+    for sequence in 1..=100 {
+        let write = p
+            .submit(
+                OperationData::new(vec![vec![sequence as u8]]).unwrap(),
+                cancel(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(write.sequence, sequence);
+        source.record(sequence);
+    }
+    assert_eq!(p.snapshot().progress.committed, 0);
+    source.snapshots.store(true, Ordering::Release);
+    let build = p.build_replica(descriptor(&s), cancel());
+    tokio::pin!(build);
+    tokio::select! {
+        result = &mut build => panic!("build before copy ACK: {result:?}"),
+        _ = until(|| source.requested.lock().unwrap().as_slice() == [100]) => {},
+    }
+    assert_eq!(
+        s.snapshot().progress.received,
+        100,
+        "StartCopy uses assigned+1, not committed+1"
+    );
+    let copy = s.copy_stream().next(cancel()).await.unwrap().unwrap();
+    assert_eq!(
+        i64::from_le_bytes(copy.data.segments()[0][..8].try_into().unwrap()),
+        100
+    );
+    target.last.store(100, Ordering::Release);
+    copy.acknowledge().unwrap();
+    drop(copy);
+    let write = p
+        .submit(OperationData::new(vec![vec![101]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    assert_eq!(write.sequence, 101);
+    source.record(101);
+    source.eos.add_permits(1);
+    tokio::select! {
+        result = &mut build => panic!("build before finish-tail ACK: {result:?}"),
+        _ = until(|| p.snapshot().peers.iter().any(|peer| peer.replica == 2 && peer.copy_finish == Some(101))) => {},
+    }
+    let operation = s
+        .replication_stream()
+        .next(cancel())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.sequence, 101);
+    assert!(timeout(std::time::Duration::from_millis(40), &mut build)
+        .await
+        .is_err());
+    target.last.store(101, Ordering::Release);
+    operation.acknowledge().unwrap();
+    drop(operation);
+    build.await.unwrap();
+    assert_eq!(source.requested.lock().unwrap().as_slice(), [100]);
+    abort_owned(&p).await;
+    abort_owned(&s).await;
+    network.shutdown();
+}
+
 fn replication(epoch: Epoch, original: Epoch, sequence: i64, data: u8) -> Body {
     Body::Replication {
         primary_epoch: epoch,
@@ -3541,6 +3804,66 @@ fn replication(epoch: Epoch, original: Epoch, sequence: i64, data: u8) -> Body {
         batch_end: sequence,
         completed: 0,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_copy_and_replication_gap_rejections_leave_engine_live_for_valid_retry() {
+    let provider = Arc::new(Provider::default());
+    let (s, network, primary, _incoming) = raw_secondary_started(provider.clone(), 1).await;
+    for sequence in [1025, 1] {
+        raw_send(
+            &network,
+            &primary,
+            &s,
+            Body::Copy {
+                epoch: EPOCH,
+                target: 2,
+                sequence,
+                data: vec![vec![1]],
+                last: false,
+            },
+        );
+    }
+    raw_send(
+        &network,
+        &primary,
+        &s,
+        Body::Copy {
+            epoch: EPOCH,
+            target: 2,
+            sequence: 2,
+            data: vec![],
+            last: true,
+        },
+    );
+    let copy = s.copy_stream().next(cancel()).await.unwrap().unwrap();
+    assert_eq!(copy.sequence, 1);
+    copy.acknowledge().unwrap();
+    drop(copy);
+    until(|| s.snapshot().copy_done).await;
+    for sequence in [1025, 1] {
+        raw_send(
+            &network,
+            &primary,
+            &s,
+            replication(EPOCH, EPOCH, sequence, 1),
+        );
+    }
+    let operation = s
+        .replication_stream()
+        .next(cancel())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.sequence, 1);
+    provider.last.store(1, Ordering::Release);
+    operation.acknowledge().unwrap();
+    until(|| s.snapshot().progress.applied == 1).await;
+    assert!(s.snapshot().fault.is_none());
+    assert_eq!(s.snapshot().progress.assigned, 1);
+    drop(operation);
+    abort_owned(&s).await;
+    network.shutdown();
 }
 
 struct CallbackGuard {

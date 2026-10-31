@@ -87,6 +87,15 @@ pub struct ReplicationEndpointOptions {
     pub actor_incarnation: uuid::Uuid,
 }
 
+/// Explicit construction capability, equivalent to the native provider's
+/// SupportsCopyUntilLatestLsn marker. Never SDK trait/type/peer discovery.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StateProviderCapabilities {
+    /// Copy receives the inclusive assigned horizon; replication starts at
+    /// assigned+1. The default classic horizon is max(committed, previous quorum).
+    pub supports_copy_until_latest_lsn: bool,
+}
+
 /// Exact-primary-epoch admission, not a second canonical contract or legacy
 /// submit adapter. Preserves application payload origin across role races.
 pub trait EpochCheckedReplication: Send + Sync {
