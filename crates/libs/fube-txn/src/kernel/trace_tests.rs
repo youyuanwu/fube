@@ -1913,7 +1913,7 @@ async fn unsupported_atomic_redo_lifecycle_and_unknown_wire_reject_before_admiss
         .await,
         Status::NotImplemented,
     );
-    code(point.prepare_checkpoint(1), Status::NotImplemented);
+    point.prepare_checkpoint(1).unwrap();
     code(
         observe(point.open(Cancellation::default())).await,
         Status::NotImplemented,

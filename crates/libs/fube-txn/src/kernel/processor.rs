@@ -109,6 +109,13 @@ impl FaultState {
             .expect("fault state poisoned")
             .push(error);
     }
+    pub(crate) fn report_checkpoint_fault(&self, error: Error) {
+        self.observed
+            .lock()
+            .expect("fault state poisoned")
+            .push(error.clone());
+        self.report_processor_fault(error);
+    }
     fn process_log_error(&self, role: ProcessingRole, error: Error) {
         self.observed
             .lock()

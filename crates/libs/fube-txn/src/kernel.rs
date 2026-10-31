@@ -9,6 +9,8 @@
 
 #![allow(dead_code, reason = "A0 kernels are private, awaiting A1 integration")]
 
+pub(crate) mod checkpoint;
+pub(crate) mod copy;
 pub(crate) mod identity;
 pub(crate) mod map;
 pub(crate) mod named;
@@ -20,5 +22,7 @@ pub(crate) mod status;
 pub(crate) mod transaction;
 pub(crate) mod version;
 
+#[cfg(test)]
+mod callback_tests;
 #[cfg(test)]
 mod trace_tests;

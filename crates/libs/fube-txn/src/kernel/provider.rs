@@ -7,8 +7,13 @@
 //! only for point locks, post-admission own writes, versioned Apply and explicit
 //! idempotent Unlock. Its payload,
 //! fault-read policy and finite initialization seam are not product TStore.
+//! Checkpoint/copy callbacks follow StateManager.cpp:1389–1514,3592–3924,
+//! 5634–5776. Registry bytes and local effects stay opaque; only bounded
+//! initialized/resurrected entries and volatile snapshots are supported.
 
 use super::{
+    checkpoint::await_all,
+    copy::NamedStateStream,
     named,
     processor::{FaultState, KernelManager, ProcessingRole},
     status::Status,
@@ -65,12 +70,56 @@ pub(crate) trait RegistryCallbacks: Send + Sync {
     fn unlock(&self, context: &dyn OperationContext) -> Result<()>;
 }
 
+#[derive(Clone)]
+pub(crate) struct RegistryMetadata {
+    pub(crate) id: StateProviderId,
+    pub(crate) name: String,
+    pub(crate) mode: ProviderMode,
+    pub(crate) provider: Arc<dyn IStateProvider2>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CopiedMetadata {
+    pub(crate) id: StateProviderId,
+    pub(crate) mode: ProviderMode,
+}
+
+/// Opaque source-format registry codec and volatile local side effects. The seam
+/// supplies decoded metadata only for initialized/resurrected directory entries;
+/// it does not implement factory/open/recover/hierarchy or persisted files.
+pub(crate) trait LocalStateCallbacks: Send + Sync + 'static {
+    fn prepare(&self, lsn: SequenceNumber, metadata: &[RegistryMetadata]) -> Result<()>;
+    fn perform(&self, cancellation: Cancellation) -> ApiFuture<'_, ()>;
+    fn complete(&self, cancellation: Cancellation) -> ApiFuture<'_, ()>;
+    fn cleanup(&self, cancellation: Cancellation) -> ApiFuture<'_, ()>;
+    fn get_current_state(
+        &self,
+        target_replica_id: i64,
+        metadata: &[RegistryMetadata],
+    ) -> Result<Arc<dyn IOperationDataStream>>;
+    fn begin(&self) -> Result<()>;
+    fn set(&self, number: i64, data: OperationData) -> ApiFuture<'_, Vec<CopiedMetadata>>;
+    fn end(&self) -> ApiFuture<'_, ()>;
+}
+
+#[derive(Default)]
+struct AggregateCheckpoint {
+    prepared: Vec<RegistryMetadata>,
+    published: Vec<RegistryMetadata>,
+    ready: bool,
+    performed: bool,
+}
+
 pub(crate) struct ProviderDirectory {
+    self_weak: Weak<Self>,
     pub(crate) entries: Mutex<BTreeMap<StateProviderId, ProviderEntry>>,
     pub(crate) faults: Arc<FaultState>,
     manager: Mutex<Option<Weak<KernelManager>>>,
     role: Mutex<ProcessingRole>,
     registry: Option<Arc<dyn RegistryCallbacks>>,
+    local: Mutex<Option<Arc<dyn LocalStateCallbacks>>>,
+    checkpoint: Mutex<AggregateCheckpoint>,
+    copy_progress: Mutex<Option<Vec<StateProviderId>>>,
 }
 
 impl ProviderDirectory {
@@ -97,13 +146,43 @@ impl ProviderDirectory {
                 return Err(Error::InvalidInput("invalid bounded initialized directory"));
             }
         }
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|self_weak| Self {
+            self_weak: self_weak.clone(),
             entries: Mutex::new(installed),
             faults: Arc::new(FaultState::default()),
             manager: Mutex::new(None),
             role: Mutex::new(ProcessingRole::Primary),
             registry,
+            local: Mutex::new(None),
+            checkpoint: Mutex::new(AggregateCheckpoint::default()),
+            copy_progress: Mutex::new(None),
         }))
+    }
+    pub(crate) fn set_local_callbacks(&self, local: Arc<dyn LocalStateCallbacks>) {
+        *self.local.lock().expect("local callbacks poisoned") = Some(local);
+    }
+    fn local(&self) -> Result<Arc<dyn LocalStateCallbacks>> {
+        self.local
+            .lock()
+            .expect("local callbacks poisoned")
+            .clone()
+            .ok_or_else(|| Status::NotImplemented.error())
+    }
+    fn shared(&self) -> Arc<Self> {
+        self.self_weak.upgrade().expect("shared directory owner")
+    }
+    pub(crate) fn copy_progress(&self) -> Option<Vec<StateProviderId>> {
+        self.copy_progress
+            .lock()
+            .expect("copy progress poisoned")
+            .clone()
+    }
+    pub(crate) fn checkpoint_metadata(&self) -> Vec<RegistryMetadata> {
+        self.checkpoint
+            .lock()
+            .expect("checkpoint metadata poisoned")
+            .published
+            .clone()
     }
     pub(crate) fn bind(&self, manager: Weak<KernelManager>, role: ProcessingRole) {
         *self.manager.lock().expect("directory binding poisoned") = Some(manager);
@@ -344,14 +423,107 @@ impl IStateProviderManager for ProviderDirectory {
             .ok_or(Error::InvalidInput("expected NamedOperationContext"))?;
         self.direct_unlock(context.provider, context.inner.as_ref())
     }
-    fn prepare_checkpoint(&self, _: SequenceNumber) -> Result<()> {
-        Err(Status::NotImplemented.error())
+    fn prepare_checkpoint(&self, lsn: SequenceNumber) -> Result<()> {
+        if lsn < 0 {
+            return Err(Status::InvalidParameter.error());
+        }
+        let local = self.local()?;
+        let metadata: Vec<_> = self
+            .entries
+            .lock()
+            .expect("directory poisoned")
+            .iter()
+            .filter(|(_, entry)| entry.mode != ProviderMode::Stale)
+            .map(|(id, entry)| RegistryMetadata {
+                id: *id,
+                name: entry.provider.get_name().to_owned(),
+                mode: entry.mode,
+                provider: entry.provider.clone(),
+            })
+            .collect();
+        {
+            let mut checkpoint = self
+                .checkpoint
+                .lock()
+                .expect("checkpoint metadata poisoned");
+            checkpoint.ready = false;
+            checkpoint.performed = false;
+            checkpoint.prepared = metadata.clone();
+        }
+        local.prepare(lsn, &metadata)?;
+        for entry in &metadata {
+            if entry.mode == ProviderMode::Active {
+                entry.provider.prepare_checkpoint(lsn)?;
+            }
+        }
+        self.checkpoint
+            .lock()
+            .expect("checkpoint metadata poisoned")
+            .ready = true;
+        Ok(())
     }
-    fn perform_checkpoint(&self, _: Cancellation) -> ApiFuture<'_, ()> {
-        Box::pin(async { Err(Status::NotImplemented.error()) })
+    fn perform_checkpoint(&self, cancellation: Cancellation) -> ApiFuture<'_, ()> {
+        let directory = self.shared();
+        own(Box::pin(async move {
+            let local = directory.local()?;
+            let metadata = {
+                let checkpoint = directory
+                    .checkpoint
+                    .lock()
+                    .expect("checkpoint metadata poisoned");
+                if !checkpoint.ready {
+                    return Err(Status::InvalidOperation.error());
+                }
+                checkpoint.prepared.clone()
+            };
+            let work = metadata
+                .iter()
+                .filter(|entry| entry.mode == ProviderMode::Active)
+                .map(|entry| {
+                    let provider = entry.provider.clone();
+                    let cancellation = cancellation.clone();
+                    Box::pin(async move { provider.perform_checkpoint(cancellation).await })
+                        as ApiFuture<'static, ()>
+                })
+                .collect();
+            await_all(work).await?;
+            local.perform(cancellation).await?;
+            let mut checkpoint = directory
+                .checkpoint
+                .lock()
+                .expect("checkpoint metadata poisoned");
+            checkpoint.published = metadata;
+            checkpoint.performed = true;
+            Ok(())
+        }))
     }
-    fn complete_checkpoint(&self, _: Cancellation) -> ApiFuture<'_, ()> {
-        Box::pin(async { Err(Status::NotImplemented.error()) })
+    fn complete_checkpoint(&self, cancellation: Cancellation) -> ApiFuture<'_, ()> {
+        let directory = self.shared();
+        own(Box::pin(async move {
+            let local = directory.local()?;
+            let metadata = {
+                let checkpoint = directory
+                    .checkpoint
+                    .lock()
+                    .expect("checkpoint metadata poisoned");
+                if !checkpoint.performed {
+                    return Err(Status::InvalidOperation.error());
+                }
+                checkpoint.published.clone()
+            };
+            let work = metadata
+                .into_iter()
+                .filter(|entry| entry.mode == ProviderMode::Active)
+                .map(|entry| {
+                    let cancellation = cancellation.clone();
+                    Box::pin(async move { entry.provider.complete_checkpoint(cancellation).await })
+                        as ApiFuture<'static, ()>
+                })
+                .collect();
+            await_all(work).await?;
+            local.complete(cancellation.clone()).await?;
+            local.cleanup(cancellation).await
+        }))
     }
     fn backup_checkpoint(&self, _: PathBuf, _: Cancellation) -> ApiFuture<'_, ()> {
         Box::pin(async { Err(Status::NotImplemented.error()) })
@@ -359,17 +531,136 @@ impl IStateProviderManager for ProviderDirectory {
     fn restore_checkpoint(&self, _: PathBuf, _: Cancellation) -> ApiFuture<'_, ()> {
         Box::pin(async { Err(Status::NotImplemented.error()) })
     }
-    fn get_current_state(&self, _: i64) -> Result<Arc<dyn IOperationDataStream>> {
-        Err(Status::NotImplemented.error())
+    fn get_current_state(&self, target: i64) -> Result<Arc<dyn IOperationDataStream>> {
+        let local = self.local()?;
+        let mut metadata = self.checkpoint_metadata();
+        metadata.sort_by(|left, right| right.name.cmp(&left.name));
+        let registry = local.get_current_state(target, &metadata)?;
+        let mut streams = Vec::new();
+        for entry in metadata {
+            if entry.mode == ProviderMode::Active {
+                match entry.provider.get_current_state() {
+                    Ok(Some(stream)) => streams.push((entry.id, stream)),
+                    Ok(None) => {}
+                    Err(error) => {
+                        // Native destruction disposes partially constructed named
+                        // streams. Preserve that cleanup explicitly, not via Drop.
+                        let _ = NamedStateStream::new(registry, streams).dispose();
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(NamedStateStream::new(registry, streams))
     }
     fn begin_setting_current_state(&self) -> ApiFuture<'_, ()> {
-        Box::pin(async { Err(Status::NotImplemented.error()) })
+        let directory = self.shared();
+        own(Box::pin(async move {
+            let local = directory.local()?;
+            if directory.copy_progress().is_some() {
+                return Err(Status::InvalidOperation.error());
+            }
+            for entry in directory
+                .entries
+                .lock()
+                .expect("directory poisoned")
+                .values_mut()
+            {
+                entry.mode = ProviderMode::Stale;
+            }
+            *directory
+                .copy_progress
+                .lock()
+                .expect("copy progress poisoned") = Some(Vec::new());
+            local.begin()
+        }))
     }
-    fn set_current_state(&self, _: i64, _: OperationData) -> ApiFuture<'_, ()> {
-        Box::pin(async { Err(Status::NotImplemented.error()) })
+    fn set_current_state(&self, number: i64, data: OperationData) -> ApiFuture<'_, ()> {
+        let directory = self.shared();
+        own(Box::pin(async move {
+            let (id, payload) = named::decode_copy(&data)?;
+            if id == 0 {
+                return Err(Status::InvalidParameter.error());
+            }
+            if directory.copy_progress().is_none() {
+                return Err(Status::InvalidOperation.error());
+            }
+            if id == REGISTRY_ID {
+                for metadata in directory.local()?.set(number, payload).await? {
+                    if metadata.mode == ProviderMode::Stale {
+                        return Err(Status::NotImplemented.error());
+                    }
+                    if metadata.id == 0 || metadata.id == REGISTRY_ID {
+                        return Err(Status::InvalidParameter.error());
+                    }
+                    // Uninitialized entries require the excluded factory/open/
+                    // recover/hierarchy path, not an invented successful Begin.
+                    let entry = directory
+                        .entry(metadata.id)
+                        .map_err(|_| Status::NotImplemented.error())?;
+                    if metadata.mode == ProviderMode::Active {
+                        if directory
+                            .copy_progress()
+                            .is_some_and(|progress| progress.contains(&metadata.id))
+                        {
+                            return Err(Status::InvalidOperation.error());
+                        }
+                        directory.set_mode(metadata.id, ProviderMode::Active, None);
+                        entry.provider.begin_setting_current_state().await?;
+                        directory
+                            .copy_progress
+                            .lock()
+                            .expect("copy progress poisoned")
+                            .as_mut()
+                            .expect("begun aggregate")
+                            .push(metadata.id);
+                    } else {
+                        directory.set_mode(metadata.id, ProviderMode::DelayDelete, None);
+                    }
+                }
+                return Ok(());
+            }
+            let entry = directory.entry(id)?;
+            match entry.mode {
+                ProviderMode::DelayDelete => return Err(Status::ObjectClosed.error()),
+                ProviderMode::Stale => return Err(Status::NotImplemented.error()),
+                ProviderMode::Active => {}
+            }
+            if !directory
+                .copy_progress()
+                .is_some_and(|progress| progress.contains(&id))
+            {
+                return Err(Status::InvalidOperation.error());
+            }
+            entry
+                .provider
+                .set_current_state(number, payload, Cancellation::default())
+                .await
+        }))
     }
     fn end_setting_current_state(&self) -> ApiFuture<'_, ()> {
-        Box::pin(async { Err(Status::NotImplemented.error()) })
+        let directory = self.shared();
+        own(Box::pin(async move {
+            let progress = directory
+                .copy_progress()
+                .ok_or_else(|| Status::InvalidOperation.error())?;
+            directory.local()?.end().await?;
+            let mut work = Vec::new();
+            for id in progress {
+                let provider = directory.entry(id)?.provider;
+                work.push(Box::pin(async move {
+                    provider
+                        .end_setting_current_state(Cancellation::default())
+                        .await
+                }) as ApiFuture<'static, ()>);
+            }
+            await_all(work).await?;
+            *directory
+                .copy_progress
+                .lock()
+                .expect("copy progress poisoned") = None;
+            Ok(())
+        }))
     }
     fn change_role(&self, _: ReplicaRole, _: Cancellation) -> ApiFuture<'_, ()> {
         Box::pin(async { Err(Status::NotImplemented.error()) })
@@ -378,6 +669,16 @@ impl IStateProviderManager for ProviderDirectory {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PointEvent {
+    Callback {
+        kind: CallbackKind,
+        completed: bool,
+    },
+    Prepare(SequenceNumber),
+    CopySet {
+        number: i64,
+        data: OperationData,
+        cancelled: bool,
+    },
     Apply {
         operation: SequenceNumber,
         commit: SequenceNumber,
@@ -391,6 +692,34 @@ pub(crate) enum PointEvent {
         capture: u64,
         transaction: TransactionId,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CallbackKind {
+    Prepare,
+    Perform,
+    Complete,
+    BeginCopy,
+    SetCopy,
+    EndCopy,
+    GetCopy,
+}
+
+#[derive(Clone)]
+pub(crate) struct CallbackPlan {
+    pub(crate) gate: Option<Completion<()>>,
+    pub(crate) result: Result<()>,
+    pub(crate) on_enter: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl Default for CallbackPlan {
+    fn default() -> Self {
+        Self {
+            gate: None,
+            result: Ok(()),
+            on_enter: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -470,6 +799,13 @@ struct PointState {
     /// Explicit local fixture policy: failed Apply rejects subsequent reads.
     read_faulted: bool,
     closed: bool,
+    callbacks: BTreeMap<CallbackKind, VecDeque<CallbackPlan>>,
+    checkpoint_prepared: Option<BTreeMap<i64, i64>>,
+    checkpoint_performed: Option<BTreeMap<i64, i64>>,
+    checkpoint_completed: Option<BTreeMap<i64, i64>>,
+    copying: Option<BTreeMap<i64, i64>>,
+    copied: BTreeMap<i64, i64>,
+    stream_override: Option<Option<Vec<OperationData>>>,
 }
 
 pub(crate) struct PointProvider {
@@ -495,6 +831,67 @@ impl PointProvider {
             .expect("point state poisoned")
             .events
             .clone()
+    }
+    pub(crate) fn inject_callback(&self, kind: CallbackKind, plan: CallbackPlan) {
+        self.state
+            .lock()
+            .expect("point state poisoned")
+            .callbacks
+            .entry(kind)
+            .or_default()
+            .push_back(plan);
+    }
+    pub(crate) fn set_copy_stream(&self, stream: Option<Vec<OperationData>>) {
+        self.state
+            .lock()
+            .expect("point state poisoned")
+            .stream_override = Some(stream);
+    }
+    pub(crate) fn copied(&self) -> BTreeMap<i64, i64> {
+        self.state
+            .lock()
+            .expect("point state poisoned")
+            .copied
+            .clone()
+    }
+    pub(crate) fn completed_checkpoint(&self) -> Option<BTreeMap<i64, i64>> {
+        self.state
+            .lock()
+            .expect("point state poisoned")
+            .checkpoint_completed
+            .clone()
+    }
+    fn callback_plan(&self, kind: CallbackKind) -> CallbackPlan {
+        let mut state = self.state.lock().expect("point state poisoned");
+        state.events.push(PointEvent::Callback {
+            kind,
+            completed: false,
+        });
+        state
+            .callbacks
+            .get_mut(&kind)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or_default()
+    }
+    fn callback_completed(&self, kind: CallbackKind) {
+        self.state
+            .lock()
+            .expect("point state poisoned")
+            .events
+            .push(PointEvent::Callback {
+                kind,
+                completed: true,
+            });
+    }
+    async fn callback_wait(&self, plan: CallbackPlan) -> Result<()> {
+        if let Some(on_enter) = plan.on_enter {
+            on_enter();
+        }
+        if let Some(gate) = plan.gate {
+            gate.wait().await.as_ref().clone()?;
+        }
+        plan.result?;
+        Ok(())
     }
     pub(crate) fn versions(&self, key: i64) -> Vec<PointVersion> {
         self.state
@@ -772,6 +1169,30 @@ impl PointProvider {
     }
 }
 
+struct PointStream {
+    data: Mutex<VecDeque<OperationData>>,
+    disposed: Mutex<bool>,
+}
+
+impl IOperationDataStream for PointStream {
+    fn get_next(&self, cancellation: Cancellation) -> ApiFuture<'_, Option<OperationData>> {
+        Box::pin(async move {
+            if *self.disposed.lock().expect("point stream poisoned") {
+                return Err(Status::ObjectClosed.error());
+            }
+            if cancellation.is_cancelled() {
+                return Err(Status::Cancelled.error());
+            }
+            Ok(self.data.lock().expect("point stream poisoned").pop_front())
+        })
+    }
+    fn dispose(&self) -> Result<()> {
+        *self.disposed.lock().expect("point stream poisoned") = true;
+        self.data.lock().expect("point stream poisoned").clear();
+        Ok(())
+    }
+}
+
 impl IStateProvider2 for PointProvider {
     fn get_name(&self) -> &str {
         &self.name
@@ -803,14 +1224,66 @@ impl IStateProvider2 for PointProvider {
         drop(state);
         self.released.notify_waiters();
     }
-    fn prepare_checkpoint(&self, _: SequenceNumber) -> Result<()> {
-        Err(Status::NotImplemented.error())
+    fn prepare_checkpoint(&self, lsn: SequenceNumber) -> Result<()> {
+        if lsn < 0 {
+            return Err(Status::InvalidParameter.error());
+        }
+        let plan = self.callback_plan(CallbackKind::Prepare);
+        if plan.gate.is_some() {
+            return Err(Error::InvalidInput(
+                "synchronous Prepare cannot await a gate",
+            ));
+        }
+        if let Some(on_enter) = plan.on_enter {
+            on_enter();
+        }
+        plan.result?;
+        let mut state = self.state.lock().expect("point state poisoned");
+        state.events.push(PointEvent::Prepare(lsn));
+        state.checkpoint_prepared = Some(
+            state
+                .versions
+                .iter()
+                .filter_map(|(key, versions)| versions.last().map(|version| (*key, version.value)))
+                .collect(),
+        );
+        drop(state);
+        self.callback_completed(CallbackKind::Prepare);
+        Ok(())
     }
     fn perform_checkpoint(&self, _: Cancellation) -> ApiFuture<'_, ()> {
-        Box::pin(async { Err(Status::NotImplemented.error()) })
+        let provider = self.self_weak.upgrade().expect("shared point owner");
+        own(Box::pin(async move {
+            let plan = provider.callback_plan(CallbackKind::Perform);
+            provider.callback_wait(plan).await?;
+            let mut state = provider.state.lock().expect("point state poisoned");
+            state.checkpoint_performed = Some(
+                state
+                    .checkpoint_prepared
+                    .clone()
+                    .ok_or_else(|| Status::InvalidOperation.error())?,
+            );
+            drop(state);
+            provider.callback_completed(CallbackKind::Perform);
+            Ok(())
+        }))
     }
     fn complete_checkpoint(&self, _: Cancellation) -> ApiFuture<'_, ()> {
-        Box::pin(async { Err(Status::NotImplemented.error()) })
+        let provider = self.self_weak.upgrade().expect("shared point owner");
+        own(Box::pin(async move {
+            let plan = provider.callback_plan(CallbackKind::Complete);
+            provider.callback_wait(plan).await?;
+            let mut state = provider.state.lock().expect("point state poisoned");
+            state.checkpoint_completed = Some(
+                state
+                    .checkpoint_performed
+                    .clone()
+                    .ok_or_else(|| Status::InvalidOperation.error())?,
+            );
+            drop(state);
+            provider.callback_completed(CallbackKind::Complete);
+            Ok(())
+        }))
     }
     fn recover_checkpoint(&self, _: Cancellation) -> ApiFuture<'_, ()> {
         Box::pin(async { Err(Status::NotImplemented.error()) })
@@ -825,17 +1298,104 @@ impl IStateProvider2 for PointProvider {
         Box::pin(async { Err(Status::NotImplemented.error()) })
     }
     fn get_current_state(&self) -> Result<Option<Arc<dyn IOperationDataStream>>> {
-        Err(Status::NotImplemented.error())
+        let plan = self.callback_plan(CallbackKind::GetCopy);
+        if plan.gate.is_some() {
+            return Err(Error::InvalidInput(
+                "synchronous GetCurrentState cannot await a gate",
+            ));
+        }
+        if let Some(on_enter) = plan.on_enter {
+            on_enter();
+        }
+        plan.result?;
+        let state = self.state.lock().expect("point state poisoned");
+        let data = match &state.stream_override {
+            Some(stream) => stream.clone(),
+            None => Some(
+                state
+                    .checkpoint_performed
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(key, value)| Self::payload(key, value))
+                    .collect(),
+            ),
+        };
+        let stream = data.map(|data| {
+            Arc::new(PointStream {
+                data: Mutex::new(data.into()),
+                disposed: Mutex::new(false),
+            }) as Arc<dyn IOperationDataStream>
+        });
+        drop(state);
+        self.callback_completed(CallbackKind::GetCopy);
+        Ok(stream)
     }
     fn begin_setting_current_state(&self) -> ApiFuture<'_, ()> {
-        Box::pin(async { Err(Status::NotImplemented.error()) })
+        let provider = self.self_weak.upgrade().expect("shared point owner");
+        own(Box::pin(async move {
+            let plan = provider.callback_plan(CallbackKind::BeginCopy);
+            provider.callback_wait(plan).await?;
+            provider.state.lock().expect("point state poisoned").copying = Some(BTreeMap::new());
+            provider.callback_completed(CallbackKind::BeginCopy);
+            Ok(())
+        }))
     }
-    fn set_current_state(&self, _: i64, _: OperationData, _: Cancellation) -> ApiFuture<'_, ()> {
-        Box::pin(async { Err(Status::NotImplemented.error()) })
+    fn set_current_state(
+        &self,
+        number: i64,
+        data: OperationData,
+        cancellation: Cancellation,
+    ) -> ApiFuture<'_, ()> {
+        let provider = self.self_weak.upgrade().expect("shared point owner");
+        own(Box::pin(async move {
+            let plan = provider.callback_plan(CallbackKind::SetCopy);
+            provider
+                .state
+                .lock()
+                .expect("point state poisoned")
+                .events
+                .push(PointEvent::CopySet {
+                    number,
+                    data: data.clone(),
+                    cancelled: cancellation.is_cancelled(),
+                });
+            provider.callback_wait(plan).await?;
+            // Header-only native data is a valid empty provider copy record.
+            let value = if data.segments().is_empty() {
+                None
+            } else {
+                Some(Self::decode(Some(data))?)
+            };
+            let mut state = provider.state.lock().expect("point state poisoned");
+            let copying = state
+                .copying
+                .as_mut()
+                .ok_or_else(|| Status::InvalidOperation.error())?;
+            if let Some((key, value)) = value {
+                copying.insert(key, value);
+            }
+            drop(state);
+            provider.callback_completed(CallbackKind::SetCopy);
+            Ok(())
+        }))
     }
     fn end_setting_current_state(&self, _: Cancellation) -> ApiFuture<'_, ()> {
-        Box::pin(async { Err(Status::NotImplemented.error()) })
+        let provider = self.self_weak.upgrade().expect("shared point owner");
+        own(Box::pin(async move {
+            let plan = provider.callback_plan(CallbackKind::EndCopy);
+            provider.callback_wait(plan).await?;
+            let mut state = provider.state.lock().expect("point state poisoned");
+            state.copied = state
+                .copying
+                .take()
+                .ok_or_else(|| Status::InvalidOperation.error())?;
+            drop(state);
+            provider.callback_completed(CallbackKind::EndCopy);
+            Ok(())
+        }))
     }
+
     fn prepare_for_remove(
         &self,
         _: Arc<dyn TransactionBase>,
