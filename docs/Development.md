@@ -162,6 +162,7 @@ cargo check --locked --workspace --all-targets --all-features
 cargo test --locked -p fube-transport -p fube-client -p fube-test-host
 cargo test --locked -p fube-ra-store
 cargo test --locked -p fube-ra
+cargo test --locked -p fube-hosting
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --all-features --no-deps
 cargo test --locked --workspace --all-features --doc
@@ -178,6 +179,15 @@ installation or full native build and does not qualify a deployed native FM/RA.
 The live tests are ignored by ordinary `cargo test`. Offline model tests do not
 establish native wire compatibility. Unsupported host platforms fail before
 Python test discovery.
+
+The [Hosting H1 core](cluster/RustHosting.md#implemented-h1-model) adds ordinary
+native-free registration, lookup, event/bound and RA-bridge tests to the
+existing workspace/archive selections. `cargo check --locked -p fube-hosting
+--lib` checks its production-only graph separately from the test-only RA/store
+dependencies. These tests use controlled clock/package outcomes and simulated
+usage/RAP; they do not execute native Hosting handlers or qualify IPC/deployed
+interoperability. The existing RA native-helper evidence is unchanged, not
+relabelled as new independent H1 evidence.
 
 The [RA P1 store](cluster/RaStore.md) uses bundled SQLite C through
 `tokio-rusqlite`; producers need a C compiler and archiver (no SF or system

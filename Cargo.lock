@@ -220,6 +220,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fube-hosting"
+version = "0.1.0"
+dependencies = [
+ "fube-ra",
+ "fube-ra-store",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "fube-ra"
 version = "0.1.0"
 dependencies = [
