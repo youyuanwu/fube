@@ -243,6 +243,7 @@ fn maximum_copy_bytes(settings: &Settings) -> usize {
 }
 
 struct Shared {
+    streams: Mutex<StreamViews>,
     #[cfg(test)]
     copy_job_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
     events: broadcast::Sender<crate::extensions::ReplicationEvent>,
@@ -257,6 +258,17 @@ struct Shared {
     engine_id: u64,
     generation: u64,
     shutdown_cleanup: Mutex<(bool, Option<DeferredCleanup>)>,
+}
+
+struct StreamViews {
+    replication: Arc<OperationStream>,
+    copy: Arc<OperationStream>,
+}
+impl StreamViews {
+    fn shutdown(&self) {
+        self.replication.shutdown();
+        self.copy.shutdown();
+    }
 }
 
 trait NativeControlView: Send + Sync {
@@ -328,8 +340,6 @@ pub struct Engine {
     writes: mpsc::Sender<Submit>,
     stop: watch::Sender<bool>,
     shared: Arc<Shared>,
-    replication: Arc<OperationStream>,
-    copy: Arc<OperationStream>,
     thread: Mutex<Option<JoinHandle<()>>>,
     transport: PeerTransport,
     #[cfg(test)]
@@ -533,6 +543,7 @@ impl Engine {
         let copy = Arc::new(OperationStream::new(copy_rx));
         let (stop, stop_rx) = watch::channel(false);
         let shared = Arc::new(Shared {
+            streams: Mutex::new(StreamViews { replication, copy }),
             #[cfg(test)]
             copy_job_pause: Mutex::new(None),
             events: broadcast::channel(64).0,
@@ -570,8 +581,7 @@ impl Engine {
         let state_endpoint = endpoint.clone();
         let state_transport = transport.clone();
         let state_settings = settings.clone();
-        let state_replication = replication.clone();
-        let state_copy = copy.clone();
+        let state_streams = shared.clone();
         let state_native_control = native_control.clone();
         let (ready, readiness) = std_mpsc::sync_channel(1);
         let (done, done_rx) = std_mpsc::sync_channel(1);
@@ -645,8 +655,7 @@ impl Engine {
                     } else {
                         owner.dispose_provider_resources().await
                     };
-                    state_replication.shutdown();
-                    state_copy.shutdown();
+                    state_streams.streams.lock().unwrap().shutdown();
                     outcome
                 });
                 drop(runtime);
@@ -685,8 +694,6 @@ impl Engine {
             writes,
             stop,
             shared,
-            replication,
-            copy,
             thread: Mutex::new(Some(thread)),
             transport,
             #[cfg(test)]
@@ -768,14 +775,14 @@ impl Engine {
     }
 
     pub fn replication_stream(&self) -> Arc<OperationStream> {
-        self.replication.clone()
+        self.shared.streams.lock().unwrap().replication.clone()
     }
     pub(crate) fn ensure_open(&self) -> Result<()> {
         self.check()
     }
 
     pub fn copy_stream(&self) -> Arc<OperationStream> {
-        self.copy.clone()
+        self.shared.streams.lock().unwrap().copy.clone()
     }
 
     pub fn snapshot(&self) -> EngineSnapshot {
@@ -1089,8 +1096,7 @@ impl Engine {
         self.shared.revision.fetch_add(1, Ordering::AcqRel);
         self.stop.send_replace(true);
         drop(admission);
-        self.replication.shutdown();
-        self.copy.shutdown();
+        self.shared.streams.lock().unwrap().shutdown();
         let thread = self.thread.lock().unwrap().take().unwrap();
         let done = self.owner_done.lock().unwrap().take().unwrap();
         let transport = self.transport.clone();
@@ -4008,6 +4014,23 @@ impl Owner {
         if !control.disposal.is_complete() {
             return;
         }
+        if matches!(
+            &control.kind,
+            ControlKind::Epoch {
+                role: ReplicaRole::Primary,
+                ..
+            }
+        ) && self.role != ReplicaRole::Primary
+            && control.drain_barrier.is_none()
+        {
+            if self.dispatched < boundary {
+                return;
+            }
+            // Successful dispatch EOS must precede the service processing/ACK
+            // drain: upper consumers may flush held ACKs only after EOS.
+            self.replication_tx.take();
+            self.copy_tx.take();
+        }
         if self.role == ReplicaRole::Primary
             && matches!(
                 &control.kind,
@@ -4367,6 +4390,26 @@ impl Owner {
                     self.dispatched = boundary;
                     self.secondary = None;
                     self.announced_completed = boundary;
+                    if matches!(
+                        role,
+                        ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+                    ) {
+                        let (replication_tx, replication_rx) =
+                            mpsc::channel(self.settings.provider_operations);
+                        let (copy_tx, copy_rx) = mpsc::channel(self.settings.provider_operations);
+                        let mut views = self.shared.streams.lock().unwrap();
+                        // Only the old role's views terminate; never revive a
+                        // receiver already handed to a previous consumer.
+                        *views = StreamViews {
+                            replication: Arc::new(OperationStream::new(replication_rx)),
+                            copy: Arc::new(OperationStream::new(copy_rx)),
+                        };
+                        self.replication_tx = Some(replication_tx);
+                        // Queue transfer is already copied/applied locally.
+                        drop(copy_tx);
+                        self.copy_tx = None;
+                        self.copy_done = true;
+                    }
                 }
                 if role == ReplicaRole::Primary {
                     if self.role != ReplicaRole::Primary {

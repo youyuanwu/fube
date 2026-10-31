@@ -1036,6 +1036,20 @@ async fn promotion_drains_contiguous_received_before_discarding_only_out_of_orde
     assert_eq!(operation.sequence, 66);
     assert_eq!(operation.epoch, NEXT_EPOCH);
     assert!(provider.epochs.lock().unwrap().contains(&(NEXT_EPOCH, 65)));
+    assert!(
+        timeout(std::time::Duration::from_secs(1), stream.next(cancel()))
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none(),
+        "frozen dispatch EOS must precede the last service ACK"
+    );
+    assert!(
+        timeout(std::time::Duration::from_millis(40), &mut promotion)
+            .await
+            .is_err()
+    );
+    assert_eq!(secondary.snapshot().progress.applied, 65);
     provider.last.store(66, Ordering::Release);
     operation.acknowledge().unwrap();
     drop(operation);
@@ -1060,6 +1074,86 @@ async fn promotion_drains_contiguous_received_before_discarding_only_out_of_orde
     network.shutdown();
     drainer.abort();
     let _ = drainer.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_and_nonempty_role_cycles_supply_fresh_streams_on_the_same_engine_without_recopy() {
+    for nonempty in [false, true] {
+        let provider = Arc::new(Provider::default());
+        let (s, network, primary, _incoming) = initialized_raw_secondary(provider.clone()).await;
+        let old_copy = s.copy_stream();
+        let old_stream = s.replication_stream();
+        let held = if nonempty {
+            raw_send(&network, &primary, &s, replication(EPOCH, EPOCH, 1, 1));
+            let operation = old_stream.next(cancel()).await.unwrap().unwrap();
+            Some(operation)
+        } else {
+            None
+        };
+        let promotion = s.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel());
+        tokio::pin!(promotion);
+        // Poll the real role change while the consumer waits for successful
+        // EOS; ACK deliberately remains withheld until after EOS.
+        let promoted = tokio::select! {
+            result = &mut promotion => {
+                assert!(!nonempty);
+                result.unwrap();
+                true
+            }
+            eos = old_stream.next(cancel()) => {
+                assert!(eos.unwrap().is_none());
+                false
+            },
+        };
+        if let Some(operation) = &held {
+            assert_eq!(s.snapshot().progress.applied, 0);
+            assert!(
+                timeout(std::time::Duration::from_millis(40), &mut promotion)
+                    .await
+                    .is_err()
+            );
+            provider.last.store(1, Ordering::Release);
+            operation.acknowledge().unwrap();
+            promotion.await.unwrap();
+        } else if !promoted {
+            promotion.await.unwrap();
+        }
+        assert!(old_stream.next(cancel()).await.unwrap().is_none());
+        assert!(old_copy.next(cancel()).await.unwrap().is_none());
+        let prefix = i64::from(nonempty);
+        s.change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
+            .await
+            .unwrap();
+        let fresh = s.replication_stream();
+        assert!(!Arc::ptr_eq(&old_stream, &fresh));
+        assert!(!Arc::ptr_eq(&old_copy, &s.copy_stream()));
+        assert!(s.copy_stream().next(cancel()).await.unwrap().is_none());
+        assert!(s.snapshot().copy_done);
+        assert_eq!(s.snapshot().progress.received, prefix);
+        raw_send(
+            &network,
+            &primary,
+            &s,
+            replication(NEXT_EPOCH, NEXT_EPOCH, prefix + 1, 2),
+        );
+        let operation = fresh.next(cancel()).await.unwrap().unwrap();
+        assert_eq!(operation.sequence, prefix + 1);
+        if let Some(old) = &held {
+            assert!(
+                old.acknowledge().is_err(),
+                "retired captures cannot ACK a new generation"
+            );
+        }
+        assert_eq!(s.snapshot().progress.applied, prefix);
+        provider.last.store(prefix + 1, Ordering::Release);
+        operation.acknowledge().unwrap();
+        until(|| s.snapshot().progress.applied == prefix + 1).await;
+        assert!(old_stream.next(cancel()).await.unwrap().is_none());
+        drop(held);
+        drop(operation);
+        abort_owned(&s).await;
+        network.shutdown();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
