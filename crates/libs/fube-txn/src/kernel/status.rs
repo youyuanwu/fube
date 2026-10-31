@@ -82,6 +82,42 @@ impl Status {
         }
     }
 
+    /// Match exact signed/unsigned HRESULT, source NTSTATUS or SDK typed identity.
+    pub(crate) fn matches(self, error: &Error) -> bool {
+        if let Some(code) = error.native_code() {
+            let bits = code as u32;
+            let native: u32 = match self {
+                Self::Cancelled => 0xc0000120,
+                Self::InvalidParameter => 0xc000000d,
+                Self::InsufficientResources => 0xc000009a,
+                Self::NotImplemented => 0xc0000002,
+                Self::InternalDbCorruption => 0xc00000e4,
+                _ => (self.code() as u32 & 0xffff) | 0xe0430000,
+            };
+            return bits == self.code() as u32 || bits == native;
+        }
+        matches!(
+            (self, error.kind()),
+            (Self::NoWriteQuorum, ErrorKind::NoWriteQuorum)
+                | (Self::NotPrimary, ErrorKind::NotPrimary)
+                | (
+                    Self::ReconfigurationPending,
+                    ErrorKind::ReconfigurationPending
+                )
+                | (Self::QueueFull, ErrorKind::ReplicationQueueFull)
+                | (Self::ObjectClosed, ErrorKind::ObjectClosed)
+                | (Self::Timeout, ErrorKind::Timeout)
+                | (Self::Cancelled, ErrorKind::Canceled)
+                | (
+                    Self::OperationTooLarge,
+                    ErrorKind::ReplicationOperationTooLarge
+                )
+                | (Self::NotImplemented, ErrorKind::Unsupported)
+                | (Self::InsufficientResources, ErrorKind::ResourceExhausted)
+                | (Self::InvalidParameter, ErrorKind::InvalidArgument)
+        )
+    }
+
     /// Preserve exact four-status retry set, never classify by text.
     pub(crate) fn is_retryable(self) -> bool {
         matches!(
@@ -96,20 +132,14 @@ impl Status {
 
 /// Classify SDK failures without collapsing generic resource exhaustion.
 pub(crate) fn retryable(error: &Error) -> bool {
-    if let Some(code) = error.native_code() {
-        // Native SF NTSTATUS and signed/unsigned HRESULT representations.
-        let bits = code as u32;
-        return [0x80071bc5, 0x80071bca, 0x80071bcb, 0x80071c25]
-            .into_iter()
-            .any(|hr| bits == hr || bits == (hr & 0xffff) | 0xe0430000);
-    }
-
-    matches!(
-        error.kind(),
-        ErrorKind::NoWriteQuorum
-            | ErrorKind::ReconfigurationPending
-            | ErrorKind::ReplicationQueueFull
-    )
+    [
+        Status::NoWriteQuorum,
+        Status::ReconfigurationPending,
+        Status::QueueFull,
+        Status::ServiceTooBusy,
+    ]
+    .into_iter()
+    .any(|status| status.matches(error))
 }
 
 /// Project accepted Apply/replication results after required Unlock invocation.
@@ -130,6 +160,32 @@ pub(crate) fn accepted_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_status_matching_preserves_exact_payload_across_representations() {
+        for status in [
+            Status::NoWriteQuorum,
+            Status::ObjectClosed,
+            Status::ServiceTooBusy,
+        ] {
+            let hr = status.code() as u32;
+            for code in [
+                status.code(),
+                i64::from(hr),
+                ((hr & 0xffff) | 0xe0430000) as i32 as i64,
+            ] {
+                let error = Error::Remote {
+                    code,
+                    message: "original".into(),
+                };
+                assert!(status.matches(&error));
+                assert_eq!(error.native_code(), Some(code));
+                assert!(!Status::NotPrimary.matches(&error));
+            }
+        }
+        assert!(Status::ObjectClosed.matches(&Error::Closed));
+        assert!(!retryable(&Error::ResourceLimit("queue")));
+    }
 
     #[test]
     fn accepted_completion_remaps_failures_but_admission_keeps_retry_identity() {

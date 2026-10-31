@@ -12,7 +12,13 @@
 pub(crate) mod identity;
 pub(crate) mod map;
 pub(crate) mod named;
+pub(crate) mod processor;
+pub(crate) mod provider;
 pub(crate) mod record;
 pub(crate) mod state;
 pub(crate) mod status;
+pub(crate) mod transaction;
 pub(crate) mod version;
+
+#[cfg(test)]
+mod trace_tests;
