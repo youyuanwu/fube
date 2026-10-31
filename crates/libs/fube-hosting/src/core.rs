@@ -48,6 +48,8 @@ pub(crate) struct State {
     pub closed_registered: Vec<ClosedRegisteredEvent>,
     pub enabled_disabled: Vec<EnabledDisabledEvent>,
     pub obligations: Vec<Obligation>,
+    pub public_activations: Vec<PackageInstance>,
+    pub pending_activations: Vec<PendingActivation>,
 }
 impl State {
     pub(crate) fn id(&mut self) -> Result<u64> {
@@ -83,11 +85,22 @@ impl State {
             + self.timers.iter().map(Timer::bytes).sum::<usize>()
             + self.operations.len() * 64
             + self.types.iter().map(TypeEntry::bytes).sum::<usize>()
-            + self.failures.iter().map(|f| 32 + f.len()).sum::<usize>();
+            + self.failures.iter().map(|f| 32 + f.len()).sum::<usize>()
+            + self
+                .public_activations
+                .iter()
+                .map(|p| 64 + p.package.bytes() + p.public_activation.len())
+                .sum::<usize>()
+            + self
+                .pending_activations
+                .iter()
+                .map(|p| 64 + p.request.bytes())
+                .sum::<usize>();
         if self.hosts.len() > limits.hosts
             || self.runtimes.len() > limits.runtimes
             || self.timers.len() > limits.timers
-            || self.operations.len() > limits.operations
+            || self.operations.len() + self.pending_activations.len() > limits.operations
+            || self.public_activations.len() > limits.packages
             || self.types.len() > limits.types
             || self.failures.len() > limits.failures
             || self.types.iter().map(|e| e.sources.len()).sum::<usize>() > limits.sources
@@ -148,7 +161,7 @@ impl Hosting {
         &self.state.timers
     }
     pub fn outstanding_operations(&self) -> usize {
-        self.state.operations.len()
+        self.state.operations.len() + self.state.pending_activations.len()
     }
     pub fn retained_host_records(&self) -> usize {
         self.state.hosts.len()
@@ -168,10 +181,43 @@ impl Hosting {
                 h.member = false;
             }
             s.runtimes.clear();
-            s.timers.clear();
+            s.timers
+                .retain(|t| matches!(t.kind, TimerKind::DisableType { .. }));
             Ok(())
         })
     }
+    /// Close all registration state, retaining already accepted owned outputs and
+    /// external pending activation observations. This receipt is not successful
+    /// physical shutdown; its remaining work must be driven/drained by the owner.
+    pub fn close_core(&mut self) -> Result<CoreClosure> {
+        self.change(|s| {
+            s.hosts_closed = true;
+            s.runtimes_closed = true;
+            s.types_closed = true;
+            for h in &mut s.hosts {
+                h.member = false;
+            }
+            s.runtimes.clear();
+            s.types.clear();
+            s.failures.clear();
+            s.public_activations.clear();
+            s.timers.clear();
+            Ok(CoreClosure {
+                held_host_operations: s.operations.len(),
+                pending_activations: s.pending_activations.len(),
+                queued_events: s.closed_registered.len() + s.enabled_disabled.len(),
+                queued_obligations: s.obligations.len(),
+            })
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreClosure {
+    pub held_host_operations: usize,
+    pub pending_activations: usize,
+    pub queued_events: usize,
+    pub queued_obligations: usize,
 }
 
 #[cfg(test)]

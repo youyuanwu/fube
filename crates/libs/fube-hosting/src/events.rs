@@ -45,8 +45,25 @@ pub enum EnabledDisabledEvent {
 /// Explicit modeled external obligations; not real health, deployment or usage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Obligation {
-    TypesUnregistered { types: Vec<TypeInstance> },
-    HealthSourceReleased { type_instance: TypeInstance },
+    TypesUnregistered {
+        types: Vec<TypeInstance>,
+    },
+    HealthSourceReleased {
+        type_instance: TypeInstance,
+    },
+    Activation {
+        request: ActivationRequest,
+        outcome: ActivationOutcome,
+        pending: Option<ActivationHandle>,
+    },
+    ActivationCompleted {
+        handle: ActivationHandle,
+        result: Result<()>,
+    },
+    DeactivationIfUnused {
+        package: PackageInstance,
+        outcome: DeactivationOutcome,
+    },
 }
 
 impl Registration {
@@ -107,6 +124,13 @@ impl Obligation {
                 types.iter().map(|t| 64 + t.bytes()).sum::<usize>()
             }
             Self::HealthSourceReleased { type_instance } => type_instance.bytes(),
+            Self::Activation {
+                request, outcome, ..
+            } => request.bytes() + outcome.bytes(),
+            Self::ActivationCompleted { result, .. } => model_error_bytes(result.as_ref().err()),
+            Self::DeactivationIfUnused { package, outcome } => {
+                64 + package.package.bytes() + package.public_activation.len() + outcome.bytes()
+            }
         }
     }
 }

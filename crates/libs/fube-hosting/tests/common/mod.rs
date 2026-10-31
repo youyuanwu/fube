@@ -64,3 +64,13 @@ pub fn disable(h: &mut Hosting, id: &TypeInstance) -> Timer {
         .unwrap()
         .unwrap()
 }
+pub fn request(id: &TypeInstance, version: VersionInstance) -> LookupRequest {
+    LookupRequest {
+        service_type: id.service_type.clone(),
+        version,
+        activation: id.activation,
+        service_name: "fabric:/app/service".into(),
+        application_name: "fabric:/app".into(),
+        should_activate: true,
+    }
+}

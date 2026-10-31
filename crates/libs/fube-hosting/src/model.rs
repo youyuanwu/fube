@@ -94,6 +94,7 @@ impl Registration {
 /// outputs belong to the caller, which must impose its own downstream budgets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
+    pub packages: usize,
     pub hosts: usize,
     pub runtimes: usize,
     pub types: usize,
@@ -110,6 +111,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            packages: 128,
             hosts: 64,
             runtimes: 128,
             types: 256,
@@ -128,6 +130,7 @@ impl Default for Limits {
 impl Limits {
     pub(crate) fn validate(&self) -> Result<()> {
         if [
+            self.packages,
             self.hosts,
             self.runtimes,
             self.types,
