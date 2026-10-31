@@ -9,3 +9,4 @@ description = "Source-backed Service Fabric V2 transactional replicator trait co
 fube-data.workspace = true
 fube-runtime.workspace = true
 uuid.workspace = true
+tokio.workspace = true

@@ -175,6 +175,11 @@ impl Record {
         } else {
             0
         };
+        if native_type <= 3 {
+            // Native TransactionLogRecord::ReadLogical creates the sign-derived
+            // transaction here, advancing the shared generator during decoding.
+            super::identity::replay(transaction_id)?;
+        }
         let kind = match native_type {
             1 => RecordKind::Begin {
                 transaction_id,
@@ -419,6 +424,20 @@ impl<'a> Segments<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decode_advances_the_shared_native_identity_generator() {
+        let before = super::super::identity::generate().unwrap();
+        let future_id = before + 100_000_000;
+        let record = super::Record {
+            lsn: 2,
+            kind: super::RecordKind::End {
+                transaction_id: -future_id,
+                committed: false,
+            },
+        };
+        super::Record::decode(&record.encode().unwrap()).unwrap();
+        assert!(super::super::identity::generate().unwrap() > future_id);
+    }
     use super::*;
 
     fn fixture(segments: &[&str]) -> OperationData {
