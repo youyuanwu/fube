@@ -86,14 +86,20 @@ impl OperationData {
     pub fn with_settings(segments: Vec<Vec<u8>>, settings: &Settings) -> Result<Self> {
         settings.validate()?;
         if segments.len() > settings.operation_segments {
-            return Err(Error::ResourceLimit("operation segments"));
+            return Err(Error::new(
+                fube_runtime::ErrorKind::ReplicationOperationTooLarge,
+                "operation segments",
+            ));
         }
         let bytes = segments.iter().try_fold(0usize, |n, s| {
             n.checked_add(s.len())
                 .ok_or(Error::InvalidInput("operation length overflow"))
         })?;
         if bytes > settings.operation_bytes {
-            return Err(Error::ResourceLimit("operation bytes"));
+            return Err(Error::new(
+                fube_runtime::ErrorKind::ReplicationOperationTooLarge,
+                "operation bytes",
+            ));
         }
         Ok(Self {
             segments: segments.into_iter().map(Arc::from).collect(),
@@ -134,11 +140,16 @@ pub trait IOperationDataStream: Send + Sync + 'static {
 /// reserves callback/capture ownership before invoking application code; an
 /// application that calls its provider directly owns that invocation itself.
 pub trait IStateProvider: Send + Sync + 'static {
-    /// Synchronous fallible application state progress. MemoryProvider reports local
-    /// application, which may lead quorum completion; this is not durable commit.
+    /// Synchronous fallible provider progress, queried during lower construction
+    /// before its later Open. Initialize the provider before constructing it.
+    /// MemoryProvider reports local application; a logging provider reports its
+    /// actual log tail, not stable/visible transaction progress or durable commit.
     fn get_last_committed_sequence_number(&self) -> Result<i64>;
-    /// Reconcile authoritative state to the supplied prior-epoch boundary;
-    /// ambiguous tail mutations may survive only in the selected history.
+    /// Apply the provider's original-operation/primary epoch boundary. A logging
+    /// provider recognizes its represented duplicate before checking tail equality;
+    /// genuine new incompatible epochs must still fail. The lower preserves the
+    /// callback result without querying/equating independent upper and lower tails.
+    /// Secondary admission-only controls do not invoke this callback.
     fn update_epoch(
         &self,
         epoch: Epoch,
@@ -151,12 +162,14 @@ pub trait IStateProvider: Send + Sync + 'static {
     /// Synchronous payload-stream factory. This volatile engine does not send
     /// a bidirectional/persisted context to get_copy_state; it supplies None.
     fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>>;
-    /// Return coherent application state at exactly `up_to`; the included
-    /// MemoryProvider copies exact history AND its request-result ledger.
+    /// Return coherent copy state for the inclusive requested `up_to`; the included
+    /// MemoryProvider copies exact history AND its request-result ledger. A native
+    /// staged upper-log provider may extend its checkpoint horizon internally and
+    /// must preserve its copy metadata/overlap semantics; lower progress is separate.
     /// Custom providers own their data, retry and reconciliation policies.
     /// Unavailable history is an error, never a silently different snapshot.
     /// Construction is synchronous but the engine calls it on the provider lane
-    /// only after local application reaches the exact requested horizon.
+    /// only after provider progress reaches at least the requested horizon.
     fn get_copy_state(
         &self,
         up_to: i64,
@@ -317,8 +330,10 @@ impl IOperation for Operation {
     }
 }
 
-/// A bounded, single-consumer service stream. Cancellation stops only that poll;
-/// it does not acknowledge the operation or dispose its owning replica.
+/// A bounded, single-consumer role-generation view. Successful promotion closes
+/// dispatch after eligible records, before waiting for service ACKs. A later
+/// secondary role needs freshly acquired views; old views never revive.
+/// Cancellation stops only that poll, not operation/replica ownership or ACKs.
 pub(crate) struct OperationStream {
     receiver: std::sync::Mutex<tokio::sync::mpsc::Receiver<Operation>>,
     poller: tokio::sync::Semaphore,

@@ -146,6 +146,7 @@ async fn separately_optional_replay_final_arc_is_owned_until_actual_cleanup_not_
         })),
         Settings::default(),
         Some(Arc::new(ExecutionView(execution.clone()))),
+        crate::extensions::StateProviderCapabilities::default(),
     )
     .unwrap();
     let owner = engine.clone();

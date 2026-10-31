@@ -127,8 +127,8 @@ pub struct PeerSnapshot {
     pub configured: bool,
     pub building: bool,
     pub cleanup_required: bool,
-    /// Node-advertised already-completed prefix, used only for WRITE_QUORUM
-    /// catch-up, never as an application ACK for a new write or ALL catch-up.
+    /// Runtime-issued initial sender prefix, represented by receive/apply/highest
+    /// and usable for CC catch-up, never an ACK for newly assigned beyond-prefix work.
     pub native_catchup_prefix: i64,
 }
 
@@ -244,6 +244,9 @@ fn maximum_copy_bytes(settings: &Settings) -> usize {
 
 struct Shared {
     #[cfg(test)]
+    epoch_entries: std::sync::atomic::AtomicUsize,
+    streams: Mutex<StreamViews>,
+    #[cfg(test)]
     copy_job_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
     events: broadcast::Sender<crate::extensions::ReplicationEvent>,
     admission: Mutex<()>,
@@ -257,6 +260,17 @@ struct Shared {
     engine_id: u64,
     generation: u64,
     shutdown_cleanup: Mutex<(bool, Option<DeferredCleanup>)>,
+}
+
+struct StreamViews {
+    replication: Arc<OperationStream>,
+    copy: Arc<OperationStream>,
+}
+impl StreamViews {
+    fn shutdown(&self) {
+        self.replication.shutdown();
+        self.copy.shutdown();
+    }
 }
 
 trait NativeControlView: Send + Sync {
@@ -328,8 +342,6 @@ pub struct Engine {
     writes: mpsc::Sender<Submit>,
     stop: watch::Sender<bool>,
     shared: Arc<Shared>,
-    replication: Arc<OperationStream>,
-    copy: Arc<OperationStream>,
     thread: Mutex<Option<JoinHandle<()>>>,
     transport: PeerTransport,
     #[cfg(test)]
@@ -363,6 +375,7 @@ impl Engine {
     /// metadata ahead of UpdateEpoch, never an engine epoch or access change.
     /// Terminal engine faults report a native transient fault through this same
     /// generation; normal Close/Abort do not. Delivery is not a replacement ack.
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_partition(
         partition: std::sync::Arc<dyn fube_runtime::IStatefulServicePartition>,
         native: NativeRuntimeIntegration,
@@ -371,6 +384,7 @@ impl Engine {
         provider: Arc<dyn IStateProvider>,
         replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         settings: Settings,
+        capabilities: crate::extensions::StateProviderCapabilities,
     ) -> Result<Arc<Self>> {
         settings.validate()?;
         let information = partition.get_partition_information()?;
@@ -398,6 +412,7 @@ impl Engine {
             replay,
             settings,
             Some(Arc::new(native)),
+            capabilities,
         )
     }
 
@@ -426,7 +441,15 @@ impl Engine {
         settings: Settings,
         native_control: Option<Arc<dyn NativeControlView>>,
     ) -> Result<Arc<Self>> {
-        Self::bind_with_capabilities(actor, address, provider, None, settings, native_control)
+        Self::bind_with_capabilities(
+            actor,
+            address,
+            provider,
+            None,
+            settings,
+            native_control,
+            crate::extensions::StateProviderCapabilities::default(),
+        )
     }
 
     fn bind_with_capabilities(
@@ -436,6 +459,7 @@ impl Engine {
         replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         settings: Settings,
         native_control: Option<Arc<dyn NativeControlView>>,
+        capabilities: crate::extensions::StateProviderCapabilities,
     ) -> Result<Arc<Self>> {
         settings.validate()?;
         let native_runtime = native_control
@@ -534,6 +558,9 @@ impl Engine {
         let (stop, stop_rx) = watch::channel(false);
         let shared = Arc::new(Shared {
             #[cfg(test)]
+            epoch_entries: std::sync::atomic::AtomicUsize::new(0),
+            streams: Mutex::new(StreamViews { replication, copy }),
+            #[cfg(test)]
             copy_job_pause: Mutex::new(None),
             events: broadcast::channel(64).0,
             admission: Mutex::new(()),
@@ -570,8 +597,7 @@ impl Engine {
         let state_endpoint = endpoint.clone();
         let state_transport = transport.clone();
         let state_settings = settings.clone();
-        let state_replication = replication.clone();
-        let state_copy = copy.clone();
+        let state_streams = shared.clone();
         let state_native_control = native_control.clone();
         let (ready, readiness) = std_mpsc::sync_channel(1);
         let (done, done_rx) = std_mpsc::sync_channel(1);
@@ -636,6 +662,7 @@ impl Engine {
                         replication_tx,
                         copy_tx,
                         state_native_control,
+                        capabilities,
                     );
                     owner.publish();
                     let outcome = if ready.send(Ok(())).is_ok() {
@@ -645,8 +672,7 @@ impl Engine {
                     } else {
                         owner.dispose_provider_resources().await
                     };
-                    state_replication.shutdown();
-                    state_copy.shutdown();
+                    state_streams.streams.lock().unwrap().shutdown();
                     outcome
                 });
                 drop(runtime);
@@ -685,8 +711,6 @@ impl Engine {
             writes,
             stop,
             shared,
-            replication,
-            copy,
             thread: Mutex::new(Some(thread)),
             transport,
             #[cfg(test)]
@@ -768,14 +792,14 @@ impl Engine {
     }
 
     pub fn replication_stream(&self) -> Arc<OperationStream> {
-        self.replication.clone()
+        self.shared.streams.lock().unwrap().replication.clone()
     }
     pub(crate) fn ensure_open(&self) -> Result<()> {
         self.check()
     }
 
     pub fn copy_stream(&self) -> Arc<OperationStream> {
-        self.copy.clone()
+        self.shared.streams.lock().unwrap().copy.clone()
     }
 
     pub fn snapshot(&self) -> EngineSnapshot {
@@ -832,8 +856,8 @@ impl Engine {
 
     /// Admit without conflating acceptance with quorum completion. The primary
     /// service applies the returned sequence locally before waiting/publishing.
-    /// ResourceLimit, including outgoing-copy headroom, rejects before assigning
-    /// an LSN. A queued submit is already charged when a build checks admission.
+    /// Permanent sizing/headroom rejection and transient queue fullness reject
+    /// before assigning an LSN. Queued submits are charged before build admission.
     pub fn submit(
         &self,
         data: OperationData,
@@ -876,8 +900,12 @@ impl Engine {
             }
             if data.bytes() > self.settings.operation_bytes
                 || data.segments().len() > self.settings.operation_segments
+                || data.retained_bytes() > self.settings.queue_bytes
             {
-                return Err(Error::ResourceLimit("operation limits"));
+                return Err(Error::new(
+                    fube_runtime::ErrorKind::ReplicationOperationTooLarge,
+                    "operation limits",
+                ));
             }
             let (reply, result) = oneshot::channel();
             {
@@ -893,19 +921,29 @@ impl Engine {
                             && !peer.cleanup_required
                     });
                 let maximum = maximum_copy_bytes(&self.settings);
-                let reserve_bytes = if copying
-                    || (snapshot.role == ReplicaRole::Primary
-                        && maximum < self.settings.queue_bytes)
-                {
+                let primary_headroom =
+                    snapshot.role == ReplicaRole::Primary && maximum < self.settings.queue_bytes;
+                if primary_headroom && data.retained_bytes() > self.settings.queue_bytes - maximum {
+                    return Err(Error::ResourceLimit(
+                        "operation exceeds primary copy headroom",
+                    ));
+                }
+                let reserve_bytes = if copying || primary_headroom {
                     maximum
                 } else {
                     0
                 };
-                let charge = self.shared.budget.acquire_reserved(
-                    data.retained_bytes(),
-                    u32::from(copying),
-                    reserve_bytes,
-                )?;
+                let charge = self
+                    .shared
+                    .budget
+                    .acquire_reserved(data.retained_bytes(), u32::from(copying), reserve_bytes)
+                    .map_err(|cause| {
+                        Error::with_cause(
+                            fube_runtime::ErrorKind::ReplicationQueueFull,
+                            "replication admission budget",
+                            cause,
+                        )
+                    })?;
                 drop(snapshot);
                 self.writes
                     .try_send(Submit {
@@ -916,9 +954,10 @@ impl Engine {
                         reply: reply.into(),
                     })
                     .map_err(|error| match error {
-                        mpsc::error::TrySendError::Full(_) => {
-                            Error::ResourceLimit("write admission")
-                        }
+                        mpsc::error::TrySendError::Full(_) => Error::new(
+                            fube_runtime::ErrorKind::ReplicationQueueFull,
+                            "write admission",
+                        ),
                         mpsc::error::TrySendError::Closed(_) => Error::Closed,
                     })?;
             }
@@ -959,11 +998,7 @@ impl Engine {
             cleanup: cleanup.clone(),
             disposal: self.shared.disposal.clone(),
         });
-        let execution = match &mut command {
-            Command::Epoch { execution, .. } | Command::Loss(_, _, execution) => Some(execution),
-            _ => None,
-        };
-        if let Some(execution) = execution {
+        if let Command::Loss(_, _, execution) = &mut command {
             *execution = Some(self.shared.execution.reserve(
                 CallLane::Provider,
                 CallOrigin {
@@ -1078,8 +1113,7 @@ impl Engine {
         self.shared.revision.fetch_add(1, Ordering::AcqRel);
         self.stop.send_replace(true);
         drop(admission);
-        self.replication.shutdown();
-        self.copy.shutdown();
+        self.shared.streams.lock().unwrap().shutdown();
         let thread = self.thread.lock().unwrap().take().unwrap();
         let done = self.owner_done.lock().unwrap().take().unwrap();
         let transport = self.transport.clone();
@@ -1438,7 +1472,9 @@ enum Job {
 }
 
 enum JobValue {
-    Epoch(i64),
+    Retired,
+    Admission,
+    Epoch,
     Loss(bool, Option<i64>),
     CopyOpen(
         Arc<dyn IOperationDataStream>,
@@ -1489,6 +1525,7 @@ struct Owner {
     transport: PeerTransport,
     provider: Option<Arc<crate::supervised::OwnedProvider>>,
     settings: Settings,
+    capabilities: crate::extensions::StateProviderCapabilities,
     shared: Arc<Shared>,
     queue: OperationQueue,
     charges: BTreeMap<i64, Arc<Charge>>,
@@ -1554,6 +1591,7 @@ impl Owner {
         replication_tx: mpsc::Sender<Operation>,
         copy_tx: mpsc::Sender<Operation>,
         native_control: Option<Arc<dyn NativeControlView>>,
+        capabilities: crate::extensions::StateProviderCapabilities,
     ) -> Self {
         let dispatched = queue.progress().applied;
         Self {
@@ -1561,6 +1599,7 @@ impl Owner {
             transport,
             provider: Some(provider),
             settings,
+            capabilities,
             shared,
             queue,
             charges: BTreeMap::new(),
@@ -2034,25 +2073,47 @@ impl Owner {
                 cancellation,
                 reply,
             } => {
+                #[cfg(test)]
+                self.shared.epoch_entries.fetch_add(1, Ordering::AcqRel);
                 if cancellation.is_cancelled() {
                     let _ = reply.send(Err(Error::Closed));
                     return;
                 }
-                if self.control.is_some() {
-                    let _ = reply.send(Err(Error::ResourceLimit("provider control callback")));
-                    return;
-                }
+                let admission_epoch = self
+                    .epoch
+                    .max(self.secondary.as_ref().map(|copy| copy.primary_epoch))
+                    .max(
+                        self.control
+                            .as_ref()
+                            .and_then(|control| match &control.kind {
+                                ControlKind::Epoch { epoch, role, .. } if *role == self.role => {
+                                    Some(*epoch)
+                                }
+                                _ => None,
+                            }),
+                    );
                 if epoch.data_loss_number < 0
                     || epoch.configuration_number < 0
-                    || self
-                        .epoch
-                        .is_some_and(|old| epoch.primary() < old.primary())
-                    || self
-                        .secondary
-                        .as_ref()
-                        .is_some_and(|copy| epoch.primary() < copy.primary_epoch)
+                    || admission_epoch.is_some_and(|minimum| epoch.primary() < minimum)
                 {
                     let _ = reply.send(Err(Error::InvalidInput("stale epoch")));
+                    return;
+                }
+                if role.is_none()
+                    && matches!(
+                        self.role,
+                        ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+                    )
+                    && admission_epoch == Some(epoch.primary())
+                {
+                    // Native equal minAllowedEpoch is a no-op, including during
+                    // copy or an original-operation provider barrier. It must
+                    // not query/reconcile an independent upper log suffix.
+                    let _ = reply.send(Ok(()));
+                    return;
+                }
+                if self.control.is_some() {
+                    let _ = reply.send(Err(Error::ResourceLimit("provider control callback")));
                     return;
                 }
                 let role = role.unwrap_or(self.role);
@@ -2067,7 +2128,10 @@ impl Owner {
                     return;
                 }
                 if self.role == ReplicaRole::Primary
-                    && role != ReplicaRole::Primary
+                    && matches!(
+                        role,
+                        ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+                    )
                     && self.queue.progress().assigned != self.queue.progress().committed
                 {
                     // Native queue transfer requires no uncommitted tail.
@@ -2087,6 +2151,18 @@ impl Owner {
                     self.queue.progress().received
                 };
                 if self.role == ReplicaRole::Primary && role != ReplicaRole::Primary {
+                    if role == ReplicaRole::None {
+                        // Retire observers before sessions/configuration can
+                        // disappear and accidentally make a quorum of one.
+                        for (_, completion) in std::mem::take(&mut self.completions) {
+                            complete_replication(&completion, Err(Error::Closed));
+                        }
+                        self.current = None;
+                        self.previous = None;
+                        for record in &self.dispositions {
+                            record.cancel();
+                        }
+                    }
                     for peer in self.peers.values_mut() {
                         if peer.copy_applied == -1
                             && peer.build.as_ref().is_some_and(|build| {
@@ -2155,7 +2231,7 @@ impl Owner {
                     } else if self.configurations.len() >= self.settings.control_messages {
                         Err(Error::ResourceLimit("configuration disposal receipts"))
                     } else {
-                        self.configure(current, previous, native_prewrite)
+                        self.configure(current, previous, native_prewrite, proof.is_some())
                     };
                 let disposal = capture.finish();
                 if !disposal.is_complete() {
@@ -2419,6 +2495,7 @@ impl Owner {
         current: ReplicaSetConfiguration,
         previous: Option<ReplicaSetConfiguration>,
         native_prewrite: Option<NativePreWrite>,
+        issued: bool,
     ) -> Result<()> {
         let epoch = self
             .epoch
@@ -2455,19 +2532,6 @@ impl Owner {
         if let Some(previous) = &previous {
             self.validate_configuration(previous)?;
         }
-        let native_status = self
-            .native_control
-            .as_ref()
-            .and_then(|view| view.status().ok())
-            .filter(|status| {
-                status.lifecycle == ReplicaLifecycle::Open
-                    && status.replicator_open
-                    && status.current_role == ReplicaRole::Primary
-                    && status.replicator_role == ReplicaRole::Primary
-                    && status.current_epoch.primary() == current_epoch
-                    && Some(current_epoch) == self.epoch
-            });
-        let completed_prefix = self.queue.progress().completed;
         let mut desired: HashMap<i64, (&ReplicaInformation, Endpoint)> = HashMap::new();
         for replica in current.replicas.iter().chain(
             previous
@@ -2573,37 +2637,22 @@ impl Owner {
                 self.transport.register_peer(&endpoint)?;
             }
             if !self.peers.contains_key(&id) {
-                let peer = self.new_peer(endpoint.clone(), replica.incarnation);
+                let mut peer = self.new_peer(endpoint.clone(), replica.incarnation);
+                if issued {
+                    // This descriptor came from the entered, frozen runtime
+                    // invocation, never from a diagnostic/public projection.
+                    let initial = replica.progress.last.max(0);
+                    peer.received = initial;
+                    peer.applied = initial;
+                    peer.maximum_sent = initial;
+                    peer.native_catchup_prefix = initial;
+                }
                 self.peers.insert(id, peer);
             }
             let peer = self.peers.get_mut(&id).unwrap();
             peer.endpoint = endpoint;
             peer.configured = true;
             peer.adopted = true;
-            // Native ReplicaManager::CreateReplica passes the node-supplied
-            // CurrentProgress into ReliableOperationSender's initial progress.
-            // Be stricter: an exact current native descriptor can attest only
-            // our already-completed prefix, and only for catch-up. Do not turn
-            // received/provider progress into a fresh application/write vote.
-            peer.native_catchup_prefix = native_status
-                .as_ref()
-                .and_then(|status| {
-                    status.configuration.iter().find(|native| {
-                        native.replica_id == id
-                            && native.incarnation == replica.incarnation
-                            && native.up
-                            && native.ready
-                            && native.role == replica.role
-                            && native.progress == replica.progress
-                            && native
-                                .address
-                                .parse::<Endpoint>()
-                                .is_ok_and(|address| same_endpoint(&address, &peer.endpoint))
-                    })
-                })
-                .map_or(0, |native| {
-                    native.progress.last.max(0).min(completed_prefix)
-                });
             if peer.build.as_ref().is_some_and(|build| {
                 !build.job
                     && build.reply.is_none()
@@ -2706,7 +2755,11 @@ impl Owner {
         if !self.peers.contains_key(&id) && self.peers.len() >= self.settings.connections {
             return Err(Error::ResourceLimit("peer sessions"));
         }
-        let horizon = self.queue.progress().committed.max(self.previous_quorum);
+        let horizon = if self.capabilities.supports_copy_until_latest_lsn {
+            self.queue.progress().assigned
+        } else {
+            self.queue.progress().committed.max(self.previous_quorum)
+        };
         if horizon > self.queue.progress().assigned {
             return Err(Error::Protocol("copy horizon beyond assigned history"));
         }
@@ -3238,7 +3291,12 @@ impl Owner {
                                 .insert(operation.sequence, Arc::new(charge.unwrap()));
                         }
                         Ok(false) => {}
-                        Err(Error::ResourceLimit(_)) => break,
+                        Err(error)
+                            if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull
+                                || matches!(error, Error::ResourceLimit("receive gap")) =>
+                        {
+                            break
+                        }
                         Err(error) => {
                             self.fail(error);
                             return;
@@ -3314,7 +3372,12 @@ impl Owner {
                         }
                     }
                     Ok(false) => {}
-                    Err(Error::ResourceLimit(_)) => return,
+                    Err(error)
+                        if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull
+                            || matches!(error, Error::ResourceLimit("receive gap")) =>
+                    {
+                        return
+                    }
                     Err(error) => {
                         self.fail(error);
                         return;
@@ -3942,10 +4005,10 @@ impl Owner {
                         })
                     })
         });
-        let ready_all = current.is_some_and(|progress| progress.quorum >= self.catch_up_fence)
-            && ready_quorum
-            && current
-                .is_some_and(|progress| progress.all_applied >= self.queue.progress().assigned);
+        // Native ALL is the CC all-apply frontier, not combined PC commitment
+        // or the WRITE must-catch-up constraint. CC<=1 resolves to latest.
+        let ready_all =
+            current.is_some_and(|progress| progress.all_applied >= self.queue.progress().assigned);
         let mut pending = Vec::new();
         for waiter in self.catchups.drain(..) {
             if waiter.cancellation.is_cancelled() {
@@ -3989,6 +4052,17 @@ impl Owner {
         if matches!(&control.kind, ControlKind::Epoch { role, .. } if *role != ReplicaRole::Primary)
             && self.role == ReplicaRole::Primary
         {
+            if matches!(
+                &control.kind,
+                ControlKind::Epoch {
+                    role: ReplicaRole::None,
+                    ..
+                }
+            ) && (self.replay_job
+                || self.dispositions.iter().any(|record| !record.is_finished()))
+            {
+                return;
+            }
             if self.peers.values().any(|peer| {
                 peer.build
                     .as_ref()
@@ -4011,6 +4085,39 @@ impl Owner {
         if !control.disposal.is_complete() {
             return;
         }
+        if matches!(
+            &control.kind,
+            ControlKind::Epoch {
+                role: ReplicaRole::Primary,
+                ..
+            }
+        ) && self.role != ReplicaRole::Primary
+            && control.drain_barrier.is_none()
+        {
+            if self.dispatched < boundary {
+                return;
+            }
+            // Successful dispatch EOS must precede the service processing/ACK
+            // drain: upper consumers may flush held ACKs only after EOS.
+            self.replication_tx.take();
+            self.copy_tx.take();
+        }
+        if self.role == ReplicaRole::Primary
+            && matches!(
+                &control.kind,
+                ControlKind::Epoch {
+                    role: ReplicaRole::None,
+                    ..
+                }
+            )
+        {
+            // Terminal retirement has no secondary queue or provider
+            // reconciliation to construct.
+            if let Err(error) = self.finish_control(Ok(JobValue::Retired)) {
+                self.fail(error);
+            }
+            return;
+        }
         if self.role != ReplicaRole::Primary && self.queue.progress().applied < boundary {
             return;
         }
@@ -4029,6 +4136,14 @@ impl Owner {
         };
         let admission_only = control.drain_barrier.is_none()
             && matches!(&control.kind, ControlKind::Epoch { role, .. } if *role != ReplicaRole::Primary);
+        if admission_only {
+            // Native secondary/role admission controls do not reconcile or
+            // compare the upper provider's independently copied log tail.
+            if let Err(error) = self.finish_control(Ok(JobValue::Admission)) {
+                self.fail(error);
+            }
+            return;
+        }
         let permit = match control.execution.take().map(Ok).unwrap_or_else(|| {
             self.shared.execution.reserve(
                 CallLane::Provider,
@@ -4062,11 +4177,9 @@ impl Owner {
                     biased;
                     _ = cancellation.cancelled() => Err(Error::Closed),
                     result = async {
-                        if admission_only {
-                            Ok(JobValue::Epoch(provider.get_last_committed_sequence_number()?))
-                        } else if let Some(epoch) = epoch {
+                        if let Some(epoch) = epoch {
                             provider.update_epoch(epoch, boundary, cancellation.clone()).await?;
-                            Ok(JobValue::Epoch(provider.get_last_committed_sequence_number()?))
+                            Ok(JobValue::Epoch)
                         } else {
                             let changed = provider.on_data_loss(cancellation.clone()).await?;
                             let progress = if changed { Some(provider.get_last_committed_sequence_number()?) } else { None };
@@ -4270,11 +4383,9 @@ impl Owner {
         }
         let value = result?;
         if let Some(control) = self.control.as_mut() {
-            if let Some((epoch, boundary)) = control.drain_barrier {
-                if !matches!(value, JobValue::Epoch(authoritative) if authoritative == boundary) {
-                    return Err(Error::Protocol(
-                        "provider drain barrier reconciliation mismatch",
-                    ));
+            if let Some((epoch, _)) = control.drain_barrier {
+                if !matches!(value, JobValue::Epoch) {
+                    return Err(Error::Protocol("provider drain barrier result mismatch"));
                 }
                 if control.cancellation.is_cancelled() {
                     return Err(Error::Protocol("provider drain barrier canceled"));
@@ -4301,10 +4412,17 @@ impl Owner {
                     boundary,
                     reply,
                 },
-                JobValue::Epoch(authoritative),
+                value @ (JobValue::Epoch | JobValue::Retired | JobValue::Admission),
             ) => {
-                if authoritative != boundary {
-                    let error = Error::Protocol("provider epoch reconciliation boundary mismatch");
+                if match value {
+                    JobValue::Epoch => role != ReplicaRole::Primary,
+                    JobValue::Retired => {
+                        self.role != ReplicaRole::Primary || role != ReplicaRole::None
+                    }
+                    JobValue::Admission => role == ReplicaRole::Primary,
+                    _ => unreachable!(),
+                } {
+                    let error = Error::Protocol("provider epoch control result mismatch");
                     let _ = reply.send(Err(error.clone()));
                     return Err(error);
                 }
@@ -4339,11 +4457,35 @@ impl Owner {
                     }
                     self.current = None;
                     self.previous = None;
-                    self.queue.reset(boundary)?;
+                    if role == ReplicaRole::None {
+                        self.queue.retire();
+                    } else {
+                        self.queue.reset(boundary)?;
+                    }
                     self.charges.clear();
                     self.dispatched = boundary;
                     self.secondary = None;
                     self.announced_completed = boundary;
+                    if matches!(
+                        role,
+                        ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+                    ) {
+                        let (replication_tx, replication_rx) =
+                            mpsc::channel(self.settings.provider_operations);
+                        let (copy_tx, copy_rx) = mpsc::channel(self.settings.provider_operations);
+                        let mut views = self.shared.streams.lock().unwrap();
+                        // Only the old role's views terminate; never revive a
+                        // receiver already handed to a previous consumer.
+                        *views = StreamViews {
+                            replication: Arc::new(OperationStream::new(replication_rx)),
+                            copy: Arc::new(OperationStream::new(copy_rx)),
+                        };
+                        self.replication_tx = Some(replication_tx);
+                        // Queue transfer is already copied/applied locally.
+                        drop(copy_tx);
+                        self.copy_tx = None;
+                        self.copy_done = true;
+                    }
                 }
                 if role == ReplicaRole::Primary {
                     if self.role != ReplicaRole::Primary {
@@ -4352,6 +4494,10 @@ impl Owner {
                         self.dispatched = boundary;
                     }
                 } else if matches!(role, ReplicaRole::None) {
+                    let ids: Vec<_> = self.peers.keys().copied().collect();
+                    for id in ids {
+                        self.retire_peer(id, Error::Closed);
+                    }
                     self.replication_tx.take();
                     self.copy_tx.take();
                     self.secondary = None;
@@ -4369,10 +4515,7 @@ impl Owner {
                 self.reconciled = true;
                 let _ = reply.send(Ok(()));
             }
-            (ControlKind::Barrier { epoch, boundary }, JobValue::Epoch(authoritative)) => {
-                if authoritative != boundary {
-                    return Err(Error::Protocol("provider barrier reconciliation mismatch"));
-                }
+            (ControlKind::Barrier { epoch, .. }, JobValue::Epoch) => {
                 self.provider_epoch = Some(epoch);
             }
             (ControlKind::Loss(reply), JobValue::Loss(changed, authoritative)) => {

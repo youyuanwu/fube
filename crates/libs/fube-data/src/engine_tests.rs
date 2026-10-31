@@ -4,8 +4,11 @@
 // Rust-only Fabric TCP source-contract fixtures; not native interoperability.
 
 use super::*;
+use crate as data_contract;
 #[path = "engine_disposal_tests.rs"]
 mod disposal_tests;
+#[path = "../tests/support/upper_log.rs"]
+pub(super) mod upper_log;
 async fn abort_owned(engine: &Arc<Engine>) {
     if engine
         .disposal_done
@@ -808,7 +811,7 @@ async fn copy_provider_error_panic_deadline_and_unavailable_history_fence_and_di
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn all_sixty_four_copy_callbacks_are_bounded_cancel_cleanup_joins_and_control_is_reserved() {
+async fn all_sixty_four_copy_callbacks_allow_callback_free_terminal_retirement_and_join_cleanup() {
     let stream = Arc::new(FailureStream {
         mode: 3,
         active: Arc::new(AtomicUsize::new(0)),
@@ -846,7 +849,6 @@ async fn all_sixty_four_copy_callbacks_are_bounded_cancel_cleanup_joins_and_cont
     let template = descriptor(&p);
     let mut builds = JoinSet::new();
     let mut replicas = Vec::new();
-    let mut cancellations = Vec::new();
     for id in 2..=65 {
         let destination = endpoint(&network, partition, id);
         let mut replica = template.clone();
@@ -858,7 +860,6 @@ async fn all_sixty_four_copy_callbacks_are_bounded_cancel_cleanup_joins_and_cont
         let owned_replica = replica.clone();
         builds.spawn(async move { owner.build_replica(owned_replica, owned_cancellation).await });
         replicas.push((replica, destination));
-        cancellations.push(cancellation);
     }
     timeout(std::time::Duration::from_secs(5), async {
         while stream.active.load(Ordering::Acquire) < 64 {
@@ -883,26 +884,18 @@ async fn all_sixty_four_copy_callbacks_are_bounded_cancel_cleanup_joins_and_cont
     excess.replica_id = 66;
     excess.address = endpoint(&network, partition, 66).to_string();
     assert!(p.build_replica(excess, cancel()).await.is_err());
-    // The new shared execution budget cannot admit a 65th independent user
-    // callback. Reject before owner mutation; reserved owner/control processing
-    // must still cancel and dispose one of the existing 64 callbacks.
+    // Actual provider callbacks still need a slot; callback-free retirement
+    // must cancel and join the callbacks occupying all of those slots.
     assert!(matches!(
         p.on_data_loss(cancel()).await,
         Err(Error::ResourceLimit(_))
     ));
     assert_eq!(stream.active.load(Ordering::Acquire), 64);
-    cancellations[0].cancel();
-    p.remove_replica(
-        replicas[0].0.clone(),
-        ReplicaRemoval::BuildRetryCleanup,
-        cancel(),
-    )
-    .await
-    .unwrap();
-    until(|| stream.active.load(Ordering::Acquire) == 63).await;
-    assert_eq!(stream.disposed.load(Ordering::Acquire), 1);
-    assert!(!p.on_data_loss(cancel()).await.unwrap());
-    abort_owned(&p).await;
+    p.change_role(EPOCH, ReplicaRole::None, cancel())
+        .await
+        .unwrap();
+    assert_eq!(p.snapshot().role, ReplicaRole::None);
+    assert!(p.snapshot().peers.is_empty());
     assert_eq!(stream.active.load(Ordering::Acquire), 0);
     assert_eq!(stream.disposed.load(Ordering::Acquire), 64);
     assert_eq!(
@@ -912,6 +905,7 @@ async fn all_sixty_four_copy_callbacks_are_bounded_cancel_cleanup_joins_and_cont
     while let Some(result) = builds.join_next().await {
         assert!(result.unwrap().is_err());
     }
+    abort_owned(&p).await;
     network.shutdown();
 }
 
@@ -1036,6 +1030,20 @@ async fn promotion_drains_contiguous_received_before_discarding_only_out_of_orde
     assert_eq!(operation.sequence, 66);
     assert_eq!(operation.epoch, NEXT_EPOCH);
     assert!(provider.epochs.lock().unwrap().contains(&(NEXT_EPOCH, 65)));
+    assert!(
+        timeout(std::time::Duration::from_secs(1), stream.next(cancel()))
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none(),
+        "frozen dispatch EOS must precede the last service ACK"
+    );
+    assert!(
+        timeout(std::time::Duration::from_millis(40), &mut promotion)
+            .await
+            .is_err()
+    );
+    assert_eq!(secondary.snapshot().progress.applied, 65);
     provider.last.store(66, Ordering::Release);
     operation.acknowledge().unwrap();
     drop(operation);
@@ -1060,6 +1068,86 @@ async fn promotion_drains_contiguous_received_before_discarding_only_out_of_orde
     network.shutdown();
     drainer.abort();
     let _ = drainer.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_and_nonempty_role_cycles_supply_fresh_streams_on_the_same_engine_without_recopy() {
+    for nonempty in [false, true] {
+        let provider = Arc::new(Provider::default());
+        let (s, network, primary, _incoming) = initialized_raw_secondary(provider.clone()).await;
+        let old_copy = s.copy_stream();
+        let old_stream = s.replication_stream();
+        let held = if nonempty {
+            raw_send(&network, &primary, &s, replication(EPOCH, EPOCH, 1, 1));
+            let operation = old_stream.next(cancel()).await.unwrap().unwrap();
+            Some(operation)
+        } else {
+            None
+        };
+        let promotion = s.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel());
+        tokio::pin!(promotion);
+        // Poll the real role change while the consumer waits for successful
+        // EOS; ACK deliberately remains withheld until after EOS.
+        let promoted = tokio::select! {
+            result = &mut promotion => {
+                assert!(!nonempty);
+                result.unwrap();
+                true
+            }
+            eos = old_stream.next(cancel()) => {
+                assert!(eos.unwrap().is_none());
+                false
+            },
+        };
+        if let Some(operation) = &held {
+            assert_eq!(s.snapshot().progress.applied, 0);
+            assert!(
+                timeout(std::time::Duration::from_millis(40), &mut promotion)
+                    .await
+                    .is_err()
+            );
+            provider.last.store(1, Ordering::Release);
+            operation.acknowledge().unwrap();
+            promotion.await.unwrap();
+        } else if !promoted {
+            promotion.await.unwrap();
+        }
+        assert!(old_stream.next(cancel()).await.unwrap().is_none());
+        assert!(old_copy.next(cancel()).await.unwrap().is_none());
+        let prefix = i64::from(nonempty);
+        s.change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
+            .await
+            .unwrap();
+        let fresh = s.replication_stream();
+        assert!(!Arc::ptr_eq(&old_stream, &fresh));
+        assert!(!Arc::ptr_eq(&old_copy, &s.copy_stream()));
+        assert!(s.copy_stream().next(cancel()).await.unwrap().is_none());
+        assert!(s.snapshot().copy_done);
+        assert_eq!(s.snapshot().progress.received, prefix);
+        raw_send(
+            &network,
+            &primary,
+            &s,
+            replication(NEXT_EPOCH, NEXT_EPOCH, prefix + 1, 2),
+        );
+        let operation = fresh.next(cancel()).await.unwrap().unwrap();
+        assert_eq!(operation.sequence, prefix + 1);
+        if let Some(old) = &held {
+            assert!(
+                old.acknowledge().is_err(),
+                "retired captures cannot ACK a new generation"
+            );
+        }
+        assert_eq!(s.snapshot().progress.applied, prefix);
+        provider.last.store(prefix + 1, Ordering::Release);
+        operation.acknowledge().unwrap();
+        until(|| s.snapshot().progress.applied == prefix + 1).await;
+        assert!(old_stream.next(cancel()).await.unwrap().is_none());
+        drop(held);
+        drop(operation);
+        abort_owned(&s).await;
+        network.shutdown();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1661,7 +1749,7 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
                     Ok(write) => break write,
                     // Retry only pre-admission backpressure while the peer is
                     // still unacknowledged, never an accepted operation.
-                    Err(Error::ResourceLimit("engine operation budget")) => {
+                    Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull => {
                         tokio::task::yield_now().await;
                     }
                     Err(error) => panic!("write admission after replay failed: {error}"),
@@ -1809,6 +1897,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
             Some(provider.clone()),
             Settings::default(),
             Some(view.clone()),
+            crate::extensions::StateProviderCapabilities::default(),
         )
         .unwrap();
         engines.push(engine);
@@ -1950,7 +2039,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_completed_prefix_attestation_is_not_a_new_write_or_all_ack() {
+async fn diagnostic_prefix_cannot_initialize_sender_or_authorize_new_writes() {
     let partition = Uuid::new_v4();
     let view = Arc::new(SourceNativeView(Mutex::new(Err(Error::Closed))));
     let provider = Arc::new(Provider {
@@ -1986,14 +2075,13 @@ async fn native_completed_prefix_attestation_is_not_a_new_write_or_all_ack() {
     p.update_current_configuration(configuration(vec![peer], true, 2), cancel())
         .await
         .unwrap();
-    timeout(
-        std::time::Duration::from_secs(1),
+    assert!(timeout(
+        std::time::Duration::from_millis(50),
         p.wait_for_catch_up(CatchUpMode::Write, cancel()),
     )
     .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(p.snapshot().peers[0].native_catchup_prefix, 20);
+    .is_err());
+    assert_eq!(p.snapshot().peers[0].native_catchup_prefix, 0);
     assert_eq!(p.snapshot().peers[0].applied, 0);
     assert!(timeout(
         std::time::Duration::from_millis(50),
@@ -2298,8 +2386,8 @@ impl IOperationDataStream for Empty {
 }
 
 #[derive(Default)]
-struct Provider {
-    last: AtomicI64,
+pub(super) struct Provider {
+    pub(super) last: AtomicI64,
     epochs: Mutex<Vec<(Epoch, i64)>>,
     horizons: Mutex<Vec<i64>>,
     epoch_delay: std::time::Duration,
@@ -2307,6 +2395,15 @@ struct Provider {
     checkpoint_times: Mutex<Vec<Instant>>,
     checkpoint: Mutex<Option<ReplayOperation>>,
     checkpoint_gate: Mutex<Option<Arc<Semaphore>>>,
+}
+
+impl Provider {
+    pub(super) fn with_initial(last: i64) -> Self {
+        Self {
+            last: AtomicI64::new(last),
+            ..Self::default()
+        }
+    }
 }
 
 impl ReplayCheckpointProvider for Provider {
@@ -2390,6 +2487,7 @@ fn engine_with_replay<T: IStateProvider + ReplayCheckpointProvider>(
         Some(provider),
         settings,
         None,
+        crate::extensions::StateProviderCapabilities::default(),
     )
     .unwrap()
 }
@@ -3104,7 +3202,7 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
     p.update_catch_up_configuration(required, previous.clone(), cancel())
         .await
         .unwrap();
-    for mode in [CatchUpMode::Write, CatchUpMode::All] {
+    for mode in [CatchUpMode::Write] {
         assert!(timeout(
             std::time::Duration::from_millis(40),
             p.wait_for_catch_up(mode, cancel())
@@ -3112,8 +3210,11 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
         .await
         .is_err());
     }
+    p.wait_for_catch_up(CatchUpMode::All, cancel())
+        .await
+        .unwrap();
     let mut unavailable = previous.clone();
-    unavailable.write_quorum = 2;
+    unavailable.write_quorum = 3;
     p.update_catch_up_configuration(current.clone(), unavailable, cancel())
         .await
         .unwrap();
@@ -3188,12 +3289,9 @@ async fn joint_quorums_previous_one_excludes_primary_and_catchup_is_not_write_co
     )
     .await
     .is_err());
-    assert!(timeout(
-        std::time::Duration::from_millis(40),
-        p.wait_for_catch_up(CatchUpMode::All, cancel())
-    )
-    .await
-    .is_err());
+    p.wait_for_catch_up(CatchUpMode::All, cancel())
+        .await
+        .unwrap();
     // A native idle cleanup cannot remove a configured member to manufacture
     // a smaller PC, nor can a quorum larger than its available PC self-commit.
     p.remove_replica(remote.clone(), ReplicaRemoval::Idle, cancel())
@@ -3201,7 +3299,7 @@ async fn joint_quorums_previous_one_excludes_primary_and_catchup_is_not_write_co
         .unwrap();
     p.update_catch_up_configuration(
         configuration(vec![], true, 1),
-        configuration(vec![remote.clone()], false, 2),
+        configuration(vec![remote.clone()], false, 3),
         cancel(),
     )
     .await
@@ -3340,7 +3438,7 @@ async fn bounded_admission_and_callback_capture_exhaustion_preserve_control_capa
     assert!(matches!(
         p.submit(OperationData::new(vec![vec![3]]).unwrap(), cancel())
             .await,
-        Err(Error::ResourceLimit(_))
+        Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull
     ));
     assert_eq!(p.snapshot().progress.assigned, 2);
     let stream = s.replication_stream();
@@ -3389,26 +3487,7 @@ fn raw_send(transport: &PeerTransport, from: &Endpoint, to: &Engine, body: Body)
 async fn initialized_raw_secondary(
     provider: Arc<dyn IStateProvider>,
 ) -> (Arc<Engine>, PeerTransport, Endpoint, Incoming) {
-    let partition = Uuid::new_v4();
-    let secondary = engine(partition, 2, provider);
-    secondary
-        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
-        .await
-        .unwrap();
-    let (transport, incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
-    let primary = endpoint(&transport, partition, 1);
-    transport.register_peer(&secondary.endpoint()).unwrap();
-    raw_send(
-        &transport,
-        &primary,
-        &secondary,
-        Body::StartCopy {
-            epoch: EPOCH,
-            target: 2,
-            start: 1,
-        },
-    );
-    until(|| secondary.snapshot().epoch == Some(EPOCH)).await;
+    let (secondary, transport, primary, incoming) = raw_secondary_started(provider, 1).await;
     // The independently sequenced empty EOS is not delivered as provider data.
     raw_send(
         &transport,
@@ -3426,6 +3505,348 @@ async fn initialized_raw_secondary(
     (secondary, transport, primary, incoming)
 }
 
+async fn raw_secondary_started(
+    provider: Arc<dyn IStateProvider>,
+    start: i64,
+) -> (Arc<Engine>, PeerTransport, Endpoint, Incoming) {
+    let partition = Uuid::new_v4();
+    let secondary = engine(partition, 2, provider);
+    secondary
+        .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
+        .await
+        .unwrap();
+    let (transport, incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let primary = endpoint(&transport, partition, 1);
+    transport.register_peer(&secondary.endpoint()).unwrap();
+    raw_send(
+        &transport,
+        &primary,
+        &secondary,
+        Body::StartCopy {
+            epoch: EPOCH,
+            target: 2,
+            start,
+        },
+    );
+    until(|| {
+        secondary.snapshot().observed_primary.is_some()
+            && secondary.snapshot().progress.received == start - 1
+    })
+    .await;
+    (secondary, transport, primary, incoming)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extended_upper100_lower90_duplicate_epoch_never_reconciles_or_gets_tail_and_overlap_drains(
+) {
+    let upper = upper_log::UpperLog::new(EPOCH, 1);
+    let source = upper_log::UpperLog::new(EPOCH, 100);
+    let (s, network, primary, _incoming) = raw_secondary_started(upper.clone(), 91).await;
+    raw_send(
+        &network,
+        &primary,
+        &s,
+        Body::Copy {
+            epoch: EPOCH,
+            target: 2,
+            sequence: 1,
+            data: source.snapshot().to_segments(),
+            last: false,
+        },
+    );
+    raw_send(
+        &network,
+        &primary,
+        &s,
+        Body::Copy {
+            epoch: EPOCH,
+            target: 2,
+            sequence: 2,
+            data: vec![],
+            last: true,
+        },
+    );
+    let copy = s.copy_stream().next(cancel()).await.unwrap().unwrap();
+    upper.apply_snapshot(&copy.data);
+    assert_eq!(upper.tail(), 100);
+    assert_eq!(s.snapshot().progress.received, 90);
+    assert_eq!(
+        s.snapshot().progress.applied,
+        0,
+        "copy-in-progress diagnostics do not expose an applied prefix yet"
+    );
+    let getters = upper.getters.load(Ordering::Acquire);
+    let updates = upper.updates.load(Ordering::Acquire);
+    assert!(!s.snapshot().copy_done);
+    s.update_epoch(EPOCH, cancel()).await.unwrap();
+    assert_eq!(upper.getters.load(Ordering::Acquire), getters);
+    assert_eq!(upper.updates.load(Ordering::Acquire), updates);
+    assert_eq!(upper.tail(), 100);
+    copy.acknowledge().unwrap();
+    drop(copy);
+    until(|| s.snapshot().copy_done).await;
+    s.change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
+        .await
+        .unwrap();
+    assert_eq!(
+        upper.getters.load(Ordering::Acquire),
+        getters,
+        "role admission must not equate independent tails"
+    );
+    let stream = s.replication_stream();
+    let mut held = Vec::new();
+    for sequence in 91..=100 {
+        raw_send(
+            &network,
+            &primary,
+            &s,
+            replication(EPOCH, EPOCH, sequence, sequence as u8),
+        );
+        let operation = stream.next(cancel()).await.unwrap().unwrap();
+        upper.append(sequence, &operation.data); // validates the copied bytes, not a new log record
+        held.push(operation);
+    }
+    assert_eq!(
+        s.snapshot().progress.applied,
+        90,
+        "upper copy is not a lower service ACK"
+    );
+    s.update_epoch(EPOCH, cancel()).await.unwrap();
+    assert_eq!(upper.getters.load(Ordering::Acquire), getters);
+    assert_eq!(upper.updates.load(Ordering::Acquire), updates);
+    for operation in held {
+        operation.acknowledge().unwrap();
+    }
+    until(|| s.snapshot().progress.applied == 100).await;
+    assert_eq!(upper.tail(), 100);
+    assert!(s.snapshot().fault.is_none());
+    abort_owned(&s).await;
+    network.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn represented_provider_epochs_preserve_upper100_lower90_for_promotion_and_original_barriers()
+{
+    for promotion in [false, true] {
+        let upper = upper_log::UpperLog::new(EPOCH, 1);
+        let source = upper_log::UpperLog::new(NEXT_EPOCH, 100);
+        let (s, network, primary, _incoming) = raw_secondary_started(upper.clone(), 91).await;
+        for (sequence, data, last) in [
+            (1, source.snapshot().to_segments(), false),
+            (2, vec![], true),
+        ] {
+            raw_send(
+                &network,
+                &primary,
+                &s,
+                Body::Copy {
+                    epoch: EPOCH,
+                    target: 2,
+                    sequence,
+                    data,
+                    last,
+                },
+            );
+        }
+        let copy = s.copy_stream().next(cancel()).await.unwrap().unwrap();
+        upper.apply_snapshot(&copy.data);
+        copy.acknowledge().unwrap();
+        drop(copy);
+        until(|| s.snapshot().copy_done).await;
+        let getters = upper.getters.load(Ordering::Acquire);
+        let stream = s.replication_stream();
+        if promotion {
+            s.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
+                .await
+                .unwrap();
+            assert!(stream.next(cancel()).await.unwrap().is_none());
+            assert_eq!(s.snapshot().progress.assigned, 90);
+            assert_eq!(s.snapshot().progress.applied, 90);
+        } else {
+            raw_send(
+                &network,
+                &primary,
+                &s,
+                replication(NEXT_EPOCH, NEXT_EPOCH, 91, 91),
+            );
+            let operation = timeout(std::time::Duration::from_secs(2), stream.next(cancel()))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(operation.sequence, 91);
+            upper.append(operation.sequence, &operation.data);
+            operation.acknowledge().unwrap();
+            drop(operation);
+            until(|| s.snapshot().progress.applied == 91).await;
+        }
+        assert_eq!(upper.updates.load(Ordering::Acquire), 1);
+        assert_eq!(upper.getters.load(Ordering::Acquire), getters);
+        assert_eq!(upper.tail(), 100);
+        assert!(s.snapshot().fault.is_none());
+        abort_owned(&s).await;
+        network.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn genuinely_new_idle_copy_control_and_original_epoch_mismatch_keep_real_errors() {
+    for original_barrier in [false, true] {
+        let upper = upper_log::UpperLog::new(EPOCH, 1);
+        let (s, network, primary, _incoming) = raw_secondary_started(upper.clone(), 91).await;
+        let image = upper_log::UpperLog::new(EPOCH, 100).snapshot();
+        raw_send(
+            &network,
+            &primary,
+            &s,
+            Body::Copy {
+                epoch: EPOCH,
+                target: 2,
+                sequence: 1,
+                data: image.to_segments(),
+                last: false,
+            },
+        );
+        raw_send(
+            &network,
+            &primary,
+            &s,
+            Body::Copy {
+                epoch: EPOCH,
+                target: 2,
+                sequence: 2,
+                data: vec![],
+                last: true,
+            },
+        );
+        let operation = s.copy_stream().next(cancel()).await.unwrap().unwrap();
+        upper.apply_snapshot(&operation.data);
+        if original_barrier {
+            operation.acknowledge().unwrap();
+            until(|| s.snapshot().copy_done).await;
+            raw_send(
+                &network,
+                &primary,
+                &s,
+                replication(NEXT_EPOCH, NEXT_EPOCH, 91, 91),
+            );
+            until(|| s.snapshot().fault.is_some()).await;
+            assert_eq!(upper.updates.load(Ordering::Acquire), 1);
+            assert!(s
+                .snapshot()
+                .fault
+                .unwrap()
+                .contains("upper epoch boundary mismatch"));
+        } else {
+            assert!(s.update_epoch(NEXT_EPOCH, cancel()).await.is_err());
+            assert_eq!(upper.updates.load(Ordering::Acquire), 0);
+            assert!(operation.acknowledge().is_err());
+        }
+        assert_eq!(upper.tail(), 100);
+        drop(operation);
+        abort_owned(&s).await;
+        network.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn latest_copy_capability_uses_assigned_horizon_and_real_finish_tail_ack() {
+    let partition = Uuid::new_v4();
+    let source = Arc::new(SnapshotProvider::default());
+    let p = Engine::bind_with_capabilities(
+        Actor {
+            partition,
+            replica: 1,
+            incarnation: Uuid::new_v4(),
+        },
+        "127.0.0.1:0",
+        source.clone(),
+        None,
+        Settings::default(),
+        None,
+        crate::extensions::StateProviderCapabilities {
+            supports_copy_until_latest_lsn: true,
+        },
+    )
+    .unwrap();
+    let target = Arc::new(Provider::default());
+    let s = engine(partition, 2, target.clone());
+    p.change_role(EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    s.change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
+        .await
+        .unwrap();
+    let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let mut remote = descriptor(&s);
+    remote.replica_id = 3;
+    remote.address = endpoint(&network, partition, 3).to_string();
+    p.update_current_configuration(configuration(vec![remote], true, 2), cancel())
+        .await
+        .unwrap();
+    for sequence in 1..=100 {
+        let write = p
+            .submit(
+                OperationData::new(vec![vec![sequence as u8]]).unwrap(),
+                cancel(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(write.sequence, sequence);
+        source.record(sequence);
+    }
+    assert_eq!(p.snapshot().progress.committed, 0);
+    source.snapshots.store(true, Ordering::Release);
+    let build = p.build_replica(descriptor(&s), cancel());
+    tokio::pin!(build);
+    tokio::select! {
+        result = &mut build => panic!("build before copy ACK: {result:?}"),
+        _ = until(|| source.requested.lock().unwrap().as_slice() == [100]) => {},
+    }
+    assert_eq!(
+        s.snapshot().progress.received,
+        100,
+        "StartCopy uses assigned+1, not committed+1"
+    );
+    let copy = s.copy_stream().next(cancel()).await.unwrap().unwrap();
+    assert_eq!(
+        i64::from_le_bytes(copy.data.segments()[0][..8].try_into().unwrap()),
+        100
+    );
+    target.last.store(100, Ordering::Release);
+    copy.acknowledge().unwrap();
+    drop(copy);
+    let write = p
+        .submit(OperationData::new(vec![vec![101]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    assert_eq!(write.sequence, 101);
+    source.record(101);
+    source.eos.add_permits(1);
+    tokio::select! {
+        result = &mut build => panic!("build before finish-tail ACK: {result:?}"),
+        _ = until(|| p.snapshot().peers.iter().any(|peer| peer.replica == 2 && peer.copy_finish == Some(101))) => {},
+    }
+    let operation = s
+        .replication_stream()
+        .next(cancel())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.sequence, 101);
+    assert!(timeout(std::time::Duration::from_millis(40), &mut build)
+        .await
+        .is_err());
+    target.last.store(101, Ordering::Release);
+    operation.acknowledge().unwrap();
+    drop(operation);
+    build.await.unwrap();
+    assert_eq!(source.requested.lock().unwrap().as_slice(), [100]);
+    abort_owned(&p).await;
+    abort_owned(&s).await;
+    network.shutdown();
+}
+
 fn replication(epoch: Epoch, original: Epoch, sequence: i64, data: u8) -> Body {
     Body::Replication {
         primary_epoch: epoch,
@@ -3439,6 +3860,66 @@ fn replication(epoch: Epoch, original: Epoch, sequence: i64, data: u8) -> Body {
         batch_end: sequence,
         completed: 0,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_copy_and_replication_gap_rejections_leave_engine_live_for_valid_retry() {
+    let provider = Arc::new(Provider::default());
+    let (s, network, primary, _incoming) = raw_secondary_started(provider.clone(), 1).await;
+    for sequence in [1025, 1] {
+        raw_send(
+            &network,
+            &primary,
+            &s,
+            Body::Copy {
+                epoch: EPOCH,
+                target: 2,
+                sequence,
+                data: vec![vec![1]],
+                last: false,
+            },
+        );
+    }
+    raw_send(
+        &network,
+        &primary,
+        &s,
+        Body::Copy {
+            epoch: EPOCH,
+            target: 2,
+            sequence: 2,
+            data: vec![],
+            last: true,
+        },
+    );
+    let copy = s.copy_stream().next(cancel()).await.unwrap().unwrap();
+    assert_eq!(copy.sequence, 1);
+    copy.acknowledge().unwrap();
+    drop(copy);
+    until(|| s.snapshot().copy_done).await;
+    for sequence in [1025, 1] {
+        raw_send(
+            &network,
+            &primary,
+            &s,
+            replication(EPOCH, EPOCH, sequence, 1),
+        );
+    }
+    let operation = s
+        .replication_stream()
+        .next(cancel())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.sequence, 1);
+    provider.last.store(1, Ordering::Release);
+    operation.acknowledge().unwrap();
+    until(|| s.snapshot().progress.applied == 1).await;
+    assert!(s.snapshot().fault.is_none());
+    assert_eq!(s.snapshot().progress.assigned, 1);
+    drop(operation);
+    abort_owned(&s).await;
+    network.shutdown();
 }
 
 struct CallbackGuard {
@@ -3746,8 +4227,11 @@ async fn original_epoch_barrier_waits_for_explicit_apply_then_provider_disposal(
             .await
             .is_err()
     );
-    // No second epoch/loss callback is admitted behind an active barrier.
-    assert!(secondary.update_epoch(next, cancel()).await.is_err());
+    // The established admission duplicate completes without admitting another
+    // provider callback behind the active original-operation barrier.
+    secondary.update_epoch(next, cancel()).await.unwrap();
+    assert_eq!(provider.active.load(Ordering::Acquire), 1);
+    assert_eq!(provider.entered.load(Ordering::Acquire), initial_calls + 1);
     provider.release.notify_one();
     let second = timeout(std::time::Duration::from_secs(2), stream.next(cancel()))
         .await
@@ -4207,6 +4691,36 @@ async fn rejected_demotion_preserves_accepted_completion_for_drain_and_retry() {
     assert_eq!(ap.snapshot().results, bp.snapshot().results);
     abort_owned(&a).await;
     abort_owned(&b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_primary_none_cancels_pending_without_commit_or_provider_reconciliation() {
+    let (p, s, provider) = pair().await;
+    p.update_current_configuration(configuration(vec![descriptor(&s)], true, 2), cancel())
+        .await
+        .unwrap();
+    let mut accepted = p
+        .submit(OperationData::new(vec![vec![1]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    until(|| s.snapshot().progress.received == 1).await;
+    assert_eq!(p.snapshot().progress.committed, 0);
+    // The local provider has not applied the write either; terminal close must
+    // not impose equality with assigned or call reconciliation to invent it.
+    assert_eq!(provider.last.load(Ordering::Acquire), 0);
+    p.change_role(NEXT_EPOCH, ReplicaRole::None, cancel())
+        .await
+        .unwrap();
+    assert!(accepted.wait(cancel()).await.is_err());
+    let snapshot = p.snapshot();
+    assert_eq!(snapshot.role, ReplicaRole::None);
+    assert_eq!(snapshot.progress.assigned, 1);
+    assert_eq!(snapshot.progress.committed, 0);
+    assert_eq!(snapshot.progress.retained_operations, 0);
+    assert!(snapshot.peers.is_empty());
+    assert_eq!(provider.last.load(Ordering::Acquire), 0);
+    abort_owned(&p).await;
+    abort_owned(&s).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4948,7 +5462,7 @@ async fn outgoing_budget_repro_requires_eos_or_explicit_preassignment_write_reje
             assert_eq!(write.wait(cancel()).await.unwrap(), 1);
             Some(write)
         }
-        Err(Error::ResourceLimit(_)) => {
+        Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull => {
             assert_eq!(p.snapshot().progress.assigned, 0);
             assert_eq!(p.snapshot().progress.committed, 0);
             None
@@ -5076,7 +5590,7 @@ async fn outgoing_copy_and_real_idle_ack_progress_with_admitted_or_rejected_live
                 assert_eq!(p.snapshot().progress.completed, 0);
                 1
             }
-            Err(Error::ResourceLimit(_)) => {
+            Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull => {
                 assert!(!admits);
                 assert_eq!(p.snapshot().progress.assigned, 0);
                 assert_eq!(p.snapshot().progress.committed, 0);
@@ -5148,6 +5662,38 @@ async fn outgoing_copy_and_real_idle_ack_progress_with_admitted_or_rejected_live
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_primary_permanent_copy_headroom_rejection_is_not_retriable_queue_full() {
+    let partition = Uuid::new_v4();
+    let provider = Arc::new(Provider::default());
+    let settings = Settings {
+        operation_bytes: 2048,
+        operation_segments: 1,
+        queue_bytes: 4096,
+        ..Settings::default()
+    };
+    let p = engine_with_settings(partition, 1, provider.clone(), settings);
+    initial_primary(&p).await;
+    let data = OperationData::new(vec![vec![7; 2000]]).unwrap();
+    for _ in 0..2 {
+        let error = p
+            .submit(data.clone(), cancel())
+            .await
+            .err()
+            .expect("permanent primary headroom cannot be recovered by retry");
+        assert_eq!(error.kind(), fube_runtime::ErrorKind::ResourceExhausted);
+        assert_eq!(p.snapshot().progress.assigned, 0);
+        assert_eq!(p.snapshot().owned_bytes, 0);
+    }
+    let mut accepted = p
+        .submit(OperationData::new(vec![vec![1]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    provider.last.store(accepted.sequence, Ordering::Release);
+    assert_eq!(accepted.wait(cancel()).await.unwrap(), 1);
+    abort_owned(&p).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn outgoing_future_copy_headroom_survives_concurrent_build_and_write_admission() {
     let partition = Uuid::new_v4();
     let source = Arc::new(SnapshotProvider::default());
@@ -5198,7 +5744,7 @@ async fn outgoing_future_copy_headroom_survives_concurrent_build_and_write_admis
     // cannot consume the next copy slot, even before a future build is known.
     assert!(matches!(
         p.submit(data.clone(), cancel()).await,
-        Err(Error::ResourceLimit(_))
+        Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull
     ));
     assert_eq!(p.snapshot().progress.assigned, 1);
     assert_eq!(p.snapshot().owned_bytes, data.retained_bytes());
@@ -5215,7 +5761,7 @@ async fn outgoing_future_copy_headroom_survives_concurrent_build_and_write_admis
             for _ in 0..32 {
                 assert!(matches!(
                     owner.submit(data.clone(), cancel()).await,
-                    Err(Error::ResourceLimit(_))
+                    Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull
                 ));
                 let snapshot = owner.snapshot();
                 assert!(snapshot.owned_operations <= settings.queue_operations);
@@ -5653,4 +6199,84 @@ async fn stream_shutdown_wakes_pending_polls_and_linearizes_concurrent_publicati
     assert_eq!(b.snapshot().owned_operations, 0);
     assert_eq!(b.snapshot().owned_bytes, 0);
     abort_owned(&a).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_none_cancels_and_joins_running_optional_replay_without_committing_pending_tail() {
+    let partition = Uuid::new_v4();
+    let provider = Arc::new(Provider {
+        last: AtomicI64::new(20),
+        checkpoint_gate: Mutex::new(Some(Arc::new(Semaphore::new(0)))),
+        ..Provider::default()
+    });
+    let p = engine_with_replay(partition, 1, provider.clone(), Settings::default());
+    p.change_role(EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let remote = endpoint(&network, partition, 2);
+    let mut descriptor = descriptor(&p);
+    descriptor.replica_id = 2;
+    descriptor.address = remote.to_string();
+    p.update_current_configuration(configuration(vec![descriptor], true, 2), cancel())
+        .await
+        .unwrap();
+    until(|| {
+        provider.checkpoint_calls.load(Ordering::Acquire) == 1
+            && p.snapshot().provider_callbacks == 1
+    })
+    .await;
+    let mut pending = p
+        .submit(OperationData::new(vec![vec![21]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    timeout(
+        std::time::Duration::from_secs(1),
+        p.change_role(NEXT_EPOCH, ReplicaRole::None, cancel()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(pending.wait(cancel()).await.is_err());
+    assert_eq!(p.snapshot().progress.assigned, 21);
+    assert_eq!(p.snapshot().progress.committed, 20);
+    assert_eq!(p.snapshot().provider_callbacks, 0);
+    assert_eq!(p.snapshot().owned_operations, 0);
+    assert_eq!(provider.last.load(Ordering::Acquire), 20);
+    assert!(p.snapshot().fault.is_none());
+    abort_owned(&p).await;
+    network.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn current_quorum_one_releases_and_all_catches_up_without_remote_acks_or_idle_owner() {
+    let partition = Uuid::new_v4();
+    let provider = Arc::new(Provider::default());
+    let p = engine(partition, 1, provider.clone());
+    p.change_role(EPOCH, ReplicaRole::Primary, cancel())
+        .await
+        .unwrap();
+    let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let mut remote = descriptor(&p);
+    remote.replica_id = 2;
+    remote.address = endpoint(&network, partition, 2).to_string();
+    p.update_current_configuration(configuration(vec![remote], true, 1), cancel())
+        .await
+        .unwrap();
+    let mut write = p
+        .submit(OperationData::new(vec![vec![1]]).unwrap(), cancel())
+        .await
+        .unwrap();
+    provider.last.store(1, Ordering::Release);
+    assert_eq!(write.wait(cancel()).await.unwrap(), 1);
+    p.wait_for_catch_up(CatchUpMode::All, cancel())
+        .await
+        .unwrap();
+    until(|| p.snapshot().progress.retained_operations == 0).await;
+    assert_eq!(p.snapshot().progress.completed, 1);
+    assert_eq!(p.snapshot().peers[0].received, 0);
+    assert_eq!(p.snapshot().peers[0].applied, 0);
+    assert_eq!(p.snapshot().peers[0].copy_horizon, None);
+    abort_owned(&p).await;
+    network.shutdown();
 }
