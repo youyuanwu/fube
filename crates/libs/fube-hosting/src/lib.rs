@@ -2,7 +2,8 @@
 //! `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
 //!
 //! This serialized, explicitly driven model owns no processes, sockets, leases,
-//! factories or real package usage. Success is a registration fact, not serving
+//! factories. H2 [`Residency`] supplies actual admitted accounting, not deployment.
+//! Success is a registration fact, not serving
 //! authority. Public processors and their split table/state steps are distinct.
 //! Owned outputs are delivered by the caller, outside the core.
 //!
@@ -37,8 +38,9 @@
 //!
 //! [`RegistrationLookup`], [`PackageUsage`], [`PackageLifecycle`] and
 //! [`HostingEventSource`] document the narrow native-derived node boundary.
-//! Contract definitions do not enable H2–H4. Usage/lifecycle have no supplied
-//! implementation; H1 model premises are not production operation inputs.
+//! H2 usage and [`PackageScheduling`] have a deterministic implementation;
+//! physical lifecycle remains definition-only. H1 model premises are not
+//! production operation inputs.
 //! Only [`H1LookupAdapter`] supplies lookup and [`Hosting`] supplies typed
 //! owned event drains. Node composition, not this crate, projects outputs to RA.
 //!
@@ -96,6 +98,7 @@ mod host;
 mod identity;
 mod lookup;
 mod model;
+mod residency;
 mod runtime;
 mod types;
 
@@ -107,5 +110,6 @@ pub use host::*;
 pub use identity::*;
 pub use lookup::*;
 pub use model::*;
+pub use residency::*;
 pub use runtime::*;
 pub use types::*;
