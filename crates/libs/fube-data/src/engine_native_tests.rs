@@ -361,6 +361,168 @@ async fn corrective_real_reserved_entry_deadline_branch_uses_current_authority()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_log_loans_restore_rejection_and_survive_full_ordinary_queue() {
+    use crate::extensions::ReservedLogReplication;
+    use crate::IStateReplicator;
+    for root in [false, true] {
+        let settings = Settings {
+            queue_operations: 4,
+            operation_bytes: 4096,
+            operation_segments: 64,
+            queue_bytes: 32 * 1024,
+            ..Settings::default()
+        };
+        let p = Fixture::using(
+            uuid::Uuid::new_v4(),
+            source(1),
+            ReplicaRole::Primary,
+            root,
+            (
+                MemoryProvider::new(),
+                Arc::new(tests::Provider::with_initial(1)),
+                settings.clone(),
+            ),
+        )
+        .await;
+        let lower = crate::FabricReplicator {
+            engine: p.engine.clone(),
+        };
+        let end = lower.reserve_log_operation(229).unwrap();
+        let barrier = lower.reserve_log_operation(208).unwrap();
+        let data = OperationData::with_settings(vec![vec![1]], &settings).unwrap();
+        let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", settings.clone()).unwrap();
+        let mut peer = p.descriptor(ReplicaRole::ActiveSecondary);
+        peer.replica_id = 2;
+        peer.incarnation = 12;
+        peer.node_id = [2; 16];
+        peer.address = Endpoint {
+            actor: Actor {
+                partition: p.native.identity().partition_id,
+                replica: 2,
+                incarnation: uuid::Uuid::new_v4(),
+            },
+            address: network.address().to_owned(),
+            transport_id: Some(String::new()),
+        }
+        .to_string();
+        peer.up = false;
+        peer.ready = false;
+        p.host
+            .configure(config(EPOCH, vec![peer.clone()], 2))
+            .await
+            .unwrap();
+        assert!(lower
+            .replicate_reserved(data.clone(), end.clone(), Cancellation::default())
+            .await
+            .is_err());
+        assert_eq!(p.engine.snapshot().progress.assigned, 1);
+        // Native-issued available member permits admission but sends no service
+        // ACK here: ordinary entries retain actual lower queue charges.
+        peer.up = true;
+        peer.ready = true;
+        // Native re-created sender, not a reset of the old down sender's live
+        // counters. The new issued incarnation samples truthful constructor tail.
+        peer.incarnation += 1;
+        peer.address = Endpoint {
+            actor: Actor {
+                partition: p.native.identity().partition_id,
+                replica: 2,
+                incarnation: uuid::Uuid::new_v4(),
+            },
+            address: network.address().to_owned(),
+            transport_id: Some(String::new()),
+        }
+        .to_string();
+        p.host
+            .configure(config(EPOCH, vec![peer], 2))
+            .await
+            .unwrap();
+        let first = lower
+            .replicate(data.clone(), Cancellation::default())
+            .await
+            .unwrap();
+        let second = lower
+            .replicate(data.clone(), Cancellation::default())
+            .await
+            .unwrap();
+        assert_eq!((first.sequence_number, second.sequence_number), (2, 3));
+        assert!(lower
+            .replicate(data.clone(), Cancellation::default())
+            .await
+            .is_err());
+        assert_eq!(p.engine.snapshot().progress.assigned, 3);
+        let terminated = lower
+            .replicate_reserved(data.clone(), end, Cancellation::default())
+            .await
+            .unwrap();
+        let boundary = lower
+            .replicate_reserved(data, barrier, Cancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            (terminated.sequence_number, boundary.sequence_number),
+            (4, 5)
+        );
+        assert_eq!(p.engine.snapshot().owned_operations, 4);
+        assert!(p.engine.snapshot().owned_bytes <= settings.queue_bytes);
+        p.host.configure(config(EPOCH, vec![], 1)).await.unwrap();
+        drop((first, second, terminated, boundary));
+        network.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_lower_identity_survives_stop_before_deferred_reply_poll() {
+    use crate::IStateReplicator;
+    let p = Fixture::using(
+        uuid::Uuid::new_v4(),
+        source(1),
+        ReplicaRole::Primary,
+        false,
+        (
+            MemoryProvider::new(),
+            Arc::new(tests::Provider::with_initial(1)),
+            Settings::default(),
+        ),
+    )
+    .await;
+    p.host.configure(config(EPOCH, vec![], 1)).await.unwrap();
+    let (entered, published) = std_mpsc::sync_channel(1);
+    let (release, resumed) = std_mpsc::sync_channel(1);
+    *p.engine.shared.write_reply_pause.lock().unwrap() = Some((entered, resumed));
+    let lower = crate::FabricReplicator {
+        engine: p.engine.clone(),
+    };
+    let write = tokio::spawn(async move {
+        lower
+            .replicate(
+                OperationData::new(vec![vec![1]]).unwrap(),
+                Cancellation::default(),
+            )
+            .await
+    });
+    published
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    let engine = p.engine.clone();
+    let permit = p.native.execution().try_reserve().unwrap();
+    let abort = permit.run_owned(move || {
+        IReplicator::abort(&*engine);
+        Ok(())
+    });
+    while !p.engine.shared.stopped.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+    release.send(()).unwrap();
+    let accepted = write
+        .await
+        .unwrap()
+        .expect("published LSN must not become an admission rejection");
+    abort.await.unwrap();
+    assert_eq!(accepted.sequence_number, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issued_new_and_recreated_senders_use_current_progress_but_repeats_keep_live_counters() {
     for root in [false, true] {
         let partition = uuid::Uuid::new_v4();

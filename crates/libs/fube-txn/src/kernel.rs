@@ -12,11 +12,15 @@
 pub(crate) mod checkpoint;
 pub(crate) mod copy;
 pub(crate) mod identity;
+pub(crate) mod limits;
 pub(crate) mod map;
+pub(crate) mod memory_log;
 pub(crate) mod named;
+pub(crate) mod native_bytes;
 pub(crate) mod processor;
 pub(crate) mod provider;
 pub(crate) mod record;
+pub(crate) mod registry_codec;
 pub(crate) mod runtime_lower;
 pub(crate) mod state;
 pub(crate) mod status;
@@ -25,6 +29,10 @@ pub(crate) mod version;
 
 #[cfg(test)]
 mod callback_tests;
+#[cfg(test)]
+mod phase1d_tests;
+#[cfg(test)]
+mod runtime_bootstrap_tests;
 #[cfg(test)]
 mod runtime_tests;
 #[cfg(test)]

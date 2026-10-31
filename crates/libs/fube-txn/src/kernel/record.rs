@@ -25,6 +25,9 @@ use std::sync::Arc;
 /// Supported native logical fields; transaction execution has a narrower gate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecordKind {
+    /// Local native physical boundary only. Never admitted to replication or
+    /// accepted by the logical wire decoder. 7=BeginCheckpoint, 12=Information.
+    Physical { native_type: i32, event: i32 },
     /// Native type 1; a single begin is itself the commit record.
     Begin {
         /// Signed native identity, including recognition-only atomic identities.
@@ -93,6 +96,12 @@ impl Record {
             RecordKind::End { .. } => 3,
             RecordKind::Barrier { .. } => 4,
             RecordKind::UpdateEpoch { .. } => 5,
+            RecordKind::Physical { .. } => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "physical record is not replication data",
+                ))
+            }
         };
         let mut wire = Wire::default();
         wire.section(&[&native_type.to_le_bytes(), &self.lsn.to_le_bytes()])?;
@@ -145,6 +154,7 @@ impl Record {
                     &timestamp_ticks.to_le_bytes(),
                 ])?;
             }
+            RecordKind::Physical { .. } => unreachable!("physical encoding rejected"),
         }
         OperationData::new(wire.segments)
     }

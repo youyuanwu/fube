@@ -21,7 +21,7 @@ impl NativeControlBinding for NativeBinder {
                 "native invocation does not bind this engine",
             ));
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "qualification"))]
         if engine.native_root_dispatch.load(Ordering::Acquire)
             && proof.kind() != NativeInvocationKind::Remove(ReplicaRemoval::BuildRetryCleanup)
         {

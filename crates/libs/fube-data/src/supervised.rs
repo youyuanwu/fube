@@ -15,6 +15,26 @@ use fube_runtime::extensions::{
 };
 use fube_runtime::ApiFuture as ServiceFuture;
 use std::sync::Arc;
+
+pub(crate) struct OwnedLifecycle {
+    inner: ManagedObject<Arc<dyn crate::extensions::ReplicatorLifecycle>>,
+}
+impl OwnedLifecycle {
+    pub(crate) fn new(
+        runtime: ExecutionRuntime,
+        tracker: DisposalTracker,
+        value: Arc<dyn crate::extensions::ReplicatorLifecycle>,
+    ) -> Result<Self> {
+        let quota = ObjectQuota::new(1)?;
+        let reservation = runtime.reserve_object(&quota, &tracker)?;
+        Ok(Self {
+            inner: reservation.publish(value),
+        })
+    }
+    pub(crate) fn get(&self) -> &dyn crate::extensions::ReplicatorLifecycle {
+        self.inner.get().as_ref()
+    }
+}
 #[cfg(test)]
 use std::{
     future::Future,

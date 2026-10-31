@@ -5921,10 +5921,11 @@ async fn outgoing_build_admission_counts_pending_writes_before_installing_any_pe
                 p.writes
                     .try_send(Submit {
                         expected_epoch: None,
-                        data: data.clone(),
-                        charge,
+                        data: Some(data.clone()),
+                        charge: Some(charge),
                         cancellation: cancel(),
-                        reply: reply.into(),
+                        reply: Some(reply.into()),
+                        reserved: None,
                     })
                     .unwrap_or_else(|_| panic!("pending write queue unexpectedly full"));
                 replies.push(result);

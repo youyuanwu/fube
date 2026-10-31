@@ -26,10 +26,12 @@ type Created =
 struct Factory {
     native: NativeIntegrationProvider,
     created: Created,
+    settings: fube_data::Settings,
 }
 struct Replica {
     native: NativeRuntimeIntegration,
     created: Created,
+    settings: fube_data::Settings,
 }
 struct LogProvider;
 impl IStateProvider for LogProvider {
@@ -68,6 +70,7 @@ impl IStatefulServiceFactory for Factory {
         Ok(Box::new(Replica {
             native: self.native.capture(partition, replica)?,
             created: self.created.clone(),
+            settings: self.settings.clone(),
         }))
     }
 }
@@ -89,7 +92,7 @@ impl IStatefulServiceReplica for Replica {
                     listen_address: "127.0.0.1:0".into(),
                     actor_incarnation: uuid::Uuid::new_v4(),
                 },
-                fube_data::Settings::default(),
+                self.settings.clone(),
             )?;
             let _ = self
                 .created
@@ -119,6 +122,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(configure: bool) -> Self {
+        Self::using_settings(configure, fube_data::Settings::default()).await
+    }
+    async fn using_settings(configure: bool, settings: fube_data::Settings) -> Self {
         let (send, recv) = oneshot::channel();
         let host = rap::Host::start(
             uuid::Uuid::new_v4(),
@@ -128,6 +134,7 @@ impl Fixture {
                 Box::new(Factory {
                     native,
                     created: Arc::new(Mutex::new(Some(send))),
+                    settings,
                 })
             },
         )
@@ -204,6 +211,46 @@ impl Fixture {
                     progress: fube_runtime::extensions::ReplicationProgress {
                         first: -1,
                         last: -1,
+                    },
+                    must_catch_up: false,
+                }],
+                write_quorum: 2,
+                local_member: true,
+            })
+            .await
+            .unwrap();
+    }
+    async fn withheld_quorum(&self) {
+        let committed = self.lower.snapshot().progress.committed;
+        let incarnation = self.lower.snapshot().progress.assigned + 100;
+        self.host
+            .configure(NativeReplicaSetConfiguration {
+                epoch: Epoch {
+                    data_loss_number: 1,
+                    configuration_number: 1 << 32,
+                },
+                replicas: vec![fube_runtime::extensions::NativeReplicaDescriptor {
+                    node_id: [3; 16],
+                    node_instance: 1,
+                    replica_id: 3,
+                    incarnation,
+                    role: ReplicaRole::ActiveSecondary,
+                    previous_role: ReplicaRole::None,
+                    up: true,
+                    ready: true,
+                    address: fube_data::wire::Endpoint {
+                        actor: fube_data::wire::Actor {
+                            partition: self.native.identity().partition_id,
+                            replica: 3,
+                            incarnation: uuid::Uuid::new_v4(),
+                        },
+                        address: "127.0.0.1:1".into(),
+                        transport_id: Some(String::new()),
+                    }
+                    .to_string(),
+                    progress: fube_runtime::extensions::ReplicationProgress {
+                        first: 1,
+                        last: committed,
                     },
                     must_catch_up: false,
                 }],
@@ -459,6 +506,355 @@ async fn corrective_rejected_capture_disposal_does_not_block_lower_owner() {
         "no quorum remains a lower rejection"
     );
     assert_eq!(f.lower.snapshot().progress.assigned, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_first_primary_group_and_idle_barriers_make_real_commits_live() {
+    use super::record::RecordKind;
+    use crate::TransactionBase;
+    let f = Fixture::new(true).await;
+    f.runtime.enable_barriers(&f.manager).unwrap();
+    let read_only = f.manager.new_transaction().unwrap();
+    read_only.commit().await.unwrap();
+    assert_eq!(
+        f.manager.tail(),
+        1,
+        "read-only commit does not establish a write barrier"
+    );
+    let single = f.manager.new_transaction().unwrap();
+    single
+        .add_operation(None, None, Some(payload(5)), 10, None)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), single.commit())
+        .await
+        .unwrap()
+        .unwrap();
+    f.runtime.group_idle().await;
+    assert_eq!(single.get_commit_sequence_number(), 3);
+    let barriers: Vec<_> = f
+        .manager
+        .records()
+        .iter()
+        .filter_map(|a| match a.node.record().kind {
+            RecordKind::Barrier { last_stable_lsn } => Some((a.node.lsn(), last_stable_lsn)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(barriers, vec![(2, 0), (4, 2), (5, 4)]);
+    assert_eq!(
+        (f.manager.tail(), f.manager.stable(), f.manager.version()),
+        (5, 5, 5)
+    );
+    let multi = f.manager.new_transaction().unwrap();
+    multi
+        .add_operation(None, None, Some(payload(1)), 10, None)
+        .unwrap();
+    let writes = multi.clone();
+    f.native
+        .execution()
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || writes.add_operation(None, None, Some(payload(2)), 10, None))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), multi.commit())
+        .await
+        .unwrap()
+        .unwrap();
+    f.runtime.group_idle().await;
+    assert_eq!(multi.get_commit_sequence_number(), 8);
+    assert_eq!(
+        f.provider
+            .events()
+            .iter()
+            .filter(|e| matches!(
+                e,
+                PointEvent::Apply {
+                    operation: 6 | 7,
+                    commit: 8,
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+    assert_eq!(f.manager.tail(), 10);
+    assert!(f.manager.lower.attempts().is_empty());
+    f.runtime.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_apply_visibility_precedes_actual_quorum_and_unlock_on_accepted_failure() {
+    use crate::{TransactionBase, TransactionState};
+    let f = Fixture::new(true).await;
+    f.runtime.enable_barriers(&f.manager).unwrap();
+    f.withheld_quorum().await;
+    let transaction = f.manager.new_transaction().unwrap();
+    let writes = transaction.clone();
+    let provider = f.provider.clone();
+    f.native
+        .execution()
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || {
+            provider.write(writes.as_ref(), 10, 1, 10)?;
+            provider.write(writes.as_ref(), 10, 2, 20)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let commit = transaction.commit();
+    drop(commit); // observer Drop is not rollback/cancellation
+    f.until(6).await;
+    tokio::time::timeout(Duration::from_secs(2), f.manager.activity(5).apply.wait())
+        .await
+        .unwrap()
+        .as_ref()
+        .clone()
+        .unwrap();
+    assert_eq!(transaction.get_commit_sequence_number(), 5);
+    assert!(!f.manager.activity(5).replication.is_completed());
+    assert!(f
+        .provider
+        .events()
+        .iter()
+        .all(|event| !matches!(event, PointEvent::Unlock { .. })));
+    let reader = f.manager.new_transaction().unwrap();
+    let version = reader.get_visibility_sequence_number().await.unwrap();
+    assert_eq!(version, 6);
+    assert_eq!(
+        f.provider.snapshot(reader.as_ref(), 1, version).unwrap(),
+        Some(10)
+    );
+    assert_eq!(f.manager.stable(), 0);
+    // Real lower role transition fails accepted replication; applied canonical
+    // versions remain and required Unlock still runs, with TransactionAborted.
+    let lower = f.lower.clone();
+    f.native
+        .execution()
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || {
+            fube_runtime::IReplicator::abort(lower.as_ref());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    f.manager.set_role(ReplicaRole::None);
+    f.manager.close_activity_gate();
+    let result = f.manager.activity(5).result.wait().await.as_ref().clone();
+    assert!(result.is_err());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while transaction.get_state() == TransactionState::Committing {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        f.provider
+            .events()
+            .iter()
+            .filter(|e| matches!(e, PointEvent::Unlock { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        f.provider.snapshot(reader.as_ref(), 1, version).unwrap(),
+        Some(10)
+    );
+    f.runtime.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_runtime_bounds_live_cache_and_snapshot_ownership_before_lower_assignment() {
+    use crate::{ITransactionVersionManager, IVersionManager};
+    let f = Fixture::new(true).await;
+    let mut owners = Vec::new();
+    for _ in 0..16 {
+        owners.push(f.manager.new_transaction().unwrap());
+    }
+    assert!(f.manager.new_transaction().is_err());
+    let large = OperationData::new(vec![vec![0; 900 * 1024]]).unwrap();
+    owners[0]
+        .add_operation(
+            Some(large.clone()),
+            Some(large.clone()),
+            Some(large.clone()),
+            10,
+            None,
+        )
+        .unwrap();
+    assert!(owners[1]
+        .add_operation(
+            Some(large.clone()),
+            Some(large.clone()),
+            Some(large),
+            10,
+            None
+        )
+        .is_err());
+    assert!(
+        !owners[1].is_write(),
+        "rejected first cache must not mark write"
+    );
+    assert_eq!(f.manager.tail(), 1);
+    for _ in 0..64 {
+        f.manager.register().await.unwrap();
+    }
+    assert!(f.manager.register().await.is_err());
+    for id in 1..=512 {
+        f.manager.try_remove_version(id, 0, 2).unwrap();
+    }
+    assert!(f.manager.try_remove_version(513, 0, 2).is_err());
+    for _ in 0..64 {
+        f.manager.unregister(1).unwrap();
+    }
+    drop(owners);
+    assert!(f.manager.new_transaction().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase1d_reserved_dispatch_progresses_at_full_lower_budget_and_loan_renews_after_retirement(
+) {
+    use crate::TransactionBase;
+    let settings = fube_data::Settings {
+        queue_operations: 40,
+        operation_bytes: 4096,
+        operation_segments: 64,
+        queue_bytes: 64 * 1024,
+        provider_operations: 1,
+        ..fube_data::Settings::default()
+    };
+    let f = Fixture::using_settings(true, settings.clone()).await;
+    f.runtime.enable_barriers(&f.manager).unwrap();
+    let initial = f.runtime.barrier_loan(0);
+    f.withheld_quorum().await;
+    let transaction = f.manager.new_transaction().unwrap();
+    transaction
+        .add_operation(None, None, Some(payload(1)), 10, None)
+        .unwrap();
+    let writes = transaction.clone();
+    f.native
+        .execution()
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || {
+            for key in 2..=5 {
+                writes.add_operation(None, None, Some(payload(key)), 10, None)?;
+            }
+            assert!(writes
+                .add_operation(None, None, Some(payload(6)), 10, None)
+                .is_err());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(f.manager.tail(), 7);
+    assert_eq!(f.lower.snapshot().owned_operations, 40);
+    let observed = transaction.clone();
+    let commit = tokio::spawn(async move { observed.commit().await });
+    f.until(9).await;
+    tokio::time::timeout(Duration::from_secs(2), f.manager.activity(8).apply.wait())
+        .await
+        .unwrap()
+        .as_ref()
+        .clone()
+        .unwrap();
+    assert_eq!(transaction.get_commit_sequence_number(), 8);
+    assert!(!f.manager.activity(8).replication.is_completed());
+    assert_eq!(f.lower.snapshot().owned_operations, 40);
+    assert!(f.lower.snapshot().owned_bytes <= settings.queue_bytes);
+    f.configure().await;
+    commit.await.unwrap().unwrap();
+    f.runtime.group_idle().await;
+    while f.manager.tail() < 22 {
+        f.barrier().await;
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !initial.is_available() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Same reservation, restored by actual retained-queue charge retirement.
+    assert!(Arc::ptr_eq(&initial, &f.runtime.barrier_loan(0)));
+    f.withheld_quorum().await;
+    let manager = f.manager.clone();
+    let sequence = f
+        .native
+        .execution()
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || manager.barrier(0).map(|activity| activity.node.lsn()))
+        .await
+        .unwrap();
+    let unavailable_while_owned = !initial.is_available();
+    assert!(!f.manager.activity(sequence).replication.is_completed());
+    f.configure().await;
+    f.manager
+        .activity(sequence)
+        .result
+        .wait()
+        .await
+        .as_ref()
+        .clone()
+        .unwrap();
+    assert!(f.lower.snapshot().owned_operations <= 40);
+    f.runtime.stop().await;
+    assert!(
+        unavailable_while_owned,
+        "reused loan stays charged while real quorum/queue ownership remains"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase1d_later_group_applies_while_earlier_barrier_quorum_is_pending() {
+    let f = Fixture::new(true).await;
+    f.runtime.enable_barriers(&f.manager).unwrap();
+    let warm = f.manager.new_transaction().unwrap();
+    warm.add_operation(None, None, Some(payload(1)), 10, None)
+        .unwrap();
+    warm.commit().await.unwrap();
+    f.runtime.group_idle().await;
+    f.withheld_quorum().await;
+    let first = f.manager.new_transaction().unwrap();
+    first
+        .add_operation(None, None, Some(payload(2)), 10, None)
+        .unwrap();
+    drop(first.commit());
+    f.until(7).await;
+    f.manager
+        .activity(6)
+        .apply
+        .wait()
+        .await
+        .as_ref()
+        .clone()
+        .unwrap();
+    assert!(!f.manager.activity(7).replication.is_completed());
+    let later = f.manager.new_transaction().unwrap();
+    later
+        .add_operation(None, None, Some(payload(3)), 10, None)
+        .unwrap();
+    drop(later.commit());
+    f.until(9).await;
+    tokio::time::timeout(Duration::from_secs(2), f.manager.activity(8).apply.wait())
+        .await
+        .unwrap()
+        .as_ref()
+        .clone()
+        .unwrap();
+    assert!(!f.manager.activity(7).replication.is_completed());
+    f.configure().await;
+    f.runtime.group_idle().await;
+    assert!(f
+        .provider
+        .events()
+        .iter()
+        .any(|event| matches!(event, PointEvent::Apply { operation: 8, .. })));
+    f.runtime.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

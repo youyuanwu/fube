@@ -43,6 +43,8 @@ struct Links {
 /// The immutable record has the authoritative assigned/replayed LSN. Context
 /// ownership is independent of map state and never silently erased on failure.
 pub(crate) struct RecordNode {
+    epoch: Mutex<crate::Epoch>,
+    retention: Mutex<Option<Arc<super::memory_log::Retention>>>,
     /// Native logical fields; links and captures are not wire metadata.
     record: Record,
     /// Optional shared primary/replay transaction passed to provider Apply.
@@ -76,6 +78,11 @@ impl RecordNode {
             return Err(Error::InvalidInput("capture on nonoperation record"));
         }
         Ok(Arc::new(Self {
+            epoch: Mutex::new(crate::Epoch {
+                data_loss_number: 0,
+                configuration_number: 0,
+            }),
+            retention: Mutex::new(None),
             record,
             transaction,
             links: Mutex::new(Links::default()),
@@ -87,6 +94,15 @@ impl RecordNode {
     /// Borrow immutable native fields.
     pub(crate) fn record(&self) -> &Record {
         &self.record
+    }
+    pub(crate) fn epoch(&self) -> crate::Epoch {
+        *self.epoch.lock().unwrap()
+    }
+    pub(crate) fn set_epoch(&self, epoch: crate::Epoch) {
+        *self.epoch.lock().unwrap() = epoch;
+    }
+    pub(crate) fn retain_memory(&self, retention: Arc<super::memory_log::Retention>) {
+        *self.retention.lock().unwrap() = Some(retention);
     }
 
     /// Observe authoritative assigned/replayed operation LSN.
@@ -283,7 +299,13 @@ impl TransactionMap {
     /// Failed admission changes neither links nor indexes. No completion/error
     /// API removes a transaction; only stable cleanup and explicit lifecycle Reuse.
     pub(crate) fn admit(&self, node: Arc<RecordNode>) -> Result<()> {
-        if node.lsn() <= 0 {
+        if node.lsn() < 0
+            || (node.lsn() == 0
+                && !matches!(
+                    node.record.kind,
+                    RecordKind::UpdateEpoch { .. } | RecordKind::Physical { .. }
+                ))
+        {
             return Err(Error::InvalidInput("nonpositive transaction-map LSN"));
         }
         if let Some(id) = node.transaction_id() {
@@ -363,7 +385,9 @@ impl TransactionMap {
                     insert_sorted(&mut map.unstable, Arc::clone(&node));
                 }
             }
-            RecordKind::Barrier { .. } | RecordKind::UpdateEpoch { .. } => {
+            RecordKind::Barrier { .. }
+            | RecordKind::UpdateEpoch { .. }
+            | RecordKind::Physical { .. } => {
                 node.mark_admitted()?;
             }
         }

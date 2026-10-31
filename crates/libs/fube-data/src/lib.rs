@@ -106,6 +106,7 @@ mod api;
 mod engine;
 pub mod extensions;
 mod fabric_replicator;
+mod owned_lifecycle;
 pub mod provider;
 /// Offline native-RAP model-node tooling, not a standalone Engine authority
 /// and not evidence of deployed Service Fabric qualification. The model still

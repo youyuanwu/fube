@@ -187,8 +187,74 @@ struct Budget {
 }
 
 struct Charge {
-    _operation: OwnedSemaphorePermit,
-    bytes: OwnedSemaphorePermit,
+    operation: Option<OwnedSemaphorePermit>,
+    bytes: Option<OwnedSemaphorePermit>,
+    recycle: Option<Weak<LogReservation>>,
+}
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.recycle.as_ref().and_then(Weak::upgrade) {
+            let mut state = reservation.state.lock().unwrap();
+            if matches!(*state, LogReservationState::Accepted) {
+                *state = LogReservationState::Available(Charge {
+                    operation: self.operation.take(),
+                    bytes: self.bytes.take(),
+                    recycle: self.recycle.take(),
+                });
+            }
+        }
+    }
+}
+
+/// A finite lower operation/byte loan reserved before upper transaction begin.
+/// It carries no membership, role or epoch authority. Rejection restores the
+/// same loan; accepted submission transfers it into native queue ownership.
+pub struct LogReservation {
+    renewable: bool,
+    owner: u64,
+    limit: usize,
+    state: Mutex<LogReservationState>,
+}
+enum LogReservationState {
+    Available(Charge),
+    InFlight,
+    Accepted,
+}
+impl LogReservation {
+    fn take(self: &Arc<Self>, owner: u64, bytes: usize) -> Result<Charge> {
+        if owner != self.owner || bytes > self.limit {
+            return Err(Error::InvalidInput("log reservation owner/size mismatch"));
+        }
+        let mut state = self.state.lock().unwrap();
+        match std::mem::replace(&mut *state, LogReservationState::InFlight) {
+            LogReservationState::Available(mut charge) => {
+                if self.renewable {
+                    charge.recycle = Some(Arc::downgrade(self));
+                }
+                Ok(charge)
+            }
+            previous => {
+                *state = previous;
+                Err(Error::new(
+                    fube_runtime::ErrorKind::ReplicationQueueFull,
+                    "log reservation not available",
+                ))
+            }
+        }
+    }
+    fn restore(&self, charge: Charge) {
+        let mut state = self.state.lock().unwrap();
+        assert!(matches!(*state, LogReservationState::InFlight));
+        *state = LogReservationState::Available(charge);
+    }
+    /// True only after all producer/queue/copy/retransmission owners of the
+    /// previous charge have retired. No budget is released to ordinary traffic.
+    pub fn is_available(&self) -> bool {
+        matches!(
+            *self.state.lock().unwrap(),
+            LogReservationState::Available(_)
+        )
+    }
 }
 
 impl Budget {
@@ -229,8 +295,9 @@ impl Budget {
             )
             .map_err(|_| Error::ResourceLimit("engine byte budget"))?;
         Ok(Charge {
-            _operation: operations.split(1).unwrap(),
-            bytes: byte_permits.split(bytes).unwrap(),
+            operation: operations.split(1),
+            bytes: byte_permits.split(bytes),
+            recycle: None,
         })
     }
 }
@@ -249,6 +316,8 @@ struct Shared {
     write_now: Mutex<Option<std::time::Instant>>,
     #[cfg(test)]
     write_prelock: Mutex<Option<std_mpsc::SyncSender<()>>>,
+    #[cfg(test)]
+    write_reply_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
     #[cfg(test)]
     epoch_entries: std::sync::atomic::AtomicUsize,
     streams: Mutex<StreamViews>,
@@ -342,6 +411,8 @@ impl NativePreWrite {
 /// operations, joins callbacks/the engine thread, then joins peer transport.
 /// Captures already published to application code stay charged until dropped.
 pub struct Engine {
+    self_weak: Weak<Engine>,
+    lifecycle: Mutex<Option<Arc<crate::supervised::OwnedLifecycle>>>,
     endpoint: Endpoint,
     settings: Settings,
     commands: mpsc::Sender<AuthorizedCommand>,
@@ -358,7 +429,7 @@ pub struct Engine {
     native_runtime: Option<NativeRuntimeIntegration>,
     native_binder: Mutex<Option<Arc<dyn NativeControlBinding>>>,
     native_progress: Mutex<Option<Arc<dyn fube_runtime::extensions::NativeProgressSource>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     native_root_dispatch: AtomicBool,
     #[cfg(test)]
     native_build_pause: Mutex<Option<(oneshot::Sender<NativeInvocation>, oneshot::Receiver<()>)>>,
@@ -392,6 +463,31 @@ impl Engine {
         settings: Settings,
         capabilities: crate::extensions::StateProviderCapabilities,
     ) -> Result<Arc<Self>> {
+        Self::bind_partition_integrated(
+            partition,
+            native,
+            actor,
+            address,
+            provider,
+            replay,
+            settings,
+            capabilities,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_partition_integrated(
+        partition: std::sync::Arc<dyn fube_runtime::IStatefulServicePartition>,
+        native: NativeRuntimeIntegration,
+        actor: Actor,
+        address: &str,
+        provider: Arc<dyn IStateProvider>,
+        replay: Option<Arc<dyn ReplayCheckpointProvider>>,
+        settings: Settings,
+        capabilities: crate::extensions::StateProviderCapabilities,
+        lifecycle: Option<Arc<dyn crate::extensions::ReplicatorLifecycle>>,
+    ) -> Result<Arc<Self>> {
         settings.validate()?;
         let information = partition.get_partition_information()?;
         native.validate()?;
@@ -411,7 +507,7 @@ impl Engine {
                 "replication actor does not match native partition",
             ));
         }
-        Self::bind_with_capabilities(
+        Self::bind_integrated(
             actor,
             address,
             provider,
@@ -419,6 +515,7 @@ impl Engine {
             settings,
             Some(Arc::new(native)),
             capabilities,
+            lifecycle,
         )
     }
 
@@ -458,6 +555,7 @@ impl Engine {
         )
     }
 
+    #[cfg(test)]
     fn bind_with_capabilities(
         actor: Actor,
         address: &str,
@@ -466,6 +564,29 @@ impl Engine {
         settings: Settings,
         native_control: Option<Arc<dyn NativeControlView>>,
         capabilities: crate::extensions::StateProviderCapabilities,
+    ) -> Result<Arc<Self>> {
+        Self::bind_integrated(
+            actor,
+            address,
+            provider,
+            replay,
+            settings,
+            native_control,
+            capabilities,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_integrated(
+        actor: Actor,
+        address: &str,
+        provider: Arc<dyn IStateProvider>,
+        replay: Option<Arc<dyn ReplayCheckpointProvider>>,
+        settings: Settings,
+        native_control: Option<Arc<dyn NativeControlView>>,
+        capabilities: crate::extensions::StateProviderCapabilities,
+        lifecycle: Option<Arc<dyn crate::extensions::ReplicatorLifecycle>>,
     ) -> Result<Arc<Self>> {
         settings.validate()?;
         let native_runtime = native_control
@@ -499,6 +620,12 @@ impl Engine {
                 .as_ref()
                 .map_or(1, |native| native.binding().generation),
         };
+        let lifecycle = lifecycle
+            .map(|value| {
+                crate::supervised::OwnedLifecycle::new(execution.clone(), disposal.clone(), value)
+                    .map(Arc::new)
+            })
+            .transpose()?;
         let terminal = execution.reserve_terminal(origin)?;
         let initial_permit =
             execution.reserve(CallLane::Provider, origin, settings.callback_timeout, false)?;
@@ -569,6 +696,8 @@ impl Engine {
             write_now: Mutex::new(None),
             #[cfg(test)]
             write_prelock: Mutex::new(None),
+            #[cfg(test)]
+            write_reply_pause: Mutex::new(None),
             #[cfg(test)]
             epoch_entries: std::sync::atomic::AtomicUsize::new(0),
             streams: Mutex::new(StreamViews { replication, copy }),
@@ -716,7 +845,9 @@ impl Engine {
             }
             return Err(error);
         }
-        let engine = Arc::new(Self {
+        let engine = Arc::new_cyclic(|self_weak| Self {
+            self_weak: self_weak.clone(),
+            lifecycle: Mutex::new(lifecycle),
             endpoint,
             settings,
             commands,
@@ -733,7 +864,7 @@ impl Engine {
             native_runtime,
             native_binder: Mutex::new(None),
             native_progress: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "qualification"))]
             native_root_dispatch: AtomicBool::new(false),
             #[cfg(test)]
             native_build_pause: Mutex::new(None),
@@ -969,10 +1100,11 @@ impl Engine {
                 self.writes
                     .try_send(Submit {
                         expected_epoch,
-                        data,
-                        charge,
+                        data: Some(data),
+                        charge: Some(charge),
                         cancellation,
-                        reply: reply.into(),
+                        reply: Some(reply.into()),
+                        reserved: None,
                     })
                     .map_err(|error| match error {
                         mpsc::error::TrySendError::Full(_) => Error::new(
@@ -989,8 +1121,105 @@ impl Engine {
         })
     }
 
+    pub(crate) fn initialize_volatile_log(&self) -> ServiceFuture<'_, ()> {
+        Box::pin(async move {
+            self.native_runtime
+                .as_ref()
+                .ok_or(Error::InvalidInput(
+                    "volatile log bootstrap needs native construction",
+                ))?
+                .validate()?;
+            self.request(|reply| Command::InitializeLog(None, reply))
+                .await
+        })
+    }
+
     pub(crate) fn execution_identity(&self) -> u64 {
         self.shared.engine_id
+    }
+    #[cfg(feature = "qualification")]
+    pub(crate) fn set_root_controls(&self, enabled: bool) {
+        self.native_root_dispatch.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn reserve_log_operation(&self, bytes: usize) -> Result<Arc<LogReservation>> {
+        self.reserve_log_capacity(bytes, false)
+    }
+    pub(crate) fn reserve_barrier_operation(&self, bytes: usize) -> Result<Arc<LogReservation>> {
+        self.reserve_log_capacity(bytes, true)
+    }
+    fn reserve_log_capacity(&self, bytes: usize, renewable: bool) -> Result<Arc<LogReservation>> {
+        ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
+        let _admission = self.shared.admission.lock().unwrap();
+        self.check()?;
+        if bytes == 0 || bytes > self.settings.queue_bytes {
+            return Err(Error::InvalidInput("invalid log reservation size"));
+        }
+        let charge = self.shared.budget.acquire(bytes).map_err(|cause| {
+            Error::with_cause(
+                fube_runtime::ErrorKind::ReplicationQueueFull,
+                "log termination reservation",
+                cause,
+            )
+        })?;
+        Ok(Arc::new(LogReservation {
+            renewable,
+            owner: self.shared.engine_id,
+            limit: bytes,
+            state: Mutex::new(LogReservationState::Available(charge)),
+        }))
+    }
+
+    pub(crate) fn submit_reserved(
+        &self,
+        data: OperationData,
+        reservation: Arc<LogReservation>,
+        cancellation: Cancellation,
+    ) -> ServiceFuture<'_, Replication> {
+        Box::pin(async move {
+            ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
+            let (reply, result) = oneshot::channel();
+            {
+                let _admission = self.shared.admission.lock().unwrap();
+                self.check()?;
+                self.check_write_deadline()?;
+                if cancellation.is_cancelled() {
+                    return Err(Error::new(
+                        fube_runtime::ErrorKind::Canceled,
+                        "reserved log canceled before enqueue",
+                    ));
+                }
+                if data.bytes() > self.settings.operation_bytes
+                    || data.segments().len() > self.settings.operation_segments
+                {
+                    return Err(Error::new(
+                        fube_runtime::ErrorKind::ReplicationOperationTooLarge,
+                        "reserved log sizing",
+                    ));
+                }
+                let charge = reservation.take(self.shared.engine_id, data.retained_bytes())?;
+                // Producer charges cover retained queue entries AND queued
+                // writes. The loan already owns one of the bounded channel/
+                // queue slots; ordinary submissions cannot consume that slot.
+                self.writes
+                    .try_send(Submit {
+                        expected_epoch: None,
+                        data: Some(data),
+                        charge: Some(charge),
+                        cancellation,
+                        reply: Some(reply.into()),
+                        reserved: Some(reservation),
+                    })
+                    .map_err(|error| match error {
+                        mpsc::error::TrySendError::Full(_) => Error::new(
+                            fube_runtime::ErrorKind::ReplicationQueueFull,
+                            "reserved write channel",
+                        ),
+                        mpsc::error::TrySendError::Closed(_) => Error::Closed,
+                    })?;
+            }
+            result.await.map_err(|_| Error::Closed)?
+        })
     }
 
     fn check_write_deadline(&self) -> Result<()> {
@@ -1047,6 +1276,18 @@ impl Engine {
             disposal: self.shared.disposal.clone(),
         });
         if let Command::Loss(_, _, execution) = &mut command {
+            *execution = Some(self.shared.execution.reserve(
+                CallLane::Provider,
+                CallOrigin {
+                    engine: self.shared.engine_id,
+                    session: 0,
+                    generation: self.shared.generation,
+                },
+                self.settings.callback_timeout,
+                false,
+            )?);
+        }
+        if let Command::InitializeLog(execution, _) = &mut command {
             *execution = Some(self.shared.execution.reserve(
                 CallLane::Provider,
                 CallOrigin {
@@ -1364,13 +1605,22 @@ fn same_endpoint(left: &Endpoint, right: &Endpoint) -> bool {
 
 struct Submit {
     expected_epoch: Option<Epoch>,
-    data: OperationData,
-    charge: Charge,
+    data: Option<OperationData>,
+    charge: Option<Charge>,
     cancellation: Cancellation,
-    reply: Reply<Replication>,
+    reply: Option<Reply<Replication>>,
+    reserved: Option<Arc<LogReservation>>,
+}
+impl Drop for Submit {
+    fn drop(&mut self) {
+        if let (Some(reservation), Some(charge)) = (&self.reserved, self.charge.take()) {
+            reservation.restore(charge);
+        }
+    }
 }
 
 enum Command {
+    InitializeLog(Option<OwnedCallPermit>, Reply<()>),
     #[cfg(feature = "qualification")]
     Probe {
         kind: String,
@@ -1509,6 +1759,7 @@ impl Control {
 
 #[derive(Clone, Copy)]
 enum Job {
+    InitializeLog,
     Control,
     Replay {
         revision: u64,
@@ -1520,6 +1771,7 @@ enum Job {
 }
 
 enum JobValue {
+    InitializedLog(i64),
     Retired,
     Admission,
     Epoch,
@@ -1569,6 +1821,8 @@ struct ConfigurationReceipt {
 }
 
 struct Owner {
+    initialized_log: bool,
+    initializing_log: Option<Reply<()>>,
     endpoint: Endpoint,
     transport: PeerTransport,
     provider: Option<Arc<crate::supervised::OwnedProvider>>,
@@ -1643,6 +1897,8 @@ impl Owner {
     ) -> Self {
         let dispatched = queue.progress().applied;
         Self {
+            initialized_log: false,
+            initializing_log: None,
             endpoint,
             transport,
             provider: Some(provider),
@@ -1768,6 +2024,8 @@ impl Owner {
             if shared.stopped.load(Ordering::Acquire) {
                 break;
             }
+            #[cfg(test)]
+            let wrote = matches!(&event, Event::Write(_));
             match event {
                 Event::Replies(_) => unreachable!(),
                 Event::Cleanup => {}
@@ -1794,8 +2052,32 @@ impl Owner {
             }
             self.publish();
             drop(_admission);
+            #[cfg(test)]
+            if wrote {
+                if let Some((entered, release)) =
+                    self.shared.write_reply_pause.lock().unwrap().take()
+                {
+                    let _ = entered.send(());
+                    release
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .expect("write reply probe released");
+                }
+            }
             let published_at = self.replay_rearm_pending.then(std::time::Instant::now);
-            self.replies.extend(replies.take());
+            // An accepted byte write must deliver its known lower identity even
+            // if Stop wins immediately after this publication boundary. Drain
+            // ready replies OUTSIDE admission before the next stop-biased loop.
+            // Disposal-dependent control replies remain pending as before.
+            for mut reply in replies.take() {
+                match reply
+                    .ready
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                {
+                    std::task::Poll::Ready(outcome) => reply.send.take().unwrap()(outcome),
+                    std::task::Poll::Pending => self.replies.push(reply),
+                }
+            }
             for start in self.starts.drain(..) {
                 if self.fault.is_none() {
                     let _ = start.send(());
@@ -2033,9 +2315,9 @@ impl Owner {
         };
     }
 
-    fn submit(&mut self, write: Submit) {
+    fn submit(&mut self, mut write: Submit) {
         if write.cancellation.is_cancelled() {
-            let _ = write.reply.send(Err(Error::new(
+            let _ = write.reply.take().unwrap().send(Err(Error::new(
                 fube_runtime::ErrorKind::Canceled,
                 "replication canceled before sequence assignment",
             )));
@@ -2059,6 +2341,8 @@ impl Owner {
             };
             let _ = write
                 .reply
+                .take()
+                .unwrap()
                 .send(Err(Error::new(kind, "primary is not write ready")));
             return;
         }
@@ -2068,26 +2352,32 @@ impl Owner {
         {
             let _ = write
                 .reply
+                .take()
+                .unwrap()
                 .send(Err(Error::InvalidInput("native admission epoch changed")));
             return;
         }
         match self
             .queue
-            .enqueue(self.epoch.unwrap().primary(), write.data)
+            .enqueue(self.epoch.unwrap().primary(), write.data.take().unwrap())
         {
             Ok(sequence) => {
-                self.charges.insert(sequence, Arc::new(write.charge));
+                self.charges
+                    .insert(sequence, Arc::new(write.charge.take().unwrap()));
+                if let Some(reservation) = &write.reserved {
+                    *reservation.state.lock().unwrap() = LogReservationState::Accepted;
+                }
                 let (completion, receiver) = watch::channel(None);
                 self.completions.insert(sequence, completion);
                 self.publish();
-                let _ = write.reply.send(Ok(Replication {
+                let _ = write.reply.take().unwrap().send(Ok(Replication {
                     sequence,
                     completion: receiver,
                 }));
                 self.send_replication();
             }
             Err(error) => {
-                let _ = write.reply.send(Err(error));
+                let _ = write.reply.take().unwrap().send(Err(error));
             }
         }
     }
@@ -2102,6 +2392,34 @@ impl Owner {
         } = envelope;
         let _enrollment = cleanup.as_ref().map(|cleanup| cleanup.enter());
         match command {
+            Command::InitializeLog(execution, reply) => {
+                if self.initialized_log
+                    || self.initializing_log.is_some()
+                    || self.role != ReplicaRole::Unknown
+                    || self.epoch.is_some()
+                    || self.queue.progress().assigned != 0
+                    || self.queue.progress().retained_operations != 0
+                {
+                    let _ = reply.send(Err(Error::InvalidInput(
+                        "volatile initialization must precede all lower activation",
+                    )));
+                    return;
+                }
+                let provider = self.provider.as_ref().unwrap().clone();
+                let call = provider_call(
+                    execution.expect("initialized before command transfer"),
+                    &mut self.starts,
+                    &mut self.dispositions,
+                    async move {
+                        provider
+                            .get_last_committed_sequence_number()
+                            .map(JobValue::InitializedLog)
+                    },
+                );
+                self.initializing_log = Some(reply);
+                self.jobs
+                    .spawn(async move { (Job::InitializeLog, call.await) });
+            }
             #[cfg(feature = "qualification")]
             Command::Probe {
                 kind,
@@ -4268,9 +4586,33 @@ impl Owner {
                 .and_then(|reply| reply.cleanup.clone()),
             Job::Control => self.control.as_ref().and_then(Control::cleanup),
             Job::Replay { .. } => None,
+            Job::InitializeLog => self
+                .initializing_log
+                .as_ref()
+                .and_then(|r| r.cleanup.clone()),
         };
         let _enrollment = cleanup.as_ref().map(|cleanup| cleanup.enter());
         match job {
+            Job::InitializeLog => {
+                let outcome = match result {
+                    Ok(JobValue::InitializedLog(1))
+                        if self.role == ReplicaRole::Unknown
+                            && self.queue.progress().assigned == 0 =>
+                    {
+                        self.initialized_log = true;
+                        self.dispatched = 1;
+                        self.announced_completed = 1;
+                        self.queue.reset(1)
+                    }
+                    Err(error) => Err(error),
+                    _ => Err(Error::InvalidInput(
+                        "fresh native volatile bootstrap must report actual tail one",
+                    )),
+                };
+                if let Some(reply) = self.initializing_log.take() {
+                    let _ = reply.send(outcome);
+                }
+            }
             Job::Replay {
                 revision,
                 sequence,
@@ -4295,7 +4637,8 @@ impl Owner {
                             || operation.epoch != operation.epoch.primary()
                             || operation.data.bytes() > self.settings.operation_bytes
                             || operation.data.segments().len() > self.settings.operation_segments
-                            || operation.data.retained_bytes() > charge.bytes.num_permits()
+                            || operation.data.retained_bytes()
+                                > charge.bytes.as_ref().unwrap().num_permits()
                         {
                             self.fail(Error::Protocol("invalid authentic replay checkpoint"));
                             return;
@@ -4378,13 +4721,18 @@ impl Owner {
                         let data = data.unwrap_or_else(|| OperationData::new(Vec::new()).unwrap());
                         if data.bytes() > self.settings.operation_bytes
                             || data.segments().len() > self.settings.operation_segments
-                            || data.retained_bytes() > charge.bytes.num_permits()
+                            || data.retained_bytes() > charge.bytes.as_ref().unwrap().num_permits()
                         {
                             self.fail(Error::ResourceLimit("provider copy item"));
                             return;
                         }
-                        let retained = charge.bytes.split(data.retained_bytes()).unwrap();
-                        charge.bytes = retained;
+                        let retained = charge
+                            .bytes
+                            .as_mut()
+                            .unwrap()
+                            .split(data.retained_bytes())
+                            .unwrap();
+                        charge.bytes = Some(retained);
                         let sequence = build.next;
                         let Some(next) = build.next.checked_add(1).filter(|next| *next < i64::MAX)
                         else {
@@ -4811,13 +5159,24 @@ impl Owner {
 
 impl Engine {
     fn open(&self, cancellation: Cancellation) -> ServiceFuture<'_, String> {
-        Box::pin(async move {
-            self.check()?;
-            if cancellation.is_cancelled() {
-                return Err(Error::Closed);
-            }
-            Ok(self.endpoint.to_string())
-        })
+        let engine = self.self_weak.upgrade().expect("owned common control");
+        crate::owned_lifecycle::own(
+            &self.shared.execution,
+            Box::pin(async move {
+                engine.check()?;
+                if cancellation.is_cancelled() {
+                    return Err(Error::Closed);
+                }
+                let lifecycle = engine.lifecycle.lock().unwrap().clone();
+                if let Some(lifecycle) = lifecycle {
+                    if let Err(error) = lifecycle.get().opened(cancellation).await {
+                        let _ = engine.shutdown_owned()?.wait().await;
+                        return Err(error);
+                    }
+                }
+                Ok(engine.endpoint.to_string())
+            }),
+        )
     }
 
     fn change_role(
@@ -4826,16 +5185,34 @@ impl Engine {
         role: ReplicaRole,
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, ()> {
-        Box::pin(async move {
-            self.request(|reply| Command::Epoch {
-                execution: None,
-                epoch,
-                role: Some(role),
-                cancellation,
-                reply,
-            })
-            .await
-        })
+        let engine = self.self_weak.upgrade().expect("owned common control");
+        crate::owned_lifecycle::own(
+            &self.shared.execution,
+            Box::pin(async move {
+                engine
+                    .request(|reply| Command::Epoch {
+                        execution: None,
+                        epoch,
+                        role: Some(role),
+                        cancellation: cancellation.clone(),
+                        reply,
+                    })
+                    .await?;
+                let lifecycle = engine.lifecycle.lock().unwrap().clone();
+                if let Some(lifecycle) = lifecycle {
+                    if let Err(error) = lifecycle
+                        .get()
+                        .role_changed(epoch, role, cancellation)
+                        .await
+                    {
+                        let _ = engine.shutdown_owned()?.wait().await;
+                        lifecycle.get().aborted();
+                        return Err(error);
+                    }
+                }
+                Ok(())
+            }),
+        )
     }
 
     fn update_epoch(&self, epoch: Epoch, cancellation: Cancellation) -> ServiceFuture<'_, ()> {
@@ -4935,17 +5312,25 @@ impl Engine {
     }
 
     fn close(&self, cancellation: Cancellation) -> ServiceFuture<'_, ()> {
-        Box::pin(async move {
-            self.shutdown()?.wait().await?;
-            if self.owns_execution && !self.shared.execution.is_current_entry() {
-                self.shared.execution.finish_standalone().await?;
-            }
-            if cancellation.is_cancelled() {
-                Err(Error::Closed)
-            } else {
-                Ok(())
-            }
-        })
+        let engine = self.self_weak.upgrade().expect("owned common control");
+        crate::owned_lifecycle::own(
+            &self.shared.execution,
+            Box::pin(async move {
+                engine.shutdown()?.wait().await?;
+                let lifecycle = engine.lifecycle.lock().unwrap().take();
+                if let Some(lifecycle) = lifecycle {
+                    lifecycle.get().closed(cancellation.clone()).await?;
+                }
+                if engine.owns_execution && !engine.shared.execution.is_current_entry() {
+                    engine.shared.execution.finish_standalone().await?;
+                }
+                if cancellation.is_cancelled() {
+                    Err(Error::Closed)
+                } else {
+                    Ok(())
+                }
+            }),
+        )
     }
 
     fn abort(&self) {
@@ -4956,6 +5341,10 @@ impl Engine {
             .as_ref()
             .is_some_and(DisposalReceipt::is_complete)
         {
+            let lifecycle = self.lifecycle.lock().unwrap().take();
+            if let Some(lifecycle) = lifecycle {
+                lifecycle.get().aborted();
+            }
             return;
         }
         if !ExecutionRuntime::in_owned_entry() || ExecutionRuntime::is_cleanup_entry() {
@@ -4966,6 +5355,11 @@ impl Engine {
             Ok(receipt) => {
                 if receipt.wait_blocking().is_err() {
                     self.shared.execution.retire();
+                } else {
+                    let lifecycle = self.lifecycle.lock().unwrap().take();
+                    if let Some(lifecycle) = lifecycle {
+                        lifecycle.get().aborted();
+                    }
                 }
             }
             Err(_) => self.shared.execution.retire(),
