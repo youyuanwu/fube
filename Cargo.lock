@@ -274,6 +274,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fube-txn"
+version = "0.1.0"
+dependencies = [
+ "fube-data",
+ "fube-runtime",
+ "uuid",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
