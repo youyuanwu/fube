@@ -7,6 +7,251 @@ mod common;
 use common::*;
 use fube_hosting::*;
 
+// Reusable boundary case: assert outer admission and every independent native
+// output through the trait, never directly call the inherent lookup here.
+fn lookup_contract_case<L: RegistrationLookup>(
+    port: &mut L,
+    input: &LookupRequest,
+    expected: Result<LookupResult>,
+) {
+    assert_eq!(RegistrationLookup::lookup(port, input), expected);
+}
+
+#[test]
+fn contract_lookup_preserves_producer_provenance_and_candidate_error_matrix() {
+    // Native-test adaptation: lookup after registration. The distinct producer
+    // snapshots and candidate-bearing error matrix are processor-derived from
+    // FabricRuntimeManager.cpp:117-249,381-458, not new native execution.
+    let mut h = hosting();
+    completed_host(&mut h, "Host");
+    let runtime = valid_runtime(&mut h, "Runtime", "Host");
+    let stored = declared(&mut h, "Widget");
+    let mut finish = runtime.clone();
+    finish.runtime_id = "runtime".into();
+    finish.host_id = "host".into();
+    finish.process_id = 88;
+    finish.code_package = "FinishCode".into();
+    finish.package_instance_sequence = 456;
+    h.register_type(&stored, &finish).result.unwrap();
+    let sequence = h.type_entries()[0].sequence;
+    let mut requested = stored.clone();
+    requested.service_type.name = "widget".into();
+    requested.service_type.package.name = "pkg".into();
+    let mut input = request(&requested, runtime.version.clone());
+    let candidate = Registration::from_context(requested, &runtime);
+    lookup_contract_case(
+        &mut H1LookupAdapter::new(&mut h, &LookupModel::default()),
+        &input,
+        Ok(LookupResult {
+            result: Ok(()),
+            candidate: Some(candidate.clone()),
+            sequence: Some(sequence),
+        }),
+    );
+    assert!(h.obligations().is_empty());
+    let event = HostingEventSource::take_closed_registered_events(&mut h);
+    assert_eq!(
+        event,
+        vec![ClosedRegisteredEvent::Registered {
+            sequence,
+            registration: Registration::from_context(stored, &finish),
+        }]
+    );
+    input.version.package.minor += 1;
+    for (outcome, error) in [
+        (
+            DeactivationOutcome::Success { scheduled: false },
+            Error::RegistrationVersionMismatch,
+        ),
+        (
+            DeactivationOutcome::Success { scheduled: true },
+            Error::NotFound,
+        ),
+        (
+            DeactivationOutcome::Failure(Error::InvalidState),
+            Error::NotFound,
+        ),
+    ] {
+        let model = LookupModel {
+            deactivation: Some(outcome.clone()),
+            ..LookupModel::default()
+        };
+        lookup_contract_case(
+            &mut H1LookupAdapter::new(&mut h, &model),
+            &input,
+            Ok(LookupResult {
+                result: Err(error),
+                candidate: Some(candidate.clone()),
+                sequence: Some(sequence),
+            }),
+        );
+        assert_eq!(
+            h.take_obligations(),
+            vec![Obligation::DeactivationIfUnused {
+                package: candidate.type_instance.package_instance(),
+                outcome,
+            }]
+        );
+    }
+}
+
+#[test]
+fn contract_lookup_missing_premise_and_early_unwritten_sequence_are_distinct() {
+    // Rust admission test plus processor-derived nonactivating public-map miss.
+    let mut h = hosting();
+    let id = declared(&mut h, "Widget");
+    let before = h.type_entries().to_vec();
+    lookup_contract_case(
+        &mut H1LookupAdapter::new(&mut h, &LookupModel::default()),
+        &request(&id, VersionInstance::default()),
+        Err(Error::MissingModelOutcome),
+    );
+    assert_eq!(h.type_entries(), before);
+    assert!(h.obligations().is_empty());
+    assert_eq!(h.pending_activation_count(), 0);
+    let mut absent = request(&id, VersionInstance::default());
+    absent.activation = Activation::from_uuid(uuid::Uuid::from_u128(17));
+    absent.should_activate = false;
+    lookup_contract_case(
+        &mut H1LookupAdapter::new(&mut h, &LookupModel::default()),
+        &absent,
+        Ok(LookupResult {
+            result: Err(Error::TypeNotRegistered),
+            candidate: None,
+            sequence: None,
+        }),
+    );
+    assert_eq!(h.type_entries(), before);
+    assert!(h.obligations().is_empty());
+}
+
+#[test]
+fn contract_lookup_activation_dispositions_keep_late_end_owned() {
+    // Processor-derived native sync/pending/failure combinations; retained End
+    // through bounded output rejection/shutdown is a Rust ownership adaptation.
+    for (outcome, semantic) in [
+        (
+            ActivationOutcome::Synchronous(Ok(())),
+            Error::TypeNotRegistered,
+        ),
+        (
+            ActivationOutcome::Synchronous(Err(Error::Dependency(-99))),
+            Error::Dependency(-99),
+        ),
+        (ActivationOutcome::Pending, Error::DeploymentInProgress),
+    ] {
+        let mut h = Hosting::new(Limits {
+            obligations: 1,
+            ..Limits::default()
+        })
+        .unwrap();
+        let id = declared(&mut h, "Widget");
+        let sequence = h.type_entries()[0].sequence;
+        let input = request(&id, VersionInstance::default());
+        let model = LookupModel {
+            activation: Some(outcome.clone()),
+            ..LookupModel::default()
+        };
+        lookup_contract_case(
+            &mut H1LookupAdapter::new(&mut h, &model),
+            &input,
+            Ok(LookupResult {
+                result: Err(semantic),
+                candidate: None,
+                sequence: Some(sequence),
+            }),
+        );
+        let [Obligation::Activation {
+            request: observed,
+            outcome: actual,
+            pending,
+        }] = h.obligations()
+        else {
+            panic!("trait lookup must publish the exact activation obligation");
+        };
+        assert_eq!(actual, &outcome);
+        assert_eq!(observed.type_instance, id);
+        assert_eq!(observed.requested_version, input.version);
+        assert_eq!(observed.application_name, input.application_name);
+        assert_eq!(observed.sequence, sequence);
+        let pending = *pending;
+        assert_eq!(pending.is_some(), outcome == ActivationOutcome::Pending);
+        if let Some(handle) = pending {
+            assert_eq!(
+                h.complete_activation(handle, Err(Error::Dependency(-33))),
+                Err(Error::Capacity)
+            );
+            assert_eq!(h.pending_activation_count(), 1);
+            h.take_obligations();
+            assert_eq!(h.close_core().unwrap().pending_activations, 1);
+            h.complete_activation(handle, Err(Error::Dependency(-33)))
+                .unwrap();
+            assert_eq!(h.pending_activation_count(), 0);
+            assert_eq!(
+                h.complete_activation(handle, Ok(())),
+                Err(Error::InvalidState)
+            );
+            assert_eq!(
+                h.take_obligations(),
+                vec![Obligation::ActivationCompleted {
+                    handle,
+                    result: Err(Error::Dependency(-33)),
+                }]
+            );
+        } else {
+            assert_eq!(h.pending_activation_count(), 0);
+        }
+    }
+}
+
+#[test]
+fn contract_lookup_capacity_veto_does_not_consume_synthetic_sequence() {
+    // Rust finite publication/ownership test, not native transactional admission.
+    let mut h = Hosting::new(Limits {
+        operations: 1,
+        obligations: 1,
+        ..Limits::default()
+    })
+    .unwrap();
+    let input = request(&type_id("Missing"), VersionInstance::default());
+    let model = LookupModel {
+        activation: Some(ActivationOutcome::Pending),
+        ..LookupModel::default()
+    };
+    let first =
+        RegistrationLookup::lookup(&mut H1LookupAdapter::new(&mut h, &model), &input).unwrap();
+    assert_eq!(first.result, Err(Error::DeploymentInProgress));
+    assert!(first.candidate.is_none());
+    let obligations = h.obligations().to_vec();
+    lookup_contract_case(
+        &mut H1LookupAdapter::new(&mut h, &model),
+        &input,
+        Err(Error::Capacity),
+    );
+    assert_eq!(h.obligations(), obligations);
+    assert_eq!(h.pending_activation_count(), 1);
+    assert!(h.type_entries().is_empty());
+    let [Obligation::Activation {
+        pending: Some(handle),
+        ..
+    }] = obligations.as_slice()
+    else {
+        panic!("pending owner");
+    };
+    h.take_obligations();
+    h.complete_activation(*handle, Ok(())).unwrap();
+    h.take_obligations();
+    lookup_contract_case(
+        &mut H1LookupAdapter::new(&mut h, &model),
+        &input,
+        Ok(LookupResult {
+            result: Err(Error::DeploymentInProgress),
+            candidate: None,
+            sequence: Some(first.sequence.unwrap() + 1),
+        }),
+    );
+}
+
 #[test]
 fn lookup_request_vs_event_stored_identity_and_each_runtime_producer() {
     let mut h = hosting();

@@ -152,6 +152,37 @@ pub trait RegistrationLookup {
     fn lookup(&mut self, request: &LookupRequest) -> Result<LookupResult>;
 }
 
+/// Explicit **model-only** implementation of [`RegistrationLookup`] over H1.
+///
+/// Production lookup inputs remain request-only. The separate borrowed
+/// [`LookupModel`] supplies controlled dependency/GUID observations, not a live
+/// package engine or a fixture restriction on all implementations. No default
+/// observations are invented. The adapter delegates H1's projected admission
+/// unchanged; dropping this borrow executes no completion, rollback or release.
+/// Reborrow with the next explicit model when an operation needs other premises.
+pub struct H1LookupAdapter<'a> {
+    core: &'a mut Hosting,
+    model: &'a LookupModel,
+}
+
+impl<'a> H1LookupAdapter<'a> {
+    /// Borrow the actual H1 core with explicit observations.
+    ///
+    /// All-None observations are sufficient only for branches with no package
+    /// dependency (for example equal-version registered lookup). If lookup needs
+    /// activation, deactivation or a new exclusive mapping, absent observations
+    /// yield `MissingModelOutcome`, not success or a call into live H2.
+    pub fn new(core: &'a mut Hosting, model: &'a LookupModel) -> Self {
+        Self { core, model }
+    }
+}
+
+impl RegistrationLookup for H1LookupAdapter<'_> {
+    fn lookup(&mut self, request: &LookupRequest) -> Result<LookupResult> {
+        self.core.lookup(request, self.model)
+    }
+}
+
 /// Increment observation with explicit residual ownership.
 ///
 /// This is a Rust ownership adaptation, not a native result DTO. In particular
@@ -465,4 +496,14 @@ pub trait HostingEventSource {
     /// [staleness]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Node.ServiceTypeUpdateStalenessChecker.h#L33-L53
     /// [test]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Test.Unit.Node.ServiceTypeUpdateStalenessChecker.cpp#L143-L215
     fn take_enabled_disabled_events(&mut self) -> Vec<EnabledDisabledEvent>;
+}
+
+impl HostingEventSource for Hosting {
+    fn take_closed_registered_events(&mut self) -> Vec<ClosedRegisteredEvent> {
+        Hosting::take_closed_registered_events(self)
+    }
+
+    fn take_enabled_disabled_events(&mut self) -> Vec<EnabledDisabledEvent> {
+        Hosting::take_enabled_disabled_events(self)
+    }
 }

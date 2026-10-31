@@ -5,6 +5,137 @@ mod common;
 use common::*;
 use fube_hosting::*;
 
+// Reusable typed-lane ownership contract, driven by actual source payloads.
+// Status may be transferred first without consuming registration/closure.
+fn event_lane_contract_case<S: HostingEventSource>(
+    source: &mut S,
+    status: &[EnabledDisabledEvent],
+    closed: &[ClosedRegisteredEvent],
+) -> (Vec<EnabledDisabledEvent>, Vec<ClosedRegisteredEvent>) {
+    let owned_status = HostingEventSource::take_enabled_disabled_events(source);
+    assert_eq!(owned_status, status);
+    assert!(HostingEventSource::take_enabled_disabled_events(source).is_empty());
+    let owned_closed = HostingEventSource::take_closed_registered_events(source);
+    assert_eq!(owned_closed, closed);
+    assert!(HostingEventSource::take_closed_registered_events(source).is_empty());
+    (owned_status, owned_closed)
+}
+
+#[test]
+fn contract_typed_lanes_preserve_disabled_finish_fields_and_owned_snapshots() {
+    // Native processor-derived Registered+Enabled lanes; explicit deterministic
+    // steps and output ownership are Rust adaptations, not worker-order proof.
+    let mut h = hosting();
+    completed_host(&mut h, "Host");
+    let runtime = valid_runtime(&mut h, "Runtime", "Host");
+    let id = declared(&mut h, "Widget");
+    let timer = disable(&mut h, &id);
+    h.disable_timer_input(&timer).unwrap();
+    let disabled_sequence = h.type_entries()[0].sequence;
+    event_lane_contract_case(
+        &mut h,
+        &[EnabledDisabledEvent::Disabled {
+            sequence: disabled_sequence,
+            type_instance: id.clone(),
+        }],
+        &[],
+    );
+    h.start_type_registration(&id, &runtime).unwrap();
+    h.finish_type_registration(&id, true, &runtime).unwrap();
+    assert_eq!(h.type_entries()[0].status, TypeStatus::RegisteredEnabled);
+    let sequence = h.type_entries()[0].sequence;
+    let expected = Registration::from_context(id.clone(), &runtime);
+    let (status, closed) = event_lane_contract_case(
+        &mut h,
+        &[EnabledDisabledEvent::Enabled {
+            sequence,
+            type_instance: id.clone(),
+        }],
+        &[ClosedRegisteredEvent::Registered {
+            sequence,
+            registration: expected.clone(),
+        }],
+    );
+    h.remove_type_source(&id, "package-component").unwrap();
+    assert!(h.type_entries().is_empty());
+    assert_eq!(
+        closed,
+        vec![ClosedRegisteredEvent::Registered {
+            sequence,
+            registration: expected,
+        }]
+    );
+    assert_eq!(
+        status,
+        vec![EnabledDisabledEvent::Enabled {
+            sequence,
+            type_instance: id,
+        }]
+    );
+}
+
+#[test]
+fn contract_event_transfer_restores_admission_without_losing_closure_kind() {
+    // Rust admission behavior plus native processor-derived runtime/host closure.
+    let mut h = Hosting::new(Limits {
+        events_per_lane: 1,
+        ..Limits::default()
+    })
+    .unwrap();
+    completed_host(&mut h, "Host");
+    let runtime = valid_runtime(&mut h, "Runtime", "Host");
+    let id = registered(&mut h, "Widget", &runtime);
+    let before = h.type_entries().to_vec();
+    let runtimes = h.runtime_records().to_vec();
+    assert_eq!(h.unregister_runtime("runtime"), Err(Error::Capacity));
+    assert_eq!(h.type_entries(), before);
+    assert_eq!(h.runtime_records(), runtimes);
+    assert!(h.obligations().is_empty());
+    let (_, registered) = event_lane_contract_case(
+        &mut h,
+        &[],
+        &[ClosedRegisteredEvent::Registered {
+            sequence: before[0].sequence,
+            registration: Registration::from_context(id.clone(), &runtime),
+        }],
+    );
+    h.unregister_runtime("runtime").unwrap();
+    assert_eq!(h.find_runtime("Runtime"), Err(Error::RuntimeNotRegistered));
+    assert_eq!(h.is_host_registered("Host"), Ok(true));
+    assert_eq!(h.type_entries()[0].status, TypeStatus::NotRegisteredEnabled);
+    let sequence = h.type_entries()[0].sequence;
+    event_lane_contract_case(
+        &mut h,
+        &[],
+        &[ClosedRegisteredEvent::RuntimeClosed {
+            sequence,
+            runtime_id: "Runtime".into(),
+            host_id: "Host".into(),
+            scope: ClosureScope {
+                activation: id.activation,
+                public_activation: id.public_activation.clone(),
+            },
+            affected: vec![id.service_type.clone()],
+        }],
+    );
+    h.unregister_host("host", "model-unregister")
+        .unwrap()
+        .reply
+        .unwrap();
+    let expected = h.closed_registered_events().to_vec();
+    assert!(matches!(
+        expected.as_slice(),
+        [ClosedRegisteredEvent::HostClosed { host_id, activity, affected, .. }]
+        if host_id == "Host" && activity == "model-unregister" && affected.is_empty()
+    ));
+    event_lane_contract_case(&mut h, &[], &expected);
+    assert!(matches!(
+        registered.as_slice(),
+        [ClosedRegisteredEvent::Registered { registration, .. }]
+        if registration.runtime_id == "Runtime"
+    ));
+}
+
 #[test]
 fn runtime_closure_does_not_close_sibling_runtime_or_host() {
     let mut h = hosting();
