@@ -730,7 +730,7 @@ promotion closes dispatch queues and waits for their source drain
 ([SecondaryReplicator.CloseAsyncOperation.cpp:41–104][n-secondary-close]).
 R0 freezes old-generation ingress, dispatches eligible contiguous buffered records,
 closes senders successfully, then waits for actual service ACKs
-([lower dispatch close](../../crates/libs/fube-data/src/engine.rs#L4071-L4108)).
+([lower dispatch close](../../crates/libs/fube-data/src/engine.rs#L4087-L4124)).
 It deliberately does not wait for ACKs before EOS: §5.3 can flush/process after
 observing EOS. Its empty/nonempty role-cycle and 64-capture tests pass.
 A later demotion needs a fresh copy/replication generation in the same engine,
@@ -831,10 +831,10 @@ This is an existing local provider capability, not a new peer negotiation.
 
 **Implemented R0 capability:** `StateProviderCapabilities` is supplied to
 `FabricReplicator::create_with_capabilities`
-([construction](../../crates/libs/fube-data/src/fabric_replicator.rs#L49-L94)).
+([construction](../../crates/libs/fube-data/src/fabric_replicator.rs#L53-L98)).
 Its true flag selects assigned+1 replication start and inclusive assigned
 provider horizon; default classic still selects max(committed,previous quorum)+1
-([selection](../../crates/libs/fube-data/src/engine.rs#L2745-L2755)).
+([selection](../../crates/libs/fube-data/src/engine.rs#L2761-L2771)).
 The provider factory keeps the exact requested argument, volatile null context,
 supervision/bounds and enumeration-EOS finish-tail snapshot. A staged upper
 provider owns checkpoint horizon extension and its metadata, not a fabricated
@@ -911,7 +911,7 @@ controls make no provider callback/getter/truncation, then drains overlap.
 Copied represented-epoch metadata also lets promotion/original-operation
 callbacks succeed without lower tail comparison, while its
 new incompatible idle-copy/original-epoch negatives preserve failure
-([regressions](../../crates/libs/fube-data/src/engine_tests.rs#L3521-L3730)).
+([regressions](../../crates/libs/fube-data/src/engine_tests.rs#L3540-L3749)).
 The latest-LSN marker alone does not fix this seam. Do not fake progress, truncate a valid copied
 suffix, or disable all epoch-tail checks for providers with the marker.
 

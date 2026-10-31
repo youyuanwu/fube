@@ -1749,7 +1749,7 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
                     Ok(write) => break write,
                     // Retry only pre-admission backpressure while the peer is
                     // still unacknowledged, never an accepted operation.
-                    Err(Error::ResourceLimit("engine operation budget")) => {
+                    Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull => {
                         tokio::task::yield_now().await;
                     }
                     Err(error) => panic!("write admission after replay failed: {error}"),
