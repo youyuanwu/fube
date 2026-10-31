@@ -13,6 +13,7 @@ members = [
   "crates/samples/stateless-test-app",
   "crates/samples/rust-runtime-app",
   "crates/samples/native-replicator-oracle",
+  "crates/tools/fube-cli",
 ]
 
 [workspace.dependencies]

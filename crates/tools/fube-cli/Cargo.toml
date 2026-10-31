@@ -1,0 +1,21 @@
+[package]
+name = "fube-cli"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Native Service Fabric development CLI"
+
+[[bin]]
+name = "fube"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+fube-client.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+fube-transport.workspace = true
+libc = "0.2"
+uuid.workspace = true
