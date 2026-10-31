@@ -32,6 +32,14 @@ impl Drop for Package {
     }
 }
 
+fn fube_executable() -> PathBuf {
+    // Archive runners remap the runtime path, not a compile-time env! value.
+    PathBuf::from(
+        std::env::var_os("CARGO_BIN_EXE_fube")
+            .expect("Cargo or nextest must provide fube's executable path at runtime"),
+    )
+}
+
 #[test]
 fn invalid_input_cannot_report_upload_success() {
     let package = Package::new();
@@ -85,7 +93,7 @@ fn invalid_input_cannot_report_upload_success() {
             package.0.to_str().unwrap(),
         ],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_fube"))
+        let output = Command::new(fube_executable())
             .args(arguments)
             .output()
             .unwrap();
@@ -236,7 +244,7 @@ async fn receive_upload(
 }
 
 fn upload_command(package: &Package, endpoint: SocketAddr) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_fube"));
+    let mut command = tokio::process::Command::new(fube_executable());
     command.args([
         "--endpoint",
         &endpoint.to_string(),
