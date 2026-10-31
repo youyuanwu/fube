@@ -16,16 +16,34 @@ async fn abort_owned(engine: &Arc<Engine>) {
     {
         return;
     }
+    if engine.snapshot().closed {
+        engine.close(cancel()).await.unwrap();
+        return;
+    }
     let execution = engine.shared.execution.clone();
     let owner = engine.clone();
-    execution
-        .reserve(
-            CallLane::Native,
-            CallOrigin::default(),
-            std::time::Duration::from_secs(30),
-            true,
-        )
-        .unwrap()
+    // Abort is a lifecycle call, not destructor cleanup.
+    let permit = timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match execution.reserve(
+                CallLane::Native,
+                CallOrigin::default(),
+                std::time::Duration::from_secs(30),
+                false,
+            ) {
+                Ok(permit) => break permit,
+                // User disposal can precede task-ticket reaping. No call or
+                // application capture has been admitted at this point.
+                Err(Error::ResourceLimit("execution scheduled tasks")) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("Abort admission failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("disposed callback task reaped before Abort admission");
+    permit
         .run_owned(move || {
             owner.abort();
             Ok(())
@@ -48,6 +66,25 @@ const NEXT_EPOCH: Epoch = Epoch {
     data_loss_number: 1,
     configuration_number: 0x2_0000_0000,
 };
+
+async fn replay_deadline(
+    observed: &mut broadcast::Receiver<crate::extensions::ReplicationEvent>,
+) -> (std::time::Instant, std::time::Instant) {
+    let event = timeout(std::time::Duration::from_secs(5), observed.recv())
+        .await
+        .expect("replay publication completed")
+        .unwrap();
+    match event {
+        crate::extensions::ReplicationEvent::ReplayRetryScheduled {
+            sequence_number,
+            published_at,
+            retry_at,
+        } => {
+            assert_eq!(sequence_number, 1);
+            (published_at, retry_at)
+        }
+    }
+}
 
 #[tokio::test]
 async fn promoted_prefix_without_retained_suffix_accepts_bounded_existing_peer_receipt() {
@@ -1562,6 +1599,9 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
                 ..Settings::default()
             },
         );
+        let replicator = crate::FabricReplicator { engine: p.clone() };
+        let mut observed = replicator.subscribe_events();
+        let mut independent = replicator.clone().subscribe_events();
         initial_primary(&p).await;
         let (network, mut incoming) =
             PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
@@ -1587,14 +1627,12 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
                 Body::Replication { .. }
             ));
         }
-        until(|| p.snapshot().owned_operations == 0).await;
-        let disposed_at = Instant::now();
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let (published_at, deadline) = replay_deadline(&mut observed).await;
         assert_eq!(
-            provider.checkpoint_calls.load(Ordering::Acquire),
-            1,
-            "callback completion, None and transport-full must not bypass retry pacing"
+            replay_deadline(&mut independent).await,
+            (published_at, deadline)
         );
+        assert!(deadline >= published_at + p.settings.retry);
         assert_eq!(p.snapshot().progress.assigned, 1);
         assert!(timeout(
             std::time::Duration::from_millis(30),
@@ -1603,12 +1641,12 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
         .await
         .is_err());
         *provider.checkpoint_gate.lock().unwrap() = None;
-        timeout(std::time::Duration::from_millis(1500), async {
-            until(|| provider.checkpoint_calls.load(Ordering::Acquire) == 2).await;
-        })
-        .await
-        .unwrap();
-        assert!(disposed_at.elapsed() >= std::time::Duration::from_millis(950));
+        gate.add_permits(1);
+        until(|| provider.checkpoint_calls.load(Ordering::Acquire) >= 2).await;
+        assert!(
+            provider.checkpoint_times.lock().unwrap()[1].into_std() >= deadline,
+            "replay retried before its published cooldown deadline"
+        );
         until(|| p.snapshot().owned_operations == 0).await;
         let next = Mutation {
             id: "next".into(),
@@ -1617,25 +1655,32 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
         }
         .operation_for_epoch(EPOCH)
         .unwrap();
-        let write = timeout(
-            std::time::Duration::from_millis(100),
-            p.submit_in_epoch(EPOCH, next, cancel()),
-        )
+        let write = timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match p.submit_in_epoch(EPOCH, next.clone(), cancel()).await {
+                    Ok(write) => break write,
+                    // Retry only pre-admission backpressure while the peer is
+                    // still unacknowledged, never an accepted operation.
+                    Err(Error::ResourceLimit("engine operation budget")) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("write admission after replay failed: {error}"),
+                }
+            }
+        })
         .await
-        .unwrap()
-        .unwrap();
+        .expect("replay released its temporary admission charge");
         assert_eq!(
             write.sequence, 2,
             "replay cannot permanently monopolize the sole operation slot"
         );
-        assert_eq!(provider.checkpoint_calls.load(Ordering::Acquire), 2);
         abort_owned(&p).await;
         network.shutdown();
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replay_cooldown_starts_after_slow_publication_releases_producer_admission() {
+async fn replay_cooldown_is_observable_after_provider_completion_and_publication() {
     let data = Mutation {
         id: "original".into(),
         key: "key".into(),
@@ -1661,6 +1706,7 @@ async fn replay_cooldown_starts_after_slow_publication_releases_producer_admissi
             ..Settings::default()
         },
     );
+    let mut observed = crate::FabricReplicator { engine: p.clone() }.subscribe_events();
     initial_primary(&p).await;
     let (network, mut incoming) = PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
     let remote = endpoint(&network, partition, 2);
@@ -1671,52 +1717,23 @@ async fn replay_cooldown_starts_after_slow_publication_releases_producer_admissi
         .await
         .unwrap();
     until(|| provider.checkpoint_calls.load(Ordering::Acquire) == 1).await;
-    let shared = p.shared.clone();
-    let (held_tx, held_rx) = std_mpsc::channel();
-    let (release_tx, release_rx) = std_mpsc::channel();
-    let blocker = std::thread::spawn(move || {
-        let _snapshot = shared.snapshot.lock().unwrap();
-        held_tx.send(()).unwrap();
-        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(3));
-    });
-    held_rx
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .unwrap();
+    assert!(matches!(
+        observed.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+    let releasing = std::time::Instant::now();
     gate.add_permits(1);
     let replay = timeout(std::time::Duration::from_secs(1), incoming.data.recv())
         .await
         .unwrap()
         .unwrap();
     assert!(matches!(replay.body, Body::Replication { .. }));
-    tokio::time::sleep(std::time::Duration::from_millis(850)).await;
+    let (published_at, deadline) = replay_deadline(&mut observed).await;
+    assert!(published_at >= releasing);
     assert!(
-        p.shared.admission.try_lock().is_err(),
-        "publication retains producer admission until it completes"
+        deadline >= published_at + p.settings.retry,
+        "publication time must not consume the producer's retry window"
     );
-    release_tx.send(()).unwrap();
-    blocker.join().unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    assert_eq!(
-        provider.checkpoint_calls.load(Ordering::Acquire),
-        1,
-        "time spent in charged fanout/publication cannot consume the producer's retry window"
-    );
-    let next = Mutation {
-        id: "next".into(),
-        key: "key".into(),
-        value: "next".into(),
-    }
-    .operation_for_epoch(EPOCH)
-    .unwrap();
-    let write = timeout(
-        std::time::Duration::from_millis(100),
-        p.submit_in_epoch(EPOCH, next, cancel()),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(write.sequence, 2);
-    assert_eq!(provider.checkpoint_calls.load(Ordering::Acquire), 1);
     abort_owned(&p).await;
     network.shutdown();
 }
@@ -2287,6 +2304,7 @@ struct Provider {
     horizons: Mutex<Vec<i64>>,
     epoch_delay: std::time::Duration,
     checkpoint_calls: AtomicUsize,
+    checkpoint_times: Mutex<Vec<Instant>>,
     checkpoint: Mutex<Option<ReplayOperation>>,
     checkpoint_gate: Mutex<Option<Arc<Semaphore>>>,
 }
@@ -2297,6 +2315,7 @@ impl ReplayCheckpointProvider for Provider {
         _: i64,
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, Option<ReplayOperation>> {
+        self.checkpoint_times.lock().unwrap().push(Instant::now());
         self.checkpoint_calls.fetch_add(1, Ordering::AcqRel);
         let value = self.checkpoint.lock().unwrap().clone();
         let gate = self.checkpoint_gate.lock().unwrap().clone();

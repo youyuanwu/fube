@@ -69,6 +69,24 @@ impl FabricReplicator {
         Arc::new(self.clone())
     }
 
+    /// Subscribe to best-effort fube diagnostics, not canonical SF callbacks.
+    /// Subscribe before triggering work: no event history is replayed. Slow receivers get
+    /// `RecvError::Lagged`; publishers never wait for subscriber progress. Events
+    /// neither pause the owner nor grant membership, epoch or write authority.
+    ///
+    /// ```
+    /// # async fn read_one(replicator: &fube_data::FabricReplicator)
+    /// # -> Result<fube_data::extensions::ReplicationEvent, tokio::sync::broadcast::error::RecvError> {
+    /// let mut events = replicator.subscribe_events();
+    /// events.recv().await // Propagates lag and closure to the caller.
+    /// # }
+    /// ```
+    pub fn subscribe_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::extensions::ReplicationEvent> {
+        self.engine.subscribe_events()
+    }
+
     pub(crate) fn snapshot(&self) -> crate::extensions::EngineSnapshot {
         self.engine.snapshot()
     }

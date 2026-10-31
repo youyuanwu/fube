@@ -71,7 +71,7 @@ use fube_runtime::{
 };
 use serde::{ser::SerializeStruct, Serialize, Serializer};
 use tokio::{
-    sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore},
+    sync::{broadcast, mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
     time::{interval, timeout, Instant, MissedTickBehavior},
 };
@@ -245,6 +245,7 @@ fn maximum_copy_bytes(settings: &Settings) -> usize {
 struct Shared {
     #[cfg(test)]
     copy_job_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
+    events: broadcast::Sender<crate::extensions::ReplicationEvent>,
     admission: Mutex<()>,
     stopped: AtomicBool,
     revision: AtomicU64,
@@ -534,6 +535,7 @@ impl Engine {
         let shared = Arc::new(Shared {
             #[cfg(test)]
             copy_job_pause: Mutex::new(None),
+            events: broadcast::channel(64).0,
             admission: Mutex::new(()),
             stopped: AtomicBool::new(false),
             revision: AtomicU64::new(1),
@@ -787,6 +789,12 @@ impl Engine {
         snapshot.owned_bytes =
             self.settings.queue_bytes - self.shared.budget.bytes.available_permits();
         snapshot
+    }
+
+    pub(crate) fn subscribe_events(
+        &self,
+    ) -> broadcast::Receiver<crate::extensions::ReplicationEvent> {
+        self.shared.events.subscribe()
     }
 
     /// Test-fixture-only invalid/obsolete peer traffic on existing connections.
@@ -1699,17 +1707,25 @@ impl Owner {
             }
             self.publish();
             drop(_admission);
+            let published_at = self.replay_rearm_pending.then(std::time::Instant::now);
             self.replies.extend(replies.take());
             for start in self.starts.drain(..) {
                 if self.fault.is_none() {
                     let _ = start.send(());
                 }
             }
-            if self.replay_rearm_pending {
+            if let Some(published_at) = published_at {
                 // Start cooldown only after payload/charge disposal, fanout,
                 // publication, AND the producer admission mutex are released.
                 self.replay_next = Instant::now() + self.settings.retry;
                 self.replay_rearm_pending = false;
+                let _ = self.shared.events.send(
+                    crate::extensions::ReplicationEvent::ReplayRetryScheduled {
+                        sequence_number: self.queue.progress().assigned,
+                        published_at,
+                        retry_at: self.replay_next.into_std(),
+                    },
+                );
             }
         }
         self.shared.stopped.store(true, Ordering::Release);

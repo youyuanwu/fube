@@ -16,7 +16,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore},
+    sync::{broadcast, mpsc, watch, OwnedSemaphorePermit, Semaphore},
     task::{JoinHandle, JoinSet},
 };
 
@@ -52,6 +52,7 @@ struct Unit {
     operation: Arc<Semaphore>,
 }
 struct Shared {
+    events: broadcast::Sender<crate::RuntimeEvent>,
     units: Mutex<HashMap<[u8; 16], Arc<Unit>>>,
     owners: Mutex<HashMap<[u8; 16], bool>>,
     stateful: crate::stateful::Registry,
@@ -71,7 +72,9 @@ struct Shared {
 pub(crate) struct Engine {
     shared: Arc<Shared>,
     stop: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    task: JoinHandle<Option<mpsc::Receiver<IpcRequest>>>,
+    retired_incoming: Option<mpsc::Receiver<IpcRequest>>,
+    active_at_stop: bool,
 }
 struct FactorySlot {
     shared: Arc<Shared>,
@@ -207,6 +210,7 @@ impl Engine {
             execution.clone(),
         );
         let shared = Arc::new(Shared {
+            events: broadcast::channel(crate::diagnostics::EVENT_CAPACITY).0,
             units: Mutex::new(HashMap::new()),
             owners: Mutex::new(HashMap::new()),
             stateful,
@@ -286,8 +290,15 @@ impl Engine {
                 record.cancel();
                 record.wait().await;
             }
+            (*stopped.borrow()).then_some(incoming)
         });
-        Self { shared, stop, task }
+        Self {
+            shared,
+            stop,
+            task,
+            retired_incoming: None,
+            active_at_stop: false,
+        }
     }
     pub(crate) fn insert_factory(
         &self,
@@ -311,13 +322,25 @@ impl Engine {
         slot.committed = true;
         Ok(())
     }
-    pub(crate) async fn quiesce(&mut self) -> Result<()> {
-        let active = self.shared.execution.has_running_callbacks();
+    pub(crate) fn begin_quiesce(&mut self) {
+        self.active_at_stop |= self.shared.execution.has_running_callbacks();
         self.stop.send_replace(true);
-        (&mut self.task)
+    }
+    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<crate::RuntimeEvent> {
+        self.shared.events.subscribe()
+    }
+    pub(crate) async fn quiesce(&mut self) -> Result<()> {
+        self.begin_quiesce();
+        // Late one-way native commands must not poison the connection while
+        // Runtime still needs it for unregistration. The queue stays bounded.
+        self.retired_incoming = (&mut self.task)
             .await
             .map_err(|_| Error::Protocol("lifecycle dispatcher panic"))?;
-        if active || self.shared.execution.has_running_callbacks() {
+        let _ = self
+            .shared
+            .events
+            .send(crate::RuntimeEvent::DispatchStopped);
+        if self.active_at_stop || self.shared.execution.has_running_callbacks() {
             return Err(Error::Protocol(
                 "shutdown with active callbacks requires process fencing",
             ));
@@ -462,10 +485,16 @@ async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
         }
     };
     if owner == Some(true) || request.service.stateful {
-        return shared
+        let result = shared
             .stateful
             .dispatch(&props.action, request, incoming.reply)
             .await;
+        if props.action == "RAPQuery" && result.is_ok() {
+            let _ = shared.events.send(crate::RuntimeEvent::QueryReplySent {
+                request_id: props.id,
+            });
+        }
+        return result;
     }
     if owner.is_none()
         && matches!(
@@ -497,7 +526,7 @@ async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
         let reply = incoming
             .reply
             .ok_or(Error::Protocol("RAPQuery requires correlation"))?;
-        return reply
+        let result = reply
             .reply(
                 12,
                 Some("RAPQueryReply"),
@@ -506,6 +535,12 @@ async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
             )
             .await
             .map_err(Error::from);
+        if result.is_ok() {
+            let _ = shared.events.send(crate::RuntimeEvent::QueryReplySent {
+                request_id: props.id,
+            });
+        }
+        return result;
     }
     validate(&shared, &request)?;
     if incoming.reply.is_some() {

@@ -21,11 +21,9 @@ async fn rap_role(route: &Arc<Route>, role: ReplicaRole) -> RuntimeResult<()> {
 }
 async fn shutdown_route(route: &Arc<Route>) {
     if route.engine.snapshot().closed {
-        // A terminal write path may already have awaited Close and joined its
-        // standalone executor. Repeating the actual idempotent shutdown must
-        // not submit new work to that stopped executor.
-        route.shutdown();
+        // Closed publication is not proof that physical disposal has finished.
         route.engine.close(Cancellation::default()).await.unwrap();
+        route.shutdown();
         return;
     }
     let execution = route.engine.execution_runtime();
@@ -35,7 +33,7 @@ async fn shutdown_route(route: &Arc<Route>) {
             fube_runtime::extensions::CallLane::Native,
             fube_runtime::extensions::CallOrigin::default(),
             Duration::from_secs(30),
-            true,
+            false,
         )
         .unwrap()
         .run_owned(move || {
