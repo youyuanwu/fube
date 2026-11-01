@@ -111,12 +111,6 @@ pub(crate) trait Reply {
     type Record: DeserializeOwned;
     type Output: Send + 'static;
 
-    /// Exact native forwarded success profile, not every optional-header
-    /// aggregate form otherwise accepted by the domain decoder.
-    fn forwarded_reply(_: &Message) -> bool {
-        false
-    }
-
     fn decode(
         message: &Message,
         validate: fn(Self::Record) -> Result<Self::Record>,
@@ -132,16 +126,6 @@ impl<T: DeserializeOwned + Send + 'static, const TAG: i32, const STRICT_PAGING: 
     type Record = T;
     type Output = QueryPage<T>;
 
-    fn forwarded_reply(message: &Message) -> bool {
-        // Native aggregate factories produce body-only QueryResult messages
-        // (AggregateHealthParallelQuerySpecificationBase.h:167). In particular
-        // GetApplicationList aggregates at CM, then retains routed correlation.
-        !message
-            .headers
-            .iter()
-            .any(|h| matches!(h.id, ACTOR | ACTION))
-    }
-
     fn decode(message: &Message, validate: fn(T) -> Result<T>) -> Result<Self::Output> {
         decode_list::<T, TAG, STRICT_PAGING, 5>(message, validate, true)
     }
@@ -155,22 +139,6 @@ impl<T: DeserializeOwned + Send + 'static, const TAG: i32, const ACTOR_ID: i64> 
 {
     type Record = T;
     type Output = Vec<T>;
-
-    fn forwarded_reply(message: &Message) -> bool {
-        let Ok(props) = message.properties() else {
-            return false;
-        };
-        if ACTOR_ID == 13 {
-            props.actor == 13 && props.action == "QueryReply"
-        } else if ACTOR_ID == 5 {
-            !message
-                .headers
-                .iter()
-                .any(|h| matches!(h.id, ACTOR | ACTION))
-        } else {
-            false
-        }
-    }
 
     fn decode(message: &Message, validate: fn(T) -> Result<T>) -> Result<Vec<T>> {
         decode_list::<T, TAG, true, ACTOR_ID>(message, validate, false).map(|page| page.items)
@@ -235,12 +203,6 @@ impl<T: DeserializeOwned + Send + 'static, const TAG: i32, const ACTOR_ID: i64> 
 {
     type Record = T;
     type Output = T;
-
-    fn forwarded_reply(message: &Message) -> bool {
-        message.properties().is_ok_and(|props| {
-            ACTOR_ID == 16 && props.actor == 16 && props.action == "OperationSuccessAction"
-        })
-    }
 
     fn decode(message: &Message, validate: fn(T) -> Result<T>) -> Result<T> {
         crate::protocol::check_failure(message)?;

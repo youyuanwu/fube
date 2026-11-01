@@ -48,11 +48,6 @@ struct Envelope {
 impl Reply for EmptyReply {
     type Record = ();
     type Output = ();
-    fn forwarded_reply(message: &Message) -> bool {
-        message
-            .properties()
-            .is_ok_and(|props| props.actor == 13 && props.action == "QueryReply")
-    }
     fn decode(message: &Message, _: fn(()) -> Result<()>) -> Result<()> {
         crate::protocol::check_failure(message)?;
         let properties = message.properties()?;

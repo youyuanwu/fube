@@ -30,17 +30,17 @@ and domain bodies are not decoded by the foundation.
 
 Native common-header scanning uses the **last** RelatesTo in wire order, not
 the first or any value matching pending state. All records are preserved.
-The ordinary native correlation profile supports `[inner, outer]` or
-`[inner, outer, outer]`; an optional third record must repeat the second
-byte-for-byte. Every forwarding record must decode to a nonempty MessageId.
+Repeated RelatesTo records have no special count or repetition-pattern limit;
+the existing total header-count, header-byte and frame bounds apply. Every
+record must decode, including earlier records; a valid empty earlier ID is not
+the effective correlation. Only the final ID is used to look up a pending request.
 An unknown final ID never falls back to an earlier neighbor. The channel does
 not inspect the pending request's domain action or authorize query envelopes.
-The client request's typed Reply family owns query eligibility and permitted
-forwarding actor/action shapes; invalid domain envelopes are call-local protocol
-errors, not channel failures. Fourth records, a nonrepeating third record and
-malformed earlier records remain channel Protocol errors.
+Typed clients validate their operation's normal actor/action/body profile;
+invalid domain envelopes are call-local protocol errors, not channel failures.
+Malformed earlier correlation records remain channel Protocol errors.
 
-This two/three-record cap is a **Rust bound**, not a native maximum. Pinned SF
+This follows pinned SF
 [Add permits appending duplicates](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/MessageHeaders.h#L86-L91);
 [the receive cache overwrites each RelatesTo](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/MessageHeaders.cpp#L805-L823);
 [RequestTable selects that final cached ID once](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/RequestTable.cpp#L46-L71).

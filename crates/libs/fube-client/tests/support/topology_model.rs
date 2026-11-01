@@ -566,22 +566,19 @@ impl NativeCompletion {
         if matches!(self, Self::Hosting) {
             response.headers.retain(|h| !matches!(h.id, ACTOR | ACTION));
         }
-        let outer = response
-            .headers
-            .iter()
-            .position(|h| h.id == RELATES_TO)
-            .unwrap();
-        response.headers.insert(
-            outer,
-            Header::relates_to(MessageId {
-                guid: [91; 16],
-                index: 17,
-            })
-            .unwrap(),
-        );
-        if records == 3 {
-            response.headers.push(response.headers[outer + 1].clone());
+        response.headers.retain(|header| header.id != RELATES_TO);
+        for index in 0..records - 1 {
+            response.headers.push(
+                Header::relates_to(MessageId {
+                    guid: [91; 16],
+                    index: index as u32,
+                })
+                .unwrap(),
+            );
         }
+        response
+            .headers
+            .push(Header::relates_to(request.properties().unwrap().id).unwrap());
         assert_eq!(
             response
                 .headers
@@ -750,9 +747,9 @@ async fn native_query_domain_header_duplicates_remain_call_local_even_when_forwa
 }
 
 #[tokio::test]
-async fn native_forwarded_query_success_and_domain_errors_accept_two_or_three_records() {
+async fn native_query_success_and_domain_errors_accept_repeated_correlation() {
     for profile in NativeCompletion::ALL {
-        for records in [2, 3] {
+        for records in [2, 3, 7] {
             for error in [0, REMOTE_CODE] {
                 let (client, server) =
                     reusable_reply(move |request| profile.forwarded_reply(request, records, error))
@@ -821,7 +818,7 @@ async fn native_forwarded_queries_still_decode_the_selected_operations_profile()
 }
 
 #[tokio::test]
-async fn native_forwarded_queries_reject_ipc_extra_or_nonrepeating_correlation() {
+async fn native_forwarded_queries_reject_ipc_and_malformed_correlation() {
     for profile in NativeCompletion::ALL {
         for case in 0..4 {
             let (client, server) = single_reply(move |request| {
@@ -830,15 +827,16 @@ async fn native_forwarded_queries_reject_ipc_extra_or_nonrepeating_correlation()
                     0 | 1 => response
                         .headers
                         .push(Header::boolean(IPC, case == 1).unwrap()),
-                    2 => response
-                        .headers
-                        .push(response.headers.last().unwrap().clone()),
+                    2 => {
+                        response
+                            .headers
+                            .iter_mut()
+                            .find(|header| header.id == RELATES_TO)
+                            .unwrap()
+                            .value = vec![1]
+                    }
                     _ => {
-                        *response.headers.last_mut().unwrap() = Header::relates_to(MessageId {
-                            guid: [92; 16],
-                            index: 18,
-                        })
-                        .unwrap();
+                        response.headers.last_mut().unwrap().value = vec![1];
                     }
                 }
                 response

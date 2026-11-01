@@ -85,14 +85,14 @@
 //! route registry. The channel owns transport correlation and native Fault;
 //! typed decoding remains above it.
 //!
-//! Forwarded ordinary queries preserve all header records and use native's
-//! final RelatesTo in wire order. The bounded Rust profile accepts two records
-//! or [inner, outer, outer], with an identical final repeat, only under
-//! source-produced query envelopes and the selected query's typed Reply family.
+//! Ordinary replies preserve all header records and use native's final valid
+//! RelatesTo in wire order, within the channel's header/frame bounds. There is
+//! no forwarding-count or repetition-pattern restriction; each typed operation
+//! validates its ordinary reply envelope/body independently of correlation.
 //! Unknown final IDs cannot complete an earlier neighbor. Caller duplicates
 //! and unrelated owned fields remain strict; opaque unowned extensions confer
 //! no retry/ACK/role authority. See the maintained NativeChannel guide and
-//! pinned native common-header/cache references; three is not a native maximum.
+//! pinned native common-header/cache references.
 //!
 //! Encoding selects operation-appropriate actor/action/header/body schemas
 //! already housed in concrete protocol modules. It must not supply ordinary

@@ -270,12 +270,13 @@ ClientOperationFailure suffixes are valid; a present diagnostic must decode.
 Transport Fault diagnostics are not reconstructed from the consumed body.
 Cancellation/timeout does not imply remote cancellation. Invalid input sends nothing.
 
-Forwarded queries use native's final effective RelatesTo in wire order.
-Preserved `[inner, outer]` / `[inner, outer, outer]` composition is authorized
-only under the exact query/typed reply profiles in the
-[channel contract](NativeChannel.md#supported-profile). No earlier pending-ID
-fallback, header normalization, notification/IPC expansion or trust bypass.
-The bounded third-repeat rule is a Rust profile, not a native global maximum.
+Ordinary replies use native's final effective RelatesTo in wire order.
+All repeated records are validated and preserved under the
+[channel's header/frame bounds](NativeChannel.md#supported-profile), without a
+special forwarding-count or repetition-pattern restriction. Typed operations
+validate their normal reply actor/action/body profile independently.
+No earlier pending-ID fallback, header normalization, notification/IPC expansion
+or trust bypass.
 
 `is_closed()` observes terminal state, including idle failures;
 `terminal_error()` returns the first terminal cause. Later operations surface

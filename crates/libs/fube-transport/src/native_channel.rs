@@ -438,10 +438,9 @@ fn local(error: Error) -> Error {
 
 /// Caller fields remain unique. Received native common-header scanning uses
 /// the final RelatesTo (MessageHeaders.cpp:765-824 at pinned SF 3988b451).
-/// Preserve all records; bound forwarded composition to [inner, outer] or
-/// [inner, outer, outer]. Domain reply eligibility belongs to the caller.
-/// Three is our finite profile, not a native global maximum. Only ExpectsReply
-/// retains the earlier second-byte-identical exception; other fields stay unique.
+/// Preserve and validate every record under the existing header/frame bounds.
+/// Only ExpectsReply retains the second-byte-identical exception; other fields
+/// stay unique. Domain reply eligibility belongs to the caller.
 fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
     let ids = [
         message::ACTOR,
@@ -456,21 +455,12 @@ fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
     ];
     let mut seen: [Option<&Header>; 9] = [None; 9];
     let mut repeated = [false; 9];
-    let mut relates_count = 0;
     if message.headers.len() > MAX_HEADER_COUNT {
         return Err(Error::Protocol("header count exceeds limit"));
     }
     for header in &message.headers {
         if let Some(index) = ids.iter().position(|id| *id == header.id) {
             if native_inbound && header.id == message::RELATES_TO {
-                relates_count += 1;
-                if relates_count > 3
-                    || (relates_count == 3
-                        && seen[index].is_some_and(|previous| previous.value != header.value))
-                {
-                    return Err(Error::Protocol("unproven native RelatesTo composition"));
-                }
-                seen[index] = Some(header);
                 continue;
             }
             if let Some(previous) = seen[index] {
@@ -501,33 +491,7 @@ fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
             seen[index] = Some(header);
         }
     }
-    let props = message.properties()?;
-    if native_inbound && forwarded_correlation(message) {
-        for header in message
-            .headers
-            .iter()
-            .filter(|h| h.id == message::RELATES_TO)
-        {
-            if header.read(MessageId::decode)? == MessageId::default() {
-                return Err(Error::Protocol("empty native forwarding RelatesTo record"));
-            }
-        }
-    }
-    Ok(props)
-}
-
-fn forwarded_correlation(message: &Message) -> bool {
-    let mut records = message
-        .headers
-        .iter()
-        .filter(|header| header.id == message::RELATES_TO);
-    let Some(first) = records.next() else {
-        return false;
-    };
-    let Some(second) = records.next() else {
-        return false;
-    };
-    first.value != second.value || records.next().is_some()
+    message.properties()
 }
 
 fn has(message: &Message, id: u16) -> bool {

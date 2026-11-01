@@ -222,7 +222,7 @@ pub(crate) fn call<'a, C: RpcChannel + ?Sized, R: ClientRequest>(
             .await
             .map_err(ClientError::Transport)?;
         check_deadline(context.deadline).map_err(ClientError::Local)?;
-        validate_reply_headers(&reply, R::forwarded_reply).map_err(|error| match error {
+        validate_reply_headers(&reply).map_err(|error| match error {
             Error::Protocol(reason) => ClientError::Protocol(reason),
             _ => ClientError::Protocol("invalid reply metadata"),
         })?;
@@ -237,9 +237,6 @@ pub(crate) fn call<'a, C: RpcChannel + ?Sized, R: ClientRequest>(
 
 pub(crate) mod sealed {
     pub trait Request {
-        fn forwarded_reply(_: &fube_transport::message::Message) -> bool {
-            false
-        }
         fn input_bytes(&self) -> usize;
     }
     pub trait Parameters {
@@ -273,28 +270,19 @@ fn wire(
     Ok(Message { headers, body })
 }
 
-fn validate_reply_headers(reply: &Message, allowed: fn(&Message) -> bool) -> Result<()> {
+fn validate_reply_headers(reply: &Message) -> Result<()> {
     if reply.body.capacity() > MAX_FRAME_SIZE || reply.headers.len() > message::MAX_HEADER_COUNT {
         return Err(Error::Protocol(
             "typed reply allocation exceeds wire bounds",
         ));
     }
     let mut bytes = 0usize;
-    let mut relations: [Option<&Header>; 3] = [None; 3];
-    let mut relation_count = 0;
     for (index, header) in reply.headers.iter().enumerate() {
         bytes = bytes
             .checked_add(header.value.capacity() + 4)
             .ok_or(Error::Protocol("reply header overflow"))?;
         if header.id == message::RELATES_TO {
-            if relation_count == 3
-                || (relation_count == 2 && relations[1].is_some_and(|h| h.value != header.value))
-                || header.read(message::MessageId::decode)? == message::MessageId::default()
-            {
-                return Err(Error::Protocol("invalid typed RelatesTo composition"));
-            }
-            relations[relation_count] = Some(header);
-            relation_count += 1;
+            header.read(message::MessageId::decode)?;
             continue;
         }
         // Validate the fields owned by this channel/client profile. Opaque
@@ -319,8 +307,7 @@ fn validate_reply_headers(reply: &Message, allowed: fn(&Message) -> bool) -> Res
         }
         let mut prior = reply.headers[..index].iter().filter(|h| h.id == header.id);
         if let Some(first) = prior.next() {
-            // Only the unchanged identical-two ExpectsReply exception remains
-            // outside the precisely bounded native forwarded-query relation.
+            // ExpectsReply retains the identical-two native exception.
             if prior.next().is_some()
                 || header.id != message::EXPECTS_REPLY
                 || first.value != header.value
@@ -331,20 +318,6 @@ fn validate_reply_headers(reply: &Message, allowed: fn(&Message) -> bool) -> Res
     }
     if bytes > MAX_HEADER_SIZE {
         return Err(Error::Protocol("reply header bytes exceed limit"));
-    }
-    if relation_count == 3
-        || (relation_count == 2 && relations[0].unwrap().value != relations[1].unwrap().value)
-    {
-        let props = reply.properties()?;
-        let has = |id| reply.headers.iter().any(|h| h.id == id);
-        if !allowed(reply)
-            || props.fault.is_some()
-            || props.expects_reply
-            || props.uncorrelated_reply
-            || has(message::IPC)
-        {
-            return Err(Error::Protocol("unauthorized typed forwarded query reply"));
-        }
     }
     Ok(())
 }
@@ -477,9 +450,6 @@ impl ClientRequest for NameRequest {
 }
 
 impl<P: Query + sealed::Parameters + Send + 'static> sealed::Request for PagedQuery<P> {
-    fn forwarded_reply(reply: &Message) -> bool {
-        <P::Reply as query_protocol::Reply>::forwarded_reply(reply)
-    }
     fn input_bytes(&self) -> usize {
         size_of::<Self>()
             + self.parameters.input_bytes()
@@ -491,9 +461,6 @@ impl<P: Query + sealed::Parameters + Send + 'static> sealed::Request for PagedQu
     }
 }
 impl<P: Query + sealed::Parameters + Send + 'static> sealed::Request for QueryDescription<P> {
-    fn forwarded_reply(reply: &Message) -> bool {
-        <P::Reply as query_protocol::Reply>::forwarded_reply(reply)
-    }
     fn input_bytes(&self) -> usize {
         size_of::<Self>() + self.parameters.input_bytes()
     }
@@ -1019,12 +986,12 @@ mod tests {
             headers: vec![header.clone(), header.clone()],
             body: vec![],
         };
-        validate_reply_headers(&reply, |_| false).unwrap();
+        validate_reply_headers(&reply).unwrap();
         reply.headers.push(header);
-        assert!(validate_reply_headers(&reply, |_| false).is_err());
+        validate_reply_headers(&reply).unwrap();
         let actor = Header::actor(5).unwrap();
         reply.headers = vec![actor.clone(), actor];
-        assert!(validate_reply_headers(&reply, |_| false).is_err());
+        assert!(validate_reply_headers(&reply).is_err());
     }
 
     #[test]

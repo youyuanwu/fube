@@ -5,7 +5,7 @@ use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 #[tokio::test]
 async fn unchanged_notification_profile_accepts_its_empty_relation_without_forwarding_authority() {
-    for count in [1, 2] {
+    for count in [1, 2, 7] {
         let (channel, mut peer) = pair(8192, true, limits());
         let receiver = channel.receiver().unwrap();
         let mut message = notification(42);
@@ -826,6 +826,7 @@ async fn disconnect_security_controls_and_malformed_duplicate_replies_retire_wit
                 response
                     .headers
                     .push(Header::relates_to(sent.properties().unwrap().id).unwrap());
+                response.headers.last_mut().unwrap().value = vec![1];
                 write_message(&mut peer, &response).await.unwrap();
             }
         }
@@ -839,7 +840,7 @@ async fn disconnect_security_controls_and_malformed_duplicate_replies_retire_wit
 }
 
 #[test]
-fn native_duplicate_allowance_is_narrow_and_finite() {
+fn owned_header_duplicates_and_malformed_relations_are_rejected() {
     let id = MessageId {
         guid: [3; 16],
         index: 19,
@@ -852,19 +853,16 @@ fn native_duplicate_allowance_is_narrow_and_finite() {
             Header::message_id(id).unwrap(),
         ],
         vec![
-            Header::relates_to(id).unwrap(),
-            Header::relates_to(id).unwrap(),
-            Header::relates_to(id).unwrap(),
-            Header::relates_to(id).unwrap(),
-        ],
-        vec![
             Header::boolean(message::EXPECTS_REPLY, true).unwrap(),
             Header::boolean(message::EXPECTS_REPLY, true).unwrap(),
             Header::boolean(message::EXPECTS_REPLY, true).unwrap(),
         ],
         vec![
             Header::relates_to(id).unwrap(),
-            Header::relates_to(MessageId::default()).unwrap(),
+            Header {
+                id: message::RELATES_TO,
+                value: vec![1],
+            },
         ],
     ] {
         let mut message = msg("Reply", vec![]);
@@ -1282,7 +1280,7 @@ async fn forwarded_correlation_completes_only_final_neighbor_and_preserves_wire_
         (None, Some("OpaqueReply")),
         (None, None),
     ] {
-        for records in [2, 3] {
+        for records in [2, 3, 7] {
             let (channel, mut peer) = pair(4096, false, limits());
             let target = target(&channel);
             let mut first = channel.request(&target, msg("FirstRequest", vec![1]), deadline());
@@ -1301,11 +1299,15 @@ async fn forwarded_correlation_completes_only_final_neighbor_and_preserves_wire_
                 .properties()
                 .unwrap()
                 .id;
-            let ids = if records == 2 {
-                vec![a, b]
-            } else {
-                vec![a, b, b]
-            };
+            let mut ids: Vec<_> = (0..records)
+                .map(|index| MessageId {
+                    guid: [93; 16],
+                    index: index as u32,
+                })
+                .collect();
+            ids[0] = a;
+            ids[records / 2] = MessageId::default();
+            ids[records - 1] = b;
             let mut response = forwarded_reply(&ids, actor, action, vec![0xff, 0, 0xc3, 42]);
             response.headers.push(Header::activity([3; 16]).unwrap());
             response.headers.push(
@@ -1341,7 +1343,7 @@ async fn forwarded_correlation_completes_only_final_neighbor_and_preserves_wire_
 #[tokio::test]
 async fn forwarded_correlation_unknown_final_id_never_falls_back_to_pending_earlier_id() {
     for (actor, action) in [(Some(77), Some("OpaqueReply")), (None, None)] {
-        for records in [2, 3] {
+        for records in [2, 3, 7] {
             let (channel, mut peer) = pair(4096, false, limits());
             let target = target(&channel);
             let mut request = channel.request(&target, msg("Rpc", vec![]), deadline());
@@ -1356,11 +1358,8 @@ async fn forwarded_correlation_unknown_final_id_never_falls_back_to_pending_earl
                 guid: [73; 16],
                 index: 91,
             };
-            let ids = if records == 2 {
-                vec![a, unknown]
-            } else {
-                vec![a, unknown, unknown]
-            };
+            let mut ids = vec![a; records];
+            ids[records - 1] = unknown;
             write_message(&mut peer, &forwarded_reply(&ids, actor, action, vec![99]))
                 .await
                 .unwrap();
@@ -1456,8 +1455,8 @@ async fn forwarded_correlation_accepts_nonempty_ids_with_one_zero_component() {
 }
 
 #[tokio::test]
-async fn forwarded_correlation_rejects_malformed_extra_nonrepeating_or_invalid_transport_fields() {
-    for case in 0..14 {
+async fn repeated_correlation_rejects_malformed_records_and_invalid_transport_fields() {
+    for case in 0..10 {
         let (channel, mut peer) = pair(4096, false, limits());
         let target = target(&channel);
         let mut request = channel.request(&target, msg("Rpc", vec![]), deadline());
@@ -1478,38 +1477,25 @@ async fn forwarded_correlation_rejects_malformed_extra_nonrepeating_or_invalid_t
             0 => {
                 response.headers[2].value = vec![1];
             }
-            1 => response.headers[2] = Header::relates_to(MessageId::default()).unwrap(),
-            2 => response.headers[3] = Header::relates_to(MessageId::default()).unwrap(),
-            3 => response.headers.extend([
-                Header::relates_to(outer).unwrap(),
-                Header::relates_to(outer).unwrap(),
-            ]),
-            4 => response.headers.push(Header::relates_to(inner).unwrap()),
-            5 => response
+            1 => response.headers[3] = Header::relates_to(MessageId::default()).unwrap(),
+            2 => response.headers.push(Header {
+                id: message::RELATES_TO,
+                value: vec![1],
+            }),
+            3 => response
                 .headers
                 .push(Header::boolean(message::UNCORRELATED_REPLY, true).unwrap()),
-            6 => response
+            4 => response
                 .headers
                 .push(Header::boolean(message::EXPECTS_REPLY, true).unwrap()),
-            7 | 8 => response
+            5 | 6 => response
                 .headers
-                .push(Header::boolean(message::IPC, case == 8).unwrap()),
-            9 => response.headers.push(response.headers[0].clone()),
-            10 => response.headers.push(response.headers[1].clone()),
-            11 => {
-                response =
-                    forwarded_reply(&[MessageId::default(), outer, outer], None, None, vec![99]);
-            }
-            12 => {
+                .push(Header::boolean(message::IPC, case == 6).unwrap()),
+            7 => response.headers.push(response.headers[0].clone()),
+            8 => response.headers.push(response.headers[1].clone()),
+            _ => {
                 response =
                     forwarded_reply(&[inner, outer, MessageId::default()], None, None, vec![99]);
-            }
-            _ => {
-                let mut third = Header::relates_to(outer).unwrap();
-                third.value[6] ^= 1;
-                assert_eq!(third.read(MessageId::decode).unwrap(), outer);
-                assert_ne!(third.value, response.headers[3].value);
-                response.headers.push(third);
             }
         };
         write_message(&mut peer, &response).await.unwrap();

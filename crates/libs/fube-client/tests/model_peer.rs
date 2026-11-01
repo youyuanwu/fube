@@ -18,14 +18,14 @@ use tokio::{
 const TIMEOUT_DURATION: Duration = Duration::from_secs(3);
 
 #[tokio::test]
-async fn ping_rejects_forwarded_envelopes_without_closing_the_channel() {
+async fn ping_validates_domain_envelopes_independently_of_repeated_correlation() {
     for (actor, action) in [
         (Some(5), Some("PingRequest")),
         (Some(16), Some("OperationSuccessAction")),
         (Some(13), Some("QueryReply")),
         (None, None),
     ] {
-        for records in [2, 3] {
+        for records in [2, 3, 7] {
             let (client, server) = reusable_reply(move |request| {
                 let mut response = ping_reply(request);
                 response.headers.retain(|header| {
@@ -53,16 +53,25 @@ async fn ping_rejects_forwarded_envelopes_without_closing_the_channel() {
                     })
                     .unwrap(),
                 );
-                if records == 3 {
-                    response.headers.push(response.headers[outer + 1].clone());
+                for index in 0..records - 2 {
+                    response.headers.insert(
+                        outer + 1,
+                        Header::relates_to(MessageId {
+                            guid: [92; 16],
+                            index: index as u32,
+                        })
+                        .unwrap(),
+                    );
                 }
                 response
             })
             .await;
-            assert!(matches!(
-                client.ping(None).await,
-                Err(ClientError::Protocol(_))
-            ));
+            let result = client.ping(None).await;
+            if actor == Some(5) {
+                assert_eq!(result.unwrap().node_id, NODE_ID);
+            } else {
+                assert!(matches!(result, Err(ClientError::Protocol(_))));
+            }
             assert!(!client.is_closed());
             client.ping(None).await.unwrap();
             client.close().await.unwrap();
