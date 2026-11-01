@@ -684,15 +684,19 @@ fn drive(residual: &mut Residual, receiver: mpsc::Receiver<Work>, shared: Arc<Sh
                 }
                 if let Some(ticket) = &p.tickets[j] {
                     // Never resubmit accepted work, including unknown-store work.
-                    if let status @ ra::Status::Complete(_) = ticket.status() {
-                        p.results[j] = Some(status);
-                    } else if ticket.owner_closed() {
-                        p.blocked = Some(Error::Ra(ra::Failure::Unknown));
-                        owner.withdraw();
-                        let mut meta = inspect(&shared.meta);
-                        meta.accepting = false;
-                        meta.error = p.blocked.clone();
-                        shared.stop.store(true, Ordering::SeqCst);
+                    match ticket.observation() {
+                        ra::TicketObservation::Status(status @ ra::Status::Complete(_)) => {
+                            p.results[j] = Some(status);
+                        }
+                        ra::TicketObservation::OwnerLost => {
+                            p.blocked = Some(Error::Ra(ra::Failure::Unknown));
+                            owner.withdraw();
+                            let mut meta = inspect(&shared.meta);
+                            meta.accepting = false;
+                            meta.error = p.blocked.clone();
+                            shared.stop.store(true, Ordering::SeqCst);
+                        }
+                        ra::TicketObservation::Status(_) => {}
                     }
                 }
             }
@@ -711,7 +715,9 @@ fn drive(residual: &mut Residual, receiver: mpsc::Receiver<Work>, shared: Arc<Sh
                     results,
                 );
             } else {
-                if Instant::now() >= p.deadline {
+                if Instant::now() >= p.deadline
+                    && p.blocked.as_ref().is_none_or(|e| *e == Error::Unknown)
+                {
                     p.blocked = Some(Error::Unknown);
                 }
                 i += 1;

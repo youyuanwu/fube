@@ -70,12 +70,40 @@ pub enum Status {
     Unknown,
     Complete(Result<Disposition>),
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TicketObservation {
+    Status(Status),
+    OwnerLost,
+}
 #[derive(Clone)]
 pub struct Ticket {
     pub id: u64,
     receiver: watch::Receiver<Status>,
 }
 impl Ticket {
+    pub fn observation(&self) -> TicketObservation {
+        self.observe_ownership(|| {})
+    }
+    fn observe_ownership(&self, between: impl FnOnce()) -> TicketObservation {
+        let first = self.status();
+        between();
+        if matches!(first, Status::Complete(_)) {
+            return TicketObservation::Status(first);
+        }
+        if self.owner_closed() {
+            // Completion publication precedes sender destruction. Once closed,
+            // the final watch value is stable; never classify from a stale
+            // Pending sample taken before that publication.
+            let final_status = self.status();
+            if matches!(final_status, Status::Complete(_)) {
+                TicketObservation::Status(final_status)
+            } else {
+                TicketObservation::OwnerLost
+            }
+        } else {
+            TicketObservation::Status(first)
+        }
+    }
     /// Sender loss is terminal ownership loss, not a living store-unknown fence.
     /// Check Complete status first: ordinary completed tickets also close.
     pub fn owner_closed(&self) -> bool {
@@ -1373,6 +1401,30 @@ async fn entity_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_ticket_sender_close_after_pending_sample_is_not_owner_loss() {
+        let (sender, receiver) = watch::channel(Status::Pending);
+        let ticket = Ticket { id: 1, receiver };
+        let observation = ticket.observe_ownership(move || {
+            sender.send_replace(Status::Complete(Ok(Disposition::HostingMatchedNoWork)));
+            drop(sender);
+        });
+        assert_eq!(
+            observation,
+            TicketObservation::Status(Status::Complete(Ok(Disposition::HostingMatchedNoWork)))
+        );
+        assert!(ticket.owner_closed());
+        assert_eq!(ticket.observation(), observation);
+
+        let (sender, receiver) = watch::channel(Status::Unknown);
+        let live_unknown = Ticket { id: 2, receiver };
+        assert_eq!(
+            live_unknown.observation(),
+            TicketObservation::Status(Status::Unknown)
+        );
+        drop(sender);
+        assert_eq!(live_unknown.observation(), TicketObservation::OwnerLost);
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
     use store::{Backend, BackendContext, MemoryBackend, Store, StoreFuture};
 
