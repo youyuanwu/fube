@@ -1,8 +1,9 @@
-//! Finite, node-local bootstrap-only Hosting IPC.
+//! Finite node-local Hosting IPC with separate bootstrap and declared-factory profiles.
 //!
 //! The caller supplies prepared package metadata and expected host/PID admission.
-//! Claimed loopback headers are not OS authentication. No factory, RA/RAP, report,
-//! deployment or distributed Federation capability is implied by this service.
+//! Claimed loopback headers are not OS authentication. Factory admission requires
+//! an owned consumer boundary; reports, deployed RA/RAP and distributed Federation
+//! capability are not implied. Node composition owns actual event consumers.
 use crate::{lease::Authority, wire, Hosting};
 use fube_transport::{
     frame::{Frame, FIXED_HEADER_SIZE},
@@ -41,8 +42,9 @@ pub const LOCAL_LEASE_DURATION: Duration = Duration::from_secs(30);
 /// lease fields/error per operation; the caller owns deployment/work artifacts.
 pub type NodeContext = wire::StartReply;
 
-/// The only admitted profile: activated single-code-package SharedProcess,
-/// noncontainer/nonactivator, no factories/services/reports.
+/// Shared bootstrap metadata: activated single-code-package SharedProcess,
+/// noncontainer/nonactivator. Factories additionally require owned declaration/
+/// consumer admission; deployed services/reports are not enabled.
 #[derive(Debug, Clone)]
 pub struct Admission {
     pub host: wire::HostContext,

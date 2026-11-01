@@ -2,8 +2,9 @@
 //! `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
 //!
 //! The serialized [`Hosting`] model owns no processes, sockets, leases or
-//! factories. The separate [`ipc`] service supplies bounded bootstrap-only
-//! sessions and finite node-local leases; it does not enable live RA/RAP.
+//! factories. The separate [`ipc`] service supplies bounded bootstrap and opt-in
+//! declared-factory sessions with finite node-local leases. Actual local event
+//! consumers belong to node composition; deployed RA/RAP remains unsupported.
 //! H2 [`Residency`] supplies actual admitted accounting, not deployment.
 //! Success is a registration fact, not serving
 //! authority. Public processors and their split table/state steps are distinct.

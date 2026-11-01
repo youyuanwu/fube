@@ -1,8 +1,8 @@
 # Rust node-side Hosting design
 
 **Status: H1 registration/lookup, H2 admitted accounting/scheduling and the narrow
-bootstrap-only H3 IPC/local-lease subset are implemented. Broader H3, H4 and live
-RA/RAP composition remain gated.**
+bootstrap H3 IPC/local leases and the bounded registration-events slice are
+implemented. Broader H3, H4 and deployed RA/RAP composition remain gated.**
 [`fube-hosting`](../../crates/libs/fube-hosting/src/lib.rs) provides
 a native-derived, deterministically driven core plus a separately owned local
 IPC service, not a complete running node. H1's original model evidence is not
@@ -15,6 +15,9 @@ executed Rust/native bootstrap profiles and their non-deployed/non-distributed
 qualification limits.
 See [supplied port contracts](#supplied-port-contracts) for the distinction
 between interface definitions, H1 model implementations and gated live work.
+See [factory registration and owned local events](HostingRegistrationEvents.md)
+for the separate production actor-9/same-core lookup/node-owner profile, exact
+native readiness/health gates and new Rust/release-native execution boundaries.
 
 **Baselines:** repository `0748b9ab3a39530a57387fda23b5889e6e7a442c`;
 native Service Fabric `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`, inspected
@@ -69,7 +72,10 @@ the [native reliability catalog](NativeRaProtocol.md).
 
 The [RA opening](RaStatelessOpening.md), [removal](RaStatelessRemoval.md) and
 [replacement](RaStatelessReplacement.md) slices use trusted simulated adapters.
-There is no production Hosting adapter or running Rust RA+Hosting executable.
+There is no deployed Hosting/RAP adapter or running Rust SF node executable.
+The bounded [`fube-node`](HostingRegistrationEvents.md) library now owns actual
+local registration/closure/status consumers and production Hosting IPC; its
+qualified matching premises do not enable RAP deployment or FM/HM completion.
 The [application runtime](../runtime/RustStatelessRuntime.md) and
 [standalone native test host](../runtime/RustTestHost.md) exercise opposite sides
 of the boundary; neither establishes the combined Rust RA-to-Rust RAP path.

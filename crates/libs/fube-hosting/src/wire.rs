@@ -1,5 +1,6 @@
 //! Hosting2 ordered wire records, pinned native baseline 3988b451.
-//! This bootstrap-only schema does not enable factories, reports or deployment.
+//! Ordered bootstrap/runtime/type records. Schema alone enables no consumer,
+//! reports or deployment; factory capability requires explicit owned admission.
 use fube_transport::serialization::serde::{ByteArray, Guid, ObjectArray, Pointer};
 use serde::{Deserialize, Serialize};
 
