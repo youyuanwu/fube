@@ -400,7 +400,7 @@ async fn larger_preconfirmation_burst_preserves_backend_resource_limit_without_p
     let (seen, ready) = tokio::sync::oneshot::channel();
     let (allow, allowed) = tokio::sync::oneshot::channel();
     let (sent, written) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
+    let mut task = tokio::spawn(async move {
         let mut peer = peer::accept(listener).await;
         read_message(&mut peer).await.unwrap();
         seen.send(()).unwrap();
@@ -413,8 +413,12 @@ async fn larger_preconfirmation_burst_preserves_backend_resource_limit_without_p
                 break;
             }
         }
+        // Backend termination, not elapsed time, fences the withheld observer.
+        assert!(tokio::time::timeout(WAIT, read_message(&mut peer))
+            .await
+            .unwrap()
+            .is_err());
         sent.send(()).unwrap();
-        assert!(read_message(&mut peer).await.is_err());
     });
     let mut opening = Box::pin(ServiceNotificationClient::connect_clear(address, WAIT));
     tokio::select! {
@@ -424,14 +428,16 @@ async fn larger_preconfirmation_burst_preserves_backend_resource_limit_without_p
     }
     allow.send(()).unwrap();
     written.await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(matches!(
         opening.await,
         Err(NotificationError::Common(Error::ResourceLimit(
             "channel retained count/bytes"
         )))
     ));
-    task.await.unwrap();
+    tokio::time::timeout(WAIT, &mut task)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
