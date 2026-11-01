@@ -61,6 +61,10 @@ fn main() {
         executable: PathBuf::from(&args[3]),
         run_parent: PathBuf::from(&args[4]),
     };
+    if args[5] == "hosting-leases" {
+        report(fube_test_host::run_hosting_leases(options));
+        return;
+    }
     let scenario = match args[5].as_str() {
         "bootstrap" => fube_test_host::Scenario::Bootstrap,
         "close" => fube_test_host::Scenario::Close,

@@ -1,8 +1,10 @@
 //! Selected in-memory Hosting2 contracts at native pin
 //! `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
 //!
-//! This serialized, explicitly driven model owns no processes, sockets, leases,
-//! factories. H2 [`Residency`] supplies actual admitted accounting, not deployment.
+//! The serialized [`Hosting`] model owns no processes, sockets, leases or
+//! factories. The separate [`ipc`] service supplies bounded bootstrap-only
+//! sessions and finite node-local leases; it does not enable live RA/RAP.
+//! H2 [`Residency`] supplies actual admitted accounting, not deployment.
 //! Success is a registration fact, not serving
 //! authority. Public processors and their split table/state steps are distinct.
 //! Owned outputs are delivered by the caller, outside the core.
@@ -98,11 +100,14 @@ mod core;
 mod events;
 mod host;
 mod identity;
+pub mod ipc;
+mod lease;
 mod lookup;
 mod model;
 mod residency;
 mod runtime;
 mod types;
+pub mod wire;
 
 pub use collaborators::*;
 pub use contracts::*;

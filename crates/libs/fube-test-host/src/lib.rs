@@ -3,6 +3,7 @@
 
 mod controller;
 mod deployment;
+mod hosting_leases;
 mod ipc;
 mod lifecycle_wire;
 mod manifest;
@@ -26,6 +27,7 @@ use std::{
 };
 
 pub type Result<T> = std::result::Result<T, HostError>;
+pub use hosting_leases::run_hosting_leases;
 
 /// Validate the supported manifest subset without native libraries or app launch.
 pub fn validate_manifest(

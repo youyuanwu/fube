@@ -669,6 +669,23 @@ every stateless listener or invokes every user's exit handler.
 [Process monitoring/invalidation][host-liveness]; [node shutdown notification][host-invalidation];
 [stateful access][stateful-access].
 
+### Rust local Hosting authority (implemented lease-focused profile)
+
+The separate [Rust Hosting bootstrap-only service](../cluster/RustHosting.md#implemented-h3-bootstrap-only-local-ipc)
+now supplies finite actor-15 authority for externally prepared local applications.
+It deliberately replaces the native node lease-agent TTL source for this local
+profile, not the native distributed lease system. Initial TTL alone is not serving
+authority; fresh correlated polls and the existing Rust runtime's send-relative
+expiration/terminal watchdog remain unchanged.
+
+Actual Rust-client frame/child tests cover orderly bootstrap/poll/shutdown and
+finite withdrawal with blocked executor/destructor effects. The separately named
+native bootstrap-only qualification loads pinned native libraries and observes
+real polling/runtime unregister, but does **not** resolve the native initial-TTL
+source discrepancy above or prove native expiry/hard fencing. Type/report/lifecycle/
+deployment capabilities and live RA consumers remain gated. See
+[the qualification boundary](RustTestHost.md#27-production-hosting-lease-qualification).
+
 ## 10. Investigation limits and test anchors
 
 This is an architecture and feasibility map, not a complete recursively specified

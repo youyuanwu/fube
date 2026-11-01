@@ -102,6 +102,8 @@ mod diagnostics;
 mod error;
 mod execution;
 pub mod extensions;
+#[cfg(test)]
+mod hosting_tests;
 mod instance_integration;
 mod lease;
 mod lifecycle;
