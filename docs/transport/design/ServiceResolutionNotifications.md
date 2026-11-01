@@ -438,7 +438,7 @@ A pushed page carries the native uncorrelated-reply marker and starts a reverse
 request/reply exchange. For its transport MessageId `N`, return
 `ServiceNotificationReply` with `RelatesTo(N)` and the processing status. Do not
 confuse that transport ID with the notification page's activity ID/page index.
-The pinned proxy [rewrites MessageId on every forwarding attempt][notification-retry],
+The pinned proxy [rewrites MessageId on every forwarding attempt][notification-proxy-retry],
 including a retry of unchanged logical page content. Sender-side IPC retries
 are a different ID scope. Keep finite transport lifetime collision protection;
 accepted page/version duplicate suppression and processing-status ACK encoding
@@ -706,7 +706,7 @@ APIs from demonstrated coverage.
 [notification-sync]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/client/ServiceNotificationClient.cpp#L515-L526
 [reverse-request]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/requestreply.cpp#L263-L280
 [duplex]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/DuplexRequestReply.cpp#L36-L77
-[notification-retry]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/ServiceNotificationManagerProxy.cpp#L453-L483
+[notification-proxy-retry]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/ServiceNotificationManagerProxy.cpp#L453-L483
 [receiver-reply]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/ReceiverContext.cpp#L25-L39
 [resolve-reply-factory]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/NamingMessage.h#L110-L116
 [notification-gateway-description]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/ServiceNotificationManager.cpp#L1141-L1147
