@@ -853,9 +853,6 @@ async fn open(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<()>
             })
             .await;
         let endpoint = result?;
-        if endpoint.is_empty() {
-            return Err(Error::InvalidInput("open returned empty endpoint"));
-        }
         shared.authority.check()?;
         if !valid.load(Ordering::Acquire) || cancel.is_cancelled() {
             return Err(Error::Closed);
