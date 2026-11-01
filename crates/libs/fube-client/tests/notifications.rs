@@ -394,6 +394,47 @@ async fn connect_confirmation_cannot_overtake_prepublication_page_admission() {
 }
 
 #[tokio::test]
+async fn larger_preconfirmation_burst_preserves_backend_resource_limit_without_publication() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (seen, ready) = tokio::sync::oneshot::channel();
+    let (allow, allowed) = tokio::sync::oneshot::channel();
+    let (sent, written) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut peer = peer::accept(listener).await;
+        read_message(&mut peer).await.unwrap();
+        seen.send(()).unwrap();
+        allowed.await.unwrap();
+        for index in 1..=64 {
+            if write_message(&mut peer, &page(index, index as i64, 1))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        sent.send(()).unwrap();
+        assert!(read_message(&mut peer).await.is_err());
+    });
+    let mut opening = Box::pin(ServiceNotificationClient::connect_clear(address, WAIT));
+    tokio::select! {
+        biased;
+        _ = ready => {},
+        result = &mut opening => panic!("premature constructor result: {}", result.is_ok()),
+    }
+    allow.send(()).unwrap();
+    written.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(matches!(
+        opening.await,
+        Err(NotificationError::Common(Error::ResourceLimit(
+            "channel retained count/bytes"
+        )))
+    ));
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn legitimate_empty_initial_sync_is_acked_without_an_application_event() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

@@ -334,6 +334,7 @@ async fn tracked_invisible_registration_retracts_and_visible_timeout_is_uncertai
                 },
                 result = &mut pending => panic!("unconfirmed mutation completed: {}", result.is_ok()),
             }
+
             assert!(matches!(pending.await, Err(Error::Timeout)));
             drop(mutation);
             assert!(matches!(
@@ -353,4 +354,80 @@ async fn tracked_invisible_registration_retracts_and_visible_timeout_is_uncertai
         session.channel.close(teardown_deadline()).await.unwrap();
         assert!(read_message(&mut peer).await.is_err());
     }
+}
+
+#[tokio::test]
+async fn cancelling_close_stops_scoped_worker_socket_and_invalidates_surviving_guard() {
+    let (session, cleanups, mut peer) = session().await;
+    session
+        .state
+        .lock()
+        .unwrap()
+        .filters
+        .insert(1, RegistrationState::Active);
+    let guard = ServiceNotificationRegistration {
+        session: Arc::downgrade(&session),
+        id: 1,
+        armed: true,
+    };
+    let native = session.channel.receiver().unwrap();
+    let (pages, incoming) = mpsc::channel(MAX_PAGES);
+    let worker_session = session.clone();
+    let exit = WorkerExit(session.clone());
+    let (done, finished) = oneshot::channel();
+    let worker = tokio::spawn(async move {
+        let _exit = exit;
+        tokio::join!(
+            stage_loop(worker_session.clone(), native, pages),
+            run(
+                worker_session.clone(),
+                incoming,
+                cleanups,
+                Progress::default()
+            ),
+        );
+        worker_session
+            .channel
+            .closed(teardown_deadline())
+            .await
+            .unwrap();
+        done.send(()).unwrap();
+    });
+    let client = ServiceNotificationClient {
+        session: session.clone(),
+        worker: Some(worker),
+        gateway: GatewayDescription {
+            address: String::new(),
+            node_id: 0,
+            node_instance: 0,
+            node_name: "test".into(),
+        },
+    };
+    let mut closing = Box::pin(client.close(None));
+    tokio::select! {
+        biased;
+        request = read_message(&mut peer) => {
+            assert_eq!(request.unwrap().properties().unwrap().action,
+                "UnregisterServiceNotificationFilterRequest");
+        }
+        result = &mut closing => panic!("unconfirmed close completed: {}", result.is_ok()),
+    }
+    drop(closing);
+    timeout_at(Instant::now() + Duration::from_secs(1), finished)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(session.state.lock().unwrap().closed);
+    assert!(session.state.lock().unwrap().filters.is_empty());
+    assert!(matches!(
+        guard.unregister(None).await,
+        Err(NotificationError::Common(Error::Closed))
+    ));
+    assert!(timeout_at(
+        Instant::now() + Duration::from_secs(1),
+        read_message(&mut peer)
+    )
+    .await
+    .unwrap()
+    .is_err());
 }
