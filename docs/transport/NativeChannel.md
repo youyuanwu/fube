@@ -77,8 +77,9 @@ channel.close(end).await?;
 
 Domain protocols may require additional version/activity/priority/time headers.
 The example demonstrates binding, not a complete typed FabricClient protocol.
-The qualification test supplies the native notification domain schemas above
-the foundation without making its private client codecs public.
+Native notification setup and processing-status schemas remain above the
+foundation. Existing domain consumers/codecs are not migrated or made public
+by this implementation.
 
 - Resolution is synchronous, performs no I/O and accepts only the configured
   numeric endpoint. It reuses one private target identity. Equal addresses or
@@ -201,8 +202,8 @@ interoperability qualification.
   independent implementation of these wire protocols.
 - Native [gateway completion:465-494][gateway-correlation] appends RelatesTo
   while forwarding composition already carries correlation; generic
-  RequestReply also appends ExpectsReply. Direct SF 11.8.121.4 qualification
-  observed the repeated identical headers. The narrow inbound allowance
+  RequestReply also appends ExpectsReply. Earlier task-local SF 11.8.121.4
+  execution observed the repeated identical headers. The narrow inbound allowance
   validates equality without deleting records or relaxing caller contracts.
 
 ## Verification and execution limits
@@ -220,52 +221,32 @@ provenance, target/role/correlation/history rejection, allocation/count/byte
 overload, full ingress/control/completion separation, consuming replies and
 retained inert-capability/timed/repeated/last-owner shutdown.
 
-Direct native qualification requires the existing
-[owned onebox prerequisites and safeguards](../UbuntuOnebox.md):
+The maintained foundation validation is the focused deterministic Rust suite,
+affected regressions and repository format/type/build/Clippy/Rustdoc checks.
+No dedicated standalone Python/Rust onebox harness, native config contract or
+framing bridge ships with this foundation.
 
-```sh
-python3 -m tests.onebox.native_channel --name my-channel-qualification
-```
+Earlier task-local development runs exercised real SF 11.8.121.4 ordinary RPC,
+raw full write, a genuine initial synchronization notification and its original
+consuming reply. Their original source identities, failed/successful outcomes
+and verified resource cleanup remain **historical LOCAL PAW evidence**. The
+temporary qualification scaffolding was removed under explicit approved scope
+reduction; those executions are not an ongoing maintained test for this PR.
+Production fixes discovered during that work remain implemented and covered by
+the 26 deterministic Rust channel tests.
 
-It creates a **fresh task-owned** SF 11.8.121.4 onebox, verifies original owner,
-container incarnation, controller readiness and independent five-node runtime
-inventory without proxies, redirects or retries, and binds the newly compiled
-test source to a private config. Catchable interruption reaps the exact
-task-owned child process group with bounded TERM/KILL before fixture cleanup. A
-bounded task-owned loopback tap forwards unchanged bytes to/from actual SF.
-The test directly exercises GatewayChannel Ping RPC, raw full write, genuine
-initial notification and its original consuming status reply forwarded to SF.
-No application/service/filter is created or modified. Driver/tap work is joined;
-the wrapper independently verifies original container/volume/network absence,
-including failure paths. It refuses missing/ignored capability results.
+Ongoing consumer end-to-end qualification belongs in the
+[existing test infrastructure](../Development.md) and
+[owner-guarded onebox lifecycle](../UbuntuOnebox.md) when consumers migrate.
+Existing live tests still exercise their current concrete Connection consumers,
+not GatewayChannel, and cannot be relabeled as new-backend coverage. Consumer
+migration and its integrated onebox scenarios remain separately authorized
+future work; this foundation does not migrate consumers now.
 
-This is an explicit local qualification command, not an addition to the existing
-CI native-client report inventory. Those five live consumer tests remain
-independent regressions and cannot qualify the new foundation.
-
-**Executed on 2026-11-01:** 26 deterministic channel tests passed; affected
-transport/client/test-host regressions and repository format, all-target/type,
-workspace executable build, strict Clippy, warning-free Rustdoc and doctests
-passed. Python offline ran 405 tests successfully (one pre-existing skip),
-including seven cleanup/interruption models; two local HTTP policy tests proved
-proxy/redirect rejection without native allocation.
-
-Direct Channel qualification passed on a fresh owned SF 11.8.121.4 onebox:
-ordinary gateway Ping, unchanged raw full local write, an unchanged genuine
-initial synchronization notification (zero entries) and its original consuming
-reply forwarded to SF. The selected live test ran 1 passed/0 failed/0 ignored.
-The driver/tap joined and original container/volume/network absence was
-independently verified. No workload/filter was created or mutated.
-
-Two earlier owned attempts failed during discovery of the native repeated
-correlation form; both cleaned their resources. They are not counted as passes.
-The corrected harness was qualified again after final-review safeguards. Its
-successful implementation/test/schema source SHA-256 is
-`2385fb2f8d865bd5b825e6f31396d89296d142ffdc8f93ac3723c04c094c19d6`.
-No live pass is inferred merely from source inspection or deterministic tests.
-Live notification retry races, nonempty application notification contents,
-secure clusters, arbitrary reverse RPC and unrelated runtime/upload/hosting
-qualification are not claimed.
+No fresh live pass is inferred from scaffolding removal, source inspection or
+deterministic checks. Live notification retry races, nonempty application
+notification contents, secure clusters, arbitrary reverse RPC and unrelated
+runtime/upload/hosting qualification remain unclaimed.
 
 [sf]: https://github.com/microsoft/service-fabric/commit/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d
 [rpc]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/requestreply.cpp#L57-L122
