@@ -447,6 +447,20 @@ async fn phase3_round2_reader_release_between_physical_boundary_insertion_and_fl
         until(|| source.runtime.maintenance().pending_truncation().is_some()).await;
         let trunc = source.runtime.maintenance().pending_truncation().unwrap();
         trunc.applied.wait().await.as_ref().clone().unwrap();
+        let logging = source
+            .runtime
+            .logging
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        let maintenance = source.runtime.maintenance();
+        // Finish automatic checkpoint work before pausing a new manual boundary.
+        logging.group_idle().await;
+        if let Some(checkpoint) = maintenance.pending_checkpoint() {
+            checkpoint.finished.wait().await.as_ref().clone().unwrap();
+        }
         let (entered, observed) = std::sync::mpsc::sync_channel(1);
         let (release, resume) = std::sync::mpsc::sync_channel(1);
         *source
@@ -457,8 +471,7 @@ async fn phase3_round2_reader_release_between_physical_boundary_insertion_and_fl
             .lock()
             .unwrap() = Some((kind, entered, resume));
         let manager = source.runtime.owner.manager.clone();
-        let maintenance = source.runtime.maintenance();
-        let work = source
+        let mut work = source
             .native
             .execution()
             .try_reserve()
@@ -472,13 +485,31 @@ async fn phase3_round2_reader_release_between_physical_boundary_insertion_and_fl
                     Ok(None)
                 }
             });
-        tokio::task::spawn_blocking(move || observed.recv_timeout(Duration::from_secs(5)).unwrap())
-            .await
-            .unwrap();
+        let mut observed =
+            tokio::task::spawn_blocking(move || observed.recv_timeout(Duration::from_secs(5)));
+        let mut completed = None;
+        let paused = tokio::select! {
+            paused = &mut observed => paused,
+            result = &mut work => {
+                completed = Some(result);
+                source.runtime.owner.manager.physical_insertion_pause.lock().unwrap().take();
+                observed.await
+            }
+        };
         memory.lock().unwrap().unpin(reader);
-        trunc.done.wait().await.as_ref().clone().unwrap();
-        release.send(()).unwrap();
-        if let Some(checkpoint) = work.await.unwrap() {
+        let truncated = trunc.done.wait().await.as_ref().clone();
+        let released = release.send(());
+        let result = match completed {
+            Some(result) => result,
+            None => work.await,
+        };
+        let checkpoint = result.expect("physical boundary insertion succeeds");
+        paused
+            .expect("physical insertion observer joins")
+            .expect("physical boundary reaches the controlled pause");
+        truncated.unwrap();
+        released.unwrap();
+        if let Some(checkpoint) = checkpoint {
             checkpoint.finished.wait().await.as_ref().clone().unwrap();
         }
         drop(source.host);
