@@ -320,7 +320,10 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
     let missing_partition =
         ReplicaQueryDescription::new(ReplicaQueryParameters::new(uuid::Uuid::nil()));
     let missing_replica_code = match client.get_replica_list(&missing_partition, None).await {
-        Err(Error::Remote { code, .. }) => code,
+        Err(
+            ClientError::Domain(DomainFailure { code, .. })
+            | ClientError::Transport(Error::Remote { code, .. }),
+        ) => code,
         other => {
             return Err(format!("missing partition must return a native error: {other:?}").into())
         }
@@ -336,7 +339,10 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
         .get_deployed_application_list(&missing_node, None)
         .await
     {
-        Err(Error::Remote { code, .. }) => code,
+        Err(
+            ClientError::Domain(DomainFailure { code, .. })
+            | ClientError::Transport(Error::Remote { code, .. }),
+        ) => code,
         other => return Err(format!("missing node must return a native error: {other:?}").into()),
     };
     assert!(!client.is_closed());

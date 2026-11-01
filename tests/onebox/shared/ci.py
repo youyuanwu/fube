@@ -1303,9 +1303,10 @@ def validate_native(reports, archive, allocation):
     for case in cases:
         true_fields(case, ("passed",))
     require(cases[1].get("result") is True and cases[2].get("result") is False
-            and type(cases[3].get("operation_count")) is int and cases[3]["operation_count"] == 32
+            and type(cases[3].get("operation_count")) is int and cases[3]["operation_count"] == 8
             and type(cases[3].get("initially_pending_count")) is int
-            and cases[3]["initially_pending_count"] == 32, "clear native concurrency/name results")
+            and cases[3]["initially_pending_count"] == 8, "clear native concurrency/name results")
+    true_fields(cases[3], ("ninth_call_rejected_locally", "reuse_after_slot_release"))
     true_fields(cases[-1], ("native_ping_passed", "closed_without_operation", "terminal_error_observed"))
     nodes = clear["node_list"]
     require(type(nodes.get("native_node_count")) is int and nodes["native_node_count"] == 5,
@@ -1315,7 +1316,8 @@ def validate_native(reports, archive, allocation):
                        "empty_name_token_omitted", "valid_continuation_after_final_id_is_empty",
                        "connection_survives_native_error"))
     require([case.get("case") for case in health["cases"]] == list(HEALTH_CASES)
-            and integer(health.get("concurrent_operations")) and health["concurrent_operations"] == 32
+            and integer(health.get("concurrent_operations")) and health["concurrent_operations"] == 8
+            and type(health.get("initially_pending_count")) is int and health["initially_pending_count"] == 8
             and type(health.get("unknown_node_code")) is int and health["unknown_node_code"] == -2147017705
             and health.get("unknown_node_management_code") == "FABRIC_E_HEALTH_ENTITY_NOT_FOUND",
             "heterogeneous native health case/error inventory")

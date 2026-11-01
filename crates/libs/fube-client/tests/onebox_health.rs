@@ -7,9 +7,9 @@ use std::{
 };
 
 use fube_client::{
-    Error, FabricClient, HealthEvaluation, HealthEvent, HealthEventsFilter, HealthState,
-    NodeHealth, NodeHealthPolicy, NodeHealthQueryDescription, NodeHealthQueryParameters,
-    NodeQueryDescription,
+    ClientError, DomainFailure, Error, FabricClient, HealthEvaluation, HealthEvent,
+    HealthEventsFilter, HealthState, NodeHealth, NodeHealthPolicy, NodeHealthQueryDescription,
+    NodeHealthQueryParameters, NodeQueryDescription,
 };
 use serde_json::{json, Value};
 use tokio::task::JoinSet;
@@ -295,10 +295,13 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
     assert!(
         matches!(
             error,
-            Error::Remote {
+            ClientError::Domain(DomainFailure {
                 code: MISSING_CODE,
                 ..
-            }
+            }) | ClientError::Transport(Error::Remote {
+                code: MISSING_CODE,
+                ..
+            })
         ),
         "{error:?}"
     );
@@ -320,11 +323,11 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
         })
         .await;
     }
-    let mut operations = JoinSet::new();
-    for index in 0..32 {
+    let mut pending_operations = Vec::with_capacity(8);
+    for index in 0..8 {
         let client = client.clone();
         let node = config.healthy.clone();
-        operations.spawn(async move {
+        pending_operations.push(Box::pin(async move {
             if index % 3 == 0 {
                 assert!(!client.ping(None).await.unwrap().node_name.is_empty());
             } else if index % 3 == 1 {
@@ -347,11 +350,26 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
                     5
                 );
             }
-        });
+        }));
     }
+    let initially_pending_count = poll_fn(|cx| {
+        for operation in &mut pending_operations {
+            assert!(operation.as_mut().poll(cx).is_pending());
+        }
+        Poll::Ready(pending_operations.len())
+    })
+    .await;
+    assert_eq!(initially_pending_count, 8);
+    let mut operations = JoinSet::new();
+    for operation in pending_operations {
+        operations.spawn(operation);
+    }
+    let mut completed = 0;
     while let Some(result) = operations.join_next().await {
         result?;
+        completed += 1;
     }
+    assert_eq!(completed, 8);
     let final_health = client.get_node_health(&healthy_query, None).await?;
     assert_health(&final_health, &config.snapshots[0], now_ms());
     assert!(!client.is_closed());
@@ -365,7 +383,8 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
         "cases": evidence, "unknown_node_code": MISSING_CODE,
         "unknown_node_management_code": config.missing_http_code,
         "healthy_reuse_after_error": health_evidence(&reused),
-        "concurrent_operations": 32, "cancelled_after_first_poll": true,
+        "concurrent_operations": completed, "initially_pending_count": initially_pending_count,
+        "cancelled_after_first_poll": true,
         "deterministic_late_cancellation": "offline model evidence, not guaranteed live wire emission",
         "final_healthy_reuse": health_evidence(&final_health),
         "completed_at_unix_ms": now_ms(),

@@ -396,7 +396,8 @@ class ProofFiles(fixtures.ProjectFiles):
         common = {"runtime_version": "11.8.121.4", "profile": "clear", "archive_sha256": digest}
         cases = [{"case": name, "passed": True} for name in ci.CLEAR_CASES]
         cases[1]["result"], cases[2]["result"] = True, False
-        cases[3].update(operation_count=32, initially_pending_count=32)
+        cases[3].update(operation_count=8, initially_pending_count=8,
+                        ninth_call_rejected_locally=True, reuse_after_slot_release=True)
         cases[-1].update(native_ping_passed=True, closed_without_operation=True, terminal_error_observed=True)
         nodes = dict.fromkeys((
             "typed_stable_fields_match", "binary_ports_match_onebox_manifest", "exact_name_hit_miss_case_prefix",
@@ -412,7 +413,7 @@ class ProofFiles(fixtures.ProjectFiles):
             **common, "owner": "ci-" + self.current["run_id"] + "-" + self.current["attempt"], "cases": [{
                 "case": name, "native_start_ms": int(start * 1000) + 11,
                 "native_end_ms": int(start * 1000) + 12} for name in ci.HEALTH_CASES],
-            "concurrent_operations": 32, "unknown_node_code": -2147017705,
+            "concurrent_operations": 8, "initially_pending_count": 8, "unknown_node_code": -2147017705,
             "unknown_node_management_code": "FABRIC_E_HEALTH_ENTITY_NOT_FOUND",
             "cancelled_after_first_poll": True, "completed_at_unix_ms": int(start * 1000) + 20,
             "healthy_reuse_after_error": {"aggregated_health_state": 1},
@@ -1219,6 +1220,28 @@ class WorkerTests(ProofFiles):
             self.assertEqual(self.checking("client-runtime", directory), 1)
             self.emit(path, original)
         self.assertEqual(self.checking("client-runtime", directory), 0)
+
+    def test_native_concurrency_requires_eight_overlapping_calls_and_bounded_reuse(self):
+        archive = self.built["inputs"]["native_archive"]["sha256"]
+        reports = self.native_reports("owned", 1)
+        allocation = ci.binding("owned", "a" * 32, "original-cid")
+        ci.validate_native(reports, archive, allocation)
+        for file, field, values in [
+            (ci.NATIVE_FILES[0], "operation_count", (7, 32, True)),
+            (ci.NATIVE_FILES[0], "initially_pending_count", (0, 7, 32, True)),
+            (ci.NATIVE_FILES[0], "ninth_call_rejected_locally", (False, 1)),
+            (ci.NATIVE_FILES[0], "reuse_after_slot_release", (False, 1)),
+            (ci.NATIVE_FILES[1], "concurrent_operations", (7, 32, True)),
+            (ci.NATIVE_FILES[1], "initially_pending_count", (None, 0, 7, 32, True)),
+        ]:
+            for value in values:
+                with self.subTest(file=file, field=field, value=value):
+                    broken = copy.deepcopy(reports)
+                    target = (broken[file]["executed_cases"][3]
+                              if file == ci.NATIVE_FILES[0] else broken[file])
+                    target[field] = value
+                    with self.assertRaises(ci.ProofError):
+                        ci.validate_native(broken, archive, allocation)
 
     def test_source_eos_variants_require_typed_payloads_bound_to_actual_held_copy(self):
         directory = self.worker("native-data")

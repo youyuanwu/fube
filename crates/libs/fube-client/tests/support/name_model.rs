@@ -69,7 +69,11 @@ fn check_request(request: &Message, delete: bool) {
     decoder.finish().unwrap();
 }
 
-async fn write(client: &FabricClient, delete: bool, timeout: Duration) -> fube_client::Result<()> {
+async fn write(
+    client: &FabricClient,
+    delete: bool,
+    timeout: Duration,
+) -> fube_client::ClientResult<()> {
     if delete {
         client
             .delete_name("fabric:/App_1/Name-2", Some(timeout))
@@ -148,7 +152,7 @@ async fn native_duplicate_and_missing_are_explicit_and_operation_local() {
     for (delete, code) in [(false, DUPLICATE), (true, MISSING)] {
         assert!(matches!(
             write(&client, delete, TIMEOUT_DURATION).await,
-            Err(Error::Remote { code: actual, message }) if actual == code && message == "native name diagnostic"
+            Err(ClientError::Domain(DomainFailure { code: actual, message })) if actual == code && message == "native name diagnostic"
         ));
         assert!(!client.is_closed());
         write(&client, delete, TIMEOUT_DURATION).await.unwrap();
@@ -185,18 +189,18 @@ async fn invalid_uri_and_budget_never_send_writes_and_keep_connection() {
     ] {
         assert!(matches!(
             client.create_name(&name, None).await,
-            Err(Error::InvalidInput(_))
+            Err(ClientError::Local(Error::InvalidInput(_)))
         ));
         assert!(matches!(
             client.delete_name(&name, None).await,
-            Err(Error::InvalidInput(_))
+            Err(ClientError::Local(Error::InvalidInput(_)))
         ));
     }
     for delete in [false, true] {
         for budget in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
             assert!(matches!(
                 write(&client, delete, budget).await,
-                Err(Error::InvalidInput(_))
+                Err(ClientError::Local(Error::InvalidInput(_)))
             ));
         }
     }
@@ -206,10 +210,10 @@ async fn invalid_uri_and_budget_never_send_writes_and_keep_connection() {
 }
 
 #[tokio::test]
-async fn malformed_write_success_retires_connection() {
+async fn malformed_write_body_is_local_but_invalid_channel_actor_is_terminal() {
     for delete in [false, true] {
         for shape in 0..5 {
-            let (client, server) = single_reply(move |request| {
+            let make_reply = move |request: &Message| {
                 let mut response = reply(request, "NameOperationReply", vec![]);
                 match shape {
                     0 => response.body = body(|_| Ok(())),
@@ -219,14 +223,26 @@ async fn malformed_write_success_retires_connection() {
                     _ => response.headers[1] = Header::action("CreateNameReply").unwrap(),
                 }
                 response
-            })
-            .await;
-            assert!(matches!(
-                write(&client, delete, TIMEOUT_DURATION).await,
-                Err(Error::Protocol(_))
-            ));
-            assert!(client.is_closed());
-            assert!(matches!(client.terminal_error(), Some(Error::Protocol(_))));
+            };
+            let (client, server) = if shape == 3 {
+                single_reply(make_reply).await
+            } else {
+                reusable_reply(make_reply).await
+            };
+            let result = write(&client, delete, TIMEOUT_DURATION).await;
+            if shape == 3 {
+                assert!(matches!(
+                    result,
+                    Err(ClientError::Transport(Error::Protocol(_)))
+                ));
+                assert!(client.is_closed());
+                assert!(matches!(client.terminal_error(), Some(Error::Protocol(_))));
+            } else {
+                assert!(matches!(result, Err(ClientError::Protocol(_))));
+                assert!(!client.is_closed());
+                assert!(client.terminal_error().is_none());
+                client.ping(None).await.unwrap();
+            }
             client.close().await.unwrap();
             server.await.unwrap();
         }
@@ -234,19 +250,29 @@ async fn malformed_write_success_retires_connection() {
 }
 
 #[tokio::test]
-async fn malformed_write_retires_without_waiter_repoll_and_fails_neighbor() {
+async fn malformed_write_is_call_local_and_pending_neighbor_succeeds() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let mut stream = establish(listener).await;
         let a = read_message(&mut stream).await.unwrap();
         let b = read_message(&mut stream).await.unwrap();
-        let request = if a.properties().unwrap().action == "DeleteNameRequest" {
-            a
+        let (request, neighbor) = if a.properties().unwrap().action == "DeleteNameRequest" {
+            (a, b)
         } else {
-            b
+            (b, a)
         };
         write_message(&mut stream, &reply(&request, "NameOperationReply", vec![0]))
+            .await
+            .unwrap();
+        write_message(
+            &mut stream,
+            &reply(&neighbor, "NameOperationReply", naming_body(true, 0)),
+        )
+        .await
+        .unwrap();
+        let reuse = read_message(&mut stream).await.unwrap();
+        write_message(&mut stream, &ping_reply(&reuse))
             .await
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
@@ -263,15 +289,11 @@ async fn malformed_write_retires_without_waiter_repoll_and_fails_neighbor() {
         Poll::Ready(())
     })
     .await;
-    tokio::time::timeout(TIMEOUT_DURATION, async {
-        while !client.is_closed() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(matches!(mutation.await, Err(Error::Protocol(_))));
-    assert!(matches!(neighbor.await, Err(Error::Protocol(_))));
+    assert!(matches!(mutation.await, Err(ClientError::Protocol(_))));
+    assert!(neighbor.await.unwrap());
+    assert!(!client.is_closed());
+    assert!(client.terminal_error().is_none());
+    client.ping(None).await.unwrap();
     client.close().await.unwrap();
     server.await.unwrap();
 }
@@ -372,7 +394,10 @@ async fn peer_observed_cancel_and_timeout_never_replay_writes_or_decode_late_rep
                 pending.abort();
                 assert!(pending.await.unwrap_err().is_cancelled());
             } else {
-                assert!(matches!(pending.await.unwrap(), Err(Error::Timeout)));
+                assert!(matches!(
+                    pending.await.unwrap(),
+                    Err(ClientError::Transport(Error::Timeout))
+                ));
             }
             release.send(()).unwrap();
             assert!(client.name_exists("fabric:/neighbor", None).await.unwrap());

@@ -42,15 +42,12 @@ struct Request<'a> {
     bypass_cache: bool,
 }
 
-pub(crate) fn encode(
+pub(crate) fn encode_refresh(
     name: &NamingUri,
     key: &PartitionKey,
-    previous: Option<&ResolvedServicePartition>,
+    previous: Option<&Refresh>,
 ) -> Result<Vec<u8>> {
     key.validate()?;
-    if let Some(previous) = previous {
-        previous.validate_previous(name, key)?;
-    }
     let key = match key {
         PartitionKey::Singleton => Key {
             kind: 1,
@@ -74,10 +71,10 @@ pub(crate) fn encode(
     let (lookup, generation, store, id) =
         previous.map_or((-1, Generation::default(), -1, Uuid::nil()), |p| {
             (
-                p.refresh.version.lookup,
-                p.refresh.version.generation,
-                p.refresh.store,
-                p.refresh.partition.id,
+                p.version.lookup,
+                p.version.generation,
+                p.store,
+                p.partition.id,
             )
         });
     to_vec(&Request {

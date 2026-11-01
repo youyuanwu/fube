@@ -32,7 +32,9 @@ mod replicas;
 mod resolution;
 mod resolution_protocol;
 mod services;
+mod typed;
 pub use applications::*;
+pub use contracts::{CallContext, Client, ClientBinding, ClientError, ClientRequest};
 pub use deployed_applications::*;
 pub use deployed_code_packages::*;
 pub use deployed_replicas::*;
@@ -47,12 +49,15 @@ pub use query::*;
 pub use replicas::*;
 pub use resolution::*;
 pub use services::*;
+pub use typed::*;
 
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use contracts::ClientFuture;
 use fube_transport::{
-    connection::{deadline_after, Connection},
-    message::Header,
+    channel::MessageChannel,
+    connection::deadline_after,
+    native_channel::{ChannelLimits, GatewayChannel, GatewayTarget},
 };
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -82,7 +87,7 @@ pub struct GatewayDescription {
 /// use std::time::Duration;
 /// use fube_client::{FabricClient, DEFAULT_TIMEOUT};
 ///
-/// # async fn example() -> fube_client::Result<()> {
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let client = FabricClient::connect_clear("127.0.0.1:19000".parse().unwrap(), DEFAULT_TIMEOUT).await?;
 /// let gateway = client.ping(None).await?;
 /// let exists = client.name_exists("fabric:/MyApplication", Some(Duration::from_secs(5))).await?;
@@ -92,7 +97,9 @@ pub struct GatewayDescription {
 /// ```
 #[derive(Clone)]
 pub struct FabricClient {
-    connection: Connection,
+    channel: GatewayChannel,
+    target: Arc<GatewayTarget>,
+    budget: typed::ClientBudget,
     timeout: Duration,
 }
 
@@ -104,24 +111,13 @@ impl FabricClient {
         key: &PartitionKey,
         previous: Option<&ResolvedServicePartition>,
         timeout: Option<Duration>,
-    ) -> Result<ResolvedServicePartition> {
-        let deadline = self.deadline(timeout)?;
-        let body = resolution_protocol::encode(name, key, previous)?;
-        let result = self
-            .request(
-                "ResolveServiceRequest",
-                body,
-                deadline,
-                resolution_protocol::decode,
-            )
-            .await?;
-        if &result.service_name != name || !key.selects(&result.partition_information) {
-            self.connection.abort();
-            return Err(Error::Protocol(
-                "resolution result does not match requested selection",
-            ));
-        }
-        Ok(result)
+    ) -> ClientResult<ResolvedServicePartition> {
+        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
+        self.call(
+            ResolutionRequest::new(name, key, previous).map_err(ClientError::Local)?,
+            CallContext { deadline },
+        )
+        .await
     }
 
     /// Connect explicitly without TLS or authentication.
@@ -130,20 +126,26 @@ impl FabricClient {
     /// `None`. There is no insecure fallback, automatic reconnect, or replay.
     pub async fn connect_clear(endpoint: SocketAddr, timeout: Duration) -> Result<Self> {
         let deadline = deadline_after(timeout)?;
-        let connection = Connection::connect_clear(endpoint, deadline).await?;
+        let channel = GatewayChannel::connect_unsecured_loopback(
+            endpoint,
+            false,
+            ChannelLimits::default(),
+            deadline,
+        )
+        .await?;
+        let target = channel.resolve_target(&endpoint.to_string())?;
+        typed::check_deadline(deadline)?;
         Ok(Self {
-            connection,
+            channel,
+            target,
+            budget: typed::default_budget(),
             timeout,
         })
     }
 
     /// Discover the native gateway's full node identity.
-    pub async fn ping(&self, timeout: Option<Duration>) -> Result<GatewayDescription> {
-        let deadline = self.deadline(timeout)?;
-        self.request("PingRequest", Vec::new(), deadline, |reply| {
-            protocol::decode_ping(&reply)
-        })
-        .await
+    pub async fn ping(&self, timeout: Option<Duration>) -> ClientResult<GatewayDescription> {
+        self.operation(PingRequest, timeout).await
     }
 
     /// Test naming-store existence, independently of user-service state.
@@ -157,13 +159,14 @@ impl FabricClient {
         &self,
         name: impl AsRef<str>,
         timeout: Option<Duration>,
-    ) -> Result<bool> {
-        let deadline = self.deadline(timeout)?;
-        let body = protocol::encode_name(name.as_ref())?;
-        self.request("NameExistsRequest", body, deadline, |reply| {
-            protocol::decode_name_exists(&reply)
-        })
-        .await
+    ) -> ClientResult<bool> {
+        match self
+            .name_operation(name.as_ref(), NameOperation::Exists, timeout)
+            .await?
+        {
+            NameResponse::Exists(exists) => Ok(exists),
+            _ => Err(ClientError::Protocol("unexpected naming result")),
+        }
     }
 
     /// Explicitly create a naming entry with one deadline from preparation through decode.
@@ -179,13 +182,10 @@ impl FabricClient {
         &self,
         name: impl AsRef<str>,
         timeout: Option<Duration>,
-    ) -> Result<()> {
-        let deadline = self.deadline(timeout)?;
-        let body = protocol::encode_name(name.as_ref())?;
-        self.request("CreateNameRequest", body, deadline, |reply| {
-            protocol::decode_name_write(&reply)
-        })
-        .await
+    ) -> ClientResult<()> {
+        self.name_operation(name.as_ref(), NameOperation::Create, timeout)
+            .await
+            .map(|_| ())
     }
 
     /// Explicitly delete one naming entry with one deadline from preparation through decode.
@@ -201,14 +201,10 @@ impl FabricClient {
         &self,
         name: impl AsRef<str>,
         timeout: Option<Duration>,
-    ) -> Result<()> {
-        let deadline = self.deadline(timeout)?;
-        let body = protocol::encode_name(name.as_ref())?;
-        let headers = vec![Header::boolean(protocol::DELETE_NAME_HEADER, true)?];
-        self.request_with_headers("DeleteNameRequest", headers, body, deadline, |reply| {
-            protocol::decode_name_write(&reply)
-        })
-        .await
+    ) -> ClientResult<()> {
+        self.name_operation(name.as_ref(), NameOperation::Delete, timeout)
+            .await
+            .map(|_| ())
     }
 
     /// Get one native node page. Inspect `continuation_token` even without an
@@ -220,36 +216,34 @@ impl FabricClient {
         &self,
         query: &NodeQueryDescription,
         timeout: Option<Duration>,
-    ) -> Result<NodeListPage> {
-        self.query(&query.parameters, Some(&query.paging), timeout)
-            .await
+    ) -> ClientResult<NodeListPage> {
+        self.query(query, timeout).await
     }
 
     /// Query actual single-node health, events and unhealthy explanations.
     /// This is not GetNodeList's summary. No paging or automatic retries occur.
     ///
-    /// Native errors are operation-local; malformed successful responses retire
-    /// the shared connection. See [`NodeHealthQueryDescription`] for defaults.
+    /// Native and malformed domain replies are operation-local; transport
+    /// envelope failures can terminate the channel. See [`NodeHealthQueryDescription`].
     pub async fn get_node_health(
         &self,
         query: &NodeHealthQueryDescription,
         timeout: Option<Duration>,
-    ) -> Result<NodeHealth> {
-        self.query(&query.parameters, None, timeout).await
+    ) -> ClientResult<NodeHealth> {
+        self.query(query, timeout).await
     }
 
     /// Get one native application page with one whole-operation deadline.
     /// Filters are mutually exclusive; parameters are included by default.
     ///
-    /// No retries or automatic traversal. Malformed successes retire the stream;
-    /// normal native errors remain operation-local.
+    /// No retries or automatic traversal. Domain validation errors are local to
+    /// this call; the channel independently owns transport failure policy.
     pub async fn get_application_list(
         &self,
         query: &ApplicationQueryDescription,
         timeout: Option<Duration>,
-    ) -> Result<ApplicationListPage> {
-        self.query(&query.parameters, Some(&query.paging), timeout)
-            .await
+    ) -> ClientResult<ApplicationListPage> {
+        self.query(query, timeout).await
     }
 
     /// Get one ordinary application-scoped service page with one whole-operation deadline.
@@ -260,9 +254,8 @@ impl FabricClient {
         &self,
         query: &ServiceQueryDescription,
         timeout: Option<Duration>,
-    ) -> Result<ServiceListPage> {
-        self.query(&query.parameters, Some(&query.paging), timeout)
-            .await
+    ) -> ClientResult<ServiceListPage> {
+        self.query(query, timeout).await
     }
 
     /// Get one partition page for a service with one whole-operation deadline.
@@ -274,9 +267,8 @@ impl FabricClient {
         &self,
         query: &PartitionQueryDescription,
         timeout: Option<Duration>,
-    ) -> Result<PartitionListPage> {
-        self.query(&query.parameters, Some(&query.paging), timeout)
-            .await
+    ) -> ClientResult<PartitionListPage> {
+        self.query(query, timeout).await
     }
 
     /// Get one replica or stateless instance page for a partition.
@@ -288,9 +280,8 @@ impl FabricClient {
         &self,
         query: &ReplicaQueryDescription,
         timeout: Option<Duration>,
-    ) -> Result<ReplicaListPage> {
-        self.query(&query.parameters, Some(&query.paging), timeout)
-            .await
+    ) -> ClientResult<ReplicaListPage> {
+        self.query(query, timeout).await
     }
 
     /// Get one deployed application page on a selected node.
@@ -301,9 +292,8 @@ impl FabricClient {
         &self,
         query: &DeployedApplicationQueryDescription,
         timeout: Option<Duration>,
-    ) -> Result<DeployedApplicationListPage> {
-        self.query(&query.parameters, Some(&query.paging), timeout)
-            .await
+    ) -> ClientResult<DeployedApplicationListPage> {
+        self.query(query, timeout).await
     }
 
     /// List service packages deployed for one application on a selected node.
@@ -314,20 +304,20 @@ impl FabricClient {
         &self,
         query: &DeployedServicePackageQueryDescription,
         timeout: Option<Duration>,
-    ) -> Result<Vec<DeployedServicePackage>> {
-        self.query(&query.parameters, None, timeout).await
+    ) -> ClientResult<Vec<DeployedServicePackage>> {
+        self.query(query, timeout).await
     }
 
     /// List code packages deployed for one application on a selected node.
     /// Includes setup/main entry points, statistics and host details; no paging.
     ///
-    /// Native errors remain operation-local; malformed successes retire the stream.
+    /// Native errors and malformed domain successes remain operation-local.
     pub async fn get_deployed_code_package_list(
         &self,
         query: &DeployedCodePackageQueryDescription,
         timeout: Option<Duration>,
-    ) -> Result<Vec<DeployedCodePackage>> {
-        self.query(&query.parameters, None, timeout).await
+    ) -> ClientResult<Vec<DeployedCodePackage>> {
+        self.query(query, timeout).await
     }
 
     /// List replicas or stateless instances deployed on one node for an application.
@@ -338,23 +328,23 @@ impl FabricClient {
         &self,
         query: &DeployedReplicaQueryDescription,
         timeout: Option<Duration>,
-    ) -> Result<Vec<DeployedReplica>> {
-        self.query(&query.parameters, None, timeout).await
+    ) -> ClientResult<Vec<DeployedReplica>> {
+        self.query(query, timeout).await
     }
 
     /// Close the shared connection and wait for the background driver to exit.
     /// Dropping one clone does not close the other handles.
     pub async fn close(&self) -> Result<()> {
-        self.connection.close().await
+        self.channel.close(self.deadline(None)?).await
     }
 
     pub fn is_closed(&self) -> bool {
-        self.connection.is_closed()
+        self.channel.terminal_error().is_some()
     }
 
     /// The first terminal connection cause, including failures detected idle.
     pub fn terminal_error(&self) -> Option<Error> {
-        self.connection.terminal_error()
+        self.channel.terminal_error()
     }
 
     /// Ask native FM to move a partition's Primary to an explicit node while
@@ -366,13 +356,17 @@ impl FabricClient {
         partition: Uuid,
         target_node: &str,
         timeout: Option<Duration>,
-    ) -> Result<()> {
+    ) -> ClientResult<()> {
+        query_arguments::validate_node_name(
+            target_node,
+            "primary target must be an explicit native node",
+        )
+        .map_err(ClientError::Local)?;
         self.query(
-            &movement::MovePrimary {
+            &QueryDescription::new(movement::MovePrimary {
                 partition,
                 target: target_node.to_owned(),
-            },
-            None,
+            }),
             timeout,
         )
         .await
@@ -382,43 +376,56 @@ impl FabricClient {
         deadline_after(timeout.unwrap_or(self.timeout))
     }
 
-    async fn query<Q: query_protocol::Query>(
+    async fn query<Q: ClientRequest<DomainError = DomainFailure> + Clone>(
         &self,
-        parameters: &Q,
-        paging: Option<&Paging>,
+        query: &Q,
         timeout: Option<Duration>,
-    ) -> Result<Q::Output> {
-        let deadline = self.deadline(timeout)?;
-        let body = query_protocol::encode_query(parameters, paging)?;
-        self.request("QueryRequest", body, deadline, |reply| {
-            query_protocol::decode_reply::<Q>(&reply)
-        })
+    ) -> ClientResult<Q::Response> {
+        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
+        typed::check_input(query).map_err(ClientError::Local)?;
+        self.call(query.clone(), CallContext { deadline }).await
+    }
+
+    async fn operation<R: ClientRequest<DomainError = DomainFailure>>(
+        &self,
+        request: R,
+        timeout: Option<Duration>,
+    ) -> ClientResult<R::Response> {
+        self.call(
+            request,
+            CallContext {
+                deadline: self.deadline(timeout).map_err(ClientError::Local)?,
+            },
+        )
         .await
     }
 
-    async fn request<T: Send + 'static>(
+    async fn name_operation(
         &self,
-        action: &str,
-        body: Vec<u8>,
-        deadline: Instant,
-        decode: fn(fube_transport::message::Message) -> Result<T>,
-    ) -> Result<T> {
-        self.request_with_headers(action, Vec::new(), body, deadline, decode)
+        name: &str,
+        operation: NameOperation,
+        timeout: Option<Duration>,
+    ) -> ClientResult<NameResponse> {
+        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
+        let name = NamingUri::parse(name).map_err(ClientError::Local)?;
+        self.call(NameRequest { name, operation }, CallContext { deadline })
             .await
     }
+}
 
-    async fn request_with_headers<T: Send + 'static>(
-        &self,
-        action: &str,
-        mut headers: Vec<Header>,
-        body: Vec<u8>,
-        deadline: Instant,
-        decode: fn(fube_transport::message::Message) -> Result<T>,
-    ) -> Result<T> {
-        headers.push(Header::activity(Uuid::new_v4().to_bytes_le())?);
-        headers.push(Header::version(1, 1)?);
-        self.connection
-            .request_decoded(action, 5, headers, body, deadline, decode)
-            .await
+impl Client for FabricClient {
+    type Channel = GatewayChannel;
+    fn binding(&self) -> ClientBinding<'_, GatewayChannel> {
+        ClientBinding {
+            channel: &self.channel,
+            target: &self.target,
+        }
+    }
+    fn call<'a, R: ClientRequest>(
+        &'a self,
+        request: R,
+        context: CallContext,
+    ) -> ClientFuture<'a, R::Response, R::DomainError> {
+        typed::call(self.binding(), &self.budget, request, context)
     }
 }

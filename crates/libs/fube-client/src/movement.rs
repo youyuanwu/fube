@@ -12,7 +12,7 @@ use fube_transport::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct MovePrimary {
     #[serde(rename = "NodeName")]
     pub(crate) target: String,
@@ -48,6 +48,11 @@ struct Envelope {
 impl Reply for EmptyReply {
     type Record = ();
     type Output = ();
+    fn forwarded_reply(message: &Message) -> bool {
+        message
+            .properties()
+            .is_ok_and(|props| props.actor == 13 && props.action == "QueryReply")
+    }
     fn decode(message: &Message, _: fn(()) -> Result<()>) -> Result<()> {
         crate::protocol::check_failure(message)?;
         let properties = message.properties()?;

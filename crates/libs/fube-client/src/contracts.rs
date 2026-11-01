@@ -251,6 +251,26 @@ pub enum ClientError<D> {
     Domain(D),
 }
 
+impl<D: std::fmt::Display> std::fmt::Display for ClientError<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(error) => write!(f, "local client: {error}"),
+            Self::Transport(error) => write!(f, "RPC transport: {error}"),
+            Self::Protocol(reason) => write!(f, "reply protocol: {reason}"),
+            Self::Domain(error) => write!(f, "{error}"),
+        }
+    }
+}
+impl<D: std::error::Error + 'static> std::error::Error for ClientError<D> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Local(error) | Self::Transport(error) => Some(error),
+            Self::Domain(error) => Some(error),
+            Self::Protocol(_) => None,
+        }
+    }
+}
+
 /// Outcomes allowed from operation-specific reply interpretation.
 ///
 /// **Proposed Rust-profile declaration.** Required malformed failure data is
@@ -283,7 +303,7 @@ pub type ClientFuture<'a, T, D> =
 /// and Send + 'static; they need not be Sync. Static adaptation is intentionally
 /// not object-safe; the response/state/error association stays statically typed.
 /// A client future can still borrow its façade for less than 'static.
-pub trait ClientRequest: Sized + Send + 'static {
+pub trait ClientRequest: crate::typed::sealed::Request + Sized + Send + 'static {
     /// Owned successful operation result, after all required validation.
     type Response: Send + 'static;
     /// Owned per-call request-derived data retained across RPC for validation.

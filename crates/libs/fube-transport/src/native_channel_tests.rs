@@ -27,7 +27,13 @@ fn pair(
         "127.0.0.1:19000".parse().unwrap(),
         notifications,
         limits,
-        [INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed); 16],
+        {
+            // Distinct from the constant-byte synthetic notification/peer IDs,
+            // even when an expanded test inventory reaches their byte values.
+            let mut id = std::array::from_fn(|i| (i + 1) as u8);
+            id[0] = INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            id
+        },
         ListenInstance::default(),
     );
     (channel, peer)
@@ -1227,4 +1233,405 @@ async fn native_equal_duplicate_correlation_is_preserved_but_caller_and_contradi
     until(|| channel.terminal_error().is_some()).await;
     assert!(matches!(channel.terminal_error(), Some(Error::Protocol(_))));
     channel.close(deadline()).await.unwrap();
+}
+
+fn forwarded_reply(
+    ids: &[MessageId],
+    actor: Option<i64>,
+    action: Option<&str>,
+    body: Vec<u8>,
+) -> Message {
+    let mut headers = Vec::new();
+    if let Some(actor) = actor {
+        headers.push(Header::actor(actor).unwrap());
+    }
+    if let Some(action) = action {
+        headers.push(Header::action(action).unwrap());
+    }
+    headers.extend(ids.iter().map(|id| Header::relates_to(*id).unwrap()));
+    Message { headers, body }
+}
+
+#[tokio::test]
+async fn forwarded_correlation_completes_only_final_neighbor_and_preserves_wire_bytes() {
+    for (actor, action) in [
+        (Some(16), Some("OperationSuccessAction")),
+        (Some(13), Some("QueryReply")),
+        (None, None),
+    ] {
+        for records in [2, 3] {
+            let (channel, mut peer) = pair(4096, false, limits());
+            let target = target(&channel);
+            let mut first = channel.request(&target, msg("QueryRequest", vec![1]), deadline());
+            pending(first.as_mut()).await;
+            let a = read_message(&mut peer)
+                .await
+                .unwrap()
+                .properties()
+                .unwrap()
+                .id;
+            let mut second = channel.request(&target, msg("QueryRequest", vec![2]), deadline());
+            pending(second.as_mut()).await;
+            let b = read_message(&mut peer)
+                .await
+                .unwrap()
+                .properties()
+                .unwrap()
+                .id;
+            let ids = if records == 2 {
+                vec![a, b]
+            } else {
+                vec![a, b, b]
+            };
+            let mut response = forwarded_reply(&ids, actor, action, vec![0xff, 0, 0xc3, 42]);
+            response.headers.push(Header::activity([3; 16]).unwrap());
+            response.headers.push(
+                Header::object(0x8999, |e| {
+                    e.u32(42);
+                    Ok(())
+                })
+                .unwrap(),
+            );
+            let wire = response.to_frame().unwrap().encode().unwrap();
+            peer.write_all(&wire).await.unwrap();
+            until(|| {
+                let inner = channel.owner.shared.inner.lock().unwrap();
+                inner.pending.contains_key(&a)
+                    && !inner.pending.contains_key(&b)
+                    && inner.entries.values().any(|entry| entry.result.is_some())
+            })
+            .await;
+            pending(first.as_mut()).await;
+            let received = second.await.unwrap();
+            assert_eq!(received, response);
+            assert_eq!(received.to_frame().unwrap().encode().unwrap(), wire);
+            assert_eq!(received.properties().unwrap().relates_to, b);
+            assert_eq!(channel.owner.shared.inner.lock().unwrap().pending.len(), 1);
+            assert!(channel.terminal_error().is_none());
+            write_message(&mut peer, &reply(a, vec![1])).await.unwrap();
+            assert_eq!(first.await.unwrap().body, [1]);
+            channel.close(deadline()).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn forwarded_correlation_unknown_final_id_never_falls_back_to_pending_earlier_id() {
+    for (actor, action) in [
+        (Some(16), Some("OperationSuccessAction")),
+        (Some(13), Some("QueryReply")),
+        (None, None),
+    ] {
+        for records in [2, 3] {
+            let (channel, mut peer) = pair(4096, false, limits());
+            let target = target(&channel);
+            let mut request = channel.request(&target, msg("QueryRequest", vec![]), deadline());
+            pending(request.as_mut()).await;
+            let a = read_message(&mut peer)
+                .await
+                .unwrap()
+                .properties()
+                .unwrap()
+                .id;
+            let unknown = MessageId {
+                guid: [73; 16],
+                index: 91,
+            };
+            let ids = if records == 2 {
+                vec![a, unknown]
+            } else {
+                vec![a, unknown, unknown]
+            };
+            write_message(&mut peer, &forwarded_reply(&ids, actor, action, vec![99]))
+                .await
+                .unwrap();
+            until(|| channel.owner.shared.inner.lock().unwrap().unmatched == 1).await;
+            pending(request.as_mut()).await;
+            assert!(channel
+                .owner
+                .shared
+                .inner
+                .lock()
+                .unwrap()
+                .pending
+                .contains_key(&a));
+            assert!(channel.terminal_error().is_none());
+            write_message(&mut peer, &reply(a, vec![1])).await.unwrap();
+            assert_eq!(request.await.unwrap().body, [1]);
+            channel.close(deadline()).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn forwarded_correlation_reversing_wire_order_selects_a_not_b() {
+    let (channel, mut peer) = pair(4096, false, limits());
+    let target = target(&channel);
+    let mut first = channel.request(&target, msg("QueryRequest", vec![1]), deadline());
+    pending(first.as_mut()).await;
+    let a = read_message(&mut peer)
+        .await
+        .unwrap()
+        .properties()
+        .unwrap()
+        .id;
+    let mut second = channel.request(&target, msg("QueryRequest", vec![2]), deadline());
+    pending(second.as_mut()).await;
+    let b = read_message(&mut peer)
+        .await
+        .unwrap()
+        .properties()
+        .unwrap()
+        .id;
+    let response = forwarded_reply(&[b, a], Some(13), Some("QueryReply"), vec![3]);
+    write_message(&mut peer, &response).await.unwrap();
+    until(|| {
+        let inner = channel.owner.shared.inner.lock().unwrap();
+        !inner.pending.contains_key(&a) && inner.pending.contains_key(&b)
+    })
+    .await;
+    assert_eq!(first.await.unwrap(), response);
+    pending(second.as_mut()).await;
+    assert_eq!(channel.owner.shared.inner.lock().unwrap().pending.len(), 1);
+    write_message(&mut peer, &reply(b, vec![2])).await.unwrap();
+    assert_eq!(second.await.unwrap().body, [2]);
+    channel.close(deadline()).await.unwrap();
+}
+
+#[tokio::test]
+async fn forwarded_correlation_accepts_nonempty_ids_with_one_zero_component() {
+    for outer in [
+        MessageId {
+            guid: [0; 16],
+            index: 19,
+        },
+        MessageId {
+            guid: [71; 16],
+            index: 0,
+        },
+    ] {
+        let (channel, mut peer) = pair(4096, false, limits());
+        let target = target(&channel);
+        let mut original = msg("QueryRequest", vec![]);
+        original.headers.push(Header::message_id(outer).unwrap());
+        let mut request = channel.request(&target, original, deadline());
+        pending(request.as_mut()).await;
+        assert_eq!(
+            read_message(&mut peer)
+                .await
+                .unwrap()
+                .properties()
+                .unwrap()
+                .id,
+            outer
+        );
+        let inner = MessageId {
+            guid: [0; 16],
+            index: 20,
+        };
+        let response = forwarded_reply(&[inner, outer, outer], None, None, vec![42]);
+        write_message(&mut peer, &response).await.unwrap();
+        assert_eq!(request.await.unwrap(), response);
+        channel.close(deadline()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn forwarded_correlation_rejects_malformed_extra_nonrepeating_or_unproven_envelopes() {
+    for case in 0..24 {
+        let (channel, mut peer) = pair(4096, false, limits());
+        let target = target(&channel);
+        let mut request = channel.request(&target, msg("QueryRequest", vec![]), deadline());
+        pending(request.as_mut()).await;
+        let outer = read_message(&mut peer)
+            .await
+            .unwrap()
+            .properties()
+            .unwrap()
+            .id;
+        let inner = MessageId {
+            guid: [74; 16],
+            index: 92,
+        };
+        let mut response = forwarded_reply(&[inner, outer], Some(13), Some("QueryReply"), vec![99]);
+        match case {
+            0 => {
+                response.headers[2].value = vec![1];
+            }
+            1 => response.headers[2] = Header::relates_to(MessageId::default()).unwrap(),
+            2 => response.headers[3] = Header::relates_to(MessageId::default()).unwrap(),
+            3 => response.headers.extend([
+                Header::relates_to(outer).unwrap(),
+                Header::relates_to(outer).unwrap(),
+            ]),
+            4 => response.headers.push(Header::relates_to(inner).unwrap()),
+            5 => response.headers[0] = Header::actor(5).unwrap(),
+            6 => response.headers[1] = Header::action("WrongAction").unwrap(),
+            7 => {
+                response.headers.remove(1);
+            }
+            8 => {
+                response.headers[0] = Header::actor(16).unwrap();
+                response.headers.remove(1);
+            }
+            9 => response.headers[0] = Header::actor(16).unwrap(),
+            10 => {
+                response.headers.remove(0);
+            }
+            11 => {
+                response.headers[0] = Header::actor(0).unwrap();
+                response.headers.remove(1);
+            }
+            12 => {
+                response.headers.remove(0);
+                response.headers[0] = Header::action("").unwrap();
+            }
+            13 | 14 => response.headers.push(
+                Header::object(message::FAULT, |e| {
+                    e.i64(if case == 13 { 0 } else { -7 });
+                    e.boolean(false);
+                    Ok(())
+                })
+                .unwrap(),
+            ),
+            15 => response
+                .headers
+                .push(Header::boolean(message::UNCORRELATED_REPLY, true).unwrap()),
+            16 => response
+                .headers
+                .push(Header::boolean(message::EXPECTS_REPLY, true).unwrap()),
+            17 | 18 => response
+                .headers
+                .push(Header::boolean(message::IPC, case == 18).unwrap()),
+            19 => response.headers.push(response.headers[0].clone()),
+            20 => response.headers.push(response.headers[1].clone()),
+            21 => {
+                response =
+                    forwarded_reply(&[MessageId::default(), outer, outer], None, None, vec![99]);
+            }
+            22 => {
+                response =
+                    forwarded_reply(&[inner, outer, MessageId::default()], None, None, vec![99]);
+            }
+            _ => {
+                let mut third = Header::relates_to(outer).unwrap();
+                third.value[6] ^= 1;
+                assert_eq!(third.read(MessageId::decode).unwrap(), outer);
+                assert_ne!(third.value, response.headers[3].value);
+                response.headers.push(third);
+            }
+        };
+        write_message(&mut peer, &response).await.unwrap();
+        until(|| channel.terminal_error().is_some()).await;
+        let result = request.await;
+        assert!(
+            matches!(result, Err(Error::Protocol(_))),
+            "case {case}: {result:?}"
+        );
+        assert_eq!(channel.owner.shared.inner.lock().unwrap().pending.len(), 0);
+        channel.close(deadline()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn forwarded_correlation_cannot_authorize_a_ping_pending_entry_or_complete_earlier_query() {
+    for (actor, action) in [
+        (Some(16), Some("OperationSuccessAction")),
+        (Some(13), Some("QueryReply")),
+        (None, None),
+    ] {
+        for records in [2, 3] {
+            let (channel, mut peer) = pair(4096, false, limits());
+            let target = target(&channel);
+            let mut query = channel.request(&target, msg("QueryRequest", vec![1]), deadline());
+            pending(query.as_mut()).await;
+            let a = read_message(&mut peer)
+                .await
+                .unwrap()
+                .properties()
+                .unwrap()
+                .id;
+            let mut ping = channel.request(&target, msg("PingRequest", vec![2]), deadline());
+            pending(ping.as_mut()).await;
+            let b = read_message(&mut peer)
+                .await
+                .unwrap()
+                .properties()
+                .unwrap()
+                .id;
+            let ids = if records == 2 {
+                vec![a, b]
+            } else {
+                vec![a, b, b]
+            };
+            write_message(&mut peer, &forwarded_reply(&ids, actor, action, vec![99]))
+                .await
+                .unwrap();
+            until(|| channel.terminal_error().is_some()).await;
+            assert!(matches!(ping.await, Err(Error::Protocol(_))));
+            assert!(matches!(query.await, Err(Error::Protocol(_))));
+            channel.close(deadline()).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn forwarded_inbound_allowance_never_relaxes_caller_duplicates() {
+    let (channel, mut peer) = pair(4096, false, limits());
+    let target = target(&channel);
+    let a = MessageId {
+        guid: [75; 16],
+        index: 1,
+    };
+    let b = MessageId {
+        guid: [75; 16],
+        index: 2,
+    };
+    for headers in [
+        vec![
+            Header::relates_to(a).unwrap(),
+            Header::relates_to(a).unwrap(),
+        ],
+        vec![
+            Header::relates_to(a).unwrap(),
+            Header::relates_to(b).unwrap(),
+        ],
+        vec![
+            Header::relates_to(a).unwrap(),
+            Header::relates_to(b).unwrap(),
+            Header::relates_to(b).unwrap(),
+        ],
+        vec![
+            Header::boolean(message::EXPECTS_REPLY, true).unwrap(),
+            Header::boolean(message::EXPECTS_REPLY, true).unwrap(),
+        ],
+        vec![Header::actor(5).unwrap()],
+        vec![Header::action("QueryRequest").unwrap()],
+        vec![
+            Header::message_id(a).unwrap(),
+            Header::message_id(a).unwrap(),
+        ],
+    ] {
+        let mut original = msg("QueryRequest", vec![]);
+        original.headers.extend(headers);
+        assert!(matches!(
+            channel.request(&target, original.clone(), deadline()).await,
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            channel.send_one_way(&target, original, deadline()).await,
+            Err(Error::InvalidInput(_))
+        ));
+    }
+    assert_eq!(count(&channel, ORDINARY), 0);
+    assert!(channel
+        .owner
+        .shared
+        .inner
+        .lock()
+        .unwrap()
+        .pending
+        .is_empty());
+    channel.close(deadline()).await.unwrap();
+    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
 }

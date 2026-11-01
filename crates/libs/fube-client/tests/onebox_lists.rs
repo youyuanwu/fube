@@ -242,7 +242,10 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
         )
         .await;
     let code = match missing {
-        Err(Error::Remote { code, .. }) => code,
+        Err(
+            ClientError::Domain(DomainFailure { code, .. })
+            | ClientError::Transport(Error::Remote { code, .. }),
+        ) => code,
         other => {
             return Err(format!("missing application must remain native error: {other:?}").into())
         }
