@@ -5,6 +5,7 @@
 //! used with an explicitly selected unsecured development gateway.
 
 mod applications;
+pub mod contracts;
 mod deployed_applications;
 mod deployed_code_packages;
 mod deployed_replicas;
