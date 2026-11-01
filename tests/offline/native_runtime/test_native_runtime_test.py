@@ -43,6 +43,19 @@ class PreparationTests(unittest.TestCase):
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_registration_receipts_are_additive_and_never_overwrite_prior_evidence(self):
+        self.assertEqual(profile.SCENARIOS[:6], ("bootstrap", "close", "abort",
+                         "manifest-close", "manifest-abort", "hosting-leases"))
+        self.assertEqual(profile.SCENARIOS[6:], ("hosting-registration",))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            output = b'MSSF_REPORT {"profile":"registration"}\n'
+            profile.save_diagnostics(root, "hosting-registration", output)
+            before = {p.name: p.read_bytes() for p in root.iterdir()}
+            with self.assertRaisesRegex(ValueError, "fresh diagnostics"):
+                profile.save_diagnostics(root, "hosting-registration", b"replacement")
+            self.assertEqual({p.name: p.read_bytes() for p in root.iterdir()}, before)
+
     def test_every_scenario_writes_bounded_diagnostics(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

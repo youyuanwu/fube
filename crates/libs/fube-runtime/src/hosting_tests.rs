@@ -30,10 +30,39 @@ fn hosting_child() {
     };
     builder.enable_all().build().unwrap().block_on(async {
         let runtime = Runtime::attach().await.unwrap();
+        let runtime = if mode.starts_with("factory") {
+            struct Factory;
+            impl IStatelessServiceFactory for Factory {
+                fn create_instance(
+                    &self,
+                    _: String,
+                    _: String,
+                    _: &[u8],
+                    _: uuid::Uuid,
+                    _: i64,
+                ) -> Result<Box<dyn IStatelessServiceInstance>> {
+                    panic!("registration-only profile must never deploy an instance")
+                }
+            }
+            runtime
+                .execution_runtime()
+                .try_reserve()
+                .unwrap()
+                .run_owned(move || {
+                    runtime
+                        .register_stateless_service_factory("Type", Box::new(Factory))
+                        .unwrap();
+                    Ok(runtime)
+                })
+                .await
+                .unwrap()
+        } else {
+            runtime
+        };
         println!("hosting-attached");
         std::io::stdout().flush().unwrap();
         match mode.as_str() {
-            "bootstrap" => {
+            "bootstrap" | "factory" => {
                 tokio::time::sleep(Duration::from_millis(2200)).await;
                 runtime.shutdown().await.unwrap();
             }
@@ -41,7 +70,7 @@ fn hosting_child() {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 panic!("finite Hosting authority did not fence");
             }
-            "executor" => {
+            "executor" | "factory-blocked" => {
                 println!("hosting-executor-entered");
                 std::io::stdout().flush().unwrap();
                 std::thread::sleep(Duration::from_secs(2));
@@ -73,12 +102,12 @@ fn hosting_child() {
     });
 }
 
-enum Observation {
+pub(super) enum Observation {
     Request(Message),
     Reply(Message),
 }
 
-fn node(root: &std::path::Path) -> hosting_wire::StartReply {
+pub(super) fn node(root: &std::path::Path) -> hosting_wire::StartReply {
     hosting_wire::StartReply {
         node_id: "1".into(),
         node_pid: std::process::id(),
@@ -100,7 +129,10 @@ fn node(root: &std::path::Path) -> hosting_wire::StartReply {
     }
 }
 
-async fn marker(reader: &mut tokio::io::BufReader<tokio::process::ChildStdout>, expected: &str) {
+pub(super) async fn marker(
+    reader: &mut tokio::io::BufReader<tokio::process::ChildStdout>,
+    expected: &str,
+) {
     tokio::time::timeout(Duration::from_secs(3), async {
         for _ in 0..16 {
             let mut line = String::new();
@@ -265,7 +297,7 @@ async fn scenario(mode: &str) {
     );
 }
 
-fn observe(
+pub(super) fn observe(
     observation: Observation,
     correlations: &mut HashMap<MessageId, (i64, String)>,
     actions: &mut Vec<(i64, String)>,

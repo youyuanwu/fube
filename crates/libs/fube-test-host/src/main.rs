@@ -51,7 +51,7 @@ fn main() {
     }
     if args.len() != 6 {
         eprintln!(
-            "usage: fube-test-host NATIVE_DIRECTORY DEPENDENCY_DIRECTORY APP_EXECUTABLE RUN_PARENT bootstrap|close|abort"
+            "usage: fube-test-host NATIVE_DIRECTORY DEPENDENCY_DIRECTORY APP_EXECUTABLE RUN_PARENT bootstrap|close|abort|hosting-leases|hosting-registration"
         );
         std::process::exit(2);
     }
@@ -63,6 +63,10 @@ fn main() {
     };
     if args[5] == "hosting-leases" {
         report(fube_test_host::run_hosting_leases(options));
+        return;
+    }
+    if args[5] == "hosting-registration" {
+        report(fube_test_host::run_hosting_registration(options));
         return;
     }
     let scenario = match args[5].as_str() {

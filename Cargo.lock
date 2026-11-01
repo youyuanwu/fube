@@ -377,6 +377,9 @@ name = "fube-runtime"
 version = "0.1.0"
 dependencies = [
  "fube-hosting",
+ "fube-node",
+ "fube-ra",
+ "fube-ra-store",
  "fube-transport",
  "libc",
  "roxmltree",
@@ -390,6 +393,9 @@ name = "fube-test-host"
 version = "0.1.0"
 dependencies = [
  "fube-hosting",
+ "fube-node",
+ "fube-ra",
+ "fube-ra-store",
  "fube-transport",
  "libc",
  "roxmltree",

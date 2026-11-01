@@ -20,20 +20,22 @@ use tokio::{
     task::JoinSet,
 };
 
-enum Observation {
+pub(super) enum Observation {
     Request(Message),
     Reply(Message),
 }
 
-struct Trace {
+#[derive(Default)]
+pub(super) struct Trace {
     pending: HashMap<MessageId, (i64, String)>,
-    actions: Vec<String>,
-    polls: usize,
-    runtime: Option<String>,
-    unregistered: bool,
+    pub(super) actions: Vec<String>,
+    pub(super) polls: usize,
+    pub(super) runtime: Option<String>,
+    pub(super) unregistered: bool,
+    pub(super) registered: bool,
 }
 impl Trace {
-    fn observe(&mut self, observation: Observation) -> Result<()> {
+    pub(super) fn observe(&mut self, observation: Observation) -> Result<()> {
         match observation {
             Observation::Request(message) => {
                 let p = message.properties()?;
@@ -105,6 +107,9 @@ impl Trace {
                     if action == "UnregisterFabricRuntimeRequest" {
                         self.unregistered = true;
                     }
+                    if action == "RegisterServiceTypeRequest" {
+                        self.registered = true;
+                    }
                 }
             }
         }
@@ -112,7 +117,7 @@ impl Trace {
     }
 }
 
-fn node(bundle: &deployment::Deployment) -> wire::StartReply {
+pub(super) fn node(bundle: &deployment::Deployment) -> wire::StartReply {
     wire::StartReply {
         node_id: "1".into(),
         node_pid: std::process::id(),
@@ -133,7 +138,7 @@ fn node(bundle: &deployment::Deployment) -> wire::StartReply {
         system_log: Pointer(None),
     }
 }
-fn mapped_libraries(native: &Path, pid: u32) -> Result<Vec<std::path::PathBuf>> {
+pub(super) fn mapped_libraries(native: &Path, pid: u32) -> Result<Vec<std::path::PathBuf>> {
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))?;
     let mut result = Vec::new();
     for name in ["libFabricRuntime.so", "libFabricCommon.so"] {
@@ -243,6 +248,7 @@ pub fn run_hosting_leases(options: Options) -> Result<RunReport> {
             polls: 0,
             runtime: None,
             unregistered: false,
+            registered: false,
         };
         let mut libraries = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(120);
