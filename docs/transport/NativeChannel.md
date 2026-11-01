@@ -69,8 +69,8 @@ original target/ID. A response must be actor5/`ServiceNotificationReply`;
 the context adds missing RelatesTo, accepts one matching value and rejects
 duplicates/contradictions, ExpectsReply=true or special reply flags.
 Domain processing-status encoding remains the caller's responsibility.
-Ordinary mode refuses receiver creation; other profiles terminate on
-notification ingress.
+Ordinary mode refuses receiver creation. Ordinary and Upload profiles terminate
+on notification ingress.
 
 Upload ACKs are classified before ordinary matching. Nonempty effective
 RelatesTo, ExpectsReply, special notification flags, Fault and IPC are rejected,
