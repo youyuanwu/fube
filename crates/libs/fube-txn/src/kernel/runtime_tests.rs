@@ -6,16 +6,14 @@ use super::{
     transaction::RetryRuntime,
 };
 use crate::{Cancellation, Epoch, ITransaction, OperationData, ReplicaRole, Result, Transaction};
-use fube_data::{
-    extensions::{ReplicationEndpointOptions, ReplicatorDiagnostics},
-    qualification as rap, FabricReplicator, IStateProvider,
-};
+use fube_data::{extensions::ReplicationEndpointOptions, FabricReplicator, IStateProvider};
+use fube_rap_test_support as rap;
 use fube_runtime::{
     extensions::{
         CallLane, CallOrigin, NativeIntegrationProvider, NativeReplicaSetConfiguration,
         NativeRuntimeIntegration,
     },
-    ApiFuture, IPrimaryReplicator, IStatefulServiceFactory, IStatefulServicePartition,
+    ApiFuture, IPrimaryReplicator, IReplicator, IStatefulServiceFactory, IStatefulServicePartition,
     IStatefulServiceReplica, OpenMode,
 };
 use std::sync::{Arc, Mutex};
@@ -153,7 +151,7 @@ impl Fixture {
             0,
             Arc::new(RetryRuntime::default()),
         );
-        let runtime = RuntimeLower::new(lower.clone()).unwrap();
+        let runtime = RuntimeLower::new(lower.get_state_replicator(), native.execution()).unwrap();
         manager.bind_runtime(runtime.clone());
         let fixture = Self {
             host,
@@ -198,16 +196,7 @@ impl Fixture {
                     previous_role: ReplicaRole::None,
                     up: false,
                     ready: false,
-                    address: fube_data::wire::Endpoint {
-                        actor: fube_data::wire::Actor {
-                            partition: self.native.identity().partition_id,
-                            replica: 2,
-                            incarnation: uuid::Uuid::new_v4(),
-                        },
-                        address: "127.0.0.1:1".into(),
-                        transport_id: Some(String::new()),
-                    }
-                    .to_string(),
+                    address: String::new(), // native down/unready member has no usable endpoint
                     progress: fube_runtime::extensions::ReplicationProgress {
                         first: -1,
                         last: -1,
@@ -221,8 +210,26 @@ impl Fixture {
             .unwrap();
     }
     async fn withheld_quorum(&self) {
-        let committed = self.lower.snapshot().progress.committed;
-        let incarnation = self.lower.snapshot().progress.assigned + 100;
+        let committed = self.lower.get_current_progress().unwrap();
+        let (send, receive) = oneshot::channel();
+        let peer = rap::Host::start(
+            self.native.identity().partition_id,
+            3,
+            ReplicaRole::IdleSecondary,
+            move |native| {
+                Box::new(Factory {
+                    native,
+                    created: Arc::new(Mutex::new(Some(send))),
+                    settings: fube_data::Settings::default(),
+                })
+            },
+        )
+        .await;
+        let (peer_lower, peer_native) = receive.await.unwrap();
+        let address = peer.replication_address().unwrap();
+        let identity = peer_native.identity().clone();
+        drop(peer); // a real opened endpoint that is now unavailable; never a wire/engine setter
+        drop(peer_lower);
         self.host
             .configure(NativeReplicaSetConfiguration {
                 epoch: Epoch {
@@ -230,24 +237,15 @@ impl Fixture {
                     configuration_number: 1 << 32,
                 },
                 replicas: vec![fube_runtime::extensions::NativeReplicaDescriptor {
-                    node_id: [3; 16],
-                    node_instance: 1,
-                    replica_id: 3,
-                    incarnation,
+                    node_id: identity.node_id,
+                    node_instance: identity.node_instance,
+                    replica_id: identity.replica_id,
+                    incarnation: identity.incarnation,
                     role: ReplicaRole::ActiveSecondary,
                     previous_role: ReplicaRole::None,
                     up: true,
                     ready: true,
-                    address: fube_data::wire::Endpoint {
-                        actor: fube_data::wire::Actor {
-                            partition: self.native.identity().partition_id,
-                            replica: 3,
-                            incarnation: uuid::Uuid::new_v4(),
-                        },
-                        address: "127.0.0.1:1".into(),
-                        transport_id: Some(String::new()),
-                    }
-                    .to_string(),
+                    address,
                     progress: fube_runtime::extensions::ReplicationProgress {
                         first: 1,
                         last: committed,
@@ -302,7 +300,6 @@ fn payload(key: i64) -> OperationData {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrective_async_retry_after_timer_uses_actual_lower_not_lost_entry() {
     let f = Fixture::new(true).await;
-    let identity = f.native.identity();
     f.host
         .configure(NativeReplicaSetConfiguration {
             epoch: Epoch {
@@ -318,16 +315,7 @@ async fn corrective_async_retry_after_timer_uses_actual_lower_not_lost_entry() {
                 previous_role: ReplicaRole::None,
                 up: false,
                 ready: false,
-                address: fube_data::wire::Endpoint {
-                    actor: fube_data::wire::Actor {
-                        partition: identity.partition_id,
-                        replica: 2,
-                        incarnation: uuid::Uuid::new_v4(),
-                    },
-                    address: "127.0.0.1:1".into(),
-                    transport_id: Some(String::new()),
-                }
-                .to_string(),
+                address: String::new(),
                 progress: fube_runtime::extensions::ReplicationProgress {
                     first: -1,
                     last: -1,
@@ -414,13 +402,20 @@ async fn corrective_sync_begin_add_then_entry_free_async_end_reconcile_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrective_publication_rejects_recursive_async_lower_before_admission_lock() {
-    use fube_data::IStateReplicator;
     use std::task::{Context, Poll, Waker};
     let f = Fixture::new(true).await;
-    let result = fube_runtime::extensions::ExecutionRuntime::engine_publication(
-        f.lower.execution_identity(),
-        || {
-            let mut nested = f.lower.replicate(payload(1), Cancellation::default());
+    let result = f
+        .runtime
+        .publication(|| {
+            let mut nested = f.runtime.admit_async(
+                f.manager.clone(),
+                super::record::Record {
+                    lsn: -1,
+                    kind: super::record::RecordKind::Barrier { last_stable_lsn: 0 },
+                },
+                None,
+                None,
+            );
             match nested
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
@@ -428,9 +423,8 @@ async fn corrective_publication_rejects_recursive_async_lower_before_admission_l
                 Poll::Ready(Err(error)) => Ok(error),
                 _ => panic!("reentry must reject before attempting an owner lock"),
             }
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert_eq!(result.kind(), fube_runtime::ErrorKind::InvalidArgument);
     assert_eq!(f.manager.tail(), 1);
 }
@@ -505,7 +499,7 @@ async fn corrective_rejected_capture_disposal_does_not_block_lower_owner() {
         progress.unwrap().is_err(),
         "no quorum remains a lower rejection"
     );
-    assert_eq!(f.lower.snapshot().progress.assigned, 1);
+    assert_eq!(f.lower.get_current_progress().unwrap(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -732,7 +726,10 @@ async fn fidelity_group_barrier_obeys_native_queue_full_backoff_then_actual_reti
     warm.commit().await.unwrap();
     f.runtime.group_idle().await;
     f.runtime.group_attempts.lock().unwrap().clear();
-    let before = f.lower.snapshot().progress.assigned;
+    let before = f
+        .runtime
+        .last_admitted
+        .load(std::sync::atomic::Ordering::Acquire);
     f.withheld_quorum().await;
     let transaction = f.manager.new_transaction().unwrap();
     transaction
@@ -753,7 +750,9 @@ async fn fidelity_group_barrier_obeys_native_queue_full_backoff_then_actual_reti
         .as_ref()
         .is_err_and(|error| super::status::Status::QueueFull.matches(error))));
     assert_eq!(
-        f.lower.snapshot().progress.assigned,
+        f.runtime
+            .last_admitted
+            .load(std::sync::atomic::Ordering::Acquire),
         before + 1,
         "failed Barrier consumes no LSN"
     );
@@ -811,7 +810,10 @@ async fn fidelity_end_and_barrier_share_queue_full_with_ordinary_writes_and_tran
         .unwrap();
     warm.commit().await.unwrap();
     f.runtime.group_idle().await;
-    let before = f.lower.snapshot().progress.assigned;
+    let before = f
+        .runtime
+        .last_admitted
+        .load(std::sync::atomic::Ordering::Acquire);
     f.withheld_quorum().await;
     let transaction = f.manager.new_transaction().unwrap();
     transaction
@@ -830,7 +832,13 @@ async fn fidelity_end_and_barrier_share_queue_full_with_ordinary_writes_and_tran
         })
         .await
         .unwrap();
-    assert_eq!(f.lower.snapshot().owned_operations, 4);
+    assert_eq!(
+        f.runtime
+            .last_admitted
+            .load(std::sync::atomic::Ordering::Acquire),
+        before + 4,
+        "four actual public admissions filled the shared ordinary queue"
+    );
     let end = f
         .manager
         .observe_async(
@@ -859,11 +867,21 @@ async fn fidelity_end_and_barrier_share_queue_full_with_ordinary_writes_and_tran
         .unwrap();
     assert!(super::status::Status::QueueFull.matches(&end));
     assert!(super::status::Status::QueueFull.matches(&barrier));
-    assert_eq!(f.lower.snapshot().progress.assigned, before + 4);
+    assert_eq!(
+        f.runtime
+            .last_admitted
+            .load(std::sync::atomic::Ordering::Acquire),
+        before + 4
+    );
     assert_eq!(f.manager.map.latest_records().len(), 1);
     drop(transaction.commit()); // native retry is still independently owned
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(f.lower.snapshot().progress.assigned, before + 4);
+    assert_eq!(
+        f.runtime
+            .last_admitted
+            .load(std::sync::atomic::Ordering::Acquire),
+        before + 4
+    );
     assert_eq!(transaction.get_state(), crate::TransactionState::Committing);
     f.configure().await;
     f.until(before + 6).await;
@@ -893,7 +911,12 @@ async fn fidelity_native_upper_throttle_applies_only_to_begin_operation_not_end_
         .await
         .unwrap_err();
     assert!(super::status::Status::ServiceTooBusy.matches(&error));
-    assert_eq!(f.lower.snapshot().progress.assigned, 2);
+    assert_eq!(
+        f.runtime
+            .last_admitted
+            .load(std::sync::atomic::Ordering::Acquire),
+        2
+    );
     let writes = transaction.clone();
     f.native
         .execution()

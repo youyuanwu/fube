@@ -24,18 +24,18 @@ use crate::{
     ReplicaRole, Result,
 };
 use fube_data::{
-    extensions::{
-        ReplicationEndpointOptions, ReplicatorDiagnostics, ReplicatorLifecycle,
-        StateProviderCapabilities, VolatileLogInitialization,
-    },
+    extensions::{ReplicationEndpointOptions, StateProviderCapabilities},
     FabricReplicator, IOperationStream, IStateProvider, IStateReplicator, Settings,
 };
-use fube_runtime::{extensions::NativeRuntimeIntegration, IStatefulServicePartition};
+use fube_runtime::{
+    extensions::{ExecutionRuntime, NativeRuntimeIntegration},
+    IPrimaryReplicator, IStatefulServicePartition,
+};
 use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicI64, Ordering},
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
     },
 };
 
@@ -51,7 +51,21 @@ pub(crate) struct Generation {
     pub(crate) copy_done: Completion<()>,
     pub(crate) done: Completion<()>,
 }
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ControlEvent {
+    Opened(String),
+    RoleEntry(ReplicaRole),
+    RoleResult(ReplicaRole, bool),
+    Role(ReplicaRole),
+    Closed,
+    Aborted,
+}
 pub(crate) struct VolatileRuntime {
+    #[cfg(test)]
+    pub(crate) operation_events: Mutex<Vec<(&'static str, i64, bool)>>,
+    #[cfg(test)]
+    pub(crate) control_events: Mutex<Vec<ControlEvent>>,
     #[cfg(test)]
     pub(crate) copy_log_read_error: Mutex<Option<usize>>,
     #[cfg(test)]
@@ -65,7 +79,9 @@ pub(crate) struct VolatileRuntime {
     pub(crate) role_events: Mutex<Vec<String>>,
     weak: Weak<Self>,
     pub(crate) owner: Arc<ProviderOwner>,
-    pub(crate) lower: Mutex<Option<Arc<FabricReplicator>>>,
+    pub(crate) lower: OnceLock<Arc<dyn IStateReplicator>>,
+    lower_primary: OnceLock<Arc<dyn IPrimaryReplicator>>,
+    pub(crate) closing_lower: AtomicBool,
     pub(crate) logging: Mutex<Option<Arc<RuntimeLower>>>,
     native: NativeRuntimeIntegration,
     config: RuntimeConfig,
@@ -118,6 +134,10 @@ impl VolatileRuntime {
         });
         let runtime = Arc::new_cyclic(|weak| Self {
             #[cfg(test)]
+            operation_events: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            control_events: Mutex::new(Vec::new()),
+            #[cfg(test)]
             copy_log_read_error: Mutex::new(None),
             #[cfg(test)]
             copy_write_failure: Mutex::new(None),
@@ -130,7 +150,9 @@ impl VolatileRuntime {
             role_events: Mutex::new(Vec::new()),
             weak: weak.clone(),
             owner: owner.clone(),
-            lower: Mutex::new(None),
+            lower: OnceLock::new(),
+            lower_primary: OnceLock::new(),
+            closing_lower: AtomicBool::new(false),
             logging: Mutex::new(None),
             native: native.clone(),
             config,
@@ -146,21 +168,23 @@ impl VolatileRuntime {
             fault_reports: AtomicI64::new(0),
         });
         let adapter = Arc::new(Adapter(Arc::downgrade(&runtime)));
-        let lower = FabricReplicator::create_with_lifecycle(
+        let lower = FabricReplicator::create_with_capabilities(
             partition,
-            native,
-            adapter.clone(),
+            native.clone(),
+            adapter,
             None,
             endpoint,
             settings.clone(),
             StateProviderCapabilities {
                 supports_copy_until_latest_lsn: true,
             },
-            adapter,
         )?;
-        let logging = RuntimeLower::with_operation_limits(lower.clone(), &settings)?;
+        let state = lower.get_state_replicator();
+        let logging =
+            RuntimeLower::with_operation_limits(state.clone(), &settings, native.execution())?;
         manager.bind_runtime(logging.clone());
-        *runtime.lower.lock().unwrap() = Some(lower);
+        let _ = runtime.lower.set(state);
+        let _ = runtime.lower_primary.set(lower);
         *runtime.logging.lock().unwrap() = Some(logging);
         let weak = Arc::downgrade(&owner);
         manager.set_write_access(Arc::new(move || {
@@ -277,8 +301,55 @@ impl VolatileRuntime {
         self.owner.manager.directory.retire_checkpoint_metadata(id);
         Ok(())
     }
-    pub(crate) fn replicator(&self) -> Arc<FabricReplicator> {
-        self.lower.lock().unwrap().as_ref().unwrap().clone()
+    pub(crate) fn state_replicator(&self) -> Arc<dyn IStateReplicator> {
+        self.lower
+            .get()
+            .expect("constructed public state view")
+            .clone()
+    }
+    pub(crate) fn lower_control(&self) -> &Arc<dyn IPrimaryReplicator> {
+        self.lower_primary
+            .get()
+            .expect("constructed public lower control")
+    }
+    pub(crate) fn composite(&self) -> Arc<super::composite::Composite> {
+        Arc::new(super::composite::Composite(self.shared()))
+    }
+    pub(crate) fn replicator(&self) -> Arc<super::composite::Composite> {
+        self.composite()
+    }
+    pub(crate) fn execution(&self) -> ExecutionRuntime {
+        self.native.execution()
+    }
+    #[cfg(test)]
+    pub(crate) fn admitted_lsn(&self) -> i64 {
+        let admitted = self.logging().last_admitted.load(Ordering::Acquire);
+        if self.owner.manager.role() == super::processor::ProcessingRole::Primary {
+            admitted.max(self.lower_control().get_current_progress().unwrap_or(0))
+        } else {
+            admitted
+        }
+    }
+    fn retire_operation(
+        &self,
+        operation: Arc<dyn fube_data::IOperation>,
+        stream: &'static str,
+        acknowledged: bool,
+    ) {
+        #[cfg(test)]
+        let sequence = operation
+            .get_metadata()
+            .map(|metadata| metadata.sequence_number);
+        drop(operation);
+        #[cfg(test)]
+        if let Ok(sequence) = sequence {
+            self.operation_events
+                .lock()
+                .unwrap()
+                .push((stream, sequence, acknowledged));
+        }
+        #[cfg(not(test))]
+        let _ = (stream, acknowledged);
     }
     fn logging(&self) -> Arc<RuntimeLower> {
         self.logging.lock().unwrap().as_ref().unwrap().clone()
@@ -315,10 +386,9 @@ impl VolatileRuntime {
         )
         .await
     }
-    async fn open(&self, cancellation: Cancellation) -> Result<()> {
+    pub(crate) async fn open(&self, cancellation: Cancellation) -> Result<()> {
         let _life = self.life.lock().await;
         self.owner.manager.open_memory(self.config.memory_bytes)?;
-        self.replicator().initialize_volatile_log().await?;
         self.owner.opened.store(true, Ordering::Release); // callback-ready, NOT app-ready
         self.owner.manager.open_cleanup_gate();
         self.owner
@@ -376,7 +446,7 @@ impl VolatileRuntime {
         }
         Ok(())
     }
-    async fn role(&self, role: ReplicaRole, cancellation: Cancellation) -> Result<()> {
+    pub(crate) async fn role(&self, role: ReplicaRole, cancellation: Cancellation) -> Result<()> {
         let _life = self.life.lock().await;
         self.owner.ready.store(false, Ordering::Release);
         self.owner.manager.fence_application();
@@ -478,7 +548,7 @@ impl VolatileRuntime {
         Ok(())
     }
     fn start_generation(&self) -> Result<()> {
-        let copy = self.replicator().get_copy_stream()?;
+        let copy = self.state_replicator().get_copy_stream()?;
         let generation = Arc::new(Generation {
             copy_done: Completion::new(),
             done: Completion::new(),
@@ -490,14 +560,15 @@ impl VolatileRuntime {
             generation.copy_done.complete(copied.clone());
             let result = match copied {
                 Err(error) => Err(error),
-                Ok(()) => match runtime.replicator().get_replication_stream() {
+                Ok(()) => match runtime.state_replicator().get_replication_stream() {
                     Err(error) => Err(error),
                     Ok(stream) => runtime.drain_replication(stream).await,
                 },
             };
             if let Err(error) = &result {
                 if !runtime.terminal_started.load(Ordering::Acquire)
-                    && !runtime.replicator().snapshot().closed
+                    && !runtime.closing_lower.load(Ordering::Acquire)
+                    && error.kind() != fube_runtime::ErrorKind::ObjectClosed
                 {
                     runtime
                         .owner
@@ -534,7 +605,7 @@ impl VolatileRuntime {
             return Err(Status::NotImplemented.error());
         }
         header.acknowledge()?;
-        drop(header); // actual lower capture BEFORE next poll
+        self.retire_operation(header, "copy", true); // actual public capture BEFORE next poll
         if stage == 3 {
             return self.drain_full(stream).await;
         }
@@ -588,7 +659,7 @@ impl VolatileRuntime {
             // Native copied-log batch ACK follows settlement of ALL flush waiters,
             // including failures (SecondaryDrainManager.cpp:715–799). Not state ACK.
             let ack = operation.acknowledge();
-            drop(operation);
+            self.retire_operation(operation, "copy", ack.is_ok());
             ack?;
             if let Some(error) = failure {
                 return Err(error);
@@ -607,7 +678,7 @@ impl VolatileRuntime {
             {
                 self.owner.manager.wait_flushed(record.lsn).await?;
                 operation.acknowledge()?;
-                drop(operation);
+                self.retire_operation(operation, "replication", true);
                 continue;
             }
             let activity = self.owner.manager.replay_decoded(record)?;
@@ -618,7 +689,7 @@ impl VolatileRuntime {
                 self.maintenance().block_secondary(false).await;
             }
             operation.acknowledge()?;
-            drop(operation); // capture retires before polling even if Apply awaits Barrier
+            self.retire_operation(operation, "replication", true); // retires before next poll
         }
         self.boundary(3).await
     }
@@ -637,7 +708,15 @@ impl VolatileRuntime {
                 *remaining -= 1;
             }
         }
-        stream.get_operation(Cancellation::default()).await
+        let result = stream.get_operation(Cancellation::default()).await;
+        #[cfg(test)]
+        if matches!(result, Ok(None)) {
+            self.operation_events
+                .lock()
+                .unwrap()
+                .push(("copy-eos", -1, false));
+        }
+        result
     }
     async fn drain_full(&self, stream: Arc<dyn IOperationStream>) -> Result<()> {
         use crate::internal::IStateProviderManager;
@@ -669,7 +748,7 @@ impl VolatileRuntime {
                         .set_current_state(number, payload)
                         .await?;
                     operation.acknowledge()?;
-                    drop(operation);
+                    self.retire_operation(operation, "copy", true);
                     number = number
                         .checked_add(1)
                         .ok_or_else(|| Status::InvalidOperation.error())?;
@@ -740,7 +819,7 @@ impl VolatileRuntime {
                 }
             }
             operation.acknowledge()?;
-            drop(operation);
+            self.retire_operation(operation, "copy", true);
             if let Some(error) = setup_failure {
                 return Err(error);
             }
@@ -818,7 +897,7 @@ impl VolatileRuntime {
                     }
                 }
                 let ack = operation.acknowledge();
-                drop(operation);
+                self.retire_operation(operation, "copy", ack.is_ok());
                 ack?;
                 if let Some(error) = failure {
                     return Err(error);
@@ -839,12 +918,18 @@ impl VolatileRuntime {
         }
         result
     }
-    fn report_fault(&self) {
+    pub(crate) fn report_fault(&self) {
+        if self
+            .fault_reports
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         self.owner.ready.store(false, Ordering::Release);
         self.owner.manager.fence_fault();
         let runtime = self.shared();
         drop(own(Box::pin(async move {
-            runtime.fault_reports.fetch_add(1, Ordering::AcqRel);
             // RoleContextDrainState.cpp:54–68 closes UPPER admission and reports
             // once; it does NOT issue lower Abort or cancel accepted quorum.
             // Native RA's subsequent Close/Abort/reconfiguration remains authority.
@@ -915,7 +1000,7 @@ impl VolatileRuntime {
         self.cleanup_done.complete(cleanup.clone());
         drained.and(cleanup)
     }
-    async fn close(&self, cancellation: Cancellation) -> Result<()> {
+    pub(crate) async fn close(&self, cancellation: Cancellation) -> Result<()> {
         self.owner.manager.fence_terminal();
         self.owner.ready.store(false, Ordering::Release);
         if self.terminal_started.swap(true, Ordering::AcqRel) {
@@ -925,7 +1010,7 @@ impl VolatileRuntime {
         self.terminal.complete(result.clone());
         result
     }
-    fn abort(&self) {
+    pub(crate) fn abort(&self) {
         self.owner.manager.fence_terminal();
         self.owner.ready.store(false, Ordering::Release);
         if self.terminal_started.swap(true, Ordering::AcqRel) {
@@ -1006,26 +1091,5 @@ struct ContextStream(Mutex<Option<OperationData>>);
 impl fube_data::IOperationDataStream for ContextStream {
     fn get_next(&self, _: Cancellation) -> ApiFuture<'_, Option<OperationData>> {
         Box::pin(async move { Ok(self.0.lock().unwrap().take()) })
-    }
-}
-impl ReplicatorLifecycle for Adapter {
-    fn opened(&self, cancellation: Cancellation) -> ApiFuture<'_, ()> {
-        Box::pin(async move { self.runtime()?.open(cancellation).await })
-    }
-    fn role_changed(
-        &self,
-        _: Epoch,
-        role: ReplicaRole,
-        cancellation: Cancellation,
-    ) -> ApiFuture<'_, ()> {
-        Box::pin(async move { self.runtime()?.role(role, cancellation).await })
-    }
-    fn closed(&self, cancellation: Cancellation) -> ApiFuture<'_, ()> {
-        Box::pin(async move { self.runtime()?.close(cancellation).await })
-    }
-    fn aborted(&self) {
-        if let Ok(runtime) = self.runtime() {
-            runtime.abort();
-        }
     }
 }

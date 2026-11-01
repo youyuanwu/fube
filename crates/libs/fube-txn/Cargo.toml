@@ -12,4 +12,4 @@ uuid.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-fube-data = { workspace = true, features = ["qualification"] }
+fube-rap-test-support.workspace = true

@@ -310,7 +310,15 @@ async fn phase3_round2_real_secondary_selects_checkpoint_before_reader_delayed_t
     let blocked = target.runtime.owner.manager.tail();
     first.complete(Ok(()));
     checkpoint.finished.wait().await.as_ref().clone().unwrap();
-    until(|| target.runtime.replicator().snapshot().progress.applied >= blocked).await;
+    until(|| {
+        target
+            .runtime
+            .operation_events
+            .lock()
+            .unwrap()
+            .contains(&("replication", blocked, true))
+    })
+    .await;
     assert!(
         !trunc.done.is_completed(),
         "selected checkpoint completion did not also wait for truncation"
@@ -325,7 +333,8 @@ async fn phase3_round2_real_secondary_selects_checkpoint_before_reader_delayed_t
     .await;
     let next = target.runtime.maintenance().pending_checkpoint().unwrap();
     until(|| target.runtime.owner.manager.tail() > next.lsn).await;
-    assert!(target.runtime.replicator().snapshot().progress.applied>=next.lsn,"new not-stable checkpoint was selected before the already-stable truncation, allowing its initiating Barrier ACK and next poll");
+    assert!(target.runtime.operation_events.lock().unwrap().iter().any(|(stream, lsn, ack)| *stream == "replication" && *ack && *lsn >= next.lsn),
+        "new not-stable checkpoint was selected before the already-stable truncation, allowing its initiating Barrier ACK and next poll");
     memory.lock().unwrap().unpin(reader);
     trunc.done.wait().await.as_ref().clone().unwrap();
     second.complete(Ok(()));
@@ -597,24 +606,30 @@ async fn phase3_corrective_full_eof_apply_fence_does_not_reopen_concurrent_nativ
         *target.providers.apply_gate.lock().unwrap() = Some(apply.clone());
         let sender = source.host.clone();
         let member = descriptor(&target);
-        let building =
+        let mut building =
             tokio::spawn(async move { sender.build(member, Cancellation::default()).await });
-        until(|| {
-            target.runtime.replicator().snapshot().copy_done
-                && target
-                    .providers
-                    .objects
-                    .lock()
-                    .unwrap()
-                    .get(&10)
-                    .is_some_and(|p| {
-                        p.point
-                            .events()
-                            .iter()
-                            .any(|e| matches!(e, PointEvent::Apply { key: 2, .. }))
-                    })
+        let observed = tokio::time::timeout(Duration::from_secs(3), async {
+            while !target
+                .providers
+                .objects
+                .lock()
+                .unwrap()
+                .get(&10)
+                .is_some_and(|p| {
+                    p.point
+                        .events()
+                        .iter()
+                        .any(|e| matches!(e, PointEvent::Apply { key: 2, .. }))
+                })
+            {
+                tokio::task::yield_now().await;
+            }
         })
         .await;
+        // Build is the public source-side application-copy EOS/finish ACK
+        // boundary. It is NOT upper EOF Information/Apply completion.
+        let built_early = tokio::time::timeout(Duration::from_secs(3), &mut building).await;
+        let build_completed_early = matches!(built_early, Ok(Ok(Ok(()))));
         let generation = target
             .runtime
             .generation
@@ -623,23 +638,36 @@ async fn phase3_corrective_full_eof_apply_fence_does_not_reopen_concurrent_nativ
             .as_ref()
             .unwrap()
             .clone();
-        assert!(
-            !generation.copy_done.is_completed(),
-            "native copy EOS precedes upper EOF Information/Apply disposition"
-        );
-        // The native epoch/promotion guard is now satisfied; no bypass of the
-        // lower unfinished-copy rejection is used to reach this lifetime race.
+        let upper_pending = !generation.copy_done.is_completed();
+        let public_eos = target
+            .runtime
+            .operation_events
+            .lock()
+            .unwrap()
+            .contains(&("copy-eos", -1, false));
+        eprintln!("PUBLIC Full before Apply release: Apply={observed:?} source Build={built_early:?} public_stream_EOS={public_eos} upper_pending={upper_pending}");
         let changing = target.host.clone();
         let active =
             tokio::spawn(async move { changing.change_role(ReplicaRole::ActiveSecondary).await });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!active.is_finished());
+        let lower_role = tokio::time::timeout(Duration::from_secs(3), async {
+            while !target.runtime.control_events.lock().unwrap().contains(
+                &super::runtime::ControlEvent::RoleResult(ReplicaRole::ActiveSecondary, true),
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let role_pending = !active.is_finished();
+        // Release ALL gates and join ownership before any assertion can unwind.
         apply.complete(Ok(()));
-        building.await.unwrap().unwrap();
-        active.await.unwrap().unwrap();
-        assert!(target.runtime.owner.get_is_readable());
         group.complete(Ok(()));
-        commit.await.unwrap();
+        let built = match built_early {
+            Ok(result) => result,
+            Err(_) => building.await,
+        };
+        let changed = active.await;
+        let committed = commit.await;
+        let readable = target.runtime.owner.get_is_readable();
         drop(source.host);
         drop(target.host);
         target
@@ -650,6 +678,12 @@ async fn phase3_corrective_full_eof_apply_fence_does_not_reopen_concurrent_nativ
             .as_ref()
             .clone()
             .unwrap();
+        assert!(observed.is_ok() && build_completed_early && public_eos && upper_pending);
+        assert!(lower_role.is_ok() && role_pending);
+        built.unwrap().unwrap();
+        changed.unwrap().unwrap();
+        committed.unwrap();
+        assert!(readable);
     }
 }
 
@@ -670,10 +704,9 @@ async fn wide_single(source: &Fixture, key: i64) {
     transaction.commit().await.unwrap();
 }
 async fn controlled_replicate(source: &Fixture, record: super::record::Record) -> i64 {
-    use fube_data::IStateReplicator;
     let mut admitted = source
         .runtime
-        .replicator()
+        .state_replicator()
         .replicate(record.encode().unwrap(), Cancellation::default())
         .await
         .unwrap();
@@ -707,7 +740,7 @@ async fn phase3_corrective_native_registry_log_insert_resets_stale_retained_stat
         .unwrap()
         .clone();
     logging.group_idle().await;
-    let create = source.runtime.replicator().snapshot().progress.assigned + 1;
+    let create = source.runtime.admitted_lsn() + 1;
     let mut retained = rows();
     retained.push(Metadata {
         id: 12,
@@ -994,19 +1027,38 @@ async fn phase3_corrective_real_replication_barrier_continues_notstable_then_blo
         .unwrap();
     let checkpoint = target.runtime.maintenance().pending_checkpoint().unwrap();
     assert!(
-        target.runtime.replicator().snapshot().progress.applied >= checkpoint.lsn,
+        target
+            .runtime
+            .operation_events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(stream, lsn, ack)| *stream == "replication" && *ack && *lsn >= checkpoint.lsn),
         "not-yet-stable initiating Barrier was ACKed so the later stable Barrier could be polled"
     );
     assert!(target.runtime.owner.manager.tail() > checkpoint.lsn);
     assert!(target.runtime.owner.manager.stable() >= checkpoint.lsn);
-    assert_eq!(
-        target.runtime.replicator().snapshot().operation_captures,
-        1,
-        "stable pressure Barrier retains its actual capture until maintenance finishes"
+    let held = target.runtime.owner.manager.tail();
+    assert!(
+        !target
+            .runtime
+            .operation_events
+            .lock()
+            .unwrap()
+            .contains(&("replication", held, true)),
+        "stable pressure Barrier has not ACKed/dropped while maintenance is held"
     );
     perform.complete(Ok(()));
     checkpoint.finished.wait().await.as_ref().clone().unwrap();
-    until(|| target.runtime.replicator().snapshot().operation_captures == 0).await;
+    until(|| {
+        target
+            .runtime
+            .operation_events
+            .lock()
+            .unwrap()
+            .contains(&("replication", held, true))
+    })
+    .await;
     drop(source.host);
     drop(target.host);
     target
@@ -1202,13 +1254,12 @@ async fn phase3_corrective_owned_first_checkpoint_errors_ack_transition_without_
             .clone()
             .unwrap();
         until(|| {
-            source
+            target
                 .runtime
-                .replicator()
-                .snapshot()
-                .peers
-                .iter()
-                .any(|p| p.copy_applied == 5)
+                .operation_events
+                .lock()
+                .unwrap()
+                .contains(&("copy", 5, true))
         })
         .await;
         assert!(!target.runtime.owner.get_is_readable());
@@ -1279,13 +1330,13 @@ async fn phase3_corrective_full_frontier_failed_write_settles_batch_ack_without_
         .clone()
         .unwrap();
     until(|| {
-        source
+        target
             .runtime
-            .replicator()
-            .snapshot()
-            .peers
+            .operation_events
+            .lock()
+            .unwrap()
             .iter()
-            .any(|p| p.copy_applied >= 7)
+            .any(|(stream, sequence, ack)| *stream == "copy" && *ack && *sequence >= 7)
     })
     .await;
     assert!(!target.runtime.owner.get_is_readable());
@@ -1390,7 +1441,7 @@ async fn phase3_corrective_new_checkpoint_extends_original_build_horizon_and_rep
     let entered = Completion::new();
     let release = Completion::new();
     *source.runtime.copy_selection_pause.lock().unwrap() = Some((entered.clone(), release.clone()));
-    let horizon = source.runtime.replicator().snapshot().progress.assigned;
+    let horizon = source.runtime.admitted_lsn();
     let sender = source.host.clone();
     let member = descriptor(&target);
     let building = tokio::spawn(async move { sender.build(member, Cancellation::default()).await });
@@ -1505,16 +1556,13 @@ async fn phase3_corrective_high_segment_records_build_in_distinct_native_batches
             None,
         )
         .unwrap();
-    let before = source.runtime.replicator().snapshot().progress.assigned;
+    let before = source.runtime.admitted_lsn();
     let error = transaction.commit().await.unwrap_err();
     assert_eq!(
         error.kind(),
         fube_runtime::ErrorKind::ReplicationOperationTooLarge
     );
-    assert_eq!(
-        source.runtime.replicator().snapshot().progress.assigned,
-        before
-    );
+    assert_eq!(source.runtime.admitted_lsn(), before);
     drop(source.host);
     drop(target.host);
     let _ = source.runtime.terminal.wait().await;
@@ -1698,10 +1746,8 @@ use super::{
     version::Completion,
 };
 use crate::*;
-use fube_data::{
-    extensions::{ReplicationEndpointOptions, ReplicatorDiagnostics},
-    qualification as rap,
-};
+use fube_data::extensions::ReplicationEndpointOptions;
+use fube_rap_test_support as rap;
 use fube_runtime::{
     extensions::{
         NativeIntegrationProvider, NativeReplicaDescriptor, NativeReplicaSetConfiguration,
@@ -2052,9 +2098,6 @@ impl IStatefulServiceReplica for Replica {
                 },
             )?;
             *self.providers.runtime.lock().unwrap() = Arc::downgrade(&runtime);
-            runtime
-                .replicator()
-                .qualification_use_root_controls(self.root);
             *self.runtime.lock().unwrap() = Some(runtime.clone());
             let _ = self
                 .created
@@ -2063,7 +2106,12 @@ impl IStatefulServiceReplica for Replica {
                 .take()
                 .unwrap()
                 .send((runtime.clone(), self.native.clone()));
-            Ok(Box::new((*runtime.replicator()).clone()) as Box<dyn IPrimaryReplicator>)
+            if self.root {
+                Ok(Box::new((*runtime.replicator()).clone()) as Box<dyn IPrimaryReplicator>)
+            } else {
+                Ok(Box::new(rap::DelegatingPrimary(runtime.replicator()))
+                    as Box<dyn IPrimaryReplicator>)
+            }
         })
     }
     fn change_role(&self, _: ReplicaRole, _: Cancellation) -> ApiFuture<'_, String> {
@@ -2220,7 +2268,7 @@ fn descriptor(f: &Fixture) -> NativeReplicaDescriptor {
         up: true,
         ready: true,
         must_catch_up: false,
-        address: f.runtime.replicator().endpoint().to_string(),
+        address: f.host.replication_address().unwrap(),
         progress: ReplicationProgress { first: 1, last: 1 },
     }
 }
@@ -2305,7 +2353,25 @@ async fn phase3_actual_null_context_full_build_registry_hierarchy_state_log_and_
             target_log.lock().unwrap().vector.last().unwrap().epoch
         );
         assert!(target_log.lock().unwrap().completed.is_some());
-        assert_eq!(target.runtime.replicator().snapshot().operation_captures, 0);
+        assert!(target
+            .runtime
+            .generation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .copy_done
+            .is_completed());
+        assert!(
+            target
+                .runtime
+                .operation_events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(stream, _, ack)| *stream == "copy" && *ack),
+            "actual Full completed with acknowledged/dropped public copy operations"
+        );
         drop(source.host);
         drop(target.host);
         target
@@ -2423,14 +2489,6 @@ async fn phase3_actual_full_pending_begin_pv_overlap_extended_provider_horizon()
     let checkpoint = memory.lock().unwrap().completed.clone().unwrap();
     assert!(checkpoint.starting_lsn < checkpoint.lsn);
     let target = Fixture::start(partition, 2, ReplicaRole::IdleSecondary, false, vec![]).await;
-    target
-        .host
-        .change_epoch(Epoch {
-            data_loss_number: 1,
-            configuration_number: 2 << 32,
-        })
-        .await
-        .unwrap();
     // Pause actual sender state ownership; a later committed group extends
     // HighestStateProviderCopiedLsn, not the captured requested copy horizon.
     let gate = Completion::new();
@@ -2467,6 +2525,18 @@ async fn phase3_actual_full_pending_begin_pv_overlap_extended_provider_horizon()
     gate.complete(Ok(()));
     build.await.unwrap().unwrap();
     target.copied().await;
+    // This native command includes GetStatus: an initial secondary correctly
+    // returns NotReady before copy. Transmission carries the new primary epoch;
+    // after real copy EOS, synchronize the model's epoch via normal public
+    // UpdateEpochAndGetStatus before the Active-role request.
+    target
+        .host
+        .change_epoch(Epoch {
+            data_loss_number: 1,
+            configuration_number: 2 << 32,
+        })
+        .await
+        .unwrap();
     target
         .host
         .change_role(ReplicaRole::ActiveSecondary)
@@ -2530,19 +2600,21 @@ async fn phase3_actual_full_post_open_factory_failure_retains_cleanup_and_failed
         assert!(target.runtime.owner.create_transaction().is_err());
         let last_good_ack = if failure == "set" { 3 } else { 2 };
         until(|| {
-            source
+            target
                 .runtime
-                .replicator()
-                .snapshot()
-                .peers
-                .iter()
-                .any(|p| p.replica == 2 && p.copy_applied == last_good_ack)
+                .operation_events
+                .lock()
+                .unwrap()
+                .contains(&("copy", last_good_ack, true))
         })
         .await;
-        assert_ne!(
-            source.runtime.replicator().snapshot().peers[0].copy_applied,
-            -1,
-            "failed state/meta record does not ACK completed Full"
+        assert!(
+            !target.runtime.operation_events.lock().unwrap().contains(&(
+                "copy",
+                last_good_ack + 1,
+                true
+            )),
+            "failed state/meta record has no public ACK or completed Full transition"
         );
         let point = target.point(10);
         assert!(!point.events().iter().any(|e| matches!(

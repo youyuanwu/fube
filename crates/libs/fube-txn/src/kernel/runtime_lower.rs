@@ -8,7 +8,7 @@ use super::{
     version::Completion,
 };
 use crate::{ApiFuture, Cancellation, Error, OperationContext, Result, TransactionBase};
-use fube_data::{extensions::ReplicatorDiagnostics, FabricReplicator, IStateReplicator};
+use fube_data::IStateReplicator;
 use fube_runtime::extensions::{
     CallLane, CallOrigin, DisposalTracker, ExecutionRuntime, ObjectQuota,
 };
@@ -31,6 +31,8 @@ fn allocation(error: Error) -> Error {
 }
 
 pub(crate) struct RuntimeLower {
+    #[cfg(test)]
+    pub(crate) last_admitted: std::sync::atomic::AtomicI64,
     copy_limits: (usize, usize),
     self_weak: Weak<Self>,
     #[cfg(test)]
@@ -39,7 +41,7 @@ pub(crate) struct RuntimeLower {
     pub(crate) group_attempts: Mutex<Vec<GroupAttempt>>,
     #[cfg(test)]
     pub(crate) group_pause: Mutex<Option<Completion<()>>>,
-    lower: Arc<FabricReplicator>,
+    lower: Arc<dyn IStateReplicator>,
     execution: ExecutionRuntime,
     drivers: tokio::runtime::Handle,
     payloads: ObjectQuota,
@@ -59,6 +61,17 @@ impl Drop for PublicationGuard {
     fn drop(&mut self) {
         self.0.state.lock().unwrap().1 -= 1;
         self.0.changed.notify_waiters();
+    }
+}
+thread_local! {
+    static PUBLICATIONS: std::cell::RefCell<Vec<Weak<RuntimeLower>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+struct ReentryScope(std::marker::PhantomData<std::rc::Rc<()>>);
+impl Drop for ReentryScope {
+    fn drop(&mut self) {
+        PUBLICATIONS.with(|owners| {
+            owners.borrow_mut().pop().expect("upper publication scope");
+        });
     }
 }
 struct GroupCommit {
@@ -101,16 +114,22 @@ impl Admission {
 }
 
 impl RuntimeLower {
-    pub(crate) fn new(lower: Arc<FabricReplicator>) -> Result<Arc<Self>> {
-        Self::with_operation_limits(lower, &fube_data::Settings::default())
+    pub(crate) fn new(
+        lower: Arc<dyn IStateReplicator>,
+        execution: ExecutionRuntime,
+    ) -> Result<Arc<Self>> {
+        Self::with_operation_limits(lower, &fube_data::Settings::default(), execution)
     }
     pub(crate) fn with_operation_limits(
-        lower: Arc<FabricReplicator>,
+        lower: Arc<dyn IStateReplicator>,
         settings: &fube_data::Settings,
+        execution: ExecutionRuntime,
     ) -> Result<Arc<Self>> {
         settings.validate()?;
         let payloads = ObjectQuota::new(32)?;
         Ok(Arc::new_cyclic(|self_weak| Self {
+            #[cfg(test)]
+            last_admitted: std::sync::atomic::AtomicI64::new(0),
             copy_limits: (settings.operation_segments, settings.operation_bytes),
             self_weak: self_weak.clone(),
             #[cfg(test)]
@@ -119,7 +138,7 @@ impl RuntimeLower {
             group_attempts: Mutex::new(Vec::new()),
             #[cfg(test)]
             group_pause: Mutex::new(None),
-            execution: lower.execution_runtime(),
+            execution,
             lower,
             drivers: tokio::runtime::Handle::current(),
             payloads,
@@ -137,6 +156,30 @@ impl RuntimeLower {
                 changed: tokio::sync::Notify::new(),
             }),
         }))
+    }
+    pub(crate) fn reject_reentry(&self) -> Result<()> {
+        if PUBLICATIONS.with(|owners| {
+            owners
+                .borrow()
+                .iter()
+                .any(|owner| owner.ptr_eq(&self.self_weak))
+        }) {
+            return Err(Error::InvalidInput("same-upper publication reentry"));
+        }
+        Ok(())
+    }
+    pub(crate) fn publication<T>(&self, publish: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.reject_reentry()?;
+        PUBLICATIONS.with(|owners| {
+            let mut owners = owners.borrow_mut();
+            if owners.len() >= 32 {
+                return Err(super::status::Status::InsufficientResources.error());
+            }
+            owners.push(self.self_weak.clone());
+            Ok(())
+        })?;
+        let _scope = ReentryScope(std::marker::PhantomData);
+        publish()
     }
     pub(crate) fn copy_limits(&self) -> (usize, usize) {
         self.copy_limits
@@ -399,7 +442,7 @@ impl RuntimeLower {
         synchronous: Option<mpsc::SyncSender<Result<Arc<Activity>>>>,
         deadline: Option<Instant>,
     ) -> Result<Arc<Admission>> {
-        ExecutionRuntime::reject_engine_reentry(self.lower.execution_identity())?;
+        self.reject_reentry()?;
         // Atomic with generation retirement, before quotas/capture/driver spawn.
         // The guard ends after disposition + ordered append + successful flush,
         // NOT after Apply/quorum (which may need the retiring final boundary).
@@ -473,6 +516,7 @@ impl RuntimeLower {
         let published = admission.clone();
         let asynchronous = published.synchronous.lock().unwrap().is_none();
         let lower = self.lower.clone();
+        let initial_runtime_for_publication = self.self_owner();
         let continuation = manager.clone();
         #[cfg(test)]
         let publication_pause = self.publication_pause.clone();
@@ -491,6 +535,10 @@ impl RuntimeLower {
                     return Err(error);
                 }
             };
+            #[cfg(test)]
+            initial_runtime_for_publication
+                .last_admitted
+                .store(accepted.sequence_number, Ordering::Release);
             #[cfg(test)]
             {
                 let pause = {
@@ -518,17 +566,16 @@ impl RuntimeLower {
                 .take()
                 .unwrap();
             captured.record.lsn = accepted.sequence_number;
-            let activity =
-                ExecutionRuntime::engine_publication(lower.execution_identity(), || {
-                    let node =
-                        RecordNode::new(captured.record, captured.transaction, captured.context)?;
-                    let activity = Activity::new(node, true);
-                    if let Some(retention) = captured.memory {
-                        activity.node.retain_memory(retention);
-                    }
-                    manager.append(activity.clone())?;
-                    Ok(activity)
-                })?;
+            let activity = initial_runtime_for_publication.publication(|| {
+                let node =
+                    RecordNode::new(captured.record, captured.transaction, captured.context)?;
+                let activity = Activity::new(node, true);
+                if let Some(retention) = captured.memory {
+                    activity.node.retain_memory(retention);
+                }
+                manager.append(activity.clone())?;
+                Ok(activity)
+            })?;
             // No transaction-cache lock or provider callback in publication.
             published.publish(Ok(activity.clone()));
             // Admission is a bounded invocation. A pending multi-transaction

@@ -3,7 +3,8 @@ use super::*;
 use crate::kernel::{
     maintenance::LogSettings, provider::PointProvider, runtime::RuntimeConfig, version::Completion,
 };
-use fube_data::{extensions::ReplicationEndpointOptions, qualification as rap};
+use fube_data::extensions::ReplicationEndpointOptions;
+use fube_rap_test_support as rap;
 use fube_runtime::{
     extensions::{
         NativeIntegrationProvider, NativeReplicaDescriptor, NativeReplicaSetConfiguration,
@@ -1430,7 +1431,7 @@ async fn phase4_registry_actual_primary_created_hierarchy_full_copies_then_promo
                 up: true,
                 ready: true,
                 must_catch_up: false,
-                address: target.runtime.replicator().endpoint().to_string(),
+                address: target.host.replication_address().unwrap(),
                 progress: ReplicationProgress { first: 1, last: 1 },
             },
             Cancellation::default(),

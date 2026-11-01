@@ -28,40 +28,6 @@ pub struct FabricReplicator {
 }
 
 impl FabricReplicator {
-    /// Source-shaped V2 composition over this SAME native-bound lower owner.
-    /// Initialize the log provider's tail before construction. Lifecycle hooks
-    /// are explicit; native root/bound common controls cannot bypass them.
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_with_lifecycle(
-        partition: Arc<dyn IStatefulServicePartition>,
-        native: NativeRuntimeIntegration,
-        provider: Arc<dyn IStateProvider>,
-        replay: Option<Arc<dyn ReplayCheckpointProvider>>,
-        endpoint: ReplicationEndpointOptions,
-        settings: Settings,
-        capabilities: StateProviderCapabilities,
-        lifecycle: Arc<dyn crate::extensions::ReplicatorLifecycle>,
-    ) -> Result<Arc<Self>> {
-        let identity = native.identity();
-        let actor = Actor {
-            partition: identity.partition_id,
-            replica: identity.replica_id,
-            incarnation: endpoint.actor_incarnation,
-        };
-        Ok(Arc::new(Self {
-            engine: Engine::bind_partition_integrated(
-                partition,
-                native,
-                actor,
-                &endpoint.listen_address,
-                provider,
-                replay,
-                settings,
-                capabilities,
-                Some(lifecycle),
-            )?,
-        }))
-    }
     /// Data-layer construction integration, NOT an extra SDK partition method.
     /// Call in the runtime-owned service Open entry. Missing/stale/mismatched
     /// runtime-issued authority fails before listener/provider activation.

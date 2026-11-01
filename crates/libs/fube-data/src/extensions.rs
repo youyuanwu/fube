@@ -10,34 +10,6 @@ use std::sync::Arc;
 pub use crate::api::Progress;
 pub use crate::engine::{EngineSnapshot, PeerSnapshot};
 
-/// Explicit upper lifecycle composition, never SDK discovery or a second binder.
-/// Common root and native-bound controls share these lower-first continuations.
-pub trait ReplicatorLifecycle: Send + Sync + 'static {
-    fn opened(&self, cancellation: Cancellation) -> ApiFuture<'_, ()>;
-    fn role_changed(
-        &self,
-        epoch: Epoch,
-        role: crate::ReplicaRole,
-        cancellation: Cancellation,
-    ) -> ApiFuture<'_, ()>;
-    fn closed(&self, cancellation: Cancellation) -> ApiFuture<'_, ()>;
-    /// Schedule owned upper cleanup after synchronous lower Abort; not completed
-    /// upper drain. The existing host execution fence retains physical ownership.
-    fn aborted(&self);
-}
-
-/// One-time fresh volatile upper bootstrap reconciliation. The owner queries the
-/// ACTUAL provider tail and permits only constructor-zero → bootstrapped-one
-/// before any role/epoch/operation activation. No caller supplies a fabricated LSN.
-pub trait VolatileLogInitialization {
-    fn initialize_volatile_log(&self) -> ApiFuture<'_, ()>;
-}
-impl VolatileLogInitialization for crate::FabricReplicator {
-    fn initialize_volatile_log(&self) -> ApiFuture<'_, ()> {
-        self.engine.initialize_volatile_log()
-    }
-}
-
 pub use fube_runtime::extensions::EpochDomains;
 
 /// Best-effort fube diagnostics, not native control or compatibility evidence.
@@ -139,10 +111,6 @@ pub trait EpochCheckedReplication: Send + Sync {
 /// Explicit engine observations and safe canonical-sync scheduling capability.
 /// Snapshots are never native control or application-access grants.
 pub trait ReplicatorDiagnostics {
-    /// Qualification routing only: choose existing root versus invocation-bound
-    /// methods after native proof validation. Grants no control authority.
-    #[cfg(feature = "qualification")]
-    fn qualification_use_root_controls(&self, enabled: bool);
     /// Process-local reentry identity, not native authority or transaction LSN.
     fn execution_identity(&self) -> u64;
     fn snapshot(&self) -> EngineSnapshot;
@@ -160,10 +128,6 @@ pub trait ReplicatorDiagnostics {
     ) -> ApiFuture<'_, serde_json::Value>;
 }
 impl ReplicatorDiagnostics for crate::FabricReplicator {
-    #[cfg(feature = "qualification")]
-    fn qualification_use_root_controls(&self, enabled: bool) {
-        self.engine.set_root_controls(enabled);
-    }
     fn execution_identity(&self) -> u64 {
         self.engine.execution_identity()
     }

@@ -355,7 +355,6 @@ pub struct Engine {
     #[cfg(test)]
     native_configuration: Mutex<Option<NativeInvocation>>,
     self_weak: Weak<Engine>,
-    lifecycle: Mutex<Option<Arc<crate::supervised::OwnedLifecycle>>>,
     endpoint: Endpoint,
     settings: Settings,
     commands: mpsc::Sender<AuthorizedCommand>,
@@ -373,7 +372,7 @@ pub struct Engine {
     #[cfg(test)]
     native_binder: Mutex<Option<Arc<dyn NativeControlBinding>>>,
     native_progress: Mutex<Option<Arc<dyn fube_runtime::extensions::NativeProgressSource>>>,
-    #[cfg(any(test, feature = "qualification"))]
+    #[cfg(test)]
     native_root_dispatch: AtomicBool,
     #[cfg(test)]
     native_build_pause: Mutex<Option<(oneshot::Sender<NativeInvocation>, oneshot::Receiver<()>)>>,
@@ -407,31 +406,6 @@ impl Engine {
         settings: Settings,
         capabilities: crate::extensions::StateProviderCapabilities,
     ) -> Result<Arc<Self>> {
-        Self::bind_partition_integrated(
-            partition,
-            native,
-            actor,
-            address,
-            provider,
-            replay,
-            settings,
-            capabilities,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn bind_partition_integrated(
-        partition: std::sync::Arc<dyn fube_runtime::IStatefulServicePartition>,
-        native: NativeRuntimeIntegration,
-        actor: Actor,
-        address: &str,
-        provider: Arc<dyn IStateProvider>,
-        replay: Option<Arc<dyn ReplayCheckpointProvider>>,
-        settings: Settings,
-        capabilities: crate::extensions::StateProviderCapabilities,
-        lifecycle: Option<Arc<dyn crate::extensions::ReplicatorLifecycle>>,
-    ) -> Result<Arc<Self>> {
         settings.validate()?;
         let information = partition.get_partition_information()?;
         native.validate()?;
@@ -459,7 +433,6 @@ impl Engine {
             settings,
             Some(Arc::new(native)),
             capabilities,
-            lifecycle,
         )
     }
 
@@ -517,7 +490,6 @@ impl Engine {
             settings,
             native_control,
             capabilities,
-            None,
         )
     }
 
@@ -530,7 +502,6 @@ impl Engine {
         settings: Settings,
         native_control: Option<Arc<dyn NativeControlView>>,
         capabilities: crate::extensions::StateProviderCapabilities,
-        lifecycle: Option<Arc<dyn crate::extensions::ReplicatorLifecycle>>,
     ) -> Result<Arc<Self>> {
         settings.validate()?;
         let native_runtime = native_control
@@ -564,12 +535,6 @@ impl Engine {
                 .as_ref()
                 .map_or(1, |native| native.binding().generation),
         };
-        let lifecycle = lifecycle
-            .map(|value| {
-                crate::supervised::OwnedLifecycle::new(execution.clone(), disposal.clone(), value)
-                    .map(Arc::new)
-            })
-            .transpose()?;
         let terminal = execution.reserve_terminal(origin)?;
         let initial_permit = if native_runtime.is_some() {
             None
@@ -811,7 +776,6 @@ impl Engine {
             #[cfg(test)]
             native_configuration: Mutex::new(None),
             self_weak: self_weak.clone(),
-            lifecycle: Mutex::new(lifecycle),
             endpoint,
             settings,
             commands,
@@ -829,7 +793,7 @@ impl Engine {
             #[cfg(test)]
             native_binder: Mutex::new(None),
             native_progress: Mutex::new(None),
-            #[cfg(any(test, feature = "qualification"))]
+            #[cfg(test)]
             native_root_dispatch: AtomicBool::new(false),
             #[cfg(test)]
             native_build_pause: Mutex::new(None),
@@ -1081,25 +1045,8 @@ impl Engine {
         })
     }
 
-    pub(crate) fn initialize_volatile_log(&self) -> ServiceFuture<'_, ()> {
-        Box::pin(async move {
-            self.native_runtime
-                .as_ref()
-                .ok_or(Error::InvalidInput(
-                    "volatile log bootstrap needs native construction",
-                ))?
-                .validate()?;
-            self.request(|reply| Command::InitializeLog(None, reply))
-                .await
-        })
-    }
-
     pub(crate) fn execution_identity(&self) -> u64 {
         self.shared.engine_id
-    }
-    #[cfg(feature = "qualification")]
-    pub(crate) fn set_root_controls(&self, enabled: bool) {
-        self.native_root_dispatch.store(enabled, Ordering::Release);
     }
 
     fn check_write_deadline(&self) -> Result<()> {
@@ -1156,18 +1103,6 @@ impl Engine {
             disposal: self.shared.disposal.clone(),
         });
         if let Command::Loss(_, _, execution) = &mut command {
-            *execution = Some(self.shared.execution.reserve(
-                CallLane::Provider,
-                CallOrigin {
-                    engine: self.shared.engine_id,
-                    session: 0,
-                    generation: self.shared.generation,
-                },
-                self.settings.callback_timeout,
-                false,
-            )?);
-        }
-        if let Command::InitializeLog(execution, _) = &mut command {
             *execution = Some(self.shared.execution.reserve(
                 CallLane::Provider,
                 CallOrigin {
@@ -1493,7 +1428,6 @@ struct Submit {
 
 enum Command {
     InitialProgress(Option<OwnedCallPermit>, InitialQuery, Reply<i64>),
-    InitializeLog(Option<OwnedCallPermit>, Reply<()>),
     #[cfg(feature = "qualification")]
     Probe {
         kind: String,
@@ -1659,7 +1593,6 @@ impl Control {
 #[derive(Clone, Copy)]
 enum Job {
     InitialProgress,
-    InitializeLog,
     Control,
     Replay {
         revision: u64,
@@ -1672,7 +1605,6 @@ enum Job {
 
 enum JobValue {
     InitialProgress(i64),
-    InitializedLog(i64),
     Retired,
     Admission,
     Epoch,
@@ -1725,8 +1657,6 @@ struct Owner {
     initial_progress: Option<i64>,
     initial_replies: Vec<(InitialQuery, Reply<i64>)>,
     initial_query: Option<InitialQuery>,
-    initialized_log: bool,
-    initializing_log: Option<Reply<()>>,
     endpoint: Endpoint,
     transport: PeerTransport,
     provider: Option<Arc<crate::supervised::OwnedProvider>>,
@@ -1804,8 +1734,6 @@ impl Owner {
             initial_progress: None,
             initial_replies: Vec::new(),
             initial_query: None,
-            initialized_log: false,
-            initializing_log: None,
             endpoint,
             transport,
             provider: Some(provider),
@@ -2361,34 +2289,6 @@ impl Owner {
                     }
                 }
             }
-            Command::InitializeLog(execution, reply) => {
-                if self.initialized_log
-                    || self.initializing_log.is_some()
-                    || self.role != ReplicaRole::Unknown
-                    || self.epoch.is_some()
-                    || self.queue.progress().assigned != 0
-                    || self.queue.progress().retained_operations != 0
-                {
-                    let _ = reply.send(Err(Error::InvalidInput(
-                        "volatile initialization must precede all lower activation",
-                    )));
-                    return;
-                }
-                let provider = self.provider.as_ref().unwrap().clone();
-                let call = provider_call(
-                    execution.expect("initialized before command transfer"),
-                    &mut self.starts,
-                    &mut self.dispositions,
-                    async move {
-                        provider
-                            .get_last_committed_sequence_number()
-                            .map(JobValue::InitializedLog)
-                    },
-                );
-                self.initializing_log = Some(reply);
-                self.jobs
-                    .spawn(async move { (Job::InitializeLog, call.await) });
-            }
             #[cfg(feature = "qualification")]
             Command::Probe {
                 kind,
@@ -2444,6 +2344,22 @@ impl Owner {
                     // Native equal minAllowedEpoch is a no-op, including during
                     // copy or an original-operation provider barrier. It must
                     // not query/reconcile an independent upper log suffix.
+                    let _ = reply.send(Ok(()));
+                    return;
+                }
+                if self.role == ReplicaRole::IdleSecondary
+                    && role == Some(ReplicaRole::ActiveSecondary)
+                {
+                    // ChangeRoleAsyncOperation.cpp:253–275 and
+                    // SecondaryReplicator.cpp:2110–2154: reuse the secondary,
+                    // not an epoch barrier/queue transfer. This lower's supported
+                    // profile requires explicit IOperation service ACKs (copy
+                    // completion below uses applied, not mere dequeue), so native
+                    // RequireServiceAck promotion completes immediately. It must
+                    // neither join copy/replication EOS nor invalidate captures.
+                    // The no-service-ACK dispatch-drain profile is not exposed by
+                    // Settings and is not emulated by waiting for application ACKs.
+                    self.role = ReplicaRole::ActiveSecondary;
                     let _ = reply.send(Ok(()));
                     return;
                 }
@@ -4582,10 +4498,6 @@ impl Owner {
                 .and_then(|reply| reply.cleanup.clone()),
             Job::Control => self.control.as_ref().and_then(Control::cleanup),
             Job::Replay { .. } => None,
-            Job::InitializeLog => self
-                .initializing_log
-                .as_ref()
-                .and_then(|r| r.cleanup.clone()),
         };
         let _enrollment = cleanup.as_ref().map(|cleanup| cleanup.enter());
         match job {
@@ -4632,26 +4544,6 @@ impl Owner {
                     if let Err(error) = outcome {
                         self.fail(error);
                     }
-                }
-            }
-            Job::InitializeLog => {
-                let outcome = match result {
-                    Ok(JobValue::InitializedLog(1))
-                        if self.role == ReplicaRole::Unknown
-                            && self.queue.progress().assigned == 0 =>
-                    {
-                        self.initialized_log = true;
-                        self.initial_progress = Some(1);
-                        *self.shared.initial_progress.lock().unwrap() = Some(1);
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                    _ => Err(Error::InvalidInput(
-                        "fresh native volatile bootstrap must report actual tail one",
-                    )),
-                };
-                if let Some(reply) = self.initializing_log.take() {
-                    let _ = reply.send(outcome);
                 }
             }
             Job::Replay {
@@ -5255,13 +5147,6 @@ impl Engine {
                     return Err(Error::Closed);
                 }
                 engine.shared.opened.store(true, Ordering::Release);
-                let lifecycle = engine.lifecycle.lock().unwrap().clone();
-                if let Some(lifecycle) = lifecycle {
-                    if let Err(error) = lifecycle.get().opened(cancellation).await {
-                        let _ = engine.shutdown_owned()?.wait().await;
-                        return Err(error);
-                    }
-                }
                 Ok(engine.endpoint.to_string())
             }),
         )
@@ -5301,18 +5186,6 @@ impl Engine {
                         reply,
                     })
                     .await?;
-                let lifecycle = engine.lifecycle.lock().unwrap().clone();
-                if let Some(lifecycle) = lifecycle {
-                    if let Err(error) = lifecycle
-                        .get()
-                        .role_changed(epoch, role, cancellation)
-                        .await
-                    {
-                        let _ = engine.shutdown_owned()?.wait().await;
-                        lifecycle.get().aborted();
-                        return Err(error);
-                    }
-                }
                 Ok(())
             }),
         )
@@ -5466,10 +5339,6 @@ impl Engine {
             &self.shared.execution,
             Box::pin(async move {
                 engine.shutdown()?.wait().await?;
-                let lifecycle = engine.lifecycle.lock().unwrap().take();
-                if let Some(lifecycle) = lifecycle {
-                    lifecycle.get().closed(cancellation.clone()).await?;
-                }
                 if engine.owns_execution && !engine.shared.execution.is_current_entry() {
                     engine.shared.execution.finish_standalone().await?;
                 }
@@ -5490,10 +5359,6 @@ impl Engine {
             .as_ref()
             .is_some_and(DisposalReceipt::is_complete)
         {
-            let lifecycle = self.lifecycle.lock().unwrap().take();
-            if let Some(lifecycle) = lifecycle {
-                lifecycle.get().aborted();
-            }
             return;
         }
         if !ExecutionRuntime::in_owned_entry() || ExecutionRuntime::is_cleanup_entry() {
@@ -5504,11 +5369,6 @@ impl Engine {
             Ok(receipt) => {
                 if receipt.wait_blocking().is_err() {
                     self.shared.execution.retire();
-                } else {
-                    let lifecycle = self.lifecycle.lock().unwrap().take();
-                    if let Some(lifecycle) = lifecycle {
-                        lifecycle.get().aborted();
-                    }
                 }
             }
             Err(_) => self.shared.execution.retire(),

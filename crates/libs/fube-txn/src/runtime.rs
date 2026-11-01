@@ -12,8 +12,9 @@ use crate::{
     Error, IDataLossHandler, IStateProvider2Factory, IStatefulServicePartition,
     ITransactionalReplicator, Result,
 };
-use fube_data::{extensions::ReplicationEndpointOptions, FabricReplicator, Settings};
+use fube_data::{extensions::ReplicationEndpointOptions, Settings};
 use fube_runtime::extensions::NativeRuntimeIntegration;
+use fube_runtime::IPrimaryReplicator;
 use std::{path::PathBuf, sync::Arc};
 
 /// Native MB-based checkpoint/truncation policy for the volatile log.
@@ -70,13 +71,13 @@ impl Default for VolatileRuntimeSettings {
     }
 }
 
-/// Constructible supported A1 service owner and its single FabricReplicator.
+/// Constructible supported A1 service owner and its public composite.
 ///
 /// Construct during the stateful replica's `open` callback with the runtime-
 /// issued native binding. Retain this owner in that service replica through
-/// native Close/Abort; return a clone of [`Self::fabric_replicator`] as the
-/// canonical `IPrimaryReplicator`. Native-issued lower Open/role/Close/Abort
-/// automatically call the existing upper lifecycle exactly once.
+/// native Close/Abort; return [`Self::into_service_replicator`] as the canonical
+/// `IPrimaryReplicator`. The composite delegates lower-first Open/role/Close/Abort
+/// and owns the upper lifecycle; one normally constructed lower remains authority.
 ///
 /// [`Self::transactional_replicator`] exposes ordinary transactions and primary
 /// Add/GetOrAdd/Get/Remove/enumeration using the supplied provider factory. The
@@ -85,8 +86,8 @@ impl Default for VolatileRuntimeSettings {
 /// by an SDK consumer. Provider payload/rollback semantics remain its obligation.
 ///
 /// Direct synchronous second/later `Transaction::add_operation` requires the
-/// canonical fube execution entry (use the lower execution runtime's
-/// `try_reserve().run_owned(...)` when outside it). Its return observes actual
+/// canonical fube execution entry (use the captured public host integration's
+/// execution `try_reserve().run_owned(...)` when outside it). Its return observes actual
 /// admission, not just enqueue. Async registry methods retain/resume that entry
 /// internally. Observer Drop is not rollback; explicit transaction Dispose
 /// releases native retained registry locks, including after read-only commit.
@@ -160,13 +161,13 @@ impl VolatileTransactionalReplicator {
         self.runtime.owner.clone()
     }
 
-    /// Obtain the ONE canonical lower control/data object and execution runtime.
-    ///
-    /// Service Open returns `Box::new((*owner.fabric_replicator()).clone())`.
-    /// Do not also open/change-role/close the upper owner: lower root and bound
-    /// native controls already forward those callbacks. Do not use raw lower
-    /// replicate to bypass the transactional record protocol.
-    pub fn fabric_replicator(&self) -> Arc<FabricReplicator> {
-        self.runtime.replicator()
+    /// Obtain the actual public composite common/primary control returned by
+    /// service Open. No lower engine/data or execution accessor is exposed.
+    pub fn replicator(&self) -> Arc<dyn IPrimaryReplicator> {
+        self.runtime.composite()
+    }
+    /// Box the same composite for the stateful service's Open return contract.
+    pub fn into_service_replicator(&self) -> Box<dyn IPrimaryReplicator> {
+        Box::new((*self.runtime.composite()).clone())
     }
 }

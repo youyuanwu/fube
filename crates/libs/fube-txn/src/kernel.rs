@@ -10,6 +10,7 @@
 #![allow(dead_code, reason = "A0 kernels are private, awaiting A1 integration")]
 
 pub(crate) mod checkpoint;
+pub(crate) mod composite;
 pub(crate) mod copy;
 pub(crate) mod copy_codec;
 pub(crate) mod copy_sender;

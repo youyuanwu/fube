@@ -319,6 +319,7 @@ dependencies = [
 name = "fube-data"
 version = "0.1.0"
 dependencies = [
+ "fube-rap-test-support",
  "fube-runtime",
  "fube-transport",
  "serde",
@@ -357,6 +358,17 @@ dependencies = [
  "libc",
  "tokio",
  "tokio-rusqlite",
+]
+
+[[package]]
+name = "fube-rap-test-support"
+version = "0.1.0"
+dependencies = [
+ "fube-runtime",
+ "fube-transport",
+ "serde",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -402,6 +414,7 @@ name = "fube-txn"
 version = "0.1.0"
 dependencies = [
  "fube-data",
+ "fube-rap-test-support",
  "fube-runtime",
  "tokio",
  "uuid",
@@ -1066,6 +1079,7 @@ name = "rust-runtime-app"
 version = "0.1.0"
 dependencies = [
  "fube-data",
+ "fube-rap-test-support",
  "fube-runtime",
  "serde_json",
  "tokio",

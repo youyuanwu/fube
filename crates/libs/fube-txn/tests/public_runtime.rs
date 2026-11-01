@@ -1,9 +1,7 @@
 //! External SDK behavioral witness over registered, native-issued in-process
 //! lower integration. No private kernels/PointProvider; no native binary claim.
-use fube_data::{
-    extensions::{ReplicationEndpointOptions, ReplicatorDiagnostics},
-    qualification as rap, Settings,
-};
+use fube_data::{extensions::ReplicationEndpointOptions, Settings};
+use fube_rap_test_support as rap;
 use fube_runtime::{
     extensions::{
         NativeIntegrationProvider, NativeReplicaDescriptor, NativeReplicaSetConfiguration,
@@ -294,16 +292,16 @@ impl IStatefulServiceReplica for Replica {
                     ..VolatileRuntimeSettings::default()
                 },
             )?;
-            let lower = owner.fabric_replicator();
+            let control = owner.into_service_replicator();
             *self.owner.lock().unwrap() = Some(owner.clone());
             if let Some(send) = self.created.lock().unwrap().take() {
                 let _ = send.send((owner, self.native.clone()));
             }
-            Ok(Box::new((*lower).clone()) as Box<dyn IPrimaryReplicator>)
+            Ok(control)
         })
     }
     fn change_role(&self, _: ReplicaRole, _: Cancellation) -> ApiFuture<'_, String> {
-        // Logging/provider controls already enter through the same lower binder.
+        // Logging/provider controls enter through the returned public composite.
         Box::pin(async { Ok("model://public-txn".into()) })
     }
     fn close(&self, _: Cancellation) -> ApiFuture<'_, ()> {
@@ -367,7 +365,7 @@ impl Fixture {
             up: true,
             ready: true,
             must_catch_up: false,
-            address: self.owner.fabric_replicator().endpoint().to_string(),
+            address: self.host.replication_address().unwrap(),
             progress: ReplicationProgress { first: 1, last: 1 },
         }
     }
@@ -392,6 +390,12 @@ impl Fixture {
         );
         tx.commit().await.unwrap();
         tx.dispose().unwrap();
+        let committed = tx.get_commit_sequence_number();
+        until(|| {
+            root.get_last_stable_sequence_number()
+                .is_ok_and(|stable| stable >= committed)
+        })
+        .await;
         assert_eq!(root.get(name).unwrap().get_name(), name);
     }
     async fn write(&self, name: &str, markers: &[u8], bytes: usize) {
@@ -400,9 +404,8 @@ impl Fixture {
         let tx = root.create_transaction().unwrap();
         let input = tx.clone();
         let markers = markers.to_vec();
-        self.owner
-            .fabric_replicator()
-            .execution_runtime()
+        self.native
+            .execution()
             .try_reserve()
             .unwrap()
             .run_owned(move || {
@@ -421,6 +424,12 @@ impl Fixture {
             .unwrap();
         tx.commit().await.unwrap();
         tx.dispose().unwrap();
+        let committed = tx.get_commit_sequence_number();
+        until(|| {
+            root.get_last_stable_sequence_number()
+                .is_ok_and(|stable| stable >= committed)
+        })
+        .await;
     }
 }
 async fn until(condition: impl Fn() -> bool) {
@@ -523,14 +532,13 @@ async fn public_factory_primary_registry_incremental_null_full_and_stream_lifecy
     source.configure(vec![member]).await;
     source.write("fabric:/public", &[91, 92, 93], 1).await;
     until(|| copied.state.lock().unwrap().ends_with(&[91, 92, 93])).await;
-    assert_eq!(
-        source
-            .owner
-            .fabric_replicator()
-            .snapshot()
-            .operation_captures,
-        0
-    );
+    let progress = source.owner.replicator().get_current_progress().unwrap();
+    // provider_operations=1: advancement across fresh transactions/Barriers
+    // requires actual operation capture retirement, not a diagnostic zero.
+    let continued: Vec<u8> = (100..108).collect();
+    source.write("fabric:/public", &continued, 1).await;
+    until(|| copied.state.lock().unwrap().ends_with(&continued)).await;
+    assert!(source.owner.replicator().get_current_progress().unwrap() > progress);
     assert!(root.create_atomic_operation().is_err());
     assert!(root.create_atomic_redo_operation().is_err());
     assert!(root.restore(PathBuf::from("unsupported")).await.is_err());

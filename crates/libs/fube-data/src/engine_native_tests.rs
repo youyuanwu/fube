@@ -7,7 +7,7 @@ use fube_runtime::{
 };
 #[path = "engine_native_disposal_tests.rs"]
 mod disposal;
-use crate::qualification as rap;
+use fube_rap_test_support as rap;
 
 type Created = Arc<Mutex<Option<oneshot::Sender<(Arc<Engine>, NativeRuntimeIntegration)>>>>;
 struct Factory {

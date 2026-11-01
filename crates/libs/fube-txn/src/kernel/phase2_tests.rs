@@ -274,12 +274,12 @@ async fn phase2_corrective_copied_epoch_after_failed_record_retains_failed_flush
             .clone()
             .unwrap();
         until(|| {
-            source
-                .lower
-                .snapshot()
-                .peers
-                .iter()
-                .any(|p| p.copy_applied >= 2 || p.copy_applied == -1)
+            target
+                .runtime
+                .operation_events
+                .lock()
+                .unwrap()
+                .contains(&("copy", 2, true))
         })
         .await;
         let records = target.runtime.owner.manager.records();
@@ -382,7 +382,7 @@ async fn phase2_corrective_cached_unlock_error_directly_notifies_native_without_
         assert_eq!(f.runtime.fault_reports.load(Ordering::Acquire), 0);
         assert!(!f.runtime.owner.manager.faults.is_closing());
         assert!(f.runtime.owner.manager.faults.service_error().is_none());
-        assert!(!f.runtime.replicator().snapshot().closed);
+        assert!(f.runtime.replicator().get_current_progress().is_ok());
         drop(f.host);
         f.runtime.terminal.wait().await.as_ref().clone().unwrap();
     }
@@ -408,7 +408,7 @@ async fn phase2_corrective_actual_epoch_waits_accepted_unpublished_primary_prefi
         logging.group_idle().await;
         let timer = Completion::new();
         *logging.group_pause.lock().unwrap() = Some(timer.clone());
-        let next = f.runtime.replicator().snapshot().progress.assigned + 1;
+        let next = f.runtime.admitted_lsn() + 1;
         let (entered, observed) = std::sync::mpsc::sync_channel(1);
         let (release, resume) = std::sync::mpsc::sync_channel(1);
         *logging.publication_pause.lock().unwrap() = Some((next, entered, resume));
@@ -593,25 +593,31 @@ async fn phase2_provider_roles_start_all_peers_wait_all_and_preserve_first_array
         let changed =
             tokio::spawn(async move { changing.change_role(ReplicaRole::ActiveSecondary).await });
         until(|| second.has("role-start")).await;
-        assert!(first.has("role:ActiveSecondary"));
-        assert!(
-            !changed.is_finished(),
-            "array-first failure must await every peer effect"
-        );
+        let first_started = first.has("role:ActiveSecondary");
+        let all_pending = !changed.is_finished();
         gate.complete(Ok(()));
-        assert!(changed.await.unwrap().is_err());
-        assert!(runtime
+        let role_result = changed.await.unwrap();
+        let first_error = runtime
             .owner
             .manager
             .faults
             .service_error()
             .unwrap()
             .to_string()
-            .contains("fabric:/first"));
-        assert!(runtime.terminal.wait().await.is_err());
-        runtime.cleanup_done.wait().await.as_ref().clone().unwrap();
-        assert!(first.has("close") && second.has("close"));
+            .contains("fabric:/first");
+        let lower_live = runtime.replicator().get_current_progress().is_ok();
+        // The same native upper-role failure rule applies to peer fan-out:
+        // ReportFault fences admission; only the actual later Close cleans up.
         drop(host);
+        let terminal = runtime.terminal.wait().await;
+        runtime.cleanup_done.wait().await.as_ref().clone().unwrap();
+        assert!(
+            first_started && all_pending,
+            "array-first failure waits every peer effect"
+        );
+        assert!(role_result.is_err() && first_error && lower_live);
+        assert!(terminal.is_err());
+        assert!(first.has("close") && second.has("close"));
     }
 }
 
@@ -641,16 +647,7 @@ async fn phase2_native_transient_write_revocation_allows_cache_then_original_low
                     up: false,
                     ready: false,
                     must_catch_up: false,
-                    address: fube_data::wire::Endpoint {
-                        actor: fube_data::wire::Actor {
-                            partition: f.native.identity().partition_id,
-                            replica: 3,
-                            incarnation: uuid::Uuid::new_v4(),
-                        },
-                        address: "127.0.0.1:1".into(),
-                        transport_id: Some(String::new()),
-                    }
-                    .to_string(),
+                    address: String::new(),
                     progress: fube_runtime::extensions::ReplicationProgress {
                         first: -1,
                         last: -1,
@@ -677,7 +674,7 @@ async fn phase2_native_transient_write_revocation_allows_cache_then_original_low
             .await
             .unwrap_err();
         assert!(super::status::Status::NoWriteQuorum.matches(&failure));
-        assert_eq!(f.runtime.replicator().snapshot().progress.assigned, 1);
+        assert_eq!(f.runtime.replicator().get_current_progress().unwrap(), 1);
         assert!(!f.runtime.owner.manager.faults.is_closing());
         transaction.abort().unwrap();
         drop(f.host);
@@ -691,11 +688,9 @@ use super::{
     version::Completion,
 };
 use crate::*;
+use fube_data::extensions::ReplicationEndpointOptions;
 use fube_data::IStateReplicator;
-use fube_data::{
-    extensions::{ReplicationEndpointOptions, ReplicatorDiagnostics},
-    qualification as rap,
-};
+use fube_rap_test_support as rap;
 use fube_runtime::{
     extensions::{
         NativeIntegrationProvider, NativeReplicaSetConfiguration, NativeRuntimeIntegration,
@@ -787,17 +782,20 @@ impl IStateProvider2 for Spy {
         assert_eq!(callback.get_last_committed_sequence_number().unwrap(), 1);
         assert!(!callback.get_is_readable());
         assert!(callback.create_transaction().is_err());
-        assert!(
-            !self
-                .runtime
-                .lock()
-                .unwrap()
-                .upgrade()
-                .unwrap()
-                .replicator()
-                .snapshot()
-                .closed
-        );
+        assert!(!self
+            .runtime
+            .lock()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+            .control_events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(
+                event,
+                super::runtime::ControlEvent::Closed | super::runtime::ControlEvent::Aborted
+            )));
         *self.owner.lock().unwrap() = Some(owner);
         self.event("initialize")
     }
@@ -821,7 +819,17 @@ impl IStateProvider2 for Spy {
     fn change_role(&self, role: ReplicaRole, _: Cancellation) -> ApiFuture<'_, ()> {
         Box::pin(async move {
             let runtime = self.runtime.lock().unwrap().upgrade().unwrap();
-            let actual = runtime.replicator().snapshot().role;
+            let actual = runtime
+                .control_events
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    super::runtime::ControlEvent::Role(role) => Some(*role),
+                    _ => None,
+                })
+                .unwrap();
             assert!(
                 actual == role
                     || (role == ReplicaRole::IdleSecondary
@@ -972,9 +980,6 @@ impl IStatefulServiceReplica for Replica {
             if let Some(extra) = &self.extra {
                 *extra.runtime.lock().unwrap() = Arc::downgrade(&runtime);
             }
-            runtime
-                .replicator()
-                .qualification_use_root_controls(self.root);
             *self.runtime.lock().unwrap() = Some(runtime.clone());
             self.created
                 .lock()
@@ -983,7 +988,12 @@ impl IStatefulServiceReplica for Replica {
                 .unwrap()
                 .send((runtime.clone(), self.native.clone()))
                 .ok();
-            Ok(Box::new((*runtime.replicator()).clone()) as Box<dyn IPrimaryReplicator>)
+            if self.root {
+                Ok(Box::new((*runtime.replicator()).clone()) as Box<dyn IPrimaryReplicator>)
+            } else {
+                Ok(Box::new(rap::DelegatingPrimary(runtime.replicator()))
+                    as Box<dyn IPrimaryReplicator>)
+            }
         })
     }
     fn change_role(&self, _: ReplicaRole, _: Cancellation) -> ApiFuture<'_, String> {
@@ -1194,6 +1204,14 @@ impl Source {
         records: Vec<OperationData>,
         eof: Option<Completion<()>>,
     ) -> Self {
+        Self::start_at(partition, 1, records, eof).await
+    }
+    async fn start_at(
+        partition: uuid::Uuid,
+        id: i64,
+        records: Vec<OperationData>,
+        eof: Option<Completion<()>>,
+    ) -> Self {
         let (send, recv) = oneshot::channel();
         let provider = Arc::new(CopySource {
             tail: AtomicI64::new(1),
@@ -1201,7 +1219,7 @@ impl Source {
             eof: Mutex::new(eof),
         });
         let input = provider.clone();
-        let host = rap::Host::start(partition, 1, ReplicaRole::Primary, move |native| {
+        let host = rap::Host::start(partition, id, ReplicaRole::Primary, move |native| {
             Box::new(SourceFactory {
                 native,
                 created: Arc::new(Mutex::new(Some(send))),
@@ -1274,7 +1292,7 @@ fn descriptor(target: &Fixture) -> fube_runtime::extensions::NativeReplicaDescri
         up: true,
         ready: true,
         must_catch_up: false,
-        address: target.runtime.replicator().endpoint().to_string(),
+        address: target.host.replication_address().unwrap(),
         progress: fube_runtime::extensions::ReplicationProgress { first: 1, last: 1 },
     }
 }
@@ -1292,37 +1310,73 @@ async fn phase2_copy_wait_idle_active_keeps_live_replication_and_single_capture_
         let building =
             tokio::spawn(async move { build_host.build(node, Cancellation::default()).await });
         until(|| {
-            target.runtime.replicator().snapshot().operation_captures == 0
-                && target
+            target
+                .runtime
+                .operation_events
+                .lock()
+                .unwrap()
+                .contains(&("copy", 1, true))
+                && !target
                     .runtime
-                    .replicator()
-                    .snapshot()
-                    .dispatched_unacknowledged
-                    == 0
-                && !target.runtime.replicator().snapshot().copy_done
+                    .generation
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .copy_done
+                    .is_completed()
         })
         .await;
         let changing = target.host.clone();
         let active =
             tokio::spawn(async move { changing.change_role(ReplicaRole::ActiveSecondary).await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!target.spy.has("role:ActiveSecondary"));
+        let entered = tokio::time::timeout(Duration::from_secs(3), async {
+            while !target.runtime.control_events.lock().unwrap().contains(
+                &super::runtime::ControlEvent::RoleResult(ReplicaRole::ActiveSecondary, true),
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let before_eos = target.runtime.control_events.lock().unwrap().clone();
+        let provider_before_eos = target.spy.events.lock().unwrap().clone();
+        eprintln!("PUBLIC before source EOS release: entered={entered:?} controls={before_eos:?} provider={provider_before_eos:?} copy={:?}", target.runtime.operation_events.lock().unwrap());
         eof.complete(Ok(()));
-        building.await.unwrap().unwrap();
-        active.await.unwrap().unwrap();
-        assert!(
-            !target
-                .runtime
-                .generation
-                .lock()
+        let built = building.await.unwrap();
+        let changed = active.await.unwrap();
+        eprintln!("PUBLIC after source EOS release: Build={built:?} role={changed:?} controls={:?} provider={:?}", target.runtime.control_events.lock().unwrap(), target.spy.events.lock().unwrap());
+        if entered.is_err() || built.is_err() || changed.is_err() {
+            let control = target.runtime.replicator();
+            let _ = target
+                .native
+                .execution()
+                .try_reserve()
                 .unwrap()
-                .as_ref()
-                .unwrap()
-                .done
-                .is_completed(),
-            "Idle→Active must not join still-live replication EOS"
-        );
-        assert!(target.runtime.owner.get_is_readable());
+                .run_owned(move || {
+                    control.abort();
+                    Ok(())
+                })
+                .await;
+            let _ = target.runtime.cleanup_done.wait().await;
+            let _ = source.host.remove(descriptor(&target)).await;
+            drop(source.host);
+            drop(target.host);
+            assert!(
+                entered.is_ok() && built.is_ok() && changed.is_ok(),
+                "public copy/role trace above; terminal cleanup completed before assertion"
+            );
+            return;
+        }
+        let live_replication = !target
+            .runtime
+            .generation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .done
+            .is_completed();
+        let readable = target.runtime.owner.get_is_readable();
         let mut node = descriptor(&target);
         node.role = ReplicaRole::ActiveSecondary;
         source
@@ -1336,7 +1390,15 @@ async fn phase2_copy_wait_idle_active_keeps_live_replication_and_single_capture_
             .await
             .unwrap();
         let n = source.replicate(single(200, 1)).await;
-        until(|| target.runtime.replicator().snapshot().progress.applied >= n).await;
+        until(|| {
+            target
+                .runtime
+                .operation_events
+                .lock()
+                .unwrap()
+                .contains(&("replication", n, true))
+        })
+        .await;
         assert!(
             !target.spy.has("apply-start"),
             "flush ACK is not transaction Apply"
@@ -1349,7 +1411,14 @@ async fn phase2_copy_wait_idle_active_keeps_live_replication_and_single_capture_
             .await;
         until(|| target.spy.has("apply-end") && target.runtime.owner.manager.version() >= barrier)
             .await;
-        assert_eq!(target.runtime.replicator().snapshot().operation_captures, 0);
+        assert!(
+            target.runtime.operation_events.lock().unwrap().contains(&(
+                "replication",
+                barrier,
+                true
+            )),
+            "provider_operations=1 reached the next Barrier after actual ACK/drop retirement"
+        );
         drop(source.host);
         drop(target.host);
         target
@@ -1360,6 +1429,14 @@ async fn phase2_copy_wait_idle_active_keeps_live_replication_and_single_capture_
             .as_ref()
             .clone()
             .unwrap();
+        assert!(!provider_before_eos
+            .iter()
+            .any(|event| event == "role:ActiveSecondary"));
+        assert!(
+            live_replication,
+            "Idle→Active must not join still-live replication EOS"
+        );
+        assert!(readable);
     }
 }
 
@@ -1395,7 +1472,14 @@ async fn phase2_promotion_waits_real_replication_eof_information_apply_before_pr
         let gate = Completion::new();
         *target.spy.apply_gate.lock().unwrap() = Some(gate.clone());
         let sequence = source.replicate(single(300, 1)).await;
-        until(|| target.runtime.replicator().snapshot().progress.applied >= sequence).await;
+        until(|| {
+            target.runtime.operation_events.lock().unwrap().contains(&(
+                "replication",
+                sequence,
+                true,
+            ))
+        })
+        .await;
         assert!(!target.spy.has("apply-start"));
         let changing = target.host.clone();
         let promoted =
@@ -1568,7 +1652,7 @@ async fn phase2_demotion_information_drains_apply_then_fresh_generation_old_eos_
         let before = f.runtime.owner.manager.tail();
         drop(transaction.commit());
         until(|| f.runtime.owner.manager.tail() > before).await;
-        let assigned = f.runtime.replicator().snapshot().progress.assigned;
+        let assigned = f.runtime.admitted_lsn();
         let changing = f.host.clone();
         let demoted =
             tokio::spawn(async move { changing.change_role(ReplicaRole::ActiveSecondary).await });
@@ -1587,7 +1671,7 @@ async fn phase2_demotion_information_drains_apply_then_fresh_generation_old_eos_
         .await;
         assert!(!f.spy.has("role:ActiveSecondary"));
         assert_eq!(
-            f.runtime.replicator().snapshot().progress.assigned,
+            f.runtime.admitted_lsn(),
             assigned,
             "localInfo has no lower LSN"
         );
@@ -1595,7 +1679,11 @@ async fn phase2_demotion_information_drains_apply_then_fresh_generation_old_eos_
         timer.complete(Ok(()));
         demoted.await.unwrap().unwrap();
         let old = f.runtime.generation.lock().unwrap().clone().unwrap();
-        let old_stream = f.runtime.replicator().get_replication_stream().unwrap();
+        let old_stream = f
+            .runtime
+            .state_replicator()
+            .get_replication_stream()
+            .unwrap();
         f.host.change_role(ReplicaRole::Primary).await.unwrap();
         assert!(old.done.is_completed());
         // A genuinely new native-issued reconfiguration generation, not an
@@ -1675,7 +1763,13 @@ async fn phase2_close_drop_and_sync_abort_retain_owned_apply_before_provider_clo
             } else {
                 let observed =
                     permit.run_future(async move { lower.close(Cancellation::default()).await });
-                until(|| f.runtime.replicator().snapshot().closed).await;
+                until(|| {
+                    f.runtime
+                        .replicator()
+                        .get_current_progress()
+                        .is_err_and(|error| error.kind() == fube_runtime::ErrorKind::ObjectClosed)
+                })
+                .await;
                 drop(observed); // observer abandonment is NOT lifecycle cancellation
             }
             until(|| {
@@ -1778,17 +1872,18 @@ async fn phase2_role_failure_fences_same_owner_and_reports_first_processor_fault
         )
         .await;
         *f.spy.fail.lock().unwrap() = Some("role:ActiveSecondary".into());
-        assert!(f
-            .host
-            .change_role(ReplicaRole::ActiveSecondary)
-            .await
-            .is_err());
-        until(|| f.runtime.replicator().snapshot().closed).await;
+        let failed_role = f.host.change_role(ReplicaRole::ActiveSecondary).await;
         f.runtime.fault_done.wait().await.as_ref().clone().unwrap();
-        assert!(
-            f.runtime.terminal.wait().await.is_err(),
-            "failed provider role is not a successful terminal boundary"
-        );
+        let lower_live = f.runtime.replicator().get_current_progress().is_ok();
+        let fenced =
+            !f.runtime.owner.get_is_readable() && f.runtime.owner.create_transaction().is_err();
+        let before_terminal = f.runtime.control_events.lock().unwrap().clone();
+        let premature_cleanup = f.runtime.terminal.is_completed() || f.spy.has("close");
+        eprintln!("PUBLIC failed upper role: result={failed_role:?} lower_live={lower_live} fenced={fenced} controls={before_terminal:?} provider={:?}", f.spy.events.lock().unwrap());
+        // RA/model ReportFault does not manufacture V1 Abort. Actual Host
+        // terminal ownership sends ReplicaClose before shutting down the host.
+        drop(f.host);
+        let terminal = f.runtime.terminal.wait().await.as_ref().clone();
         f.runtime
             .cleanup_done
             .wait()
@@ -1796,11 +1891,17 @@ async fn phase2_role_failure_fences_same_owner_and_reports_first_processor_fault
             .as_ref()
             .clone()
             .unwrap();
+        assert!(failed_role.is_err());
+        assert!(lower_live && fenced && !premature_cleanup);
+        assert!(!before_terminal.contains(&super::runtime::ControlEvent::Aborted));
+        assert!(
+            terminal.is_err(),
+            "provider role error remains terminally observable"
+        );
         assert_eq!(f.runtime.fault_reports.load(Ordering::Acquire), 1);
         assert_eq!(f.runtime.owner.manager.faults.reported().len(), 1);
         assert!(!f.runtime.owner.get_is_readable());
         assert!(f.spy.has("close"));
-        drop(f.host);
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1861,6 +1962,9 @@ async fn phase2_first_apply_fault_reports_once_without_inventing_lower_abort_or_
             .filter(|e| e.as_str() == "unlock")
             .count();
         *f.spy.fail.lock().unwrap() = Some("apply-start".into());
+        // Actually constructed/Open, but not built from f: no fake serialized
+        // endpoint and no receiver session capable of acknowledging f's suffix.
+        let peer = Source::start_at(f.native.identity().partition_id, 3, vec![], None).await;
         f.host
             .configure(NativeReplicaSetConfiguration {
                 epoch: epoch(),
@@ -1876,19 +1980,10 @@ async fn phase2_first_apply_fault_reports_once_without_inventing_lower_abort_or_
                     up: true,
                     ready: true,
                     must_catch_up: false,
-                    address: fube_data::wire::Endpoint {
-                        actor: fube_data::wire::Actor {
-                            partition: f.native.identity().partition_id,
-                            replica: 3,
-                            incarnation: uuid::Uuid::new_v4(),
-                        },
-                        address: "127.0.0.1:1".into(),
-                        transport_id: Some(String::new()),
-                    }
-                    .to_string(),
+                    address: peer.host.replication_address().unwrap(),
                     progress: fube_runtime::extensions::ReplicationProgress {
                         first: 1,
-                        last: f.runtime.replicator().snapshot().progress.committed,
+                        last: f.runtime.replicator().get_current_progress().unwrap(),
                     },
                 }],
             })
@@ -1901,7 +1996,7 @@ async fn phase2_first_apply_fault_reports_once_without_inventing_lower_abort_or_
         drop(transaction.commit());
         f.runtime.fault_done.wait().await.as_ref().clone().unwrap();
         assert!(
-            !f.runtime.replicator().snapshot().closed,
+            f.runtime.replicator().get_current_progress().is_ok(),
             "native ReportFault does NOT issue V1 Abort"
         );
         assert_eq!(transaction.get_state(), TransactionState::Committing);
@@ -2118,10 +2213,13 @@ async fn phase2_failed_replication_flush_never_acks_and_unsupported_copy_batch_p
                     .as_ref()
                     .clone()
                     .unwrap();
-                assert_eq!(
-                    target.runtime.replicator().snapshot().progress.applied,
-                    1,
-                    "failed flush has NO service ACK"
+                assert!(
+                    !target.runtime.operation_events.lock().unwrap().contains(&(
+                        "replication",
+                        2,
+                        true
+                    )),
+                    "failed flush has NO public service ACK"
                 );
                 assert!(!target.spy.has("apply-start"));
                 assert!(target
@@ -2222,12 +2320,12 @@ async fn phase2_copied_log_flush_failure_settles_then_acks_batch_but_never_ends_
         // Header ACK only is1. Native copied-log waiter settlement still ACKs the
         // failed batch2, unlike failed replication flush in the preceding test.
         until(|| {
-            source
-                .lower
-                .snapshot()
-                .peers
-                .iter()
-                .any(|p| p.copy_applied >= 2 || p.copy_applied == -1)
+            target
+                .runtime
+                .operation_events
+                .lock()
+                .unwrap()
+                .contains(&("copy", 2, true))
         })
         .await;
         let generation = target

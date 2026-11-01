@@ -14,7 +14,6 @@ use super::{
     transaction::own,
 };
 use crate::*;
-use fube_data::extensions::ReplicatorDiagnostics;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, Weak},
@@ -770,8 +769,7 @@ impl Registry {
                 let metadata = metadata.clone();
                 let redo = redo.clone();
                 self.runtime()?
-                    .replicator()
-                    .execution_runtime()
+                    .execution()
                     .try_reserve()?
                     .run_owned(move || {
                         owner.add_operation(

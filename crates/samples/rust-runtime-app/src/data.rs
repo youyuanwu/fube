@@ -570,7 +570,7 @@ pub(super) struct Route {
     service_address: String,
     generation: u64,
     #[cfg(test)]
-    native_host: Option<Arc<fube_data::qualification::Host>>,
+    native_host: Option<Arc<fube_rap_test_support::Host>>,
 }
 impl Route {
     fn start(

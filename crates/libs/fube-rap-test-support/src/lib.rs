@@ -1,5 +1,7 @@
 //! Offline native-RAP MODEL host. Registration, lease, lifecycle and control
 //! traverse real Runtime IPC/issuer/binder paths; this is NOT deployed SF proof.
+//! Shared support depends only on public framework/runtime/transport contracts;
+//! it exposes no data engine, diagnostics, lifecycle hook or control setter.
 use fube_runtime::{
     extensions::{
         attach_runtime, NativeIntegrationProvider, NativeReplicaDescriptor,
@@ -20,6 +22,9 @@ use tokio::{
     net::TcpListener,
     sync::{broadcast, mpsc, oneshot},
 };
+
+mod primary;
+pub use primary::DelegatingPrimary;
 
 // Field order mirrors Hosting2/ServiceModel FABRIC_FIELDS (3988b451); these
 // private model records are neither public SDK descriptors nor authority APIs.
@@ -211,6 +216,7 @@ struct Pending {
 }
 
 pub struct Host {
+    opened_address: Arc<std::sync::Mutex<Option<String>>>,
     commands: mpsc::Sender<Command>,
     stop: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     thread: std::sync::Mutex<Option<JoinHandle<()>>>,
@@ -321,6 +327,8 @@ impl Host {
         let (stop, stopped) = oneshot::channel();
         let events = broadcast::channel(8).0;
         let peer_events = events.clone();
+        let opened_address = Arc::new(std::sync::Mutex::new(None));
+        let peer_address = opened_address.clone();
         let thread = std::thread::Builder::new()
             .name("rap-model-application".into())
             .spawn(move || {
@@ -340,7 +348,7 @@ impl Host {
                         partition,
                         source,
                         (role, epoch),
-                        peer_events,
+                        (peer_events, peer_address),
                     ));
                     let runtime = attach_runtime(context).await.unwrap();
                     let native = runtime.native_integration_provider();
@@ -375,6 +383,7 @@ impl Host {
             stop: std::sync::Mutex::new(Some(stop)),
             thread: std::sync::Mutex::new(Some(thread)),
             events,
+            opened_address,
         });
         readiness.await.expect("RAP model bootstrap");
         let mut opened = host.request(Action::Open).await;
@@ -403,6 +412,17 @@ impl Host {
     /// lag and closure are explicit receiver errors, not shutdown completion.
     pub fn subscribe_events(&self) -> broadcast::Receiver<HostEvent> {
         self.events.subscribe()
+    }
+    /// The address actually returned by public replicator Open and transported
+    /// in the successful native ReplicaOpenReply, not lower diagnostics.
+    pub fn replication_address(&self) -> Result<String> {
+        self.opened_address
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(Error::InvalidInput(
+                "native Open has not returned an address",
+            ))
     }
     pub async fn configure(&self, configuration: NativeReplicaSetConfiguration) -> Result<()> {
         self.request(Action::Configure(configuration)).await
@@ -625,9 +645,13 @@ async fn serve(
     partition: uuid::Uuid,
     source: ReplicaSource,
     initial: (ReplicaRole, fube_runtime::Epoch),
-    events: broadcast::Sender<HostEvent>,
+    observation: (
+        broadcast::Sender<HostEvent>,
+        Arc<std::sync::Mutex<Option<String>>>,
+    ),
 ) {
     let (role, epoch) = initial;
+    let (events, opened_address) = observation;
     let (mut socket, _) = listener.accept().await.unwrap();
     let hello = read_message(&mut socket).await.unwrap();
     assert_eq!(hello.properties().unwrap().actor, 1);
@@ -715,6 +739,9 @@ async fn serve(
                         {
                             let pending = pending.remove(index);
                             if reply.error.error == 0 {
+                                if pending.action == "ReplicaOpen" {
+                                    *opened_address.lock().unwrap() = Some(reply.local.replication_endpoint.clone());
+                                }
                                 let state = local.as_mut().unwrap();
                                 state.unit = reply.unit;
                                 state.local = reply.local;

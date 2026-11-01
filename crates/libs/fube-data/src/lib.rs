@@ -108,12 +108,6 @@ pub mod extensions;
 mod fabric_replicator;
 mod owned_lifecycle;
 pub mod provider;
-/// Offline native-RAP model-node tooling, not a standalone Engine authority
-/// and not evidence of deployed Service Fabric qualification. The model still
-/// performs real runtime registration/lease/partition-issued construction.
-#[cfg(any(test, feature = "qualification"))]
-#[path = "../tests/support/rap_model.rs"]
-pub mod qualification;
 mod queue;
 mod quorum;
 mod supervised;

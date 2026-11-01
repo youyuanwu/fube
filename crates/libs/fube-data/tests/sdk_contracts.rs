@@ -26,8 +26,7 @@ use tokio::sync::oneshot;
 #[path = "support/upper_log.rs"]
 mod upper_log;
 
-#[path = "support/rap_model.rs"]
-mod rap;
+use fube_rap_test_support as rap;
 
 const EPOCH: Epoch = Epoch {
     data_loss_number: 1,
@@ -785,10 +784,18 @@ async fn standard_provider_sync_shapes_one_owner_copy_gap_early_lsn_and_explicit
         !secondary.fabric.snapshot().copy_done,
         "ACK gap is not copied completion"
     );
+    // Native RequireServiceAck Idle→Active completes even with a service-held
+    // copy ACK gap. Keep the same public captures/stream and release them before
+    // assertions: promotion must not turn this into epoch reconciliation.
+    let promoted = secondary
+        .host
+        .change_role(ReplicaRole::ActiveSecondary)
+        .await;
     one.acknowledge().unwrap();
     assert!(one.acknowledge().is_err(), "ACK is once only");
     drop((one, two, three));
     build.await.unwrap().unwrap();
+    promoted.unwrap();
     assert!(
         copy.get_operation(Cancellation::default())
             .await
@@ -801,11 +808,6 @@ async fn standard_provider_sync_shapes_one_owner_copy_gap_early_lsn_and_explicit
         secondary.provider.memory.snapshot().results,
         primary.provider.memory.snapshot().results
     );
-    secondary
-        .host
-        .change_role(ReplicaRole::ActiveSecondary)
-        .await
-        .unwrap();
     let mut current = config(vec![secondary.descriptor(ReplicaRole::ActiveSecondary)], 2);
     current.epoch.configuration_number += 7;
     primary

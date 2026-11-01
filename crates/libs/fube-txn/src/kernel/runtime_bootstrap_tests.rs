@@ -5,15 +5,13 @@ use super::{
 };
 use crate::{ApiFuture, Cancellation, Epoch, Result};
 use fube_data::{
-    extensions::{
-        ReplicationEndpointOptions, ReplicatorDiagnostics, ReplicatorLifecycle,
-        StateProviderCapabilities, VolatileLogInitialization,
-    },
-    qualification as rap, FabricReplicator, IStateProvider,
+    extensions::{ReplicationEndpointOptions, StateProviderCapabilities},
+    FabricReplicator, IStateProvider, IStateReplicator,
 };
+use fube_rap_test_support as rap;
 use fube_runtime::{
     extensions::{NativeIntegrationProvider, NativeRuntimeIntegration},
-    IPrimaryReplicator, IStatefulServiceFactory, IStatefulServicePartition,
+    IPrimaryReplicator, IReplicator, IStatefulServiceFactory, IStatefulServicePartition,
     IStatefulServiceReplica, OpenMode, ReplicaRole,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,11 +21,140 @@ struct Core {
     partition: uuid::Uuid,
     fail_role: AtomicBool,
     manager: Arc<KernelManager>,
-    lower: Mutex<Weak<FabricReplicator>>,
+    lower: std::sync::OnceLock<Arc<dyn IPrimaryReplicator>>,
+    state: std::sync::OnceLock<Arc<dyn IStateReplicator>>,
+    native: NativeRuntimeIntegration,
     runtime: Mutex<Option<Arc<RuntimeLower>>>,
     events: Mutex<Vec<&'static str>>,
 }
 struct Bridge(Weak<Core>);
+#[derive(Clone)]
+struct CoreComposite(Arc<Core>);
+impl IReplicator for CoreComposite {
+    fn open(&self, cancellation: Cancellation) -> ApiFuture<'_, String> {
+        let core = self.0.clone();
+        super::composite::Composite::owned_control(
+            &core.native.execution(),
+            Box::pin(async move {
+                let address = core.lower.get().unwrap().open(cancellation.clone()).await?;
+                Bridge(Arc::downgrade(&core)).opened(cancellation).await?;
+                Ok(address)
+            }),
+        )
+    }
+    fn change_role(
+        &self,
+        epoch: Epoch,
+        role: ReplicaRole,
+        cancellation: Cancellation,
+    ) -> ApiFuture<'_, ()> {
+        let core = self.0.clone();
+        super::composite::Composite::owned_control(
+            &core.native.execution(),
+            Box::pin(async move {
+                core.lower
+                    .get()
+                    .unwrap()
+                    .change_role(epoch, role, cancellation.clone())
+                    .await?;
+                let result = Bridge(Arc::downgrade(&core))
+                    .role_changed(epoch, role, cancellation)
+                    .await;
+                if result.is_err() {
+                    core.manager.close_activity_gate();
+                    let _ = core
+                        .native
+                        .report_fault(fube_runtime::FaultType::Transient)
+                        .await;
+                    core.events.lock().unwrap().push("upper-role-fault");
+                }
+                result
+            }),
+        )
+    }
+    fn update_epoch(&self, epoch: Epoch, cancellation: Cancellation) -> ApiFuture<'_, ()> {
+        self.0
+            .lower
+            .get()
+            .unwrap()
+            .update_epoch(epoch, cancellation)
+    }
+    fn get_current_progress(&self) -> Result<i64> {
+        self.0.lower.get().unwrap().get_current_progress()
+    }
+    fn get_catch_up_capability(&self) -> Result<i64> {
+        self.0.lower.get().unwrap().get_catch_up_capability()
+    }
+    fn close(&self, cancellation: Cancellation) -> ApiFuture<'_, ()> {
+        let core = self.0.clone();
+        super::composite::Composite::owned_control(
+            &core.native.execution(),
+            Box::pin(async move {
+                core.lower
+                    .get()
+                    .unwrap()
+                    .close(cancellation.clone())
+                    .await?;
+                Bridge(Arc::downgrade(&core)).closed(cancellation).await
+            }),
+        )
+    }
+    fn abort(&self) {
+        self.0.lower.get().unwrap().abort();
+        Bridge(Arc::downgrade(&self.0)).aborted();
+    }
+}
+impl IPrimaryReplicator for CoreComposite {
+    fn on_data_loss(&self, cancellation: Cancellation) -> ApiFuture<'_, bool> {
+        self.0.lower.get().unwrap().on_data_loss(cancellation)
+    }
+    fn update_catch_up_replica_set_configuration(
+        &self,
+        current: fube_runtime::ReplicaSetConfig,
+        previous: fube_runtime::ReplicaSetConfig,
+    ) -> Result<()> {
+        self.0
+            .lower
+            .get()
+            .unwrap()
+            .update_catch_up_replica_set_configuration(current, previous)
+    }
+    fn update_current_replica_set_configuration(
+        &self,
+        current: fube_runtime::ReplicaSetConfig,
+    ) -> Result<()> {
+        self.0
+            .lower
+            .get()
+            .unwrap()
+            .update_current_replica_set_configuration(current)
+    }
+    fn wait_for_catch_up_quorum(
+        &self,
+        mode: fube_runtime::ReplicaSetQuorumMode,
+        cancellation: Cancellation,
+    ) -> ApiFuture<'_, ()> {
+        self.0
+            .lower
+            .get()
+            .unwrap()
+            .wait_for_catch_up_quorum(mode, cancellation)
+    }
+    fn build_replica(
+        &self,
+        replica: fube_runtime::ReplicaInformation,
+        cancellation: Cancellation,
+    ) -> ApiFuture<'_, ()> {
+        self.0
+            .lower
+            .get()
+            .unwrap()
+            .build_replica(replica, cancellation)
+    }
+    fn remove_replica(&self, id: i64) -> Result<()> {
+        self.0.lower.get().unwrap().remove_replica(id)
+    }
+}
 impl Bridge {
     fn core(&self) -> Result<Arc<Core>> {
         self.0.upgrade().ok_or(crate::Error::Closed)
@@ -74,32 +201,19 @@ impl IStateProvider for Bridge {
         self.get_copy_context()
     }
 }
-impl ReplicatorLifecycle for Bridge {
+impl Bridge {
     fn opened(&self, _: Cancellation) -> ApiFuture<'_, ()> {
         Box::pin(async move {
             let core = self.core()?;
             core.events.lock().unwrap().push("lower-open");
             core.manager.open_memory(1024 * 1024)?;
             core.events.lock().unwrap().push("bootstrap-one");
-            let lower = core.lower.lock().unwrap().upgrade().unwrap();
-            lower.initialize_volatile_log().await?;
-            core.events.lock().unwrap().push("measured-rebase-one");
             Ok(())
         })
     }
     fn role_changed(&self, _: Epoch, role: ReplicaRole, _: Cancellation) -> ApiFuture<'_, ()> {
         Box::pin(async move {
             let core = self.core()?;
-            assert_eq!(
-                core.lower
-                    .lock()
-                    .unwrap()
-                    .upgrade()
-                    .unwrap()
-                    .snapshot()
-                    .role,
-                role
-            );
             core.events.lock().unwrap().push("lower-role");
             if core.fail_role.swap(false, Ordering::AcqRel) {
                 return Err(crate::Error::InvalidInput("upper role fixture failure"));
@@ -128,15 +242,7 @@ impl ReplicatorLifecycle for Bridge {
     fn closed(&self, _: Cancellation) -> ApiFuture<'_, ()> {
         Box::pin(async move {
             let core = self.core()?;
-            assert!(
-                core.lower
-                    .lock()
-                    .unwrap()
-                    .upgrade()
-                    .unwrap()
-                    .snapshot()
-                    .closed
-            );
+            assert!(core.lower.get().unwrap().get_current_progress().is_err());
             core.events.lock().unwrap().push("lower-close");
             core.manager.close_activity_gate();
             let runtime = core.runtime.lock().unwrap().clone().unwrap();
@@ -189,7 +295,9 @@ impl IStatefulServiceFactory for Factory {
                     ProviderDirectory::preinitialized([], None)?,
                     Arc::new(RetryRuntime::default()),
                 ),
-                lower: Mutex::new(Weak::new()),
+                lower: std::sync::OnceLock::new(),
+                state: std::sync::OnceLock::new(),
+                native: self.native.capture(partition, id)?,
                 runtime: Mutex::new(None),
                 events: Mutex::new(Vec::new()),
             }),
@@ -206,7 +314,7 @@ impl IStatefulServiceReplica for Replica {
         Box::pin(async move {
             mode.validate()?;
             let bridge = Arc::new(Bridge(Arc::downgrade(&self.core)));
-            let lower = FabricReplicator::create_with_lifecycle(
+            let lower = FabricReplicator::create_with_capabilities(
                 partition,
                 self.native.clone(),
                 bridge.clone(),
@@ -219,11 +327,10 @@ impl IStatefulServiceReplica for Replica {
                 StateProviderCapabilities {
                     supports_copy_until_latest_lsn: true,
                 },
-                bridge,
             )?;
-            lower.qualification_use_root_controls(self.root);
-            *self.core.lower.lock().unwrap() = Arc::downgrade(&lower);
-            let runtime = RuntimeLower::new(lower.clone())?;
+            let _ = self.core.state.set(lower.get_state_replicator());
+            let _ = self.core.lower.set(lower.clone());
+            let runtime = RuntimeLower::new(lower.get_state_replicator(), self.native.execution())?;
             self.core.manager.bind_runtime(runtime.clone());
             *self.core.runtime.lock().unwrap() = Some(runtime);
             let _ = self
@@ -233,7 +340,13 @@ impl IStatefulServiceReplica for Replica {
                 .take()
                 .unwrap()
                 .send(self.core.clone());
-            Ok(Box::new((*lower).clone()) as Box<dyn IPrimaryReplicator>)
+            let control = CoreComposite(self.core.clone());
+            if self.root {
+                Ok(Box::new(control) as Box<dyn IPrimaryReplicator>)
+            } else {
+                Ok(Box::new(rap::DelegatingPrimary(Arc::new(control)))
+                    as Box<dyn IPrimaryReplicator>)
+            }
         })
     }
     fn change_role(&self, _: ReplicaRole, _: Cancellation) -> ApiFuture<'_, String> {
@@ -245,19 +358,21 @@ impl IStatefulServiceReplica for Replica {
     fn abort(&self) {}
 }
 async fn initialized_host(root: bool) -> (Arc<rap::Host>, Arc<Core>) {
+    initialized_host_at(uuid::Uuid::new_v4(), 1, root).await
+}
+async fn initialized_host_at(
+    partition: uuid::Uuid,
+    id: i64,
+    root: bool,
+) -> (Arc<rap::Host>, Arc<Core>) {
     let (send, recv) = oneshot::channel();
-    let host = rap::Host::start(
-        uuid::Uuid::new_v4(),
-        1,
-        ReplicaRole::Primary,
-        move |native| {
-            Box::new(Factory {
-                native,
-                created: Arc::new(Mutex::new(Some(send))),
-                root,
-            })
-        },
-    )
+    let host = rap::Host::start(partition, id, ReplicaRole::Primary, move |native| {
+        Box::new(Factory {
+            native,
+            created: Arc::new(Mutex::new(Some(send))),
+            root,
+        })
+    })
     .await;
     let core = recv.await.unwrap();
     host.configure(fube_runtime::extensions::NativeReplicaSetConfiguration {
@@ -295,8 +410,11 @@ async fn fidelity_after_lower_lsn_local_write_error_retains_admission_quorum_and
         provider.write(warm.as_ref(), 10, 0, 0).unwrap();
         warm.commit().await.unwrap();
         runtime.group_idle().await;
-        let lower = core.lower.lock().unwrap().upgrade().unwrap();
-        let prefix = lower.snapshot().progress.committed;
+        let lower = CoreComposite(core.clone());
+        let prefix = lower.get_current_progress().unwrap();
+        // A real public Open endpoint, but not a built receiver of this primary.
+        // It therefore cannot ACK this generation's writes or supply quorum.
+        let (peer_host, _) = initialized_host_at(core.partition, 3, root).await;
         host.configure(fube_runtime::extensions::NativeReplicaSetConfiguration {
             epoch: Epoch {
                 data_loss_number: 1,
@@ -312,16 +430,7 @@ async fn fidelity_after_lower_lsn_local_write_error_retains_admission_quorum_and
                 up: true,
                 ready: true,
                 must_catch_up: false,
-                address: fube_data::wire::Endpoint {
-                    actor: fube_data::wire::Actor {
-                        partition: core.partition,
-                        replica: 3,
-                        incarnation: uuid::Uuid::new_v4(),
-                    },
-                    address: "127.0.0.1:1".into(),
-                    transport_id: Some(String::new()),
-                }
-                .to_string(),
+                address: peer_host.replication_address().unwrap(),
                 progress: fube_runtime::extensions::ReplicationProgress {
                     first: 1,
                     last: prefix,
@@ -457,18 +566,22 @@ async fn fidelity_after_lower_lsn_local_write_error_retains_admission_quorum_and
 async fn phase1d_owned_upper_role_failure_fences_same_lower_on_root_and_bound() {
     for root in [false, true] {
         let (host, core) = initialized_host(root).await;
-        let lower = core.lower.lock().unwrap().upgrade().unwrap();
+        let lower = CoreComposite(core.clone());
         core.fail_role.store(true, Ordering::Release);
         let failed = host.change_role(ReplicaRole::ActiveSecondary).await;
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while !core.events.lock().unwrap().contains(&"upper-abort-owned") {
+            while !core.events.lock().unwrap().contains(&"upper-role-fault") {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
         assert!(failed.is_err());
-        assert!(lower.snapshot().closed);
+        assert!(
+            lower.get_current_progress().is_ok(),
+            "upper role failure must not unconditionally abort lower"
+        );
+        assert!(!core.events.lock().unwrap().contains(&"lower-abort"));
         assert!(core.manager.gate().is_err());
         drop(host);
     }
@@ -503,8 +616,8 @@ async fn phase1d_active_publication_is_fenced_before_final_role_boundary_on_root
         warm.add_operation(None, None, payload(), 10, None).unwrap();
         warm.commit().await.unwrap();
         runtime.group_idle().await;
-        let lower = core.lower.lock().unwrap().upgrade().unwrap();
-        let next = lower.snapshot().progress.assigned + 1;
+        let lower = CoreComposite(core.clone());
+        let next = runtime.last_admitted.load(Ordering::Acquire) + 1;
         let (entered, observed) = std::sync::mpsc::sync_channel(1);
         let (release, resume) = std::sync::mpsc::sync_channel(1);
         *runtime.publication_pause.lock().unwrap() = Some((next, entered, resume));
@@ -517,7 +630,7 @@ async fn phase1d_active_publication_is_fenced_before_final_role_boundary_on_root
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
-            while lower.snapshot().progress.committed < next {
+            while lower.get_current_progress().unwrap() < next {
                 tokio::task::yield_now().await;
             }
         })
@@ -626,9 +739,9 @@ async fn phase1d_primary_generation_drains_old_scheduler_and_reestablishes_first
     host.change_role(ReplicaRole::ActiveSecondary)
         .await
         .unwrap();
-    let lower = core.lower.lock().unwrap().upgrade().unwrap();
-    let copy = fube_data::IStateReplicator::get_copy_stream(lower.as_ref()).unwrap();
-    let replication = fube_data::IStateReplicator::get_replication_stream(lower.as_ref()).unwrap();
+    let lower = core.state.get().unwrap().clone();
+    let copy = lower.get_copy_stream().unwrap();
+    let replication = lower.get_replication_stream().unwrap();
     let pump = tokio::spawn(async move {
         while let Some(operation) = copy.get_operation(Cancellation::default()).await.unwrap() {
             operation.acknowledge().unwrap();
@@ -699,14 +812,8 @@ async fn fresh_lower_first_open_bootstrap_measured_rebase_on_root_and_bound_cont
         .await;
         let core = recv.await.unwrap();
         assert_eq!(
-            &core.events.lock().unwrap()[..5],
-            [
-                "constructor-tail-zero",
-                "lower-open",
-                "bootstrap-one",
-                "measured-rebase-one",
-                "lower-role"
-            ]
+            &core.events.lock().unwrap()[..4],
+            ["lower-open", "bootstrap-one", "lower-role", "upper-role"]
         );
         assert_eq!(core.manager.tail(), 1);
         host.configure(fube_runtime::extensions::NativeReplicaSetConfiguration {
@@ -720,8 +827,8 @@ async fn fresh_lower_first_open_bootstrap_measured_rebase_on_root_and_bound_cont
         })
         .await
         .unwrap();
-        let lower = core.lower.lock().unwrap().upgrade().unwrap();
-        assert_eq!(lower.snapshot().progress.assigned, 1);
+        let lower = CoreComposite(core.clone());
+        assert_eq!(lower.get_current_progress().unwrap(), 1);
         let runtime = core.runtime.lock().unwrap().clone().unwrap();
         let barrier = runtime
             .admit_async(
