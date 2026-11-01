@@ -8,7 +8,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Mutex, MutexGuard,
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -23,6 +23,17 @@ pub enum Error {
     Unknown,
 }
 pub type Result<T> = std::result::Result<T, Error>;
+struct RaGate(ra::ConsumerLifetime);
+impl RegistrationConsumerGate for RaGate {
+    fn is_accepting(&self) -> bool {
+        self.0.is_accepting()
+    }
+}
+/// Poison recovery is inspection/ownership transfer only. Admission never uses
+/// this helper, and the poisoned ledger is never trusted to resume serving.
+fn inspect<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -36,6 +47,8 @@ pub struct Config {
     pub queued_command_bytes: usize,
     pub events_per_lane: usize,
     pub event_bytes_per_lane: usize,
+    /// Independent retained target/ticket/result/receipt logical byte budget.
+    pub fanout_bytes_per_lane: usize,
     pub max_entities: usize,
     pub status_types: usize,
     pub status_bytes: usize,
@@ -52,6 +65,7 @@ impl Config {
             queued_command_bytes: 4 * 1024 * 1024,
             events_per_lane: 256,
             event_bytes_per_lane: 1024 * 1024,
+            fanout_bytes_per_lane: 8 * 1024 * 1024,
             max_entities: 32,
             status_types: 64,
             status_bytes: 256 * 1024,
@@ -68,6 +82,8 @@ impl Config {
             || self.events_per_lane > 256
             || self.event_bytes_per_lane == 0
             || self.event_bytes_per_lane > 1024 * 1024
+            || self.fanout_bytes_per_lane == 0
+            || self.fanout_bytes_per_lane > 16 * 1024 * 1024
             || self.max_entities == 0
             || self.max_entities > 64
             || self.status_types == 0
@@ -121,6 +137,7 @@ struct Meta {
     receipts: VecDeque<Receipt>,
     counts: [usize; 3],
     payload: [usize; 3],
+    fanout: [usize; 3],
     error: Option<Error>,
     unknown: usize,
 }
@@ -143,10 +160,10 @@ pub struct Ticket {
 }
 impl Ticket {
     pub fn take(&self) -> Option<Result<Response>> {
-        let result = self.record.result.lock().ok()?.take()?;
-        let mut meta = self.shared.meta.lock().ok()?;
+        let mut meta = inspect(&self.shared.meta);
+        let result = inspect(&self.record.result).take()?;
         meta.commands.remove(&self.id);
-        meta.bytes -= self.record.charge;
+        meta.bytes = meta.bytes.saturating_sub(self.record.charge);
         Some(result)
     }
     pub fn wait(&self, budget: Duration) -> Result<Response> {
@@ -168,17 +185,23 @@ impl Ticket {
 impl Handle {
     pub fn submit(&self, input: Input) -> Result<Ticket> {
         let input_charge = input_bytes(&input);
-        let charge = input_charge.saturating_add(reply_reservation(&input, &self.shared.config));
+        let charge = input_charge
+            .checked_add(reply_reservation(&input, &self.shared.config))
+            .ok_or(Error::Capacity)?;
         let mut meta = self.shared.meta.lock().map_err(|_| Error::Closed)?;
         if !meta.accepting {
             return Err(Error::Closed);
         }
         if input_charge > self.shared.config.command_bytes
             || meta.commands.len() >= self.shared.config.max_commands
-            || meta.bytes.saturating_add(charge) > self.shared.config.queued_command_bytes
+            || meta
+                .bytes
+                .checked_add(charge)
+                .is_none_or(|bytes| bytes > self.shared.config.queued_command_bytes)
         {
             return Err(Error::Capacity);
         }
+        let next_bytes = meta.bytes.checked_add(charge).ok_or(Error::Capacity)?;
         let id = meta.next.checked_add(1).ok_or(Error::Capacity)?;
         let record = Arc::new(Record {
             charge,
@@ -194,7 +217,7 @@ impl Handle {
                 mpsc::TrySendError::Disconnected(_) => Error::Closed,
             })?;
         meta.next = id;
-        meta.bytes += charge;
+        meta.bytes = next_bytes;
         meta.commands.insert(id, record.clone());
         Ok(Ticket {
             id,
@@ -204,11 +227,7 @@ impl Handle {
     }
     /// Explicit recovery of completed commands whose observers were lost.
     pub fn recover_commands(&self) -> Vec<(u64, Result<Response>)> {
-        let records: Vec<_> = self
-            .shared
-            .meta
-            .lock()
-            .unwrap()
+        let records: Vec<_> = inspect(&self.shared.meta)
             .commands
             .iter()
             .map(|(id, r)| (*id, r.clone()))
@@ -227,16 +246,27 @@ impl Handle {
     }
     /// Transfer receipts exactly once. This is not an RA/FM/HM ACK.
     pub fn take_receipts(&self) -> Vec<Receipt> {
-        let mut meta = self.shared.meta.lock().unwrap();
+        let mut meta = inspect(&self.shared.meta);
         let receipts: Vec<_> = meta.receipts.drain(..).collect();
         for r in &receipts {
             meta.counts[r.lane] -= 1;
             meta.payload[r.lane] -= r.input.retained_bytes();
+            meta.fanout[r.lane] -= r.proof;
         }
         receipts
     }
     pub fn take_shutdown(&self) -> Option<Residual> {
-        self.shared.residual.lock().ok()?.take()
+        let residual = inspect(&self.shared.residual).take()?;
+        let mut meta = inspect(&self.shared.meta);
+        for p in &residual.pending {
+            meta.counts[p.lane] = meta.counts[p.lane].saturating_sub(1);
+            meta.payload[p.lane] = meta.payload[p.lane].saturating_sub(p.input.retained_bytes());
+            meta.fanout[p.lane] = meta.fanout[p.lane].saturating_sub(p.proof);
+        }
+        Some(residual)
+    }
+    pub fn fanout_usage(&self) -> [usize; 3] {
+        inspect(&self.shared.meta).fanout
     }
     pub fn progress(&self) -> ([usize; 3], [usize; 3], usize, Option<Error>) {
         let meta = self.shared.meta.lock().unwrap();
@@ -251,6 +281,7 @@ pub struct Receipt {
     /// Local decisions only; required effects remain capability-gated.
     pub downstream_completion: bool,
     lane: usize,
+    proof: usize,
 }
 pub struct Pending {
     pub input: Delivery,
@@ -259,6 +290,7 @@ pub struct Pending {
     pub results: Vec<Option<ra::Status>>,
     pub blocked: Option<Error>,
     lane: usize,
+    proof: usize,
     deadline: Instant,
 }
 pub struct Residual {
@@ -278,12 +310,18 @@ pub struct Node {
 impl Node {
     pub fn bind(address: SocketAddr, config: Config, ra: Arc<ra::Executor>) -> Result<Self> {
         config.validate()?;
+        if !ra.consumer_lifetime().is_accepting() {
+            return Err(Error::Closed);
+        }
         if ra.entity_ids().len() > config.max_entities {
             return Err(Error::Capacity);
         }
         let hosting = Server::bind(address, config.hosting.clone()).map_err(Error::Hosting)?;
         let owner = hosting
             .registration_owner(config.required)
+            .map_err(Error::Hosting)?;
+        let owner = owner
+            .with_consumer_gate(Arc::new(RaGate(ra.consumer_lifetime())))
             .map_err(Error::Hosting)?;
         let statuses = ra::LocalStatusConsumer::new(config.status_types, config.status_bytes)
             .map_err(Error::Ra)?;
@@ -298,6 +336,7 @@ impl Node {
                 receipts: VecDeque::new(),
                 counts: [0; 3],
                 payload: [0; 3],
+                fanout: [0; 3],
                 error: None,
                 unknown: 0,
             }),
@@ -355,10 +394,14 @@ impl Node {
         self.handle.clone()
     }
     pub fn stop(&mut self) -> Result<()> {
+        self.handle.shared.stop.store(true, Ordering::SeqCst);
+        let poisoned = self.handle.shared.meta.is_poisoned();
         {
-            let mut meta = self.handle.shared.meta.lock().map_err(|_| Error::Closed)?;
+            let mut meta = inspect(&self.handle.shared.meta);
             meta.accepting = false;
-            self.handle.shared.stop.store(true, Ordering::SeqCst);
+            if poisoned {
+                meta.error = Some(Error::Unknown);
+            }
         }
         if let Some(thread) = self.thread.take() {
             let residual = thread.join().map_err(|_| Error::Closed)?;
@@ -370,6 +413,9 @@ impl Node {
                 .lock()
                 .map_err(|_| Error::Closed)? = Some(residual);
             outcome?;
+        }
+        if poisoned {
+            return Err(Error::Closed);
         }
         Ok(())
     }
@@ -391,6 +437,20 @@ fn drive(residual: &mut Residual, receiver: mpsc::Receiver<Work>, shared: Arc<Sh
     } = residual;
     let origin = Instant::now();
     loop {
+        if !ra.consumer_lifetime().is_accepting() {
+            let error = match ra.terminal_result() {
+                Some(Err(e)) => Error::Ra(e),
+                _ => Error::Ra(ra::Failure::Closed),
+            };
+            owner.withdraw();
+            let mut meta = inspect(&shared.meta);
+            meta.accepting = false;
+            meta.error = Some(error.clone());
+            for p in pending.iter_mut() {
+                p.blocked = Some(error.clone());
+            }
+            shared.stop.store(true, Ordering::SeqCst);
+        }
         for _ in 0..4 {
             let Ok(work) = receiver.try_recv() else {
                 break;
@@ -431,9 +491,14 @@ fn drive(residual: &mut Residual, receiver: mpsc::Receiver<Work>, shared: Arc<Sh
             {
                 continue;
             }
+            let proof = proof_charge(&shared.config, lane);
             let available = {
                 let meta = shared.meta.lock().unwrap();
-                if meta.counts[lane] >= shared.config.events_per_lane {
+                if meta.counts[lane] >= shared.config.events_per_lane
+                    || meta.fanout[lane]
+                        .checked_add(proof)
+                        .is_none_or(|bytes| bytes > shared.config.fanout_bytes_per_lane)
+                {
                     0
                 } else {
                     shared
@@ -457,6 +522,7 @@ fn drive(residual: &mut Residual, receiver: mpsc::Receiver<Work>, shared: Arc<Sh
                 let mut meta = shared.meta.lock().unwrap();
                 meta.counts[lane] += 1;
                 meta.payload[lane] += delivery.retained_bytes();
+                meta.fanout[lane] += proof;
             }
             // Retain an accepted snapshot before calling any external consumer.
             // During an unwind this placeholder remains an explicit unknown,
@@ -469,6 +535,7 @@ fn drive(residual: &mut Residual, receiver: mpsc::Receiver<Work>, shared: Arc<Sh
                 results: Vec::new(),
                 blocked: Some(Error::Unknown),
                 lane,
+                proof,
                 deadline: Instant::now(),
             });
             let ready = &shared.config.readiness;
@@ -518,6 +585,7 @@ fn drive(residual: &mut Residual, receiver: mpsc::Receiver<Work>, shared: Arc<Sh
                                 results: Vec::new(),
                                 blocked: Some(Error::Ra(e)),
                                 lane,
+                                proof,
                                 deadline: Instant::now(),
                             });
                         }
@@ -536,6 +604,7 @@ fn drive(residual: &mut Residual, receiver: mpsc::Receiver<Work>, shared: Arc<Sh
                         results: Vec::new(),
                         blocked: Some(Error::Hosting(hosting::Error::UnsupportedCapability)),
                         lane,
+                        proof,
                         deadline: Instant::now(),
                     });
                 }
@@ -548,6 +617,7 @@ fn drive(residual: &mut Residual, receiver: mpsc::Receiver<Work>, shared: Arc<Sh
                         results: Vec::new(),
                         blocked: Some(Error::Hosting(hosting::Error::UnsupportedCapability)),
                         lane,
+                        proof,
                         deadline: Instant::now(),
                     });
                 }
@@ -565,6 +635,7 @@ fn drive(residual: &mut Residual, receiver: mpsc::Receiver<Work>, shared: Arc<Sh
                             results: Vec::new(),
                             blocked: Some(Error::Capacity),
                             lane,
+                            proof,
                             deadline: Instant::now(),
                         });
                     } else if targets.is_empty() {
@@ -584,6 +655,7 @@ fn drive(residual: &mut Residual, receiver: mpsc::Receiver<Work>, shared: Arc<Sh
                             results: vec![None; count],
                             blocked: None,
                             lane,
+                            proof,
                             deadline: Instant::now() + shared.config.decision_deadline,
                         });
                     }
@@ -614,6 +686,13 @@ fn drive(residual: &mut Residual, receiver: mpsc::Receiver<Work>, shared: Arc<Sh
                     // Never resubmit accepted work, including unknown-store work.
                     if let status @ ra::Status::Complete(_) = ticket.status() {
                         p.results[j] = Some(status);
+                    } else if ticket.owner_closed() {
+                        p.blocked = Some(Error::Ra(ra::Failure::Unknown));
+                        owner.withdraw();
+                        let mut meta = inspect(&shared.meta);
+                        meta.accepting = false;
+                        meta.error = p.blocked.clone();
+                        shared.stop.store(true, Ordering::SeqCst);
                     }
                 }
             }
@@ -658,6 +737,7 @@ fn finish(
         entities,
         downstream_completion: false,
         lane,
+        proof: proof_charge(&shared.config, lane),
     });
 }
 fn process(
@@ -867,6 +947,13 @@ fn input_bytes(input: &Input) -> usize {
         Input::HealthSources | Input::Operations | Input::HostStatus(_) => 0,
     }
 }
+fn proof_charge(config: &Config, lane: usize) -> usize {
+    128 + if lane == 0 {
+        config.max_entities * 512
+    } else {
+        0
+    }
+}
 fn reply_reservation(input: &Input, config: &Config) -> usize {
     match input {
         Input::HealthSources => config.hosting.core_limits.state_bytes,
@@ -880,3 +967,6 @@ fn reply_reservation(input: &Input, config: &Config) -> usize {
         Input::Admit { .. } | Input::PreparedFailure { .. } | Input::RemoveFailure(_) => 512,
     }
 }
+
+#[cfg(test)]
+mod tests;

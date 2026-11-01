@@ -59,7 +59,9 @@ pub(super) fn consume(
                 {
                     Disposition::IgnoredStale
                 } else if !s.body.replica.up {
-                    Disposition::HostingReopenRequired
+                    // Native down-reopen requires persisted state, which this
+                    // stateless consumer profile does not admit.
+                    Disposition::HostingMatchedNoWork
                 } else {
                     match s.phase {
                         Phase::Opening => Disposition::HostingOpenRetryRequired,
@@ -76,7 +78,8 @@ pub(super) fn consume(
         Kind::HostingRuntimeClosed => {
             let event: HostingRuntimeClosed = from_slice(&work.bytes).map_err(invalid)?;
             let disposition = if current.is_some_and(|s| {
-                s.phase != Phase::Closed
+                !matches!(s.phase, Phase::Closing | Phase::Closed)
+                    && s.body.replica.up
                     && s.runtime
                         .as_ref()
                         .is_some_and(|r| r.host == event.host && r.runtime == event.runtime)

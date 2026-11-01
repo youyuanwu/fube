@@ -9,6 +9,7 @@ fube-ra = { path = "../fube-ra" }
 uuid = { workspace = true }
 
 [dev-dependencies]
+fube-ra = { path = "../fube-ra", features = ["qualification"] }
 fube-ra-store = { path = "../fube-ra-store" }
 fube-transport = { workspace = true }
 tokio = { workspace = true }

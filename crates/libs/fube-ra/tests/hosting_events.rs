@@ -232,6 +232,61 @@ async fn runtime_closed_and_host_closed_remain_distinct_exact_current_owner_deci
         &before
     );
     assert!(executor.take_effects().is_empty());
+    executor
+        .submit(Command::Remove {
+            body: Box::new(RemoveInstance::new(b.clone(), false)),
+            source: admission().fm_source,
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        })
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    let owned_close = executor.take_effects();
+    assert!(owned_close
+        .iter()
+        .any(|e| matches!(e.effect, Effect::Close { .. })));
+    let closing = executor.snapshot(b.unit.id.guid.0).committed.unwrap();
+    assert_eq!(closing.phase, Phase::Closing);
+    assert!(closing.runtime.is_some());
+    let runtime = executor
+        .submit(Command::HostingRuntimeClosed(Box::new(
+            HostingRuntimeClosed {
+                unit: b.unit.id.clone(),
+                readiness: readiness(),
+                host: "HOST".into(),
+                runtime: "RUNTIME".into(),
+            },
+        )))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    assert_eq!(runtime, Disposition::IgnoredStale); // normal Close is already pending
+    let host = executor
+        .submit(Command::HostingHostClosed(Box::new(HostingHostClosed {
+            unit: b.unit.id.clone(),
+            readiness: readiness(),
+            host: "HOST".into(),
+            activity: "closing-crash".into(),
+        })))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    assert_eq!(host, Disposition::HostingHostCrashRequired); // distinct crash exception
+    assert_eq!(
+        executor
+            .snapshot(b.unit.id.guid.0)
+            .committed
+            .as_ref()
+            .unwrap(),
+        &closing
+    );
+    assert!(executor.take_effects().is_empty());
     executor.close(WAIT).await.unwrap();
     store.close().await.unwrap();
 }

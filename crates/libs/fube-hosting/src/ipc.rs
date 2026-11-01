@@ -111,7 +111,7 @@ struct Record {
     loss: Option<Loss>,
     cleanup: Option<crate::Result<()>>,
     results: VecDeque<OperationResult>,
-    registration_consumer: Option<Arc<AtomicBool>>,
+    registration_consumer: Option<RegistrationGate>,
 }
 struct State {
     core: Hosting,
@@ -231,6 +231,27 @@ impl RequiredCapabilities {
 pub struct RegistrationOwner {
     shared: Arc<Shared>,
     live: Arc<AtomicBool>,
+    upstream: Option<Arc<dyn RegistrationConsumerGate>>,
+}
+/// A composition-owned terminal admission predicate. Implementations MUST be
+/// lock-free/nonblocking; this is checked at the Hosting mutation boundary.
+/// No RA/runtime dependency or callback completion is implied.
+pub trait RegistrationConsumerGate: Send + Sync {
+    fn is_accepting(&self) -> bool;
+}
+#[derive(Clone)]
+struct RegistrationGate {
+    live: Arc<AtomicBool>,
+    upstream: Option<Arc<dyn RegistrationConsumerGate>>,
+}
+impl RegistrationGate {
+    fn active(&self) -> bool {
+        self.live.load(Ordering::SeqCst)
+            && self
+                .upstream
+                .as_ref()
+                .is_none_or(|gate| gate.is_accepting())
+    }
 }
 pub struct PreparedRegistration {
     pub lease: HostLease,
@@ -259,6 +280,28 @@ impl Delivery {
     }
 }
 impl RegistrationOwner {
+    pub fn with_consumer_gate(
+        mut self,
+        gate: Arc<dyn RegistrationConsumerGate>,
+    ) -> crate::Result<Self> {
+        if self
+            .shared
+            .state()?
+            .records
+            .iter()
+            .any(|r| r.registration_consumer.is_some())
+        {
+            return Err(crate::Error::InvalidState);
+        }
+        self.upstream = Some(gate);
+        Ok(self)
+    }
+    fn gate(&self) -> RegistrationGate {
+        RegistrationGate {
+            live: self.live.clone(),
+            upstream: self.upstream.clone(),
+        }
+    }
     pub fn withdraw(&self) {
         self.live.store(false, Ordering::SeqCst);
     }
@@ -655,6 +698,7 @@ impl Server {
         Ok(RegistrationOwner {
             shared: self.shared.clone(),
             live,
+            upstream: None,
         })
     }
     /// Prefix preparation is explicit. Failure retains the prefix and its
@@ -666,8 +710,10 @@ impl Server {
         types: Vec<String>,
         source: &str,
     ) -> crate::Result<PreparedRegistration> {
+        if !owner.gate().active() {
+            return Err(crate::Error::ObjectClosed);
+        }
         if !Arc::ptr_eq(&self.shared, &owner.shared)
-            || !owner.live.load(Ordering::SeqCst)
             || types.is_empty()
             || types.len() > self.shared.config.core_limits.types
             || !valid_string(source)
@@ -710,7 +756,12 @@ impl Server {
             state.health = health;
             prepared.admitted += 1;
         }
-        state.records[index].registration_consumer = Some(owner.live.clone());
+        if !owner.gate().active() {
+            prepared.lease.revoke();
+            prepared.failure = Some((prepared.admitted, crate::Error::ObjectClosed));
+            return Ok(prepared);
+        }
+        state.records[index].registration_consumer = Some(owner.gate());
         Ok(prepared)
     }
     /// Synchronous admission reserves one complete scratch/session/result slot.
@@ -1372,7 +1423,7 @@ fn dispatch(
                 .as_ref()
                 .ok_or(protocol("factory capability not admitted"))?
                 .clone();
-            if !consumer.load(Ordering::SeqCst) {
+            if !consumer.active() {
                 return Err(protocol("factory consumer withdrawn"));
             }
             let value: wire::TypeRequest = decode(body, shared.config.decode_bytes)?;
@@ -1415,7 +1466,7 @@ fn dispatch(
             if type_deadline.is_some_and(|due| Instant::now() >= due) {
                 return Err(protocol("type request deadline before mutation"));
             }
-            if !consumer.load(Ordering::SeqCst) {
+            if !consumer.active() {
                 return Err(protocol("factory consumer withdrawn before mutation"));
             }
             result.action = "RegisterServiceTypeRequest";

@@ -589,6 +589,8 @@ async fn unknown_store_retains_accepted_event_tickets_without_blocking_polls_or_
     let mut cfg = config();
     cfg.decision_deadline = Duration::from_millis(20);
     cfg.events_per_lane = 1;
+    cfg.max_entities = 1;
+    cfg.fanout_bytes_per_lane = 640;
     let mut node = Node::bind("127.0.0.1:0".parse().unwrap(), cfg, ra.clone()).unwrap();
     let handle = node.handle();
     let add = ra.submit(add()).unwrap();
@@ -622,6 +624,7 @@ async fn unknown_store_retains_accepted_event_tickets_without_blocking_polls_or_
     .await
     .unwrap();
     assert!(handle.take_receipts().is_empty());
+    assert_eq!(handle.fanout_usage()[0], 640);
     assert!(ra.take_effects().is_empty());
     for _ in 0..3 {
         assert!(peer.poll().await > 0);
@@ -631,6 +634,7 @@ async fn unknown_store_retains_accepted_event_tickets_without_blocking_polls_or_
     node.stop().unwrap();
     assert!(start.elapsed() < Duration::from_secs(1));
     let residual = handle.take_shutdown().unwrap();
+    assert_eq!(handle.fanout_usage()[0], 0); // explicit residual transfer releases the reservation
     let pending = residual
         .pending
         .iter()
@@ -659,6 +663,280 @@ async fn unknown_store_retains_accepted_event_tickets_without_blocking_polls_or_
     assert!(matches!(effects[0].effect, ra::Effect::Open { .. }));
     assert_eq!(effects[0].operation, add.id);
     ra.close(WAIT).await.unwrap();
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn full_fanout_budget_preserves_empty_closure_head_and_uncollected_receipt_ownership() {
+    for shortage in [true, false] {
+        let store = Arc::new(
+            Store::new(Box::new(MemoryBackend::new()), StoreSettings::default())
+                .await
+                .unwrap(),
+        );
+        let ra = Arc::new(
+            ra::Executor::new(store.clone(), ra_admission(), ra::Settings::default()).unwrap(),
+        );
+        for id in [1u8, 2] {
+            let mut b = ra_body();
+            b.unit.id.guid.0 = [id; 16];
+            b.unit.consistency.id = b.unit.id.clone();
+            ra.submit(ra::Command::Add {
+                body: Box::new(b),
+                source: ra_admission().fm_source,
+                generation: p::GenerationHeader {
+                    number: ra_admission().generation,
+                    for_fm_replica: false,
+                },
+            })
+            .unwrap()
+            .wait(WAIT)
+            .await
+            .unwrap();
+        }
+        let owned_lookup_effects = ra.take_effects();
+        assert_eq!(owned_lookup_effects.len(), 2);
+        let mut cfg = config();
+        cfg.max_entities = 2;
+        cfg.event_bytes_per_lane = 160;
+        cfg.events_per_lane = 2;
+        cfg.fanout_bytes_per_lane = 128 + 2 * 512 - usize::from(shortage);
+        let mut node = Node::bind("127.0.0.1:0".parse().unwrap(), cfg, ra.clone()).unwrap();
+        let handle = node.handle();
+        let a = host_admission();
+        let Response::Prepared(prepared) = request(
+            &handle,
+            Input::Admit {
+                admission: a.clone(),
+                types: vec!["Widget".into()],
+                source: "prepared-package".into(),
+            },
+        ) else {
+            panic!("admit");
+        };
+        assert!(prepared.failure.is_none());
+        let mut peer = Peer::new(&node, a).await;
+        peer.bootstrap().await;
+        let id = peer.context.id.clone();
+        peer.call(9, "UnregisterFabricRuntimeRequest", &wire::IdRequest { id })
+            .await;
+        let id = peer.admission.host.id.clone();
+        peer.call(
+            7,
+            "UnregisterApplicationHostRequest",
+            &wire::UnregisterHost {
+                id,
+                activity: wire::Activity {
+                    id: wire::ActivityId {
+                        guid: Guid([2; 16]),
+                        index: 1,
+                    },
+                    kind: 0,
+                },
+            },
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if shortage {
+            assert_eq!(handle.progress().0[0], 0);
+            assert_eq!(handle.fanout_usage()[0], 0);
+            assert!(handle.take_receipts().is_empty());
+            node.stop().unwrap();
+            let residual = handle.take_shutdown().unwrap();
+            assert!(
+                matches!(residual.owner.next_delivery(DeliveryLane::Registration, usize::MAX).unwrap(),
+                Some(Delivery::Registration(hosting::ClosedRegisteredEvent::RuntimeClosed { affected, .. })) if affected.is_empty())
+            );
+        } else {
+            assert_eq!(handle.progress().0[0], 1); // second head cannot steal retained result budget
+            assert_eq!(handle.fanout_usage()[0], 1152);
+            let first = handle.take_receipts();
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].entities.len(), 2);
+            assert!(
+                matches!(&first[0].input, Delivery::Registration(hosting::ClosedRegisteredEvent::RuntimeClosed { affected, .. }) if affected.is_empty())
+            );
+            let second = receipt(&handle).await;
+            assert!(matches!(
+                second.input,
+                Delivery::Registration(hosting::ClosedRegisteredEvent::HostClosed { .. })
+            ));
+            assert_eq!(second.entities.len(), 2);
+            assert_eq!(handle.fanout_usage()[0], 0);
+            assert_eq!(handle.progress().0[0], 0);
+            assert!(handle.take_receipts().is_empty());
+            node.stop().unwrap();
+            handle.take_shutdown().unwrap();
+        }
+        ra.close(WAIT).await.unwrap();
+        store.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn checked_command_reservations_reject_per_command_and_aggregate_overflow_before_enqueue() {
+    for aggregate in [false, true] {
+        let store = Arc::new(
+            Store::new(Box::new(MemoryBackend::new()), StoreSettings::default())
+                .await
+                .unwrap(),
+        );
+        let ra = Arc::new(
+            ra::Executor::new(store.clone(), ra_admission(), ra::Settings::default()).unwrap(),
+        );
+        let mut cfg = config();
+        cfg.queued_command_bytes = usize::MAX;
+        cfg.hosting.core_limits.state_bytes = if aggregate {
+            usize::MAX - 1536
+        } else {
+            usize::MAX
+        };
+        let mut node = Node::bind("127.0.0.1:0".parse().unwrap(), cfg, ra.clone()).unwrap();
+        let handle = node.handle();
+        if aggregate {
+            let first = handle.submit(Input::HealthSources).unwrap();
+            assert!(matches!(
+                handle.submit(Input::RemoveFailure("x".into())),
+                Err(fube_node::Error::Capacity)
+            ));
+            assert!(matches!(first.wait(WAIT).unwrap(), Response::Sources(s) if s.is_empty()));
+            assert!(matches!(
+                request(&handle, Input::RemoveFailure("x".into())),
+                Response::Done
+            ));
+        } else {
+            assert!(matches!(
+                handle.submit(Input::HealthSources),
+                Err(fube_node::Error::Capacity)
+            ));
+        }
+        assert!(handle.recover_commands().is_empty());
+        node.stop().unwrap();
+        assert!(handle.take_shutdown().unwrap().shutdown.is_ok());
+        ra.close(WAIT).await.unwrap();
+        store.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn terminal_ra_loss_fences_existing_factory_and_new_admission_without_another_event() {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let store = Arc::new(
+        Store::new(
+            Box::new(PausedWrite {
+                inner: MemoryBackend::new(),
+                gate: Some((entered_tx, release_rx)),
+                writes: Arc::new(AtomicUsize::new(0)),
+            }),
+            StoreSettings {
+                operation_timeout: Duration::from_millis(20),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let ra = Arc::new(
+        ra::Executor::new(store.clone(), ra_admission(), ra::Settings::default()).unwrap(),
+    );
+    let mut node = Node::bind("127.0.0.1:0".parse().unwrap(), config(), ra.clone()).unwrap();
+    let handle = node.handle();
+    let add = ra.submit(add()).unwrap();
+    entered_rx.await.unwrap();
+    let terminate = ra
+        .submit(ra::Command::QualificationTerminate(ra_body().unit.id))
+        .unwrap();
+    let a = host_admission();
+    let Response::Prepared(prepared) = request(
+        &handle,
+        Input::Admit {
+            admission: a.clone(),
+            types: vec!["Widget".into()],
+            source: "prepared-package".into(),
+        },
+    ) else {
+        panic!("admit");
+    };
+    assert!(prepared.failure.is_none());
+    let mut peer = Peer::new(&node, a).await;
+    peer.bootstrap().await;
+    peer.factory().await;
+    tokio::time::timeout(WAIT, async {
+        while ra.statistics().outstanding < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    release_tx.send(()).unwrap();
+    assert_eq!(add.resolve(WAIT).await.unwrap(), ra::Disposition::Applied);
+    assert_eq!(terminate.resolve(WAIT).await, Err(ra::Failure::Unknown));
+    tokio::time::timeout(WAIT, async {
+        while handle.progress().3.is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!ra.consumer_lifetime().is_accepting());
+    peer.index += 1;
+    let id = MessageId {
+        guid: peer.guid,
+        index: peer.index,
+    };
+    let request = wire::TypeRequest {
+        context: peer.context.clone(),
+        id: wire::TypeId {
+            package: peer.context.code.id.package.clone(),
+            name: "Widget".into(),
+        },
+    };
+    let headers = vec![
+        Header::actor(9).unwrap(),
+        Header::message_id(id).unwrap(),
+        Header::boolean(EXPECTS_REPLY, true).unwrap(),
+        Header::timeout(50_000_000).unwrap(),
+        Header::action("RegisterServiceTypeRequest").unwrap(),
+        Header::object(IPC, |e| {
+            e.string(&peer.admission.host.id)?;
+            e.u32(peer.admission.host.pid);
+            Ok(())
+        })
+        .unwrap(),
+    ];
+    if write_message(
+        &mut peer.socket,
+        &Message {
+            headers,
+            body: to_vec(&request).unwrap(),
+        },
+    )
+    .await
+    .is_ok()
+    {
+        if let Ok(Ok(reply)) = tokio::time::timeout(WAIT, read_message(&mut peer.socket)).await {
+            let error = from_slice::<wire::ErrorReply>(&reply.body).unwrap().error;
+            assert_ne!(error, 0);
+            assert_ne!(error, 0x80071d31u32 as i32 as i64);
+        }
+    }
+    assert!(matches!(
+        handle.submit(Input::Admit {
+            admission: host_admission(),
+            types: vec!["Other".into()],
+            source: "new".into()
+        }),
+        Err(fube_node::Error::Closed)
+    ));
+    node.stop().unwrap();
+    let residual = handle.take_shutdown().unwrap();
+    assert!(residual.pending.iter().any(|p| p
+        .tickets
+        .iter()
+        .any(|t| t.as_ref().is_some_and(ra::Ticket::owner_closed))));
+    assert!(handle.take_receipts().is_empty());
+    assert_eq!(ra.close(WAIT).await, Err(ra::Failure::Unknown));
     store.close().await.unwrap();
 }
 
