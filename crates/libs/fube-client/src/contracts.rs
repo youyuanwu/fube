@@ -1,14 +1,14 @@
-//! **Declarations only: not implemented or wired to any existing client or transport.**
+//! Operational bounded typed ordinary calls over an explicitly bound RPC channel.
 //!
-//! Proposed bounded Rust-profile contracts for typed ordinary request/reply over
-//! Service Fabric native actors/actions and Fabric serialization. A future
-//! handwritten/generated client can resemble a typed gRPC stub conceptually;
+//! Rust-profile contracts for typed ordinary request/reply over Service Fabric
+//! native actors/actions and Fabric serialization. Handwritten sealed adapters
+//! can resemble a typed gRPC stub conceptually;
 //! this is **not** gRPC, protobuf, HTTP/2, an SF ABI, or a public COM-IDL-generated
-//! network stub. No backend, constructor, codec, send, dispatch or lifecycle
-//! implementation is supplied. [`FabricClient`](crate::FabricClient) and
-//! [`Connection`](fube_transport::connection::Connection) do not implement these
-//! traits; their behavior, clear-TCP security limits, roles and no-replay policy
-//! are unchanged.
+//! network stub. [`FabricClient`](crate::FabricClient) is the explicit channel
+//! owner; [`GatewayClient`](crate::GatewayClient) is a borrowing typed observer.
+//! Both implement [`Client`] through the shared call layer. Notification and
+//! image-transfer clients remain independently owned
+//! [`Connection`](fube_transport::connection::Connection) consumers.
 //!
 //! # Native boundary (source facts)
 //!
@@ -46,7 +46,7 @@
 //!   teardown. Its broader [gateway management][gateway] includes settings and
 //!   connection/notification handling; these are not promised here.
 //!
-//! # Proposed Rust-profile responsibilities (not native guarantees)
+//! # Operational Rust-profile responsibilities (not native guarantees)
 //!
 //! ```text
 //! owned typed request + CallContext
@@ -70,7 +70,7 @@
 //! One absolute deadline covers preparation, RPC admission/send/wait and final
 //! local validation/result completion, without restarted budgets or late
 //! success. Preparation/validation are bounded, nonblocking local work, not
-//! detached tasks. A future backend must specify finite call/count/byte limits
+//! detached tasks. [`ClientLimits`](crate::ClientLimits) specifies finite count/byte limits
 //! covering all client/channel-retained requests, encoded messages, validation
 //! state, pending work and undelivered results until retirement or transfer.
 //! Enforce those limits without unbounded allocations from untrusted lengths;
@@ -84,6 +84,15 @@
 //! failover or exactly-once execution; no second pending table or client reply
 //! route registry. The channel owns transport correlation and native Fault;
 //! typed decoding remains above it.
+//!
+//! Forwarded ordinary queries preserve all header records and use native's
+//! final RelatesTo in wire order. The bounded Rust profile accepts two records
+//! or [inner, outer, outer], with an identical final repeat, only under
+//! source-produced query envelopes and the selected query's typed Reply family.
+//! Unknown final IDs cannot complete an earlier neighbor. Caller duplicates
+//! and unrelated owned fields remain strict; opaque unowned extensions confer
+//! no retry/ACK/role authority. See the maintained NativeChannel guide and
+//! pinned native common-header/cache references; three is not a native maximum.
 //!
 //! Encoding selects operation-appropriate actor/action/header/body schemas
 //! already housed in concrete protocol modules. It must not supply ordinary
@@ -102,8 +111,9 @@
 //! the channel can independently become terminal under its own policy. A valid
 //! operation-appropriate failure yields [`ClientError::Domain`], preserving its
 //! required native code/data; missing/malformed required error data is Protocol,
-//! not zero-HRESULT success. This proposed observer policy does not generalize
-//! or change the concrete client's existing abort/error mappings.
+//! not zero-HRESULT success. This observer policy deliberately replaces ordinary
+//! FabricClient's previous malformed-domain abort policy, not the excluded
+//! Connection clients' lifecycle/error mappings.
 //!
 //! Ordinary typed RPC does not cover every native semantic protocol.
 //! [File transfer][file-transfer] accesses transport for its own protocol;
@@ -115,11 +125,11 @@
 //! inbound foundation/router, not a new generic client listener. Generated
 //! stubs, codecs, pools, middleware and gateway recovery are deferred.
 //!
-//! # Declaration usability, not an operational example
+//! # Generic type guarantees
 //!
 //! These uncalled consumers check typed response/error relationships, Send,
 //! owned request-derived validation state, and erased binding/channel usability.
-//! They contain no backend or codec implementations. Constructing a binding
+//! Built-in adapters supply backend-independent codecs. Constructing a binding
 //! cannot prove runtime affinity, authorization, budgets or lifecycle readiness.
 //!
 //! ```
@@ -200,7 +210,7 @@ use tokio::time::Instant;
 
 /// One owned whole-call budget, not a duplicate wire-metadata envelope.
 ///
-/// **Proposed Rust-profile declaration.** The caller chooses the absolute
+/// **Rust-profile contract.** The caller chooses the absolute
 /// deadline before preparation. [`Client::call`] checks it before/after encode,
 /// across RPC, and before/after decode and local result completion. Expiry at
 /// client stages is [`ClientError::Local`] with [`Error::Timeout`]; an RPC
@@ -216,8 +226,7 @@ pub struct CallContext {
 
 /// Borrowed snapshot of an explicitly supplied channel and its target.
 ///
-/// **Proposed Rust-profile declaration.** No constructor, lookup or authority
-/// proof is supplied. Both references must belong to the same ready foundation;
+/// **Rust-profile contract.** Both references must belong to the same foundation;
 /// the backend still validates affinity/retirement/role at admission. The
 /// snapshot is stable for that call; type equality alone is insufficient.
 /// Borrows/shared handles do not grant this observer ownership of shutdown.
@@ -231,7 +240,7 @@ pub struct ClientBinding<'a, C: RpcChannel + ?Sized> {
 
 /// Client-stage error provenance, distinct from the unchanged transport Error.
 ///
-/// **Proposed Rust-profile declaration.** No automatic conversions, display,
+/// Display/source retain origin; there is no implicit flattening conversion,
 /// fallback, close or recovery logic. Returning an error after acceptance
 /// cannot promise nonexecution. See the [module](self) for malformed-reply policy.
 #[derive(Debug)]
@@ -273,7 +282,7 @@ impl<D: std::error::Error + 'static> std::error::Error for ClientError<D> {
 
 /// Outcomes allowed from operation-specific reply interpretation.
 ///
-/// **Proposed Rust-profile declaration.** Required malformed failure data is
+/// **Rust-profile contract.** Required malformed failure data is
 /// Protocol; a readable, valid domain failure is Domain, never transport success
 /// coerced into a fake success result. RPC Fault never reaches this decoder.
 #[derive(Debug)]
@@ -286,7 +295,7 @@ pub enum ReplyError<D> {
 
 /// Boxed Send call future with typed client errors, borrowing its façade.
 ///
-/// **Proposed Rust-profile declaration.** Unlike ChannelFuture, its result
+/// **Rust-profile contract.** Unlike ChannelFuture, its result
 /// preserves domain provenance. Owned payloads do not make this future `'static`.
 /// See [`Client::call`] for lazy progress and whole-call completion obligations.
 pub type ClientFuture<'a, T, D> =
@@ -294,10 +303,10 @@ pub type ClientFuture<'a, T, D> =
 
 /// One owned typed request and its operation-specific request/reply adapter.
 ///
-/// **Proposed Rust-profile declaration.** Implement this shared trait for
-/// request representations, not a new trait per operation/actor. Concrete
-/// schemas stay in protocol modules. No universal codec, dynamic route registry,
-/// decoder implementation or type erasure is supplied.
+/// Built-in request representations implement this sealed shared trait, not a
+/// new trait per operation/actor. Sealing makes the allocation proof enforceable;
+/// arbitrary user codecs cannot silently claim a bound. Concrete schemas stay
+/// in protocol modules; no universal codec, dynamic registry or type erasure.
 ///
 /// The request, response, one-shot validation state and domain error are owned
 /// and Send + 'static; they need not be Sync. Static adaptation is intentionally
@@ -356,7 +365,7 @@ pub trait ClientRequest: crate::typed::sealed::Request + Sized + Send + 'static 
 
 /// Typed observer over an explicitly bound existing RPC foundation.
 ///
-/// **Proposed Rust-profile declaration, not implemented by FabricClient.**
+/// Implemented by the borrowing GatewayClient and designated FabricClient owner.
 /// Shared concurrent calls are permitted under documented finite owner limits.
 /// The binding accessor is object-safe with Channel fixed (including an erased
 /// RpcChannel). The generic call requires Self: Sized; no erased universal call

@@ -16,7 +16,116 @@ use tokio::{
 };
 
 const TIMEOUT_DURATION: Duration = Duration::from_secs(3);
+
+#[tokio::test]
+async fn naming_deadline_precedes_and_includes_caller_conversion() {
+    struct InvalidConversion;
+    impl AsRef<str> for InvalidConversion {
+        fn as_ref(&self) -> &str {
+            panic!("invalid timeout must precede conversion")
+        }
+    }
+    struct SlowConversion;
+    impl AsRef<str> for SlowConversion {
+        fn as_ref(&self) -> &str {
+            std::thread::sleep(Duration::from_millis(20));
+            "fabric:/SlowConversion"
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut stream = establish(listener).await;
+        let request = read_message(&mut stream).await.unwrap();
+        assert_eq!(request.properties().unwrap().action, "PingRequest");
+        write_message(&mut stream, &ping_reply(&request))
+            .await
+            .unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    });
+    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+        .await
+        .unwrap();
+    assert!(matches!(
+        client
+            .name_exists(InvalidConversion, Some(Duration::ZERO))
+            .await,
+        Err(ClientError::Local(Error::InvalidInput(_)))
+    ));
+    assert!(matches!(
+        client
+            .create_name(InvalidConversion, Some(Duration::ZERO))
+            .await,
+        Err(ClientError::Local(Error::InvalidInput(_)))
+    ));
+    assert!(matches!(
+        client
+            .delete_name(InvalidConversion, Some(Duration::ZERO))
+            .await,
+        Err(ClientError::Local(Error::InvalidInput(_)))
+    ));
+    let tiny = Some(Duration::from_millis(5));
+    assert!(matches!(
+        client.name_exists(SlowConversion, tiny).await,
+        Err(ClientError::Local(Error::Timeout))
+    ));
+    assert!(matches!(
+        client.create_name(SlowConversion, tiny).await,
+        Err(ClientError::Local(Error::Timeout))
+    ));
+    assert!(matches!(
+        client.delete_name(SlowConversion, tiny).await,
+        Err(ClientError::Local(Error::Timeout))
+    ));
+    client.ping(None).await.unwrap();
+    client.close().await.unwrap();
+    server.await.unwrap();
+}
+
 const NODE_ID: u128 = 0x0123456789abcdef_fedcba9876543210;
+
+#[tokio::test]
+async fn naming_conversion_input_is_not_retained_across_rpc() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    struct Input(Arc<AtomicBool>);
+    impl AsRef<str> for Input {
+        fn as_ref(&self) -> &str {
+            "fabric:/OwnedSnapshot"
+        }
+    }
+    impl Drop for Input {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let released = Arc::new(AtomicBool::new(false));
+    let observed = released.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut stream = establish(listener).await;
+        let request = read_message(&mut stream).await.unwrap();
+        assert_eq!(request.properties().unwrap().action, "NameExistsRequest");
+        assert!(observed.load(Ordering::SeqCst));
+        write_message(
+            &mut stream,
+            &reply(&request, "NameOperationReply", naming_body(true, 0)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    });
+    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+        .await
+        .unwrap();
+    assert!(client.name_exists(Input(released), None).await.unwrap());
+    client.close().await.unwrap();
+    server.await.unwrap();
+}
+
 const REMOTE_CODE: i64 = -2147017794;
 
 #[path = "support/health_model.rs"]

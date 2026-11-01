@@ -1288,6 +1288,101 @@ def validate_data(value, profile, built):
             "assertions": [profile + "/" + name for name in required]}
 
 
+def validate_native_movement(lists, owner):
+    move = lists.get("movement")
+    require(type(move) is dict and text(owner) and move.get("owner") == owner,
+            "native movement fixture owner")
+    application, service, partition = (move.get(key) for key in ("application", "service", "partition"))
+    require(text(application)
+            and re.fullmatch(r"fabric:/native-lists-" + re.escape(owner) + r"-[a-f0-9]{32}-[ab]", application),
+            "native movement journal-owned application")
+    stem = application.removeprefix("fabric:/")[:-2]
+    require(lists.get("owned_applications") == [f"fabric:/{stem}-a", f"fabric:/{stem}-b"]
+            and lists.get("owned_type") == "ListType-" + stem
+            and service == application + "/Stateful"
+            and type(partition) is str
+            and re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", partition)
+            and partition != "00000000-0000-0000-0000-000000000000",
+            "native movement exact owned service/partition identities")
+    require(any(app.get("name") == application and app.get("type_name") == lists["owned_type"]
+                for app in lists["native_applications"])
+            and any(app.get("Name") == application and app.get("TypeName") == lists["owned_type"]
+                    for app in lists["independent_applications"])
+            and any(item.get("name") == service and item.get("kind") == "Stateful"
+                    for item in lists["native_services"])
+            and any(item.get("Name") == service and item.get("ServiceKind") == "Stateful"
+                    for item in lists["independent_services"]),
+            "native movement must reuse corroborated owned application/service")
+    old, target = move.get("old_primary"), move.get("target")
+    require(text(old) and text(target) and old != target
+            and type(move.get("request")) is dict and type(move["request"].get("count")) is int
+            and move["request"].get("native_succeeded") is True
+            and move.get("request") == {"operation": "MovePrimary", "constraints": "enforced",
+                                       "count": 1, "native_succeeded": True},
+            "native movement requires one successful constraint-enforced request")
+    node = move.get("target_node_observation")
+    require(type(node) is dict and node.get("Name") == target and node.get("NodeStatus") == "Up",
+            "native movement existing target node must be Up")
+    require(type(move.get("overall_budget_ms")) is int and move["overall_budget_ms"] == 120000
+            and integer(move.get("poll_count"), 1) and move["poll_count"] <= 120
+            and all(integer(move.get(key), 1) for key in ("native_start_unix_ms", "native_end_unix_ms")),
+            "native movement finite observation budget/polling")
+    window = interval(move, "native_start_unix_ms", "native_end_unix_ms")
+    require(window[1] - window[0] <= move["overall_budget_ms"], "native movement exceeded overall budget")
+    observations = move.get("verified_observations")
+    exact(observations, ("before", "after"), "native movement before/after observations")
+
+    def replicas(values, native=False):
+        require(type(values) is list and 2 <= len(values) <= 5, "native movement nonempty replica set")
+        result = {}
+        for value in values:
+            require(type(value) is dict, "native movement replica observation")
+            identity = value.get("replica_id" if native else "ReplicaId")
+            require(type(identity) is int or (text(identity) and re.fullmatch(r"-?[0-9]{1,19}", identity)),
+                    "native movement replica identity")
+            identity = int(identity)
+            require(-(2 ** 63) <= identity < 2 ** 63 and identity not in result,
+                    "native movement unique replica identities")
+            node, kind, status, role = (value.get(key) for key in
+                (("node", "kind", "status", "role") if native else
+                 ("NodeName", "ServiceKind", "ReplicaStatus", "ReplicaRole")))
+            require(text(node) and kind == "Stateful" and status == "Ready"
+                    and role in ("Primary", "ActiveSecondary"), "native movement ready stateful replicas")
+            result[identity] = (node, role)
+        require(len({node for node, _ in result.values()}) == len(result), "native movement distinct replica nodes")
+        return result
+
+    snapshots = {}
+    for stage in ("before", "after"):
+        snapshot = observations[stage]
+        require(type(snapshot) is dict, "native movement verified replica snapshot")
+        snapshots[stage] = replicas(snapshot.get("native_replicas"), native=True)
+        require(snapshots[stage] == replicas(snapshot.get("http_replicas")),
+                "native movement independent HTTP/native corroboration")
+    before, after = snapshots["before"], snapshots["after"]
+    require(set(before) == set(after)
+            and {identity: node for identity, (node, _) in before.items()}
+                == {identity: node for identity, (node, _) in after.items()}
+            and [node for node, role in before.values() if role == "Primary"] == [old]
+            and (target, "ActiveSecondary") in before.values()
+            and [node for node, role in after.values() if role == "Primary"] == [target]
+            and (old, "ActiveSecondary") in after.values(),
+            "native movement must observe old primary to existing secondary target")
+    topology = lists["topology"].get("independent_partition_replicas", [])
+    captured = [entry for entry in topology if entry.get("service") == service
+                and entry.get("partition", {}).get("ServiceKind") == "Stateful"
+                and entry["partition"].get("PartitionInformation", {}).get("Id") == partition]
+    require(len(captured) == 1 and replicas(captured[0].get("replicas")) == before,
+            "native movement must reuse the exact captured topology")
+    deployments = lists["deployment_inspection"].get("observations", [])
+    for node in (old, target):
+        require(any(entry.get("node") == node and entry.get("application") == application
+                    and any(replica.get("PartitionId") == partition and replica.get("ServiceName") == service
+                            and replica.get("ServiceKind") == "Stateful" for replica in entry.get("replicas", []))
+                    for entry in deployments), "native movement must reuse captured owned deployments")
+    return [stamp / 1000 for stamp in window]
+
+
 def validate_native(reports, archive, allocation):
     clear, health, name, lists, notification = [reports[file] for file in NATIVE_FILES]
     for value in (clear, health, name, notification):
@@ -1340,6 +1435,7 @@ def validate_native(reports, archive, allocation):
             and all(nonempty(lists.get(key)) for key in ("topology", "deployment_inspection",
                     "independent_applications", "independent_services", "native_applications", "native_services")),
             "native application/service/topology/deployment observations")
+    movement_window = validate_native_movement(lists, health.get("owner"))
     true_fields(notification, ("owned_cleanup_confirmed",))
     require(notification.get("allocation") == allocation["name"]
             and notification.get("passed") == list(NOTIFICATION_CASES)
@@ -1354,6 +1450,7 @@ def validate_native(reports, archive, allocation):
     windows = {
         "clear_node_queries": [stamp / 1000 for stamp in interval(
             nodes, "native_observation_start_unix_ms", "native_observation_end_unix_ms")],
+        "native_move_primary": movement_window,
     }
     require(all(integer(nodes.get(key), 1) for key in
                 ("native_observation_start_unix_ms", "native_observation_end_unix_ms")),

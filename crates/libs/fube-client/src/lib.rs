@@ -78,7 +78,10 @@ pub struct GatewayDescription {
 
 /// Cloneable client for the native clear-TCP development profile.
 ///
-/// Clones share one continuously driven connection and its terminal state.
+/// Clones explicitly share one GatewayChannel lifecycle owner and terminal state.
+/// A [`GatewayClient`] instead borrows a supplied foundation without adopting it.
+/// Eight admitted typed calls are retained through result transfer/drop; excess
+/// calls fail immediately. Protocol/domain failures do not abort the owner.
 /// Every remote operation accepts an optional whole-operation timeout:
 /// `None` uses the timeout configured by [`Self::connect_clear`], while
 /// `Some(duration)` overrides it for that call. `None` is not an infinite timeout.
@@ -124,6 +127,8 @@ impl FabricClient {
     ///
     /// `timeout` also supplies the default for subsequent operations that pass
     /// `None`. There is no insecure fallback, automatic reconnect, or replay.
+    /// Only numeric nonzero-port loopback endpoints are allowed. Notifications
+    /// are disabled on this owner; excluded clients retain separate Connection owners.
     pub async fn connect_clear(endpoint: SocketAddr, timeout: Duration) -> Result<Self> {
         let deadline = deadline_after(timeout)?;
         let channel = GatewayChannel::connect_unsecured_loopback(
@@ -160,10 +165,10 @@ impl FabricClient {
         name: impl AsRef<str>,
         timeout: Option<Duration>,
     ) -> ClientResult<bool> {
-        match self
-            .name_operation(name.as_ref(), NameOperation::Exists, timeout)
-            .await?
-        {
+        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
+        let request = self.name_request(name.as_ref(), NameOperation::Exists, deadline)?;
+        drop(name);
+        match self.call(request, CallContext { deadline }).await? {
             NameResponse::Exists(exists) => Ok(exists),
             _ => Err(ClientError::Protocol("unexpected naming result")),
         }
@@ -183,7 +188,10 @@ impl FabricClient {
         name: impl AsRef<str>,
         timeout: Option<Duration>,
     ) -> ClientResult<()> {
-        self.name_operation(name.as_ref(), NameOperation::Create, timeout)
+        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
+        let request = self.name_request(name.as_ref(), NameOperation::Create, deadline)?;
+        drop(name);
+        self.call(request, CallContext { deadline })
             .await
             .map(|_| ())
     }
@@ -202,7 +210,10 @@ impl FabricClient {
         name: impl AsRef<str>,
         timeout: Option<Duration>,
     ) -> ClientResult<()> {
-        self.name_operation(name.as_ref(), NameOperation::Delete, timeout)
+        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
+        let request = self.name_request(name.as_ref(), NameOperation::Delete, deadline)?;
+        drop(name);
+        self.call(request, CallContext { deadline })
             .await
             .map(|_| ())
     }
@@ -357,17 +368,18 @@ impl FabricClient {
         target_node: &str,
         timeout: Option<Duration>,
     ) -> ClientResult<()> {
+        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
         query_arguments::validate_node_name(
             target_node,
             "primary target must be an explicit native node",
         )
         .map_err(ClientError::Local)?;
-        self.query(
-            &QueryDescription::new(movement::MovePrimary {
+        self.call(
+            QueryDescription::new(movement::MovePrimary {
                 partition,
                 target: target_node.to_owned(),
             }),
-            timeout,
+            CallContext { deadline },
         )
         .await
     }
@@ -400,16 +412,15 @@ impl FabricClient {
         .await
     }
 
-    async fn name_operation(
+    fn name_request(
         &self,
         name: &str,
         operation: NameOperation,
-        timeout: Option<Duration>,
-    ) -> ClientResult<NameResponse> {
-        let deadline = self.deadline(timeout).map_err(ClientError::Local)?;
+        deadline: Instant,
+    ) -> ClientResult<NameRequest> {
+        typed::check_deadline(deadline).map_err(ClientError::Local)?;
         let name = NamingUri::parse(name).map_err(ClientError::Local)?;
-        self.call(NameRequest { name, operation }, CallContext { deadline })
-            .await
+        Ok(NameRequest { name, operation })
     }
 }
 

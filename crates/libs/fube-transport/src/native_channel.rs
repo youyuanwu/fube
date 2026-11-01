@@ -471,9 +471,6 @@ fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
                 {
                     return Err(Error::Protocol("unproven native RelatesTo composition"));
                 }
-                if header.read(MessageId::decode)? == MessageId::default() {
-                    return Err(Error::Protocol("empty native RelatesTo record"));
-                }
                 seen[index] = Some(header);
                 continue;
             }
@@ -506,8 +503,19 @@ fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
         }
     }
     let props = message.properties()?;
-    if native_inbound && forwarded_correlation(message) && !forwarded_query_reply(message, &props) {
-        return Err(Error::Protocol("unauthorized forwarded query reply"));
+    if native_inbound && forwarded_correlation(message) {
+        if !forwarded_query_reply(message, &props) {
+            return Err(Error::Protocol("unauthorized forwarded query reply"));
+        }
+        for header in message
+            .headers
+            .iter()
+            .filter(|h| h.id == message::RELATES_TO)
+        {
+            if header.read(MessageId::decode)? == MessageId::default() {
+                return Err(Error::Protocol("empty native forwarding RelatesTo record"));
+            }
+        }
     }
     Ok(props)
 }

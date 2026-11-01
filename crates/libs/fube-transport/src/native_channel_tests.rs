@@ -3,6 +3,24 @@ use crate::connection::{read_message, write_message};
 use std::{future::Future, pin::Pin, time::Duration};
 use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
+#[tokio::test]
+async fn unchanged_notification_profile_accepts_its_empty_relation_without_forwarding_authority() {
+    for count in [1, 2] {
+        let (channel, mut peer) = pair(8192, true, limits());
+        let receiver = channel.receiver().unwrap();
+        let mut message = notification(42);
+        for _ in 0..count {
+            message
+                .headers
+                .push(Header::relates_to(MessageId::default()).unwrap());
+        }
+        write_message(&mut peer, &message).await.unwrap();
+        let incoming = receiver.receive(deadline()).await.unwrap();
+        assert_eq!(incoming.message, message);
+        channel.close(deadline()).await.unwrap();
+    }
+}
+
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }

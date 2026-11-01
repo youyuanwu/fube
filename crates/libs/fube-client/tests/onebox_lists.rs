@@ -262,6 +262,7 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     client.ping(None).await?;
     let topology = topology::observe(&client, &http, &journal).await?;
     let deployment = deployment::observe(&client, &http, &journal).await?;
+    let movement = topology::move_primary(&client, &http, &journal, &topology).await?;
     client.close().await?;
     Ok(json!({
         "runtime_version": runtime, "archive_sha256": journal.archive_sha256,
@@ -280,6 +281,7 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
         "native_services": native_services,
         "topology": topology,
         "deployment_inspection": deployment,
+        "movement": movement,
         "qualification_limit": "volatile implicit-host stateful kind; not persisted application data replication"
     }))
 }
