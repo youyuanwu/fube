@@ -429,7 +429,12 @@ No replicator is opened for this path. Partition construction supplies singleton
 int64-range or named information. Open finds the runtime's local factory,
 creates the instance with native IDs/initialization bytes, invokes user
 Begin/EndOpen and records the returned endpoint string in `ReplicaOpenReply`.
-The runtime does not start an application listener on the user's behalf.
+Successful stateless EndOpen may return a null/empty opaque endpoint; the
+consumer becomes Opened based on success, not a nonempty address. The
+[Rust stateless runtime](RustStatelessRuntime.md#owned-programming-model) now
+accepts empty success too. The runtime does not start an application listener
+on the user's behalf; an empty endpoint advertises no client address and does
+not prove serving or deployment readiness.
 [Action lists][action-lists]; [instance open][instance-open].
 
 Close calls user Begin/EndClose; abort calls synchronous user Abort. Failed

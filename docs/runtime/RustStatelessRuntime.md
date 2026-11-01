@@ -57,11 +57,20 @@ UTF-8/UUID, boxed participants and partition trait objects rather than COM lifet
    partition GUID and public stateless instance ID. A factory-owned context
    handle supplies activation snapshots; explicit `InstanceIntegrationProvider`
    captures native incarnation/integration separately, not as SDK arguments.
-4. Open receives `Arc<dyn IStatelessServicePartition>` and cancellation. Bind the
-   real application listener **before returning** its opaque endpoint string.
+4. Open receives `Arc<dyn IStatelessServicePartition>` and cancellation.
+   Successful Open may return an **empty opaque endpoint** when no client address
+   is advertised; emptiness is not failure or serving/deployment readiness.
+   If advertising a listener, bind it **before returning** its endpoint string.
 5. Close asynchronously disposes resources. Abort synchronously disposes them
    before returning; neither may rely on a dropped future as proof of cleanup.
 6. Explicitly await `shutdown()` for orderly unregistration.
+
+The [empty-endpoint lifecycle regression](../../crates/libs/fube-runtime/src/lifecycle_tests.rs#L1054-L1134)
+executes Rust RAP Open, duplicate Open and successful graceful Close with
+independent factory/callback counts and blocked actual destruction before Close
+ACK. Error, cancellation and retired-authority fences remain in force.
+This delivers the [H4 runtime prerequisite](../cluster/RustHosting.md#h4-owned-activation-and-real-stateless-lifecycle),
+not H4 owned activation or production deployed RA/RAP interoperability.
 
 The [compiling Rustdoc example](../../crates/libs/fube-runtime/src/lib.rs#L12-L31)
 uses the actual public reservation/registration APIs. Direct unknown async

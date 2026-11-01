@@ -376,17 +376,19 @@ activation remain gated; it is not live RA/RAP deployment.
 
 ### H4: owned activation and real stateless lifecycle
 
-**Dependent runtime-alignment prerequisite:** at the repository baseline,
-[`fube-runtime` Open][runtime-empty-open] rejects a successful empty endpoint
-with `InvalidInput("open returned empty endpoint")`, aborts the instance and
-replies with failure. Native [stateless EndOpen][native-stateless-end-open]
+**Delivered runtime-alignment prerequisite:**
+[`fube-runtime` Open][runtime-empty-open] accepts a successful empty opaque
+endpoint without treating it as failure. Native [stateless EndOpen][native-stateless-end-open]
 accepts null/empty endpoint results, and its
 [Open consumer][native-stateless-open-consumer] becomes Opened on success.
-H4 therefore includes a dependent `fube-runtime` alignment slice before its
-combined-path qualification; Hosting changes or test-host acceptance alone
-cannot satisfy this contract. Reuse the existing RAP and preserve genuine
-failure cleanup and authority checks. This design does not implement that fix
-or claim the current runtime already supports it.
+The [Rust lifecycle regression][runtime-empty-tests] executes actual
+application-side RAP messages with a test peer: empty success without Abort,
+matching duplicate reuse without another factory/Open, and successful graceful
+Close with independently observed destruction before ACK. Genuine failure
+cleanup and authority checks remain unchanged. This bounded prerequisite is
+delivered; H4 owned activation, production RA/RAP and combined-path deployed
+qualification below remain gated. Hosting/test-host acceptance alone is not
+Rust lifecycle evidence.
 
 Port the selected native activation lifecycle with a trusted local-package
 adapter instead of image-store download or a FabricHost dependency. Validate
@@ -405,10 +407,11 @@ RAP command. Preserve actual replies, endpoints and failures. Endpoint strings
 may be opaque or empty; application-specific probes belong in acceptance tests.
 There is no direct service callback or role setter on the node.
 
-The runtime prerequisite must prove that a successful empty-endpoint Open stays
+The delivered runtime prerequisite proves that a successful empty-endpoint Open stays
 Open without Abort, a matching duplicate Open returns the same empty endpoint
 without another factory/Open callback, and subsequent Close disposes the
-instance normally. H4 must also exercise this through real RA/RAP traffic using
+instance normally after successful graceful Close. H4 must still exercise this
+through its owned activation and production RA/RAP traffic using
 independent callback/resource observations, not a connection to the returned
 endpoint string. Nonempty samples or native-runtime test-host success do not
 qualify the Rust runtime's empty-endpoint path.
@@ -930,4 +933,5 @@ executes service callbacks under finite local authority.**
 [native-ra-type-map]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Hosting.ServiceTypeMapEntity.cpp#L16-L79
 [native-stateless-end-open]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ComProxyStatelessService.OpenAsyncOperation.cpp#L16-L35
 [native-stateless-open-consumer]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.OpenInstanceAsyncOperation.cpp#L134-L174
-[runtime-empty-open]: ../../crates/libs/fube-runtime/src/lifecycle.rs#L783-L849
+[runtime-empty-open]: ../../crates/libs/fube-runtime/src/lifecycle.rs#L845-L911
+[runtime-empty-tests]: ../../crates/libs/fube-runtime/src/lifecycle_tests.rs#L1054-L1161
