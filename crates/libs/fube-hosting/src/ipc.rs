@@ -464,29 +464,7 @@ impl RegistrationOwner {
             return Err(crate::Error::UnsupportedCapability);
         }
         let mut state = self.shared.state()?;
-        // Only the equal-version branch requires no package-lifecycle premise.
-        // Preserve the native candidate/sequence on mismatch without inventing
-        // successful scheduling; mismatch remains outside this live capability.
-        let id = crate::TypeInstance {
-            service_type: request.service_type.clone(),
-            activation: request.activation,
-            public_activation: String::new(),
-        };
-        if let Some(e) = state
-            .core
-            .type_entries()
-            .iter()
-            .find(|e| crate::compare_type_instances(&e.id, &id).is_eq())
-        {
-            if !e.runtime_id.is_empty() {
-                if let Ok(r) = state.core.find_runtime(&e.runtime_id) {
-                    if r.version != request.version {
-                        return Err(crate::Error::UnsupportedCapability);
-                    }
-                }
-            }
-        }
-        state.core.lookup(request, &crate::LookupModel::default())
+        state.core.lookup_registration(request)
     }
     pub fn close(self) -> crate::Result<Outputs> {
         self.live.store(false, Ordering::SeqCst);

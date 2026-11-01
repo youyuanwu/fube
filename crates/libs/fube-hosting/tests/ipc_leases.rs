@@ -673,6 +673,67 @@ fn never_reported_health_entity_removal_does_not_fabricate_delete_report() {
     server.stop().unwrap();
 }
 
+#[tokio::test]
+async fn scoped_lookup_preserves_registered_mismatch_snapshot_and_nonregistered_sequence() {
+    let mut server = server(LOCAL_LEASE_DURATION);
+    let owner = server.registration_owner(Default::default()).unwrap();
+    let a = admission();
+    let prepared = server
+        .admit_registration(&owner, a.clone(), vec!["Widget".into()], "prepared-package")
+        .unwrap();
+    let mut peer = Peer::connect(&server, a).await;
+    peer.bootstrap().await;
+    let source = owner.health_sources().unwrap().remove(0);
+    let version = server.status(&prepared.lease).unwrap().runtimes[0]
+        .version
+        .clone();
+    let mut request = fube_hosting::LookupRequest {
+        service_type: fube_hosting::ServiceTypeId {
+            name: "widget".into(),
+            ..source.id.service_type.clone()
+        },
+        version: version.clone(),
+        activation: fube_hosting::Activation::SHARED,
+        service_name: "fabric:/RustApp/service".into(),
+        application_name: "fabric:/RustApp".into(),
+        should_activate: false,
+    };
+    request.version.instance += 1;
+    let missing = owner.lookup(&request).unwrap();
+    assert_eq!(missing.result, Err(Error::TypeNotRegistered));
+    assert!(missing.candidate.is_none());
+    assert!(missing.sequence.is_some());
+    let type_request = type_request(&peer, "Widget");
+    let reply = peer
+        .call(9, "RegisterServiceTypeRequest", &type_request)
+        .await;
+    assert_eq!(
+        from_slice::<wire::ErrorReply>(&reply.body).unwrap().error,
+        0
+    );
+    let mismatch = owner.lookup(&request).unwrap();
+    assert_eq!(mismatch.result, Err(Error::UnsupportedCapability));
+    assert!(mismatch.sequence.is_some());
+    let candidate = mismatch.candidate.unwrap();
+    assert_eq!(candidate.type_instance.service_type.name, "widget");
+    assert_eq!(candidate.version, version);
+    assert_eq!(candidate.runtime_id, peer.runtime);
+    assert_eq!(candidate.package_instance_sequence, 2);
+    request.version = version;
+    let equal = owner.lookup(&request).unwrap();
+    assert_eq!(equal.result, Ok(()));
+    assert!(equal.candidate.is_some());
+    assert!(!owner
+        .take_outputs()
+        .unwrap()
+        .obligations
+        .iter()
+        .any(|o| matches!(o, fube_hosting::Obligation::DeactivationIfUnused { .. })));
+    drop(peer);
+    disconnected(&server, &prepared.lease).await;
+    server.stop().unwrap();
+}
+
 async fn disconnected(server: &Server, lease: &HostLease) {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {

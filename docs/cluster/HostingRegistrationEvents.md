@@ -43,7 +43,7 @@ factory permission.
 | Enabled/Disabled | Owned local staleness/coalescing/pending processing; activation is not the status key. No FM send/ACK API is exposed. |
 | Node managed health | Explicit construction-time reporting-disabled profile with real bounded entity/source/report/removal bookkeeping; no enabled processing/HM delivery. |
 | Application health/load/fault reports, required FM status completion, deployed lifecycle | Required profiles rejected before preparation; no successful dummy replies. |
-| Activating/mismatched-version operational lookup | Unsupported by this live slice without real required H2/package premises; unchanged H1/H2 APIs retain their broader candidate/error/sequence semantics. |
+| Activating/mismatched-version operational lookup | Activating lookup is unsupported. Registered mismatch returns an inner UnsupportedCapability with request-spelled candidate/sequence intact, without invented H2 scheduling/deactivation outcomes. |
 | Exclusive/adhoc/multicode/stateful/container/remote/TLS/upgrade/distributed leases | Unsupported; no field stripping or fabricated activation identities. |
 
 Native `FabricClient/IsHealthReportingEnabled=false` is an explicit
@@ -60,7 +60,7 @@ No enabled-health terminal local store is substituted for HM.
 
 The actual factory producer emits the ordered complete runtime context and
 type-instance identity. The production handler
-([ipc.rs:1422](../../crates/libs/fube-hosting/src/ipc.rs#L1422)) checks the full
+([ipc.rs:1400](../../crates/libs/fube-hosting/src/ipc.rs#L1400)) checks the full
 admitted wire context before H1 projection, declared type and exact current
 session/runtime ownership. Native semantic CI/UTF-16 identity is not replaced
 with blanket ASCII/Unicode folding. Transport route identity, semantic identity,
@@ -120,7 +120,7 @@ payload limits are not allocator/RSS guarantees. Default node bounds
 | Node transferred payload | 256 items/1MiB per each of the three lanes. Capacity leaves the original source head intact. |
 | Node retained fanout/results | Separate 8MiB per lane, conservative `128 + max_entities*512` per registration event; follows pending/unknown/receipt/shutdown ownership. |
 | Node routing | 32 current entity candidates by default, final validation still serialized. |
-| Node commands/results | 64 slots, input256KiB; aggregate4MiB includes worst-case retained output reservations until explicit collection. Checked arithmetic precedes enqueue. |
+| Node commands/results | 64 slots, input256KiB; aggregate4MiB includes worst-case retained output until collection. Lookup reserves projection bytes plus request-spelling/input and fixed-result bytes, not encoded UTF-16 frame size. Checked arithmetic precedes enqueue. |
 | Status history/pending | 64 types/256KiB; admission reserves possible keys before type preparation. |
 | Decision observation | At most30 seconds; Unknown retains accepted tickets and never resubmits them. Worker turns sleep5ms; uncertainty is not cancellation. |
 | IPC | Existing64KiB frames, finite read/write/scratch/result reservations and ≤30-second atomic local authority. |

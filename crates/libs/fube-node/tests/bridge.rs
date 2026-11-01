@@ -941,6 +941,86 @@ async fn terminal_ra_loss_fences_existing_factory_and_new_admission_without_anot
 }
 
 #[tokio::test]
+async fn legal_multibyte_lookup_payloads_remain_reserved_until_once_only_collection() {
+    let store = Arc::new(
+        Store::new(Box::new(MemoryBackend::new()), StoreSettings::default())
+            .await
+            .unwrap(),
+    );
+    let ra = Arc::new(
+        ra::Executor::new(store.clone(), ra_admission(), ra::Settings::default()).unwrap(),
+    );
+    let mut cfg = config();
+    cfg.queued_command_bytes = 300_000;
+    let mut node = Node::bind("127.0.0.1:0".parse().unwrap(), cfg, ra.clone()).unwrap();
+    let handle = node.handle();
+    let mut a = host_admission();
+    a.code.id.name = "界".repeat(28_000); // 56K native UTF-16 data, 84K retained UTF-8
+    let Response::Prepared(prepared) = request(
+        &handle,
+        Input::Admit {
+            admission: a.clone(),
+            types: vec!["Widget".into()],
+            source: "prepared-package".into(),
+        },
+    ) else {
+        panic!("admit");
+    };
+    assert!(prepared.failure.is_none());
+    let mut peer = Peer::new(&node, a).await;
+    peer.bootstrap().await;
+    peer.factory().await;
+    let lookup = hosting::LookupRequest {
+        service_type: hosting::ServiceTypeId {
+            package: hosting::PackageId {
+                application: hosting::ApplicationId {
+                    type_name: "App".into(),
+                    number: 1,
+                },
+                name: "Pkg".into(),
+            },
+            name: "widget".into(),
+        },
+        version: hosting::VersionInstance::default(),
+        activation: hosting::Activation::SHARED,
+        service_name: "fabric:/App/service".into(),
+        application_name: "fabric:/App".into(),
+        should_activate: false,
+    };
+    let first = handle.submit(Input::Lookup(lookup.clone())).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await; // completed but deliberately uncollected
+    for _ in 0..3 {
+        assert!(matches!(
+            handle.submit(Input::Lookup(lookup.clone())),
+            Err(fube_node::Error::Capacity)
+        ));
+    }
+    let Response::Lookup(result) = first.wait(WAIT).unwrap() else {
+        panic!("lookup");
+    };
+    assert_eq!(result.result, Ok(()));
+    assert_eq!(result.candidate.unwrap().code_package.len(), 84_000);
+    assert!(first.take().is_none());
+    let mut mismatch = lookup.clone();
+    mismatch.version.instance += 1;
+    let Response::Lookup(result) = request(&handle, Input::Lookup(mismatch)) else {
+        panic!("mismatch");
+    };
+    assert_eq!(result.result, Err(hosting::Error::UnsupportedCapability));
+    assert!(result.sequence.is_some());
+    let candidate = result.candidate.unwrap();
+    assert_eq!(candidate.code_package.len(), 84_000);
+    assert_eq!(candidate.type_instance.service_type.name, "widget");
+    assert!(
+        matches!(request(&handle, Input::Lookup(lookup)), Response::Lookup(r) if r.result.is_ok())
+    );
+    node.stop().unwrap();
+    handle.take_shutdown().unwrap();
+    ra.close(WAIT).await.unwrap();
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn required_unsupported_consumers_are_rejected_before_profile_admission() {
     let store = Arc::new(
         Store::new(Box::new(MemoryBackend::new()), StoreSettings::default())

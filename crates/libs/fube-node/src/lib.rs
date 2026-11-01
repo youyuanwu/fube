@@ -969,7 +969,14 @@ fn reply_reservation(input: &Input, config: &Config) -> usize {
             .max_admissions
             .saturating_mul(16)
             .saturating_mul(256),
-        Input::Lookup(_) => 64 * 1024,
+        // UTF-16 wire size is not retained UTF-8 size. Every admitted runtime
+        // context fits the proven projection budget; candidate request spelling
+        // fits the separately charged input budget. Include fixed result data.
+        Input::Lookup(_) => config
+            .hosting
+            .projection_bytes
+            .saturating_add(input_bytes(input))
+            .saturating_add(256),
         Input::Admit { .. } | Input::PreparedFailure { .. } | Input::RemoveFailure(_) => 512,
     }
 }
