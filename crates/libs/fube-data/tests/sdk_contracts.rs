@@ -258,33 +258,23 @@ async fn model_stop_observes_actual_close_before_guarded_shutdown_with_active_ep
         .await
         .unwrap()
         .unwrap();
-    let close = host.close_submitted();
-    let requested = host.close_requested();
-    let submitted = requested.notified();
-    tokio::pin!(submitted);
-    submitted.as_mut().enable();
+    let mut events = host.subscribe_events();
     let stopped = std::thread::spawn(move || drop(host));
-    let retained = tokio::time::timeout(std::time::Duration::from_secs(2), submitted).await;
+    let retained = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await;
     let waited_for_callback = !stopped.is_finished();
     // Always release the callback, including failed pre-correction probes.
     let _ = release.send(());
     let result = tokio::time::timeout(std::time::Duration::from_secs(2), pending).await;
-    let sent = tokio::time::timeout(std::time::Duration::from_secs(2), close.notified()).await;
+    let sent = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await;
     let joined = tokio::task::spawn_blocking(move || stopped.join())
         .await
         .unwrap();
-    assert!(
-        retained.is_ok(),
-        "model did not retain Close while callback was held"
-    );
+    assert_eq!(retained.unwrap().unwrap(), rap::HostEvent::CloseRequested);
     assert!(
         waited_for_callback,
         "model shut down before admitted callback completed"
     );
-    assert!(
-        sent.is_ok(),
-        "actual Close frame not submitted after callback completion"
-    );
+    assert_eq!(sent.unwrap().unwrap(), rap::HostEvent::CloseFrameSent);
     assert!(
         result.unwrap().unwrap().is_ok(),
         "original callback result was not successful"
