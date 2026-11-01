@@ -237,7 +237,137 @@ pub struct PreparedRegistration {
     pub admitted: usize,
     pub failure: Option<(usize, crate::Error)>,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryLane {
+    Registration,
+    Status,
+    Obligation,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivery {
+    Registration(crate::ClosedRegisteredEvent),
+    Status(crate::EnabledDisabledEvent),
+    Obligation(crate::Obligation),
+}
+impl Delivery {
+    pub fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Registration(e) => e.bytes(),
+            Self::Status(e) => e.bytes(),
+            Self::Obligation(e) => e.bytes(),
+        }
+    }
+}
 impl RegistrationOwner {
+    pub fn withdraw(&self) {
+        self.live.store(false, Ordering::SeqCst);
+    }
+    /// Reserve downstream capacity before ownership transfer. Saturation leaves
+    /// the original head in its producer lane; it is never a lossy subscription.
+    pub fn next_delivery(
+        &self,
+        lane: DeliveryLane,
+        available_bytes: usize,
+    ) -> crate::Result<Option<Delivery>> {
+        let mut state = self.shared.state()?;
+        if !state
+            .consumer
+            .as_ref()
+            .is_some_and(|v| Arc::ptr_eq(v, &self.live))
+        {
+            return Err(crate::Error::ObjectClosed);
+        }
+        let size = match lane {
+            DeliveryLane::Registration => state
+                .core
+                .state
+                .closed_registered
+                .first()
+                .map(|e| e.bytes()),
+            DeliveryLane::Status => state.core.state.enabled_disabled.first().map(|e| e.bytes()),
+            DeliveryLane::Obligation => state.core.state.obligations.first().map(|e| e.bytes()),
+        };
+        let Some(size) = size else {
+            return Ok(None);
+        };
+        if size > available_bytes {
+            return Err(crate::Error::Capacity);
+        }
+        Ok(Some(match lane {
+            DeliveryLane::Registration => {
+                Delivery::Registration(state.core.state.closed_registered.remove(0))
+            }
+            DeliveryLane::Status => Delivery::Status(state.core.state.enabled_disabled.remove(0)),
+            DeliveryLane::Obligation => {
+                Delivery::Obligation(state.core.state.obligations.remove(0))
+            }
+        }))
+    }
+    pub fn take_operations(&self) -> crate::Result<Vec<OperationResult>> {
+        let mut state = self.shared.state()?;
+        Ok(state
+            .records
+            .iter_mut()
+            .flat_map(|r| r.results.drain(..))
+            .collect())
+    }
+    /// Explicit producer input, not proof of physical package activation/failure.
+    pub fn prepared_type_failure(
+        &self,
+        id: &crate::TypeInstance,
+        failure: String,
+        grace_ticks: i64,
+    ) -> crate::Result<()> {
+        if !self.live.load(Ordering::SeqCst) {
+            return Err(crate::Error::ObjectClosed);
+        }
+        let mut state = self.shared.state()?;
+        state.core.register_failure(failure.clone())?;
+        state.core.disable_type(
+            id,
+            &failure,
+            &crate::ManualClock(self.shared.ticks()),
+            grace_ticks,
+            true,
+        )?;
+        Ok(())
+    }
+    pub fn remove_prepared_failure(&self, failure: &str) -> crate::Result<()> {
+        self.shared.state()?.core.unregister_failure(failure)
+    }
+    pub fn drive_type_timers(&self) -> crate::Result<()> {
+        let mut state = self.shared.state()?;
+        let now = self.shared.ticks();
+        let due: Vec<_> = state
+            .core
+            .timers()
+            .iter()
+            .filter(|t| {
+                t.due_ticks <= now && matches!(t.kind, crate::TimerKind::DisableType { .. })
+            })
+            .cloned()
+            .collect();
+        for timer in due {
+            let mut health = state.health.clone();
+            if let crate::TimerKind::DisableType {
+                type_instance,
+                sequence,
+            } = &timer.kind
+            {
+                if state.core.type_entries().iter().any(|e| {
+                    crate::compare_type_instances(&e.id, type_instance).is_eq()
+                        && e.sequence == *sequence
+                        && e.status == crate::TypeStatus::NotRegisteredDisableScheduled
+                }) {
+                    health.disabled(type_instance, &self.shared.config.node)?;
+                }
+            }
+            if state.core.disable_timer_input(&timer)? {
+                state.health = health;
+            }
+        }
+        Ok(())
+    }
     pub fn take_outputs(&self) -> crate::Result<Outputs> {
         let mut state = self.shared.state()?;
         if !state

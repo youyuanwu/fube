@@ -30,6 +30,9 @@ pub use description::ServiceDescriptionCompletion;
 #[path = "config.rs"]
 mod config;
 pub use config::*;
+#[path = "hosting_events.rs"]
+mod hosting_events;
+pub use hosting_events::*;
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -52,6 +55,13 @@ pub enum Disposition {
     IgnoredStale,
     IgnoredPending,
     IgnoredNotReady,
+    HostingMatchedNoWork,
+    HostingReopenRequired,
+    HostingOpenRetryRequired,
+    HostingCloseRetryRequired,
+    HostingRuntimeCloseRequired,
+    HostingHostCrashRequired,
+    HostingStatusProcessed,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -214,6 +224,9 @@ pub enum Command {
     Registered(Box<RegistrationCompletion>),
     CompleteClose(Box<CloseCompletion>),
     HostDown(Box<HostDown>),
+    HostingRegistered(Box<HostingRegistered>),
+    HostingRuntimeClosed(Box<HostingRuntimeClosed>),
+    HostingHostClosed(Box<HostingHostClosed>),
     RetryClose(PartitionId),
     RetryReport(PartitionId),
     /// Honor pending Add-carried RAP description work; not an FM replacement retry.
@@ -259,6 +272,9 @@ enum Kind {
     Registered,
     CompleteClose,
     HostDown,
+    HostingRegistered,
+    HostingRuntimeClosed,
+    HostingHostClosed,
     RetryClose,
     RetryReport,
     RetryServiceDescription,
@@ -561,6 +577,15 @@ impl Executor {
                 (body.unit.id.guid.0, Kind::CompleteClose, to_vec(&body))
             }
             Command::HostDown(body) => (body.unit.guid.0, Kind::HostDown, to_vec(&body)),
+            Command::HostingRegistered(body) => {
+                (body.unit.guid.0, Kind::HostingRegistered, to_vec(&body))
+            }
+            Command::HostingRuntimeClosed(body) => {
+                (body.unit.guid.0, Kind::HostingRuntimeClosed, to_vec(&body))
+            }
+            Command::HostingHostClosed(body) => {
+                (body.unit.guid.0, Kind::HostingHostClosed, to_vec(&body))
+            }
             Command::RetryClose(unit) => (unit.guid.0, Kind::RetryClose, to_vec(&unit)),
             Command::RetryReport(unit) => (unit.guid.0, Kind::RetryReport, to_vec(&unit)),
             Command::RetryServiceDescription(unit) => {
@@ -604,6 +629,7 @@ impl Executor {
             Kind::Add { .. } => 2,
             Kind::Retry | Kind::RetryReport | Kind::RetryServiceDescription => 1,
             Kind::CompleteServiceDescription => 0,
+            Kind::HostingRegistered | Kind::HostingRuntimeClosed | Kind::HostingHostClosed => 0,
             kind if kind.node_work() => 2,
             _ => 8,
         };
@@ -661,6 +687,11 @@ impl Executor {
             .get(&entity)
             .cloned()
             .unwrap_or_default()
+    }
+    /// Bounded current routing inventory; the serialized worker still performs
+    /// final committed-state validation after this potentially stale snapshot.
+    pub fn entity_ids(&self) -> Vec<EntityId> {
+        lock(&self.shared.view).entities.keys().copied().collect()
     }
     pub fn statistics(&self) -> Statistics {
         lock(&self.shared.view).stats.clone()
@@ -1008,6 +1039,9 @@ fn transition(
                 update: Update::Memory(proposed),
                 disposition: Disposition::Applied,
             })
+        }
+        Kind::HostingRegistered | Kind::HostingRuntimeClosed | Kind::HostingHostClosed => {
+            hosting_events::consume(work, state, admission)
         }
         _ => lifecycle::transition(work, state, admission, config),
     }

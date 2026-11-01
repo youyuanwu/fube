@@ -341,6 +341,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fube-node"
+version = "0.1.0"
+dependencies = [
+ "fube-hosting",
+ "fube-ra",
+ "fube-ra-store",
+ "fube-transport",
+ "serde",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "fube-ra"
 version = "0.1.0"
 dependencies = [

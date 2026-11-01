@@ -5,6 +5,7 @@ use crate::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisabledReportKind {
     Registered,
+    TypeDisabled,
     DeleteEvent,
     DeleteEntity,
 }
@@ -12,6 +13,7 @@ pub enum DisabledReportKind {
 pub struct DisabledReport {
     pub kind: DisabledReportKind,
     pub source: &'static str,
+    pub health_state: i64,
     pub sequence: u64,
     pub entity_instance: u64,
     pub node_id: String,
@@ -173,6 +175,17 @@ impl DisabledHealth {
         self.check()
     }
     pub fn registered(&mut self, id: &TypeInstance, node: &crate::wire::StartReply) -> Result<()> {
+        self.report(id, node, DisabledReportKind::Registered)
+    }
+    pub fn disabled(&mut self, id: &TypeInstance, node: &crate::wire::StartReply) -> Result<()> {
+        self.report(id, node, DisabledReportKind::TypeDisabled)
+    }
+    fn report(
+        &mut self,
+        id: &TypeInstance,
+        node: &crate::wire::StartReply,
+        kind: DisabledReportKind,
+    ) -> Result<()> {
         let i = self
             .sources
             .iter()
@@ -188,8 +201,13 @@ impl DisabledHealth {
         entity.has_sent_report = true;
         let s = &mut self.sources[i];
         s.last_disabled_report = Some(DisabledReport {
-            kind: DisabledReportKind::Registered,
+            kind,
             source: "System.Hosting",
+            health_state: if kind == DisabledReportKind::TypeDisabled {
+                3
+            } else {
+                1
+            },
             sequence,
             entity_instance: s.entity_instance,
             node_id: node.node_id.clone(),
@@ -242,6 +260,7 @@ impl DisabledHealth {
                 DisabledReportKind::DeleteEvent
             },
             source: "System.Hosting",
+            health_state: 1,
             sequence,
             entity_instance: source.entity_instance,
             node_id: node.node_id.clone(),
