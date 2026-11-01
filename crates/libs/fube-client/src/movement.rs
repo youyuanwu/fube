@@ -12,7 +12,7 @@ use fube_transport::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct MovePrimary {
     #[serde(rename = "NodeName")]
     pub(crate) target: String,

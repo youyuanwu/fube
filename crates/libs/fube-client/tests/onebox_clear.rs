@@ -7,9 +7,9 @@ use std::{
 };
 
 use fube_client::{
-    FabricClient, GatewayDescription, HealthState, Node, NodeDeactivationIntent,
-    NodeDeactivationStatus, NodeListPage, NodeQueryDescription, NodeQueryParameters, NodeStatus,
-    NodeStatusFilter, Paging, DEFAULT_TIMEOUT,
+    ClientError, DomainFailure, FabricClient, GatewayDescription, HealthState, Node,
+    NodeDeactivationIntent, NodeDeactivationStatus, NodeListPage, NodeQueryDescription,
+    NodeQueryParameters, NodeStatus, NodeStatusFilter, Paging, DEFAULT_TIMEOUT,
 };
 use serde::Deserialize;
 use tokio::{
@@ -20,7 +20,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-const CONCURRENT_OPERATIONS: usize = 32;
+const CONCURRENT_OPERATIONS: usize = 8;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const OBSERVATION_MAX_AGE_MS: u64 = 120_000;
 
@@ -395,7 +395,9 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
         )
         .await
         .expect_err("malformed continuation must be a native error, not empty success");
-    let fube_client::Error::Remote { code, message } = invalid else {
+    let (ClientError::Domain(DomainFailure { code, message })
+    | ClientError::Transport(fube_client::Error::Remote { code, message })) = invalid
+    else {
         panic!("expected native error, got {invalid:?}");
     };
     // On this runtime all invalid-token subqueries can fail, and the parallel
@@ -649,7 +651,13 @@ async fn onebox_ping_name_exists_and_node_list() {
     })
     .await;
     assert_eq!(initially_pending_count, CONCURRENT_OPERATIONS);
-    assert!(initially_pending_count >= 16);
+    assert_eq!(initially_pending_count, 8);
+    assert!(matches!(
+        client.ping(None).await,
+        Err(ClientError::Local(fube_client::Error::ResourceLimit(_)))
+    ));
+    assert!(!client.is_closed());
+    assert!(client.terminal_error().is_none());
     let mut operations = JoinSet::new();
     for operation in pending_operations {
         operations.spawn(operation);
@@ -711,6 +719,8 @@ async fn onebox_ping_name_exists_and_node_list() {
                 "case": "native_concurrent_mixed",
                 "operation_count": concurrent_completed,
                 "initially_pending_count": initially_pending_count,
+                "ninth_call_rejected_locally": true,
+                "reuse_after_slot_release": true,
                 "ping_count": (0..CONCURRENT_OPERATIONS).filter(|i| i % 5 <= 1).count(),
                 "existing_name_count": (0..CONCURRENT_OPERATIONS).filter(|i| i % 5 == 2).count(),
                 "absent_name_count": (0..CONCURRENT_OPERATIONS).filter(|i| i % 5 == 3).count(),

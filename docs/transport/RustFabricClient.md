@@ -10,6 +10,17 @@ have been demonstrated against the repository's Ubuntu onebox running
 Service Fabric **11.8.121.4**. This is not a complete FabricClient replacement
 and does not support TLS or authentication.
 
+**Ordinary-channel migration:** all 16 existing ordinary operations now use
+GatewayChannel through a shared, sealed typed-call layer. Naming, all nine
+list/deployed-list queries, node health, resolution and MovePrimary retain their
+native schemas. `FabricClient` explicitly owns the channel; `GatewayClient`
+borrows a supplied binding. ServiceNotificationClient owns its **own**
+notification-enabled GatewayChannel/native session; it does not adopt an
+ordinary client's channel or lifecycle. Image-transfer remains an independent
+`Connection` consumer. Rust error/admission/lifecycle changes below
+are deliberate API breaks, not compatibility wrappers. Historical source/wire
+evidence in later sections is not a substitute for current migration receipts.
+
 Native ImageStore v1.2 package copy has also qualified on **11.8.121.4**:
 native SDK predecessor/Rust replacement comparison, completion markers,
 provisioning/creation, independent live application contact and deployed Data
@@ -52,7 +63,8 @@ Neither uses HTTP to execute client operations. "Clear TCP" still carries the
 | ResolveServicePartition | Uncached native gateway request with singleton, named or signed-int64 selection and optional previous-result metadata. Owned partition details, endpoints/roles and identity-scoped generation/lookup versions. All three key kinds, refreshes, missing-service errors and independent endpoint/role comparisons qualified on 11.8.121.4. |
 | Service notifications | Standalone noncloneable `ServiceNotificationClient`, independent connection/session/receiver, many owning RAII filter guards. Exact/prefix/primary-only registration, native updates, endpoint-count changes, primary replacement, empty invalidations, unregister and independent close qualified on 11.8.121.4. A lost successful ACK caused a real native retry without duplicate delivery. Distinct-address primary-only delivery remains separately unqualified. |
 | Native ImageStore package copy | Dedicated `ImageStoreClient`, v1.2 session/chunk/commit protocol and native AtomicCopy root replacement. Rust's complete inventory matched one native SDK predecessor minus a deliberate obsolete file, and independently matched local files/zero-byte postorder `_.dir` markers. Nested Unicode/space paths, empty files/directories, 7 MiB data, a 132 MiB binary, stale removal, provisioning/creation, independent live application contact and deployed Data SHA256 comparison passed on 11.8.121.4. Repeated native SDK copy reliability is not claimed. |
-| Native faults/errors | Retains native signed error codes and available diagnostics. Malformed GetNodeList continuation produced live `E_INVALIDARG` (-2147024809) or `FMFailoverUnitNotFound` (-2147017462); the same connection remained usable. Other fault forms have offline model-peer coverage. |
+| MovePrimary | Constraint-enforced native FM query with RS13/QueryReply and empty QueryResult. No force/ignore option. Current owned-fixture qualification records independent native/HTTP primary transition and cleanup. |
+| Native faults/errors | Typed Local/Transport/Protocol/Domain origins. Transport Fault retains its exact header code with a generic diagnostic, not optional native-body enrichment. Domain failures retain required native codes and valid diagnostic data. |
 | Concurrent operations | Mixed ping, NameExists, node-list and node-health queries on clones sharing one connection; real onebox coverage. Deterministic cancellation/late-reply safety remains model-covered. |
 | Idle disconnect | Real native ping through a test-owned proxy, followed by proxy cutoff; closure detected without another operation. |
 | Controls and stream lifecycle | Idle ListenInstance, deadlines, fragmentation, backpressure, correlation, cancellation, and close/drop; offline model-peer coverage. |
@@ -154,7 +166,7 @@ just onebox destroy poc --confirm poc
 ```rust,no_run
 use fube_client::{FabricClient, DEFAULT_TIMEOUT};
 
-# async fn example() -> fube_client::Result<()> {
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let endpoint = "127.0.0.1:19000".parse().expect("IP socket endpoint");
 let client = FabricClient::connect_clear(endpoint, DEFAULT_TIMEOUT).await?;
 let clone = client.clone();
@@ -167,10 +179,26 @@ client.close().await?;
 # }
 ```
 
-The handle is **cloneable**; operations take `&self` and share one connection.
-Admission allows 32 operations, including completed results not yet delivered
-to their awaiting futures. Excess callers wait within their original deadlines.
-There is no automatic reconnect, retry, or replay.
+The explicit owner is **cloneable**; operations take `&self` and share one
+GatewayChannel, target and typed budget. Default admission is **eight** retained
+calls, including ready-undelivered replies. The ninth fails immediately with a
+local resource error; there is no admission-waiter queue. Default lifetime
+identity history is **4096**, including the handshake; exhaustion terminates
+the channel without automatic reconnect, retry or replay.
+
+Ordinary methods return `ClientResult<T>` / `ClientError<DomainFailure>`:
+`Local(Error)` for preparation/budget, `Transport(Error)` for RPC including
+Fault, `Protocol(&'static str)` for malformed/mismatched required domain data,
+and `Domain { code, message }` for valid native operation failure. Connect/close
+and excluded clients retain transport Result/Error. There are no flattening
+conversions or old-Connection compatibility wrappers.
+
+The shared `Client::call` future is lazy and owns a sealed `ClientRequest`.
+Preparation, admission and I/O begin on first poll. `GatewayClient::new` borrows
+an explicitly supplied channel/target; it does not clone/adopt/close an external
+owner. Concrete query descriptions, PingRequest, NameRequest and
+ResolutionRequest use existing codecs. Resolution retains owned selection and
+minimal previous refresh metadata, never a cloned endpoint cache.
 
 Every remote operation takes a final `timeout: Option<Duration>` argument.
 `None` uses the default configured by `connect_clear`; `Some(duration)` overrides
@@ -179,13 +207,13 @@ infinite. Explicit durations must satisfy the same finite positive bounds as
 the configured default. There are no separate `_with_timeout` methods.
 
 `create_name(name, timeout)` and `delete_name(name, timeout)` return owned
-`Result<()>` and use one deadline calculated **before URI preparation**, through
+`ClientResult<()>` and use one deadline calculated **before URI preparation**, through
 admission and reply decoding. Both reuse the existing bounded URI encoder and
 shared driver; the supported URI grammar is unchanged.
 For example, with a unique caller-owned name on a disposable cluster:
 
 ```rust,no_run
-# async fn write(client: &fube_client::FabricClient, owned_name: &str) -> fube_client::Result<()> {
+# async fn write(client: &fube_client::FabricClient, owned_name: &str) -> fube_client::ClientResult<()> {
 client.create_name(owned_name, Some(std::time::Duration::from_secs(5))).await?;
 client.delete_name(owned_name, None).await?;
 # Ok(())
@@ -197,7 +225,7 @@ an already **explicitly created** name returns native `FABRIC_E_NAME_ALREADY_EXI
 (-2147017792), not an idempotent success. Deleting an absent name returns
 `FABRIC_E_NAME_DOES_NOT_EXIST` (-2147017791). Deletion is not recursive and can
 reject a nonempty name; the service may remove empty implicit ancestors.
-Native codes and available diagnostics remain `Error::Remote`, operation-local
+Native body codes/diagnostics remain `ClientError::Domain`, operation-local
 when the stream is healthy. Write success has an empty body, unlike NameExists
 despite their shared reply action.
 
@@ -234,24 +262,38 @@ within 30 seconds of their first byte; an idle connection has no inactivity
 timeout. A stalled partial read/write, I/O failure, or malformed frame closes
 the connection and resolves pending callers.
 
-Successful operation bodies are decoded on the driver before result delivery.
-Malformed success closes the shared connection, even if its waiter has not been
-polled again. An ordinary complete native operation failure preserves its error
-code without itself poisoning the stream. Cancellation/timeout does not imply
-that remote execution was cancelled. Invalid naming input sends nothing.
+Successful domain bodies are decoded on the polling typed observer, not a
+detached task or the transport driver. The absolute deadline is rechecked
+before/after preparation and final validation: an on-time channel settlement
+observed too late cannot become a late typed success. Malformed/mismatched
+domain data fails only that call and leaves neighbors/owner usable; malformed
+transport envelopes independently terminate the channel. Native code-only
+ClientOperationFailure suffixes are valid; a present diagnostic must decode.
+Transport Fault diagnostics are not reconstructed from the consumed body.
+Cancellation/timeout does not imply remote cancellation. Invalid input sends nothing.
+
+Ordinary replies use native's final effective RelatesTo in wire order.
+All repeated records are validated and preserved under the
+[channel's header/frame bounds](NativeChannel.md#supported-profile), without a
+special forwarding-count or repetition-pattern restriction. Typed operations
+validate their normal reply actor/action/body profile independently.
+No earlier pending-ID fallback, header normalization, notification/IPC expansion
+or trust bypass.
 
 `is_closed()` observes terminal state, including idle failures;
 `terminal_error()` returns the first terminal cause. Later operations surface
-that cause rather than reconnecting. `close()` is shared and idempotent, resolves
+closure/resource/deadline errors rather than reconnecting; inspect
+`terminal_error()` for the original cause. `close()` is shared and idempotent, resolves
 pending callers and waits for driver exit. Cancelling its wait does not cancel
 shutdown. Dropping one clone leaves others usable; dropping the final handle
 signals shutdown without an asynchronous join. Use `close()` when release must
 be observed before continuing.
 
-`ScheduleClose` conservatively retires immediately, preserving a readable native
-fault code; native delayed security-session draining is not implemented.
-`Reconnect`, authorization/security controls, and unknown control actions are
-unsupported in this clear-only profile and terminate explicitly. This is not
+Only valid ListenInstance updates are supported controls. `ScheduleClose`,
+`Reconnect`, authorization/security controls and other control actions are
+unsupported and terminate explicitly; there is no delayed session draining or
+recovery. Supported correlated Faults retain exact header code, not optional
+diagnostic-body enrichment. This is not
 qualification of native secure-session recovery or service notifications.
 
 ### Native ImageStore application-package copy
@@ -389,10 +431,10 @@ for the native wire.
 
 Internally, parameter structs implement `Query: Serialize`, binding the native
 query name, optional `validate_parameters` hook, paging placement, output and
-declarative reply profile. Request wrappers retain their public composition;
-the executor receives parameters and optional paging separately, without trait
-accessors for either. It starts the deadline before preparation and supplies the
-typed decoder to the connection driver. The shared encoder validates and
+declarative reply profile. Existing request wrappers implement the sealed
+ClientRequest family. The shared call starts its deadline before preparation,
+awaits an opaque channel response and validates/decodes on the polling typed
+observer, never on the transport driver. The shared encoder validates and
 serializes parameters directly; operations no longer implement parameter encoding.
 A dedicated Serde argument serializer consumes the parameter types and `Paging`.
 Ordinary `rename`, `flatten`, `skip_serializing_if` and reusable `with` field
@@ -474,7 +516,7 @@ use fube_client::{
     FabricClient, NodeQueryDescription, NodeQueryParameters, NodeStatusFilter, Paging,
 };
 
-# async fn pages(client: &FabricClient) -> fube_client::Result<()> {
+# async fn pages(client: &FabricClient) -> Result<(), Box<dyn std::error::Error>> {
 let mut query = NodeQueryDescription {
     parameters: NodeQueryParameters {
         status_filter: NodeStatusFilter::UP | NodeStatusFilter::DOWN,
@@ -522,8 +564,8 @@ not a UUID; its display matches native hexadecimal numeric formatting.
 zero means native default. Durations remain signed native seconds.
 Scalar enums distinguish named `Unknown` from `Unrecognized(i64)`; unrecognized
 numbers are retained, not silently coerced. Unsupported polymorphic wrapper/
-safety-check tags or malformed field structure fail explicitly and retire the
-stream. Nonempty deactivation/safety variants have source/model coverage only.
+safety-check tags or malformed field structure fail explicitly for that typed
+call, without aborting the owner. Nonempty deactivation/safety variants have source/model coverage only.
 
 ### Native node health
 
@@ -533,7 +575,7 @@ use fube_client::{
     NodeHealthQueryParameters,
 };
 
-# async fn health(client: &FabricClient) -> fube_client::Result<()> {
+# async fn health(client: &FabricClient) -> Result<(), Box<dyn std::error::Error>> {
 let mut query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("N0020"));
 query.parameters.events_filter = Some(HealthEventsFilter::ERROR.into());
 query.parameters.health_policy = Some(NodeHealthPolicy { consider_warning_as_error: true });
@@ -546,7 +588,7 @@ for evaluation in health.unhealthy_evaluations {
 # }
 ```
 
-`get_node_health` uses one deadline from preparation through driver
+`get_node_health` uses one deadline from preparation through typed-observer
 decode, like node-list. `NodeHealth` owns its node name, event vector, aggregate
 `HealthState` and unhealthy evaluations. This is **actual detail health**, not
 `Node.health_state` from GetNodeList. Unhealthy aggregate is successful data;
@@ -587,7 +629,7 @@ single-node detail path generates Event evaluations, including synthetic HM
 reports; it may return a representative explanation, not every unhealthy event.
 Other general health evaluation kinds/recursive child trees are **not**
 implemented: unknown structural tags, tag/kind disagreement, mandatory nulls
-and malformed success retire the shared stream explicitly.
+and malformed domain success fail the typed call explicitly.
 
 The exact source pin remains
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`, separate from deployed runtime
@@ -608,7 +650,7 @@ use fube_client::{
     Paging, ServiceListFilter, ServiceQueryDescription, ServiceQueryParameters,
 };
 
-# async fn workloads(client: &FabricClient) -> fube_client::Result<()> {
+# async fn workloads(client: &FabricClient) -> Result<(), Box<dyn std::error::Error>> {
 let mut applications = ApplicationQueryDescription {
     parameters: ApplicationQueryParameters {
         filter: ApplicationListFilter::TypeName("MyApplicationType".into()),
@@ -640,10 +682,10 @@ println!("continuation={:?}", page.continuation_token);
 `get_application_list` / `get_service_list` use the connection's configured
 default operation timeout when passed `None`, or an override with `Some(duration)`.
 Both use one deadline from preparation through admission, write waiting and
-driver decode. Neither
+typed-observer decode. Neither
 automatically pages, retries, reconnects or replays. Native errors stay
-`Error::Remote { code, message }` and permit same-connection reuse; malformed
-successful results retire the shared stream before pending callers can reuse it.
+`ClientError::Domain` and permit same-owner reuse; malformed successful domain
+results return `ClientError::Protocol` without failing independent neighbors.
 
 | Description | Selector and independent controls |
 |---|---|
@@ -739,7 +781,7 @@ Each accepts a `PagedQuery`-based description and returns one owned `QueryPage`.
 The optional timeout uses one whole-operation deadline,
 including parameter validation and decoding. Continuations are opaque and must
 be followed explicitly; observations across pages and families are not a
-snapshot. Native errors remain operation-local, while malformed replies retire
+snapshot. Native errors and malformed domain replies remain operation-local; transport failures retire
 the shared connection. The existing restricted naming URI profile still applies
 to service names and application selectors.
 
@@ -751,7 +793,7 @@ use fube_client::{
     ReplicaQueryDescription, ReplicaQueryParameters,
 };
 
-# async fn topology(client: &FabricClient, partition_id: uuid::Uuid) -> fube_client::Result<()> {
+# async fn topology(client: &FabricClient, partition_id: uuid::Uuid) -> Result<(), Box<dyn std::error::Error>> {
 let mut partitions = PartitionQueryDescription::new(PartitionQueryParameters::new(
     "fabric:/MyApplication/MyService".parse()?,
 ));
@@ -861,7 +903,7 @@ Each takes a `QueryDescription`-based request and returns `Vec<Record>`, not a
 `QueryPage`. The native facade/specifications expose **no paging controls** for
 these queries: there is no `paging`, `MaxResults` or continuation token to set.
 Each takes an optional timeout, with the same whole-operation
-deadline, native-error reuse and malformed-response retirement behavior as the
+deadline, native-error reuse and call-local domain validation behavior as the
 other queries. There are no retries, reconnects or automatic replay.
 Unpaged description JSON rejects unknown outer fields, including `paging`,
 rather than ignoring unsupported controls. This also tightens the shared
@@ -876,7 +918,7 @@ use fube_client::{
     DeployedReplicaQueryParameters,
 };
 
-# async fn inspect(client: &FabricClient) -> fube_client::Result<()> {
+# async fn inspect(client: &FabricClient) -> Result<(), Box<dyn std::error::Error>> {
 let application = "fabric:/MyApplication".parse()?;
 let packages = DeployedServicePackageQueryDescription::new(
     DeployedServicePackageQueryParameters::new("N0010", application),
@@ -1023,13 +1065,38 @@ Explicit close attempts deregistration under one deadline and awaits task/socket
 stop even on cleanup failure. Owner drop initiates shutdown; remote disconnect
 cleanup is eventual, not an immediate deregistration guarantee.
 
+**Notification connect-policy break:** `connect_clear(SocketAddr, Duration)`
+now accepts only explicit numeric loopback/nonzero-port NamingGateway endpoints,
+matching GatewayChannel's existing unsecured profile. Previously accepted
+non-loopback addresses now fail InvalidInput. No hostname/advertised-address
+fallback, compatibility wrapper or TLS/claims/security expansion is supplied.
+The native session/filter API and error types otherwise remain unchanged.
+
+Construction pulls and client-charges ingress alongside Connect, then admits a
+finite pending snapshot before starting semantic draining or publishing the
+owner. Runtime staging and semantic processing are scoped inside one worker.
+Registration cancellation can retract until the first **positive** socket write;
+after visibility an unconfirmed mutation retires the session. Dropping/cancelling
+close fences the owner and stops the same worker/socket; awaitable close retains
+its worker handle and observes teardown after the shared cleanup deadline.
+An irrevocably started frame retains the separate 30-second completion watchdog.
+
+Native retries preserve logical page identity but the proxy assigns a fresh
+client-leg MessageId on every forwarding attempt
+([pinned source:453–483](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/ServiceNotificationManagerProxy.cpp#L453-L483)).
+The client suppresses accepted versions, merges progress and ACKs each admitted
+attempt. Transport same-ID collisions still terminate without a second reply
+authority. ACK success means whole-page local acceptance, not application
+consumption or a per-page fixed-body fingerprint.
+
 Notification construction, registration, receive, unregister, and close return
 `NotificationResult<T>`, whose error is `NotificationError`. Delivery-budget
 exhaustion is `NotificationError::Lagged`; notification filter/bookkeeping/queue
 limits are `NotificationError::ResourceLimit`. Shared transport, protocol,
 timeout, input, and native faults are retained as `NotificationError::Common(Error)`,
 including genuinely shared decoder/control resource limits. The ordinary
-`FabricClient` keeps its existing `Result<T>` and has no notification-only error cases.
+`FabricClient` uses layered `ClientResult<T>` and has no notification-only error cases;
+notification-only failures stay above the shared channel and its opaque RPC boundary.
 This changes notification method error types, not the native payload or wire
 format. Match `NotificationError::Common(Error::Timeout)` for a notification
 timeout instead of matching `Error::Timeout` directly.
@@ -1075,28 +1142,32 @@ Naming methods accept `impl AsRef<str>`, so both existing string calls and
 | String | 32,768 UTF-16 code units |
 | Byte-array/object-array/type-information count | 4,096 |
 | Application/service rows, parameter pairs, URI segments | 4,096 each (the row bound is independent of requested count) |
-| Admitted operations, including unconsumed results | 32 |
-| Queued output frames, including cancelled commands awaiting disposal | 32 |
+| Ordinary typed/RPC calls, including undelivered results | 8 by default; immediate exhaustion error |
+| Ordinary lifetime IDs, including handshake | 4096; terminal exhaustion |
+| Typed input owned capacities | 1 MiB per accepted call |
+| Typed retained-byte reservation | 4 GiB +16 MiB per call; conservative accounting, not an allocation/RSS estimate |
+| Channel aggregate retained-byte reservation | 512 MiB ordinary default; 2 GiB notification-owned profile, not eager allocation |
 | Started write / partial incoming frame | 30 seconds; request expiry ends local waiting, not started frame completion |
 | Notification delivery | 256 events and 8 MiB of accounted page/delivery allocations, whichever is reached first |
 | Notification filters, including pending registration/cleanup | 32 per independently owned session |
 | Notification partition identities / version intervals | 4,096 each; exhaustion is terminal, never silent eviction |
-| Notification page queue / processing | 32 pages and one worker; pages share the delivery memory budget |
-| Notification reply/control / cleanup queues | 32 each, admitted independently of application delivery |
+| Notification page queue / processing | 32 client-staged pages plus at most one transferred envelope; 33 backend ingress slots and one scoped worker |
+| Notification ordinary RPC / consuming replies | 8 / 4, independently counted under the shared channel byte ceiling |
+| Notification cleanup commands | 32, admitted independently of application delivery |
+| Notification lifetime IDs, including handshake | 4096, transport attempts not logical pages; terminal exhaustion without eviction |
 
 Native ImageStore's separate chunk, traversal, path and stale-reply limits are
 listed in [its API section](#native-imagestore-application-package-copy).
 
-The ordinary request writer queue is a count bound, not an aggregate memory
-limit of one frame: 32 maximum-sized queued frames can occupy 128 MiB.
-Memory also includes active
-encoding and frame copies, one active writer, one incoming frame and decoded
-results. Admission and queue capacity are acquired before transport frame
-encoding, and admission follows each result through delivery. Facade-prepared
-URI/query bodies and activity/version headers already exist before admission; waiting
-calls can own these bounded buffers. Cancelled commands retain no admission but
-remain within the queue bound until discarded. Returned values and caller-created
-input buffers remain the caller's responsibility.
+Ordinary channel entries cover queued/pending/ready-undelivered work; a started
+writer retains its lease after observer abandonment. Client admission occurs
+before typed encoding and follows result/state until transfer/drop. Sealed
+schemas have compile-time element/minimum-wire bounds; vector growth, map-node
+conversion, UTF conversion and overlapping endpoint/slot copies are included
+in the conservative fixed slot. This is intentionally looser than actual memory
+usage. Unpolled futures and transferred values are caller-held. Notifications
+apply both their own channel profile and client accounting above; upload retains
+its independent Connection-specific limits.
 
 The decoder skips unknown/deleted header records by their bounded record
 lengths. Effective common headers use the last visible occurrence; first
@@ -1353,10 +1424,11 @@ fields and service kind/persistence consistency. In particular `HealthState`
 retains unknown codes structurally, then list validation rejects them; node and
 health results continue retaining them. Node paging retains its permissive type-info
 policy; application/service paging requires an empty tag. Payload validation
-precedes reporting an embedded query error so malformed records still retire
-the connection. Actor/action, Item/List invariants and connection policy remain
-outside the serializer. Operation failures retain incremental code/diagnostic
-decoding so a readable nonzero native error survives a malformed diagnostic.
+precedes reporting an embedded query error, so malformed required records remain
+Protocol rather than becoming fake domain success. Actor/action, Item/List
+invariants and owner policy remain outside the serializer. Ordinary failure
+decoding requires a nonzero code, accepts native code-only suffixes and rejects
+malformed present diagnostics; excluded Connection helpers retain their policy.
 
 See the [backend contract and compiling example][native-serde],
 [transport payloads][serde-messages], [query DTOs][serde-query],
@@ -1509,8 +1581,8 @@ not reused as an externally ordered prerequisite.
 Tests fail on missing/wrong configuration, inaccessible native gateways or unmet
 prerequisites. The baseline scenario writes a result
 only after node field/filter/paging/error assertions, sequential ping/true/false,
-32 initially Pending overlapping mixed operations on clones (14 ping, 6 existing
-names, 6 absent names, 6 node queries),
+8 initially Pending overlapping mixed operations on clones (4 ping, 2 existing
+names, 1 absent name, 1 node query), ninth local refusal and slot-release reuse,
 clone-drop survival, explicit close and a test-owned proxy idle-disconnect case
 pass. The proxy first proves a real native ping, then cuts the TCP connection;
 no new application operation is used to detect the failure. It does not restart
@@ -1578,7 +1650,7 @@ to the native query end +1ms. This is an actual observation window, not a blanke
 The sanitized success report retains independent snapshots and native raw
 signed ticks/sequence as decimal strings, full Event explanations, native
 observation windows and archive hash. It also records unknown-node
-HealthEntityNotFound followed by healthy same-connection reuse, 32 mixed
+HealthEntityNotFound followed by healthy same-owner reuse, 8 mixed
 ping/list/health operations, and reuse after a first-polled health future is
 dropped. That live cancellation does not prove wire emission on fast loopback;
 model tests deterministically cover cancelled/timed-out late malformed replies.
@@ -1640,7 +1712,7 @@ Never use these fixtures on a shared cluster.
 
 The native-name archive qualified on **11.8.121.4**, five logical nodes in one
 Ubuntu container, with **119 offline tests and all three live group scenarios**.
-Offline tests cover exact requests, malformed-success retirement, concurrent
+Offline tests cover exact requests, call-local malformed-domain rejection, concurrent
 reordering, peer-observed cancellation/timeouts without replay, partial setup,
 collision/foreign-owner refusal, errors/panics, cleanup failure and
 absence-then-late-create ownership retention. They do not establish runtime
@@ -1686,11 +1758,14 @@ block success. File sync and rename run on every platform; only directory fsync
 is gated to Unix. A hard kill can skip in-process cleanup, so always-run exact
 allocation teardown remains essential.
 
-The **11.8.121.4** archived group now has four live scenarios and passes all four.
-The application/service delivery also passes 148 offline tests plus four CLI
+The earlier **11.8.121.4** application/service delivery documented four passing
+live scenarios and 148 offline tests plus four CLI
 parser tests. Offline evidence covers strict suffixes, hostile bounds, enums,
 malformed successes, native errors, out-of-order mixed queries, deadlines,
 ownership collisions, ambiguous mutation retention and cleanup dependency order.
+The current maintained native group has five tests; owned MovePrimary is included
+inside the list fixture. Current migration results are new executable receipts,
+not a relabeling of that earlier four-scenario archive.
 Live coverage does not establish Compose/Mesh applications, service groups,
 persisted stateful data, upgrade/deletion transitions, partial aggregation,
 byte-size paging, divergent unions, other runtime versions or full URI grammar.

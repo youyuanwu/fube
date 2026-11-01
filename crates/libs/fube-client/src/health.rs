@@ -127,8 +127,8 @@ pub struct HealthEvent {
 /// Supported node-detail polymorphism at the pinned native source.
 ///
 /// Every reachable node-detail explanation is Event, including synthetic HM
-/// reports. Unsupported structural tags fail the operation and retire the
-/// connection rather than being silently discarded or guessed.
+/// reports. Unsupported structural tags fail the typed operation without
+/// aborting its shared owner, rather than being silently discarded or guessed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum HealthEvaluation {

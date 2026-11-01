@@ -257,8 +257,9 @@ pub async fn retry(proxy: &LossProxy, client: &mut ServiceNotificationClient) ->
     let mut delivered = 0usize;
     tokio::time::timeout(Duration::from_secs(90),async {
         loop {
-            let (dropped,retries,forwarded)=proxy.evidence();
-            if dropped==1 && retries>0 && forwarded>0 {break;}
+            let evidence=proxy.evidence();
+            if evidence.successful_acks_dropped==1 && evidence.native_page_retries>0
+                && evidence.subsequent_target_acks_forwarded>0 {break;}
             tokio::select! {
                 _=proxy.changed()=>{},
                 update=client.recv()=>{
@@ -276,8 +277,28 @@ pub async fn retry(proxy: &LossProxy, client: &mut ServiceNotificationClient) ->
         }
         Ok::<_,Box<dyn std::error::Error+Send+Sync>>(())
     }).await??;
-    let (dropped, retries, forwarded) = proxy.evidence();
-    Ok(
-        json!({"successful_acks_dropped":dropped,"native_page_retries":retries,"subsequent_target_acks_forwarded":forwarded,"unique_delivered_versions":delivered,"duplicate_versions":0}),
-    )
+    let evidence = proxy.evidence();
+    let dropped = evidence
+        .dropped_attempt
+        .as_ref()
+        .ok_or("native dropped-attempt witness missing")?;
+    let retry = evidence
+        .retry_attempt
+        .as_ref()
+        .ok_or("native retry-attempt witness missing")?;
+    let ack = evidence
+        .forwarded_success_ack
+        .as_ref()
+        .ok_or("native forwarded-ACK witness missing")?;
+    if dropped.request_id == retry.request_id
+        || retry.request_id != ack.request_id
+        || dropped.page_id != retry.page_id
+        || retry.page_id != ack.page_id
+    {
+        return Err("native retry did not use a fresh target request ID and its own ACK".into());
+    }
+    let mut report = serde_json::to_value(evidence)?;
+    report["unique_delivered_versions"] = json!(delivered);
+    report["duplicate_versions"] = json!(0);
+    Ok(report)
 }

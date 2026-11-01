@@ -149,7 +149,7 @@ fn arguments(mut args: Vec<String>) -> Result<(SocketAddr, Operation, Duration)>
     Ok((endpoint, operation, timeout))
 }
 
-async fn run() -> Result<()> {
+async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (endpoint, operation, timeout) = arguments(std::env::args().skip(1).collect())?;
     let client = FabricClient::connect_clear(endpoint, timeout).await?;
     match operation {
@@ -201,7 +201,8 @@ async fn run() -> Result<()> {
             println!("deleted name={name}");
         }
     }
-    client.close().await
+    client.close().await?;
+    Ok(())
 }
 
 #[cfg(test)]

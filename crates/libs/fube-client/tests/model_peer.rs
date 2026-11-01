@@ -3,7 +3,7 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use fube_client::{Error, FabricClient, GatewayDescription};
+use fube_client::{ClientError, DomainFailure, Error, FabricClient, GatewayDescription};
 use fube_transport::{
     connection::{read_message, write_message},
     message::{Header, ListenInstance, Message, MessageId, ACTIVITY, FAULT, TIMEOUT},
@@ -16,7 +16,179 @@ use tokio::{
 };
 
 const TIMEOUT_DURATION: Duration = Duration::from_secs(3);
+
+#[tokio::test]
+async fn ping_validates_domain_envelopes_independently_of_repeated_correlation() {
+    for (actor, action) in [
+        (Some(5), Some("PingRequest")),
+        (Some(16), Some("OperationSuccessAction")),
+        (Some(13), Some("QueryReply")),
+        (None, None),
+    ] {
+        for records in [2, 3, 7] {
+            let (client, server) = reusable_reply(move |request| {
+                let mut response = ping_reply(request);
+                response.headers.retain(|header| {
+                    !matches!(
+                        header.id,
+                        fube_transport::message::ACTOR | fube_transport::message::ACTION
+                    )
+                });
+                if let Some(actor) = actor {
+                    response.headers.push(Header::actor(actor).unwrap());
+                }
+                if let Some(action) = action {
+                    response.headers.push(Header::action(action).unwrap());
+                }
+                let outer = response
+                    .headers
+                    .iter()
+                    .position(|header| header.id == fube_transport::message::RELATES_TO)
+                    .unwrap();
+                response.headers.insert(
+                    outer,
+                    Header::relates_to(MessageId {
+                        guid: [91; 16],
+                        index: 17,
+                    })
+                    .unwrap(),
+                );
+                for index in 0..records - 2 {
+                    response.headers.insert(
+                        outer + 1,
+                        Header::relates_to(MessageId {
+                            guid: [92; 16],
+                            index: index as u32,
+                        })
+                        .unwrap(),
+                    );
+                }
+                response
+            })
+            .await;
+            let result = client.ping(None).await;
+            if actor == Some(5) {
+                assert_eq!(result.unwrap().node_id, NODE_ID);
+            } else {
+                assert!(matches!(result, Err(ClientError::Protocol(_))));
+            }
+            assert!(!client.is_closed());
+            client.ping(None).await.unwrap();
+            client.close().await.unwrap();
+            server.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn naming_deadline_precedes_and_includes_caller_conversion() {
+    struct InvalidConversion;
+    impl AsRef<str> for InvalidConversion {
+        fn as_ref(&self) -> &str {
+            panic!("invalid timeout must precede conversion")
+        }
+    }
+    struct SlowConversion;
+    impl AsRef<str> for SlowConversion {
+        fn as_ref(&self) -> &str {
+            std::thread::sleep(Duration::from_millis(20));
+            "fabric:/SlowConversion"
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut stream = establish(listener).await;
+        let request = read_message(&mut stream).await.unwrap();
+        assert_eq!(request.properties().unwrap().action, "PingRequest");
+        write_message(&mut stream, &ping_reply(&request))
+            .await
+            .unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    });
+    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+        .await
+        .unwrap();
+    assert!(matches!(
+        client
+            .name_exists(InvalidConversion, Some(Duration::ZERO))
+            .await,
+        Err(ClientError::Local(Error::InvalidInput(_)))
+    ));
+    assert!(matches!(
+        client
+            .create_name(InvalidConversion, Some(Duration::ZERO))
+            .await,
+        Err(ClientError::Local(Error::InvalidInput(_)))
+    ));
+    assert!(matches!(
+        client
+            .delete_name(InvalidConversion, Some(Duration::ZERO))
+            .await,
+        Err(ClientError::Local(Error::InvalidInput(_)))
+    ));
+    let tiny = Some(Duration::from_millis(5));
+    assert!(matches!(
+        client.name_exists(SlowConversion, tiny).await,
+        Err(ClientError::Local(Error::Timeout))
+    ));
+    assert!(matches!(
+        client.create_name(SlowConversion, tiny).await,
+        Err(ClientError::Local(Error::Timeout))
+    ));
+    assert!(matches!(
+        client.delete_name(SlowConversion, tiny).await,
+        Err(ClientError::Local(Error::Timeout))
+    ));
+    client.ping(None).await.unwrap();
+    client.close().await.unwrap();
+    server.await.unwrap();
+}
+
 const NODE_ID: u128 = 0x0123456789abcdef_fedcba9876543210;
+
+#[tokio::test]
+async fn naming_conversion_input_is_not_retained_across_rpc() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    struct Input(Arc<AtomicBool>);
+    impl AsRef<str> for Input {
+        fn as_ref(&self) -> &str {
+            "fabric:/OwnedSnapshot"
+        }
+    }
+    impl Drop for Input {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let released = Arc::new(AtomicBool::new(false));
+    let observed = released.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut stream = establish(listener).await;
+        let request = read_message(&mut stream).await.unwrap();
+        assert_eq!(request.properties().unwrap().action, "NameExistsRequest");
+        assert!(observed.load(Ordering::SeqCst));
+        write_message(
+            &mut stream,
+            &reply(&request, "NameOperationReply", naming_body(true, 0)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    });
+    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+        .await
+        .unwrap();
+    assert!(client.name_exists(Input(released), None).await.unwrap());
+    client.close().await.unwrap();
+    server.await.unwrap();
+}
+
 const REMOTE_CODE: i64 = -2147017794;
 
 #[path = "support/health_model.rs"]
@@ -113,6 +285,31 @@ async fn single_reply(
         write_message(&mut stream, &make_reply(&request))
             .await
             .unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    });
+    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+        .await
+        .unwrap();
+    (client, server)
+}
+
+async fn reusable_reply(
+    make_reply: impl FnOnce(&Message) -> Message + Send + 'static,
+) -> (FabricClient, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut stream = establish(listener).await;
+        let request = read_message(&mut stream).await.unwrap();
+        write_message(&mut stream, &make_reply(&request))
+            .await
+            .unwrap();
+        let followup = read_message(&mut stream).await.unwrap();
+        assert_eq!(followup.properties().unwrap().action, "PingRequest");
+        write_message(&mut stream, &ping_reply(&followup))
+            .await
+            .unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
     let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
         .await
@@ -228,7 +425,10 @@ async fn sequential_ping_and_naming_use_native_headers_and_keep_bool_independent
     client.close().await.unwrap();
     assert!(client.is_closed());
     client.close().await.unwrap();
-    assert!(matches!(client.ping(None).await, Err(Error::Closed)));
+    assert!(matches!(
+        client.ping(None).await,
+        Err(ClientError::Transport(Error::Closed))
+    ));
     server.await.unwrap();
 }
 
@@ -304,10 +504,10 @@ async fn all_operations_select_optional_timeout_and_reject_invalid_overrides_wit
                 if valid {
                     assert!(matches!(
                         result,
-                        Err(Error::Remote { code: REMOTE_CODE, .. })
+                        Err(ClientError::Transport(Error::Remote { code: REMOTE_CODE, .. }))
                     ), "{}: {result:?}", stringify!($method));
                 } else {
-                    assert!(matches!(result, Err(Error::InvalidInput(_))),
+                    assert!(matches!(result, Err(ClientError::Local(Error::InvalidInput(_)))),
                         "{}: {result:?}", stringify!($method));
                 }
                 assert!(!client.is_closed());
@@ -420,7 +620,10 @@ async fn ping_and_name_exists_timeout_overrides_expire_without_retiring_connecti
         })
         .await
         .expect("override must expire before the configured three-second default");
-        assert!(matches!(result, Err(Error::Timeout)));
+        assert!(matches!(
+            result,
+            Err(ClientError::Transport(Error::Timeout))
+        ));
         assert!(!client.is_closed());
         release_tx.send(()).unwrap();
         client.ping(None).await.unwrap();
@@ -430,7 +633,7 @@ async fn ping_and_name_exists_timeout_overrides_expire_without_retiring_connecti
 }
 
 #[tokio::test]
-async fn malformed_naming_success_never_returns_absent_and_closes() {
+async fn malformed_naming_success_never_returns_absent_and_allows_reuse() {
     let incomplete = [
         Vec::new(),
         body(|_| Ok(())),
@@ -446,12 +649,15 @@ async fn malformed_naming_success_never_returns_absent_and_closes() {
     ];
     for bytes in incomplete {
         let (client, server) =
-            single_reply(move |request| reply(request, "NameOperationReply", bytes)).await;
+            reusable_reply(move |request| reply(request, "NameOperationReply", bytes)).await;
         assert!(matches!(
             client.name_exists("fabric:/a", None).await,
-            Err(Error::Protocol(_))
+            Err(ClientError::Protocol(_))
         ));
-        assert!(client.is_closed());
+        assert!(!client.is_closed());
+        assert!(client.terminal_error().is_none());
+        client.ping(None).await.unwrap();
+        client.close().await.unwrap();
         server.await.unwrap();
     }
 }
@@ -492,14 +698,19 @@ async fn malformed_ping_success_requires_every_identity_field() {
         }),
     ];
     for bytes in incomplete {
-        let (client, server) = single_reply(move |request| {
+        let (client, server) = reusable_reply(move |request| {
             let mut response = reply(request, "PingRequest", bytes);
             response.headers.push(Header::version(1, 1).unwrap());
             response
         })
         .await;
-        assert!(matches!(client.ping(None).await, Err(Error::Protocol(_))));
-        assert!(client.is_closed());
+        assert!(matches!(
+            client.ping(None).await,
+            Err(ClientError::Protocol(_))
+        ));
+        assert!(!client.is_closed());
+        client.ping(None).await.unwrap();
+        client.close().await.unwrap();
         server.await.unwrap();
     }
 }
@@ -507,7 +718,7 @@ async fn malformed_ping_success_requires_every_identity_field() {
 #[tokio::test]
 async fn empty_gateway_identity_is_not_a_success() {
     for (address, node_name) in [("", "N0010"), ("10.0.0.2:19000", "")] {
-        let (client, server) = single_reply(move |request| {
+        let (client, server) = reusable_reply(move |request| {
             let bytes = body(|encoder| {
                 encoder.object(|encoder| {
                     encoder.string(address)?;
@@ -524,8 +735,13 @@ async fn empty_gateway_identity_is_not_a_success() {
             response
         })
         .await;
-        assert!(matches!(client.ping(None).await, Err(Error::Protocol(_))));
-        assert!(client.is_closed());
+        assert!(matches!(
+            client.ping(None).await,
+            Err(ClientError::Protocol(_))
+        ));
+        assert!(!client.is_closed());
+        client.ping(None).await.unwrap();
+        client.close().await.unwrap();
         server.await.unwrap();
     }
 }
@@ -539,7 +755,7 @@ async fn ping_requires_compatible_version_action_and_actor() {
         Some((0, 2)),
         Some((1, -1)),
     ] {
-        let (client, server) = single_reply(move |request| {
+        let (client, server) = reusable_reply(move |request| {
             let mut response = reply(request, "PingRequest", ping_body());
             if let Some((major, minor)) = version {
                 response
@@ -549,8 +765,13 @@ async fn ping_requires_compatible_version_action_and_actor() {
             response
         })
         .await;
-        assert!(matches!(client.ping(None).await, Err(Error::Protocol(_))));
-        assert!(client.is_closed());
+        assert!(matches!(
+            client.ping(None).await,
+            Err(ClientError::Protocol(_))
+        ));
+        assert!(!client.is_closed());
+        client.ping(None).await.unwrap();
+        client.close().await.unwrap();
         server.await.unwrap();
     }
     for (actor, action) in [
@@ -565,7 +786,10 @@ async fn ping_requires_compatible_version_action_and_actor() {
             response
         })
         .await;
-        assert!(matches!(client.ping(None).await, Err(Error::Protocol(_))));
+        assert!(matches!(
+            client.ping(None).await,
+            Err(ClientError::Transport(Error::Protocol(_)))
+        ));
         assert!(client.is_closed());
         server.await.unwrap();
     }
@@ -582,7 +806,7 @@ async fn naming_rejects_wrong_success_action_or_actor() {
         .await;
         assert!(matches!(
             client.name_exists("fabric:/a", None).await,
-            Err(Error::Protocol(_))
+            Err(ClientError::Transport(Error::Protocol(_)))
         ));
         assert!(client.is_closed());
         server.await.unwrap();
@@ -592,8 +816,8 @@ async fn naming_rejects_wrong_success_action_or_actor() {
 #[tokio::test]
 async fn transport_fault_preserves_error_with_optional_malformed_details() {
     let details = [
-        (false, Vec::new(), REMOTE_CODE, ""),
-        (true, Vec::new(), REMOTE_CODE, "malformed"),
+        (false, Vec::new()),
+        (true, Vec::new()),
         (
             true,
             body(|encoder| {
@@ -602,8 +826,6 @@ async fn transport_fault_preserves_error_with_optional_malformed_details() {
                     encoder.string("diagnostic")
                 })
             }),
-            REMOTE_CODE - 1,
-            "diagnostic",
         ),
         (
             true,
@@ -613,8 +835,6 @@ async fn transport_fault_preserves_error_with_optional_malformed_details() {
                     encoder.string("diagnostic")
                 })
             }),
-            REMOTE_CODE,
-            "diagnostic",
         ),
         (
             true,
@@ -624,8 +844,6 @@ async fn transport_fault_preserves_error_with_optional_malformed_details() {
                     encoder.string("")
                 })
             }),
-            REMOTE_CODE,
-            "",
         ),
         (
             true,
@@ -633,11 +851,9 @@ async fn transport_fault_preserves_error_with_optional_malformed_details() {
                 encoder.i64(REMOTE_CODE);
                 encoder.string("wrong un-nested schema")
             }),
-            REMOTE_CODE,
-            "malformed",
         ),
     ];
-    for (has_body, bytes, expected_code, diagnostic) in details {
+    for (has_body, bytes) in details {
         let (client, server) = single_reply(move |request| {
             let mut response = reply(request, "", bytes);
             response.headers.push(
@@ -652,68 +868,81 @@ async fn transport_fault_preserves_error_with_optional_malformed_details() {
         })
         .await;
         match client.name_exists("fabric:/a", None).await {
-            Err(Error::Remote { code, message }) => {
-                assert_eq!(code, expected_code);
-                assert!(message.contains(diagnostic), "{message}");
+            Err(ClientError::Transport(Error::Remote { code, message })) => {
+                assert_eq!(code, REMOTE_CODE);
+                assert_eq!(message, "native transport Fault");
             }
             result => panic!("fault became {result:?}"),
         }
+        assert!(!client.is_closed());
+        assert!(client.terminal_error().is_none());
+        client.close().await.unwrap();
         server.await.unwrap();
     }
 }
 
 #[tokio::test]
-async fn operation_failure_is_not_reject_fault_and_retains_readable_code() {
-    for (bytes, expected_diagnostic) in [
-        (
+async fn operation_failure_requires_nonzero_code_and_valid_present_diagnostic() {
+    let (client, server) = reusable_reply(|request| {
+        reply(
+            request,
+            "ClientOperationFailure",
             body(|encoder| {
                 encoder.i64(REMOTE_CODE);
                 encoder.string("operation failed")
             }),
-            "operation failed",
-        ),
-        (
-            body(|encoder| {
-                encoder.i64(REMOTE_CODE);
-                Ok(())
-            }),
-            "diagnostic",
-        ),
-        (
-            body(|encoder| {
-                encoder.i64(REMOTE_CODE);
-                encoder.boolean(true);
-                Ok(())
-            }),
-            "diagnostic",
-        ),
-    ] {
-        let (client, server) =
-            single_reply(move |request| reply(request, "ClientOperationFailure", bytes)).await;
-        match client.ping(None).await {
-            Err(Error::Remote { code, message }) => {
-                assert_eq!(code, REMOTE_CODE);
-                assert!(message.contains(expected_diagnostic));
-            }
-            result => panic!("operation failure became {result:?}"),
+        )
+    })
+    .await;
+    match client.ping(None).await {
+        Err(ClientError::Domain(DomainFailure { code, message })) => {
+            assert_eq!(code, REMOTE_CODE);
+            assert_eq!(message, "operation failed");
         }
-        server.await.unwrap();
+        result => panic!("operation failure became {result:?}"),
     }
+    client.ping(None).await.unwrap();
+    client.close().await.unwrap();
+    server.await.unwrap();
+    let (client, server) = reusable_reply(|request| {
+        reply(
+            request,
+            "ClientOperationFailure",
+            body(|encoder| {
+                encoder.i64(REMOTE_CODE);
+                Ok(())
+            }),
+        )
+    })
+    .await;
+    assert!(matches!(client.ping(None).await,
+        Err(ClientError::Domain(DomainFailure { code: REMOTE_CODE, message })) if message.is_empty()));
+    client.ping(None).await.unwrap();
+    client.close().await.unwrap();
+    server.await.unwrap();
     for bytes in [
         Vec::new(),
         body(|_| Ok(())),
+        body(|encoder| {
+            encoder.i64(REMOTE_CODE);
+            encoder.boolean(true);
+            Ok(())
+        }),
         body(|encoder| {
             encoder.i64(0);
             encoder.string("not a native failure")
         }),
     ] {
         let (client, server) =
-            single_reply(move |request| reply(request, "ClientOperationFailure", bytes)).await;
+            reusable_reply(move |request| reply(request, "ClientOperationFailure", bytes)).await;
         assert!(matches!(
             client.name_exists("fabric:/a", None).await,
-            Err(Error::Protocol(_))
+            Err(ClientError::Protocol(_))
         ));
-        assert!(client.is_closed());
+        assert!(!client.is_closed());
+        assert!(client.terminal_error().is_none());
+        client.ping(None).await.unwrap();
+        client.close().await.unwrap();
         server.await.unwrap();
     }
 }
@@ -748,15 +977,15 @@ async fn input_error_does_not_send_and_native_error_does_not_poison_complete_str
         .unwrap();
     assert!(matches!(
         client.name_exists("fabric:/invalid?", None).await,
-        Err(Error::InvalidInput(_))
+        Err(ClientError::Local(Error::InvalidInput(_)))
     ));
     assert!(!client.is_closed());
     assert!(matches!(
         client.name_exists("fabric:/a", None).await,
-        Err(Error::Remote {
+        Err(ClientError::Domain(DomainFailure {
             code: REMOTE_CODE,
             ..
-        })
+        }))
     ));
     assert!(!client.is_closed());
     assert!(!client.name_exists("fabric:/a", None).await.unwrap());
@@ -1130,7 +1359,7 @@ mod node_queries {
     #[tokio::test]
     async fn embedded_error_cannot_hide_invalid_record_or_required_pointer() {
         for shape in [NodeShape::DisagreeingIdCopies, NodeShape::NullSafetyCheck] {
-            let (client, server) = single_reply(move |request| {
+            let (client, server) = reusable_reply(move |request| {
                 node_reply(
                     request,
                     query_result(2, Some(&1i32.to_le_bytes()), REMOTE_CODE, None, |encoder| {
@@ -1143,9 +1372,11 @@ mod node_queries {
                 client
                     .get_node_list(&NodeQueryDescription::default(), None)
                     .await,
-                Err(Error::Protocol(_))
+                Err(ClientError::Protocol(_))
             ));
-            assert!(client.is_closed());
+            assert!(!client.is_closed());
+            client.ping(None).await.unwrap();
+            client.close().await.unwrap();
             server.await.unwrap();
         }
     }
@@ -1281,6 +1512,7 @@ mod node_queries {
                 continuation_token: Some("opaque-next".into()),
             }
         );
+        client.close().await.unwrap();
         server.await.unwrap();
     }
 
@@ -1306,6 +1538,7 @@ mod node_queries {
         assert_eq!(page.items, vec![expected]);
         assert_eq!(page.items[0].status.as_raw(), i64::MIN);
         assert_eq!(page.items[0].health_state.as_raw(), i64::MAX);
+        client.close().await.unwrap();
         server.await.unwrap();
     }
 
@@ -1391,7 +1624,7 @@ mod node_queries {
             };
             assert!(matches!(
                 client.get_node_list(&query, None).await,
-                Err(Error::InvalidInput(_))
+                Err(ClientError::Local(Error::InvalidInput(_)))
             ));
             assert!(!client.is_closed());
         }
@@ -1410,7 +1643,7 @@ mod node_queries {
         ] {
             assert!(matches!(
                 client.get_node_list(&query, None).await,
-                Err(Error::InvalidInput(_))
+                Err(ClientError::Local(Error::InvalidInput(_)))
             ));
             assert!(!client.is_closed());
         }
@@ -1419,7 +1652,7 @@ mod node_queries {
                 client
                     .get_node_list(&NodeQueryDescription::default(), Some(timeout))
                     .await,
-                Err(Error::InvalidInput(_))
+                Err(ClientError::Local(Error::InvalidInput(_)))
             ));
             assert!(!client.is_closed());
         }
@@ -1434,30 +1667,25 @@ mod node_queries {
     }
 
     async fn assert_malformed_success(bytes: Vec<u8>, label: &str) {
-        let (client, server) = single_reply(move |request| node_reply(request, bytes)).await;
+        let (client, server) = reusable_reply(move |request| node_reply(request, bytes)).await;
         let clone = client.clone();
         let result = client
             .get_node_list(&NodeQueryDescription::default(), None)
             .await;
         assert!(
-            matches!(result, Err(Error::Protocol(_))),
+            matches!(result, Err(ClientError::Protocol(_))),
             "{label}: {result:?}"
         );
-        assert!(client.is_closed(), "{label}");
-        assert!(clone.is_closed(), "{label}");
-        assert!(
-            matches!(clone.ping(None).await, Err(Error::Protocol(_))),
-            "{label}"
-        );
-        assert!(
-            matches!(client.terminal_error(), Some(Error::Protocol(_))),
-            "{label}"
-        );
+        assert!(!client.is_closed(), "{label}");
+        assert!(!clone.is_closed(), "{label}");
+        assert!(client.terminal_error().is_none(), "{label}");
+        clone.ping(None).await.unwrap();
+        client.close().await.unwrap();
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn wrong_result_kinds_tags_pointers_and_scalar_metadata_retire_stream() {
+    async fn wrong_result_kinds_tags_pointers_and_scalar_metadata_are_call_local() {
         let tag = 1i32.to_le_bytes();
         for kind in [0, 1, -1, 99] {
             assert_malformed_success(
@@ -1606,7 +1834,7 @@ mod node_queries {
     }
 
     #[tokio::test]
-    async fn bare_or_recognized_success_headers_are_valid_but_wrong_headers_retire() {
+    async fn bare_or_recognized_success_headers_are_valid_but_wrong_headers_are_call_local() {
         for headers in [
             vec![],
             vec![Header::actor(5).unwrap()],
@@ -1628,13 +1856,14 @@ mod node_queries {
                 .unwrap()
                 .items
                 .is_empty());
+            client.close().await.unwrap();
             server.await.unwrap();
         }
         for header in [
             Header::actor(2).unwrap(),
             Header::action("NameOperationReply").unwrap(),
         ] {
-            let (client, server) = single_reply(move |request| {
+            let (client, server) = reusable_reply(move |request| {
                 let mut response = node_reply(request, node_body(&[], None));
                 response.headers.push(header);
                 response
@@ -1644,9 +1873,11 @@ mod node_queries {
                 client
                     .get_node_list(&NodeQueryDescription::default(), None)
                     .await,
-                Err(Error::Protocol(_))
+                Err(ClientError::Protocol(_))
             ));
-            assert!(client.is_closed());
+            assert!(!client.is_closed());
+            client.ping(None).await.unwrap();
+            client.close().await.unwrap();
             server.await.unwrap();
         }
     }
@@ -1713,20 +1944,19 @@ mod node_queries {
         let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
             .await
             .unwrap();
-        for (index, diagnostic) in [
-            "",
-            "",
-            "malformed optional fault details",
-            "invalid continuation",
-        ]
-        .into_iter()
-        .enumerate()
+        for (index, diagnostic) in ["", "", "native transport Fault", "invalid continuation"]
+            .into_iter()
+            .enumerate()
         {
             match client
                 .get_node_list(&NodeQueryDescription::default(), None)
                 .await
             {
-                Err(Error::Remote { code, message }) => {
+                Err(ClientError::Domain(DomainFailure { code, message })) if index != 2 => {
+                    assert_eq!(code, REMOTE_CODE - index as i64);
+                    assert_eq!(message, diagnostic);
+                }
+                Err(ClientError::Transport(Error::Remote { code, message })) if index == 2 => {
                     assert_eq!(code, REMOTE_CODE - index as i64);
                     assert_eq!(message, diagnostic);
                 }
@@ -1747,17 +1977,17 @@ mod node_queries {
     }
 
     #[tokio::test]
-    async fn malformed_node_success_retires_before_waiter_repoll_and_fails_pending_clone() {
+    async fn malformed_node_success_is_call_local_and_pending_clone_succeeds() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let mut stream = establish(listener).await;
             let first = read_message(&mut stream).await.unwrap();
             let second = read_message(&mut stream).await.unwrap();
-            let query = if first.properties().unwrap().action == "QueryRequest" {
-                first
+            let (query, neighbor) = if first.properties().unwrap().action == "QueryRequest" {
+                (first, second)
             } else {
-                second
+                (second, first)
             };
             write_message(
                 &mut stream,
@@ -1765,6 +1995,16 @@ mod node_queries {
             )
             .await
             .unwrap();
+            write_message(
+                &mut stream,
+                &reply(&neighbor, "NameOperationReply", naming_body(true, 0)),
+            )
+            .await
+            .unwrap();
+            let reuse = read_message(&mut stream).await.unwrap();
+            write_message(&mut stream, &ping_reply(&reuse))
+                .await
+                .unwrap();
             assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
         });
         let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
@@ -1781,17 +2021,11 @@ mod node_queries {
             Poll::Ready(())
         })
         .await;
-        tokio::time::timeout(TIMEOUT_DURATION, async {
-            while !client.is_closed() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(matches!(nodes.await, Err(Error::Protocol(_))));
-        assert!(matches!(neighbor.await, Err(Error::Protocol(_))));
-        assert!(clone.is_closed());
-        assert!(matches!(clone.ping(None).await, Err(Error::Protocol(_))));
+        assert!(matches!(nodes.await, Err(ClientError::Protocol(_))));
+        assert!(neighbor.await.unwrap());
+        assert!(!clone.is_closed());
+        assert!(client.terminal_error().is_none());
+        clone.ping(None).await.unwrap();
         client.close().await.unwrap();
         server.await.unwrap();
     }
@@ -1950,7 +2184,10 @@ mod node_queries {
                 nodes.abort();
                 assert!(nodes.await.unwrap_err().is_cancelled());
             } else {
-                assert!(matches!(nodes.await.unwrap(), Err(Error::Timeout)));
+                assert!(matches!(
+                    nodes.await.unwrap(),
+                    Err(ClientError::Transport(Error::Timeout))
+                ));
             }
             assert!(!client.is_closed());
             release_tx.send(()).unwrap();

@@ -194,7 +194,7 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
         ordinary
             .resolve_service_partition(&missing, &PartitionKey::Singleton, None, None)
             .await,
-        Err(Error::Remote { .. })
+        Err(ClientError::Domain(_) | ClientError::Transport(Error::Remote { .. }))
     ));
     ordinary.ping(None).await?;
     // Only a service under the exact owned application journal is mutated.
