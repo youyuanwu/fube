@@ -278,6 +278,43 @@ impl Host {
             + Send
             + 'static,
     ) -> (Arc<Self>, Result<()>) {
+        Self::start_source_outcome_at_epoch(
+            partition,
+            source,
+            role,
+            fube_runtime::Epoch {
+                data_loss_number: 1,
+                configuration_number: 1 << 32,
+            },
+            factory,
+        )
+        .await
+    }
+    /// Configure the actual initial native ReplicaOpen request, not a lower
+    /// epoch setter or a progress query against an unbuilt secondary.
+    pub async fn start_source_at_epoch(
+        partition: uuid::Uuid,
+        source: ReplicaSource,
+        role: ReplicaRole,
+        epoch: fube_runtime::Epoch,
+        factory: impl FnOnce(NativeIntegrationProvider) -> Box<dyn IStatefulServiceFactory>
+            + Send
+            + 'static,
+    ) -> Arc<Self> {
+        let (host, opened) =
+            Self::start_source_outcome_at_epoch(partition, source, role, epoch, factory).await;
+        opened.unwrap();
+        host
+    }
+    pub async fn start_source_outcome_at_epoch(
+        partition: uuid::Uuid,
+        source: ReplicaSource,
+        role: ReplicaRole,
+        epoch: fube_runtime::Epoch,
+        factory: impl FnOnce(NativeIntegrationProvider) -> Box<dyn IStatefulServiceFactory>
+            + Send
+            + 'static,
+    ) -> (Arc<Self>, Result<()>) {
         let (ready, readiness) = oneshot::channel();
         let (commands, receive) = mpsc::channel(32);
         let shutdown_commands = commands.clone();
@@ -302,7 +339,7 @@ impl Host {
                         artifacts.root.clone(),
                         partition,
                         source,
-                        role,
+                        (role, epoch),
                         peer_events,
                     ));
                     let runtime = attach_runtime(context).await.unwrap();
@@ -462,6 +499,7 @@ fn base(
     partition: uuid::Uuid,
     source: &ReplicaSource,
     role: ReplicaRole,
+    epoch: fube_runtime::Epoch,
 ) -> ProxyRequest {
     let version = context.code.version.clone();
     ProxyRequest {
@@ -480,8 +518,8 @@ fn base(
                 kind: 1,
             },
             current: Epoch {
-                configuration: 1 << 32,
-                data_loss: 1,
+                configuration: epoch.configuration_number,
+                data_loss: epoch.data_loss_number,
             },
             previous: Epoch {
                 configuration: 0,
@@ -586,9 +624,10 @@ async fn serve(
     deployment: PathBuf,
     partition: uuid::Uuid,
     source: ReplicaSource,
-    role: ReplicaRole,
+    initial: (ReplicaRole, fube_runtime::Epoch),
     events: broadcast::Sender<HostEvent>,
 ) {
+    let (role, epoch) = initial;
     let (mut socket, _) = listener.accept().await.unwrap();
     let hello = read_message(&mut socket).await.unwrap();
     assert_eq!(hello.properties().unwrap().actor, 1);
@@ -647,7 +686,7 @@ async fn serve(
                         let registration: TypeRequest = from_slice(&message.body).unwrap();
                         assert_eq!(registration.id.name, "ModelStatefulType");
                         assert_eq!(registration.context.id, context.as_ref().unwrap().id);
-                        local = Some(base(context.as_ref().unwrap(), partition, &source, role));
+                        local = Some(base(context.as_ref().unwrap(), partition, &source, role, epoch));
                         to_vec(&ErrorReply { error: 0 }).unwrap()
                     },
                     "FinishRegisterApplicationHostRequest" | "UnregisterFabricRuntimeRequest" | "UnregisterApplicationHostRequest" => to_vec(&ErrorReply { error: 0 }).unwrap(),

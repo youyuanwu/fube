@@ -270,8 +270,8 @@ impl Registry {
                     }
                 }
                 // Generic SDK implementations need only the separate getters.
-                let first = replicator.get_catch_up_capability()?;
                 let last = replicator.get_current_progress()?;
+                let first = replicator.get_catch_up_capability()?;
                 Ok(ReplicationProgress { first, last })
             })
             .await;

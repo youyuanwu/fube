@@ -179,6 +179,7 @@ impl NativeIntegrationProvider {
     }
 }
 struct Issued {
+    is_current: AtomicBool,
     kind: NativeInvocationKind,
     request: w::ProxyRequest,
     current: Option<NativeReplicaSet>,
@@ -202,6 +203,18 @@ pub struct NativeInvocation {
     entered: Arc<AtomicBool>,
 }
 impl NativeInvocation {
+    #[cfg(test)]
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.issued, &other.issued) && Arc::ptr_eq(&self.entered, &other.entered)
+    }
+    #[cfg(test)]
+    pub(crate) fn same_revision(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.issued.revision, &other.issued.revision)
+            && self.issued.expected == other.issued.expected
+    }
+    pub(crate) fn in_own_execution(&self) -> bool {
+        self.unit.execution.is_current_entry()
+    }
     pub fn cancellation(&self) -> Cancellation {
         self.issued.cancellation.clone()
     }
@@ -240,7 +253,8 @@ impl NativeInvocation {
     }
     pub fn validate(&self) -> Result<()> {
         self.unit.authority.check()?;
-        if !self.unit.valid.load(Ordering::Acquire)
+        if !self.issued.is_current.load(Ordering::Acquire)
+            || !self.unit.valid.load(Ordering::Acquire)
             || self.issued.lifetime.is_cancelled()
             || self.issued.cancellation.is_cancelled()
             || self.issued.revision.load(Ordering::Acquire) != self.issued.expected
@@ -350,7 +364,12 @@ impl NativeRuntimeIntegration {
         &self.0.binding.identity
     }
     pub(super) fn retire_ledger(&self) {
-        self.0.ledger.lock().unwrap().clear();
+        let mut ledger = self.0.ledger.lock().unwrap();
+        for issued in ledger.iter() {
+            issued.is_current.store(false, Ordering::Release);
+        }
+        ledger.clear();
+        drop(ledger);
         self.0.binder.lock().unwrap().take();
         self.0.progress.lock().unwrap().take();
     }
@@ -422,7 +441,7 @@ impl NativeRuntimeIntegration {
         } else {
             NativeInvocationKind::CurrentConfiguration
         };
-        let invocation = self.lookup_record(kind, None, None)?;
+        let invocation = self.capture_scoped(kind, None)?;
         let (cc, pc) = invocation
             .configuration()
             .ok_or(Error::InvalidInput("missing native configuration"))?;
@@ -436,7 +455,7 @@ impl NativeRuntimeIntegration {
     }
     /// Captures the exact native target before an async Build future is returned.
     pub fn capture_build(&self, replica: &crate::ReplicaInformation) -> Result<NativeInvocation> {
-        let invocation = self.lookup_record(NativeInvocationKind::Build, Some(replica.id), None)?;
+        let invocation = self.capture_scoped(NativeInvocationKind::Build, Some(replica.id))?;
         if invocation
             .replica()
             .map(NativeReplica::sdk)
@@ -449,45 +468,48 @@ impl NativeRuntimeIntegration {
         Ok(invocation)
     }
     pub fn capture_removal(&self, replica_id: i64) -> Result<NativeInvocation> {
-        self.lookup_record(
-            NativeInvocationKind::Remove(ReplicaRemoval::Idle),
-            Some(replica_id),
-            None,
-        )
+        let invocation = self.scoped_invocation()?;
+        if !matches!(invocation.kind(), NativeInvocationKind::Remove(_))
+            || invocation.replica().map(|r| r.replica_id) != Some(replica_id)
+        {
+            return Err(Error::InvalidInput(
+                "removal differs from native invocation",
+            ));
+        }
+        Ok(invocation)
     }
     /// Native-aware custom controls may observe the currently issued cleanup
     /// purpose. This does not select a new target or authorize a later retry.
     pub fn capture_pending_removal(&self, replica_id: i64) -> Result<NativeInvocation> {
-        let ledger = self.0.ledger.lock().unwrap().clone();
-        let mut valid = Vec::new();
-        for issued in ledger.into_iter().rev() {
-            if matches!(issued.kind, NativeInvocationKind::Remove(_))
-                && issued
-                    .replica
-                    .as_ref()
-                    .is_some_and(|r| r.replica_id == replica_id)
-            {
-                let invocation = NativeInvocation {
-                    unit: self.0.clone(),
-                    issued,
-                    entered: Arc::new(AtomicBool::new(false)),
-                };
-                if invocation.validate().is_ok() {
-                    valid.push(invocation);
-                }
-            }
+        self.capture_removal(replica_id)
+    }
+    fn scoped_invocation(&self) -> Result<NativeInvocation> {
+        self.validate()?;
+        if crate::extensions::ExecutionRuntime::is_cleanup_entry() {
+            return Err(Error::InvalidInput(
+                "cleanup cannot capture native invocation",
+            ));
         }
-        let selected = valid
-            .first()
-            .ok_or(Error::InvalidInput("native removal is not authorized"))?
-            .clone();
-        if valid
-            .iter()
-            .any(|other| other.replica() != selected.replica())
-        {
-            return Err(Error::InvalidInput("ambiguous native removal"));
+        let invocation = crate::extensions::ExecutionRuntime::capturable_invocation()
+            .ok_or(Error::InvalidInput("no current native invocation"))?;
+        if !Arc::ptr_eq(&self.0, &invocation.unit) {
+            return Err(Error::InvalidInput(
+                "native invocation belongs to another unit",
+            ));
         }
-        Ok(selected)
+        invocation.validate()?;
+        Ok(invocation)
+    }
+    fn capture_scoped(
+        &self,
+        kind: NativeInvocationKind,
+        replica: Option<i64>,
+    ) -> Result<NativeInvocation> {
+        let invocation = self.scoped_invocation()?;
+        if invocation.kind() != kind || invocation.replica().map(|r| r.replica_id) != replica {
+            return Err(Error::InvalidInput("call differs from native invocation"));
+        }
+        Ok(invocation)
     }
     pub fn execution(&self) -> crate::extensions::ExecutionRuntime {
         self.0.execution.clone()
@@ -498,7 +520,8 @@ impl NativeRuntimeIntegration {
             return Err(Error::Closed);
         }
         let state = self.0.state.upgrade().ok_or(Error::Closed)?;
-        if state.lock().unwrap().generation != self.0.binding.generation {
+        let state = state.lock().unwrap();
+        if state.generation != self.0.binding.generation || state.cancel.is_cancelled() {
             return Err(Error::Closed);
         }
         Ok(())
@@ -543,6 +566,7 @@ impl NativeRuntimeIntegration {
     }
     /// Private immutable ledger lookup for coordinated canonical root migration.
     /// It does not acquire a native logical gate or constitute a public control.
+    #[cfg(test)]
     pub(crate) fn lookup_record(
         &self,
         kind: NativeInvocationKind,
@@ -662,6 +686,7 @@ pub(super) fn issue(
             NativeEpoch::from(&status.previous_epoch.primary()),
         ));
     let issued = Arc::new(Issued {
+        is_current: AtomicBool::new(true),
         kind,
         request: request.clone(),
         current: current.as_ref().map(NativeReplicaSet::from),
@@ -678,9 +703,13 @@ pub(super) fn issue(
     // At most the two configuration forms plus the bounded native remote ledger.
     let mut ledger = native.0.ledger.lock().unwrap();
     ledger.retain(|old| {
-        !(old.kind == kind
+        let superseded = old.kind == kind
             && old.replica.as_ref().map(|r| (r.node_id, r.replica_id))
-                == issued.replica.as_ref().map(|r| (r.node_id, r.replica_id)))
+                == issued.replica.as_ref().map(|r| (r.node_id, r.replica_id));
+        if superseded {
+            old.is_current.store(false, Ordering::Release);
+        }
+        !superseded
     });
     if ledger.len() >= 2 + 3 * 256 {
         return Err(Error::ResourceLimit("native invocation ledger"));
@@ -697,15 +726,6 @@ pub(super) fn bind(
     fallback: Arc<dyn IPrimaryReplicator>,
 ) -> Result<Arc<dyn IPrimaryReplicator>> {
     invocation.validate()?;
-    let integration = NativeRuntimeIntegration(invocation.unit.clone());
-    let selected = integration.lookup_record(
-        invocation.kind(),
-        invocation.replica().map(|replica| replica.replica_id),
-        invocation.replica().map(|replica| replica.node_id),
-    )?;
-    if !Arc::ptr_eq(&selected.issued, &invocation.issued) {
-        return Err(Error::Closed);
-    }
     let binder = invocation
         .unit
         .binder
@@ -713,8 +733,109 @@ pub(super) fn bind(
         .unwrap()
         .as_ref()
         .and_then(Weak::upgrade);
-    match binder {
-        Some(binder) => binder.bind_invocation(invocation),
-        None => Ok(fallback),
+    let control = match binder {
+        Some(binder) => binder.bind_invocation(invocation.clone())?,
+        None => fallback,
+    };
+    invocation.validate()?;
+    Ok(Arc::new(InvocationControl {
+        control,
+        invocation,
+    }))
+}
+
+struct InvocationControl {
+    control: Arc<dyn IPrimaryReplicator>,
+    invocation: NativeInvocation,
+}
+struct InvocationFuture<'a, T> {
+    work: crate::ApiFuture<'a, T>,
+    invocation: NativeInvocation,
+}
+impl<T> std::future::Future for InvocationFuture<'_, T> {
+    type Output = Result<T>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let scope = crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone());
+        match scope {
+            Ok(_scope) => self.work.as_mut().poll(cx),
+            Err(error) => std::task::Poll::Ready(Err(error)),
+        }
+    }
+}
+impl IReplicator for InvocationControl {
+    fn open(&self, cancel: Cancellation) -> crate::ApiFuture<'_, String> {
+        self.control.open(cancel)
+    }
+    fn close(&self, cancel: Cancellation) -> crate::ApiFuture<'_, ()> {
+        self.control.close(cancel)
+    }
+    fn change_role(
+        &self,
+        epoch: Epoch,
+        role: ReplicaRole,
+        cancel: Cancellation,
+    ) -> crate::ApiFuture<'_, ()> {
+        self.control.change_role(epoch, role, cancel)
+    }
+    fn update_epoch(&self, epoch: Epoch, cancel: Cancellation) -> crate::ApiFuture<'_, ()> {
+        self.control.update_epoch(epoch, cancel)
+    }
+    fn get_current_progress(&self) -> Result<i64> {
+        self.control.get_current_progress()
+    }
+    fn get_catch_up_capability(&self) -> Result<i64> {
+        self.control.get_catch_up_capability()
+    }
+    fn abort(&self) {
+        self.control.abort();
+    }
+}
+impl IPrimaryReplicator for InvocationControl {
+    fn on_data_loss(&self, cancel: Cancellation) -> crate::ApiFuture<'_, bool> {
+        self.control.on_data_loss(cancel)
+    }
+    fn update_catch_up_replica_set_configuration(
+        &self,
+        cc: crate::ReplicaSetConfig,
+        pc: crate::ReplicaSetConfig,
+    ) -> Result<()> {
+        let _scope =
+            crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone())?;
+        self.control
+            .update_catch_up_replica_set_configuration(cc, pc)
+    }
+    fn update_current_replica_set_configuration(&self, cc: crate::ReplicaSetConfig) -> Result<()> {
+        let _scope =
+            crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone())?;
+        self.control.update_current_replica_set_configuration(cc)
+    }
+    fn wait_for_catch_up_quorum(
+        &self,
+        mode: crate::ReplicaSetQuorumMode,
+        cancel: Cancellation,
+    ) -> crate::ApiFuture<'_, ()> {
+        self.control.wait_for_catch_up_quorum(mode, cancel)
+    }
+    fn build_replica(
+        &self,
+        replica: crate::ReplicaInformation,
+        cancel: Cancellation,
+    ) -> crate::ApiFuture<'_, ()> {
+        let scope = crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone());
+        match scope {
+            Ok(_scope) => Box::pin(InvocationFuture {
+                work: self.control.build_replica(replica, cancel),
+                invocation: self.invocation.clone(),
+            }),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
+    fn remove_replica(&self, id: i64) -> Result<()> {
+        let _scope =
+            crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone())?;
+        self.control.remove_replica(id)
     }
 }

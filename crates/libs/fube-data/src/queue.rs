@@ -18,6 +18,7 @@ pub struct Entry {
 }
 
 pub struct OperationQueue {
+    initialized: bool,
     entries: BTreeMap<i64, Entry>,
     settings: Settings,
     bytes: usize,
@@ -36,6 +37,7 @@ impl OperationQueue {
             return Err(Error::InvalidInput("invalid initial LSN"));
         }
         Ok(Self {
+            initialized: true,
             settings,
             entries: BTreeMap::new(),
             bytes: 0,
@@ -47,6 +49,21 @@ impl OperationQueue {
             client_completed: initial,
             released: initial,
         })
+    }
+    pub(crate) fn deferred(settings: Settings) -> Result<Self> {
+        let mut queue = Self::new(settings, 0)?;
+        queue.initialized = false;
+        Ok(queue)
+    }
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+    pub(crate) fn initialize(&mut self, initial: i64) -> Result<()> {
+        if self.initialized {
+            return Err(Error::InvalidInput("replication queue already initialized"));
+        }
+        *self = Self::new(self.settings.clone(), initial)?;
+        Ok(())
     }
     pub fn progress(&self) -> Progress {
         Progress {
@@ -77,6 +94,9 @@ impl OperationQueue {
         self.released = self.assigned;
     }
     fn admit(&self, data: &OperationData) -> Result<()> {
+        if !self.initialized {
+            return Err(Error::InvalidInput("replication queue is not initialized"));
+        }
         if data.bytes() > self.settings.operation_bytes
             || data.segments().len() > self.settings.operation_segments
             || data.retained_bytes() > self.settings.queue_bytes
@@ -239,6 +259,17 @@ mod tests {
     };
     fn data(n: u8) -> OperationData {
         OperationData::new(vec![vec![], vec![n]]).unwrap()
+    }
+    #[test]
+    fn deferred_initial_creation_is_not_activated_zero_or_rebase() {
+        let mut queue = OperationQueue::deferred(Settings::default()).unwrap();
+        assert!(!queue.is_initialized());
+        assert!(queue.enqueue(E, data(1)).is_err());
+        assert_eq!(queue.progress().assigned, 0);
+        queue.initialize(27).unwrap();
+        assert_eq!(queue.enqueue(E, data(1)).unwrap(), 28);
+        assert!(queue.initialize(1).is_err());
+        assert_eq!(queue.progress().assigned, 28);
     }
     #[test]
     fn gaps_and_out_of_order_acknowledgment_have_distinct_frontiers() {

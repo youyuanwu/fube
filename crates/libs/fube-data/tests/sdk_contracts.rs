@@ -11,8 +11,8 @@ use fube_data::{
 };
 use fube_runtime::{
     extensions::{
-        NativeIntegrationProvider, NativeReplicaDescriptor, NativeReplicaSetConfiguration,
-        NativeRuntimeIntegration, ReplicationProgress,
+        NativeIntegrationProvider, NativeInvocation, NativeInvocationKind, NativeReplicaDescriptor,
+        NativeReplicaSetConfiguration, NativeRuntimeIntegration, ReplicationProgress,
     },
     ApiFuture, ErrorKind, IPrimaryReplicator, IReplicator, IStatefulServiceFactory,
     IStatefulServicePartition, IStatefulServiceReplica, OpenMode, ReplicaRole,
@@ -107,6 +107,14 @@ impl IStateProvider for StandardOnly {
 type Created =
     Arc<Mutex<Option<oneshot::Sender<(Arc<FabricReplicator>, NativeRuntimeIntegration)>>>>;
 type PayloadStream = Arc<dyn IOperationDataStream>;
+#[derive(Default)]
+struct ControlCalls {
+    configurations: std::sync::atomic::AtomicUsize,
+    builds: std::sync::atomic::AtomicUsize,
+    removals: Mutex<Vec<NativeInvocation>>,
+    fail_after_build: std::sync::atomic::AtomicBool,
+    roles: std::sync::atomic::AtomicUsize,
+}
 struct Factory {
     native: NativeIntegrationProvider,
     provider: Arc<dyn IStateProvider>,
@@ -114,6 +122,7 @@ struct Factory {
     created: Created,
     capabilities: Option<StateProviderCapabilities>,
     bootstrap: Option<Arc<upper_log::UpperLog>>,
+    control_calls: Arc<ControlCalls>,
 }
 struct Replica {
     native: NativeRuntimeIntegration,
@@ -122,6 +131,7 @@ struct Replica {
     created: Created,
     capabilities: Option<StateProviderCapabilities>,
     bootstrap: Option<Arc<upper_log::UpperLog>>,
+    control_calls: Arc<ControlCalls>,
 }
 impl IStatefulServiceFactory for Factory {
     fn create_replica(
@@ -139,6 +149,7 @@ impl IStatefulServiceFactory for Factory {
             created: self.created.clone(),
             capabilities: self.capabilities,
             bootstrap: self.bootstrap.clone(),
+            control_calls: self.control_calls.clone(),
         }))
     }
 }
@@ -180,6 +191,11 @@ impl IStatefulServiceReplica for Replica {
                 )?
             };
             if let Some(bootstrap) = &self.bootstrap {
+                assert_eq!(
+                    bootstrap.getters.load(std::sync::atomic::Ordering::Acquire),
+                    0,
+                    "native-bound construction must not query the unopened provider"
+                );
                 bootstrap
                     .constructed
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -187,8 +203,15 @@ impl IStatefulServiceReplica for Replica {
             if let Some(send) = self.created.lock().unwrap().take() {
                 let _ = send.send((fabric.clone(), self.native.clone()));
             }
-            // The service retains data access while returning canonical control.
-            Ok(Box::new((*fabric).clone()) as Box<dyn IPrimaryReplicator>)
+            Ok(Box::new(PublicComposite {
+                lower: fabric,
+                upper: self.bootstrap.clone(),
+                probe_cache: self
+                    .capabilities
+                    .is_some_and(|c| c.supports_copy_until_latest_lsn),
+                controls: self.control_calls.clone(),
+                native: self.native.clone(),
+            }) as Box<dyn IPrimaryReplicator>)
         })
     }
     fn change_role(&self, _: ReplicaRole, _: Cancellation) -> ApiFuture<'_, String> {
@@ -204,22 +227,252 @@ struct Fixture {
     native: NativeRuntimeIntegration,
     provider: Arc<StandardOnly>,
     host: Arc<rap::Host>,
+    controls: Arc<ControlCalls>,
+}
+
+/// Only ordinary public contracts: no data engine/lifecycle/rebase/binder seam.
+struct PublicComposite {
+    lower: Arc<FabricReplicator>,
+    upper: Option<Arc<upper_log::UpperLog>>,
+    probe_cache: bool,
+    controls: Arc<ControlCalls>,
+    native: NativeRuntimeIntegration,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_primary_provider_failure_faults_before_epoch_and_preserves_failed_open_cleanup() {
+    use std::sync::atomic::Ordering;
+    for failure in 0..3 {
+        let upper = upper_log::UpperLog::new(EPOCH, 27);
+        match failure {
+            0 => upper.fail_next_getter.store(true, Ordering::Release),
+            1 => upper.bad_next_getter.store(true, Ordering::Release),
+            _ => upper.fail_next_epoch.store(true, Ordering::Release),
+        }
+        let supplied = upper.clone();
+        let marker = upper.clone();
+        let controls = Arc::new(ControlCalls::default());
+        let control_calls = controls.clone();
+        let (send, receive) = oneshot::channel();
+        let (host, opened) = rap::Host::start_source_outcome(
+            uuid::Uuid::new_v4(),
+            rap::ReplicaSource {
+                replica_id: 1,
+                native_incarnation: 11,
+                node_id: [1; 16],
+                node_instance: 1,
+            },
+            ReplicaRole::Primary,
+            move |native| {
+                Box::new(Factory {
+                    native,
+                    provider: supplied,
+                    replay: None,
+                    created: Arc::new(Mutex::new(Some(send))),
+                    capabilities: Some(StateProviderCapabilities {
+                        supports_copy_until_latest_lsn: false,
+                    }),
+                    bootstrap: Some(marker),
+                    control_calls,
+                })
+            },
+        )
+        .await;
+        let (fabric, _native) = receive.await.unwrap();
+        assert!(opened.is_err());
+        assert_eq!(upper.getters.load(Ordering::Acquire), 1);
+        assert_eq!(
+            upper.updates.load(Ordering::Acquire),
+            usize::from(failure == 2)
+        );
+        assert_eq!(
+            controls.roles.load(Ordering::Acquire),
+            0,
+            "lower failure reached upper role continuation"
+        );
+        assert!(fabric.snapshot().closed);
+        assert_eq!(
+            fabric.get_current_progress().unwrap_err().kind(),
+            ErrorKind::ObjectClosed
+        );
+        drop(host);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_secondary_progress_is_native_not_ready_not_zero_success() {
+    let fixture = Fixture::new(uuid::Uuid::new_v4(), 1, ReplicaRole::IdleSecondary).await;
+    let error = fixture.host.get_status().await.unwrap_err();
+    assert_eq!(error.native_code(), Some(0x80071bc7u32 as i32 as i64));
+    let control = fixture.fabric.clone();
+    let error = fixture
+        .native
+        .execution()
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || control.get_catch_up_capability())
+        .await
+        .unwrap_err();
+    assert_eq!(error.native_code(), Some(0x80004005u32 as i32 as i64));
+    assert!(fixture.provider.copies.lock().unwrap().is_empty());
+    assert!(fixture.provider.epochs.lock().unwrap().is_empty());
+}
+impl IReplicator for PublicComposite {
+    fn open(&self, cancel: Cancellation) -> ApiFuture<'_, String> {
+        Box::pin(async move {
+            let address = self.lower.open(cancel).await?;
+            if let Some(upper) = &self.upper {
+                assert_eq!(
+                    upper.getters.load(std::sync::atomic::Ordering::Acquire),
+                    0,
+                    "lower Open must not query the upper provider"
+                );
+                if self.probe_cache {
+                    upper
+                        .fail_next_getter
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    assert_eq!(
+                        self.lower.get_current_progress().unwrap_err().kind(),
+                        ErrorKind::Provider
+                    );
+                    assert_eq!(self.lower.get_catch_up_capability()?, 0);
+                    assert_eq!(self.lower.get_current_progress()?, upper.tail());
+                    assert_eq!(self.lower.get_current_progress()?, upper.tail());
+                    assert_eq!(
+                        upper.getters.load(std::sync::atomic::Ordering::Acquire),
+                        2,
+                        "failure was not cached; success was"
+                    );
+                }
+            }
+            Ok(address)
+        })
+    }
+    fn close(&self, cancel: Cancellation) -> ApiFuture<'_, ()> {
+        self.lower.close(cancel)
+    }
+    fn change_role(
+        &self,
+        epoch: Epoch,
+        role: ReplicaRole,
+        cancel: Cancellation,
+    ) -> ApiFuture<'_, ()> {
+        let lower = self.lower.change_role(epoch, role, cancel);
+        Box::pin(async move {
+            lower.await?;
+            self.controls
+                .roles
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(())
+        })
+    }
+    fn update_epoch(&self, epoch: Epoch, cancel: Cancellation) -> ApiFuture<'_, ()> {
+        self.lower.update_epoch(epoch, cancel)
+    }
+    fn get_current_progress(&self) -> Result<i64> {
+        self.lower.get_current_progress()
+    }
+    fn get_catch_up_capability(&self) -> Result<i64> {
+        self.lower.get_catch_up_capability()
+    }
+    fn abort(&self) {
+        self.lower.abort();
+    }
+}
+impl IPrimaryReplicator for PublicComposite {
+    fn on_data_loss(&self, cancel: Cancellation) -> ApiFuture<'_, bool> {
+        self.lower.on_data_loss(cancel)
+    }
+    fn update_catch_up_replica_set_configuration(
+        &self,
+        cc: fube_runtime::ReplicaSetConfig,
+        pc: fube_runtime::ReplicaSetConfig,
+    ) -> Result<()> {
+        self.controls
+            .configurations
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.lower.update_catch_up_replica_set_configuration(cc, pc)
+    }
+    fn update_current_replica_set_configuration(
+        &self,
+        cc: fube_runtime::ReplicaSetConfig,
+    ) -> Result<()> {
+        self.controls
+            .configurations
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.lower.update_current_replica_set_configuration(cc)
+    }
+    fn wait_for_catch_up_quorum(
+        &self,
+        mode: fube_runtime::ReplicaSetQuorumMode,
+        cancel: Cancellation,
+    ) -> ApiFuture<'_, ()> {
+        self.lower.wait_for_catch_up_quorum(mode, cancel)
+    }
+    fn build_replica(
+        &self,
+        replica: fube_runtime::ReplicaInformation,
+        cancel: Cancellation,
+    ) -> ApiFuture<'_, ()> {
+        self.controls
+            .builds
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let lower = self.lower.build_replica(replica, cancel);
+        Box::pin(async move {
+            lower.await?;
+            if self
+                .controls
+                .fail_after_build
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return Err(fube_data::Error::Remote {
+                    code: 0x80004005u32 as i32 as i64,
+                    message: "controlled public completion failure after real lower Build".into(),
+                });
+            }
+            Ok(())
+        })
+    }
+    fn remove_replica(&self, replica: i64) -> Result<()> {
+        // Framework-only native-proof discriminator. No shared support/txn
+        // helper exports this association or controls the lower.
+        self.controls
+            .removals
+            .lock()
+            .unwrap()
+            .push(self.native.capture_removal(replica)?);
+        self.lower.remove_replica(replica)
+    }
 }
 impl Fixture {
     async fn new(partition: uuid::Uuid, replica: i64, role: ReplicaRole) -> Self {
         let provider = StandardOnly::new();
         let supplied = provider.clone();
+        let controls = Arc::new(ControlCalls::default());
+        let control_calls = controls.clone();
         let (send, receive) = oneshot::channel();
-        let host = rap::Host::start(partition, replica, role, move |native| {
-            Box::new(Factory {
-                native,
-                provider: supplied,
-                replay: None,
-                created: Arc::new(Mutex::new(Some(send))),
-                capabilities: None,
-                bootstrap: None,
-            })
-        })
+        let host = rap::Host::start_source_at_epoch(
+            partition,
+            rap::ReplicaSource {
+                replica_id: replica,
+                native_incarnation: replica + 10,
+                node_id: [replica as u8; 16],
+                node_instance: 1,
+            },
+            role,
+            EPOCH,
+            move |native| {
+                Box::new(Factory {
+                    native,
+                    provider: supplied,
+                    replay: None,
+                    created: Arc::new(Mutex::new(Some(send))),
+                    capabilities: None,
+                    bootstrap: None,
+                    control_calls,
+                })
+            },
+        )
         .await;
         let (fabric, native) = receive.await.unwrap();
         Self {
@@ -227,6 +480,7 @@ impl Fixture {
             native,
             provider,
             host,
+            controls,
         }
     }
 }
@@ -241,6 +495,7 @@ async fn model_stop_observes_actual_close_before_guarded_shutdown_with_active_ep
         native,
         provider,
         host,
+        controls: _,
     } = fixture;
     let (entered, active) = oneshot::channel();
     let (release, blocked) = std::sync::mpsc::sync_channel(1);
@@ -285,13 +540,15 @@ async fn model_stop_observes_actual_close_before_guarded_shutdown_with_active_ep
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn callback_ready_upper_log_bootstrap_passes_actual_nonempty_tail_before_lower_open() {
+async fn first_primary_samples_actual_nonempty_provider_tail_after_construction() {
     use std::sync::atomic::Ordering;
-    for (tail, latest) in [(1, false), (27, true)] {
+    for (tail, latest) in [(1, false), (27, true), (20, false)] {
         let partition = uuid::Uuid::new_v4();
         let upper = upper_log::UpperLog::new(EPOCH, tail);
         let supplied = upper.clone();
         let marker = upper.clone();
+        let controls = Arc::new(ControlCalls::default());
+        let control_calls = controls.clone();
         let (send, receive) = oneshot::channel();
         let host = rap::Host::start(partition, 1, ReplicaRole::Primary, move |native| {
             Box::new(Factory {
@@ -303,18 +560,28 @@ async fn callback_ready_upper_log_bootstrap_passes_actual_nonempty_tail_before_l
                     supports_copy_until_latest_lsn: latest,
                 }),
                 bootstrap: Some(marker),
+                control_calls,
             })
         })
         .await;
         let (fabric, native) = receive.await.unwrap();
-        assert!(upper.queried_before_return.load(Ordering::Acquire));
+        assert!(!upper.queried_before_return.load(Ordering::Acquire));
         assert!(upper.constructed.load(Ordering::Acquire));
+        assert_eq!(
+            upper.getters.load(Ordering::Acquire),
+            if latest { 2 } else { 1 }
+        );
         assert_eq!(upper.tail(), tail);
         assert_eq!(fabric.snapshot().progress.assigned, tail);
         assert_eq!(fabric.snapshot().progress.committed, tail);
         host.get_status().await.unwrap();
         assert_eq!(native.status().unwrap().progress.last, tail);
         host.configure(config(vec![], 1)).await.unwrap();
+        assert_eq!(
+            controls.configurations.load(Ordering::Acquire),
+            1,
+            "returned composite was bypassed/duplicated"
+        );
         let data = OperationData::new(vec![vec![28]]).unwrap();
         let mut admitted = fabric
             .get_state_replicator()
@@ -439,7 +706,7 @@ async fn standard_provider_sync_shapes_one_owner_copy_gap_early_lsn_and_explicit
     let control: Arc<dyn IPrimaryReplicator> = Arc::new((*primary.fabric).clone());
     let root = control.clone();
     let current = config(vec![], 1).sdk().unwrap();
-    primary
+    let outside_invocation = primary
         .fabric
         .execution_runtime()
         .try_reserve()
@@ -448,8 +715,12 @@ async fn standard_provider_sync_shapes_one_owner_copy_gap_early_lsn_and_explicit
             let result: Result<()> = root.update_current_replica_set_configuration(current);
             result
         })
-        .await
-        .unwrap();
+        .await;
+    assert_eq!(
+        outside_invocation.unwrap_err().kind(),
+        ErrorKind::InvalidArgument
+    );
+    primary.host.configure(config(vec![], 1)).await.unwrap();
     let state: Arc<dyn IStateReplicator> = primary.fabric.get_state_replicator();
     let stream_a: Result<Arc<dyn IOperationStream>> = state.get_replication_stream();
     let stream_b: Result<Arc<dyn IOperationStream>> = state.get_replication_stream();
@@ -793,12 +1064,19 @@ async fn combined_native_bound_build_remove_and_full_low_bit_epoch_controls_work
             .unwrap();
         operation.acknowledge().unwrap();
     }
+
     build.await.unwrap().unwrap();
     assert!(copy
         .get_operation(Cancellation::default())
         .await
         .unwrap()
         .is_none());
+    idle.host.get_status().await.unwrap();
+    assert_eq!(
+        idle.native.status().unwrap().progress.last,
+        0,
+        "zero is valid only after the actual empty copy initialized/completed the queue"
+    );
     primary.host.remove(target).await.unwrap();
     assert!(primary.fabric.snapshot().peers.is_empty());
     let full = Epoch {
@@ -810,4 +1088,107 @@ async fn combined_native_bound_build_remove_and_full_low_bit_epoch_controls_work
     assert_eq!(primary.fabric.snapshot().epoch, Some(EPOCH.primary()));
     primary.fabric.close(Cancellation::default()).await.unwrap();
     idle.fabric.close(Cancellation::default()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn returned_composite_build_idle_remove_and_native_retry_cleanup_are_once_only() {
+    use std::sync::atomic::Ordering;
+    let partition = uuid::Uuid::new_v4();
+    let primary = Fixture::new(partition, 1, ReplicaRole::Primary).await;
+    primary.host.configure(config(vec![], 1)).await.unwrap();
+    let idle = Fixture::new(partition, 2, ReplicaRole::IdleSecondary).await;
+    let copy = idle
+        .fabric
+        .get_state_replicator()
+        .get_copy_stream()
+        .unwrap();
+    let target = idle.descriptor(ReplicaRole::IdleSecondary);
+    primary
+        .controls
+        .fail_after_build
+        .store(true, Ordering::Release);
+    let node = primary.host.clone();
+    let build_target = target.clone();
+    let first =
+        tokio::spawn(async move { node.build(build_target, Cancellation::default()).await });
+    for _ in 0..2 {
+        let operation = next(&*copy).await;
+        idle.provider
+            .memory
+            .apply_copy(&operation.get_data().unwrap())
+            .unwrap();
+        operation.acknowledge().unwrap();
+    }
+    assert!(
+        first.await.unwrap().is_err(),
+        "actual completed lower result was deliberately rejected"
+    );
+    assert!(copy
+        .get_operation(Cancellation::default())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(primary.controls.builds.load(Ordering::Acquire), 1);
+    primary
+        .host
+        .build(target.clone(), Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(primary.controls.builds.load(Ordering::Acquire), 2);
+    {
+        let removals = primary.controls.removals.lock().unwrap();
+        assert_eq!(removals.len(), 1);
+        assert_eq!(
+            removals[0].kind(),
+            NativeInvocationKind::Remove(
+                fube_runtime::extensions::ReplicaRemoval::BuildRetryCleanup
+            )
+        );
+    }
+    primary.host.remove(target).await.unwrap();
+    let removals = primary.controls.removals.lock().unwrap();
+    assert_eq!(removals.len(), 2);
+    assert_eq!(
+        removals[1].kind(),
+        NativeInvocationKind::Remove(fube_runtime::extensions::ReplicaRemoval::Idle)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secondary_progress_while_copy_is_incomplete_reports_not_ready_after_queue_creation() {
+    let partition = uuid::Uuid::new_v4();
+    let primary = Fixture::new(partition, 1, ReplicaRole::Primary).await;
+    primary.host.configure(config(vec![], 1)).await.unwrap();
+    let idle = Fixture::new(partition, 2, ReplicaRole::IdleSecondary).await;
+    let stream = idle
+        .fabric
+        .get_state_replicator()
+        .get_copy_stream()
+        .unwrap();
+    let host = primary.host.clone();
+    let target = idle.descriptor(ReplicaRole::IdleSecondary);
+    let build = tokio::spawn(async move { host.build(target, Cancellation::default()).await });
+    let first = next(&*stream).await;
+    idle.provider
+        .memory
+        .apply_copy(&first.get_data().unwrap())
+        .unwrap();
+    let status = idle.host.get_status().await;
+    first.acknowledge().unwrap();
+    let end = next(&*stream).await;
+    idle.provider
+        .memory
+        .apply_copy(&end.get_data().unwrap())
+        .unwrap();
+    end.acknowledge().unwrap();
+    build.await.unwrap().unwrap();
+    assert_eq!(
+        status.unwrap_err().native_code(),
+        Some(0x80071bc7u32 as i32 as i64)
+    );
+    assert!(stream
+        .get_operation(Cancellation::default())
+        .await
+        .unwrap()
+        .is_none());
 }

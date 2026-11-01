@@ -46,12 +46,18 @@ pub struct CallOrigin {
 }
 
 #[derive(Clone)]
+struct InvocationAssociation {
+    proof: crate::extensions::NativeInvocation,
+    capture: bool,
+}
+#[derive(Clone)]
 struct EntryContext {
     origin: CallOrigin,
     active: Arc<Active>,
     scope: Option<Arc<owned::Scope>>,
     cleanup: bool,
     release_budget: Option<Duration>,
+    invocation: Option<InvocationAssociation>,
 }
 thread_local! {
     static ENTRY: RefCell<Option<EntryContext>> = const { RefCell::new(None) };
@@ -78,10 +84,11 @@ impl Entry {
             previous: ENTRY.with(|slot| {
                 slot.replace(Some(EntryContext {
                     origin,
-                    active,
+                    active: active.clone(),
                     scope: None,
                     cleanup,
                     release_budget: None,
+                    invocation: active.invocation.clone(),
                 }))
             }),
             _thread: std::marker::PhantomData,
@@ -116,6 +123,7 @@ struct Active {
     cleanup_owner: Option<Arc<AtomicUsize>>,
     scopes: Mutex<Vec<std::sync::Weak<owned::Scope>>>,
     cleanup_ready: Arc<Semaphore>,
+    invocation: Option<InvocationAssociation>,
 }
 impl Drop for Active {
     fn drop(&mut self) {
@@ -334,6 +342,59 @@ pub struct ExecutionRuntime {
 }
 
 impl ExecutionRuntime {
+    #[cfg(test)]
+    pub(crate) fn current_invocation() -> Option<crate::extensions::NativeInvocation> {
+        Self::current_association().map(|association| association.proof)
+    }
+    fn current_association() -> Option<InvocationAssociation> {
+        ENTRY.with(|entry| {
+            entry
+                .borrow()
+                .as_ref()
+                .and_then(|entry| entry.invocation.clone())
+        })
+    }
+    pub(crate) fn capturable_invocation() -> Option<crate::extensions::NativeInvocation> {
+        ENTRY.with(|entry| {
+            entry
+                .borrow()
+                .as_ref()
+                .filter(|entry| !entry.cleanup)
+                .and_then(|entry| entry.invocation.as_ref())
+                .filter(|association| association.capture && association.proof.in_own_execution())
+                .map(|association| association.proof.clone())
+        })
+    }
+    pub(crate) fn invocation_scope(
+        invocation: crate::extensions::NativeInvocation,
+    ) -> Result<impl Drop> {
+        invocation.validate()?;
+        if !invocation.in_own_execution() {
+            return Err(Error::InvalidInput(
+                "native invocation execution owner mismatch",
+            ));
+        }
+        let mut context = ENTRY
+            .with(|entry| entry.borrow().clone())
+            .ok_or(Error::InvalidInput(
+                "native invocation requires owned execution",
+            ))?;
+        if context.cleanup
+            || context
+                .invocation
+                .as_ref()
+                .is_some_and(|association| !association.capture)
+        {
+            return Err(Error::InvalidInput(
+                "cleanup cannot authorize native invocation",
+            ));
+        }
+        context.invocation = Some(InvocationAssociation {
+            proof: invocation,
+            capture: true,
+        });
+        Ok(Entry::scoped(context))
+    }
     /// Standalone fixtures have no native process authority/watchdog. Their
     /// application remains responsible for a terminal blocking-code fence.
     pub fn standalone(application: tokio::runtime::Handle) -> Result<Self> {
@@ -466,6 +527,14 @@ impl ExecutionRuntime {
                 cleanup_owner: None,
                 scopes: Mutex::new(Vec::new()),
                 cleanup_ready: Arc::new(Semaphore::new(1)),
+                invocation: if self.is_current_entry() {
+                    Self::current_association().map(|mut association| {
+                        association.capture &= !Self::is_cleanup_entry();
+                        association
+                    })
+                } else {
+                    None
+                },
             }),
         })
     }

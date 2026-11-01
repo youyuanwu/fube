@@ -15,12 +15,88 @@ struct Factory {
     provider: Arc<dyn IStateProvider>,
     settings: Settings,
     created: Created,
+    opening_cancel: Arc<Mutex<Option<Cancellation>>>,
+    sample_open_progress: bool,
+    retry_open_progress: bool,
 }
 struct Replica {
     native: NativeRuntimeIntegration,
     provider: Arc<dyn IStateProvider>,
     settings: Settings,
     created: Created,
+    opening_cancel: Arc<Mutex<Option<Cancellation>>>,
+    sample_open_progress: bool,
+    retry_open_progress: bool,
+}
+struct OpenedSampler(Arc<crate::FabricReplicator>, bool);
+impl IReplicator for OpenedSampler {
+    fn open(&self, cancel: Cancellation) -> ServiceFuture<'_, String> {
+        Box::pin(async move {
+            let address = self.0.open(cancel).await?;
+            let progress = self.0.get_current_progress();
+            if progress.is_err() && self.1 {
+                self.0.get_current_progress()?;
+            } else {
+                progress?;
+            }
+            Ok(address)
+        })
+    }
+    fn close(&self, cancel: Cancellation) -> ServiceFuture<'_, ()> {
+        self.0.close(cancel)
+    }
+    fn change_role(
+        &self,
+        epoch: Epoch,
+        role: ReplicaRole,
+        cancel: Cancellation,
+    ) -> ServiceFuture<'_, ()> {
+        self.0.change_role(epoch, role, cancel)
+    }
+    fn update_epoch(&self, epoch: Epoch, cancel: Cancellation) -> ServiceFuture<'_, ()> {
+        self.0.update_epoch(epoch, cancel)
+    }
+    fn get_current_progress(&self) -> Result<i64> {
+        self.0.get_current_progress()
+    }
+    fn get_catch_up_capability(&self) -> Result<i64> {
+        self.0.get_catch_up_capability()
+    }
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+impl IPrimaryReplicator for OpenedSampler {
+    fn on_data_loss(&self, cancel: Cancellation) -> ServiceFuture<'_, bool> {
+        self.0.on_data_loss(cancel)
+    }
+    fn update_catch_up_replica_set_configuration(
+        &self,
+        cc: ReplicaSetConfig,
+        pc: ReplicaSetConfig,
+    ) -> Result<()> {
+        self.0.update_catch_up_replica_set_configuration(cc, pc)
+    }
+    fn update_current_replica_set_configuration(&self, cc: ReplicaSetConfig) -> Result<()> {
+        self.0.update_current_replica_set_configuration(cc)
+    }
+    fn wait_for_catch_up_quorum(
+        &self,
+        mode: CatchUpMode,
+        cancel: Cancellation,
+    ) -> ServiceFuture<'_, ()> {
+        self.0.wait_for_catch_up_quorum(mode, cancel)
+    }
+    fn build_replica(
+        &self,
+        replica: SdkReplicaInformation,
+        cancel: Cancellation,
+    ) -> ServiceFuture<'_, ()> {
+        self.0.build_replica(replica, cancel)
+    }
+    fn remove_replica(&self, replica: i64) -> Result<()> {
+        self.0.remove_replica(replica)
+    }
 }
 impl IStatefulServiceFactory for Factory {
     fn create_replica(
@@ -36,6 +112,9 @@ impl IStatefulServiceFactory for Factory {
             provider: self.provider.clone(),
             settings: self.settings.clone(),
             created: self.created.clone(),
+            opening_cancel: self.opening_cancel.clone(),
+            sample_open_progress: self.sample_open_progress,
+            retry_open_progress: self.retry_open_progress,
         }))
     }
 }
@@ -44,10 +123,11 @@ impl IStatefulServiceReplica for Replica {
         &self,
         mode: OpenMode,
         partition: Arc<dyn IStatefulServicePartition>,
-        _: Cancellation,
+        cancellation: Cancellation,
     ) -> ServiceFuture<'_, Box<dyn IPrimaryReplicator>> {
         Box::pin(async move {
             mode.validate()?;
+            *self.opening_cancel.lock().unwrap() = Some(cancellation);
             let fabric = crate::FabricReplicator::create(
                 partition,
                 self.native.clone(),
@@ -61,6 +141,10 @@ impl IStatefulServiceReplica for Replica {
             )?;
             if let Some(send) = self.created.lock().unwrap().take() {
                 let _ = send.send((fabric.engine.clone(), self.native.clone()));
+            }
+            if self.sample_open_progress {
+                return Ok(Box::new(OpenedSampler(fabric, self.retry_open_progress))
+                    as Box<dyn IPrimaryReplicator>);
             }
             Ok(Box::new((*fabric).clone()) as Box<dyn IPrimaryReplicator>)
         })
@@ -111,6 +195,16 @@ impl Fixture {
         root: bool,
         storage: (Arc<MemoryProvider>, Arc<dyn IStateProvider>, Settings),
     ) -> Self {
+        Self::using_at_epoch(partition, source, role, root, storage, EPOCH).await
+    }
+    async fn using_at_epoch(
+        partition: uuid::Uuid,
+        source: rap::ReplicaSource,
+        role: ReplicaRole,
+        root: bool,
+        storage: (Arc<MemoryProvider>, Arc<dyn IStateProvider>, Settings),
+        epoch: Epoch,
+    ) -> Self {
         let (provider, supplied, settings) = storage;
         let (send, receive) = oneshot::channel();
         let standard = source == self::source(source.replica_id);
@@ -120,9 +214,14 @@ impl Fixture {
                 provider: supplied,
                 settings,
                 created: Arc::new(Mutex::new(Some(send))),
+                opening_cancel: Arc::new(Mutex::new(None)),
+                sample_open_progress: false,
+                retry_open_progress: false,
             })
         };
-        let host = if standard {
+        let host = if epoch != EPOCH {
+            rap::Host::start_source_at_epoch(partition, source, role, epoch, factory).await
+        } else if standard {
             rap::Host::start(partition, source.replica_id, role, factory).await
         } else {
             rap::Host::start_source(partition, source, role, factory).await
@@ -717,10 +816,16 @@ async fn issued_root_and_bound_canonical_controls_copy_ack_memberships_remove_an
             .catch_up(current.clone(), previous.clone())
             .await
             .unwrap();
+        // Observe the exact proof actually consumed by canonical dispatch,
+        // never reselect a latest matching ledger record after the call.
         let proof = primary
-            .native
-            .capture_configuration(&current.sdk().unwrap(), Some(&previous.sdk().unwrap()))
+            .engine
+            .native_configuration
+            .lock()
+            .unwrap()
+            .clone()
             .unwrap();
+        assert!(proof.clone().enter().is_err());
         let (cc, pc) = proof.configuration().unwrap();
         assert_eq!((cc.write_quorum, cc.local_member), (2, true));
         assert_eq!(
@@ -770,6 +875,249 @@ async fn issued_root_and_bound_canonical_controls_copy_ack_memberships_remove_an
     }
 }
 
+struct InitialPublicationProvider {
+    memory: Arc<MemoryProvider>,
+    gate: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
+    getters: AtomicU64,
+    fail_next_getter: AtomicBool,
+}
+impl IStateProvider for InitialPublicationProvider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
+        self.getters.fetch_add(1, Ordering::AcqRel);
+        let gate = self.gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            release
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .map_err(|_| Error::Timeout)?;
+        }
+        if self.fail_next_getter.swap(false, Ordering::AcqRel) {
+            return Err(Error::InvalidInput("controlled ordinary getter failure"));
+        }
+        self.memory.get_last_committed_sequence_number()
+    }
+    fn update_epoch(
+        &self,
+        epoch: Epoch,
+        previous: i64,
+        cancel: Cancellation,
+    ) -> ServiceFuture<'_, ()> {
+        self.memory.update_epoch(epoch, previous, cancel)
+    }
+    fn on_data_loss(&self, cancel: Cancellation) -> ServiceFuture<'_, bool> {
+        self.memory.on_data_loss(cancel)
+    }
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
+        self.memory.get_copy_context()
+    }
+    fn get_copy_state(
+        &self,
+        horizon: i64,
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
+        self.memory.get_copy_state(horizon, context)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_progress_completed_callback_cannot_publish_after_native_cancel_or_deadline() {
+    for (cancel, sample_open_progress) in [(false, false), (true, false), (true, true)] {
+        let memory = MemoryProvider::new();
+        for sequence in 1..=27 {
+            memory
+                .apply_replication(
+                    sequence,
+                    &Mutation {
+                        id: format!("initial-{sequence}"),
+                        key: format!("initial-{sequence}"),
+                        value: "value".into(),
+                    }
+                    .operation()
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let (getter_entered, getter_wait) = std_mpsc::sync_channel(1);
+        let (getter_release, getter_blocked) = std_mpsc::sync_channel(1);
+        let provider = Arc::new(InitialPublicationProvider {
+            memory: memory.clone(),
+            gate: Mutex::new(Some((getter_entered, getter_blocked))),
+            getters: AtomicU64::new(0),
+            fail_next_getter: AtomicBool::new(false),
+        });
+        let supplied = provider.clone();
+        let opening_cancel = Arc::new(Mutex::new(None));
+        let captured_cancel = opening_cancel.clone();
+        let (created, receive) = oneshot::channel();
+        let settings = Settings {
+            callback_timeout: if cancel {
+                std::time::Duration::from_secs(2)
+            } else {
+                std::time::Duration::from_millis(300)
+            },
+            ..Settings::default()
+        };
+        let started = tokio::spawn(async move {
+            rap::Host::start_source_outcome(
+                uuid::Uuid::new_v4(),
+                source(1),
+                ReplicaRole::Primary,
+                move |native| {
+                    Box::new(Factory {
+                        native,
+                        provider: supplied,
+                        settings,
+                        created: Arc::new(Mutex::new(Some(created))),
+                        opening_cancel: captured_cancel,
+                        sample_open_progress,
+                        retry_open_progress: false,
+                    })
+                },
+            )
+            .await
+        });
+        let (engine, _native) = receive.await.unwrap();
+        getter_wait
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let (publication_entered, publication_wait) = std_mpsc::sync_channel(1);
+        let (publication_release, publication_blocked) = std_mpsc::sync_channel(1);
+        *engine.shared.initial_publication_pause.lock().unwrap() =
+            Some((publication_entered, publication_blocked));
+        getter_release.send(()).unwrap();
+        publication_wait
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        if cancel {
+            opening_cancel.lock().unwrap().as_ref().unwrap().cancel();
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        }
+        publication_release.send(()).unwrap();
+        let (host, opened) = started.await.unwrap();
+        assert!(opened.is_err());
+        assert!(engine.shared.initial_progress.lock().unwrap().is_none());
+        assert_eq!(provider.getters.load(Ordering::Acquire), 1);
+        drop(host);
+        memory
+            .apply_replication(
+                28,
+                &Mutation {
+                    id: "new-initial".into(),
+                    key: "new-initial".into(),
+                    value: "value".into(),
+                }
+                .operation()
+                .unwrap(),
+            )
+            .unwrap();
+        let supplied = provider.clone();
+        let (created, receive) = oneshot::channel();
+        let host = rap::Host::start(
+            uuid::Uuid::new_v4(),
+            1,
+            ReplicaRole::Primary,
+            move |native| {
+                Box::new(Factory {
+                    native,
+                    provider: supplied,
+                    settings: Settings::default(),
+                    created: Arc::new(Mutex::new(Some(created))),
+                    opening_cancel: Arc::new(Mutex::new(None)),
+                    sample_open_progress: false,
+                    retry_open_progress: false,
+                })
+            },
+        )
+        .await;
+        let (fresh, _) = receive.await.unwrap();
+        assert_eq!(provider.getters.load(Ordering::Acquire), 2);
+        assert_eq!(fresh.snapshot().progress.assigned, 28);
+        drop(host);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_coalesced_primary_does_not_fault_valid_opened_getter_retry() {
+    let memory = MemoryProvider::new();
+    memory
+        .apply_replication(
+            1,
+            &Mutation {
+                id: "shared".into(),
+                key: "shared".into(),
+                value: "value".into(),
+            }
+            .operation()
+            .unwrap(),
+        )
+        .unwrap();
+    let (getter_entered, getter_wait) = std_mpsc::sync_channel(1);
+    let (getter_release, getter_blocked) = std_mpsc::sync_channel(1);
+    let provider = Arc::new(InitialPublicationProvider {
+        memory,
+        gate: Mutex::new(Some((getter_entered, getter_blocked))),
+        getters: AtomicU64::new(0),
+        fail_next_getter: AtomicBool::new(true),
+    });
+    let supplied = provider.clone();
+    let (created, receive) = oneshot::channel();
+    let started = tokio::spawn(async move {
+        rap::Host::start_source_outcome(
+            uuid::Uuid::new_v4(),
+            source(1),
+            ReplicaRole::Primary,
+            move |native| {
+                Box::new(Factory {
+                    native,
+                    provider: supplied,
+                    settings: Settings::default(),
+                    created: Arc::new(Mutex::new(Some(created))),
+                    opening_cancel: Arc::new(Mutex::new(None)),
+                    sample_open_progress: true,
+                    retry_open_progress: true,
+                })
+            },
+        )
+        .await
+    });
+    let (engine, native) = receive.await.unwrap();
+    getter_wait
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let (primary_entered, primary_wait) = std_mpsc::sync_channel(1);
+    *engine.shared.initial_coalesced_primary.lock().unwrap() = Some(primary_entered);
+    let cancelled = Cancellation::default();
+    let supplied_cancel = cancelled.clone();
+    let lower = engine.clone();
+    let primary = native
+        .execution()
+        .try_reserve()
+        .unwrap()
+        .run_future(async move {
+            IReplicator::change_role(&*lower, EPOCH, ReplicaRole::Primary, supplied_cancel).await
+        });
+    primary_wait
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    cancelled.cancel();
+    getter_release.send(()).unwrap();
+    let primary_result = primary.await;
+    let (host, opened) = started.await.unwrap();
+    assert_eq!(
+        primary_result.unwrap_err().kind(),
+        fube_runtime::ErrorKind::ObjectClosed
+    );
+    assert!(
+        opened.is_ok(),
+        "valid ordinary getter retry was terminally faulted: {opened:?}"
+    );
+    assert_eq!(provider.getters.load(Ordering::Acquire), 2);
+    assert_eq!(engine.snapshot().progress.assigned, 1);
+    assert!(engine.snapshot().fault.is_none());
+    drop(host);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owned_native_bound_duplicate_secondary_epoch_enters_lower_while_copy_ack_is_pending() {
     let partition = uuid::Uuid::new_v4();
@@ -807,13 +1155,9 @@ async fn owned_native_bound_duplicate_secondary_epoch_enters_lower_while_copy_ac
     let getters = upper.getters.load(Ordering::Acquire);
     assert!(!s.engine.snapshot().copy_done);
     let entries = s.engine.shared.epoch_entries.load(Ordering::Acquire);
-    // RAP legitimately suppresses a duplicate before calling lower. Verify
-    // that optimization, then exercise the canonical lower method itself.
-    s.host.change_epoch(EPOCH).await.unwrap();
-    assert_eq!(
-        s.engine.shared.epoch_entries.load(Ordering::Acquire),
-        entries
-    );
+    // The bare SDK UpdateEpoch is valid during copy. RAP's combined
+    // UpdateEpochAndGetStatus must wait for real copy readiness: its status
+    // getter cannot report a fictitious initialized zero during this gate.
     let permit = s
         .native
         .execution()
@@ -845,6 +1189,12 @@ async fn owned_native_bound_duplicate_secondary_epoch_enters_lower_while_copy_ac
     operation.acknowledge().unwrap();
     drop(operation);
     build.await.unwrap();
+    s.host.change_epoch(EPOCH).await.unwrap();
+    assert_eq!(
+        s.engine.shared.epoch_entries.load(Ordering::Acquire),
+        entries + 1,
+        "RAP suppressed the duplicate while obtaining actual completed-copy status"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1019,9 +1369,16 @@ async fn captured_unpolled_build_is_revoked_never_retargets_replacement_native_n
         if variant == 3 {
             replacement.node_id = [9; 16];
         }
-        let replacement =
-            Fixture::new(partition, replacement, ReplicaRole::IdleSecondary, false).await;
-        replacement.host.change_epoch(NEXT).await.unwrap();
+        let memory = MemoryProvider::new();
+        let replacement = Fixture::using_at_epoch(
+            partition,
+            replacement,
+            ReplicaRole::IdleSecondary,
+            false,
+            (memory.clone(), memory, Settings::default()),
+            NEXT,
+        )
+        .await;
         primary
             .host
             .configure(config(NEXT, vec![], 1))
