@@ -7,7 +7,7 @@
 contracts](../../crates/libs/fube-transport/src/channel.rs) for one dedicated
 **explicitly unsecured-development, numeric-loopback NamingGateway connection**.
 This is native Fabric TCP messaging, not `IFabricTransport`, UDP, actor36,
-a typed client, router or replacement for existing `Connection` consumers.
+a typed client, router or adapter around `Connection`.
 
 `GatewayChannel::connect_unsecured_loopback(endpoint, notifications, limits,
 deadline)` establishes TCP and the clear ListenInstance exchange inside one
@@ -100,7 +100,8 @@ Domain protocols may require additional version/activity/priority/time headers.
 The example demonstrates binding, not a complete typed FabricClient protocol.
 Native notification setup and processing-status schemas remain above the
 foundation. Ordinary FabricClient uses the shared typed adapter above this
-foundation; notifications and image upload retain independent Connection owners.
+foundation. ServiceNotificationClient owns a separate notification-enabled
+GatewayChannel/native session; image upload retains its independent Connection.
 
 - Resolution is synchronous, performs no I/O and accepts only the configured
   numeric endpoint. It reuses one private target identity. Equal addresses or
@@ -126,11 +127,24 @@ foundation; notifications and image upload retain independent Connection owners.
   on-time reply/Fault/write result remains settled even if its observer is
   polled after the deadline. A genuinely late completion is Timeout.
   Explicit shutdown can instead retire undelivered results.
+- Concrete `request_tracked` additionally returns a nonowning
+  `RequestCancellation`. `cancel_unsent()` retracts under the same first-write
+  lock and returns true only if no byte became visible; false means an
+  unconfirmed remote outcome remains possible. This observation survives
+  settlement/expiry/future drop. Ordinary RPC contracts do not acquire
+  notification registration policy.
 - Native controls and ordinary completions bypass application ingress.
   Receive transfers an envelope only in a ready poll before its deadline.
   Cancelled/expired receive does not consume queued ingress. Full ingress
   remains intact until transfer or explicit terminal retirement; overflow is
   an explicit ResourceLimit termination, never a silent accepted-message drop.
+- Concrete `GatewayReceiver::drain_pending` consumes a finite snapshot of
+  currently queued authorized ingress in wire order, without waiting for new
+  traffic. The sole notification constructor uses this handoff before
+  publication; contexts remain private, consuming and bound to their original
+  socket. The snapshot retains each slot's reservation until individual
+  transfer or Drop, avoiding bulk unaccounted input. Transferred values are
+  caller-owned and require consumer accounting.
 - Dropping an envelope or unused context emits no response. Calling consuming
   reply consumes its one attempt even if its returned owned future is never
   polled. Public IncomingMessage fields cannot mint private reply authority.
@@ -144,6 +158,9 @@ single owned driver after its I/O halves and expiry scope stop. A started frame
 is still retired safely. Timeout/drop does not detach its retained join handle
 or undo shutdown; repeated/concurrent closes can wait again. Later target/reply
 attempts fail Closed. No unused capability keeps workers alive after close.
+`abort()`/`abort_with_error()` initiate shutdown synchronously, preserving the
+first cause; `closed(deadline)` only observes the retained driver join and never
+initiates shutdown. Its timeout/drop also leaves the join handle owned.
 
 ## Finite retention and ordering
 
@@ -191,7 +208,22 @@ Unknown/late/duplicate ordinary replies never complete another ID and are not
 retained; more than 1024 consecutive unmatched replies terminates. History
 exhaustion retires the channel instead of evicting IDs unsafely.
 Duplicate/colliding notification IDs terminate without minting a second context.
-This intentionally does **not** implement native notification retry/deduplication.
+This is transport-attempt collision protection, not semantic page deduplication.
+Pinned [ServiceNotificationManagerProxy.cpp:453–483][notification-retry] replaces
+the MessageId on **every proxy-to-client forwarding attempt**, including retries;
+the sender's unchanged IPC request can retain an ID on a different transport leg.
+Repeated logical page/version content under fresh client-leg IDs is admitted
+normally and acknowledged through each attempt's original context.
+ServiceNotificationClient owns bounded semantic progress and duplicate delivery
+suppression; the channel neither decodes pages nor relaxes same-ID collisions.
+
+The notification consumer uses 33 retained backend ingress slots, 32 client-staged
+pages and one scoped staging/semantic worker, with the existing 8 MiB client
+allocation budget. Its finite transport reservation ceiling is 2 GiB (not eager
+allocation); default ordinary limits stay unchanged. Thirty-three maximum-frame
+slots cannot fit the ordinary 512 MiB ceiling. Client page-count overflow is
+notification ResourceLimit, memory exhaustion is Lagged; independently exhausted
+backend admission retains its Common(ResourceLimit) cause.
 
 ## Native evidence and stronger Rust obligations
 
@@ -224,8 +256,10 @@ interoperability qualification.
 - Native [gateway completion:465-494][gateway-correlation] appends RelatesTo
   while forwarding composition already carries correlation; generic
   RequestReply also appends ExpectsReply. Earlier task-local SF 11.8.121.4
-  execution observed the repeated identical headers. The narrow inbound allowance
-  validates equality without deleting records or relaxing caller contracts.
+  execution observed repeated headers. Current RelatesTo handling validates
+  every record and selects only the final effective ID, without a bespoke
+  repetition count/equality restriction or earlier-ID fallback. Only the
+  second identical ExpectsReply exception remains; caller inputs stay strict.
 
 ## Verification and execution limits
 
@@ -262,13 +296,18 @@ Ongoing consumer end-to-end qualification belongs in the
 uses GatewayChannel and the maintained native group exercises naming, all
 query/health/deployment/resolution families and one owned MovePrimary. Current
 receipts come from rebuilt migrated consumers, not the historical foundation
-smoke. The independent notification/image-transfer Connection consumers remain
-unchanged; their results are not fresh GatewayReceiver/upload-channel coverage.
+smoke. The same maintained group now exercises independently owned notification
+GatewayReceiver/session consumers and the existing loss relay: one successful
+ACK is dropped, the same target logical page is retried under an observed fresh
+full MessageId, and a successful ACK is fully forwarded for that retry's exact
+ID without duplicate delivered versions. The receipt validator checks these
+bounded witnesses. Image-transfer remains an unmigrated Connection consumer.
 
 No fresh live pass is inferred from scaffolding removal, source inspection or
-deterministic checks. Live notification retry races, nonempty application
-notification contents, secure clusters, arbitrary reverse RPC and unrelated
-runtime/upload/hosting qualification remain unclaimed.
+deterministic checks. Exact-candidate live results require fresh maintained
+receipts. Isolated primary-address-only filtering with distinct nonempty
+addresses, secure clusters, arbitrary reverse RPC and unrelated runtime/
+upload/hosting qualification remain unclaimed.
 
 [sf]: https://github.com/microsoft/service-fabric/commit/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d
 [rpc]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/requestreply.cpp#L57-L122
@@ -282,3 +321,4 @@ runtime/upload/hosting qualification remain unclaimed.
 [sync]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/ServiceNotificationManager.cpp#L1016-L1072
 [mssf]: https://github.com/youyuanwu/service-fabric-rs-fork/blob/35555883476ac5f78f5f53ef0215b6a32e43b574/crates/libs/core/src/client/mod.rs#L267-L280
 [gateway-correlation]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/EntreeServiceProxy.cpp#L465-L494
+[notification-retry]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/ServiceNotificationManagerProxy.cpp#L453-L483

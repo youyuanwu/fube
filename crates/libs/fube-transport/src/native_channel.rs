@@ -186,6 +186,48 @@ struct Entry {
     bytes: Option<Vec<u8>>,
     result: Option<Result<Outcome>>,
     lease: Arc<Lease>,
+    tracking: Option<Arc<Mutex<RequestState>>>,
+}
+
+#[derive(Default)]
+struct RequestState {
+    token: Option<u64>,
+    visible: bool,
+    cancelled: bool,
+}
+
+/// Nonowning cancellation observation for one tracked request.
+///
+/// Visibility means an actual positive socket write, not queue selection.
+/// It survives reply settlement, expiry and abandonment of the request future.
+#[derive(Clone)]
+pub struct RequestCancellation {
+    shared: Weak<Shared>,
+    state: Arc<Mutex<RequestState>>,
+}
+
+impl RequestCancellation {
+    /// Retract only if no byte has become visible. A `false` result means
+    /// visibility cannot be rolled back; it does not imply a remote outcome.
+    /// Retraction before the lazy request's first poll prevents submission.
+    pub fn cancel_unsent(&self) -> bool {
+        let shared = self.shared.upgrade();
+        let mut inner = shared.as_ref().map(|s| s.inner.lock().unwrap());
+        let mut state = self.state.lock().unwrap();
+        if state.visible {
+            return false;
+        }
+        state.cancelled = true;
+        if let (Some(inner), Some(token)) = (inner.as_mut(), state.token) {
+            retire(inner, token);
+        }
+        drop(state);
+        drop(inner);
+        if let Some(shared) = shared {
+            shared.changed.notify_waiters();
+        }
+        true
+    }
 }
 
 struct Ingress {
@@ -298,6 +340,37 @@ pub struct GatewayChannel {
 pub struct GatewayReceiver {
     shared: Weak<Shared>,
 }
+
+/// Finite ingress handoff retaining each reservation until individual transfer.
+///
+/// This owns no channel lifecycle or socket. Drop releases untaken envelopes;
+/// no new traffic is added to the snapshot.
+pub struct GatewayIngressSnapshot {
+    shared: Arc<Shared>,
+    pending: VecDeque<Ingress>,
+}
+
+impl GatewayIngressSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+impl Iterator for GatewayIngressSnapshot {
+    type Item = IncomingMessage<GatewayTarget>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.pending
+            .pop_front()
+            .map(|ingress| GatewayReceiver::transfer(&self.shared, ingress))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.pending.len(), Some(self.pending.len()))
+    }
+}
+
+impl ExactSizeIterator for GatewayIngressSnapshot {}
 
 impl GatewayChannel {
     /// Connect a dedicated, explicitly trusted unsecured-development gateway.
@@ -413,6 +486,67 @@ impl GatewayChannel {
 
     pub fn terminal_error(&self) -> Option<Error> {
         self.owner.shared.error()
+    }
+
+    /// Initiate irreversible bounded shutdown without awaiting driver exit.
+    pub fn abort(&self) {
+        self.abort_with_error(Error::Closed);
+    }
+
+    /// Initiate shutdown retaining the first terminal cause.
+    pub fn abort_with_error(&self, error: Error) {
+        self.owner.shared.terminate(error);
+    }
+
+    /// Noninitiating bounded wait for the owned socket/driver to exit.
+    ///
+    /// The join handle stays owned if this observer times out or is dropped.
+    pub fn closed(&self, deadline: Instant) -> ChannelFuture<'_, ()> {
+        Box::pin(async move {
+            let _waiter = self.owner.shared.budget.reserve(CLOSE)?;
+            timeout_at(deadline, async {
+                let mut join = self.owner.join.lock().await;
+                if let Some(handle) = join.as_mut() {
+                    let result = handle.await;
+                    *join = None;
+                    result.map_err(|_| Error::Protocol("channel driver task failed"))?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| Error::Timeout)?
+        })
+    }
+
+    /// Lazy ordinary RPC plus independently retained first-write cancellation.
+    /// Domain decoding and uncertain-mutation policy remain caller-owned.
+    pub fn request_tracked<'a>(
+        &'a self,
+        target: &'a GatewayTarget,
+        message: Message,
+        deadline: Instant,
+    ) -> (ChannelFuture<'a, Message>, RequestCancellation) {
+        let state = Arc::new(Mutex::new(RequestState::default()));
+        let cancellation = RequestCancellation {
+            shared: Arc::downgrade(&self.owner.shared),
+            state: state.clone(),
+        };
+        let future = Box::pin(async move {
+            match submit(
+                &self.owner.shared,
+                target,
+                message,
+                deadline,
+                Submission::Rpc,
+                Some(state),
+            )
+            .await?
+            {
+                Outcome::Message(message) => Ok(message),
+                Outcome::Written => unreachable!(),
+            }
+        });
+        (future, cancellation)
     }
 
     /// Latest native ListenInstance; diagnostic only, not renewed authority.
@@ -556,16 +690,20 @@ struct OperationGuard {
     token: u64,
 }
 
+fn retire(inner: &mut Inner, token: u64) {
+    if let Some(entry) = inner.entries.remove(&token) {
+        if let Some(id) = entry.id {
+            inner.pending.remove(&id);
+        }
+    }
+    inner.ordinary.retain(|queued| *queued != token);
+    inner.replies.retain(|queued| *queued != token);
+}
+
 impl Drop for OperationGuard {
     fn drop(&mut self) {
         let mut inner = self.shared.inner.lock().unwrap();
-        if let Some(entry) = inner.entries.remove(&self.token) {
-            if let Some(id) = entry.id {
-                inner.pending.remove(&id);
-            }
-        }
-        inner.ordinary.retain(|token| *token != self.token);
-        inner.replies.retain(|token| *token != self.token);
+        retire(&mut inner, self.token);
         drop(inner);
         self.shared.changed.notify_waiters();
     }
@@ -577,6 +715,7 @@ async fn submit(
     mut message: Message,
     deadline: Instant,
     submission: Submission,
+    tracking: Option<Arc<Mutex<RequestState>>>,
 ) -> Result<Outcome> {
     if shared.error().is_some() {
         return Err(Error::Closed);
@@ -639,10 +778,15 @@ async fn submit(
             return Err(error.clone());
         }
         check_deadline(deadline)?;
+        let mut tracked = tracking.as_ref().map(|state| state.lock().unwrap());
+        if tracked.as_ref().is_some_and(|state| state.cancelled) {
+            return Err(Error::Closed);
+        }
         let mut id = (props.id != MessageId::default()).then_some(props.id);
         if rpc && id.is_none() {
             loop {
                 let Some(next) = inner.next_index.checked_add(1) else {
+                    drop(tracked);
                     drop(inner);
                     let error = Error::ResourceLimit("channel generated ID exhaustion");
                     shared.terminate(error.clone());
@@ -674,6 +818,7 @@ async fn submit(
         if let Some(id) = id {
             if let Err(error) = shared.remember(&mut inner, id) {
                 if matches!(error, Error::ResourceLimit(_)) {
+                    drop(tracked);
                     drop(inner);
                     shared.terminate(error.clone());
                 }
@@ -693,8 +838,12 @@ async fn submit(
                 bytes: Some(bytes),
                 result: None,
                 lease,
+                tracking: tracking.clone(),
             },
         );
+        if let Some(state) = tracked.as_mut() {
+            state.token = Some(token);
+        }
         if rpc {
             inner.pending.insert(id.unwrap(), token);
         }
@@ -728,6 +877,9 @@ async fn submit(
                     return result;
                 }
                 check_deadline(deadline)?;
+                if !inner.entries.contains_key(&token) {
+                    return Err(Error::Closed);
+                }
             }
             notified.await;
         }
@@ -767,6 +919,7 @@ impl MessageChannel for GatewayChannel {
                 message,
                 deadline,
                 Submission::Raw,
+                None,
             )
             .await?
             {
@@ -778,21 +931,9 @@ impl MessageChannel for GatewayChannel {
 
     fn close(&self, deadline: Instant) -> ChannelFuture<'_, ()> {
         Box::pin(async move {
-            let shared = &self.owner.shared;
             // Shutdown is irreversible even when its wait cannot be admitted.
-            shared.terminate(Error::Closed);
-            let _waiter = shared.budget.reserve(CLOSE)?;
-            timeout_at(deadline, async {
-                let mut join = self.owner.join.lock().await;
-                if let Some(handle) = join.as_mut() {
-                    let result = handle.await;
-                    *join = None;
-                    result.map_err(|_| Error::Protocol("channel driver task failed"))?;
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|_| Error::Timeout)?
+            self.abort();
+            self.closed(deadline).await
         })
     }
 }
@@ -811,6 +952,7 @@ impl RpcChannel for GatewayChannel {
                 message,
                 deadline,
                 Submission::Rpc,
+                None,
             )
             .await?
             {
@@ -837,6 +979,7 @@ impl ReplyContext for NotificationReply {
                 message,
                 deadline,
                 Submission::Reply(self.id),
+                None,
             )
             .await?
             {
@@ -844,6 +987,36 @@ impl ReplyContext for NotificationReply {
                 Outcome::Message(_) => unreachable!(),
             }
         })
+    }
+}
+
+impl GatewayReceiver {
+    fn transfer(shared: &Arc<Shared>, ingress: Ingress) -> IncomingMessage<GatewayTarget> {
+        IncomingMessage {
+            message: ingress.message,
+            source: shared.target.clone(),
+            reply: Some(Box::new(NotificationReply {
+                shared: Arc::downgrade(shared),
+                target: shared.target.clone(),
+                id: ingress.id,
+            })),
+        }
+    }
+
+    /// Consume a finite snapshot of already-admitted ingress in wire order.
+    ///
+    /// Does not wait for new traffic. Intended for a sole receiver's handoff
+    /// across an RPC completion; concurrent receivers may consume other items.
+    /// Each transferred envelope retains only its original one-use authority.
+    pub fn drain_pending(&self) -> Result<GatewayIngressSnapshot> {
+        let shared = self.shared.upgrade().ok_or(Error::Closed)?;
+        let mut inner = shared.inner.lock().unwrap();
+        if let Some(error) = &inner.terminal {
+            return Err(error.clone());
+        }
+        let pending = std::mem::take(&mut inner.ingress);
+        drop(inner);
+        Ok(GatewayIngressSnapshot { shared, pending })
     }
 }
 
@@ -870,15 +1043,7 @@ impl MessageReceiver for GatewayReceiver {
                         }
                         check_deadline(deadline)?;
                         if let Some(ingress) = inner.ingress.pop_front() {
-                            return Ok(IncomingMessage {
-                                message: ingress.message,
-                                source: shared.target.clone(),
-                                reply: Some(Box::new(NotificationReply {
-                                    shared: Arc::downgrade(&shared),
-                                    target: shared.target.clone(),
-                                    id: ingress.id,
-                                })),
-                            });
+                            return Ok(Self::transfer(&shared, ingress));
                         }
                     }
                     notified.await;
@@ -1069,7 +1234,12 @@ async fn send_loop<W: AsyncWrite + Unpin>(mut writer: W, shared: &Arc<Shared>) -
                             match std::pin::Pin::new(&mut writer).poll_write(cx, &bytes) {
                                 Poll::Pending => Poll::Pending,
                                 Poll::Ready(Ok(0)) => Poll::Ready(Err(Error::Io(std::io::ErrorKind::WriteZero.into()))),
-                                Poll::Ready(Ok(size)) => Poll::Ready(Ok(Some(size))),
+                                Poll::Ready(Ok(size)) => {
+                                    if let Some(tracking) = &inner.entries[&token].tracking {
+                                        tracking.lock().unwrap().visible = true;
+                                    }
+                                    Poll::Ready(Ok(Some(size)))
+                                },
                                 Poll::Ready(Err(error)) => Poll::Ready(Err(Error::from(error))),
                             }
                         }) => return result,
