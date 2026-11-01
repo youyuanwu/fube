@@ -111,6 +111,200 @@ fn count(channel: &GatewayChannel, class: usize) -> usize {
 }
 
 #[tokio::test]
+async fn tracked_lazy_retraction_prevents_submission_and_does_not_own_lifecycle() {
+    let (channel, mut peer) = pair(4096, false, limits());
+    let target = target(&channel);
+    let (future, cancellation) =
+        channel.request_tracked(&target, msg("NeverSent", vec![]), deadline());
+    assert!(cancellation.cancel_unsent());
+    assert!(matches!(future.await, Err(Error::Closed)));
+    assert_eq!(count(&channel, ORDINARY), 0);
+    let stopped = channel.owner.shared.stopped.subscribe();
+    drop(channel);
+    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+    until(|| *stopped.borrow()).await;
+    assert!(cancellation.cancel_unsent());
+}
+
+#[tokio::test(start_paused = true)]
+async fn tracked_selected_zero_progress_retracts_before_drop_and_after_expiry() {
+    for expire in [false, true] {
+        let fill = msg("Fill", vec![1; 128]);
+        let capacity = fill.to_frame().unwrap().encode().unwrap().len();
+        let (channel, mut peer) = pair(capacity, false, limits());
+        let target = target(&channel);
+        channel
+            .send_one_way(&target, fill.clone(), deadline())
+            .await
+            .unwrap();
+        let (mut future, cancellation) = channel.request_tracked(
+            &target,
+            msg("UnwrittenMutation", vec![2]),
+            Instant::now() + Duration::from_secs(1),
+        );
+        pending(future.as_mut()).await;
+        until(|| {
+            channel
+                .owner
+                .shared
+                .inner
+                .lock()
+                .unwrap()
+                .entries
+                .values()
+                .any(|entry| entry.bytes.is_none() && entry.result.is_none())
+        })
+        .await;
+        if expire {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(matches!(future.await, Err(Error::Timeout)));
+            assert!(cancellation.cancel_unsent());
+        } else {
+            assert!(cancellation.cancel_unsent());
+            assert!(matches!(future.await, Err(Error::Closed)));
+        }
+        assert_eq!(read_message(&mut peer).await.unwrap(), fill);
+        channel.close(deadline()).await.unwrap();
+        assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+    }
+}
+
+#[tokio::test]
+async fn tracked_positive_write_is_retained_after_abandonment_and_frame_completes() {
+    let (channel, mut peer) = pair(1, false, limits());
+    let target = target(&channel);
+    let body = vec![9; 2048];
+    let (mut future, cancellation) =
+        channel.request_tracked(&target, msg("VisibleMutation", body.clone()), deadline());
+    pending(future.as_mut()).await;
+    until(|| cancellation.state.lock().unwrap().visible).await;
+    assert!(!cancellation.cancel_unsent());
+    drop(future);
+    let received = read_message(&mut peer).await.unwrap();
+    assert_eq!(received.body, body);
+    assert_eq!(received.properties().unwrap().action, "VisibleMutation");
+    assert!(!cancellation.cancel_unsent());
+    channel.abort_with_error(Error::Protocol("original cause"));
+    channel.abort();
+    assert!(matches!(
+        channel.terminal_error(),
+        Some(Error::Protocol("original cause"))
+    ));
+    channel.closed(deadline()).await.unwrap();
+    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+    assert!(!cancellation.cancel_unsent());
+}
+
+#[tokio::test]
+async fn tracked_visibility_survives_reply_transfer_and_ordinary_slot_reuse() {
+    let (channel, mut peer) = pair(4096, false, limits());
+    let target = target(&channel);
+    let (mut future, cancellation) =
+        channel.request_tracked(&target, msg("Mutation", vec![]), deadline());
+    pending(future.as_mut()).await;
+    let request = read_message(&mut peer).await.unwrap();
+    let response = reply(request.properties().unwrap().id, vec![7]);
+    write_message(&mut peer, &response).await.unwrap();
+    assert_eq!(future.await.unwrap(), response);
+    assert_eq!(count(&channel, ORDINARY), 0);
+    assert!(!cancellation.cancel_unsent());
+    channel
+        .send_one_way(&target, msg("Reuse", vec![]), deadline())
+        .await
+        .unwrap();
+    assert_eq!(
+        read_message(&mut peer)
+            .await
+            .unwrap()
+            .properties()
+            .unwrap()
+            .action,
+        "Reuse"
+    );
+    channel.close(deadline()).await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_snapshot_is_finite_ordered_consuming_and_preserves_future_ingress() {
+    let profile = ChannelLimits {
+        max_ingress: 33,
+        max_retained_bytes: 2 * 1024 * 1024 * 1024,
+        ..ChannelLimits::default()
+    };
+    profile.validate().unwrap();
+    let reservations = (33 + 8 + 4) * profile.slot_bytes().unwrap() + 16 * 256;
+    assert!(reservations <= profile.max_retained_bytes);
+    let (channel, mut peer) = pair(8192, true, profile);
+    let receiver = channel.receiver().unwrap();
+    for index in 1..=33 {
+        write_message(&mut peer, &notification(index))
+            .await
+            .unwrap();
+    }
+    until(|| count(&channel, INGRESS) == 33).await;
+    let snapshot = receiver.drain_pending().unwrap();
+    assert_eq!(snapshot.len(), 33);
+    assert_eq!(count(&channel, INGRESS), 0);
+    assert!(receiver.drain_pending().unwrap().is_empty());
+    for (index, incoming) in snapshot.into_iter().enumerate() {
+        assert_eq!(
+            incoming.message.properties().unwrap().id.index,
+            index as u32 + 1
+        );
+        incoming
+            .reply
+            .unwrap()
+            .reply(msg("ServiceNotificationReply", vec![]), deadline())
+            .await
+            .unwrap();
+        let ack = read_message(&mut peer).await.unwrap();
+        assert_eq!(ack.properties().unwrap().relates_to.index, index as u32 + 1);
+    }
+    write_message(&mut peer, &notification(34)).await.unwrap();
+    assert_eq!(
+        receiver
+            .receive(deadline())
+            .await
+            .unwrap()
+            .message
+            .properties()
+            .unwrap()
+            .id
+            .index,
+        34
+    );
+    channel.close(deadline()).await.unwrap();
+    assert!(matches!(receiver.drain_pending(), Err(Error::Closed)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn noninitiating_driver_wait_timeout_does_not_close_or_detach_owner() {
+    let (channel, mut peer) = pair(4096, false, limits());
+    assert!(matches!(
+        channel.closed(Instant::now()).await,
+        Err(Error::Timeout)
+    ));
+    assert!(channel.terminal_error().is_none());
+    let target = target(&channel);
+    channel
+        .send_one_way(&target, msg("StillLive", vec![]), deadline())
+        .await
+        .unwrap();
+    assert_eq!(
+        read_message(&mut peer)
+            .await
+            .unwrap()
+            .properties()
+            .unwrap()
+            .action,
+        "StillLive"
+    );
+    channel.abort();
+    channel.closed(deadline()).await.unwrap();
+    channel.closed(deadline()).await.unwrap();
+}
+
+#[tokio::test]
 async fn lazy_expired_raw_rpc_receive_reply_and_close_do_nothing_before_poll() {
     let (channel, mut peer) = pair(4096, true, limits());
     let target = target(&channel);
