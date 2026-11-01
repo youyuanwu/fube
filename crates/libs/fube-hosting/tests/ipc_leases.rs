@@ -34,6 +34,7 @@ fn node() -> wire::StartReply {
 }
 fn admission() -> Admission {
     Admission {
+        deadlines: RequestDeadlines::Propagated,
         host: wire::HostContext {
             id: uuid::Uuid::new_v4().to_string(),
             kind: 1,
@@ -511,7 +512,7 @@ async fn truncated_start_requests_never_register() {
 
 #[tokio::test]
 async fn malformed_headers_pid_and_frame_allocation_limit() {
-    for variant in 0..4 {
+    for variant in 0..5 {
         let server = server(LOCAL_LEASE_DURATION);
         let a = admission();
         let lease = server.admit(a.clone()).unwrap();
@@ -521,7 +522,10 @@ async fn malformed_headers_pid_and_frame_allocation_limit() {
             0 => request.headers.push(Header::actor(15).unwrap()),
             1 => peer.admission.host.pid += 1,
             2 => request.headers.retain(|h| h.id != IPC),
-            _ => request.headers.push(Header::timeout(-1).unwrap()),
+            3 => request.headers.push(Header::timeout(-1).unwrap()),
+            _ => request
+                .headers
+                .retain(|h| h.id != fube_transport::message::TIMEOUT),
         }
         if variant == 1 {
             request = peer.frame(15, "", vec![]);
@@ -1088,4 +1092,28 @@ async fn blocked_reply_writer_and_queued_polls_do_not_prevent_withdrawal() {
         .unwrap();
         assert_eq!(server.status(&lease).unwrap().reserved_bytes, 512 * 1024);
     }
+}
+
+#[tokio::test]
+async fn native_local_deadlines_are_explicit_and_do_not_accept_expired_headers() {
+    let server = server(LOCAL_LEASE_DURATION);
+    let mut a = admission();
+    a.deadlines = RequestDeadlines::NativeClientLocal;
+    let lease = server.admit(a.clone()).unwrap();
+    let mut peer = Peer::connect(&server, a).await;
+    peer.bootstrap().await;
+    let mut request = peer.frame(15, "", vec![]);
+    request
+        .headers
+        .retain(|h| h.id != fube_transport::message::TIMEOUT);
+    let reply = peer.raw(request).await.unwrap();
+    assert!(from_slice::<wire::LeaseReply>(&reply.body).unwrap().ttl > 0);
+    let mut expired = peer.frame(15, "", vec![]);
+    expired
+        .headers
+        .retain(|h| h.id != fube_transport::message::TIMEOUT);
+    expired.headers.push(Header::timeout(-1).unwrap());
+    assert!(peer.raw(expired).await.is_err());
+    disconnected(&server, &lease).await;
+    assert_eq!(server.status(&lease).unwrap().loss, Some(Loss::Protocol));
 }

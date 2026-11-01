@@ -34,6 +34,7 @@ fn event(value: serde_json::Value) {
 #[derive(Default)]
 struct FixtureConfig {
     manifest: bool,
+    hosting_lease_bootstrap_only: bool,
     service_type: String,
     service_name: Option<String>,
     terminal: Option<String>,
@@ -50,6 +51,7 @@ impl FixtureConfig {
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--hosting-lease-bootstrap-only" => config.hosting_lease_bootstrap_only = true,
                 "--manifest-fixture" => config.manifest = true,
                 "--type" => config.service_type = args.next().ok_or("missing type")?,
                 "--service" => config.service_name = Some(args.next().ok_or("missing service")?),
@@ -72,6 +74,18 @@ impl FixtureConfig {
         }
         if config.manifest && (config.service_name.is_none() || config.terminal.is_none()) {
             return Err("manifest fixture requires expected service and terminal".into());
+        }
+        if config.hosting_lease_bootstrap_only
+            && (config.manifest
+                || config.service_name.is_some()
+                || config.terminal.is_some()
+                || config.opaque
+                || config.service_type != "NativeStatelessType")
+        {
+            return Err(
+                "Hosting lease bootstrap is mutually exclusive with service/manifest profiles"
+                    .into(),
+            );
         }
         Ok(config)
     }
@@ -243,11 +257,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         json!({"event":"context", "work":activation.get_code_package_info().work_directory.to_string(),
         "node":node.ip_address_or_fqdn.to_string()}),
     );
-    runtime.register_stateless_service_factory(
-        &WString::from(&config.service_type),
-        Box::new(Factory(config.clone())),
-    )?;
-    event(json!({"event":"type_registered"}));
+    if config.hosting_lease_bootstrap_only {
+        event(json!({"event":"hosting_lease_bootstrap_only"}));
+    } else {
+        runtime.register_stateless_service_factory(
+            &WString::from(&config.service_type),
+            Box::new(Factory(config.clone())),
+        )?;
+        event(json!({"event":"type_registered"}));
+    }
     if config.manifest {
         // General manifest apps have no owned-stdin shutdown contract. The host
         // must report semantic completion separately from forced owned cleanup.

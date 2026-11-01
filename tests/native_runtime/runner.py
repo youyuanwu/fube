@@ -30,7 +30,8 @@ LIBRARY_HASHES = {
 }
 RELATIVE_NATIVE = pathlib.Path("opt/microsoft/servicefabric/bin/Fabric/Fabric.Code")
 DIAGNOSTIC_LIMIT = 1024 * 1024
-SCENARIOS = ("bootstrap", "close", "abort", "manifest-close", "manifest-abort")
+SCENARIOS = ("bootstrap", "close", "abort", "manifest-close", "manifest-abort",
+             "hosting-leases")
 BINARY_OUTPUTS = {
     "fube-test-host": "target/debug/fube-test-host",
     "stateless-test-app": "target/debug/stateless-test-app",

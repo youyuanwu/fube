@@ -12,4 +12,5 @@ libc = "0.2"
 roxmltree = "0.21"
 
 [dev-dependencies]
+fube-hosting = { path = "../fube-hosting" }
 tokio = { workspace = true, features = ["test-util"] }

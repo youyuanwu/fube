@@ -363,6 +363,7 @@ dependencies = [
 name = "fube-runtime"
 version = "0.1.0"
 dependencies = [
+ "fube-hosting",
  "fube-transport",
  "libc",
  "roxmltree",
@@ -375,12 +376,14 @@ dependencies = [
 name = "fube-test-host"
 version = "0.1.0"
 dependencies = [
+ "fube-hosting",
  "fube-transport",
  "libc",
  "roxmltree",
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
  "uuid",
 ]
 

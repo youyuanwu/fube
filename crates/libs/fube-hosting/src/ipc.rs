@@ -47,6 +47,15 @@ pub type NodeContext = wire::StartReply;
 pub struct Admission {
     pub host: wire::HostContext,
     pub code: wire::CodeContext,
+    pub deadlines: RequestDeadlines,
+}
+/// Explicit producer profile: Rust propagates remaining Timeout headers; native
+/// IpcClient/RequestReply owns its deadline locally and omits that header.
+/// Both profiles retain finite node frame/write/registration/authority bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestDeadlines {
+    Propagated,
+    NativeClientLocal,
 }
 
 /// Logical session scratch reservations include frame/header duplication,
@@ -600,7 +609,7 @@ fn unique_headers(message: &Message) -> TransportResult<()> {
     }
     Ok(())
 }
-fn envelope(message: &Message, decode_limit: usize) -> TransportResult<(String, u32)> {
+fn envelope(message: &Message, decode_limit: usize) -> TransportResult<(String, u32, bool)> {
     unique_headers(message)?;
     let p = message.properties()?;
     if p.id == MessageId::default()
@@ -616,9 +625,9 @@ fn envelope(message: &Message, decode_limit: usize) -> TransportResult<(String, 
         .headers
         .iter()
         .find(|h| h.id == message::TIMEOUT)
-        .ok_or(protocol("missing Hosting timeout"))?
-        .read(|d| d.i64())?;
-    if timeout <= 0 {
+        .map(|h| h.read(|d| d.i64()))
+        .transpose()?;
+    if timeout.is_some_and(|value| value <= 0) {
         return Err(protocol("expired Hosting request"));
     }
     let header = message
@@ -629,7 +638,7 @@ fn envelope(message: &Message, decode_limit: usize) -> TransportResult<(String, 
     #[derive(Deserialize)]
     struct Identity(String, u32);
     let Identity(host, pid) = decode(&header.value, decode_limit)?;
-    Ok((host, pid))
+    Ok((host, pid, timeout.is_some()))
 }
 fn reply(id: MessageId, body: Vec<u8>) -> TransportResult<Message> {
     Ok(Message {
@@ -712,7 +721,7 @@ async fn run_connection(
         } else {
             read(socket).await?
         };
-        let (host, pid) = envelope(&request, shared.config.decode_bytes)?;
+        let (host, pid, has_timeout) = envelope(&request, shared.config.decode_bytes)?;
         let p = request.properties()?;
         if p.id.guid == [0; 16]
             || last_id.is_some_and(|last| p.id.guid != last.guid || p.id.index <= last.index)
@@ -732,6 +741,9 @@ async fn run_connection(
                     r.entry.admission.host.id == host && r.entry.admission.host.pid == pid
                 })
                 .ok_or(protocol("unadmitted Hosting identity"))?;
+            if !has_timeout && r.entry.admission.deadlines == RequestDeadlines::Propagated {
+                return Err(protocol("missing propagated Hosting timeout"));
+            }
             if r.claimed || !r.entry.authority.live() {
                 return Err(protocol("obsolete Hosting session"));
             }
@@ -740,6 +752,9 @@ async fn run_connection(
             *claimed = Some(r.entry.clone());
         }
         let entry = claimed.as_ref().expect("claimed session");
+        if !has_timeout && entry.admission.deadlines == RequestDeadlines::Propagated {
+            return Err(protocol("missing propagated Hosting timeout"));
+        }
         if entry.admission.host.id != host || entry.admission.host.pid != pid {
             return Err(protocol("Hosting identity changed"));
         }
