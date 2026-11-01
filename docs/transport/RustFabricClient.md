@@ -14,8 +14,10 @@ and does not support TLS or authentication.
 GatewayChannel through a shared, sealed typed-call layer. Naming, all nine
 list/deployed-list queries, node health, resolution and MovePrimary retain their
 native schemas. `FabricClient` explicitly owns the channel; `GatewayClient`
-borrows a supplied binding. Notification and image-transfer clients remain
-independent `Connection` consumers. Rust error/admission/lifecycle changes below
+borrows a supplied binding. ServiceNotificationClient owns its **own**
+notification-enabled GatewayChannel/native session; it does not adopt an
+ordinary client's channel or lifecycle. Image-transfer remains an independent
+`Connection` consumer. Rust error/admission/lifecycle changes below
 are deliberate API breaks, not compatibility wrappers. Historical source/wire
 evidence in later sections is not a substitute for current migration receipts.
 
@@ -1063,6 +1065,30 @@ Explicit close attempts deregistration under one deadline and awaits task/socket
 stop even on cleanup failure. Owner drop initiates shutdown; remote disconnect
 cleanup is eventual, not an immediate deregistration guarantee.
 
+**Notification connect-policy break:** `connect_clear(SocketAddr, Duration)`
+now accepts only explicit numeric loopback/nonzero-port NamingGateway endpoints,
+matching GatewayChannel's existing unsecured profile. Previously accepted
+non-loopback addresses now fail InvalidInput. No hostname/advertised-address
+fallback, compatibility wrapper or TLS/claims/security expansion is supplied.
+The native session/filter API and error types otherwise remain unchanged.
+
+Construction pulls and client-charges ingress alongside Connect, then admits a
+finite pending snapshot before starting semantic draining or publishing the
+owner. Runtime staging and semantic processing are scoped inside one worker.
+Registration cancellation can retract until the first **positive** socket write;
+after visibility an unconfirmed mutation retires the session. Dropping/cancelling
+close fences the owner and stops the same worker/socket; awaitable close retains
+its worker handle and observes teardown after the shared cleanup deadline.
+An irrevocably started frame retains the separate 30-second completion watchdog.
+
+Native retries preserve logical page identity but the proxy assigns a fresh
+client-leg MessageId on every forwarding attempt
+([pinned source:453–483](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/ServiceNotificationManagerProxy.cpp#L453-L483)).
+The client suppresses accepted versions, merges progress and ACKs each admitted
+attempt. Transport same-ID collisions still terminate without a second reply
+authority. ACK success means whole-page local acceptance, not application
+consumption or a per-page fixed-body fingerprint.
+
 Notification construction, registration, receive, unregister, and close return
 `NotificationResult<T>`, whose error is `NotificationError`. Delivery-budget
 exhaustion is `NotificationError::Lagged`; notification filter/bookkeeping/queue
@@ -1070,7 +1096,7 @@ limits are `NotificationError::ResourceLimit`. Shared transport, protocol,
 timeout, input, and native faults are retained as `NotificationError::Common(Error)`,
 including genuinely shared decoder/control resource limits. The ordinary
 `FabricClient` uses layered `ClientResult<T>` and has no notification-only error cases;
-the excluded notification client's Result/Error and Connection lifecycle are unchanged.
+notification-only failures stay above the shared channel and its opaque RPC boundary.
 This changes notification method error types, not the native payload or wire
 format. Match `NotificationError::Common(Error::Timeout)` for a notification
 timeout instead of matching `Error::Timeout` directly.
@@ -1120,13 +1146,15 @@ Naming methods accept `impl AsRef<str>`, so both existing string calls and
 | Ordinary lifetime IDs, including handshake | 4096; terminal exhaustion |
 | Typed input owned capacities | 1 MiB per accepted call |
 | Typed retained-byte reservation | 4 GiB +16 MiB per call; conservative accounting, not an allocation/RSS estimate |
-| Channel aggregate retained-byte reservation | 512 MiB default; see ChannelLimits |
+| Channel aggregate retained-byte reservation | 512 MiB ordinary default; 2 GiB notification-owned profile, not eager allocation |
 | Started write / partial incoming frame | 30 seconds; request expiry ends local waiting, not started frame completion |
 | Notification delivery | 256 events and 8 MiB of accounted page/delivery allocations, whichever is reached first |
 | Notification filters, including pending registration/cleanup | 32 per independently owned session |
 | Notification partition identities / version intervals | 4,096 each; exhaustion is terminal, never silent eviction |
-| Notification page queue / processing | 32 pages and one worker; pages share the delivery memory budget |
-| Notification reply/control / cleanup queues | 32 each, admitted independently of application delivery |
+| Notification page queue / processing | 32 client-staged pages plus at most one transferred envelope; 33 backend ingress slots and one scoped worker |
+| Notification ordinary RPC / consuming replies | 8 / 4, independently counted under the shared channel byte ceiling |
+| Notification cleanup commands | 32, admitted independently of application delivery |
+| Notification lifetime IDs, including handshake | 4096, transport attempts not logical pages; terminal exhaustion without eviction |
 
 Native ImageStore's separate chunk, traversal, path and stale-reply limits are
 listed in [its API section](#native-imagestore-application-package-copy).
@@ -1138,7 +1166,8 @@ schemas have compile-time element/minimum-wire bounds; vector growth, map-node
 conversion, UTF conversion and overlapping endpoint/slot copies are included
 in the conservative fixed slot. This is intentionally looser than actual memory
 usage. Unpolled futures and transferred values are caller-held. Notifications
-and uploads retain their independent Connection-specific limits above.
+apply both their own channel profile and client accounting above; upload retains
+its independent Connection-specific limits.
 
 The decoder skips unknown/deleted header records by their bounded record
 lengths. Effective common headers use the last visible occurrence; first

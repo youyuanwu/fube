@@ -355,15 +355,17 @@ is based on protocol identities/versions, not stored endpoint-list equality.
 ```text
 Application
   FabricClient
-    ordinary connection -> resolve and existing request/reply APIs
+    owned ordinary GatewayChannel -> resolve and existing request/reply APIs
   ServiceNotificationClient
-    notification connection/session -> filters, reverse requests, replies
-                                       bounded queue -> recv()
+    own notification-enabled GatewayChannel/native session
+      constructor pull + finite pending handoff -> publish owner
+      scoped ingress staging + semantic worker -> bounded queue -> recv()
+      filters/RAII cleanup + original consuming reply contexts
 ```
 
 Constructing a `FabricClient` never opens notification transport.
 `ServiceNotificationClient::connect_clear` establishes its own connection using
-the explicitly configured endpoint and security profile, then connects the
+an explicit numeric-loopback/nonzero-port unsecured endpoint, then connects the
 native notification session. It needs no existing ordinary connection or second
 public open step. This follows the native separation of normal/high-priority
 connections while making ownership and failure isolation explicit. Do not dial
@@ -378,11 +380,17 @@ Native notification gateway descriptions intentionally omit a public address;
 retain their node identity/name without requiring or inventing an address.
 [Source: [gateway description][notification-gateway-description].]
 
-Extend `fube-transport` with explicit duplex capability for this connection role.
-Normal request-only connections continue to reject unsupported reverse traffic.
+This narrows the previous notification clear-TCP endpoint policy deliberately;
+non-loopback input now fails explicitly, without compatibility wrapping or
+widening the channel's trust/security profile.
+
+Use GatewayChannel's existing opted-in native MessageReceiver/ReplyContext.
+Normal request-only channels continue to reject unsupported reverse traffic.
 After controls, route the uncorrelated-notification marker before ordinary
-`RelatesTo` lookup. Only the supported action, envelope, and body can enter the
-session handler. Ordinary replies must never satisfy notification processing.
+`RelatesTo` lookup. Only the supported authorized envelope enters pull ingress;
+the client alone decodes domain bodies. Ordinary replies must never satisfy
+notification processing. All ordinary RelatesTo records remain validated in
+wire order and only the final effective ID matches pending state.
 
 The writer needs a bounded reply/control path that does not require an
 outstanding locally initiated request. Notification replies retain the original
@@ -430,6 +438,11 @@ A pushed page carries the native uncorrelated-reply marker and starts a reverse
 request/reply exchange. For its transport MessageId `N`, return
 `ServiceNotificationReply` with `RelatesTo(N)` and the processing status. Do not
 confuse that transport ID with the notification page's activity ID/page index.
+The pinned proxy [rewrites MessageId on every forwarding attempt][notification-retry],
+including a retry of unchanged logical page content. Sender-side IPC retries
+are a different ID scope. Keep finite transport lifetime collision protection;
+accepted page/version duplicate suppression and processing-status ACK encoding
+belong to the client, not a transport body-fingerprint history.
 [Sources: [session bodies][connection-body], [session reply][connection-reply],
 [identity binding][notification-identity], [reverse exchange][reverse-request],
 [page identity][notification-page].]
@@ -478,8 +491,10 @@ Use named internal limits, not new public configuration in the first API:
 | Registered, pending, or cleaning-up filters | 32 per session; dropping a guard does not release its slot until cleanup completes or the session closes. |
 | Tracked partition identities | 4,096 per session. |
 | Native version-range intervals | 4,096 per session. |
-| Page processing | One worker per session; at most 32 queued pages, charged to the same 8 MiB delivery budget. |
-| Queued reply/control records | 32, with admission independent of ordinary outgoing requests. |
+| Page processing | One worker with scoped staging/semantic halves; 32 staged pages and one transfer, sharing the 8 MiB delivery budget. |
+| Native channel ingress / aggregate reservation | 33 slots / 2 GiB charged ceiling; 4 MiB frames. No eager allocation or ordinary-default change. |
+| Native ordinary RPC / consuming reply operations | 8 / 4, independently counted under aggregate reservations. |
+| Native lifetime transport IDs | 4,096; terminal exhaustion, no history eviction or same-ID retry exception. |
 | Automatic cleanup commands | 32, with reserved admission independent of user-update delivery. |
 
 Apply existing frame, object, string, collection, pending-request, and started-I/O
@@ -491,6 +506,15 @@ Never evict version/partition state silently to stay within a limit. Queue
 overflow yields a distinct notification-lag/resource error; bookkeeping
 exhaustion yields an explicit resource-limit error. Both terminate this initial
 session instead of claiming an uninterrupted subscription.
+
+Before publication, the constructor drives pull alongside Connect and charges
+each staged body/context. A finite pending-ingress snapshot closes the ordering
+gap if Connect completion overtakes pulling; semantic draining starts only after
+that handoff succeeds. Count exhaustion preserves notification ResourceLimit;
+8 MiB memory exhaustion preserves Lagged. Larger backend-admission bursts can
+terminate first with the original Common(ResourceLimit) transport cause.
+Construction cancellation owns the candidate channel; no constructor-spawned
+reception task can survive it.
 
 ### 6.2 Receive and shutdown
 
@@ -508,7 +532,9 @@ Normal explicit shutdown ends with `None`, not a fabricated update.
 remaining registrations and queued cleanups, attempts deregistration under one
 overall deadline, then stops the notification connection and waits for owned
 tasks to exit. It returns an error if cleanup failed or timed out; socket
-shutdown still proceeds. Dropping `ServiceNotificationClient` initiates local
+shutdown still proceeds, with started-frame completion separately bounded by
+the 30-second watchdog. Close retains its worker handle while waiting; cancellation
+does not revoke disposal. Dropping `ServiceNotificationClient` initiates local
 connection shutdown but cannot await or guarantee remote deregistration.
 Closing that dedicated connection releases the remote registration through the
 gateway's disconnect path once it detects the disconnect, not an instantaneous
@@ -567,6 +593,11 @@ unregister against that closed session returns a closed-session error.
 Before sending, invalid inputs, exhausted local limits, and expired deadlines
 fail without creating remote filters. Definitive native registration errors
 remain errors rather than successful empty handles.
+
+The concrete tracked channel operation exposes nonowning synchronous retraction
+fenced against the actual first positive write, not writer selection. An invisible
+abandoned registration releases its local slot. The visibility observation
+survives settlement/timeout/future drop without adopting another lifecycle owner.
 
 After sending, timeout or future cancellation can leave a registration or
 unregistration outcome unknown. Since the caller might never obtain a handle
@@ -675,6 +706,7 @@ APIs from demonstrated coverage.
 [notification-sync]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/client/ServiceNotificationClient.cpp#L515-L526
 [reverse-request]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/requestreply.cpp#L263-L280
 [duplex]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/DuplexRequestReply.cpp#L36-L77
+[notification-retry]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/ServiceNotificationManagerProxy.cpp#L453-L483
 [receiver-reply]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/ReceiverContext.cpp#L25-L39
 [resolve-reply-factory]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/NamingMessage.h#L110-L116
 [notification-gateway-description]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/ServiceNotificationManager.cpp#L1141-L1147

@@ -244,9 +244,14 @@ async fn pending_snapshot_is_finite_ordered_consuming_and_preserves_future_ingre
     until(|| count(&channel, INGRESS) == 33).await;
     let snapshot = receiver.drain_pending().unwrap();
     assert_eq!(snapshot.len(), 33);
-    assert_eq!(count(&channel, INGRESS), 0);
+    assert_eq!(
+        count(&channel, INGRESS),
+        33,
+        "snapshot retains untransferred reservations"
+    );
     assert!(receiver.drain_pending().unwrap().is_empty());
     for (index, incoming) in snapshot.into_iter().enumerate() {
+        assert_eq!(count(&channel, INGRESS), 32 - index);
         assert_eq!(
             incoming.message.properties().unwrap().id.index,
             index as u32 + 1
@@ -260,6 +265,7 @@ async fn pending_snapshot_is_finite_ordered_consuming_and_preserves_future_ingre
         let ack = read_message(&mut peer).await.unwrap();
         assert_eq!(ack.properties().unwrap().relates_to.index, index as u32 + 1);
     }
+    assert_eq!(count(&channel, INGRESS), 0);
     write_message(&mut peer, &notification(34)).await.unwrap();
     assert_eq!(
         receiver

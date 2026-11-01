@@ -128,7 +128,8 @@ impl FabricClient {
     /// `timeout` also supplies the default for subsequent operations that pass
     /// `None`. There is no insecure fallback, automatic reconnect, or replay.
     /// Only numeric nonzero-port loopback endpoints are allowed. Notifications
-    /// are disabled on this owner; excluded clients retain separate Connection owners.
+    /// are disabled on this owner; notification clients own separate opted-in
+    /// GatewayChannels and image-transfer clients retain separate Connections.
     pub async fn connect_clear(endpoint: SocketAddr, timeout: Duration) -> Result<Self> {
         let deadline = deadline_after(timeout)?;
         let channel = GatewayChannel::connect_unsecured_loopback(

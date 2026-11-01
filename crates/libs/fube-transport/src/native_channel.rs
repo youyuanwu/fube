@@ -341,6 +341,37 @@ pub struct GatewayReceiver {
     shared: Weak<Shared>,
 }
 
+/// Finite ingress handoff retaining each reservation until individual transfer.
+///
+/// This owns no channel lifecycle or socket. Drop releases untaken envelopes;
+/// no new traffic is added to the snapshot.
+pub struct GatewayIngressSnapshot {
+    shared: Arc<Shared>,
+    pending: VecDeque<Ingress>,
+}
+
+impl GatewayIngressSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+impl Iterator for GatewayIngressSnapshot {
+    type Item = IncomingMessage<GatewayTarget>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.pending
+            .pop_front()
+            .map(|ingress| GatewayReceiver::transfer(&self.shared, ingress))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.pending.len(), Some(self.pending.len()))
+    }
+}
+
+impl ExactSizeIterator for GatewayIngressSnapshot {}
+
 impl GatewayChannel {
     /// Connect a dedicated, explicitly trusted unsecured-development gateway.
     ///
@@ -977,17 +1008,15 @@ impl GatewayReceiver {
     /// Does not wait for new traffic. Intended for a sole receiver's handoff
     /// across an RPC completion; concurrent receivers may consume other items.
     /// Each transferred envelope retains only its original one-use authority.
-    pub fn drain_pending(&self) -> Result<Vec<IncomingMessage<GatewayTarget>>> {
+    pub fn drain_pending(&self) -> Result<GatewayIngressSnapshot> {
         let shared = self.shared.upgrade().ok_or(Error::Closed)?;
         let mut inner = shared.inner.lock().unwrap();
         if let Some(error) = &inner.terminal {
             return Err(error.clone());
         }
-        Ok(inner
-            .ingress
-            .drain(..)
-            .map(|ingress| Self::transfer(&shared, ingress))
-            .collect())
+        let pending = std::mem::take(&mut inner.ingress);
+        drop(inner);
+        Ok(GatewayIngressSnapshot { shared, pending })
     }
 }
 
