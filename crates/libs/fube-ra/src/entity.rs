@@ -7,6 +7,7 @@ use crate::protocol::*;
 use fube_ra_store::{self as store, KeyValueStore, Output, Record, RecordId, Request};
 use fube_transport::serialization::serde::{from_slice, to_vec};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex, MutexGuard},
@@ -30,6 +31,9 @@ pub use description::ServiceDescriptionCompletion;
 #[path = "config.rs"]
 mod config;
 pub use config::*;
+#[path = "hosting_events.rs"]
+mod hosting_events;
+pub use hosting_events::*;
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -52,6 +56,13 @@ pub enum Disposition {
     IgnoredStale,
     IgnoredPending,
     IgnoredNotReady,
+    HostingMatchedNoWork,
+    HostingReopenRequired,
+    HostingOpenRetryRequired,
+    HostingCloseRetryRequired,
+    HostingRuntimeCloseRequired,
+    HostingHostCrashRequired,
+    HostingStatusProcessed,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -59,15 +70,49 @@ pub enum Status {
     Unknown,
     Complete(Result<Disposition>),
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TicketObservation {
+    Status(Status),
+    OwnerLost,
+}
 #[derive(Clone)]
 pub struct Ticket {
     pub id: u64,
     receiver: watch::Receiver<Status>,
 }
 impl Ticket {
+    pub fn observation(&self) -> TicketObservation {
+        self.observe_ownership(|| {})
+    }
+    fn observe_ownership(&self, between: impl FnOnce()) -> TicketObservation {
+        let first = self.status();
+        between();
+        if matches!(first, Status::Complete(_)) {
+            return TicketObservation::Status(first);
+        }
+        if self.owner_closed() {
+            // Completion publication precedes sender destruction. Once closed,
+            // the final watch value is stable; never classify from a stale
+            // Pending sample taken before that publication.
+            let final_status = self.status();
+            if matches!(final_status, Status::Complete(_)) {
+                TicketObservation::Status(final_status)
+            } else {
+                TicketObservation::OwnerLost
+            }
+        } else {
+            TicketObservation::Status(first)
+        }
+    }
+    /// Sender loss is terminal ownership loss, not a living store-unknown fence.
+    /// Check Complete status first: ordinary completed tickets also close.
+    pub fn owner_closed(&self) -> bool {
+        self.receiver.has_changed().is_err()
+    }
     pub fn status(&self) -> Status {
         self.receiver.borrow().clone()
     }
+
     /// Finite caller observation. Cancellation never owns/retracts accepted work.
     pub async fn wait(&self, budget: Duration) -> Result<Disposition> {
         self.observe(budget, false).await
@@ -90,6 +135,17 @@ impl Ticket {
         })
         .await
         .map_err(|_| Failure::Unknown)?
+    }
+}
+
+#[derive(Clone)]
+pub struct ConsumerLifetime {
+    accepting: Arc<AtomicBool>,
+}
+impl ConsumerLifetime {
+    /// Read-only, lock-free and terminal: this incarnation is never reenabled.
+    pub fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::SeqCst)
     }
 }
 
@@ -193,6 +249,8 @@ pub struct OpenCompletion {
     pub detail: ProxyErrorDetail,
 }
 pub enum Command {
+    #[cfg(feature = "qualification")]
+    QualificationTerminate(PartitionId),
     Add {
         body: Box<AddInstance>,
         source: NodeInstance,
@@ -214,6 +272,9 @@ pub enum Command {
     Registered(Box<RegistrationCompletion>),
     CompleteClose(Box<CloseCompletion>),
     HostDown(Box<HostDown>),
+    HostingRegistered(Box<HostingRegistered>),
+    HostingRuntimeClosed(Box<HostingRuntimeClosed>),
+    HostingHostClosed(Box<HostingHostClosed>),
     RetryClose(PartitionId),
     RetryReport(PartitionId),
     /// Honor pending Add-carried RAP description work; not an FM replacement retry.
@@ -242,6 +303,8 @@ pub enum Command {
     },
 }
 enum Kind {
+    #[cfg(feature = "qualification")]
+    QualificationTerminate,
     Add {
         source: NodeInstance,
         generation: GenerationHeader,
@@ -259,6 +322,9 @@ enum Kind {
     Registered,
     CompleteClose,
     HostDown,
+    HostingRegistered,
+    HostingRuntimeClosed,
+    HostingHostClosed,
     RetryClose,
     RetryReport,
     RetryServiceDescription,
@@ -424,6 +490,7 @@ struct View {
     notification: notification::Coordinator,
 }
 struct Shared {
+    consumer_lifetime: ConsumerLifetime,
     view: Mutex<View>,
     settings: Settings,
     config: Arc<NativeConfig>,
@@ -476,6 +543,9 @@ impl Executor {
         let (sender, receiver) = mpsc::channel(settings.max_outstanding);
         let (done, closed) = watch::channel(None);
         let shared = Arc::new(Shared {
+            consumer_lifetime: ConsumerLifetime {
+                accepting: Arc::new(AtomicBool::new(true)),
+            },
             config: Arc::new(NativeConfig::new(&settings)),
             notification_clock,
             view: Mutex::new(View {
@@ -495,6 +565,12 @@ impl Executor {
                     runtime.block_on(supervise(owned.clone(), receiver, store, admission))
                 }))
                 .unwrap_or(Err(Failure::Unknown));
+                // Fence new composition admission even if the following view
+                // publication itself encounters a poisoned worker mutex.
+                owned
+                    .consumer_lifetime
+                    .accepting
+                    .store(false, Ordering::SeqCst);
                 let mut view = lock(&owned.view);
                 view.accepting = false;
                 if result.is_err() {
@@ -515,6 +591,10 @@ impl Executor {
 
     pub fn submit(&self, command: Command) -> Result<Ticket> {
         let (entity, kind, bytes) = match command {
+            #[cfg(feature = "qualification")]
+            Command::QualificationTerminate(unit) => {
+                (unit.guid.0, Kind::QualificationTerminate, to_vec(&unit))
+            }
             Command::Add {
                 body,
                 source,
@@ -561,6 +641,15 @@ impl Executor {
                 (body.unit.id.guid.0, Kind::CompleteClose, to_vec(&body))
             }
             Command::HostDown(body) => (body.unit.guid.0, Kind::HostDown, to_vec(&body)),
+            Command::HostingRegistered(body) => {
+                (body.unit.guid.0, Kind::HostingRegistered, to_vec(&body))
+            }
+            Command::HostingRuntimeClosed(body) => {
+                (body.unit.guid.0, Kind::HostingRuntimeClosed, to_vec(&body))
+            }
+            Command::HostingHostClosed(body) => {
+                (body.unit.guid.0, Kind::HostingHostClosed, to_vec(&body))
+            }
             Command::RetryClose(unit) => (unit.guid.0, Kind::RetryClose, to_vec(&unit)),
             Command::RetryReport(unit) => (unit.guid.0, Kind::RetryReport, to_vec(&unit)),
             Command::RetryServiceDescription(unit) => {
@@ -604,6 +693,7 @@ impl Executor {
             Kind::Add { .. } => 2,
             Kind::Retry | Kind::RetryReport | Kind::RetryServiceDescription => 1,
             Kind::CompleteServiceDescription => 0,
+            Kind::HostingRegistered | Kind::HostingRuntimeClosed | Kind::HostingHostClosed => 0,
             kind if kind.node_work() => 2,
             _ => 8,
         };
@@ -662,6 +752,17 @@ impl Executor {
             .cloned()
             .unwrap_or_default()
     }
+    /// Bounded current routing inventory; the serialized worker still performs
+    /// final committed-state validation after this potentially stale snapshot.
+    pub fn entity_ids(&self) -> Vec<EntityId> {
+        lock(&self.shared.view).entities.keys().copied().collect()
+    }
+    pub fn consumer_lifetime(&self) -> ConsumerLifetime {
+        self.shared.consumer_lifetime.clone()
+    }
+    pub fn terminal_result(&self) -> Option<Result<Statistics>> {
+        self.closed.borrow().clone()
+    }
     pub fn statistics(&self) -> Statistics {
         lock(&self.shared.view).stats.clone()
     }
@@ -680,6 +781,10 @@ impl Executor {
     }
     /// Close only this executor, not the caller-owned shared store.
     pub async fn close(&self, budget: Duration) -> Result<Statistics> {
+        self.shared
+            .consumer_lifetime
+            .accepting
+            .store(false, Ordering::SeqCst);
         lock(&self.shared.view).accepting = false;
         self.shared.shutdown.notify_one();
         let mut receiver = self.closed.clone();
@@ -867,6 +972,8 @@ fn transition(
 ) -> Result<Transition> {
     let decode_error = |_| Failure::Admission("invalid native command payload");
     match &work.kind {
+        #[cfg(feature = "qualification")]
+        Kind::QualificationTerminate => panic!("explicit qualification worker termination"),
         Kind::Add { source, generation } => {
             let body: AddInstance = from_slice(&work.bytes).map_err(decode_error)?;
             if source != &admission.fm_source || body.replica.node != admission.local_node {
@@ -1008,6 +1115,9 @@ fn transition(
                 update: Update::Memory(proposed),
                 disposition: Disposition::Applied,
             })
+        }
+        Kind::HostingRegistered | Kind::HostingRuntimeClosed | Kind::HostingHostClosed => {
+            hosting_events::consume(work, state, admission)
         }
         _ => lifecycle::transition(work, state, admission, config),
     }
@@ -1291,6 +1401,30 @@ async fn entity_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_ticket_sender_close_after_pending_sample_is_not_owner_loss() {
+        let (sender, receiver) = watch::channel(Status::Pending);
+        let ticket = Ticket { id: 1, receiver };
+        let observation = ticket.observe_ownership(move || {
+            sender.send_replace(Status::Complete(Ok(Disposition::HostingMatchedNoWork)));
+            drop(sender);
+        });
+        assert_eq!(
+            observation,
+            TicketObservation::Status(Status::Complete(Ok(Disposition::HostingMatchedNoWork)))
+        );
+        assert!(ticket.owner_closed());
+        assert_eq!(ticket.observation(), observation);
+
+        let (sender, receiver) = watch::channel(Status::Unknown);
+        let live_unknown = Ticket { id: 2, receiver };
+        assert_eq!(
+            live_unknown.observation(),
+            TicketObservation::Status(Status::Unknown)
+        );
+        drop(sender);
+        assert_eq!(live_unknown.observation(), TicketObservation::OwnerLost);
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
     use store::{Backend, BackendContext, MemoryBackend, Store, StoreFuture};
 

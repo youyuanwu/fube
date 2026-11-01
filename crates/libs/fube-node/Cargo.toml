@@ -1,0 +1,16 @@
+[package]
+name = "fube-node"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fube-hosting = { path = "../fube-hosting" }
+fube-ra = { path = "../fube-ra" }
+uuid = { workspace = true }
+
+[dev-dependencies]
+fube-ra = { path = "../fube-ra", features = ["qualification"] }
+fube-ra-store = { path = "../fube-ra-store" }
+fube-transport = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }

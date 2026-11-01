@@ -5,6 +5,10 @@ edition = "2021"
 license = "MIT"
 description = "Bounded reliability protocol and RA entity foundation; not a running RA"
 
+[features]
+default = []
+qualification = []
+
 [dependencies]
 fube-transport.workspace = true
 fube-ra-store = { path = "../fube-ra-store" }

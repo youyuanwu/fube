@@ -328,6 +328,40 @@ not a silent missing-header fallback. Source inspection and release-library
 version/hashes remain distinct provenance from complete original native node
 handler execution or deployed/distributed parity.
 
+## 2.8. Owned registration-events qualification
+
+The separate `hosting-registration` action runs the actual native stateless
+factory producer against production Hosting composed by `fube-node`, not the
+old canned factory/lifecycle responder. It verifies correlated type registration,
+actual same-core equal-version lookup, managed reporting-disabled source
+bookkeeping and owned Registered/RuntimeClosed/HostClosed local decisions before
+shutdown. Default native FM/RA readiness is closed: IgnoredNotReady is an
+explicit local decision, not native-ready FT/FM/HM completion.
+
+```sh
+cargo build --locked --workspace --bins --examples --all-features
+python3 -m tests.native_runtime.runner package --output build/registration-NEW
+python3 -m tests.native_runtime.runner hosting-registration \
+  --prebuilt build/registration-NEW \
+  --diagnostics-directory build/registration-NEW-receipts
+```
+
+Choose fresh directories; new registration receipts refuse overwrite.
+Retain all six earlier actions as separate required regressions. The original
+five remain lifecycle fixtures and hosting-leases remains no-factory production
+bootstrap. New registration is not their success relabeled.
+Actual Runtime/Common11.8.121.4 mappings and exact-source binary hashes are
+verified. Semantic source pin, Rust local consumers, release-native producer
+protocol and native deployed-node execution remain distinct.
+
+Runtime-unregister traffic is observed. HostClosed is qualified as owned
+connection-loss cleanup; native host-unregister emission was not observed.
+One gated package obligation remains owned, not consumed as cleanup/H2 release.
+No endpoint, launch/package/process activation, report consumer, FM/HM ACK,
+native lease-agent or deployed RA/RAP lifecycle is qualified.
+[API/ownership/profile details](../cluster/HostingRegistrationEvents.md)
+describe the production-versus-qualification boundaries.
+
 ## 3. Why a small RA-only listener is insufficient
 
 The native runtime has a startup dependency graph:

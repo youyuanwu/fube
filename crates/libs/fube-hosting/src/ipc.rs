@@ -1,8 +1,9 @@
-//! Finite, node-local bootstrap-only Hosting IPC.
+//! Finite node-local Hosting IPC with separate bootstrap and declared-factory profiles.
 //!
 //! The caller supplies prepared package metadata and expected host/PID admission.
-//! Claimed loopback headers are not OS authentication. No factory, RA/RAP, report,
-//! deployment or distributed Federation capability is implied by this service.
+//! Claimed loopback headers are not OS authentication. Factory admission requires
+//! an owned consumer boundary; reports, deployed RA/RAP and distributed Federation
+//! capability are not implied. Node composition owns actual event consumers.
 use crate::{lease::Authority, wire, Hosting};
 use fube_transport::{
     frame::{Frame, FIXED_HEADER_SIZE},
@@ -41,8 +42,9 @@ pub const LOCAL_LEASE_DURATION: Duration = Duration::from_secs(30);
 /// lease fields/error per operation; the caller owns deployment/work artifacts.
 pub type NodeContext = wire::StartReply;
 
-/// The only admitted profile: activated single-code-package SharedProcess,
-/// noncontainer/nonactivator, no factories/services/reports.
+/// Shared bootstrap metadata: activated single-code-package SharedProcess,
+/// noncontainer/nonactivator. Factories additionally require owned declaration/
+/// consumer admission; deployed services/reports are not enabled.
 #[derive(Debug, Clone)]
 pub struct Admission {
     pub host: wire::HostContext,
@@ -111,10 +113,13 @@ struct Record {
     loss: Option<Loss>,
     cleanup: Option<crate::Result<()>>,
     results: VecDeque<OperationResult>,
+    registration_consumer: Option<RegistrationGate>,
 }
 struct State {
     core: Hosting,
     records: Vec<Record>,
+    health: crate::health::DisabledHealth,
+    consumer: Option<Arc<AtomicBool>>,
 }
 struct Shared {
     config: Config,
@@ -124,6 +129,8 @@ struct Shared {
     wake: Notify,
     used: Arc<AtomicUsize>,
     node_bytes: usize,
+    #[cfg(test)]
+    dispatch_ready: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
 struct Reservation {
     used: Arc<AtomicUsize>,
@@ -201,6 +208,299 @@ pub struct Server {
     address: SocketAddr,
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// Required downstream capabilities are admission constraints, not reply stubs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequiredCapabilities {
+    pub health_reporting: bool,
+    pub application_reports: bool,
+    pub fm_status_completion: bool,
+    pub deployed_lifecycle: bool,
+}
+impl RequiredCapabilities {
+    fn local_only(self) -> bool {
+        !self.health_reporting
+            && !self.application_reports
+            && !self.fm_status_completion
+            && !self.deployed_lifecycle
+    }
+}
+
+/// Exclusive, nonclone delivery owner. Drop withdraws factory admission without
+/// releasing sources, outputs, RA work or package usage. Explicit close returns
+/// all residual outputs; transferred outputs still require a bounded consumer.
+pub struct RegistrationOwner {
+    shared: Arc<Shared>,
+    live: Arc<AtomicBool>,
+    upstream: Option<Arc<dyn RegistrationConsumerGate>>,
+}
+/// A composition-owned terminal admission predicate. Implementations MUST be
+/// lock-free/nonblocking; this is checked at the Hosting mutation boundary.
+/// No RA/runtime dependency or callback completion is implied.
+pub trait RegistrationConsumerGate: Send + Sync {
+    fn is_accepting(&self) -> bool;
+}
+#[derive(Clone)]
+struct RegistrationGate {
+    live: Arc<AtomicBool>,
+    upstream: Option<Arc<dyn RegistrationConsumerGate>>,
+}
+impl RegistrationGate {
+    fn active(&self) -> bool {
+        self.live.load(Ordering::SeqCst)
+            && self
+                .upstream
+                .as_ref()
+                .is_none_or(|gate| gate.is_accepting())
+    }
+}
+pub struct PreparedRegistration {
+    pub lease: HostLease,
+    pub admitted: usize,
+    pub failure: Option<(usize, crate::Error)>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryLane {
+    Registration,
+    Status,
+    Obligation,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivery {
+    Registration(crate::ClosedRegisteredEvent),
+    Status(crate::EnabledDisabledEvent),
+    Obligation(crate::Obligation),
+}
+impl Delivery {
+    pub fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Registration(e) => e.bytes(),
+            Self::Status(e) => e.bytes(),
+            Self::Obligation(e) => e.bytes(),
+        }
+    }
+}
+impl RegistrationOwner {
+    pub fn with_consumer_gate(
+        mut self,
+        gate: Arc<dyn RegistrationConsumerGate>,
+    ) -> crate::Result<Self> {
+        if self
+            .shared
+            .state()?
+            .records
+            .iter()
+            .any(|r| r.registration_consumer.is_some())
+        {
+            return Err(crate::Error::InvalidState);
+        }
+        self.upstream = Some(gate);
+        Ok(self)
+    }
+    fn gate(&self) -> RegistrationGate {
+        RegistrationGate {
+            live: self.live.clone(),
+            upstream: self.upstream.clone(),
+        }
+    }
+    pub fn withdraw(&self) {
+        self.live.store(false, Ordering::SeqCst);
+    }
+    /// Reserve downstream capacity before ownership transfer. Saturation leaves
+    /// the original head in its producer lane; it is never a lossy subscription.
+    pub fn next_delivery(
+        &self,
+        lane: DeliveryLane,
+        available_bytes: usize,
+    ) -> crate::Result<Option<Delivery>> {
+        let mut state = self.shared.state()?;
+        if !state
+            .consumer
+            .as_ref()
+            .is_some_and(|v| Arc::ptr_eq(v, &self.live))
+        {
+            return Err(crate::Error::ObjectClosed);
+        }
+        let size = match lane {
+            DeliveryLane::Registration => state
+                .core
+                .state
+                .closed_registered
+                .first()
+                .map(|e| e.bytes()),
+            DeliveryLane::Status => state.core.state.enabled_disabled.first().map(|e| e.bytes()),
+            DeliveryLane::Obligation => state.core.state.obligations.first().map(|e| e.bytes()),
+        };
+        let Some(size) = size else {
+            return Ok(None);
+        };
+        if size > available_bytes {
+            return Err(crate::Error::Capacity);
+        }
+        Ok(Some(match lane {
+            DeliveryLane::Registration => {
+                Delivery::Registration(state.core.state.closed_registered.remove(0))
+            }
+            DeliveryLane::Status => Delivery::Status(state.core.state.enabled_disabled.remove(0)),
+            DeliveryLane::Obligation => {
+                Delivery::Obligation(state.core.state.obligations.remove(0))
+            }
+        }))
+    }
+    pub fn take_operations(&self) -> crate::Result<Vec<OperationResult>> {
+        let mut state = self.shared.state()?;
+        Ok(state
+            .records
+            .iter_mut()
+            .flat_map(|r| r.results.drain(..))
+            .collect())
+    }
+    /// Explicit producer input, not proof of physical package activation/failure.
+    pub fn prepared_type_failure(
+        &self,
+        id: &crate::TypeInstance,
+        failure: String,
+        grace_ticks: i64,
+    ) -> crate::Result<()> {
+        if !self.live.load(Ordering::SeqCst) {
+            return Err(crate::Error::ObjectClosed);
+        }
+        let mut state = self.shared.state()?;
+        state.core.register_failure(failure.clone())?;
+        state.core.disable_type(
+            id,
+            &failure,
+            &crate::ManualClock(self.shared.ticks()),
+            grace_ticks,
+            true,
+        )?;
+        Ok(())
+    }
+    pub fn remove_prepared_failure(&self, failure: &str) -> crate::Result<()> {
+        self.shared.state()?.core.unregister_failure(failure)
+    }
+    pub fn drive_type_timers(&self) -> crate::Result<()> {
+        let mut state = self.shared.state()?;
+        let now = self.shared.ticks();
+        let due: Vec<_> = state
+            .core
+            .timers()
+            .iter()
+            .filter(|t| {
+                t.due_ticks <= now && matches!(t.kind, crate::TimerKind::DisableType { .. })
+            })
+            .cloned()
+            .collect();
+        for timer in due {
+            let mut health = state.health.clone();
+            if let crate::TimerKind::DisableType {
+                type_instance,
+                sequence,
+            } = &timer.kind
+            {
+                if state.core.type_entries().iter().any(|e| {
+                    crate::compare_type_instances(&e.id, type_instance).is_eq()
+                        && e.sequence == *sequence
+                        && e.status == crate::TypeStatus::NotRegisteredDisableScheduled
+                }) {
+                    health.disabled(type_instance, &self.shared.config.node)?;
+                }
+            }
+            if state.core.disable_timer_input(&timer)? {
+                state.health = health;
+            }
+        }
+        Ok(())
+    }
+    pub fn take_outputs(&self) -> crate::Result<Outputs> {
+        let mut state = self.shared.state()?;
+        if !state
+            .consumer
+            .as_ref()
+            .is_some_and(|v| Arc::ptr_eq(v, &self.live))
+        {
+            return Err(crate::Error::ObjectClosed);
+        }
+        Ok(take_outputs(&mut state))
+    }
+    pub fn health_sources(&self) -> crate::Result<Vec<crate::HealthSource>> {
+        Ok(self.shared.state()?.health.sources.clone())
+    }
+    pub fn remove_declaration(
+        &self,
+        id: &crate::TypeInstance,
+        source: &str,
+    ) -> crate::Result<Option<crate::HealthRemoval>> {
+        let mut state = self.shared.state()?;
+        let last = state
+            .core
+            .type_entries()
+            .iter()
+            .find(|e| crate::compare_type_instances(&e.id, id).is_eq())
+            .is_some_and(|e| e.sources.len() == 1 && e.sources[0] == source);
+        let mut health = state.health.clone();
+        let removed = if last {
+            let component = health
+                .sources
+                .iter()
+                .find(|s| crate::compare_type_instances(&s.id, id).is_eq())
+                .ok_or(crate::Error::InvalidServiceType)?
+                .component
+                .clone();
+            Some(health.remove(id, &component, &self.shared.config.node)?)
+        } else {
+            None
+        };
+        state.core.remove_type_source(id, source)?;
+        state.health = health;
+        Ok(removed)
+    }
+    pub fn lookup(&self, request: &crate::LookupRequest) -> crate::Result<crate::LookupResult> {
+        if !self.live.load(Ordering::SeqCst)
+            || request.should_activate
+            || request.activation != crate::Activation::SHARED
+        {
+            return Err(crate::Error::UnsupportedCapability);
+        }
+        let mut state = self.shared.state()?;
+        state.core.lookup_registration(request)
+    }
+    pub fn close(self) -> crate::Result<Outputs> {
+        self.live.store(false, Ordering::SeqCst);
+        let mut state = self.shared.state()?;
+        if !state
+            .consumer
+            .as_ref()
+            .is_some_and(|v| Arc::ptr_eq(v, &self.live))
+        {
+            return Err(crate::Error::ObjectClosed);
+        }
+        // No source release or automatic replay adoption. A successor owner is
+        // not permitted while any registration admission/residual source exists.
+        let outputs = take_outputs(&mut state);
+        if state.records.is_empty() && state.health.sources.is_empty() {
+            state.consumer = None;
+        }
+        Ok(outputs)
+    }
+}
+impl Drop for RegistrationOwner {
+    fn drop(&mut self) {
+        self.live.store(false, Ordering::SeqCst);
+    }
+}
+fn take_outputs(state: &mut State) -> Outputs {
+    Outputs {
+        operations: state
+            .records
+            .iter_mut()
+            .flat_map(|r| r.results.drain(..))
+            .collect(),
+        events: state.core.take_closed_registered_events(),
+        statuses: state.core.take_enabled_disabled_events(),
+        obligations: state.core.take_obligations(),
+    }
 }
 
 fn protocol(why: &'static str) -> TransportError {
@@ -303,6 +603,7 @@ impl Server {
             return Err(crate::Error::InvalidInput);
         }
         let core = Hosting::new(config.core_limits.clone())?;
+        let health = crate::health::DisabledHealth::new(&config.core_limits);
         let listener =
             std::net::TcpListener::bind(address).map_err(|_| crate::Error::OperationFailed)?;
         listener
@@ -315,13 +616,17 @@ impl Server {
             config,
             origin: Instant::now(),
             state: Mutex::new(State {
+                health,
                 core,
                 records: Vec::new(),
+                consumer: None,
             }),
             stop: AtomicBool::new(false),
             wake: Notify::new(),
             used: Arc::new(AtomicUsize::new(0)),
             node_bytes,
+            #[cfg(test)]
+            dispatch_ready: Mutex::new(None),
         });
         let owned = shared.clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -351,6 +656,93 @@ impl Server {
     }
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+    /// Claim local delivery before factory admission. Reporting is explicitly
+    /// disabled at construction; callers must own actual local consumers.
+    pub fn registration_owner(
+        &self,
+        required: RequiredCapabilities,
+    ) -> crate::Result<RegistrationOwner> {
+        if !required.local_only() {
+            return Err(crate::Error::UnsupportedCapability);
+        }
+        if self.shared.stop.load(Ordering::SeqCst) {
+            return Err(crate::Error::ObjectClosed);
+        }
+        let mut state = self.shared.state()?;
+        if state.consumer.is_some() {
+            return Err(crate::Error::InvalidState);
+        }
+        let live = Arc::new(AtomicBool::new(true));
+        state.consumer = Some(live.clone());
+        Ok(RegistrationOwner {
+            shared: self.shared.clone(),
+            live,
+            upstream: None,
+        })
+    }
+    /// Prefix preparation is explicit. Failure retains the prefix and its
+    /// revoked host lease; it never implicitly removes sources or declarations.
+    pub fn admit_registration(
+        &self,
+        owner: &RegistrationOwner,
+        admission: Admission,
+        types: Vec<String>,
+        source: &str,
+    ) -> crate::Result<PreparedRegistration> {
+        if !owner.gate().active() {
+            return Err(crate::Error::ObjectClosed);
+        }
+        if !Arc::ptr_eq(&self.shared, &owner.shared)
+            || types.is_empty()
+            || types.len() > self.shared.config.core_limits.types
+            || !valid_string(source)
+            || types.iter().any(|s| !valid_string(s))
+        {
+            return Err(crate::Error::InvalidInput);
+        }
+        let lease = self.admit(admission.clone())?;
+        let mut state = self.shared.state()?;
+        let index = record_index(&state, &lease.entry)?;
+        let mut prepared = PreparedRegistration {
+            lease,
+            admitted: 0,
+            failure: None,
+        };
+        for (i, name) in types.into_iter().enumerate() {
+            let id = wire::TypeId {
+                package: admission.code.id.package.clone(),
+                name,
+            }
+            .project();
+            let mut health = state.health.clone();
+            let health_admission = if state
+                .core
+                .type_entries()
+                .iter()
+                .any(|e| crate::compare_type_instances(&e.id, &id).is_eq())
+            {
+                Ok(())
+            } else {
+                health.declare(id.clone(), admission.code.application_name.clone())
+            };
+            let result =
+                health_admission.and_then(|()| state.core.declare_type(id, source.into(), Ok(())));
+            if let Err(error) = result {
+                prepared.lease.revoke();
+                prepared.failure = Some((i, error));
+                return Ok(prepared);
+            }
+            state.health = health;
+            prepared.admitted += 1;
+        }
+        if !owner.gate().active() {
+            prepared.lease.revoke();
+            prepared.failure = Some((prepared.admitted, crate::Error::ObjectClosed));
+            return Ok(prepared);
+        }
+        state.records[index].registration_consumer = Some(owner.gate());
+        Ok(prepared)
     }
     /// Synchronous admission reserves one complete scratch/session/result slot.
     /// One connection incarnation only; reconnect requires explicit release and
@@ -420,6 +812,7 @@ impl Server {
             loss: None,
             cleanup: None,
             results: VecDeque::new(),
+            registration_consumer: None,
         });
         Ok(HostLease { entry })
     }
@@ -470,17 +863,23 @@ impl Server {
     /// Cannot be abandoned between drain and transfer: synchronous owned return.
     pub fn take_outputs(&self) -> crate::Result<Outputs> {
         let mut state = self.shared.state()?;
-        let operations = state
-            .records
-            .iter_mut()
-            .flat_map(|r| r.results.drain(..))
-            .collect();
-        Ok(Outputs {
-            operations,
-            events: state.core.take_closed_registered_events(),
-            statuses: state.core.take_enabled_disabled_events(),
-            obligations: state.core.take_obligations(),
-        })
+        if state.consumer.is_some() {
+            return Err(crate::Error::InvalidState);
+        }
+        Ok(take_outputs(&mut state))
+    }
+    /// Explicit recovery after an owner was dropped. This cannot steal an active
+    /// subscription and does not adopt old admissions into a successor owner.
+    pub fn take_registration_residuals(&self) -> crate::Result<Outputs> {
+        let mut state = self.shared.state()?;
+        if state
+            .consumer
+            .as_ref()
+            .is_none_or(|v| v.load(Ordering::SeqCst))
+        {
+            return Err(crate::Error::InvalidState);
+        }
+        Ok(take_outputs(&mut state))
     }
     pub fn stop(&mut self) -> crate::Result<()> {
         self.shared.stop.store(true, Ordering::SeqCst);
@@ -609,7 +1008,7 @@ fn unique_headers(message: &Message) -> TransportResult<()> {
     }
     Ok(())
 }
-fn envelope(message: &Message, decode_limit: usize) -> TransportResult<(String, u32, bool)> {
+fn envelope(message: &Message, decode_limit: usize) -> TransportResult<(String, u32, Option<i64>)> {
     unique_headers(message)?;
     let p = message.properties()?;
     if p.id == MessageId::default()
@@ -638,7 +1037,7 @@ fn envelope(message: &Message, decode_limit: usize) -> TransportResult<(String, 
     #[derive(Deserialize)]
     struct Identity(String, u32);
     let Identity(host, pid) = decode(&header.value, decode_limit)?;
-    Ok((host, pid, timeout.is_some()))
+    Ok((host, pid, timeout))
 }
 fn reply(id: MessageId, body: Vec<u8>) -> TransportResult<Message> {
     Ok(Message {
@@ -721,7 +1120,9 @@ async fn run_connection(
         } else {
             read(socket).await?
         };
-        let (host, pid, has_timeout) = envelope(&request, shared.config.decode_bytes)?;
+        let arrived = Instant::now();
+        let (host, pid, timeout) = envelope(&request, shared.config.decode_bytes)?;
+        let has_timeout = timeout.is_some();
         let p = request.properties()?;
         if p.id.guid == [0; 16]
             || last_id.is_some_and(|last| p.id.guid != last.guid || p.id.index <= last.index)
@@ -771,7 +1172,21 @@ async fn run_connection(
             reply_budget(shared, 32)?;
             to_vec(&wire::LeaseReply { ttl })?
         } else {
-            dispatch(shared, entry, p.actor, &p.action, &request.body)?
+            let type_deadline =
+                (p.actor == 9 && p.action == "RegisterServiceTypeRequest").then(|| {
+                    arrived
+                        + Duration::from_nanos(
+                            timeout.unwrap_or(300_000_000).min(300_000_000) as u64 * 100,
+                        )
+                });
+            dispatch(
+                shared,
+                entry,
+                p.actor,
+                &p.action,
+                &request.body,
+                type_deadline,
+            )?
         };
         // No queued writer; this is the pre-frame fence. Cancellation discards
         // the connection after a partial frame, never reuses its writer.
@@ -787,24 +1202,29 @@ async fn run_connection(
     }
 }
 
-fn deadline(shared: &Shared, entry: &Arc<Entry>) -> TransportResult<()> {
+fn deadline_needs_state(shared: &Shared, entry: &Arc<Entry>) -> TransportResult<bool> {
     let cleanup_due = entry.cleanup_deadline.load(Ordering::SeqCst);
     if cleanup_due != 0 {
         if shared.ticks() as u64 >= cleanup_due {
             entry.authority.revoke();
             return Err(TransportError::Closed);
         }
-        return Ok(());
+        return Ok(false);
     }
     if !entry.authority.live() {
         return Err(TransportError::Closed);
     }
     let due = entry.registration_deadline.load(Ordering::SeqCst);
     if due == 0 || (shared.ticks() as u64) < due {
+        return Ok(false);
+    }
+    Ok(true)
+}
+fn deadline_locked(shared: &Shared, entry: &Arc<Entry>, state: &mut State) -> TransportResult<()> {
+    if !deadline_needs_state(shared, entry)? {
         return Ok(());
     }
-    let mut state = shared.state().map_err(|_| protocol("Hosting closed"))?;
-    let i = record_index(&state, entry).map_err(|_| protocol("stale session"))?;
+    let i = record_index(state, entry).map_err(|_| protocol("stale session"))?;
     if let Some(timer) = state.records[i].timer.clone() {
         if timer.due_ticks <= shared.ticks() {
             // Timer cannot survive this incarnation's disposal/release.
@@ -818,6 +1238,13 @@ fn deadline(shared: &Shared, entry: &Arc<Entry>) -> TransportResult<()> {
         }
     }
     Ok(())
+}
+fn deadline(shared: &Shared, entry: &Arc<Entry>) -> TransportResult<()> {
+    if !deadline_needs_state(shared, entry)? {
+        return Ok(());
+    }
+    let mut state = shared.state().map_err(|_| protocol("Hosting closed"))?;
+    deadline_locked(shared, entry, &mut state)
 }
 async fn watch_deadlines(shared: &Shared, entry: &Arc<Entry>) -> TransportResult<()> {
     loop {
@@ -833,6 +1260,10 @@ fn native_error(error: &crate::Error) -> TransportResult<i64> {
         crate::Error::HostNotRegistered => 0x80071d2e,
         crate::Error::RuntimeAlreadyRegistered => 0x80071d2f,
         crate::Error::RuntimeNotRegistered => 0x80071d30,
+        crate::Error::TypeAlreadyRegisteredToSameRuntime => 0x80071d31,
+        crate::Error::TypeAlreadyRegistered => 0x80071bd1,
+        crate::Error::InvalidServiceType => 0x80071c21,
+        crate::Error::TypeDisabled => 0x80071d33,
         crate::Error::OperationFailed => 0x80004005,
         crate::Error::Dependency(value) => return Ok(*value),
         _ => return Err(protocol("local Hosting operation failure")),
@@ -845,6 +1276,7 @@ fn dispatch(
     actor: i64,
     action: &str,
     body: &[u8],
+    type_deadline: Option<Instant>,
 ) -> TransportResult<Vec<u8>> {
     // Before mutation as well as in the independent wait supervisor.
     deadline(shared, entry)?;
@@ -856,8 +1288,18 @@ fn dispatch(
     {
         return Err(protocol("retired session accepts cleanup only"));
     }
+    #[cfg(test)]
+    if let Some(ready) = shared.dispatch_ready.lock().unwrap().take() {
+        ready.send(()).unwrap();
+    }
     let mut state = shared.state().map_err(|_| protocol("Hosting closed"))?;
     let i = record_index(&state, entry).map_err(|_| protocol("stale session"))?;
+    // The core lock may have been stalled by an independent consumer/control
+    // operation. Recheck this exact incarnation at the mutation boundary.
+    deadline_locked(shared, entry, &mut state)?;
+    if type_deadline.is_some_and(|due| Instant::now() >= due) {
+        return Err(protocol("type request deadline before admission"));
+    }
     if state.records[i].results.len() == MAX_RESULTS {
         return Err(protocol("Hosting retained result capacity"));
     }
@@ -953,6 +1395,66 @@ fn dispatch(
             if result.primary.is_ok() {
                 state.records[i].runtime = Some(context.id.clone());
                 entry.ready.store(true, Ordering::SeqCst);
+            }
+        }
+        (9, "RegisterServiceTypeRequest") => {
+            let consumer = state.records[i]
+                .registration_consumer
+                .as_ref()
+                .ok_or(protocol("factory capability not admitted"))?
+                .clone();
+            if !consumer.active() {
+                return Err(protocol("factory consumer withdrawn"));
+            }
+            let value: wire::TypeRequest = decode(body, shared.config.decode_bytes)?;
+            let context = &value.context;
+            let mut expected_host = entry.admission.host.clone();
+            expected_host.id = context.host.id.clone();
+            if !host_matches(&context.host.id)
+                || context.host != expected_host
+                || context.code != entry.admission.code
+                || value.id.package != context.code.id.package
+                || !valid_string(&value.id.name)
+                || !state.records[i]
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|id| crate::compare_names(id, &context.id).is_eq())
+            {
+                return Err(protocol("type context outside admitted profile"));
+            }
+            let projection = context_projection_bytes(context)
+                .saturating_mul(2)
+                .saturating_add(value.id.name.len());
+            if projection > shared.config.projection_bytes {
+                return Err(protocol("Hosting type projection budget"));
+            }
+            let id = value.id.project();
+            let mut health = state.health.clone();
+            // Reserve source/report bookkeeping before publishing type outputs.
+            // Undeclared types retain their native InvalidServiceType outcome.
+            if state
+                .core
+                .type_entries()
+                .iter()
+                .any(|e| crate::compare_type_instances(&e.id, &id).is_eq())
+            {
+                health
+                    .registered(&id, &shared.config.node)
+                    .map_err(|_| protocol("managed health source/report admission"))?;
+            }
+            deadline_locked(shared, entry, &mut state)?;
+            if type_deadline.is_some_and(|due| Instant::now() >= due) {
+                return Err(protocol("type request deadline before mutation"));
+            }
+            if !consumer.active() {
+                return Err(protocol("factory consumer withdrawn before mutation"));
+            }
+            result.action = "RegisterServiceTypeRequest";
+            let registration = state.core.register_type(&id, &context.project());
+            result.primary = registration.result;
+            result.cleanup = registration.cleanup;
+            if result.primary.is_ok() {
+                state.health = health;
             }
         }
         (9, "UnregisterFabricRuntimeRequest") => {
@@ -1071,6 +1573,312 @@ fn cleanup(state: &mut State, i: usize, loss: Loss) {
 mod fence_tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    fn fixture(duration: Duration) -> (Server, Admission) {
+        let node = NodeContext {
+            node_id: "1".into(),
+            node_pid: 1,
+            lease_handle: 0,
+            lease_duration: 0,
+            error: 0,
+            node_instance: 1,
+            node_name: "local".into(),
+            node_type: "local".into(),
+            client_address: "127.0.0.1:19000".into(),
+            deployment: "/tmp/prepared".into(),
+            ip: "127.0.0.1".into(),
+            work: "/tmp".into(),
+            initial_ttl: 0,
+            application_directories: fube_transport::serialization::serde::ObjectArray(vec![]),
+            node_directories: fube_transport::serialization::serde::ObjectArray(vec![]),
+            application_log: fube_transport::serialization::serde::Pointer(None),
+            system_log: fube_transport::serialization::serde::Pointer(None),
+        };
+        let admission = Admission {
+            deadlines: RequestDeadlines::Propagated,
+            host: wire::HostContext {
+                id: uuid::Uuid::new_v4().to_string(),
+                kind: 1,
+                pid: 1,
+                container: false,
+                activator: false,
+            },
+            code: wire::CodeContext {
+                id: wire::CodeId {
+                    package: wire::PackageInstance {
+                        package: wire::PackageId {
+                            application: wire::ApplicationId {
+                                type_name: "App".into(),
+                                number: 1,
+                            },
+                            name: "Pkg".into(),
+                        },
+                        activation: wire::Activation {
+                            guid: fube_transport::serialization::serde::Guid([0; 16]),
+                            mode: 0,
+                        },
+                        public_id: String::new(),
+                    },
+                    name: "Code".into(),
+                },
+                code_sequence: 1,
+                package_sequence: 1,
+                version: wire::VersionInstance {
+                    version: wire::PackageVersion {
+                        application: wire::ApplicationVersion {
+                            value: wire::Rollout { major: 1, minor: 0 },
+                        },
+                        value: wire::Rollout { major: 1, minor: 0 },
+                    },
+                    instance: 1,
+                },
+                application_name: "fabric:/App".into(),
+            },
+        };
+        let server = Server::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Config {
+                node,
+                core_limits: Default::default(),
+                max_admissions: 1,
+                scratch_bytes: 8 * 1024 * 1024,
+                decode_bytes: 4096,
+                projection_bytes: 4096,
+                reply_bytes: 4096,
+                lease_duration: duration,
+            },
+        )
+        .unwrap();
+        (server, admission)
+    }
+
+    #[test]
+    fn dispatch_lock_wait_rechecks_host_authority_and_request_deadlines_without_recursion() {
+        for mode in 0..3 {
+            let duration = if mode == 1 {
+                Duration::from_millis(200)
+            } else {
+                LOCAL_LEASE_DURATION
+            };
+            let (mut server, admission) = fixture(duration);
+            let owner = (mode == 2).then(|| server.registration_owner(Default::default()).unwrap());
+            let lease = if let Some(owner) = &owner {
+                let prepared = server
+                    .admit_registration(
+                        owner,
+                        admission.clone(),
+                        vec!["Probe".into(), "Target".into()],
+                        "prepared",
+                    )
+                    .unwrap();
+                assert!(prepared.failure.is_none());
+                prepared.lease
+            } else {
+                server.admit(admission.clone()).unwrap()
+            };
+            let shared = server.shared.clone();
+            let entry = lease.entry.clone();
+            let context = wire::RuntimeContext {
+                id: "runtime".into(),
+                host: admission.host.clone(),
+                code: admission.code.clone(),
+            };
+            if mode == 2 {
+                {
+                    let mut state = shared.state().unwrap();
+                    let i = record_index(&state, &entry).unwrap();
+                    state.core.add_host(admission.host.id.clone()).unwrap();
+                    state
+                        .core
+                        .start_host(
+                            &admission.host.id,
+                            &crate::ManualClock(shared.ticks()),
+                            10_000_000,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        state
+                            .core
+                            .finish_host(&admission.host.id, false)
+                            .unwrap()
+                            .reply,
+                        Ok(())
+                    );
+                    assert_eq!(
+                        state.core.register_runtime(context.project()).result,
+                        Ok(())
+                    );
+                    state.records[i].runtime = Some(context.id.clone());
+                    state.records[i].completed = true;
+                    entry.ready.store(true, Ordering::SeqCst);
+                }
+                let body = to_vec(&wire::TypeRequest {
+                    context: context.clone(),
+                    id: wire::TypeId {
+                        package: context.code.id.package.clone(),
+                        name: "Probe".into(),
+                    },
+                })
+                .unwrap();
+                let response = dispatch(
+                    &shared,
+                    &entry,
+                    9,
+                    "RegisterServiceTypeRequest",
+                    &body,
+                    Some(Instant::now() + Duration::from_secs(1)),
+                )
+                .unwrap();
+                assert_eq!(
+                    fube_transport::serialization::serde::from_slice::<wire::ErrorReply>(&response)
+                        .unwrap()
+                        .error,
+                    0
+                );
+                owner.as_ref().unwrap().take_outputs().unwrap();
+            }
+            let mut state = shared.state().unwrap();
+            let i = record_index(&state, &entry).unwrap();
+            if mode == 0 {
+                state.core.add_host(admission.host.id.clone()).unwrap();
+                let timer = state
+                    .core
+                    .start_host(
+                        &admission.host.id,
+                        &crate::ManualClock(shared.ticks()),
+                        2_000_000,
+                    )
+                    .unwrap();
+                entry
+                    .registration_deadline
+                    .store(timer.due_ticks as u64, Ordering::SeqCst);
+                state.records[i].timer = Some(timer);
+            }
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            *shared.dispatch_ready.lock().unwrap() = Some(ready_tx);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let owned = shared.clone();
+            let body = if mode == 2 {
+                to_vec(&wire::TypeRequest {
+                    context: context.clone(),
+                    id: wire::TypeId {
+                        package: context.code.id.package.clone(),
+                        name: "Target".into(),
+                    },
+                })
+                .unwrap()
+            } else {
+                to_vec(&wire::IdRequest {
+                    id: admission.host.id,
+                })
+                .unwrap()
+            };
+            let type_due = (mode == 2).then(|| Instant::now() + Duration::from_millis(200));
+            let worker = std::thread::spawn(move || {
+                let result = dispatch(
+                    &owned,
+                    &entry,
+                    if mode == 2 { 9 } else { 7 },
+                    if mode == 2 {
+                        "RegisterServiceTypeRequest"
+                    } else {
+                        "FinishRegisterApplicationHostRequest"
+                    },
+                    &body,
+                    type_due,
+                );
+                done_tx.send(result).unwrap();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            // The worker has passed its nonlocking precheck and must wait for
+            // this guard. Cross the real finite deadline before releasing it.
+            std::thread::sleep(Duration::from_millis(250));
+            drop(state);
+            let result = done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            match mode {
+                0 => assert!(matches!(
+                    result,
+                    Err(TransportError::Protocol("Hosting registration timeout"))
+                )),
+                1 => assert!(matches!(result, Err(TransportError::Closed))),
+                _ => assert!(matches!(
+                    result,
+                    Err(TransportError::Protocol(
+                        "type request deadline before admission"
+                    ))
+                )),
+            }
+            worker.join().unwrap();
+            let state = shared.state().unwrap();
+            assert!(state.records[i].results.is_empty());
+            if mode == 0 {
+                assert_eq!(state.records[i].loss, Some(Loss::RegistrationTimeout));
+                assert_eq!(state.records[i].cleanup, Some(Ok(())));
+                assert!(state.records[i].timer.is_none());
+            }
+            if mode == 2 {
+                let target = state
+                    .core
+                    .type_entries()
+                    .iter()
+                    .find(|e| e.id.service_type.name == "Target")
+                    .unwrap();
+                assert_eq!(target.status, crate::TypeStatus::NotRegisteredEnabled);
+                assert!(target.runtime_id.is_empty());
+                assert!(state
+                    .health
+                    .sources
+                    .iter()
+                    .find(|s| s.id.service_type.name == "Target")
+                    .unwrap()
+                    .last_disabled_report
+                    .is_none());
+            }
+            drop(state);
+            server.stop().unwrap();
+        }
+    }
+
+    #[test]
+    fn health_removal_capacity_preserves_source_core_membership_and_entity_history() {
+        let (mut server, admission) = fixture(LOCAL_LEASE_DURATION);
+        let owner = server.registration_owner(Default::default()).unwrap();
+        let prepared = server
+            .admit_registration(&owner, admission, vec!["A".into()], "prepared")
+            .unwrap();
+        let id = owner.health_sources().unwrap()[0].id.clone();
+        {
+            let mut state = server.shared.state().unwrap();
+            // Controlled producer premise for this capacity corner, not a
+            // native/Rust application protocol qualification.
+            state
+                .health
+                .registered(&id, &server.shared.config.node)
+                .unwrap();
+            state.health.bound_to_retained();
+        }
+        let before = owner.health_sources().unwrap();
+        assert_eq!(
+            owner.remove_declaration(&id, "prepared"),
+            Err(crate::Error::Capacity)
+        );
+        assert_eq!(owner.health_sources().unwrap(), before);
+        {
+            let mut state = server.shared.state().unwrap();
+            assert_eq!(state.core.type_entries()[0].sources, vec!["prepared"]);
+            state
+                .health
+                .restore_budget(server.shared.config.core_limits.state_bytes);
+        }
+        let removed = owner.remove_declaration(&id, "prepared").unwrap().unwrap();
+        assert_eq!(
+            removed.disabled_report.unwrap().kind,
+            crate::DisabledReportKind::DeleteEntity
+        );
+        server.release(prepared.lease).unwrap();
+        owner.close().unwrap();
+        server.stop().unwrap();
+    }
 
     #[tokio::test]
     async fn queued_production_reply_fence_observes_no_frame_after_terminal_loss() {

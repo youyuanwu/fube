@@ -22,8 +22,12 @@ The [node-side Hosting design](RustHosting.md#implemented-h1-model) now includes
 the native-derived H1 registry and [H2 admitted residency/scheduling](RustHosting.md#implemented-h2-accounting-and-scheduling).
 A separate real-accounting RA test composition exercises original completion/
 ticket ownership and definite/unknown durable close; FSR remains memory-only.
-Live event consumers, IPC/leases and processes remain dependent work; this
-does not enable a production RA/Hosting adapter or alter native RA policy.
+The [owned registration-events node slice](HostingRegistrationEvents.md) now
+adds actual serialized current-state/local status consumers and actor-9 Hosting
+registration/lookup over finite local sessions. Matching FT/readiness and issued
+acquisition premises are explicitly qualification-only; required FM/HM/RAP
+completion and deployed processes remain gated. This is not the full production
+RA/Hosting lifecycle adapter and does not replace native policy with a queue ACK.
 
 ## 1. Scope and compatibility
 

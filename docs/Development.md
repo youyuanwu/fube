@@ -203,6 +203,7 @@ cargo test --locked -p fube-transport -p fube-client -p fube-test-host
 cargo test --locked -p fube-ra-store
 cargo test --locked -p fube-ra
 cargo test --locked -p fube-hosting
+cargo test --locked -p fube-node
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --all-features --no-deps
 cargo test --locked --workspace --all-features --doc
@@ -349,6 +350,27 @@ do not reuse an older source revision after documentation changes. All five
 original native fixture scenarios remain separate required regressions; the existing
 CI workflow still selects those five, not an implicitly added Hosting job.
 See [profile and evidence limits](runtime/RustTestHost.md#27-production-hosting-lease-qualification).
+
+The separately named [owned registration-events profile](cluster/HostingRegistrationEvents.md)
+adds actual factory-client/node and bounded current-state consumer checks:
+
+```sh
+cargo test --locked -p fube-ra --test hosting_events -- --test-threads=1
+cargo test --locked -p fube-node -- --test-threads=1
+cargo test --locked -p fube-runtime --lib hosting_registration_tests:: -- --test-threads=1
+python3 -m unittest discover -s tests/offline/native_runtime -p 'test_*.py'
+python3 -m tests.native_runtime.runner hosting-registration \
+  --prebuilt build/registration-NEW \
+  --diagnostics-directory build/registration-NEW-receipts
+```
+
+Build/package `registration-NEW` using the locked workspace command above from
+the current **clean** HEAD, then run all six preserved native actions separately.
+New native registration exercises production Hosting lookup and three owned
+local closure-lane decisions, with native readiness/report/deployment gates
+explicit. Matching FT/status and unknown-store cases are focused Rust
+qualification, not native node/FM/HM/RAP execution. No earlier receipts may be
+overwritten or relabeled; final documentation commits require fresh bundles too.
 
 ## Live native client
 

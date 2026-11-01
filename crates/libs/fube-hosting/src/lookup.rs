@@ -2,6 +2,62 @@
 //! Candidate/error/sequence are independent, including error with a candidate.
 use crate::*;
 
+#[cfg(test)]
+mod scoped_tests {
+    use super::*;
+    #[test]
+    fn tentative_mismatch_keeps_native_not_registered_sequence_without_candidate() {
+        let mut core = Hosting::new(Limits::default()).unwrap();
+        let package = PackageId {
+            application: ApplicationId {
+                type_name: "App".into(),
+                number: 1,
+            },
+            name: "Pkg".into(),
+        };
+        let id = TypeInstance {
+            service_type: ServiceTypeId {
+                package: package.clone(),
+                name: "Type".into(),
+            },
+            activation: Activation::SHARED,
+            public_activation: String::new(),
+        };
+        let context = RuntimeContext {
+            runtime_id: "runtime".into(),
+            host_id: "host".into(),
+            process_id: 1,
+            package: id.package_instance(),
+            code_package: "Code".into(),
+            package_instance_sequence: 1,
+            version: VersionInstance::default(),
+        };
+        core.declare_type(id.clone(), "prepared".into(), Ok(()))
+            .unwrap();
+        core.add_host("host".into()).unwrap();
+        core.start_host("host", &ManualClock(0), 100).unwrap();
+        core.finish_host("host", false).unwrap();
+        assert_eq!(core.register_runtime(context.clone()).result, Ok(()));
+        core.start_type_registration(&id, &context).unwrap();
+        let request = LookupRequest {
+            service_type: id.service_type,
+            version: VersionInstance {
+                instance: 1,
+                ..Default::default()
+            },
+            activation: Activation::SHARED,
+            service_name: "fabric:/App/service".into(),
+            application_name: "fabric:/App".into(),
+            should_activate: false,
+        };
+        let result = core.lookup_registration(&request).unwrap();
+        assert_eq!(result.result, Err(Error::TypeNotRegistered));
+        assert!(result.sequence.is_some());
+        assert!(result.candidate.is_none());
+        assert!(core.take_obligations().is_empty());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Immutable lookup inputs; see [`RegistrationLookup`] for native provenance,
 /// comparison and supported activating/nonactivating paths.
@@ -138,6 +194,20 @@ impl Hosting {
     /// invariant/capability boundary) and may retain a candidate.
     /// Modeled dependencies are recorded, never called as success-shaped stubs.
     pub fn lookup(&mut self, request: &LookupRequest, model: &LookupModel) -> Result<LookupResult> {
+        self.lookup_inner(request, model, false)
+    }
+    /// Scoped operational lookup: normal state/error/sequence branches are
+    /// preserved; registered mismatch retains its snapshot with an inner
+    /// capability gate, without inventing a scheduling/deactivation outcome.
+    pub(crate) fn lookup_registration(&mut self, request: &LookupRequest) -> Result<LookupResult> {
+        self.lookup_inner(request, &LookupModel::default(), true)
+    }
+    fn lookup_inner(
+        &mut self,
+        request: &LookupRequest,
+        model: &LookupModel,
+        gate_mismatch: bool,
+    ) -> Result<LookupResult> {
         self.change(|s| {
             let Some(public_activation) = s.public_activation(request, model)? else {
                 return Ok(LookupResult::error(Error::TypeNotRegistered, None));
@@ -163,6 +233,8 @@ impl Hosting {
                     let candidate = Registration::from_context(id, runtime);
                     let result = if candidate.version == request.version {
                         Ok(())
+                    } else if gate_mismatch {
+                        Err(Error::UnsupportedCapability)
                     } else {
                         let outcome = model
                             .deactivation

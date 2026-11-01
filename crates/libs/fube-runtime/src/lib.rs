@@ -103,6 +103,8 @@ mod error;
 mod execution;
 pub mod extensions;
 #[cfg(test)]
+mod hosting_registration_tests;
+#[cfg(test)]
 mod hosting_tests;
 mod instance_integration;
 mod lease;
