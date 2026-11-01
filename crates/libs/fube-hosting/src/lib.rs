@@ -114,7 +114,7 @@ pub use collaborators::*;
 pub use contracts::*;
 pub use core::*;
 pub use events::*;
-pub use health::{DisabledReport, HealthSource};
+pub use health::{DisabledReport, DisabledReportKind, HealthRemoval, HealthSource};
 pub use host::*;
 pub use identity::*;
 pub use lookup::*;

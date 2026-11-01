@@ -347,7 +347,13 @@ async fn admitted_factory_lookup_duplicates_and_owned_health_disabled_sources() 
     let removed = owner
         .remove_declaration(&source.id, "prepared-package")
         .unwrap();
-    assert_eq!(removed, Some(source));
+    let removed = removed.unwrap();
+    assert_eq!(removed.source, source);
+    assert!(removed.entity_deleted);
+    assert_eq!(
+        removed.disabled_report.unwrap().kind,
+        fube_hosting::DisabledReportKind::DeleteEntity
+    );
     assert!(owner.health_sources().unwrap().is_empty());
     server.stop().unwrap();
 }
@@ -580,6 +586,90 @@ async fn stale_factory_session_cannot_register_into_same_identity_successor() {
         [ClosedRegisteredEvent::Registered { registration, .. }] if registration.runtime_id == current.runtime));
     drop(current);
     disconnected(&server, &successor.lease).await;
+    server.stop().unwrap();
+}
+
+#[tokio::test]
+async fn disabled_health_keeps_shared_entity_history_after_reported_type_is_removed() {
+    use fube_hosting::DisabledReportKind;
+    let mut server = server(LOCAL_LEASE_DURATION);
+    let owner = server.registration_owner(Default::default()).unwrap();
+    let a = admission();
+    let prepared = server
+        .admit_registration(
+            &owner,
+            a.clone(),
+            vec!["A".into(), "B".into()],
+            "prepared-package",
+        )
+        .unwrap();
+    let mut peer = Peer::connect(&server, a).await;
+    peer.bootstrap().await;
+    let request = type_request(&peer, "A");
+    let reply = peer.call(9, "RegisterServiceTypeRequest", &request).await;
+    assert_eq!(
+        from_slice::<wire::ErrorReply>(&reply.body).unwrap().error,
+        0
+    );
+    let sources = owner.health_sources().unwrap();
+    let a = sources
+        .iter()
+        .find(|s| s.id.service_type.name == "A")
+        .unwrap();
+    let b = sources
+        .iter()
+        .find(|s| s.id.service_type.name == "B")
+        .unwrap();
+    assert_eq!(a.entity_instance, b.entity_instance);
+    assert!(b.last_disabled_report.is_none());
+    let first = owner
+        .remove_declaration(&a.id, "prepared-package")
+        .unwrap()
+        .unwrap();
+    assert!(!first.entity_deleted);
+    let report = first.disabled_report.unwrap();
+    assert_eq!(report.kind, DisabledReportKind::DeleteEvent);
+    assert_eq!(report.source, "System.Hosting");
+    assert_eq!(report.property, "ServiceTypeRegistration:A");
+    assert_eq!(report.ttl_ticks, Some(1_000_000));
+    assert!(report.remove_when_expired);
+    assert!(report.sequence > a.last_disabled_report.as_ref().unwrap().sequence);
+    let last = owner
+        .remove_declaration(&b.id, "prepared-package")
+        .unwrap()
+        .unwrap();
+    assert!(last.entity_deleted);
+    let report = last.disabled_report.unwrap();
+    assert_eq!(report.kind, DisabledReportKind::DeleteEntity);
+    assert_eq!(report.entity_instance, a.entity_instance);
+    assert_eq!(report.property, "DeleteProperty");
+    assert_eq!(report.ttl_ticks, Some(72_000_000_000));
+    assert!(!report.remove_when_expired);
+    assert!(last.sequence > first.sequence);
+    assert!(owner.health_sources().unwrap().is_empty());
+    drop(peer);
+    disconnected(&server, &prepared.lease).await;
+    server.stop().unwrap();
+}
+
+#[test]
+fn never_reported_health_entity_removal_does_not_fabricate_delete_report() {
+    let mut server = server(LOCAL_LEASE_DURATION);
+    let owner = server.registration_owner(Default::default()).unwrap();
+    let prepared = server
+        .admit_registration(&owner, admission(), vec!["A".into()], "prepared-package")
+        .unwrap();
+    let source = owner.health_sources().unwrap().remove(0);
+    let removal = owner
+        .remove_declaration(&source.id, "prepared-package")
+        .unwrap()
+        .unwrap();
+    assert!(removal.entity_deleted);
+    assert!(removal.disabled_report.is_none());
+    assert!(removal.sequence > source.entity_instance);
+    assert!(owner.health_sources().unwrap().is_empty());
+    server.release(prepared.lease).unwrap();
+    owner.close().unwrap();
     server.stop().unwrap();
 }
 

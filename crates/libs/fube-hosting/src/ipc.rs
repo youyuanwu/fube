@@ -127,6 +127,8 @@ struct Shared {
     wake: Notify,
     used: Arc<AtomicUsize>,
     node_bytes: usize,
+    #[cfg(test)]
+    dispatch_ready: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
 struct Reservation {
     used: Arc<AtomicUsize>,
@@ -254,7 +256,7 @@ impl RegistrationOwner {
         &self,
         id: &crate::TypeInstance,
         source: &str,
-    ) -> crate::Result<Option<crate::HealthSource>> {
+    ) -> crate::Result<Option<crate::HealthRemoval>> {
         let mut state = self.shared.state()?;
         let last = state
             .core
@@ -271,7 +273,7 @@ impl RegistrationOwner {
                 .ok_or(crate::Error::InvalidServiceType)?
                 .component
                 .clone();
-            Some(health.remove(id, &component)?)
+            Some(health.remove(id, &component, &self.shared.config.node)?)
         } else {
             None
         };
@@ -470,6 +472,8 @@ impl Server {
             wake: Notify::new(),
             used: Arc::new(AtomicUsize::new(0)),
             node_bytes,
+            #[cfg(test)]
+            dispatch_ready: Mutex::new(None),
         });
         let owned = shared.clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1037,24 +1041,29 @@ async fn run_connection(
     }
 }
 
-fn deadline(shared: &Shared, entry: &Arc<Entry>) -> TransportResult<()> {
+fn deadline_needs_state(shared: &Shared, entry: &Arc<Entry>) -> TransportResult<bool> {
     let cleanup_due = entry.cleanup_deadline.load(Ordering::SeqCst);
     if cleanup_due != 0 {
         if shared.ticks() as u64 >= cleanup_due {
             entry.authority.revoke();
             return Err(TransportError::Closed);
         }
-        return Ok(());
+        return Ok(false);
     }
     if !entry.authority.live() {
         return Err(TransportError::Closed);
     }
     let due = entry.registration_deadline.load(Ordering::SeqCst);
     if due == 0 || (shared.ticks() as u64) < due {
+        return Ok(false);
+    }
+    Ok(true)
+}
+fn deadline_locked(shared: &Shared, entry: &Arc<Entry>, state: &mut State) -> TransportResult<()> {
+    if !deadline_needs_state(shared, entry)? {
         return Ok(());
     }
-    let mut state = shared.state().map_err(|_| protocol("Hosting closed"))?;
-    let i = record_index(&state, entry).map_err(|_| protocol("stale session"))?;
+    let i = record_index(state, entry).map_err(|_| protocol("stale session"))?;
     if let Some(timer) = state.records[i].timer.clone() {
         if timer.due_ticks <= shared.ticks() {
             // Timer cannot survive this incarnation's disposal/release.
@@ -1068,6 +1077,13 @@ fn deadline(shared: &Shared, entry: &Arc<Entry>) -> TransportResult<()> {
         }
     }
     Ok(())
+}
+fn deadline(shared: &Shared, entry: &Arc<Entry>) -> TransportResult<()> {
+    if !deadline_needs_state(shared, entry)? {
+        return Ok(());
+    }
+    let mut state = shared.state().map_err(|_| protocol("Hosting closed"))?;
+    deadline_locked(shared, entry, &mut state)
 }
 async fn watch_deadlines(shared: &Shared, entry: &Arc<Entry>) -> TransportResult<()> {
     loop {
@@ -1111,11 +1127,15 @@ fn dispatch(
     {
         return Err(protocol("retired session accepts cleanup only"));
     }
+    #[cfg(test)]
+    if let Some(ready) = shared.dispatch_ready.lock().unwrap().take() {
+        ready.send(()).unwrap();
+    }
     let mut state = shared.state().map_err(|_| protocol("Hosting closed"))?;
     let i = record_index(&state, entry).map_err(|_| protocol("stale session"))?;
     // The core lock may have been stalled by an independent consumer/control
     // operation. Recheck this exact incarnation at the mutation boundary.
-    deadline(shared, entry)?;
+    deadline_locked(shared, entry, &mut state)?;
     if type_deadline.is_some_and(|due| Instant::now() >= due) {
         return Err(protocol("type request deadline before admission"));
     }
@@ -1220,7 +1240,8 @@ fn dispatch(
             let consumer = state.records[i]
                 .registration_consumer
                 .as_ref()
-                .ok_or(protocol("factory capability not admitted"))?;
+                .ok_or(protocol("factory capability not admitted"))?
+                .clone();
             if !consumer.load(Ordering::SeqCst) {
                 return Err(protocol("factory consumer withdrawn"));
             }
@@ -1260,7 +1281,7 @@ fn dispatch(
                     .registered(&id, &shared.config.node)
                     .map_err(|_| protocol("managed health source/report admission"))?;
             }
-            deadline(shared, entry)?;
+            deadline_locked(shared, entry, &mut state)?;
             if type_deadline.is_some_and(|due| Instant::now() >= due) {
                 return Err(protocol("type request deadline before mutation"));
             }
@@ -1391,6 +1412,197 @@ fn cleanup(state: &mut State, i: usize, loss: Loss) {
 mod fence_tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    fn fixture(duration: Duration) -> (Server, Admission) {
+        let node = NodeContext {
+            node_id: "1".into(),
+            node_pid: 1,
+            lease_handle: 0,
+            lease_duration: 0,
+            error: 0,
+            node_instance: 1,
+            node_name: "local".into(),
+            node_type: "local".into(),
+            client_address: "127.0.0.1:19000".into(),
+            deployment: "/tmp/prepared".into(),
+            ip: "127.0.0.1".into(),
+            work: "/tmp".into(),
+            initial_ttl: 0,
+            application_directories: fube_transport::serialization::serde::ObjectArray(vec![]),
+            node_directories: fube_transport::serialization::serde::ObjectArray(vec![]),
+            application_log: fube_transport::serialization::serde::Pointer(None),
+            system_log: fube_transport::serialization::serde::Pointer(None),
+        };
+        let admission = Admission {
+            deadlines: RequestDeadlines::Propagated,
+            host: wire::HostContext {
+                id: uuid::Uuid::new_v4().to_string(),
+                kind: 1,
+                pid: 1,
+                container: false,
+                activator: false,
+            },
+            code: wire::CodeContext {
+                id: wire::CodeId {
+                    package: wire::PackageInstance {
+                        package: wire::PackageId {
+                            application: wire::ApplicationId {
+                                type_name: "App".into(),
+                                number: 1,
+                            },
+                            name: "Pkg".into(),
+                        },
+                        activation: wire::Activation {
+                            guid: fube_transport::serialization::serde::Guid([0; 16]),
+                            mode: 0,
+                        },
+                        public_id: String::new(),
+                    },
+                    name: "Code".into(),
+                },
+                code_sequence: 1,
+                package_sequence: 1,
+                version: wire::VersionInstance {
+                    version: wire::PackageVersion {
+                        application: wire::ApplicationVersion {
+                            value: wire::Rollout { major: 1, minor: 0 },
+                        },
+                        value: wire::Rollout { major: 1, minor: 0 },
+                    },
+                    instance: 1,
+                },
+                application_name: "fabric:/App".into(),
+            },
+        };
+        let server = Server::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Config {
+                node,
+                core_limits: Default::default(),
+                max_admissions: 1,
+                scratch_bytes: 8 * 1024 * 1024,
+                decode_bytes: 4096,
+                projection_bytes: 4096,
+                reply_bytes: 4096,
+                lease_duration: duration,
+            },
+        )
+        .unwrap();
+        (server, admission)
+    }
+
+    #[test]
+    fn dispatch_lock_wait_rechecks_host_authority_and_request_deadlines_without_recursion() {
+        for mode in 0..3 {
+            let duration = if mode == 1 {
+                Duration::from_millis(200)
+            } else {
+                LOCAL_LEASE_DURATION
+            };
+            let (mut server, admission) = fixture(duration);
+            let lease = server.admit(admission.clone()).unwrap();
+            let shared = server.shared.clone();
+            let entry = lease.entry.clone();
+            let mut state = shared.state().unwrap();
+            let i = record_index(&state, &entry).unwrap();
+            if mode == 0 {
+                state.core.add_host(admission.host.id.clone()).unwrap();
+                let timer = state
+                    .core
+                    .start_host(
+                        &admission.host.id,
+                        &crate::ManualClock(shared.ticks()),
+                        2_000_000,
+                    )
+                    .unwrap();
+                entry
+                    .registration_deadline
+                    .store(timer.due_ticks as u64, Ordering::SeqCst);
+                state.records[i].timer = Some(timer);
+            }
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            *shared.dispatch_ready.lock().unwrap() = Some(ready_tx);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let owned = shared.clone();
+            let body = to_vec(&wire::IdRequest {
+                id: admission.host.id,
+            })
+            .unwrap();
+            let type_due = (mode == 2).then(|| Instant::now() + Duration::from_millis(200));
+            let worker = std::thread::spawn(move || {
+                let result = dispatch(
+                    &owned,
+                    &entry,
+                    if mode == 2 { 9 } else { 7 },
+                    if mode == 2 {
+                        "RegisterServiceTypeRequest"
+                    } else {
+                        "FinishRegisterApplicationHostRequest"
+                    },
+                    &body,
+                    type_due,
+                );
+                done_tx.send(result.is_err()).unwrap();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            // The worker has passed its nonlocking precheck and must wait for
+            // this guard. Cross the real finite deadline before releasing it.
+            std::thread::sleep(Duration::from_millis(250));
+            drop(state);
+            assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+            worker.join().unwrap();
+            let state = shared.state().unwrap();
+            assert!(state.records[i].results.is_empty());
+            if mode == 0 {
+                assert_eq!(state.records[i].loss, Some(Loss::RegistrationTimeout));
+                assert_eq!(state.records[i].cleanup, Some(Ok(())));
+                assert!(state.records[i].timer.is_none());
+            }
+            drop(state);
+            server.stop().unwrap();
+        }
+    }
+
+    #[test]
+    fn health_removal_capacity_preserves_source_core_membership_and_entity_history() {
+        let (mut server, admission) = fixture(LOCAL_LEASE_DURATION);
+        let owner = server.registration_owner(Default::default()).unwrap();
+        let prepared = server
+            .admit_registration(&owner, admission, vec!["A".into()], "prepared")
+            .unwrap();
+        let id = owner.health_sources().unwrap()[0].id.clone();
+        {
+            let mut state = server.shared.state().unwrap();
+            // Controlled producer premise for this capacity corner, not a
+            // native/Rust application protocol qualification.
+            state
+                .health
+                .registered(&id, &server.shared.config.node)
+                .unwrap();
+            state.health.bound_to_retained();
+        }
+        let before = owner.health_sources().unwrap();
+        assert_eq!(
+            owner.remove_declaration(&id, "prepared"),
+            Err(crate::Error::Capacity)
+        );
+        assert_eq!(owner.health_sources().unwrap(), before);
+        {
+            let mut state = server.shared.state().unwrap();
+            assert_eq!(state.core.type_entries()[0].sources, vec!["prepared"]);
+            state
+                .health
+                .restore_budget(server.shared.config.core_limits.state_bytes);
+        }
+        let removed = owner.remove_declaration(&id, "prepared").unwrap().unwrap();
+        assert_eq!(
+            removed.disabled_report.unwrap().kind,
+            crate::DisabledReportKind::DeleteEntity
+        );
+        server.release(prepared.lease).unwrap();
+        owner.close().unwrap();
+        server.stop().unwrap();
+    }
 
     #[tokio::test]
     async fn queued_production_reply_fence_observes_no_frame_after_terminal_loss() {
