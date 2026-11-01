@@ -1,7 +1,7 @@
 //! Self-contained native writes; HTTP observes and cleans only the pre-owned name.
 use std::{path::Path, time::Duration};
 
-use fube_client::{Error, FabricClient};
+use fube_client::{ClientError, DomainFailure, Error, FabricClient};
 use serde_json::{json, Value};
 
 #[path = "support/name_oracle.rs"]
@@ -33,7 +33,7 @@ async fn mutate(
 fn settle(
     journal: &mut Journal,
     path: &Path,
-    outcome: fube_client::Result<()>,
+    outcome: fube_client::ClientResult<()>,
     expected_error: Option<i64>,
 ) -> Result<Option<i64>> {
     // Unknown errors deliberately keep Pending, including timeout/cancel/disconnect.
@@ -48,9 +48,10 @@ fn settle(
             }
             Ok(None)
         }
-        Err(Error::Remote { code, .. })
-            if Some(code) == expected_error && (code == DUPLICATE || code == MISSING) =>
-        {
+        Err(
+            ClientError::Domain(DomainFailure { code, .. })
+            | ClientError::Transport(Error::Remote { code, .. }),
+        ) if Some(code) == expected_error && (code == DUPLICATE || code == MISSING) => {
             journal.record(path, Stage::Settled)?;
             Ok(Some(code))
         }
@@ -135,44 +136,49 @@ fn only_conclusive_success_or_expected_native_rejections_settle_ownership() {
     }
     for (outcome, expected, settled, accepted) in [
         (
-            Err(Error::Remote {
+            Err(ClientError::Domain(DomainFailure {
                 code: DUPLICATE,
                 message: "unexpected duplicate".into(),
-            }),
+            })),
             None,
             false,
             false,
         ),
         (
-            Err(Error::Remote {
+            Err(ClientError::Domain(DomainFailure {
                 code: MISSING,
                 message: "wrong rejection".into(),
-            }),
+            })),
             Some(DUPLICATE),
             false,
             false,
         ),
-        (Err(Error::Timeout), None, false, false),
         (
-            Err(Error::Protocol("malformed success")),
+            Err(ClientError::Transport(Error::Timeout)),
             None,
             false,
             false,
         ),
         (
-            Err(Error::Remote {
+            Err(ClientError::Protocol("malformed success")),
+            None,
+            false,
+            false,
+        ),
+        (
+            Err(ClientError::Domain(DomainFailure {
                 code: DUPLICATE,
                 message: "expected duplicate".into(),
-            }),
+            })),
             Some(DUPLICATE),
             true,
             true,
         ),
         (
-            Err(Error::Remote {
+            Err(ClientError::Transport(Error::Remote {
                 code: MISSING,
                 message: "expected missing".into(),
-            }),
+            })),
             Some(MISSING),
             true,
             true,
@@ -180,8 +186,10 @@ fn only_conclusive_success_or_expected_native_rejections_settle_ownership() {
         (Ok(()), None, true, true),
         (Ok(()), Some(DUPLICATE), true, false),
     ] {
-        let directory =
-            Directory(std::env::temp_dir().join(format!("name-outcome-{}", uuid::Uuid::new_v4())));
+        let directory = Directory(std::path::PathBuf::from(format!(
+            "name-outcome-{}",
+            uuid::Uuid::new_v4()
+        )));
         std::fs::create_dir(&directory.0).unwrap();
         let path = directory.0.join("journal.json");
         let mut journal = Journal::new("test-owner".into(), "a".repeat(64)).unwrap();

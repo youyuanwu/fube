@@ -20,21 +20,41 @@ disabled or widened.
 Only actor5 with a nonempty Action is authorized for outbound domain messages.
 Raw sends cannot bypass ordinary RPC or reply authority using ExpectsReply,
 RelatesTo or special-notification flags. Ordinary replies must come through
-this established socket and the gateway role; native Fault envelopes may use
-the native empty actor. A different actor, unsupported ingress, malformed
+this established socket. Their domain actor/action and body are opaque to the
+channel; typed clients validate the particular operation. Transport controls
+and notification ingress retain their separate profile checks. Unsupported ingress, malformed
 transport fields or unsupported security/reconnect control terminates the
 foundation. A well-formed nonzero Fault returns `Error::Remote` with its exact
 header code; absent/zero Fault returns the opaque message. Optional diagnostics
 and domain bodies are not decoded by the foundation.
 
+Native common-header scanning uses the **last** RelatesTo in wire order, not
+the first or any value matching pending state. All records are preserved.
+Repeated RelatesTo records have no special count or repetition-pattern limit;
+the existing total header-count, header-byte and frame bounds apply. Every
+record must decode, including earlier records; a valid empty earlier ID is not
+the effective correlation. Only the final ID is used to look up a pending request.
+An unknown final ID never falls back to an earlier neighbor. The channel does
+not inspect the pending request's domain action or authorize query envelopes.
+Typed clients validate their operation's normal actor/action/body profile;
+invalid domain envelopes are call-local protocol errors, not channel failures.
+Malformed earlier correlation records remain channel Protocol errors.
+
+This follows pinned SF
+[Add permits appending duplicates](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/MessageHeaders.h#L86-L91);
+[the receive cache overwrites each RelatesTo](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/MessageHeaders.cpp#L805-L823);
+[RequestTable selects that final cached ID once](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/RequestTable.cpp#L46-L71).
+The [outer proxy appends client correlation](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/EntreeServiceProxy.cpp#L479-L495)
+without removing inner records. Opaque unowned extensions such as Idempotent
+remain byte-preserved and confer no retry/replay authority.
+
 Notification opt-in permits only a valid actor5
 `ServiceNotificationRequest`: nonempty MessageId, ExpectsReply=true,
 IsUncorrelatedReply=true, empty RelatesTo, no Fault or IPC identity, and validated
-transport envelope fields. Native gateway composition can append a second
-byte-identical inbound ExpectsReply or RelatesTo. Those two evidenced fields
-alone permit one identical repeat, preserved unchanged; contradictory/third
-copies and every other duplicate envelope field are Protocol. **Caller inputs
-retain strict duplicate rejection without this native-inbound exception.**
+transport envelope fields. ExpectsReply still permits only a second identical
+inbound record. Notification envelopes retain their empty-RelatesTo requirement.
+Other owned transport fields remain unique.
+**Caller inputs retain strict duplicate rejection without any inbound exception.**
 The validated envelope mints a private consuming context on the
 original target/ID. A response must be actor5/`ServiceNotificationReply`;
 the context adds missing RelatesTo, accepts one matching value and rejects
@@ -46,7 +66,8 @@ Disabled mode refuses receiver creation and terminates on notification ingress.
 listeners, other actors/transport roles, file upload, replication, actor36
 application-service transport, TLS/claims/security negotiation, reconnect,
 retry, replay, failover, pools, middleware, code generation, routing/registry
-or typed Client/ClientRequest implementation. There are no fake capability
+or typed codecs in the transport crate. The ordinary typed Client/ClientRequest
+implementation lives in `fube-client`; there are no fake capability
 implementations for those roles.
 
 ## Ownership and operations
@@ -78,8 +99,8 @@ channel.close(end).await?;
 Domain protocols may require additional version/activity/priority/time headers.
 The example demonstrates binding, not a complete typed FabricClient protocol.
 Native notification setup and processing-status schemas remain above the
-foundation. Existing domain consumers/codecs are not migrated or made public
-by this implementation.
+foundation. Ordinary FabricClient uses the shared typed adapter above this
+foundation; notifications and image upload retain independent Connection owners.
 
 - Resolution is synchronous, performs no I/O and accepts only the configured
   numeric endpoint. It reuses one private target identity. Equal addresses or
@@ -233,15 +254,16 @@ and verified resource cleanup remain **historical LOCAL PAW evidence**. The
 temporary qualification scaffolding was removed under explicit approved scope
 reduction; those executions are not an ongoing maintained test for this PR.
 Production fixes discovered during that work remain implemented and covered by
-the 26 deterministic Rust channel tests.
+the expanded deterministic Rust channel tests.
 
 Ongoing consumer end-to-end qualification belongs in the
 [existing test infrastructure](../Development.md) and
-[owner-guarded onebox lifecycle](../UbuntuOnebox.md) when consumers migrate.
-Existing live tests still exercise their current concrete Connection consumers,
-not GatewayChannel, and cannot be relabeled as new-backend coverage. Consumer
-migration and its integrated onebox scenarios remain separately authorized
-future work; this foundation does not migrate consumers now.
+[owner-guarded onebox lifecycle](../UbuntuOnebox.md). Ordinary FabricClient now
+uses GatewayChannel and the maintained native group exercises naming, all
+query/health/deployment/resolution families and one owned MovePrimary. Current
+receipts come from rebuilt migrated consumers, not the historical foundation
+smoke. The independent notification/image-transfer Connection consumers remain
+unchanged; their results are not fresh GatewayReceiver/upload-channel coverage.
 
 No fresh live pass is inferred from scaffolding removal, source inspection or
 deterministic checks. Live notification retry races, nonempty application

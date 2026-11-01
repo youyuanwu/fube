@@ -267,6 +267,7 @@ async fn application_selectors_exclusion_and_native_paging_are_explicit() {
             app.definition_kind,
             ApplicationDefinitionKind::ServiceFabricApplicationDescription
         );
+        client.close().await.unwrap();
         server.await.unwrap();
     }
 }
@@ -332,6 +333,7 @@ async fn service_selectors_route_to_application_service_list_and_both_kinds_deco
         assert_eq!(service.manifest_version, "1.2");
         assert!(service.is_service_group);
         assert!(page.continuation_token.is_none());
+        client.close().await.unwrap();
         server.await.unwrap();
     }
 }
@@ -386,6 +388,7 @@ async fn optional_record_suffixes_use_only_native_defaults() {
                 assert!(page.items[0].upgrade_type_version.is_empty());
                 assert!(page.items[0].upgrade_parameters.is_empty());
             }
+            client.close().await.unwrap();
             server.await.unwrap();
         }
     }
@@ -443,6 +446,7 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
                     assert_eq!(page.items[0].status, expected[status as usize]);
                     assert_eq!(page.items[0].health_state.as_raw(), health);
                 }
+                client.close().await.unwrap();
                 server.await.unwrap();
             }
         }
@@ -456,7 +460,7 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
         (2, ApplicationDefinitionKind::MeshApplicationDescription),
         (65535, ApplicationDefinitionKind::Invalid),
     ] {
-        let (client, server) = single_reply(move |r| {
+        let make_reply = move |r: &Message| {
             aggregate(
                 r,
                 list_body(
@@ -467,8 +471,8 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
                     None,
                 ),
             )
-        })
-        .await;
+        };
+        let (client, server) = single_reply(make_reply).await;
         assert_eq!(
             client
                 .get_application_list(&ApplicationQueryDescription::default(), None)
@@ -478,12 +482,13 @@ async fn all_named_status_health_definition_values_are_not_normalized() {
                 .definition_kind,
             expected
         );
+        client.close().await.unwrap();
         server.await.unwrap();
     }
 }
 
 #[tokio::test]
-async fn malformed_list_successes_retire_shared_stream() {
+async fn malformed_list_successes_are_call_local_and_preserve_shared_stream() {
     for service in [false, true] {
         let base = if service {
             Shape::service()
@@ -583,7 +588,7 @@ async fn malformed_list_successes_retire_shared_stream() {
         }
         for s in shapes {
             let (client, server) =
-                single_reply(move |r| aggregate(r, list_body(&s, Some("token")))).await;
+                reusable_reply(move |r| aggregate(r, list_body(&s, Some("token")))).await;
             let outcome = if service {
                 client
                     .get_service_list(
@@ -600,9 +605,14 @@ async fn malformed_list_successes_retire_shared_stream() {
                     .await
                     .map(|_| ())
             };
-            assert!(matches!(outcome, Err(Error::Protocol(_))), "{outcome:?}");
-            assert!(client.is_closed());
-            assert!(client.ping(None).await.is_err());
+            assert!(
+                matches!(outcome, Err(ClientError::Protocol(_))),
+                "{outcome:?}"
+            );
+            assert!(!client.is_closed());
+            assert!(client.terminal_error().is_none());
+            client.ping(None).await.unwrap();
+            client.close().await.unwrap();
             server.await.unwrap();
         }
     }
@@ -619,7 +629,7 @@ async fn truncated_and_wrong_metadata_are_not_missing_optional_suffixes() {
         let valid = list_body(&s, Some("next"));
         for removed in [1, 2, 5, valid.len() / 2] {
             let bytes = valid[..valid.len() - removed].to_vec();
-            let (client, server) = single_reply(move |r| aggregate(r, bytes)).await;
+            let (client, server) = reusable_reply(move |r| aggregate(r, bytes)).await;
             let outcome = if service {
                 client
                     .get_service_list(
@@ -636,8 +646,10 @@ async fn truncated_and_wrong_metadata_are_not_missing_optional_suffixes() {
                     .await
                     .map(|_| ())
             };
-            assert!(matches!(outcome, Err(Error::Protocol(_))));
-            assert!(client.is_closed());
+            assert!(matches!(outcome, Err(ClientError::Protocol(_))));
+            assert!(!client.is_closed());
+            client.ping(None).await.unwrap();
+            client.close().await.unwrap();
             server.await.unwrap();
         }
     }
@@ -673,7 +685,7 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
                     None
                 )
                 .await,
-            Err(Error::InvalidInput(_))
+            Err(ClientError::Local(Error::InvalidInput(_)))
         ));
     }
     for application in ["", "fabric:", "fabric:/", "FABRIC:/a", "fabric:/é"] {
@@ -687,13 +699,13 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
     ));
     assert!(matches!(
         client.get_service_list(&service, None).await,
-        Err(Error::InvalidInput(_))
+        Err(ClientError::Local(Error::InvalidInput(_)))
     ));
     service.parameters.application_name = "fabric:/Model".parse().unwrap();
     service.parameters.filter = ServiceListFilter::TypeName(String::new());
     assert!(matches!(
         client.get_service_list(&service, None).await,
-        Err(Error::InvalidInput(_))
+        Err(ClientError::Local(Error::InvalidInput(_)))
     ));
     for name in ["fabric:", "fabric:/bad/", "fabric:/bad//name"] {
         assert!(matches!(
@@ -705,7 +717,7 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
     service.paging.max_results = NonZeroU64::new(u64::MAX);
     assert!(matches!(
         client.get_service_list(&service, None).await,
-        Err(Error::InvalidInput(_))
+        Err(ClientError::Local(Error::InvalidInput(_)))
     ));
     for q in [
         ApplicationQueryDescription {
@@ -725,7 +737,7 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
     ] {
         assert!(matches!(
             client.get_application_list(&q, None).await,
-            Err(Error::InvalidInput(_))
+            Err(ClientError::Local(Error::InvalidInput(_)))
         ));
     }
     for timeout in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
@@ -733,7 +745,7 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
             client
                 .get_application_list(&Default::default(), Some(timeout))
                 .await,
-            Err(Error::InvalidInput(_))
+            Err(ClientError::Local(Error::InvalidInput(_)))
         ));
         assert!(matches!(
             client
@@ -744,10 +756,11 @@ async fn invalid_list_inputs_and_timeouts_send_no_request() {
                     Some(timeout)
                 )
                 .await,
-            Err(Error::InvalidInput(_))
+            Err(ClientError::Local(Error::InvalidInput(_)))
         ));
     }
     client.ping(None).await.unwrap();
+    client.close().await.unwrap();
     server.await.unwrap();
 }
 
@@ -808,7 +821,7 @@ async fn semantic_list_validation_precedes_embedded_query_errors() {
         },
     ] {
         let service = shape.service;
-        let (client, server) = single_reply(move |request| {
+        let (client, server) = reusable_reply(move |request| {
             aggregate(
                 request,
                 list_body(
@@ -837,9 +850,13 @@ async fn semantic_list_validation_precedes_embedded_query_errors() {
                 .await
                 .map(|_| ())
         };
-        assert!(matches!(result, Err(Error::Protocol(_))), "{result:?}");
-        assert!(client.is_closed());
-        assert!(matches!(client.terminal_error(), Some(Error::Protocol(_))));
+        assert!(
+            matches!(result, Err(ClientError::Protocol(_))),
+            "{result:?}"
+        );
+        assert!(!client.is_closed());
+        assert!(client.terminal_error().is_none());
+        client.ping(None).await.unwrap();
         client.close().await.unwrap();
         server.await.unwrap();
     }
@@ -880,16 +897,17 @@ async fn native_list_errors_are_local_and_allow_mixed_reuse() {
             };
             write_message(&mut stream, &response).await.unwrap();
         }
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
     let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
         .await
         .unwrap();
     assert!(matches!(
         client.get_application_list(&Default::default(), None).await,
-        Err(Error::Remote {
+        Err(ClientError::Domain(DomainFailure {
             code: REMOTE_CODE,
             ..
-        })
+        }))
     ));
     assert!(!client.is_closed());
     assert!(matches!(
@@ -901,10 +919,10 @@ async fn native_list_errors_are_local_and_allow_mixed_reuse() {
                 None
             )
             .await,
-        Err(Error::Remote {
+        Err(ClientError::Domain(DomainFailure {
             code: REMOTE_CODE,
             ..
-        })
+        }))
     ));
     client
         .get_application_list(&Default::default(), None)
@@ -920,6 +938,7 @@ async fn native_list_errors_are_local_and_allow_mixed_reuse() {
         .await
         .unwrap();
     client.ping(None).await.unwrap();
+    client.close().await.unwrap();
     server.await.unwrap();
 }
 
@@ -959,6 +978,7 @@ async fn mixed_lists_ping_and_name_complete_out_of_order_on_one_stream() {
         write_message(&mut stream, &ping_reply(&request))
             .await
             .unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
     let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
         .await
@@ -978,18 +998,24 @@ async fn mixed_lists_ping_and_name_complete_out_of_order_on_one_stream() {
     p.unwrap();
     assert!(n.unwrap());
     client.ping(None).await.unwrap();
+    client.close().await.unwrap();
     server.await.unwrap();
 }
 
 #[tokio::test]
-async fn malformed_list_is_terminal_before_pending_waiter_repoll() {
+async fn malformed_list_is_call_local_and_pending_neighbor_succeeds() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();
     let (sent, received) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let mut stream = establish(listener).await;
-        let a = read_message(&mut stream).await.unwrap();
-        let _neighbor = read_message(&mut stream).await.unwrap();
+        let first = read_message(&mut stream).await.unwrap();
+        let second = read_message(&mut stream).await.unwrap();
+        let (a, neighbor) = if arguments(&first).0 == "GetApplicationList" {
+            (first, second)
+        } else {
+            (second, first)
+        };
         write_message(
             &mut stream,
             &aggregate(
@@ -1006,6 +1032,16 @@ async fn malformed_list_is_terminal_before_pending_waiter_repoll() {
         .await
         .unwrap();
         sent.send(()).unwrap();
+        write_message(
+            &mut stream,
+            &aggregate(&neighbor, list_body(&Shape::service(), None)),
+        )
+        .await
+        .unwrap();
+        let reuse = read_message(&mut stream).await.unwrap();
+        write_message(&mut stream, &ping_reply(&reuse))
+            .await
+            .unwrap();
         assert_eq!(
             stream.read_u8().await.unwrap_err().kind(),
             std::io::ErrorKind::UnexpectedEof
@@ -1029,16 +1065,15 @@ async fn malformed_list_is_terminal_before_pending_waiter_repoll() {
         .await
     });
     received.await.unwrap();
-    tokio::time::timeout(TIMEOUT_DURATION, async {
-        while !client.is_closed() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(matches!(first.await.unwrap(), Err(Error::Protocol(_))));
-    assert!(matches!(second.await.unwrap(), Err(Error::Protocol(_))));
-    assert!(client.ping(None).await.is_err());
+    assert!(matches!(
+        first.await.unwrap(),
+        Err(ClientError::Protocol(_))
+    ));
+    assert_eq!(second.await.unwrap().unwrap().items.len(), 1);
+    assert!(!client.is_closed());
+    assert!(client.terminal_error().is_none());
+    client.ping(None).await.unwrap();
+    client.close().await.unwrap();
     server.await.unwrap();
 }
 
@@ -1079,6 +1114,7 @@ async fn explicit_service_paging_stops_at_empty_terminal_page_without_hidden_req
         write_message(&mut stream, &ping_reply(&request))
             .await
             .unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
     let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
         .await
@@ -1094,6 +1130,7 @@ async fn explicit_service_paging_stops_at_empty_terminal_page_without_hidden_req
     assert!(terminal.items.is_empty());
     assert!(terminal.continuation_token.is_none());
     client.ping(None).await.unwrap();
+    client.close().await.unwrap();
     server.await.unwrap();
 }
 
@@ -1101,21 +1138,34 @@ async fn explicit_service_paging_stops_at_empty_terminal_page_without_hidden_req
 async fn present_aggregate_headers_are_validated_for_each_list() {
     for service in [false, true] {
         for (actor, action, valid) in [
-            (5, "QueryReply", true),
-            (16, "QueryReply", false),
-            (5, "OperationSuccessAction", false),
+            (Some(5), Some("QueryReply"), true),
+            (Some(13), Some("QueryReply"), false),
+            (Some(5), None, true),
+            (Some(13), None, false),
+            (None, Some("QueryReply"), true),
+            (None, None, true),
+            (Some(0), Some("QueryReply"), false),
+            (Some(16), Some("QueryReply"), false),
+            (Some(5), Some("OperationSuccessAction"), false),
+            (Some(16), Some("OperationSuccessAction"), false),
+            (None, Some("OperationSuccessAction"), false),
         ] {
-            let (client, server) = single_reply(move |r| {
+            let make_reply = move |r: &Message| {
                 let s = if service {
                     Shape::service()
                 } else {
                     Shape::application()
                 };
-                let mut response = reply(r, action, list_body(&s, None));
-                response.headers[0] = Header::actor(actor).unwrap();
+                let mut response = aggregate(r, list_body(&s, None));
+                if let Some(actor) = actor {
+                    response.headers.push(Header::actor(actor).unwrap());
+                }
+                if let Some(action) = action {
+                    response.headers.push(Header::action(action).unwrap());
+                }
                 response
-            })
-            .await;
+            };
+            let (client, server) = reusable_reply(make_reply).await;
             let result = if service {
                 client
                     .get_service_list(
@@ -1132,10 +1182,14 @@ async fn present_aggregate_headers_are_validated_for_each_list() {
                     .await
                     .map(|_| ())
             };
-            assert_eq!(result.is_ok(), valid);
+            assert_eq!(result.is_ok(), valid, "{actor:?}/{action:?}: {result:?}");
             if !valid {
-                assert!(client.is_closed());
+                assert!(matches!(result, Err(ClientError::Protocol(_))));
             }
+            assert!(!client.is_closed());
+            assert!(client.terminal_error().is_none());
+            client.ping(None).await.unwrap();
+            client.close().await.unwrap();
             server.await.unwrap();
         }
     }
@@ -1163,6 +1217,7 @@ async fn timed_out_list_ignores_late_malformed_reply_and_preserves_reuse() {
         write_message(&mut stream, &ping_reply(&request))
             .await
             .unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
     let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
         .await
@@ -1171,7 +1226,7 @@ async fn timed_out_list_ignores_late_malformed_reply_and_preserves_reuse() {
         client
             .get_application_list(&Default::default(), Some(Duration::from_millis(75)))
             .await,
-        Err(Error::Timeout)
+        Err(ClientError::Transport(Error::Timeout))
     ));
     client
         .get_service_list(
@@ -1183,5 +1238,6 @@ async fn timed_out_list_ignores_late_malformed_reply_and_preserves_reuse() {
         .await
         .unwrap();
     client.ping(None).await.unwrap();
+    client.close().await.unwrap();
     server.await.unwrap();
 }

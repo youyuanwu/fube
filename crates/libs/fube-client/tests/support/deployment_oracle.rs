@@ -406,7 +406,10 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
             .map(|_| ()),
     ] {
         match result {
-            Err(Error::Remote { code, .. }) => missing_node_codes.push(code),
+            Err(
+                ClientError::Domain(DomainFailure { code, .. })
+                | ClientError::Transport(Error::Remote { code, .. }),
+            ) => missing_node_codes.push(code),
             other => {
                 return Err(
                     format!("missing deployment node must return native error: {other:?}").into(),

@@ -1,7 +1,11 @@
 //! Live native topology queries against the existing independently owned workload.
 use fube_client::*;
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, num::NonZeroU64, time::Duration};
+use std::{
+    collections::BTreeSet,
+    num::NonZeroU64,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use super::oracle::{Http, Journal, Result};
 
@@ -109,6 +113,214 @@ fn compare_replica(replica: &Replica, observed: &Value) {
     }
 }
 
+async fn native_replicas(
+    client: &FabricClient,
+    id: uuid::Uuid,
+    expected_count: usize,
+) -> Result<(Vec<Replica>, bool)> {
+    let mut query = ReplicaQueryDescription::new(ReplicaQueryParameters::new(id));
+    let mut seen_tokens = BTreeSet::new();
+    let mut native = Vec::new();
+    loop {
+        let page = client
+            .get_replica_list(&query, Some(Duration::from_secs(30)))
+            .await?;
+        assert!(!page.items.is_empty());
+        native.extend(page.items);
+        assert!(native.len() <= expected_count);
+        let Some(token) = page.continuation_token else {
+            break;
+        };
+        assert!(
+            seen_tokens.insert(token.clone()),
+            "repeated native replica token"
+        );
+        assert!(seen_tokens.len() < expected_count);
+        query.paging.continuation_token = Some(token);
+    }
+    assert_eq!(native.len(), expected_count);
+    Ok((native, !seen_tokens.is_empty()))
+}
+
+fn movement_replicas(native: &[Replica]) -> Value {
+    json!(native
+        .iter()
+        .map(|replica| json!({
+            "replica_id": replica_id(replica), "node": replica.node_name,
+            "kind": format!("{:?}", replica.kind), "status": format!("{:?}", replica.status),
+            "role": format!("{:?}", replica.role),
+        }))
+        .collect::<Vec<_>>())
+}
+
+fn movement_matches(native: &[Replica], observed: &[Value]) -> bool {
+    native.len() == observed.len()
+        && native.iter().map(replica_id).collect::<BTreeSet<_>>().len() == native.len()
+        && native.iter().all(|replica| {
+            observed.iter().any(|value| {
+                observed_replica_id(value) == replica_id(replica)
+                    && value["ServiceKind"] == "Stateful"
+                    && replica.kind == ServiceKind::Stateful
+                    && value["NodeName"] == replica.node_name
+                    && value["ReplicaStatus"] == format!("{:?}", replica.status)
+                    && value["ReplicaRole"] == format!("{:?}", replica.role)
+            })
+        })
+}
+
+pub async fn move_primary(
+    client: &FabricClient,
+    http: &Http,
+    journal: &Journal,
+    topology: &Value,
+) -> Result<Value> {
+    let budget = Duration::from_secs(120);
+    let deadline = tokio::time::Instant::now() + budget;
+    let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    let movement = async {
+        let application = &journal.applications[0];
+        let service = format!("{application}/Stateful");
+        let captured = topology["independent_partition_replicas"]
+            .as_array()
+            .ok_or("missing captured owned topology")?
+            .iter()
+            .find(|value| value["service"] == service)
+            .ok_or("missing captured owned stateful partition")?;
+        if captured["partition"]["ServiceKind"] != "Stateful" {
+            return Err("movement requires the captured owned stateful partition".into());
+        }
+        let partition = captured["partition"]["PartitionInformation"]["Id"]
+            .as_str()
+            .ok_or("missing captured partition identity")?
+            .parse::<uuid::Uuid>()?;
+        let captured_replicas = captured["replicas"]
+            .as_array()
+            .ok_or("missing captured owned replicas")?;
+        let (before, _) = native_replicas(client, partition, captured_replicas.len()).await?;
+        let before_http = http.replicas(partition).await?;
+        if !movement_matches(&before, captured_replicas)
+            || !movement_matches(&before, &before_http)
+            || before
+                .iter()
+                .filter(|replica| replica.role == ReplicaRole::Primary)
+                .count()
+                != 1
+            || before.iter().any(|replica| {
+                replica.status != ReplicaStatus::Ready
+                    || !matches!(
+                        replica.role,
+                        ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+                    )
+            })
+        {
+            return Err("owned placement changed before the single movement request".into());
+        }
+        for replica in &before {
+            compare_replica(
+                replica,
+                before_http
+                    .iter()
+                    .find(|value| observed_replica_id(value) == replica_id(replica))
+                    .ok_or("missing independent pre-movement replica")?,
+            );
+        }
+        let old = before
+            .iter()
+            .find(|replica| {
+                replica.role == ReplicaRole::Primary && replica.status == ReplicaStatus::Ready
+            })
+            .ok_or("missing ready owned primary")?;
+        let target = before
+            .iter()
+            .find(|replica| {
+                replica.role == ReplicaRole::ActiveSecondary
+                    && replica.status == ReplicaStatus::Ready
+                    && replica.node_name != old.node_name
+            })
+            .ok_or("missing existing ready owned secondary")?;
+        let nodes = http.nodes().await?;
+        let target_node = nodes["Items"]
+            .as_array()
+            .ok_or("missing independent nodes before movement")?
+            .iter()
+            .find(|node| node["Name"] == target.node_name && node["NodeStatus"] == "Up")
+            .ok_or("target secondary node is not independently Up")?;
+        // Only observation is repeated. An ambiguous mutation is a fixture failure.
+        client
+            .move_primary(
+                partition,
+                &target.node_name,
+                Some(
+                    deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .min(Duration::from_secs(60)),
+                ),
+            )
+            .await?;
+        let mut polls = 0;
+        loop {
+            polls += 1;
+            let (after, _) = native_replicas(client, partition, before.len()).await?;
+            let after_http = http.replicas(partition).await?;
+            let primaries: Vec<_> = after
+                .iter()
+                .filter(|replica| replica.role == ReplicaRole::Primary)
+                .collect();
+            if primaries.len() == 1
+                && primaries[0].node_name == target.node_name
+                && primaries[0].status == ReplicaStatus::Ready
+                && after.iter().any(|replica| {
+                    replica.node_name == old.node_name
+                        && replica.role == ReplicaRole::ActiveSecondary
+                        && replica.status == ReplicaStatus::Ready
+                })
+                && after.iter().map(replica_id).collect::<BTreeSet<_>>()
+                    == before.iter().map(replica_id).collect()
+                && after.iter().all(|replica| {
+                    replica.status == ReplicaStatus::Ready
+                        && matches!(
+                            replica.role,
+                            ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+                        )
+                        && before.iter().any(|previous| {
+                            replica_id(previous) == replica_id(replica)
+                                && previous.node_name == replica.node_name
+                        })
+                })
+                && movement_matches(&after, &after_http)
+            {
+                for replica in &after {
+                    compare_replica(
+                        replica,
+                        after_http
+                            .iter()
+                            .find(|value| observed_replica_id(value) == replica_id(replica))
+                            .ok_or("missing independent post-movement replica")?,
+                    );
+                }
+                return Ok(json!({
+                    "owner": journal.owner, "application": application, "service": service,
+                    "partition": partition, "old_primary": old.node_name, "target": target.node_name,
+                    "target_node_observation": target_node,
+                    "request": {"operation": "MovePrimary", "constraints": "enforced",
+                        "count": 1, "native_succeeded": true},
+                    "overall_budget_ms": budget.as_millis(), "poll_count": polls,
+                    "native_start_unix_ms": started,
+                    "native_end_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+                    "verified_observations": {
+                        "before": {"native_replicas": movement_replicas(&before), "http_replicas": before_http},
+                        "after": {"native_replicas": movement_replicas(&after), "http_replicas": after_http},
+                    },
+                }));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    };
+    tokio::time::timeout_at(deadline, movement)
+        .await
+        .map_err(|_| "owned MovePrimary observation exceeded its overall budget")?
+}
+
 pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> Result<Value> {
     let mut partition_count = 0;
     let mut replica_count = 0;
@@ -187,31 +399,13 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
                     expected_replicas > 0,
                     "independent replica/instance list is empty"
                 );
-                let mut query = ReplicaQueryDescription::new(ReplicaQueryParameters::new(id));
-                let mut seen_tokens = BTreeSet::new();
-                let mut native = Vec::new();
-                loop {
-                    let page = client
-                        .get_replica_list(&query, Some(Duration::from_secs(30)))
-                        .await?;
-                    assert!(!page.items.is_empty());
-                    native.extend(page.items);
-                    let Some(token) = page.continuation_token else {
-                        break;
-                    };
-                    assert!(
-                        seen_tokens.insert(token.clone()),
-                        "repeated native replica token"
-                    );
-                    assert!(seen_tokens.len() < expected_replicas);
-                    query.paging.continuation_token = Some(token);
-                    replica_paging = true;
-                }
-                assert_eq!(native.len(), expected_replicas);
+                let (native, paged) = native_replicas(client, id, expected_replicas).await?;
+                replica_paging |= paged;
                 assert_eq!(
                     native.iter().map(replica_id).collect::<BTreeSet<_>>(),
                     replicas.iter().map(observed_replica_id).collect()
                 );
+                let mut query = ReplicaQueryDescription::new(ReplicaQueryParameters::new(id));
                 for replica in &native {
                     compare_replica(
                         replica,
@@ -320,7 +514,10 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
     let missing_partition =
         ReplicaQueryDescription::new(ReplicaQueryParameters::new(uuid::Uuid::nil()));
     let missing_replica_code = match client.get_replica_list(&missing_partition, None).await {
-        Err(Error::Remote { code, .. }) => code,
+        Err(
+            ClientError::Domain(DomainFailure { code, .. })
+            | ClientError::Transport(Error::Remote { code, .. }),
+        ) => code,
         other => {
             return Err(format!("missing partition must return a native error: {other:?}").into())
         }
@@ -336,7 +533,10 @@ pub async fn observe(client: &FabricClient, http: &Http, journal: &Journal) -> R
         .get_deployed_application_list(&missing_node, None)
         .await
     {
-        Err(Error::Remote { code, .. }) => code,
+        Err(
+            ClientError::Domain(DomainFailure { code, .. })
+            | ClientError::Transport(Error::Remote { code, .. }),
+        ) => code,
         other => return Err(format!("missing node must return a native error: {other:?}").into()),
     };
     assert!(!client.is_closed());

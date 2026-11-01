@@ -247,6 +247,7 @@ async fn health_complete_owned_data_and_unknown_scalars_retain_native_values() {
             )
             .await
             .unwrap();
+        client.close().await.unwrap();
         server.await.unwrap();
         let e = &value.health_events[0];
         assert_eq!(value.node_name, "Node_Å😀");
@@ -287,7 +288,7 @@ async fn health_complete_owned_data_and_unknown_scalars_retain_native_values() {
 }
 
 async fn malformed(bytes: Vec<u8>) {
-    let (client, server) = single_reply(move |request| health_reply(request, bytes)).await;
+    let (client, server) = reusable_reply(move |request| health_reply(request, bytes)).await;
     let clone = client.clone();
     assert!(matches!(
         client
@@ -296,15 +297,17 @@ async fn malformed(bytes: Vec<u8>) {
                 None
             )
             .await,
-        Err(Error::Protocol(_))
+        Err(ClientError::Protocol(_))
     ));
-    assert!(client.is_closed());
-    assert!(matches!(clone.ping(None).await, Err(Error::Protocol(_))));
+    assert!(!client.is_closed());
+    assert!(client.terminal_error().is_none());
+    clone.ping(None).await.unwrap();
+    client.close().await.unwrap();
     server.await.unwrap();
 }
 
 #[tokio::test]
-async fn health_malformed_structure_tags_pointers_fields_and_extents_retire() {
+async fn health_malformed_structure_tags_pointers_fields_and_extents_are_call_local() {
     for shape in [
         Shape::ListKind,
         Shape::NullWrapper,
@@ -353,25 +356,26 @@ async fn health_success_requires_hm_envelope() {
         vec![Header::actor(16).unwrap()],
         vec![Header::action("OperationSuccessAction").unwrap()],
     ] {
-        let (client, server) = single_reply(move |request| Message {
+        let make_reply = move |request: &Message| Message {
             headers: [
                 headers,
                 vec![Header::relates_to(request.properties().unwrap().id).unwrap()],
             ]
             .concat(),
             body: result(Shape::Empty, 0),
-        })
-        .await;
-        assert!(matches!(
-            client
-                .get_node_health(
-                    &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n")),
-                    None
-                )
-                .await,
-            Err(Error::Protocol(_))
-        ));
-        assert!(client.is_closed());
+        };
+        let (client, server) = reusable_reply(make_reply).await;
+        let outcome = client
+            .get_node_health(
+                &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n")),
+                None,
+            )
+            .await;
+        assert!(matches!(outcome, Err(ClientError::Protocol(_))));
+        assert!(!client.is_closed());
+        assert!(client.terminal_error().is_none());
+        client.ping(None).await.unwrap();
+        client.close().await.unwrap();
         server.await.unwrap();
     }
 }
@@ -411,13 +415,23 @@ async fn health_native_failures_are_local_and_healthy_queries_reuse_the_connecti
         .await
         .unwrap();
     let query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n"));
-    for _ in 0..3 {
+    for index in 0..3 {
+        let outcome = client.get_node_health(&query, None).await;
         assert!(matches!(
-            client.get_node_health(&query, None).await,
-            Err(Error::Remote {
-                code: REMOTE_CODE,
-                ..
-            })
+            (&outcome, index),
+            (
+                Err(ClientError::Domain(DomainFailure {
+                    code: REMOTE_CODE,
+                    ..
+                })),
+                0 | 1
+            ) | (
+                Err(ClientError::Transport(Error::Remote {
+                    code: REMOTE_CODE,
+                    ..
+                })),
+                2
+            )
         ));
         assert!(!client.is_closed());
         assert!(client
@@ -459,7 +473,7 @@ async fn health_local_invalid_names_and_timeouts_send_nothing() {
                     None
                 )
                 .await,
-            Err(Error::InvalidInput(_))
+            Err(ClientError::Local(Error::InvalidInput(_)))
         ));
     }
     for timeout in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
@@ -470,7 +484,7 @@ async fn health_local_invalid_names_and_timeouts_send_nothing() {
                     Some(timeout)
                 )
                 .await,
-            Err(Error::InvalidInput(_))
+            Err(ClientError::Local(Error::InvalidInput(_)))
         ));
     }
     client.ping(None).await.unwrap();
@@ -479,17 +493,17 @@ async fn health_local_invalid_names_and_timeouts_send_nothing() {
 }
 
 #[tokio::test]
-async fn health_malformed_success_retires_before_repoll_and_fails_pending_neighbor() {
+async fn health_malformed_success_is_call_local_and_pending_neighbor_succeeds() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let mut stream = establish(listener).await;
         let first = read_message(&mut stream).await.unwrap();
         let second = read_message(&mut stream).await.unwrap();
-        let query = if first.properties().unwrap().action == "QueryRequest" {
-            first
+        let (query, neighbor) = if first.properties().unwrap().action == "QueryRequest" {
+            (first, second)
         } else {
-            second
+            (second, first)
         };
         write_message(
             &mut stream,
@@ -497,6 +511,16 @@ async fn health_malformed_success_retires_before_repoll_and_fails_pending_neighb
         )
         .await
         .unwrap();
+        write_message(
+            &mut stream,
+            &reply(&neighbor, "NameOperationReply", naming_body(true, 0)),
+        )
+        .await
+        .unwrap();
+        let reuse = read_message(&mut stream).await.unwrap();
+        write_message(&mut stream, &ping_reply(&reuse))
+            .await
+            .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
     let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
@@ -512,15 +536,11 @@ async fn health_malformed_success_retires_before_repoll_and_fails_pending_neighb
         Poll::Ready(())
     })
     .await;
-    tokio::time::timeout(TIMEOUT_DURATION, async {
-        while !client.is_closed() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(matches!(health.await, Err(Error::Protocol(_))));
-    assert!(matches!(neighbor.await, Err(Error::Protocol(_))));
+    assert!(matches!(health.await, Err(ClientError::Protocol(_))));
+    assert!(neighbor.await.unwrap());
+    assert!(!client.is_closed());
+    assert!(client.terminal_error().is_none());
+    client.ping(None).await.unwrap();
     client.close().await.unwrap();
     server.await.unwrap();
 }
@@ -579,7 +599,7 @@ async fn health_reordered_mixed_operations_and_late_cancelled_malformed_replies(
                 Some(Duration::from_millis(30))
             )
             .await,
-        Err(Error::Timeout)
+        Err(ClientError::Transport(Error::Timeout))
     ));
     let query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n"));
     let (health, ping) = tokio::join!(client.get_node_health(&query, None), client.ping(None));

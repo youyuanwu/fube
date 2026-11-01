@@ -436,10 +436,11 @@ fn local(error: Error) -> Error {
     }
 }
 
-/// Caller correlation stays unique. Native gateway composition can append a
-/// second identical RelatesTo/ExpectsReply; accept only that evidenced inbound
-/// form, never contradictory values or arbitrary duplicate envelope fields.
-/// Preserve both wire headers in the returned Message.
+/// Caller fields remain unique. Received native common-header scanning uses
+/// the final RelatesTo (MessageHeaders.cpp:765-824 at pinned SF 3988b451).
+/// Preserve and validate every record under the existing header/frame bounds.
+/// Only ExpectsReply retains the second-byte-identical exception; other fields
+/// stay unique. Domain reply eligibility belongs to the caller.
 fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
     let ids = [
         message::ACTOR,
@@ -459,15 +460,31 @@ fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
     }
     for header in &message.headers {
         if let Some(index) = ids.iter().position(|id| *id == header.id) {
+            if native_inbound && header.id == message::RELATES_TO {
+                continue;
+            }
             if let Some(previous) = seen[index] {
                 if !native_inbound
                     || !matches!(header.id, message::RELATES_TO | message::EXPECTS_REPLY)
                     || previous.value != header.value
                     || repeated[index]
                 {
-                    return Err(Error::Protocol(
-                        "duplicate or contradictory transport envelope header",
-                    ));
+                    let reason = if native_inbound
+                        && repeated[index]
+                        && matches!(header.id, message::RELATES_TO | message::EXPECTS_REPLY)
+                    {
+                        "more than two native correlation headers"
+                    } else {
+                        match header.id {
+                            message::RELATES_TO => "contradictory native RelatesTo header",
+                            message::EXPECTS_REPLY => "contradictory native ExpectsReply header",
+                            message::MESSAGE_ID => "duplicate native MessageId header",
+                            message::ACTOR => "duplicate native Actor header",
+                            message::ACTION => "duplicate native Action header",
+                            _ => "duplicate or contradictory transport envelope header",
+                        }
+                    };
+                    return Err(Error::Protocol(reason));
                 }
                 repeated[index] = true;
             }
@@ -966,12 +983,14 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
         if props.relates_to == MessageId::default()
             || props.expects_reply
             || has(&message, message::IPC)
-            || (props.actor != 5 && !(props.actor == 0 && props.fault.is_some()))
         {
             return Err(Error::Protocol("unauthorized ordinary gateway reply"));
         }
         let token = {
             let mut inner = shared.inner.lock().unwrap();
+            // Properties validates every occurrence and exposes the final
+            // native-effective ID. Never try an earlier ID, even if final is
+            // unknown/retired and an earlier one names a live neighbor.
             let token = inner.pending.remove(&props.relates_to);
             if token.is_none() {
                 inner.unmatched += 1;

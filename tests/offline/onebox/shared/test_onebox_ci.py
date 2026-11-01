@@ -396,7 +396,8 @@ class ProofFiles(fixtures.ProjectFiles):
         common = {"runtime_version": "11.8.121.4", "profile": "clear", "archive_sha256": digest}
         cases = [{"case": name, "passed": True} for name in ci.CLEAR_CASES]
         cases[1]["result"], cases[2]["result"] = True, False
-        cases[3].update(operation_count=32, initially_pending_count=32)
+        cases[3].update(operation_count=8, initially_pending_count=8,
+                        ninth_call_rejected_locally=True, reuse_after_slot_release=True)
         cases[-1].update(native_ping_passed=True, closed_without_operation=True, terminal_error_observed=True)
         nodes = dict.fromkeys((
             "typed_stable_fields_match", "binary_ports_match_onebox_manifest", "exact_name_hit_miss_case_prefix",
@@ -412,7 +413,7 @@ class ProofFiles(fixtures.ProjectFiles):
             **common, "owner": "ci-" + self.current["run_id"] + "-" + self.current["attempt"], "cases": [{
                 "case": name, "native_start_ms": int(start * 1000) + 11,
                 "native_end_ms": int(start * 1000) + 12} for name in ci.HEALTH_CASES],
-            "concurrent_operations": 32, "unknown_node_code": -2147017705,
+            "concurrent_operations": 8, "initially_pending_count": 8, "unknown_node_code": -2147017705,
             "unknown_node_management_code": "FABRIC_E_HEALTH_ENTITY_NOT_FOUND",
             "cancelled_after_first_poll": True, "completed_at_unix_ms": int(start * 1000) + 20,
             "healthy_reuse_after_error": {"aggregated_health_state": 1},
@@ -431,6 +432,50 @@ class ProofFiles(fixtures.ProjectFiles):
             **dict.fromkeys(("topology", "deployment_inspection", "independent_applications",
                              "independent_services", "native_applications", "native_services"), [{"model": 1}])}
         del lists["profile"]
+        owner = health["owner"]
+        stem = "native-lists-" + owner + "-" + "b" * 32
+        applications = [f"fabric:/{stem}-a", f"fabric:/{stem}-b"]
+        application, partition = applications[0], "11111111-1111-4111-8111-111111111111"
+        service, type_name = application + "/Stateful", "ListType-" + stem
+        before = [{"replica_id": identity, "node": node, "kind": "Stateful", "status": "Ready", "role": role}
+                  for identity, node, role in ((10, "N0010", "Primary"),
+                                               (11, "N0020", "ActiveSecondary"),
+                                               (12, "N0030", "ActiveSecondary"))]
+        after = copy.deepcopy(before)
+        after[0]["role"], after[1]["role"] = "ActiveSecondary", "Primary"
+
+        def http_replicas(native):
+            return [{"ReplicaId": str(replica["replica_id"]), "NodeName": replica["node"],
+                     "ServiceKind": replica["kind"], "ReplicaStatus": replica["status"],
+                     "ReplicaRole": replica["role"]} for replica in native]
+
+        lists.update(
+            owned_applications=applications, owned_type=type_name,
+            native_applications=[{"name": app, "type_name": type_name} for app in applications],
+            independent_applications=[{"Name": app, "TypeName": type_name} for app in applications],
+            native_services=[{"name": service, "kind": "Stateful"}],
+            independent_services=[{"Name": service, "ServiceKind": "Stateful"}],
+            topology={"independent_partition_replicas": [{
+                "service": service, "partition": {"ServiceKind": "Stateful",
+                    "PartitionInformation": {"Id": partition}}, "replicas": http_replicas(before)}]},
+            deployment_inspection={"observations": [{
+                "application": application, "node": node, "replicas": [{
+                    "ServiceKind": "Stateful", "ServiceName": service, "PartitionId": partition,
+                }]} for node in ("N0010", "N0020", "N0030")]},
+            movement={
+                "owner": owner, "application": application, "service": service, "partition": partition,
+                "old_primary": "N0010", "target": "N0020",
+                "target_node_observation": {"Name": "N0020", "NodeStatus": "Up"},
+                "request": {"operation": "MovePrimary", "constraints": "enforced",
+                            "count": 1, "native_succeeded": True},
+                "overall_budget_ms": 120000, "poll_count": 1,
+                "native_start_unix_ms": int(start * 1000) + 21,
+                "native_end_unix_ms": int(start * 1000) + 22,
+                "verified_observations": {
+                    "before": {"native_replicas": before, "http_replicas": http_replicas(before)},
+                    "after": {"native_replicas": after, "http_replicas": http_replicas(after)},
+                },
+            })
         notification = {
             **common, "allocation": allocation, "passed": list(ci.NOTIFICATION_CASES),
             "owned_cleanup_confirmed": True, "resolved": [{"model": 1}], "named": {"model": 1},
@@ -1218,6 +1263,82 @@ class WorkerTests(ProofFiles):
             self.emit(path, {"status": "PASS"})
             self.assertEqual(self.checking("client-runtime", directory), 1)
             self.emit(path, original)
+        self.assertEqual(self.checking("client-runtime", directory), 0)
+
+    def test_native_concurrency_requires_eight_overlapping_calls_and_bounded_reuse(self):
+        archive = self.built["inputs"]["native_archive"]["sha256"]
+        reports = self.native_reports("owned", 1)
+        allocation = ci.binding("owned", "a" * 32, "original-cid")
+        ci.validate_native(reports, archive, allocation)
+        for file, field, values in [
+            (ci.NATIVE_FILES[0], "operation_count", (7, 32, True)),
+            (ci.NATIVE_FILES[0], "initially_pending_count", (0, 7, 32, True)),
+            (ci.NATIVE_FILES[0], "ninth_call_rejected_locally", (False, 1)),
+            (ci.NATIVE_FILES[0], "reuse_after_slot_release", (False, 1)),
+            (ci.NATIVE_FILES[1], "concurrent_operations", (7, 32, True)),
+            (ci.NATIVE_FILES[1], "initially_pending_count", (None, 0, 7, 32, True)),
+        ]:
+            for value in values:
+                with self.subTest(file=file, field=field, value=value):
+                    broken = copy.deepcopy(reports)
+                    target = (broken[file]["executed_cases"][3]
+                              if file == ci.NATIVE_FILES[0] else broken[file])
+                    target[field] = value
+                    with self.assertRaises(ci.ProofError):
+                        ci.validate_native(broken, archive, allocation)
+
+    def test_native_movement_requires_owned_single_request_and_independent_role_change(self):
+        archive = self.built["inputs"]["native_archive"]["sha256"]
+        reports = self.native_reports("owned", 1)
+        allocation = ci.binding("owned", "a" * 32, "original-cid")
+        _, windows = ci.validate_native(reports, archive, allocation)
+        self.assertEqual(windows["native_move_primary"], [1.021, 1.022])
+        changes = [
+            lambda lists: lists.pop("movement"),
+            lambda lists: lists["movement"].update(owner="foreign"),
+            lambda lists: lists["movement"].update(application="fabric:/foreign"),
+            lambda lists: lists["movement"].update(service=lists["movement"]["application"] + "/Stateless"),
+            lambda lists: lists["movement"].update(partition="22222222-2222-4222-8222-222222222222"),
+            lambda lists: lists["movement"].update(target=lists["movement"]["old_primary"]),
+            lambda lists: lists["movement"]["request"].update(count=2),
+            lambda lists: lists["movement"]["request"].update(count=True),
+            lambda lists: lists["movement"]["request"].update(native_succeeded=False),
+            lambda lists: lists["movement"]["request"].update(constraints="ignored"),
+            lambda lists: lists["movement"]["request"].update(force=True),
+            lambda lists: lists["movement"]["target_node_observation"].update(NodeStatus="Down"),
+            lambda lists: lists["movement"]["verified_observations"]["after"].update(
+                http_replicas=lists["movement"]["verified_observations"]["before"]["http_replicas"]),
+            lambda lists: lists["movement"]["verified_observations"]["after"]["native_replicas"][0].update(
+                role="Primary"),
+            lambda lists: lists["movement"]["verified_observations"]["before"]["native_replicas"][1].update(
+                status="InBuild"),
+            lambda lists: lists["movement"]["verified_observations"]["after"]["native_replicas"][1].update(
+                replica_id=10),
+            lambda lists: lists["topology"]["independent_partition_replicas"][0]["partition"][
+                "PartitionInformation"].update(Id="22222222-2222-4222-8222-222222222222"),
+            lambda lists: lists["deployment_inspection"].update(observations=[]),
+            lambda lists: lists["movement"].update(overall_budget_ms=0),
+            lambda lists: lists["movement"].update(poll_count=121),
+            lambda lists: lists["movement"].update(native_end_unix_ms=1020),
+            lambda lists: lists["movement"].update(native_end_unix_ms=122000),
+            lambda lists: lists.update(owned_cleanup_confirmed=False),
+        ]
+        for index, change in enumerate(changes):
+            with self.subTest(change=index):
+                broken = copy.deepcopy(reports)
+                change(broken[ci.NATIVE_FILES[3]])
+                with self.assertRaises(ci.ProofError):
+                    ci.validate_native(broken, archive, allocation)
+
+    def test_native_movement_observation_must_belong_to_current_execution(self):
+        directory = self.worker("client-runtime")
+        path = directory / "client" / ci.NATIVE_FILES[3]
+        original = ci.read(path)
+        changed = copy.deepcopy(original)
+        changed["movement"].update(native_start_unix_ms=1000, native_end_unix_ms=1001)
+        self.emit(path, changed)
+        self.assertEqual(self.checking("client-runtime", directory), 1)
+        self.emit(path, original)
         self.assertEqual(self.checking("client-runtime", directory), 0)
 
     def test_source_eos_variants_require_typed_payloads_bound_to_actual_held_copy(self):

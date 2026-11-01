@@ -16,6 +16,18 @@ const WAIT: Duration = Duration::from_secs(3);
 const ID: [u8; 16] = [6; 16];
 
 fn result(kind: i64, low: i64, high: i64, name: &str, version: i64, group: bool) -> Vec<u8> {
+    result_for_service(kind, low, high, name, version, group, "fabric:/App/Service")
+}
+
+fn result_for_service(
+    kind: i64,
+    low: i64,
+    high: i64,
+    name: &str,
+    version: i64,
+    group: bool,
+    service: &str,
+) -> Vec<u8> {
     body(|e| {
         e.boolean(group);
         e.object(|e| {
@@ -23,7 +35,7 @@ fn result(kind: i64, low: i64, high: i64, name: &str, version: i64, group: bool)
                 e.guid(&ID);
                 Ok(())
             })?;
-            e.string("fabric:/App/Service")?;
+            e.string(service)?;
             e.object(|e| {
                 e.boolean(true);
                 e.boolean(true);
@@ -182,7 +194,7 @@ async fn keys_refresh_binding_and_versions() {
             client
                 .resolve_service_partition(&name, &key, Some(&altered), None)
                 .await,
-            Err(Error::InvalidInput(_))
+            Err(ClientError::Local(Error::InvalidInput(_)))
         ));
         let other = NamingUri::parse("fabric:/Other").unwrap();
         assert!(client
@@ -199,7 +211,7 @@ async fn keys_refresh_binding_and_versions() {
                         None
                     )
                     .await,
-                Err(Error::InvalidInput(_))
+                Err(ClientError::Local(Error::InvalidInput(_)))
             ));
         }
         client.close().await.unwrap();
@@ -208,27 +220,69 @@ async fn keys_refresh_binding_and_versions() {
 }
 
 #[tokio::test]
-async fn groups_and_malformed_replies_fail_explicitly() {
-    for body in [result(1, 0, 0, "", 1, true), vec![0, 1, 2]] {
+async fn groups_malformed_and_mismatched_replies_are_call_local() {
+    for bytes in [
+        result(1, 0, 0, "", 1, true),
+        vec![0, 1, 2],
+        result(2, 0, 10, "", 1, false),
+        result(3, 0, 0, "other-partition", 1, false),
+        result_for_service(1, 0, 0, "", 1, false, "fabric:/Other"),
+    ] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let mut s = peer::accept(listener).await;
             let req = read_message(&mut s).await.unwrap();
-            write_message(&mut s, &peer::reply(&req, "ResolveServiceRequest", body))
-                .await
-                .unwrap();
-        });
-        let client = FabricClient::connect_clear(addr, WAIT).await.unwrap();
-        assert!(client
-            .resolve_service_partition(
-                &"fabric:/App/Service".parse().unwrap(),
-                &PartitionKey::Singleton,
-                None,
-                None
+            let neighbor = read_message(&mut s).await.unwrap();
+            assert_eq!(req.properties().unwrap().action, "ResolveServiceRequest");
+            assert_eq!(neighbor.properties().unwrap().action, "NameExistsRequest");
+            write_message(
+                &mut s,
+                &peer::reply(
+                    &neighbor,
+                    "NameOperationReply",
+                    body(|e| {
+                        e.boolean(true);
+                        e.i64(0);
+                        Ok(())
+                    }),
+                ),
             )
             .await
-            .is_err());
+            .unwrap();
+            write_message(&mut s, &peer::reply(&req, "ResolveServiceRequest", bytes))
+                .await
+                .unwrap();
+            let reuse = read_message(&mut s).await.unwrap();
+            write_message(
+                &mut s,
+                &peer::reply(
+                    &reuse,
+                    "ResolveServiceRequest",
+                    result(1, 0, 0, "", 1, false),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(read_message(&mut s).await.is_err());
+        });
+        let client = FabricClient::connect_clear(addr, WAIT).await.unwrap();
+        let name = "fabric:/App/Service".parse().unwrap();
+        let (outcome, neighbor) = tokio::join!(
+            client.resolve_service_partition(&name, &PartitionKey::Singleton, None, None),
+            client.name_exists("fabric:/neighbor", None)
+        );
+        assert!(
+            matches!(outcome, Err(ClientError::Protocol(_))),
+            "{outcome:?}"
+        );
+        assert!(neighbor.unwrap());
+        assert!(!client.is_closed());
+        assert!(client.terminal_error().is_none());
+        client
+            .resolve_service_partition(&name, &PartitionKey::Singleton, None, None)
+            .await
+            .unwrap();
         client.close().await.unwrap();
         task.await.unwrap();
     }
