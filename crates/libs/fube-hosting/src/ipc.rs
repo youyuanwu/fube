@@ -1500,9 +1500,82 @@ mod fence_tests {
                 LOCAL_LEASE_DURATION
             };
             let (mut server, admission) = fixture(duration);
-            let lease = server.admit(admission.clone()).unwrap();
+            let owner = (mode == 2).then(|| server.registration_owner(Default::default()).unwrap());
+            let lease = if let Some(owner) = &owner {
+                let prepared = server
+                    .admit_registration(
+                        owner,
+                        admission.clone(),
+                        vec!["Probe".into(), "Target".into()],
+                        "prepared",
+                    )
+                    .unwrap();
+                assert!(prepared.failure.is_none());
+                prepared.lease
+            } else {
+                server.admit(admission.clone()).unwrap()
+            };
             let shared = server.shared.clone();
             let entry = lease.entry.clone();
+            let context = wire::RuntimeContext {
+                id: "runtime".into(),
+                host: admission.host.clone(),
+                code: admission.code.clone(),
+            };
+            if mode == 2 {
+                {
+                    let mut state = shared.state().unwrap();
+                    let i = record_index(&state, &entry).unwrap();
+                    state.core.add_host(admission.host.id.clone()).unwrap();
+                    state
+                        .core
+                        .start_host(
+                            &admission.host.id,
+                            &crate::ManualClock(shared.ticks()),
+                            10_000_000,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        state
+                            .core
+                            .finish_host(&admission.host.id, false)
+                            .unwrap()
+                            .reply,
+                        Ok(())
+                    );
+                    assert_eq!(
+                        state.core.register_runtime(context.project()).result,
+                        Ok(())
+                    );
+                    state.records[i].runtime = Some(context.id.clone());
+                    state.records[i].completed = true;
+                    entry.ready.store(true, Ordering::SeqCst);
+                }
+                let body = to_vec(&wire::TypeRequest {
+                    context: context.clone(),
+                    id: wire::TypeId {
+                        package: context.code.id.package.clone(),
+                        name: "Probe".into(),
+                    },
+                })
+                .unwrap();
+                let response = dispatch(
+                    &shared,
+                    &entry,
+                    9,
+                    "RegisterServiceTypeRequest",
+                    &body,
+                    Some(Instant::now() + Duration::from_secs(1)),
+                )
+                .unwrap();
+                assert_eq!(
+                    fube_transport::serialization::serde::from_slice::<wire::ErrorReply>(&response)
+                        .unwrap()
+                        .error,
+                    0
+                );
+                owner.as_ref().unwrap().take_outputs().unwrap();
+            }
             let mut state = shared.state().unwrap();
             let i = record_index(&state, &entry).unwrap();
             if mode == 0 {
@@ -1524,10 +1597,21 @@ mod fence_tests {
             *shared.dispatch_ready.lock().unwrap() = Some(ready_tx);
             let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
             let owned = shared.clone();
-            let body = to_vec(&wire::IdRequest {
-                id: admission.host.id,
-            })
-            .unwrap();
+            let body = if mode == 2 {
+                to_vec(&wire::TypeRequest {
+                    context: context.clone(),
+                    id: wire::TypeId {
+                        package: context.code.id.package.clone(),
+                        name: "Target".into(),
+                    },
+                })
+                .unwrap()
+            } else {
+                to_vec(&wire::IdRequest {
+                    id: admission.host.id,
+                })
+                .unwrap()
+            };
             let type_due = (mode == 2).then(|| Instant::now() + Duration::from_millis(200));
             let worker = std::thread::spawn(move || {
                 let result = dispatch(
@@ -1542,14 +1626,27 @@ mod fence_tests {
                     &body,
                     type_due,
                 );
-                done_tx.send(result.is_err()).unwrap();
+                done_tx.send(result).unwrap();
             });
             ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
             // The worker has passed its nonlocking precheck and must wait for
             // this guard. Cross the real finite deadline before releasing it.
             std::thread::sleep(Duration::from_millis(250));
             drop(state);
-            assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+            let result = done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            match mode {
+                0 => assert!(matches!(
+                    result,
+                    Err(TransportError::Protocol("Hosting registration timeout"))
+                )),
+                1 => assert!(matches!(result, Err(TransportError::Closed))),
+                _ => assert!(matches!(
+                    result,
+                    Err(TransportError::Protocol(
+                        "type request deadline before admission"
+                    ))
+                )),
+            }
             worker.join().unwrap();
             let state = shared.state().unwrap();
             assert!(state.records[i].results.is_empty());
@@ -1557,6 +1654,24 @@ mod fence_tests {
                 assert_eq!(state.records[i].loss, Some(Loss::RegistrationTimeout));
                 assert_eq!(state.records[i].cleanup, Some(Ok(())));
                 assert!(state.records[i].timer.is_none());
+            }
+            if mode == 2 {
+                let target = state
+                    .core
+                    .type_entries()
+                    .iter()
+                    .find(|e| e.id.service_type.name == "Target")
+                    .unwrap();
+                assert_eq!(target.status, crate::TypeStatus::NotRegisteredEnabled);
+                assert!(target.runtime_id.is_empty());
+                assert!(state
+                    .health
+                    .sources
+                    .iter()
+                    .find(|s| s.id.service_type.name == "Target")
+                    .unwrap()
+                    .last_disabled_report
+                    .is_none());
             }
             drop(state);
             server.stop().unwrap();
