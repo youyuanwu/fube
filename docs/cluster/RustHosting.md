@@ -1,13 +1,18 @@
 # Rust node-side Hosting design
 
-**Status: H1 registration/lookup and H2 admitted accounting/scheduling implemented;
-H3/H4 and live composition remain gated.**
+**Status: H1 registration/lookup, H2 admitted accounting/scheduling and the narrow
+bootstrap-only H3 IPC/local-lease subset are implemented. Broader H3, H4 and live
+RA/RAP composition remain gated.**
 [`fube-hosting`](../../crates/libs/fube-hosting/src/lib.rs) provides
-a native-derived, deterministically driven model, not a running node or new
-interoperability qualification. See [implemented H1](#implemented-h1-model)
+a native-derived, deterministically driven core plus a separately owned local
+IPC service, not a complete running node. H1's original model evidence is not
+new interoperability qualification. See [implemented H1](#implemented-h1-model)
 for the exact API/source and evidence boundary.
 See [implemented H2](#implemented-h2-accounting-and-scheduling) for actual
 residency and the separate real-accounting RA test profile.
+See [implemented H3](#implemented-h3-bootstrap-only-local-ipc) for the newly
+executed Rust/native bootstrap profiles and their non-deployed/non-distributed
+qualification limits.
 See [supplied port contracts](#supplied-port-contracts) for the distinction
 between interface definitions, H1 model implementations and gated live work.
 
@@ -358,6 +363,11 @@ Closed/retired local authority cannot resume on an old connection.
 This is a documented local-authority adaptation, not native distributed lease
 parity.
 
+**Implemented H3 subset:** [the bootstrap-only local service](#implemented-h3-bootstrap-only-local-ipc)
+now accepts external host/PID/package admission and supplies host/runtime
+registration plus finite local polling. Broader H3 type/report/control and H4
+activation remain gated; it is not live RA/RAP deployment.
+
 ### H4: owned activation and real stateless lifecycle
 
 **Dependent runtime-alignment prerequisite:** at the repository baseline,
@@ -502,9 +512,10 @@ because this design names H1-H4.
 The core is single-owner synchronous Rust with no consumer callback or I/O
 under registration locks. Each native table/state operation uses bounded
 projection-before-publication; public Start/Finish/timeout and tentative
-registration steps remain separately drivable. It introduces no production
-dependency on RA, runtime, test-host or native SF. UUID is the sole direct
-production dependency ([manifest](../../crates/libs/fube-hosting/Cargo.toml#L1-L14)).
+registration steps remain separately drivable. The H1 core introduces no production
+dependency on RA, runtime, test-host or native SF. The crate now additionally uses
+transport/Serde/Tokio for the separate bootstrap-only H3 service; socket2 is
+test-only ([manifest](../../crates/libs/fube-hosting/Cargo.toml)).
 
 | Implemented surface | Rust source | Native closure |
 |---|---|---|
@@ -615,8 +626,9 @@ it does not port unsolicited native Hosting event routing. Missing live RA
 RuntimeClosed/Enabled/Disabled consumers remain gated, and RuntimeClosed is
 never silently translated to HostDown. `require_live_composition` rejects live
 admission. H2 now supplies actual admitted acquisition/release and scheduling
-in its separate ledger below; H3 wire handlers/leases and H4 process/RAP ownership
-remain unfinished. No complete native
+in its separate ledger below; broader H3 capabilities and H4 process/RAP ownership
+remain unfinished. The new bootstrap-only H3 evidence is recorded separately below.
+The H1 delivery ran no complete native
 Hosting handler execution, new codec oracle, wire interoperability or deployed
 process qualification was run. Existing test-host/native evidence is unchanged;
 it is not relabelled for H1.
@@ -805,6 +817,71 @@ owned completion races the requested retirement. It keeps the original owned
 drain, authority retirement, other errors and active-callback fencing intact.
 Controlled old/new race tests and original full/repeated SDK evidence qualify
 that closure; old candidate passes remain historical, not parent acceptance.
+
+### Implemented H3 bootstrap-only local IPC
+
+[`ipc::Server`](../../crates/libs/fube-hosting/src/ipc.rs) is a separately owned,
+dedicated-executor service for externally prepared activated single-code-package,
+SharedProcess, noncontainer/nonactivator ExeHosts on clear loopback TCP. The caller
+owns process launch, actual PID admission and validated package/node inputs.
+Claimed IPC headers are not authenticated OS peer credentials or a same-user sandbox.
+
+The implemented route is application-initiated ListenInstance → actor-7
+Start/Finish → actor-9 runtime registration → actor-15 empty-action/body correlated
+polls. Full native Start/runtime scopes are preserved in
+[`wire`](../../crates/libs/fube-hosting/src/wire.rs), with explicit projection
+into H1 and operation-specific native errors. Runtime/host unregister retain
+primary/state/cleanup outputs. Replies remain on the original accepted stream;
+there is no enabled general reverse host-control dispatcher.
+
+`Admission::deadlines` explicitly distinguishes Rust's positive propagated
+Timeout header from native IpcClient's caller-local deadline (no Timeout header).
+The latter was observed on actual native frames and traced to
+`Transport/IpcClient.cpp:201–239` at the pinned native source. It is not a default
+for malformed Rust requests: present expired/malformed headers always fail.
+Both profiles retain finite frame/write, registration and local authority bounds.
+
+The default local duration is **30 seconds**, configurable only to a finite
+1 ms–30 s duration. Initial TTL is informational: completed host, owned valid
+runtime and a fresh correlated poll are required. Polls bind a producer GUID and
+increasing index, permit gaps and reject replay/GUID changes. Atomic terminal
+authority checks precede renewal and frame start. `HostLease::stop_renewal` permits
+only the remaining prior grant; `revoke` closes authority/I/O without waiting for
+registration cleanup, callbacks, diagnostics, RA or process teardown. Expiry/EOF/
+registration timeout/replacement cannot revive an old session. Already-started
+or buffered frames are not retroactively recalled; the runtime retains its
+request-send-relative TTL and independent terminal fence.
+
+One-use incarnation admission, timer disposal and per-operation target checks
+prevent old/foreign host or runtime IDs from mutating a successor. Release/new
+admission is explicit and fails closed while old work/results/cleanup failures
+remain. Connections reserve 4 MiB of logical scratch and admissions 512 KiB;
+decode/projection/reply budgets and slot counts are checked before excess work.
+`take_outputs` synchronously transfers owned H1 results/events/obligations.
+Transfer is not live RA delivery ACK, process cleanup or Residency release.
+Full closure capacity can retain membership and a cleanup failure while authority
+is already terminal. The H1/H2 semantics and live-composition rejection remain.
+
+**New qualification (2026-11-01, `1a1a51fd215d0b237f1f0d63902e5ef3d02a951f`):**
+23 [Hosting socket cases](../../crates/libs/fube-hosting/tests/ipc_leases.rs)
+exercise malformed/truncated requests, identity/target/freshness rejection,
+deadline/write pressure, expiry/revocation, EOF/replacement and owned closure.
+Four [actual Rust runtime child profiles](../../crates/libs/fube-runtime/src/hosting_tests.rs)
+observe real frames: bootstrap with three correlated polls and orderly shutdown,
+finite stop-renewal, blocked executor and blocked capture destructor with exit 70.
+The [new native `hosting-leases` profile](../runtime/RustTestHost.md#27-production-hosting-lease-qualification)
+observes two finite replies, actual runtime unregister and graceful reaped/group-
+drained exit through production Hosting. All five original native fixture profiles
+also ran anew from the verified exact-head bundle; their lifecycle evidence still
+belongs to the fixture, not production Hosting.
+
+Type/factory registration, health/load/fault, lifecycle, context-update/reconnect/
+security and other host profiles are rejected/gated, never generic Success.
+Physical deployment/launch/removal, stateful hosting, live RA event consumers,
+full H3/H4 and the H4 empty-endpoint alignment remain out of scope. Actual native
+application frames are not complete original native node-handler execution,
+deployed interoperability or distributed Federation lease parity. Native expiry/
+hard-process fencing is not inferred from the short native bootstrap run.
 
 ## 10. Deferred work and invariants
 

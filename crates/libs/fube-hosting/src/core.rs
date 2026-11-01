@@ -171,8 +171,8 @@ impl Hosting {
     pub fn retained_host_records(&self) -> usize {
         self.state.hosts.len()
     }
-    /// No live RA event consumer/IPC/lease/process capability is supplied.
-    /// H2 accounting alone does not satisfy node composition admission.
+    /// No live RA event consumer or process composition is supplied. Neither H2
+    /// accounting nor the separate bootstrap-only IPC service satisfies this gate.
     pub fn require_live_composition(&self) -> Result<()> {
         Err(Error::UnsupportedCapability)
     }

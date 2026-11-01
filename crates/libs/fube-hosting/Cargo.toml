@@ -3,7 +3,7 @@ name = "fube-hosting"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Bounded native-derived in-memory Hosting2 registration model; not a live Hosting service"
+description = "Bounded Hosting2 registration, residency and bootstrap-only local IPC leases"
 
 [dependencies]
 uuid.workspace = true

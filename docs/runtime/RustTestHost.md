@@ -293,6 +293,41 @@ adapters/profiles or must be rejected as unsupported.
 Guest executables that never create/register a FabricRuntime do not acquire a
 RAP simply because the host injects environment variables.
 
+### 2.7 Production Hosting lease qualification
+
+`hosting-leases` is a **separate bootstrap-only profile**, not another name for
+the fixture's factory/Open/Close controller. It uses
+[`fube-hosting::ipc::Server`](../../crates/libs/fube-hosting/src/ipc.rs) as the
+production responder and independently observes native application TCP frames.
+The existing fixture owns only prepared artifacts, expected PID, process and
+qualification observations; production Hosting does not depend on test-host.
+
+The native sample receives `--hosting-lease-bootstrap-only`, mutually exclusive
+with manifest/service modes, and does not register a factory. The profile requires
+Start/Finish/runtime registration, **two** correlated empty-action/body actor-15
+polls with positive ≤30-second TTL, actual runtime unregister, mapped pinned
+Runtime/Common libraries and graceful exit/direct-child reap/group drain.
+No endpoint, lifecycle, stateful/report consumer or native expiry/fencing claim
+is implied. Unsupported capabilities receive no generic successful response.
+
+After a fresh build/package from the exact clean source revision:
+
+```sh
+python3 -m tests.native_runtime.runner hosting-leases \
+  --prebuilt build/native-runtime-binaries \
+  --diagnostics-directory build/hosting-lease-receipts
+```
+
+Choose a **new** bundle directory when the standard path already exists; never
+overwrite or relabel historical binaries. Retain all five original bootstrap/
+close/abort/manifest scenarios as distinct regressions. On 2026-11-01 the new
+production profile and those five unchanged profiles passed anew at
+`1a1a51fd215d0b237f1f0d63902e5ef3d02a951f`. Native client requests omit Timeout
+headers; the production admission selects explicit `NativeClientLocal` deadlines,
+not a silent missing-header fallback. Source inspection and release-library
+version/hashes remain distinct provenance from complete original native node
+handler execution or deployed/distributed parity.
+
 ## 3. Why a small RA-only listener is insufficient
 
 The native runtime has a startup dependency graph:
