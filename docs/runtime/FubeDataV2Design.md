@@ -1,17 +1,19 @@
 # Fube Data V2: transactional replication design
 
-**Status:** source-derived port proposal after semantic audit; not an
-implemented or qualified V2 feature.
+**Status:** source-derived design with implemented ordinary volatile A1
+integration; see [A1 as-built scope](FubeTxnA1.md). Not native-binary,
+mixed-native, persisted-state or collection-product qualification.
 **Created:** 2026-10-29. **Revised:** 2026-10-30 after SF API alignment (#19)
-and the Astra source-semantic review.
+and the Astra source-semantic review. **A1 update:** 2026-11-01.
 **Initial target:** Rust-owned volatile transactions over
 `fube-data`, packaged as a new `fube-txn` crate. The initial scope narrows
 supported capabilities, not the transaction or copy algorithms.
 
-This document is the complete design and acceptance contract. It does not
-authorize implementation or change the support claims of the existing engine.
-“Proposed,” “must,” and the milestone requirements below describe future work;
-the explicitly cited **current** and **reference** observations describe code.
+This document retains the design and acceptance contract, including explicitly
+historical proposal/audit observations. R0/A0/A1 are implemented at their stated
+boundaries; later product/qualification milestones remain future work. The A1
+guide records current public construction and unavoidable Rust adaptations.
+Design text itself does not authorize publication or establish native execution.
 
 ## 1. Decisions and scope
 
@@ -121,8 +123,9 @@ separate from these phase-reviewed local changes.
 ### 2.1 Additional audit findings and design resolutions
 
 The revised upper core is source-derived. Private A0 kernels now have offline
-implementation evidence in [FubeTxnA0.md](FubeTxnA0.md); A1 runtime integration
-remains unimplemented. This does not change native qualification claims.
+implementation evidence in [FubeTxnA0.md](FubeTxnA0.md); [A1](FubeTxnA1.md)
+now integrates the public service/primary registry, actual lower transactions,
+lifecycle, Full copy and memory-log maintenance. Native qualification is unchanged.
 Detailed pre-R0/native evidence and current correction regressions are recorded
 in the V1 reference. The table retains the original audit resolutions; all four
 lower seams below are corrected by R0, without implementing upper kernels.
@@ -176,7 +179,7 @@ or compatibility paths
 ```text
 native SF node: membership / role / epoch / reconfiguration / access authority
           |
- fube-runtime service + fube-txn IPrimaryReplicator lifecycle wrapper
+ fube-runtime service retains fube-txn owner + SAME lower IPrimaryReplicator/binder
           |                             |
           | delegates control           | gates application readiness
           v                             v
@@ -197,7 +200,7 @@ native SF node: membership / role / epoch / reconfiguration / access authority
 | Transaction/log manager | Record codec, transaction table, ordered decisions, bounded log, promotion cleanup, stable/checkpoint tracking | Native control authority |
 | State manager | Transactional provider name/ID/type/parent registry, factory validation, routing, copy/checkpoint coordination | Collection-specific locks or serialization parity |
 | Upper provider | Transactional Apply/Unlock, source-compatible isolation/version contexts and checkpoint/copy state; first a small test provider | Lower transport ACK policy or a partition-wide root-swap requirement |
-| Runtime wrapper | Compose lower/upper Open, ChangeRole, Close and Abort; gate application access and own cleanup | Intercept every native configuration/build/removal or replace lower progress |
+| Runtime owner + common lower hooks | Compose lower/upper Open, ChangeRole, Close and Abort; gate application access and own cleanup | Intercept every native configuration/build/removal or replace lower progress |
 
 ### 3.2.1 Public trait boundary before A0
 
@@ -298,7 +301,7 @@ commitment, catch-up, copy or promotion policy.
 
 | Native reference concept | Proposed fube mapping | Required interpretation |
 |---|---|---|
-| `ReplicateAsync(data, out LSN)` | `IStateReplicator::replicate`; use explicit `EpochCheckedReplication::replicate_in_epoch` for origin-fenced admission, then local log ingestion and `ReplicationCompletion::wait` | `ReplicationAdmission.sequence_number` is available before quorum; its `completion` is a separate observer |
+| `ReplicateAsync(data, out LSN)` | A1 uses ordinary `IStateReplicator::replicate`, then local log ingestion and `ReplicationCompletion::wait`; the separate R0 EpochCheckedReplication capability is not an A1 admission prerequisite | `ReplicationAdmission.sequence_number` is available before quorum; its `completion` is a separate observer |
 | `GetCopyStream` / `GetReplicationStream` | Synchronous fallible `get_copy_stream` / `get_replication_stream`, followed by async `IOperationStream::get_operation` | One consumer shared with origin views; retain authentic original data |
 | Lower `GetLastCommittedSequenceNumber` | Adapter `IStateProvider::get_last_committed_sequence_number` returns its reconciled accepted **log tail** | Never return the last visible transaction's commit LSN instead |
 | Lower `UpdateEpoch(previous-last)` | Preserve native role/drain/duplicate gates and applicable provider validation; write/flush/process a new native epoch record at its source boundary | No unconditional upper/lower tail equality after extended copy; canonical false-progress handling is separate |
@@ -502,7 +505,8 @@ Implement that native flow through the current Rust admission/completion seam:
    Cache only the first operation as native does; do not require a complete
    request, a replicated retry binding or a clean lower queue before enlistment.
 2. When a record must be replicated, validate native role/access/epoch and
-   reserve finite ownership for that record. Admit through `replicate_in_epoch`,
+   obtain finite ordinary ownership for that record. A1 admits through standard
+   `IStateReplicator::replicate` (the earlier epoch-capability recipe is superseded),
    attach its early LSN and completion observer, then append to the ordered
    local log. Accepted log/transaction ownership outlives the requesting future.
 3. Begin/Add return after their source admission boundary while owned record
@@ -693,20 +697,22 @@ checkpoint and transactional apply paths
 Implementing a transactional replicator supplies neither those formats nor those
 collection semantics.
 
-### 6.2 Open, role, epoch and promotion (proposal)
+### 6.2 Open, role, epoch and promotion (implemented volatile A1)
 
 Use synchronous `IStatefulServiceFactory::create_replica` and capture the
 factory-supplied `NativeIntegrationProvider` separately from SDK identity
 arguments. In runtime-owned `IStatefulServiceReplica::open`, validate
-`OpenMode::New` and call `FabricReplicator::create_with_capabilities` with:
-`Arc<dyn IStatefulServicePartition>`, captured `NativeRuntimeIntegration`,
-`Arc<dyn IStateProvider>` for the upper log, no replay workaround for the
-source-conformance path, `ReplicationEndpointOptions`, and `Settings`.
-Supply `StateProviderCapabilities { supports_copy_until_latest_lsn: true }`,
-the implemented explicit native-equivalent construction capability (§7),
-not a new SDK discovery member. `create` retains classic defaults. Keep its
-`Arc<FabricReplicator>` and state view in the upper owner; return a boxed
-`IPrimaryReplicator` lifecycle wrapper over that same instance
+`OpenMode::New` and call the supported
+[`VolatileTransactionalReplicator::create`](../../crates/libs/fube-txn/src/runtime.rs#L112)
+with the actual partition, captured native integration, endpoint/lower Settings,
+provider factory, data-loss handler and volatile allocation/work-folder settings.
+The owner internally constructs ONE lower `create_with_lifecycle` with native
+latest-LSN capability and no replay workaround; its common root/bound hooks
+already execute upper lifecycle once. Retain the public owner in the service and
+return a boxed clone of its SAME `fabric_replicator()` as `IPrimaryReplicator`,
+not an additional outer control/lifecycle wrapper. The earlier capability-only
+wrapper recipe is superseded; do not separately call the upper lifecycle.
+See the [constructible usage and execution-entry rule](FubeTxnA1.md)
 ([stateful_api.rs:118–148][f-factory],
 [fabric_replicator.rs:29–70][f-fabric],
 [stateful_binding.rs:160–180][f-native-capture]).
@@ -715,9 +721,10 @@ CreateReplicator method, SDK discovery hook, or second lower owner.
 `Existing` is Unsupported and `Invalid` is InvalidArgument before activation
 ([stateful_api.rs:235–255][f-open-mode]).
 
-For A, construct callback-ready empty log/registry metadata before lower
+For fresh A1, construct callback-ready empty log/registry metadata at truthful
+**tail0** before lower
 creation: the current engine invokes the provider's initial progress getter
-while constructing the owner, not only after the wrapper's later Open
+while constructing the owner, not only during later Open
 ([engine.rs:629–660][f-initial-progress]).
 Do not return a fabricated zero while a nonempty log is still initializing.
 The native factory likewise initializes its lower state-provider bridge with
@@ -728,8 +735,16 @@ R0 proves this construction boundary passes nonempty actual fixture record tails
 with the getter called before the lower facade is returned
 ([public witness](../../crates/libs/fube-data/tests/sdk_contracts.rs#L222-L297)).
 The fixture is not native record serialization or a transaction log kernel.
-Native zero/one records, registry/log initialization and persisted recovery still
-belong to A0/A1/C as applicable; callers must initialize them before lower creation.
+The R0 nonempty fixture does NOT prescribe A1 bootstrap-before-lower-creation.
+Native ComTransactionalReplicator.cpp:654–711 opens V1 first; upper LogManager.cpp:
+246–341 then constructs/flushed-checks zero/one records. A1 follows **lower Open →
+upper bootstrap1 → one-time actual-getter measured lower rebase1 → lower role →
+actual Barrier LSN2**, tested on root/bound controls in
+[`runtime_bootstrap_tests.rs:684–754`](../../crates/libs/fube-txn/src/kernel/runtime_bootstrap_tests.rs#L684-L754).
+SDK callers never pre-bootstrap records or supply a synthetic LSN. The measured
+rebase is a FUBE ADAPTATION of constructor-time progress sampling, not a second
+native authority or a ported native queue command. Persisted Existing/recovery
+remains unsupported, not a variant of this fresh construction.
 
 Preserve native status/access checks, cancellation, watchdogs, capture disposal
 and incarnation fencing; cancellation alone does not establish quiescence

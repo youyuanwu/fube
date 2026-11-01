@@ -2,7 +2,7 @@
 //! 257–459, StateManager.cpp:103–179,4797–4919 and SecondaryDrainManager.cpp:
 //! 200–233,323–376,653–799,906–972. Binding/owned futures are FUBE ADAPTATION;
 //! no new admission policy or second binder. Native staged volatile copy and
-//! memory/checkpoint execution remain distinct from the unfinished public facade.
+//! memory/checkpoint execution back the supported public service/registry facade.
 use super::{
     checkpoint::await_all,
     copy_codec::{remove_stage, CopyContext, CopyMetadata, Stage},
