@@ -361,8 +361,7 @@ async fn corrective_real_reserved_entry_deadline_branch_uses_current_authority()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reserved_log_loans_restore_rejection_and_survive_full_ordinary_queue() {
-    use crate::extensions::ReservedLogReplication;
+async fn fidelity_ordinary_queue_full_has_no_log_record_category_or_reserved_capacity() {
     use crate::IStateReplicator;
     for root in [false, true] {
         let settings = Settings {
@@ -387,8 +386,6 @@ async fn reserved_log_loans_restore_rejection_and_survive_full_ordinary_queue() 
         let lower = crate::FabricReplicator {
             engine: p.engine.clone(),
         };
-        let end = lower.reserve_log_operation(229).unwrap();
-        let barrier = lower.reserve_log_operation(208).unwrap();
         let data = OperationData::with_settings(vec![vec![1]], &settings).unwrap();
         let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", settings.clone()).unwrap();
         let mut peer = p.descriptor(ReplicaRole::ActiveSecondary);
@@ -412,7 +409,7 @@ async fn reserved_log_loans_restore_rejection_and_survive_full_ordinary_queue() 
             .await
             .unwrap();
         assert!(lower
-            .replicate_reserved(data.clone(), end.clone(), Cancellation::default())
+            .replicate(data.clone(), Cancellation::default())
             .await
             .is_err());
         assert_eq!(p.engine.snapshot().progress.assigned, 1);
@@ -446,27 +443,54 @@ async fn reserved_log_loans_restore_rejection_and_survive_full_ordinary_queue() 
             .await
             .unwrap();
         assert_eq!((first.sequence_number, second.sequence_number), (2, 3));
-        assert!(lower
+        let third = lower
             .replicate(data.clone(), Cancellation::default())
             .await
-            .is_err());
-        assert_eq!(p.engine.snapshot().progress.assigned, 3);
-        let terminated = lower
-            .replicate_reserved(data.clone(), end, Cancellation::default())
+            .unwrap();
+        let fourth = lower
+            .replicate(data.clone(), Cancellation::default())
             .await
             .unwrap();
-        let boundary = lower
-            .replicate_reserved(data, barrier, Cancellation::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            (terminated.sequence_number, boundary.sequence_number),
-            (4, 5)
-        );
+        assert_eq!((third.sequence_number, fourth.sequence_number), (4, 5));
         assert_eq!(p.engine.snapshot().owned_operations, 4);
         assert!(p.engine.snapshot().owned_bytes <= settings.queue_bytes);
+        // V1 treats data as opaque; even a V2 type discriminator grants no
+        // special admission. Valid txn End/Barrier tests live in fube-txn.
+        for kind in [1i32, 3, 4] {
+            let opaque =
+                OperationData::with_settings(vec![kind.to_le_bytes().to_vec()], &settings).unwrap();
+            let rejected = lower
+                .replicate(opaque, Cancellation::default())
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(
+                rejected.kind(),
+                fube_runtime::ErrorKind::ReplicationQueueFull
+            );
+            assert_eq!(p.engine.snapshot().progress.assigned, 5);
+        }
         p.host.configure(config(EPOCH, vec![], 1)).await.unwrap();
-        drop((first, second, terminated, boundary));
+        for mut accepted in [first, second, third, fourth] {
+            accepted
+                .completion
+                .wait(Cancellation::default())
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while p.engine.snapshot().owned_operations != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let recovered = lower
+            .replicate(data, Cancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(recovered.sequence_number, 6);
+        drop(recovered);
         network.shutdown();
     }
 }

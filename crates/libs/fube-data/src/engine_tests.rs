@@ -5925,7 +5925,6 @@ async fn outgoing_build_admission_counts_pending_writes_before_installing_any_pe
                         charge: Some(charge),
                         cancellation: cancel(),
                         reply: Some(reply.into()),
-                        reserved: None,
                     })
                     .unwrap_or_else(|_| panic!("pending write queue unexpectedly full"));
                 replies.push(result);

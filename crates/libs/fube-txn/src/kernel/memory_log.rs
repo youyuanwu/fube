@@ -10,14 +10,11 @@ use super::{
 use crate::{Epoch, Error, Result};
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, Mutex, Weak},
+    sync::Arc,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub(crate) const CHUNK: usize = 64 * 1024;
-const MAINTENANCE: usize = 4 * CHUNK;
-const CONTROL: usize = 8 * 1024;
-const MAINTENANCE_BATCH: usize = 8 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProgressEntry {
@@ -63,37 +60,7 @@ pub(crate) struct Checkpoint {
     pub(crate) stable: i64,
 }
 pub(crate) struct Retention {
-    bytes: Option<OwnedSemaphorePermit>,
-    credit: Option<Weak<MemoryCredit>>,
-}
-impl Drop for Retention {
-    fn drop(&mut self) {
-        if let Some(credit) = self.credit.as_ref().and_then(Weak::upgrade) {
-            let mut available = credit.available.lock().unwrap();
-            debug_assert!(available.is_none());
-            *available = self.bytes.take();
-        }
-    }
-}
-pub(crate) struct MemoryCredit {
-    available: Mutex<Option<OwnedSemaphorePermit>>,
-}
-impl MemoryCredit {
-    pub(crate) fn take(self: &Arc<Self>) -> Result<Arc<Retention>> {
-        let bytes = self
-            .available
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| Status::ServiceTooBusy.error())?;
-        Ok(Arc::new(Retention {
-            bytes: Some(bytes),
-            credit: Some(Arc::downgrade(self)),
-        }))
-    }
-    pub(crate) fn available(&self) -> bool {
-        self.available.lock().unwrap().is_some()
-    }
+    _bytes: OwnedSemaphorePermit,
 }
 pub(crate) struct Entry {
     pub(crate) position: u64,
@@ -101,7 +68,7 @@ pub(crate) struct Entry {
     pub(crate) lsn: i64,
     pub(crate) native_type: i32,
     pub(crate) logical: Option<Arc<RecordNode>>,
-    _maintenance: Option<Retention>,
+    _storage: Option<Retention>,
 }
 pub(crate) struct MemoryLog {
     chunks: BTreeMap<u64, Box<[u8; CHUNK]>>,
@@ -119,10 +86,10 @@ pub(crate) struct MemoryLog {
     pub(crate) pending: Option<Checkpoint>,
     pending_ended: bool,
     pub(crate) vector: Vec<ProgressEntry>,
-    ordinary: Arc<Semaphore>,
-    maintenance: Arc<Semaphore>,
-    controls: Arc<Semaphore>,
-    maintenance_batch: Option<OwnedSemaphorePermit>,
+    allocation: Arc<Semaphore>,
+    logging_error: Option<Error>,
+    #[cfg(test)]
+    pub(crate) write_error: Option<Error>,
     capacity: usize,
     readers: BTreeMap<u64, u64>,
     next_reader: u64,
@@ -155,17 +122,19 @@ impl MemoryLog {
             pending: None,
             pending_ended: false,
             vector: zero_vector(),
-            ordinary: Arc::new(Semaphore::new(capacity - MAINTENANCE - CONTROL - 2 * CHUNK)),
-            maintenance: Arc::new(Semaphore::new(MAINTENANCE)),
-            controls: Arc::new(Semaphore::new(CONTROL)),
-            maintenance_batch: None,
+            // Explicit uniform Rust allocation profile, not reserved native
+            // admission or future End/Barrier/checkpoint progress capacity.
+            allocation: Arc::new(Semaphore::new(capacity)),
+            logging_error: None,
+            #[cfg(test)]
+            write_error: None,
             capacity,
             readers: BTreeMap::new(),
             next_reader: 1,
             events: VecDeque::new(),
         })
     }
-    fn reservation_size(&self, record: &Record) -> Result<usize> {
+    fn allocation_size(&self, record: &Record) -> Result<usize> {
         let wire = record.encode()?;
         let transaction_physical = if record.transaction_id().is_some() {
             12
@@ -174,58 +143,37 @@ impl MemoryLog {
         };
         Ok(wire.bytes() + wire.retained_bytes() + 28 + transaction_physical + 256)
     }
-    fn ordinary_permit(&self, record: &Record) -> Result<OwnedSemaphorePermit> {
-        let bytes = self.reservation_size(record)?;
-        if bytes > self.capacity - MAINTENANCE - CONTROL - 2 * CHUNK {
+    fn allocation_permit(&self, record: &Record) -> Result<OwnedSemaphorePermit> {
+        let bytes = self.allocation_size(record)?;
+        if bytes > self.capacity {
             return Err(Status::OperationTooLarge.error());
         }
-        if self.maintenance_batch.is_none()
-            && self.maintenance.available_permits() < MAINTENANCE_BATCH
-        {
-            return Err(Status::ServiceTooBusy.error());
-        }
-        self.ordinary
+        self.allocation
             .clone()
             .try_acquire_many_owned(bytes as u32)
-            .map_err(|_| Status::ServiceTooBusy.error())
+            .map_err(|_| Status::InsufficientResources.error())
     }
     pub(crate) fn reserve(&self, record: &Record) -> Result<Arc<Retention>> {
         Ok(Arc::new(Retention {
-            bytes: Some(self.ordinary_permit(record)?),
-            credit: None,
+            _bytes: self.allocation_permit(record)?,
         }))
     }
-    pub(crate) fn reserve_reusable(&self, record: &Record) -> Result<Arc<MemoryCredit>> {
-        Ok(Arc::new(MemoryCredit {
-            available: Mutex::new(Some(self.ordinary_permit(record)?)),
-        }))
+    #[cfg(test)]
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.capacity - self.allocation.available_permits()
     }
-    pub(crate) fn reserve_control(&self, record: &Record) -> Result<Arc<Retention>> {
-        let bytes = self.reservation_size(record)?;
-        let permit = self
-            .controls
+    #[cfg(test)]
+    pub(crate) fn occupy_remaining_allocation(&self) -> OwnedSemaphorePermit {
+        self.allocation
             .clone()
-            .try_acquire_many_owned(bytes as u32)
-            .map_err(|_| Status::ServiceTooBusy.error())?;
-        Ok(Arc::new(Retention {
-            bytes: Some(permit),
-            credit: None,
-        }))
+            .try_acquire_many_owned(self.allocation.available_permits() as u32)
+            .unwrap()
     }
-    pub(crate) fn begin_maintenance(&mut self) -> Result<()> {
-        if self.maintenance_batch.is_some() {
-            return Err(Error::InvalidInput("maintenance batch already reserved"));
-        }
-        self.maintenance_batch = Some(
-            self.maintenance
-                .clone()
-                .try_acquire_many_owned(MAINTENANCE_BATCH as u32)
-                .map_err(|_| Status::ServiceTooBusy.error())?,
-        );
-        Ok(())
-    }
-    pub(crate) fn end_maintenance(&mut self) {
-        self.maintenance_batch.take();
+    pub(crate) fn fail_writer(&mut self, error: Error) {
+        // PhysicalLogWriter.cpp:686–755 retains the FIRST loggingError_.
+        // Only existing-owned write/flush failure enters this path, not
+        // pre-record allocation rejection.
+        self.logging_error.get_or_insert(error);
     }
     fn logical_sections(&self, node: &Arc<RecordNode>) -> Result<Vec<Vec<u8>>> {
         let record = node.record();
@@ -260,6 +208,9 @@ impl MemoryLog {
         Ok(sections)
     }
     pub(crate) fn preflight_logical(&self, node: &Arc<RecordNode>) -> Result<()> {
+        if let Some(error) = &self.logging_error {
+            return Err(error.clone());
+        }
         let size: usize = self.logical_sections(node)?.iter().map(Vec::len).sum();
         self.check_frame(size + 8)
     }
@@ -271,7 +222,7 @@ impl MemoryLog {
             .checked_add(size as u64)
             .ok_or(Error::ResourceLimit("physical position exhausted"))?;
         if self.tail_position - self.head + size as u64 > self.capacity as u64 {
-            return Err(Status::ServiceTooBusy.error());
+            return Err(Status::InsufficientResources.error());
         }
         Ok(())
     }
@@ -328,6 +279,13 @@ impl MemoryLog {
         sections: Vec<Vec<u8>>,
         physical: bool,
     ) -> Result<u64> {
+        if let Some(error) = &self.logging_error {
+            return Err(error.clone());
+        }
+        #[cfg(test)]
+        if let Some(error) = self.write_error.take() {
+            return Err(error);
+        }
         let body: Vec<_> = sections.into_iter().flatten().collect();
         let size = u32::try_from(body.len())
             .map_err(|_| Error::ResourceLimit("physical frame too large"))?;
@@ -338,19 +296,13 @@ impl MemoryLog {
         ]
         .concat();
         self.check_frame(frame.len())?;
-        let maintenance = if physical {
+        let storage = if physical {
             Some(Retention {
-                bytes: Some(if let Some(batch) = &mut self.maintenance_batch {
-                    batch
-                        .split(frame.len() + 256)
-                        .ok_or_else(|| Status::ServiceTooBusy.error())?
-                } else {
-                    self.maintenance
-                        .clone()
-                        .try_acquire_many_owned((frame.len() + 256) as u32)
-                        .map_err(|_| Status::ServiceTooBusy.error())?
-                }),
-                credit: None,
+                _bytes: self
+                    .allocation
+                    .clone()
+                    .try_acquire_many_owned((frame.len() + 256) as u32)
+                    .map_err(|_| Status::InsufficientResources.error())?,
             })
         } else {
             None
@@ -378,7 +330,7 @@ impl MemoryLog {
             lsn,
             native_type,
             logical: None,
-            _maintenance: maintenance,
+            _storage: storage,
         });
         if self.events.len() == 1024 {
             self.events.pop_front();
@@ -521,7 +473,9 @@ impl MemoryLog {
         Ok(())
     }
     pub(crate) fn flush(&mut self) {
-        self.flushed_lsn = self.tail_lsn;
+        if self.logging_error.is_none() {
+            self.flushed_lsn = self.tail_lsn;
+        }
     }
     pub(crate) fn read(&self, position: u64, count: usize) -> Vec<u8> {
         if position < self.head || position >= self.tail_position {
@@ -543,7 +497,7 @@ impl MemoryLog {
             .checked_add(1)
             .ok_or(Error::ResourceLimit("reader IDs"))?;
         if self.readers.len() >= 16 {
-            return Err(Status::ServiceTooBusy.error());
+            return Err(Status::InsufficientResources.error());
         }
         self.readers.insert(id, position);
         Ok(id)

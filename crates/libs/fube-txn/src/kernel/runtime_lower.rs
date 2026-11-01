@@ -8,27 +8,23 @@ use super::{
     version::Completion,
 };
 use crate::{ApiFuture, Cancellation, Error, OperationContext, Result, TransactionBase};
-use fube_data::{
-    extensions::{LogReservation, ReplicatorDiagnostics, ReservedLogReplication},
-    FabricReplicator, IStateReplicator,
-};
+use fube_data::{extensions::ReplicatorDiagnostics, FabricReplicator, IStateReplicator};
 use fube_runtime::extensions::{
-    CallLane, CallOrigin, DisposalTracker, ExecutionRuntime, ManagedObject, ObjectQuota,
+    CallLane, CallOrigin, DisposalTracker, ExecutionRuntime, ObjectQuota,
 };
-use std::collections::BTreeMap;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc, Arc, Mutex, Weak,
 };
 use std::time::{Duration, Instant};
-const GLOBAL_BARRIERS: usize = 18; // first plus idle continuations for 16 live owners
-const DISPATCH_BARRIERS: usize = 16;
-const BARRIER_SLOTS: usize = GLOBAL_BARRIERS + DISPATCH_BARRIERS;
 #[cfg(test)]
 type PublicationPause = (i64, mpsc::SyncSender<()>, mpsc::Receiver<()>);
-fn throttle(error: Error) -> Error {
+#[cfg(test)]
+type GroupAttempt = (u64, Result<i64>);
+fn allocation(error: Error) -> Error {
     if error.kind() == fube_runtime::ErrorKind::ResourceExhausted {
-        super::status::Status::ServiceTooBusy.error()
+        // Explicit finite Rust allocator boundary, not native writer throttle.
+        super::status::Status::InsufficientResources.error()
     } else {
         error
     }
@@ -38,14 +34,12 @@ pub(crate) struct RuntimeLower {
     self_weak: Weak<Self>,
     #[cfg(test)]
     pub(crate) publication_pause: Arc<Mutex<Option<PublicationPause>>>,
+    #[cfg(test)]
+    pub(crate) group_attempts: Mutex<Vec<GroupAttempt>>,
     lower: Arc<FabricReplicator>,
     execution: ExecutionRuntime,
     drivers: tokio::runtime::Handle,
     payloads: ObjectQuota,
-    endings: ObjectQuota,
-    end_loans: Mutex<BTreeMap<i64, Arc<CriticalSlot>>>,
-    barriers: ObjectQuota,
-    barrier_pool: Mutex<Option<BarrierPool>>,
     barriers_enabled: AtomicBool,
     first_primary: tokio::sync::Mutex<bool>,
     group: Mutex<GroupCommit>,
@@ -64,38 +58,10 @@ impl Drop for PublicationGuard {
         self.0.changed.notify_waiters();
     }
 }
-struct CriticalSlot {
-    payload: Arc<ManagedObject<Mutex<Option<Payload>>>>,
-    lower: Arc<LogReservation>,
-    memory: Option<Arc<super::memory_log::Retention>>,
-    dispatch: Option<Arc<BarrierGrant>>,
-}
-struct BarrierPool {
-    payloads: Vec<Arc<ManagedObject<Mutex<Option<Payload>>>>>,
-    loans: Vec<Arc<LogReservation>>,
-    memory: Vec<Option<Arc<super::memory_log::MemoryCredit>>>,
-    busy: Vec<bool>,
-}
-struct BarrierGrant {
-    index: usize,
-    slot: Arc<CriticalSlot>,
-    runtime: Weak<RuntimeLower>,
-    submitted: AtomicBool,
-}
-impl Drop for BarrierGrant {
-    fn drop(&mut self) {
-        if !self.submitted.load(Ordering::Acquire) {
-            if let Some(runtime) = self.runtime.upgrade() {
-                runtime.release_barrier(self.index);
-            }
-        }
-    }
-}
 struct GroupCommit {
     needed: bool,
     running: bool,
     delay_ms: u64,
-    pending: Vec<Arc<BarrierGrant>>,
 }
 #[derive(Default)]
 struct Live {
@@ -134,28 +100,23 @@ impl Admission {
 impl RuntimeLower {
     pub(crate) fn new(lower: Arc<FabricReplicator>) -> Result<Arc<Self>> {
         let payloads = ObjectQuota::new(32)?;
-        let endings = ObjectQuota::new(16)?;
-        let barriers = ObjectQuota::new(BARRIER_SLOTS)?;
         Ok(Arc::new_cyclic(|self_weak| Self {
             self_weak: self_weak.clone(),
             #[cfg(test)]
             publication_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            group_attempts: Mutex::new(Vec::new()),
             execution: lower.execution_runtime(),
             lower,
             drivers: tokio::runtime::Handle::current(),
             payloads,
-            endings,
-            barriers,
-            barrier_pool: Mutex::new(None),
             barriers_enabled: AtomicBool::new(false),
             first_primary: tokio::sync::Mutex::new(false),
             group: Mutex::new(GroupCommit {
                 needed: false,
                 running: false,
                 delay_ms: 2,
-                pending: Vec::new(),
             }),
-            end_loans: Mutex::new(BTreeMap::new()),
             disposal: DisposalTracker::default(),
             live: Arc::new(Live::default()),
             publication: Arc::new(PublicationState {
@@ -168,50 +129,15 @@ impl RuntimeLower {
         self.self_weak.upgrade().expect("runtime owner")
     }
 
-    /// Establish only upper scheduling capacity; native lower control remains
+    /// Enable only native upper scheduling state; lower control remains
     /// the role/quorum authority. The first replicated record is still emitted
     /// lazily by the native first-write election gate, not by read-only commit.
-    pub(crate) fn enable_barriers(&self, manager: &Arc<KernelManager>) -> Result<()> {
+    pub(crate) fn enable_barriers(&self, _: &Arc<KernelManager>) -> Result<()> {
         let mut publication = self.publication.state.lock().unwrap();
         if !publication.0 && self.live.count.load(Ordering::Acquire) != 0 {
             return Err(Error::InvalidInput(
                 "previous scheduling generation is not drained",
             ));
-        }
-        let mut pool = self.barrier_pool.lock().unwrap();
-        if pool.is_none() {
-            let mut payloads = Vec::new();
-            let mut loans = Vec::new();
-            let mut memory = Vec::new();
-            for _ in 0..BARRIER_SLOTS {
-                let payload = self
-                    .execution
-                    .reserve_object_with_origin(
-                        &self.barriers,
-                        &self.disposal,
-                        CallOrigin::default(),
-                    )?
-                    .publish(Mutex::new(None));
-                loans.push(self.lower.reserve_barrier_operation(208)?);
-                memory.push(
-                    manager
-                        .memory()
-                        .map(|log| {
-                            log.lock().unwrap().reserve_reusable(&Record {
-                                lsn: -1,
-                                kind: RecordKind::Barrier { last_stable_lsn: 0 },
-                            })
-                        })
-                        .transpose()?,
-                );
-                payloads.push(Arc::new(payload));
-            }
-            *pool = Some(BarrierPool {
-                payloads,
-                loans,
-                memory,
-                busy: vec![false; BARRIER_SLOTS],
-            });
         }
         self.barriers_enabled.store(true, Ordering::Release);
         publication.0 = true;
@@ -245,59 +171,6 @@ impl RuntimeLower {
         }
     }
 
-    fn claim_barrier(&self, dispatch: bool) -> Result<(usize, Arc<CriticalSlot>)> {
-        let mut pool = self.barrier_pool.lock().unwrap();
-        let pool = pool
-            .as_mut()
-            .ok_or(Error::InvalidInput("barrier capacity not established"))?;
-        let range = if dispatch {
-            GLOBAL_BARRIERS..BARRIER_SLOTS
-        } else {
-            0..GLOBAL_BARRIERS
-        };
-        for index in range {
-            if pool.busy[index]
-                || !pool.loans[index].is_available()
-                || pool.memory[index]
-                    .as_ref()
-                    .is_some_and(|credit| !credit.available())
-            {
-                continue;
-            }
-            let lower = pool.loans[index].clone();
-            let memory = pool.memory[index]
-                .as_ref()
-                .map(|credit| credit.take())
-                .transpose()?;
-            pool.busy[index] = true;
-            return Ok((
-                index,
-                Arc::new(CriticalSlot {
-                    payload: pool.payloads[index].clone(),
-                    lower,
-                    memory,
-                    dispatch: None,
-                }),
-            ));
-        }
-        Err(super::status::Status::ServiceTooBusy.error())
-    }
-
-    fn release_barrier(&self, index: usize) {
-        if let Some(pool) = self.barrier_pool.lock().unwrap().as_mut() {
-            pool.busy[index] = false;
-        }
-    }
-    fn reserve_dispatch(&self) -> Result<Arc<BarrierGrant>> {
-        let (index, slot) = self.claim_barrier(true)?;
-        Ok(Arc::new(BarrierGrant {
-            index,
-            slot,
-            runtime: self.self_weak.clone(),
-            submitted: AtomicBool::new(false),
-        }))
-    }
-
     async fn ensure_first(&self, manager: Arc<KernelManager>, asynchronous: bool) -> Result<()> {
         let mut established = self.first_primary.lock().await;
         if *established {
@@ -327,12 +200,11 @@ impl RuntimeLower {
         Ok(())
     }
 
-    fn schedule_group(&self, manager: Arc<KernelManager>, grant: Arc<BarrierGrant>) {
+    fn schedule_group(&self, manager: Arc<KernelManager>) {
         if !self.barriers_enabled.load(Ordering::Acquire) {
             return;
         }
         let mut group = self.group.lock().unwrap();
-        group.pending.push(grant);
         group.needed = true;
         if group.running {
             return;
@@ -355,36 +227,44 @@ impl RuntimeLower {
                     break;
                 }
                 runtime.group.lock().unwrap().needed = false;
-                let mut grants = std::mem::take(&mut runtime.group.lock().unwrap().pending);
-                let selected = grants.pop();
-                let barrier = if let Some(grant) = selected.clone() {
-                    runtime.admit_granted(manager.clone(), grant).await
-                } else {
-                    runtime
-                        .admit_async(
-                            manager.clone(),
-                            Record {
-                                lsn: -1,
-                                kind: RecordKind::Barrier {
-                                    last_stable_lsn: manager.stable(),
-                                },
+                let barrier = runtime
+                    .admit_async(
+                        manager.clone(),
+                        Record {
+                            lsn: -1,
+                            kind: RecordKind::Barrier {
+                                last_stable_lsn: manager.stable(),
                             },
-                            None,
-                            None,
-                        )
-                        .await
-                };
-                let barrier = match barrier {
-                    Ok(barrier) => {
-                        drop(grants);
-                        barrier
+                        },
+                        None,
+                        None,
+                    )
+                    .await;
+                #[cfg(test)]
+                {
+                    let mut attempts = runtime.group_attempts.lock().unwrap();
+                    if attempts.len() == 64 {
+                        let _ = attempts.remove(0);
                     }
+                    attempts.push((
+                        delay,
+                        barrier.as_ref().map(|a| a.node.lsn()).map_err(Clone::clone),
+                    ));
+                }
+                let barrier = match barrier {
+                    Ok(barrier) => barrier,
                     Err(_) => {
                         let mut group = runtime.group.lock().unwrap();
-                        if let Some(grant) = selected {
-                            grants.push(grant);
+                        // This is not TransactionBase's retry whitelist.
+                        // Native GroupCommit retries failed admission only while
+                        // Primary/not-closing; unexpected errors fault separately.
+                        if !runtime.barriers_enabled.load(Ordering::Acquire)
+                            || manager.role() != super::processor::ProcessingRole::Primary
+                            || manager.faults.is_closing()
+                        {
+                            group.running = false;
+                            break;
                         }
-                        group.pending.extend(grants);
                         group.delay_ms = (group.delay_ms * 2).min(5000);
                         continue;
                     }
@@ -398,7 +278,7 @@ impl RuntimeLower {
                     && barrier.previous_stable.load(Ordering::Acquire) == barrier.node.lsn() - 1;
                 let mut group = runtime.group.lock().unwrap();
                 group.delay_ms = 2;
-                // Native GroupCommit.cpp additional idle barrier advertises the
+                // Native CheckpointManager::GroupCommit additional idle barrier advertises the
                 // newly stable frontier, then stops on a consecutive barrier.
                 if group.running {
                     break;
@@ -461,54 +341,25 @@ impl RuntimeLower {
         synchronous: Option<mpsc::SyncSender<Result<Arc<Activity>>>>,
         deadline: Option<Instant>,
     ) -> Result<Arc<Admission>> {
-        let begin = match record.kind {
-            RecordKind::Begin {
-                transaction_id,
-                single: false,
-                ..
-            } => Some(transaction_id),
-            _ => None,
-        };
         let started = self.start_inner(
-            manager,
+            manager.clone(),
             record,
             transaction,
             context,
             synchronous,
             deadline,
-            None,
         );
-        if started.is_err() {
-            if let Some(id) = begin {
-                self.end_loans.lock().unwrap().remove(&id);
+        if let Err(error) = &started {
+            if super::status::Status::InsufficientResources.matches(error) {
+                // FUBE ADAPTATION: bounded pre-record allocation failure.
+                // Native creation can throw; this fallible Rust boundary faults,
+                // not a counterfeit successful/queue-full Barrier attempt.
+                manager.faults.replication_error(error);
             }
         }
         started
     }
 
-    fn admit_granted(
-        &self,
-        manager: Arc<KernelManager>,
-        grant: Arc<BarrierGrant>,
-    ) -> ApiFuture<'static, Arc<Activity>> {
-        let record = Record {
-            lsn: -1,
-            kind: RecordKind::Barrier {
-                last_stable_lsn: manager.stable(),
-            },
-        };
-        match self.start_inner(manager, record, None, None, None, None, Some(grant)) {
-            Ok(admission) => {
-                Box::pin(async move { admission.initial.wait().await.as_ref().clone() })
-            }
-            Err(error) => Box::pin(async move { Err(error) }),
-        }
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "native admission parameters plus pre-reserved dispatch ownership"
-    )]
     fn start_inner(
         &self,
         manager: Arc<KernelManager>,
@@ -517,97 +368,37 @@ impl RuntimeLower {
         context: Option<Arc<dyn OperationContext>>,
         synchronous: Option<mpsc::SyncSender<Result<Arc<Activity>>>>,
         deadline: Option<Instant>,
-        supplied: Option<Arc<BarrierGrant>>,
     ) -> Result<Arc<Admission>> {
         ExecutionRuntime::reject_engine_reentry(self.lower.execution_identity())?;
         // Atomic with generation retirement, before quotas/capture/driver spawn.
         // The guard ends after disposition + ordered append + successful flush,
         // NOT after Apply/quorum (which may need the retiring final boundary).
         let publication = self.reserve_publication()?;
-        let wire = record.encode()?;
-        let begin_id = match record.kind {
-            RecordKind::Begin {
-                transaction_id,
-                single: false,
-                ..
-            } => Some(transaction_id),
-            _ => None,
-        };
-        if let Some(id) = begin_id {
-            let mut loans = self.end_loans.lock().unwrap();
-            if let std::collections::btree_map::Entry::Vacant(entry) = loans.entry(id) {
-                let reservation = self
-                    .execution
-                    .reserve_object_with_origin(
-                        &self.endings,
-                        &self.disposal,
-                        CallOrigin::default(),
-                    )
-                    .map_err(throttle)?;
-                let lower = self.lower.reserve_log_operation(229)?;
-                let memory = manager.reserve_memory(&Record {
-                    lsn: -1,
-                    kind: RecordKind::End {
-                        transaction_id: id,
-                        committed: true,
-                    },
-                })?;
-                let dispatch = if self.barriers_enabled.load(Ordering::Acquire) {
-                    Some(self.reserve_dispatch()?)
-                } else {
-                    None
-                };
-                entry.insert(Arc::new(CriticalSlot {
-                    payload: Arc::new(reservation.publish(Mutex::new(None))),
-                    lower,
-                    memory,
-                    dispatch,
-                }));
-            }
+        if record.transaction_id().is_some_and(|id| id <= 0) {
+            return Err(super::status::Status::NotImplemented.error());
         }
-        let end_id = match record.kind {
-            RecordKind::End { transaction_id, .. } => Some(transaction_id),
-            _ => None,
-        };
-        let barrier = if matches!(record.kind, RecordKind::Barrier { .. })
-            && self.barriers_enabled.load(Ordering::Acquire)
+        if transaction
+            .as_ref()
+            .is_some_and(|owner| record.transaction_id() != Some(owner.get_transaction_id()))
+            || (context.is_some()
+                && !matches!(
+                    record.kind,
+                    RecordKind::Begin { .. } | RecordKind::Operation { .. }
+                ))
         {
-            Some(if let Some(grant) = &supplied {
-                (grant.index, grant.slot.clone())
-            } else {
-                self.claim_barrier(false)?
-            })
-        } else {
-            None
-        };
-        let critical = if let Some((_, slot)) = &barrier {
-            Some(slot.clone())
-        } else {
-            end_id
-                .map(|id| {
-                    self.end_loans
-                        .lock()
-                        .unwrap()
-                        .get(&id)
-                        .cloned()
-                        .ok_or(Error::InvalidInput("end lacks accepted begin reservation"))
-                })
-                .transpose()?
-        };
-        let payload = if let Some(slot) = &critical {
-            slot.payload.clone()
-        } else {
-            Arc::new(
-                self.execution
-                    .reserve_object_with_origin(
-                        &self.payloads,
-                        &self.disposal,
-                        CallOrigin::default(),
-                    )
-                    .map_err(throttle)?
-                    .publish(Mutex::new(None)),
-            )
-        };
+            return Err(Error::InvalidInput(
+                "invalid record ownership before lower admission",
+            ));
+        }
+        let wire = record.encode()?;
+        // Every record class uses the same finite allocator AND ordinary lower
+        // replicate. End/Barrier are not priority/loan-backed admissions.
+        let payload = Arc::new(
+            self.execution
+                .reserve_object_with_origin(&self.payloads, &self.disposal, CallOrigin::default())
+                .map_err(allocation)?
+                .publish(Mutex::new(None)),
+        );
         let first_needed = self.barriers_enabled.load(Ordering::Acquire)
             && matches!(
                 record.kind,
@@ -617,24 +408,8 @@ impl RuntimeLower {
             record.kind,
             RecordKind::Begin { single: true, .. } | RecordKind::End { .. }
         );
-        let dispatch = if latency_sensitive && self.barriers_enabled.load(Ordering::Acquire) {
-            if let Some(slot) = &critical {
-                slot.dispatch.clone()
-            } else {
-                Some(self.reserve_dispatch()?)
-            }
-        } else {
-            None
-        };
-        let memory = if let Some(slot) = &critical {
-            slot.memory.clone()
-        } else {
-            manager.reserve_memory(&record)?
-        };
+        let memory = manager.reserve_memory(&record)?;
         let mut capture = payload.get().lock().unwrap();
-        if capture.is_some() {
-            return Err(super::status::Status::ServiceTooBusy.error());
-        }
         *capture = Some(Payload {
             record,
             transaction,
@@ -650,15 +425,10 @@ impl RuntimeLower {
         });
         // Provider lane is the distinct supervised upper-log execution lane,
         // not a lower owner callback or a recursive Native reservation.
-        let permit = if critical.is_none() {
-            Some(
-                self.execution
-                    .reserve(CallLane::Provider, CallOrigin::default(), budget, false)
-                    .map_err(throttle)?,
-            )
-        } else {
-            None
-        };
+        let permit = self
+            .execution
+            .reserve(CallLane::Provider, CallOrigin::default(), budget, false)
+            .map_err(allocation)?;
         let admission = Arc::new(Admission {
             initial: Completion::new(),
             synchronous: Mutex::new(synchronous),
@@ -667,20 +437,10 @@ impl RuntimeLower {
         let asynchronous = published.synchronous.lock().unwrap().is_none();
         let lower = self.lower.clone();
         let continuation = manager.clone();
-        let rejected_runtime = self.self_owner();
-        let barrier_index = barrier.as_ref().map(|(index, _)| *index);
-        let reusable = critical.is_some();
-        let reservation = critical.as_ref().map(|slot| slot.lower.clone());
         #[cfg(test)]
         let publication_pause = self.publication_pause.clone();
         let body = async move {
-            let admitted = if let Some(reservation) = reservation {
-                lower
-                    .replicate_reserved(wire, reservation, Cancellation::default())
-                    .await
-            } else {
-                lower.replicate(wire, Cancellation::default()).await
-            };
+            let admitted = lower.replicate(wire, Cancellation::default()).await;
             let accepted = match admitted {
                 Ok(accepted) => accepted,
                 Err(error) => {
@@ -688,22 +448,8 @@ impl RuntimeLower {
                     // ManagedObject Drop transfers captures to supervised cleanup.
                     // The lower has never owned them. Await physical retirement
                     // before announcing rejection to either observer.
-                    let error = if reusable {
-                        // End contains only a concrete transaction already held
-                        // by its pending Begin, never application operation data/
-                        // context. Its dormant slot remains reserved across retry.
-                        drop(payload.get().lock().unwrap().take());
-                        error
-                    } else {
-                        drop(payload);
-                        receipt.wait().await.err().unwrap_or(error)
-                    };
-                    if let Some(id) = begin_id {
-                        rejected_runtime.end_loans.lock().unwrap().remove(&id);
-                    }
-                    if let Some(index) = barrier_index {
-                        rejected_runtime.release_barrier(index);
-                    }
+                    drop(payload);
+                    let error = receipt.wait().await.err().unwrap_or(error);
                     published.publish(Err(error.clone()));
                     return Err(error);
                 }
@@ -753,9 +499,6 @@ impl RuntimeLower {
             // Dormant payload/continuation capacity remains owned until processing.
             Ok((activity, accepted, payload))
         };
-        // Termination is pure internal log work with pre-reserved dormant
-        // capacity: no application/provider code runs during its admission.
-        // It cannot be starved by ordinary callback-lane records.
         let initial_runtime = self.self_owner();
         let initial_manager = continuation.clone();
         let work: ApiFuture<'static, _> = Box::pin(async move {
@@ -764,34 +507,22 @@ impl RuntimeLower {
                     .ensure_first(initial_manager, asynchronous)
                     .await?;
             }
-            if let Some(permit) = permit {
-                permit.run_future(body).await
-            } else {
-                body.await
-            }
+            permit.run_future(body).await
         });
         let observation = admission.clone();
         self.live.count.fetch_add(1, Ordering::AcqRel);
         let driver = Driver(self.live.clone());
         let runtime = self.self_owner();
-        if let Some(grant) = &supplied {
-            grant.submitted.store(true, Ordering::Release);
-        }
         // This bounded driver retains OwnedCall until physical completion. Client
         // Drop never reaches OwnedCall::drop or cancels accepted admission/retry.
         drop(self.drivers.spawn(async move {
             let _driver = driver;
             match work.await {
                 Ok((activity, mut accepted, payload)) => {
-                    if let Some(id) = end_id {
-                        runtime.end_loans.lock().unwrap().remove(&id);
-                    }
                     continuation.start_completion(activity.clone());
                     continuation.flush(Ok(()));
                     if latency_sensitive {
-                        if let Some(grant) = dispatch {
-                            runtime.schedule_group(continuation.clone(), grant);
-                        }
+                        runtime.schedule_group(continuation.clone());
                     }
                     drop(publication);
                     let quorum = accepted
@@ -804,24 +535,12 @@ impl RuntimeLower {
                     let _ = activity.processing.wait().await;
                     let receipt = payload.receipt();
                     drop(payload);
-                    if !reusable {
-                        let _ = receipt.wait().await;
-                    }
-                    if let Some(index) = barrier_index {
-                        runtime.release_barrier(index);
-                    }
+                    let _ = receipt.wait().await;
                 }
                 Err(error) => {
-                    if let Some(index) = barrier_index {
-                        runtime.release_barrier(index);
-                    }
-                    if let Some(id) = begin_id {
-                        runtime.end_loans.lock().unwrap().remove(&id);
-                    }
                     observation.publish(Err(error));
                 }
             }
-            drop(supplied);
         }));
         Ok(admission)
     }
@@ -843,7 +562,6 @@ impl RuntimeLower {
         {
             let mut group = self.group.lock().unwrap();
             group.needed = false;
-            group.pending.clear();
         }
         self.drained().await;
         // Reset only after every old-generation accepted continuation retires.
@@ -853,11 +571,7 @@ impl RuntimeLower {
             needed: false,
             running: false,
             delay_ms: 2,
-            pending: Vec::new(),
         };
-        let endings = std::mem::take(&mut *self.end_loans.lock().unwrap());
-        let barriers = self.barrier_pool.lock().unwrap().take();
-        drop((endings, barriers));
         self.disposal.drained().await;
     }
 
@@ -903,25 +617,18 @@ impl RuntimeLower {
     ) -> Result<()> {
         self.fence_publication();
         self.publications_drained().await;
-        manager
-            .local_boundary(12, event)?
-            .processing
-            .wait()
-            .await
-            .as_ref()
-            .clone()?;
+        let boundary = manager.local_boundary(12, event)?;
+        let flushed = boundary.flush.wait().await.as_ref().clone();
+        let applied = boundary.apply.wait().await.as_ref().clone();
+        let processed = boundary.processing.wait().await.as_ref().clone();
         self.stop().await;
-        Ok(())
+        // Native terminal processing completion is not successful flush/Apply.
+        flushed.and(applied).and(processed)
     }
 
     #[cfg(test)]
     pub(crate) fn publications_fenced(&self) -> bool {
         !self.publication.state.lock().unwrap().0
-    }
-
-    #[cfg(test)]
-    pub(crate) fn barrier_loan(&self, index: usize) -> Arc<LogReservation> {
-        self.barrier_pool.lock().unwrap().as_ref().unwrap().loans[index].clone()
     }
 
     #[cfg(test)]

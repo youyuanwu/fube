@@ -111,7 +111,6 @@ fn local_maintenance_batch_validates_head_identity_anchor_and_pins() {
     let index = log.indexing(1, zero()).unwrap();
     // Indexing is not head movement: EndCheckpoint still describes original head.
     let reader = log.pin(0).unwrap();
-    log.begin_maintenance().unwrap();
     let checkpoint = log.begin_checkpoint(1, None).unwrap();
     log.end_checkpoint().unwrap();
     log.complete_checkpoint().unwrap();
@@ -133,7 +132,6 @@ fn local_maintenance_batch_validates_head_identity_anchor_and_pins() {
         (head_lsn, head_psn, head_offset),
         (1, 8, truncation.position - index)
     );
-    log.end_maintenance();
 }
 
 #[test]
@@ -305,14 +303,13 @@ async fn pending_snapshot_quota_is_owned_before_spawn_and_survives_observer_drop
 }
 
 #[test]
-fn memory_barrier_credit_renews_only_after_final_retained_record_release() {
+fn fidelity_memory_allocation_retires_only_after_final_retained_record_release() {
     let mut log = MemoryLog::new(512 * 1024).unwrap();
     log.bootstrap().unwrap();
     let wire = Record {
         lsn: -1,
         kind: RecordKind::Barrier { last_stable_lsn: 0 },
     };
-    let credit = log.reserve_reusable(&wire).unwrap();
     let node = RecordNode::new(
         Record {
             lsn: 2,
@@ -322,12 +319,10 @@ fn memory_barrier_credit_renews_only_after_final_retained_record_release() {
         None,
     )
     .unwrap();
-    node.retain_memory(credit.take().unwrap());
+    node.retain_memory(log.reserve(&wire).unwrap());
     log.append_logical(node.clone()).unwrap();
     log.flush();
-    assert!(!credit.available());
     let pin = log.pin(0).unwrap();
-    log.begin_maintenance().unwrap();
     let index = log.indexing(2, zero()).unwrap();
     log.begin_checkpoint(2, None).unwrap();
     log.end_checkpoint().unwrap();
@@ -335,18 +330,17 @@ fn memory_barrier_credit_renews_only_after_final_retained_record_release() {
     assert!(!log.reclaim(index).unwrap());
     log.unpin(pin);
     assert!(log.reclaim(index).unwrap());
-    assert!(
-        !credit.available(),
-        "external record observer still owns its bytes"
-    );
+    let before = log.allocated_bytes();
     drop(node);
-    assert!(credit.available());
+    assert!(
+        log.allocated_bytes() < before,
+        "external record observer owned its allocation until final Drop"
+    );
     let reused = RecordNode::new(Record { lsn: 3, ..wire }, None, None).unwrap();
-    reused.retain_memory(credit.take().unwrap());
+    reused.retain_memory(log.reserve(reused.record()).unwrap());
     log.append_logical(reused).unwrap();
     log.flush();
     assert_eq!(log.flushed_lsn, 3);
-    log.end_maintenance();
 }
 
 struct Lock {
@@ -440,6 +434,80 @@ async fn dispose_retains_native_list_and_retries_but_retires_successful_work_per
 }
 
 #[test]
+fn fidelity_uniform_allocation_has_no_control_preference_or_synthetic_information_on_failure() {
+    use super::{processor::KernelManager, provider::ProviderDirectory, transaction::RetryRuntime};
+    let execution = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entry = execution.enter();
+    let manager = KernelManager::fresh(
+        ProviderDirectory::preinitialized([], None).unwrap(),
+        Arc::new(RetryRuntime::default()),
+    );
+    manager.open_memory(512 * 1024).unwrap();
+    let memory = manager.memory().unwrap();
+    let ordinary = Record {
+        lsn: -1,
+        kind: RecordKind::Barrier { last_stable_lsn: 0 },
+    };
+    let mut owners = Vec::new();
+    {
+        let log = memory.lock().unwrap();
+        while let Ok(retained) = log.reserve(&ordinary) {
+            owners.push(retained);
+        }
+    }
+    let before = {
+        let log = memory.lock().unwrap();
+        (
+            log.tail_position,
+            log.events.clone(),
+            manager.records().len(),
+        )
+    };
+    for kind in [
+        RecordKind::End {
+            transaction_id: 300,
+            committed: true,
+        },
+        RecordKind::Barrier { last_stable_lsn: 0 },
+        RecordKind::UpdateEpoch {
+            epoch: zero(),
+            primary_replica_id: 0,
+            timestamp_ticks: 0,
+        },
+    ] {
+        let error = memory
+            .lock()
+            .unwrap()
+            .reserve(&Record { lsn: -1, kind })
+            .err()
+            .unwrap();
+        assert!(super::status::Status::InsufficientResources.matches(&error));
+        assert!(!super::status::retryable(&error));
+    }
+    // Exhaust the REAL allocator remainder without fault injection. A restored
+    // preferential physical pool would make this counterexample fail.
+    let remainder = memory.lock().unwrap().occupy_remaining_allocation();
+    let rejected = manager.local_boundary(12, 4).err().unwrap();
+    assert!(super::status::Status::InsufficientResources.matches(&rejected));
+    let log = memory.lock().unwrap();
+    assert_eq!(
+        (
+            log.tail_position,
+            log.events.clone(),
+            manager.records().len()
+        ),
+        before
+    );
+    drop(log);
+    drop(remainder);
+    drop(owners);
+    assert!(memory.lock().unwrap().reserve(&ordinary).is_ok());
+}
+
+#[test]
 fn epoch_pressure_rejects_before_log_map_pv_or_physical_publication() {
     use super::{processor::KernelManager, provider::ProviderDirectory, transaction::RetryRuntime};
     let manager = KernelManager::fresh(
@@ -453,7 +521,7 @@ fn epoch_pressure_rejects_before_log_map_pv_or_physical_publication() {
         .unwrap();
     let _entered = runtime.enter();
     manager.open_memory(512 * 1024).unwrap();
-    for number in 1..128 {
+    for number in 1..=128 {
         let before_records = manager.records().len();
         let memory = manager.memory().unwrap();
         let before = {
@@ -486,12 +554,10 @@ fn epoch_pressure_rejects_before_log_map_pv_or_physical_publication() {
             );
             let memory = manager.memory().unwrap();
             let mut memory = memory.lock().unwrap();
-            memory.begin_maintenance().unwrap();
-            memory.indexing(1, epoch).unwrap(); // protected maintenance remains available
-            memory.end_maintenance();
+            memory.indexing(1, epoch).unwrap(); // ordinary allocation, no protected pool
             return;
         }
         manager.flush(Ok(()));
     }
-    panic!("control retention must reach its finite bound");
+    panic!("finite Rust progress-vector bound must reject without partial publication");
 }

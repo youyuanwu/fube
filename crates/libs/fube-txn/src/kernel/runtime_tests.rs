@@ -715,11 +715,9 @@ async fn native_runtime_bounds_live_cache_and_snapshot_ownership_before_lower_as
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn phase1d_reserved_dispatch_progresses_at_full_lower_budget_and_loan_renews_after_retirement(
-) {
-    use crate::TransactionBase;
+async fn fidelity_group_barrier_obeys_native_queue_full_backoff_then_actual_retirement() {
     let settings = fube_data::Settings {
-        queue_operations: 40,
+        queue_operations: 1,
         operation_bytes: 4096,
         operation_segments: 64,
         queue_bytes: 64 * 1024,
@@ -728,7 +726,92 @@ async fn phase1d_reserved_dispatch_progresses_at_full_lower_budget_and_loan_rene
     };
     let f = Fixture::using_settings(true, settings.clone()).await;
     f.runtime.enable_barriers(&f.manager).unwrap();
-    let initial = f.runtime.barrier_loan(0);
+    let warm = f.manager.new_transaction().unwrap();
+    warm.add_operation(None, None, Some(payload(0)), 10, None)
+        .unwrap();
+    warm.commit().await.unwrap();
+    f.runtime.group_idle().await;
+    f.runtime.group_attempts.lock().unwrap().clear();
+    let before = f.lower.snapshot().progress.assigned;
+    f.withheld_quorum().await;
+    let transaction = f.manager.new_transaction().unwrap();
+    transaction
+        .add_operation(None, None, Some(payload(1)), 10, None)
+        .unwrap();
+    drop(transaction.commit()); // accepted worker survives observer abandonment
+    f.until(before + 1).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.runtime.group_attempts.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let rejected = f.runtime.group_attempts.lock().unwrap().clone();
+    assert_eq!((rejected[0].0, rejected[1].0), (2, 4));
+    assert!(rejected.iter().all(|(_, status)| status
+        .as_ref()
+        .is_err_and(|error| super::status::Status::QueueFull.matches(error))));
+    assert_eq!(
+        f.lower.snapshot().progress.assigned,
+        before + 1,
+        "failed Barrier consumes no LSN"
+    );
+    assert!(
+        !f.manager.activity(before + 1).apply.is_completed(),
+        "no preferential dispatch while lower remains full"
+    );
+    assert!(
+        !f.manager.faults.is_closing(),
+        "native expected queue-full is not a processor fault"
+    );
+    f.configure().await;
+    f.runtime.group_idle().await;
+    f.manager
+        .activity(before + 1)
+        .result
+        .wait()
+        .await
+        .as_ref()
+        .clone()
+        .unwrap();
+    assert!(f
+        .runtime
+        .group_attempts
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, result)| result.is_ok()));
+    assert_eq!(
+        f.runtime.group_attempts.lock().unwrap().last().unwrap().0,
+        2,
+        "successful processing resets native delay before idle barrier"
+    );
+    f.runtime.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fidelity_end_and_barrier_share_queue_full_with_ordinary_writes_and_transaction_retries() {
+    use super::record::{Record, RecordKind};
+    use crate::TransactionBase;
+    let f = Fixture::using_settings(
+        true,
+        fube_data::Settings {
+            queue_operations: 4,
+            queue_bytes: 64 * 1024,
+            operation_bytes: 4096,
+            operation_segments: 64,
+            ..Default::default()
+        },
+    )
+    .await;
+    f.runtime.enable_barriers(&f.manager).unwrap();
+    let warm = f.manager.new_transaction().unwrap();
+    warm.add_operation(None, None, Some(payload(0)), 10, None)
+        .unwrap();
+    warm.commit().await.unwrap();
+    f.runtime.group_idle().await;
+    let before = f.lower.snapshot().progress.assigned;
     f.withheld_quorum().await;
     let transaction = f.manager.new_transaction().unwrap();
     transaction
@@ -740,73 +823,92 @@ async fn phase1d_reserved_dispatch_progresses_at_full_lower_budget_and_loan_rene
         .try_reserve()
         .unwrap()
         .run_owned(move || {
-            for key in 2..=5 {
+            for key in 2..=4 {
                 writes.add_operation(None, None, Some(payload(key)), 10, None)?;
             }
-            assert!(writes
-                .add_operation(None, None, Some(payload(6)), 10, None)
-                .is_err());
             Ok(())
         })
         .await
         .unwrap();
-    assert_eq!(f.manager.tail(), 7);
-    assert_eq!(f.lower.snapshot().owned_operations, 40);
-    let observed = transaction.clone();
-    let commit = tokio::spawn(async move { observed.commit().await });
-    f.until(9).await;
-    tokio::time::timeout(Duration::from_secs(2), f.manager.activity(8).apply.wait())
+    assert_eq!(f.lower.snapshot().owned_operations, 4);
+    let end = f
+        .manager
+        .observe_async(
+            Record {
+                lsn: -1,
+                kind: RecordKind::End {
+                    transaction_id: transaction.get_transaction_id(),
+                    committed: true,
+                },
+            },
+            Some(transaction.clone()),
+            None,
+        )
         .await
-        .unwrap()
-        .as_ref()
-        .clone()
+        .err()
         .unwrap();
-    assert_eq!(transaction.get_commit_sequence_number(), 8);
-    assert!(!f.manager.activity(8).replication.is_completed());
-    assert_eq!(f.lower.snapshot().owned_operations, 40);
-    assert!(f.lower.snapshot().owned_bytes <= settings.queue_bytes);
-    f.configure().await;
-    commit.await.unwrap().unwrap();
-    f.runtime.group_idle().await;
-    while f.manager.tail() < 22 {
-        f.barrier().await;
-    }
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !initial.is_available() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    // Same reservation, restored by actual retained-queue charge retirement.
-    assert!(Arc::ptr_eq(&initial, &f.runtime.barrier_loan(0)));
-    f.withheld_quorum().await;
     let manager = f.manager.clone();
-    let sequence = f
+    let barrier = f
         .native
         .execution()
         .try_reserve()
         .unwrap()
-        .run_owned(move || manager.barrier(0).map(|activity| activity.node.lsn()))
+        .run_owned(move || manager.barrier(0).map(|a| a.node.lsn()))
         .await
+        .err()
         .unwrap();
-    let unavailable_while_owned = !initial.is_available();
-    assert!(!f.manager.activity(sequence).replication.is_completed());
+    assert!(super::status::Status::QueueFull.matches(&end));
+    assert!(super::status::Status::QueueFull.matches(&barrier));
+    assert_eq!(f.lower.snapshot().progress.assigned, before + 4);
+    assert_eq!(f.manager.map.latest_records().len(), 1);
+    drop(transaction.commit()); // native retry is still independently owned
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(f.lower.snapshot().progress.assigned, before + 4);
+    assert_eq!(transaction.get_state(), crate::TransactionState::Committing);
     f.configure().await;
-    f.manager
-        .activity(sequence)
-        .result
-        .wait()
-        .await
-        .as_ref()
-        .clone()
-        .unwrap();
-    assert!(f.lower.snapshot().owned_operations <= 40);
+    f.until(before + 6).await;
+    f.runtime.group_idle().await;
+    assert_eq!(transaction.get_state(), crate::TransactionState::Committed);
+    assert_eq!(transaction.get_commit_sequence_number(), before + 5);
     f.runtime.stop().await;
-    assert!(
-        unavailable_while_owned,
-        "reused loan stays charged while real quorum/queue ownership remains"
-    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fidelity_native_upper_throttle_applies_only_to_begin_operation_not_end_or_barrier() {
+    let f = Fixture::new(true).await;
+    let transaction = f.manager.new_transaction().unwrap();
+    transaction
+        .add_operation(None, None, Some(payload(1)), 10, None)
+        .unwrap();
+    f.manager
+        .script_throttle([Err(super::status::Status::ServiceTooBusy.error())]);
+    f.barrier().await; // must not consume the Begin/Operation throttle outcome
+    let writes = transaction.clone();
+    let error = f
+        .native
+        .execution()
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || writes.add_operation(None, None, Some(payload(2)), 10, None))
+        .await
+        .unwrap_err();
+    assert!(super::status::Status::ServiceTooBusy.matches(&error));
+    assert_eq!(f.lower.snapshot().progress.assigned, 2);
+    let writes = transaction.clone();
+    f.native
+        .execution()
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || writes.add_operation(None, None, Some(payload(2)), 10, None))
+        .await
+        .unwrap();
+    f.manager
+        .script_throttle([Err(super::status::Status::ServiceTooBusy.error())]);
+    let commit = transaction.commit();
+    f.until(5).await; // End bypasses upper throttle, still ordinary lower admission
+    f.barrier().await;
+    commit.await.unwrap();
+    f.runtime.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

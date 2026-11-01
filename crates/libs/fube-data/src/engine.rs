@@ -187,74 +187,8 @@ struct Budget {
 }
 
 struct Charge {
-    operation: Option<OwnedSemaphorePermit>,
-    bytes: Option<OwnedSemaphorePermit>,
-    recycle: Option<Weak<LogReservation>>,
-}
-impl Drop for Charge {
-    fn drop(&mut self) {
-        if let Some(reservation) = self.recycle.as_ref().and_then(Weak::upgrade) {
-            let mut state = reservation.state.lock().unwrap();
-            if matches!(*state, LogReservationState::Accepted) {
-                *state = LogReservationState::Available(Charge {
-                    operation: self.operation.take(),
-                    bytes: self.bytes.take(),
-                    recycle: self.recycle.take(),
-                });
-            }
-        }
-    }
-}
-
-/// A finite lower operation/byte loan reserved before upper transaction begin.
-/// It carries no membership, role or epoch authority. Rejection restores the
-/// same loan; accepted submission transfers it into native queue ownership.
-pub struct LogReservation {
-    renewable: bool,
-    owner: u64,
-    limit: usize,
-    state: Mutex<LogReservationState>,
-}
-enum LogReservationState {
-    Available(Charge),
-    InFlight,
-    Accepted,
-}
-impl LogReservation {
-    fn take(self: &Arc<Self>, owner: u64, bytes: usize) -> Result<Charge> {
-        if owner != self.owner || bytes > self.limit {
-            return Err(Error::InvalidInput("log reservation owner/size mismatch"));
-        }
-        let mut state = self.state.lock().unwrap();
-        match std::mem::replace(&mut *state, LogReservationState::InFlight) {
-            LogReservationState::Available(mut charge) => {
-                if self.renewable {
-                    charge.recycle = Some(Arc::downgrade(self));
-                }
-                Ok(charge)
-            }
-            previous => {
-                *state = previous;
-                Err(Error::new(
-                    fube_runtime::ErrorKind::ReplicationQueueFull,
-                    "log reservation not available",
-                ))
-            }
-        }
-    }
-    fn restore(&self, charge: Charge) {
-        let mut state = self.state.lock().unwrap();
-        assert!(matches!(*state, LogReservationState::InFlight));
-        *state = LogReservationState::Available(charge);
-    }
-    /// True only after all producer/queue/copy/retransmission owners of the
-    /// previous charge have retired. No budget is released to ordinary traffic.
-    pub fn is_available(&self) -> bool {
-        matches!(
-            *self.state.lock().unwrap(),
-            LogReservationState::Available(_)
-        )
-    }
+    _operation: OwnedSemaphorePermit,
+    bytes: OwnedSemaphorePermit,
 }
 
 impl Budget {
@@ -295,9 +229,8 @@ impl Budget {
             )
             .map_err(|_| Error::ResourceLimit("engine byte budget"))?;
         Ok(Charge {
-            operation: operations.split(1),
-            bytes: byte_permits.split(bytes),
-            recycle: None,
+            _operation: operations.split(1).unwrap(),
+            bytes: byte_permits.split(bytes).unwrap(),
         })
     }
 }
@@ -1104,7 +1037,6 @@ impl Engine {
                         charge: Some(charge),
                         cancellation,
                         reply: Some(reply.into()),
-                        reserved: None,
                     })
                     .map_err(|error| match error {
                         mpsc::error::TrySendError::Full(_) => Error::new(
@@ -1140,86 +1072,6 @@ impl Engine {
     #[cfg(feature = "qualification")]
     pub(crate) fn set_root_controls(&self, enabled: bool) {
         self.native_root_dispatch.store(enabled, Ordering::Release);
-    }
-
-    pub(crate) fn reserve_log_operation(&self, bytes: usize) -> Result<Arc<LogReservation>> {
-        self.reserve_log_capacity(bytes, false)
-    }
-    pub(crate) fn reserve_barrier_operation(&self, bytes: usize) -> Result<Arc<LogReservation>> {
-        self.reserve_log_capacity(bytes, true)
-    }
-    fn reserve_log_capacity(&self, bytes: usize, renewable: bool) -> Result<Arc<LogReservation>> {
-        ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
-        let _admission = self.shared.admission.lock().unwrap();
-        self.check()?;
-        if bytes == 0 || bytes > self.settings.queue_bytes {
-            return Err(Error::InvalidInput("invalid log reservation size"));
-        }
-        let charge = self.shared.budget.acquire(bytes).map_err(|cause| {
-            Error::with_cause(
-                fube_runtime::ErrorKind::ReplicationQueueFull,
-                "log termination reservation",
-                cause,
-            )
-        })?;
-        Ok(Arc::new(LogReservation {
-            renewable,
-            owner: self.shared.engine_id,
-            limit: bytes,
-            state: Mutex::new(LogReservationState::Available(charge)),
-        }))
-    }
-
-    pub(crate) fn submit_reserved(
-        &self,
-        data: OperationData,
-        reservation: Arc<LogReservation>,
-        cancellation: Cancellation,
-    ) -> ServiceFuture<'_, Replication> {
-        Box::pin(async move {
-            ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
-            let (reply, result) = oneshot::channel();
-            {
-                let _admission = self.shared.admission.lock().unwrap();
-                self.check()?;
-                self.check_write_deadline()?;
-                if cancellation.is_cancelled() {
-                    return Err(Error::new(
-                        fube_runtime::ErrorKind::Canceled,
-                        "reserved log canceled before enqueue",
-                    ));
-                }
-                if data.bytes() > self.settings.operation_bytes
-                    || data.segments().len() > self.settings.operation_segments
-                {
-                    return Err(Error::new(
-                        fube_runtime::ErrorKind::ReplicationOperationTooLarge,
-                        "reserved log sizing",
-                    ));
-                }
-                let charge = reservation.take(self.shared.engine_id, data.retained_bytes())?;
-                // Producer charges cover retained queue entries AND queued
-                // writes. The loan already owns one of the bounded channel/
-                // queue slots; ordinary submissions cannot consume that slot.
-                self.writes
-                    .try_send(Submit {
-                        expected_epoch: None,
-                        data: Some(data),
-                        charge: Some(charge),
-                        cancellation,
-                        reply: Some(reply.into()),
-                        reserved: Some(reservation),
-                    })
-                    .map_err(|error| match error {
-                        mpsc::error::TrySendError::Full(_) => Error::new(
-                            fube_runtime::ErrorKind::ReplicationQueueFull,
-                            "reserved write channel",
-                        ),
-                        mpsc::error::TrySendError::Closed(_) => Error::Closed,
-                    })?;
-            }
-            result.await.map_err(|_| Error::Closed)?
-        })
     }
 
     fn check_write_deadline(&self) -> Result<()> {
@@ -1609,14 +1461,6 @@ struct Submit {
     charge: Option<Charge>,
     cancellation: Cancellation,
     reply: Option<Reply<Replication>>,
-    reserved: Option<Arc<LogReservation>>,
-}
-impl Drop for Submit {
-    fn drop(&mut self) {
-        if let (Some(reservation), Some(charge)) = (&self.reserved, self.charge.take()) {
-            reservation.restore(charge);
-        }
-    }
 }
 
 enum Command {
@@ -2364,9 +2208,6 @@ impl Owner {
             Ok(sequence) => {
                 self.charges
                     .insert(sequence, Arc::new(write.charge.take().unwrap()));
-                if let Some(reservation) = &write.reserved {
-                    *reservation.state.lock().unwrap() = LogReservationState::Accepted;
-                }
                 let (completion, receiver) = watch::channel(None);
                 self.completions.insert(sequence, completion);
                 self.publish();
@@ -4637,8 +4478,7 @@ impl Owner {
                             || operation.epoch != operation.epoch.primary()
                             || operation.data.bytes() > self.settings.operation_bytes
                             || operation.data.segments().len() > self.settings.operation_segments
-                            || operation.data.retained_bytes()
-                                > charge.bytes.as_ref().unwrap().num_permits()
+                            || operation.data.retained_bytes() > charge.bytes.num_permits()
                         {
                             self.fail(Error::Protocol("invalid authentic replay checkpoint"));
                             return;
@@ -4721,18 +4561,13 @@ impl Owner {
                         let data = data.unwrap_or_else(|| OperationData::new(Vec::new()).unwrap());
                         if data.bytes() > self.settings.operation_bytes
                             || data.segments().len() > self.settings.operation_segments
-                            || data.retained_bytes() > charge.bytes.as_ref().unwrap().num_permits()
+                            || data.retained_bytes() > charge.bytes.num_permits()
                         {
                             self.fail(Error::ResourceLimit("provider copy item"));
                             return;
                         }
-                        let retained = charge
-                            .bytes
-                            .as_mut()
-                            .unwrap()
-                            .split(data.retained_bytes())
-                            .unwrap();
-                        charge.bytes = Some(retained);
+                        let retained = charge.bytes.split(data.retained_bytes()).unwrap();
+                        charge.bytes = retained;
                         let sequence = build.next;
                         let Some(next) = build.next.checked_add(1).filter(|next| *next < i64::MAX)
                         else {

@@ -8,7 +8,6 @@ use fube_runtime::ApiFuture;
 use std::sync::Arc;
 
 pub use crate::api::Progress;
-pub use crate::engine::LogReservation;
 pub use crate::engine::{EngineSnapshot, PeerSnapshot};
 
 /// Explicit upper lifecycle composition, never SDK discovery or a second binder.
@@ -39,46 +38,6 @@ impl VolatileLogInitialization for crate::FabricReplicator {
     }
 }
 
-/// Bounded upper-log support, not a new native control/data authority.
-pub trait ReservedLogReplication: Send + Sync {
-    fn reserve_log_operation(&self, retained_bytes: usize) -> Result<Arc<LogReservation>>;
-    /// Renewable protected Barrier capacity; the same permits return only after
-    /// final native queue/session charge retirement, never at quorum alone.
-    fn reserve_barrier_operation(&self, retained_bytes: usize) -> Result<Arc<LogReservation>>;
-    fn replicate_reserved(
-        &self,
-        data: OperationData,
-        reservation: Arc<LogReservation>,
-        cancellation: Cancellation,
-    ) -> ApiFuture<'_, crate::ReplicationAdmission>;
-}
-impl ReservedLogReplication for crate::FabricReplicator {
-    fn reserve_log_operation(&self, retained_bytes: usize) -> Result<Arc<LogReservation>> {
-        self.engine.reserve_log_operation(retained_bytes)
-    }
-    fn reserve_barrier_operation(&self, retained_bytes: usize) -> Result<Arc<LogReservation>> {
-        self.engine.reserve_barrier_operation(retained_bytes)
-    }
-    fn replicate_reserved(
-        &self,
-        data: OperationData,
-        reservation: Arc<LogReservation>,
-        cancellation: Cancellation,
-    ) -> ApiFuture<'_, crate::ReplicationAdmission> {
-        Box::pin(async move {
-            let accepted = self
-                .engine
-                .submit_reserved(data, reservation, cancellation)
-                .await?;
-            Ok(crate::ReplicationAdmission {
-                sequence_number: accepted.sequence,
-                completion: crate::ReplicationCompletion {
-                    receiver: accepted.completion,
-                },
-            })
-        })
-    }
-}
 pub use fube_runtime::extensions::EpochDomains;
 
 /// Best-effort fube diagnostics, not native control or compatibility evidence.

@@ -219,6 +219,7 @@ impl ControlledLower {
 }
 
 pub(crate) struct Activity {
+    io_error: Mutex<Option<Error>>,
     pub(crate) previous_stable: AtomicI64,
     pub(crate) node: Arc<RecordNode>,
     pub(crate) flush: Completion<()>,
@@ -232,6 +233,7 @@ pub(crate) struct Activity {
 impl Activity {
     pub(crate) fn new(node: Arc<RecordNode>, primary: bool) -> Arc<Self> {
         Arc::new(Self {
+            io_error: Mutex::new(None),
             previous_stable: AtomicI64::new(-1),
             node,
             flush: Completion::new(),
@@ -467,6 +469,9 @@ impl KernelManager {
         let mut memory = super::memory_log::MemoryLog::new(capacity)?;
         for record in memory.bootstrap()? {
             let activity = self.replay_record(record.encode()?, None)?;
+            activity
+                .node
+                .retain_memory(memory.reserve(activity.node.record())?);
             for entry in &mut memory.entries {
                 if entry
                     .logical
@@ -678,10 +683,13 @@ impl KernelManager {
         } else if lsn == log.tail + 1 {
             log.tail = lsn;
             if let Some(memory) = self.memory() {
-                memory
-                    .lock()
-                    .unwrap()
-                    .append_logical(activity.node.clone())?;
+                let mut memory = memory.lock().unwrap();
+                if let Err(error) = memory.append_logical(activity.node.clone()) {
+                    // Actual lower admission/map/LSN are already owned. Local
+                    // write failure is failed flush, never an admission rollback.
+                    memory.fail_writer(error.clone());
+                    *activity.io_error.lock().unwrap() = Some(error);
+                }
             }
             log.ordered.push(activity);
             loop {
@@ -691,7 +699,11 @@ impl KernelManager {
                 };
                 log.tail = next;
                 if let Some(memory) = self.memory() {
-                    memory.lock().unwrap().append_logical(queued.node.clone())?;
+                    let mut memory = memory.lock().unwrap();
+                    if let Err(error) = memory.append_logical(queued.node.clone()) {
+                        memory.fail_writer(error.clone());
+                        *queued.io_error.lock().unwrap() = Some(error);
+                    }
                 }
                 log.ordered.push(queued);
             }
@@ -893,21 +905,21 @@ impl KernelManager {
             None,
         )?;
         let activity = Activity::new(node, self.role() == ProcessingRole::Primary);
-        // Control/PV admission is preflighted in protected space before any
+        // Uniform allocation/PV admission is preflighted before any
         // map/log/epoch mutation. Holding log→memory prevents a stale preview.
         let memory_owner = self.memory();
         let mut memory = memory_owner.as_ref().map(|memory| memory.lock().unwrap());
         if let Some(memory) = memory.as_mut() {
             if memory.vector.len() >= 128 {
-                return Err(Status::ServiceTooBusy.error());
+                return Err(Status::InsufficientResources.error());
             }
-            let retention = memory.reserve_control(activity.node.record())?;
+            let retention = memory.reserve(activity.node.record())?;
             activity.node.retain_memory(retention);
             memory.preflight_logical(&activity.node)?;
             memory
                 .vector
                 .try_reserve(1)
-                .map_err(|_| Status::ServiceTooBusy.error())?;
+                .map_err(|_| Status::InsufficientResources.error())?;
         }
         self.map.admit(activity.node.clone())?;
         if let Some(memory) = memory.as_mut() {
@@ -1006,7 +1018,11 @@ impl KernelManager {
             .map(KernelTransaction::replay)
             .transpose()?
             .map(|transaction| transaction as Arc<dyn TransactionBase>);
+        let retention = self.reserve_memory(&record)?;
         let node = RecordNode::new(record, transaction, None)?;
+        if let Some(retention) = retention {
+            node.retain_memory(retention);
+        }
         let activity = Activity::new(node, false);
         self.append(activity.clone())?;
         activity.replication.complete(Ok(()));
@@ -1061,12 +1077,27 @@ impl KernelManager {
     pub(crate) fn flush(&self, result: Result<()>) {
         let launch = {
             let mut log = self.log.lock().expect("log poisoned");
-            if result.is_ok() {
+            let batch = log.ordered[log.flushed..].to_vec();
+            // Native terminal writer error affects this/later batches; earlier
+            // already-completed successful flush/Apply is not retroactively failed.
+            let failed = self
+                .faults
+                .log_error()
+                .or_else(|| result.as_ref().err().cloned())
+                .or_else(|| {
+                    batch
+                        .iter()
+                        .find_map(|a| a.io_error.lock().unwrap().clone())
+                });
+            if let Some(error) = &failed {
+                if let Some(memory) = self.memory() {
+                    memory.lock().unwrap().fail_writer(error.clone());
+                }
+            } else {
                 if let Some(memory) = self.memory() {
                     memory.lock().unwrap().flush();
                 }
             }
-            let batch = log.ordered[log.flushed..].to_vec();
             log.flushed = log.ordered.len();
             #[cfg(test)]
             if let Some((entered, release)) = self.flush_extracted.lock().unwrap().take() {
@@ -1079,15 +1110,17 @@ impl KernelManager {
             // release log before enqueue: a later Barrier could otherwise
             // overtake this extracted prefix. No Apply/provider runs here.
             let mut dispatch = self.dispatch.lock().expect("dispatch poisoned");
-            for activity in &batch {
-                activity.flush.complete(result.clone());
-                if let Err(error) = &result {
+            dispatch.flushed.extend(batch.into_iter().map(|activity| {
+                let flushed = failed.clone().map_or(Ok(()), Err);
+                // Native completes each actual owned record with its failed
+                // writer status, then dispatches it (LoggingReplicatorImpl.cpp:
+                // 1306–1337). First global flush result must not hide local I/O.
+                if let Err(error) = &flushed {
                     self.faults.process_log_error(self.role(), error.clone());
                 }
-            }
-            dispatch
-                .flushed
-                .extend(batch.into_iter().map(|activity| (activity, result.clone())));
+                activity.flush.complete(flushed.clone());
+                (activity, flushed)
+            }));
             let launch = !dispatch.running;
             dispatch.running = true;
             launch

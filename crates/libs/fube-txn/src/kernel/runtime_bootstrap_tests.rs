@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::oneshot;
 struct Core {
+    partition: uuid::Uuid,
     fail_role: AtomicBool,
     manager: Arc<KernelManager>,
     lower: Mutex<Weak<FabricReplicator>>,
@@ -182,6 +183,7 @@ impl IStatefulServiceFactory for Factory {
             created: self.created.clone(),
             root: self.root,
             core: Arc::new(Core {
+                partition,
                 fail_role: AtomicBool::new(false),
                 manager: KernelManager::fresh(
                     ProviderDirectory::preinitialized([], None)?,
@@ -270,6 +272,185 @@ async fn initialized_host(root: bool) -> (Arc<rap::Host>, Arc<Core>) {
     .await
     .unwrap();
     (host, core)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fidelity_after_lower_lsn_local_write_error_retains_admission_quorum_and_unlock_on_root_and_bound(
+) {
+    use super::provider::{PointEvent, PointProvider, ProviderEntry, ProviderMode};
+    use crate::ITransactionManager;
+    for root in [false, true] {
+        let (host, core) = initialized_host(root).await;
+        let provider = PointProvider::preinitialized("fabric:/write-fault");
+        core.manager.directory.entries.lock().unwrap().insert(
+            10,
+            ProviderEntry {
+                provider: provider.clone(),
+                mode: ProviderMode::Active,
+                deleting_by: None,
+            },
+        );
+        let runtime = core.runtime.lock().unwrap().clone().unwrap();
+        let warm = core.manager.create_transaction().unwrap();
+        provider.write(warm.as_ref(), 10, 0, 0).unwrap();
+        warm.commit().await.unwrap();
+        runtime.group_idle().await;
+        let lower = core.lower.lock().unwrap().upgrade().unwrap();
+        let prefix = lower.snapshot().progress.committed;
+        host.configure(fube_runtime::extensions::NativeReplicaSetConfiguration {
+            epoch: Epoch {
+                data_loss_number: 1,
+                configuration_number: 1 << 32,
+            },
+            replicas: vec![fube_runtime::extensions::NativeReplicaDescriptor {
+                node_id: [3; 16],
+                node_instance: 1,
+                replica_id: 3,
+                incarnation: 100,
+                role: ReplicaRole::ActiveSecondary,
+                previous_role: ReplicaRole::None,
+                up: true,
+                ready: true,
+                must_catch_up: false,
+                address: fube_data::wire::Endpoint {
+                    actor: fube_data::wire::Actor {
+                        partition: core.partition,
+                        replica: 3,
+                        incarnation: uuid::Uuid::new_v4(),
+                    },
+                    address: "127.0.0.1:1".into(),
+                    transport_id: Some(String::new()),
+                }
+                .to_string(),
+                progress: fube_runtime::extensions::ReplicationProgress {
+                    first: 1,
+                    last: prefix,
+                },
+            }],
+            write_quorum: 2,
+            local_member: true,
+        })
+        .await
+        .unwrap();
+        let previous_unlocks = provider
+            .events()
+            .iter()
+            .filter(|e| matches!(e, PointEvent::Unlock { .. }))
+            .count();
+        let successful_prefix = core.manager.activity(warm.get_commit_sequence_number());
+        let flushed_prefix = core.manager.memory().unwrap().lock().unwrap().flushed_lsn;
+        let transaction = core.manager.create_transaction().unwrap();
+        provider.write(transaction.as_ref(), 10, 1, 10).unwrap();
+        let successor = core.manager.create_transaction().unwrap();
+        provider.write(successor.as_ref(), 10, 2, 20).unwrap();
+        let (entered, observed) = std::sync::mpsc::sync_channel(1);
+        let (release, resume) = std::sync::mpsc::sync_channel(1);
+        *runtime.publication_pause.lock().unwrap() = Some((prefix + 1, entered, resume));
+        drop(transaction.commit());
+        tokio::task::spawn_blocking(move || {
+            observed
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        drop(successor.commit());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !core.manager.queued_lsns().contains(&(prefix + 3)) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        core.manager.memory().unwrap().lock().unwrap().write_error = Some(
+            crate::Error::InvalidInput("controlled native memory write failure"),
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while core.manager.tail() < prefix + 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let admitted = core.manager.activity(prefix + 1);
+        assert!(admitted.flush.wait().await.is_err());
+        assert!(admitted.apply.wait().await.is_err());
+        assert!(
+            !admitted.result.is_completed(),
+            "accepted failure still awaits actual quorum"
+        );
+        assert!(!admitted.replication.is_completed());
+        for sequence in prefix + 2..=prefix + 3 {
+            let affected = core.manager.activity(sequence);
+            assert!(affected.flush.wait().await.is_err());
+            assert!(affected.apply.wait().await.is_err());
+            assert!(!affected.result.is_completed());
+        }
+        assert_eq!(
+            core.manager.memory().unwrap().lock().unwrap().flushed_lsn,
+            flushed_prefix
+        );
+        assert!(successful_prefix.flush.wait().await.is_ok());
+        assert!(successful_prefix.apply.wait().await.is_ok());
+        assert_eq!(
+            provider
+                .events()
+                .iter()
+                .filter(|e| matches!(e, PointEvent::Unlock { .. }))
+                .count(),
+            previous_unlocks
+        );
+        assert_eq!(transaction.get_commit_sequence_number(), -1);
+        host.configure(fube_runtime::extensions::NativeReplicaSetConfiguration {
+            epoch: Epoch {
+                data_loss_number: 1,
+                configuration_number: 1 << 32,
+            },
+            replicas: vec![],
+            write_quorum: 1,
+            local_member: true,
+        })
+        .await
+        .unwrap();
+        let failure = admitted.result.wait().await.as_ref().clone().unwrap_err();
+        admitted.processing.wait().await.as_ref().clone().unwrap();
+        for sequence in prefix + 2..=prefix + 3 {
+            let affected = core.manager.activity(sequence);
+            assert!(affected.result.wait().await.is_err());
+            affected.processing.wait().await.as_ref().clone().unwrap();
+        }
+        let before_information = core
+            .manager
+            .memory()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .events
+            .clone();
+        assert!(
+            runtime.finish_generation(&core.manager, 4).await.is_err(),
+            "terminal processing is not successful generation completion"
+        );
+        assert_eq!(
+            core.manager.memory().unwrap().lock().unwrap().events,
+            before_information,
+            "no successful Information across missing write"
+        );
+        runtime.stop().await;
+        assert!(super::status::Status::TransactionAborted.matches(&failure));
+        assert_eq!(core.manager.tail(), prefix + 3);
+        assert_eq!(
+            provider
+                .events()
+                .iter()
+                .filter(|e| matches!(e, PointEvent::Unlock { .. }))
+                .count(),
+            previous_unlocks + 2
+        );
+        assert_eq!(core.manager.faults.reported().len(), 1);
+        drop(host);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
