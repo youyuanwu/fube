@@ -334,7 +334,7 @@ impl GatewayChannel {
             )
             .await?;
             let message = read_bounded(&mut stream, limits.max_frame_bytes).await?;
-            let props = envelope(&message)?;
+            let props = envelope(&message, true)?;
             control_instance(&message, &props).map(|remote| (stream, remote))
         })
         .await
@@ -436,8 +436,11 @@ fn local(error: Error) -> Error {
     }
 }
 
-/// Validate unique transport fields without relying on last-visible properties.
-fn envelope(message: &Message) -> Result<Properties> {
+/// Caller correlation stays unique. Native gateway composition can append a
+/// second identical RelatesTo/ExpectsReply; accept only that evidenced inbound
+/// form, never contradictory values or arbitrary duplicate envelope fields.
+/// Preserve both wire headers in the returned Message.
+fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
     let ids = [
         message::ACTOR,
         message::ACTION,
@@ -449,16 +452,26 @@ fn envelope(message: &Message) -> Result<Properties> {
         message::HIGH_PRIORITY,
         message::IPC,
     ];
-    let mut seen = [false; 9];
+    let mut seen: [Option<&Header>; 9] = [None; 9];
+    let mut repeated = [false; 9];
     if message.headers.len() > MAX_HEADER_COUNT {
         return Err(Error::Protocol("header count exceeds limit"));
     }
     for header in &message.headers {
         if let Some(index) = ids.iter().position(|id| *id == header.id) {
-            if seen[index] {
-                return Err(Error::Protocol("duplicate transport envelope header"));
+            if let Some(previous) = seen[index] {
+                if !native_inbound
+                    || !matches!(header.id, message::RELATES_TO | message::EXPECTS_REPLY)
+                    || previous.value != header.value
+                    || repeated[index]
+                {
+                    return Err(Error::Protocol(
+                        "duplicate or contradictory transport envelope header",
+                    ));
+                }
+                repeated[index] = true;
             }
-            seen[index] = true;
+            seen[index] = Some(header);
         }
     }
     message.properties()
@@ -558,7 +571,7 @@ async fn submit(
         return Err(Error::InvalidInput("foreign channel target"));
     }
     allocation_check(&message, shared.budget.limits)?;
-    let props = envelope(&message).map_err(local)?;
+    let props = envelope(&message, false).map_err(local)?;
     domain_gateway(&message, &props)?;
     let rpc = matches!(submission, Submission::Rpc);
     let class = if matches!(submission, Submission::Reply(_)) {
@@ -899,7 +912,7 @@ fn control_instance(message: &Message, props: &Properties) -> Result<ListenInsta
 async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>) -> Result<()> {
     loop {
         let message = read_bounded(&mut reader, shared.budget.limits.max_frame_bytes).await?;
-        let props = envelope(&message)?;
+        let props = envelope(&message, true)?;
         if props.actor == 1 {
             let remote = control_instance(&message, &props)?;
             shared.inner.lock().unwrap().remote = remote;

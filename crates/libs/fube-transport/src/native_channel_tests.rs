@@ -792,9 +792,13 @@ async fn disconnect_security_controls_and_malformed_duplicate_replies_retire_wit
             }
             _ => {
                 let mut response = reply(sent.properties().unwrap().id, vec![]);
-                response
-                    .headers
-                    .push(Header::relates_to(sent.properties().unwrap().id).unwrap());
+                response.headers.push(
+                    Header::relates_to(MessageId {
+                        guid: [42; 16],
+                        index: 42,
+                    })
+                    .unwrap(),
+                );
                 write_message(&mut peer, &response).await.unwrap();
             }
         }
@@ -804,6 +808,40 @@ async fn disconnect_security_controls_and_malformed_duplicate_replies_retire_wit
             Err(Error::Protocol(_) | Error::Io(_))
         ));
         channel.close(deadline()).await.unwrap();
+    }
+}
+
+#[test]
+fn native_duplicate_allowance_is_narrow_and_finite() {
+    let id = MessageId {
+        guid: [3; 16],
+        index: 19,
+    };
+    for headers in [
+        vec![Header::actor(5).unwrap()],
+        vec![Header::action("Other").unwrap()],
+        vec![
+            Header::message_id(id).unwrap(),
+            Header::message_id(id).unwrap(),
+        ],
+        vec![
+            Header::relates_to(id).unwrap(),
+            Header::relates_to(id).unwrap(),
+            Header::relates_to(id).unwrap(),
+        ],
+        vec![
+            Header::boolean(message::EXPECTS_REPLY, true).unwrap(),
+            Header::boolean(message::EXPECTS_REPLY, true).unwrap(),
+            Header::boolean(message::EXPECTS_REPLY, true).unwrap(),
+        ],
+        vec![
+            Header::relates_to(id).unwrap(),
+            Header::relates_to(MessageId::default()).unwrap(),
+        ],
+    ] {
+        let mut message = msg("Reply", vec![]);
+        message.headers.extend(headers);
+        assert!(matches!(envelope(&message, true), Err(Error::Protocol(_))));
     }
 }
 
@@ -1107,6 +1145,7 @@ async fn on_time_settlement_survives_late_observation_for_rpc_fault_raw_and_repl
                     .unwrap(),
                 );
             }
+
             write_message(&mut peer, &response).await.unwrap();
         }
         until(|| {
@@ -1133,4 +1172,59 @@ async fn on_time_settlement_survives_late_observation_for_rpc_fault_raw_and_repl
         assert_eq!(count(&channel, class), 0);
         channel.close(deadline()).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn native_equal_duplicate_correlation_is_preserved_but_caller_and_contradictory_duplicates_reject(
+) {
+    let (channel, mut peer) = pair(4096, true, limits());
+    let target = target(&channel);
+    let receiver = channel.receiver().unwrap();
+    let mut request = channel.request(&target, msg("Rpc", vec![]), deadline());
+    pending(request.as_mut()).await;
+    let sent = read_message(&mut peer).await.unwrap();
+    let mut response = reply(sent.properties().unwrap().id, vec![42]);
+    response
+        .headers
+        .push(Header::relates_to(sent.properties().unwrap().id).unwrap());
+    write_message(&mut peer, &response).await.unwrap();
+    assert_eq!(
+        request.await.unwrap(),
+        response,
+        "both native wire headers preserved"
+    );
+    let mut pushed = notification(1);
+    pushed
+        .headers
+        .push(Header::boolean(message::EXPECTS_REPLY, true).unwrap());
+    write_message(&mut peer, &pushed).await.unwrap();
+    let incoming = receiver.receive(deadline()).await.unwrap();
+    assert_eq!(incoming.message, pushed);
+    let mut caller = msg("ServiceNotificationReply", vec![]);
+    caller.headers.extend([
+        Header::relates_to(incoming.message.properties().unwrap().id).unwrap(),
+        Header::relates_to(incoming.message.properties().unwrap().id).unwrap(),
+    ]);
+    assert!(matches!(
+        incoming.reply.unwrap().reply(caller, deadline()).await,
+        Err(Error::InvalidInput(_))
+    ));
+    let mut caller = msg("Rpc", vec![]);
+    caller.headers.extend([
+        Header::boolean(message::EXPECTS_REPLY, true).unwrap(),
+        Header::boolean(message::EXPECTS_REPLY, true).unwrap(),
+    ]);
+    assert!(matches!(
+        channel.request(&target, caller, deadline()).await,
+        Err(Error::InvalidInput(_))
+    ));
+    let mut contradictory = pushed;
+    contradictory.headers.last_mut().unwrap().value =
+        Header::boolean(message::EXPECTS_REPLY, false)
+            .unwrap()
+            .value;
+    write_message(&mut peer, &contradictory).await.unwrap();
+    until(|| channel.terminal_error().is_some()).await;
+    assert!(matches!(channel.terminal_error(), Some(Error::Protocol(_))));
+    channel.close(deadline()).await.unwrap();
 }

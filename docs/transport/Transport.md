@@ -27,6 +27,12 @@ packet capture, live TLS negotiation, or native test execution was performed for
 this document. In particular, a deployed runtime's TLS versions, cipher suites,
 configuration, and build dependencies must be established separately.
 
+The separate Rust [operational native gateway channel profile](NativeChannel.md)
+implements shared raw/RPC and opted-in notification capabilities below domain
+protocols, not the actor36 `IFabricTransport` application-service API described
+here. Its stronger ownership/bounds and actual qualification are documented
+separately; this document's source-derived evidence limits remain unchanged.
+
 The interfaces here are the buffer-based FabricTransport API, referred to as
 "V2" in parts of the source. They are not the older
 `IFabricServiceCommunication*` API, although both use

@@ -96,6 +96,9 @@ pub struct FabricClient {
     timeout: Duration,
 }
 
+#[cfg(test)]
+mod native_channel_live_tests;
+
 impl FabricClient {
     /// Resolve on the gateway without retaining endpoint results in this client.
     pub async fn resolve_service_partition(
