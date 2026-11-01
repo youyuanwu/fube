@@ -111,10 +111,13 @@ struct Record {
     loss: Option<Loss>,
     cleanup: Option<crate::Result<()>>,
     results: VecDeque<OperationResult>,
+    registration_consumer: Option<Arc<AtomicBool>>,
 }
 struct State {
     core: Hosting,
     records: Vec<Record>,
+    health: crate::health::DisabledHealth,
+    consumer: Option<Arc<AtomicBool>>,
 }
 struct Shared {
     config: Config,
@@ -201,6 +204,148 @@ pub struct Server {
     address: SocketAddr,
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// Required downstream capabilities are admission constraints, not reply stubs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequiredCapabilities {
+    pub health_reporting: bool,
+    pub application_reports: bool,
+    pub fm_status_completion: bool,
+    pub deployed_lifecycle: bool,
+}
+impl RequiredCapabilities {
+    fn local_only(self) -> bool {
+        !self.health_reporting
+            && !self.application_reports
+            && !self.fm_status_completion
+            && !self.deployed_lifecycle
+    }
+}
+
+/// Exclusive, nonclone delivery owner. Drop withdraws factory admission without
+/// releasing sources, outputs, RA work or package usage. Explicit close returns
+/// all residual outputs; transferred outputs still require a bounded consumer.
+pub struct RegistrationOwner {
+    shared: Arc<Shared>,
+    live: Arc<AtomicBool>,
+}
+pub struct PreparedRegistration {
+    pub lease: HostLease,
+    pub admitted: usize,
+    pub failure: Option<(usize, crate::Error)>,
+}
+impl RegistrationOwner {
+    pub fn take_outputs(&self) -> crate::Result<Outputs> {
+        let mut state = self.shared.state()?;
+        if !state
+            .consumer
+            .as_ref()
+            .is_some_and(|v| Arc::ptr_eq(v, &self.live))
+        {
+            return Err(crate::Error::ObjectClosed);
+        }
+        Ok(take_outputs(&mut state))
+    }
+    pub fn health_sources(&self) -> crate::Result<Vec<crate::HealthSource>> {
+        Ok(self.shared.state()?.health.sources.clone())
+    }
+    pub fn remove_declaration(
+        &self,
+        id: &crate::TypeInstance,
+        source: &str,
+    ) -> crate::Result<Option<crate::HealthSource>> {
+        let mut state = self.shared.state()?;
+        let last = state
+            .core
+            .type_entries()
+            .iter()
+            .find(|e| crate::compare_type_instances(&e.id, id).is_eq())
+            .is_some_and(|e| e.sources.len() == 1 && e.sources[0] == source);
+        let mut health = state.health.clone();
+        let removed = if last {
+            let component = health
+                .sources
+                .iter()
+                .find(|s| crate::compare_type_instances(&s.id, id).is_eq())
+                .ok_or(crate::Error::InvalidServiceType)?
+                .component
+                .clone();
+            Some(health.remove(id, &component)?)
+        } else {
+            None
+        };
+        state.core.remove_type_source(id, source)?;
+        state.health = health;
+        Ok(removed)
+    }
+    pub fn lookup(&self, request: &crate::LookupRequest) -> crate::Result<crate::LookupResult> {
+        if !self.live.load(Ordering::SeqCst)
+            || request.should_activate
+            || request.activation != crate::Activation::SHARED
+        {
+            return Err(crate::Error::UnsupportedCapability);
+        }
+        let mut state = self.shared.state()?;
+        // Only the equal-version branch requires no package-lifecycle premise.
+        // Preserve the native candidate/sequence on mismatch without inventing
+        // successful scheduling; mismatch remains outside this live capability.
+        let id = crate::TypeInstance {
+            service_type: request.service_type.clone(),
+            activation: request.activation,
+            public_activation: String::new(),
+        };
+        if let Some(e) = state
+            .core
+            .type_entries()
+            .iter()
+            .find(|e| crate::compare_type_instances(&e.id, &id).is_eq())
+        {
+            if !e.runtime_id.is_empty() {
+                if let Ok(r) = state.core.find_runtime(&e.runtime_id) {
+                    if r.version != request.version {
+                        return Err(crate::Error::UnsupportedCapability);
+                    }
+                }
+            }
+        }
+        state.core.lookup(request, &crate::LookupModel::default())
+    }
+    pub fn close(self) -> crate::Result<Outputs> {
+        self.live.store(false, Ordering::SeqCst);
+        let mut state = self.shared.state()?;
+        if !state
+            .consumer
+            .as_ref()
+            .is_some_and(|v| Arc::ptr_eq(v, &self.live))
+        {
+            return Err(crate::Error::ObjectClosed);
+        }
+        // No source release or automatic replay adoption. A successor owner is
+        // not permitted while any registration admission/residual source exists.
+        let outputs = take_outputs(&mut state);
+        if state.records.is_empty() && state.health.sources.is_empty() {
+            state.consumer = None;
+        }
+        Ok(outputs)
+    }
+}
+impl Drop for RegistrationOwner {
+    fn drop(&mut self) {
+        self.live.store(false, Ordering::SeqCst);
+    }
+}
+fn take_outputs(state: &mut State) -> Outputs {
+    Outputs {
+        operations: state
+            .records
+            .iter_mut()
+            .flat_map(|r| r.results.drain(..))
+            .collect(),
+        events: state.core.take_closed_registered_events(),
+        statuses: state.core.take_enabled_disabled_events(),
+        obligations: state.core.take_obligations(),
+    }
 }
 
 fn protocol(why: &'static str) -> TransportError {
@@ -303,6 +448,7 @@ impl Server {
             return Err(crate::Error::InvalidInput);
         }
         let core = Hosting::new(config.core_limits.clone())?;
+        let health = crate::health::DisabledHealth::new(&config.core_limits);
         let listener =
             std::net::TcpListener::bind(address).map_err(|_| crate::Error::OperationFailed)?;
         listener
@@ -315,8 +461,10 @@ impl Server {
             config,
             origin: Instant::now(),
             state: Mutex::new(State {
+                health,
                 core,
                 records: Vec::new(),
+                consumer: None,
             }),
             stop: AtomicBool::new(false),
             wake: Notify::new(),
@@ -351,6 +499,85 @@ impl Server {
     }
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+    /// Claim local delivery before factory admission. Reporting is explicitly
+    /// disabled at construction; callers must own actual local consumers.
+    pub fn registration_owner(
+        &self,
+        required: RequiredCapabilities,
+    ) -> crate::Result<RegistrationOwner> {
+        if !required.local_only() {
+            return Err(crate::Error::UnsupportedCapability);
+        }
+        if self.shared.stop.load(Ordering::SeqCst) {
+            return Err(crate::Error::ObjectClosed);
+        }
+        let mut state = self.shared.state()?;
+        if state.consumer.is_some() {
+            return Err(crate::Error::InvalidState);
+        }
+        let live = Arc::new(AtomicBool::new(true));
+        state.consumer = Some(live.clone());
+        Ok(RegistrationOwner {
+            shared: self.shared.clone(),
+            live,
+        })
+    }
+    /// Prefix preparation is explicit. Failure retains the prefix and its
+    /// revoked host lease; it never implicitly removes sources or declarations.
+    pub fn admit_registration(
+        &self,
+        owner: &RegistrationOwner,
+        admission: Admission,
+        types: Vec<String>,
+        source: &str,
+    ) -> crate::Result<PreparedRegistration> {
+        if !Arc::ptr_eq(&self.shared, &owner.shared)
+            || !owner.live.load(Ordering::SeqCst)
+            || types.is_empty()
+            || types.len() > self.shared.config.core_limits.types
+            || !valid_string(source)
+            || types.iter().any(|s| !valid_string(s))
+        {
+            return Err(crate::Error::InvalidInput);
+        }
+        let lease = self.admit(admission.clone())?;
+        let mut state = self.shared.state()?;
+        let index = record_index(&state, &lease.entry)?;
+        let mut prepared = PreparedRegistration {
+            lease,
+            admitted: 0,
+            failure: None,
+        };
+        for (i, name) in types.into_iter().enumerate() {
+            let id = wire::TypeId {
+                package: admission.code.id.package.clone(),
+                name,
+            }
+            .project();
+            let mut health = state.health.clone();
+            let health_admission = if state
+                .core
+                .type_entries()
+                .iter()
+                .any(|e| crate::compare_type_instances(&e.id, &id).is_eq())
+            {
+                Ok(())
+            } else {
+                health.declare(id.clone(), admission.code.application_name.clone())
+            };
+            let result =
+                health_admission.and_then(|()| state.core.declare_type(id, source.into(), Ok(())));
+            if let Err(error) = result {
+                prepared.lease.revoke();
+                prepared.failure = Some((i, error));
+                return Ok(prepared);
+            }
+            state.health = health;
+            prepared.admitted += 1;
+        }
+        state.records[index].registration_consumer = Some(owner.live.clone());
+        Ok(prepared)
     }
     /// Synchronous admission reserves one complete scratch/session/result slot.
     /// One connection incarnation only; reconnect requires explicit release and
@@ -420,6 +647,7 @@ impl Server {
             loss: None,
             cleanup: None,
             results: VecDeque::new(),
+            registration_consumer: None,
         });
         Ok(HostLease { entry })
     }
@@ -470,17 +698,23 @@ impl Server {
     /// Cannot be abandoned between drain and transfer: synchronous owned return.
     pub fn take_outputs(&self) -> crate::Result<Outputs> {
         let mut state = self.shared.state()?;
-        let operations = state
-            .records
-            .iter_mut()
-            .flat_map(|r| r.results.drain(..))
-            .collect();
-        Ok(Outputs {
-            operations,
-            events: state.core.take_closed_registered_events(),
-            statuses: state.core.take_enabled_disabled_events(),
-            obligations: state.core.take_obligations(),
-        })
+        if state.consumer.is_some() {
+            return Err(crate::Error::InvalidState);
+        }
+        Ok(take_outputs(&mut state))
+    }
+    /// Explicit recovery after an owner was dropped. This cannot steal an active
+    /// subscription and does not adopt old admissions into a successor owner.
+    pub fn take_registration_residuals(&self) -> crate::Result<Outputs> {
+        let mut state = self.shared.state()?;
+        if state
+            .consumer
+            .as_ref()
+            .is_none_or(|v| v.load(Ordering::SeqCst))
+        {
+            return Err(crate::Error::InvalidState);
+        }
+        Ok(take_outputs(&mut state))
     }
     pub fn stop(&mut self) -> crate::Result<()> {
         self.shared.stop.store(true, Ordering::SeqCst);
@@ -609,7 +843,7 @@ fn unique_headers(message: &Message) -> TransportResult<()> {
     }
     Ok(())
 }
-fn envelope(message: &Message, decode_limit: usize) -> TransportResult<(String, u32, bool)> {
+fn envelope(message: &Message, decode_limit: usize) -> TransportResult<(String, u32, Option<i64>)> {
     unique_headers(message)?;
     let p = message.properties()?;
     if p.id == MessageId::default()
@@ -638,7 +872,7 @@ fn envelope(message: &Message, decode_limit: usize) -> TransportResult<(String, 
     #[derive(Deserialize)]
     struct Identity(String, u32);
     let Identity(host, pid) = decode(&header.value, decode_limit)?;
-    Ok((host, pid, timeout.is_some()))
+    Ok((host, pid, timeout))
 }
 fn reply(id: MessageId, body: Vec<u8>) -> TransportResult<Message> {
     Ok(Message {
@@ -721,7 +955,9 @@ async fn run_connection(
         } else {
             read(socket).await?
         };
-        let (host, pid, has_timeout) = envelope(&request, shared.config.decode_bytes)?;
+        let arrived = Instant::now();
+        let (host, pid, timeout) = envelope(&request, shared.config.decode_bytes)?;
+        let has_timeout = timeout.is_some();
         let p = request.properties()?;
         if p.id.guid == [0; 16]
             || last_id.is_some_and(|last| p.id.guid != last.guid || p.id.index <= last.index)
@@ -771,7 +1007,21 @@ async fn run_connection(
             reply_budget(shared, 32)?;
             to_vec(&wire::LeaseReply { ttl })?
         } else {
-            dispatch(shared, entry, p.actor, &p.action, &request.body)?
+            let type_deadline =
+                (p.actor == 9 && p.action == "RegisterServiceTypeRequest").then(|| {
+                    arrived
+                        + Duration::from_nanos(
+                            timeout.unwrap_or(300_000_000).min(300_000_000) as u64 * 100,
+                        )
+                });
+            dispatch(
+                shared,
+                entry,
+                p.actor,
+                &p.action,
+                &request.body,
+                type_deadline,
+            )?
         };
         // No queued writer; this is the pre-frame fence. Cancellation discards
         // the connection after a partial frame, never reuses its writer.
@@ -833,6 +1083,10 @@ fn native_error(error: &crate::Error) -> TransportResult<i64> {
         crate::Error::HostNotRegistered => 0x80071d2e,
         crate::Error::RuntimeAlreadyRegistered => 0x80071d2f,
         crate::Error::RuntimeNotRegistered => 0x80071d30,
+        crate::Error::TypeAlreadyRegisteredToSameRuntime => 0x80071d31,
+        crate::Error::TypeAlreadyRegistered => 0x80071bd1,
+        crate::Error::InvalidServiceType => 0x80071c21,
+        crate::Error::TypeDisabled => 0x80071d33,
         crate::Error::OperationFailed => 0x80004005,
         crate::Error::Dependency(value) => return Ok(*value),
         _ => return Err(protocol("local Hosting operation failure")),
@@ -845,6 +1099,7 @@ fn dispatch(
     actor: i64,
     action: &str,
     body: &[u8],
+    type_deadline: Option<Instant>,
 ) -> TransportResult<Vec<u8>> {
     // Before mutation as well as in the independent wait supervisor.
     deadline(shared, entry)?;
@@ -858,6 +1113,12 @@ fn dispatch(
     }
     let mut state = shared.state().map_err(|_| protocol("Hosting closed"))?;
     let i = record_index(&state, entry).map_err(|_| protocol("stale session"))?;
+    // The core lock may have been stalled by an independent consumer/control
+    // operation. Recheck this exact incarnation at the mutation boundary.
+    deadline(shared, entry)?;
+    if type_deadline.is_some_and(|due| Instant::now() >= due) {
+        return Err(protocol("type request deadline before admission"));
+    }
     if state.records[i].results.len() == MAX_RESULTS {
         return Err(protocol("Hosting retained result capacity"));
     }
@@ -953,6 +1214,65 @@ fn dispatch(
             if result.primary.is_ok() {
                 state.records[i].runtime = Some(context.id.clone());
                 entry.ready.store(true, Ordering::SeqCst);
+            }
+        }
+        (9, "RegisterServiceTypeRequest") => {
+            let consumer = state.records[i]
+                .registration_consumer
+                .as_ref()
+                .ok_or(protocol("factory capability not admitted"))?;
+            if !consumer.load(Ordering::SeqCst) {
+                return Err(protocol("factory consumer withdrawn"));
+            }
+            let value: wire::TypeRequest = decode(body, shared.config.decode_bytes)?;
+            let context = &value.context;
+            let mut expected_host = entry.admission.host.clone();
+            expected_host.id = context.host.id.clone();
+            if !host_matches(&context.host.id)
+                || context.host != expected_host
+                || context.code != entry.admission.code
+                || value.id.package != context.code.id.package
+                || !valid_string(&value.id.name)
+                || !state.records[i]
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|id| crate::compare_names(id, &context.id).is_eq())
+            {
+                return Err(protocol("type context outside admitted profile"));
+            }
+            let projection = context_projection_bytes(context)
+                .saturating_mul(2)
+                .saturating_add(value.id.name.len());
+            if projection > shared.config.projection_bytes {
+                return Err(protocol("Hosting type projection budget"));
+            }
+            let id = value.id.project();
+            let mut health = state.health.clone();
+            // Reserve source/report bookkeeping before publishing type outputs.
+            // Undeclared types retain their native InvalidServiceType outcome.
+            if state
+                .core
+                .type_entries()
+                .iter()
+                .any(|e| crate::compare_type_instances(&e.id, &id).is_eq())
+            {
+                health
+                    .registered(&id, &shared.config.node)
+                    .map_err(|_| protocol("managed health source/report admission"))?;
+            }
+            deadline(shared, entry)?;
+            if type_deadline.is_some_and(|due| Instant::now() >= due) {
+                return Err(protocol("type request deadline before mutation"));
+            }
+            if !consumer.load(Ordering::SeqCst) {
+                return Err(protocol("factory consumer withdrawn before mutation"));
+            }
+            result.action = "RegisterServiceTypeRequest";
+            let registration = state.core.register_type(&id, &context.project());
+            result.primary = registration.result;
+            result.cleanup = registration.cleanup;
+            if result.primary.is_ok() {
+                state.health = health;
             }
         }
         (9, "UnregisterFabricRuntimeRequest") => {

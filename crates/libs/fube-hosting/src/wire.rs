@@ -122,6 +122,16 @@ pub struct IdRequest {
 pub struct RuntimeRequest {
     pub context: RuntimeContext,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TypeId {
+    pub package: PackageInstance,
+    pub name: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TypeRequest {
+    pub context: RuntimeContext,
+    pub id: TypeId,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorReply {
     pub error: i64,
@@ -180,6 +190,27 @@ impl RuntimeContext {
             code_package: self.code.id.name.clone(),
             // ServiceTypeRegistrationHelper consumes the package, not code, sequence.
             package_instance_sequence: self.code.package_sequence,
+        }
+    }
+}
+
+impl TypeId {
+    pub(crate) fn project(&self) -> crate::TypeInstance {
+        crate::TypeInstance {
+            service_type: crate::ServiceTypeId {
+                package: crate::PackageId {
+                    application: crate::ApplicationId {
+                        type_name: self.package.package.application.type_name.clone(),
+                        number: self.package.package.application.number,
+                    },
+                    name: self.package.package.name.clone(),
+                },
+                name: self.name.clone(),
+            },
+            activation: crate::Activation(
+                *uuid::Uuid::from_bytes_le(self.package.activation.guid.0).as_bytes(),
+            ),
+            public_activation: self.package.public_id.clone(),
         }
     }
 }
