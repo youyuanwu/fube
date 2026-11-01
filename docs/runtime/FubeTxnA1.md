@@ -2,7 +2,8 @@
 
 The private transaction kernels now use actual fube-data admission/LSNs and
 separate local flush, Apply, quorum and Unlock. Full provider/stream lifecycle
-(Phase2), native Full-copy registry/hierarchy/checkpoint integration (Phase3) and
+integration is implemented and both-model reviewed as a private Phase2 unit. Native
+Full-copy registry/hierarchy/checkpoint integration (Phase3) and
 aggregate acceptance remain unfinished. This is not a public runtime construction
 API, native-binary qualification, mixed-native or recovery/restore claim.
 
@@ -66,11 +67,56 @@ Concrete **FUBE ADAPTATION** limits, not native sizing equivalence:
 
 | Boundary | Current private limit | Observable effect |
 | --- | --- | --- |
-| Retained admission payloads | 32 (`kernel/runtime_lower.rs:102`) | Uniform pre-record InsufficientResources, never End/Barrier priority |
-| Admission execution | ≤30 seconds, also bounded by caller's reserved deadline (`runtime_lower.rs:421–424`) | Execution expiry is failure/fencing, not queue-full or native retry timing |
+| Retained admission payloads | 32 (`kernel/runtime_lower.rs:104`) | Uniform pre-record InsufficientResources, never End/Barrier priority |
+| Admission execution | ≤30 seconds, also bounded by caller's reserved deadline (`runtime_lower.rs:436–439`) | Execution expiry is failure/fencing, not queue-full or native retry timing |
 | Memory log | 512 KiB–16 MiB (`kernel/memory_log.rs:97–103`) | Uniform allocation exhaustion; no future checkpoint capacity guarantee |
-| Progress vector | 128 entries (`kernel/processor.rs:913–920`) | InsufficientResources before publication, no automatic native trim claim |
-| Memory-log copy readers | 16 (`memory_log.rs:499–502`) | InsufficientResources; successful pins retain head until explicit release |
+| Progress vector | 128 entries (`kernel/processor.rs:1068–1079,1224–1232`) | InsufficientResources before publication, no automatic native trim claim |
+| Memory-log copy readers | 16 (`memory_log.rs:506–509`) | InsufficientResources; successful pins retain head until explicit release |
 
 Preexisting R0 copy-headroom allocation mechanics are unchanged by this
 correction; they are not End/Barrier preference or native queue-size equivalence.
+
+## Private Phase2 provider/lifecycle/drain unit
+
+`kernel/runtime.rs:74,190,251` constructs ONE lower/binder, bootstraps after lower
+Open and executes actual Initialize/Open/Recover before successful provider roles/
+app readiness. A private weak forwarding owner supplies supported transaction/
+version callbacks; dynamic registry/factory/hierarchy is not implemented here.
+
+Native Idle→Active waits copy only and pauses dispatch around provider roles;
+Primary promotion joins old copy/replication/log processing. Generation-owned
+pumps ACK normal secondary only after local flush and drop the lower capture
+before next poll. Copied LSNs stay embedded; replication uses lower metadata.
+Native Information at current tail dispatches buffered groups on EOF/role/Close/
+Abort without a fabricated replicated LSN. Close owns drain/provider cleanup;
+sync Abort retains scheduled work and is not completed upper drain.
+
+Failure completion is not disposal: a failed Information construction reports
+the terminal **attempt** error promptly while a strong cleanup continuation waits
+actual logical processing, actual quorum observers and service cleanup entries.
+Provider Close never runs under possible Apply. Cleanup has its own completion;
+no failed attempt becomes successful drain, no boundary is fabricated and no
+automatic allocation/Information retry or fairness guarantee is implied.
+Unresolved terminal failures may require native disposal/process fencing.
+
+Temporary app readiness and native service cleanup eligibility are distinct.
+Cached Abort can Unlock during a role/fault app fence; true service closure
+retains native closed-state behavior. Direct provider Unlock error sends the
+native StateManager fault notification without a processor service-error latch.
+Terminal/fault state dominates readiness reopen, and closed-owner version
+callbacks reject after actual cleanup.
+
+First fault follows `RoleContextDrainState.cpp:54–68`: closes upper admission/
+reports once, DOES NOT issue lower Abort or synthesize accepted quorum success.
+Runtime's native reconfiguration/Close/Abort remains sole control authority.
+Native read/write semantics include transient write revocation and readable Active
+fallback; role alone is not writable admission.
+
+Native None/Log staged frames through actual lower Build are **private ownership
+fixtures**, not normal volatile null-context Full negotiation. Unsupported stages
+reject; copied-log failed-flush waiter ACK asymmetry and no-ACK replication failure
+are retained. Full/PV/registry/hierarchy/checkpoint/truncation are Phase3; no copied
+state End or full runtime/native qualification credit is borrowed.
+Copied UpdateEpoch uses the supported existing-record failed-flush settlement
+path, not control epoch preflight. Actual primary epoch callbacks wait admitted
+publication/order before the local prefix.

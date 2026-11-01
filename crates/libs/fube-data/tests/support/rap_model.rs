@@ -264,6 +264,20 @@ impl Host {
             + Send
             + 'static,
     ) -> Arc<Self> {
+        let (host, opened) = Self::start_source_outcome(partition, source, role, factory).await;
+        opened.unwrap();
+        host
+    }
+    /// Qualification-only failure fixture: preserve the actual native Open
+    /// result instead of panicking before callers can inspect retained cleanup.
+    pub async fn start_source_outcome(
+        partition: uuid::Uuid,
+        source: ReplicaSource,
+        role: ReplicaRole,
+        factory: impl FnOnce(NativeIntegrationProvider) -> Box<dyn IStatefulServiceFactory>
+            + Send
+            + 'static,
+    ) -> (Arc<Self>, Result<()>) {
         let (ready, readiness) = oneshot::channel();
         let (commands, receive) = mpsc::channel(32);
         let shutdown_commands = commands.clone();
@@ -326,11 +340,11 @@ impl Host {
             events,
         });
         readiness.await.expect("RAP model bootstrap");
-        host.request(Action::Open).await.unwrap();
-        if role == ReplicaRole::ActiveSecondary {
-            host.change_role(role).await.unwrap();
+        let mut opened = host.request(Action::Open).await;
+        if opened.is_ok() && role == ReplicaRole::ActiveSecondary {
+            opened = host.change_role(role).await;
         }
-        host
+        (host, opened)
     }
     async fn request(&self, action: Action) -> Result<()> {
         observed_request(&self.commands, action).await

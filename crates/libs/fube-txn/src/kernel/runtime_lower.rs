@@ -36,6 +36,8 @@ pub(crate) struct RuntimeLower {
     pub(crate) publication_pause: Arc<Mutex<Option<PublicationPause>>>,
     #[cfg(test)]
     pub(crate) group_attempts: Mutex<Vec<GroupAttempt>>,
+    #[cfg(test)]
+    pub(crate) group_pause: Mutex<Option<Completion<()>>>,
     lower: Arc<FabricReplicator>,
     execution: ExecutionRuntime,
     drivers: tokio::runtime::Handle,
@@ -106,6 +108,8 @@ impl RuntimeLower {
             publication_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             group_attempts: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            group_pause: Mutex::new(None),
             execution: lower.execution_runtime(),
             lower,
             drivers: tokio::runtime::Handle::current(),
@@ -171,6 +175,10 @@ impl RuntimeLower {
         }
     }
 
+    pub(crate) async fn wait_publications(&self) {
+        self.publications_drained().await;
+    }
+
     async fn ensure_first(&self, manager: Arc<KernelManager>, asynchronous: bool) -> Result<()> {
         let mut established = self.first_primary.lock().await;
         if *established {
@@ -217,6 +225,13 @@ impl RuntimeLower {
         drop(self.drivers.spawn(async move {
             let _driver = driver;
             loop {
+                #[cfg(test)]
+                {
+                    let paused = runtime.group_pause.lock().unwrap().clone();
+                    if let Some(paused) = paused {
+                        let _ = paused.wait().await;
+                    }
+                }
                 let delay = runtime.group.lock().unwrap().delay_ms;
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 if !runtime.barriers_enabled.load(Ordering::Acquire)

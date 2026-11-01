@@ -166,6 +166,32 @@ impl Record {
             segments: data.segments(),
             next: 0,
         };
+        let record = Self::read_one(&mut reader)?;
+        if reader.next != reader.segments.len() {
+            return Err(Error::InvalidInput("trailing native record segments"));
+        }
+        Ok(record)
+    }
+
+    /// Native LogRecord::ReadFromOperationDataBatch: concatenated logical
+    /// segmented records, after the caller removes the trailing copy-stage buffer.
+    pub(crate) fn decode_batch(data: &OperationData) -> Result<Vec<Self>> {
+        check_size(data.segments().len(), data.bytes())?;
+        let mut reader = Segments {
+            segments: data.segments(),
+            next: 0,
+        };
+        let mut records = Vec::new();
+        while reader.next < reader.segments.len() {
+            records.push(Self::read_one(&mut reader)?);
+        }
+        if records.is_empty() {
+            return Err(Error::InvalidInput("empty copied log batch"));
+        }
+        Ok(records)
+    }
+
+    fn read_one(reader: &mut Segments<'_>) -> Result<Self> {
         let common = reader.section(16)?;
         let native_type = read_u32(&common[..4])? as i32;
         let lsn = read_i64(&common[4..12])?;
@@ -228,9 +254,6 @@ impl Record {
             }
             _ => unreachable!(),
         };
-        if reader.next != reader.segments.len() {
-            return Err(Error::InvalidInput("trailing native record segments"));
-        }
         let record = Self { lsn, kind };
         record.validate()?;
         Ok(record)

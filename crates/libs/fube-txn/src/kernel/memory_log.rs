@@ -90,6 +90,8 @@ pub(crate) struct MemoryLog {
     logging_error: Option<Error>,
     #[cfg(test)]
     pub(crate) write_error: Option<Error>,
+    #[cfg(test)]
+    pub(crate) write_error_after: usize,
     capacity: usize,
     readers: BTreeMap<u64, u64>,
     next_reader: u64,
@@ -128,6 +130,8 @@ impl MemoryLog {
             logging_error: None,
             #[cfg(test)]
             write_error: None,
+            #[cfg(test)]
+            write_error_after: 0,
             capacity,
             readers: BTreeMap::new(),
             next_reader: 1,
@@ -283,8 +287,11 @@ impl MemoryLog {
             return Err(error.clone());
         }
         #[cfg(test)]
-        if let Some(error) = self.write_error.take() {
-            return Err(error);
+        if self.write_error.is_some() {
+            if self.write_error_after == 0 {
+                return Err(self.write_error.take().unwrap());
+            }
+            self.write_error_after -= 1;
         }
         let body: Vec<_> = sections.into_iter().flatten().collect();
         let size = u32::try_from(body.len())

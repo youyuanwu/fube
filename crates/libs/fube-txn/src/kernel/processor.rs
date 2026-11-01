@@ -50,8 +50,13 @@ impl ProcessingRole {
     }
 }
 
+type ProcessorFaultHook = Arc<dyn Fn(Error) + Send + Sync>;
+type WriteAccessCheck = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
 #[derive(Default)]
 pub(crate) struct FaultState {
+    hook: Mutex<Option<ProcessorFaultHook>>,
+    provider_hook: Mutex<Option<ProcessorFaultHook>>,
     service: Mutex<Option<Error>>,
     log: Mutex<Option<Error>>,
     reported: Mutex<Vec<Error>>,
@@ -61,6 +66,12 @@ pub(crate) struct FaultState {
 }
 
 impl FaultState {
+    pub(crate) fn set_provider_hook(&self, hook: ProcessorFaultHook) {
+        *self.provider_hook.lock().unwrap() = Some(hook);
+    }
+    pub(crate) fn set_hook(&self, hook: Arc<dyn Fn(Error) + Send + Sync>) {
+        *self.hook.lock().unwrap() = Some(hook);
+    }
     pub(crate) fn service_error(&self) -> Option<Error> {
         self.service.lock().expect("fault state poisoned").clone()
     }
@@ -87,7 +98,11 @@ impl FaultState {
             self.reported
                 .lock()
                 .expect("fault state poisoned")
-                .push(error);
+                .push(error.clone());
+            let hook = self.hook.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook(error);
+            }
         }
     }
     pub(crate) fn process_service_error(&self, role: ProcessingRole, error: Error) -> Error {
@@ -108,7 +123,12 @@ impl FaultState {
         self.reported
             .lock()
             .expect("fault state poisoned")
-            .push(error);
+            .push(error.clone());
+        // StateManager.cpp:4055–4059 direct partition notification is NOT the
+        // processor service-error latch or RoleContextDrainState one-shot.
+        if let Some(hook) = self.provider_hook.lock().unwrap().clone() {
+            hook(error);
+        }
     }
     pub(crate) fn report_checkpoint_fault(&self, error: Error) {
         self.observed
@@ -269,6 +289,22 @@ enum DispatchAction {
 }
 
 type CommitCallback = Arc<dyn Fn(Arc<dyn TransactionBase>) + Send + Sync>;
+struct AccessState {
+    application: bool,
+    terminal: bool,
+    faulted: bool,
+}
+struct CleanupState {
+    state: Mutex<(bool, usize)>,
+    changed: tokio::sync::Notify,
+}
+struct CleanupEntry(Arc<CleanupState>);
+impl Drop for CleanupEntry {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().1 -= 1;
+        self.0.changed.notify_waiters();
+    }
+}
 
 pub(crate) struct KernelManager {
     #[cfg(test)]
@@ -301,7 +337,10 @@ pub(crate) struct KernelManager {
     retry: Arc<RetryRuntime>,
     notifications: Mutex<Vec<(TransactionId, SequenceNumber)>>,
     commit_callback: Mutex<Option<CommitCallback>>,
-    activity_open: AtomicBool,
+    access: Mutex<AccessState>,
+    cleanup: Arc<CleanupState>,
+    dispatch_gate: Arc<tokio::sync::RwLock<()>>,
+    write_access: Mutex<Option<WriteAccessCheck>>,
     unregister_error: Mutex<Option<Error>>,
     throttle: Mutex<VecDeque<Result<()>>>,
 }
@@ -361,7 +400,17 @@ impl KernelManager {
             owners: Mutex::new(BTreeMap::new()),
             retry,
             notifications: Mutex::new(Vec::new()),
-            activity_open: AtomicBool::new(true),
+            access: Mutex::new(AccessState {
+                application: true,
+                terminal: false,
+                faulted: false,
+            }),
+            cleanup: Arc::new(CleanupState {
+                state: Mutex::new((true, 0)),
+                changed: tokio::sync::Notify::new(),
+            }),
+            dispatch_gate: Arc::new(tokio::sync::RwLock::new(())),
+            write_access: Mutex::new(None),
             commit_callback: Mutex::new(None),
             unregister_error: Mutex::new(None),
             throttle: Mutex::new(VecDeque::new()),
@@ -487,14 +536,109 @@ impl KernelManager {
         Ok(())
     }
     pub(crate) fn gate(&self) -> Result<()> {
-        if self.activity_open.load(Ordering::Acquire) {
+        let access = self.access.lock().unwrap();
+        if access.application && !access.terminal && !access.faulted {
             Ok(())
         } else {
             Err(Status::ObjectClosed.error())
         }
     }
     pub(crate) fn close_activity_gate(&self) {
-        self.activity_open.store(false, Ordering::Release);
+        self.fence_terminal();
+        self.cleanup.state.lock().unwrap().0 = false;
+    }
+    pub(crate) fn fence_application(&self) {
+        self.access.lock().unwrap().application = false;
+    }
+    pub(crate) fn fence_fault(&self) {
+        let mut access = self.access.lock().unwrap();
+        access.faulted = true;
+        access.application = false;
+    }
+    pub(crate) fn fence_terminal(&self) {
+        let mut access = self.access.lock().unwrap();
+        access.terminal = true;
+        access.application = false;
+    }
+    pub(crate) fn open_activity_gate(&self) -> Result<()> {
+        let mut access = self.access.lock().unwrap();
+        if access.terminal || access.faulted || self.faults.is_closing() {
+            return Err(Status::ObjectClosed.error());
+        }
+        access.application = true;
+        Ok(())
+    }
+    pub(crate) fn open_cleanup_gate(&self) {
+        self.cleanup.state.lock().unwrap().0 = true;
+    }
+    fn cleanup_entry(&self) -> Result<CleanupEntry> {
+        let mut state = self.cleanup.state.lock().unwrap();
+        if !state.0 {
+            return Err(Status::ObjectClosed.error());
+        }
+        state.1 += 1;
+        Ok(CleanupEntry(self.cleanup.clone()))
+    }
+    pub(crate) async fn close_cleanup_gate(&self) {
+        self.cleanup.state.lock().unwrap().0 = false;
+        loop {
+            let changed = self.cleanup.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.cleanup.state.lock().unwrap().1 == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+    pub(crate) async fn processing_drained(&self) {
+        // OperationProcessor.cpp:1085–1133 owns this independently of lower
+        // stream/capture and primary admission-driver completion.
+        let records = {
+            let log = self.log.lock().unwrap();
+            log.ordered
+                .iter()
+                .chain(log.queue.values())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for activity in records {
+            if !matches!(activity.node.record().kind, RecordKind::Physical { .. }) {
+                let _ = activity.processing.wait().await;
+            }
+        }
+    }
+    pub(crate) async fn wait_lsn_ordering(&self, previous: i64) {
+        loop {
+            let changed = self.log_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let log = self.log.lock().unwrap();
+                if log.tail >= previous && log.queue.is_empty() {
+                    return;
+                }
+            }
+            changed.await;
+        }
+    }
+    pub(crate) fn set_write_access(&self, access: Arc<dyn Fn() -> Result<()> + Send + Sync>) {
+        *self.write_access.lock().unwrap() = Some(access);
+    }
+    fn writable(&self) -> Result<()> {
+        self.gate()?;
+        if let Some(check) = self.write_access.lock().unwrap().clone() {
+            check()?;
+        }
+        Ok(())
+    }
+    pub(crate) async fn pause_dispatch(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        // Native DrainAndPauseDispatch waits the prior group and blocks only
+        // dispatcher/provider-role overlap, not independent transaction groups.
+        self.dispatch_gate.clone().write_owned().await
+    }
+    pub(crate) fn epoch(&self) -> Epoch {
+        self.log.lock().unwrap().epoch
     }
     pub(crate) fn inject_unregister_error(&self, error: Error) {
         *self
@@ -872,6 +1016,17 @@ impl KernelManager {
         ticks: i64,
     ) -> Result<Option<Arc<Activity>>> {
         self.gate()?;
+        self.update_epoch_provider(epoch, previous_lsn, replica_id, ticks)
+    }
+    /// Internal lower callback/copy admission while application access is fenced.
+    /// This grants no control authority; only the bound runtime's provider uses it.
+    pub(crate) fn update_epoch_provider(
+        &self,
+        epoch: Epoch,
+        previous_lsn: i64,
+        replica_id: i64,
+        ticks: i64,
+    ) -> Result<Option<Arc<Activity>>> {
         let mut log = self.log.lock().expect("log poisoned");
         if self.role() == ProcessingRole::Primary && !log.queue.is_empty() {
             return Err(Error::InvalidInput(
@@ -988,6 +1143,10 @@ impl KernelManager {
         if let Some(lsn) = sequence {
             record.lsn = lsn;
         }
+        Self::preflight_replay(&record)?;
+        self.replay_decoded(record)
+    }
+    pub(crate) fn preflight_replay(record: &Record) -> Result<()> {
         if record.transaction_id().is_some_and(|id| id < 0)
             || matches!(
                 record.kind,
@@ -1013,6 +1172,10 @@ impl KernelManager {
                 return Err(Error::InvalidInput("empty native provider identity"));
             }
         }
+        Ok(())
+    }
+    pub(crate) fn replay_decoded(&self, record: Record) -> Result<Arc<Activity>> {
+        Self::preflight_replay(&record)?;
         let transaction = record
             .transaction_id()
             .map(KernelTransaction::replay)
@@ -1028,6 +1191,69 @@ impl KernelManager {
         activity.replication.complete(Ok(()));
         self.start_completion(activity.clone());
         Ok(activity)
+    }
+    /// SecondaryDrainManager::CopiedUpdateEpoch preserves supported local epoch
+    /// record ownership through the writer's failed-flush path, unlike a new
+    /// primary control's preflight. No new lower LSN or counterfeit success.
+    pub(crate) fn replay_copied_epoch(&self, record: Record) -> Result<Option<Arc<Activity>>> {
+        let RecordKind::UpdateEpoch {
+            epoch,
+            primary_replica_id,
+            timestamp_ticks,
+        } = record.kind
+        else {
+            return Err(Error::InvalidInput("copied epoch requires UpdateEpoch"));
+        };
+        let mut log = self.log.lock().unwrap();
+        if self.role() == ProcessingRole::Primary || record.lsn != log.tail {
+            return Err(Error::InvalidInput(
+                "copied epoch must be at secondary tail",
+            ));
+        }
+        if epoch == log.epoch {
+            return Ok(None);
+        }
+        if (epoch.data_loss_number, epoch.configuration_number)
+            < (log.epoch.data_loss_number, log.epoch.configuration_number)
+        {
+            return Err(Status::NotImplemented.error());
+        }
+        let memory_owner = self.memory();
+        let mut memory = memory_owner.as_ref().map(|m| m.lock().unwrap());
+        if let Some(memory) = &mut memory {
+            if memory.vector.len() >= 128 {
+                return Err(Status::InsufficientResources.error());
+            }
+            memory
+                .vector
+                .try_reserve(1)
+                .map_err(|_| Status::InsufficientResources.error())?;
+        }
+        let node = RecordNode::new(record, None, None)?;
+        if let Some(memory) = &memory {
+            node.retain_memory(memory.reserve(node.record())?);
+        }
+        node.set_epoch(log.epoch);
+        let activity = Activity::new(node, false);
+        self.map.admit(activity.node.clone())?;
+        if let Some(memory) = &mut memory {
+            if let Err(error) = memory.append_logical(activity.node.clone()) {
+                memory.fail_writer(error.clone());
+                *activity.io_error.lock().unwrap() = Some(error);
+            }
+            memory.vector.push(super::memory_log::ProgressEntry {
+                epoch,
+                lsn: activity.node.lsn(),
+                primary: primary_replica_id,
+                ticks: timestamp_ticks,
+            });
+        }
+        log.epoch = epoch;
+        log.epoch_lsn = activity.node.lsn();
+        log.ordered.push(activity.clone());
+        activity.replication.complete(Ok(()));
+        self.log_changed.notify_waiters();
+        Ok(Some(activity))
     }
 
     pub(crate) fn start_completion(&self, activity: Arc<Activity>) {
@@ -1180,7 +1406,11 @@ impl KernelManager {
     }
 
     async fn run_dispatcher(&self) {
-        while let Some(action) = self.next_dispatch() {
+        loop {
+            let _dispatch = self.dispatch_gate.read().await;
+            let Some(action) = self.next_dispatch() else {
+                break;
+            };
             match action {
                 DispatchAction::Failed(activity, error) => {
                     self.process_immediately(&activity, Err(error), true);
@@ -1471,7 +1701,7 @@ impl ITransactionManager for KernelManager {
         provider: StateProviderId,
         context: &dyn OperationContext,
     ) -> Result<()> {
-        self.gate()?;
+        let _activity = self.cleanup_entry()?;
         // TransactionalReplicator.cpp:626–635 masks inner cleanup failure.
         let _ = self
             .directory
@@ -1483,7 +1713,7 @@ impl ITransactionManager for KernelManager {
         provider: StateProviderId,
         id: TransactionId,
     ) -> Result<()> {
-        self.gate()?;
+        self.writable()?;
         self.directory
             .error_if_state_provider_is_not_registered(provider, id)
     }
@@ -1496,7 +1726,7 @@ impl ITransactionManager for KernelManager {
         provider: StateProviderId,
         context: Option<Arc<dyn OperationContext>>,
     ) -> Result<()> {
-        self.gate()?;
+        self.writable()?;
         self.directory
             .begin_transaction(transaction, provider, metadata, undo, redo, context)
     }
@@ -1509,7 +1739,7 @@ impl ITransactionManager for KernelManager {
         provider: StateProviderId,
         context: Option<Arc<dyn OperationContext>>,
     ) -> ApiFuture<'_, SequenceNumber> {
-        if let Err(error) = self.gate() {
+        if let Err(error) = self.writable() {
             return Box::pin(async move { Err(error) });
         }
         self.directory
@@ -1524,7 +1754,7 @@ impl ITransactionManager for KernelManager {
         provider: StateProviderId,
         context: Option<Arc<dyn OperationContext>>,
     ) -> Result<()> {
-        self.gate()?;
+        self.writable()?;
         self.directory
             .add_operation(transaction, provider, metadata, undo, redo, context)
     }
