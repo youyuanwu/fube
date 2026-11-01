@@ -1,7 +1,9 @@
 //! Private volatile runtime composition. Native TransactionalReplicator.cpp:
 //! 257–459, StateManager.cpp:103–179,4797–4919 and SecondaryDrainManager.cpp:
-//! 200–233,323–376,653–799,906–972. Binding/owned futures are FUBE ADAPTATION;
-//! no new admission policy or second binder. Native staged volatile copy and
+//! 200–233,323–376,653–799,906–972. Public lower composition/owned futures are
+//! FUBE ADAPTATION; no lifecycle/rebase hook, new admission policy or upper binder.
+//! Host execution, not lower diagnostics, owns callback/admission capture.
+//! Native staged volatile copy and
 //! memory/checkpoint execution back the supported public service/registry facade.
 use super::{
     checkpoint::await_all,

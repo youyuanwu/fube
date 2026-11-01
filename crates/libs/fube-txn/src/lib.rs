@@ -3,7 +3,13 @@
 
 //! Service Fabric V2 contracts and supported ordinary volatile A1 execution.
 //! [`VolatileTransactionalReplicator`] constructs the real runtime and primary
-//! provider registry over one [`fube_data::FabricReplicator`]/native binder.
+//! provider registry over one normally constructed [`fube_data::FabricReplicator`].
+//! The service returns the actual common/primary transactional composite.
+//! Production and tests use public state/provider/operation/stream contracts
+//! plus normal settings/copy capability; no lower lifecycle, rebase, execution,
+//! identity, diagnostic or qualification hooks. Public host execution retains
+//! owned synchronous admission; exact native invocation dispatch stays internal
+//! to the framework, not an upper binder or authority.
 //! Existing private A0 algorithms supply incremental records, transactions,
 //! map/version bookkeeping, Apply/Unlock, checkpoint and staged Full copy.
 //! Test payload providers are not ReliableCollections implementations.

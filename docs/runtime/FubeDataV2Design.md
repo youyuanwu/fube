@@ -114,7 +114,9 @@ differences; the earlier review is not approval of the new port.
 
 **R0 lower implementation (2026-10-31):** [FubeData.md's audit/corrections][f-v1-differences]
 records corrected DD-01–DD-07, explicit latest-assigned copy capability and the
-callback-ready truthful constructor-tail seam with offline regressions. The
+then-current callback-ready constructor-tail seam with offline regressions.
+The A1 public-boundary correction supersedes that sampling recipe with native
+Opened-getter/first-Primary INITIAL creation (§6.2). The
 Astra findings remain historical audit context, not unresolved lower semantics.
 This is implementation evidence, not a native deployment qualification or an
 A0 transaction/log/state-manager kernel. Final independent review/publication is
@@ -132,7 +134,7 @@ lower seams below are corrected by R0, without implementing upper kernels.
 
 | Finding | Priority | Required design resolution |
 |---|---|---|
-| [DD-04: promotion stream completion](FubeData.md#dd-04-promotion-does-not-finish-the-secondary-stream-generation) (Astra N1) | P1 | Role-scoped EOS, native processing/ACK drain completion and a new stream generation after demotion, in the same engine (§5.3, §6.2) |
+| [DD-04: secondary-to-Primary stream completion](FubeData.md#dd-04-secondary-to-primary-promotion-does-not-finish-the-stream-generation) (Astra N1) | P1 | Role-scoped EOS, native processing/ACK drain completion and a new stream generation after demotion, in the same engine (§5.3, §6.2) |
 | [DD-05: admission retry distinction](FubeData.md#dd-05-admission-errors-lose-the-native-retry-distinction) (Astra N2) | P2 | Lossless typed/native-coded or admission-stage mapping of transient queue fullness versus permanent sizing/resource rejection (§5.4) |
 | [DD-06: local-not-PC general quorum](FubeData.md#dd-06-local-not-pc-quorum-greater-than-one-requires-an-extra-vote) (Astra N3) | P2 | Native PC availability/order statistic for quorum greater than one, retaining the separate remote-PC-quorum-one rule and issued membership (§8, §10.1) |
 | [DD-07: extended-copy epoch validation](FubeData.md#dd-07-extended-copy-tails-fail-unconditional-epoch-reconciliation) (Astra N4) | P1 | Independent upper/lower tails, duplicate-control no-op gates and source role/copy-specific validation; preserve genuine new-epoch mismatch errors (§4, §6.2, §7.3) |
@@ -179,7 +181,7 @@ or compatibility paths
 ```text
 native SF node: membership / role / epoch / reconfiguration / access authority
           |
- fube-runtime service retains fube-txn owner + SAME lower IPrimaryReplicator/binder
+ fube-runtime service retains fube-txn owner + ACTUAL composite IPrimaryReplicator
           |                             |
           | delegates control           | gates application readiness
           v                             v
@@ -200,7 +202,7 @@ native SF node: membership / role / epoch / reconfiguration / access authority
 | Transaction/log manager | Record codec, transaction table, ordered decisions, bounded log, promotion cleanup, stable/checkpoint tracking | Native control authority |
 | State manager | Transactional provider name/ID/type/parent registry, factory validation, routing, copy/checkpoint coordination | Collection-specific locks or serialization parity |
 | Upper provider | Transactional Apply/Unlock, source-compatible isolation/version contexts and checkpoint/copy state; first a small test provider | Lower transport ACK policy or a partition-wide root-swap requirement |
-| Runtime owner + common lower hooks | Compose lower/upper Open, ChangeRole, Close and Abort; gate application access and own cleanup | Intercept every native configuration/build/removal or replace lower progress |
+| Runtime owner + returned public composite | Delegate every common/primary control to one normal lower; compose lower-first lifecycle, gate application access and own cleanup | Issue native proofs, replace lower progress or create another lower authority |
 
 ### 3.2.1 Public trait boundary before A0
 
@@ -241,7 +243,7 @@ Commit/Backup/Restore paths; `None` timeout means native infinite timeout.
 cancellation argument. `Unlock` is a separate synchronous fallible callback.
 The upper copy stream retains native explicit disposal, rather than silently
 aliasing the classic lower stream's narrower interface. Runtime control still
-uses the existing lower engine/binder; native COM construction/test hooks and
+uses the one existing lower engine through the returned public composite; native COM construction/test hooks and
 internal logging/checkpoint-manager interfaces are outside this public boundary.
 Backup/recovery declarations do not enable those capabilities. A0 kernel
 evidence is now recorded separately; compile-only
@@ -262,7 +264,7 @@ must run an upper hook
 | Close / Abort | V1 first, then upper close/abort | Stop new application admissions, preserve lower-first delegation, and retain upper drain/cleanup ownership |
 | UpdateEpoch / OnDataLoss | Forward to V1; V1 calls its upper logging `IStateProvider` | Delegate once; implement upper work in lower-provider callbacks, not a second wrapper callback |
 | Current progress / catch-up capability | Forward to V1 | Keep lower role-specific observations; do not substitute visible-transaction LSNs |
-| Configurations / catch-up / build / removal | Forward to V1 | Use existing canonical root or native invocation-bound lower controls; no second upper control authority |
+| Configurations / catch-up / build / removal | Forward to V1 | Return/invoke the actual composite; delegate once to canonical lower controls with the exact internally scoped native invocation/purpose; no upper control authority |
 
 Open/close/role ordering and failure behavior are in
 [ComTransactionalReplicator.cpp:654–885][n-lifecycle];
@@ -270,29 +272,28 @@ Abort invokes lower then upper at
 [482–486][n-abort]. Upper epoch/data-loss callbacks dispatch to the logging
 replicator through [StateProvider.cpp:59–109][n-provider-callbacks].
 
-**Current fube integration:** construction installs a native invocation binder
-and coherent progress source for the private engine
-([engine.rs:708–735][f-native-install]).
-Runtime configuration/build/removal dispatch chooses that bound control instead
-of the service-returned fallback, while progress can use the installed source
-([stateful_binding.rs:695–720][f-native-dispatch],
-[stateful_reconfiguration.rs:245–280][f-native-progress]).
-Only one live binder/progress source is allowed
-([stateful_binding.rs:309–323][f-progress-install],
-[525–542][f-binding-install]).
+**Current public-boundary correction (supersedes the old binder-bypass decision):**
+normal data construction reserves one engine and installs one coherent progress
+source, **not** a replacement-object binder. Runtime scopes the original issued
+record/shared one-use flag over the exact service-returned composite; public
+configuration/Remove delegation and eager Build construction/owned polling reach
+the canonical lower method with that exact proof and Remove purpose, including
+BuildRetryCleanup
+([stateful_binding.rs:724–841][f-native-dispatch],
+[composite.rs:180–218](../../crates/libs/fube-txn/src/kernel/composite.rs#L180-L218)).
+Record-current, actor/revision/remote/generation, native lifetime, actual lease and
+deadline fences survive capture/admission/completion; an invalid scoped proof
+cannot select a newer ledger record. Explicit custom framework binder
+registration retains its selected-view semantics; txn/support never installs it.
 
-**Decision:** keep those lower bindings. A plain lifecycle wrapper need not
-receive configuration/build/remove or progress interception: that is consistent
-with native V2 delegation. Do not require a generic decorator, replace an
-installed binder, or construct another engine. Enforce log reconciliation and
-copy installation through the upper `IStateProvider` and destination drains;
-enforce application readiness through the upper service/lifecycle owner. If a
-source-required copy completion is missing, represent that existing stage/
-completion locally (§7), not a new protocol or control-routing redesign.
-A1 must exercise bound and
-root control paths and show that neither bypasses the relevant provider/drain
-guarantees. R0 corrects DD-01–DD-07 through shared lower behavior and
-explicitly tested seam mappings; an upper wrapper must not hide them with a new
+This exact-invocation scope is **Rust hosting plumbing**, not a native algorithm,
+new public SF contract or second authority. The installed coherent lower sampler
+retains lower progress semantics, including native Opened last-before-first
+sampling. Upper log reconciliation/copy installation stays in public
+`IStateProvider` callbacks/drains. Public composite and ordinary delegating-view
+tests must show once-only control/lifecycle and provider/drain guarantees; no
+root flag, lower snapshot or internal test-control escape hatch is allowed.
+R0/A1 preserve lower membership/quorum/queue authority without an alternate
 commitment, catch-up, copy or promotion policy.
 
 ## 4. Lower seam and progress contract
@@ -706,12 +707,13 @@ arguments. In runtime-owned `IStatefulServiceReplica::open`, validate
 [`VolatileTransactionalReplicator::create`](../../crates/libs/fube-txn/src/runtime.rs#L112)
 with the actual partition, captured native integration, endpoint/lower Settings,
 provider factory, data-loss handler and volatile allocation/work-folder settings.
-The owner internally constructs ONE lower `create_with_lifecycle` with native
-latest-LSN capability and no replay workaround; its common root/bound hooks
-already execute upper lifecycle once. Retain the public owner in the service and
-return a boxed clone of its SAME `fabric_replicator()` as `IPrimaryReplicator`,
-not an additional outer control/lifecycle wrapper. The earlier capability-only
-wrapper recipe is superseded; do not separately call the upper lifecycle.
+The owner internally constructs ONE normal `create_with_capabilities` with R0
+latest-LSN capability and no replay workaround. Retain the public owner in the
+service and return `into_service_replicator()`: a boxed clone of the ACTUAL
+composite shared by `replicator() -> Arc<dyn IPrimaryReplicator>`, not the lower
+concrete object. The composite performs lower-first upper lifecycle once.
+The old private `create_with_lifecycle`/lower-accessor recipe is withdrawn;
+do not separately call either layer's lifecycle.
 See the [constructible usage and execution-entry rule](FubeTxnA1.md)
 ([stateful_api.rs:118–148][f-factory],
 [fabric_replicator.rs:29–70][f-fabric],
@@ -721,30 +723,48 @@ CreateReplicator method, SDK discovery hook, or second lower owner.
 `Existing` is Unsupported and `Invalid` is InvalidArgument before activation
 ([stateful_api.rs:235–255][f-open-mode]).
 
-For fresh A1, construct callback-ready empty log/registry metadata at truthful
-**tail0** before lower
-creation: the current engine invokes the provider's initial progress getter
-while constructing the owner, not only during later Open
-([engine.rs:629–660][f-initial-progress]).
-Do not return a fabricated zero while a nonempty log is still initializing.
-The native factory likewise initializes its lower state-provider bridge with
-the upper logging provider before exposing the composed replicator
-([ComTransactionalReplicator.cpp:280–295][n-provider-init]).
-R0 proves this construction boundary passes nonempty actual fixture record tails
-1/27 (including source-shaped zero/one markers) through to lower initial progress,
-with the getter called before the lower facade is returned
-([public witness](../../crates/libs/fube-data/tests/sdk_contracts.rs#L222-L297)).
-The fixture is not native record serialization or a transaction log kernel.
-The R0 nonempty fixture does NOT prescribe A1 bootstrap-before-lower-creation.
-Native ComTransactionalReplicator.cpp:654–711 opens V1 first; upper LogManager.cpp:
-246–341 then constructs/flushed-checks zero/one records. A1 follows **lower Open →
-upper bootstrap1 → one-time actual-getter measured lower rebase1 → lower role →
-actual Barrier LSN2**, tested on root/bound controls in
-[`runtime_bootstrap_tests.rs:684–754`](../../crates/libs/fube-txn/src/kernel/runtime_bootstrap_tests.rs#L684-L754).
-SDK callers never pre-bootstrap records or supply a synthetic LSN. The measured
-rebase is a FUBE ADAPTATION of constructor-time progress sampling, not a second
-native authority or a ported native queue command. Persisted Existing/recovery
-remains unsupported, not a variant of this fresh construction.
+Normal construction starts supervision/transport/owner without sampling progress
+or activating a zero PRIMARY queue. Lower Open marks Opened; upper Open then
+creates/flushed-checks the real fresh zero/one log. Native lower
+Replicator.cpp:296–390 queries provider progress **outside its lock** at Opened
+GetCurrentProgress, caches success only and returns capability zero. First
+Primary uses cached success or calls the provider, THEN creates its INITIAL
+queue at actual tail+1 (ChangeRoleAsyncOperation.cpp:127–211;
+ReplicationQueueManager.cpp:29–58). Initial secondary uses transmitted start;
+promotion/demotion transfer lower queues (:60–91), not upper-tail rebase.
+Current Rust follows those callers
+([engine.rs:5088–5248][f-initial-progress]).
+
+Thus A1 follows **lower Open → upper bootstrap1 → actual getter or first-Primary
+sample1 → INITIAL primary queue → actual Barrier LSN2**
+([registered bootstrap test](../../crates/libs/fube-txn/src/kernel/runtime_bootstrap_tests.rs#L797-L860)).
+Nonempty public fixtures retain tails1/27→assigned2/28, ordinary getter
+error/retry, first Primary without a getter, and lifetime/deadline publication
+fences. No activated queue reset, preconstruction tail requirement or synthetic
+LSN is supported. The earlier init-rebase recipe is explicitly superseded.
+Upper source order is ComTransactionalReplicator.cpp:654–711 and
+LogManager.cpp:246–341 at the unchanged pin. Persisted Existing/recovery is not
+a variant of fresh construction.
+
+**Idle→Active is distinct:** pinned Replicator.ChangeRoleAsyncOperation.cpp:
+253–275 promotes the existing secondary; SecondaryReplicator.cpp:2110–2154
+completes immediately for RequireServiceAck. This lower already has that fixed
+explicit-service-ACK profile; no no-service-ACK setting is exposed. The
+[public lower branch](../../crates/libs/fube-data/src/engine.rs#L2349-L2373)
+does not wait for upper application ACK/live replication EOS, rebase epoch or
+replace captures/streams. Upper role separately waits copy completion
+([runtime.rs:469–487](../../crates/libs/fube-txn/src/kernel/runtime.rs#L469-L487)).
+Public tests observe lower success before source EOF release, then upper/provider
+Active and subsequent single+Barrier with one capture.
+
+Lower Open/role/Close errors skip the corresponding upper operation; upper Open
+error aborts lower and returns its original error. Upper role error fences
+admission/reports fault **without unconditional Abort**; actual native Close or
+Abort later owns terminal cleanup. Abort remains lower first
+([composite.rs:51–178](../../crates/libs/fube-txn/src/kernel/composite.rs#L51-L178)).
+Full source Build/public EOS is not upper Apply/copy completion. The controlled
+pre-fix role rejection/post-fix success is proved; the older uninstrumented
+successful-Build/role-timeout chronology remains unknown.
 
 Preserve native status/access checks, cancellation, watchdogs, capture disposal
 and incarnation fencing; cancellation alone does not establish quiescence
@@ -1108,9 +1128,9 @@ from this design pass**. No tier can borrow a lower tier's qualification label.
 
 | Milestone | Work boundary | Required evidence before acceptance |
 |---|---|---|
-| R0: correct V1 foundation | Implemented lower DD-01–DD-07, explicit latest-LSN capability and callback-ready actual-tail construction seam | Offline phase-reviewed regressions pass, including quorum-one release/ALL, EOS-before-ACK role generations, typed retry/sizing, local-not-PC quorum, extended-copy duplicates, latest start/finish and nonempty bootstrap. No A0 kernels or new native qualification claimed |
+| R0: correct V1 foundation | Implemented lower DD-01–DD-07, explicit latest-LSN capability; A1 boundary correction defers INITIAL progress to native getter/first-Primary callers | Offline phase-reviewed regressions, including quorum-one release/ALL, EOS-before-ACK role generations, typed retry/sizing, local-not-PC quorum, extended-copy duplicates, latest start/finish, nonempty initial progress and service-ACK Idle promotion. No new native qualification claimed |
 | A0: native kernels and test provider | Implemented private supported records/codecs, transaction states/map/version, Apply/Unlock and checkpoint/copy callbacks with narrow offline seams | [Source-derived deterministic traces and limitations](FubeTxnA0.md) for read-only/single/multi, interleaving, retry/cancel/abort, IDs/replay, visibility and failure cleanup; not A1 or native qualification |
-| A1: volatile Rust integration | Implemented public service/primary registry facade, lower-bound pass-through, lifecycle/log/provider drains, native memory-log/checkpoint/copy | [As-built guide and external behavioral evidence](FubeTxnA1.md); R0/A0 algorithms, one engine/binder and bounded owned execution; no preferential End/Barrier, release-gated serial/root/ledger substitute or native-binary claim |
+| A1: volatile Rust integration | Implemented public service/primary registry facade and ACTUAL composite, public lower pass-through, lifecycle/log/provider drains, native memory-log/checkpoint/copy | [As-built guide and external behavioral evidence](FubeTxnA1.md); same production/test public boundary, one normal engine and bounded public-host execution; no lower hooks, preferential End/Barrier, release-gated serial/root/ledger substitute or native-binary claim |
 | A2: volatile qualification | Pinned SF binary/environment, pressure and fault campaign | Repeated A scenarios with recorded environment, limits, traces and unsupported modes; only Tier A claim |
 | B: mixed-native qualification | Qualify the already source-derived records, transactions, provider routing and copy in both directions | All B scenarios and exact native provider/version/settings matrix; any unsupported feature is explicit, not implemented by an alternate algorithm |
 | C: persistent recovery | Durable log/checkpoints/copy publication plus persisted SF lifecycle | All C scenarios with process/host/storage fault injection; persisted manifest/open checks changed only with the full contract |
@@ -1124,7 +1144,7 @@ from this design pass**. No tier can borrow a lower tier's qualification label.
 | Concurrent interleaved transaction chains with spare queue capacity | Disjoint transactions admit records while preceding records remain retained; no partition write lease or per-record-release prerequisite |
 | Multi-key/multi-provider and provider add/remove transaction | Native transaction/context boundaries protect supported read isolation; no partial transaction becomes visible and registry metadata follows source transactional add/remove |
 | Provider Apply/Unlock, replication and flush failures | Source completion/error/state and required context cleanup; no skipped record, fake abort proof or blanket hard fault for source-retriable queue pressure |
-| Native invocation-bound configuration/build/removal and lower progress | Existing lower binder remains selected; no second engine/binder; exact target/purpose and completed/disposed sync semantics survive; upper provider/install guarantees hold without outer-wrapper interception |
+| Native configuration/build/removal and lower progress | Actual returned composite receives canonical dispatch; original internally scoped proof/purpose and actual lease fences survive public delegation; no built-in replacement binder or upper authority; completed/disposed sync and upper provider/install guarantees hold |
 | Direct async sync-control call, reserved owned call and provider reentry | InvalidExecutionContext/reentry rejection is explicit; reserved call completes applied/disposed boundary; dropped observer is not rollback or proof of disposal |
 | Native initial progress and no-write promotion with replay capability absent | ALL at the represented prefix follows corrected native rules; a new record beyond that prefix still needs its required ACKs |
 | Caller disconnect and native commit timeout/cancel/retry | No orphaned record/context owner; native transaction state/result and retry transitions are preserved without a request ledger or invented rollback |
@@ -1202,7 +1222,7 @@ only for the particular compatibility claim being made.
 | Claim mixed-native qualification before the Rust foundation exists | Defer the claim only: native records, bootstrap and applicable copy semantics are implementation requirements in A, with execution evidence added in B |
 | Serial release-gated transactions / optimistic global root coordinator | Reject as the core: alternate concurrency, visibility and availability algorithms, not a semantic-preserving port |
 | Native transaction/log/provider/copy kernels with Rust ownership | Choose from A: narrow feature support and bounded memory without replacing correctness algorithms |
-| Generic outer native-control decorator / replacement binder | Do not require: native V2 forwards these methods to V1; preserve fube's issued lower control path and fix only a demonstrated provider/drain fence gap |
+| Binder-selected lower bypass / publicized private hooks | Reject: native returns the composite. Use ordinary public delegation and internal exact-invocation scope, not a second binder, root-routing flag or renamed engine hook |
 
 Reference logging-replicator build dependencies include LogRecordLib,
 txnreplicator common, data utilities, LogicalLog, TestHooks, KtlLoggerUser and
@@ -1270,8 +1290,8 @@ relative to this document; native references are pinned to the baseline in §2.
 [f-capabilities]: ../../crates/libs/fube-data/src/extensions.rs#L14-L95
 [f-diagnostics]: ../../crates/libs/fube-data/src/extensions.rs#L88-L103
 [f-native-install]: ../../crates/libs/fube-data/src/engine.rs#L708-L735
-[f-initial-progress]: ../../crates/libs/fube-data/src/engine.rs#L629-L660
-[f-native-dispatch]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L695-L720
+[f-initial-progress]: ../../crates/libs/fube-data/src/engine.rs#L5088-L5248
+[f-native-dispatch]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L724-L841
 [f-native-progress]: ../../crates/libs/fube-runtime/src/stateful_reconfiguration.rs#L245-L280
 [f-progress-install]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L309-L323
 [f-binding-install]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L525-L542

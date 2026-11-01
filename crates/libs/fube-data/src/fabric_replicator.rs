@@ -19,9 +19,10 @@ use std::sync::Arc;
 /// Managed FabricReplicator responsibility, with Rust object-safe control/data
 /// views over ONE private engine, listener and owner. Clones share that owner.
 /// Not a native COM proxy/CreateReplicator or mutable native settings facade.
-/// Canonical root and private invocation-bound primary controls both work with
-/// valid native-issued records; neither public descriptors nor diagnostic
-/// snapshots create those records. No standalone out-of-host primary authority.
+/// Canonical primary controls consume the exact internally scoped native-issued
+/// invocation through ordinary delegation; normal construction installs no
+/// replacement-object binder. Public descriptors and diagnostics create no
+/// records. No standalone out-of-host primary authority.
 #[derive(Clone)]
 pub struct FabricReplicator {
     pub(crate) engine: Arc<Engine>,
@@ -36,8 +37,11 @@ impl FabricReplicator {
     /// This helper's location/signature is fube-specific, not native partition
     /// CreateReplicator source/ABI compatibility. See the production sample
     /// `crates/samples/rust-runtime-app/src/data.rs` for construction and pumps.
-    /// Provider callbacks must already be ready: construction queries the actual
-    /// provider tail before lower Open. This helper retains classic copy defaults.
+    /// Construction supervises the provider but does not query its initial tail.
+    /// Lower Open marks Opened; the Opened getter or first Primary samples actual
+    /// progress and first Primary creates its initial queue at progress + 1.
+    /// An upper composite may therefore initialize its log after lower Open.
+    /// This helper retains classic copy defaults.
     pub fn create(
         partition: Arc<dyn IStatefulServicePartition>,
         native: NativeRuntimeIntegration,
@@ -58,9 +62,11 @@ impl FabricReplicator {
     }
 
     /// Explicit provider-copy capability; `create` retains classic defaults.
-    /// The provider must already be callback-ready: construction queries its
-    /// actual log/application tail before the returned lower object's Open.
-    /// This does not open/recover/bootstrap an upper transaction log for callers.
+    /// Provider progress must be ready at the actual Opened getter/first-Primary
+    /// call, not before construction. Successful initial progress is cached;
+    /// getter errors remain retryable and first-Primary errors fault lower.
+    /// This does not open/recover/bootstrap an upper transaction log for callers
+    /// or rebase an activated queue.
     pub fn create_with_capabilities(
         partition: Arc<dyn IStatefulServicePartition>,
         native: NativeRuntimeIntegration,
