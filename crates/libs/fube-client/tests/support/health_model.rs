@@ -347,20 +347,14 @@ async fn health_malformed_structure_tags_pointers_fields_and_extents_are_call_lo
 
 #[tokio::test]
 async fn health_success_requires_hm_envelope() {
-    for (headers, terminal) in [
-        (vec![], false),
-        (
-            vec![
-                Header::actor(5).unwrap(),
-                Header::action("QueryReply").unwrap(),
-            ],
-            false,
-        ),
-        (vec![Header::actor(16).unwrap()], true),
-        (
-            vec![Header::action("OperationSuccessAction").unwrap()],
-            true,
-        ),
+    for headers in [
+        vec![],
+        vec![
+            Header::actor(5).unwrap(),
+            Header::action("QueryReply").unwrap(),
+        ],
+        vec![Header::actor(16).unwrap()],
+        vec![Header::action("OperationSuccessAction").unwrap()],
     ] {
         let make_reply = move |request: &Message| Message {
             headers: [
@@ -370,29 +364,17 @@ async fn health_success_requires_hm_envelope() {
             .concat(),
             body: result(Shape::Empty, 0),
         };
-        let (client, server) = if terminal {
-            single_reply(make_reply).await
-        } else {
-            reusable_reply(make_reply).await
-        };
+        let (client, server) = reusable_reply(make_reply).await;
         let outcome = client
             .get_node_health(
                 &NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n")),
                 None,
             )
             .await;
-        if terminal {
-            assert!(matches!(
-                outcome,
-                Err(ClientError::Transport(Error::Protocol(_)))
-            ));
-            assert!(client.is_closed());
-        } else {
-            assert!(matches!(outcome, Err(ClientError::Protocol(_))));
-            assert!(!client.is_closed());
-            assert!(client.terminal_error().is_none());
-            client.ping(None).await.unwrap();
-        }
+        assert!(matches!(outcome, Err(ClientError::Protocol(_))));
+        assert!(!client.is_closed());
+        assert!(client.terminal_error().is_none());
+        client.ping(None).await.unwrap();
         client.close().await.unwrap();
         server.await.unwrap();
     }

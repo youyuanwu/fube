@@ -1137,18 +1137,18 @@ async fn explicit_service_paging_stops_at_empty_terminal_page_without_hidden_req
 #[tokio::test]
 async fn present_aggregate_headers_are_validated_for_each_list() {
     for service in [false, true] {
-        for (actor, action, valid, terminal) in [
-            (Some(5), Some("QueryReply"), true, false),
-            (Some(13), Some("QueryReply"), false, false),
-            (Some(5), None, true, false),
-            (Some(13), None, false, false),
-            (None, Some("QueryReply"), true, false),
-            (None, None, true, false),
-            (Some(0), Some("QueryReply"), false, true),
-            (Some(16), Some("QueryReply"), false, true),
-            (Some(5), Some("OperationSuccessAction"), false, false),
-            (Some(16), Some("OperationSuccessAction"), false, false),
-            (None, Some("OperationSuccessAction"), false, true),
+        for (actor, action, valid) in [
+            (Some(5), Some("QueryReply"), true),
+            (Some(13), Some("QueryReply"), false),
+            (Some(5), None, true),
+            (Some(13), None, false),
+            (None, Some("QueryReply"), true),
+            (None, None, true),
+            (Some(0), Some("QueryReply"), false),
+            (Some(16), Some("QueryReply"), false),
+            (Some(5), Some("OperationSuccessAction"), false),
+            (Some(16), Some("OperationSuccessAction"), false),
+            (None, Some("OperationSuccessAction"), false),
         ] {
             let make_reply = move |r: &Message| {
                 let s = if service {
@@ -1165,11 +1165,7 @@ async fn present_aggregate_headers_are_validated_for_each_list() {
                 }
                 response
             };
-            let (client, server) = if terminal {
-                single_reply(make_reply).await
-            } else {
-                reusable_reply(make_reply).await
-            };
+            let (client, server) = reusable_reply(make_reply).await;
             let result = if service {
                 client
                     .get_service_list(
@@ -1187,20 +1183,12 @@ async fn present_aggregate_headers_are_validated_for_each_list() {
                     .map(|_| ())
             };
             assert_eq!(result.is_ok(), valid, "{actor:?}/{action:?}: {result:?}");
-            if terminal {
-                assert!(matches!(
-                    result,
-                    Err(ClientError::Transport(Error::Protocol(_)))
-                ));
-                assert!(client.is_closed());
-            } else {
-                if !valid {
-                    assert!(matches!(result, Err(ClientError::Protocol(_))));
-                }
-                assert!(!client.is_closed());
-                assert!(client.terminal_error().is_none());
-                client.ping(None).await.unwrap();
+            if !valid {
+                assert!(matches!(result, Err(ClientError::Protocol(_))));
             }
+            assert!(!client.is_closed());
+            assert!(client.terminal_error().is_none());
+            client.ping(None).await.unwrap();
             client.close().await.unwrap();
             server.await.unwrap();
         }

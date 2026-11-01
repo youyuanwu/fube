@@ -342,9 +342,6 @@ fn validate_reply_headers(reply: &Message, allowed: fn(&Message) -> bool) -> Res
             || props.expects_reply
             || props.uncorrelated_reply
             || has(message::IPC)
-            || !((props.actor == 16 && props.action == "OperationSuccessAction")
-                || (props.actor == 13 && props.action == "QueryReply")
-                || (!has(message::ACTOR) && !has(message::ACTION)))
         {
             return Err(Error::Protocol("unauthorized typed forwarded query reply"));
         }

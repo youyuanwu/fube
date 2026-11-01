@@ -20,10 +20,9 @@ disabled or widened.
 Only actor5 with a nonempty Action is authorized for outbound domain messages.
 Raw sends cannot bypass ordinary RPC or reply authority using ExpectsReply,
 RelatesTo or special-notification flags. Ordinary replies must come through
-this established socket. The narrow native completion union includes gateway,
-body-only aggregates/Hosting, RS13 QueryReply and HM16 OperationSuccessAction;
-typed clients validate the particular operation. Native Fault may use
-the empty actor. An unsupported actor/ingress, malformed
+this established socket. Their domain actor/action and body are opaque to the
+channel; typed clients validate the particular operation. Transport controls
+and notification ingress retain their separate profile checks. Unsupported ingress, malformed
 transport fields or unsupported security/reconnect control terminates the
 foundation. A well-formed nonzero Fault returns `Error::Remote` with its exact
 header code; absent/zero Fault returns the opaque message. Optional diagnostics
@@ -31,15 +30,15 @@ and domain bodies are not decoded by the foundation.
 
 Native common-header scanning uses the **last** RelatesTo in wire order, not
 the first or any value matching pending state. All records are preserved.
-The ordinary forwarded-query profile supports `[inner, outer]` or
+The ordinary native correlation profile supports `[inner, outer]` or
 `[inner, outer, outer]`; an optional third record must repeat the second
 byte-for-byte. Every forwarding record must decode to a nonempty MessageId.
-The exception requires a strict HM16/OperationSuccessAction, RS13/QueryReply
-or body-only native aggregate/Hosting success envelope, no Fault/reverse/IPC,
-and any selected pending entry must be QueryRequest. An unknown final ID never
-falls back to an earlier neighbor. The typed Reply family further authorizes
-the specific forwarding profile. Fourth records, a nonrepeating third record,
-malformed earlier records and unproven shapes remain Protocol.
+An unknown final ID never falls back to an earlier neighbor. The channel does
+not inspect the pending request's domain action or authorize query envelopes.
+The client request's typed Reply family owns query eligibility and permitted
+forwarding actor/action shapes; invalid domain envelopes are call-local protocol
+errors, not channel failures. Fourth records, a nonrepeating third record and
+malformed earlier records remain channel Protocol errors.
 
 This two/three-record cap is a **Rust bound**, not a native maximum. Pinned SF
 [Add permits appending duplicates](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/MessageHeaders.h#L86-L91);
@@ -53,8 +52,8 @@ Notification opt-in permits only a valid actor5
 `ServiceNotificationRequest`: nonempty MessageId, ExpectsReply=true,
 IsUncorrelatedReply=true, empty RelatesTo, no Fault or IPC identity, and validated
 transport envelope fields. ExpectsReply still permits only a second identical
-inbound record; the earlier two-identical RelatesTo form remains valid outside
-the forwarded exception. Other owned transport fields remain unique.
+inbound record. Notification envelopes retain their empty-RelatesTo requirement.
+Other owned transport fields remain unique.
 **Caller inputs retain strict duplicate rejection without any inbound exception.**
 The validated envelope mints a private consuming context on the
 original target/ID. A response must be actor5/`ServiceNotificationReply`;

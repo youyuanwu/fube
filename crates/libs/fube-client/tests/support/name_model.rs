@@ -210,7 +210,7 @@ async fn invalid_uri_and_budget_never_send_writes_and_keep_connection() {
 }
 
 #[tokio::test]
-async fn malformed_write_body_is_local_but_invalid_channel_actor_is_terminal() {
+async fn malformed_write_body_and_domain_envelope_are_call_local() {
     for delete in [false, true] {
         for shape in 0..5 {
             let make_reply = move |request: &Message| {
@@ -224,25 +224,12 @@ async fn malformed_write_body_is_local_but_invalid_channel_actor_is_terminal() {
                 }
                 response
             };
-            let (client, server) = if shape == 3 {
-                single_reply(make_reply).await
-            } else {
-                reusable_reply(make_reply).await
-            };
+            let (client, server) = reusable_reply(make_reply).await;
             let result = write(&client, delete, TIMEOUT_DURATION).await;
-            if shape == 3 {
-                assert!(matches!(
-                    result,
-                    Err(ClientError::Transport(Error::Protocol(_)))
-                ));
-                assert!(client.is_closed());
-                assert!(matches!(client.terminal_error(), Some(Error::Protocol(_))));
-            } else {
-                assert!(matches!(result, Err(ClientError::Protocol(_))));
-                assert!(!client.is_closed());
-                assert!(client.terminal_error().is_none());
-                client.ping(None).await.unwrap();
-            }
+            assert!(matches!(result, Err(ClientError::Protocol(_))));
+            assert!(!client.is_closed());
+            assert!(client.terminal_error().is_none());
+            client.ping(None).await.unwrap();
             client.close().await.unwrap();
             server.await.unwrap();
         }

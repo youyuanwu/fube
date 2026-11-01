@@ -18,6 +18,60 @@ use tokio::{
 const TIMEOUT_DURATION: Duration = Duration::from_secs(3);
 
 #[tokio::test]
+async fn ping_rejects_forwarded_envelopes_without_closing_the_channel() {
+    for (actor, action) in [
+        (Some(5), Some("PingRequest")),
+        (Some(16), Some("OperationSuccessAction")),
+        (Some(13), Some("QueryReply")),
+        (None, None),
+    ] {
+        for records in [2, 3] {
+            let (client, server) = reusable_reply(move |request| {
+                let mut response = ping_reply(request);
+                response.headers.retain(|header| {
+                    !matches!(
+                        header.id,
+                        fube_transport::message::ACTOR | fube_transport::message::ACTION
+                    )
+                });
+                if let Some(actor) = actor {
+                    response.headers.push(Header::actor(actor).unwrap());
+                }
+                if let Some(action) = action {
+                    response.headers.push(Header::action(action).unwrap());
+                }
+                let outer = response
+                    .headers
+                    .iter()
+                    .position(|header| header.id == fube_transport::message::RELATES_TO)
+                    .unwrap();
+                response.headers.insert(
+                    outer,
+                    Header::relates_to(MessageId {
+                        guid: [91; 16],
+                        index: 17,
+                    })
+                    .unwrap(),
+                );
+                if records == 3 {
+                    response.headers.push(response.headers[outer + 1].clone());
+                }
+                response
+            })
+            .await;
+            assert!(matches!(
+                client.ping(None).await,
+                Err(ClientError::Protocol(_))
+            ));
+            assert!(!client.is_closed());
+            client.ping(None).await.unwrap();
+            client.close().await.unwrap();
+            server.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn naming_deadline_precedes_and_includes_caller_conversion() {
     struct InvalidConversion;
     impl AsRef<str> for InvalidConversion {
@@ -1771,7 +1825,7 @@ mod node_queries {
     }
 
     #[tokio::test]
-    async fn bare_or_recognized_success_headers_are_valid_but_wrong_headers_retire() {
+    async fn bare_or_recognized_success_headers_are_valid_but_wrong_headers_are_call_local() {
         for headers in [
             vec![],
             vec![Header::actor(5).unwrap()],
@@ -1800,7 +1854,7 @@ mod node_queries {
             Header::actor(2).unwrap(),
             Header::action("NameOperationReply").unwrap(),
         ] {
-            let (client, server) = single_reply(move |request| {
+            let (client, server) = reusable_reply(move |request| {
                 let mut response = node_reply(request, node_body(&[], None));
                 response.headers.push(header);
                 response
@@ -1810,9 +1864,11 @@ mod node_queries {
                 client
                     .get_node_list(&NodeQueryDescription::default(), None)
                     .await,
-                Err(ClientError::Transport(Error::Protocol(_)))
+                Err(ClientError::Protocol(_))
             ));
-            assert!(client.is_closed());
+            assert!(!client.is_closed());
+            client.ping(None).await.unwrap();
+            client.close().await.unwrap();
             server.await.unwrap();
         }
     }

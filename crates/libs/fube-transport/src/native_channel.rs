@@ -183,7 +183,6 @@ struct Entry {
     deadline: Instant,
     id: Option<MessageId>,
     rpc: bool,
-    query_reply: bool,
     bytes: Option<Vec<u8>>,
     result: Option<Result<Outcome>>,
     lease: Arc<Lease>,
@@ -440,7 +439,7 @@ fn local(error: Error) -> Error {
 /// Caller fields remain unique. Received native common-header scanning uses
 /// the final RelatesTo (MessageHeaders.cpp:765-824 at pinned SF 3988b451).
 /// Preserve all records; bound forwarded composition to [inner, outer] or
-/// [inner, outer, outer]. The receive path separately checks query authority.
+/// [inner, outer, outer]. Domain reply eligibility belongs to the caller.
 /// Three is our finite profile, not a native global maximum. Only ExpectsReply
 /// retains the earlier second-byte-identical exception; other fields stay unique.
 fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
@@ -504,9 +503,6 @@ fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
     }
     let props = message.properties()?;
     if native_inbound && forwarded_correlation(message) {
-        if !forwarded_query_reply(message, &props) {
-            return Err(Error::Protocol("unauthorized forwarded query reply"));
-        }
         for header in message
             .headers
             .iter()
@@ -524,7 +520,7 @@ fn forwarded_correlation(message: &Message) -> bool {
     let mut records = message
         .headers
         .iter()
-        .filter(|h| h.id == message::RELATES_TO);
+        .filter(|header| header.id == message::RELATES_TO);
     let Some(first) = records.next() else {
         return false;
     };
@@ -534,32 +530,8 @@ fn forwarded_correlation(message: &Message) -> bool {
     first.value != second.value || records.next().is_some()
 }
 
-// Precisely source-produced forwarded success envelopes, not a fallback based
-// on whichever relation matches pending state. Hosting replies have no actor
-// or action; absence is distinct from an explicitly serialized actor 0.
-fn forwarded_query_reply(message: &Message, props: &Properties) -> bool {
-    props.fault.is_none()
-        && ((props.actor == 16 && props.action == "OperationSuccessAction")
-            || (props.actor == 13 && props.action == "QueryReply")
-            || (!has(message, message::ACTOR) && !has(message, message::ACTION)))
-}
-
 fn has(message: &Message, id: u16) -> bool {
     message.headers.iter().any(|header| header.id == id)
-}
-
-// The established gateway forwards native query responses without rewriting
-// their domain actor/action: RS QueryReply (13), HM OperationSuccessAction (16),
-// and independently optional aggregate headers. This is only the narrow union
-// of existing ordinary profiles, not authority to send to those actors or to
-// admit their unsolicited requests. Typed callers validate the specific profile.
-fn ordinary_reply(message: &Message, props: &Properties) -> bool {
-    let query_action = !has(message, message::ACTION) || props.action == "QueryReply";
-    props.actor == 5
-        || (!has(message, message::ACTOR) && query_action)
-        || (props.actor == 13 && query_action)
-        || (props.actor == 16 && props.action == "OperationSuccessAction")
-        || (props.actor == 0 && props.fault.is_some())
 }
 
 fn domain_gateway(message: &Message, props: &Properties) -> Result<()> {
@@ -754,7 +726,6 @@ async fn submit(
                 deadline,
                 id,
                 rpc,
-                query_reply: rpc && props.action == "QueryRequest",
                 bytes: Some(bytes),
                 result: None,
                 lease,
@@ -1048,29 +1019,14 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
         if props.relates_to == MessageId::default()
             || props.expects_reply
             || has(&message, message::IPC)
-            || !ordinary_reply(&message, &props)
         {
             return Err(Error::Protocol("unauthorized ordinary gateway reply"));
         }
-        let forwarded = forwarded_correlation(&message);
         let token = {
             let mut inner = shared.inner.lock().unwrap();
             // Properties validates every occurrence and exposes the final
             // native-effective ID. Never try an earlier ID, even if final is
             // unknown/retired and an earlier one names a live neighbor.
-            if forwarded {
-                if let Some(token) = inner.pending.get(&props.relates_to) {
-                    if !inner
-                        .entries
-                        .get(token)
-                        .is_some_and(|entry| entry.query_reply)
-                    {
-                        return Err(Error::Protocol(
-                            "forwarded reply requires pending QueryRequest",
-                        ));
-                    }
-                }
-            }
             let token = inner.pending.remove(&props.relates_to);
             if token.is_none() {
                 inner.unmatched += 1;

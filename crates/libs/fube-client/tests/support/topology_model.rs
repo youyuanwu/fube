@@ -632,11 +632,7 @@ async fn native_query_presence_matrix_rejects_wrong_values_ipc_and_duplicate_hea
         NativeCompletion::Movement,
     ] {
         for case in 0..10 {
-            let terminal = match case {
-                0 => false,
-                3 => !matches!(profile, NativeCompletion::Hosting),
-                _ => true,
-            };
+            let terminal = case >= 4;
             let make_reply = move |request: &Message| {
                 let mut response = profile.reply(request, 0);
                 match case {
