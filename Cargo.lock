@@ -333,6 +333,9 @@ version = "0.1.0"
 dependencies = [
  "fube-ra",
  "fube-ra-store",
+ "fube-transport",
+ "serde",
+ "socket2",
  "tokio",
  "uuid",
 ]

@@ -98,11 +98,14 @@ mod core;
 mod events;
 mod host;
 mod identity;
+pub mod ipc;
+mod lease;
 mod lookup;
 mod model;
 mod residency;
 mod runtime;
 mod types;
+pub mod wire;
 
 pub use collaborators::*;
 pub use contracts::*;

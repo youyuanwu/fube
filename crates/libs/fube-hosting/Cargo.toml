@@ -7,8 +7,12 @@ description = "Bounded native-derived in-memory Hosting2 registration model; not
 
 [dependencies]
 uuid.workspace = true
+fube-transport.workspace = true
+serde.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
+socket2 = { version = "0.6", features = ["all"] }
 fube-ra = { path = "../fube-ra" }
 fube-ra-store = { path = "../fube-ra-store" }
 tokio.workspace = true
