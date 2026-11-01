@@ -1,11 +1,14 @@
-//! **Declarations only: not implemented or wired to any existing transport.**
+//! **Operational for the explicit native gateway profile in
+//! [`native_channel`](crate::native_channel).**
 //!
-//! Proposed bounded Rust-profile contracts for a shared native message/RPC
+//! Bounded Rust-profile contracts for a shared native message/RPC
 //! foundation, **not** an `IFabricTransport` application-service API or an SF ABI.
-//! No backend, constructor, driver, request table, demux, or lifecycle logic is
-//! supplied. [`Connection`](crate::connection::Connection) does not implement
-//! these traits; its behavior, clear-profile security limits and explicit IPC,
-//! notification and upload roles remain unchanged.
+//! [`GatewayChannel`](crate::native_channel::GatewayChannel) implements raw/RPC
+//! and owned shutdown; its opted-in receiver and consuming context implement
+//! authorized native notification ingress/replies. This is not a general
+//! listener/IPC/upload/replication or secure transport implementation.
+//! [`Connection`](crate::connection::Connection) does not implement these traits;
+//! its behavior, security limits and explicit roles remain unchanged.
 //!
 //! # Native component boundary (source facts)
 //!
@@ -31,7 +34,7 @@
 //!   [replication ACKs][ack] carry protocol progress and a fresh MessageId, not
 //!   ordinary RelatesTo request-table replies.
 //!
-//! # Proposed Rust-profile component contracts (not native guarantees)
+//! # Rust-profile component contracts (not native guarantees)
 //!
 //! ```text
 //! protocol actor/action/body, domain validation, semantic ACKs
@@ -41,9 +44,10 @@
 //!                                               -> optional ReplyContext
 //! ```
 //!
-//! A future backend configures security, role permissions, dispatch and finite
-//! resource limits before exposing ready capabilities. No settings/factory API
-//! is defined here. Raw-only protocols need not implement [`RpcChannel`].
+//! Each backend configures security, role permissions, dispatch and finite
+//! resource limits before exposing ready capabilities. The operational gateway
+//! constructor/limits live in [`native_channel`](crate::native_channel), not in
+//! these generic traits. Raw-only protocols need not implement [`RpcChannel`].
 //! Components sharing a foundation bind the same backend [`MessageChannel::Target`]
 //! type, but type equality does **not** establish instance affinity or authority.
 //! Implementations must reject foreign/retired targets before admission and
@@ -135,7 +139,7 @@ use crate::{message::Message, Result};
 
 /// Object-safe Send future returning the existing transport [`Result`].
 ///
-/// **Proposed Rust-profile declaration, not implemented.** The lifetime permits
+/// **Rust-profile contract.** The lifetime permits
 /// borrowing a channel/target; consuming reply futures instead own their state
 /// and use `'static`. See the [module](self) for lazy progress, acceptance,
 /// cancellation, finite resource accounting and deadline obligations.
@@ -143,7 +147,7 @@ pub type ChannelFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 
 
 /// Raw outbound message delivery and lifecycle ownership, independent of RPC.
 ///
-/// **Proposed Rust-profile declaration, not implemented.** Concurrent calls
+/// **Rust-profile contract, implemented by the explicit GatewayChannel profile.** Concurrent calls
 /// through shared references are supported; no cross-target ordering/fairness
 /// guarantee is imposed. A backend must document its per-target ordering,
 /// affinity, finite admission/byte limits and authorized roles.
@@ -223,10 +227,10 @@ pub trait MessageChannel: Send + Sync + 'static {
 
 /// Ordinary correlated request/reply above a raw [`MessageChannel`].
 ///
-/// **Proposed Rust-profile declaration, not implemented.** Correlation,
+/// **Rust-profile contract, implemented by the explicit GatewayChannel profile.** Correlation,
 /// bounded pending ownership and reply completion are distinct from protocol
 /// actor dispatch/domain validation. The inherited channel and this RPC
-/// capability belong to the same foundation; no automatic adapter is supplied.
+/// capability belong to the same foundation; no automatic Connection adapter is supplied.
 ///
 /// **Native facts:** [requestreply.cpp:57–122](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/requestreply.cpp#L57-L122)
 /// adds ExpectsReply, generates a missing MessageId, starts/inserts pending work
@@ -281,7 +285,7 @@ pub trait RpcChannel: MessageChannel {
 
 /// Pull delivery of authorized non-completion ingress.
 ///
-/// **Proposed Rust-profile declaration, not implemented.** A receiver is paired
+/// **Rust-profile contract, implemented by the opted-in GatewayReceiver.** A receiver is paired
 /// with its foundation's lifecycle owner and source Target type; it need not
 /// require ordinary RPC. Concurrent receives each deliver one distinct owned
 /// envelope, with no fairness guarantee. Transport controls and, where RPC is
@@ -318,12 +322,12 @@ pub trait MessageReceiver: Send + Sync + 'static {
 
 /// Owned ingress plus source identity and optional authorized reply capability.
 ///
-/// **Proposed Rust-profile declaration, not implemented.** Raw one-way messages,
+/// **Rust-profile contract.** Raw one-way messages,
 /// authorized reverse requests and special notifications can be represented
 /// without inventing another wire format. Inspect existing Message properties
 /// under protocol policy; presence of a context is permission for one reply
 /// attempt, not a domain success claim. No public fields mint backend authority:
-/// future implementations must validate that authority at send admission.
+/// implementations must validate that authority at send admission.
 ///
 /// **Native facts:** [Demuxer.cpp:16–24](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/Demuxer.cpp#L16-L24)
 /// builds ReceiverContext from MessageId, sender target and transport without
@@ -344,7 +348,7 @@ pub struct IncomingMessage<Target: Send + Sync + 'static> {
 
 /// Consuming capability bound to an original destination and correlation ID.
 ///
-/// **Proposed Rust-profile declaration, not implemented.** Send permits moving
+/// **Rust-profile contract, implemented by the private consuming gateway context.** Send permits moving
 /// the capability to a worker; Sync and Clone are not required. Consuming one
 /// context permits at most one local attempt through that value, not exactly-one
 /// remote execution or protection against separately minted backend authority.
