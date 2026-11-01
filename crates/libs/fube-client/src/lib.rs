@@ -57,7 +57,7 @@ use contracts::ClientFuture;
 use fube_transport::{
     channel::MessageChannel,
     connection::deadline_after,
-    native_channel::{ChannelLimits, GatewayChannel, GatewayTarget},
+    native_channel::{ChannelLimits, GatewayChannel, GatewayProfile, GatewayTarget},
 };
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -129,12 +129,12 @@ impl FabricClient {
     /// `None`. There is no insecure fallback, automatic reconnect, or replay.
     /// Only numeric nonzero-port loopback endpoints are allowed. Notifications
     /// are disabled on this owner; notification clients own separate opted-in
-    /// GatewayChannels and image-transfer clients retain separate Connections.
+    /// GatewayChannels; image-transfer clients own separate upload channels.
     pub async fn connect_clear(endpoint: SocketAddr, timeout: Duration) -> Result<Self> {
         let deadline = deadline_after(timeout)?;
         let channel = GatewayChannel::connect_unsecured_loopback(
             endpoint,
-            false,
+            GatewayProfile::Ordinary,
             ChannelLimits::default(),
             deadline,
         )
