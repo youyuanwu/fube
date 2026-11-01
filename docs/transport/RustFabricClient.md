@@ -299,10 +299,12 @@ qualification of native secure-session recovery or service notifications.
 ### Native ImageStore application-package copy
 
 `ImageStoreClient` is a noncloneable owner of a dedicated native upload
-connection. It does not borrow a `FabricClient` or notification session.
+Upload-profile `GatewayChannel`. It does not borrow a `FabricClient` or
+notification session.
 Production upload uses no native SDK, COM library, HTTP gateway or subprocess.
 Only native `fabric:ImageStore`, canonical protocol **1.2**, and explicitly
-unsecured development gateways are supported; there is no TLS, authentication,
+unsecured **numeric-loopback, nonzero-port** development gateways are supported;
+nonloopback and zero-port upload endpoints are deliberately rejected. There is no TLS, authentication,
 backend selection or v1.1 fallback.
 
 Build the thin CLI and put `target/debug` on your PATH, or invoke that binary
@@ -374,9 +376,9 @@ source can fail or produce mixed-time content.
 | Content frame | **4 MiB total**, including the **12-byte** fixed header and every native header. An oversized negotiated threshold fails before content is read/sent; it is never silently shrunk. A zero advertised threshold uses **3 MiB**. |
 | Directory traversal | **128** simultaneously open directory levels, including the source root; **1,000,000** visited entries. No package-sized file or GUID snapshot is retained. |
 | Native path encoding | Each native string is at most **32,768 UTF-16 units**; the complete native header area must fit **65,535 bytes**. Before Delete, the generated `/_.dir` FileCreate is encoded as a complete frame, including Actor/Action/MessageId, Activity/version, upload fields, Timeout and record overhead, with maximum relevant MessageId index/timeout widths. These are encoded-size limits, not a promise that every 32,768-unit path fits. |
-| Reply handoff | **32** validated semantic replies; overflow is terminal. |
+| Reply handoff | **32** raw backend ACK envelopes, no second queue/worker; overflow is terminal. Transport authority is validated on ingress; domain headers/body are decoded at client pull before stale filtering. Unread domain-invalid ACKs remain bounded raw ingress until pull. |
 | Stale/duplicate replies | At most **64 consecutive** well-formed obsolete replies per awaited stage; the 65th fails. Wrong future sequences/actions and malformed bodies fail, not count as harmless stale traffic. |
-| Transport capacity | **32** ordinary admitted sends/requests and **32** queued ordinary frames; upload content and controls never use the separately reserved **32** IPC/reply-control slots. |
+| Transport capacity | **8** ordinary admitted sends/requests, including started writes and completed-undelivered results; upload content/controls never use consuming reply slots. **1 GiB** conservative aggregate reservation ceiling, not eager allocation. |
 
 Every file uses FileCreate, acknowledged raw content chunks, then actor-27
 commit success followed by a flushed FileUploadCommitAck. Even an empty file
@@ -384,7 +386,10 @@ sends **one empty chunk** before commit. Content/chunk ACKs alone cannot report
 file success. Native semantic ACKs can omit MessageId/RelatesTo: strict actor
 25/27, action, version, Activity GUID and sequence/body checks are required.
 Late prior-file cleanup results and duplicate commits cannot complete a later
-file. OperationsPending can resend the **same GUID's commit** within the original
+file. Upload actor26 frames omit ordinary MessageIds; this avoids consuming
+transport lifetime-ID history per chunk without relaxing history/collision rules.
+Root Delete is still ordinary actor5 RPC on this upload socket.
+OperationsPending can resend the **same GUID's commit** within the original
 deadline; there is no reconnect or whole-package replay.
 
 **Failure is not rollback.** Root replacement has already removed the previous
@@ -401,15 +406,26 @@ expiry may eventually reclaim staged data. Uncertain errors/deadlines also
 retire the client. `is_closed()`/`terminal_error()` expose terminal state and
 reuse fails rather than reconnecting. Validation failures before guarded remote
 work can leave the client usable; successful copies retain a reusable socket.
-`close(&self) -> Result<()>` awaits socket-driver release.
+`close(&self) -> Result<()>` awaits the retained socket-driver join with a
+separate **31-second teardown budget** (30-second full-frame watchdog plus
+one second), without extending the upload deadline. A started frame may finish
+its suffix after observer cancellation; completion means local full-frame
+write, never remote ACK, commit or rollback. Close/disposal success is separate
+from the retained terminal cause.
 
 Implementation: [public API and copy lifecycle](../../crates/libs/fube-client/src/image_store.rs#L59),
-[native codecs](../../crates/libs/fube-client/src/image_store_protocol.rs#L27),
-[complete root-marker preflight](../../crates/libs/fube-client/src/image_store_protocol.rs#L193),
-[strict semantic ACK decoding](../../crates/libs/fube-transport/src/file_transfer.rs#L26)
-and [dedicated transport role](../../crates/libs/fube-transport/src/connection.rs#L420).
+[native codecs](../../crates/libs/fube-client/src/image_store_protocol.rs#L144),
+[complete root-marker preflight](../../crates/libs/fube-client/src/image_store_protocol.rs#L310),
+[strict client semantic ACK decoding](../../crates/libs/fube-client/src/image_store_protocol.rs#L48)
+and [concrete upload transport authority](../../crates/libs/fube-transport/src/native_channel.rs#L1135).
 Native copy semantics follow the pinned
 [NativeImageStore directory path](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Management/ImageStore/NativeImageStore.cpp#L1139-L1369).
+Native gateway ACKs use raw actor25/27
+[SendOneWay replies](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Naming/FileTransferGateway.cpp#L1789-L1843);
+they are not ordinary RPC completions. mssf's package-copy reference invokes
+native COM, not a second wire implementation. This directory-root v1.2 subset
+does not claim all native/.NET image-store stores, direct-file copy, retries,
+security profiles or source-lock/cancellation semantics.
 
 ### Query parameters, paging, and serialization
 
