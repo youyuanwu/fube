@@ -28,7 +28,7 @@ use crate::{
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc, Mutex, Weak,
     },
 };
@@ -39,7 +39,175 @@ pub(crate) enum ProcessingRole {
     Secondary,
     Recovery,
 }
-
+impl KernelManager {
+    pub(crate) fn set_maintenance_hooks(
+        &self,
+        admitted: AdmissionHook,
+        throttle: WriteAccessCheck,
+    ) {
+        *self.admission_hook.lock().unwrap() = Some(admitted);
+        *self.throttle_hook.lock().unwrap() = Some(throttle);
+    }
+    pub(crate) fn on_admitted(&self, record: &Record) -> Result<bool> {
+        if let Some(hook) = self.admission_hook.lock().unwrap().clone() {
+            hook(record)
+        } else {
+            Ok(false)
+        }
+    }
+    pub(crate) fn abort_old(&self, ids: &[i64]) {
+        let manager = self.shared();
+        let ids = ids.to_vec();
+        drop(own(Box::pin(async move {
+            // Native CheckpointManager::AbortOldTransactions queues a work item;
+            // do not first-poll an End under the writer lock/engine reentry scope.
+            tokio::task::yield_now().await;
+            for id in ids {
+                if let Some(owner) = manager
+                    .owners
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .and_then(Weak::upgrade)
+                {
+                    let _ = owner.system_abort();
+                }
+            }
+            Ok(())
+        })));
+    }
+    pub(crate) async fn stable_permission(&self, lsn: i64) {
+        loop {
+            let changed = self.log_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.stable() >= lsn || self.faults.is_closing() {
+                return;
+            }
+            changed.await;
+        }
+    }
+    pub(crate) fn index_if_needed(&self, interval: u64) -> Result<()> {
+        let log = self.log.lock().unwrap();
+        let memory = self.memory().unwrap();
+        let mut memory = memory.lock().unwrap();
+        if memory
+            .latest_index()
+            .is_none_or(|p| memory.tail_position - p >= interval)
+        {
+            memory.indexing(log.tail, log.epoch)?;
+            memory.flush();
+        }
+        Ok(())
+    }
+    pub(crate) fn runtime_checkpoint<T>(
+        &self,
+        create: impl FnOnce(i64) -> Result<Option<(Arc<Activity>, T)>>,
+    ) -> Result<Option<T>> {
+        let mut log = self.log.lock().unwrap();
+        let Some((activity, result)) = create(log.tail)? else {
+            return Ok(None);
+        };
+        self.map.admit(activity.node.clone())?;
+        log.ordered.push(activity.clone());
+        drop(log);
+        #[cfg(test)]
+        self.pause_physical_insertion(7);
+        activity.replication.complete(Ok(()));
+        self.start_completion(activity.clone());
+        self.flush(Ok(()));
+        Ok(Some(result))
+    }
+    pub(crate) fn set_checkpoint_hook(&self, hook: OrderedCheckpointHook) {
+        *self.checkpoint_hook.lock().unwrap() = Some(hook);
+    }
+    #[cfg(test)]
+    fn pause_physical_insertion(&self, kind: i32) {
+        let pause = {
+            let mut slot = self.physical_insertion_pause.lock().unwrap();
+            if slot.as_ref().is_some_and(|(k, _, _)| *k == kind) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered, release)) = pause {
+            let _ = entered.send(());
+            release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+    }
+    fn buffered_checkpoint(
+        &self,
+        log: &mut LogState,
+        activity: &Activity,
+        errors: &mut Vec<Error>,
+    ) {
+        if !matches!(activity.node.record().kind, RecordKind::Barrier { .. }) {
+            return;
+        }
+        if activity.io_error.lock().unwrap().is_some() || self.faults.is_closing() {
+            return;
+        }
+        if let Some(hook) = self.checkpoint_hook.lock().unwrap().clone() {
+            match hook(log.tail) {
+                Ok(Some(begin)) => {
+                    if let Err(error) = self.map.admit(begin.node.clone()) {
+                        errors.push(error);
+                        return;
+                    }
+                    log.ordered.push(begin.clone());
+                    begin.replication.complete(Ok(()));
+                    self.start_completion(begin);
+                }
+                Ok(None) => {}
+                Err(error) => errors.push(error),
+            }
+        }
+    }
+    pub(crate) fn reset_copy_log(
+        &self,
+        metadata: &super::copy_codec::CopyMetadata,
+        capacity: usize,
+    ) -> Result<()> {
+        if self.role() != ProcessingRole::Secondary {
+            return Err(Status::InvalidOperation.error());
+        }
+        let mut memory = super::memory_log::MemoryLog::new(capacity)?;
+        memory.periodic_times = self
+            .memory()
+            .ok_or_else(|| Status::ObjectClosed.error())?
+            .lock()
+            .unwrap()
+            .periodic_times;
+        memory.indexing(metadata.starting, metadata.starting_epoch)?;
+        memory.tail_lsn = metadata.starting;
+        memory.vector = metadata.vector.clone();
+        memory.flush();
+        self.map.reuse();
+        self.map.set_covered(metadata.checkpoint);
+        self.covered_prefix
+            .store(metadata.checkpoint, Ordering::Release);
+        let ordering = Completion::new();
+        ordering.complete(Ok(()));
+        *self.log.lock().unwrap() = LogState {
+            tail: metadata.starting,
+            ordered: Vec::new(),
+            queue: BTreeMap::new(),
+            flushed: 0,
+            epoch: metadata.starting_epoch,
+            epoch_lsn: metadata.starting,
+            ordering,
+        };
+        *self.dispatch.lock().unwrap() = DispatchState::default();
+        self.last_barrier
+            .store(metadata.starting, Ordering::Release);
+        self.stable.store(metadata.checkpoint, Ordering::Release);
+        *self.memory.lock().unwrap() = Some(Arc::new(Mutex::new(memory)));
+        Ok(())
+    }
+}
 impl ProcessingRole {
     fn redo(self) -> ApplyContext {
         match self {
@@ -52,6 +220,8 @@ impl ProcessingRole {
 
 type ProcessorFaultHook = Arc<dyn Fn(Error) + Send + Sync>;
 type WriteAccessCheck = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+type AdmissionHook = Arc<dyn Fn(&Record) -> Result<bool> + Send + Sync>;
+type OrderedCheckpointHook = Arc<dyn Fn(i64) -> Result<Option<Arc<Activity>>> + Send + Sync>;
 
 #[derive(Default)]
 pub(crate) struct FaultState {
@@ -239,6 +409,9 @@ impl ControlledLower {
 }
 
 pub(crate) struct Activity {
+    pub(crate) physical_position: AtomicU64,
+    pub(crate) checkpoint_entered: Completion<()>,
+    pub(crate) checkpoint_prepared: Mutex<Option<Completion<()>>>,
     io_error: Mutex<Option<Error>>,
     pub(crate) previous_stable: AtomicI64,
     pub(crate) node: Arc<RecordNode>,
@@ -253,6 +426,9 @@ pub(crate) struct Activity {
 impl Activity {
     pub(crate) fn new(node: Arc<RecordNode>, primary: bool) -> Arc<Self> {
         Arc::new(Self {
+            physical_position: AtomicU64::new(u64::MAX),
+            checkpoint_entered: Completion::new(),
+            checkpoint_prepared: Mutex::new(None),
             io_error: Mutex::new(None),
             previous_stable: AtomicI64::new(-1),
             node,
@@ -306,7 +482,16 @@ impl Drop for CleanupEntry {
     }
 }
 
+#[cfg(test)]
+type PhysicalInsertionPause = (
+    i32,
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
 pub(crate) struct KernelManager {
+    #[cfg(test)]
+    pub(crate) physical_insertion_pause: Mutex<Option<PhysicalInsertionPause>>,
+    checkpoint_hook: Mutex<Option<OrderedCheckpointHook>>,
     #[cfg(test)]
     pub(crate) flush_extracted: Mutex<
         Option<(
@@ -326,14 +511,16 @@ pub(crate) struct KernelManager {
     pub(crate) faults: Arc<FaultState>,
     role: Mutex<ProcessingRole>,
     replica_role: Mutex<ReplicaRole>,
-    covered_prefix: SequenceNumber,
+    covered_prefix: AtomicI64,
     log: Mutex<LogState>,
     dispatch: Mutex<DispatchState>,
     last_barrier: Arc<AtomicI64>,
     stable: AtomicI64,
     /// Weak capture bridge for borrowed SDK begin/add, not a request ledger or
     /// successful-outcome index. Record nodes retain their own shared owners.
-    owners: Mutex<BTreeMap<TransactionId, Weak<dyn Transaction>>>,
+    owners: Mutex<BTreeMap<TransactionId, Weak<KernelTransaction>>>,
+    admission_hook: Mutex<Option<AdmissionHook>>,
+    throttle_hook: Mutex<Option<WriteAccessCheck>>,
     retry: Arc<RetryRuntime>,
     notifications: Mutex<Vec<(TransactionId, SequenceNumber)>>,
     commit_callback: Mutex<Option<CommitCallback>>,
@@ -381,7 +568,10 @@ impl KernelManager {
             } else {
                 ReplicaRole::IdleSecondary
             }),
-            covered_prefix,
+            covered_prefix: AtomicI64::new(covered_prefix),
+            checkpoint_hook: Mutex::new(None),
+            #[cfg(test)]
+            physical_insertion_pause: Mutex::new(None),
             log: Mutex::new(LogState {
                 tail: 1,
                 ordered: Vec::new(),
@@ -398,6 +588,8 @@ impl KernelManager {
             last_barrier,
             stable: AtomicI64::new(0),
             owners: Mutex::new(BTreeMap::new()),
+            admission_hook: Mutex::new(None),
+            throttle_hook: Mutex::new(None),
             retry,
             notifications: Mutex::new(Vec::new()),
             access: Mutex::new(AccessState {
@@ -486,7 +678,10 @@ impl KernelManager {
         let old_flushed = log.flushed;
         let mut index = 0;
         log.ordered.retain(|activity| {
-            let keep = retained.contains(&(Arc::as_ptr(&activity.node) as usize));
+            let keep = index >= old_flushed
+                || !activity.processing.is_completed()
+                || matches!(activity.node.record().kind, RecordKind::Physical { .. })
+                || retained.contains(&(Arc::as_ptr(&activity.node) as usize));
             if !keep && index < old_flushed {
                 removed_flushed += 1;
             }
@@ -494,6 +689,38 @@ impl KernelManager {
             keep
         });
         log.flushed -= removed_flushed;
+        Ok(true)
+    }
+    pub(crate) fn physical_truncate(&self, position: u64) -> Result<bool> {
+        let mut log = self.log.lock().unwrap();
+        let memory = self.memory().ok_or_else(|| Status::ObjectClosed.error())?;
+        let mut memory = memory.lock().unwrap();
+        if !memory.physical_truncate_selected(position)? {
+            return Ok(false);
+        }
+        let retained: std::collections::BTreeSet<_> = memory
+            .entries
+            .iter()
+            .filter_map(|entry| entry.logical.as_ref())
+            .map(|node| Arc::as_ptr(node) as usize)
+            .collect();
+        let old = log.flushed;
+        let mut index = 0;
+        let mut removed = 0;
+        log.ordered.retain(|activity| {
+            let keep = index >= old
+                || !activity.flush.is_completed()
+                || !activity.processing.is_completed()
+                || (matches!(activity.node.record().kind, RecordKind::Physical { .. })
+                    && activity.physical_position.load(Ordering::Acquire) >= position)
+                || retained.contains(&(Arc::as_ptr(&activity.node) as usize));
+            if !keep && index < old {
+                removed += 1;
+            }
+            index += 1;
+            keep
+        });
+        log.flushed -= removed;
         Ok(true)
     }
     pub(crate) fn fresh(directory: Arc<ProviderDirectory>, retry: Arc<RetryRuntime>) -> Arc<Self> {
@@ -640,6 +867,23 @@ impl KernelManager {
     pub(crate) fn epoch(&self) -> Epoch {
         self.log.lock().unwrap().epoch
     }
+    pub(crate) async fn wait_flushed(&self, upto: i64) -> Result<()> {
+        loop {
+            let changed = self.log_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(error) = self.faults.log_error() {
+                return Err(error);
+            }
+            if self
+                .memory()
+                .is_some_and(|memory| memory.lock().unwrap().flushed_lsn >= upto)
+            {
+                return Ok(());
+            }
+            changed.await;
+        }
+    }
     pub(crate) fn inject_unregister_error(&self, error: Error) {
         *self
             .unregister_error
@@ -667,7 +911,6 @@ impl KernelManager {
             self.role() == ProcessingRole::Primary,
             self.retry.clone(),
         )?;
-        let owner: Arc<dyn Transaction> = transaction.clone();
         if let Some(limits) = self.limits.lock().unwrap().clone() {
             transaction.bind_limits(limits)?;
         }
@@ -676,7 +919,10 @@ impl KernelManager {
         if owners.len() >= 1024 {
             return Err(Status::InsufficientResources.error());
         }
-        owners.insert(transaction.get_transaction_id(), Arc::downgrade(&owner));
+        owners.insert(
+            transaction.get_transaction_id(),
+            Arc::downgrade(&transaction),
+        );
         Ok(transaction)
     }
     fn retain_borrowed(&self, transaction: &dyn Transaction) -> Result<Arc<dyn Transaction>> {
@@ -685,6 +931,7 @@ impl KernelManager {
             .expect("transaction owners poisoned")
             .get(&transaction.get_transaction_id())
             .and_then(Weak::upgrade)
+            .map(|owner| owner as Arc<dyn Transaction>)
             .ok_or(Error::InvalidInput(
                 "borrowed transaction has no bounded shared owner",
             ))
@@ -744,6 +991,19 @@ impl KernelManager {
 
     fn preflight(&self, record: &Record) -> Result<()> {
         self.gate()?;
+        if let RecordKind::Begin {
+            metadata: Some(metadata),
+            redo,
+            ..
+        }
+        | RecordKind::Operation {
+            metadata: Some(metadata),
+            redo,
+            ..
+        } = &record.kind
+        {
+            self.directory.preflight_record(metadata, redo.as_ref())?;
+        }
         if record.transaction_id().is_some_and(|id| id <= 0)
             || matches!(
                 record.kind,
@@ -759,6 +1019,9 @@ impl KernelManager {
             record.kind,
             RecordKind::Begin { .. } | RecordKind::Operation { .. }
         ) {
+            if let Some(throttle) = self.throttle_hook.lock().unwrap().clone() {
+                throttle()?;
+            }
             self.throttle
                 .lock()
                 .expect("throttle seam poisoned")
@@ -813,6 +1076,7 @@ impl KernelManager {
 
     pub(crate) fn append(&self, activity: Arc<Activity>) -> Result<()> {
         let mut log = self.log.lock().expect("log poisoned");
+        let mut checkpoint_errors = Vec::new();
         let epoch = matches!(activity.node.record().kind, RecordKind::UpdateEpoch { .. });
         let lsn = activity.node.lsn();
         activity.node.set_epoch(log.epoch);
@@ -823,6 +1087,13 @@ impl KernelManager {
         // Native map mutation precedes ordered append, including gap admission.
         self.map.admit(activity.node.clone())?;
         if epoch {
+            if let Some(memory) = self.memory() {
+                let mut memory = memory.lock().unwrap();
+                if let Err(error) = memory.append_logical(activity.node.clone()) {
+                    memory.fail_writer(error.clone());
+                    *activity.io_error.lock().unwrap() = Some(error);
+                }
+            }
             log.ordered.push(activity);
         } else if lsn == log.tail + 1 {
             log.tail = lsn;
@@ -835,7 +1106,8 @@ impl KernelManager {
                     *activity.io_error.lock().unwrap() = Some(error);
                 }
             }
-            log.ordered.push(activity);
+            log.ordered.push(activity.clone());
+            self.buffered_checkpoint(&mut log, &activity, &mut checkpoint_errors);
             loop {
                 let next = log.tail + 1;
                 let Some(queued) = log.queue.remove(&next) else {
@@ -849,7 +1121,8 @@ impl KernelManager {
                         *queued.io_error.lock().unwrap() = Some(error);
                     }
                 }
-                log.ordered.push(queued);
+                log.ordered.push(queued.clone());
+                self.buffered_checkpoint(&mut log, &queued, &mut checkpoint_errors);
             }
             if log.queue.is_empty() {
                 log.ordering.complete(Ok(()));
@@ -859,6 +1132,10 @@ impl KernelManager {
                 log.ordering = Completion::new();
             }
             log.queue.insert(lsn, activity);
+        }
+        drop(log);
+        for error in checkpoint_errors {
+            self.faults.report_checkpoint_fault(error);
         }
         self.log_changed.notify_waiters();
         Ok(())
@@ -958,9 +1235,11 @@ impl KernelManager {
             return Err(Error::InvalidInput("unsupported native local boundary"));
         }
         let mut log = self.log.lock().unwrap();
+        let mut physical_position = u64::MAX;
         if native_type == 12 {
             if let Some(memory) = self.memory() {
                 let mut memory = memory.lock().unwrap();
+                physical_position = memory.tail_position;
                 memory.information(event)?;
                 memory.flush();
             }
@@ -975,8 +1254,13 @@ impl KernelManager {
         )?;
         self.map.admit(node.clone())?;
         let activity = Activity::new(node, self.role() == ProcessingRole::Primary);
+        activity
+            .physical_position
+            .store(physical_position, Ordering::Release);
         log.ordered.push(activity.clone());
         drop(log);
+        #[cfg(test)]
+        self.pause_physical_insertion(native_type);
         activity.replication.complete(Ok(()));
         self.start_completion(activity.clone());
         self.flush(Ok(()));
@@ -1144,7 +1428,24 @@ impl KernelManager {
             record.lsn = lsn;
         }
         Self::preflight_replay(&record)?;
+        self.preflight_replay_routing(&record)?;
         self.replay_decoded(record)
+    }
+    pub(crate) fn preflight_replay_routing(&self, record: &Record) -> Result<()> {
+        if let RecordKind::Begin {
+            metadata: Some(metadata),
+            redo,
+            ..
+        }
+        | RecordKind::Operation {
+            metadata: Some(metadata),
+            redo,
+            ..
+        } = &record.kind
+        {
+            self.directory.preflight_record(metadata, redo.as_ref())?;
+        }
+        Ok(())
     }
     pub(crate) fn preflight_replay(record: &Record) -> Result<()> {
         if record.transaction_id().is_some_and(|id| id < 0)
@@ -1176,6 +1477,7 @@ impl KernelManager {
     }
     pub(crate) fn replay_decoded(&self, record: Record) -> Result<Arc<Activity>> {
         Self::preflight_replay(&record)?;
+        self.preflight_replay_routing(&record)?;
         let transaction = record
             .transaction_id()
             .map(KernelTransaction::replay)
@@ -1210,24 +1512,50 @@ impl KernelManager {
                 "copied epoch must be at secondary tail",
             ));
         }
-        if epoch == log.epoch {
-            return Ok(None);
-        }
-        if (epoch.data_loss_number, epoch.configuration_number)
-            < (log.epoch.data_loss_number, log.epoch.configuration_number)
-        {
-            return Err(Status::NotImplemented.error());
-        }
         let memory_owner = self.memory();
         let mut memory = memory_owner.as_ref().map(|m| m.lock().unwrap());
+        let key = super::copy_codec::epoch_key;
+        let last_epoch = memory
+            .as_ref()
+            .and_then(|m| m.vector.last())
+            .map_or(log.epoch, |v| v.epoch);
+        let full_prefix = key(log.epoch) < key(last_epoch) && key(epoch) <= key(last_epoch);
+        if full_prefix && record.lsn > self.covered_prefix.load(Ordering::Acquire) {
+            return Err(Error::InvalidInput("copied PV prefix exceeds checkpoint"));
+        }
+        let insert = if full_prefix {
+            None
+        } else if let Some(memory) = &memory {
+            if let Some(existing) = memory.vector.iter().find(|v| v.epoch == epoch) {
+                if existing.lsn != record.lsn {
+                    return Err(Error::InvalidInput("copied PV epoch has different LSN"));
+                }
+                return Ok(None);
+            }
+            let position = memory.vector.partition_point(|v| key(v.epoch) < key(epoch));
+            if memory.vector[position..]
+                .iter()
+                .any(|v| v.lsn != record.lsn)
+            {
+                return Err(Error::InvalidInput("copied retry PV LSN differs"));
+            }
+            Some(position)
+        } else {
+            if epoch == log.epoch {
+                return Ok(None);
+            }
+            Some(0)
+        };
         if let Some(memory) = &mut memory {
-            if memory.vector.len() >= 128 {
+            if insert.is_some() && memory.vector.len() >= 128 {
                 return Err(Status::InsufficientResources.error());
             }
-            memory
-                .vector
-                .try_reserve(1)
-                .map_err(|_| Status::InsufficientResources.error())?;
+            if insert.is_some() {
+                memory
+                    .vector
+                    .try_reserve(1)
+                    .map_err(|_| Status::InsufficientResources.error())?;
+            }
         }
         let node = RecordNode::new(record, None, None)?;
         if let Some(memory) = &memory {
@@ -1241,14 +1569,21 @@ impl KernelManager {
                 memory.fail_writer(error.clone());
                 *activity.io_error.lock().unwrap() = Some(error);
             }
-            memory.vector.push(super::memory_log::ProgressEntry {
-                epoch,
-                lsn: activity.node.lsn(),
-                primary: primary_replica_id,
-                ticks: timestamp_ticks,
-            });
+            if let Some(position) = insert {
+                memory.vector.insert(
+                    position,
+                    super::memory_log::ProgressEntry {
+                        epoch,
+                        lsn: activity.node.lsn(),
+                        primary: primary_replica_id,
+                        ticks: timestamp_ticks,
+                    },
+                );
+            }
         }
-        log.epoch = epoch;
+        if key(epoch) > key(log.epoch) {
+            log.epoch = epoch;
+        }
         log.epoch_lsn = activity.node.lsn();
         log.ordered.push(activity.clone());
         activity.replication.complete(Ok(()));
@@ -1257,7 +1592,7 @@ impl KernelManager {
     }
 
     pub(crate) fn start_completion(&self, activity: Arc<Activity>) {
-        if !activity.primary {
+        if !activity.primary || activity.checkpoint_prepared.lock().unwrap().is_some() {
             return;
         }
         let manager = self.shared();
@@ -1283,6 +1618,7 @@ impl KernelManager {
                     let previous = manager.stable.fetch_max(stable, Ordering::AcqRel);
                     activity.previous_stable.store(previous, Ordering::Release);
                     manager.map.remove_stable(stable);
+                    manager.log_changed.notify_waiters();
                 }
                 activity.processing.complete(Ok(()));
             } else if matches!(activity.node.record().kind, RecordKind::UpdateEpoch { .. }) {
@@ -1351,6 +1687,7 @@ impl KernelManager {
             dispatch.running = true;
             launch
         };
+        self.log_changed.notify_waiters();
         if !launch {
             return;
         }
@@ -1413,7 +1750,11 @@ impl KernelManager {
             };
             match action {
                 DispatchAction::Failed(activity, error) => {
-                    self.process_immediately(&activity, Err(error), true);
+                    if activity.checkpoint_prepared.lock().unwrap().is_some() {
+                        activity.checkpoint_entered.complete(Err(error));
+                    } else {
+                        self.process_immediately(&activity, Err(error), true);
+                    }
                 }
                 DispatchAction::Group(group) => {
                     let mut transactions = BTreeMap::new();
@@ -1424,11 +1765,19 @@ impl KernelManager {
                             // advances GetVersion through a completed group.
                             self.last_barrier
                                 .store(activity.node.lsn(), Ordering::Release);
-                            self.process_immediately(
-                                &activity,
-                                self.faults.service_error().map_or(Ok(()), Err),
-                                false,
-                            );
+                            let prepared = activity.checkpoint_prepared.lock().unwrap().clone();
+                            if let Some(prepared) = prepared {
+                                activity
+                                    .checkpoint_entered
+                                    .complete(self.faults.service_error().map_or(Ok(()), Err));
+                                let _ = prepared.wait().await;
+                            } else {
+                                self.process_immediately(
+                                    &activity,
+                                    self.faults.service_error().map_or(Ok(()), Err),
+                                    false,
+                                );
+                            }
                         } else {
                             let id = activity
                                 .node
@@ -1455,6 +1804,7 @@ impl KernelManager {
                 if let RecordKind::Barrier { last_stable_lsn } = activity.node.record().kind {
                     self.stable.fetch_max(last_stable_lsn, Ordering::AcqRel);
                     self.map.remove_stable(last_stable_lsn);
+                    self.log_changed.notify_waiters();
                 }
             }
             activity
@@ -1516,7 +1866,7 @@ impl KernelManager {
                 ..
             }
         );
-        if (!single && !committed) || node.lsn() <= self.covered_prefix {
+        if (!single && !committed) || node.lsn() <= self.covered_prefix.load(Ordering::Acquire) {
             return Ok(());
         }
         let transaction = node.transaction().expect("operation has transaction");
@@ -1563,7 +1913,7 @@ impl KernelManager {
             return Ok(());
         }
         let result: Result<()> = (|| {
-            if node.lsn() > self.covered_prefix {
+            if node.lsn() > self.covered_prefix.load(Ordering::Acquire) {
                 let constituents = if single {
                     vec![node.clone()]
                 } else {

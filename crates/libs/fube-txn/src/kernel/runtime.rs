@@ -1,13 +1,18 @@
-//! Private Phase2 volatile composition. Native TransactionalReplicator.cpp:
+//! Private volatile runtime composition. Native TransactionalReplicator.cpp:
 //! 257–459, StateManager.cpp:103–179,4797–4919 and SecondaryDrainManager.cpp:
 //! 200–233,323–376,653–799,906–972. Binding/owned futures are FUBE ADAPTATION;
-//! no new admission policy, second binder or Full-copy installation product.
+//! no new admission policy or second binder. Native staged volatile copy and
+//! memory/checkpoint execution remain distinct from the unfinished public facade.
 use super::{
     checkpoint::await_all,
+    copy_codec::{remove_stage, CopyContext, CopyMetadata, Stage},
+    copy_sender::LazyCopy,
     identity,
+    maintenance::{LogSettings, Maintenance},
     processor::KernelManager,
     provider::ProviderDirectory,
     record::{Record, RecordKind},
+    registry::{Registry, RegistrySettings},
     runtime_lower::RuntimeLower,
     runtime_owner::ProviderOwner,
     status::Status,
@@ -15,8 +20,8 @@ use super::{
     version::Completion,
 };
 use crate::{
-    ApiFuture, Cancellation, Epoch, Error, IDataLossHandler, IStateProvider2,
-    ITransactionalReplicator, OperationData, ReplicaRole, Result,
+    ApiFuture, Cancellation, Epoch, Error, IDataLossHandler, IStateProvider2, OperationData,
+    ReplicaRole, Result,
 };
 use fube_data::{
     extensions::{
@@ -35,6 +40,8 @@ use std::{
 };
 
 pub(crate) struct RuntimeConfig {
+    pub(crate) log_settings: LogSettings,
+    pub(crate) registry: Option<RegistrySettings>,
     pub(crate) providers: Vec<(i64, Arc<dyn IStateProvider2>)>,
     pub(crate) work_folder: PathBuf,
     pub(crate) memory_bytes: usize,
@@ -45,6 +52,15 @@ pub(crate) struct Generation {
     pub(crate) done: Completion<()>,
 }
 pub(crate) struct VolatileRuntime {
+    #[cfg(test)]
+    pub(crate) copy_log_read_error: Mutex<Option<usize>>,
+    #[cfg(test)]
+    pub(crate) copy_write_failure: Mutex<Option<(i64, Error)>>,
+    #[cfg(test)]
+    pub(crate) copy_selection_pause: Mutex<Option<(Completion<()>, Completion<()>)>>,
+    full_copy_unfinished: AtomicBool,
+    pub(crate) maintenance: Mutex<Option<Arc<Maintenance>>>,
+    pub(crate) registry: Arc<Registry>,
     #[cfg(test)]
     pub(crate) role_events: Mutex<Vec<String>>,
     weak: Weak<Self>,
@@ -76,7 +92,7 @@ impl VolatileRuntime {
         native: NativeRuntimeIntegration,
         endpoint: ReplicationEndpointOptions,
         settings: Settings,
-        config: RuntimeConfig,
+        mut config: RuntimeConfig,
     ) -> Result<Arc<Self>> {
         let mut names = std::collections::BTreeSet::new();
         if config
@@ -86,10 +102,11 @@ impl VolatileRuntime {
         {
             return Err(Error::InvalidInput("duplicate supplied provider name"));
         }
-        let manager = KernelManager::fresh(
-            ProviderDirectory::preinitialized(config.providers.clone(), None)?,
-            Arc::new(RetryRuntime::default()),
-        );
+        let registry = Registry::new(config.registry.take(), &config.providers)?;
+        let directory =
+            ProviderDirectory::preinitialized(config.providers.clone(), Some(registry.clone()))?;
+        directory.set_local_callbacks(registry.clone());
+        let manager = KernelManager::fresh(directory, Arc::new(RetryRuntime::default()));
         manager.fence_application();
         let owner = Arc::new(ProviderOwner {
             manager: manager.clone(),
@@ -99,6 +116,15 @@ impl VolatileRuntime {
             read_after: AtomicI64::new(i64::MAX),
         });
         let runtime = Arc::new_cyclic(|weak| Self {
+            #[cfg(test)]
+            copy_log_read_error: Mutex::new(None),
+            #[cfg(test)]
+            copy_write_failure: Mutex::new(None),
+            #[cfg(test)]
+            copy_selection_pause: Mutex::new(None),
+            full_copy_unfinished: AtomicBool::new(false),
+            maintenance: Mutex::new(None),
+            registry: registry.clone(),
             #[cfg(test)]
             role_events: Mutex::new(Vec::new()),
             weak: weak.clone(),
@@ -125,13 +151,13 @@ impl VolatileRuntime {
             adapter.clone(),
             None,
             endpoint,
-            settings,
+            settings.clone(),
             StateProviderCapabilities {
                 supports_copy_until_latest_lsn: true,
             },
             adapter,
         )?;
-        let logging = RuntimeLower::new(lower.clone())?;
+        let logging = RuntimeLower::with_operation_limits(lower.clone(), &settings)?;
         manager.bind_runtime(logging.clone());
         *runtime.lower.lock().unwrap() = Some(lower);
         *runtime.logging.lock().unwrap() = Some(logging);
@@ -140,6 +166,33 @@ impl VolatileRuntime {
             weak.upgrade()
                 .ok_or_else(|| Status::ObjectClosed.error())?
                 .writable()
+        }));
+        registry.bind(Arc::downgrade(&runtime));
+        let maintenance = Maintenance::new(
+            Arc::downgrade(&runtime),
+            runtime.config.log_settings.clone(),
+        )?;
+        *runtime.maintenance.lock().unwrap() = Some(maintenance.clone());
+        let weak = Arc::downgrade(&maintenance);
+        let throttle = Arc::downgrade(&maintenance);
+        manager.set_maintenance_hooks(
+            Arc::new(move |record| {
+                weak.upgrade()
+                    .ok_or_else(|| Status::ObjectClosed.error())?
+                    .after_record(record)
+            }),
+            Arc::new(move || {
+                throttle
+                    .upgrade()
+                    .ok_or_else(|| Status::ObjectClosed.error())?
+                    .throttle()
+            }),
+        );
+        let weak = Arc::downgrade(&maintenance);
+        manager.set_checkpoint_hook(Arc::new(move |lsn| {
+            weak.upgrade()
+                .ok_or_else(|| Status::ObjectClosed.error())?
+                .checkpoint_on_barrier(lsn)
         }));
         let weak = Arc::downgrade(&runtime);
         manager.faults.set_hook(Arc::new(move |_| {
@@ -158,6 +211,71 @@ impl VolatileRuntime {
     fn shared(&self) -> Arc<Self> {
         self.weak.upgrade().expect("owned volatile runtime")
     }
+    pub(crate) fn maintenance(&self) -> Arc<Maintenance> {
+        self.maintenance.lock().unwrap().as_ref().unwrap().clone()
+    }
+    pub(crate) fn request_group_commit(&self) {
+        self.logging().request_group(self.owner.manager.clone());
+    }
+    pub(crate) fn identity(&self) -> (uuid::Uuid, i64) {
+        let identity = self.native.identity();
+        (identity.partition_id, identity.replica_id)
+    }
+    pub(crate) fn work_folder(&self) -> PathBuf {
+        self.config.work_folder.clone()
+    }
+    pub(crate) fn copy_limits(&self) -> (usize, usize) {
+        self.logging().copy_limits()
+    }
+    pub(crate) fn adopt_opened(
+        &self,
+        id: i64,
+        provider: Arc<dyn IStateProvider2>,
+        mode: super::provider::ProviderMode,
+    ) -> Result<()> {
+        let mut opened = self.opened.lock().unwrap();
+        if opened.len() >= 128 {
+            return Err(Status::InsufficientResources.error());
+        }
+        opened.push(provider.clone());
+        self.owner.manager.directory.entries.lock().unwrap().insert(
+            id,
+            super::provider::ProviderEntry {
+                provider,
+                mode,
+                deleting_by: None,
+            },
+        );
+        Ok(())
+    }
+    pub(crate) async fn retire_provider(&self, id: i64) -> Result<()> {
+        let entry = self
+            .owner
+            .manager
+            .directory
+            .entries
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Status::InvalidParameter.error())?;
+        if entry.provider.close(Cancellation::default()).await.is_err() {
+            entry.provider.abort();
+        }
+        self.owner
+            .manager
+            .directory
+            .entries
+            .lock()
+            .unwrap()
+            .remove(&id);
+        self.opened
+            .lock()
+            .unwrap()
+            .retain(|p| !Arc::ptr_eq(p, &entry.provider));
+        self.owner.manager.directory.retire_checkpoint_metadata(id);
+        Ok(())
+    }
     pub(crate) fn replicator(&self) -> Arc<FabricReplicator> {
         self.lower.lock().unwrap().as_ref().unwrap().clone()
     }
@@ -165,7 +283,16 @@ impl VolatileRuntime {
         self.logging.lock().unwrap().as_ref().unwrap().clone()
     }
     fn providers(&self) -> Vec<Arc<dyn IStateProvider2>> {
-        self.opened.lock().unwrap().clone()
+        self.owner
+            .manager
+            .directory
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.mode == super::provider::ProviderMode::Active)
+            .map(|entry| entry.provider.clone())
+            .collect()
     }
     async fn close_providers(&self, cancellation: Cancellation) -> Result<()> {
         let providers = std::mem::take(&mut *self.opened.lock().unwrap());
@@ -196,20 +323,20 @@ impl VolatileRuntime {
         self.owner
             .read_after
             .store(self.owner.manager.tail(), Ordering::Release);
-        let owner: Arc<dyn ITransactionalReplicator> = self.owner.clone();
         let result: Result<()> = async {
-            for (id, provider) in &self.config.providers {
-                if !provider.get_children(provider.get_name())?.is_empty() {
-                    return Err(Status::NotImplemented.error()); // hierarchy is Phase3
-                }
-                provider.initialize(
-                    Arc::downgrade(&owner),
-                    &self.config.work_folder.join(id.to_string()),
-                    None,
-                )?;
+            for (id, provider) in self.registry.initialize_initial(&self.config.providers)? {
                 provider.open(cancellation.clone()).await?;
-                self.opened.lock().unwrap().push(provider.clone()); // cleanup ownership BEFORE recovery
-                provider.recover_checkpoint(cancellation.clone()).await?;
+                let mode = self
+                    .registry
+                    .rows()
+                    .into_iter()
+                    .find(|r| r.id == id)
+                    .unwrap()
+                    .mode;
+                self.adopt_opened(id, provider.clone(), mode)?;
+                if mode == super::provider::ProviderMode::Active {
+                    provider.recover_checkpoint(cancellation.clone()).await?;
+                }
             }
             Ok(())
         }
@@ -262,6 +389,9 @@ impl VolatileRuntime {
             .unwrap()
             .push(format!("start:{previous:?}->{role:?}"));
         if previous == role {
+            if self.full_copy_unfinished.load(Ordering::Acquire) {
+                return Ok(());
+            }
             self.owner.manager.open_activity_gate()?;
             self.owner.ready.store(true, Ordering::Release);
             return Ok(());
@@ -284,6 +414,7 @@ impl VolatileRuntime {
             if let Some(generation) = &generation {
                 generation.done.wait().await.as_ref().clone()?;
             }
+            self.maintenance().stop().await;
             if previous == ReplicaRole::Primary
                 || matches!(role, ReplicaRole::None | ReplicaRole::Unknown)
             {
@@ -304,6 +435,7 @@ impl VolatileRuntime {
             *self.generation.lock().unwrap() = None;
             let _pause = self.owner.manager.pause_dispatch().await;
             self.owner.manager.set_role(role);
+            self.maintenance().resume();
             // Native newly initialized ActiveSecondary providers pass Idle first.
             if previous == ReplicaRole::Unknown && role == ReplicaRole::ActiveSecondary {
                 self.provider_role(ReplicaRole::IdleSecondary, cancellation.clone())
@@ -331,7 +463,9 @@ impl VolatileRuntime {
         if self.owner.manager.faults.is_closing() {
             return Err(Status::ObjectClosed.error());
         }
-        if !matches!(role, ReplicaRole::None | ReplicaRole::Unknown) {
+        if !matches!(role, ReplicaRole::None | ReplicaRole::Unknown)
+            && !self.full_copy_unfinished.load(Ordering::Acquire)
+        {
             self.owner.manager.open_activity_gate()?;
             self.owner.ready.store(true, Ordering::Release);
         }
@@ -395,11 +529,14 @@ impl VolatileRuntime {
             return Err(Status::NotImplemented.error());
         }
         let stage = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        if stage != 2 && stage != 7 {
+        if stage != 2 && stage != 3 && stage != 7 {
             return Err(Status::NotImplemented.error());
         }
         header.acknowledge()?;
         drop(header); // actual lower capture BEFORE next poll
+        if stage == 3 {
+            return self.drain_full(stream).await;
+        }
         if stage == 2 {
             if stream
                 .get_operation(Cancellation::default())
@@ -428,9 +565,11 @@ impl VolatileRuntime {
             let records = Record::decode_batch(&batch)?;
             for record in &records {
                 KernelManager::preflight_replay(record)?;
+                self.owner.manager.preflight_replay_routing(record)?;
             }
             let mut failure = None;
             for record in records {
+                let epoch = matches!(record.kind, RecordKind::UpdateEpoch { .. });
                 let activity = if matches!(record.kind, RecordKind::UpdateEpoch { .. }) {
                     self.owner.manager.replay_copied_epoch(record)?
                 } else {
@@ -440,6 +579,8 @@ impl VolatileRuntime {
                 if let Some(activity) = activity {
                     if let Err(error) = activity.flush.wait().await.as_ref() {
                         failure.get_or_insert(error.clone());
+                    } else if !epoch {
+                        let _ = self.maintenance().after_record(activity.node.record())?;
                     }
                 }
             }
@@ -456,16 +597,246 @@ impl VolatileRuntime {
     }
     async fn drain_replication(&self, stream: Arc<dyn IOperationStream>) -> Result<()> {
         while let Some(operation) = stream.get_operation(Cancellation::default()).await? {
-            let activity = self.owner.manager.replay_record(
-                operation.get_data()?,
-                Some(operation.get_metadata()?.sequence_number),
-            )?;
+            let mut record = Record::decode(&operation.get_data()?)?;
+            record.lsn = operation.get_metadata()?.sequence_number;
+            KernelManager::preflight_replay(&record)?;
+            self.owner.manager.preflight_replay_routing(&record)?;
+            if record.lsn <= self.owner.manager.tail()
+                && !matches!(record.kind, RecordKind::UpdateEpoch { .. })
+            {
+                self.owner.manager.wait_flushed(record.lsn).await?;
+                operation.acknowledge()?;
+                drop(operation);
+                continue;
+            }
+            let activity = self.owner.manager.replay_decoded(record)?;
             self.owner.manager.flush(Ok(()));
             activity.flush.wait().await.as_ref().clone()?; // failed replication flush has NO ACK
+            let _ = self.maintenance().after_record(activity.node.record())?;
+            if matches!(activity.node.record().kind, RecordKind::Barrier { .. }) {
+                self.maintenance().block_secondary(false).await;
+            }
             operation.acknowledge()?;
             drop(operation); // capture retires before polling even if Apply awaits Barrier
         }
         self.boundary(3).await
+    }
+    async fn next_copy_log(
+        &self,
+        stream: &Arc<dyn IOperationStream>,
+    ) -> Result<Option<Arc<dyn fube_data::IOperation>>> {
+        #[cfg(test)]
+        {
+            let mut fault = self.copy_log_read_error.lock().unwrap();
+            if let Some(remaining) = fault.as_mut() {
+                if *remaining == 0 {
+                    *fault = None;
+                    return Err(Error::InvalidInput("controlled copy stream read failure"));
+                }
+                *remaining -= 1;
+            }
+        }
+        stream.get_operation(Cancellation::default()).await
+    }
+    async fn drain_full(&self, stream: Arc<dyn IOperationStream>) -> Result<()> {
+        use crate::internal::IStateProviderManager;
+        self.full_copy_unfinished.store(true, Ordering::Release);
+        self.owner.manager.fence_application();
+        self.owner.ready.store(false, Ordering::Release);
+        self.owner.read_after.store(i64::MAX, Ordering::Release);
+        let Some(mut operation) = stream.get_operation(Cancellation::default()).await? else {
+            return Ok(());
+        };
+        let mut began = false;
+        let mut number = 0i64;
+        let metadata = loop {
+            let data = operation.get_data()?;
+            let (stage, payload) = remove_stage(&data)?;
+            match stage {
+                Stage::State => {
+                    if !began {
+                        self.owner
+                            .manager
+                            .directory
+                            .begin_setting_current_state()
+                            .await?;
+                        began = true;
+                    }
+                    self.owner
+                        .manager
+                        .directory
+                        .set_current_state(number, payload)
+                        .await?;
+                    operation.acknowledge()?;
+                    drop(operation);
+                    number = number
+                        .checked_add(1)
+                        .ok_or_else(|| Status::InvalidOperation.error())?;
+                    let Some(next) = stream.get_operation(Cancellation::default()).await? else {
+                        return Err(Status::Cancelled.error());
+                    };
+                    operation = next;
+                }
+                Stage::Progress => {
+                    if !began {
+                        return Err(Status::InvalidOperation.error());
+                    }
+                    let metadata = CopyMetadata::decode(&data)?;
+                    self.owner
+                        .manager
+                        .directory
+                        .end_setting_current_state()
+                        .await?;
+                    break metadata;
+                }
+                _ => return Err(Status::NotImplemented.error()),
+            }
+        };
+        // Retain EXACT transition operation through actual native log setup,
+        // first checkpoint initiation and only then ACK.
+        let mut checkpoint = false;
+        let mut completed = false;
+        let result: Result<()> = async {
+            self.owner.manager.processing_drained().await;
+            self.maintenance().stop().await;
+            self.maintenance().resume();
+            self.owner
+                .manager
+                .reset_copy_log(&metadata, self.config.memory_bytes)?;
+            self.owner
+                .read_after
+                .store(metadata.highest_provider, Ordering::Release);
+            let mut setup_failure = None;
+            if let Some(last) = metadata
+                .vector
+                .last()
+                .filter(|v| v.lsn == metadata.starting)
+            {
+                let record = Record {
+                    lsn: metadata.starting,
+                    kind: RecordKind::UpdateEpoch {
+                        epoch: last.epoch,
+                        primary_replica_id: last.primary,
+                        timestamp_ticks: last.ticks,
+                    },
+                };
+                let seeded = self.owner.manager.replay_decoded(record)?;
+                self.owner.manager.flush(Ok(()));
+                if let Err(error) = seeded.flush.wait().await.as_ref() {
+                    setup_failure = Some(error.clone());
+                }
+            }
+            if metadata.starting == metadata.checkpoint && setup_failure.is_none() {
+                self.maintenance()
+                    .start_checkpoint(true)?
+                    .ok_or_else(|| Status::InvalidOperation.error())?;
+                checkpoint = true;
+                if metadata.starting == metadata.upto {
+                    match self.maintenance().finish_copy(metadata.upto).await {
+                        Ok(()) => completed = true,
+                        Err(error) => setup_failure = Some(error),
+                    }
+                }
+            }
+            operation.acknowledge()?;
+            drop(operation);
+            if let Some(error) = setup_failure {
+                return Err(error);
+            }
+            while let Some(operation) = self.next_copy_log(&stream).await? {
+                let (stage, payload) = remove_stage(&operation.get_data()?)?;
+                if stage != Stage::Log {
+                    return Err(Status::NotImplemented.error());
+                }
+                let records = Record::decode_batch(&payload)?;
+                for record in &records {
+                    KernelManager::preflight_replay(record)?;
+                    self.owner.manager.preflight_replay_routing(record)?;
+                }
+                let mut failure = None;
+                for record in records {
+                    let current = self.owner.manager.tail();
+                    if record.lsn < current
+                        || (record.lsn == current
+                            && !matches!(record.kind, RecordKind::UpdateEpoch { .. }))
+                    {
+                        continue;
+                    }
+                    let epoch = matches!(record.kind, RecordKind::UpdateEpoch { .. });
+                    #[cfg(test)]
+                    {
+                        let fault = self.copy_write_failure.lock().unwrap().clone();
+                        if let Some((lsn, error)) = fault.filter(|(lsn, _)| *lsn == record.lsn) {
+                            self.copy_write_failure.lock().unwrap().take();
+                            self.owner
+                                .manager
+                                .memory()
+                                .unwrap()
+                                .lock()
+                                .unwrap()
+                                .write_error = Some(error);
+                            let _ = lsn;
+                        }
+                    }
+                    let activity = if epoch {
+                        self.owner.manager.replay_copied_epoch(record)?
+                    } else {
+                        Some(self.owner.manager.replay_decoded(record)?)
+                    };
+                    self.owner.manager.flush(Ok(()));
+                    if let Some(activity) = activity {
+                        if let Err(error) = activity.flush.wait().await.as_ref() {
+                            failure.get_or_insert(error.clone());
+                        } else if !epoch {
+                            let tail = self.owner.manager.tail();
+                            if tail < metadata.checkpoint {
+                                self.owner
+                                    .manager
+                                    .index_if_needed(self.config.log_settings.index_interval())?;
+                            } else if tail > metadata.checkpoint {
+                                self.maintenance().after_record(activity.node.record())?;
+                            }
+                        }
+                    }
+                    if !checkpoint
+                        && failure.is_none()
+                        && self.owner.manager.tail() == metadata.checkpoint
+                    {
+                        self.maintenance()
+                            .start_checkpoint(true)?
+                            .ok_or_else(|| Status::InvalidOperation.error())?;
+                        checkpoint = true;
+                    }
+                    if checkpoint && !completed && self.owner.manager.tail() == metadata.upto {
+                        match self.maintenance().finish_copy(metadata.upto).await {
+                            Ok(()) => completed = true,
+                            Err(error) => {
+                                failure.get_or_insert(error);
+                            }
+                        }
+                    }
+                }
+                let ack = operation.acknowledge();
+                drop(operation);
+                ack?;
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+            }
+            if !completed {
+                return Err(Status::Cancelled.error());
+            }
+            self.boundary(2).await?;
+            self.full_copy_unfinished.store(false, Ordering::Release);
+            // Only the lifecycle owner may publish readiness after provider roles.
+            // copy_done can release a concurrently fenced Idle->Active callback.
+            Ok(())
+        }
+        .await;
+        if result.is_err() && checkpoint && !completed {
+            self.maintenance().settle_failed_copy(metadata.upto).await;
+        }
+        result
     }
     fn report_fault(&self) {
         self.owner.ready.store(false, Ordering::Release);
@@ -521,6 +892,7 @@ impl VolatileRuntime {
         } else {
             Ok(())
         };
+        self.maintenance().stop().await;
         let processed = self
             .logging()
             .finish_generation(&self.owner.manager, 4)
@@ -600,14 +972,39 @@ impl IStateProvider for Adapter {
         })
     }
     fn get_copy_context(&self) -> Result<Arc<dyn fube_data::IOperationDataStream>> {
-        Err(Status::NotImplemented.error())
+        let runtime = self.runtime()?;
+        let manager = &runtime.owner.manager;
+        let tail = manager.tail();
+        let memory = manager.memory().unwrap();
+        let memory = memory.lock().unwrap();
+        let (_, _, head, head_epoch) = memory.head_identity();
+        let data = CopyContext {
+            replica: runtime.identity().1,
+            vector: memory.vector.clone(),
+            head_epoch,
+            head,
+            tail,
+            atomic_redo: 0,
+        }
+        .encode()?;
+        Ok(Arc::new(ContextStream(Mutex::new(Some(data)))))
     }
     fn get_copy_state(
         &self,
-        _: i64,
-        _: Option<Arc<dyn fube_data::IOperationDataStream>>,
+        upto: i64,
+        context: Option<Arc<dyn fube_data::IOperationDataStream>>,
     ) -> Result<Arc<dyn fube_data::IOperationDataStream>> {
-        Err(Status::NotImplemented.error())
+        Ok(LazyCopy::new(
+            Arc::downgrade(&self.runtime()?),
+            upto,
+            context,
+        ))
+    }
+}
+struct ContextStream(Mutex<Option<OperationData>>);
+impl fube_data::IOperationDataStream for ContextStream {
+    fn get_next(&self, _: Cancellation) -> ApiFuture<'_, Option<OperationData>> {
+        Box::pin(async move { Ok(self.0.lock().unwrap().take()) })
     }
 }
 impl ReplicatorLifecycle for Adapter {

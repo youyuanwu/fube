@@ -274,7 +274,7 @@ pub(crate) struct TransactionMap {
     /// All transaction indexes, not a partition-wide write lease.
     state: Mutex<MapState>,
     /// Bounded replay/copy seam; does not implement persisted recovery.
-    covered_prefix: SequenceNumber,
+    covered_prefix: std::sync::atomic::AtomicI64,
 }
 
 /// Native earliest-pending result, including its distinct failed barrier check.
@@ -286,11 +286,14 @@ pub(crate) struct EarliestPending {
 }
 
 impl TransactionMap {
+    pub(crate) fn set_covered(&self, lsn: i64) {
+        self.covered_prefix.store(lsn, Ordering::Release);
+    }
     /// Construct an empty map with an explicit covered checkpoint LSN.
     pub(crate) fn new(covered_prefix: SequenceNumber) -> Self {
         Self {
             state: Mutex::new(MapState::default()),
-            covered_prefix,
+            covered_prefix: std::sync::atomic::AtomicI64::new(covered_prefix),
         }
     }
 
@@ -355,7 +358,11 @@ impl TransactionMap {
                 transaction_id: id, ..
             } => {
                 let previous = map.latest.get(id).cloned();
-                let enlisted = validate_previous(&node, previous.as_ref(), self.covered_prefix)?;
+                let enlisted = validate_previous(
+                    &node,
+                    previous.as_ref(),
+                    self.covered_prefix.load(Ordering::Acquire),
+                )?;
                 node.mark_admitted()?;
                 node.link(previous, enlisted);
                 map.latest.insert(*id, Arc::clone(&node));
@@ -364,7 +371,11 @@ impl TransactionMap {
                 transaction_id: id, ..
             } => {
                 let previous = map.latest.get(id).cloned();
-                let enlisted = validate_previous(&node, previous.as_ref(), self.covered_prefix)?;
+                let enlisted = validate_previous(
+                    &node,
+                    previous.as_ref(),
+                    self.covered_prefix.load(Ordering::Acquire),
+                )?;
                 let begin = map.pending_by_id.get(id).cloned();
                 if enlisted != begin.is_some()
                     || begin.as_ref().is_some_and(|begin| {

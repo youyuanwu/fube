@@ -31,6 +31,7 @@ fn allocation(error: Error) -> Error {
 }
 
 pub(crate) struct RuntimeLower {
+    copy_limits: (usize, usize),
     self_weak: Weak<Self>,
     #[cfg(test)]
     pub(crate) publication_pause: Arc<Mutex<Option<PublicationPause>>>,
@@ -101,8 +102,16 @@ impl Admission {
 
 impl RuntimeLower {
     pub(crate) fn new(lower: Arc<FabricReplicator>) -> Result<Arc<Self>> {
+        Self::with_operation_limits(lower, &fube_data::Settings::default())
+    }
+    pub(crate) fn with_operation_limits(
+        lower: Arc<FabricReplicator>,
+        settings: &fube_data::Settings,
+    ) -> Result<Arc<Self>> {
+        settings.validate()?;
         let payloads = ObjectQuota::new(32)?;
         Ok(Arc::new_cyclic(|self_weak| Self {
+            copy_limits: (settings.operation_segments, settings.operation_bytes),
             self_weak: self_weak.clone(),
             #[cfg(test)]
             publication_pause: Arc::new(Mutex::new(None)),
@@ -128,6 +137,9 @@ impl RuntimeLower {
                 changed: tokio::sync::Notify::new(),
             }),
         }))
+    }
+    pub(crate) fn copy_limits(&self) -> (usize, usize) {
+        self.copy_limits
     }
     fn self_owner(&self) -> Arc<Self> {
         self.self_weak.upgrade().expect("runtime owner")
@@ -307,6 +319,9 @@ impl RuntimeLower {
         }));
     }
 
+    pub(crate) fn request_group(&self, manager: Arc<KernelManager>) {
+        self.schedule_group(manager);
+    }
     pub(crate) fn admit(
         &self,
         manager: Arc<KernelManager>,
@@ -406,6 +421,13 @@ impl RuntimeLower {
             ));
         }
         let wire = record.encode()?;
+        let (segments, bytes) = self.copy_limits;
+        if wire.segments().len() + 1 > segments || wire.bytes() + 4 > bytes {
+            return Err(Error::new(
+                fube_runtime::ErrorKind::ReplicationOperationTooLarge,
+                "finite native copy framing including stage",
+            ));
+        }
         // Every record class uses the same finite allocator AND ordinary lower
         // replicate. End/Barrier are not priority/loan-backed admissions.
         let payload = Arc::new(
@@ -536,7 +558,11 @@ impl RuntimeLower {
                 Ok((activity, mut accepted, payload)) => {
                     continuation.start_completion(activity.clone());
                     continuation.flush(Ok(()));
-                    if latency_sensitive {
+                    let maintenance = continuation.on_admitted(activity.node.record());
+                    if let Err(error) = &maintenance {
+                        continuation.faults.report_checkpoint_fault(error.clone());
+                    }
+                    if latency_sensitive || maintenance.is_ok_and(|v| v) {
                         runtime.schedule_group(continuation.clone());
                     }
                     drop(publication);

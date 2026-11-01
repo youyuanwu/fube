@@ -146,7 +146,14 @@ pub(crate) fn decode_copy(data: &OperationData) -> Result<RegistryPacket> {
         _ => Err(unsupported("native registry-copy opcode")),
     }
 }
-pub(crate) fn encode_copy(mut rows: Vec<Metadata>) -> Result<Vec<OperationData>> {
+pub(crate) fn encode_copy(rows: Vec<Metadata>) -> Result<Vec<OperationData>> {
+    encode_copy_with_limits(rows, &fube_data::Settings::default())
+}
+pub(crate) fn encode_copy_with_limits(
+    mut rows: Vec<Metadata>,
+    limits: &fube_data::Settings,
+) -> Result<Vec<OperationData>> {
+    limits.validate()?;
     if rows.len() > 64 {
         return Err(invalid());
     }
@@ -154,7 +161,18 @@ pub(crate) fn encode_copy(mut rows: Vec<Metadata>) -> Result<Vec<OperationData>>
     let mut result = vec![OperationData::new(vec![vec![1, 0, 0, 0, 0]])?];
     let mut chunk = Vec::new();
     for row in rows {
-        chunk.extend(row.encode()?);
+        let row = row.encode()?;
+        if row.len() + 17 > limits.operation_bytes || limits.operation_segments < 3 {
+            return Err(crate::Error::new(
+                fube_runtime::ErrorKind::ReplicationOperationTooLarge,
+                "finite native registry copy framing",
+            ));
+        }
+        if !chunk.is_empty() && chunk.len() + row.len() + 17 > limits.operation_bytes {
+            chunk.push(1);
+            result.push(OperationData::new(vec![std::mem::take(&mut chunk)])?);
+        }
+        chunk.extend(row);
         if chunk.len() >= 32 * 1024 {
             chunk.push(1);
             result.push(OperationData::new(vec![std::mem::take(&mut chunk)])?);

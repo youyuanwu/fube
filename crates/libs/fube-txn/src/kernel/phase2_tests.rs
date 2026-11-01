@@ -2,6 +2,128 @@
 //! Controlled None/Log copy source is ownership evidence ONLY, not Full negotiation.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase3_initial_state_eos_before_first_data_keeps_native_success_without_begin_or_end() {
+    let partition = uuid::Uuid::new_v4();
+    let target = Fixture::start(partition, 2, ReplicaRole::IdleSecondary, false, Spy::new()).await;
+    let source = Source::start(partition, vec![header(3)], None).await;
+    source
+        .host
+        .build(descriptor(&target), Cancellation::default())
+        .await
+        .unwrap();
+    let generation = target
+        .runtime
+        .generation
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    generation.copy_done.wait().await.as_ref().clone().unwrap();
+    assert!(target
+        .runtime
+        .owner
+        .manager
+        .directory
+        .copy_progress()
+        .is_none());
+    assert!(!target.spy.point.events().iter().any(|e| matches!(
+        e,
+        super::provider::PointEvent::Callback {
+            kind: super::provider::CallbackKind::BeginCopy | super::provider::CallbackKind::EndCopy,
+            ..
+        }
+    )));
+    drop(source.host);
+    drop(target.host);
+    target
+        .runtime
+        .terminal
+        .wait()
+        .await
+        .as_ref()
+        .clone()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase3_interrupted_after_begin_state_eos_is_cancelled_without_replication_end_or_readiness(
+) {
+    let partition = uuid::Uuid::new_v4();
+    let target = Fixture::start(partition, 2, ReplicaRole::IdleSecondary, false, Spy::new()).await;
+    let version = OperationData::new(vec![vec![1, 0, 0, 0, 0]]).unwrap();
+    let state = super::copy_codec::add_stage(
+        super::named::encode_copy(super::provider::REGISTRY_ID, &version).unwrap(),
+        super::copy_codec::Stage::State,
+    )
+    .unwrap();
+    let source = Source::start(partition, vec![header(3), state], None).await;
+    source
+        .host
+        .build(descriptor(&target), Cancellation::default())
+        .await
+        .unwrap();
+    let generation = target
+        .runtime
+        .generation
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    let error = generation
+        .copy_done
+        .wait()
+        .await
+        .as_ref()
+        .clone()
+        .unwrap_err();
+    assert!(super::status::Status::Cancelled.matches(&error));
+    assert!(generation.done.wait().await.is_err());
+    assert!(!target.runtime.owner.ready.load(Ordering::Acquire));
+    assert!(!target.runtime.owner.get_is_readable());
+    assert!(target.runtime.owner.create_transaction().is_err());
+    assert!(target
+        .runtime
+        .owner
+        .manager
+        .directory
+        .copy_progress()
+        .is_some());
+    assert!(!target.spy.point.events().iter().any(|e| matches!(
+        e,
+        super::provider::PointEvent::Callback {
+            kind: super::provider::CallbackKind::EndCopy,
+            ..
+        }
+    )));
+    let lower = target.runtime.replicator();
+    target
+        .native
+        .execution()
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || {
+            lower.abort();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(target.runtime.terminal.wait().await.is_err());
+    target
+        .runtime
+        .cleanup_done
+        .wait()
+        .await
+        .as_ref()
+        .clone()
+        .unwrap();
+    source.host.remove(descriptor(&target)).await.unwrap();
+    drop(source.host);
+    drop(target.host);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn phase2_corrective_secondary_successful_prefix_processing_outlives_failed_copy_and_info() {
     for root in [false, true] {
         let partition = uuid::Uuid::new_v4();
@@ -838,6 +960,8 @@ impl IStatefulServiceReplica for Replica {
                 },
                 self.settings.clone(),
                 RuntimeConfig {
+                    log_settings: Default::default(),
+                    registry: None,
                     providers,
                     work_folder: PathBuf::from("/tmp/fube-phase2"),
                     memory_bytes: 1024 * 1024,

@@ -3,8 +3,9 @@
 The private transaction kernels now use actual fube-data admission/LSNs and
 separate local flush, Apply, quorum and Unlock. Full provider/stream lifecycle
 integration is implemented and both-model reviewed as a private Phase2 unit. Native
-Full-copy registry/hierarchy/checkpoint integration (Phase3) and
-aggregate acceptance remain unfinished. This is not a public runtime construction
+Full-copy registry/hierarchy/checkpoint integration is also implemented and
+both-model reviewed as a private Phase3 unit. Public construction and aggregate
+acceptance remain unfinished. This is not a public runtime construction
 API, native-binary qualification, mixed-native or recovery/restore claim.
 
 ## Native algorithms versus Rust adapters
@@ -60,7 +61,8 @@ may remain stalled; only actual queue progress changes eligibility.
 After real lower assignment, local write failure retains the actual Activity,
 map and LSN, completes flush/Apply with error, awaits actual quorum and invokes
 required Unlock. Physical construction failure creates no substitute Information
-record or successful drain. Full physical writer/checkpoint ownership is Phase3.
+record or successful drain. The private Phase3 writer/checkpoint paths preserve
+those failure and ownership distinctions.
 Supported finite limits are not native allocator/queue-size equivalence.
 
 Concrete **FUBE ADAPTATION** limits, not native sizing equivalence:
@@ -115,8 +117,76 @@ fallback; role alone is not writable admission.
 Native None/Log staged frames through actual lower Build are **private ownership
 fixtures**, not normal volatile null-context Full negotiation. Unsupported stages
 reject; copied-log failed-flush waiter ACK asymmetry and no-ACK replication failure
-are retained. Full/PV/registry/hierarchy/checkpoint/truncation are Phase3; no copied
-state End or full runtime/native qualification credit is borrowed.
+are retained. The separately accepted Phase3 paths exercise actual Full transfer;
+the earlier None/Log fixtures do not supply that evidence or native qualification.
 Copied UpdateEpoch uses the supported existing-record failed-flush settlement
 path, not control epoch preflight. Actual primary epoch callbacks wait admitted
 publication/order before the local prefix.
+
+## Private Phase3 integration
+
+The compiled private runtime now has native NULL-context Full negotiation,
+registry metadata/factory/hierarchy and original state3/metadata4/log7 streams.
+Actual lower two-replica Build tests cover empty bootstrap, state+log, pending
+Begin/epoch/PV overlap, callback failure ownership and retained resurrection.
+Explicit-context None/Partial are upper-only tests; volatile lower transport
+still supplies NULL. No Done packet, bidirectional context transport or new binder.
+
+Only ordered Barrier insertion triggers native checkpoint selection. Prepare
+follows prior Apply; real checkpoint Apply waits stability, processing waits
+completion/cancellation. Perform does not serialize independent transaction
+groups. End/flush precedes provider Complete and CompleteCheckpoint/flush.
+Native volatile copy-log rename is a no-op, not a persistence product.
+
+TruncateHead is proposed unstable: logical selection, actual flush, stable Apply,
+then reader-safe physical release are distinct. Provider cleanup has its native
+completed-checkpoint/FullCopy frontier and strict `<`, not a reverse log pin:
+None role, RemoveState, Close/Abort fallback, then immediate metadata retirement.
+Old transaction abort is queued native work and ordinary lower End admission.
+
+Rust continuation/entered/Apply/processing fences and count-owned generation
+drains are **FUBE ADAPTATION** implementing those native lifetimes. Phase3 adds
+no lower API/admission policy. A native aborted state-EOS status is not published
+as successful End/full state/application readiness.
+
+The finite profile remains an observable allocation difference. Native MB
+thresholds are not remapped to smaller magic units: tests explicitly select
+1MiB checkpoint/min log, factors2/4 and8MiB memory. Default50MiB cannot trigger
+inside the16MiB maximum Rust log;16 retained transaction owners can also reject
+small records before native thresholds. No reserved resources or promised
+termination/checkpoint progress compensate for this.
+
+Both-model Phase3 acceptance and serial quality checks pass. Phase4 must supply/
+audit supported public service construction and primary registry/owner facade,
+complete aggregate FR/SC mapping, final docs/validation and both final reviews.
+Private provider data remain fixtures, not a collection product. No A2 native
+binary/deployment, mixed-native, restore/recovery/backup qualification is claimed.
+
+The implementation also retains native log-Insert idempotency/reset, overlapping
+copy/replication duplicate ACKs, phase-aware checkpoint cancellation and complete
+owned first-copy error/ACK settlement. The finite Rust copy framing is explicit:
+ordinary record wire plus one stage segment/4bytes must fit the actual lower
+operation budget before LSN assignment (default1023segments,1MiB−4bytes).
+Packet splitting for those finite bounds preserves native fields but is a
+**FUBE ADAPTATION**, not an SF allocator/packet-size/admission equivalence claim.
+
+Further native corrections preserve bootstrap-initialized periodic timestamp
+caches even with scheduling disabled; retain pending physical dispatch through
+truncation; join already-Applied reader-delayed truncation; select checkpoint
+before truncation in secondary throttling; and split whole registry rows before
+finite native-framing overflow.
+
+The implementation also captures registry metadata and provider streams
+from one locked checkpoint snapshot. Native state EOS is successful only before
+first data; after Begin/Set it is Cancelled, without replication continuation or
+End/readiness. Earlier draft interpretations were corrected against actual pinned
+callers and retained in local review history.
+
+Copy descriptor selection shares the runtime's checkpoint-completion consistency
+lock across End flush and provider Complete, then releases it before provider
+stream capture (`CopyStream.cpp:249-285`, `CheckpointManager.cpp:1473-1505`).
+An actual Full Build regression gates Complete, serves completed rather than
+performed state and verifies both checkpointed writes arrive. Serial validation
+passes 208 transaction tests, denied-warning Clippy, formatting and strict
+public/private Rustdoc. These are source-derived Rust integration results, not
+executions of a pinned native binary.

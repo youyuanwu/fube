@@ -71,11 +71,14 @@ pub(crate) struct Entry {
     _storage: Option<Retention>,
 }
 pub(crate) struct MemoryLog {
+    pub(crate) periodic_times: (i64, i64),
+    pub(crate) changed: Arc<tokio::sync::Notify>,
     chunks: BTreeMap<u64, Box<[u8; CHUNK]>>,
     pub(crate) head: u64,
     pub(crate) tail_position: u64,
     pub(crate) tail_lsn: i64,
     pub(crate) flushed_lsn: i64,
+    pub(crate) flushed_position: u64,
     psn: i64,
     physical: Option<u64>,
     linked: Option<u64>,
@@ -94,6 +97,7 @@ pub(crate) struct MemoryLog {
     pub(crate) write_error_after: usize,
     capacity: usize,
     readers: BTreeMap<u64, u64>,
+    reader_ranges: BTreeMap<u64, (i64, bool)>,
     next_reader: u64,
     pub(crate) events: VecDeque<(i32, i64, u64)>,
 }
@@ -109,11 +113,14 @@ impl MemoryLog {
             configuration_number: 0,
         };
         Ok(Self {
+            periodic_times: (0, 0),
+            changed: Arc::new(tokio::sync::Notify::new()),
             chunks: BTreeMap::from([(0, Box::new([0; CHUNK]))]),
             head: 0,
             tail_position: 0,
             tail_lsn: 0,
             flushed_lsn: 0,
+            flushed_position: 0,
             psn: 0,
             physical: None,
             linked: None,
@@ -134,6 +141,7 @@ impl MemoryLog {
             write_error_after: 0,
             capacity,
             readers: BTreeMap::new(),
+            reader_ranges: BTreeMap::new(),
             next_reader: 1,
             events: VecDeque::new(),
         })
@@ -178,6 +186,9 @@ impl MemoryLog {
         // Only existing-owned write/flush failure enters this path, not
         // pre-record allocation rejection.
         self.logging_error.get_or_insert(error);
+    }
+    pub(crate) fn writer_error(&self) -> Option<Error> {
+        self.logging_error.clone()
     }
     fn logical_sections(&self, node: &Arc<RecordNode>) -> Result<Vec<Vec<u8>>> {
         let record = node.record();
@@ -411,8 +422,8 @@ impl MemoryLog {
         fields.extend([0; 16]); // required no-backup GUID scalar, not backup support
         fields.extend([0; 24]); // zero backup epoch and LSN
         fields.extend([0; 8]); // u32 count and u32 size
-        fields.extend(identity::native_system_time()?.to_le_bytes());
-        fields.extend(identity::native_system_time()?.to_le_bytes());
+        fields.extend(self.periodic_times.0.to_le_bytes());
+        fields.extend(self.periodic_times.1.to_le_bytes());
         self.physical_record(7, lsn, vec![section(&fields)])?;
         let cp = Checkpoint {
             lsn,
@@ -462,6 +473,11 @@ impl MemoryLog {
         self.pending_ended = true;
         Ok(())
     }
+    pub(crate) fn publish_ended_checkpoint(&mut self) {
+        if self.pending_ended {
+            self.completed = self.pending.clone();
+        }
+    }
     pub(crate) fn complete_checkpoint(&mut self) -> Result<()> {
         if self.pending.is_none() || !self.pending_ended {
             return Err(Error::InvalidInput("complete lacks ended checkpoint"));
@@ -475,6 +491,10 @@ impl MemoryLog {
         self.pending_ended = false;
         Ok(())
     }
+    pub(crate) fn abort_checkpoint(&mut self) {
+        self.pending = None;
+        self.pending_ended = false;
+    }
     pub(crate) fn information(&mut self, event: i32) -> Result<()> {
         self.physical_record(12, self.tail_lsn, vec![section(&event.to_le_bytes())])?;
         Ok(())
@@ -482,6 +502,7 @@ impl MemoryLog {
     pub(crate) fn flush(&mut self) {
         if self.logging_error.is_none() {
             self.flushed_lsn = self.tail_lsn;
+            self.flushed_position = self.tail_position;
         }
     }
     pub(crate) fn read(&self, position: u64, count: usize) -> Vec<u8> {
@@ -507,10 +528,114 @@ impl MemoryLog {
             return Err(Status::InsufficientResources.error());
         }
         self.readers.insert(id, position);
+        self.reader_ranges
+            .entry(position)
+            .or_insert((self.tail_lsn, false));
         Ok(id)
     }
+    pub(crate) fn pin_copy(&mut self, position: u64, full: bool) -> Result<u64> {
+        let id = self.pin(position)?;
+        if full {
+            self.reader_ranges.get_mut(&position).unwrap().1 = true;
+        }
+        Ok(id)
+    }
+    pub(crate) fn safe_provider_lsn(&self) -> i64 {
+        let earliest = self.completed.as_ref().map_or(0, |cp| {
+            if cp.reader_position < cp.begin_position {
+                cp.starting_lsn + 1
+            } else {
+                cp.lsn
+            }
+        });
+        self.reader_ranges
+            .values()
+            .filter(|(_, full)| *full)
+            .map(|(lsn, _)| *lsn)
+            .min()
+            .map_or(earliest, |copy| earliest.min(copy))
+    }
+    #[cfg(test)]
+    pub(crate) fn reader_count(&self) -> usize {
+        self.readers.len()
+    }
     pub(crate) fn unpin(&mut self, id: u64) {
-        self.readers.remove(&id);
+        if let Some(position) = self.readers.remove(&id) {
+            if !self.readers.values().any(|p| *p == position) {
+                self.reader_ranges.remove(&position);
+            }
+        }
+        self.changed.notify_waiters();
+    }
+    pub(crate) fn head_identity(&self) -> (u64, i64, i64, Epoch) {
+        self.head_record
+    }
+    pub(crate) fn latest_index(&self) -> Option<u64> {
+        self.indices.keys().next_back().copied()
+    }
+    pub(crate) fn candidates(&self) -> Vec<(u64, i64)> {
+        self.indices
+            .iter()
+            .map(|(p, (_, lsn, _))| (*p, *lsn))
+            .collect()
+    }
+    pub(crate) fn position_of(&self, node: &Arc<RecordNode>) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|entry| entry.logical.as_ref().is_some_and(|n| Arc::ptr_eq(n, node)))
+            .map(|e| e.position)
+    }
+    pub(crate) fn select_runtime_head(&mut self, position: u64) -> Result<i64> {
+        let &(psn, lsn, epoch) = self
+            .indices
+            .get(&position)
+            .ok_or(Error::InvalidInput("runtime head requires retained index"))?;
+        let anchor = self
+            .completed
+            .as_ref()
+            .ok_or(Error::InvalidInput(
+                "truncation requires completed checkpoint",
+            ))?
+            .reader_position;
+        if position <= self.head_record.0 || position >= anchor {
+            return Err(Error::InvalidInput("index is outside completed anchor"));
+        }
+        let old = self.head_record;
+        self.head_record = (position, psn, lsn, epoch);
+        let fields = section(&[vec![0], self.periodic_times.1.to_le_bytes().to_vec()].concat());
+        match self.physical_record(10, self.tail_lsn, vec![self.head_fields(), fields]) {
+            Ok(linked) => {
+                self.linked = Some(linked);
+                Ok(self.tail_lsn)
+            }
+            Err(error) => {
+                self.head_record = old;
+                Err(error)
+            }
+        }
+    }
+    pub(crate) fn physical_truncate_selected(&mut self, position: u64) -> Result<bool> {
+        if self.head_record.0 != position {
+            return Err(Error::InvalidInput("selected runtime head mismatch"));
+        }
+        if self.readers.values().any(|reader| *reader < position) {
+            return Ok(false);
+        }
+        self.release_before(position);
+        Ok(true)
+    }
+    fn release_before(&mut self, position: u64) {
+        self.head = position;
+        self.chunks
+            .retain(|chunk, _| (chunk + 1) * CHUNK as u64 > position);
+        while self
+            .entries
+            .front()
+            .is_some_and(|entry| entry.position < position)
+        {
+            self.entries.pop_front();
+        }
+        self.indices.retain(|index, _| *index >= position);
     }
     pub(crate) fn reclaim(&mut self, position: u64) -> Result<bool> {
         let &(psn, lsn, epoch) = self.indices.get(&position).ok_or(Error::InvalidInput(
@@ -543,20 +668,16 @@ impl MemoryLog {
         };
         self.linked = Some(linked);
         self.flush();
-        self.head = position;
-        self.chunks
-            .retain(|chunk, _| (chunk + 1) * CHUNK as u64 > position);
-        while self
-            .entries
-            .front()
-            .is_some_and(|entry| entry.position < position)
-        {
-            self.entries.pop_front();
-        }
-        self.indices.retain(|index, _| *index >= position);
+        self.release_before(position);
         Ok(true)
     }
     pub(crate) fn bootstrap(&mut self) -> Result<Vec<Record>> {
+        self.bootstrap_with_clock(identity::native_system_time)
+    }
+    pub(crate) fn bootstrap_with_clock(
+        &mut self,
+        mut now: impl FnMut() -> Result<i64>,
+    ) -> Result<Vec<Record>> {
         if self.tail_position != 0 {
             return Err(Error::InvalidInput("bootstrap requires empty memory log"));
         }
@@ -574,6 +695,7 @@ impl MemoryLog {
             },
         };
         self.append_logical(RecordNode::new(epoch.clone(), None, None)?)?;
+        self.periodic_times = (now()?, now()?);
         self.begin_checkpoint(0, None)?;
         let barrier = Record {
             lsn: 1,
