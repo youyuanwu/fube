@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+fube-hosting = { path = "../fube-hosting" }
+tokio.workspace = true
 libc = "0.2"
 fube-transport.workspace = true
 roxmltree = "0.21"

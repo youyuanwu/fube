@@ -247,8 +247,10 @@ cargo tree --locked --offline -p fube-hosting -e normal
 
 `ra_residency` uses real accounting and actual RA/store proposals under controlled
 backend/RAP observations; old `ra_bridge` still simulates usage. Neither is a
-running production node. Physical End, deployment, IPC/leases, live required
-event consumers and empty-endpoint runtime alignment remain H3/H4 gates.
+running production node. Physical End, deployment, broader/live IPC integration,
+required live event consumers and empty-endpoint runtime alignment remain H3/H4
+gates; the separate [bootstrap-only IPC/local-lease subset](cluster/RustHosting.md#implemented-h3-bootstrap-only-local-ipc)
+is now implemented and qualified independently of this H2 profile.
 Source/test inspection is not native execution. Count/byte bounds are logical
 retained-payload limits; uncertain releases/unknown-store ownership are retained,
 not blindly retried. Ordinary workspace tests keep existing live tests ignored.
@@ -330,6 +332,23 @@ Use `--dependency-directory PATH` for private ABI dependencies.
 The reusable [native workflow](../.github/workflows/native-runtime.yaml), called
 by the main CI after artifact production, qualifies all five scenarios on Ubuntu
 22.04 without installing a Rust toolchain.
+
+The separately enabled production Hosting bootstrap-only profile additionally runs:
+
+```sh
+cargo test --locked -p fube-hosting --test ipc_leases -- --test-threads=1
+cargo test --locked -p fube-runtime --lib hosting_tests:: -- --test-threads=1
+python3 -m tests.native_runtime.runner hosting-leases \
+  --prebuilt build/native-runtime-binaries \
+  --diagnostics-directory build/hosting-lease-receipts
+```
+
+It uses actual native application frames against `fube-hosting`, without factory/
+lifecycle admission. Rebuild/package a **new** bundle for the current clean HEAD;
+do not reuse an older source revision after documentation changes. All five
+original native fixture scenarios remain separate required regressions; the existing
+CI workflow still selects those five, not an implicitly added Hosting job.
+See [profile and evidence limits](runtime/RustTestHost.md#27-production-hosting-lease-qualification).
 
 ## Live native client
 
