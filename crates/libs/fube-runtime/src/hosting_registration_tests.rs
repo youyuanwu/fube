@@ -288,9 +288,30 @@ async fn run(mode: &str) {
         assert!(actions.contains(&(9, "UnregisterFabricRuntimeRequest".into())));
         assert!(actions.contains(&(7, "UnregisterApplicationHostRequest".into())));
     }
+    let mut receipts = Vec::new();
+    if mode == "factory" {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                receipts.extend(handle.take_receipts());
+                if receipts.iter().any(|r| {
+                    matches!(
+                        r.input,
+                        ipc::Delivery::Registration(
+                            fube_hosting::ClosedRegisteredEvent::HostClosed { .. }
+                        )
+                    )
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
     owned.stop().unwrap();
     let residual = handle.take_shutdown().unwrap();
-    let receipts = handle.take_receipts();
+    receipts.extend(handle.take_receipts());
     if mode == "factory" {
         assert!(receipts.iter().any(|r| matches!(
             r.input,
@@ -299,6 +320,10 @@ async fn run(mode: &str) {
         assert!(receipts.iter().any(|r| matches!(
             r.input,
             ipc::Delivery::Registration(fube_hosting::ClosedRegisteredEvent::RuntimeClosed { .. })
+        )));
+        assert!(receipts.iter().any(|r| matches!(
+            r.input,
+            ipc::Delivery::Registration(fube_hosting::ClosedRegisteredEvent::HostClosed { .. })
         )));
     } else {
         assert!(residual.pending.iter().any(|p| matches!(

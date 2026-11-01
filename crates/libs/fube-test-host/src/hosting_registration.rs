@@ -146,7 +146,9 @@ pub fn run_hosting_registration(options: Options) -> Result<RunReport> {
                 receipts.extend(handle.take_receipts());
                 let registered = receipts.iter().any(|r| matches!(r.input, ipc::Delivery::Registration(hosting::ClosedRegisteredEvent::Registered { .. })));
                 let closed = receipts.iter().any(|r| matches!(r.input, ipc::Delivery::Registration(hosting::ClosedRegisteredEvent::RuntimeClosed { .. })));
-                if registered && closed { break; }
+                let host_closed = receipts.iter().any(|r| matches!(&r.input,
+                    ipc::Delivery::Registration(hosting::ClosedRegisteredEvent::HostClosed { host_id, .. }) if host_id == &host));
+                if registered && closed && host_closed { break; }
                 require(Instant::now() < decision_due, "owned native registration/closure decisions absent")?;
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -169,7 +171,9 @@ pub fn run_hosting_registration(options: Options) -> Result<RunReport> {
             "decisions":receipts.iter().map(|r|format!("{:?}:{:?}",r.input,r.root)).collect::<Vec<_>>(),
             "pending_owned_obligations":residual.pending.len()+remaining.obligations.len(),
             "remaining_events":remaining.events.len(),"native_fm_readiness":false,
-            "qualified":"actual native factory registration, same-core lookup, owned local registration/runtime closure decisions",
+            "host_unregister_frame_observed":trace.actions.iter().any(|a| a=="UnregisterApplicationHostRequest"),
+            "host_closed_source":"owned connection-loss cleanup unless an actual host-unregister frame was observed",
+            "qualified":"actual native factory registration, same-core lookup, owned local registration/runtime/host closure decisions",
             "not_qualified":"native node handlers, FM/HM/RA-ready/deployed lifecycle, health reporting, package/process cleanup"}));
         ra.close(Duration::from_secs(3)).await.map_err(|e| HostError(format!("local RA close: {e:?}")))?;
         store.close().await.map_err(|e| HostError(format!("local store close: {e}")))?;
