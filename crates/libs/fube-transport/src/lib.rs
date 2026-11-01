@@ -9,6 +9,7 @@ pub mod error;
 pub mod file_transfer;
 pub mod frame;
 pub mod message;
+pub mod native_channel;
 pub mod routing;
 pub mod serialization;
 
