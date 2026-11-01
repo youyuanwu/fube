@@ -231,11 +231,47 @@ relabelled as new independent H1 evidence.
 
 The [Hosting port contracts](cluster/RustHosting.md#supplied-port-contracts)
 add six behavioral cases in the existing H1 lookup/event targets and a request-only
-lookup Rustdoc example. Only the explicit H1 model adapter and typed owned drains
-are implemented; package usage/lifecycle traits do not enable live H2. Run
-`cargo test --locked -p fube-hosting` for the original 72 plus six contract cases
-and two model doctests. Native implementation/test links document semantics,
+lookup Rustdoc example. Those original cases and model doctests remain in
+`cargo test --locked -p fube-hosting`. Native implementation/test links document semantics,
 not newly executed native-handler or deployed conformance.
+
+The [H2 accounting/scheduling profile](cluster/RustHosting.md#implemented-h2-accounting-and-scheduling)
+adds actual bounded residency, residual ownership and sequence-fenced scheduling.
+Run focused cases before affected/workspace gates:
+
+```sh
+cargo test --locked -p fube-hosting --test residency --test lookup_residency --test ra_residency -- --test-threads=1
+cargo test --locked -p fube-hosting -p fube-ra -p fube-ra-store --all-features -- --test-threads=1
+cargo tree --locked --offline -p fube-hosting -e normal
+```
+
+`ra_residency` uses real accounting and actual RA/store proposals under controlled
+backend/RAP observations; old `ra_bridge` still simulates usage. Neither is a
+running production node. Physical End, deployment, IPC/leases, live required
+event consumers and empty-endpoint runtime alignment remain H3/H4 gates.
+Source/test inspection is not native execution. Count/byte bounds are logical
+retained-payload limits; uncertain releases/unknown-store ownership are retained,
+not blindly retried. Ordinary workspace tests keep existing live tests ignored.
+
+The callback/shutdown qualification corrections preserve synchronous native
+`Invoke` and once-only End while handing off the existing oracle worker during
+blocking callbacks ([context owner](../crates/samples/native-replicator-oracle/src/async_context.rs#L299-L357)).
+The [data model host](../crates/libs/fube-data/tests/support/rap_model.rs#L264-L417)
+retains pending probe results, then observes actual ReplicaClose before guarded
+Runtime shutdown. Active-callback fencing, actor authority and native Runtime
+semantics are not relaxed. The causal regression uses an actually entered
+UpdateEpoch callback; cached GetStatus alone is not callback-entry evidence.
+These are local ownership/model tests, not new native or deployed qualification.
+
+Close-reply ordering alone proved insufficient for the original SDK target:
+an owned library dispatch can still observe retirement after that reply.
+The [lifecycle dispatcher](../crates/libs/fube-runtime/src/lifecycle.rs#L274-L349)
+now sends only exact `Closed` during requested shutdown through its existing
+owned drain, preserving IPC for unregister. Retirement without stop and all
+other faults, limits, expiry and active-callback fencing remain terminal.
+Controlled admission/result-window tests verify real unregister round trips;
+the original SDK full target and fifty predefined exact bootstrap selections
+are separate regression evidence, not substituted by a newly green cleanup test.
 
 The [RA P1 store](cluster/RaStore.md) uses bundled SQLite C through
 `tokio-rusqlite`; producers need a C compiler and archiver (no SF or system

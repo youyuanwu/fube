@@ -1415,3 +1415,200 @@ async fn retired_authority_cannot_republish_cached_duplicate_endpoint() {
     assert_eq!(h.calls.opens.load(Ordering::SeqCst), 1);
     h.engine.quiesce().await.unwrap();
 }
+
+pub(super) enum DispatchPoint {
+    BeforeReservation,
+    BeforeDispatch,
+    CompletionSelected,
+}
+
+impl DispatchPoint {
+    fn index(&self) -> usize {
+        match self {
+            Self::BeforeReservation => 0,
+            Self::BeforeDispatch => 1,
+            Self::CompletionSelected => 2,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct DispatchHooks {
+    pauses: Mutex<[Option<Arc<DispatchPause>>; 3]>,
+}
+
+impl DispatchHooks {
+    fn pause_once(&self, point: DispatchPoint) -> Arc<DispatchPause> {
+        let mut pauses = self.pauses.lock().unwrap();
+        let slot = &mut pauses[point.index()];
+        assert!(slot.is_none(), "dispatch point already armed");
+        let pause = Arc::new(DispatchPause::default());
+        *slot = Some(pause.clone());
+        pause
+    }
+
+    pub(super) async fn reach(&self, point: DispatchPoint) {
+        let pause = self.pauses.lock().unwrap()[point.index()].take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+    }
+}
+
+/// One-shot interleaving control, not a diagnostic subscription or production field.
+#[derive(Default)]
+struct DispatchPause {
+    reached: Notify,
+    resume: Notify,
+}
+
+async fn dispatch_pause_reached(pause: &DispatchPause) {
+    tokio::time::timeout(Duration::from_secs(2), pause.reached.notified())
+        .await
+        .unwrap();
+}
+
+async fn prove_unregister_ipc_after_drain(h: &mut Harness) {
+    let connection = h.engine.shared.connection.clone();
+    let body = to_vec(&ErrorReply { error: 0 }).unwrap();
+    let id = h.engine.shared.activation.runtime.id.clone();
+    let receive = async {
+        let request = read_message(&mut h.peer).await.unwrap();
+        let properties = request.properties().unwrap();
+        assert_eq!(properties.actor, 9);
+        assert_eq!(properties.action, "UnregisterFabricRuntimeRequest");
+        write_message(
+            &mut h.peer,
+            &Message {
+                headers: vec![Header::relates_to(properties.id).unwrap()],
+                body,
+            },
+        )
+        .await
+        .unwrap();
+    };
+    let send = connection.request(
+        "UnregisterFabricRuntimeRequest",
+        9,
+        vec![],
+        to_vec(&IdRequest { id }).unwrap(),
+        deadline_after(Duration::from_secs(2)).unwrap(),
+    );
+    let (reply, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(send, receive)
+    })
+    .await
+    .unwrap();
+    let reply: ErrorReply = from_slice(&reply.unwrap().body).unwrap();
+    assert_eq!(reply.error, 0);
+}
+
+#[tokio::test]
+async fn shutdown_retirement_before_reservation_retains_unregister_ipc() {
+    // Local selected-branch race, not native execution. The request passed
+    // authority admission but no application callback has been invoked.
+    let mut h = Harness::new().await;
+    let pause = h
+        .engine
+        .shared
+        .test_hooks
+        .pause_once(DispatchPoint::BeforeReservation);
+    h.send("ReplicaOpen", &h.request(1, 1, 0)).await;
+    dispatch_pause_reached(&pause).await;
+    h.engine.begin_quiesce();
+    h.engine.shared.authority.retire();
+    pause.resume.notify_one();
+    h.engine.quiesce().await.unwrap();
+    assert!(h.engine.shared.authority.check().is_err());
+    assert_eq!(h.calls.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(h.engine.shared.active.load(Ordering::SeqCst), 0);
+    assert_eq!(h.engine.shared.callbacks.available_permits(), MAX_CALLBACKS);
+    assert!(h.engine.retired_incoming.is_some());
+    assert!(
+        !h.engine.shared.connection.is_closed(),
+        "retirement closed unregister IPC"
+    );
+    prove_unregister_ipc_after_drain(&mut h).await;
+}
+
+#[tokio::test]
+async fn shutdown_retirement_of_selected_closed_result_retains_unregister_ipc() {
+    let mut h = Harness::new().await;
+    let dispatch = h
+        .engine
+        .shared
+        .test_hooks
+        .pause_once(DispatchPoint::BeforeDispatch);
+    let completion = h
+        .engine
+        .shared
+        .test_hooks
+        .pause_once(DispatchPoint::CompletionSelected);
+    h.send("ReplicaOpen", &h.request(1, 1, 0)).await;
+    dispatch_pause_reached(&dispatch).await;
+    // The real owned root sees retirement before resuming its library dispatch.
+    // Its Closed result is selected before the stop receiver observes a change.
+    h.engine.shared.authority.retire();
+    dispatch.resume.notify_one();
+    dispatch_pause_reached(&completion).await;
+    h.engine.begin_quiesce();
+    completion.resume.notify_one();
+    h.engine.quiesce().await.unwrap();
+    assert_eq!(h.calls.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(h.engine.shared.active.load(Ordering::SeqCst), 0);
+    assert_eq!(h.engine.shared.callbacks.available_permits(), MAX_CALLBACKS);
+    assert!(h.engine.retired_incoming.is_some());
+    assert!(
+        !h.engine.shared.connection.is_closed(),
+        "selected Closed poisoned unregister IPC"
+    );
+    prove_unregister_ipc_after_drain(&mut h).await;
+}
+
+#[tokio::test]
+async fn retirement_without_requested_shutdown_still_faults_dispatch_ipc() {
+    let mut h = Harness::new().await;
+    let pause = h
+        .engine
+        .shared
+        .test_hooks
+        .pause_once(DispatchPoint::BeforeReservation);
+    h.send("ReplicaOpen", &h.request(1, 1, 0)).await;
+    dispatch_pause_reached(&pause).await;
+    h.engine.shared.authority.retire();
+    pause.resume.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(2), h.engine.shared.connection.closed())
+        .await
+        .unwrap();
+    assert!(matches!(error, fube_transport::Error::Closed));
+    assert_eq!(h.calls.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(h.engine.shared.active.load(Ordering::SeqCst), 0);
+    h.engine.quiesce().await.unwrap();
+}
+
+#[tokio::test]
+async fn requested_shutdown_does_not_mask_selected_non_closed_dispatch_fault() {
+    let mut h = Harness::new().await;
+    let completion = h
+        .engine
+        .shared
+        .test_hooks
+        .pause_once(DispatchPoint::CompletionSelected);
+    let mut request = h.request(1, 1, 0);
+    request.runtime = "foreign-runtime".into();
+    h.send("ReplicaOpen", &request).await;
+    dispatch_pause_reached(&completion).await;
+    h.engine.begin_quiesce();
+    h.engine.shared.authority.retire();
+    completion.resume.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(2), h.engine.shared.connection.closed())
+        .await
+        .unwrap();
+    assert!(
+        matches!(error, fube_transport::Error::Protocol(_)),
+        "{error:?}"
+    );
+    assert_eq!(h.calls.opens.load(Ordering::SeqCst), 0);
+    h.engine.quiesce().await.unwrap();
+}

@@ -11,6 +11,10 @@ Drop/FM resend and direct Add/one-FT-ack description helpers.
 The source mappings here describe the preserved removal slice; current code
 line numbers have advanced with that addition.
 
+The separate [H2 real-accounting profile](RustHosting.md#implemented-h2-accounting-and-scheduling)
+now tests postcommit usage release and original unknown-store close ownership.
+It does not relabel this slice's simulated RAP/Hosting tests as live integration.
+
 ## Interface and runtime boundary
 
 The [existing executor](../../crates/libs/fube-ra/src/entity.rs#L165-L280)

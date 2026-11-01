@@ -343,7 +343,15 @@ impl<T: Send + 'static> Slot<T> {
                 if let Some(count) = callbacks {
                     count.fetch_add(1, Ordering::Relaxed);
                 }
-                invocation.invoke(|| unsafe { callback.Invoke(&result_context) });
+                // Common/ComAsyncOperationContext.cpp:159-174 at native pin
+                // 3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d invokes synchronously.
+                // https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Common/ComAsyncOperationContext.cpp#L159-L174
+                // External Invoke may block/reenter. Hand off the multithread
+                // worker core (including its non-stealable LIFO slot), without
+                // detaching the callback from this bounded owned task/frame.
+                tokio::task::block_in_place(|| {
+                    invocation.invoke(|| unsafe { callback.Invoke(&result_context) });
+                });
             }
         }, frame)?;
         *entry = Some(Entry {

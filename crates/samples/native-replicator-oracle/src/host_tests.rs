@@ -502,6 +502,56 @@ async fn cleanup_worker_failure_still_disposes_unended_lifecycle_results() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn synchronous_callback_wake_preserves_sibling_progress_and_reentrant_abort() {
+    // Local scheduler/ownership regression, not a native execution claim.
+    // Direct native Invoke can synchronously wait/reenter. A notified sibling
+    // must not be stranded on the worker while that Invoke owns its stack.
+    let route = route();
+    let (replica, lifecycle) = replica(route.clone());
+    let provider = route.app.bridge();
+    let wake = Arc::new(Notify::new());
+    let child_wake = wake.clone();
+    let (waiting, ready) = tokio::sync::oneshot::channel();
+    let (done, sibling) = std::sync::mpsc::sync_channel(1);
+    route
+        .workers
+        .spawn(async move {
+            let notified = child_wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            waiting.send(()).unwrap();
+            notified.await;
+            let _ = done.send(());
+        })
+        .unwrap();
+    ready.await.unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let end = provider.clone();
+    let app = route.app.clone();
+    let (observed, result) = tokio::sync::oneshot::channel();
+    let callback = callback(drops.clone(), move |context| {
+        let ended = unsafe { end.EndOnDataLoss(&context) }.is_ok();
+        let once = unsafe { end.EndOnDataLoss(&context) }.is_err();
+        let body_disposed = app.callbacks.load(Ordering::Acquire) == 0;
+        wake.notify_one();
+        let progressed = sibling.recv_timeout(Duration::from_secs(2)).is_ok();
+        unsafe { replica.Abort() };
+        let _ = observed.send((ended, once, body_disposed, progressed));
+    });
+    let context = unsafe { provider.BeginOnDataLoss(&callback) }.unwrap();
+    assert!(!unsafe { context.CompletedSynchronously() });
+    drop(callback);
+    let outcome = tokio::time::timeout(Duration::from_secs(2), result).await;
+    drop(context);
+    route.workers.join_fully().await.unwrap();
+    lifecycle.join_fully().await.unwrap();
+    assert_eq!(outcome.unwrap().unwrap(), (true, true, true, true));
+    assert!(route.workers.can_release());
+    assert!(lifecycle.can_release());
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+}
+
 fn mutation(id: &str) -> Mutation {
     Mutation {
         id: id.into(),

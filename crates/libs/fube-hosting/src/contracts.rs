@@ -73,8 +73,9 @@ use crate::*;
 /// A returned [`Registration`] is a snapshot, not an acquired package residency
 /// or an RA-owned reference. RA's issued lookup/acquisition IDs and retain-existing-
 /// usage policy remain private node/adapter bookkeeping. The existing RA seam
-/// requires exactly one acquisition for an issued result: replay/unissued results
-/// must not acquire again or retarget disposal. Candidate-bearing NotFound is
+/// requires one acquisition for an issued result needing fresh usage; retained
+/// usage is reused. Replay must not acquire again or retarget disposal. Unissued
+/// fresh ownership stays with its caller. Candidate-bearing NotFound is
 /// diagnostic/unacquired there, not automatic RA-owned cleanup.
 ///
 /// Native RA can adopt a mismatch candidate under its upgrade-instance policy,
@@ -183,6 +184,35 @@ impl RegistrationLookup for H1LookupAdapter<'_> {
     }
 }
 
+/// Request-only lookup with real H2 scheduling and explicitly controlled H4 activation.
+///
+/// Supplying [`Residency`] replaces the deactivation/accounting premise only.
+/// This adapter does not acquire usage, launch a process or route live RA events.
+/// H1's outer admission reserves the entire projection before one scheduling call.
+pub struct H2LookupAdapter<'a, S: PackageScheduling> {
+    core: &'a mut Hosting,
+    model: &'a LookupModel,
+    scheduling: &'a mut S,
+}
+
+impl<'a, S: PackageScheduling> H2LookupAdapter<'a, S> {
+    /// Borrow independent registration and accounting owners; no default activation.
+    pub fn new(core: &'a mut Hosting, model: &'a LookupModel, scheduling: &'a mut S) -> Self {
+        Self {
+            core,
+            model,
+            scheduling,
+        }
+    }
+}
+
+impl<S: PackageScheduling> RegistrationLookup for H2LookupAdapter<'_, S> {
+    fn lookup(&mut self, request: &LookupRequest) -> Result<LookupResult> {
+        self.core
+            .lookup_with_scheduling(request, self.model, self.scheduling)
+    }
+}
+
 /// Increment observation with explicit residual ownership.
 ///
 /// This is a Rust ownership adaptation, not a native result DTO. In particular
@@ -216,7 +246,7 @@ pub enum UsageRelease<A> {
     },
 }
 
-/// Definition-only package residency port; **no H1/H2 implementation is supplied**.
+/// Package residency port, implemented by the deterministic H2 [`Residency`] ledger.
 ///
 /// Native receives service type plus activation context and resolves the managed
 /// public activation map. Missing mapping asserts. Adhoc increment succeeds and
@@ -237,7 +267,7 @@ pub enum UsageRelease<A> {
 /// implementation must have a bounded reconciliation owner for partial/unknown
 /// operations and shutdown, must not claim destructor Drop executed async release,
 /// and must not silently discard a token on error. Interfaces alone enable no
-/// package capability or live RA acquired-reference integration.
+/// physical package capability or live RA acquired-reference integration.
 ///
 /// Native wrapper tests exercise duplicate acquisition, increment failure,
 /// down-with-retained-usage and close-once
@@ -344,7 +374,7 @@ pub enum ActivationFinish<O> {
 ///
 /// [activation]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Hosting2/ApplicationManager.cpp#L357-L635
 /// [test]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Hosting2/ParallelActivationDeactivation.Test.cpp#L301-L379
-pub trait PackageLifecycle {
+pub trait PackageLifecycle: PackageScheduling {
     /// Opaque nonclone operation ownership; no wire/correlation ID is introduced.
     /// Shutdown must retain/consume admitted operations, not rely on observer Drop.
     type Activation;
@@ -380,11 +410,19 @@ pub trait PackageLifecycle {
         &mut self,
         operation: Self::Activation,
     ) -> ActivationFinish<Self::Activation>;
+}
 
+/// Narrow H2 scheduling dependency, independent of H4 activation/physical End.
+///
+/// The closed [`SchedulingDisposition`] makes the result's retained footprint
+/// bounded before invocation. Timer-admission diagnostics and final work are owned
+/// separately by the scheduler; eligibility is not timer or process success.
+pub trait PackageScheduling {
     /// Request scheduling for the candidate's exact package instance, not physical removal.
     ///
-    /// Outer error is local pre-admission failure. Inner [`DeactivationOutcome`]
-    /// records the underlying scheduling observation; the native public wrapper
+    /// [`SchedulingDisposition`] records the underlying scheduling observation;
+    /// local projected lookup admission happens before calling this dependency.
+    /// The native public wrapper
     /// returns void and derives hasReplica=false on underlying error. Success's
     /// `scheduled` is source eligibility, **not verified timer enqueue**.
     /// Eligibility needs zero usage, not closing and finite applicable grace:
@@ -417,7 +455,38 @@ pub trait PackageLifecycle {
     fn schedule_deactivation_if_unused(
         &mut self,
         package: &PackageInstance,
-    ) -> Result<DeactivationOutcome>;
+    ) -> SchedulingDisposition;
+}
+
+/// Fixed-payload native scheduling observation for pre-reserved real lookup.
+///
+/// Variable local diagnostics must remain with a separately bounded scheduler
+/// owner. This is not a native wire enum, rollback receipt or timer admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulingDisposition {
+    Success { scheduled: bool },
+    NotFound,
+    InvalidState,
+    ObjectClosed,
+    SequenceOverflow,
+}
+
+impl SchedulingDisposition {
+    /// Maximum logical H1 outcome charge after conversion, including static detail.
+    pub const MAX_OUTCOME_BYTES: usize = 32 + "package accounting sequence overflow".len();
+
+    /// Preserve native hasReplica disposition in the existing H1 observation DTO.
+    pub fn outcome(self) -> DeactivationOutcome {
+        match self {
+            Self::Success { scheduled } => DeactivationOutcome::Success { scheduled },
+            Self::NotFound => DeactivationOutcome::Failure(Error::NotFound),
+            Self::InvalidState => DeactivationOutcome::Failure(Error::InvalidState),
+            Self::ObjectClosed => DeactivationOutcome::Failure(Error::ObjectClosed),
+            Self::SequenceOverflow => DeactivationOutcome::Failure(Error::NativeInvariant(
+                "package accounting sequence overflow",
+            )),
+        }
+    }
 }
 
 /// Two typed owned event lanes; not native worker/subscription emulation.

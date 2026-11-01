@@ -18,7 +18,7 @@ use fube_transport::{
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, thread::JoinHandle};
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, oneshot},
+    sync::{broadcast, mpsc, oneshot},
 };
 
 // Field order mirrors Hosting2/ServiceModel FABRIC_FIELDS (3988b451); these
@@ -191,6 +191,7 @@ record!(ReplicaMessage {
 
 enum Action {
     Open,
+    Close,
     Configure(NativeReplicaSetConfiguration),
     CatchUp(NativeReplicaSetConfiguration, NativeReplicaSetConfiguration),
     Build(NativeReplicaDescriptor),
@@ -213,6 +214,16 @@ pub struct Host {
     commands: mpsc::Sender<Command>,
     stop: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     thread: std::sync::Mutex<Option<JoinHandle<()>>>,
+    events: broadcast::Sender<HostEvent>,
+}
+
+/// Observational model milestones, never execution barriers or cleanup receipts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostEvent {
+    /// Cleanup intent selected once; outstanding command results may still be pending.
+    CloseRequested,
+    /// Actual ReplicaClose frame written, not its reply or successful disposal.
+    CloseFrameSent,
 }
 /// Explicit model-node input, never a native invocation/proof constructor.
 /// Runtime derives the actual binding only after these RAP bytes are admitted.
@@ -255,7 +266,10 @@ impl Host {
     ) -> Arc<Self> {
         let (ready, readiness) = oneshot::channel();
         let (commands, receive) = mpsc::channel(32);
+        let shutdown_commands = commands.clone();
         let (stop, stopped) = oneshot::channel();
+        let events = broadcast::channel(8).0;
+        let peer_events = events.clone();
         let thread = std::thread::Builder::new()
             .name("rap-model-application".into())
             .spawn(move || {
@@ -275,6 +289,7 @@ impl Host {
                         partition,
                         source,
                         role,
+                        peer_events,
                     ));
                     let runtime = attach_runtime(context).await.unwrap();
                     let native = runtime.native_integration_provider();
@@ -291,6 +306,12 @@ impl Host {
                         .unwrap();
                     if ready.send(()).is_ok() {
                         let _ = stopped.await;
+                        // This model owns its node commands. Observe pending
+                        // results and actual ReplicaClose before host shutdown;
+                        // a prior reply/observer Drop is not callback disposal.
+                        observed_request(&shutdown_commands, Action::Close)
+                            .await
+                            .expect("model semantic ReplicaClose");
                     }
                     runtime.shutdown().await.unwrap();
                     peer.await.unwrap();
@@ -302,6 +323,7 @@ impl Host {
             commands,
             stop: std::sync::Mutex::new(Some(stop)),
             thread: std::sync::Mutex::new(Some(thread)),
+            events,
         });
         readiness.await.expect("RAP model bootstrap");
         host.request(Action::Open).await.unwrap();
@@ -311,15 +333,25 @@ impl Host {
         host
     }
     async fn request(&self, action: Action) -> Result<()> {
+        observed_request(&self.commands, action).await
+    }
+    /// Owned test-profile observation; retains the original pending result even
+    /// when the last Host observer is dropped. No command cancellation is inferred.
+    pub async fn begin_epoch(&self, epoch: fube_runtime::Epoch) -> oneshot::Receiver<Result<()>> {
         let (result, receive) = oneshot::channel();
         self.commands
-            .send(Command { action, result })
+            .send(Command {
+                action: Action::Epoch(epoch),
+                result,
+            })
             .await
-            .map_err(|_| Error::Closed)?;
-        tokio::time::timeout(std::time::Duration::from_secs(30), receive)
-            .await
-            .map_err(|_| Error::Timeout.uncertain())?
-            .map_err(|_| Error::Closed)?
+            .expect("model epoch admitted");
+        receive
+    }
+    /// Subscribe before triggering work. Bounded best-effort events have no replay;
+    /// lag and closure are explicit receiver errors, not shutdown completion.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<HostEvent> {
+        self.events.subscribe()
     }
     pub async fn configure(&self, configuration: NativeReplicaSetConfiguration) -> Result<()> {
         self.request(Action::Configure(configuration)).await
@@ -361,6 +393,17 @@ impl Host {
     pub async fn remove(&self, peer: NativeReplicaDescriptor) -> Result<()> {
         self.request(Action::Remove(peer)).await
     }
+}
+async fn observed_request(commands: &mpsc::Sender<Command>, action: Action) -> Result<()> {
+    let (result, receive) = oneshot::channel();
+    commands
+        .send(Command { action, result })
+        .await
+        .map_err(|_| Error::Closed)?;
+    tokio::time::timeout(std::time::Duration::from_secs(30), receive)
+        .await
+        .map_err(|_| Error::Timeout.uncertain())?
+        .map_err(|_| Error::Closed)?
 }
 impl Drop for Host {
     fn drop(&mut self) {
@@ -530,6 +573,7 @@ async fn serve(
     partition: uuid::Uuid,
     source: ReplicaSource,
     role: ReplicaRole,
+    events: broadcast::Sender<HostEvent>,
 ) {
     let (mut socket, _) = listener.accept().await.unwrap();
     let hello = read_message(&mut socket).await.unwrap();
@@ -559,6 +603,10 @@ async fn serve(
     let mut context = None;
     let mut local = None::<ProxyRequest>;
     let mut pending = Vec::<Pending>::new();
+    // One separately retained cleanup owner. Pending ordinary observations
+    // complete first, preserving their original identities/results and the
+    // newest acknowledged unit/epoch for the actual Close.
+    let mut close_after_pending = None::<Command>;
     let mut sequence = 100;
     let mut retry = tokio::time::interval(std::time::Duration::from_millis(10));
     retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -628,12 +676,28 @@ async fn serve(
                 };
                 write_message(&mut writer, &Message { headers: vec![Header::relates_to(properties.id).unwrap()], body }).await.unwrap();
             }
-            command = commands.recv() => {
-                let Some(command) = command else { break; };
+            command = async {
+                if pending.is_empty() && close_after_pending.is_some() {
+                    close_after_pending.take().map(|command| (command, false))
+                } else {
+                    commands.recv().await.map(|command| (command, true))
+                }
+            } => {
+                let Some((command, fresh)) = command else { break; };
+                if matches!(command.action, Action::Close) {
+                    if fresh { let _ = events.send(HostEvent::CloseRequested); }
+                    if !pending.is_empty() {
+                        assert!(close_after_pending.is_none(), "single model cleanup owner");
+                        close_after_pending = Some(command);
+                        continue;
+                    }
+                }
                 assert!(pending.len() < 32, "model native command bound");
-                let mut request = match command.action { Action::Open => local.as_ref().unwrap().clone(), _ => control(local.as_ref().unwrap()) };
+                let closing = matches!(command.action, Action::Close);
+                let mut request = match command.action { Action::Open | Action::Close => local.as_ref().unwrap().clone(), _ => control(local.as_ref().unwrap()) };
                 let action = match command.action {
                     Action::Open => "ReplicaOpen",
+                    Action::Close => "ReplicaClose",
                     Action::Configure(configuration) => {
                         request.flags = 1; // native end-reconfiguration/current configuration
                         request.unit.previous = Epoch { data_loss: 0, configuration: 0 };
@@ -699,6 +763,7 @@ async fn serve(
                     },
                 };
                 send(&mut writer, action, &request, &mut sequence).await.unwrap();
+                if closing { let _ = events.send(HostEvent::CloseFrameSent); }
                 if !command.result.is_closed() { pending.push(Pending { action, request, result: command.result }); }
             }
             _ = retry.tick(), if !pending.is_empty() => {

@@ -1,5 +1,6 @@
 //! Explicit H1 package premises. FabricRuntimeManager.cpp:296-428 and
-//! ApplicationManager.cpp:1079-1093. Real activation/usage/deactivation is H2-H4.
+//! ApplicationManager.cpp:1079-1093. H2 supplies separate actual scheduling;
+//! physical activation/deactivation remain H4.
 use crate::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,7 +12,7 @@ pub enum ActivationOutcome {
 pub enum DeactivationOutcome {
     /// Underlying Deactivator success: source scheduling eligibility, not proof
     /// of timer enqueue or physical deactivation. False also covers zero usage
-    /// with infinite applicable grace. See [`PackageLifecycle::schedule_deactivation_if_unused`].
+    /// with infinite applicable grace. See [`PackageScheduling::schedule_deactivation_if_unused`].
     Success { scheduled: bool },
     /// ApplicationManager translates every scheduling error to hasReplica=false.
     Failure(Error),

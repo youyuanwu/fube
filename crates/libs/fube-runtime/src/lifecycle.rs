@@ -68,6 +68,8 @@ struct Shared {
     reports: Arc<Semaphore>,
     execution: crate::extensions::ExecutionRuntime,
     core: tokio::runtime::Handle,
+    #[cfg(test)]
+    test_hooks: tests::DispatchHooks,
 }
 pub(crate) struct Engine {
     shared: Arc<Shared>,
@@ -226,6 +228,8 @@ impl Engine {
             reports,
             execution,
             core: tokio::runtime::Handle::current(),
+            #[cfg(test)]
+            test_hooks: tests::DispatchHooks::default(),
         });
         let (stop, mut stopped) = watch::channel(false);
         let task_shared = shared.clone();
@@ -247,6 +251,16 @@ impl Engine {
                     }
                     result=work.join_next(), if !work.is_empty() => {
                         task_shared.active.fetch_sub(1,Ordering::SeqCst);
+                        #[cfg(test)]
+                        task_shared.test_hooks.reach(tests::DispatchPoint::CompletionSelected).await;
+                        // Stop can be requested after select polled its watch
+                        // branch. A retired normal root then returns Closed at
+                        // its next poll; this is not a successful RAP command.
+                        // Use the existing owned drain and retain unregister IPC.
+                        // Real faults/panics and active-callback fencing remain.
+                        if *stopped.borrow() && matches!(&result,Some(Ok(Err(Error::Closed)))) {
+                            break;
+                        }
                         if !matches!(result,Some(Ok(Ok(())))) {
                             let error=match result {
                                 Some(Ok(Err(error)))=>error,
@@ -258,7 +272,9 @@ impl Engine {
                     }
                     request=incoming.recv() => {
                         let Some(request)=request else { break };
-                        if task_shared.authority.check().is_err() { break }
+                        if *stopped.borrow() || task_shared.authority.check().is_err() { break }
+                        #[cfg(test)]
+                        task_shared.test_hooks.reach(tests::DispatchPoint::BeforeReservation).await;
                         let permit=match task_shared.callbacks.clone().try_acquire_owned() {
                             Ok(p)=>p,
                             Err(_)=>{task_shared.authority.retire();task_shared.connection.abort();break}
@@ -267,12 +283,24 @@ impl Engine {
                             crate::extensions::CallLane::Native,
                             crate::extensions::CallOrigin::default(), CALLBACK_TIMEOUT, false) {
                             Ok(permit)=>permit,
-                            Err(_)=>{task_shared.authority.retire();task_shared.connection.abort();break}
+                            Err(error)=>{
+                                // The selected request passed admission before
+                                // orderly retirement raced reserve. No callback
+                                // was accepted; do not poison unregister IPC.
+                                if !(*stopped.borrow() && matches!(error,Error::Closed)) {
+                                    task_shared.authority.retire();
+                                    task_shared.connection.abort();
+                                }
+                                break;
+                            }
                         };
                         task_shared.active.fetch_add(1,Ordering::SeqCst);
                         let state=task_shared.clone();
                         let call=call_permit.run_future(async move {
-                            let _permit=permit; dispatch(state,request).await
+                            let _permit=permit;
+                            #[cfg(test)]
+                            state.test_hooks.reach(tests::DispatchPoint::BeforeDispatch).await;
+                            dispatch(state,request).await
                         });
                         dispositions.retain(|record| !record.is_finished());
                         dispositions.push(call.disposition());

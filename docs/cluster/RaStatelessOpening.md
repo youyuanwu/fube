@@ -70,7 +70,8 @@ notification checks read at their source-defined points. Undefined native signed
 overflow is not emulated: checked wider Rust arithmetic retains finite safety.
 
 Issued lookup IDs and usage leases are Rust adapter ownership bookkeeping, not
-native reply fields. Exactly one acquired result belongs to each issued lookup.
+native reply fields. An issued lookup needing fresh usage acquires once; a new
+lookup with retained usage reuses its original owner.
 An unused candidate releases its own registration/usage; replay cannot release
 again. Across opening host-down, usage is retained once and a native-valid
 replacement can attach. Extra offered usage is disposed without rejecting its
@@ -79,6 +80,15 @@ clear health. Rejection/capacity veto leaves the offered callback and issued
 obligation with its adapter for correction/retry. Unissued acquisitions are never
 silently adopted. No live Hosting/health transport exists; original error,
 message and API identity remain explicit owned health obligations.
+
+The [H2 real-accounting test profile](RustHosting.md#implemented-h2-accounting-and-scheduling)
+now exercises these seams with actual package/application counts, exact partial
+ownership, failed publication correction or explicit withdrawal/compensation,
+and retained usage on reopen. FSR attachment remains memory-only. Unknown/late
+durable-close tests retain the original CompleteClose proposal/ticket/fence and
+release only from postcommit actions. Observer cancellation is not abandonment;
+ticket success alone does not prove acquisition adoption or disposal. This
+test composition is not a live Hosting/RAP adapter or new persistence format.
 
 ## Shared node registration notifications
 
