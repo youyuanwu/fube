@@ -54,6 +54,42 @@ fn compiled_sources() -> Vec<u8> {
     .concat()
 }
 
+fn local_observer(builder: reqwest::ClientBuilder) -> LiveResult<reqwest::Client> {
+    Ok(builder
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .timeout(Duration::from_secs(30))
+        .build()?)
+}
+
+async fn node_inventory(http: &reqwest::Client, endpoint: SocketAddr) -> LiveResult<Value> {
+    require(
+        endpoint.ip().is_loopback(),
+        "native observation must remain loopback",
+    )?;
+    let mut response = http
+        .get(format!("http://{endpoint}/Nodes?api-version=6.2"))
+        .send()
+        .await?;
+    require(
+        response.status() == reqwest::StatusCode::OK,
+        "native observation refused redirect/non-success status",
+    )?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        require(
+            bytes
+                .len()
+                .checked_add(chunk.len())
+                .is_some_and(|n| n <= 1024 * 1024),
+            "native node inventory exceeds bound",
+        )?;
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 fn config() -> LiveResult<Config> {
     let path = PathBuf::from(std::env::var("FUBE_CHANNEL_NATIVE_CONFIG")?);
     let metadata = std::fs::symlink_metadata(&path)?;
@@ -375,16 +411,8 @@ async fn exchanges(
 async fn native_channel_live() -> LiveResult<()> {
     let config = config()?;
     // Independent read-only native observation, not mere Docker liveness.
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
-    let nodes: Value = http
-        .get("http://127.0.0.1:19080/Nodes?api-version=6.2")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let http = local_observer(reqwest::Client::builder())?;
+    let nodes = node_inventory(&http, "127.0.0.1:19080".parse()?).await?;
     let items = nodes["Items"]
         .as_array()
         .ok_or("native node inventory absent")?;
@@ -442,5 +470,92 @@ async fn native_channel_live() -> LiveResult<()> {
         serde_json::to_string(&result)?
     );
     println!("Native Channel and bounded tap helpers joined; no workload/filter created.");
+    Ok(())
+}
+
+async fn serve_http_once(listener: TcpListener, response: String) -> LiveResult<()> {
+    let (mut stream, _) = listener.accept().await?;
+    timeout(Duration::from_secs(5), async {
+        let mut bytes = [0; 4096];
+        let mut used = 0;
+        loop {
+            require(used < bytes.len(), "offline HTTP request exceeds bound")?;
+            let count = stream.read(&mut bytes[used..]).await?;
+            require(count > 0, "offline HTTP request ended prematurely")?;
+            used += count;
+            if bytes[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                break;
+            }
+        }
+        stream.write_all(response.as_bytes()).await?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn native_observer_rejects_redirect_without_contacting_other_endpoint() -> LiveResult<()> {
+    let origin = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = origin.local_addr()?;
+    let target = TcpListener::bind("127.0.0.1:0").await?;
+    let redirected = target.local_addr()?;
+    let contacted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = contacted.clone();
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target.accept().await?;
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"Items\":[]}",
+            )
+            .await?;
+        Ok::<_, std::io::Error>(())
+    });
+    let origin_task = tokio::spawn(serve_http_once(origin, format!(
+        "HTTP/1.1 302 Found\r\nLocation: http://{redirected}/Nodes\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")));
+    let result = node_inventory(&local_observer(reqwest::Client::builder())?, endpoint).await;
+    origin_task.await??;
+    target_task.abort();
+    let _ = target_task.await;
+    require(
+        result.is_err() && !contacted.load(std::sync::atomic::Ordering::Acquire),
+        "native observation followed a redirect",
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_observer_ignores_even_explicitly_configured_proxy() -> LiveResult<()> {
+    let origin = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = origin.local_addr()?;
+    let proxy = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_endpoint = proxy.local_addr()?;
+    let contacted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = contacted.clone();
+    let proxy_task = tokio::spawn(async move {
+        let (mut stream, _) = proxy.accept().await?;
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .await?;
+        Ok::<_, std::io::Error>(())
+    });
+    let origin_task = tokio::spawn(serve_http_once(
+        origin,
+        "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"Items\":[]}".into(),
+    ));
+    let http = local_observer(
+        reqwest::Client::builder().proxy(reqwest::Proxy::all(format!("http://{proxy_endpoint}"))?),
+    )?;
+    let result = node_inventory(&http, endpoint).await;
+    // Stop/join owned listeners before any assertion can fail.
+    origin_task.abort();
+    let _ = origin_task.await;
+    proxy_task.abort();
+    let _ = proxy_task.await;
+    require(
+        result?.get("Items").is_some() && !contacted.load(std::sync::atomic::Ordering::Acquire),
+        "native observation used a configured proxy",
+    )?;
     Ok(())
 }

@@ -27,6 +27,22 @@ SOURCES = (
 )
 
 
+def reap_owned_child(child: subprocess.Popen) -> None:
+    """Stop/reap this exact session before allocation cleanup can proceed."""
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        child.communicate(timeout=35)
+    except BaseException:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.communicate(timeout=10)
+
+
 def run_test(config: Path) -> dict:
     environment = dict(os.environ, FUBE_CHANNEL_NATIVE_CONFIG=str(config))
     child = subprocess.Popen(
@@ -37,15 +53,14 @@ def run_test(config: Path) -> dict:
     )
     try:
         output, _ = child.communicate(timeout=300)
-    except subprocess.TimeoutExpired:
-        # Exact task-owned process group, never name-based termination.
-        os.killpg(child.pid, signal.SIGTERM)
+    except BaseException as primary:
         try:
-            child.communicate(timeout=35)
-        except subprocess.TimeoutExpired:
-            os.killpg(child.pid, signal.SIGKILL)
-            child.communicate(timeout=10)
-        raise RuntimeError("bounded native Channel test timed out") from None
+            reap_owned_child(child)
+        except BaseException as cleanup:
+            primary.add_note(f"task-owned child cleanup failed: {cleanup}")
+        if isinstance(primary, subprocess.TimeoutExpired):
+            raise RuntimeError("bounded native Channel test timed out") from primary
+        raise
     print(output, end="")
     if child.returncode:
         raise RuntimeError(f"direct native Channel test failed ({child.returncode})")

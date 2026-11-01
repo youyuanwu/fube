@@ -229,7 +229,9 @@ python3 -m tests.onebox.native_channel --name my-channel-qualification
 
 It creates a **fresh task-owned** SF 11.8.121.4 onebox, verifies original owner,
 container incarnation, controller readiness and independent five-node runtime
-inventory, and binds the newly compiled test source to a private config. A
+inventory without proxies, redirects or retries, and binds the newly compiled
+test source to a private config. Catchable interruption reaps the exact
+task-owned child process group with bounded TERM/KILL before fixture cleanup. A
 bounded task-owned loopback tap forwards unchanged bytes to/from actual SF.
 The test directly exercises GatewayChannel Ping RPC, raw full write, genuine
 initial notification and its original consuming status reply forwarded to SF.
@@ -244,7 +246,9 @@ independent regressions and cannot qualify the new foundation.
 **Executed on 2026-11-01:** 26 deterministic channel tests passed; affected
 transport/client/test-host regressions and repository format, all-target/type,
 workspace executable build, strict Clippy, warning-free Rustdoc and doctests
-passed. Python offline ran 402 tests successfully (one pre-existing skip).
+passed. Python offline ran 405 tests successfully (one pre-existing skip),
+including seven cleanup/interruption models; two local HTTP policy tests proved
+proxy/redirect rejection without native allocation.
 
 Direct Channel qualification passed on a fresh owned SF 11.8.121.4 onebox:
 ordinary gateway Ping, unchanged raw full local write, an unchanged genuine
@@ -255,8 +259,9 @@ independently verified. No workload/filter was created or mutated.
 
 Two earlier owned attempts failed during discovery of the native repeated
 correlation form; both cleaned their resources. They are not counted as passes.
-The successful executed implementation/test/schema source SHA-256 is
-`1385a31c996072488d3687ebfd810a3d5609ce806d281689c690cdd7b69ff1e7`.
+The corrected harness was qualified again after final-review safeguards. Its
+successful implementation/test/schema source SHA-256 is
+`2385fb2f8d865bd5b825e6f31396d89296d142ffdc8f93ac3723c04c094c19d6`.
 No live pass is inferred merely from source inspection or deterministic tests.
 Live notification retry races, nonempty application notification contents,
 secure clusters, arbitrary reverse RPC and unrelated runtime/upload/hosting
