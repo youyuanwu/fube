@@ -474,7 +474,7 @@ struct CleanupState {
     state: Mutex<(bool, usize)>,
     changed: tokio::sync::Notify,
 }
-struct CleanupEntry(Arc<CleanupState>);
+pub(crate) struct CleanupEntry(Arc<CleanupState>);
 impl Drop for CleanupEntry {
     fn drop(&mut self) {
         self.0.state.lock().unwrap().1 -= 1;
@@ -798,7 +798,7 @@ impl KernelManager {
     pub(crate) fn open_cleanup_gate(&self) {
         self.cleanup.state.lock().unwrap().0 = true;
     }
-    fn cleanup_entry(&self) -> Result<CleanupEntry> {
+    pub(crate) fn cleanup_entry(&self) -> Result<CleanupEntry> {
         let mut state = self.cleanup.state.lock().unwrap();
         if !state.0 {
             return Err(Status::ObjectClosed.error());

@@ -110,6 +110,7 @@ impl VolatileRuntime {
         manager.fence_application();
         let owner = Arc::new(ProviderOwner {
             manager: manager.clone(),
+            registry: registry.clone(),
             partition: partition.clone(),
             opened: AtomicBool::new(false),
             ready: AtomicBool::new(false),

@@ -1,7 +1,8 @@
 # Fube transaction A0: private native kernels
 
-**Status:** implemented, offline source-derived kernels; not an A1 runtime,
-public concrete SDK, native interoperability or persisted feature.
+**Status:** implemented, offline source-derived A0 kernels. This document records
+the A0 boundary; [A1](FubeTxnA1.md) now supplies the public volatile integration.
+Neither milestone establishes native interoperability or persisted support.
 **Native source:** Service Fabric
 `51a7703a1f83749a9234d3ceb4296d8622e42cca`.
 **Validation:** deterministic Rust tests, not executions of a native binary.
@@ -11,9 +12,10 @@ public concrete SDK, native interoperability or persisted feature.
 The public [`fube-txn`](../../crates/libs/fube-txn/src/lib.rs) contracts are
 unchanged. Concrete components live in private
 [`kernel`](../../crates/libs/fube-txn/src/kernel.rs). A maintainer can exercise
-them with crate-local tests, not create an integrated public replicator.
+them with crate-local tests. The later [A1 service owner](FubeTxnA1.md) exposes
+supported integrated execution without exporting kernel internals.
 The same lower engine/binder and native membership/role/quorum/epoch authority
-remain the [design](FubeDataV2Design.md). No runtime adapter is added.
+remain the [design](FubeDataV2Design.md). A0 itself added no runtime adapter.
 
 | Component | Implemented responsibility |
 |---|---|
@@ -164,8 +166,9 @@ late DelayDelete Apply can still skip. Replay preflights native named routing
 before append even for covered-prefix records; codec ID advancement remains
 separate from this execution-support gate.
 
-A1 lower lifecycle/engine stream/ACK pump integration and native copy negotiation
-remain absent. Full collections, deployment qualification, mixed-native replicas,
+At the A0 checkpoint, lower lifecycle/engine stream/ACK pumps and native copy
+negotiation were absent; [A1](FubeTxnA1.md) now implements the volatile paths,
+physical codecs and primary registry/hierarchy. Full collections, deployment qualification, mixed-native replicas,
 native binary format provenance and persisted manifests remain unclaimed.
 This source pin is not deployed-binary evidence. Private logs/provider captures
 are test-bounded, not a production memory-quota/recovery/lifecycle guarantee.

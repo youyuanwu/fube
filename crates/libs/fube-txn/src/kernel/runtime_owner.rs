@@ -1,6 +1,7 @@
 //! Callback-ready weak provider owner. This private adapter forwards supported
-//! A0 transaction/version kernels; it does not claim registry/collection products.
-use super::{processor::KernelManager, provider::ProviderMode, status::Status};
+//! transaction/version kernels and native primary state-provider map. It does
+//! not implement collection products, persistence, or native qualification.
+use super::{processor::KernelManager, registry::Registry, status::Status};
 use crate::*;
 use fube_runtime::ServicePartitionAccessStatus as Access;
 use std::{
@@ -14,6 +15,7 @@ use std::{
 
 pub(crate) struct ProviderOwner {
     pub(crate) manager: Arc<KernelManager>,
+    pub(crate) registry: Arc<Registry>,
     pub(crate) partition: Arc<dyn IStatefulServicePartition>,
     pub(crate) opened: AtomicBool,
     pub(crate) ready: AtomicBool,
@@ -33,7 +35,7 @@ impl ProviderOwner {
             _ => Ok(()),
         }
     }
-    fn readable(&self) -> Result<()> {
+    pub(crate) fn readable(&self) -> Result<()> {
         self.manager.gate()?;
         if self.manager.faults.is_closing() {
             return Err(Status::ObjectClosed.error());
@@ -47,7 +49,7 @@ impl ProviderOwner {
             Err(Status::NotReadable.error())
         }
     }
-    fn api(&self) -> Result<()> {
+    pub(crate) fn api(&self) -> Result<()> {
         if self.opened.load(Ordering::Acquire) {
             Ok(())
         } else {
@@ -156,50 +158,56 @@ impl ITransactionManager for ProviderOwner {
 }
 impl IStateProviderMap for ProviderOwner {
     fn get(&self, name: &str) -> Result<Arc<dyn IStateProvider2>> {
-        self.readable()?;
-        self.manager
-            .directory
-            .entries
-            .lock()
-            .unwrap()
-            .values()
-            .find(|entry| entry.mode == ProviderMode::Active && entry.provider.get_name() == name)
-            .map(|entry| entry.provider.clone())
-            .ok_or_else(|| Status::NameDoesNotExist.error())
+        self.registry.get(name)
     }
     fn add(
         &self,
-        _: Arc<dyn Transaction>,
-        _: String,
-        _: String,
-        _: Option<OperationData>,
-        _: Option<Duration>,
-        _: Cancellation,
+        transaction: Arc<dyn Transaction>,
+        name: String,
+        type_name: String,
+        initialization: Option<OperationData>,
+        timeout: Option<Duration>,
+        cancellation: Cancellation,
     ) -> ApiFuture<'_, ()> {
-        Box::pin(async { Err(Status::NotImplemented.error()) })
+        self.registry.add(
+            transaction,
+            name,
+            type_name,
+            initialization,
+            timeout,
+            cancellation,
+        )
     }
     fn remove(
         &self,
-        _: Arc<dyn Transaction>,
-        _: String,
-        _: Option<Duration>,
-        _: Cancellation,
+        transaction: Arc<dyn Transaction>,
+        name: String,
+        timeout: Option<Duration>,
+        cancellation: Cancellation,
     ) -> ApiFuture<'_, ()> {
-        Box::pin(async { Err(Status::NotImplemented.error()) })
+        self.registry
+            .remove(transaction, name, timeout, cancellation)
     }
-    fn create_enumerator(&self, _: bool) -> Result<Arc<dyn IStateProviderEnumerator>> {
-        Err(Status::NotImplemented.error())
+    fn create_enumerator(&self, parents_only: bool) -> Result<Arc<dyn IStateProviderEnumerator>> {
+        self.registry.enumerator(parents_only)
     }
     fn get_or_add(
         &self,
-        _: Arc<dyn Transaction>,
-        _: String,
-        _: String,
-        _: Option<OperationData>,
-        _: Option<Duration>,
-        _: Cancellation,
+        transaction: Arc<dyn Transaction>,
+        name: String,
+        type_name: String,
+        initialization: Option<OperationData>,
+        timeout: Option<Duration>,
+        cancellation: Cancellation,
     ) -> ApiFuture<'_, GetOrAddResult> {
-        Box::pin(async { Err(Status::NotImplemented.error()) })
+        self.registry.get_or_add(
+            transaction,
+            name,
+            type_name,
+            initialization,
+            timeout,
+            cancellation,
+        )
     }
 }
 impl ITransactionalReplicator for ProviderOwner {

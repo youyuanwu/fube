@@ -201,18 +201,20 @@ native SF node: membership / role / epoch / reconfiguration / access authority
 
 ### 3.2.1 Public trait boundary before A0
 
-**Current A0 update (2026-10-31):** the API-only baseline below is historical.
+**Current A1 update (2026-11-01):** the API-only baseline below is historical.
 Public signatures remain contract projections, while private kernels now
 execute the supported offline record/transaction/map/version/Apply/Unlock and
 checkpoint/copy paths. [A0 as-built scope and evidence](FubeTxnA0.md) identifies
 the narrow lower/registry/physical-effect seams, point fixture and unsupported
-boundaries. This is neither a public runtime facade nor A1/native qualification.
+boundaries. [A1 as-built integration](FubeTxnA1.md) now supplies a constructible
+public service/primary registry facade, real lower transactions/lifecycle and
+native Full/checkpoint/truncation. It is not native-binary qualification.
 
-[`fube-txn`](../../crates/libs/fube-txn/src/lib.rs) now declares the source-backed
-public V2/provider contracts. It contains **traits and signature types only**:
+The pre-A0 [`fube-txn`](../../crates/libs/fube-txn/src/lib.rs) baseline declared
+public V2/provider contracts with **traits and signature types only**:
 no replicator/transaction/log/state-manager/provider implementation or lower
 adapter, no native serialization, and no new qualification or persisted support.
-The ownership split above remains the implementation proposal.
+The ownership split above is retained by A1's implemented composition.
 
 | Native contract | Rust declaration |
 |---|---|
@@ -970,7 +972,7 @@ alternate correctness mechanism. If existing fube boundaries cannot express
 a source-required completion, extend only that local representation while
 preserving the native stage/ACK contract; do not ship the unsupported path.
 
-## 8. Boundedness, truncation and termination headroom
+## 8. Boundedness, truncation and ordinary admission
 
 Current engine defaults are 1 MiB / 1024 segments per operation, 1024 retained
 operations / 16 MiB, 64 provider operations and an 8-second callback timeout
@@ -1093,7 +1095,7 @@ from this design pass**. No tier can borrow a lower tier's qualification label.
 |---|---|---|
 | R0: correct V1 foundation | Implemented lower DD-01–DD-07, explicit latest-LSN capability and callback-ready actual-tail construction seam | Offline phase-reviewed regressions pass, including quorum-one release/ALL, EOS-before-ACK role generations, typed retry/sizing, local-not-PC quorum, extended-copy duplicates, latest start/finish and nonempty bootstrap. No A0 kernels or new native qualification claimed |
 | A0: native kernels and test provider | Implemented private supported records/codecs, transaction states/map/version, Apply/Unlock and checkpoint/copy callbacks with narrow offline seams | [Source-derived deterministic traces and limitations](FubeTxnA0.md) for read-only/single/multi, interleaving, retry/cancel/abort, IDs/replay, visibility and failure cleanup; not A1 or native qualification |
-| A1: volatile Rust integration | Current canonical APIs, lower-bound pass-through, lifecycle/log/provider drains, native memory-log/checkpoint/copy | Requires R0 and A0; native copy stages and incremental transaction flow work with one engine/binder and bounded owned execution; no release-gated serial/root/ledger substitute |
+| A1: volatile Rust integration | Implemented public service/primary registry facade, lower-bound pass-through, lifecycle/log/provider drains, native memory-log/checkpoint/copy | [As-built guide and external behavioral evidence](FubeTxnA1.md); R0/A0 algorithms, one engine/binder and bounded owned execution; no preferential End/Barrier, release-gated serial/root/ledger substitute or native-binary claim |
 | A2: volatile qualification | Pinned SF binary/environment, pressure and fault campaign | Repeated A scenarios with recorded environment, limits, traces and unsupported modes; only Tier A claim |
 | B: mixed-native qualification | Qualify the already source-derived records, transactions, provider routing and copy in both directions | All B scenarios and exact native provider/version/settings matrix; any unsupported feature is explicit, not implemented by an alternate algorithm |
 | C: persistent recovery | Durable log/checkpoints/copy publication plus persisted SF lifecycle | All C scenarios with process/host/storage fault injection; persisted manifest/open checks changed only with the full contract |
