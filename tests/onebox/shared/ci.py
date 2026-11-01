@@ -1383,6 +1383,44 @@ def validate_native_movement(lists, owner):
     return [stamp / 1000 for stamp in window]
 
 
+def validate_notification_retry(retry):
+    require(isinstance(retry, dict), "native notification retry evidence")
+    require(type(retry.get("successful_acks_dropped")) is int
+            and retry["successful_acks_dropped"] == 1
+            and all(integer(retry.get(key), 1) for key in
+                    ("native_page_retries", "subsequent_target_acks_forwarded",
+                     "unique_delivered_versions"))
+            and type(retry.get("duplicate_versions")) is int
+            and retry["duplicate_versions"] == 0,
+            "actual native ACK loss/retry without duplicate delivery")
+
+    def guid(value):
+        return (isinstance(value, list) and len(value) == 16
+                and all(type(byte) is int and 0 <= byte <= 255 for byte in value))
+
+    attempts = []
+    for field in ("dropped_attempt", "retry_attempt", "forwarded_success_ack"):
+        attempt = retry.get(field)
+        require(isinstance(attempt, dict), "observed native target attempt/ACK witness")
+        request = attempt.get("request_id")
+        page = attempt.get("page_id")
+        require(isinstance(request, dict) and set(request) == {"guid", "index"}
+                and guid(request["guid"]) and type(request["index"]) is int
+                and 0 <= request["index"] <= 0xffffffff
+                and (any(request["guid"]) or request["index"] != 0),
+                "full nonempty observed native transport MessageId")
+        require(isinstance(page, list) and len(page) == 3 and guid(page[0])
+                and all(type(index) is int and 0 <= index <= 0xffffffffffffffff
+                        for index in page[1:]),
+                "full observed native logical page identity")
+        attempts.append(attempt)
+    dropped, retried, acked = attempts
+    require(dropped["page_id"] == retried["page_id"] == acked["page_id"]
+            and dropped["request_id"] != retried["request_id"]
+            and retried["request_id"] == acked["request_id"],
+            "fresh native retry ID for dropped target and exactly correlated success ACK")
+
+
 def validate_native(reports, archive, allocation):
     clear, health, name, lists, notification = [reports[file] for file in NATIVE_FILES]
     for value in (clear, health, name, notification):
@@ -1442,11 +1480,7 @@ def validate_native(reports, archive, allocation):
             and all(nonempty(notification.get(key)) for key in
                     ("resolved", "named", "ack_retry", "endpoint_change", "role_change")),
             "native notification allocation/cases/actual observations")
-    retry = notification["ack_retry"]
-    require(all(integer(retry.get(key), 1) for key in
-                ("successful_acks_dropped", "native_page_retries", "subsequent_target_acks_forwarded"))
-            and type(retry.get("duplicate_versions")) is int and retry["duplicate_versions"] == 0,
-            "actual native ACK loss/retry without duplicate delivery")
+    validate_notification_retry(notification["ack_retry"])
     windows = {
         "clear_node_queries": [stamp / 1000 for stamp in interval(
             nodes, "native_observation_start_unix_ms", "native_observation_end_unix_ms")],

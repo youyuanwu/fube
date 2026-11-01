@@ -42,7 +42,20 @@ async fn connect_peer(listener: TcpListener) -> (TcpStream, String) {
         })
         .unwrap();
     d.finish().unwrap();
-    let reply = body(|e| {
+    write_message(
+        &mut stream,
+        &peer::reply(
+            &request,
+            "NotificationClientConnectionReply",
+            connected_body(),
+        ),
+    )
+    .await
+    .unwrap();
+    (stream, id)
+}
+fn connected_body() -> Vec<u8> {
+    body(|e| {
         e.object(|e| {
             e.i64(1);
             e.byte_array(&[0; 16])
@@ -57,14 +70,7 @@ async fn connect_peer(listener: TcpListener) -> (TcpStream, String) {
             })?;
             e.string("native-peer")
         })
-    });
-    write_message(
-        &mut stream,
-        &peer::reply(&request, "NotificationClientConnectionReply", reply),
-    )
-    .await
-    .unwrap();
-    (stream, id)
+    })
 }
 fn register(request: &Message, expected: &str) -> u64 {
     assert_eq!(
@@ -138,11 +144,14 @@ fn page_with_endpoints(index: u32, version: i64, count: usize, endpoints: &[Stri
                     e.byte_array(&[0; 16])
                 })?;
                 e.pointer(Some(&[]), |e| {
-                    e.object_array(&[(version, version + count as i64)], |e, (start, end)| {
-                        e.i64(*start);
-                        e.i64(*end);
-                        Ok(())
-                    })
+                    e.object_array(
+                        &[(version, version + count.max(1) as i64)],
+                        |e, (start, end)| {
+                            e.i64(*start);
+                            e.i64(*end);
+                            Ok(())
+                        },
+                    )
                 })?;
                 e.u32(count as u32);
                 for id in 0..count {
@@ -321,8 +330,139 @@ async fn failed_or_cancelled_construction_closes_candidate_socket() {
 }
 
 #[tokio::test]
+async fn connect_confirmation_cannot_overtake_prepublication_page_admission() {
+    for count in [32, 33] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen, ready) = tokio::sync::oneshot::channel();
+        let (allow, allowed) = tokio::sync::oneshot::channel();
+        let (sent, written) = tokio::sync::oneshot::channel();
+        let (acked, delivered) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut peer = peer::accept(listener).await;
+            let request = read_message(&mut peer).await.unwrap();
+            seen.send(()).unwrap();
+            allowed.await.unwrap();
+            for index in 1..=count {
+                write_message(&mut peer, &page(index, index as i64, 1))
+                    .await
+                    .unwrap();
+            }
+            write_message(
+                &mut peer,
+                &peer::reply(
+                    &request,
+                    "NotificationClientConnectionReply",
+                    connected_body(),
+                ),
+            )
+            .await
+            .unwrap();
+            sent.send(()).unwrap();
+            if count == 32 {
+                for index in 1..=count {
+                    ack(&mut peer, index, true).await;
+                }
+                acked.send(()).unwrap();
+            }
+            assert!(read_message(&mut peer).await.is_err());
+        });
+        let opening = ServiceNotificationClient::connect_clear(address, WAIT);
+        tokio::pin!(opening);
+        tokio::select! {
+            biased;
+            _ = ready => {},
+            result = &mut opening => panic!("premature constructor result: {}", result.is_ok()),
+        }
+        // Keep the constructor/pull observer withheld while the owned backend
+        // receives the burst and its valid RPC completion.
+        allow.send(()).unwrap();
+        written.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if count == 33 {
+            assert!(matches!(
+                opening.await,
+                Err(NotificationError::ResourceLimit("notification page queue"))
+            ));
+        } else {
+            let client = opening.await.unwrap();
+            delivered.await.unwrap();
+            client.close(None).await.unwrap();
+        }
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn legitimate_empty_initial_sync_is_acked_without_an_application_event() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (acked, sync_done) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut peer, _) = connect_peer(listener).await;
+        write_message(&mut peer, &page(100, 1, 0)).await.unwrap();
+        ack(&mut peer, 100, true).await;
+        acked.send(()).unwrap();
+        assert!(read_message(&mut peer).await.is_err());
+    });
+    let mut client = ServiceNotificationClient::connect_clear(address, WAIT)
+        .await
+        .unwrap();
+    sync_done.await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), client.recv())
+            .await
+            .is_err()
+    );
+    client.close(None).await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn notification_connect_rejects_nonloopback_and_zero_port_without_dialing() {
+    for endpoint in ["192.0.2.1:19000", "127.0.0.1:0"] {
+        assert!(matches!(
+            ServiceNotificationClient::connect_clear(endpoint.parse().unwrap(), WAIT).await,
+            Err(NotificationError::Common(Error::InvalidInput(_)))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn repeated_transport_id_is_terminal_not_a_second_native_retry_authority() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (delivered, delivery) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut peer, _) = connect_peer(listener).await;
+        write_message(&mut peer, &page(10, 1, 1)).await.unwrap();
+        ack(&mut peer, 10, true).await;
+        delivery.await.unwrap();
+        write_message(&mut peer, &page(10, 1, 1)).await.unwrap();
+        assert!(read_message(&mut peer).await.is_err());
+    });
+    let mut client = ServiceNotificationClient::connect_clear(address, WAIT)
+        .await
+        .unwrap();
+    assert!(client.recv().await.unwrap().is_ok());
+    delivered.send(()).unwrap();
+    assert!(matches!(
+        client.recv().await,
+        Some(Err(NotificationError::Common(Error::Protocol(_))))
+    ));
+    assert!(client.recv().await.is_none());
+    assert!(matches!(
+        client.close(None).await,
+        Err(NotificationError::Common(Error::Protocol(_)))
+    ));
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn independent_public_clients_survive_other_client_close_and_connection_faults() {
     for ordinary_fails in [false, true] {
+        // Fault an established owner, not an unobserved constructor candidate.
+        let (published, publication) = tokio::sync::oneshot::channel();
         let ordinary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ordinary_address = ordinary_listener.local_addr().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -346,6 +486,7 @@ async fn independent_public_clients_survive_other_client_close_and_connection_fa
         let notification_peer = tokio::spawn(async move {
             let (mut s, id) = connect_peer(listener).await;
             if !ordinary_fails {
+                publication.await.unwrap();
                 return;
             }
             while let Ok(req) = read_message(&mut s).await {
@@ -369,6 +510,9 @@ async fn independent_public_clients_survive_other_client_close_and_connection_fa
         let mut client = ServiceNotificationClient::connect_clear(addr, WAIT)
             .await
             .unwrap();
+        if !ordinary_fails {
+            published.send(()).unwrap();
+        }
         if ordinary_fails {
             normal_peer.await.unwrap();
             ordinary.close().await.unwrap();

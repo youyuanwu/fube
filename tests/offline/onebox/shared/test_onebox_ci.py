@@ -480,7 +480,14 @@ class ProofFiles(fixtures.ProjectFiles):
             **common, "allocation": allocation, "passed": list(ci.NOTIFICATION_CASES),
             "owned_cleanup_confirmed": True, "resolved": [{"model": 1}], "named": {"model": 1},
             "ack_retry": {"successful_acks_dropped": 1, "native_page_retries": 1,
-                          "subsequent_target_acks_forwarded": 1, "duplicate_versions": 0},
+                          "subsequent_target_acks_forwarded": 1, "unique_delivered_versions": 1,
+                          "duplicate_versions": 0,
+                          "dropped_attempt": {"request_id": {"guid": [1] * 16, "index": 1},
+                                              "page_id": [[2] * 16, 1, 0]},
+                          "retry_attempt": {"request_id": {"guid": [1] * 16, "index": 2},
+                                            "page_id": [[2] * 16, 1, 0]},
+                          "forwarded_success_ack": {"request_id": {"guid": [1] * 16, "index": 2},
+                                                    "page_id": [[2] * 16, 1, 0]}},
             "endpoint_change": {"from": 2, "to": 1}, "role_change": {"model": 1},
         }
         return dict(zip(ci.NATIVE_FILES, (clear, health, names, lists, notification)))
@@ -1286,6 +1293,33 @@ class WorkerTests(ProofFiles):
                     target[field] = value
                     with self.assertRaises(ci.ProofError):
                         ci.validate_native(broken, archive, allocation)
+
+    def test_notification_retry_requires_fresh_target_id_and_its_exact_success_ack(self):
+        reports = self.native_reports("owned", 1)
+        original = reports[ci.NATIVE_FILES[4]]["ack_retry"]
+        ci.validate_notification_retry(original)
+        mutations = [
+            lambda value: value.pop("dropped_attempt"),
+            lambda value: value.update(retry_attempt=None),
+            lambda value: value["retry_attempt"].update(
+                request_id=value["dropped_attempt"]["request_id"]),
+            lambda value: value["forwarded_success_ack"]["request_id"].update(index=3),
+            lambda value: value["retry_attempt"]["page_id"].__setitem__(2, 9),
+            lambda value: value["dropped_attempt"].update(request_id={"guid": [0] * 16, "index": 0}),
+            lambda value: value["retry_attempt"]["request_id"].update(index=True),
+            lambda value: value["retry_attempt"]["request_id"].update(index=0x100000000),
+            lambda value: value["retry_attempt"]["request_id"].update(guid=[1] * 15),
+            lambda value: value.update(duplicate_versions=1),
+            lambda value: value.update(unique_delivered_versions=0),
+            lambda value: value.update(successful_acks_dropped=True),
+            lambda value: value.update(native_page_retries=0),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                broken = copy.deepcopy(original)
+                mutate(broken)
+                with self.assertRaises(ci.ProofError):
+                    ci.validate_notification_retry(broken)
 
     def test_native_movement_requires_owned_single_request_and_independent_role_change(self):
         archive = self.built["inputs"]["native_archive"]["sha256"]

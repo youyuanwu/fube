@@ -1,4 +1,4 @@
-//! Independent clear-TCP native notification sessions with owning filter guards.
+//! Independently owned unsecured-loopback gateway notification sessions.
 use std::{
     collections::HashMap,
     fmt,
@@ -8,8 +8,12 @@ use std::{
 };
 
 use fube_transport::{
-    connection::{deadline_after, Connection, ReplyContext, SendStatus},
+    channel::{IncomingMessage, MessageChannel, MessageReceiver, ReplyContext, RpcChannel},
+    connection::{deadline_after, MAX_FRAME_TIME},
     message::{Header, Message, HIGH_PRIORITY},
+    native_channel::{
+        ChannelLimits, GatewayChannel, GatewayReceiver, GatewayTarget, RequestCancellation,
+    },
     serialization::serde::{to_vec, CountedValues, ObjectArray, Pointer},
 };
 use tokio::{
@@ -114,11 +118,12 @@ struct Cleanup {
 }
 struct Incoming {
     body: Vec<u8>,
-    context: ReplyContext,
+    context: Box<dyn ReplyContext>,
     memory: Memory,
 }
 struct Session {
-    connection: Connection,
+    channel: GatewayChannel,
+    target: Arc<GatewayTarget>,
     id: String,
     timeout: Duration,
     state: Mutex<Registrations>,
@@ -137,7 +142,7 @@ impl Session {
             state.filters.clear();
         }
         self.receiver.fail(error.into());
-        self.connection.abort();
+        self.channel.abort();
         self.wake.notify_one();
     }
     fn stop(&self) {
@@ -147,7 +152,7 @@ impl Session {
             state.filters.clear();
         }
         self.receiver.finish();
-        self.connection.abort();
+        self.channel.abort();
         self.wake.notify_one();
     }
     fn enqueue(
@@ -226,7 +231,7 @@ impl Session {
     }
 }
 
-/// A standalone non-cloneable session, connection, and cancellation-safe receiver.
+/// A standalone non-cloneable gateway owner, native session and receiver.
 ///
 /// Filters are not retroactive. Register first, resolve initial state separately,
 /// then compare versions by partition identity rather than arrival order.
@@ -241,8 +246,10 @@ pub struct ServiceNotificationClient {
     gateway: GatewayDescription,
 }
 impl ServiceNotificationClient {
-    /// Establish an independent unsecured development connection and native session.
-    /// No advertised private gateway address is dialed.
+    /// Establish an independent unsecured numeric-loopback gateway/native session.
+    /// Non-loopback and zero-port endpoints are rejected. This deliberately
+    /// narrows the previous clear-TCP policy; advertised private addresses are
+    /// never dialed and an ordinary FabricClient's channel is never adopted.
     pub async fn connect_clear(
         endpoint: SocketAddr,
         timeout: Duration,
@@ -250,43 +257,19 @@ impl ServiceNotificationClient {
         let deadline = deadline_after(timeout)?;
         let receiver = Arc::new(Receiver::default());
         let (pages, incoming) = mpsc::channel(MAX_PAGES);
-        let weak_receiver = Arc::downgrade(&receiver);
-        let handler = Arc::new(move |request: fube_transport::connection::ReverseRequest| {
-            let receiver = weak_receiver.upgrade().ok_or(Error::Closed)?;
-            // Queued input is charged now; shared Serde reserves owned storage
-            // before allocation when the worker decodes the page.
-            let result = (|| -> NotificationResult<()> {
-                let bytes = request.message.body.capacity() + std::mem::size_of::<Incoming>();
-                let memory = receiver.budget.reserve(bytes)?;
-                pages
-                    .try_send(Incoming {
-                        body: request.message.body,
-                        context: request.context,
-                        memory,
-                    })
-                    .map_err(|error| match error {
-                        mpsc::error::TrySendError::Full(_) => {
-                            NotificationError::ResourceLimit("notification page queue")
-                        }
-                        mpsc::error::TrySendError::Closed(_) => Error::Closed.into(),
-                    })
-            })();
-            result.map_err(|error| {
-                // Preserve the domain cause before the generic driver retires.
-                receiver.fail(error.clone());
-                match error {
-                    NotificationError::Common(error) => error,
-                    _ => Error::ResourceLimit("reverse request ingress"),
-                }
-            })
-        });
-        let connection = Connection::connect_duplex_clear(endpoint, deadline, handler)
-            .await
-            .map_err(|error| receiver.common_error(error))?;
+        let channel = GatewayChannel::connect_unsecured_loopback(
+            endpoint,
+            true,
+            notification_limits(),
+            deadline,
+        )
+        .await?;
         let mut candidate = Candidate {
-            connection: connection.clone(),
+            channel: channel.clone(),
             armed: true,
         };
+        let target = channel.resolve_target(&endpoint.to_string())?;
+        let native = channel.receiver()?;
         let id = Uuid::new_v4().to_string();
         let body = to_vec(&wire::Connect {
             client: &id,
@@ -296,16 +279,32 @@ impl ServiceNotificationClient {
             })),
             filters: CountedValues(Vec::new()),
         })?;
-        let connected = request(
-            &connection,
+        let connecting = request(
+            &channel,
+            &target,
             "NotificationClientConnectionRequest",
             body,
             deadline,
             wire::decode_connected,
-            SendStatus::default(),
-        )
-        .await
-        .map_err(|error| receiver.common_error(error))?;
+        );
+        tokio::pin!(connecting);
+        let connected = loop {
+            tokio::select! {
+                biased;
+                result = &mut connecting => break result.map_err(|error| receiver.common_error(error))?,
+                envelope = native.receive(deadline) => {
+                    stage(envelope.map_err(|error| receiver.common_error(error))?, &pages, &receiver)?;
+                }
+            }
+        };
+        // The RPC observer may run ahead of pulling earlier wire-order ingress.
+        // Admit that finite snapshot before semantic draining/publication.
+        for envelope in native
+            .drain_pending()
+            .map_err(|error| receiver.common_error(error))?
+        {
+            stage(envelope, &pages, &receiver)?;
+        }
         if let Some(error) = receiver.error() {
             return Err(error);
         }
@@ -314,7 +313,8 @@ impl ServiceNotificationClient {
         let gateway = connected.description();
         let (cleanup, cleanups) = mpsc::channel(MAX_CLEANUPS);
         let session = Arc::new(Session {
-            connection,
+            channel: channel.clone(),
+            target: target.clone(),
             id,
             timeout,
             state: Mutex::new(Registrations {
@@ -329,13 +329,18 @@ impl ServiceNotificationClient {
         let exit = WorkerExit(session.clone());
         let worker = tokio::spawn(async move {
             let _exit = exit;
-            run(
-                worker_session,
-                incoming,
-                cleanups,
-                Progress::new(connected.generation),
-            )
-            .await;
+            tokio::join!(
+                stage_loop(worker_session.clone(), native, pages),
+                run(
+                    worker_session.clone(),
+                    incoming,
+                    cleanups,
+                    Progress::new(connected.generation)
+                ),
+            );
+            if let Err(error) = worker_session.channel.closed(teardown_deadline()).await {
+                worker_session.receiver.fail(error.into());
+            }
         });
         candidate.armed = false;
         Ok(Self {
@@ -373,11 +378,10 @@ impl ServiceNotificationClient {
             state.filters.insert(id, RegistrationState::Registering);
             id
         };
-        let sent = SendStatus::default();
         let mut mutation = Mutation {
             session: Arc::downgrade(&self.session),
             id,
-            sent: sent.clone(),
+            sent: None,
             armed: true,
         };
         let body = to_vec(&wire::Register {
@@ -390,15 +394,17 @@ impl ServiceNotificationClient {
                 },
             })),
         })?;
-        let result = request(
-            &self.session.connection,
-            "RegisterServiceNotificationFilterRequest",
-            body,
-            deadline,
+        let message = request_message("RegisterServiceNotificationFilterRequest", body, deadline)?;
+        let (pending, sent) =
+            self.session
+                .channel
+                .request_tracked(&self.session.target, message, deadline);
+        mutation.sent = Some(sent);
+        let result = decode_reply(
+            &self.session.channel,
+            pending.await,
             wire::decode_registered,
-            sent,
-        )
-        .await;
+        );
         match result {
             Ok(()) => {
                 let mut state = self.session.state.lock().unwrap();
@@ -428,7 +434,7 @@ impl ServiceNotificationClient {
     pub async fn recv(&mut self) -> Option<NotificationResult<ServiceNotification>> {
         // A known transport failure takes priority over buffered updates even
         // when the worker has not yet been scheduled to observe driver exit.
-        if let Some(error) = self.session.connection.terminal_error() {
+        if let Some(error) = self.session.channel.terminal_error() {
             self.session.fail(error);
         }
         self.session.receiver.recv().await
@@ -446,8 +452,8 @@ impl ServiceNotificationClient {
             }
         };
         let mut result = self.session.begin_close(deadline);
-        if let Some(mut worker) = self.worker.take() {
-            match timeout_at(deadline, &mut worker).await {
+        if let Some(worker) = self.worker.as_mut() {
+            match timeout_at(deadline, &mut *worker).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
                     self.session
@@ -456,14 +462,19 @@ impl ServiceNotificationClient {
                 }
                 Err(_) => {
                     self.session.fail(Error::Timeout);
-                    let _ = worker.await;
+                    if worker.await.is_err() {
+                        self.session
+                            .receiver
+                            .fail(Error::Protocol("notification worker failed").into());
+                    }
                     result = Err(Error::Timeout.into());
                 }
             }
         }
+        self.worker = None;
         self.session
-            .connection
-            .close()
+            .channel
+            .close(teardown_deadline())
             .await
             .map_err(|error| self.session.receiver.common_error(error))?;
         if let Some(error) = self.session.receiver.error() {
@@ -472,10 +483,17 @@ impl ServiceNotificationClient {
         result
     }
     async fn join(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.await;
+        if let Some(worker) = self.worker.as_mut() {
+            if worker.await.is_err() {
+                self.session
+                    .receiver
+                    .fail(Error::Protocol("notification worker failed").into());
+            }
         }
-        let _ = self.session.connection.close().await;
+        self.worker = None;
+        if let Err(error) = self.session.channel.close(teardown_deadline()).await {
+            self.session.receiver.fail(error.into());
+        }
     }
 }
 impl Drop for ServiceNotificationClient {
@@ -522,7 +540,7 @@ impl Drop for ServiceNotificationRegistration {
 struct Mutation {
     session: Weak<Session>,
     id: u64,
-    sent: SendStatus,
+    sent: Option<RequestCancellation>,
     armed: bool,
 }
 impl Drop for Mutation {
@@ -531,7 +549,7 @@ impl Drop for Mutation {
             return;
         }
         if let Some(session) = self.session.upgrade() {
-            if self.sent.cancel_unsent() {
+            if self.sent.as_ref().is_some_and(|sent| !sent.cancel_unsent()) {
                 session.fail(Error::Protocol(
                     "notification registration outcome is uncertain",
                 ));
@@ -542,13 +560,13 @@ impl Drop for Mutation {
     }
 }
 struct Candidate {
-    connection: Connection,
+    channel: GatewayChannel,
     armed: bool,
 }
 impl Drop for Candidate {
     fn drop(&mut self) {
         if self.armed {
-            self.connection.abort();
+            self.channel.abort();
         }
     }
 }
@@ -559,29 +577,123 @@ impl Drop for WorkerExit {
             .fail(Error::Protocol("notification worker stopped unexpectedly"));
     }
 }
-async fn request<T: Send + 'static>(
-    connection: &Connection,
+fn notification_limits() -> ChannelLimits {
+    ChannelLimits {
+        max_ingress: MAX_PAGES + 1,
+        max_retained_bytes: 2 * 1024 * 1024 * 1024,
+        ..ChannelLimits::default()
+    }
+}
+
+fn teardown_deadline() -> Instant {
+    Instant::now() + MAX_FRAME_TIME + Duration::from_secs(1)
+}
+
+fn request_message(action: &str, body: Vec<u8>, deadline: Instant) -> Result<Message> {
+    let ticks = i64::try_from(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_nanos()
+            / 100,
+    )
+    .map_err(|_| Error::InvalidInput("notification timeout too large"))?;
+    Ok(Message {
+        headers: vec![
+            Header::actor(5)?,
+            Header::action(action)?,
+            Header::activity(Uuid::new_v4().to_bytes_le())?,
+            Header::version(1, 1)?,
+            Header::boolean(HIGH_PRIORITY, true)?,
+            Header::timeout(ticks)?,
+        ],
+        body,
+    })
+}
+
+fn decode_reply<T>(
+    channel: &GatewayChannel,
+    result: Result<Message>,
+    decode: fn(Message) -> Result<T>,
+) -> Result<T> {
+    let result = result.and_then(decode);
+    if let Err(error @ Error::Protocol(_)) = &result {
+        channel.abort_with_error(error.clone());
+    }
+    result
+}
+
+async fn request<T>(
+    channel: &GatewayChannel,
+    target: &GatewayTarget,
     action: &str,
     body: Vec<u8>,
     deadline: Instant,
     decode: fn(Message) -> Result<T>,
-    sent: SendStatus,
 ) -> Result<T> {
-    connection
-        .request_decoded_tracked(
-            action,
-            5,
-            vec![
-                Header::activity(Uuid::new_v4().to_bytes_le())?,
-                Header::version(1, 1)?,
-                Header::boolean(HIGH_PRIORITY, true)?,
-            ],
-            body,
-            deadline,
-            decode,
-            sent,
-        )
-        .await
+    let message = request_message(action, body, deadline)?;
+    decode_reply(
+        channel,
+        channel.request(target, message, deadline).await,
+        decode,
+    )
+}
+
+fn stage(
+    envelope: IncomingMessage<GatewayTarget>,
+    pages: &mpsc::Sender<Incoming>,
+    receiver: &Receiver,
+) -> NotificationResult<()> {
+    let result = (|| {
+        // Conservative fixed allowance includes the private native context.
+        let bytes = envelope
+            .message
+            .body
+            .capacity()
+            .checked_add(std::mem::size_of::<Incoming>() + 256)
+            .ok_or(NotificationError::ResourceLimit(
+                "notification ingress allocation",
+            ))?;
+        let memory = receiver.budget.reserve(bytes)?;
+        let context = envelope
+            .reply
+            .ok_or(Error::Protocol("notification reply authority missing"))?;
+        pages
+            .try_send(Incoming {
+                body: envelope.message.body,
+                context,
+                memory,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    NotificationError::ResourceLimit("notification page queue")
+                }
+                mpsc::error::TrySendError::Closed(_) => Error::Closed.into(),
+            })
+    })();
+    if let Err(error) = &result {
+        receiver.fail(error.clone());
+    }
+    result
+}
+
+async fn stage_loop(session: Arc<Session>, native: GatewayReceiver, pages: mpsc::Sender<Incoming>) {
+    loop {
+        // This deadline bounds only a local idle receive observer, not session
+        // lifetime; expiry consumes no ingress and is retried without replay.
+        match native.receive(Instant::now() + MAX_FRAME_TIME).await {
+            Ok(envelope) => {
+                if let Err(error) = stage(envelope, &pages, &session.receiver) {
+                    session.fail(error);
+                    break;
+                }
+            }
+            Err(Error::Timeout) => continue,
+            Err(error) => {
+                session.fail(session.channel.terminal_error().unwrap_or(error));
+                break;
+            }
+        }
+    }
 }
 async fn run(
     session: Arc<Session>,
@@ -604,12 +716,11 @@ async fn run(
         tokio::select! {
             biased;
             _ = session.wake.notified() => {}
-            error = session.connection.closed() => { session.fail(error); break; }
             cleanup = cleanups.recv() => {
                 let Some(cleanup)=cleanup else { session.fail(Error::Closed); break; };
                 let body=to_vec(&wire::Unregister {client:&session.id,id:cleanup.id});
                 let result=(match body {
-                    Ok(body)=>request(&session.connection,"UnregisterServiceNotificationFilterRequest",body,cleanup.deadline,wire::decode_unregistered,SendStatus::default()).await,
+                    Ok(body)=>request(&session.channel,&session.target,"UnregisterServiceNotificationFilterRequest",body,cleanup.deadline,wire::decode_unregistered).await,
                     Err(error)=>Err(error),
                 }).map_err(|error|session.receiver.common_error(error));
                 if result.is_ok() { session.state.lock().unwrap().filters.remove(&cleanup.id); }
@@ -625,13 +736,23 @@ async fn run(
                 let result=decoded.and_then(|page|progress.commit(page,incoming.memory,&session.receiver));
                 if let Err(error)=&result { session.receiver.fail(error.clone()); }
                 let ack=match (wire::status(result.is_ok()),deadline_after(session.timeout)) {
-                    (Ok(body),Ok(deadline))=>incoming.context.reply(body,deadline).await,
+                    (Ok(body),Ok(deadline))=> {
+                        let message = (|| -> Result<Message> {
+                            Ok(Message {
+                                headers: vec![Header::actor(5)?, Header::action("ServiceNotificationReply")?, Header::boolean(HIGH_PRIORITY, true)?],
+                                body,
+                            })
+                        })();
+                        match message {
+                            Ok(message) => incoming.context.reply(message,deadline).await,
+                            Err(error) => Err(error),
+                        }
+                    },
                     (Err(error),_)|(_,Err(error))=>Err(error),
                 }.map_err(|error|session.receiver.common_error(error));
                 if let Err(error)=result.and(ack) { session.fail(error); break; }
             }
         }
     }
-    session.connection.abort();
-    let _ = session.connection.close().await;
+    session.channel.abort();
 }
