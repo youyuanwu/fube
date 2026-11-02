@@ -8,7 +8,7 @@
 //! owner; [`GatewayClient`](crate::GatewayClient) is a borrowing typed observer.
 //! Both implement [`Client`] through the shared call layer. Notification and
 //! image-transfer clients remain independently owned
-//! [`Connection`](fube_transport::connection::Connection) consumers.
+//! runtime IPC compositions.
 //!
 //! # Native boundary (source facts)
 //!

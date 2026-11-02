@@ -259,8 +259,10 @@ impl RequestCancellation {
 
 struct Ingress {
     message: Message,
+    received_at: Instant,
     reply_id: Option<MessageId>,
     reply_authorize: Option<EnvelopeValidator>,
+    handoff: Option<oneshot::Sender<()>>,
     _lease: Arc<Lease>,
 }
 
@@ -581,6 +583,27 @@ impl GatewayChannel {
         self.owner.shared.error()
     }
 
+    /// Observe first-cause terminal state without initiating close or joining
+    /// a started frame. Waiter admission is finite and nonowning.
+    pub fn wait_terminal(&self, deadline: Instant) -> ChannelFuture<'_, Error> {
+        Box::pin(async move {
+            let _waiter = self.owner.shared.budget.reserve(CLOSE)?;
+            timeout_at(deadline, async {
+                loop {
+                    let stopped = self.owner.shared.stop.notified();
+                    tokio::pin!(stopped);
+                    stopped.as_mut().enable();
+                    if let Some(error) = self.terminal_error() {
+                        return Ok(error);
+                    }
+                    stopped.await;
+                }
+            })
+            .await
+            .map_err(|_| Error::Timeout)?
+        })
+    }
+
     /// Initiate irreversible bounded shutdown without awaiting driver exit.
     pub fn abort(&self) {
         self.abort_with_error(Error::Closed);
@@ -699,6 +722,34 @@ impl GatewayChannel {
                 Submission::Raw,
                 None,
                 Some(valid),
+                false,
+            )
+            .await?
+            {
+                Outcome::Written => Ok(()),
+                _ => unreachable!(),
+            }
+        })
+    }
+
+    /// Semantic one-way control traffic using separately bounded reply slots.
+    /// Requires explicit Reserved authorization; never adds RelatesTo.
+    pub fn send_reserved<'a>(
+        &'a self,
+        target: &'a GatewayTarget,
+        message: Message,
+        deadline: Instant,
+        valid: Option<WritePredicate>,
+    ) -> ChannelFuture<'a, ()> {
+        Box::pin(async move {
+            match submit(
+                &self.owner.shared,
+                target,
+                message,
+                deadline,
+                Submission::Reserved,
+                None,
+                valid,
                 false,
             )
             .await?
@@ -832,6 +883,7 @@ fn allocation_check(message: &Message, limits: ChannelLimits) -> Result<()> {
 
 enum Submission {
     Raw,
+    Reserved,
     Rpc,
     Reply(MessageId, EnvelopeValidator),
 }
@@ -895,17 +947,20 @@ async fn submit(
     }
     match submission {
         Submission::Raw => (shared.composition.outbound)(&message, &props, OutboundKind::Raw)?,
+        Submission::Reserved => {
+            (shared.composition.outbound)(&message, &props, OutboundKind::Reserved)?
+        }
         Submission::Rpc => (shared.composition.outbound)(&message, &props, OutboundKind::Rpc)?,
         Submission::Reply(_, authorize) => authorize(&message, &props)?,
     }
     let rpc = matches!(submission, Submission::Rpc);
-    let class = if matches!(submission, Submission::Reply(..)) {
+    let class = if matches!(submission, Submission::Reply(..) | Submission::Reserved) {
         REPLY
     } else {
         ORDINARY
     };
     match submission {
-        Submission::Raw
+        Submission::Raw | Submission::Reserved
             if props.expects_reply
                 || props.uncorrelated_reply
                 || props.relates_to != MessageId::default() =>
@@ -934,7 +989,7 @@ async fn submit(
                 message.headers.push(Header::relates_to(id)?);
             }
         }
-        Submission::Raw => {}
+        Submission::Raw | Submission::Reserved => {}
     }
     if !matches!(submission, Submission::Reply(..)) {
         if let Some(identity) = &shared.ipc_identity {
@@ -1197,6 +1252,11 @@ impl GatewayReceiver {
     fn transfer(shared: &Arc<Shared>, ingress: Ingress) -> IncomingMessage<GatewayTarget> {
         IncomingMessage {
             message: ingress.message,
+            received_at: ingress.received_at,
+            handoff: ingress.handoff.map(|release| CompletionGuard {
+                release: Some(release),
+                _lease: ingress._lease.clone(),
+            }),
             source: shared.target.clone(),
             reply: ingress.reply_id.map(|id| {
                 Box::new(DuplexReply {
@@ -1302,6 +1362,7 @@ fn control_instance(message: &Message, props: &Properties) -> Result<ListenInsta
 async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>) -> Result<()> {
     loop {
         let message = read_bounded(&mut reader, shared.budget.limits.max_frame_bytes).await?;
+        let received_at = Instant::now();
         let props = envelope(&message, true)?;
         if props.actor == 1 {
             let remote = control_instance(&message, &props)?;
@@ -1360,28 +1421,42 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
         };
         if let Some(reply_id) = reply_id {
             let lease = shared.budget.reserve(INGRESS)?;
-            let mut inner = shared.inner.lock().unwrap();
-            if inner.terminal.is_some() {
-                return Err(Error::Closed);
+            let (handoff, acknowledgment) = if shared.composition.ordered_ingress {
+                let (send, receive) = oneshot::channel();
+                (Some(send), Some(receive))
+            } else {
+                (None, None)
+            };
+            {
+                let mut inner = shared.inner.lock().unwrap();
+                if inner.terminal.is_some() {
+                    return Err(Error::Closed);
+                }
+                if let Some(id) = reply_id {
+                    shared
+                        .remember(&mut inner, id)
+                        .map_err(|error| match error {
+                            Error::InvalidInput(_) => {
+                                Error::Protocol("duplicate or colliding request ID")
+                            }
+                            other => other,
+                        })?;
+                }
+                inner.ingress.push_back(Ingress {
+                    message,
+                    received_at,
+                    reply_id,
+                    reply_authorize,
+                    handoff,
+                    _lease: lease,
+                });
             }
-            if let Some(id) = reply_id {
-                shared
-                    .remember(&mut inner, id)
-                    .map_err(|error| match error {
-                        Error::InvalidInput(_) => {
-                            Error::Protocol("duplicate or colliding duplex ID")
-                        }
-                        other => other,
-                    })?;
-            }
-            inner.ingress.push_back(Ingress {
-                message,
-                reply_id,
-                reply_authorize,
-                _lease: lease,
-            });
-            drop(inner);
             shared.changed.notify_waiters();
+            if let Some(acknowledgment) = acknowledgment {
+                let _ = timeout(MAX_FRAME_TIME, acknowledgment)
+                    .await
+                    .map_err(|_| Error::Timeout)?;
+            }
             continue;
         }
         if props.relates_to == MessageId::default()

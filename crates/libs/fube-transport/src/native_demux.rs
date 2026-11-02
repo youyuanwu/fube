@@ -24,6 +24,9 @@ pub type EnvelopeValidator = fn(&Message, &Properties) -> Result<()>;
 pub enum OutboundKind {
     Raw,
     Rpc,
+    /// Explicitly authorized semantic one-way control/reply traffic.
+    /// This does not confer an inbound request's correlation authority.
+    Reserved,
 }
 
 /// Explicit sender authorization; actor registration never supplies this.
@@ -123,6 +126,9 @@ pub struct ChannelComposition {
     pub actors: ActorDemux,
     pub duplex: Option<DuplexPolicy>,
     pub requests: Option<RequestPolicy>,
+    /// Pause later wire delivery until a receiver acknowledges bounded ingress
+    /// handoff. No handler or domain work executes in transport.
+    pub ordered_ingress: bool,
 }
 
 #[cfg(test)]

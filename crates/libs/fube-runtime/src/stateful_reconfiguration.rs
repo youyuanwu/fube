@@ -1473,11 +1473,11 @@ impl Registry {
                                 return;
                             }
                         },
-                        SendStatus::fenced(Arc::new(move || {
+                        Arc::new(move || {
                             fence_authority.upgrade().is_some_and(|a| a.check().is_ok())
                                 && fence_valid.load(Ordering::Acquire)
                                 && !fence_cancel.is_cancelled()
-                        })),
+                        }),
                     )
                     .await;
                 if cancel.is_cancelled() || !valid.load(Ordering::Acquire) {

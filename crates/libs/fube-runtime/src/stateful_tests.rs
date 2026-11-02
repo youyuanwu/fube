@@ -722,10 +722,10 @@ async fn queued_stateful_fault_is_fenced_after_authority_retirement() {
     let connection = h.engine.shared.connection.clone();
     let blocker = connection.send_one_way_fenced(
         12,
-        "FixtureBlocked",
+        "RAPReportLoad",
         vec![0; fube_transport::frame::MAX_FRAME_SIZE - 4096],
         deadline_after(Duration::from_secs(5)).unwrap(),
-        fube_transport::connection::SendStatus::default(),
+        Arc::new(|| true),
     );
     tokio::pin!(blocker);
     poll_pending_once(blocker.as_mut()).await;
