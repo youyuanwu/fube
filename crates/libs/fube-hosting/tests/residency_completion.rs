@@ -198,3 +198,57 @@ fn old_completion_cannot_retire_a_new_same_identity_package() {
         next.package_instance_id
     );
 }
+
+#[test]
+fn current_same_ledger_application_final_rejects_beginning_acquisition_until_compensated() {
+    let p = premise(1, "Pkg");
+    let mut h = ledger();
+    h.admit_package(p.clone()).unwrap();
+    let beginning = match h.begin_acquisition(&target(&p)) {
+        AcquisitionBegin::Beginning(a) => a,
+        other => panic!("{other:?}"),
+    };
+    let acquisition_id = beginning.id();
+    assert_eq!(h.package_accounting(&p.package).unwrap().usage, 1);
+    assert_eq!(
+        h.application_accounting(&p.package.package.application)
+            .unwrap()
+            .usage,
+        0
+    );
+    h.scan_unused().unwrap();
+    finals(&mut h);
+    let current = token(&h);
+    let before = h.resources();
+    assert!(matches!(
+        h.final_obligations().next().unwrap().subject,
+        ResidencySubject::Application(_)
+    ));
+    assert!(h
+        .finish_local_deactivation(&current, std::slice::from_ref(&p))
+        .is_err());
+    assert_eq!(h.resources(), before);
+    assert_eq!(
+        h.acquisition(acquisition_id).unwrap().phase,
+        AcquisitionPhase::Beginning
+    );
+    let partial = match h.finish_acquisition(beginning) {
+        UsageIncrement::Unresolved { ownership, .. } => ownership,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        h.acquisition(acquisition_id).unwrap().phase,
+        AcquisitionPhase::PackageOnly
+    );
+    assert!(h
+        .finish_local_deactivation(&current, std::slice::from_ref(&p))
+        .is_err());
+    assert!(matches!(
+        h.compensate_package_only(partial),
+        UsageRelease::Released
+    ));
+    h.finish_local_deactivation(&current, std::slice::from_ref(&p))
+        .unwrap();
+    assert_eq!(h.resources().logical_bytes, 0);
+    assert_eq!(h.resources().acquisitions, 0);
+}

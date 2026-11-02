@@ -662,59 +662,88 @@ mod tests {
     use super::*;
     #[test]
     fn failed_physical_cleanup_preserves_process_root_and_exact_final_for_retry() {
-        let parent =
-            std::env::temp_dir().join(format!("hosting-cleanup-fault-{}", uuid::Uuid::new_v4()));
-        let input = parent.join("input");
-        std::fs::create_dir_all(input.join("LocalService/Code")).unwrap();
-        std::fs::write(
-            input.join("ApplicationManifest.xml"),
-            include_str!("../../../samples/hosting-local-app/pkg/ApplicationManifest.xml"),
-        )
-        .unwrap();
-        std::fs::write(
-            input.join("LocalService/ServiceManifest.xml"),
-            include_str!("../../../samples/hosting-local-app/pkg/LocalService/ServiceManifest.xml"),
-        )
-        .unwrap();
-        std::fs::copy(
-            "/bin/sleep",
-            input.join("LocalService/Code/hosting-local-app"),
-        )
-        .unwrap();
-        let mut options = Options::new(parent.clone());
-        options.residency.shared_grace = GracePeriod::Finite(0);
-        let mut owner = Activation::new(options).unwrap();
-        owner
-            .start(
-                &input,
-                "fabric:/Local",
-                &[("Arguments".into(), "30".into())],
+        for application_first in [false, true] {
+            let parent = std::env::temp_dir()
+                .join(format!("hosting-cleanup-fault-{}", uuid::Uuid::new_v4()));
+            let input = parent.join("input");
+            std::fs::create_dir_all(input.join("LocalService/Code")).unwrap();
+            std::fs::write(
+                input.join("ApplicationManifest.xml"),
+                include_str!("../../../samples/hosting-local-app/pkg/ApplicationManifest.xml"),
             )
             .unwrap();
-        let premise = owner.premise.as_ref().unwrap().clone();
-        owner
-            .residency
-            .schedule_package_timer(&premise.package, 0)
+            std::fs::write(
+                input.join("LocalService/ServiceManifest.xml"),
+                include_str!(
+                    "../../../samples/hosting-local-app/pkg/LocalService/ServiceManifest.xml"
+                ),
+            )
             .unwrap();
-        // Test-only deterministic failure at the physical cleanup boundary.
-        owner.options.cleanup_budget = Duration::ZERO;
-        assert!(owner.drive_deactivation(&ManualClock(0)).is_err());
-        let id = owner.residency.final_obligations().next().unwrap().id;
-        assert!(!owner.process_status().unwrap().reaped);
-        assert!(owner.root().unwrap().exists());
-        assert!(
+            std::fs::copy(
+                "/bin/sleep",
+                input.join("LocalService/Code/hosting-local-app"),
+            )
+            .unwrap();
+            let mut options = Options::new(parent.clone());
+            options.residency.shared_grace = GracePeriod::Finite(0);
+            options.residency.unused_scan_interval = GracePeriod::Finite(0);
+            let mut owner = Activation::new(options).unwrap();
             owner
-                .residency
-                .package_accounting(&premise.package)
-                .unwrap()
-                .closing
-        );
-        owner.options.cleanup_budget = Duration::from_secs(10);
-        assert!(owner.terminate().unwrap());
-        assert!(owner.residency.local_deactivation(id).is_err());
-        assert!(!owner.root().unwrap().exists());
-        drop(owner);
-        std::fs::remove_dir_all(parent).unwrap();
+                .start(
+                    &input,
+                    "fabric:/Local",
+                    &[("Arguments".into(), "30".into())],
+                )
+                .unwrap();
+            let premise = owner.premise.as_ref().unwrap().clone();
+            if application_first {
+                owner.residency.scan_unused().unwrap();
+            } else {
+                owner
+                    .residency
+                    .schedule_package_timer(&premise.package, 0)
+                    .unwrap();
+            }
+            // Test-only deterministic failure at the physical cleanup boundary.
+            owner.options.cleanup_budget = Duration::ZERO;
+            assert!(owner.drive_deactivation(&ManualClock(0)).is_err());
+            let id = owner.residency.final_obligations().next().unwrap().id;
+            assert_eq!(
+                matches!(
+                    owner.residency.final_obligations().next().unwrap().subject,
+                    ResidencySubject::Application(_)
+                ),
+                application_first
+            );
+            assert!(!owner.process_status().unwrap().reaped);
+            assert!(owner.root().unwrap().exists());
+            assert_eq!(owner.residency.resources().packages, 1);
+            assert_eq!(owner.residency.resources().applications, 1);
+            assert!(!owner.cleanup_status().package_retired);
+            assert!(!owner.cleanup_status().application_retired);
+            assert_eq!(
+                owner
+                    .residency
+                    .package_accounting(&premise.package)
+                    .unwrap()
+                    .closing,
+                !application_first
+            );
+            assert_eq!(
+                owner
+                    .residency
+                    .application_accounting(&premise.package.package.application)
+                    .unwrap()
+                    .closing,
+                application_first
+            );
+            owner.options.cleanup_budget = Duration::from_secs(10);
+            assert!(owner.terminate().unwrap());
+            assert!(owner.residency.local_deactivation(id).is_err());
+            assert!(!owner.root().unwrap().exists());
+            drop(owner);
+            std::fs::remove_dir_all(parent).unwrap();
+        }
     }
 
     #[test]
