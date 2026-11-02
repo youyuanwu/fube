@@ -81,6 +81,13 @@ not reasons to assume liveness is already solved.
 
 ## 3. What this repository can actually reuse
 
+The table and notification-specific warning below describe the original
+research baseline. The parallel Connection/connect_duplex_clear APIs have since
+been retired. Current activated-host IPC uses a separately authorized composition
+of the [operational shared channel](../transport/NativeChannel.md#runtime-ipc-composition)
+with runtime-owned domain policy; no runtime command is routed through the
+notification exception. Historical qualification remains tied to its source.
+
 | Existing component | Reusable part | Work still required |
 |---|---|---|
 | [`fube-transport` frames][rust-frame] | Bounded clear Fabric frames, CRCs and native header records | IPC-appropriate negotiated/admitted limits and secure profiles; current frame cap is 4 MiB |
@@ -95,9 +102,10 @@ The native-backed `mssf-ext`, `mssf-rplctr`, and `kvmap` examples remain in
 `service-fabric-apps-rs`; the links above pin that source snapshot. They are not
 members of the fube workspace.
 
-In particular, `connect_duplex_clear` is **not generic runtime duplex IPC**.
-Its only accepted reverse envelope is the NamingGateway service-notification
-protocol; its consuming reply context constructs `ServiceNotificationReply`.
+In particular, the former `connect_duplex_clear` was **not generic runtime duplex IPC**.
+The current notification composition likewise accepts only the NamingGateway
+service-notification envelope; its separate consuming response policy authorizes
+`ServiceNotificationReply`, not normal runtime requests.
 Native runtime commands include different actors, actions and one-way protocol
 replies. Do not route them through that notification exception.
 [Evidence: reverse dispatch][rust-reverse-dispatch] and
@@ -524,13 +532,13 @@ the inspected implementation; line anchors identify the relevant surfaces.
 
 [rust-frame]: ../../crates/libs/fube-transport/src/frame.rs#L1-L85
 [rust-serde]: ../../crates/libs/fube-transport/src/serialization/serde.rs#L1-L28
-[rust-connection]: ../../crates/libs/fube-transport/src/connection.rs#L265-L554
+[rust-connection]: ../../crates/libs/fube-transport/src/native_channel.rs
 [rust-client]: ../../crates/libs/fube-client/Cargo.toml
 [rust-ext]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/libs/mssf-ext/src/state_replicator.rs#L17-L69
 [rust-replicator]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/libs/mssf-rplctr/src/rplctr.rs#L73-L138
 [rust-sample]: https://github.com/youyuanwu/service-fabric-apps-rs/blob/3fad8553f532589031235c66d64a652de051cf44/crates/samples/kvmap/src/kvmap.rs#L210-L259
-[rust-reverse]: ../../crates/libs/fube-transport/src/connection.rs#L119-L164
-[rust-reverse-dispatch]: ../../crates/libs/fube-transport/src/connection.rs#L579-L639
+[rust-reverse]: ../../crates/libs/fube-client/src/channel_adapter.rs#L58-L73
+[rust-reverse-dispatch]: ../../crates/libs/fube-client/src/channel_adapter.rs#L43-L55
 [rust-limits]: ../../crates/libs/fube-transport/src/serialization.rs#L5-L8
 [client-status]: ../transport/RustFabricClient.md
 [native-ipc-config]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/TransportConfig.h#L90-L115

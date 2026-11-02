@@ -5,7 +5,8 @@
 `fube_transport::native_channel` implements the existing
 [`MessageChannel`, `RpcChannel`, `MessageReceiver` and consuming `ReplyContext`
 contracts](../../crates/libs/fube-transport/src/channel.rs) for one dedicated
-**explicitly unsecured-development, numeric-loopback NamingGateway connection**.
+**explicitly unsecured-development, numeric-loopback connection**, composed for
+NamingGateway clients or activated-host IPC.
 This is native Fabric TCP messaging, not `IFabricTransport`, UDP, actor36,
 a typed client, router or adapter around `Connection`.
 
@@ -19,15 +20,16 @@ disabled or widened.
 
 The former `GatewayProfile` API is removed, with no compatibility wrapper.
 `native_demux::ChannelComposition` installs independent stateless envelope
-validators for outbound raw/RPC, ordinary replies, actor ingress and optional
-special duplex ingress/responses. Protocol choices live in
-`fube-client/src/channel_adapter.rs`, not in the connection core:
+validators for outbound raw/RPC/reserved one-way sends, ordinary replies, actor
+ingress, optional normal-request grants and special duplex ingress/responses.
+Protocol choices live in client/runtime adapters, not in the connection core:
 
 | Client adapter | Outbound | Unsolicited ingress |
 | --- | --- | --- |
 | Ordinary | actor5 raw/RPC | none |
 | Notifications | actor5 raw/RPC and consuming notification reply | exact actor5 notification envelope |
 | Upload | actor26 raw and actor5 RPC | actor25/27 raw semantic ACK envelopes, **no reply capability** |
+| Runtime IPC | Hosting/runtime/lease RPC, actor12 reports and separately reserved lifecycle responses | actor8 controls and actor12 lifecycle; independently authorized normal-request grants |
 
 The operational `ActorDemux` is an immutable actor-only table, not the
 declaration-only actor/action `routing::Router`/`Registry`. At most 32 unique
@@ -45,8 +47,9 @@ Envelope checks must not block, perform I/O or decode domain bodies; actual
 domain handling occurs after bounded pull delivery, outside the driver.
 
 Registration selects ingress only. It cannot grant sender permission or a
-reply capability. Even ExpectsReply actor ingress has no context. Only an
-authorized configured special duplex envelope mints the private consuming
+reply capability. ExpectsReply alone has no authority: a separate `RequestPolicy`
+must authorize a normal request, or `DuplexPolicy` a special notification.
+Only that independently authorized envelope mints the private consuming
 original-socket/original-MessageId context with its captured response policy.
 Public envelopes, flags, arbitrary actor IDs and equal target types cannot
 forge or redirect it. Generic correlation and socket checks cannot be disabled
@@ -115,13 +118,91 @@ An unread domain-invalid ACK with a valid transport envelope remains bounded
 raw ingress until pull; no idle domain-validation worker is added.
 
 **Not supported by the client adapters:** arbitrary reverse RPC/one-way ingress.
-The generic composition supports explicitly registered actors, not listeners,
-activated-host IPC, other transport roles, replication, actor36
+The generic composition supports explicitly registered actors and the bounded
+activated-host IPC composition below, not listeners, other transport roles, replication, actor36
 application-service transport, TLS/claims/security negotiation, reconnect,
 retry, replay, failover, pools, middleware, code generation, routing/registry
 or typed codecs in the transport crate. The ordinary typed Client/ClientRequest
 implementation lives in `fube-client`; there are no fake capability
 implementations for those roles.
+
+## Runtime IPC composition
+
+`GatewayChannel::connect_ipc_clear` reuses the bounded TCP/ListenInstance exchange
+and captures a nonempty bounded host identity plus the actual OS PID. Numeric
+loopback/nonzero-port restrictions remain; the runtime additionally requires
+genuine node-injected activated single-code-package ExeHost context and rejects
+SSL/container/activator/nonactivated profiles. No TLS/claims fallback is added.
+
+Native [IpcHeader fields](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/IpcHeader.h#L10-L32)
+are host/client string and PID, distinct from MessageId GUID, runtime ID and
+ListenInstance. Native [IpcClient sending](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/IpcClient.cpp#L205-L245)
+adds that identity and a missing MessageId to requests and semantic one-way
+sends. There is no separate mandatory host-identity ACK. The Rust constructor
+does not send a reconnect actor21 hello; reconnect remains unsupported.
+Caller-supplied IPC headers and explicit empty IPC MessageIds reject. Correlated
+context replies instead carry their original RelatesTo and **no automatic IPC
+identity or new MessageId**, matching the separate native receiver-context path.
+
+Native [IpcDemuxer](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/IpcDemuxer.cpp#L16-L32)
+builds contexts for ordinary actor ingress without testing ExpectsReply; native
+contexts are reusable and target-bound. The stronger Rust bounded profile mints
+a consuming normal-request grant only after both actor and independent
+`RequestPolicy.incoming` authorization, nonempty original MessageId,
+ExpectsReply=true, empty final-effective relation and no Fault/special flag.
+One-way actor ingress has no context. Special IsUncorrelatedReply remains a
+different `DuplexPolicy` mechanism; enabling one does not enable the other.
+Private grants capture the original channel/target/ID and response validator,
+not subsequently edited public incoming fields. Authorized normal-request IDs
+join the existing non-evicting lifetime history; duplicates/collisions fail,
+history exhaustion terminates rather than permitting unsafe reuse.
+
+[`fube-runtime/src/channel_adapter.rs`](../../crates/libs/fube-runtime/src/channel_adapter.rs)
+owns Hosting/RAP action envelopes and timeouts, actor8/12 eligibility, finite
+handoff and domain completion work. Raw registration never installs a domain
+worker in transport. Actor8 readiness and invalidation are sampled during
+runtime handoff **before any following wire completion is exposed**:
+`ordered_ingress` pauses the reader until opaque handoff acknowledgment/drop,
+with an independent 30-second bound. This opt-in intentionally orders later
+controls/completions too; it is not an unlimited control-progress promise while
+an application holds handoff. Client compositions leave it disabled.
+
+Only RAPQuery uses a correlated actor12/RAPQueryReply context; lifecycle replies,
+load/fault and endpoint reports use semantic one-way sends. Native
+[RAP dispatch](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ReconfigurationAgentProxy.cpp#L180-L283)
+and [correlated versus semantic sending](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ReconfigurationAgentProxy.cpp#L1721-L1740)
+are the source boundary. Runtime generations/revisions, per-action native
+metadata, binding proof, callback/disposal ownership and report semantics remain
+above transport. Obsolete queued stateless success is suppressed without
+retiring healthy siblings; real channel/authority failure remains terminal.
+InvalidateLease's original bounded acknowledgment and orderly-unregister cleanup
+remain permitted after serving retirement; neither renews serving authority.
+
+Runtime composes 32 ordinary operations, 32 reserved semantic/reply operations,
+32 backend ingress slots and a 3 GiB reservation ceiling (not eager allocation).
+Its ordinary semaphore preserves absolute-deadline waiting for RPC versus
+immediate bounded report admission; existing 16 global/one-per-partition report
+budgets leave lease headroom. Reserved sends require distinct outbound permission
+and never manufacture RelatesTo authority; all client adapters reject them.
+Normal requests, reports and responses retain applicable per-attempt first-write
+validity checks; started suffixes remain transport-owned.
+
+Malformed health protocol success must retire the channel even when the caller
+is not repolled, before a later correlated response succeeds. A generic
+`request_held` completion returns opaque bytes and an acknowledgment/result
+reservation; the reader waits under the original request deadline. Finite
+runtime-owned completion work decodes, aborts before releasing malformed
+completion, or acknowledges a valid one. Unobserved success/error results retain
+runtime admission. Cardinality/identity/per-report domain errors remain distinct
+from malformed wire decoding. No health codec or domain callback runs in the
+transport. This ordered mode is opt-in; ordinary clients keep opaque replies.
+
+The former parallel `Connection`, legacy reverse/IPC contexts and SendStatus
+are removed, not wrapped. Still-used public `connection::{deadline_after,
+read_message,write_message,MAX_FRAME_TIME}` remain; free I/O callers own their
+watchdogs and partial-frame cancellation safety. This page states the source
+boundary, not deployed qualification of an arbitrary later head. Historical
+receipts below cannot qualify a changed runtime/channel build.
 
 ## Ownership and operations
 
@@ -153,14 +234,19 @@ GatewayChannel with actor registrations and directly pulls bounded ACK ingress.
   encoding or I/O until poll. Unpolled futures remain caller-owned. Immediate
   admission checks reject expired, overlarge, foreign or unauthorized inputs.
   There is no unbounded pre-admission waiter queue.
-- Raw headers/body are preserved. RPC adds only missing MessageId and
+- Raw headers/body are preserved outside the explicit IPC identity composition.
+  RPC adds missing MessageId and
   ExpectsReply=true, preserves valid supplied unused IDs and rejects duplicate
   or contradictory correlation. No TimeoutHeader, activity, version or client
-  role is inserted. One unchanged deadline covers admission, send and RPC
+  role is inserted outside that IPC opt-in. One unchanged deadline covers admission, send and RPC
   completion.
 - Writer selection is **not** frame start. Until a positive first write, drop,
   expiry and close can retract the frame. The first positive write is fenced
-  with the same private-state lock as cancellation. Thereafter the complete
+  with the same visibility gate as cancellation. Optional bounded nonblocking
+  validity predicates run outside the shared-state mutex on each pre-positive
+  write attempt, followed by live-entry/deadline/terminal revalidation.
+  Authority is sampled, not an atomic transaction over arbitrary domain state
+  or a stopped clock during a socket syscall. Thereafter the complete
   suffix and reservation survive observer abandonment/expiry/close until a full
   write or the independent 30-second frame watchdog/socket failure.
 - Raw/reply success means a **complete local frame write**, not native
@@ -204,6 +290,9 @@ attempts fail Closed. No unused capability keeps workers alive after close.
 `abort()`/`abort_with_error()` initiate shutdown synchronously, preserving the
 first cause; `closed(deadline)` only observes the retained driver join and never
 initiates shutdown. Its timeout/drop also leaves the join handle owned.
+`wait_terminal(deadline)` separately observes the first terminal cause without
+waiting for a started frame's suffix or initiating shutdown; it is count/byte
+bounded like other close observers.
 
 ## Finite retention and ordering
 
@@ -245,7 +334,7 @@ can reject any new data reservation. This cannot block an already reserved RPC
 completion or a transport control's below-ingress processing. No fairness or
 cross-operation completion ordering is promised.
 
-All used outbound and notification IDs remain in finite lifetime history,
+All used outbound and authorized notification/normal-request IDs remain in finite lifetime history,
 including raw-supplied IDs that could otherwise collide with a late reply.
 Unknown/late/duplicate ordinary replies never complete another ID and are not
 retained; more than 1024 consecutive unmatched replies terminates. History

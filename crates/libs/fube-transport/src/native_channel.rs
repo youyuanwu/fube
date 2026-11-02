@@ -1,7 +1,7 @@
 //! Operational, owned native channels for unsecured loopback development.
 //!
-//! This is a separate backend for [`crate::channel`], not an adapter around
-//! Connection's envelope-building APIs. Connect-time composition separates native
+//! This is the operational backend for [`crate::channel`], not an adapter around
+//! the retired legacy envelope-building APIs. Connect-time composition separates native
 //! actor ingress, ordinary correlation and authorized special duplex handling.
 //! Consumer actor/action/envelope authorization is supplied by client adapters.
 //! IPC identity and separately authorized normal-request replies are optional.

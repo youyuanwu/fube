@@ -189,16 +189,33 @@ Success is replied only after publication and callbacks, with deadline/cancellat
 authority checked again at the transport writer's pre-frame boundary. Sender
 cancellation is not remotely observable, and local failure does not roll back an
 already-published snapshot or revoke delivered callbacks/already-started frames
-([reply fencing:156](../../crates/libs/fube-transport/src/connection.rs#L156)).
+([shared writer fencing](../transport/NativeChannel.md#runtime-ipc-composition)).
 
 ## Wire and ownership invariants
 
-Generic IPC is an explicit transport role, separate from the gateway notification
-exception. Requests and one-way sends carry host/PID IPC identity; consuming
+Runtime IPC composes the shared native channel and actor-only demux, separate
+from ordinary, notification and ImageStore owners. Runtime actor/action/readiness
+policy remains in its [adapter](../../crates/libs/fube-runtime/src/channel_adapter.rs),
+not transport. Requests and one-way sends carry host/PID IPC identity; consuming
 correlated replies do not. Lifecycle RA actor **12** is used in both directions;
 Open/Close semantic replies are one-way, not `RelatesTo` responses
-([connection.rs:349](../../crates/libs/fube-transport/src/connection.rs#L349),
-[connection.rs:509](../../crates/libs/fube-transport/src/connection.rs#L509)).
+([source-backed IPC boundary](../transport/NativeChannel.md#runtime-ipc-composition)).
+
+Normal IPC ExpectsReply grants are independently authorized and are not the
+notification IsUncorrelatedReply exception. Original source/socket/MessageId and
+consuming response permission cannot be redirected by public envelope edits.
+Ordered bounded ingress handoff preserves early actor8 readiness/invalidation
+before a following lease/registration completion; original receipt time survives
+queueing. Malformed health protocol success is decoded by bounded runtime-owned
+work before later correlated delivery, not by a codec in transport.
+
+The runtime retains 32 ordinary admissions, 32 independent reply/semantic
+response slots, 32 backend ingress slots and the existing 16 global report
+admissions. Applicable serving authority/generation predicates are sampled at
+each pre-positive-write attempt; explicit cancellation is serialized at the first
+positive write, and started suffixes remain owned. Invalidation's 250ms original
+acknowledgment and orderly unregister use distinct bounded control/cleanup
+authority after serving retirement; neither permits serving revival.
 
 Each service unit has independent operation ownership; callbacks never run on
 the socket reader or under registry/state locks. Duplicate Open reuses the
@@ -380,7 +397,8 @@ new reports; load/move have no automatic retry.
 | Sample retained package notifications | 32; overflow explicitly fails the fixture |
 
 Queues do not silently discard required replies. Source/model limits and resource
-tests are in [transport tests](../../crates/libs/fube-transport/src/connection_ipc_tests.rs),
+tests are in [shared IPC tests](../../crates/libs/fube-transport/src/native_channel_ipc_tests.rs),
+[runtime adapter tests](../../crates/libs/fube-runtime/src/channel_adapter_tests.rs),
 [runtime models](../../crates/libs/fube-runtime/src/model_tests.rs) and
 [lifecycle models](../../crates/libs/fube-runtime/src/lifecycle_tests.rs).
 

@@ -358,11 +358,17 @@ impl Runtime {
                 )),
             }
         });
+        let send_authority = Arc::downgrade(&authority);
         let connection = IpcChannel::connect(
             activation.address,
             deadline_after(REGISTRATION_TIMEOUT)?,
             &activation.host_id,
             handler,
+            Some(Arc::new(move || {
+                send_authority
+                    .upgrade()
+                    .is_some_and(|authority| authority.check().is_ok())
+            })),
         )
         .await?;
         let start: StartReply = call(

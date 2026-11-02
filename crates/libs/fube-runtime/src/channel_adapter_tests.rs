@@ -26,10 +26,13 @@ async fn pair() -> (IpcChannel, TcpStream, mpsc::Receiver<IpcMessage>) {
     (channel, stream, receive)
 }
 async fn pair_with(handoff: Handoff) -> (IpcChannel, TcpStream) {
+    pair_bound(handoff, None).await
+}
+async fn pair_bound(handoff: Handoff, serving: Option<WritePredicate>) -> (IpcChannel, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (channel, stream) = tokio::join!(
-        IpcChannel::connect(address, deadline(), "host", handoff),
+        IpcChannel::connect(address, deadline(), "host", handoff, serving),
         async {
             let (mut stream, _) = listener.accept().await.unwrap();
             read_message(&mut stream).await.unwrap();
@@ -62,6 +65,42 @@ fn decode(message: Message) -> Result<u8> {
         return Err(Error::Protocol("malformed health fixture"));
     }
     Ok(message.body[0])
+}
+
+#[tokio::test]
+async fn retired_serving_authority_fences_registration_and_lease_but_not_cleanup() {
+    let (channel, mut peer) = pair_bound(Arc::new(|_| Ok(())), Some(Arc::new(|| false))).await;
+    for (actor, action) in [
+        (15, ""),
+        (9, "RegisterServiceTypeRequest"),
+        (7, "StartRegisterApplicationHostRequest"),
+    ] {
+        assert!(matches!(
+            channel
+                .request(action, actor, vec![], vec![], deadline())
+                .await,
+            Err(Error::Closed)
+        ));
+    }
+    let mut cleanup = Box::pin(channel.request(
+        "UnregisterFabricRuntimeRequest",
+        9,
+        vec![],
+        vec![],
+        deadline(),
+    ));
+    pending(cleanup.as_mut()).await;
+    let sent = read_message(&mut peer).await.unwrap();
+    assert_eq!(
+        sent.properties().unwrap().action,
+        "UnregisterFabricRuntimeRequest"
+    );
+    write_message(&mut peer, &reply(sent.properties().unwrap().id, vec![]))
+        .await
+        .unwrap();
+    cleanup.await.unwrap();
+    assert!(!channel.is_closed());
+    channel.close().await.unwrap();
 }
 
 #[tokio::test]

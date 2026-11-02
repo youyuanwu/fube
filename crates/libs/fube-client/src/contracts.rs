@@ -7,8 +7,7 @@
 //! network stub. [`FabricClient`](crate::FabricClient) is the explicit channel
 //! owner; [`GatewayClient`](crate::GatewayClient) is a borrowing typed observer.
 //! Both implement [`Client`] through the shared call layer. Notification and
-//! image-transfer clients remain independently owned
-//! runtime IPC compositions.
+//! image-transfer clients and runtime IPC compositions remain independently owned.
 //!
 //! # Native boundary (source facts)
 //!
@@ -113,7 +112,7 @@
 //! required native code/data; missing/malformed required error data is Protocol,
 //! not zero-HRESULT success. This observer policy deliberately replaces ordinary
 //! FabricClient's previous malformed-domain abort policy, not the excluded
-//! Connection clients' lifecycle/error mappings.
+//! runtime IPC lifecycle/error mappings.
 //!
 //! Ordinary typed RPC does not cover every native semantic protocol.
 //! [File transfer][file-transfer] accesses transport for its own protocol;
