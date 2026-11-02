@@ -45,6 +45,10 @@ ImageStore downloads and resource governance are not enabled. Endpoint metadata
 does not reserve ports. Inputs must stay trusted and immutable through copy;
 this is not a hostile filesystem or malicious-same-user sandbox.
 
+The existing run parent must resolve outside the source Code directory.
+Canonical path checks reject equal or nested paths, including symlink aliases,
+before reserving a root, and recheck separation before materialization.
+
 ## Ownership and usage
 
 Construction validates options/capabilities without filesystem/process side

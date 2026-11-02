@@ -1,6 +1,6 @@
 use crate::{
     manifest::{self, escape, Package},
-    HostError, Result,
+    require, HostError, Result,
 };
 use std::{
     fs,
@@ -22,9 +22,17 @@ pub struct Deployment {
     pub service_name: String,
 }
 
+fn require_outside_source(directory: &Path, package: &Package) -> Result<()> {
+    require(
+        !directory.starts_with(package.source_code.canonicalize()?),
+        "deployment directory must be outside the source code package",
+    )
+}
+
 impl Deployment {
     pub fn reserve(parent: &Path, package: &Package) -> Result<Self> {
         let parent = parent.canonicalize()?;
+        require_outside_source(&parent, package)?;
         let root = parent.join(format!("local-host-{}", uuid::Uuid::new_v4()));
         let deployment = root.join("deployment");
         let application = deployment.join(package.application_id());
@@ -53,6 +61,7 @@ impl Deployment {
     }
 
     pub fn materialize(&self, package: &Package) -> Result<()> {
+        require_outside_source(&self.root.canonicalize()?, package)?;
         manifest::validate_tree(&package.source_code)?;
         for directory in [
             self.code.clone(),
