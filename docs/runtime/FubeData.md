@@ -39,11 +39,36 @@ Production dependencies are **runtime → data → core/transport**.
 `fube-core` owns shared SDK types/errors and neutral host execution, with no
 runtime or data implementation dependency. Runtime retains native proof
 interpretation, callback-slot/lease accounting and the independent watchdog.
-It reuses bounded framing/serialization but owns peer listener/session policy,
-not the gateway client's connection assumptions. Production engine/runtime/app
+The data adapter owns peer listener/session policy and independent global
+control/data budgets, not the gateway client's connection assumptions. It and
+gateway/runtime channels use the same operational
+[`raw_session`](../../crates/libs/fube-transport/src/raw_session.rs) establishment,
+staged receive, fenced complete-frame write and joined I/O lifetime.
+Production engine/runtime/app
 have no FabricRuntime, FabricCommon, COM or native replicator dependency.
 See [crate exports](../../crates/libs/fube-data/src/lib.rs),
 [peer transport](../../crates/libs/fube-data/src/transport.rs).
+
+The existing peer supervisor bounds accepted and initiating sessions together,
+including pending handshakes. Initiators send a zero nonce; acceptors send a
+fresh listen-side nonce. Connect and hello exchange share one absolute budget.
+Outgoing work's callback budget starts at admission and fences its first
+positive write. Control is selected before queued data without preempting a
+started frame. Shutdown/retirement stops new work and joins any started suffix
+through completion or the independent callback-timeout frame watchdog, rather
+than abort-dropping it. A blocked peer can therefore delay joined shutdown up
+to that finite watchdog; idle reads still have no inactivity timeout.
+
+Incoming class admission still occurs before body allocation; rejected data
+is drained without ACK. The engine receives a private source-session grant
+paired atomically with bounded ingress accounting. Validated secondary state
+retains it for immediate and later application-apply ACKs. Registration,
+duplicate advertised listeners and actor/address relearning cannot replace
+that grant: retired responses fail locally rather than dial another session.
+EOF does not retract a fully received packet already delivered to the engine;
+its historical source identity survives, but its closed reply target cannot write.
+Native membership projection and ordinary outbound membership routes remain
+separate adapter authority. Local write receipts are not semantic ACKs.
 
 The existing mixed `rust-runtime-app` keeps `RustRuntimeType` stateless and
 `RustStatefulRuntimeType` volatile stateful in the same executable/code package.

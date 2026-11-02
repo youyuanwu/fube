@@ -78,7 +78,7 @@ use crate::extensions::{ReplayCheckpointProvider, ReplayOperation};
 use crate::{
     queue::OperationQueue,
     quorum::{configuration_progress, ConfigurationProgress, PeerProgress},
-    transport::{Incoming, PeerTransport},
+    transport::{Incoming, PeerTransport, SourceTarget},
     wire::{Actor, Body, Endpoint, Packet, WireOperation},
     Acknowledgment, Cancellation, Epoch, Error, IOperationDataStream, IStateProvider, Operation,
     OperationData, OperationStream, Progress, ReplicaRole, Result, Settings,
@@ -242,6 +242,8 @@ pub struct Shared {
     partition: Mutex<Option<Arc<crate::supervised::OwnedPartition>>>,
     prequeue_calls: Mutex<Vec<OwnedCall<()>>>,
     prequeue_changed: tokio::sync::Notify,
+    #[cfg(test)]
+    ingress_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
     #[cfg(any(test, feature = "test-hooks"))]
     pub initial_coalesced_primary: Mutex<Option<std_mpsc::SyncSender<()>>>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -562,6 +564,8 @@ impl Engine {
             prequeue_changed: tokio::sync::Notify::new(),
             #[cfg(any(test, feature = "test-hooks"))]
             initial_coalesced_primary: Mutex::new(None),
+            #[cfg(test)]
+            ingress_pause: Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
             initial_publication_pause: Mutex::new(None),
             secondary_progress_fault: AtomicBool::new(false),
@@ -1578,6 +1582,7 @@ struct Peer {
 
 struct SecondaryCopy {
     primary: Endpoint,
+    source: Option<SourceTarget>,
     primary_epoch: Epoch,
     copy_epoch: Epoch,
     horizon: i64,
@@ -1658,7 +1663,7 @@ enum Event {
     Ack(ApplyAck),
     Command(AuthorizedCommand),
     Job(Option<std::result::Result<(Job, Result<JobValue>), tokio::task::JoinError>>),
-    Packet(Packet),
+    Packet(Packet, SourceTarget),
     Write(Submit),
     WriteChecked(Option<std::result::Result<(Submit, Result<()>), tokio::task::JoinError>>),
     Retry,
@@ -1892,8 +1897,7 @@ impl Owner {
                 Some(ack) = acks.recv() => Event::Ack(ack),
                 Some(command) = commands.recv() => Event::Command(command),
                 result = self.jobs.join_next(), if !self.jobs.is_empty() => Event::Job(result),
-                Some(packet) = incoming.control.recv() => Event::Packet(packet),
-                Some(packet) = incoming.data.recv() => Event::Packet(packet),
+                Some((packet, source)) = incoming.recv_bound() => Event::Packet(packet, source),
                 result = std::future::poll_fn(|cx| {
                     let mut calls = self.shared.prequeue_calls.lock().unwrap();
                     let before = calls.len();
@@ -1953,7 +1957,7 @@ impl Owner {
                     Some(Err(_)) => self.fail(Error::Protocol("provider callback panicked")),
                     None => {}
                 },
-                Event::Packet(packet) => self.packet(packet),
+                Event::Packet(packet, source) => self.packet(packet, source),
                 Event::Write(mut write) => {
                     if let Some((partition, permit)) = write.access.take() {
                         let shared = self.shared.clone();
@@ -3562,7 +3566,17 @@ impl Owner {
 }
 
 impl Owner {
-    fn packet(&mut self, packet: Packet) {
+    fn packet(&mut self, packet: Packet, source: SourceTarget) {
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.shared.ingress_pause.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            resume
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        if !source.matches(&packet.from) {
+            return;
+        }
         if packet.to != self.endpoint.actor
             || packet.from.actor.partition != self.endpoint.actor.partition
             || packet.from.actor == self.endpoint.actor
@@ -3590,6 +3604,7 @@ impl Owner {
                 if let Some(copy) = &self.secondary {
                     if epoch == copy.copy_epoch && copy.primary == from && copy.horizon == start - 1
                     {
+                        self.secondary.as_mut().unwrap().source = Some(source);
                         self.send_ack();
                     } else if epoch > copy.copy_epoch {
                         self.fail(Error::Protocol(
@@ -3623,6 +3638,7 @@ impl Owner {
                 self.provider_epoch = None;
                 self.secondary = Some(SecondaryCopy {
                     primary: from,
+                    source: Some(source),
                     primary_epoch: epoch,
                     copy_epoch: epoch,
                     horizon: start - 1,
@@ -3665,6 +3681,7 @@ impl Owner {
                 {
                     self.secondary = Some(SecondaryCopy {
                         primary: from.clone(),
+                        source: Some(source.clone()),
                         primary_epoch,
                         copy_epoch: primary_epoch,
                         horizon: self.queue.progress().applied,
@@ -3691,7 +3708,9 @@ impl Owner {
                 if !self.valid_primary(&from, primary_epoch) {
                     return;
                 }
-                self.secondary.as_mut().unwrap().primary_epoch = primary_epoch;
+                let copy = self.secondary.as_mut().unwrap();
+                copy.primary_epoch = primary_epoch;
+                copy.source = Some(source);
                 for operation in operations {
                     if operation.sequence <= self.dispatched {
                         if let Some(old) = self.queue.get(operation.sequence) {
@@ -3782,6 +3801,7 @@ impl Owner {
                 let Some(copy) = &mut self.secondary else {
                     return;
                 };
+                copy.source = Some(source);
                 if last && copy.queue.progress().assigned > sequence
                     || !last && copy.eos == Some(sequence)
                 {
@@ -3845,6 +3865,7 @@ impl Owner {
                     .as_ref()
                     .is_some_and(|copy| copy.primary == from)
                 {
+                    self.secondary.as_mut().unwrap().source = Some(source);
                     self.send_ack();
                 }
             }
@@ -3980,28 +4001,37 @@ impl Owner {
         let copy_progress = copy.queue.progress();
         let received_all = copy.eos.is_some_and(|eos| copy_progress.received >= eos);
         let applied_all = copy.eos.is_some_and(|eos| copy_progress.applied >= eos);
-        let _ = self.send(
-            &copy.primary,
-            Body::Ack {
-                received: self.queue.progress().received,
-                applied: if self.copy_done {
-                    self.queue.progress().applied
-                } else {
-                    0
-                },
-                copy_received: if received_all {
-                    -1
-                } else {
-                    copy_progress.received
-                },
-                copy_applied: if applied_all {
-                    -1
-                } else {
-                    copy_progress.applied
-                },
-                error: 0,
+        let body = Body::Ack {
+            received: self.queue.progress().received,
+            applied: if self.copy_done {
+                self.queue.progress().applied
+            } else {
+                0
             },
-        );
+            copy_received: if received_all {
+                -1
+            } else {
+                copy_progress.received
+            },
+            copy_applied: if applied_all {
+                -1
+            } else {
+                copy_progress.applied
+            },
+            error: 0,
+        };
+        let packet = Packet {
+            from: self.endpoint.clone(),
+            to: copy.primary.actor,
+            body,
+        };
+        let _ = if let Some(source) = &copy.source {
+            self.transport.send_bound(packet, source)
+        } else {
+            // A native membership projection may precede any inbound session;
+            // it is intentional outbound policy, not a reconstructed reply grant.
+            self.transport.send(packet)
+        };
     }
 
     fn operation(
@@ -4250,6 +4280,9 @@ impl Owner {
         }
         self.transport.register_peer(&endpoint)?;
         if let Some(copy) = self.secondary.as_mut() {
+            if !same_endpoint(&copy.primary, &endpoint) {
+                copy.source = None;
+            }
             copy.primary = endpoint;
             copy.primary_epoch = epoch;
         } else {
@@ -4257,6 +4290,7 @@ impl Owner {
             // No provider data, progress or ACK is synthesized.
             self.secondary = Some(SecondaryCopy {
                 primary: endpoint,
+                source: None,
                 primary_epoch: epoch,
                 copy_epoch: epoch,
                 horizon: self.queue.progress().applied,

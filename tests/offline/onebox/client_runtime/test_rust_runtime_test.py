@@ -4,6 +4,7 @@ import copy
 import io
 import json
 import shlex
+import shutil
 import textwrap
 import unittest
 import subprocess
@@ -202,6 +203,22 @@ class BinaryBundleTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "missing executable build output"):
                 runtime.built_binaries()
             command.assert_not_called()
+
+    def test_explicit_target_does_not_fall_back_to_default_outputs(self):
+        target = self.root / "owned-target"
+        app = target / "debug/rust-runtime-app"
+        observer = target / "debug/examples/runtime_observer"
+        observer.parent.mkdir(parents=True)
+        shutil.copyfile(self.app, app)
+        shutil.copyfile(self.observer, observer)
+        app.chmod(0o755)
+        observer.chmod(0o755)
+        with patch.object(runtime, "run", return_value=self.binaries.dependency_graph):
+            selected = runtime.built_binaries(target)
+            self.assertEqual((selected.app, selected.observer), (app, observer))
+            app.unlink()
+            with self.assertRaisesRegex(RuntimeError, "missing executable build output"):
+                runtime.built_binaries(target)
 
 
 class ReportingEvidenceTests(unittest.TestCase):

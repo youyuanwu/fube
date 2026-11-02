@@ -7,6 +7,8 @@ use super::*;
 use crate as data_contract;
 #[path = "engine_disposal_tests.rs"]
 mod disposal_tests;
+#[path = "engine_transport_tests.rs"]
+mod transport_tests;
 #[path = "../tests/support/upper_log.rs"]
 pub(super) mod upper_log;
 async fn abort_owned(engine: &Arc<Engine>) {

@@ -123,7 +123,7 @@ async fn receive(receiver: &mut mpsc::Receiver<Packet>) -> Packet {
         .expect("live incoming channel")
 }
 
-async fn native_socket(address: &str, published: &str) -> TcpStream {
+pub(crate) async fn native_socket(address: &str, published: &str) -> TcpStream {
     let mut socket = TcpStream::connect(address).await.unwrap();
     let hello = read_message(&mut socket).await.unwrap();
     assert_eq!(hello.properties().unwrap().actor, 1);
@@ -159,6 +159,85 @@ async fn expect_closed(socket: &mut TcpStream) {
         .await
         .expect("session must close");
     assert!(matches!(result, Ok(0) | Err(_)));
+}
+
+#[tokio::test]
+async fn ingress_grant_survives_registration_but_never_session_retirement_or_relearning() {
+    let (transport, mut incoming) =
+        PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let published = "127.0.0.1:32113";
+    let mut selected = native_socket(transport.address(), published).await;
+    write_message(
+        &mut selected,
+        &request(published, 3, 1).encode(true).unwrap(),
+    )
+    .await
+    .unwrap();
+    incoming.recv_bound().await.unwrap();
+    let mut source = native_socket(transport.address(), published).await;
+    write_message(&mut source, &request(published, 2, 1).encode(true).unwrap())
+        .await
+        .unwrap();
+    // Leave the old packet queued until after its original session retires.
+    timeout(std::time::Duration::from_secs(2), async {
+        while incoming.control.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let old_grant = incoming
+        .control_received
+        .lock()
+        .unwrap()
+        .front()
+        .unwrap()
+        .source
+        .clone();
+    drop(source);
+    timeout(std::time::Duration::from_secs(2), async {
+        while old_grant.is_live() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Retirement without any replacement cannot become an outbound dial.
+    transport.register_peer(&endpoint(published, 2)).unwrap();
+    assert!(matches!(
+        transport.send_bound(request(transport.address(), 1, 2), &old_grant),
+        Err(Error::Closed)
+    ));
+    let mut replacement = native_socket(transport.address(), published).await;
+    write_message(
+        &mut replacement,
+        &request(published, 2, 1).encode(true).unwrap(),
+    )
+    .await
+    .unwrap();
+    let (_, queued_old) = incoming.recv_bound().await.unwrap();
+    assert!(!queued_old.is_live());
+    assert!(transport
+        .send_bound(request(transport.address(), 1, 2), &queued_old)
+        .is_err());
+    let (_, current) = incoming.recv_bound().await.unwrap();
+    transport.register_peer(&endpoint(published, 2)).unwrap();
+    transport
+        .send_bound(request(transport.address(), 1, 2), &current)
+        .unwrap();
+    assert_eq!(
+        Packet::decode(&read_message(&mut replacement).await.unwrap())
+            .unwrap()
+            .body,
+        Body::RequestAck
+    );
+    assert!(timeout(
+        std::time::Duration::from_millis(30),
+        read_message(&mut selected)
+    )
+    .await
+    .is_err());
+    transport.shutdown();
 }
 
 #[test]
@@ -833,10 +912,46 @@ async fn shutdown_is_terminal_synchronous_and_drains_a_backpressured_writer() {
         let _ = transport.send(operation(transport.address(), 1, 2, 1024 * 1024 - 1));
     }
     sleep(std::time::Duration::from_millis(30)).await;
-    let started = Instant::now();
+    // At least the first frame has actually become visible, and the large
+    // queued train has backpressured the socket. Closing must not drop a
+    // selected writer's partial suffix.
+    let mut fixed = [0; FIXED_HEADER_SIZE];
+    socket.read_exact(&mut fixed).await.unwrap();
+    let closing = transport.clone();
+    let joined = tokio::task::spawn_blocking(move || closing.shutdown());
+    let draining = async {
+        let mut frames = 0;
+        loop {
+            let size = validate_fixed(&fixed).unwrap().0;
+            let mut bytes = fixed.to_vec();
+            bytes.resize(size, 0);
+            socket
+                .read_exact(&mut bytes[FIXED_HEADER_SIZE..])
+                .await
+                .expect("shutdown retains every started frame suffix");
+            let packet =
+                Packet::decode(&Message::from_frame(Frame::decode(&bytes).unwrap()).unwrap())
+                    .unwrap();
+            assert!(matches!(packet.body, Body::Replication { .. }));
+            frames += 1;
+            if socket.read(&mut fixed[..1]).await.unwrap() == 0 {
+                break;
+            }
+            socket
+                .read_exact(&mut fixed[1..])
+                .await
+                .expect("no truncated next frame");
+        }
+        assert!(frames > 0);
+    };
+    timeout(std::time::Duration::from_secs(3), draining)
+        .await
+        .unwrap();
+    timeout(std::time::Duration::from_secs(3), joined)
+        .await
+        .unwrap()
+        .unwrap();
     transport.shutdown();
-    transport.shutdown();
-    assert!(started.elapsed() < std::time::Duration::from_millis(250));
     assert!(matches!(
         transport.send(request(transport.address(), 1, 2)),
         Err(Error::Closed)

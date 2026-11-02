@@ -44,14 +44,15 @@ def git(*args):
                           text=True, timeout=30).stdout.strip()
 
 
-def package_bundle(directory):
+def package_bundle(directory, target_dir=None):
     if git("status", "--porcelain", "--untracked-files=normal"):
         raise ValueError("standalone bundle requires a clean source tree")
     revision = git("rev-parse", "HEAD")
     directory.mkdir(parents=True, exist_ok=False)
     artifacts = {}
     for name, relative in BINARY_OUTPUTS.items():
-        source = ROOT / relative
+        source = (ROOT / relative if target_dir is None else
+                  target_dir / pathlib.Path(relative).relative_to("target"))
         if source.is_symlink() or not source.is_file() or not source.stat().st_mode & 0o111:
             raise ValueError(f"missing executable build output: {source}; run cargo build upstream")
         target = directory / name
@@ -173,6 +174,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["prepare", "package", *SCENARIOS])
     parser.add_argument("--output", type=pathlib.Path, help="NEW standalone bundle directory for package")
+    parser.add_argument("--target-dir", type=pathlib.Path, help="explicit Cargo output root for package only")
     parser.add_argument("--prebuilt", type=pathlib.Path, help="verified standalone binary bundle; no compilation")
     parser.add_argument("--root", type=pathlib.Path,
                         default=repo / "build/native-runtime-test-host")
@@ -184,8 +186,13 @@ def main(argv=None):
     if args.action == "package":
         if args.output is None:
             parser.error("package requires --output")
-        package_bundle(args.output)
+        if args.target_dir is None:
+            package_bundle(args.output)
+        else:
+            package_bundle(args.output, args.target_dir.resolve(strict=True))
         return 0
+    if args.target_dir is not None:
+        parser.error("--target-dir requires package")
     if args.action != "prepare" and args.prebuilt is None:
         parser.error("native acceptance requires --prebuilt; build and package binaries upstream")
     binaries = load_bundle(args.prebuilt) if args.action != "prepare" else None

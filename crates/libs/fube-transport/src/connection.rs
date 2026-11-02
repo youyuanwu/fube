@@ -1,8 +1,9 @@
 //! Public bounded clear-frame I/O and deadline helpers.
 //!
 //! The former parallel Connection object is retired. Operational socket
-//! ownership, correlation and cancellation live in [`crate::native_channel`].
-//! Free I/O helpers remain used by peer transports, test hosts and fixtures;
+//! byte progress lives in [`crate::raw_session`]; gateway messaging/correlation
+//! lives in [`crate::native_channel`].
+//! Free I/O helpers remain used by test hosts and protocol fixtures;
 //! callers, not these functions, own progress watchdogs and cancellation safety.
 
 use std::time::Duration;
