@@ -1,7 +1,303 @@
 use super::*;
 use crate::connection::{read_message, write_message};
+use crate::native_demux::{ActorDemux, ActorRegistration, DuplexPolicy};
 use std::{future::Future, pin::Pin, time::Duration};
 use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+// Test-only consumer fixtures, not a production transport profile. Independent
+// nonconsumer compositions below verify that mechanisms do not know these rules.
+#[derive(Clone, Copy)]
+enum GatewayProfile {
+    Ordinary,
+    Notifications,
+    Upload,
+}
+
+fn fixture_reply(_: &Message, props: &Properties) -> Result<()> {
+    if matches!(props.actor, 25 | 27) {
+        return Err(Error::Protocol("fixture ACK cannot complete RPC"));
+    }
+    Ok(())
+}
+
+fn fixture_outbound(_: &Message, props: &Properties, _: OutboundKind) -> Result<()> {
+    if props.actor != 5 || props.action.is_empty() {
+        return Err(Error::InvalidInput("fixture outbound"));
+    }
+    Ok(())
+}
+
+fn fixture_upload_outbound(_: &Message, props: &Properties, kind: OutboundKind) -> Result<()> {
+    if props.actor != if kind == OutboundKind::Raw { 26 } else { 5 } || props.action.is_empty() {
+        return Err(Error::InvalidInput("fixture upload outbound"));
+    }
+    Ok(())
+}
+
+fn fixture_upload_incoming(_: &Message, props: &Properties) -> Result<()> {
+    if props.action.is_empty() || props.expects_reply || props.fault.is_some() {
+        return Err(Error::Protocol("fixture upload ingress"));
+    }
+    Ok(())
+}
+
+fn fixture_notification(_: &Message, props: &Properties) -> Result<()> {
+    if props.actor != 5
+        || props.action != "ServiceNotificationRequest"
+        || props.relates_to != MessageId::default()
+        || !props.expects_reply
+        || props.fault.is_some()
+    {
+        return Err(Error::Protocol("fixture notification ingress"));
+    }
+    Ok(())
+}
+
+fn fixture_notification_reply(_: &Message, props: &Properties) -> Result<()> {
+    if props.actor != 5 || props.action != "ServiceNotificationReply" {
+        return Err(Error::InvalidInput("fixture notification reply"));
+    }
+    Ok(())
+}
+
+fn fixture_composition(profile: GatewayProfile) -> ChannelComposition {
+    ChannelComposition {
+        outbound: if matches!(profile, GatewayProfile::Upload) {
+            fixture_upload_outbound
+        } else {
+            fixture_outbound
+        },
+        ordinary_reply: fixture_reply,
+        actors: ActorDemux::new(if matches!(profile, GatewayProfile::Upload) {
+            [25, 27]
+                .into_iter()
+                .map(|actor| ActorRegistration {
+                    actor,
+                    authorize: fixture_upload_incoming,
+                })
+                .collect()
+        } else {
+            vec![]
+        })
+        .unwrap(),
+        duplex: matches!(profile, GatewayProfile::Notifications).then_some(DuplexPolicy {
+            incoming: fixture_notification,
+            reply: fixture_notification_reply,
+        }),
+    }
+}
+
+fn independent_outbound(_: &Message, props: &Properties, _: OutboundKind) -> Result<()> {
+    if props.actor != 70002 {
+        return Err(Error::InvalidInput("independent sender"));
+    }
+    Ok(())
+}
+
+fn independent_actor(_: &Message, props: &Properties) -> Result<()> {
+    if props.actor != 70001 {
+        return Err(Error::Protocol("independent actor"));
+    }
+    Ok(())
+}
+
+fn independent_reply(_: &Message, props: &Properties) -> Result<()> {
+    if props.actor != 70001 || props.action != "Completed" {
+        return Err(Error::Protocol("independent ordinary reply"));
+    }
+    Ok(())
+}
+
+fn independent_duplex(_: &Message, props: &Properties) -> Result<()> {
+    if props.actor != 70001 || props.action != "Pushed" || props.fault.is_some() {
+        return Err(Error::Protocol("independent duplex"));
+    }
+    Ok(())
+}
+
+fn independent_response(_: &Message, props: &Properties) -> Result<()> {
+    if props.actor != 70004 || props.action != "Accepted" {
+        return Err(Error::InvalidInput("independent consuming reply"));
+    }
+    Ok(())
+}
+
+fn independent_pair() -> (GatewayChannel, DuplexStream) {
+    let (stream, peer) = duplex(8192);
+    (
+        GatewayChannel::start(
+            stream,
+            "127.0.0.1:19000".parse().unwrap(),
+            ChannelComposition {
+                outbound: independent_outbound,
+                ordinary_reply: independent_reply,
+                actors: ActorDemux::new(vec![ActorRegistration {
+                    actor: 70001,
+                    authorize: independent_actor,
+                }])
+                .unwrap(),
+                duplex: Some(DuplexPolicy {
+                    incoming: independent_duplex,
+                    reply: independent_response,
+                }),
+            },
+            limits(),
+            [100; 16],
+            ListenInstance::default(),
+        ),
+        peer,
+    )
+}
+
+fn independent_message(actor: i64, action: &str) -> Message {
+    Message {
+        headers: vec![
+            Header::actor(actor).unwrap(),
+            Header::action(action).unwrap(),
+        ],
+        body: vec![7],
+    }
+}
+
+#[tokio::test]
+async fn native_actor_registration_does_not_grant_sender_or_reply_authority() {
+    let (channel, mut peer) = independent_pair();
+    let target = target(&channel);
+    let receiver = channel.receiver().unwrap();
+    for action in ["", "Arbitrary"] {
+        let mut ingress = independent_message(70001, action);
+        ingress
+            .headers
+            .push(Header::boolean(message::EXPECTS_REPLY, true).unwrap());
+        write_message(&mut peer, &ingress).await.unwrap();
+        let received = receiver.receive(deadline()).await.unwrap();
+        assert_eq!(received.message, ingress);
+        assert!(Arc::ptr_eq(&received.source, &target));
+        assert!(received.reply.is_none(), "ExpectsReply is not authority");
+        assert!(
+            matches!(
+                channel
+                    .send_one_way(&target, received.message, deadline())
+                    .await,
+                Err(Error::InvalidInput(_))
+            ),
+            "registration is not sender permission"
+        );
+    }
+    // Missing Action is not a native actor lookup failure either.
+    let ingress = Message {
+        headers: vec![Header::actor(70001).unwrap()],
+        body: vec![],
+    };
+    write_message(&mut peer, &ingress).await.unwrap();
+    assert_eq!(receiver.receive(deadline()).await.unwrap().message, ingress);
+    let mut forged = independent_message(70002, "Accepted");
+    forged.headers.push(
+        Header::relates_to(MessageId {
+            guid: [44; 16],
+            index: 8,
+        })
+        .unwrap(),
+    );
+    assert!(matches!(
+        channel.send_one_way(&target, forged, deadline()).await,
+        Err(Error::InvalidInput(_))
+    ));
+    channel.close(deadline()).await.unwrap();
+}
+
+#[tokio::test]
+async fn native_same_actor_splits_actor_duplex_and_rpc_with_private_original_context() {
+    let (channel, mut peer) = independent_pair();
+    let target = target(&channel);
+    let receiver = channel.receiver().unwrap();
+    let mut rpc = channel.request(&target, independent_message(70002, "Request"), deadline());
+    pending(rpc.as_mut()).await;
+    let request_id = read_message(&mut peer)
+        .await
+        .unwrap()
+        .properties()
+        .unwrap()
+        .id;
+    let id = MessageId {
+        guid: [42; 16],
+        index: 7,
+    };
+    let mut pushed = independent_message(70001, "Pushed");
+    pushed.headers.extend([
+        Header::message_id(id).unwrap(),
+        Header::relates_to(request_id).unwrap(),
+        Header::boolean(message::UNCORRELATED_REPLY, true).unwrap(),
+    ]);
+    // Native special classification wins even with a nonempty relation.
+    write_message(&mut peer, &pushed).await.unwrap();
+    let incoming = receiver.receive(deadline()).await.unwrap();
+    assert_eq!(incoming.message, pushed);
+    pending(rpc.as_mut()).await;
+    let context = incoming.reply.unwrap();
+    let mut response = Box::pin(context.reply(independent_message(70004, "Accepted"), deadline()));
+    pending(response.as_mut()).await;
+    let sent = read_message(&mut peer).await.unwrap();
+    assert_eq!(
+        sent.properties().unwrap().relates_to,
+        id,
+        "original MessageId, not RelatesTo"
+    );
+    response.await.unwrap();
+    let mut completed = independent_message(70001, "Completed");
+    completed
+        .headers
+        .push(Header::relates_to(request_id).unwrap());
+    write_message(&mut peer, &completed).await.unwrap();
+    assert_eq!(rpc.await.unwrap(), completed);
+    assert_eq!(count(&channel, INGRESS), 0);
+    channel.close(deadline()).await.unwrap();
+}
+
+#[tokio::test]
+async fn native_ordinary_authorization_runs_before_matching_without_actor_fallback() {
+    let (channel, mut peer) = independent_pair();
+    let target = target(&channel);
+    let mut rpc = channel.request(&target, independent_message(70002, "Request"), deadline());
+    pending(rpc.as_mut()).await;
+    let id = read_message(&mut peer)
+        .await
+        .unwrap()
+        .properties()
+        .unwrap()
+        .id;
+    let mut contradictory = independent_message(70001, "Pushed");
+    contradictory.headers.push(Header::relates_to(id).unwrap());
+    write_message(&mut peer, &contradictory).await.unwrap();
+    assert!(matches!(
+        rpc.await,
+        Err(Error::Protocol("independent ordinary reply"))
+    ));
+    assert_eq!(count(&channel, INGRESS), 0);
+    channel.close(deadline()).await.unwrap();
+}
+
+#[tokio::test]
+async fn native_unknown_actor_and_unconfigured_duplex_remain_explicit_errors() {
+    for special in [false, true] {
+        let (channel, mut peer) = pair(8192, false, limits());
+        let mut message = independent_message(70001, "Unknown");
+        if special {
+            message.headers.extend([
+                Header::message_id(MessageId {
+                    guid: [42; 16],
+                    index: 1,
+                })
+                .unwrap(),
+                Header::boolean(message::UNCORRELATED_REPLY, true).unwrap(),
+            ]);
+        }
+        write_message(&mut peer, &message).await.unwrap();
+        until(|| channel.terminal_error().is_some()).await;
+        assert!(matches!(channel.terminal_error(), Some(Error::Protocol(_))));
+        channel.close(deadline()).await.unwrap();
+    }
+}
 
 #[tokio::test]
 async fn unchanged_notification_profile_accepts_its_empty_relation_without_forwarding_authority() {
@@ -59,7 +355,7 @@ fn profile_pair(
     let channel = GatewayChannel::start(
         stream,
         "127.0.0.1:19000".parse().unwrap(),
-        profile,
+        fixture_composition(profile),
         limits,
         {
             // Distinct from the constant-byte synthetic notification/peer IDs,
@@ -1486,7 +1782,7 @@ async fn connection_establishment_enforces_profile_and_rejects_oversized_frame_b
     assert!(matches!(
         GatewayChannel::connect_unsecured_loopback(
             "192.0.2.1:19000".parse().unwrap(),
-            GatewayProfile::Ordinary,
+            fixture_composition(GatewayProfile::Ordinary),
             limits(),
             deadline()
         )
@@ -1527,7 +1823,7 @@ async fn connection_establishment_enforces_profile_and_rejects_oversized_frame_b
     });
     let channel = GatewayChannel::connect_unsecured_loopback(
         endpoint,
-        GatewayProfile::Ordinary,
+        fixture_composition(GatewayProfile::Ordinary),
         limits(),
         deadline(),
     )

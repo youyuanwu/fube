@@ -1,9 +1,9 @@
-//! Operational, owned native NamingGateway channels for unsecured loopback development.
+//! Operational, owned native channels for unsecured loopback development.
 //!
 //! This is a separate backend for [`crate::channel`], not an adapter around
-//! Connection's envelope-building APIs. Concrete profiles authorize ordinary
-//! gateway traffic, notifications with consuming reply capabilities, or upload
-//! one-way traffic with bounded raw acknowledgements and no reply capability.
+//! Connection's envelope-building APIs. Connect-time composition separates native
+//! actor ingress, ordinary correlation and authorized special duplex handling.
+//! Consumer actor/action/envelope authorization is supplied by client adapters.
 //! No listener, arbitrary reverse RPC, IPC, replication, TLS, reconnect or replay
 //! is supplied.
 //!
@@ -34,6 +34,7 @@ use crate::{
     connection::{write_message, MAX_FRAME_TIME},
     frame::{validate_fixed, Frame, FIXED_HEADER_SIZE, MAX_FRAME_SIZE, MAX_HEADER_SIZE},
     message::{self, Header, ListenInstance, Message, MessageId, Properties, MAX_HEADER_COUNT},
+    native_demux::{ChannelComposition, Dispatch, EnvelopeValidator, OutboundKind},
     Error, Result,
 };
 
@@ -46,17 +47,6 @@ const REPLY: usize = 1;
 const INGRESS: usize = 2;
 const RECEIVE: usize = 3;
 const CLOSE: usize = 4;
-
-/// Exclusive envelope authority for one established gateway socket.
-///
-/// Upload semantics (actions, codecs and acknowledgement correlation) remain
-/// caller-owned. Upload ingress never grants ordinary or notification replies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GatewayProfile {
-    Ordinary,
-    Notifications,
-    Upload,
-}
 
 /// Immutable finite limits, validated before connection establishment.
 ///
@@ -265,7 +255,7 @@ struct Shared {
     inner: Mutex<Inner>,
     budget: Arc<Budget>,
     target: Arc<GatewayTarget>,
-    profile: GatewayProfile,
+    composition: ChannelComposition,
     process_id: [u8; 16],
     changed: Notify,
     stop: Notify,
@@ -386,12 +376,12 @@ impl ExactSizeIterator for GatewayIngressSnapshot {}
 impl GatewayChannel {
     /// Connect a dedicated, explicitly trusted unsecured-development gateway.
     ///
-    /// Only numeric loopback endpoints are allowed. The selected profile grants
-    /// concrete envelope authority, never arbitrary reverse requests.
+    /// Only numeric loopback endpoints are allowed. The immutable composition
+    /// authorizes envelopes independently of actor selection.
     /// One deadline includes TCP connect and the ListenInstance exchange.
     pub async fn connect_unsecured_loopback(
         endpoint: SocketAddr,
-        profile: GatewayProfile,
+        composition: ChannelComposition,
         limits: ChannelLimits,
         deadline: Instant,
     ) -> Result<Self> {
@@ -425,14 +415,19 @@ impl GatewayChannel {
         .map_err(|_| Error::Timeout)??;
         check_deadline(deadline)?;
         Ok(Self::start(
-            stream, endpoint, profile, limits, process_id, remote,
+            stream,
+            endpoint,
+            composition,
+            limits,
+            process_id,
+            remote,
         ))
     }
 
     fn start<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         stream: S,
         endpoint: SocketAddr,
-        profile: GatewayProfile,
+        composition: ChannelComposition,
         limits: ChannelLimits,
         process_id: [u8; 16],
         remote: ListenInstance,
@@ -462,7 +457,7 @@ impl GatewayChannel {
                 identity: Arc::new(()),
                 address: endpoint,
             }),
-            profile,
+            composition,
             process_id,
             changed: Notify::new(),
             stop: Notify::new(),
@@ -482,7 +477,9 @@ impl GatewayChannel {
         if self.owner.shared.error().is_some() {
             return Err(Error::Closed);
         }
-        if self.owner.shared.profile == GatewayProfile::Ordinary {
+        if self.owner.shared.composition.actors.is_empty()
+            && self.owner.shared.composition.duplex.is_none()
+        {
             return Err(Error::InvalidInput("gateway ingress is not enabled"));
         }
         Ok(GatewayReceiver {
@@ -638,28 +635,6 @@ fn has(message: &Message, id: u16) -> bool {
     message.headers.iter().any(|header| header.id == id)
 }
 
-fn domain_gateway(
-    message: &Message,
-    props: &Properties,
-    profile: GatewayProfile,
-    submission: &Submission,
-) -> Result<()> {
-    let authorized = match profile {
-        GatewayProfile::Ordinary | GatewayProfile::Notifications => props.actor == 5,
-        GatewayProfile::Upload => match submission {
-            Submission::Raw => props.actor == 26,
-            Submission::Rpc => props.actor == 5,
-            Submission::Reply(_) => false,
-        },
-    };
-    if !authorized || props.action.is_empty() || has(message, message::IPC) {
-        return Err(Error::InvalidInput(
-            "native gateway profile does not authorize this submission",
-        ));
-    }
-    Ok(())
-}
-
 fn allocation_check(message: &Message, limits: ChannelLimits) -> Result<()> {
     let input_limit =
         limits.max_frame_bytes + MAX_HEADER_COUNT * size_of::<Header>() + MAX_HEADER_SIZE;
@@ -701,7 +676,7 @@ fn allocation_check(message: &Message, limits: ChannelLimits) -> Result<()> {
 enum Submission {
     Raw,
     Rpc,
-    Reply(MessageId),
+    Reply(MessageId, EnvelopeValidator),
 }
 
 struct OperationGuard {
@@ -747,9 +722,16 @@ async fn submit(
     }
     allocation_check(&message, shared.budget.limits)?;
     let props = envelope(&message, false).map_err(local)?;
-    domain_gateway(&message, &props, shared.profile, &submission)?;
+    if crate::native_demux::is_control(props.actor) || has(&message, message::IPC) {
+        return Err(Error::InvalidInput("reserved native transport envelope"));
+    }
+    match submission {
+        Submission::Raw => (shared.composition.outbound)(&message, &props, OutboundKind::Raw)?,
+        Submission::Rpc => (shared.composition.outbound)(&message, &props, OutboundKind::Rpc)?,
+        Submission::Reply(_, authorize) => authorize(&message, &props)?,
+    }
     let rpc = matches!(submission, Submission::Rpc);
-    let class = if matches!(submission, Submission::Reply(_)) {
+    let class = if matches!(submission, Submission::Reply(..)) {
         REPLY
     } else {
         ORDINARY
@@ -773,15 +755,12 @@ async fn submit(
                 return Err(Error::InvalidInput("contradictory RPC correlation"));
             }
         }
-        Submission::Reply(id) => {
-            if props.action != "ServiceNotificationReply"
-                || props.expects_reply
+        Submission::Reply(id, _) => {
+            if props.expects_reply
                 || props.uncorrelated_reply
                 || (has(&message, message::RELATES_TO) && props.relates_to != id)
             {
-                return Err(Error::InvalidInput(
-                    "contradictory or unauthorized notification reply",
-                ));
+                return Err(Error::InvalidInput("contradictory duplex reply"));
             }
             if !has(&message, message::RELATES_TO) {
                 message.headers.push(Header::relates_to(id)?);
@@ -982,13 +961,14 @@ impl RpcChannel for GatewayChannel {
     }
 }
 
-struct NotificationReply {
+struct DuplexReply {
     shared: Weak<Shared>,
     target: Arc<GatewayTarget>,
     id: MessageId,
+    authorize: EnvelopeValidator,
 }
 
-impl ReplyContext for NotificationReply {
+impl ReplyContext for DuplexReply {
     fn reply(self: Box<Self>, message: Message, deadline: Instant) -> ChannelFuture<'static, ()> {
         Box::pin(async move {
             let shared = self.shared.upgrade().ok_or(Error::Closed)?;
@@ -997,7 +977,7 @@ impl ReplyContext for NotificationReply {
                 &self.target,
                 message,
                 deadline,
-                Submission::Reply(self.id),
+                Submission::Reply(self.id, self.authorize),
                 None,
             )
             .await?
@@ -1015,10 +995,13 @@ impl GatewayReceiver {
             message: ingress.message,
             source: shared.target.clone(),
             reply: ingress.reply_id.map(|id| {
-                Box::new(NotificationReply {
+                Box::new(DuplexReply {
                     shared: Arc::downgrade(shared),
                     target: shared.target.clone(),
                     id,
+                    // This is private ingress state, populated only after
+                    // configured duplex authorization in the receive loop.
+                    authorize: shared.composition.duplex.as_ref().unwrap().reply,
                 }) as Box<dyn ReplyContext>
             }),
         }
@@ -1132,59 +1115,49 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
                 "unsupported role/security/reconnect control; no recovery",
             ));
         }
-        if matches!(props.actor, 25 | 27) {
-            if shared.profile != GatewayProfile::Upload
-                || props.action.is_empty()
-                || props.relates_to != MessageId::default()
-                || props.expects_reply
-                || props.uncorrelated_reply
-                || props.fault.is_some()
-                || has(&message, message::IPC)
-            {
-                return Err(Error::Protocol("unauthorized native upload envelope"));
-            }
-            let lease = shared.budget.reserve(INGRESS)?;
-            let mut inner = shared.inner.lock().unwrap();
-            if inner.terminal.is_some() {
-                return Err(Error::Closed);
-            }
-            inner.ingress.push_back(Ingress {
-                message,
-                reply_id: None,
-                _lease: lease,
-            });
-            drop(inner);
-            shared.changed.notify_waiters();
-            continue;
+        if has(&message, message::IPC) {
+            return Err(Error::Protocol("IPC envelope on native channel"));
         }
-        if props.uncorrelated_reply {
-            if shared.profile != GatewayProfile::Notifications
-                || props.actor != 5
-                || props.action != "ServiceNotificationRequest"
-                || props.id == MessageId::default()
-                || props.relates_to != MessageId::default()
-                || !props.expects_reply
-                || props.fault.is_some()
-                || has(&message, message::IPC)
-            {
-                return Err(Error::Protocol("unauthorized native notification envelope"));
+        let reply_id = match shared.composition.actors.select(&props)? {
+            Dispatch::Actor(authorize) => {
+                authorize(&message, &props)?;
+                Some(None)
             }
+            Dispatch::Reply if props.uncorrelated_reply => {
+                let duplex = shared
+                    .composition
+                    .duplex
+                    .as_ref()
+                    .ok_or(Error::Protocol("native duplex ingress is not enabled"))?;
+                if props.id == MessageId::default() {
+                    return Err(Error::Protocol(
+                        "duplex ingress requires original MessageId",
+                    ));
+                }
+                (duplex.incoming)(&message, &props)?;
+                Some(Some(props.id))
+            }
+            Dispatch::Reply => None,
+        };
+        if let Some(reply_id) = reply_id {
             let lease = shared.budget.reserve(INGRESS)?;
             let mut inner = shared.inner.lock().unwrap();
             if inner.terminal.is_some() {
                 return Err(Error::Closed);
             }
-            shared
-                .remember(&mut inner, props.id)
-                .map_err(|error| match error {
-                    Error::InvalidInput(_) => {
-                        Error::Protocol("duplicate or colliding notification ID")
-                    }
-                    other => other,
-                })?;
+            if let Some(id) = reply_id {
+                shared
+                    .remember(&mut inner, id)
+                    .map_err(|error| match error {
+                        Error::InvalidInput(_) => {
+                            Error::Protocol("duplicate or colliding duplex ID")
+                        }
+                        other => other,
+                    })?;
+            }
             inner.ingress.push_back(Ingress {
                 message,
-                reply_id: Some(props.id),
+                reply_id,
                 _lease: lease,
             });
             drop(inner);
@@ -1195,8 +1168,9 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
             || props.expects_reply
             || has(&message, message::IPC)
         {
-            return Err(Error::Protocol("unauthorized ordinary gateway reply"));
+            return Err(Error::Protocol("invalid ordinary native reply"));
         }
+        (shared.composition.ordinary_reply)(&message, &props)?;
         let token = {
             let mut inner = shared.inner.lock().unwrap();
             // Properties validates every occurrence and exposes the final

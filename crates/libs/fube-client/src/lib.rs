@@ -5,6 +5,7 @@
 //! used with an explicitly selected unsecured development gateway.
 
 mod applications;
+mod channel_adapter;
 pub mod contracts;
 mod deployed_applications;
 mod deployed_code_packages;
@@ -57,7 +58,7 @@ use contracts::ClientFuture;
 use fube_transport::{
     channel::MessageChannel,
     connection::deadline_after,
-    native_channel::{ChannelLimits, GatewayChannel, GatewayProfile, GatewayTarget},
+    native_channel::{ChannelLimits, GatewayChannel, GatewayTarget},
 };
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -134,7 +135,7 @@ impl FabricClient {
         let deadline = deadline_after(timeout)?;
         let channel = GatewayChannel::connect_unsecured_loopback(
             endpoint,
-            GatewayProfile::Ordinary,
+            channel_adapter::ordinary()?,
             ChannelLimits::default(),
             deadline,
         )

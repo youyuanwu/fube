@@ -329,7 +329,7 @@ async fn actor26_upload_does_not_consume_ordinary_id_history_or_authorize_rpc() 
 
 #[tokio::test]
 async fn cancelled_upload_retires_only_its_owned_socket_not_query_or_notification_sessions() {
-    for profile in [GatewayProfile::Ordinary, GatewayProfile::Notifications] {
+    for notifications in [false, true] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = listener.local_addr().unwrap();
         let other_peer = tokio::spawn(async move {
@@ -352,7 +352,11 @@ async fn cancelled_upload_retires_only_its_owned_socket_not_query_or_notificatio
         });
         let channel = GatewayChannel::connect_unsecured_loopback(
             endpoint,
-            profile,
+            if notifications {
+                crate::channel_adapter::notifications().unwrap()
+            } else {
+                crate::channel_adapter::ordinary().unwrap()
+            },
             ChannelLimits::default(),
             Instant::now() + Duration::from_secs(3),
         )
@@ -374,7 +378,7 @@ async fn cancelled_upload_retires_only_its_owned_socket_not_query_or_notificatio
         assert!(read_message(&mut upload_peer).await.is_err());
         assert!(channel.terminal_error().is_none());
         let deadline = Instant::now() + Duration::from_secs(3);
-        if profile == GatewayProfile::Ordinary {
+        if !notifications {
             let mut query = channel.request(
                 &target,
                 Message {
