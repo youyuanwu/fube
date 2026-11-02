@@ -21,6 +21,9 @@ use std::{
     time::Duration,
 };
 use tokio::sync::oneshot;
+#[path = "support/partition_access.rs"]
+mod partition_access;
+use partition_access::{AccessPartition, WriteAccess};
 
 type Events = Arc<Mutex<Vec<String>>>;
 #[derive(Default)]
@@ -398,6 +401,7 @@ type Created = Arc<
     >,
 >;
 struct Factory {
+    access: Option<Arc<WriteAccess>>,
     native: NativeIntegrationProvider,
     providers: Arc<Providers>,
     created: Created,
@@ -405,6 +409,7 @@ struct Factory {
     settings: Settings,
 }
 struct Replica {
+    access: Option<Arc<WriteAccess>>,
     native: NativeRuntimeIntegration,
     providers: Arc<Providers>,
     created: Created,
@@ -422,6 +427,7 @@ impl IStatefulServiceFactory for Factory {
         id: i64,
     ) -> Result<Box<dyn IStatefulServiceReplica>> {
         Ok(Box::new(Replica {
+            access: self.access.clone(),
             native: self.native.capture(partition, id)?,
             providers: self.providers.clone(),
             created: self.created.clone(),
@@ -440,6 +446,13 @@ impl IStatefulServiceReplica for Replica {
     ) -> ApiFuture<'_, Box<dyn IPrimaryReplicator>> {
         Box::pin(async move {
             mode.validate()?;
+            let partition: Arc<dyn IStatefulServicePartition> = match &self.access {
+                Some(access) => Arc::new(AccessPartition {
+                    inner: partition,
+                    access: access.clone(),
+                }),
+                None => partition,
+            };
             let owner = VolatileTransactionalReplicator::create(
                 partition,
                 self.native.clone(),
@@ -514,11 +527,22 @@ impl Fixture {
         delegating: bool,
         settings: Settings,
     ) -> Self {
+        Self::start_using_access(partition, id, role, delegating, settings, None).await
+    }
+    async fn start_using_access(
+        partition: uuid::Uuid,
+        id: i64,
+        role: ReplicaRole,
+        delegating: bool,
+        settings: Settings,
+        access: Option<Arc<WriteAccess>>,
+    ) -> Self {
         let providers = Arc::new(Providers::default());
         let input = providers.clone();
         let (send, receive) = oneshot::channel();
         let host = rap::Host::start(partition, id, role, move |native| {
             Box::new(Factory {
+                access,
                 native,
                 providers: input,
                 created: Arc::new(Mutex::new(Some(send))),

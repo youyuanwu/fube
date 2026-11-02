@@ -10,10 +10,10 @@
 
 use crate::extensions::{ReplayCheckpointProvider, ReplayOperation};
 use crate::{Cancellation, Epoch, IOperationDataStream, IStateProvider, OperationData, Result};
-use fube_runtime::extensions::{
+use fube_core::hosting::{
     DisposalTracker, ExecutionRuntime, ManagedObject, ObjectQuota, ObjectReservation,
 };
-use fube_runtime::ApiFuture as ServiceFuture;
+use fube_core::ApiFuture as ServiceFuture;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -227,12 +227,12 @@ struct ProviderCapabilities {
 fn provider_error(error: crate::Error) -> crate::Error {
     if matches!(
         error.kind(),
-        fube_runtime::ErrorKind::Canceled | fube_runtime::ErrorKind::Timeout
+        fube_core::ErrorKind::Canceled | fube_core::ErrorKind::Timeout
     ) {
         return error;
     }
     crate::Error::with_cause(
-        fube_runtime::ErrorKind::Provider,
+        fube_core::ErrorKind::Provider,
         format!("provider callback failed: {error}"),
         error,
     )
@@ -244,8 +244,8 @@ impl OwnedProvider {
         replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         streams: usize,
         tracker: DisposalTracker,
-        origin: fube_runtime::extensions::CallOrigin,
-        construction: Option<&fube_runtime::extensions::OwnedCallPermit>,
+        origin: fube_core::hosting::CallOrigin,
+        construction: Option<&fube_core::hosting::OwnedCallPermit>,
     ) -> Result<Self> {
         let quota = ObjectQuota::new(1)?;
         let reservation = if let Some(construction) = construction {
@@ -260,10 +260,10 @@ impl OwnedProvider {
             tracker,
         })
     }
-    pub(crate) fn publication(&self) -> fube_runtime::extensions::ObjectPublication {
+    pub(crate) fn publication(&self) -> fube_core::hosting::ObjectPublication {
         self.inner.publication()
     }
-    pub(crate) fn disposal_receipt(&self) -> fube_runtime::extensions::DisposalReceipt {
+    pub(crate) fn disposal_receipt(&self) -> fube_core::hosting::DisposalReceipt {
         self.inner.receipt()
     }
     pub(crate) fn copy_state_constructed(
@@ -271,7 +271,7 @@ impl OwnedProvider {
         up_to: i64,
     ) -> Result<(
         Arc<dyn IOperationDataStream>,
-        fube_runtime::extensions::ObjectPublication,
+        fube_core::hosting::ObjectPublication,
     )> {
         let reserved = self
             .runtime

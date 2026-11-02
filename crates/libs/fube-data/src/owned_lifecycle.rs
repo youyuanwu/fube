@@ -1,7 +1,7 @@
 //! Observer-independent common lifecycle continuation on the existing owner.
 use crate::Result;
-use fube_runtime::{
-    extensions::{CommandCleanup, ExecutionRuntime},
+use fube_core::{
+    hosting::{CommandCleanup, ExecutionRuntime},
     ApiFuture,
 };
 use std::{

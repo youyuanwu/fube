@@ -1,17 +1,12 @@
 //! One native-bound owner shared by canonical common, primary and state access.
 use crate::{
     engine::{Engine, Replication},
-    extensions::{
-        EpochCheckedReplication, OperationOriginStream, ReplayCheckpointProvider,
-        ReplicationEndpointOptions, StateProviderCapabilities,
-    },
-    wire::Actor,
-    Cancellation, Epoch, IOperationStream, IStateProvider, IStateReplicator, OperationData,
-    ReplicationAdmission, ReplicationCompletion, Result, Settings,
+    extensions::{EpochCheckedReplication, OperationOriginStream},
+    Cancellation, Epoch, IOperationStream, IStateReplicator, OperationData, ReplicationAdmission,
+    ReplicationCompletion, Result,
 };
-use fube_runtime::{
-    extensions::NativeRuntimeIntegration, ApiFuture, IPrimaryReplicator, IReplicator,
-    IStatefulServicePartition, ReplicaInformation, ReplicaRole, ReplicaSetConfig,
+use fube_core::{
+    ApiFuture, IPrimaryReplicator, IReplicator, ReplicaInformation, ReplicaRole, ReplicaSetConfig,
     ReplicaSetQuorumMode,
 };
 use std::sync::Arc;
@@ -19,83 +14,16 @@ use std::sync::Arc;
 /// Managed FabricReplicator responsibility, with Rust object-safe control/data
 /// views over ONE private engine, listener and owner. Clones share that owner.
 /// Not a native COM proxy/CreateReplicator or mutable native settings facade.
-/// Canonical primary controls consume the exact internally scoped native-issued
-/// invocation through ordinary delegation; normal construction installs no
-/// replacement-object binder. Public descriptors and diagnostics create no
-/// records. No standalone out-of-host primary authority.
+/// The runtime-owned adapter projects controls through the replication-defined
+/// hosting protocol. This object cannot capture native controls: direct SDK
+/// configuration/Build/Remove without that adapter are unsupported. Public
+/// descriptors and diagnostics create no records or standalone host authority.
 #[derive(Clone)]
 pub struct FabricReplicator {
     pub(crate) engine: Arc<Engine>,
 }
 
 impl FabricReplicator {
-    /// Data-layer construction integration, NOT an extra SDK partition method.
-    /// Call in the runtime-owned service Open entry. Missing/stale/mismatched
-    /// runtime-issued authority fails before listener/provider activation.
-    /// Provider and optional replay share one supervised ownership group; no
-    /// replay supertrait, implicit discovery or standalone authority is required.
-    /// This helper's location/signature is fube-specific, not native partition
-    /// CreateReplicator source/ABI compatibility. See the production sample
-    /// `crates/samples/rust-runtime-app/src/data.rs` for construction and pumps.
-    /// Construction supervises the provider but does not query its initial tail.
-    /// Lower Open marks Opened; the Opened getter or first Primary samples actual
-    /// progress and first Primary creates its initial queue at progress + 1.
-    /// An upper composite may therefore initialize its log after lower Open.
-    /// This helper retains classic copy defaults.
-    pub fn create(
-        partition: Arc<dyn IStatefulServicePartition>,
-        native: NativeRuntimeIntegration,
-        provider: Arc<dyn IStateProvider>,
-        replay: Option<Arc<dyn ReplayCheckpointProvider>>,
-        endpoint: ReplicationEndpointOptions,
-        settings: Settings,
-    ) -> Result<Arc<Self>> {
-        Self::create_with_capabilities(
-            partition,
-            native,
-            provider,
-            replay,
-            endpoint,
-            settings,
-            StateProviderCapabilities::default(),
-        )
-    }
-
-    /// Explicit provider-copy capability; `create` retains classic defaults.
-    /// Provider progress must be ready at the actual Opened getter/first-Primary
-    /// call, not before construction. Successful initial progress is cached;
-    /// getter errors remain retryable and first-Primary errors fault lower.
-    /// This does not open/recover/bootstrap an upper transaction log for callers
-    /// or rebase an activated queue.
-    pub fn create_with_capabilities(
-        partition: Arc<dyn IStatefulServicePartition>,
-        native: NativeRuntimeIntegration,
-        provider: Arc<dyn IStateProvider>,
-        replay: Option<Arc<dyn ReplayCheckpointProvider>>,
-        endpoint: ReplicationEndpointOptions,
-        settings: Settings,
-        capabilities: StateProviderCapabilities,
-    ) -> Result<Arc<Self>> {
-        let identity = native.identity();
-        let actor = Actor {
-            partition: identity.partition_id,
-            replica: identity.replica_id,
-            incarnation: endpoint.actor_incarnation,
-        };
-        Ok(Arc::new(Self {
-            engine: Engine::bind_partition(
-                partition,
-                native,
-                actor,
-                &endpoint.listen_address,
-                provider,
-                replay,
-                settings,
-                capabilities,
-            )?,
-        }))
-    }
-
     /// Retained state access shares the control object's owner. No engine escape
     /// hatch and no relay/task/queue is allocated by this view.
     pub fn get_state_replicator(&self) -> Arc<dyn IStateReplicator> {
@@ -126,7 +54,7 @@ impl FabricReplicator {
     pub(crate) fn endpoint(&self) -> crate::wire::Endpoint {
         self.engine.endpoint()
     }
-    pub(crate) fn execution(&self) -> fube_runtime::extensions::ExecutionRuntime {
+    pub(crate) fn execution(&self) -> fube_core::hosting::ExecutionRuntime {
         self.engine.execution_runtime()
     }
     pub(crate) fn copy_with_origin(&self) -> Result<Arc<dyn OperationOriginStream>> {
@@ -248,9 +176,9 @@ impl IPrimaryReplicator for FabricReplicator {
         replica: ReplicaInformation,
         cancel: Cancellation,
     ) -> ApiFuture<'_, ()> {
-        self.engine.build_replica(replica, cancel)
+        IPrimaryReplicator::build_replica(&*self.engine, replica, cancel)
     }
     fn remove_replica(&self, replica: i64) -> Result<()> {
-        self.engine.remove_replica(replica)
+        IPrimaryReplicator::remove_replica(&*self.engine, replica)
     }
 }

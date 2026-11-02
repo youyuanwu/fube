@@ -756,9 +756,8 @@ impl IStatefulServiceReplica for Service {
                     .map_err(|_| RuntimeError::InvalidInput("invalid data listener IP"))?,
                 0,
             );
-            let engine = FabricReplicator::create(
+            let engine = native.create_replicator(
                 partition.clone(),
-                native.clone(),
                 Arc::new(CopyProvider {
                     inner: provider.clone(),
                     delay: copy_delay.clone(),
@@ -773,7 +772,7 @@ impl IStatefulServiceReplica for Service {
             let route = Route::start(
                 Arc::new(native.clone()),
                 self.context.identity.clone(),
-                engine.clone(),
+                engine.diagnostics(),
                 provider,
                 format!(
                     "http://{}{}/service",

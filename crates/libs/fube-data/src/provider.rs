@@ -17,8 +17,8 @@ use crate::extensions::{ReplayCheckpointProvider, ReplayOperation};
 use crate::{
     Cancellation, Epoch, Error, IOperationDataStream, IStateProvider, OperationData, Result,
 };
-use fube_runtime::extensions::EpochDomains;
-use fube_runtime::ApiFuture as ServiceFuture;
+use fube_core::hosting::EpochDomains;
+use fube_core::ApiFuture as ServiceFuture;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -966,7 +966,7 @@ mod tests {
         let p = MemoryProvider::new();
         assert!(matches!(
             p.apply_replication(1, &oversized_copy),
-            Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationOperationTooLarge
+            Err(error) if error.kind() == fube_core::ErrorKind::ReplicationOperationTooLarge
         ));
         assert_eq!(p.snapshot().last, 0);
         assert_eq!(p.snapshot().retained_bytes, 0);

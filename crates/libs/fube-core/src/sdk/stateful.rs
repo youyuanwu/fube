@@ -202,8 +202,8 @@ pub struct ReplicaSetConfig {
 /// Object-safe information/access and synchronous reports. Reports require a
 /// supported reserved execution entry; do not await their Result or block an
 /// async worker. Information/access getters are immediate fallible observations.
-/// Native CreateReplicator and mssf try_get_com have no member here: neither COM
-/// proxy nor runtime-owned native replication is supported by this SDK trait.
+/// Native CreateReplicator and mssf try_get_com have no member here. The runtime
+/// construction helper is a separate Rust hosting adapter, not this SDK ABI.
 pub trait IStatefulServicePartition: Send + Sync + 'static {
     fn get_partition_information(&self) -> Result<ServicePartitionInformation>;
     /// Check current read access per request; cached Granted is not authority.

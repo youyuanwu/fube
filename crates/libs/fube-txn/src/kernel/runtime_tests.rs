@@ -6,21 +6,30 @@ use super::{
     transaction::RetryRuntime,
 };
 use crate::{Cancellation, Epoch, ITransaction, OperationData, ReplicaRole, Result, Transaction};
-use fube_data::{extensions::ReplicationEndpointOptions, FabricReplicator, IStateProvider};
+use fube_data::{extensions::ReplicationEndpointOptions, IStateProvider, IStateReplicator};
 use fube_rap_test_support as rap;
 use fube_runtime::{
     extensions::{
         CallLane, CallOrigin, NativeIntegrationProvider, NativeReplicaSetConfiguration,
         NativeRuntimeIntegration,
     },
-    ApiFuture, IPrimaryReplicator, IReplicator, IStatefulServiceFactory, IStatefulServicePartition,
+    ApiFuture, IPrimaryReplicator, IStatefulServiceFactory, IStatefulServicePartition,
     IStatefulServiceReplica, OpenMode,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
-type Created =
-    Arc<Mutex<Option<oneshot::Sender<(Arc<FabricReplicator>, NativeRuntimeIntegration)>>>>;
+type Created = Arc<
+    Mutex<
+        Option<
+            oneshot::Sender<(
+                Arc<dyn IPrimaryReplicator>,
+                Arc<dyn IStateReplicator>,
+                NativeRuntimeIntegration,
+            )>,
+        >,
+    >,
+>;
 struct Factory {
     native: NativeIntegrationProvider,
     created: Created,
@@ -81,9 +90,8 @@ impl IStatefulServiceReplica for Replica {
     ) -> ApiFuture<'_, Box<dyn IPrimaryReplicator>> {
         Box::pin(async move {
             mode.validate()?;
-            let lower = FabricReplicator::create(
+            let lower = self.native.create_replicator(
                 partition,
-                self.native.clone(),
                 Arc::new(LogProvider),
                 None,
                 ReplicationEndpointOptions {
@@ -92,13 +100,11 @@ impl IStatefulServiceReplica for Replica {
                 },
                 self.settings.clone(),
             )?;
-            let _ = self
-                .created
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap()
-                .send((lower.clone(), self.native.clone()));
+            let _ = self.created.lock().unwrap().take().unwrap().send((
+                lower.clone(),
+                lower.get_state_replicator(),
+                self.native.clone(),
+            ));
             Ok(Box::new((*lower).clone()) as Box<dyn IPrimaryReplicator>)
         })
     }
@@ -112,7 +118,8 @@ impl IStatefulServiceReplica for Replica {
 }
 struct Fixture {
     host: Arc<rap::Host>,
-    lower: Arc<FabricReplicator>,
+    lower: Arc<dyn IPrimaryReplicator>,
+    state: Arc<dyn IStateReplicator>,
     native: NativeRuntimeIntegration,
     manager: Arc<KernelManager>,
     runtime: Arc<RuntimeLower>,
@@ -137,7 +144,7 @@ impl Fixture {
             },
         )
         .await;
-        let (lower, native) = recv.await.unwrap();
+        let (lower, state, native) = recv.await.unwrap();
         let provider = PointProvider::preinitialized("fabric:/point");
         let directory = ProviderDirectory::preinitialized(
             [(10, provider.clone() as Arc<dyn crate::IStateProvider2>)],
@@ -151,11 +158,12 @@ impl Fixture {
             0,
             Arc::new(RetryRuntime::default()),
         );
-        let runtime = RuntimeLower::new(lower.get_state_replicator(), native.execution()).unwrap();
+        let runtime = RuntimeLower::new(state.clone(), native.execution()).unwrap();
         manager.bind_runtime(runtime.clone());
         let fixture = Self {
             host,
             lower,
+            state,
             native,
             manager,
             runtime,
@@ -225,11 +233,12 @@ impl Fixture {
             },
         )
         .await;
-        let (peer_lower, peer_native) = receive.await.unwrap();
+        let (peer_lower, peer_state, peer_native) = receive.await.unwrap();
         let address = peer.replication_address().unwrap();
         let identity = peer_native.identity().clone();
         drop(peer); // a real opened endpoint that is now unavailable; never a wire/engine setter
         drop(peer_lower);
+        drop(peer_state);
         self.host
             .configure(NativeReplicaSetConfiguration {
                 epoch: Epoch {
@@ -436,7 +445,6 @@ async fn corrective_rejected_capture_disposal_does_not_block_lower_owner() {
         record::{Record, RecordKind},
     };
     use crate::{OperationContext, TransactionBase};
-    use fube_data::IStateReplicator;
     use std::sync::Condvar;
     struct Capture {
         entered: Option<oneshot::Sender<String>>,
@@ -488,7 +496,7 @@ async fn corrective_rejected_capture_disposal_does_not_block_lower_owner() {
         .unwrap();
     let progress = tokio::time::timeout(
         Duration::from_millis(100),
-        f.lower.replicate(payload(2), Cancellation::default()),
+        f.state.replicate(payload(2), Cancellation::default()),
     )
     .await;
     *release.0.lock().unwrap() = true;

@@ -3,7 +3,7 @@
 
 //! Service Fabric V2 contracts and supported ordinary volatile A1 execution.
 //! [`VolatileTransactionalReplicator`] constructs the real runtime and primary
-//! provider registry over one normally constructed [`fube_data::FabricReplicator`].
+//! provider registry over one normally constructed public lower replicator.
 //! The service returns the actual common/primary transactional composite.
 //! Production and tests use public state/provider/operation/stream contracts
 //! plus normal settings/copy capability; no lower lifecycle, rebase, execution,

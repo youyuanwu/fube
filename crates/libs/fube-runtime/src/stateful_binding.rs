@@ -204,6 +204,45 @@ pub struct NativeInvocation {
 }
 impl NativeInvocation {
     #[cfg(test)]
+    pub(crate) fn invalidate_for_queue_test(&self, cause: &str) {
+        match cause {
+            "revision" => {
+                self.issued.revision.fetch_add(1, Ordering::AcqRel);
+            }
+            "generation" => {
+                self.unit
+                    .state
+                    .upgrade()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .generation += 1;
+            }
+            "actor" => {
+                *self.unit.actor.lock().unwrap() = Some(uuid::Uuid::new_v4());
+            }
+            "cancellation" => self.issued.cancellation.cancel(),
+            "remote" => {
+                let (node, _) = self.issued.remote.expect("remote-issued invocation");
+                self.unit
+                    .state
+                    .upgrade()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .remotes
+                    .get_mut(&node)
+                    .unwrap()
+                    .sequence += 1;
+            }
+            "authority" => self
+                .unit
+                .authority
+                .retire_at(std::time::Instant::now() + Duration::from_secs(10)),
+            _ => panic!("unknown invalidation cause"),
+        }
+    }
+    #[cfg(test)]
     pub(crate) fn same_instance(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.issued, &other.issued) && Arc::ptr_eq(&self.entered, &other.entered)
     }
@@ -664,6 +703,20 @@ pub(super) struct IssueInput {
     pub remote: Option<([u8; 16], u64)>,
     pub cancellation: Cancellation,
 }
+pub(crate) fn prewrite_projection(
+    status: &ReplicaDiagnostics,
+) -> Option<(NativeEpoch, NativeEpoch)> {
+    (status.lifecycle == ReplicaLifecycle::Open
+        && status.replicator_open
+        && status.current_role == ReplicaRole::ActiveSecondary
+        && status.service_role == ReplicaRole::Primary
+        && status.replicator_role == ReplicaRole::Primary
+        && status.configuration_stage == ConfigurationStage::PreWriteRevoke)
+        .then_some((
+            NativeEpoch::from(&status.current_epoch.primary()),
+            NativeEpoch::from(&status.previous_epoch.primary()),
+        ))
+}
 pub(super) fn issue(
     unit: &Unit,
     request: &w::ProxyRequest,
@@ -681,16 +734,7 @@ pub(super) fn issue(
     let state = unit.state.lock().unwrap();
     let native = state.native.as_ref().ok_or(Error::Closed)?;
     let status = state.status.lock().unwrap();
-    let prewrite = (status.lifecycle == ReplicaLifecycle::Open
-        && status.replicator_open
-        && status.current_role == ReplicaRole::ActiveSecondary
-        && status.service_role == ReplicaRole::Primary
-        && status.replicator_role == ReplicaRole::Primary
-        && status.configuration_stage == ConfigurationStage::PreWriteRevoke)
-        .then_some((
-            NativeEpoch::from(&status.current_epoch.primary()),
-            NativeEpoch::from(&status.previous_epoch.primary()),
-        ));
+    let prewrite = prewrite_projection(&status);
     let issued = Arc::new(Issued {
         is_current: AtomicBool::new(true),
         kind,

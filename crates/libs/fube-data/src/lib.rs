@@ -11,8 +11,10 @@
 //!
 //! # Provider integration
 //!
-//! Construct a [`FabricReplicator`] with explicit runtime-issued native
-//! integration for authority and callback/destructor supervision. Implement
+//! The runtime's generation-bound `create_replicator` helper composes
+//! [`hosting::ReplicatorFactory`] and retains its lower through public views.
+//! Native authority stays with the runtime adapter; callbacks/destructors use
+//! neutral host execution. Implement
 //! [`IStateProvider`] to reconcile authoritative history at epoch boundaries and
 //! return coherent inclusive-horizon copy state, including application retry identities.
 //! The provider is application state, not the quorum engine.
@@ -21,8 +23,8 @@
 //! getter or first Primary queries the actual provider tail, caches success only,
 //! and first Primary creates its initial queue at tail + 1. Opened catch-up
 //! capability is zero; initial secondary uses transmitted start, not a tail rebase.
-//! [`FabricReplicator::create`] defaults to classic copy;
-//! [`FabricReplicator::create_with_capabilities`] explicitly selects latest-assigned
+//! The runtime's `create_replicator` defaults to classic copy;
+//! `create_replicator_with_capabilities` explicitly selects latest-assigned
 //! copy through [`extensions::StateProviderCapabilities`], never SDK discovery.
 //!
 //! [`IStateReplicator::replicate`] admits a nonzero sequence; apply that accepted sequence to
@@ -41,13 +43,13 @@
 //! primary application state may lead its queue's reconciliation `applied`
 //! frontier; secondary receipt/application is not a global quorum proof.
 //! A Primary role or diagnostic `ready` alone cannot grant reads/writes: the
-//! application must also validate the current native partition's access,
-//! lifetime, epoch and host authority.
+//! lower independently checks public partition write access at submission and
+//! assignment; applications must also validate lifetime, read access and epoch.
 //!
 //! [`Settings`] enforces finite payload, queue, peer, copy and callback budgets.
 //! Resource errors are explicit, not unbounded waiting or silent eviction.
-//! [`fube_runtime::ErrorKind::ReplicationQueueFull`] is temporary admission
-//! pressure; [`fube_runtime::ErrorKind::ReplicationOperationTooLarge`] is permanent
+//! [`fube_core::ErrorKind::ReplicationQueueFull`] is temporary admission
+//! pressure; [`fube_core::ErrorKind::ReplicationOperationTooLarge`] is permanent
 //! sizing rejection. They preserve distinct native HRESULTs; generic resource
 //! exhaustion and display text are not a replication retry classifier.
 //! This Linux volatile profile has no durable restart, transactional stack,
@@ -90,7 +92,7 @@
 //! ```
 //! ```compile_fail
 //! fn getter_is_not_async(replicator: &dyn fube_data::IStateReplicator) {
-//!     let _: fube_runtime::ApiFuture<'_, std::sync::Arc<dyn fube_data::IOperationStream>>
+//!     let _: fube_core::ApiFuture<'_, std::sync::Arc<dyn fube_data::IOperationStream>>
 //!         = replicator.get_copy_stream();
 //! }
 //! ```
@@ -112,6 +114,7 @@ mod api;
 mod engine;
 pub mod extensions;
 mod fabric_replicator;
+pub mod hosting;
 mod owned_lifecycle;
 pub mod provider;
 mod queue;
@@ -130,5 +133,5 @@ pub use api::{
     Settings,
 };
 pub use fabric_replicator::FabricReplicator;
-pub use fube_runtime::{Cancellation, Epoch, Error, ReplicaRole, Result};
+pub use fube_core::{Cancellation, Epoch, Error, ReplicaRole, Result};
 pub use provider::{MemoryProvider, Mutation, ProviderSnapshot};

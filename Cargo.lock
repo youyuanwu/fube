@@ -328,8 +328,7 @@ dependencies = [
 name = "fube-data"
 version = "0.1.0"
 dependencies = [
- "fube-rap-test-support",
- "fube-runtime",
+ "fube-core",
  "fube-transport",
  "serde",
  "serde_json",
@@ -409,14 +408,18 @@ name = "fube-runtime"
 version = "0.1.0"
 dependencies = [
  "fube-core",
+ "fube-data",
  "fube-hosting",
  "fube-node",
  "fube-ra",
  "fube-ra-store",
+ "fube-rap-test-support",
+ "fube-runtime",
  "fube-transport",
  "libc",
  "roxmltree",
  "serde",
+ "serde_json",
  "tokio",
  "uuid",
 ]

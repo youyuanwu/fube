@@ -6,6 +6,181 @@ use crate::extensions::{
 };
 use std::time::Instant;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_runtime_control_check_rejects_revocation_at_actual_lower_queued_mutation() {
+    use crate::extensions::EpochDomains;
+    use fube_data::{
+        extensions::ReplicationEndpointOptions, hosting::MutationCheck, MemoryProvider,
+    };
+    for cause in [
+        "supersession",
+        "revision",
+        "generation",
+        "actor",
+        "cancellation",
+        "remote",
+        "authority",
+    ] {
+        let mut h = Harness::new().await;
+        let calls = register(&h);
+        let open = request(&h, 2, 1, 20);
+        h.send("ReplicaOpen", &open).await;
+        h.receive("ReplicaOpenReply").await;
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        let native = calls.partitions.lock().unwrap()[0].clone();
+        let actor = uuid::Uuid::new_v4();
+        let (partition, _) = native.observe_report().unwrap();
+        let constructor = native.clone();
+        let lower = native
+            .execution()
+            .try_reserve()
+            .unwrap()
+            .run_owned(move || {
+                constructor.create_replicator(
+                    partition,
+                    MemoryProvider::new(),
+                    None,
+                    ReplicationEndpointOptions {
+                        listen_address: "127.0.0.1:0".into(),
+                        actor_incarnation: actor,
+                    },
+                    Default::default(),
+                )
+            })
+            .await
+            .unwrap();
+        let epoch = native.status().unwrap().current_epoch.primary();
+        let common = lower.clone();
+        native
+            .execution()
+            .try_reserve()
+            .unwrap()
+            .run_future(async move {
+                common.open(Cancellation::default()).await?;
+                common
+                    .change_role(epoch, ReplicaRole::Primary, Cancellation::default())
+                    .await
+            })
+            .await
+            .unwrap();
+        let issued = Arc::new(Mutex::new(Vec::new()));
+        let binder: Arc<dyn NativeControlBinding> = Arc::new(CaptureBinder {
+            calls: calls.clone(),
+            issued: issued.clone(),
+            mode: 20,
+        });
+        native.install_binding(actor, &binder).unwrap();
+        calls.configuration_failure.store(true, Ordering::Release);
+        let mut target = peer(&open.local, 3);
+        target.replication_endpoint = fube_data::wire::Endpoint {
+            actor: fube_data::wire::Actor {
+                partition: native.identity().partition_id,
+                replica: target.id,
+                incarnation: uuid::Uuid::new_v4(),
+            },
+            address: "127.0.0.1:43210".into(),
+            transport_id: None,
+        }
+        .to_string();
+        let remote = cause == "remote";
+        if remote {
+            target.current_role = 2;
+            target.previous_role = 0;
+        }
+        let action = if remote {
+            "ReplicatorBuildIdleReplica"
+        } else {
+            "UpdateConfiguration"
+        };
+        let input = control(
+            &open,
+            action,
+            if remote {
+                vec![target]
+            } else {
+                vec![open.local.clone(), target]
+            },
+        );
+        h.send(action, &input).await;
+        h.receive(if remote {
+            "ReplicatorBuildIdleReplicaReply"
+        } else {
+            "UpdateConfigurationReply"
+        })
+        .await;
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        let proof = issued.lock().unwrap().last().unwrap().clone();
+        proof.validate().unwrap();
+        let data = lower.diagnostics();
+        let engine = data.engine_for_test();
+        let (held, holding) = std::sync::mpsc::sync_channel(1);
+        let (release, blocked) = std::sync::mpsc::sync_channel(1);
+        let shared = engine.shared.clone();
+        let lock = std::thread::spawn(move || {
+            let _guard = shared.admission.lock().unwrap();
+            held.send(()).unwrap();
+            blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        holding.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (enqueued, queued) = std::sync::mpsc::sync_channel(1);
+        *engine.shared.command_enqueued.lock().unwrap() = Some(enqueued);
+        let check: Arc<dyn MutationCheck> =
+            Arc::new(crate::replication::ControlCheck(proof.clone()));
+        let control = data.clone();
+        let command = if remote {
+            let target = crate::replication::project_descriptor(
+                &proof.replica().unwrap().descriptor().unwrap(),
+            );
+            native
+                .execution()
+                .try_reserve()
+                .unwrap()
+                .run_future(
+                    async move { control.build(target, Cancellation::default(), check).await },
+                )
+        } else {
+            let config =
+                crate::replication::project_configuration(proof.configuration().unwrap().0)
+                    .unwrap();
+            native
+                .execution()
+                .try_reserve()
+                .unwrap()
+                .run_owned(move || {
+                    control.configure(config, None, None, Cancellation::default(), check)
+                })
+        };
+        queued.recv_timeout(Duration::from_secs(2)).unwrap();
+        if cause == "supersession" {
+            h.send(action, &input).await;
+            h.receive("UpdateConfigurationReply").await;
+            h.engine.shared.stateful.wait_idle([2; 16]).await;
+            let replacement = issued.lock().unwrap().last().unwrap().clone();
+            assert!(proof.same_revision(&replacement));
+            replacement.validate().unwrap();
+        } else {
+            proof.invalidate_for_queue_test(cause);
+        }
+        assert!(proof.validate().is_err(), "{cause}");
+        release.send(()).unwrap();
+        lock.join().unwrap();
+        assert_eq!(
+            command.await.unwrap_err().kind(),
+            crate::ErrorKind::ObjectClosed,
+            "{cause}"
+        );
+        assert!(
+            engine.snapshot().peers.is_empty(),
+            "{cause} mutated lower membership"
+        );
+        assert_eq!(engine.snapshot().epoch, Some(epoch));
+        assert_eq!(engine.snapshot().progress.assigned, 0);
+        let lower = lower.clone();
+        // Close uses the already-owned terminal reservation even after revocation.
+        lower.close(Cancellation::default()).await.unwrap();
+    }
+}
+
 struct CaptureBinder {
     calls: Arc<StatefulCalls>,
     issued: Arc<Mutex<Vec<NativeInvocation>>>,

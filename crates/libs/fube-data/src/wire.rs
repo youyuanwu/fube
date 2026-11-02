@@ -28,7 +28,7 @@
 
 use std::{fmt, net::Ipv6Addr, str::FromStr};
 
-use fube_runtime::Epoch;
+use fube_core::Epoch;
 use fube_transport::{
     frame::MAX_FRAME_SIZE,
     message::{Header, Message, MessageId, ACTION, MESSAGE_ID},

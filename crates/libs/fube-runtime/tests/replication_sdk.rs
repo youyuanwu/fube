@@ -5,9 +5,9 @@ use fube_data::{
         EpochDomains, OperationOriginStream, ReplayCheckpointProvider, ReplicationEndpointOptions,
         ReplicatorDiagnostics, StateProviderCapabilities,
     },
-    Cancellation, Epoch, FabricReplicator, IOperation, IOperationDataStream, IOperationStream,
-    IStateProvider, IStateReplicator, MemoryProvider, Mutation, OperationData, OperationType,
-    ReplicationAdmission, Result, Settings,
+    Cancellation, Epoch, IOperation, IOperationDataStream, IOperationStream, IStateProvider,
+    IStateReplicator, MemoryProvider, Mutation, OperationData, OperationType, ReplicationAdmission,
+    Result, Settings,
 };
 use fube_runtime::{
     extensions::{
@@ -16,6 +16,7 @@ use fube_runtime::{
     },
     ApiFuture, ErrorKind, IPrimaryReplicator, IReplicator, IStatefulServiceFactory,
     IStatefulServicePartition, IStatefulServiceReplica, OpenMode, ReplicaRole,
+    RuntimeReplicator as FabricReplicator,
 };
 use std::{
     collections::VecDeque,
@@ -23,7 +24,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::oneshot;
-#[path = "support/upper_log.rs"]
+#[path = "../../fube-data/tests/support/upper_log.rs"]
 mod upper_log;
 
 use fube_rap_test_support as rap;
@@ -170,9 +171,8 @@ impl IStatefulServiceReplica for Replica {
                 ..Settings::default()
             };
             let fabric = if let Some(capabilities) = self.capabilities {
-                FabricReplicator::create_with_capabilities(
+                self.native.create_replicator_with_capabilities(
                     partition,
-                    self.native.clone(),
                     self.provider.clone(),
                     self.replay.clone(),
                     endpoint,
@@ -180,9 +180,8 @@ impl IStatefulServiceReplica for Replica {
                     capabilities,
                 )?
             } else {
-                FabricReplicator::create(
+                self.native.create_replicator(
                     partition,
-                    self.native.clone(),
                     self.provider.clone(),
                     self.replay.clone(),
                     endpoint,
@@ -707,6 +706,7 @@ async fn standard_provider_sync_shapes_one_owner_copy_gap_early_lsn_and_explicit
     let current = config(vec![], 1).sdk().unwrap();
     let outside_invocation = primary
         .fabric
+        .diagnostics()
         .execution_runtime()
         .try_reserve()
         .unwrap()
@@ -881,6 +881,7 @@ async fn standard_provider_sync_shapes_one_owner_copy_gap_early_lsn_and_explicit
     drop(third.completion);
     let origin: Arc<dyn OperationOriginStream> = secondary
         .fabric
+        .diagnostics()
         .get_replication_stream_with_origin()
         .unwrap();
     let original = origin

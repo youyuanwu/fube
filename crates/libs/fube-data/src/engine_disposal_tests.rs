@@ -1,5 +1,4 @@
 use super::*;
-use fube_runtime::extensions::CatchUpResult;
 
 #[tokio::test]
 async fn actual_owner_and_peer_ack_progress_while_entire_application_executor_is_stalled() {
@@ -170,32 +169,14 @@ async fn separately_optional_replay_final_arc_is_owned_until_actual_cleanup_not_
     execution.finish_standalone().await.unwrap();
 }
 
-impl NativeControlView for ExecutionView {
+impl FixtureControl for ExecutionView {
     fn execution(&self) -> Result<Option<ExecutionRuntime>> {
         Ok(Some(self.0.clone()))
     }
-    fn status(&self) -> Result<ReplicaStatus> {
-        Ok(ReplicaStatus {
-            lifecycle: ReplicaLifecycle::Open,
-            service_role: ReplicaRole::Unknown,
-            replicator_role: ReplicaRole::Unknown,
-            replicator_open: true,
-            current_role: ReplicaRole::Unknown,
-            current_epoch: EPOCH,
-            previous_epoch: Epoch::INVALID,
-            configuration_stage: ConfigurationStage::Current,
-            catch_up: CatchUpResult::NotStarted,
-            minimum_replica_set_size: 1,
-            configuration: Vec::new(),
-            service_address: String::new(),
-            replication_address: String::new(),
-            progress: ReplicationProgress::EMPTY,
-        })
+    fn observe(&self) -> Result<StableFacts> {
+        Ok(StableFacts::default())
     }
-    fn report_fault(
-        &self,
-        _: fube_runtime::FaultType,
-    ) -> ServiceFuture<'_, fube_runtime::extensions::FaultDelivery> {
+    fn report_fault(&self, _: fube_core::FaultType) -> ServiceFuture<'_, ()> {
         Box::pin(async { Err(Error::Closed) })
     }
 }
@@ -286,7 +267,7 @@ async fn delayed_command_disposal(configure: bool, cancelled: bool, closing: boo
     // Shared execution accounting only; this deliberately does not manufacture
     // native invocation authority or claim deployed qualification.
     let execution = ExecutionRuntime::standalone(tokio::runtime::Handle::current()).unwrap();
-    let view: Arc<dyn NativeControlView> = Arc::new(ExecutionView(execution.clone()));
+    let view: Arc<dyn FixtureControl> = Arc::new(ExecutionView(execution.clone()));
     let partition = Uuid::new_v4();
     let (entered, entered_rx) = tokio::sync::oneshot::channel();
     let (release, release_rx) = std_mpsc::sync_channel(1);
@@ -335,7 +316,6 @@ async fn delayed_command_disposal(configure: bool, cancelled: bool, closing: boo
     let mut replica = descriptor(&primary);
     replica.replica_id = 2;
     replica.address = remote.to_string();
-    replica.role = ReplicaRole::ActiveSecondary;
     if configure {
         primary
             .update_current_configuration(configuration(vec![replica.clone()], true, 1), cancel())
@@ -447,7 +427,7 @@ struct ReentryProvider {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deferred_remove_transfers_accepted_cleanup_at_full_shared64_after_enumeration() {
     let execution = ExecutionRuntime::standalone(tokio::runtime::Handle::current()).unwrap();
-    let view: Arc<dyn NativeControlView> = Arc::new(ExecutionView(execution.clone()));
+    let view: Arc<dyn FixtureControl> = Arc::new(ExecutionView(execution.clone()));
     let partition = Uuid::new_v4();
     let (dropped, drop_rx) = tokio::sync::oneshot::channel();
     let (release_drop, drop_gate) = std_mpsc::sync_channel(1);

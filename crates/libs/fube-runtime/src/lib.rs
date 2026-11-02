@@ -114,7 +114,15 @@ mod managed_participants;
 mod model_tests;
 mod package_context;
 mod packages;
+mod replication;
 mod reporting;
+pub use replication::RuntimeReplicator;
+#[cfg(feature = "test-hooks")]
+pub mod replication_testing {
+    pub use crate::replication::{
+        project_configuration, project_descriptor, NativeBuildPause, NativeRemovePause,
+    };
+}
 mod stateful;
 mod stateful_api;
 mod wire;

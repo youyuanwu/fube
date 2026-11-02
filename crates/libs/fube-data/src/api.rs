@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-use fube_runtime::{ApiFuture as ServiceFuture, Cancellation, Epoch, Error, Result};
+use fube_core::{ApiFuture as ServiceFuture, Cancellation, Epoch, Error, Result};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -87,7 +87,7 @@ impl OperationData {
         settings.validate()?;
         if segments.len() > settings.operation_segments {
             return Err(Error::new(
-                fube_runtime::ErrorKind::ReplicationOperationTooLarge,
+                fube_core::ErrorKind::ReplicationOperationTooLarge,
                 "operation segments",
             ));
         }
@@ -97,7 +97,7 @@ impl OperationData {
         })?;
         if bytes > settings.operation_bytes {
             return Err(Error::new(
-                fube_runtime::ErrorKind::ReplicationOperationTooLarge,
+                fube_core::ErrorKind::ReplicationOperationTooLarge,
                 "operation bytes",
             ));
         }
@@ -266,7 +266,7 @@ impl ReplicationCompletion {
             }
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Err(Error::new(fube_runtime::ErrorKind::Canceled, "replication completion wait canceled").uncertain()),
+                _ = cancellation.cancelled() => return Err(Error::new(fube_core::ErrorKind::Canceled, "replication completion wait canceled").uncertain()),
                 result = self.receiver.changed() => result.map_err(|_| Error::Closed)?,
             }
         }
@@ -275,7 +275,7 @@ impl ReplicationCompletion {
 
 /// An explicit, once-only acknowledgment. Drop/poll does not invoke it.
 /// A retired owner rejects late acknowledgments without reviving progress.
-pub(crate) struct Acknowledgment {
+pub struct Acknowledgment {
     acknowledged: AtomicBool,
     action: Box<dyn Fn() -> Result<()> + Send + Sync>,
 }
@@ -306,7 +306,7 @@ impl Acknowledgment {
 }
 
 #[derive(Debug)]
-pub(crate) struct Operation {
+pub struct Operation {
     pub sequence: i64,
     pub epoch: Epoch,
     pub data: OperationData,
@@ -337,7 +337,7 @@ impl IOperation for Operation {
 /// dispatch after eligible records, before waiting for service ACKs. A later
 /// secondary role needs freshly acquired views; old views never revive.
 /// Cancellation stops only that poll, not operation/replica ownership or ACKs.
-pub(crate) struct OperationStream {
+pub struct OperationStream {
     receiver: std::sync::Mutex<tokio::sync::mpsc::Receiver<Operation>>,
     poller: tokio::sync::Semaphore,
     stopped: Cancellation,

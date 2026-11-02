@@ -102,7 +102,7 @@ impl OperationQueue {
             || data.retained_bytes() > self.settings.queue_bytes
         {
             return Err(Error::new(
-                fube_runtime::ErrorKind::ReplicationOperationTooLarge,
+                fube_core::ErrorKind::ReplicationOperationTooLarge,
                 "replication operation limits",
             ));
         }
@@ -110,7 +110,7 @@ impl OperationQueue {
             || data.retained_bytes() > self.settings.queue_bytes.saturating_sub(self.bytes)
         {
             return Err(Error::new(
-                fube_runtime::ErrorKind::ReplicationQueueFull,
+                fube_core::ErrorKind::ReplicationQueueFull,
                 "replication queue",
             ));
         }
@@ -294,7 +294,7 @@ mod tests {
         let mut q = OperationQueue::new(s, 0).unwrap();
         assert_eq!(q.enqueue(E, data(1)).unwrap(), 1);
         let error = q.enqueue(E, data(2)).unwrap_err();
-        assert_eq!(error.kind(), fube_runtime::ErrorKind::ReplicationQueueFull);
+        assert_eq!(error.kind(), fube_core::ErrorKind::ReplicationQueueFull);
         assert_eq!(error.native_code(), Some(0x80071bcbu32 as i32 as i64));
         assert_eq!(q.progress().assigned, 1);
         q.commit(1).unwrap();
@@ -315,7 +315,7 @@ mod tests {
             let error = q.enqueue(E, oversized.clone()).unwrap_err();
             assert_eq!(
                 error.kind(),
-                fube_runtime::ErrorKind::ReplicationOperationTooLarge
+                fube_core::ErrorKind::ReplicationOperationTooLarge
             );
             assert_eq!(error.native_code(), Some(0x80071c2fu32 as i32 as i64));
             assert_eq!(q.progress().assigned, 0);
