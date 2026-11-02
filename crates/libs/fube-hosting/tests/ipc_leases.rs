@@ -842,13 +842,126 @@ async fn disconnected(server: &Server, lease: &HostLease) {
 }
 
 #[tokio::test]
+async fn terminal_consumer_loss_cannot_be_postponed_by_continuous_lease_traffic() {
+    struct Gate(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl fube_hosting::ipc::RegistrationConsumerGate for Gate {
+        fn is_accepting(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    let server = server(LOCAL_LEASE_DURATION);
+    let accepting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let owner = server
+        .registration_owner(Default::default())
+        .unwrap()
+        .with_consumer_gate(std::sync::Arc::new(Gate(accepting.clone())))
+        .unwrap();
+    let a = admission();
+    let lease = server
+        .admit_registration(&owner, a.clone(), vec!["Type".into()], "test")
+        .unwrap()
+        .lease;
+    let mut peer = Peer::connect(&server, a).await;
+    peer.bootstrap().await;
+    assert!(peer.poll().await.unwrap() > 0);
+    accepting.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        peer.poll().await.is_err(),
+        "terminal owner cannot grant another fresh poll"
+    );
+    disconnected(&server, &lease).await;
+    assert_eq!(server.status(&lease).unwrap().loss, Some(Loss::Authority));
+}
+
+#[tokio::test]
+async fn saturated_lifecycle_preserves_lease_ingress_and_stop_settles_accepted_send() {
+    let mut server = server(LOCAL_LEASE_DURATION);
+    let a = admission();
+    let lease = server.admit(a.clone()).unwrap();
+    let mut peer = Peer::connect(&server, a).await;
+    peer.bootstrap().await;
+    let mut blocked = None;
+    for _ in 0..200 {
+        let send = lease
+            .send_lifecycle("ReplicaOpen", vec![0; 64_000])
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        if send.result().is_none() {
+            blocked = Some(send);
+            break;
+        }
+        send.result().unwrap().unwrap();
+    }
+    let blocked = blocked.expect("actual TCP writer backpressure");
+    assert!(lease.send_lifecycle("ReplicaOpen", vec![]).is_err());
+    let poll = peer.frame(15, "", vec![]);
+    write_message(&mut peer.socket, &poll).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        server.status(&lease).unwrap().connected,
+        "lease ingress has independent byte headroom"
+    );
+    server.stop().unwrap();
+    assert!(
+        blocked.result().is_some(),
+        "accepted observation settles even if its task is dropped"
+    );
+    assert_eq!(server.status(&lease).unwrap().reserved_bytes, 512 * 1024);
+}
+
+#[tokio::test]
+async fn semantic_lifecycle_is_one_way_on_the_owned_session_and_allows_priority_reordering() {
+    let server = server(LOCAL_LEASE_DURATION);
+    let a = admission();
+    let lease = server.admit(a.clone()).unwrap();
+    let mut peer = Peer::connect(&server, a).await;
+    peer.bootstrap().await;
+    // The ordinary request obtains its ID first; reserved output can overtake
+    // it in the runtime's real shared writer. Force that wire order here.
+    let ordinary = peer.frame(15, "", vec![]);
+    let mut semantic = peer.frame(12, "ReplicaOpenReply", vec![7, 8]);
+    semantic
+        .headers
+        .retain(|h| h.id != EXPECTS_REPLY && h.id != fube_transport::message::TIMEOUT);
+    write_message(&mut peer.socket, &semantic).await.unwrap();
+    let result = peer.raw(ordinary).await.unwrap();
+    assert!(from_slice::<wire::LeaseReply>(&result.body).unwrap().ttl > 0);
+    let received = lease.take_lifecycle_reply().unwrap();
+    assert!(received.belongs_to(&lease));
+    assert_eq!(received.action().unwrap(), "ReplicaOpenReply");
+    assert_eq!(received.body(), &[7, 8]);
+    assert!(lease.take_lifecycle_reply().is_none());
+    // Only the lease had a correlated response. Lifecycle ingress emits none.
+    let send = lease.send_lifecycle("ReplicaClose", vec![9]).unwrap();
+    let request = read_message(&mut peer.socket).await.unwrap();
+    let p = request.properties().unwrap();
+    assert_eq!(p.actor, 12);
+    assert_eq!(p.action, "ReplicaClose");
+    assert!(!p.expects_reply);
+    assert_eq!(p.relates_to, MessageId::default());
+    assert_eq!(request.body, [9]);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while send.result().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    send.result().unwrap().unwrap();
+    // Replaying the same actual wire ID cannot regain admission.
+    write_message(&mut peer.socket, &semantic).await.unwrap();
+    disconnected(&server, &lease).await;
+    assert_eq!(server.status(&lease).unwrap().loss, Some(Loss::Protocol));
+}
+
+#[tokio::test]
 async fn finite_frames_and_registration_outcomes() {
     let mut server = server(LOCAL_LEASE_DURATION);
     let a = admission();
     let lease = server.admit(a.clone()).unwrap();
     let mut peer = Peer::connect(&server, a).await;
     peer.bootstrap().await;
-    assert_eq!(peer.finish().await, 0); // Native public/state split, not a fresh grant.
+    assert_eq!(peer.finish().await, 0);
     assert_eq!(peer.register().await, 0x80071d2fu32 as i32 as i64);
     for _ in 0..2 {
         assert!((1..=300_000_000).contains(&peer.poll().await.unwrap()));
