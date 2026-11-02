@@ -391,6 +391,9 @@ For shared raw I/O, the data adapter's tests are `transport::tests::` (or its fu
 library), not only the engine's separate `transport_tests::` source-grant tests.
 Accepted IPC policy lives in `native_ipc`; Hosting explicitly disposes withdrawn
 connections. No session role changes ordinary abort/close suffix ownership.
+Native-data reports retain every structured evidence field in compact JSON;
+the existing proof-input byte limit and full semantic/provenance validation
+still apply. Bounded console summaries are not substitutes for those reports.
 
 ### Separate release-native regression
 

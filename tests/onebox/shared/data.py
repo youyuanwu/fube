@@ -3556,7 +3556,8 @@ def main(argv=None) -> None:
         finalize(result)
         if report_file is not None:
             try:
-                json.dump(result, report_file, indent=2)
+                # Preserve all evidence; bounded proof bytes need no indentation.
+                json.dump(result, report_file, separators=(",", ":"))
                 report_file.flush()
                 os.fsync(report_file.fileno())
             except Exception as error:

@@ -2645,6 +2645,7 @@ class ReportingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / "report.json"
             result = {"profile": "rust", "errors": [], "cleanup": {}, "large_evidence": "X" * 100000,
+                      "nested_evidence": [{"text": "space \u7a7a", "values": [None, True, 17]}] * 64,
                       "scenarios": {name: {"status": "PASS"} for name in data.required_scenarios("rust")}}
             stdout = io.StringIO()
             with patch.object(sys, "argv", ["fube_data_test", "summary-model", "--prebuilt", directory,
@@ -2655,6 +2656,9 @@ class ReportingTests(unittest.TestCase):
                  patch.object(data.runtime, "destroy_owned") as destroy, contextlib.redirect_stdout(stdout):
                 data.main()
             self.assertEqual(json.loads(report.read_text())["large_evidence"], "X" * 100000)
+            self.assertEqual(json.loads(report.read_text()), result)
+            self.assertEqual(report.read_text(), json.dumps(result, separators=(",", ":")))
+            self.assertLess(report.stat().st_size, len(json.dumps(result, indent=2).encode()))
             self.assertEqual(json.loads(stdout.getvalue())["status"], "PASS")
             self.assertNotIn("large_evidence", stdout.getvalue())
             self.assertLess(len(stdout.getvalue()), 4000)
