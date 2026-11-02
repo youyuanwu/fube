@@ -14,7 +14,7 @@ use fube_transport::{
     native_demux::{
         ActorDemux, ActorRegistration, ChannelComposition, OutboundKind, RequestPolicy,
     },
-    Error, Result,
+    native_ipc, Error, Result,
 };
 use tokio::{
     sync::{mpsc, oneshot, watch, Mutex, Semaphore},
@@ -253,7 +253,7 @@ impl IpcChannel {
         handoff: Handoff,
         serving: Option<WritePredicate>,
     ) -> Result<Self> {
-        let channel = GatewayChannel::connect_ipc_clear(
+        let channel = native_ipc::connect_unsecured_loopback(
             address,
             composition()?,
             ChannelLimits {

@@ -36,14 +36,16 @@ fn composition() -> ChannelComposition {
 fn ipc_pair(capacity: usize) -> (GatewayChannel, DuplexStream) {
     let (stream, peer) = duplex(capacity);
     (
-        GatewayChannel::start_with_identity(
+        GatewayChannel::start_with_envelope(
             stream,
             "127.0.0.1:19000".parse().unwrap(),
             composition(),
             limits(),
             [100; 16],
             ListenInstance::default(),
-            Some(identity()),
+            Some(Arc::new(
+                crate::native_ipc::IpcSession::new("host", 42).unwrap(),
+            )),
         ),
         peer,
     )
@@ -64,8 +66,9 @@ fn command(index: u32, expects: bool) -> Message {
 #[tokio::test]
 async fn ipc_identity_is_automatic_but_original_context_reply_has_no_identity() {
     let (channel, mut peer) = ipc_pair(8192);
+    let sending_owner = channel.clone();
     let target = target(&channel);
-    let mut request = channel.request(&target, msg("Register", vec![]), deadline());
+    let mut request = sending_owner.request(&target, msg("Register", vec![]), deadline());
     pending(request.as_mut()).await;
     let sent = read_message(&mut peer).await.unwrap();
     assert_eq!(
@@ -99,7 +102,7 @@ async fn ipc_identity_is_automatic_but_original_context_reply_has_no_identity() 
     );
     assert!(!has(&sent, message::IPC));
     assert!(!has(&sent, message::MESSAGE_ID));
-    channel
+    sending_owner
         .send_one_way(&target, msg("SemanticReply", vec![]), deadline())
         .await
         .unwrap();
@@ -379,7 +382,7 @@ async fn ipc_connect_uses_listen_exchange_then_actual_host_pid_without_extra_hel
     use tokio::net::TcpListener;
     for host in ["", &"x".repeat(4097)] {
         assert!(matches!(
-            GatewayChannel::connect_ipc_clear(
+            crate::native_ipc::connect_unsecured_loopback(
                 "127.0.0.1:19000".parse().unwrap(),
                 composition(),
                 limits(),
@@ -436,7 +439,7 @@ async fn ipc_connect_uses_listen_exchange_then_actual_host_pid_without_extra_hel
         .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let channel = GatewayChannel::connect_ipc_clear(
+    let channel = crate::native_ipc::connect_unsecured_loopback(
         endpoint,
         composition(),
         limits(),
@@ -559,7 +562,7 @@ async fn repeated_valid_zero_progress_polls_do_not_commit_any_send_kind() {
 #[tokio::test]
 async fn reserved_semantic_sends_have_independent_finite_capacity_and_fences() {
     let (stream, mut peer) = duplex(8192);
-    let channel = GatewayChannel::start_with_identity(
+    let channel = GatewayChannel::start_with_envelope(
         stream,
         "127.0.0.1:19000".parse().unwrap(),
         composition(),
@@ -570,7 +573,9 @@ async fn reserved_semantic_sends_have_independent_finite_capacity_and_fences() {
         },
         [100; 16],
         ListenInstance::default(),
-        Some(identity()),
+        Some(Arc::new(
+            crate::native_ipc::IpcSession::new("host", 42).unwrap(),
+        )),
     );
     let target = target(&channel);
     let mut request = channel.request(&target, msg("Rpc", vec![]), deadline());
@@ -637,14 +642,16 @@ async fn ordered_ingress_handoff_timeout_preserves_first_terminal_cause() {
     let (stream, mut peer) = duplex(8192);
     let mut composition = composition();
     composition.ordered_ingress = true;
-    let channel = GatewayChannel::start_with_identity(
+    let channel = GatewayChannel::start_with_envelope(
         stream,
         "127.0.0.1:19000".parse().unwrap(),
         composition,
         limits(),
         [100; 16],
         ListenInstance::default(),
-        Some(identity()),
+        Some(Arc::new(
+            crate::native_ipc::IpcSession::new("host", 42).unwrap(),
+        )),
     );
     write_message(&mut peer, &command(1, true)).await.unwrap();
     // No receiver acknowledges handoff. Its independent finite bound expires.

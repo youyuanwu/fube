@@ -10,6 +10,7 @@ pub mod frame;
 pub mod message;
 pub mod native_channel;
 pub mod native_demux;
+pub mod native_ipc;
 pub mod routing;
 pub mod serialization;
 

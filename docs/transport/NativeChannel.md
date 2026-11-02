@@ -128,8 +128,10 @@ implementations for those roles.
 
 ## Runtime IPC composition
 
-`GatewayChannel::connect_ipc_clear` reuses the bounded TCP/ListenInstance exchange
-and captures a nonempty bounded host identity plus the actual OS PID. Numeric
+[`native_ipc::connect_unsecured_loopback`](../../crates/libs/fube-transport/src/native_ipc.rs)
+creates the IPC session above the shared channel, reuses its bounded
+TCP/ListenInstance exchange and captures a nonempty bounded host identity plus
+the actual OS PID. Numeric
 loopback/nonzero-port restrictions remain; the runtime additionally requires
 genuine node-injected activated single-code-package ExeHost context and rejects
 SSL/container/activator/nonactivated profiles. No TLS/claims fallback is added.
@@ -143,6 +145,16 @@ does not send a reconnect actor21 hello; reconnect remains unsupported.
 Caller-supplied IPC headers and explicit empty IPC MessageIds reject. Correlated
 context replies instead carry their original RelatesTo and **no automatic IPC
 identity or new MessageId**, matching the separate native receiver-context path.
+
+The generic channel has no IPC constructor or host/PID state. Its private,
+bounded session-envelope hook applies the captured protocol envelope on
+submission, including through cloned owners; it is not a public plugin or a
+domain executor. Collision-aware ID allocation/history, budgets and first-write
+fencing remain shared-driver mechanisms. The internal
+[`native_request_reply`](../../crates/libs/fube-transport/src/native_request_reply.rs)
+component owns the consuming source-bound reply context for both normal and
+special ingress. Runtime actor/action rules and control/health processing stay
+in the runtime adapter; only opaque ordering acknowledgments live below it.
 
 Native [IpcDemuxer](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/IpcDemuxer.cpp#L16-L32)
 builds contexts for ordinary actor ingress without testing ExpectsReply; native

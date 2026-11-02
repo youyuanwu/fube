@@ -1189,7 +1189,7 @@ conversion, UTF conversion and overlapping endpoint/slot copies are included
 in the conservative fixed slot. This is intentionally looser than actual memory
 usage. Unpolled futures and transferred values are caller-held. Notifications
 apply both their own channel profile and client accounting above; upload retains
-its independent Connection-specific limits.
+its independent upload-channel and protocol limits.
 
 The decoder skips unknown/deleted header records by their bounded record
 lengths. Effective common headers use the last visible occurrence; first
@@ -1450,7 +1450,8 @@ precedes reporting an embedded query error, so malformed required records remain
 Protocol rather than becoming fake domain success. Actor/action, Item/List
 invariants and owner policy remain outside the serializer. Ordinary failure
 decoding requires a nonzero code, accepts native code-only suffixes and rejects
-malformed present diagnostics; excluded Connection helpers retain their policy.
+malformed present diagnostics; runtime IPC and other domain-specific error
+policies remain separate.
 
 See the [backend contract and compiling example][native-serde],
 [transport payloads][serde-messages], [query DTOs][serde-query],

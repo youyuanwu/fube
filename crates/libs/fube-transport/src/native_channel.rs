@@ -4,7 +4,8 @@
 //! the retired legacy envelope-building APIs. Connect-time composition separates native
 //! actor ingress, ordinary correlation and authorized special duplex handling.
 //! Consumer actor/action/envelope authorization is supplied by client adapters.
-//! IPC identity and separately authorized normal-request replies are optional.
+//! IPC session envelopes are composed by [`crate::native_ipc`]; separately
+//! authorized normal-request replies are shared request/reply machinery.
 //! No listener, replication, TLS, reconnect or replay is supplied.
 //!
 //! Clear loopback is an explicit trust assumption, not authentication of local
@@ -41,6 +42,10 @@ use crate::{
 #[cfg(test)]
 #[path = "native_channel_tests.rs"]
 mod tests;
+
+#[path = "native_request_reply.rs"]
+mod request_reply;
+use request_reply::NativeReplyContext;
 
 const ORDINARY: usize = 0;
 const REPLY: usize = 1;
@@ -187,6 +192,12 @@ enum Outcome {
 /// not mutate/cancel this channel or perform I/O, blocking work or user callbacks.
 pub type WritePredicate = Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// Trusted, bounded session envelope preparation, never domain work or I/O.
+pub(crate) trait OutboundEnvelope: Send + Sync {
+    fn header(&self, message: &Message, original_reply: bool) -> Result<Option<Header>>;
+    fn requires_message_id(&self) -> bool;
+}
+
 /// Opaque completion acknowledgment and retained result reservation.
 ///
 /// An opted-in reader waits until acknowledgment/drop before delivering later
@@ -292,7 +303,7 @@ struct Shared {
     /// Serializes actual first-write progress with cancellation/termination.
     /// Separate from inner so validity samples can safely read diagnostics.
     visibility: Mutex<()>,
-    ipc_identity: Option<Header>,
+    outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
 }
 
 impl Shared {
@@ -419,38 +430,15 @@ impl GatewayChannel {
         limits: ChannelLimits,
         deadline: Instant,
     ) -> Result<Self> {
-        Self::connect(endpoint, composition, limits, deadline, None).await
+        Self::connect_with_envelope(endpoint, composition, limits, deadline, None).await
     }
 
-    /// Connect the existing clear-loopback IPC client profile.
-    ///
-    /// SF IpcClient::OnSending appends host/PID on requests and semantic
-    /// one-way sends, not ReceiverContext replies. No additional hello/ACK,
-    /// reconnect, DNS, authentication or security expansion is implied.
-    pub async fn connect_ipc_clear(
+    pub(crate) async fn connect_with_envelope(
         endpoint: SocketAddr,
         composition: ChannelComposition,
         limits: ChannelLimits,
         deadline: Instant,
-        host_id: &str,
-    ) -> Result<Self> {
-        if host_id.is_empty() || host_id.len() > 4096 {
-            return Err(Error::InvalidInput("IPC requires bounded nonempty host ID"));
-        }
-        let identity = Header::object(message::IPC, |e| {
-            e.string(host_id)?;
-            e.u32(std::process::id());
-            Ok(())
-        })?;
-        Self::connect(endpoint, composition, limits, deadline, Some(identity)).await
-    }
-
-    async fn connect(
-        endpoint: SocketAddr,
-        composition: ChannelComposition,
-        limits: ChannelLimits,
-        deadline: Instant,
-        ipc_identity: Option<Header>,
+        outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
     ) -> Result<Self> {
         limits.validate()?;
         if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
@@ -481,14 +469,14 @@ impl GatewayChannel {
         .await
         .map_err(|_| Error::Timeout)??;
         check_deadline(deadline)?;
-        Ok(Self::start_with_identity(
+        Ok(Self::start_with_envelope(
             stream,
             endpoint,
             composition,
             limits,
             process_id,
             remote,
-            ipc_identity,
+            outbound_envelope,
         ))
     }
 
@@ -501,7 +489,7 @@ impl GatewayChannel {
         process_id: [u8; 16],
         remote: ListenInstance,
     ) -> Self {
-        Self::start_with_identity(
+        Self::start_with_envelope(
             stream,
             endpoint,
             composition,
@@ -513,14 +501,14 @@ impl GatewayChannel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start_with_identity<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    fn start_with_envelope<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         stream: S,
         endpoint: SocketAddr,
         composition: ChannelComposition,
         limits: ChannelLimits,
         process_id: [u8; 16],
         remote: ListenInstance,
-        ipc_identity: Option<Header>,
+        outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
     ) -> Self {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
@@ -553,7 +541,7 @@ impl GatewayChannel {
             stop: Notify::new(),
             stopped: watch::channel(false).0,
             visibility: Mutex::new(()),
-            ipc_identity,
+            outbound_envelope,
         });
         let join = tokio::spawn(drive(stream, shared.clone()));
         Self {
@@ -938,13 +926,10 @@ async fn submit(
     if crate::native_demux::is_control(props.actor) || has(&message, message::IPC) {
         return Err(Error::InvalidInput("reserved native transport envelope"));
     }
-    if shared.ipc_identity.is_some()
-        && has(&message, message::MESSAGE_ID)
-        && props.id == MessageId::default()
-        && !matches!(submission, Submission::Reply(..))
-    {
-        return Err(Error::InvalidInput("explicitly empty IPC MessageId"));
-    }
+    let session_header = match &shared.outbound_envelope {
+        Some(envelope) => envelope.header(&message, matches!(submission, Submission::Reply(..)))?,
+        None => None,
+    };
     match submission {
         Submission::Raw => (shared.composition.outbound)(&message, &props, OutboundKind::Raw)?,
         Submission::Reserved => {
@@ -991,11 +976,14 @@ async fn submit(
         }
         Submission::Raw | Submission::Reserved => {}
     }
-    if !matches!(submission, Submission::Reply(..)) {
-        if let Some(identity) = &shared.ipc_identity {
-            message.headers.push(identity.clone());
-        }
+    if let Some(header) = session_header {
+        message.headers.push(header);
     }
+    let requires_id = rpc
+        || shared
+            .outbound_envelope
+            .as_ref()
+            .is_some_and(|envelope| envelope.requires_message_id());
     let lease = shared.budget.reserve(class)?;
     let token;
     {
@@ -1009,10 +997,7 @@ async fn submit(
             return Err(Error::Closed);
         }
         let mut id = (props.id != MessageId::default()).then_some(props.id);
-        if (rpc || shared.ipc_identity.is_some())
-            && id.is_none()
-            && !matches!(submission, Submission::Reply(..))
-        {
+        if requires_id && id.is_none() && !matches!(submission, Submission::Reply(..)) {
             loop {
                 let Some(next) = inner.next_index.checked_add(1) else {
                     drop(tracked);
@@ -1198,56 +1183,6 @@ impl RpcChannel for GatewayChannel {
     }
 }
 
-struct DuplexReply {
-    shared: Weak<Shared>,
-    target: Arc<GatewayTarget>,
-    id: MessageId,
-    authorize: EnvelopeValidator,
-}
-
-impl ReplyContext for DuplexReply {
-    fn reply(self: Box<Self>, message: Message, deadline: Instant) -> ChannelFuture<'static, ()> {
-        self.reply_inner(message, deadline, None)
-    }
-
-    fn reply_fenced(
-        self: Box<Self>,
-        message: Message,
-        deadline: Instant,
-        valid: WritePredicate,
-    ) -> ChannelFuture<'static, ()> {
-        self.reply_inner(message, deadline, Some(valid))
-    }
-}
-
-impl DuplexReply {
-    fn reply_inner(
-        self: Box<Self>,
-        message: Message,
-        deadline: Instant,
-        valid: Option<WritePredicate>,
-    ) -> ChannelFuture<'static, ()> {
-        Box::pin(async move {
-            let shared = self.shared.upgrade().ok_or(Error::Closed)?;
-            match submit(
-                &shared,
-                &self.target,
-                message,
-                deadline,
-                Submission::Reply(self.id, self.authorize),
-                None,
-                valid,
-                false,
-            )
-            .await?
-            {
-                Outcome::Written => Ok(()),
-                _ => unreachable!(),
-            }
-        })
-    }
-}
-
 impl GatewayReceiver {
     fn transfer(shared: &Arc<Shared>, ingress: Ingress) -> IncomingMessage<GatewayTarget> {
         IncomingMessage {
@@ -1259,7 +1194,7 @@ impl GatewayReceiver {
             }),
             source: shared.target.clone(),
             reply: ingress.reply_id.map(|id| {
-                Box::new(DuplexReply {
+                Box::new(NativeReplyContext {
                     shared: Arc::downgrade(shared),
                     target: shared.target.clone(),
                     id,

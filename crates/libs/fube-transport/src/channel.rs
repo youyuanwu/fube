@@ -9,9 +9,10 @@
 //! Client/runtime adapters install
 //! domain actor/action/envelope rules through [`native_demux`](crate::native_demux).
 //! Actor registration alone grants neither outbound nor reply authority.
-//! IPC identity is an explicit clear-loopback opt-in, not a general listener,
-//! replication or secure transport implementation. Legacy Connection is retired;
-//! runtime domain policy remains above this foundation.
+//! IPC identity belongs to the explicit [`native_ipc`](crate::native_ipc)
+//! session composition, not the generic channel constructor. This is not a
+//! general listener, replication or secure transport implementation. Legacy
+//! Connection is retired; runtime domain policy remains above this foundation.
 //!
 //! # Native component boundary (source facts)
 //!
