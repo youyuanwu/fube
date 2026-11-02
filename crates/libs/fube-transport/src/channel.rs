@@ -5,12 +5,13 @@
 //! foundation, **not** an `IFabricTransport` application-service API or an SF ABI.
 //! [`GatewayChannel`](crate::native_channel::GatewayChannel) implements raw/RPC
 //! and owned shutdown; its configured receiver and consuming context implement
-//! authorized actor ingress and special duplex replies. Client adapters install
+//! authorized actor ingress, distinct normal-request and special duplex replies.
+//! Client/runtime adapters install
 //! domain actor/action/envelope rules through [`native_demux`](crate::native_demux).
 //! Actor registration alone grants neither outbound nor reply authority.
-//! This is not a general listener/IPC/replication or secure transport implementation.
-//! The retired legacy Connection did not implement these traits;
-//! its unrelated IPC/reverse behavior and security limits remain unchanged.
+//! IPC identity is an explicit clear-loopback opt-in, not a general listener,
+//! replication or secure transport implementation. Legacy Connection is retired;
+//! runtime domain policy remains above this foundation.
 //!
 //! # Native component boundary (source facts)
 //!

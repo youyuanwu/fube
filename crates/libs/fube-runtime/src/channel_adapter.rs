@@ -7,7 +7,7 @@
 use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 
 use fube_transport::{
-    channel::{MessageChannel, MessageReceiver, ReplyContext, RpcChannel},
+    channel::{MessageChannel, MessageReceiver, ReplyContext},
     connection::MAX_FRAME_TIME,
     message::{Header, Message, MessageId, Properties},
     native_channel::{ChannelLimits, GatewayChannel, GatewayTarget, WritePredicate},
@@ -229,6 +229,7 @@ struct Owner {
     work: mpsc::Sender<Work>,
     slots: Arc<Semaphore>,
     ordinary: Arc<Semaphore>,
+    serving: Option<WritePredicate>,
     driver: Mutex<Option<JoinHandle<()>>>,
     stopped: watch::Receiver<bool>,
 }
@@ -250,6 +251,7 @@ impl IpcChannel {
         deadline: Instant,
         host_id: &str,
         handoff: Handoff,
+        serving: Option<WritePredicate>,
     ) -> Result<Self> {
         let channel = GatewayChannel::connect_ipc_clear(
             address,
@@ -325,6 +327,7 @@ impl IpcChannel {
             work: send,
             slots,
             ordinary,
+            serving,
             driver: Mutex::new(Some(driver)),
             stopped: observed,
         })))
@@ -407,14 +410,23 @@ impl IpcChannel {
             .map_err(|_| Error::Timeout)?
             .map_err(|_| Error::Closed)?;
         // Build remaining TimeoutHeader after admission, never extend deadline.
-        self.0
-            .channel
-            .request(
-                &self.0.target,
-                Self::request_message(action, actor, headers, body, deadline)?,
-                deadline,
-            )
-            .await
+        // Cleanup has a distinct already-admitted authority: serving retirement
+        // must not suppress the unregister exchanges needed to quiesce.
+        let valid = if matches!(
+            action,
+            "UnregisterFabricRuntimeRequest" | "UnregisterApplicationHostRequest"
+        ) {
+            None
+        } else {
+            self.0.serving.clone()
+        };
+        let (request, _observation) = self.0.channel.request_tracked_fenced(
+            &self.0.target,
+            Self::request_message(action, actor, headers, body, deadline)?,
+            deadline,
+            valid,
+        );
+        request.await
     }
 
     /// Runtime-owned bounded decoding is polled independently of its observer.

@@ -747,7 +747,8 @@ impl Harness {
                 address,
                 deadline_after(Duration::from_secs(2)).unwrap(),
                 &activation.host_id,
-                handler
+                handler,
+                None
             ),
             async {
                 let (mut stream, _) = listener.accept().await.unwrap();
