@@ -9,3 +9,6 @@ fube-runtime.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+fube-rap-test-support.workspace = true

@@ -2,6 +2,7 @@
 use super::*;
 use fube_runtime::{ErrorKind, ReplicaSetQuorumMode};
 
+#[cfg(test)]
 pub(super) struct NativeBinder(pub Weak<Engine>);
 pub(super) struct NativeProgress(pub Weak<Engine>);
 impl fube_runtime::extensions::NativeProgressSource for NativeProgress {
@@ -9,6 +10,7 @@ impl fube_runtime::extensions::NativeProgressSource for NativeProgress {
         self.0.upgrade().ok_or(Error::Closed)?.progress()
     }
 }
+#[cfg(test)]
 impl NativeControlBinding for NativeBinder {
     fn bind_invocation(&self, proof: NativeInvocation) -> Result<Arc<dyn IPrimaryReplicator>> {
         proof.validate()?;
@@ -21,7 +23,6 @@ impl NativeControlBinding for NativeBinder {
                 "native invocation does not bind this engine",
             ));
         }
-        #[cfg(test)]
         if engine.native_root_dispatch.load(Ordering::Acquire)
             && proof.kind() != NativeInvocationKind::Remove(ReplicaRemoval::BuildRetryCleanup)
         {
@@ -30,13 +31,14 @@ impl NativeControlBinding for NativeBinder {
         Ok(Arc::new(BoundControl { engine, proof }))
     }
 }
+#[cfg(test)]
 struct BoundControl {
     engine: Arc<Engine>,
     proof: NativeInvocation,
 }
 
 impl Engine {
-    fn native_required(&self) -> Result<&NativeRuntimeIntegration> {
+    pub(super) fn native_required(&self) -> Result<&NativeRuntimeIntegration> {
         self.native_runtime.as_ref().ok_or_else(|| {
             Error::new(
                 ErrorKind::Unsupported,
@@ -213,6 +215,10 @@ impl Engine {
         let native_prewrite = Self::proof_prewrite(&proof);
         let cancellation = proof.cancellation();
         proof.enter()?;
+        #[cfg(test)]
+        {
+            *self.native_configuration.lock().unwrap() = Some(proof.clone());
+        }
         self.request_blocking(Some(proof), |reply| Command::Configure {
             current,
             previous,
@@ -328,6 +334,14 @@ impl IReplicator for Engine {
     fn get_catch_up_capability(&self) -> Result<i64> {
         #[cfg(test)]
         self.scalar_progress_reads.fetch_add(1, Ordering::SeqCst);
+        if self.native_runtime.is_some() && self.snapshot().role == ReplicaRole::Unknown {
+            self.check()?;
+            if !self.shared.opened.load(Ordering::Acquire) {
+                return Err(Error::InvalidInput("replicator is not Opened"));
+            }
+            self.native_required()?.validate()?;
+            return Ok(0);
+        }
         Ok(self.progress()?.first)
     }
     fn abort(&self) {
@@ -388,6 +402,7 @@ impl IPrimaryReplicator for Engine {
         self.remove_sync(replica_id, None)
     }
 }
+#[cfg(test)]
 impl IReplicator for BoundControl {
     fn open(&self, cancel: Cancellation) -> ServiceFuture<'_, String> {
         IReplicator::open(&*self.engine, cancel)
@@ -416,6 +431,7 @@ impl IReplicator for BoundControl {
         IReplicator::abort(&*self.engine);
     }
 }
+#[cfg(test)]
 impl IPrimaryReplicator for BoundControl {
     fn on_data_loss(&self, cancel: Cancellation) -> ServiceFuture<'_, bool> {
         self.engine.on_data_loss(cancel)

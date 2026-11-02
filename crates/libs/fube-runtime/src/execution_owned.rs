@@ -231,6 +231,7 @@ pub(super) struct Scope {
     completed: Condvar,
     pending_results: AtomicUsize,
     publications: Mutex<Vec<std::sync::Weak<dyn Publication>>>,
+    invocation: Option<InvocationAssociation>,
 }
 impl Scope {
     fn new(
@@ -238,16 +239,18 @@ impl Scope {
         parent: Option<Arc<Scope>>,
         origin: CallOrigin,
         until: Instant,
+        invocation: Option<InvocationAssociation>,
     ) -> Arc<Self> {
-        Self::new_reserved(active, parent, origin, until, false)
+        Self::new_reserved(active, parent, origin, until, false, invocation)
     }
     fn callback(
         active: Arc<Active>,
         parent: Option<Arc<Scope>>,
         origin: CallOrigin,
         until: Instant,
+        invocation: Option<InvocationAssociation>,
     ) -> Arc<Self> {
-        Self::new_kind(active, parent, origin, until, false, false)
+        Self::new_kind(active, parent, origin, until, false, false, invocation)
     }
     fn new_reserved(
         active: Arc<Active>,
@@ -255,8 +258,17 @@ impl Scope {
         origin: CallOrigin,
         until: Instant,
         parent_reserved: bool,
+        invocation: Option<InvocationAssociation>,
     ) -> Arc<Self> {
-        Self::new_kind(active, parent, origin, until, parent_reserved, true)
+        Self::new_kind(
+            active,
+            parent,
+            origin,
+            until,
+            parent_reserved,
+            true,
+            invocation,
+        )
     }
     fn new_kind(
         active: Arc<Active>,
@@ -265,7 +277,11 @@ impl Scope {
         until: Instant,
         parent_reserved: bool,
         cleanup: bool,
+        mut invocation: Option<InvocationAssociation>,
     ) -> Arc<Self> {
+        if let Some(association) = &mut invocation {
+            association.capture &= !cleanup;
+        }
         if !parent_reserved {
             if let Some(parent) = &parent {
                 parent.add();
@@ -287,6 +303,7 @@ impl Scope {
             completed: Condvar::new(),
             pending_results: AtomicUsize::new(0),
             publications: Mutex::new(Vec::new()),
+            invocation,
         });
         active.scopes.lock().unwrap().push(Arc::downgrade(&scope));
         active.refresh();
@@ -325,6 +342,7 @@ impl Scope {
             scope: Some(self.clone()),
             cleanup,
             release_budget: None,
+            invocation: self.invocation.clone(),
         })
     }
     fn fail(&self, error: Error) {
@@ -507,6 +525,7 @@ struct PendingPublication {
     active: Arc<Active>,
     scope: Option<Arc<Scope>>,
     until: Instant,
+    invocation: Option<InvocationAssociation>,
 }
 impl Drop for PendingPublication {
     fn drop(&mut self) {
@@ -528,7 +547,12 @@ struct ReleaseSlot<T: Send + 'static> {
     releasing: AtomicBool,
 }
 impl<T: Send + 'static> ReleaseSlot<T> {
-    fn set_pending(self: &Arc<Self>, active: Arc<Active>, scope: Option<Arc<Scope>>) {
+    fn set_pending(
+        self: &Arc<Self>,
+        active: Arc<Active>,
+        scope: Option<Arc<Scope>>,
+        invocation: Option<InvocationAssociation>,
+    ) {
         let until = scope
             .as_ref()
             .map_or_else(|| active.until(), |scope| scope.until.min(active.until()));
@@ -547,6 +571,7 @@ impl<T: Send + 'static> ReleaseSlot<T> {
             active,
             scope,
             until,
+            invocation,
         });
     }
 }
@@ -604,6 +629,7 @@ impl<T: Send + 'static> Drop for ManagedObject<T> {
                 parent,
                 slot.origin,
                 until,
+                pending.invocation.clone(),
             ))
         } else {
             slot.runtime.disposal_scope(slot.origin, None)
@@ -759,6 +785,7 @@ impl CommandCleanup {
             scope: Some(self.scope.clone()),
             cleanup: true,
             release_budget: Some(Duration::from_millis(250)),
+            invocation: self.scope.invocation.clone(),
         };
         context.cleanup = true;
         Entry::scoped(context)
@@ -779,6 +806,7 @@ impl DeferredCleanup {
             parent.origin,
             (Instant::now() + self.budget).min(parent.until),
             true,
+            parent.invocation.clone(),
         );
         CleanupPermit {
             runtime: self.runtime.clone(),
@@ -967,6 +995,21 @@ impl ExecutionRuntime {
                 .is_some_and(|entry| Arc::ptr_eq(&entry.active.authority, &self.inner.authority))
         })
     }
+    /// Observe this owned call's absolute deadline, including a retained
+    /// non-authorizing cleanup context. This grants neither invocation capture
+    /// nor permission to perform canonical synchronous waiting operations.
+    pub fn current_deadline(&self) -> Result<Instant> {
+        ENTRY.with(|entry| match entry.borrow().as_ref() {
+            Some(entry) if Arc::ptr_eq(&entry.active.authority, &self.inner.authority) => Ok(entry
+                .scope
+                .as_ref()
+                .map_or_else(|| entry.active.until(), |scope| scope.until)),
+            _ => Err(Error::new(
+                crate::ErrorKind::InvalidExecutionContext,
+                "owned deadline owner mismatch",
+            )),
+        })
+    }
     /// Absolute deadline for a canonical synchronous waiting operation. This
     /// accepts only this owner's supervised entry, never an arbitrary async
     /// worker. It neither reserves recursively nor extends the enclosing budget.
@@ -1064,7 +1107,13 @@ impl ExecutionRuntime {
                 .min(
                     budget.map_or_else(|| parent.active.until(), |budget| Instant::now() + budget),
                 );
-            return Ok(Scope::new(parent.active, parent.scope, origin, until));
+            return Ok(Scope::new(
+                parent.active,
+                parent.scope,
+                origin,
+                until,
+                parent.invocation,
+            ));
         }
         let budget = budget
             .unwrap_or(Duration::from_millis(250))
@@ -1093,8 +1142,15 @@ impl ExecutionRuntime {
             cleanup_owner: Some(self.inner.cleanup_owners.clone()),
             scopes: Mutex::new(Vec::new()),
             cleanup_ready: Arc::new(Semaphore::new(1)),
+            invocation: None,
         });
-        Ok(Scope::new(active, None, origin, Instant::now() + budget))
+        Ok(Scope::new(
+            active,
+            None,
+            origin,
+            Instant::now() + budget,
+            None,
+        ))
     }
     pub fn command_cleanup(&self) -> Option<CommandCleanup> {
         let parent = ENTRY.with(|entry| {
@@ -1109,7 +1165,13 @@ impl ExecutionRuntime {
             .as_ref()
             .map_or_else(|| parent.active.until(), |scope| scope.until);
         Some(CommandCleanup {
-            scope: Scope::callback(parent.active, parent.scope, parent.origin, until),
+            scope: Scope::callback(
+                parent.active,
+                parent.scope,
+                parent.origin,
+                until,
+                parent.invocation,
+            ),
         })
     }
     pub fn reserve_cleanup(&self, budget: Duration) -> Result<CleanupPermit> {
@@ -1179,7 +1241,9 @@ impl ExecutionRuntime {
                 "construction requires an owned callback",
             ))?;
         let ticket = self.reserve_object_with_origin(quota, tracker, origin)?;
-        ticket.slot.set_pending(entry.active, entry.scope);
+        ticket
+            .slot
+            .set_pending(entry.active, entry.scope, entry.invocation);
         Ok(ConstructionReservation { slot: ticket.slot })
     }
     pub fn reserve_object_with_origin<T: Send + 'static>(
@@ -1275,7 +1339,13 @@ impl ExecutionRuntime {
         let _running = Running(self.inner.clone());
         let context = ENTRY.with(|entry| entry.borrow().as_ref().unwrap().clone());
         let until = (Instant::now() + timeout).min(context.active.until());
-        let scope = Scope::callback(context.active, context.scope, context.origin, until);
+        let scope = Scope::callback(
+            context.active,
+            context.scope,
+            context.origin,
+            until,
+            context.invocation,
+        );
         let mut future = Box::pin(ScopedFuture {
             inner: Some(Box::pin(operation)),
             scope: scope.clone(),
@@ -1308,7 +1378,9 @@ impl OwnedCallPermit {
                 .filter(|entry| Arc::ptr_eq(&entry.active.authority, &self.active.authority))
                 .and_then(|entry| entry.scope.clone())
         });
-        ticket.slot.set_pending(self.active.clone(), scope);
+        ticket
+            .slot
+            .set_pending(self.active.clone(), scope, self.active.invocation.clone());
         Ok(ConstructionReservation { slot: ticket.slot })
     }
 }

@@ -1,5 +1,5 @@
 use super::*;
-use fube_data::qualification as rap_model;
+use fube_rap_test_support as rap_model;
 fn host(route: &Arc<Route>) -> Arc<rap_model::Host> {
     route.native_host.as_ref().unwrap().clone()
 }

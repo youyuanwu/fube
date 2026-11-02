@@ -21,6 +21,9 @@ pub struct UpperLog {
     pub constructed: AtomicBool,
     pub queried_before_return: AtomicBool,
     pub horizons: Mutex<Vec<i64>>,
+    pub fail_next_getter: AtomicBool,
+    pub bad_next_getter: AtomicBool,
+    pub fail_next_epoch: AtomicBool,
 }
 impl UpperLog {
     pub fn new(epoch: Epoch, tail: i64) -> Arc<Self> {
@@ -42,6 +45,9 @@ impl UpperLog {
             constructed: AtomicBool::new(false),
             queried_before_return: AtomicBool::new(false),
             horizons: Mutex::new(Vec::new()),
+            fail_next_getter: AtomicBool::new(false),
+            bad_next_getter: AtomicBool::new(false),
+            fail_next_epoch: AtomicBool::new(false),
         });
         for sequence in 2..=tail {
             log.append(
@@ -106,6 +112,12 @@ impl IOperationDataStream for Payloads {
 impl IStateProvider for UpperLog {
     fn get_last_committed_sequence_number(&self) -> Result<i64> {
         self.getters.fetch_add(1, Ordering::AcqRel);
+        if self.fail_next_getter.swap(false, Ordering::AcqRel) {
+            return Err(Error::new(ErrorKind::InvalidState, "unopened upper log"));
+        }
+        if self.bad_next_getter.swap(false, Ordering::AcqRel) {
+            return Ok(-1);
+        }
         if !self.constructed.load(Ordering::Acquire) {
             self.queried_before_return.store(true, Ordering::Release);
         }
@@ -122,6 +134,12 @@ impl IStateProvider for UpperLog {
                 return Err(Error::Closed);
             }
             self.updates.fetch_add(1, Ordering::AcqRel);
+            if self.fail_next_epoch.swap(false, Ordering::AcqRel) {
+                return Err(Error::new(
+                    ErrorKind::InvalidState,
+                    "controlled initial epoch failure",
+                ));
+            }
             let mut represented = self.epoch.lock().unwrap();
             if epoch == *represented {
                 return Ok(());

@@ -170,7 +170,9 @@ connection establishment. Native AtomicCopy replaces the destination directory
 and publishes completion markers after its contents; failure is not rollback.
 Only native `fabric:ImageStore` through an explicitly unsecured numeric-loopback
 gateway with a nonzero port is supported. Upload owns a separate native
-GatewayChannel; ACK decoding and package policy stay in the client.
+GatewayChannel; ACK decoding and package policy stay in the client. Client adapters
+install envelope authorization and raw ACK actor registrations; the channel's
+native actor demux is independent of gateway/upload protocol values.
 See [Rust FabricClient](transport/RustFabricClient.md) for the
 library API, transfer limits and cancellation behavior.
 

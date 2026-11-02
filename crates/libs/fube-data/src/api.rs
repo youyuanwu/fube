@@ -140,8 +140,11 @@ pub trait IOperationDataStream: Send + Sync + 'static {
 /// reserves callback/capture ownership before invoking application code; an
 /// application that calls its provider directly owns that invocation itself.
 pub trait IStateProvider: Send + Sync + 'static {
-    /// Synchronous fallible provider progress, queried during lower construction
-    /// before its later Open. Initialize the provider before constructing it.
+    /// Synchronous fallible provider progress, queried at the native Opened
+    /// current-progress getter or first Primary, not normal construction/Open.
+    /// A composite initializes its upper log after lower Open and before these
+    /// callers. Successful initial results are cached; ordinary getter errors
+    /// retry, while first-Primary failure faults lower before upper role.
     /// MemoryProvider reports local application; a logging provider reports its
     /// actual log tail, not stable/visible transaction progress or durable commit.
     fn get_last_committed_sequence_number(&self) -> Result<i64>;

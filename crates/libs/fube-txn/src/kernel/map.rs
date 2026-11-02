@@ -43,6 +43,8 @@ struct Links {
 /// The immutable record has the authoritative assigned/replayed LSN. Context
 /// ownership is independent of map state and never silently erased on failure.
 pub(crate) struct RecordNode {
+    epoch: Mutex<crate::Epoch>,
+    retention: Mutex<Option<Arc<super::memory_log::Retention>>>,
     /// Native logical fields; links and captures are not wire metadata.
     record: Record,
     /// Optional shared primary/replay transaction passed to provider Apply.
@@ -76,6 +78,11 @@ impl RecordNode {
             return Err(Error::InvalidInput("capture on nonoperation record"));
         }
         Ok(Arc::new(Self {
+            epoch: Mutex::new(crate::Epoch {
+                data_loss_number: 0,
+                configuration_number: 0,
+            }),
+            retention: Mutex::new(None),
             record,
             transaction,
             links: Mutex::new(Links::default()),
@@ -87,6 +94,15 @@ impl RecordNode {
     /// Borrow immutable native fields.
     pub(crate) fn record(&self) -> &Record {
         &self.record
+    }
+    pub(crate) fn epoch(&self) -> crate::Epoch {
+        *self.epoch.lock().unwrap()
+    }
+    pub(crate) fn set_epoch(&self, epoch: crate::Epoch) {
+        *self.epoch.lock().unwrap() = epoch;
+    }
+    pub(crate) fn retain_memory(&self, retention: Arc<super::memory_log::Retention>) {
+        *self.retention.lock().unwrap() = Some(retention);
     }
 
     /// Observe authoritative assigned/replayed operation LSN.
@@ -258,7 +274,7 @@ pub(crate) struct TransactionMap {
     /// All transaction indexes, not a partition-wide write lease.
     state: Mutex<MapState>,
     /// Bounded replay/copy seam; does not implement persisted recovery.
-    covered_prefix: SequenceNumber,
+    covered_prefix: std::sync::atomic::AtomicI64,
 }
 
 /// Native earliest-pending result, including its distinct failed barrier check.
@@ -270,11 +286,14 @@ pub(crate) struct EarliestPending {
 }
 
 impl TransactionMap {
+    pub(crate) fn set_covered(&self, lsn: i64) {
+        self.covered_prefix.store(lsn, Ordering::Release);
+    }
     /// Construct an empty map with an explicit covered checkpoint LSN.
     pub(crate) fn new(covered_prefix: SequenceNumber) -> Self {
         Self {
             state: Mutex::new(MapState::default()),
-            covered_prefix,
+            covered_prefix: std::sync::atomic::AtomicI64::new(covered_prefix),
         }
     }
 
@@ -283,7 +302,13 @@ impl TransactionMap {
     /// Failed admission changes neither links nor indexes. No completion/error
     /// API removes a transaction; only stable cleanup and explicit lifecycle Reuse.
     pub(crate) fn admit(&self, node: Arc<RecordNode>) -> Result<()> {
-        if node.lsn() <= 0 {
+        if node.lsn() < 0
+            || (node.lsn() == 0
+                && !matches!(
+                    node.record.kind,
+                    RecordKind::UpdateEpoch { .. } | RecordKind::Physical { .. }
+                ))
+        {
             return Err(Error::InvalidInput("nonpositive transaction-map LSN"));
         }
         if let Some(id) = node.transaction_id() {
@@ -333,7 +358,11 @@ impl TransactionMap {
                 transaction_id: id, ..
             } => {
                 let previous = map.latest.get(id).cloned();
-                let enlisted = validate_previous(&node, previous.as_ref(), self.covered_prefix)?;
+                let enlisted = validate_previous(
+                    &node,
+                    previous.as_ref(),
+                    self.covered_prefix.load(Ordering::Acquire),
+                )?;
                 node.mark_admitted()?;
                 node.link(previous, enlisted);
                 map.latest.insert(*id, Arc::clone(&node));
@@ -342,7 +371,11 @@ impl TransactionMap {
                 transaction_id: id, ..
             } => {
                 let previous = map.latest.get(id).cloned();
-                let enlisted = validate_previous(&node, previous.as_ref(), self.covered_prefix)?;
+                let enlisted = validate_previous(
+                    &node,
+                    previous.as_ref(),
+                    self.covered_prefix.load(Ordering::Acquire),
+                )?;
                 let begin = map.pending_by_id.get(id).cloned();
                 if enlisted != begin.is_some()
                     || begin.as_ref().is_some_and(|begin| {
@@ -363,7 +396,9 @@ impl TransactionMap {
                     insert_sorted(&mut map.unstable, Arc::clone(&node));
                 }
             }
-            RecordKind::Barrier { .. } | RecordKind::UpdateEpoch { .. } => {
+            RecordKind::Barrier { .. }
+            | RecordKind::UpdateEpoch { .. }
+            | RecordKind::Physical { .. } => {
                 node.mark_admitted()?;
             }
         }

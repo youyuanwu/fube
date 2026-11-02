@@ -16,9 +16,12 @@
 //! [`IStateProvider`] to reconcile authoritative history at epoch boundaries and
 //! return coherent inclusive-horizon copy state, including application retry identities.
 //! The provider is application state, not the quorum engine.
-//! Initialize provider/log metadata before lower construction: its synchronous
-//! getter is queried before the returned lower object's Open, and must return the
-//! actual provider tail. [`FabricReplicator::create`] defaults to classic copy;
+//! Normal construction does not query provider progress. Lower Open marks Opened;
+//! a composite may then initialize its upper log. The Opened current-progress
+//! getter or first Primary queries the actual provider tail, caches success only,
+//! and first Primary creates its initial queue at tail + 1. Opened catch-up
+//! capability is zero; initial secondary uses transmitted start, not a tail rebase.
+//! [`FabricReplicator::create`] defaults to classic copy;
 //! [`FabricReplicator::create_with_capabilities`] explicitly selects latest-assigned
 //! copy through [`extensions::StateProviderCapabilities`], never SDK discovery.
 //!
@@ -28,8 +31,11 @@
 //! dropping the waiter is ambiguous and cannot undo admission. Secondary pumps
 //! consume copy/replication streams, apply each item, then explicitly call
 //! [`IOperation::acknowledge`]; polling, receiving or dropping never ACKs.
-//! Successful promotion supplies role-generation EOS before ACK drain completes;
-//! reacquire streams when entering a later secondary role on that same owner.
+//! Secondary-to-Primary promotion supplies role-generation EOS before ACK drain
+//! completes; reacquire streams on a later secondary role on that same owner.
+//! Idle-to-Active promotion instead retains live streams/captures and completes
+//! lower role immediately under this explicit-service-ACK profile. An upper
+//! transactional composite still waits its copy completion, not replication EOS.
 //!
 //! [`extensions::Progress`] fields are distinct, role-dependent observations. In particular,
 //! primary application state may lead its queue's reconciliation `applied`
@@ -106,13 +112,8 @@ mod api;
 mod engine;
 pub mod extensions;
 mod fabric_replicator;
+mod owned_lifecycle;
 pub mod provider;
-/// Offline native-RAP model-node tooling, not a standalone Engine authority
-/// and not evidence of deployed Service Fabric qualification. The model still
-/// performs real runtime registration/lease/partition-issued construction.
-#[cfg(any(test, feature = "qualification"))]
-#[path = "../tests/support/rap_model.rs"]
-pub mod qualification;
 mod queue;
 mod quorum;
 mod supervised;

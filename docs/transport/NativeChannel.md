@@ -1,6 +1,6 @@
-# Operational native gateway channels
+# Operational native channel composition
 
-## Supported profile
+## Supported composition
 
 `fube_transport::native_channel` implements the existing
 [`MessageChannel`, `RpcChannel`, `MessageReceiver` and consuming `ReplyContext`
@@ -9,7 +9,7 @@ contracts](../../crates/libs/fube-transport/src/channel.rs) for one dedicated
 This is native Fabric TCP messaging, not `IFabricTransport`, UDP, actor36,
 a typed client, router or adapter around `Connection`.
 
-`GatewayChannel::connect_unsecured_loopback(endpoint, profile, limits,
+`GatewayChannel::connect_unsecured_loopback(endpoint, composition, limits,
 deadline)` establishes TCP and the clear ListenInstance exchange inside one
 absolute deadline. It rejects non-loopback/zero-port endpoints and invalid
 limits. Clear loopback assumes trusted local peers; it does not authenticate
@@ -17,21 +17,52 @@ hostile local processes and does not qualify secure production clusters.
 Existing permissions, security controls and concrete connection roles are not
 disabled or widened.
 
-`GatewayProfile` selects mutually exclusive envelope authority:
+The former `GatewayProfile` API is removed, with no compatibility wrapper.
+`native_demux::ChannelComposition` installs independent stateless envelope
+validators for outbound raw/RPC, ordinary replies, actor ingress and optional
+special duplex ingress/responses. Protocol choices live in
+`fube-client/src/channel_adapter.rs`, not in the connection core:
 
-| Profile | Outbound | Unsolicited ingress |
+| Client adapter | Outbound | Unsolicited ingress |
 | --- | --- | --- |
-| `Ordinary` | actor5 raw/RPC | none |
-| `Notifications` | actor5 raw/RPC and consuming notification reply | exact actor5 notification envelope |
-| `Upload` | actor26 raw and actor5 RPC | actor25/27 raw semantic ACK envelopes, **no reply capability** |
+| Ordinary | actor5 raw/RPC | none |
+| Notifications | actor5 raw/RPC and consuming notification reply | exact actor5 notification envelope |
+| Upload | actor26 raw and actor5 RPC | actor25/27 raw semantic ACK envelopes, **no reply capability** |
 
-Actions must be nonempty. Upload action/version/Activity/sequence/body policy
+The operational `ActorDemux` is an immutable actor-only table, not the
+declaration-only actor/action `routing::Router`/`Registry`. At most 32 unique
+positive actors may be registered; duplicate, nonpositive and reserved
+transport/security/role actors reject before connect. Table storage is shrunk
+to the retained entries. No dynamic registry or executor is supplied.
+
+Controls stay below external dispatch. After common-header validation, empty
+effective RelatesTo and nonspecial ingress selects its registered actor,
+**without testing ExpectsReply or Action**. Other messages enter reply handling:
+special IsUncorrelatedReply goes through configured duplex authorization;
+ordinary nonempty RelatesTo goes through configured ordinary authorization and
+the request table. There is no actor fallback for a correlated message.
+Envelope checks must not block, perform I/O or decode domain bodies; actual
+domain handling occurs after bounded pull delivery, outside the driver.
+
+Registration selects ingress only. It cannot grant sender permission or a
+reply capability. Even ExpectsReply actor ingress has no context. Only an
+authorized configured special duplex envelope mints the private consuming
+original-socket/original-MessageId context with its captured response policy.
+Public envelopes, flags, arbitrary actor IDs and equal target types cannot
+forge or redirect it. Generic correlation and socket checks cannot be disabled
+by composition. The API trusts composition code, not wire fields.
+
+The client adapters require nonempty outbound/raw-ingress actions and exact
+notification ingress/response actions. Ordinary reply domain Actor/Action
+eligibility remains operation-local, including native replies without those
+headers. Upload action/version/Activity/sequence/body policy
 belongs to ImageStoreClient, not the channel.
 Raw sends cannot bypass ordinary RPC or reply authority using ExpectsReply,
 RelatesTo or special-notification flags. Ordinary replies must come through
 this established socket. Their domain actor/action and body are opaque to the
-channel; typed clients validate the particular operation. Transport controls
-and notification ingress retain their separate profile checks. Unsupported ingress, malformed
+channel; typed clients validate the particular operation. The adapters reject
+upload actors on the ordinary reply path before request-table lookup.
+Transport controls and special duplex ingress retain separate checks. Unsupported ingress, malformed
 transport fields or unsupported security/reconnect control terminates the
 foundation. A well-formed nonzero Fault returns `Error::Remote` with its exact
 header code; absent/zero Fault returns the opaque message. Optional diagnostics
@@ -69,11 +100,13 @@ original target/ID. A response must be actor5/`ServiceNotificationReply`;
 the context adds missing RelatesTo, accepts one matching value and rejects
 duplicates/contradictions, ExpectsReply=true or special reply flags.
 Domain processing-status encoding remains the caller's responsibility.
-Ordinary mode refuses receiver creation. Ordinary and Upload profiles terminate
+Composition without actor/duplex ingress refuses receiver creation. Ordinary and Upload adapters terminate
 on notification ingress.
 
-Upload ACKs are classified before ordinary matching. Nonempty effective
-RelatesTo, ExpectsReply, special notification flags, Fault and IPC are rejected,
+Upload ACKs with empty relation select registered actors. Nonempty effective
+RelatesTo is rejected by the ordinary-reply adapter, and special flags by
+separate duplex authorization, never by an actor-specific shortcut in the core.
+ExpectsReply, Fault and IPC are also rejected,
 even if a relation names a pending management RPC. MessageId and RelatesTo may
 be absent. Accepted envelopes retain their original source and raw contents;
 they never mint a notification reply context or consume notification ID history.
@@ -81,8 +114,9 @@ ImageStoreClient decodes semantic headers/body **at pull, before stale filtering
 An unread domain-invalid ACK with a valid transport envelope remains bounded
 raw ingress until pull; no idle domain-validation worker is added.
 
-**Not supported:** arbitrary reverse RPC/one-way ingress, activated-host IPC,
-listeners, other actors/transport roles, replication, actor36
+**Not supported by the client adapters:** arbitrary reverse RPC/one-way ingress.
+The generic composition supports explicitly registered actors, not listeners,
+activated-host IPC, other transport roles, replication, actor36
 application-service transport, TLS/claims/security negotiation, reconnect,
 retry, replay, failover, pools, middleware, code generation, routing/registry
 or typed codecs in the transport crate. The ordinary typed Client/ClientRequest
@@ -92,36 +126,25 @@ implementations for those roles.
 ## Ownership and operations
 
 ```rust,no_run
-use fube_transport::{
-    channel::{MessageChannel, RpcChannel},
-    message::{Header, Message},
-    native_channel::{ChannelLimits, GatewayChannel, GatewayProfile},
-};
-use tokio::time::{Duration, Instant};
+use fube_client::{FabricClient, DEFAULT_TIMEOUT};
 
-# async fn example() -> fube_transport::Result<()> {
-let end = Instant::now() + Duration::from_secs(30);
-let channel = GatewayChannel::connect_unsecured_loopback(
-    "127.0.0.1:19000".parse().unwrap(), GatewayProfile::Ordinary, ChannelLimits::default(), end,
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let client = FabricClient::connect_clear(
+    "127.0.0.1:19000".parse().unwrap(), DEFAULT_TIMEOUT,
 ).await?;
-let target = channel.resolve_target("127.0.0.1:19000")?;
-let message = Message {
-    headers: vec![Header::actor(5)?, Header::action("PingRequest")?],
-    body: vec![],
-};
-let _opaque_reply = channel.request(target.as_ref(), message, end).await?;
-channel.close(end).await?;
+let _gateway = client.ping(None).await?; // typed domain result, not a raw write ACK
+client.close().await?;
 # Ok(())
 # }
 ```
 
 Domain protocols may require additional version/activity/priority/time headers.
-The example demonstrates binding, not a complete typed FabricClient protocol.
+The client adapter installs the appropriate composition for these protocols.
 Native notification setup and processing-status schemas remain above the
 foundation. Ordinary FabricClient uses the shared typed adapter above this
 foundation. ServiceNotificationClient owns a separate notification-enabled
-GatewayChannel/native session; ImageStoreClient owns a separate Upload-profile
-GatewayChannel and directly pulls bounded ACK ingress.
+GatewayChannel/native session; ImageStoreClient owns a separate upload-composed
+GatewayChannel with actor registrations and directly pulls bounded ACK ingress.
 
 - Resolution is synchronous, performs no I/O and accepts only the configured
   numeric endpoint. It reuses one private target identity. Equal addresses or
@@ -294,7 +317,7 @@ interoperability qualification.
 Deterministic behavior:
 
 ```sh
-cargo test --locked -p fube-transport native_channel -- --test-threads=1
+cargo test --locked -p fube-transport native_ -- --test-threads=1
 cargo test --locked -p fube-transport -p fube-client -p fube-test-host
 ```
 
@@ -329,7 +352,7 @@ GatewayReceiver/session consumers and the existing loss relay: one successful
 ACK is dropped, the same target logical page is retried under an observed fresh
 full MessageId, and a successful ACK is fully forwarded for that retry's exact
 ID without duplicate delivered versions. The receipt validator checks these
-bounded witnesses. ImageStoreClient now uses its own Upload-profile channel;
+bounded witnesses. ImageStoreClient now installs its own upload composition;
 the maintained `tests.onebox.native_upload` journey separately compares native
 COM and Rust package copies, replacement, provisioning and deployed data.
 

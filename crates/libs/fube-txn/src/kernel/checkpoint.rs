@@ -41,11 +41,19 @@ pub(crate) enum FlushReason {
 /// Established log/dispatcher observations, not a substitute log authority.
 pub(crate) trait CheckpointIo: Send + Sync + 'static {
     fn dispatcher_fence(&self) -> VoidFuture<'_>;
+    fn prepared(&self) {}
+    fn applied(&self, _: Result<()>) {}
+    fn processed(&self) {}
     fn begin_record_flush(&self) -> ApiFuture<'_, ()>;
     fn stability_permission(&self, checkpoint_lsn: SequenceNumber) -> VoidFuture<'_>;
     fn role(&self) -> ProcessingRole;
     fn tail(&self) -> SequenceNumber;
-    fn append(&self, record: PhysicalRecord);
+    fn append(&self, record: PhysicalRecord) -> Result<()>;
+    /// Observe actual owned record/writer failure separately from native void
+    /// FlushAsync completion. Opaque A0 fixtures default to no supplied error.
+    fn status(&self) -> Result<()> {
+        Ok(())
+    }
     fn flush(&self, reason: FlushReason) -> VoidFuture<'_>;
     fn rename_copy_log(&self) -> ApiFuture<'_, ()>;
 }
@@ -56,6 +64,7 @@ pub(crate) enum CheckpointPhase {
     Ready,
     Applied,
     Completed,
+    Aborted,
     Faulted,
 }
 
@@ -69,6 +78,15 @@ pub(crate) struct CheckpointActivity {
 }
 
 impl CheckpointActivity {
+    pub(crate) fn abort_if_ready(&self) -> bool {
+        let mut phase = self.phase.lock().unwrap();
+        if matches!(*phase, CheckpointPhase::Invalid | CheckpointPhase::Ready) {
+            *phase = CheckpointPhase::Aborted;
+            true
+        } else {
+            false
+        }
+    }
     pub(crate) fn phase(&self) -> CheckpointPhase {
         *self.phase.lock().expect("checkpoint phase poisoned")
     }
@@ -82,7 +100,7 @@ pub(crate) struct CheckpointCoordinator {
     io: Arc<dyn CheckpointIo>,
     faults: Arc<FaultState>,
     api_lock: tokio::sync::Mutex<()>,
-    consistency_lock: tokio::sync::Mutex<()>,
+    consistency_lock: Arc<tokio::sync::Mutex<()>>,
     pending: Mutex<Option<Arc<CheckpointActivity>>>,
 }
 
@@ -92,12 +110,25 @@ impl CheckpointCoordinator {
         io: Arc<dyn CheckpointIo>,
         faults: Arc<FaultState>,
     ) -> Arc<Self> {
+        Self::with_consistency(
+            state_manager,
+            io,
+            faults,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+    }
+    pub(crate) fn with_consistency(
+        state_manager: Arc<dyn IStateProviderManager>,
+        io: Arc<dyn CheckpointIo>,
+        faults: Arc<FaultState>,
+        consistency_lock: Arc<tokio::sync::Mutex<()>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state_manager,
             io,
             faults,
             api_lock: tokio::sync::Mutex::new(()),
-            consistency_lock: tokio::sync::Mutex::new(()),
+            consistency_lock,
             pending: Mutex::new(None),
         })
     }
@@ -162,14 +193,38 @@ impl CheckpointCoordinator {
             }
             error => error,
         };
+        self.io.prepared();
         if let Err(error) = prepare {
+            self.io.applied(Err(error.clone()));
             activity.set_phase(CheckpointPhase::Faulted);
             self.faults.report_checkpoint_fault(error.clone());
             return Err(error);
         }
-        activity.set_phase(CheckpointPhase::Ready);
+        {
+            let mut phase = activity.phase.lock().unwrap();
+            if *phase == CheckpointPhase::Invalid {
+                *phase = CheckpointPhase::Ready;
+            }
+        }
+        if activity.phase() == CheckpointPhase::Aborted {
+            self.io.applied(Ok(()));
+            return Err(Status::ObjectClosed.error());
+        }
         self.io.stability_permission(activity.lsn).await;
-        activity.set_phase(CheckpointPhase::Applied);
+        {
+            let mut phase = activity.phase.lock().unwrap();
+            if *phase == CheckpointPhase::Aborted {
+                self.io.applied(Ok(()));
+                return Err(Status::ObjectClosed.error());
+            }
+            if let Err(error) = self.io.status() {
+                self.io.applied(Err(error.clone()));
+                *phase = CheckpointPhase::Faulted;
+                return Err(error);
+            }
+            *phase = CheckpointPhase::Applied;
+            self.io.applied(Ok(()));
+        }
         let result = {
             let _api = self.api_lock.lock().await;
             self.state_manager
@@ -191,9 +246,11 @@ impl CheckpointCoordinator {
 
     async fn complete(&self, _: &CheckpointActivity, rename: bool) -> Result<()> {
         let _consistency = self.consistency_lock.lock().await;
-        self.io.append(PhysicalRecord::EndCheckpoint);
-        self.io.flush(FlushReason::EndCheckpoint).await;
         let result: Result<()> = async {
+            self.io.status()?;
+            self.io.append(PhysicalRecord::EndCheckpoint)?;
+            self.io.flush(FlushReason::EndCheckpoint).await;
+            self.io.status()?;
             if rename {
                 self.io.flush(FlushReason::BeforeRename).await;
                 self.io.rename_copy_log().await?;
@@ -204,8 +261,9 @@ impl CheckpointCoordinator {
                     .complete_checkpoint(Cancellation::default())
                     .await?;
             }
-            self.io.append(PhysicalRecord::CompleteCheckpoint);
+            self.io.append(PhysicalRecord::CompleteCheckpoint)?;
             self.io.flush(FlushReason::CompleteCheckpoint).await;
+            self.io.status()?;
             Ok(())
         }
         .await;
@@ -279,6 +337,21 @@ impl CheckpointCoordinator {
         }))
     }
 
+    pub(crate) async fn abort_first_copy(&self, activity: Arc<CheckpointActivity>) {
+        let claimed = {
+            let pending = self.pending.lock().expect("checkpoint pending poisoned");
+            activity.first_copy
+                && pending.as_ref().is_some_and(|a| Arc::ptr_eq(a, &activity))
+                && !activity.drain_claimed.swap(true, Ordering::AcqRel)
+        };
+        if claimed {
+            let _ = activity.phase1.wait().await;
+            self.finish(&activity, Err(Status::ObjectClosed.error()));
+        } else {
+            let _ = activity.finished.wait().await;
+        }
+    }
+
     fn finish(&self, activity: &Arc<CheckpointActivity>, result: Result<()>) {
         let mut pending = self.pending.lock().expect("checkpoint pending poisoned");
         if pending
@@ -287,6 +360,7 @@ impl CheckpointCoordinator {
         {
             *pending = None;
         }
+        self.io.processed();
         activity.finished.complete(result);
     }
 }

@@ -1,0 +1,13 @@
+[package]
+name = "fube-rap-test-support"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Offline native-shaped RAP registration and lease model support"
+
+[dependencies]
+fube-runtime.workspace = true
+fube-transport.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+serde.workspace = true

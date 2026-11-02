@@ -67,6 +67,7 @@ impl Default for RetryRuntime {
 
 #[derive(Clone)]
 struct FirstOperation {
+    _retention: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     metadata: Option<OperationData>,
     undo: Option<OperationData>,
     redo: Option<OperationData>,
@@ -81,6 +82,9 @@ struct Writes {
 }
 
 pub(crate) struct KernelTransaction {
+    limits: Mutex<Option<Arc<super::limits::Limits>>>,
+    owner_capacity: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
+    lock_capacity: Mutex<Vec<Option<tokio::sync::OwnedSemaphorePermit>>>,
     self_weak: Weak<Self>,
     manager: Option<Weak<dyn ITransactionManager>>,
     id: TransactionId,
@@ -127,6 +131,9 @@ impl KernelTransaction {
         retry: Arc<RetryRuntime>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|self_weak| Self {
+            limits: Mutex::new(None),
+            owner_capacity: Mutex::new(None),
+            lock_capacity: Mutex::new(Vec::new()),
             self_weak: self_weak.clone(),
             manager,
             id,
@@ -142,6 +149,11 @@ impl KernelTransaction {
         })
     }
 
+    pub(crate) fn bind_limits(&self, limits: Arc<super::limits::Limits>) -> Result<()> {
+        *self.owner_capacity.lock().unwrap() = Some(limits.owner()?);
+        *self.limits.lock().unwrap() = Some(limits);
+        Ok(())
+    }
     fn shared(&self) -> Arc<Self> {
         self.self_weak
             .upgrade()
@@ -315,7 +327,14 @@ impl TransactionBase for KernelTransaction {
         if !self.primary {
             return Err(Status::TransactionNotActive.error());
         }
-        self.locks.lock().expect("locks poisoned").push(context);
+        let mut locks = self.locks.lock().expect("locks poisoned");
+        let limits = self.limits.lock().unwrap().clone();
+        if limits.is_some() && locks.len() >= 64 {
+            return Err(Error::ResourceLimit("retained transaction lock list"));
+        }
+        let permit = limits.map(|limits| limits.lock()).transpose()?;
+        self.lock_capacity.lock().unwrap().push(permit);
+        locks.push(context);
         Ok(())
     }
     fn dispose(&self) -> Result<()> {
@@ -333,11 +352,24 @@ impl TransactionBase for KernelTransaction {
         if abort.is_ok() {
             self.start_abort();
         }
-        for context in self.locks.lock().expect("locks poisoned").iter() {
+        let locks = self.locks.lock().expect("locks poisoned");
+        for (index, context) in locks.iter().enumerate() {
             if !context.is_tracking_context() {
                 context.unlock()?;
+                // Keep native list/retry behavior; retire only this successful
+                // obligation. Failed and later slots remain charged.
+                self.lock_capacity.lock().unwrap()[index].take();
             }
         }
+        // Native tracking lists stay retained, but successful Dispose has no
+        // remaining nontracking work obligation. Bound retained list separately.
+        self.lock_capacity
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .for_each(|slot| {
+                slot.take();
+            });
         self.disposed.store(true, Ordering::Release);
         Ok(())
     }
@@ -402,8 +434,23 @@ impl Transaction for KernelTransaction {
             let mut writes = self.writes.lock().expect("writes poisoned");
             if !writes.write {
                 manager.error_if_state_provider_is_not_registered(provider, self.id)?;
+                let retention = self
+                    .limits
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|limits| {
+                        let bytes = [&metadata, &undo, &redo]
+                            .iter()
+                            .filter_map(|data| data.as_ref())
+                            .map(|data| data.retained_bytes())
+                            .sum();
+                        limits.cached(bytes)
+                    })
+                    .transpose()?;
                 writes.write = true;
                 writes.first = Some(FirstOperation {
+                    _retention: retention,
                     metadata,
                     undo,
                     redo,

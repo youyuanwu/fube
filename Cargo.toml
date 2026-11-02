@@ -5,6 +5,7 @@ members = [
   "crates/libs/fube-client",
   "crates/libs/fube-test-host",
   "crates/libs/fube-local-host",
+  "crates/libs/fube-rap-test-support",
   "crates/libs/fube-runtime",
   "crates/libs/fube-data",
   "crates/libs/fube-txn",
@@ -23,6 +24,7 @@ members = [
 fube-transport = { path = "./crates/libs/fube-transport" }
 fube-client = { path = "./crates/libs/fube-client" }
 fube-runtime = { path = "./crates/libs/fube-runtime" }
+fube-rap-test-support = { path = "./crates/libs/fube-rap-test-support" }
 fube-data = { path = "./crates/libs/fube-data" }
 fube-txn = { path = "./crates/libs/fube-txn" }
 mssf-core = "0.10"

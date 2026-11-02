@@ -57,9 +57,11 @@ stateless registration. This is not an environment role override.
   ([public construction and Rustdoc](../../crates/libs/fube-data/src/fabric_replicator.rs#L23-L74)).
   This helper lives in data to preserve data → runtime dependency. Native
   partition `CreateReplicator`, mssf `try_get_com`, COM proxy/ABI and mutable
-  native settings are not supported SDK members. Canonical root and private
-  bound configuration/build/remove controls are functioning paths to that same
-  owner, not a separate extension authority.
+  native settings are not supported SDK members. Normal configuration/Build/
+  Remove reaches that same owner by exact internally scoped canonical delegation,
+  not a replacement binder. The built-in private bound route is lower-only
+  `cfg(test)` negative tooling; supported explicit custom runtime bindings are
+  separate and retain their selected-view behavior.
 - `IStateProvider` supplies synchronous `get_last_committed_sequence_number`,
   `get_copy_context`/`get_copy_state` factories, async `update_epoch` and
   bool `on_data_loss` callbacks
@@ -93,8 +95,12 @@ stateless registration. This is not an environment role override.
   data/explicit ACK. Receipt, polling and Drop do not acknowledge.
   A late retired-owner ACK fails rather than reviving progress
   ([ACK and stream contract](../../crates/libs/fube-data/src/api.rs#L173-L267)).
-  Streams are role-generation views: promotion dispatches eligible records,
-  supplies successful EOS, then waits for actual processing ACKs. Reacquire both
+  Streams are role-generation views: secondary→Primary promotion dispatches
+  eligible records, supplies successful EOS, then waits for actual processing
+  ACKs. Idle→Active instead retains live streams/captures and completes lower
+  promotion immediately under the fixed explicit-service-ACK profile; an upper
+  transactional composite waits copy completion, not live replication EOS.
+  Reacquire both
   views on a later secondary role; old views never revive. The sample refreshes
   after its lower role transition, without replacing the engine.
 - Provider callbacks run outside engine/transport locks. Returned errors,
@@ -360,11 +366,12 @@ cover those separate obligations; the
 observes released storage/ALL with zero remote receive/apply and no idle owner.
 Joint-configuration tests retain PC APPLY blocking while CC ALL succeeds.
 
-### DD-04: promotion does not finish the secondary stream generation
+### DD-04: secondary-to-Primary promotion does not finish the stream generation
 
-**Pre-R0 audit:** engine-lifetime replication views stayed open after promotion.
+**Pre-R0 audit:** engine-lifetime replication views stayed open after promotion
+to Primary. The distinct Idle→Active transition retains them.
 
-**Native:** secondary close during promotion closes dispatch queues and waits
+**Native:** secondary close during promotion to Primary closes dispatch queues and waits
 for the required drain. The upper `SecondaryDrainManager` observes replication
 EOS, processes the replication-finished information record, waits for logical
 processing and outstanding ACKs, and only then signals its drain completion
@@ -479,13 +486,14 @@ These are offline fixtures, not a V2 log kernel or deployed qualification.
 
 ### Effect on the V2 port
 
-R0 implements DD-01–DD-07 plus explicit latest-copy and truthful constructor
-tail integration. Native transaction/log/state-manager kernels and staged copy
+R0 implements DD-01–DD-07 plus explicit latest-copy. The A1 public-boundary
+correction now samples truthful INITIAL progress at native getter/first-Primary
+callers rather than construction. Native transaction/log/state-manager kernels and staged copy
 serialization remain A0/A1, not upper workarounds supplied by R0. Fixed budgets,
 RequireServiceAck, trusted clear transport and unsupported persisted/TLS modes
 remain explicit profile limits.
 
-### R0 copy capability and callback-ready construction
+### R0 copy capability and native INITIAL progress
 
 `FabricReplicator::create` remains backwards-compatible classic copy. Opt in with
 `create_with_capabilities(..., StateProviderCapabilities {
@@ -499,17 +507,21 @@ enumeration-EOS finish tail remain unchanged. The
 [latest copy regression](../../crates/libs/fube-data/src/engine_tests.rs#L3753-L3847)
 starts at101/horizon100 with committed0 and waits for real finish-tail ACK101.
 
-Initialize the provider before construction, in the runtime-owned service Open
-entry. Lower construction already calls its fallible progress getter before the
-returned lower object's later Open
-([constructor](../../crates/libs/fube-data/src/engine.rs#L631-L662)).
-A logging adapter must return its real log tail, not stable/visible progress or
-temporary zero. The [public bootstrap witness](../../crates/libs/fube-data/tests/sdk_contracts.rs#L222-L297)
-passes actual nonempty fixture records with source-shaped zero/one markers and
-tail1/27 through construction, then assigns2/28. Its markers are **not native
-record serialization or persisted recovery**. R0 neither initializes a real
-transaction log for callers nor supports Existing-open. Native kernels are A0;
-mixed deployment qualification remains unrun.
+The earlier callback-ready-before-construction recipe is **superseded**.
+Normal construction and lower Open do not query provider progress; an upper
+composite opens/initializes its log after lower Open. Opened current-progress
+queries the real tail and caches success only; capability is zero. First Primary
+uses that success or queries the provider, then creates the INITIAL queue at
+tail+1. Getter failures retry; first-Primary failures fault lower. Initial
+secondary starts from transmission and role transfer preserves queue authority,
+not an activated rebase
+([constructor contract](../../crates/libs/fube-data/src/fabric_replicator.rs#L30-L75),
+[getters](../../crates/libs/fube-data/src/engine.rs#L5088-L5248)).
+The public SDK/bootstrap witnesses retain actual tails1/27→assigned2/28 and
+getter/error/first-Primary coverage. Their markers are **not native record
+serialization or persisted recovery**. See [A1 composition](FubeTxnA1.md) for
+source callers, exact dispatch and explicit-service-ACK Idle→Active. Existing
+Open and mixed deployment qualification remain unsupported/unrun.
 
 [sf-admission-codes]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/prebuilt/sdk/FabricTypes.h#L119-L236
 [sf-admission-conversion]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Replication/EnumOperators.cpp#L85-L128

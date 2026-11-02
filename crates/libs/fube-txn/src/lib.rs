@@ -1,11 +1,18 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-//! Service Fabric V2 application/provider contracts and private A0 kernels.
-//! The public surface remains declarations: there is no public runtime
-//! constructor or lower engine adapter. Private kernels implement supported
-//! records, ordinary transactions, map/version bookkeeping, Apply/Unlock,
-//! checkpoint/copy callbacks and a nonproduct point-map test provider.
+//! Service Fabric V2 contracts and supported ordinary volatile A1 execution.
+//! [`VolatileTransactionalReplicator`] constructs the real runtime and primary
+//! provider registry over one normally constructed [`fube_data::FabricReplicator`].
+//! The service returns the actual common/primary transactional composite.
+//! Production and tests use public state/provider/operation/stream contracts
+//! plus normal settings/copy capability; no lower lifecycle, rebase, execution,
+//! identity, diagnostic or qualification hooks. Public host execution retains
+//! owned synchronous admission; exact native invocation dispatch stays internal
+//! to the framework, not an upper binder or authority.
+//! Existing private A0 algorithms supply incremental records, transactions,
+//! map/version bookkeeping, Apply/Unlock, checkpoint and staged Full copy.
+//! Test payload providers are not ReliableCollections implementations.
 //!
 //! Source authority is the native `data/txnreplicator` headers and implementations at
 //! [SF commit 51a7703](https://github.com/microsoft/service-fabric/tree/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/data/txnreplicator).
@@ -28,7 +35,7 @@
 //! disposal. Implementations must preserve native owned completion,
 //! Apply/replication/Unlock ordering and synchronous Abort's owned async work.
 //! Native concrete transaction classes remain public trait projections;
-//! supported concrete kernels are private until A1 integration.
+//! supported concrete kernels execute behind the public A1 service facade.
 //! Runtime control remains in fube-runtime/fube-data, not here.
 //!
 //! The four aggregate state/log manager interfaces are crate-internal and are not
@@ -40,6 +47,7 @@ mod internal;
 mod kernel;
 mod provider;
 mod replicator;
+mod runtime;
 mod transaction;
 mod types;
 
@@ -55,6 +63,7 @@ pub use replicator::{
     IStateManagerChangeHandler, IStateProviderMap, ITransactionChangeHandler, ITransactionManager,
     ITransactionVersionManager, ITransactionalReplicator, IVersionManager,
 };
+pub use runtime::{VolatileLogSettings, VolatileRuntimeSettings, VolatileTransactionalReplicator};
 pub use transaction::{
     AtomicOperation, AtomicRedoOperation, ITransaction, LockContext, OperationContext, Transaction,
     TransactionBase,

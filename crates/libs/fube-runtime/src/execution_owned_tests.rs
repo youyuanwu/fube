@@ -9,12 +9,32 @@ fn runtime() -> ExecutionRuntime {
 }
 
 #[tokio::test]
+async fn retained_deadline_observation_does_not_authorize_cleanup_waiting() {
+    let runtime = runtime();
+    let owned = runtime.clone();
+    runtime
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || {
+            let deadline = owned.current_deadline()?;
+            let cleanup = owned.command_cleanup().unwrap();
+            let _entry = cleanup.enter();
+            assert_eq!(owned.current_deadline()?, deadline);
+            assert!(owned.blocking_deadline().is_err());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    runtime.finish_standalone().await.unwrap();
+}
+
+#[tokio::test]
 async fn expired_scope_finish_retains_exact_original_fence_under_live_root() {
     let runtime = runtime();
     let root = runtime.try_reserve().unwrap();
     let active = root.active.clone();
     let until = Instant::now() - Duration::from_millis(200);
-    let scope = Scope::new(active.clone(), None, CallOrigin::default(), until);
+    let scope = Scope::new(active.clone(), None, CallOrigin::default(), until, None);
     scope.finish();
     assert_eq!(runtime.inner.authority.retired_at_for_test(), Some(until));
     assert!(active.until() > Instant::now() + Duration::from_secs(20));
@@ -34,7 +54,7 @@ async fn late_pending_result_release_retains_exact_fence_and_earlier_retirement_
             runtime.inner.authority.retire_at(earlier);
         }
         let until = Instant::now() + Duration::from_millis(50);
-        let scope = Scope::new(active.clone(), None, CallOrigin::default(), until);
+        let scope = Scope::new(active.clone(), None, CallOrigin::default(), until, None);
         scope.pending_results.store(1, Ordering::Release);
         scope.finish();
         assert_eq!(
@@ -60,18 +80,26 @@ async fn nested_and_sibling_expired_scopes_cannot_replace_earlier_fence() {
     let active = root.active.clone();
     let parent_until = Instant::now() - Duration::from_millis(100);
     let first_until = parent_until - Duration::from_millis(100);
-    let parent = Scope::new(active.clone(), None, CallOrigin::default(), parent_until);
+    let parent = Scope::new(
+        active.clone(),
+        None,
+        CallOrigin::default(),
+        parent_until,
+        None,
+    );
     let first = Scope::new(
         active.clone(),
         Some(parent.clone()),
         CallOrigin::default(),
         first_until,
+        None,
     );
     let sibling = Scope::new(
         active.clone(),
         Some(parent.clone()),
         CallOrigin::default(),
         parent_until,
+        None,
     );
     parent.finish();
     first.finish();

@@ -1,5 +1,7 @@
 //! Offline native-RAP MODEL host. Registration, lease, lifecycle and control
 //! traverse real Runtime IPC/issuer/binder paths; this is NOT deployed SF proof.
+//! Shared support depends only on public framework/runtime/transport contracts;
+//! it exposes no data engine, diagnostics, lifecycle hook or control setter.
 use fube_runtime::{
     extensions::{
         attach_runtime, NativeIntegrationProvider, NativeReplicaDescriptor,
@@ -20,6 +22,9 @@ use tokio::{
     net::TcpListener,
     sync::{broadcast, mpsc, oneshot},
 };
+
+mod primary;
+pub use primary::DelegatingPrimary;
 
 // Field order mirrors Hosting2/ServiceModel FABRIC_FIELDS (3988b451); these
 // private model records are neither public SDK descriptors nor authority APIs.
@@ -211,6 +216,7 @@ struct Pending {
 }
 
 pub struct Host {
+    opened_address: Arc<std::sync::Mutex<Option<String>>>,
     commands: mpsc::Sender<Command>,
     stop: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     thread: std::sync::Mutex<Option<JoinHandle<()>>>,
@@ -264,12 +270,65 @@ impl Host {
             + Send
             + 'static,
     ) -> Arc<Self> {
+        let (host, opened) = Self::start_source_outcome(partition, source, role, factory).await;
+        opened.unwrap();
+        host
+    }
+    /// Qualification-only failure fixture: preserve the actual native Open
+    /// result instead of panicking before callers can inspect retained cleanup.
+    pub async fn start_source_outcome(
+        partition: uuid::Uuid,
+        source: ReplicaSource,
+        role: ReplicaRole,
+        factory: impl FnOnce(NativeIntegrationProvider) -> Box<dyn IStatefulServiceFactory>
+            + Send
+            + 'static,
+    ) -> (Arc<Self>, Result<()>) {
+        Self::start_source_outcome_at_epoch(
+            partition,
+            source,
+            role,
+            fube_runtime::Epoch {
+                data_loss_number: 1,
+                configuration_number: 1 << 32,
+            },
+            factory,
+        )
+        .await
+    }
+    /// Configure the actual initial native ReplicaOpen request, not a lower
+    /// epoch setter or a progress query against an unbuilt secondary.
+    pub async fn start_source_at_epoch(
+        partition: uuid::Uuid,
+        source: ReplicaSource,
+        role: ReplicaRole,
+        epoch: fube_runtime::Epoch,
+        factory: impl FnOnce(NativeIntegrationProvider) -> Box<dyn IStatefulServiceFactory>
+            + Send
+            + 'static,
+    ) -> Arc<Self> {
+        let (host, opened) =
+            Self::start_source_outcome_at_epoch(partition, source, role, epoch, factory).await;
+        opened.unwrap();
+        host
+    }
+    pub async fn start_source_outcome_at_epoch(
+        partition: uuid::Uuid,
+        source: ReplicaSource,
+        role: ReplicaRole,
+        epoch: fube_runtime::Epoch,
+        factory: impl FnOnce(NativeIntegrationProvider) -> Box<dyn IStatefulServiceFactory>
+            + Send
+            + 'static,
+    ) -> (Arc<Self>, Result<()>) {
         let (ready, readiness) = oneshot::channel();
         let (commands, receive) = mpsc::channel(32);
         let shutdown_commands = commands.clone();
         let (stop, stopped) = oneshot::channel();
         let events = broadcast::channel(8).0;
         let peer_events = events.clone();
+        let opened_address = Arc::new(std::sync::Mutex::new(None));
+        let peer_address = opened_address.clone();
         let thread = std::thread::Builder::new()
             .name("rap-model-application".into())
             .spawn(move || {
@@ -288,8 +347,8 @@ impl Host {
                         artifacts.root.clone(),
                         partition,
                         source,
-                        role,
-                        peer_events,
+                        (role, epoch),
+                        (peer_events, peer_address),
                     ));
                     let runtime = attach_runtime(context).await.unwrap();
                     let native = runtime.native_integration_provider();
@@ -324,13 +383,14 @@ impl Host {
             stop: std::sync::Mutex::new(Some(stop)),
             thread: std::sync::Mutex::new(Some(thread)),
             events,
+            opened_address,
         });
         readiness.await.expect("RAP model bootstrap");
-        host.request(Action::Open).await.unwrap();
-        if role == ReplicaRole::ActiveSecondary {
-            host.change_role(role).await.unwrap();
+        let mut opened = host.request(Action::Open).await;
+        if opened.is_ok() && role == ReplicaRole::ActiveSecondary {
+            opened = host.change_role(role).await;
         }
-        host
+        (host, opened)
     }
     async fn request(&self, action: Action) -> Result<()> {
         observed_request(&self.commands, action).await
@@ -352,6 +412,17 @@ impl Host {
     /// lag and closure are explicit receiver errors, not shutdown completion.
     pub fn subscribe_events(&self) -> broadcast::Receiver<HostEvent> {
         self.events.subscribe()
+    }
+    /// The address actually returned by public replicator Open and transported
+    /// in the successful native ReplicaOpenReply, not lower diagnostics.
+    pub fn replication_address(&self) -> Result<String> {
+        self.opened_address
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(Error::InvalidInput(
+                "native Open has not returned an address",
+            ))
     }
     pub async fn configure(&self, configuration: NativeReplicaSetConfiguration) -> Result<()> {
         self.request(Action::Configure(configuration)).await
@@ -448,6 +519,7 @@ fn base(
     partition: uuid::Uuid,
     source: &ReplicaSource,
     role: ReplicaRole,
+    epoch: fube_runtime::Epoch,
 ) -> ProxyRequest {
     let version = context.code.version.clone();
     ProxyRequest {
@@ -466,8 +538,8 @@ fn base(
                 kind: 1,
             },
             current: Epoch {
-                configuration: 1 << 32,
-                data_loss: 1,
+                configuration: epoch.configuration_number,
+                data_loss: epoch.data_loss_number,
             },
             previous: Epoch {
                 configuration: 0,
@@ -572,9 +644,14 @@ async fn serve(
     deployment: PathBuf,
     partition: uuid::Uuid,
     source: ReplicaSource,
-    role: ReplicaRole,
-    events: broadcast::Sender<HostEvent>,
+    initial: (ReplicaRole, fube_runtime::Epoch),
+    observation: (
+        broadcast::Sender<HostEvent>,
+        Arc<std::sync::Mutex<Option<String>>>,
+    ),
 ) {
+    let (role, epoch) = initial;
+    let (events, opened_address) = observation;
     let (mut socket, _) = listener.accept().await.unwrap();
     let hello = read_message(&mut socket).await.unwrap();
     assert_eq!(hello.properties().unwrap().actor, 1);
@@ -633,7 +710,7 @@ async fn serve(
                         let registration: TypeRequest = from_slice(&message.body).unwrap();
                         assert_eq!(registration.id.name, "ModelStatefulType");
                         assert_eq!(registration.context.id, context.as_ref().unwrap().id);
-                        local = Some(base(context.as_ref().unwrap(), partition, &source, role));
+                        local = Some(base(context.as_ref().unwrap(), partition, &source, role, epoch));
                         to_vec(&ErrorReply { error: 0 }).unwrap()
                     },
                     "FinishRegisterApplicationHostRequest" | "UnregisterFabricRuntimeRequest" | "UnregisterApplicationHostRequest" => to_vec(&ErrorReply { error: 0 }).unwrap(),
@@ -662,6 +739,9 @@ async fn serve(
                         {
                             let pending = pending.remove(index);
                             if reply.error.error == 0 {
+                                if pending.action == "ReplicaOpen" {
+                                    *opened_address.lock().unwrap() = Some(reply.local.replication_endpoint.clone());
+                                }
                                 let state = local.as_mut().unwrap();
                                 state.unit = reply.unit;
                                 state.local = reply.local;

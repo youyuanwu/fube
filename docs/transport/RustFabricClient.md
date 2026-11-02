@@ -16,8 +16,12 @@ list/deployed-list queries, node health, resolution and MovePrimary retain their
 native schemas. `FabricClient` explicitly owns the channel; `GatewayClient`
 borrows a supplied binding. ServiceNotificationClient owns its **own**
 notification-enabled GatewayChannel/native session; it does not adopt an
-ordinary client's channel or lifecycle. Image-transfer remains an independent
-`Connection` consumer. Rust error/admission/lifecycle changes below
+ordinary client's channel or lifecycle. ImageStoreClient owns an independent
+GatewayChannel with registered raw ACK actors. Each client installs its own
+actor/action/envelope authorization; the native channel's minimal actor demux
+and duplex/RPC split contain no gateway/upload/notification profile switch.
+The broader actor/action router remains declarations only.
+Rust error/admission/lifecycle changes below
 are deliberate API breaks, not compatibility wrappers. Historical source/wire
 evidence in later sections is not a substitute for current migration receipts.
 
@@ -274,7 +278,7 @@ Cancellation/timeout does not imply remote cancellation. Invalid input sends not
 
 Ordinary replies use native's final effective RelatesTo in wire order.
 All repeated records are validated and preserved under the
-[channel's header/frame bounds](NativeChannel.md#supported-profile), without a
+[channel's header/frame bounds](NativeChannel.md#supported-composition), without a
 special forwarding-count or repetition-pattern restriction. Typed operations
 validate their normal reply actor/action/body profile independently.
 No earlier pending-ID fallback, header normalization, notification/IPC expansion
@@ -299,7 +303,9 @@ qualification of native secure-session recovery or service notifications.
 ### Native ImageStore application-package copy
 
 `ImageStoreClient` is a noncloneable owner of a dedicated native upload
-Upload-profile `GatewayChannel`. It does not borrow a `FabricClient` or
+`GatewayChannel` with client-installed authorization and actor25/27 registration.
+Registration alone grants neither sender nor consuming reply permission.
+It does not borrow a `FabricClient` or
 notification session.
 Production upload uses no native SDK, COM library, HTTP gateway or subprocess.
 Only native `fabric:ImageStore`, canonical protocol **1.2**, and explicitly
@@ -417,7 +423,7 @@ Implementation: [public API and copy lifecycle](../../crates/libs/fube-client/sr
 [native codecs](../../crates/libs/fube-client/src/image_store_protocol.rs#L144),
 [complete root-marker preflight](../../crates/libs/fube-client/src/image_store_protocol.rs#L310),
 [strict client semantic ACK decoding](../../crates/libs/fube-client/src/image_store_protocol.rs#L48)
-and [concrete upload transport authority](../../crates/libs/fube-transport/src/native_channel.rs#L1135).
+and [client-owned upload envelope authority](../../crates/libs/fube-client/src/channel_adapter.rs#L72).
 Native copy semantics follow the pinned
 [NativeImageStore directory path](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Management/ImageStore/NativeImageStore.cpp#L1139-L1369).
 Native gateway ACKs use raw actor25/27
@@ -684,7 +690,7 @@ for application in page.items {
 // Caller decides whether/when to issue another operation with this opaque token.
 applications.paging.continuation_token = page.continuation_token;
 
-let mut services = ServiceQueryDescription::new(ServiceQueryParameters::new("fabric:/MyApplication"));
+let mut services = ServiceQueryDescription::new(ServiceQueryParameters::new("fabric:/MyApplication".parse()?));
 services.parameters.filter = ServiceListFilter::TypeName("MyServiceType".into());
 let page = client.get_service_list(&services, Some(Duration::from_secs(5))).await?;
 for service in page.items {
@@ -1028,7 +1034,7 @@ use fube_client::{
     ServiceNotificationFilter, DEFAULT_TIMEOUT,
 };
 
-# async fn example() -> fube_client::NotificationResult<()> {
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let endpoint = "127.0.0.1:19000".parse().unwrap();
 let ordinary = FabricClient::connect_clear(endpoint, DEFAULT_TIMEOUT).await?;
 let mut changes =

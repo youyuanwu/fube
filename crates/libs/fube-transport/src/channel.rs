@@ -1,12 +1,13 @@
-//! **Operational for the explicit native gateway profile in
+//! **Operational for the explicit native loopback composition in
 //! [`native_channel`](crate::native_channel).**
 //!
 //! Bounded Rust-profile contracts for a shared native message/RPC
 //! foundation, **not** an `IFabricTransport` application-service API or an SF ABI.
 //! [`GatewayChannel`](crate::native_channel::GatewayChannel) implements raw/RPC
-//! and owned shutdown; its opted-in receiver and consuming context implement
-//! authorized native notification ingress/replies. Its exclusive upload profile
-//! provides actor26 raw sends and bounded actor25/27 ingress without replies.
+//! and owned shutdown; its configured receiver and consuming context implement
+//! authorized actor ingress and special duplex replies. Client adapters install
+//! domain actor/action/envelope rules through [`native_demux`](crate::native_demux).
+//! Actor registration alone grants neither outbound nor reply authority.
 //! This is not a general listener/IPC/replication or secure transport implementation.
 //! [`Connection`](crate::connection::Connection) does not implement these traits;
 //! its unrelated IPC/reverse behavior and security limits remain unchanged.
@@ -148,7 +149,7 @@ pub type ChannelFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 
 
 /// Raw outbound message delivery and lifecycle ownership, independent of RPC.
 ///
-/// **Rust-profile contract, implemented by the explicit GatewayChannel profile.** Concurrent calls
+/// **Rust-profile contract, implemented by the configured GatewayChannel.** Concurrent calls
 /// through shared references are supported; no cross-target ordering/fairness
 /// guarantee is imposed. A backend must document its per-target ordering,
 /// affinity, finite admission/byte limits and authorized roles.
@@ -228,7 +229,7 @@ pub trait MessageChannel: Send + Sync + 'static {
 
 /// Ordinary correlated request/reply above a raw [`MessageChannel`].
 ///
-/// **Rust-profile contract, implemented by the explicit GatewayChannel profile.** Correlation,
+/// **Rust-profile contract, implemented by the configured GatewayChannel.** Correlation,
 /// bounded pending ownership and reply completion are distinct from protocol
 /// actor dispatch/domain validation. The inherited channel and this RPC
 /// capability belong to the same foundation; no automatic Connection adapter is supplied.

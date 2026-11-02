@@ -109,12 +109,28 @@ struct Readers {
 
 /// Shared native owner retained by accepted registration work.
 struct VersionState {
+    pending_readers: std::sync::atomic::AtomicUsize,
+    max_readers: std::sync::atomic::AtomicUsize,
+    max_notifications: std::sync::atomic::AtomicUsize,
     /// Last dispatch barrier; snapshotted synchronously when Register is invoked.
     dispatching_barrier: Mutex<Option<Completion<()>>>,
     /// Native duplicate registrations and notification deduplication.
     readers: Mutex<Readers>,
     /// Narrow GetVersion callback, called under the reader-list lock.
     version_provider: Arc<dyn Fn() -> Result<SequenceNumber> + Send + Sync>,
+}
+struct PendingReader {
+    inner: Arc<VersionState>,
+    transferred: bool,
+}
+impl Drop for PendingReader {
+    fn drop(&mut self) {
+        if !self.transferred {
+            self.inner
+                .pending_readers
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
 }
 
 /// Private real version manager implementing the unchanged SDK contracts.
@@ -134,6 +150,9 @@ impl VersionManager {
     ) -> Self {
         Self {
             inner: Arc::new(VersionState {
+                pending_readers: std::sync::atomic::AtomicUsize::new(0),
+                max_readers: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                max_notifications: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 dispatching_barrier: Mutex::new(None),
                 readers: Mutex::new(Readers::default()),
                 version_provider,
@@ -159,6 +178,14 @@ impl VersionManager {
             .versions
             .clone()
     }
+    pub(crate) fn set_limits(&self, readers: usize, notifications: usize) {
+        self.inner
+            .max_readers
+            .store(readers, std::sync::atomic::Ordering::Release);
+        self.inner
+            .max_notifications
+            .store(notifications, std::sync::atomic::Ordering::Release);
+    }
 
     /// Reset native lifecycle lists/fence without synthesizing reader releases.
     pub(crate) fn reuse(&self) {
@@ -171,7 +198,29 @@ impl VersionManager {
     }
 
     /// Sample and append while holding the exclusive native reader-list lock.
-    fn register_sample(inner: &VersionState) -> Result<SequenceNumber> {
+    fn reserve_reader(inner: &Arc<VersionState>) -> Result<PendingReader> {
+        let readers = inner.readers.lock().expect("version readers poisoned");
+        if readers.versions.len().saturating_add(
+            inner
+                .pending_readers
+                .load(std::sync::atomic::Ordering::Acquire),
+        ) >= inner.max_readers.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(super::status::Status::ServiceTooBusy.error());
+        }
+        inner
+            .pending_readers
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(PendingReader {
+            inner: inner.clone(),
+            transferred: false,
+        })
+    }
+
+    fn register_sample(
+        inner: &VersionState,
+        mut reserved: PendingReader,
+    ) -> Result<SequenceNumber> {
         let mut readers = inner.readers.lock().expect("version readers poisoned");
         let version = (inner.version_provider)()?;
         if version < 0 || readers.versions.last().is_some_and(|last| version < *last) {
@@ -179,12 +228,20 @@ impl VersionManager {
         }
         readers.versions.push(version);
         readers.removal.entry(version).or_default();
+        reserved.transferred = true;
+        inner
+            .pending_readers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         Ok(version)
     }
 }
 
 impl ITransactionVersionManager for VersionManager {
     fn register(&self) -> ApiFuture<'_, SequenceNumber> {
+        let reserved = match Self::reserve_reader(&self.inner) {
+            Ok(reserved) => reserved,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
         let fence = self
             .inner
             .dispatching_barrier
@@ -195,7 +252,7 @@ impl ITransactionVersionManager for VersionManager {
         // Native KTL starts eagerly and does not suspend on absent/ready fences.
         // Preserve reader admission before returning its observation on this path.
         if fence.as_ref().is_none_or(Completion::is_completed) {
-            let result = Self::register_sample(&inner);
+            let result = Self::register_sample(&inner, reserved);
             return Box::pin(async move { result });
         }
         let result = Completion::new();
@@ -214,7 +271,7 @@ impl ITransactionVersionManager for VersionManager {
             if let Some(fence) = fence {
                 let _ = fence.wait().await;
             }
-            result.complete(Self::register_sample(&inner));
+            result.complete(Self::register_sample(&inner, reserved));
         }));
         Box::pin(async move { observation.wait().await.as_ref().clone() })
     }
@@ -312,6 +369,22 @@ impl IVersionManager for VersionManager {
                 enumeration_completion_notifications: None,
             });
         };
+        let new = retaining
+            .iter()
+            .filter(|version| {
+                !readers
+                    .notifications
+                    .contains_key(&(state_provider_id, **version))
+            })
+            .count();
+        if readers.notifications.len().saturating_add(new)
+            > self
+                .inner
+                .max_notifications
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::ResourceLimit("version notification registry"));
+        }
         let mut notifications: Vec<Arc<dyn EnumerationCompletionResult>> = Vec::new();
         for &version in &retaining {
             let key = (state_provider_id, version);
