@@ -408,8 +408,6 @@ dependencies = [
  "fube-ra",
  "fube-ra-store",
  "fube-transport",
- "libc",
- "roxmltree",
  "serde",
  "serde_json",
  "sha2",

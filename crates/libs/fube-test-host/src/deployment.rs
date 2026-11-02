@@ -22,6 +22,22 @@ pub struct Deployment {
     pub initialization: Vec<u8>,
 }
 
+fn rollback_layout<T>(
+    layout: &fube_local_host::deployment::Deployment,
+    result: Result<T>,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => match layout.release() {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(HostError(format!(
+                "{error}; retained root {}: {cleanup}",
+                layout.root.display()
+            ))),
+        },
+    }
+}
+
 impl Deployment {
     pub fn create(parent: &Path, executable: &Path) -> Result<Self> {
         let parent = parent.canonicalize()?;
@@ -93,9 +109,15 @@ impl Deployment {
     pub fn from_manifest(parent: &Path, package: &Package) -> Result<Self> {
         let layout = fube_local_host::deployment::Deployment::from_manifest(parent, package)?;
         let config = layout.root.join("FabricConfig.cfg");
-        fs::create_dir_all(layout.root.join("native-data"))?;
-        fs::create_dir_all(layout.root.join("native-objects"))?;
-        fs::write(&config, format!("[Common]\nObjectFolder={}\n[Trace/Console]\nLevel=4\n[Trace/Etw]\nLevel=0\n[Trace/File]\nLevel=0\n", layout.root.join("native-objects").display()))?;
+        rollback_layout(
+            &layout,
+            (|| {
+                fs::create_dir_all(layout.root.join("native-data"))?;
+                fs::create_dir_all(layout.root.join("native-objects"))?;
+                fs::write(&config, format!("[Common]\nObjectFolder={}\n[Trace/Console]\nLevel=4\n[Trace/Etw]\nLevel=0\n[Trace/File]\nLevel=0\n", layout.root.join("native-objects").display()))?;
+                Ok(())
+            })(),
+        )?;
         Ok(Self {
             executable: layout.executable,
             arguments: layout.arguments,
@@ -170,6 +192,46 @@ pub fn preflight(runtime: &Path, app: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_setup_failure_rolls_back_only_its_reserved_root() {
+        let parent = std::env::temp_dir().join(format!("adapter-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&parent).unwrap();
+        let caller_package = parent.join("caller-package");
+        fs::create_dir(&caller_package).unwrap();
+        fs::write(caller_package.join("keep"), "unchanged").unwrap();
+        fs::copy("/bin/true", caller_package.join("program")).unwrap();
+        let package = Package {
+            application_type: "App".into(),
+            application_version: "1".into(),
+            application_name: "fabric:/App".into(),
+            service_manifest: "Service".into(),
+            manifest_version: "1".into(),
+            code_name: "Code".into(),
+            code_version: "1".into(),
+            service_type: "Type".into(),
+            service_name: "Singleton".into(),
+            program: "program".into(),
+            arguments: vec![],
+            argument_text: String::new(),
+            working_folder: "Work".into(),
+            endpoints: vec![],
+            source_code: caller_package.clone(),
+        };
+        let layout =
+            fube_local_host::deployment::Deployment::from_manifest(&parent, &package).unwrap();
+        assert!(layout.executable.is_file());
+        let root = layout.root.clone();
+        fs::create_dir(root.join("FabricConfig.cfg")).unwrap();
+        let result = fs::write(root.join("FabricConfig.cfg"), "configuration").map_err(Into::into);
+        assert!(rollback_layout(&layout, result).is_err());
+        assert!(!root.exists());
+        assert_eq!(
+            fs::read_to_string(caller_package.join("keep")).unwrap(),
+            "unchanged"
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
 
     #[test]
     fn private_bundle_is_unique_and_has_required_native_inputs() {

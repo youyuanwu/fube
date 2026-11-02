@@ -73,7 +73,13 @@ impl OwnedApp {
         self.0.logs()
     }
     pub fn callbacks(&self) -> Vec<serde_json::Value> {
-        self.0.callbacks()
+        self.logs()
+            .iter()
+            .filter_map(|line| {
+                line.find("MSSF_APP ")
+                    .and_then(|start| serde_json::from_str(&line[start + 9..]).ok())
+            })
+            .collect()
     }
     pub fn check_alive(&mut self) -> Result<()> {
         self.0.check_alive().map_err(Into::into)
