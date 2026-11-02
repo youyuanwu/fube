@@ -22,6 +22,7 @@ use std::{
 
 use tokio::{
     io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
     sync::{oneshot, watch, Notify},
     task::JoinHandle,
     time::{timeout, timeout_at, Instant},
@@ -31,7 +32,7 @@ use crate::{
     channel::{
         ChannelFuture, IncomingMessage, MessageChannel, MessageReceiver, ReplyContext, RpcChannel,
     },
-    connection::MAX_FRAME_TIME,
+    connection::{write_message, MAX_FRAME_TIME},
     frame::{FIXED_HEADER_SIZE, MAX_FRAME_SIZE, MAX_HEADER_SIZE},
     message::{self, Header, ListenInstance, Message, MessageId, Properties, MAX_HEADER_COUNT},
     native_demux::{ChannelComposition, Dispatch, EnvelopeValidator, OutboundKind},
@@ -306,6 +307,7 @@ struct Shared {
     /// Separate from inner so validity samples can safely read diagnostics.
     visibility: Mutex<()>,
     outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
+    accepted_ipc: bool,
 }
 
 impl Shared {
@@ -421,6 +423,76 @@ impl Iterator for GatewayIngressSnapshot {
 impl ExactSizeIterator for GatewayIngressSnapshot {}
 
 impl GatewayChannel {
+    /// Adopt one accepted, explicitly trusted numeric-loopback IPC socket.
+    ///
+    /// Performs the client-only ListenInstance exchange before starting the same
+    /// bounded driver used by outgoing channels. IPC identity is admitted only
+    /// in this immutable server mode and must be validated by domain actors.
+    /// This does not authenticate local processes or supply a listener.
+    pub async fn accept_unsecured_loopback_ipc(
+        mut stream: TcpStream,
+        composition: ChannelComposition,
+        limits: ChannelLimits,
+        deadline: Instant,
+    ) -> Result<Self> {
+        limits.validate()?;
+        let endpoint = stream.peer_addr()?;
+        let local = stream.local_addr()?;
+        if !endpoint.ip().is_loopback() || !local.ip().is_loopback() {
+            return Err(Error::InvalidInput("accepted IPC requires loopback"));
+        }
+        check_deadline(deadline)?;
+        let process_id = uuid::Uuid::new_v4().to_bytes_le();
+        timeout_at(deadline, async {
+            let first = read_bounded(&mut stream, limits.max_frame_bytes).await?;
+            let props = envelope(&first, true)?;
+            if props.id == MessageId::default()
+                || ListenInstance::decode(&first.body)? != ListenInstance::default()
+                || props.actor != 1
+                || !props.action.is_empty()
+                || first.headers.iter().any(|h| {
+                    !matches!(
+                        h.id,
+                        message::ACTOR
+                            | message::ACTION
+                            | message::MESSAGE_ID
+                            | message::HIGH_PRIORITY
+                    )
+                })
+            {
+                return Err(Error::Protocol("invalid client-only ListenInstance"));
+            }
+            write_message(
+                &mut stream,
+                &Message::listen_instance(
+                    MessageId {
+                        guid: process_id,
+                        index: 1,
+                    },
+                    &ListenInstance {
+                        address: local.to_string(),
+                        instance: 1,
+                        nonce: process_id,
+                    },
+                )?,
+            )
+            .await?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| Error::Timeout)??;
+        stream.set_nodelay(true)?;
+        Ok(Self::start_composed(
+            stream,
+            endpoint,
+            composition,
+            limits,
+            process_id,
+            ListenInstance::default(),
+            None,
+            true,
+        ))
+    }
     /// Connect a dedicated, explicitly trusted unsecured-development gateway.
     ///
     /// Only numeric loopback endpoints are allowed. The immutable composition
@@ -506,6 +578,29 @@ impl GatewayChannel {
         remote: ListenInstance,
         outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
     ) -> Self {
+        Self::start_composed(
+            stream,
+            endpoint,
+            composition,
+            limits,
+            process_id,
+            remote,
+            outbound_envelope,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_composed<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+        stream: S,
+        endpoint: SocketAddr,
+        composition: ChannelComposition,
+        limits: ChannelLimits,
+        process_id: [u8; 16],
+        remote: ListenInstance,
+        outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
+        accepted_ipc: bool,
+    ) -> Self {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 terminal: None,
@@ -538,6 +633,7 @@ impl GatewayChannel {
             stopped: watch::channel(false).0,
             visibility: Mutex::new(()),
             outbound_envelope,
+            accepted_ipc,
         });
         let join = tokio::spawn(drive(stream, shared.clone()));
         Self {
@@ -976,6 +1072,7 @@ async fn submit(
         message.headers.push(header);
     }
     let requires_id = rpc
+        || shared.accepted_ipc
         || shared
             .outbound_envelope
             .as_ref()
@@ -1304,7 +1401,7 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
                 "unsupported role/security/reconnect control; no recovery",
             ));
         }
-        if has(&message, message::IPC) {
+        if has(&message, message::IPC) && !shared.accepted_ipc {
             return Err(Error::Protocol("IPC envelope on native channel"));
         }
         let mut reply_authorize = None;
@@ -1621,10 +1718,27 @@ async fn drive<S: AsyncRead + AsyncWrite + Unpin>(stream: S, shared: Arc<Shared>
         }
         stop.await;
     };
+    let writing = async {
+        if !shared.accepted_ipc {
+            return send_loop(writer, &shared).await;
+        }
+        let stop = shared.stop.notified();
+        tokio::pin!(stop);
+        stop.as_mut().enable();
+        // Accepted Hosting retirement discards the entire socket, including any
+        // uncertain partial reply. Client writers must still finish their suffix.
+        if shared.error().is_some() {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = stop => Ok(()),
+            result = send_loop(writer, &shared) => result,
+        }
+    };
     tokio::join!(
         raw_session::join_io(
             receive_loop(reader, &shared),
-            send_loop(writer, &shared),
+            writing,
             stopped,
             |error| shared.terminate(error),
             Error::Closed,

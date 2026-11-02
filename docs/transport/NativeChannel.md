@@ -172,7 +172,7 @@ Caller-supplied IPC headers and explicit empty IPC MessageIds reject. Correlated
 context replies instead carry their original RelatesTo and **no automatic IPC
 identity or new MessageId**, matching the separate native receiver-context path.
 
-The generic channel has no IPC constructor or host/PID state. Its private,
+The generic channel has no outgoing IPC-identity constructor or host/PID state. Its private,
 bounded session-envelope hook applies the captured protocol envelope on
 submission, including through cloned owners; it is not a public plugin or a
 domain executor. Collision-aware ID allocation/history, budgets and first-write
@@ -181,6 +181,19 @@ fencing remain shared-driver mechanisms. The internal
 component owns the consuming source-bound reply context for both normal and
 special ingress. Runtime actor/action rules and control/health processing stay
 in the runtime adapter; only opaque ordering acknowledgments live below it.
+
+Hosting additionally adopts one accepted numeric-loopback socket through
+`accept_unsecured_loopback_ipc`, performing the client-only ListenInstance
+exchange and using this same driver. Immutable accepted mode permits IPC
+headers for Hosting's exact host/PID/session validation; normal gateway/client
+ingress still rejects them. Server semantic sends receive missing MessageIds,
+not RelatesTo. Its bounded no-eviction session ID history admits legitimate
+priority-lane reordering, rejects replay and retires on exhaustion. Terminal
+accepted-session retirement discards the entire socket (an uncertain partial
+reply is not reused); ordinary client started-suffix guarantees stay unchanged.
+Hosting reserves one ordinary lifecycle send, one ingress and one reserved
+response within its 4MiB connection scratch budget, leaving lease byte headroom.
+See [production local composition and regressions](../cluster/StatelessRaRap.md).
 
 Native [IpcDemuxer](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/IpcDemuxer.cpp#L16-L32)
 builds contexts for ordinary actor ingress without testing ExpectsReply; native

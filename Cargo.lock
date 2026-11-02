@@ -550,7 +550,11 @@ name = "hosting-local-app"
 version = "0.1.0"
 dependencies = [
  "fube-hosting",
+ "fube-node",
+ "fube-ra",
+ "fube-ra-store",
  "fube-runtime",
+ "fube-transport",
  "tokio",
  "uuid",
 ]

@@ -6,24 +6,29 @@
 //! capability are not implied. Node composition owns actual event consumers.
 use crate::{lease::Authority, wire, Hosting};
 use fube_transport::{
-    frame::{Frame, FIXED_HEADER_SIZE},
-    message::{self, Header, ListenInstance, Message, MessageId},
+    channel::{MessageChannel, MessageReceiver},
+    message::{self, Header, Message, MessageId},
+    native_channel::{ChannelLimits, GatewayChannel, GatewayTarget},
+    native_demux::{
+        ActorDemux, ActorRegistration, ChannelComposition, OutboundKind, RequestPolicy,
+    },
     serialization::serde::{from_slice_with_budget, to_vec},
     Error as TransportError, Result as TransportResult,
 };
 use serde::{de::DeserializeOwned, Deserialize};
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, OnceLock,
     },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
+#[cfg(test)]
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Notify,
     task::JoinSet,
@@ -103,6 +108,58 @@ struct Entry {
     registration_deadline: AtomicU64,
     cleanup_deadline: AtomicU64,
     _reservation: Reservation,
+    consumer: OnceLock<RegistrationGate>,
+    session: Mutex<Option<Session>>,
+    semantic: Mutex<VecDeque<Message>>,
+    sends: Arc<tokio::sync::Semaphore>,
+}
+#[derive(Clone)]
+struct Session {
+    channel: GatewayChannel,
+    target: Arc<GatewayTarget>,
+    executor: tokio::runtime::Handle,
+}
+
+/// A retained local-write observation, never a service lifecycle completion.
+/// Dropping it does not cancel accepted channel work.
+pub struct LifecycleSend {
+    result: Arc<Mutex<Option<TransportResult<()>>>>,
+    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+impl LifecycleSend {
+    pub fn result(&self) -> Option<TransportResult<()>> {
+        self.result.lock().unwrap().clone()
+    }
+}
+struct SendCompletion {
+    result: Arc<Mutex<Option<TransportResult<()>>>>,
+    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+impl Drop for SendCompletion {
+    fn drop(&mut self) {
+        let _ = self
+            .result
+            .lock()
+            .unwrap()
+            .get_or_insert(Err(TransportError::Closed));
+    }
+}
+/// An admitted one-way RAP reply from one exact owned connection.
+/// Private construction prevents callers from manufacturing source provenance.
+pub struct LifecycleReply {
+    entry: Arc<Entry>,
+    message: Message,
+}
+impl LifecycleReply {
+    pub fn action(&self) -> TransportResult<String> {
+        Ok(self.message.properties()?.action)
+    }
+    pub fn body(&self) -> &[u8] {
+        &self.message.body
+    }
+    pub fn belongs_to(&self, lease: &HostLease) -> bool {
+        Arc::ptr_eq(&self.entry, &lease.entry)
+    }
 }
 struct Record {
     entry: Arc<Entry>,
@@ -173,11 +230,93 @@ pub struct HostLease {
     entry: Arc<Entry>,
 }
 impl HostLease {
+    /// Fault injection only. The opaque source remains this exact owned Entry;
+    /// this never fabricates another host/PID/session or bypasses Node admission.
+    #[cfg(feature = "qualification")]
+    #[doc(hidden)]
+    pub fn qualification_reply(
+        &self,
+        action: &str,
+        body: Vec<u8>,
+    ) -> TransportResult<LifecycleReply> {
+        if !matches!(action, "ReplicaOpenReply" | "ReplicaCloseReply") || body.len() > MAX_INPUT {
+            return Err(protocol("invalid qualification reply"));
+        }
+        Ok(LifecycleReply {
+            entry: self.entry.clone(),
+            message: Message {
+                headers: vec![Header::actor(12)?, Header::action(action)?],
+                body,
+            },
+        })
+    }
     pub fn stop_renewal(&self) {
         self.entry.authority.stop_renewal();
     }
     pub fn revoke(&self) {
         self.entry.authority.revoke();
+    }
+    /// Begin a bounded semantic one-way send on this exact admitted session.
+    /// Success of the returned observer means only a complete local frame write.
+    pub fn send_lifecycle(&self, action: &str, body: Vec<u8>) -> TransportResult<LifecycleSend> {
+        if !matches!(action, "ReplicaOpen" | "ReplicaClose") || body.len() > MAX_INPUT {
+            return Err(protocol("unsupported local lifecycle action/body"));
+        }
+        if !session_live(&self.entry) || !self.entry.ready.load(Ordering::SeqCst) {
+            return Err(TransportError::Closed);
+        }
+        let permit = Arc::new(
+            self.entry
+                .sends
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| TransportError::ResourceLimit("Hosting lifecycle sends"))?,
+        );
+        let session = self
+            .entry
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(TransportError::Closed)?;
+        let result = Arc::new(Mutex::new(None));
+        let completion = SendCompletion {
+            result: result.clone(),
+            _permit: permit.clone(),
+        };
+        let entry = self.entry.clone();
+        let message = Message {
+            headers: vec![Header::actor(12)?, Header::action(action)?],
+            body,
+        };
+        session.executor.spawn(async move {
+            let value = session
+                .channel
+                .send_one_way_fenced(
+                    session.target.as_ref(),
+                    message,
+                    tokio::time::Instant::now() + IO_DEADLINE,
+                    Arc::new(move || session_live(&entry)),
+                )
+                .await;
+            *completion.result.lock().unwrap() = Some(value);
+            drop(completion);
+        });
+        Ok(LifecycleSend {
+            result,
+            _permit: permit,
+        })
+    }
+    pub fn take_lifecycle_reply(&self) -> Option<LifecycleReply> {
+        self.entry
+            .semantic
+            .lock()
+            .unwrap()
+            .pop_front()
+            .map(|message| LifecycleReply {
+                entry: self.entry.clone(),
+                message,
+            })
     }
 }
 
@@ -348,6 +487,14 @@ impl RegistrationOwner {
                 Delivery::Obligation(state.core.state.obligations.remove(0))
             }
         }))
+    }
+    /// Observation only; stable drain additionally requires the sole producer
+    /// owner to stop its session and finish declaration/source removal.
+    pub fn has_deliveries(&self) -> crate::Result<bool> {
+        let state = self.shared.state()?;
+        Ok(!state.core.state.closed_registered.is_empty()
+            || !state.core.state.enabled_disabled.is_empty()
+            || !state.core.state.obligations.is_empty())
     }
     pub fn take_operations(&self) -> crate::Result<Vec<OperationResult>> {
         let mut state = self.shared.state()?;
@@ -774,7 +921,13 @@ impl Server {
             prepared.failure = Some((prepared.admitted, crate::Error::ObjectClosed));
             return Ok(prepared);
         }
-        state.records[index].registration_consumer = Some(owner.gate());
+        let gate = owner.gate();
+        state.records[index]
+            .entry
+            .consumer
+            .set(gate.clone())
+            .map_err(|_| crate::Error::InvalidState)?;
+        state.records[index].registration_consumer = Some(gate);
         Ok(prepared)
     }
     /// Synchronous admission reserves one complete scratch/session/result slot.
@@ -835,6 +988,10 @@ impl Server {
             registration_deadline: AtomicU64::new(0),
             cleanup_deadline: AtomicU64::new(0),
             _reservation: reservation,
+            consumer: OnceLock::new(),
+            session: Mutex::new(None),
+            semantic: Mutex::new(VecDeque::new()),
+            sends: Arc::new(tokio::sync::Semaphore::new(1)),
         });
         state.records.push(Record {
             entry: entry.clone(),
@@ -968,6 +1125,9 @@ async fn serve(listener: TcpListener, shared: Arc<Shared>) {
     while tasks.join_next().await.is_some() {}
     if let Ok(mut state) = shared.state() {
         for i in 0..state.records.len() {
+            if let Some(session) = state.records[i].entry.session.lock().unwrap().take() {
+                session.channel.abort();
+            }
             state.records[i].entry.authority.revoke();
             state.records[i]
                 .entry
@@ -978,27 +1138,7 @@ async fn serve(listener: TcpListener, shared: Arc<Shared>) {
     }
 }
 
-async fn read(socket: &mut TcpStream) -> TransportResult<Message> {
-    // Idle has a finite deadline too; profile maximum is checked before allocation.
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let mut fixed = [0; FIXED_HEADER_SIZE];
-        socket.read_exact(&mut fixed).await?;
-        let (length, _) = fube_transport::frame::validate_fixed(&fixed)?;
-        if length > MAX_INPUT {
-            return Err(protocol("Hosting frame exceeds bootstrap profile"));
-        }
-        let mut bytes = Vec::with_capacity(length);
-        bytes.extend_from_slice(&fixed);
-        bytes.resize(length, 0);
-        socket.read_exact(&mut bytes[FIXED_HEADER_SIZE..]).await?;
-        Message::from_frame(Frame::decode(&bytes)?)
-    })
-    .await
-    .map_err(|_| protocol("Hosting frame deadline"))?
-}
-async fn write(socket: &mut TcpStream, value: Message) -> TransportResult<()> {
-    write_fenced(socket, value, None).await
-}
+#[cfg(test)]
 async fn write_fenced<W: AsyncWrite + Unpin>(
     socket: &mut W,
     value: Message,
@@ -1049,7 +1189,7 @@ fn envelope(message: &Message, decode_limit: usize) -> TransportResult<(String, 
     let p = message.properties()?;
     if p.id == MessageId::default()
         || p.relates_to != MessageId::default()
-        || !p.expects_reply
+        || (p.actor == 12) == p.expects_reply
         || p.fault.is_some()
         || p.uncorrelated_reply
         || !message.headers.iter().any(|h| h.id == message::ACTOR)
@@ -1075,6 +1215,7 @@ fn envelope(message: &Message, decode_limit: usize) -> TransportResult<(String, 
     let Identity(host, pid) = decode(&header.value, decode_limit)?;
     Ok((host, pid, timeout))
 }
+#[cfg(test)]
 fn reply(id: MessageId, body: Vec<u8>) -> TransportResult<Message> {
     Ok(Message {
         headers: vec![
@@ -1088,10 +1229,11 @@ fn reply(id: MessageId, body: Vec<u8>) -> TransportResult<Message> {
     })
 }
 
-async fn connection(mut socket: TcpStream, shared: Arc<Shared>) -> Option<Arc<Entry>> {
+async fn connection(socket: TcpStream, shared: Arc<Shared>) -> Option<Arc<Entry>> {
     let mut claimed: Option<Arc<Entry>> = None;
-    let outcome = run_connection(&mut socket, &shared, &mut claimed).await;
+    let outcome = run_connection(socket, &shared, &mut claimed).await;
     if let Some(entry) = claimed {
+        let session = entry.session.lock().unwrap().take();
         let loss = match &outcome {
             Ok(()) | Err(TransportError::Io(_)) => Loss::ConnectionClosed,
             Err(TransportError::Closed) => Loss::Authority,
@@ -1103,71 +1245,72 @@ async fn connection(mut socket: TcpStream, shared: Arc<Shared>) -> Option<Arc<En
                 cleanup(&mut state, i, loss);
             }
         }
+        if let Some(session) = session {
+            session.channel.abort();
+            let _ = session
+                .channel
+                .closed(tokio::time::Instant::now() + IO_DEADLINE)
+                .await;
+        }
         Some(entry)
     } else {
         None
     }
 }
 async fn run_connection(
-    socket: &mut TcpStream,
+    socket: TcpStream,
     shared: &Arc<Shared>,
     claimed: &mut Option<Arc<Entry>>,
 ) -> TransportResult<()> {
-    let first = read(socket).await?;
-    unique_headers(&first)?;
-    let properties = first.properties()?;
-    let listen = ListenInstance::decode(&first.body)?;
-    if properties.actor != 1
-        || !properties.action.is_empty()
-        || listen != ListenInstance::default()
-        || properties.id == MessageId::default()
-        || first.headers.iter().any(|h| {
-            !matches!(
-                h.id,
-                message::ACTOR | message::ACTION | message::MESSAGE_ID | message::HIGH_PRIORITY
-            )
-        })
-    {
-        return Err(protocol("invalid client-only ListenInstance"));
-    }
-    write(
+    let peer = socket.peer_addr()?.to_string();
+    let channel = GatewayChannel::accept_unsecured_loopback_ipc(
         socket,
-        Message::listen_instance(
-            MessageId {
-                guid: uuid::Uuid::new_v4().to_bytes_le(),
-                index: 0,
-            },
-            &ListenInstance {
-                address: socket.local_addr()?.to_string(),
-                instance: 1,
-                nonce: uuid::Uuid::new_v4().to_bytes_le(),
-            },
-        )?,
+        hosting_composition()?,
+        ChannelLimits {
+            max_operations: 1,
+            max_replies: 1,
+            max_ingress: 1,
+            max_frame_bytes: MAX_INPUT,
+            max_retained_bytes: SCRATCH,
+            max_history: 4096,
+        },
+        tokio::time::Instant::now() + IO_DEADLINE,
     )
     .await?;
-    let mut last_id: Option<MessageId> = None;
+    let receiver = channel.receiver()?;
+    let target = channel.resolve_target(&peer)?;
+    let mut guid = None;
+    let mut seen = HashSet::new();
     loop {
-        let request = if let Some(entry) = claimed.as_ref() {
+        if let Some(entry) = claimed.as_ref() {
+            deadline(shared, entry)?;
+        }
+        let incoming = if let Some(entry) = claimed.as_ref() {
             tokio::select! {
                 _ = entry.authority.cancel.notified() => return Err(TransportError::Closed),
-                value = read(socket) => value?,
+                value = receiver.receive(tokio::time::Instant::now() + Duration::from_secs(30)) => value?,
                 result = watch_deadlines(shared, entry) => return result,
             }
         } else {
-            read(socket).await?
+            receiver
+                .receive(tokio::time::Instant::now() + Duration::from_secs(30))
+                .await?
         };
-        let arrived = Instant::now();
+        let arrived = incoming.received_at.into_std();
+        let request = incoming.message;
         let (host, pid, timeout) = envelope(&request, shared.config.decode_bytes)?;
         let has_timeout = timeout.is_some();
         let p = request.properties()?;
         if p.id.guid == [0; 16]
-            || last_id.is_some_and(|last| p.id.guid != last.guid || p.id.index <= last.index)
+            || guid.is_some_and(|guid| p.id.guid != guid)
+            || seen.len() == 4096
+            || !seen.insert(p.id.index)
         {
-            return Err(protocol("stale Hosting correlation"));
+            return Err(protocol("replayed or exhausted Hosting session identity"));
         }
-        // Native MessageId is process GUID/increasing index; Rust IPC is
-        // connection GUID/increasing index. Gaps are valid; wrap/replay is not.
-        last_id = Some(p.id);
+        // Reserved semantic replies may overtake older ordinary lease RPCs.
+        // No eviction: a replay can never become fresh by waiting.
+        guid = Some(p.id.guid);
         if claimed.is_none() {
             let mut state = shared.state().map_err(|_| protocol("Hosting closed"))?;
             let r = state
@@ -1186,14 +1329,36 @@ async fn run_connection(
             }
             r.claimed = true;
             r.entry.connected.store(true, Ordering::SeqCst);
+            *r.entry.session.lock().unwrap() = Some(Session {
+                channel: channel.clone(),
+                target: target.clone(),
+                executor: tokio::runtime::Handle::current(),
+            });
             *claimed = Some(r.entry.clone());
         }
         let entry = claimed.as_ref().expect("claimed session");
-        if !has_timeout && entry.admission.deadlines == RequestDeadlines::Propagated {
+        if !has_timeout
+            && p.actor != 12
+            && entry.admission.deadlines == RequestDeadlines::Propagated
+        {
             return Err(protocol("missing propagated Hosting timeout"));
         }
         if entry.admission.host.id != host || entry.admission.host.pid != pid {
             return Err(protocol("Hosting identity changed"));
+        }
+        if p.actor == 12 {
+            if !entry.ready.load(Ordering::SeqCst)
+                || incoming.reply.is_some()
+                || !matches!(p.action.as_str(), "ReplicaOpenReply" | "ReplicaCloseReply")
+            {
+                return Err(protocol("unsupported semantic RAP input"));
+            }
+            let mut queue = entry.semantic.lock().unwrap();
+            if queue.len() == 4 {
+                return Err(TransportError::ResourceLimit("Hosting semantic inbox"));
+            }
+            queue.push_back(request);
+            continue;
         }
         let lease_reply = p.actor == 15;
         let body = if lease_reply {
@@ -1224,21 +1389,91 @@ async fn run_connection(
                 type_deadline,
             )?
         };
-        // No queued writer; this is the pre-frame fence. Cancellation discards
-        // the connection after a partial frame, never reuses its writer.
+        // Serving replies use the shared first-write fence. Terminal accepted
+        // session retirement discards its socket, never reuses a partial writer.
         if lease_reply && !entry.authority.live() {
             return Err(TransportError::Closed);
         }
-        let value = reply(p.id, body)?;
+        let value = Message {
+            headers: vec![],
+            body,
+        };
+        let context = incoming
+            .reply
+            .ok_or(protocol("missing Hosting request grant"))?;
+        let fenced_entry = entry.clone();
+        let response = if lease_reply {
+            context.reply_fenced(
+                value,
+                tokio::time::Instant::now() + IO_DEADLINE,
+                Arc::new(move || session_live(&fenced_entry)),
+            )
+        } else {
+            // Unregister replies use the original cleanup grant after serving
+            // authority retires. They cannot renew lease or authorize callbacks.
+            context.reply(value, tokio::time::Instant::now() + IO_DEADLINE)
+        };
         tokio::select! {
             _ = entry.authority.cancel.notified() => return Err(TransportError::Closed),
             result = watch_deadlines(shared, entry) => return result,
-            result = write_fenced(socket, value, lease_reply.then_some(entry.authority.as_ref())) => result?,
+            result = response => result?,
         }
     }
 }
 
+fn hosting_composition() -> TransportResult<ChannelComposition> {
+    fn ingress(m: &Message, _: &message::Properties) -> TransportResult<()> {
+        envelope(m, 256 * 1024).map(|_| ())
+    }
+    fn response(_: &Message, p: &message::Properties) -> TransportResult<()> {
+        if p.actor != 0 || !p.action.is_empty() || p.expects_reply || p.fault.is_some() {
+            return Err(protocol("invalid Hosting response"));
+        }
+        Ok(())
+    }
+    fn outbound(_: &Message, p: &message::Properties, kind: OutboundKind) -> TransportResult<()> {
+        if kind != OutboundKind::Raw
+            || p.actor != 12
+            || !matches!(p.action.as_str(), "ReplicaOpen" | "ReplicaClose")
+            || p.expects_reply
+            || p.relates_to != MessageId::default()
+        {
+            return Err(protocol("invalid Hosting lifecycle send"));
+        }
+        Ok(())
+    }
+    fn reject(_: &Message, _: &message::Properties) -> TransportResult<()> {
+        Err(protocol("Hosting has no ordinary outbound RPC"))
+    }
+    Ok(ChannelComposition {
+        outbound,
+        ordinary_reply: reject,
+        actors: ActorDemux::new(
+            [7, 9, 12, 15]
+                .into_iter()
+                .map(|actor| ActorRegistration {
+                    actor,
+                    authorize: ingress,
+                })
+                .collect(),
+        )?,
+        duplex: None,
+        requests: Some(RequestPolicy {
+            incoming: ingress,
+            reply: response,
+        }),
+        ordered_ingress: true,
+    })
+}
+
+fn session_live(entry: &Entry) -> bool {
+    entry.authority.live() && entry.consumer.get().is_none_or(RegistrationGate::active)
+}
 fn deadline_needs_state(shared: &Shared, entry: &Arc<Entry>) -> TransportResult<bool> {
+    if entry.consumer.get().is_some_and(|gate| !gate.active()) {
+        entry.authority.revoke();
+        return Err(TransportError::Closed);
+    }
     let cleanup_due = entry.cleanup_deadline.load(Ordering::SeqCst);
     if cleanup_due != 0 {
         if shared.ticks() as u64 >= cleanup_due {

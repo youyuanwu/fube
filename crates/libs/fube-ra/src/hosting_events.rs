@@ -1,10 +1,14 @@
-//! Actual serialized local Hosting consumers. Required lifecycle/FM completion
-//! is explicitly unavailable; a local decision is not deployment or an ACK.
+//! Serialized Hosting consumers: explicit local lifecycle executes native
+//! transitions; the older decision-only/deployed/FM profile remains gated.
+//! Neither local processing nor retained external work is an FM/HM ACK.
 use super::*;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostingReadiness {
     pub fm_ready: bool,
+    /// Trusted locally owned lifecycle profile; never implies FM readiness.
+    #[serde(default)]
+    pub local_lifecycle: bool,
     pub node_active: bool,
     pub upgrading: bool,
     pub ra_open: bool,
@@ -37,6 +41,7 @@ pub(super) fn consume(
     work: &Submission,
     current: Option<&EntityState>,
     admission: &Admission,
+    config: &NativeConfig,
 ) -> Result<Transition> {
     let invalid = |_| Failure::Admission("invalid Hosting event input");
     let (ready, disposition) = match work.kind {
@@ -108,11 +113,64 @@ pub(super) fn consume(
     } else {
         ready.ra_open || ready.ra_closing
     };
-    if !admission.owner_ready || !ready.fm_ready || !can_run {
+    if !admission.owner_ready || !(ready.fm_ready || ready.local_lifecycle) || !can_run {
         return Ok(Transition::ignored(Disposition::IgnoredNotReady));
     }
-    // No acquisition/lookup is fabricated from an event. A matching required
-    // action is explicitly gated, before any mutation/store/effect publication.
+    if ready.local_lifecycle {
+        let Some(current) = current else {
+            return Ok(Transition::ignored(disposition));
+        };
+        let mut state = current.clone();
+        let mut effects = Vec::new();
+        match disposition {
+            Disposition::HostingOpenRetryRequired => {
+                state.retry_attempts = state
+                    .retry_attempts
+                    .checked_add(1)
+                    .ok_or(Failure::Capacity)?;
+                effects.push(if let Some(registration) = &state.runtime {
+                    Effect::RuntimeOpen {
+                        token: state.open_token,
+                        body: state.body.clone(),
+                        registration: registration.clone(),
+                        flags: config
+                            .policy(RetryState::Opening)
+                            .flags(state.open_failures),
+                    }
+                } else {
+                    Effect::Open {
+                        token: state.open_token,
+                        lookup: 0,
+                        body: state.body.clone(),
+                        usage: state.usage,
+                    }
+                });
+                return Ok(lifecycle::changed(state, effects, false));
+            }
+            Disposition::HostingCloseRetryRequired => {
+                lifecycle::close_retry(&state, &mut effects);
+                return Ok(lifecycle::changed(state, effects, false));
+            }
+            Disposition::HostingRuntimeCloseRequired => {
+                lifecycle::start_close(&mut state, CloseMode::Close, work.id, &mut effects);
+                return Ok(lifecycle::changed(state, effects, true));
+            }
+            Disposition::HostingHostCrashRequired => {
+                if state.phase == Phase::Opening {
+                    return opening::runtime_failure(
+                        state,
+                        APPLICATION_HOST_CRASH,
+                        ProxyErrorDetail::default(),
+                        config,
+                    );
+                }
+                lifecycle::start_close(&mut state, CloseMode::AppHostDown, work.id, &mut effects);
+                return Ok(lifecycle::changed(state, effects, true));
+            }
+            _ => {}
+        }
+    }
+    // The existing deployed/registration-only profile remains decision-only.
     Ok(Transition::ignored(disposition))
 }
 
@@ -182,6 +240,17 @@ impl LocalStatusConsumer {
         if !fm_ready {
             return Ok(Disposition::IgnoredNotReady);
         }
+        self.consume_local(id, sequence, enabled, now)
+    }
+    /// Local sequence/coalescing ownership only, without an FM readiness premise
+    /// or any FM send/acknowledgment capability.
+    pub fn consume_local(
+        &mut self,
+        id: ServiceType,
+        sequence: u64,
+        enabled: bool,
+        now: i64,
+    ) -> Result<Disposition> {
         let mut next = self.clone();
         next.tick(now)?;
         if let Some(h) = next

@@ -110,6 +110,7 @@ pub struct Activation {
     retired_operations: Vec<ipc::OperationResult>,
     server_stopped: bool,
     retained_callback: Option<DeactivationCallback>,
+    consumer_gate: Option<std::sync::Arc<dyn ipc::RegistrationConsumerGate>>,
 }
 impl Activation {
     /// Side-effect-free. Unsupported downstream capabilities reject here, not
@@ -159,7 +160,20 @@ impl Activation {
             retired_operations: vec![],
             server_stopped: false,
             retained_callback: None,
+            consumer_gate: None,
         })
+    }
+
+    /// Bind the original RA owner lifetime before any launch or admission.
+    pub fn bind_consumer(
+        &mut self,
+        gate: std::sync::Arc<dyn ipc::RegistrationConsumerGate>,
+    ) -> LocalResult<()> {
+        if self.started.is_some() {
+            return Err(Error::InvalidState.into());
+        }
+        self.consumer_gate = Some(gate);
+        Ok(())
     }
 
     /// Validation precedes all side effects. Once a root/process/admission exists,
@@ -283,7 +297,11 @@ impl Activation {
             },
         )?);
         let server = self.server.as_ref().expect("owned server");
-        self.registration = Some(server.registration_owner(self.options.required)?);
+        let mut owner = server.registration_owner(self.options.required)?;
+        if let Some(gate) = &self.consumer_gate {
+            owner = owner.with_consumer_gate(gate.clone())?;
+        }
+        self.registration = Some(owner);
         let mut command = Command::new(&deployment.executable);
         command
             .args(&deployment.arguments)
@@ -368,6 +386,48 @@ impl Activation {
     }
     pub fn residency(&self) -> &Residency {
         &self.residency
+    }
+    pub fn premise(&self) -> Option<&ResidencyAdmission> {
+        self.premise.as_ref()
+    }
+    pub fn declared_type(&self) -> Option<ServiceTypeId> {
+        Some(ServiceTypeId {
+            package: self.premise.as_ref()?.package.package.clone(),
+            name: self.package.as_ref()?.service_type.clone(),
+        })
+    }
+    /// Stable source fence for the sole local owner. No session or declaration
+    /// operation can produce more IPC/core deliveries after this boundary.
+    pub fn producers_stopped(&self) -> bool {
+        self.started.is_none() || (self.server_stopped && self.cleanup.declarations_removed)
+    }
+    pub fn deliveries_drained(&self) -> bool {
+        self.registration
+            .as_ref()
+            .is_none_or(|owner| owner.has_deliveries() == Ok(false))
+    }
+    /// Exact owned-session control, not a reconnect or callback capability.
+    pub fn host_lease(&self) -> Option<ipc::HostLease> {
+        self.lease.clone()
+    }
+    pub fn lookup_registration(&self, request: &LookupRequest) -> crate::Result<LookupResult> {
+        self.registration
+            .as_ref()
+            .ok_or(Error::ObjectClosed)?
+            .lookup(request)
+    }
+    pub fn next_delivery(
+        &self,
+        lane: ipc::DeliveryLane,
+        bytes: usize,
+    ) -> crate::Result<Option<ipc::Delivery>> {
+        self.registration
+            .as_ref()
+            .ok_or(Error::ObjectClosed)?
+            .next_delivery(lane, bytes)
+    }
+    pub fn compensate_usage(&mut self, owner: Acquisition) -> UsageRelease<Acquisition> {
+        self.residency.compensate_package_only(owner)
     }
     pub fn logs(&self) -> Vec<String> {
         self.process

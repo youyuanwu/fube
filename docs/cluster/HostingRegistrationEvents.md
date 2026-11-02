@@ -4,6 +4,10 @@
 lookup, with an owned local node/RA event bridge, are implemented. Native-ready
 RA/FM/HM and deployed package/process/replica lifecycle remain capability-gated.**
 This is not a running Service Fabric node or serving/deployment readiness.
+The later [production local stateless composition](StatelessRaRap.md) uses
+Activation's actual owned session, not this prepared-registration listener.
+It enables required local RA lifecycle consumers with `local_lifecycle=true`
+and **fm_ready=false**; the older profile below retains its readiness gates.
 
 **Authorities:** native semantics pin
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`; release-native protocol profile
@@ -60,7 +64,7 @@ No enabled-health terminal local store is substituted for HM.
 
 The actual factory producer emits the ordered complete runtime context and
 type-instance identity. The production handler
-([ipc.rs:1400](../../crates/libs/fube-hosting/src/ipc.rs#L1400)) checks the full
+([ipc.rs:1671-1730](../../crates/libs/fube-hosting/src/ipc.rs#L1671-L1730)) checks the full
 admitted wire context before H1 projection, declared type and exact current
 session/runtime ownership. Native semantic CI/UTF-16 identity is not replaced
 with blanket ASCII/Unicode folding. Transport route identity, semantic identity,
@@ -89,8 +93,12 @@ FT type/local full version/activation/readiness and exact host/runtime.
 Normal RuntimeClosed vetoes already-closing/down/closed replicas; it is never
 HostDown. Matching excluded reopen/retry/close work is reported as Required/gated
 without fabricated lookup, acquisition, RAP completion or usage release.
+That decision-only behavior describes the original profile. Explicit local
+lifecycle admission now executes Registered retry, ordinary RuntimeClosed Close
+and HostClosed crash transitions within RA, with reserved effect capacity;
+it never translates RuntimeClosed into generic HostDown.
 
-[`LocalStatusConsumer`](../../crates/libs/fube-ra/src/hosting_events.rs#L131)
+[`LocalStatusConsumer`](../../crates/libs/fube-ra/src/hosting_events.rs#L189-L301)
 uses native type CI keys, ten-minute sequence history with hourly cleanup,
 lower/equal-sequence staleness, opposite-status coalescing, Disabled priority
 and a separate downstream message counter. Local processing is not FM
@@ -106,7 +114,10 @@ interoperability are different evidence classes.
 
 `TypesUnregistered`/health-source package obligations remain explicitly owned
 and gated where an Opened package/timeout owner is absent. They are not physical
-cleanup or H2 release. No new production H2 acquisition bridge is implied.
+cleanup or H2 release. The separate local lifecycle owner consumes its single
+package's registration timestamps and already-performed disabled-health source
+removal, retains local status/external FM obligations and owns exact H2 use.
+Native package upgrade/reactivation timeout engines remain unsupported.
 
 ## 4. Ownership, bounds and shutdown
 

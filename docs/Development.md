@@ -360,6 +360,28 @@ qualification below. Shared validation/materialization/supervision changes
 require both profiles; never inject native loader variables into the Rust child
 or relabel a historical receipt as current source.
 
+### Owned local stateless RA/RAP
+
+The [production local lifecycle guide](cluster/StatelessRaRap.md) separates
+actual combined native-free evidence from standalone native/runtime results.
+Run both fixture targets, not only registration:
+
+```sh
+mkdir -p build/stateless-ra-rap-validation
+env -u LD_LIBRARY_PATH -u FabricConfigFileName \
+  TMPDIR="$PWD/build/stateless-ra-rap-validation" \
+  cargo test --locked -p hosting-local-app --test lifecycle --test activation \
+  -- --test-threads=1
+```
+
+Also run the affected core/runtime/Hosting/Node/RA/store/local-host/transport
+library and integration targets, the offline suite (including runtime/data
+separation), and workspace locked all-target/all-feature check/Clippy, binaries/
+examples build, formatting, Rustdoc and doctests. No deployed FM/HM/serving
+readiness or stateful activation is implied. Shared Hosting/process changes
+retain all seven separate release-native actions below on a fresh clean-source
+bundle; those are not combined production Rust RA evidence.
+
 ### Separate release-native regression
 
 Follow [native ABI prerequisites and commands](runtime/RustTestHost.md#22-prerequisites-and-commands):

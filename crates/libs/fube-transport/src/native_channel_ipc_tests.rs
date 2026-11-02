@@ -64,6 +64,30 @@ fn command(index: u32, expects: bool) -> Message {
 }
 
 #[tokio::test]
+async fn reserved_semantic_output_overtakes_older_ordinary_id_without_changing_client_rules() {
+    let (channel, mut peer) = ipc_pair(8192);
+    let target = target(&channel);
+    let mut lease = channel.request(&target, msg("Lease", vec![]), deadline());
+    pending(lease.as_mut()).await;
+    let mut semantic =
+        channel.send_reserved(&target, msg("ReplicaOpenReply", vec![]), deadline(), None);
+    pending(semantic.as_mut()).await;
+    // Both are queued before this current-thread test yields to the writer.
+    let first = read_message(&mut peer).await.unwrap();
+    let second = read_message(&mut peer).await.unwrap();
+    assert_eq!(first.properties().unwrap().action, "ReplicaOpenReply");
+    assert_eq!(second.properties().unwrap().action, "Lease");
+    assert!(first.properties().unwrap().id.index > second.properties().unwrap().id.index);
+    assert!(!first.properties().unwrap().expects_reply);
+    semantic.await.unwrap();
+    write_message(&mut peer, &reply(second.properties().unwrap().id, vec![]))
+        .await
+        .unwrap();
+    lease.await.unwrap();
+    channel.close(deadline()).await.unwrap();
+}
+
+#[tokio::test]
 async fn ipc_identity_is_automatic_but_original_context_reply_has_no_identity() {
     let (channel, mut peer) = ipc_pair(8192);
     let sending_owner = channel.clone();

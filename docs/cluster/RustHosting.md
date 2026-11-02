@@ -2,7 +2,8 @@
 
 **Status: H1 registration/lookup, H2 admitted accounting/scheduling and the narrow
 bootstrap H3 IPC/local leases and the bounded registration-events slice are
-implemented, together with bounded H4 owned local package/process activation.
+implemented, together with bounded H4 owned local package/process activation
+and [production local stateless RA/RAP](StatelessRaRap.md).
 Broader H3 and deployed RA/RAP composition remain gated.**
 [`fube-hosting`](../../crates/libs/fube-hosting/src/lib.rs) provides
 a native-derived, deterministically driven core plus a separately owned local
@@ -73,15 +74,17 @@ the [native reliability catalog](NativeRaProtocol.md).
 
 ## 2. Existing implementation and extraction boundary
 
-The [RA opening](RaStatelessOpening.md), [removal](RaStatelessRemoval.md) and
-[replacement](RaStatelessReplacement.md) slices use trusted simulated adapters.
+The original [RA opening](RaStatelessOpening.md), [removal](RaStatelessRemoval.md)
+and [replacement](RaStatelessReplacement.md) qualifications use trusted simulated adapters.
+The later [production local composition](StatelessRaRap.md) now connects these
+decisions to actual owned activation, H2 and Rust application RAP traffic.
 There is no deployed Hosting/RAP adapter or running Rust SF node executable.
 The bounded [`fube-node`](HostingRegistrationEvents.md) library now owns actual
 local registration/closure/status consumers and production Hosting IPC; its
 qualified matching premises do not enable RAP deployment or FM/HM completion.
 The [application runtime](../runtime/RustStatelessRuntime.md) and
 [standalone native test host](../runtime/RustTestHost.md) exercise opposite sides
-of the boundary; neither establishes the combined Rust RA-to-Rust RAP path.
+of the boundary; their standalone results are not the later combined-path evidence.
 Dated native evidence qualifies its exact source/profile, not every later change.
 
 The local validator/materializer/supervisor now live below both Hosting and the
@@ -396,8 +399,9 @@ matching duplicate reuse without another factory/Open, and successful graceful
 Close with independently observed destruction before ACK. Genuine failure
 cleanup and authority checks remain unchanged. This bounded prerequisite is
 delivered. [H4 owned local activation](HostingLocalActivation.md) is now delivered
-separately; production RA/RAP and combined-path deployed qualification below
-remain gated. Hosting/test-host acceptance alone is not
+separately. [Production local RA/RAP](StatelessRaRap.md) now supplies combined
+native-free qualification; deployed FM/HM/cluster qualification below remains
+gated. Hosting/test-host acceptance alone is not
 Rust lifecycle evidence.
 
 Port the selected native activation lifecycle with a trusted local-package
@@ -420,10 +424,10 @@ There is no direct service callback or role setter on the node.
 The delivered runtime prerequisite proves that a successful empty-endpoint Open stays
 Open without Abort, a matching duplicate Open returns the same empty endpoint
 without another factory/Open callback, and subsequent Close disposes the
-instance normally after successful graceful Close. A later deployed H4 slice must exercise this
-through its owned activation and production RA/RAP traffic using
-independent callback/resource observations, not a connection to the returned
-endpoint string. Nonempty samples or native-runtime test-host success do not
+instance normally after successful graceful Close. The later
+[combined local regression](StatelessRaRap.md#native-free-qualification) exercises
+owned activation and actual RA/RAP with independent callback/resource observations,
+not a connection to the returned endpoint string. Nonempty samples or native-runtime test-host success do not
 qualify the Rust runtime's empty-endpoint path.
 
 Track service Close/Abort, runtime unregister, lease retirement, termination
@@ -474,7 +478,7 @@ These are Rust execution/ownership adaptations, not extra native wire fields.
 | **H1: registration and lookup core** | New crate; native-derived host/runtime/type records, registration transitions, scoped lookup decisions, events and explicit package/clock adapters. | Deterministic source-derived scenarios and RA registration-bridge tests cover producer-specific spelling and separate host Finish/timeout reply/state outcomes. No IPC, process launch, real usage or deployed-parity claim. |
 | **H2: usage and deactivation** | Implemented admitted package/application accounting, exact residual ownership, deterministic grace/sequence scheduling and real-accounting RA test composition. | Tests cover mismatch disposition, exact release, retention and definite/unknown-store ordering. Physical final work remains owned; required live event consumers are still gated. |
 | **H3: IPC and local leases** | Extract/adapt accepted sessions and Hosting handlers; long-running bounded dispatch and finite local authority. | Actual protocol/lease tests and standalone native-host regression qualify the enabled profile. H3 is not yet a real Rust RA deployment. |
-| **H4: process activation and RA/RAP** | Bounded [owned local activation](HostingLocalActivation.md) and empty-endpoint Runtime prerequisite implemented. Production RA/RAP Open/Close/Drop/resend remains future work. | Local owner tests qualify real package/process/IPC registration and H2 teardown, not callbacks. Future combined-path qualification must prove actual RA/RAP replies, independent callback/resource observations and exit/drain/reap, including crashes and lease loss. |
+| **H4: process activation and RA/RAP** | Bounded [owned local activation](HostingLocalActivation.md) plus [production local stateless lifecycle](StatelessRaRap.md): RA-authorized Open/Close/Drop/Abort, exact H2 ownership and required local event consumers. | Real native-free process/IPC/RA/RAP tests qualify empty endpoints, independent callbacks/blocked disposal/resources, duplicate/stale traffic, replacement resend, crash/lease loss and separate exit/drain/reap/directory cleanup. FM/HM serving readiness and deployed-cluster parity remain gated. |
 
 Each slice may require several PRs. Publish its source mapping, enabled
 capabilities, remaining dependencies and actual qualification separately.
@@ -901,8 +905,9 @@ belongs to the fixture, not production Hosting.
 In this bootstrap-only profile, type/factory registration, health/load/fault,
 lifecycle, context-update/reconnect/security and other host profiles reject rather
 than return generic Success. The later factory-registration and local-activation
-profiles are documented separately; production RA/RAP and stateful Hosting remain
-out of scope. Actual native
+profiles and the later [production local stateless RA/RAP](StatelessRaRap.md)
+are documented separately; that bootstrap-only evidence does not qualify them.
+Stateful Hosting remains out of scope. Actual native
 application frames are not complete original native node-handler execution,
 deployed interoperability or distributed Federation lease parity. Native expiry/
 hard-process fencing is not inferred from the short native bootstrap run.
@@ -914,11 +919,12 @@ protocol. Initial recovery follows the cluster's fresh-deployment/fencing
 policy; reconstructing a registration from disk is not permission to trust a
 live process or resume its lease. It does not change `fube-data` volatility.
 
-Stateful Hosting integration, all required RA runtime-event consumers, upgrades,
+Stateful Hosting integration, runtime-event consumers outside the enabled
+[local stateless profile](StatelessRaRap.md), upgrades,
 broader package/activation profiles, health aggregation, remote security and
 owner/process-loss qualification remain explicit staged work. Full native
 Hosting and deployed SF interoperability are not implied by crate extraction,
-native-derived unit tests or the eventual stateless end-to-end milestone.
+native-derived unit tests or the bounded local stateless end-to-end milestone.
 
 The invariant through every slice is the same: **Hosting reports actual
 registration/process/package facts and performs owned operations; RA decides

@@ -188,6 +188,7 @@ fn config() -> Config {
     let mut config = Config::registration(host_config(LOCAL_LEASE_DURATION));
     // Trusted qualification facts only; no deployed/native FM-ready assertion.
     config.readiness = ra::HostingReadiness {
+        local_lifecycle: false,
         fm_ready: true,
         node_active: true,
         upgrading: false,

@@ -28,6 +28,7 @@ fn admission() -> Admission {
 fn readiness() -> HostingReadiness {
     HostingReadiness {
         fm_ready: true,
+        local_lifecycle: false,
         node_active: true,
         upgrading: false,
         ra_open: true,
@@ -321,6 +322,187 @@ fn statuses_use_expiring_type_history_coalescing_priority_and_separate_message_s
     consumer.consume(a, 1, false, true, 36_000_000_001).unwrap();
     assert_eq!(consumer.next_enabled(), Some(false)); // expired history admits lower seq
     assert_eq!(consumer.message_sequence(), 3);
+}
+
+#[tokio::test]
+async fn local_registered_retries_without_fm_readiness_and_keeps_effect_reservation() {
+    let store = Arc::new(
+        Store::new(Box::new(MemoryBackend::new()), StoreSettings::default())
+            .await
+            .unwrap(),
+    );
+    let executor = Executor::new(store.clone(), admission(), Settings::default()).unwrap();
+    let b = body();
+    executor
+        .submit(add(b.clone()))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    let first = executor.take_effects();
+    let mut local = readiness();
+    local.fm_ready = false;
+    local.local_lifecycle = true;
+    executor
+        .submit(Command::HostingRegistered(Box::new(HostingRegistered {
+            unit: b.unit.id.clone(),
+            readiness: local,
+            service_type: b.service.service_type.clone(),
+            version: b.replica.version.clone(),
+            activation: PartitionId::default(),
+        })))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    let retry = executor.take_effects_up_to(1);
+    assert_eq!(retry.len(), 1);
+    let (
+        Effect::Open {
+            lookup: a,
+            token: at,
+            ..
+        },
+        Effect::Open {
+            lookup: b,
+            token: bt,
+            ..
+        },
+    ) = (&first[0].effect, &retry[0].effect)
+    else {
+        panic!("real lookup retries required");
+    };
+    assert_ne!(a, b);
+    assert_eq!(at, bt);
+    executor.close(WAIT).await.unwrap();
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn local_runtime_close_is_ordinary_and_host_close_finishes_distinctly() {
+    let store = Arc::new(
+        Store::new(Box::new(MemoryBackend::new()), StoreSettings::default())
+            .await
+            .unwrap(),
+    );
+    let executor = Executor::new(store.clone(), admission(), Settings::default()).unwrap();
+    let b = body();
+    executor
+        .submit(add(b.clone()))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    let effect = executor.take_effects().remove(0);
+    let Effect::Open { token, lookup, .. } = effect.effect else {
+        panic!()
+    };
+    executor
+        .submit(Command::Registered(Box::new(RegistrationCompletion {
+            unit: b.unit.id.clone(),
+            token,
+            lookup,
+            usage_acquired: true,
+            registration: RuntimeRegistration {
+                host: "host".into(),
+                runtime: "runtime".into(),
+                service_type: b.service.service_type.clone(),
+                acquisition: lookup,
+                code_package: "Code".into(),
+            },
+            version: b.replica.version.clone(),
+            ..Default::default()
+        })))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    executor.take_effects();
+    let mut local = readiness();
+    local.fm_ready = false;
+    local.local_lifecycle = true;
+    // Wrong runtime cannot close the matching host's instance.
+    let event = |runtime: &str| {
+        Command::HostingRuntimeClosed(Box::new(HostingRuntimeClosed {
+            unit: b.unit.id.clone(),
+            readiness: local.clone(),
+            host: "host".into(),
+            runtime: runtime.into(),
+        }))
+    };
+    assert_eq!(
+        executor
+            .submit(event("other"))
+            .unwrap()
+            .wait(WAIT)
+            .await
+            .unwrap(),
+        Disposition::IgnoredStale
+    );
+    executor
+        .submit(event("runtime"))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    assert_eq!(
+        executor
+            .snapshot(b.unit.id.guid.0)
+            .committed
+            .unwrap()
+            .close_mode,
+        Some(CloseMode::Close)
+    );
+    assert!(matches!(
+        executor.take_effects().as_slice(),
+        [Dispatched {
+            effect: Effect::Close { flags: 0, .. },
+            ..
+        }]
+    ));
+    executor
+        .submit(Command::HostingHostClosed(Box::new(HostingHostClosed {
+            unit: b.unit.id.clone(),
+            readiness: local,
+            host: "host".into(),
+            activity: "observed".into(),
+        })))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    let closed = executor.snapshot(b.unit.id.guid.0).committed.unwrap();
+    assert_eq!(closed.phase, Phase::Closed);
+    assert_eq!(closed.usage, None);
+    let released = executor.take_effects();
+    assert!(released.iter().any(|d| d.effect
+        == Effect::ReleaseUsage {
+            acquisition: lookup
+        }));
+    assert!(!released
+        .iter()
+        .any(|d| matches!(d.effect, Effect::TerminateHost { .. })));
+    executor.close(WAIT).await.unwrap();
+    store.close().await.unwrap();
+}
+
+#[test]
+fn local_status_processing_is_not_fm_readiness_or_ack() {
+    let mut consumer = LocalStatusConsumer::new(1, 16 * 1024).unwrap();
+    let id = body().service.service_type;
+    assert_eq!(
+        consumer.consume(id.clone(), 1, true, false, 0).unwrap(),
+        Disposition::IgnoredNotReady
+    );
+    assert_eq!(
+        consumer.consume_local(id.clone(), 1, true, 0).unwrap(),
+        Disposition::HostingStatusProcessed
+    );
+    assert_eq!(
+        consumer.consume_local(id, 1, false, 1).unwrap(),
+        Disposition::IgnoredStale
+    );
+    assert_eq!(consumer.pending().len(), 1);
 }
 
 #[test]
