@@ -151,15 +151,25 @@ async fn actual_secondary_start_copy_and_apply_ack_keep_the_nonselected_source_s
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delayed_engine_ingress_cannot_reconstruct_a_retired_source_from_registration() {
+    delayed_ingress_case(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_engine_ingress_without_replacement_never_dials_the_registered_address() {
+    delayed_ingress_case(false).await;
+}
+
+async fn delayed_ingress_case(relearn: bool) {
     let partition = Uuid::new_v4();
     let secondary = engine(partition, 2, Arc::new(Provider::default()));
     secondary
         .change_role(EPOCH, ReplicaRole::IdleSecondary, cancel())
         .await
         .unwrap();
-    let published = "127.0.0.1:32115";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let published = listener.local_addr().unwrap().to_string();
     let primary = Endpoint {
-        address: published.into(),
+        address: published.clone(),
         actor: Actor {
             partition,
             replica: 1,
@@ -170,7 +180,7 @@ async fn delayed_engine_ingress_cannot_reconstruct_a_retired_source_from_registr
     let (entered, waiting) = std_mpsc::sync_channel(1);
     let (resume, resumed) = std_mpsc::sync_channel(1);
     *secondary.shared.ingress_pause.lock().unwrap() = Some((entered, resumed));
-    let mut original = native_socket(&secondary.endpoint().address, published).await;
+    let mut original = native_socket(&secondary.endpoint().address, &published).await;
     send(
         &mut original,
         &primary,
@@ -200,28 +210,44 @@ async fn delayed_engine_ingress_cannot_reconstruct_a_retired_source_from_registr
     // Both no-current-route registration and same-source relearning happen
     // before the old packet reaches production validation/ACK enqueue.
     secondary.transport.register_peer(&primary).unwrap();
-    let mut replacement = native_socket(&secondary.endpoint().address, published).await;
-    send(&mut replacement, &primary, &secondary, Body::RequestAck).await;
-    until(|| {
-        secondary.transport.diagnostics()["events"]["received_control"][0]
-            .as_u64()
-            .unwrap_or(0)
-            >= 2
-    })
-    .await;
+    let mut replacement = if relearn {
+        let mut socket = native_socket(&secondary.endpoint().address, &published).await;
+        send(&mut socket, &primary, &secondary, Body::RequestAck).await;
+        until(|| {
+            secondary.transport.diagnostics()["events"]["received_control"][0]
+                .as_u64()
+                .unwrap_or(0)
+                >= 2
+        })
+        .await;
+        Some(socket)
+    } else {
+        None
+    };
     resume.send(()).unwrap();
-    assert!(timeout(
-        std::time::Duration::from_millis(80),
-        read_message(&mut replacement)
-    )
-    .await
-    .is_err());
+    if let Some(socket) = replacement.as_mut() {
+        assert!(
+            timeout(std::time::Duration::from_millis(80), read_message(socket))
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        timeout(std::time::Duration::from_millis(80), listener.accept())
+            .await
+            .is_err(),
+        "old ingress cannot turn into a registered-address dial"
+    );
     assert!(
         secondary.snapshot().observed_primary.is_none(),
         "retired ingress never starts copy"
     );
     // A genuinely new source message is independently usable, not poisoned by
     // the stale ingress and not interpreted as remote acknowledgment.
+    let mut replacement = match replacement {
+        Some(socket) => socket,
+        None => native_socket(&secondary.endpoint().address, &published).await,
+    };
     send(
         &mut replacement,
         &primary,
