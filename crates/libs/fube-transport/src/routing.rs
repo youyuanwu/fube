@@ -1,5 +1,9 @@
 //! **Declarations only: not implemented or wired to any existing transport.**
 //!
+//! This proposed actor+action framework is distinct from the operational
+//! actor-only [`native_demux`](crate::native_demux). Its routing-header uniqueness
+//! and handler/executor contracts do not govern ordinary native RPC completion.
+//!
 //! An axum-inspired composition target for native actor/action handlers and
 //! shared state **over** the [`channel`](crate::channel) foundation, not HTTP
 //! routing, an `IFabricTransport` port, an SF ABI, or an operational framework.

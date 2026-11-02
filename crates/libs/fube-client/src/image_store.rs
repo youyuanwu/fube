@@ -9,9 +9,7 @@ use fube_transport::{
     channel::{MessageChannel, MessageReceiver, RpcChannel},
     connection::{deadline_after, MAX_FRAME_TIME},
     message::{Header, Message},
-    native_channel::{
-        ChannelLimits, GatewayChannel, GatewayProfile, GatewayReceiver, GatewayTarget,
-    },
+    native_channel::{ChannelLimits, GatewayChannel, GatewayReceiver, GatewayTarget},
 };
 use tokio::{
     fs::{self, File, ReadDir},
@@ -68,7 +66,7 @@ impl ImageStoreClient {
         let deadline = deadline_after(timeout)?;
         let channel = GatewayChannel::connect_unsecured_loopback(
             endpoint,
-            GatewayProfile::Upload,
+            crate::channel_adapter::upload()?,
             ChannelLimits {
                 max_ingress: 32,
                 max_retained_bytes: 1024 * 1024 * 1024,
