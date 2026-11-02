@@ -4,6 +4,7 @@ members = [
   "crates/libs/fube-transport",
   "crates/libs/fube-client",
   "crates/libs/fube-test-host",
+  "crates/libs/fube-local-host",
   "crates/libs/fube-runtime",
   "crates/libs/fube-data",
   "crates/libs/fube-txn",

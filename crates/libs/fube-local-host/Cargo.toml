@@ -1,0 +1,10 @@
+[package]
+name = "fube-local-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+roxmltree = "0.21"
+serde_json.workspace = true
+uuid.workspace = true

@@ -341,6 +341,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fube-local-host"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "roxmltree",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "fube-node"
 version = "0.1.0"
 dependencies = [
@@ -393,6 +403,7 @@ name = "fube-test-host"
 version = "0.1.0"
 dependencies = [
  "fube-hosting",
+ "fube-local-host",
  "fube-node",
  "fube-ra",
  "fube-ra-store",

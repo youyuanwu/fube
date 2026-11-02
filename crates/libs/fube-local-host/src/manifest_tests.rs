@@ -89,11 +89,10 @@ fn defaults_overrides_and_native_layout_are_not_fixture_constants() {
         );
     }
     assert_eq!(bundle.arguments, ["a<b", "c>d"]);
-    assert_eq!(bundle.identity.code.package.package.name, "OtherPackage");
-    assert_eq!(bundle.identity.application_name, "fabric:/Another/NamedApp");
+    assert_eq!(package.service_manifest, "OtherPackage");
+    assert_eq!(package.application_name, "fabric:/Another/NamedApp");
     assert_eq!(bundle.working_directory, bundle.application.join("work"));
     assert_eq!(bundle.service_name, "fabric:/Another/NamedApp/Overridden");
-    assert!(bundle.initialization.is_empty());
     for file in [
         "App.1.0.xml",
         "OtherPackage.Package.Current.xml",

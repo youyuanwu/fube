@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+fube-local-host = { path = "../fube-local-host" }
 fube-hosting = { path = "../fube-hosting" }
 fube-node = { path = "../fube-node" }
 fube-ra = { path = "../fube-ra" }

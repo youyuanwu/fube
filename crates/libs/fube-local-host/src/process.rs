@@ -1,0 +1,578 @@
+use std::os::{fd::AsRawFd, unix::process::CommandExt};
+use std::{
+    collections::VecDeque,
+    io::{Read, Write},
+    process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+
+use crate::{HostError, Result};
+
+const LOG_LIMIT: usize = 1024 * 1024;
+
+fn proc_stat_result(result: std::io::Result<Vec<u8>>) -> std::io::Result<Option<Vec<u8>>> {
+    match result {
+        Ok(stat) => Ok(Some(stat)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub struct OwnedApp {
+    child: Child,
+    logs: Arc<Mutex<VecDeque<String>>>,
+    readers: Vec<JoinHandle<()>>,
+    reaped: bool,
+    group_cleaned: bool,
+    stop_logs: Arc<AtomicBool>,
+    dropped_logs: Arc<AtomicU64>,
+    termination_requested: bool,
+    exit_observed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessStatus {
+    pub pid: u32,
+    pub termination_requested: bool,
+    pub exit_observed: bool,
+    pub group_drained: bool,
+    pub reaped: bool,
+    pub dropped_log_records: u64,
+}
+
+fn capture(
+    input: impl Read + Send + 'static,
+    logs: Arc<Mutex<VecDeque<String>>>,
+    stop: Arc<AtomicBool>,
+    dropped: Arc<AtomicU64>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut input = input;
+        let mut chunk = [0; 4096];
+        let mut tail = Vec::new();
+        let mut stopping_bytes = 0usize;
+        loop {
+            if stopping_bytes >= LOG_LIMIT {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            let count = match input.read(&mut chunk) {
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            if count == 0 {
+                break;
+            }
+            if stop.load(Ordering::Acquire) {
+                stopping_bytes += count;
+            }
+            for byte in &chunk[..count] {
+                if *byte == b'\n' || tail.len() == 16 * 1024 {
+                    let line = String::from_utf8_lossy(&tail).into_owned();
+                    let mut logs = logs.lock().unwrap();
+                    while logs.len() >= 4096
+                        || logs.iter().map(String::len).sum::<usize>() + line.len() > LOG_LIMIT
+                    {
+                        logs.pop_front();
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    logs.push_back(line);
+                    tail.clear();
+                }
+                if *byte != b'\n' {
+                    tail.push(*byte);
+                }
+            }
+        }
+        if !tail.is_empty() {
+            let mut logs = logs.lock().unwrap();
+            let line = String::from_utf8_lossy(&tail).into_owned();
+            while logs.len() >= 4096
+                || logs.iter().map(String::len).sum::<usize>() + line.len() > LOG_LIMIT
+            {
+                logs.pop_front();
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            logs.push_back(line);
+        }
+    })
+}
+
+impl OwnedApp {
+    /// Store the child owner before any post-spawn fallible setup. An error
+    /// leaves `slot` populated when a child exists, including failed cleanup.
+    pub fn start(slot: &mut Option<Self>, mut command: Command) -> Result<()> {
+        if slot.is_some() {
+            return Err(HostError("process slot already occupied".into()));
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        {
+            command.process_group(0);
+            // Parent-death containment and no potentially enormous native core.
+            unsafe {
+                command.pre_exec(|| {
+                    let parent = libc::getppid();
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if parent == 1 || libc::getppid() != parent {
+                        return Err(std::io::Error::other("owner exited during app launch"));
+                    }
+                    let limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = command.spawn()?;
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let logs = Arc::new(Mutex::new(VecDeque::new()));
+        let stop_logs = Arc::new(AtomicBool::new(false));
+        *slot = Some(Self {
+            child,
+            logs: logs.clone(),
+            readers: Vec::new(),
+            reaped: false,
+            group_cleaned: false,
+            stop_logs: stop_logs.clone(),
+            dropped_logs: Arc::default(),
+            termination_requested: false,
+            exit_observed: false,
+        });
+        let owned = slot.as_mut().expect("stored owned child");
+        for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                let error = std::io::Error::last_os_error();
+                return Err(error.into());
+            }
+        }
+        owned.readers = vec![
+            capture(
+                stdout,
+                logs.clone(),
+                stop_logs.clone(),
+                owned.dropped_logs.clone(),
+            ),
+            capture(
+                stderr,
+                logs.clone(),
+                stop_logs.clone(),
+                owned.dropped_logs.clone(),
+            ),
+        ];
+        Ok(())
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn logs(&self) -> Vec<String> {
+        self.logs.lock().unwrap().iter().cloned().collect()
+    }
+
+    pub fn dropped_logs(&self) -> u64 {
+        self.dropped_logs.load(Ordering::Relaxed)
+    }
+
+    pub fn status(&self) -> ProcessStatus {
+        ProcessStatus {
+            pid: self.pid(),
+            termination_requested: self.termination_requested,
+            exit_observed: self.exit_observed,
+            group_drained: self.group_cleaned,
+            reaped: self.reaped,
+            dropped_log_records: self.dropped_logs(),
+        }
+    }
+
+    pub fn callbacks(&self) -> Vec<serde_json::Value> {
+        self.logs()
+            .iter()
+            .filter_map(|line| {
+                line.find("MSSF_APP ")
+                    .and_then(|start| serde_json::from_str(&line[start + 9..]).ok())
+            })
+            .collect()
+    }
+
+    pub fn check_alive(&mut self) -> Result<()> {
+        if let Some(status) = self.observed_exit()? {
+            return Err(HostError(format!("native child exited: {status}")));
+        }
+        Ok(())
+    }
+
+    pub fn command(&mut self, command: &[u8]) -> Result<()> {
+        self.child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| HostError("app stdin closed".into()))?
+            .write_all(command)?;
+        Ok(())
+    }
+
+    pub fn wait_exit(&mut self, deadline: Instant) -> Result<()> {
+        loop {
+            if let Some(status) = self.observed_exit()? {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(HostError(format!("native app exit failed: {status}")))
+                };
+            }
+            if Instant::now() >= deadline {
+                return Err(HostError("graceful app exit deadline exceeded".into()));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // Keep an exited Linux leader waitable until its group is drained. Reaping
+    // early releases the PID/PGID reservation and makes later group kills unsafe.
+    pub fn observed_exit(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt;
+        if self.reaped {
+            return self.child.try_wait();
+        }
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pid(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { info.si_pid() } == 0 {
+            return Ok(None);
+        }
+        let status = unsafe { info.si_status() };
+        let raw = match info.si_code {
+            libc::CLD_EXITED => status << 8,
+            libc::CLD_KILLED => status,
+            libc::CLD_DUMPED => status | 0x80,
+            _ => return Err(std::io::Error::other("unexpected owned child wait state")),
+        };
+        self.exit_observed = true;
+        Ok(Some(std::process::ExitStatus::from_raw(raw)))
+    }
+
+    fn group_running(&self, deadline: Instant) -> Result<bool> {
+        for entry in std::fs::read_dir("/proc")? {
+            if Instant::now() >= deadline {
+                return Err(HostError("owned-group cleanup deadline exceeded".into()));
+            }
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+                continue;
+            }
+            // An unrelated process can exit between /proc enumeration and
+            // stat read; Linux may report ESRCH as well as ENOENT. This does
+            // not relax the separate WNOWAIT reservation of our owned leader.
+            let Some(stat) = proc_stat_result(std::fs::read(entry.path().join("stat")))? else {
+                continue;
+            };
+            // comm can contain spaces/parentheses. Fields after its final ')':
+            // state, ppid, pgrp. Zombies are terminated, but only our direct
+            // child is waitable/reapable by this supervisor.
+            let end = stat
+                .iter()
+                .rposition(|byte| *byte == b')')
+                .ok_or_else(|| HostError("invalid proc process stat".into()))?;
+            let fields: Vec<_> = std::str::from_utf8(&stat[end + 1..])
+                .map_err(|error| HostError(format!("invalid proc stat fields: {error}")))?
+                .split_ascii_whitespace()
+                .take(3)
+                .collect();
+            require_stat(&fields)?;
+            if fields[2].parse::<u32>().ok() == Some(self.pid()) && !["Z", "X"].contains(&fields[0])
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn cleanup(&mut self) -> Result<serde_json::Value> {
+        self.cleanup_with_budget(Duration::from_secs(10))
+    }
+
+    pub fn cleanup_with_budget(&mut self, budget: Duration) -> Result<serde_json::Value> {
+        if budget.is_zero() || budget > Duration::from_secs(10) {
+            return Err(HostError(
+                "cleanup budget must be positive and at most 10s".into(),
+            ));
+        }
+        let deadline = Instant::now() + budget;
+        let forced = if self.group_cleaned {
+            false
+        } else {
+            // Check ownership before any numeric PGID signal. WNOWAIT keeps the
+            // leader's identity reserved even if it exited during a callback.
+            let _ = self.observed_exit()?;
+            let mut running = self.group_running(deadline)?;
+            // Always signal while ownership is reserved, including when the
+            // leader is a zombie: a helper may fork/exit during the proc scan.
+            if unsafe { libc::kill(-(self.pid() as i32), libc::SIGKILL) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error.into());
+                }
+            }
+            self.termination_requested = true;
+            while self.group_running(deadline)? {
+                running = true;
+                if unsafe { libc::kill(-(self.pid() as i32), libc::SIGKILL) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(error.into());
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            self.group_cleaned = true;
+            running
+        };
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                self.reaped = true;
+                self.exit_observed = true;
+                self.stop_logs.store(true, Ordering::Release);
+                for reader in self.readers.drain(..) {
+                    let _ = reader.join();
+                }
+                return Ok(serde_json::json!({"pid":self.pid(), "forced":forced,
+                    "reaped":true, "status":status.to_string(),
+                    "process_group_drained":self.group_cleaned}));
+            }
+            if Instant::now() >= deadline {
+                return Err(HostError("owned-child reap deadline exceeded".into()));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for OwnedApp {
+    fn drop(&mut self) {
+        self.stop_logs.store(true, Ordering::Release);
+        if !self.reaped || !self.group_cleaned {
+            let _ = self.cleanup();
+        }
+    }
+}
+
+fn require_stat(fields: &[&str]) -> Result<()> {
+    if fields.len() == 3 && fields[2].parse::<u32>().is_ok() {
+        Ok(())
+    } else {
+        Err(HostError("invalid proc process group fields".into()))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_scan_skips_disappeared_entries_but_propagates_real_io_failures() {
+        for error in [libc::ESRCH, libc::ENOENT, libc::EACCES] {
+            assert!(
+                proc_stat_result(Err(std::io::Error::from_raw_os_error(error)))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for error in [libc::EIO, libc::EBADF] {
+            assert_eq!(
+                proc_stat_result(Err(std::io::Error::from_raw_os_error(error)))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(error)
+            );
+        }
+        assert_eq!(
+            proc_stat_result(Ok(b"owned stat".to_vec())).unwrap(),
+            Some(b"owned stat".to_vec())
+        );
+    }
+
+    #[test]
+    fn forced_cleanup_kills_and_reaps_only_owned_child() {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut owned = OwnedApp {
+            child,
+            logs: Arc::default(),
+            readers: vec![],
+            reaped: false,
+            group_cleaned: false,
+            stop_logs: Arc::default(),
+            dropped_logs: Arc::default(),
+            termination_requested: false,
+            exit_observed: false,
+        };
+        let result = owned.cleanup().unwrap();
+        assert_eq!(result["forced"], true);
+        assert_eq!(result["reaped"], true);
+        assert_eq!(unsafe { libc::kill(owned.pid() as i32, 0) }, -1);
+        assert_eq!(owned.cleanup().unwrap()["forced"], false);
+    }
+
+    #[test]
+    fn early_child_failure_is_not_scenario_success() {
+        let child = Command::new("/bin/false").process_group(0).spawn().unwrap();
+        let mut owned = OwnedApp {
+            child,
+            logs: Arc::default(),
+            readers: vec![],
+            reaped: false,
+            group_cleaned: false,
+            stop_logs: Arc::default(),
+            dropped_logs: Arc::default(),
+            termination_requested: false,
+            exit_observed: false,
+        };
+        assert!(owned
+            .wait_exit(Instant::now() + Duration::from_secs(2))
+            .is_err());
+        assert_eq!(owned.cleanup().unwrap()["reaped"], true);
+    }
+
+    #[test]
+    fn exited_leader_keeps_group_owned_until_helpers_are_terminated() {
+        use std::os::unix::process::ExitStatusExt;
+        for mode in 0..3 {
+            let through_check_alive = mode != 1;
+            let child = Command::new("/bin/sh")
+                .args(["-c", "read line; exit 0"])
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut owned = OwnedApp {
+                child,
+                logs: Arc::default(),
+                readers: vec![],
+                reaped: false,
+                group_cleaned: false,
+                stop_logs: Arc::default(),
+                dropped_logs: Arc::default(),
+                termination_requested: false,
+                exit_observed: false,
+            };
+            // A directly waitable test helper joins the same owned group. This
+            // permits independent reap/assertions without becoming a subreaper.
+            let mut helper = Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(owned.pid() as i32)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::getpgid(helper.id() as i32) },
+                owned.pid() as i32
+            );
+            drop(owned.child.stdin.take());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let outcome = if through_check_alive {
+                loop {
+                    if let Err(error) = owned.check_alive() {
+                        break Err(error);
+                    }
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(5));
+                }
+            } else {
+                owned.wait_exit(deadline).unwrap();
+                Ok(())
+            };
+            assert!(
+                !owned.reaped,
+                "exit observation must not release PID/PGID ownership"
+            );
+            assert!(helper.try_wait().unwrap().is_none());
+            if mode == 2 {
+                drop(owned);
+                assert_eq!(helper.wait().unwrap().signal(), Some(libc::SIGKILL));
+                continue;
+            }
+            let cleanup = owned.cleanup().unwrap();
+            assert_eq!(cleanup["forced"], true);
+            assert_eq!(cleanup["reaped"], true);
+            assert_eq!(cleanup["process_group_drained"], true);
+            assert_eq!(helper.wait().unwrap().signal(), Some(libc::SIGKILL));
+            assert_eq!(outcome.is_err(), through_check_alive);
+            assert_eq!(owned.cleanup().unwrap()["forced"], false);
+        }
+    }
+
+    #[test]
+    fn bounded_logs_report_eviction_and_failed_cleanup_keeps_owner() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "seq 1 8000; sleep 30"]);
+        let mut slot = None;
+        OwnedApp::start(&mut slot, command).unwrap();
+        let owner = slot.as_mut().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while owner.dropped_logs() == 0 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(owner.logs().len() <= 4096);
+        assert!(owner.cleanup_with_budget(Duration::ZERO).is_err());
+        assert!(!owner.status().reaped);
+        owner.cleanup().unwrap();
+        let status = owner.status();
+        assert!(
+            status.termination_requested
+                && status.exit_observed
+                && status.group_drained
+                && status.reaped
+        );
+    }
+}
