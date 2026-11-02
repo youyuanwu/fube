@@ -169,8 +169,15 @@ callbacks and explicit-ACK streams are separate from admission/quorum waiters
 [api.rs:218–259][f-submit]). `IStatefulServiceReplica::open` returns
 `Box<dyn IPrimaryReplicator>`; common lifecycle/progress and primary-only control
 are split into `IReplicator` and `IPrimaryReplicator`
-([stateful_api.rs:133–248][f-runtime]).
-`FabricReplicator` shares one private engine among control/state views; the
+([shared stateful contracts][f-runtime]).
+`RuntimeReplicator` wraps one `FabricReplicator` lower and shares that private
+engine among public control/state views. Runtime owns native proof capture and
+queued validation; replication receives only lower facts and narrow host
+interfaces. Production dependencies are runtime → data → core/transport; shared
+SDK/error/neutral execution types live in core. Native factory/health/optional
+query seams are allowed; this is not an SDK-only architecture
+([runtime adapter](../../crates/libs/fube-runtime/src/replication.rs#L162-L270),
+[boundary](FubeData.md#runtimereplication-boundary)). The
 engine, old concrete streams and old traits are no longer public construction
 or compatibility paths
 ([fabric_replicator.rs:19–70][f-fabric],
@@ -185,7 +192,9 @@ native SF node: membership / role / epoch / reconfiguration / access authority
           |                             |
           | delegates control           | gates application readiness
           v                             v
- fube-data FabricReplicator <---- log adapter / stream drains
+ runtime-owned lower adapter <---- log adapter / stream drains
+          |
+ fube-data FabricReplicator
       (one private Engine)
           |                    |
      Fabric TCP          log + transaction manager
@@ -625,7 +634,7 @@ not a cross-replica application request-deduplication protocol.
 `ErrorKind::ReplicationQueueFull` (HRESULT 0x80071bcb) versus
 `ReplicationOperationTooLarge` (0x80071c2f), retaining causes/native conversion
 through runtime/data and callers
-([error kinds](../../crates/libs/fube-runtime/src/error.rs#L31-L43),
+([error kinds](../../crates/libs/fube-core/src/error.rs#L31-L43),
 [lower queue stages](../../crates/libs/fube-data/src/queue.rs#L80-L102)).
 Lower capacity-recovery and permanent-oversize/headroom regressions pass; this upper
 transaction retry loop/state kernel remains A0/A1. A prevalidated record's actual
@@ -707,7 +716,7 @@ arguments. In runtime-owned `IStatefulServiceReplica::open`, validate
 [`VolatileTransactionalReplicator::create`](../../crates/libs/fube-txn/src/runtime.rs#L112)
 with the actual partition, captured native integration, endpoint/lower Settings,
 provider factory, data-loss handler and volatile allocation/work-folder settings.
-The owner internally constructs ONE normal `create_with_capabilities` with R0
+The owner internally constructs ONE normal `native.create_replicator_with_capabilities` with R0
 latest-LSN capability and no replay workaround. Retain the public owner in the
 service and return `into_service_replicator()`: a boxed clone of the ACTUAL
 composite shared by `replicator() -> Arc<dyn IPrimaryReplicator>`, not the lower
@@ -715,13 +724,13 @@ concrete object. The composite performs lower-first upper lifecycle once.
 The old private `create_with_lifecycle`/lower-accessor recipe is withdrawn;
 do not separately call either layer's lifecycle.
 See the [constructible usage and execution-entry rule](FubeTxnA1.md)
-([stateful_api.rs:118–148][f-factory],
-[fabric_replicator.rs:29–70][f-fabric],
+([shared factory contract][f-factory],
+[runtime construction](../../crates/libs/fube-runtime/src/replication.rs#L180-L270),
 [stateful_binding.rs:160–180][f-native-capture]).
 There is no supported public standalone `Engine`, extra partition
 CreateReplicator method, SDK discovery hook, or second lower owner.
 `Existing` is Unsupported and `Invalid` is InvalidArgument before activation
-([stateful_api.rs:235–255][f-open-mode]).
+([shared open-mode contract][f-open-mode]).
 
 Normal construction starts supervision/transport/owner without sampling progress
 or activating a zero PRIMARY queue. Lower Open marks Opened; upper Open then
@@ -750,7 +759,7 @@ a variant of fresh construction.
 253–275 promotes the existing secondary; SecondaryReplicator.cpp:2110–2154
 completes immediately for RequireServiceAck. This lower already has that fixed
 explicit-service-ACK profile; no no-service-ACK setting is exposed. The
-[public lower branch](../../crates/libs/fube-data/src/engine.rs#L2349-L2373)
+[public lower branch](../../crates/libs/fube-data/src/engine.rs#L2328-L2342)
 does not wait for upper application ACK/live replication EOS, rebase epoch or
 replace captures/streams. Upper role separately waits copy completion
 ([runtime.rs:469–487](../../crates/libs/fube-txn/src/kernel/runtime.rs#L469-L487)).
@@ -870,7 +879,7 @@ Keep native-issued incarnation, revision, full epochs, local votes and removal
 purpose outside public SDK descriptors. Freeze Build authority at method call,
 before returning its future; never resolve a later “latest replica with this ID”
 ([stateful_api.rs:194–233][f-primary-control],
-[engine_binding.rs:181–304][f-bound-controls]).
+[runtime bound controls][f-bound-controls]).
 
 Runtime-invoked controls already enter owned execution. For application-owned
 async callers, reserve `ExecutionRuntime::try_reserve` **before** moving captures,
@@ -880,7 +889,7 @@ the call, or re-enter the same engine from a provider callback. Unknown contexts
 and same-engine reentry fail rather than turning a queued operation into
 success
 ([SfApiAlignment.md:133–163][f-owned-execution],
-[execution.rs:372–380][f-reserve],
+[neutral reservation][f-reserve],
 [578–588][f-run-owned],
 [482–498][f-reentry]).
 Use the supplied bounded runtime/provider/cleanup ownership facilities; do not
@@ -911,11 +920,11 @@ the committed/previous-configuration boundary
 This is an existing local provider capability, not a new peer negotiation.
 
 **Implemented R0 capability:** `StateProviderCapabilities` is supplied to
-`FabricReplicator::create_with_capabilities`
-([construction](../../crates/libs/fube-data/src/fabric_replicator.rs#L53-L98)).
+`native.create_replicator_with_capabilities`
+([construction](../../crates/libs/fube-runtime/src/replication.rs#L204-L270)).
 Its true flag selects assigned+1 replication start and inclusive assigned
 provider horizon; default classic still selects max(committed,previous quorum)+1
-([selection](../../crates/libs/fube-data/src/engine.rs#L2761-L2771)).
+([selection](../../crates/libs/fube-data/src/engine.rs#L3005-L3009)).
 The provider factory keeps the exact requested argument, volatile null context,
 supervision/bounds and enumeration-EOS finish-tail snapshot. A staged upper
 provider owns checkpoint horizon extension and its metadata, not a fabricated
@@ -1278,11 +1287,11 @@ relative to this document; native references are pinned to the baseline in §2.
 [f-data-provider]: ../../crates/libs/fube-data/src/api.rs#L77-L165
 [f-stream]: ../../crates/libs/fube-data/src/api.rs#L168-L229
 [f-submit]: ../../crates/libs/fube-data/src/api.rs#L218-L259
-[f-runtime]: ../../crates/libs/fube-runtime/src/stateful_api.rs#L133-L248
-[f-runtime-control]: ../../crates/libs/fube-runtime/src/stateful_api.rs#L133-L248
-[f-factory]: ../../crates/libs/fube-runtime/src/stateful_api.rs#L118-L148
-[f-open-mode]: ../../crates/libs/fube-runtime/src/stateful_api.rs#L235-L255
-[f-primary-control]: ../../crates/libs/fube-runtime/src/stateful_api.rs#L194-L233
+[f-runtime]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L38-L147
+[f-runtime-control]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L38-L147
+[f-factory]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L38-L73
+[f-open-mode]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L157-L180
+[f-primary-control]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L103-L147
 [f-fabric]: ../../crates/libs/fube-data/src/fabric_replicator.rs#L19-L70
 [f-removed]: ../../crates/libs/fube-data/src/lib.rs#L44-L80
 [f-state-access]: ../../crates/libs/fube-data/src/fabric_replicator.rs#L112-L142
@@ -1290,25 +1299,25 @@ relative to this document; native references are pinned to the baseline in §2.
 [f-capabilities]: ../../crates/libs/fube-data/src/extensions.rs#L14-L95
 [f-diagnostics]: ../../crates/libs/fube-data/src/extensions.rs#L88-L103
 [f-native-install]: ../../crates/libs/fube-data/src/engine.rs#L708-L735
-[f-initial-progress]: ../../crates/libs/fube-data/src/engine.rs#L5088-L5248
+[f-initial-progress]: ../../crates/libs/fube-data/src/engine.rs#L5049-L5225
 [f-native-dispatch]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L724-L841
 [f-native-progress]: ../../crates/libs/fube-runtime/src/stateful_reconfiguration.rs#L245-L280
 [f-progress-install]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L309-L323
 [f-binding-install]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L525-L542
 [f-native-capture]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L160-L180
-[f-bound-controls]: ../../crates/libs/fube-data/src/engine_binding.rs#L181-L304
-[f-progress-getters]: ../../crates/libs/fube-runtime/src/stateful_api.rs#L178-L184
+[f-bound-controls]: ../../crates/libs/fube-runtime/src/replication.rs#L293-L482
+[f-progress-getters]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L88-L96
 [f-owned-execution]: SfApiAlignment.md#L133-L163
-[f-reserve]: ../../crates/libs/fube-runtime/src/execution.rs#L372-L380
-[f-run-owned]: ../../crates/libs/fube-runtime/src/execution.rs#L578-L588
-[f-reentry]: ../../crates/libs/fube-runtime/src/execution.rs#L482-L498
-[f-values]: ../../crates/libs/fube-runtime/src/stateful_api.rs#L30-L58
+[f-reserve]: ../../crates/libs/fube-core/src/hosting/execution.rs#L454-L551
+[f-run-owned]: ../../crates/libs/fube-core/src/hosting/execution.rs#L710-L763
+[f-reentry]: ../../crates/libs/fube-core/src/hosting/execution.rs#L575-L614
+[f-values]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L8-L36
 [f-epoch-domains]: ../../crates/libs/fube-runtime/src/extensions.rs#L9-L25
-[f-errors]: ../../crates/libs/fube-runtime/src/error.rs#L273-L335
-[f-error-ownership]: ../../crates/libs/fube-runtime/src/error.rs#L1-L12
+[f-errors]: ../../crates/libs/fube-core/src/error.rs#L273-L335
+[f-error-ownership]: ../../crates/libs/fube-core/src/error.rs#L1-L12
 [f-admission-errors]: ../../crates/libs/fube-data/src/engine.rs#L869-L915
 [f-queue-errors]: ../../crates/libs/fube-data/src/queue.rs#L73-L80
-[f-resource-code]: ../../crates/libs/fube-runtime/src/error.rs#L213-L224
+[f-resource-code]: ../../crates/libs/fube-core/src/error.rs#L213-L224
 [f-promotion-stream]: ../../crates/libs/fube-data/src/engine.rs#L4332-L4343
 [f-epoch-equality]: ../../crates/libs/fube-data/src/engine.rs#L4288-L4293
 [f-order]: ../../crates/libs/fube-data/src/lib.rs#L13-L32

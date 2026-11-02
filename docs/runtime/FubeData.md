@@ -1,7 +1,7 @@
 # Fube Data: volatile classic V1 replication
 
 `fube-data` is an owned Rust replication engine, separate from the SF-facing
-control contract in `fube-runtime`. It implements a **qualified subset** of
+runtime/RAP implementation in `fube-runtime`. It implements a **qualified subset** of
 classic V1: ordered nonzero sequences, explicit application acknowledgments,
 current/previous configuration quorums, epoch reconciliation, bounded copy and
 replication streams, retries and native Fabric TCP peers. Native SF nodes remain
@@ -26,14 +26,19 @@ They do not qualify R0 against a deployed native cluster.
 
 ```text
 native node -- Hosting/RAP control --> fube-runtime
-                                      |
+                                      | actual service-returned public control
+                              composite / ordinary forwarder
+                                      | runtime-owned lower adapter
                          fube-data Engine (owned Rust)
                          |                         |
               application provider         Fabric TCP peers
               copy/apply + explicit ACK     Rust or native classic V1
 ```
 
-`fube-data` depends on `fube-runtime` and `fube-transport`, not the reverse.
+Production dependencies are **runtime → data → core/transport**.
+`fube-core` owns shared SDK types/errors and neutral host execution, with no
+runtime or data implementation dependency. Runtime retains native proof
+interpretation, callback-slot/lease accounting and the independent watchdog.
 It reuses bounded framing/serialization but owns peer listener/session policy,
 not the gateway client's connection assumptions. Production engine/runtime/app
 have no FabricRuntime, FabricCommon, COM or native replicator dependency.
@@ -50,17 +55,72 @@ stateless registration. This is not an environment role override.
 
 ## Owned API and provider obligations
 
-- `FabricReplicator::create` consumes a canonical partition and explicit
-  runtime-issued native integration, provider and endpoint/settings capabilities.
-  Control and state-replicator views share one private engine/listener;
+### Runtime/replication boundary
+
+Native separation is **interface-based**, not “SDK-only”: RAP retains common/
+primary interfaces of the service-returned object and optionally queries
+`IFabricInternalReplicator`; replication uses public partition/provider proxies
+and a narrow internal factory/health client
+([ComProxyReplicator.h:17–35][sf-runtime-proxy],
+[IReplicatorFactory.h:19–26][sf-factory],
+[IReplicatorHealthClient.h:12–20][sf-health]).
+Native transactional construction calls that replication-defined factory once
+([ComTransactionalReplicator.cpp:204–212][sf-txn-factory]).
+
+Fube's [replication-defined hosting protocol](../../crates/libs/fube-data/src/hosting.rs#L22-L124)
+accepts explicit lower peer/configuration values, public partition/provider,
+neutral execution, a validate-only mutation callback, eligible stable membership
+facts and health notification. It cannot inspect RAP nodes, request records,
+actors, revisions, cancellation ledgers or lease slots. Runtime owns exact
+capture/equality/once-entry and
+[the original proof check](../../crates/libs/fube-runtime/src/replication.rs#L26-L33),
+including validation at actual queued mutation and completion. Stable singleton
+and secondary-primary routing qualifications are computed
+[in runtime](../../crates/libs/fube-runtime/src/replication.rs#L112-L146), while
+lower epoch/endpoint checks and queue mutation remain in data.
+
+Those validation/projection and finite execution/destructor facilities are
+**Rust host adapters**, not native SDK algorithms. The actual control route is
+RAP → service-returned composite/forwarder → runtime lower adapter → one engine.
+Txn production and tests use normal construction and public lower views, never
+data hosting/test hooks. Optional `test-hooks` exists only for implementation
+regressions owned by runtime; it contains no native issuer and is not supported
+application construction. The shared RAP harness has no direct data dependency
+or data-specific API.
+
+The lower independently checks public partition write access
+[before submission](../../crates/libs/fube-data/src/engine.rs#L881-L885) and
+[before queue assignment](../../crates/libs/fube-data/src/engine.rs#L2168-L2180),
+not merely role or readiness. Failed access getters normalize to NotPrimary
+as native's partition proxy does. ReconfigurationPending/NoWriteQuorum remain
+distinct. Returned Invalid also fails closed as NotPrimary in Rust; native's
+unknown-status switch is a coding error, so this is not switch parity
+([access mapping](../../crates/libs/fube-data/src/engine.rs#L282-L303),
+[native proxy][sf-partition-write], [native switch][sf-access-switch]).
+Denied admission consumes no LSN; later revocation does not undo accepted work.
+Upper transient-cache preflight is unchanged.
+
+The native construction helper changed location; migrate
+`FabricReplicator::create(partition, native, ...)` to
+`native.create_replicator(partition, ...)`, and similarly migrate explicit
+copy-capability construction. Retain its state trait view and return the
+runtime adapter or composite through `IPrimaryReplicator`; do not return the
+sample's raw `diagnostics()` view as the canonical lower control.
+
+- `NativeRuntimeIntegration::create_replicator` consumes a canonical partition,
+  provider, optional replay, endpoint and validated settings in service Open.
+  Runtime validates identity and its one-engine claim, invokes the
+  replication-defined factory, and returns a `RuntimeReplicator`.
+  Its public control and state-replicator views share one private engine/listener;
   no standalone public control authority is supplied
-  ([public construction and Rustdoc](../../crates/libs/fube-data/src/fabric_replicator.rs#L23-L74)).
-  This helper lives in data to preserve data → runtime dependency. Native
+  ([construction](../../crates/libs/fube-runtime/src/replication.rs#L180-L270)).
+  Native
   partition `CreateReplicator`, mssf `try_get_com`, COM proxy/ABI and mutable
   native settings are not supported SDK members. Normal configuration/Build/
-  Remove reaches that same owner by exact internally scoped canonical delegation,
-  not a replacement binder. The built-in private bound route is lower-only
-  `cfg(test)` negative tooling; supported explicit custom runtime bindings are
+  Remove reaches that same owner through the actual returned composite and
+  runtime-owned lower adapter, not a replacement binder. Direct SDK
+  configuration/Build/Remove on the raw data facade is unsupported; diagnostics
+  cannot capture authority. Supported explicit custom runtime bindings are
   separate and retain their selected-view behavior.
 - `IStateProvider` supplies synchronous `get_last_committed_sequence_number`,
   `get_copy_context`/`get_copy_state` factories, async `update_epoch` and
@@ -300,7 +360,7 @@ observes assigned1/committed0, failed completion and unchanged provider state.
 Terminal retirement also cancels/joins an in-flight optional replay before
 publication
 ([ownership gate](../../crates/libs/fube-data/src/engine.rs#L4053-L4071),
-[regression](../../crates/libs/fube-data/src/engine_tests.rs#L6205-L6249)).
+[regression](../../crates/libs/fube-data/src/engine_tests.rs#L6103-L6147)).
 Callback-free retirement does not reserve another provider slot before canceling
 the callbacks occupying that budget; the
 [all-64-callback regression](../../crates/libs/fube-data/src/engine_tests.rs#L813-L912)
@@ -326,8 +386,8 @@ requirement for an already represented prefix
 highest from the entered, frozen runtime descriptor's CurrentProgress.
 Repeated descriptors preserve live counters; diagnostics cannot attest a vote
 ([issued initialization](../../crates/libs/fube-data/src/engine.rs#L2636-L2653),
-[canonical proof](../../crates/libs/fube-data/src/engine_binding.rs#L181-L225)).
-The [issued root/bound regression](../../crates/libs/fube-data/src/engine_native_tests.rs#L225-L332)
+[canonical proof](../../crates/libs/fube-runtime/src/replication.rs#L293-L339)).
+The [issued sender regression](../../crates/libs/fube-runtime/tests/replication_native.rs#L813-L919)
 proves ALL at20 with no replay/fresh ACK, repeated and recreated descriptors,
 and LSN21 still pending without a real ACK. The diagnostic-prefix test remains
 a negative authority witness, not the source-conformance path.
@@ -362,7 +422,7 @@ ALL uses CC, not combined PC commit or WRITE required-target constraints.
 The [sentinel/PC regression](../../crates/libs/fube-data/src/quorum.rs#L167-L202)
 and [idle retention test](../../crates/libs/fube-data/src/engine_tests.rs#L318-L395)
 cover those separate obligations; the
-[direct configured-lagging CCq1 test](../../crates/libs/fube-data/src/engine_tests.rs#L6252-L6282)
+[direct configured-lagging CCq1 test](../../crates/libs/fube-data/src/engine_tests.rs#L6150-L6180)
 observes released storage/ALL with zero remote receive/apply and no idle owner.
 Joint-configuration tests retain PC APPLY blocking while CC ALL succeeds.
 
@@ -410,12 +470,12 @@ retriable failure
 **R0 correction:** distinct ErrorKind values preserve **0x80071bcb queue-full**
 and **0x80071c2f operation-too-large**, including causes, native conversion,
 uncertainty and transport round trips
-([runtime errors](../../crates/libs/fube-runtime/src/error.rs#L31-L41),
+([shared errors](../../crates/libs/fube-core/src/error.rs#L31-L41),
 [admission](../../crates/libs/fube-data/src/engine.rs#L890-L957),
 [queue stages](../../crates/libs/fube-data/src/queue.rs#L80-L102)).
 These exact codes come from [FabricTypes.h:119–136,226–236][sf-admission-codes]
 and [EnumOperators.cpp:85–128][sf-admission-conversion].
-The [runtime fidelity test](../../crates/libs/fube-runtime/src/error_tests.rs#L9-L38),
+The [shared fidelity test](../../crates/libs/fube-core/src/error_tests.rs#L9-L38),
 [capacity-recovery test](../../crates/libs/fube-data/src/engine_tests.rs#L3398-L3463),
 and [permanent-sizing test](../../crates/libs/fube-data/src/queue.rs#L275-L294)
 prove lower retry recovery versus permanent rejection without consuming a
@@ -477,9 +537,9 @@ or truncation, then drains 91–100. The
 [represented-provider duplicate tests](../../crates/libs/fube-data/src/engine_tests.rs#L3627-L3690)
 exercise promotion and original-operation barriers without post-callback getters.
 The [new incompatible epoch negatives](../../crates/libs/fube-data/src/engine_tests.rs#L3692-L3749)
-preserve real provider errors. The [owned canonical lower-entry test](../../crates/libs/fube-data/src/engine_native_tests.rs#L449-L523)
+preserve real provider errors. The [owned canonical lower-entry test](../../crates/libs/fube-runtime/tests/replication_native.rs#L1292-L1367)
 separately proves RAP's duplicate suppression and actual lower no-op execution;
-[traffic-epoch and saturated-entry regressions](../../crates/libs/fube-data/src/engine_native_tests.rs#L525-L645)
+[traffic-epoch and saturated-entry regressions](../../crates/libs/fube-runtime/tests/replication_native.rs#L1371-L1488)
 cover newer StartCopy/replication admission during unfinished copy, equal success,
 stale rejection and callback-free execution under the shared record limit.
 These are offline fixtures, not a V2 log kernel or deployed qualification.
@@ -495,12 +555,12 @@ remain explicit profile limits.
 
 ### R0 copy capability and native INITIAL progress
 
-`FabricReplicator::create` remains backwards-compatible classic copy. Opt in with
-`create_with_capabilities(..., StateProviderCapabilities {
+`native.create_replicator` retains classic copy defaults. Opt in with
+`native.create_replicator_with_capabilities(..., StateProviderCapabilities {
 supports_copy_until_latest_lsn: true })`. This is explicit construction, not SDK
 trait discovery, peer negotiation or type inference
 ([capability](../../crates/libs/fube-data/src/extensions.rs#L89-L97),
-[helper](../../crates/libs/fube-data/src/fabric_replicator.rs#L53-L96)).
+[helper](../../crates/libs/fube-runtime/src/replication.rs#L180-L270)).
 Latest selects inclusive assigned horizon and replication start assigned+1;
 classic retains max(committed,previous quorum)+1. Provider supervision and the
 enumeration-EOS finish tail remain unchanged. The
@@ -515,8 +575,8 @@ uses that success or queries the provider, then creates the INITIAL queue at
 tail+1. Getter failures retry; first-Primary failures fault lower. Initial
 secondary starts from transmission and role transfer preserves queue authority,
 not an activated rebase
-([constructor contract](../../crates/libs/fube-data/src/fabric_replicator.rs#L30-L75),
-[getters](../../crates/libs/fube-data/src/engine.rs#L5088-L5248)).
+([constructor contract](../../crates/libs/fube-runtime/src/replication.rs#L180-L204),
+[getters](../../crates/libs/fube-data/src/engine.rs#L5049-L5225)).
 The public SDK/bootstrap witnesses retain actual tails1/27→assigned2/28 and
 getter/error/first-Primary coverage. Their markers are **not native record
 serialization or persisted recovery**. See [A1 composition](FubeTxnA1.md) for
@@ -551,6 +611,13 @@ Open and mixed deployment qualification remain unsupported/unrun.
 [sf-upper-epoch]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/data/txnreplicator/loggingreplicator/LoggingReplicatorImpl.cpp#L1368-L1401
 
 ## Client fixture
+
+[sf-runtime-proxy]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Failover/ra/ComProxyReplicator.h#L17-L35
+[sf-factory]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Replication/IReplicatorFactory.h#L19-L26
+[sf-health]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Replication/IReplicatorHealthClient.h#L12-L20
+[sf-txn-factory]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/data/txnreplicator/ComTransactionalReplicator.cpp#L204-L212
+[sf-partition-write]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Replication/ComProxyStatefulServicePartition.cpp#L70-L79
+[sf-access-switch]: https://github.com/microsoft/service-fabric/blob/51a7703a1f83749a9234d3ceb4296d8622e42cca/src/prod/src/Reliability/Replication/Replicator.cpp#L889-L906
 
 Resolve the actual native-published service address; do not send HTTP to the
 classic replication endpoint. Under that exact replica/incarnation owner path:

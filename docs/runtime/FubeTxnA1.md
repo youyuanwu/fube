@@ -1,7 +1,8 @@
 # Fube transaction A1: ordinary volatile execution
 
 A1 supplies a [public service owner](../../crates/libs/fube-txn/src/runtime.rs#L79)
-over **one normally constructed** FabricReplicator. The service returns the
+over **one normally constructed** lower engine through a runtime-owned adapter.
+The service returns the
 actual transactional composite `Arc<dyn IPrimaryReplicator>` (boxed for service
 Open), not the lower concrete object or a binder-selected substitute. Ordinary incremental
 transactions, primary provider registry operations, native null-context Full
@@ -86,8 +87,10 @@ The old `create_with_lifecycle`/private bootstrap-rebase recipe and lower
 execution/identity/snapshot/root-routing access are **withdrawn**, not renamed
 public APIs. Production and tests use the same boundary:
 
-- Normal `FabricReplicator::create` / `create_with_capabilities`, public
-  partition + runtime-issued host integration, endpoint and validated `Settings`.
+- Normal `native.create_replicator` / `create_replicator_with_capabilities`,
+  public partition, endpoint and validated `Settings`. Runtime validates its
+  generation-bound construction and composes the replication-defined factory;
+  replication never receives broad native integration or RAP control records.
   A1 uses no replay extension and explicitly selects the existing R0
   `StateProviderCapabilities::supports_copy_until_latest_lsn`
   ([construction](../../crates/libs/fube-txn/src/kernel/runtime.rs#L170-L187)).
@@ -110,7 +113,11 @@ Provider capture occurs outside transaction-selection locks.
 
 **FUBE ADAPTATION:** runtime internally scopes the exact issued invocation and
 purpose through canonical configuration/Build/Remove delegation, including eager
-Build construction and owned polling. Normal built-in construction installs no
+Build construction and owned polling. The runtime lower adapter retains the exact
+proof and revalidates at actual lower queued mutation; data receives only lower
+values and a validate-only callback. Shared SDK/error/neutral execution types
+live in `fube-core`, while runtime retains lease/watchdog/proof interpretation.
+Normal built-in construction installs no
 replacement-object binder. Explicit custom framework bindings retain their
 existing selected-view behavior; txn and its helper never install one
 ([stateful_binding.rs:724–841](../../crates/libs/fube-runtime/src/stateful_binding.rs#L724-L841)).
@@ -144,7 +151,7 @@ secondary. This lower's fixed explicit-service-ACK profile completes lower
 promotion immediately, without epoch rebase, stream/capture replacement or
 waiting for application ACK/live replication EOS. Upper promotion still awaits
 its copy completion, not live replication completion
-([engine.rs:2349–2373](../../crates/libs/fube-data/src/engine.rs#L2349-L2373),
+([engine.rs:2328–2342](../../crates/libs/fube-data/src/engine.rs#L2328-L2342),
 [runtime.rs:469–487](../../crates/libs/fube-txn/src/kernel/runtime.rs#L469-L487)).
 Pinned SecondaryReplicator.cpp:2110–2154 distinguishes this RequireServiceAck
 branch from the unsupported no-service-ACK dispatch-drain branch.
@@ -249,12 +256,21 @@ are observed; the older uninstrumented successful-Build/role-timeout chronology
 remains **unknown**, not reconstructed.
 
 The single [RAP test-support package](../../crates/libs/fube-rap-test-support/Cargo.toml#L8-L13)
-depends only on public runtime/transport/tokio/uuid/serde, not data. Txn depends
+depends only on public runtime/transport/tokio/uuid/serde, with no direct data
+dependency or data API (runtime now reaches data transitively). Txn depends
 normally on data/runtime/tokio/uuid and dev-depends on that helper; it has no data
 qualification feature, private source inclusion/friend access or lower-control
 reexport. The moved model retains actual registration/Open addresses and
 Close-before-host-shutdown, not fabricated lower proofs.
 Byte/Point payloads remain test fixtures, not collection compatibility.
+
+The [external public access regression](../../crates/libs/fube-txn/tests/support/partition_access.rs#L74-L123)
+keeps the first transient cache operation available during ReconfigurationPending
+and NoWriteQuorum, but rejects the next real lower admission with the native
+access error. After restoring access the same retained transaction commits.
+Both direct and forwarding service returns run this path. Lower denial consumes
+no LSN and cannot roll back already accepted continuations; upper transient-cache
+policy and ordinary End/Barrier admission are unchanged.
 
 Run serially using the existing toolchain:
 
