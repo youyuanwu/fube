@@ -215,6 +215,12 @@ impl NativeInvocation {
     pub(crate) fn in_own_execution(&self) -> bool {
         self.unit.execution.is_current_entry()
     }
+    pub(crate) fn execution(&self) -> crate::extensions::ExecutionRuntime {
+        self.unit.execution.clone()
+    }
+    pub(crate) fn authority(&self) -> Arc<Authority> {
+        self.unit.authority.clone()
+    }
     pub fn cancellation(&self) -> Cancellation {
         self.issued.cancellation.clone()
     }
@@ -490,7 +496,7 @@ impl NativeRuntimeIntegration {
                 "cleanup cannot capture native invocation",
             ));
         }
-        let invocation = crate::extensions::ExecutionRuntime::capturable_invocation()
+        let invocation = crate::execution::capturable_invocation()
             .ok_or(Error::InvalidInput("no current native invocation"))?;
         if !Arc::ptr_eq(&self.0, &invocation.unit) {
             return Err(Error::InvalidInput(
@@ -758,7 +764,7 @@ impl<T> std::future::Future for InvocationFuture<'_, T> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let scope = crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone());
+        let scope = crate::execution::invocation_scope(self.invocation.clone());
         match scope {
             Ok(_scope) => self.work.as_mut().poll(cx),
             Err(error) => std::task::Poll::Ready(Err(error)),
@@ -802,14 +808,12 @@ impl IPrimaryReplicator for InvocationControl {
         cc: crate::ReplicaSetConfig,
         pc: crate::ReplicaSetConfig,
     ) -> Result<()> {
-        let _scope =
-            crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone())?;
+        let _scope = crate::execution::invocation_scope(self.invocation.clone())?;
         self.control
             .update_catch_up_replica_set_configuration(cc, pc)
     }
     fn update_current_replica_set_configuration(&self, cc: crate::ReplicaSetConfig) -> Result<()> {
-        let _scope =
-            crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone())?;
+        let _scope = crate::execution::invocation_scope(self.invocation.clone())?;
         self.control.update_current_replica_set_configuration(cc)
     }
     fn wait_for_catch_up_quorum(
@@ -824,7 +828,7 @@ impl IPrimaryReplicator for InvocationControl {
         replica: crate::ReplicaInformation,
         cancel: Cancellation,
     ) -> crate::ApiFuture<'_, ()> {
-        let scope = crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone());
+        let scope = crate::execution::invocation_scope(self.invocation.clone());
         match scope {
             Ok(_scope) => Box::pin(InvocationFuture {
                 work: self.control.build_replica(replica, cancel),
@@ -834,8 +838,7 @@ impl IPrimaryReplicator for InvocationControl {
         }
     }
     fn remove_replica(&self, id: i64) -> Result<()> {
-        let _scope =
-            crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone())?;
+        let _scope = crate::execution::invocation_scope(self.invocation.clone())?;
         self.control.remove_replica(id)
     }
 }

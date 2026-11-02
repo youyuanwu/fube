@@ -9,20 +9,7 @@
 /// Fube's explicit full/primary epoch-domain conversion. It is not a member of
 /// the SDK Epoch contract; invalid and valid zero remain distinct. The bitmask
 /// follows native ToPrimaryEpoch; exposing this trait is fube's API choice.
-pub trait EpochDomains {
-    fn primary(self) -> crate::Epoch;
-}
-impl EpochDomains for crate::Epoch {
-    fn primary(self) -> Self {
-        if self == Self::INVALID {
-            return self;
-        }
-        Self {
-            data_loss_number: self.data_loss_number,
-            configuration_number: self.configuration_number & !0xffff_ffff,
-        }
-    }
-}
+pub use fube_core::hosting::EpochDomains;
 /// Explicit owned activation input for embedding and model hosts. This follows
 /// the same native IPC registration, artifact validation, lease and supervision
 /// path as `Runtime::attach`; the input itself grants no native authority.

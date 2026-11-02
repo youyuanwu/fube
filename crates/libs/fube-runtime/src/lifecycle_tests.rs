@@ -771,8 +771,7 @@ impl Harness {
         let authority = Authority::new(std::time::Instant::now(), 3_000_000_000).unwrap();
         let current = crate::ActivationContextHandle::new(activation);
         let engine = if let Some(application) = application {
-            let execution =
-                crate::extensions::ExecutionRuntime::new(authority.clone(), application);
+            let execution = crate::execution::new(authority.clone(), application);
             Engine::start_with_execution(current, authority, client.unwrap(), rx, execution)
         } else {
             Engine::start(current, authority, client.unwrap(), rx)

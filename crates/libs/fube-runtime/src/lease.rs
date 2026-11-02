@@ -57,6 +57,15 @@ impl Drop for CallbackDeadline {
     }
 }
 
+impl fube_core::hosting::ExecutionDeadline for CallbackDeadline {
+    fn arm_until(&self, until: Instant) {
+        CallbackDeadline::arm_until(self, until);
+    }
+    fn set_effective_until(&self, until: Instant) {
+        CallbackDeadline::set_effective_until(self, until);
+    }
+}
+
 /// Atomic terminal authority. The hard fence never waits for a user lock or I/O.
 #[derive(Debug)]
 pub(crate) struct Authority {
@@ -94,6 +103,36 @@ impl OwnedThread {
             // asynchronous OS-completion probe, not cleanup-admission retry.
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+    }
+}
+impl fube_core::hosting::ExecutionThread for OwnedThread {
+    fn join_finished(&self) -> crate::ApiFuture<'_, ()> {
+        Box::pin(OwnedThread::join_finished(self))
+    }
+}
+impl fube_core::hosting::ExecutionAuthority for Authority {
+    fn check(&self) -> Result<()> {
+        Authority::check(self)
+    }
+    fn retire(&self) {
+        Authority::retire(self);
+    }
+    fn retire_at(&self, until: Instant) {
+        Authority::retire_at(self, until);
+    }
+    fn reserve_callback_deadline(
+        self: Arc<Self>,
+        cleanup: bool,
+    ) -> Result<Box<dyn fube_core::hosting::ExecutionDeadline>> {
+        Ok(Box::new(Authority::reserve_callback_deadline(
+            &self, cleanup,
+        )?))
+    }
+    fn own_thread(
+        &self,
+        thread: std::thread::JoinHandle<()>,
+    ) -> Arc<dyn fube_core::hosting::ExecutionThread> {
+        Authority::own_thread(self, thread)
     }
 }
 impl Authority {

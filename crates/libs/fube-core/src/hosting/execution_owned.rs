@@ -1,4 +1,4 @@
-//! Finite disposal scopes and dormant release entries used by runtime and data.
+//! Finite disposal scopes and dormant release entries shared by host consumers.
 use super::*;
 #[cfg(test)]
 #[path = "execution_owned_tests.rs"]
@@ -231,7 +231,7 @@ pub(super) struct Scope {
     completed: Condvar,
     pending_results: AtomicUsize,
     publications: Mutex<Vec<std::sync::Weak<dyn Publication>>>,
-    invocation: Option<InvocationAssociation>,
+    invocation: Option<HostAssociation>,
 }
 impl Scope {
     fn new(
@@ -239,7 +239,7 @@ impl Scope {
         parent: Option<Arc<Scope>>,
         origin: CallOrigin,
         until: Instant,
-        invocation: Option<InvocationAssociation>,
+        invocation: Option<HostAssociation>,
     ) -> Arc<Self> {
         Self::new_reserved(active, parent, origin, until, false, invocation)
     }
@@ -248,7 +248,7 @@ impl Scope {
         parent: Option<Arc<Scope>>,
         origin: CallOrigin,
         until: Instant,
-        invocation: Option<InvocationAssociation>,
+        invocation: Option<HostAssociation>,
     ) -> Arc<Self> {
         Self::new_kind(active, parent, origin, until, false, false, invocation)
     }
@@ -258,7 +258,7 @@ impl Scope {
         origin: CallOrigin,
         until: Instant,
         parent_reserved: bool,
-        invocation: Option<InvocationAssociation>,
+        invocation: Option<HostAssociation>,
     ) -> Arc<Self> {
         Self::new_kind(
             active,
@@ -277,7 +277,7 @@ impl Scope {
         until: Instant,
         parent_reserved: bool,
         cleanup: bool,
-        mut invocation: Option<InvocationAssociation>,
+        mut invocation: Option<HostAssociation>,
     ) -> Arc<Self> {
         if let Some(association) = &mut invocation {
             association.capture &= !cleanup;
@@ -508,9 +508,9 @@ impl ObjectPublication {
         self.0.accept()
     }
 }
-pub(crate) struct PublicationBatch(Arc<Scope>);
+pub struct PublicationBatch(Arc<Scope>);
 impl PublicationBatch {
-    pub(crate) fn accept(self) -> Result<()> {
+    pub fn accept(self) -> Result<()> {
         for publication in self.0.publications.lock().unwrap().drain(..) {
             if let Some(publication) = publication.upgrade() {
                 if !publication.releasing() {
@@ -525,7 +525,7 @@ struct PendingPublication {
     active: Arc<Active>,
     scope: Option<Arc<Scope>>,
     until: Instant,
-    invocation: Option<InvocationAssociation>,
+    invocation: Option<HostAssociation>,
 }
 impl Drop for PendingPublication {
     fn drop(&mut self) {
@@ -551,7 +551,7 @@ impl<T: Send + 'static> ReleaseSlot<T> {
         self: &Arc<Self>,
         active: Arc<Active>,
         scope: Option<Arc<Scope>>,
-        invocation: Option<InvocationAssociation>,
+        invocation: Option<HostAssociation>,
     ) {
         let until = scope
             .as_ref()
@@ -957,16 +957,16 @@ impl<T> Drop for ScopedFuture<T> {
     }
 }
 impl ExecutionRuntime {
-    pub(crate) fn has_running_callbacks(&self) -> bool {
+    pub fn has_running_callbacks(&self) -> bool {
         self.inner.callbacks_running.load(Ordering::Acquire) != 0
     }
-    pub(crate) fn factory_quota(&self) -> ObjectQuota {
+    pub fn factory_quota(&self) -> ObjectQuota {
         self.inner.factory_quota.clone()
     }
-    pub(crate) fn service_quota(&self) -> ObjectQuota {
+    pub fn service_quota(&self) -> ObjectQuota {
         self.inner.service_quota.clone()
     }
-    pub(crate) fn control_quota(&self) -> ObjectQuota {
+    pub fn control_quota(&self) -> ObjectQuota {
         self.inner.control_quota.clone()
     }
     pub fn root_origin() -> Option<CallOrigin> {
@@ -1016,7 +1016,7 @@ impl ExecutionRuntime {
     pub fn blocking_deadline(&self) -> Result<Instant> {
         Self::blocking_deadline_for(&self.inner.authority)
     }
-    pub(crate) fn blocking_deadline_for(authority: &Arc<Authority>) -> Result<Instant> {
+    pub fn blocking_deadline_for(authority: &Arc<dyn ExecutionAuthority>) -> Result<Instant> {
         ENTRY.with(|entry| match entry.borrow().as_ref() {
             Some(entry) if Arc::ptr_eq(&entry.active.authority, authority) && !entry.cleanup => {
                 authority.check()?;
@@ -1031,7 +1031,7 @@ impl ExecutionRuntime {
             )),
         })
     }
-    pub(crate) fn set_current_generation(&self, generation: u64) {
+    pub fn set_current_generation(&self, generation: u64) {
         ENTRY.with(|entry| {
             if let Some(entry) = entry.borrow_mut().as_mut() {
                 if Arc::ptr_eq(&entry.active.authority, &self.inner.authority) {
@@ -1124,7 +1124,11 @@ impl ExecutionRuntime {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::ResourceLimit("final release records"))?;
-        let deadline = self.inner.authority.reserve_callback_deadline(true)?;
+        let deadline = self
+            .inner
+            .authority
+            .clone()
+            .reserve_callback_deadline(true)?;
         self.inner.cleanup_owners.fetch_add(1, Ordering::AcqRel);
         let active = Arc::new(Active {
             origin,
@@ -1282,23 +1286,35 @@ impl ExecutionRuntime {
             }),
         })
     }
-    pub(crate) async fn invoke<T: Send + 'static>(
+    fn invocation_entry(&self) -> Result<bool> {
+        ENTRY.with(|entry| match entry.borrow().as_ref() {
+            None => Ok(false),
+            Some(entry) if Arc::ptr_eq(&entry.active.authority, &self.inner.authority) => Ok(true),
+            Some(_) => Err(Error::new(
+                crate::ErrorKind::InvalidExecutionContext,
+                "invocation execution owner mismatch",
+            )),
+        })
+    }
+    /// Invoke under this owner, rejecting any foreign owned entry.
+    pub async fn invoke<T: Send + 'static>(
         &self,
         timeout: Duration,
         operation: impl Future<Output = Result<T>> + Send + 'static,
     ) -> Result<T> {
-        self.inner.authority.check()?;
         let (value, publication) = self.invoke_creation(timeout, operation).await?;
         publication.accept()?;
         Ok(value)
     }
-    pub(crate) async fn invoke_creation<T: Send + 'static>(
+    /// Invoke with deferred publication, rejecting any foreign owned entry.
+    pub async fn invoke_creation<T: Send + 'static>(
         &self,
         timeout: Duration,
         operation: impl Future<Output = Result<T>> + Send + 'static,
     ) -> Result<(T, PublicationBatch)> {
+        let inline = self.invocation_entry()?;
         self.inner.authority.check()?;
-        if !Self::in_owned_entry() {
+        if !inline {
             let permit = self.reserve(CallLane::Native, CallOrigin::default(), timeout, true)?;
             let runtime = self.clone();
             return permit
@@ -1307,12 +1323,13 @@ impl ExecutionRuntime {
         }
         self.invoke_creation_inline(timeout, operation).await
     }
-    pub(crate) async fn invoke_cleanup<T: Send + 'static>(
+    /// Invoke cleanup under this owner, never a foreign entry's ancestry.
+    pub async fn invoke_cleanup<T: Send + 'static>(
         &self,
         timeout: Duration,
         operation: impl Future<Output = Result<T>> + Send + 'static,
     ) -> Result<T> {
-        let output = if !Self::in_owned_entry() {
+        let output = if !self.invocation_entry()? {
             let permit = self.reserve(CallLane::Native, CallOrigin::default(), timeout, true)?;
             let runtime = self.clone();
             permit

@@ -316,6 +316,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fube-core"
+version = "0.1.0"
+dependencies = [
+ "fube-transport",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "fube-data"
 version = "0.1.0"
 dependencies = [
@@ -399,6 +408,7 @@ dependencies = [
 name = "fube-runtime"
 version = "0.1.0"
 dependencies = [
+ "fube-core",
  "fube-hosting",
  "fube-node",
  "fube-ra",

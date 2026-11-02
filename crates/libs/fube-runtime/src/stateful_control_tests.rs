@@ -446,7 +446,9 @@ async fn promotion_endpoint_scenario(application: Option<tokio::runtime::Handle>
         h.receive("ReplicaCloseReply").await;
         h.engine.shared.stateful.wait_idle([2; 16]).await;
         h.engine.quiesce().await.unwrap();
-        h.engine.shared.execution.shutdown().await.unwrap();
+        crate::execution::shutdown(&h.engine.shared.execution, &h.engine.shared.authority)
+            .await
+            .unwrap();
         return;
     }
     let mut ack = control(&promote, "ProxyReplicaEndpointUpdatedReply", vec![]);
@@ -503,7 +505,9 @@ async fn promotion_endpoint_scenario(application: Option<tokio::runtime::Handle>
     tokio::time::resume();
     h.engine.shared.stateful.wait_idle([2; 16]).await;
     h.engine.quiesce().await.unwrap();
-    h.engine.shared.execution.shutdown().await.unwrap();
+    crate::execution::shutdown(&h.engine.shared.execution, &h.engine.shared.authority)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
