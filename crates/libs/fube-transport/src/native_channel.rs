@@ -459,10 +459,11 @@ impl GatewayChannel {
             },
             raw_limits(limits.max_frame_bytes),
             deadline,
+            |_, _| Ok(raw_session::Admission::Retain(())),
         )
         .await?;
-        let props = envelope(&message, true)?;
-        let remote = control_instance(&message, &props)?;
+        let props = envelope(&message.message, true)?;
+        let remote = control_instance(&message.message, &props)?;
         check_deadline(deadline)?;
         Ok(Self::start_with_envelope(
             stream,
@@ -1626,6 +1627,7 @@ async fn drive<S: AsyncRead + AsyncWrite + Unpin>(stream: S, shared: Arc<Shared>
             send_loop(writer, &shared),
             stopped,
             |error| shared.terminate(error),
+            Error::Closed,
         ),
         expire_loop(&shared)
     );

@@ -4,7 +4,7 @@
 //! own finite queues and retain their admission charges while awaiting a write.
 //! Canceling an established write future is not safe: owners must join it.
 
-use std::{future::Future, io, net::SocketAddr, task::Poll, time::Duration};
+use std::{future::Future, io, net::SocketAddr, sync::Mutex, task::Poll, time::Duration};
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -121,14 +121,19 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R, limits: Limits) 
 /// Establish an already-connected or accepted stream. Constructor cancellation
 /// disposes this unpublished stream; it never leaves a live partial session.
 /// The caller validates the remote hello's profile before publishing authority.
-pub async fn establish<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn establish<S, T, F>(
     mut stream: S,
     role: Role,
     mut local: ListenInstance,
     id: MessageId,
     limits: Limits,
     deadline: Instant,
-) -> Result<(S, Message)> {
+    admit: F,
+) -> Result<(S, Received<T>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(&[u8], usize) -> Result<Admission<T>>,
+{
     limits.validate()?;
     if Instant::now() >= deadline {
         return Err(Error::Timeout);
@@ -139,7 +144,9 @@ pub async fn establish<S: AsyncRead + AsyncWrite + Unpin>(
     };
     timeout_at(deadline, async {
         write_message(&mut stream, &Message::listen_instance(id, &local)?).await?;
-        let remote = read_message(&mut stream, limits).await?;
+        let remote = read_frame(&mut stream, limits, admit)
+            .await?
+            .ok_or(Error::Protocol("missing ListenInstance"))?;
         Ok((stream, remote))
     })
     .await
@@ -147,13 +154,17 @@ pub async fn establish<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Connect and exchange under the *same* absolute establishment deadline.
-pub async fn connect(
+pub async fn connect<T, F>(
     endpoint: SocketAddr,
     local: ListenInstance,
     id: MessageId,
     limits: Limits,
     deadline: Instant,
-) -> Result<(TcpStream, Message)> {
+    admit: F,
+) -> Result<(TcpStream, Received<T>)>
+where
+    F: FnOnce(&[u8], usize) -> Result<Admission<T>>,
+{
     limits.validate()?;
     if Instant::now() >= deadline {
         return Err(Error::Timeout);
@@ -162,7 +173,7 @@ pub async fn connect(
         .await
         .map_err(|_| Error::Timeout)??;
     stream.set_nodelay(true)?;
-    establish(stream, Role::Initiating, local, id, limits, deadline).await
+    establish(stream, Role::Initiating, local, id, limits, deadline, admit).await
 }
 
 /// Write one frame with an adapter-owned synchronous visibility fence.
@@ -234,18 +245,18 @@ where
 
 /// Stop the reader on terminal notification, but always join the writer.
 /// Each adapter records the first terminal cause and wakes unstarted work.
-pub async fn join_io<R, W, S, T>(reading: R, writing: W, stopped: S, terminate: T)
+pub async fn join_io<R, W, S, T, E>(reading: R, writing: W, stopped: S, terminate: T, closed: E)
 where
-    R: Future<Output = Result<()>>,
-    W: Future<Output = Result<()>>,
+    R: Future<Output = std::result::Result<(), E>>,
+    W: Future<Output = std::result::Result<(), E>>,
     S: Future<Output = ()>,
-    T: Fn(Error),
+    T: Fn(E),
 {
     let reading = async {
         tokio::select! {
             biased;
             _ = stopped => {},
-            result = reading => terminate(result.err().unwrap_or(Error::Closed)),
+            result = reading => terminate(result.err().unwrap_or(closed)),
         }
     };
     let writing = async {
@@ -254,6 +265,61 @@ where
         }
     };
     tokio::join!(reading, writing);
+}
+
+/// Nonowning stop/visibility state for adapters without an existing terminal
+/// gate. Holding this state does not own a task or socket. First cause wins.
+pub struct SessionState<E> {
+    terminal: Mutex<Option<E>>,
+    pub changed: Notify,
+}
+
+impl<E: Clone> Default for SessionState<E> {
+    fn default() -> Self {
+        Self {
+            terminal: Mutex::new(None),
+            changed: Notify::new(),
+        }
+    }
+}
+
+impl<E: Clone> SessionState<E> {
+    pub fn terminate(&self, cause: E) {
+        let mut terminal = self.terminal.lock().unwrap();
+        if terminal.is_none() {
+            *terminal = Some(cause);
+            self.changed.notify_waiters();
+        }
+    }
+
+    pub fn error(&self) -> Option<E> {
+        self.terminal.lock().unwrap().clone()
+    }
+
+    /// Samples adapter authority and polls under the same gate as termination.
+    pub fn attempt(
+        &self,
+        valid: impl FnOnce() -> bool,
+        write: &mut dyn FnMut() -> Poll<io::Result<usize>>,
+    ) -> Option<Poll<io::Result<usize>>> {
+        let terminal = self.terminal.lock().unwrap();
+        if terminal.is_some() || !valid() {
+            return None;
+        }
+        Some(write())
+    }
+
+    pub async fn stopped(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.error().is_some() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[cfg(test)]

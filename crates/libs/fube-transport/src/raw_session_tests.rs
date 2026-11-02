@@ -33,17 +33,27 @@ async fn accepted_and_initiating_exchange_directional_nonce_and_frames() {
         index: 1,
     };
     let (a, b) = tokio::join!(
-        establish(a, Role::Initiating, local.clone(), id, limits(), deadline),
-        establish(b, Role::Accepted, local, id, limits(), deadline),
+        establish(
+            a,
+            Role::Initiating,
+            local.clone(),
+            id,
+            limits(),
+            deadline,
+            |_, _| Ok(Admission::Retain(()))
+        ),
+        establish(b, Role::Accepted, local, id, limits(), deadline, |_, _| Ok(
+            Admission::Retain(())
+        )),
     );
     let (mut a, hello_b) = a.unwrap();
     let (mut b, hello_a) = b.unwrap();
     assert_eq!(
-        ListenInstance::decode(&hello_a.body).unwrap().nonce,
+        ListenInstance::decode(&hello_a.message.body).unwrap().nonce,
         [0; 16]
     );
     assert_ne!(
-        ListenInstance::decode(&hello_b.body).unwrap().nonce,
+        ListenInstance::decode(&hello_b.message.body).unwrap().nonce,
         [0; 16]
     );
     let frame = message(vec![1; 4096]);
@@ -146,10 +156,61 @@ async fn establishment_uses_supplied_absolute_deadline() {
                 index: 1
             },
             limits(),
-            start + Duration::from_millis(100)
+            start + Duration::from_millis(100),
+            |_, _| Ok(Admission::Retain(())),
         )
         .await,
         Err(Error::Timeout),
     ));
     assert_eq!(Instant::now() - start, Duration::from_millis(100));
+}
+
+#[tokio::test]
+async fn terminal_state_keeps_first_cause_and_join_keeps_a_started_suffix() {
+    let (a, mut b) = tokio::io::duplex(16);
+    let (_reader, mut writer) = tokio::io::split(a);
+    let state = SessionState::default();
+    let message = message(vec![4; 8192]);
+    let bytes = message.to_frame().unwrap().encode().unwrap();
+    let visible = AtomicBool::new(false);
+    let writing = async {
+        assert!(
+            write_frame(
+                &mut writer,
+                &bytes,
+                Instant::now() + Duration::from_secs(1),
+                limits(),
+                &state.changed,
+                |write| state.attempt(|| true, &mut || {
+                    let result = write();
+                    if matches!(result, Poll::Ready(Ok(n)) if n > 0) {
+                        visible.store(true, Ordering::Release);
+                    }
+                    result
+                }),
+            )
+            .await?
+        );
+        Ok(())
+    };
+    let closing = async {
+        while !visible.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        state.terminate(Error::Protocol("first cause"));
+        state.terminate(Error::Closed);
+        assert_eq!(read_message(&mut b, limits()).await.unwrap(), message);
+    };
+    let driving = join_io(
+        std::future::pending::<Result<()>>(),
+        writing,
+        state.stopped(),
+        |error| state.terminate(error),
+        Error::Closed,
+    );
+    tokio::join!(driving, closing);
+    assert!(matches!(
+        state.error(),
+        Some(Error::Protocol("first cause"))
+    ));
 }
