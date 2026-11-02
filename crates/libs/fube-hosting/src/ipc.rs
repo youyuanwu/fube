@@ -1263,7 +1263,7 @@ async fn run_connection(
     claimed: &mut Option<Arc<Entry>>,
 ) -> TransportResult<()> {
     let peer = socket.peer_addr()?.to_string();
-    let channel = GatewayChannel::accept_unsecured_loopback_ipc(
+    let channel = fube_transport::native_ipc::accept_unsecured_loopback(
         socket,
         hosting_composition()?,
         ChannelLimits {

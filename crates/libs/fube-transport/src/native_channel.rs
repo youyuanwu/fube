@@ -32,7 +32,7 @@ use crate::{
     channel::{
         ChannelFuture, IncomingMessage, MessageChannel, MessageReceiver, ReplyContext, RpcChannel,
     },
-    connection::{write_message, MAX_FRAME_TIME},
+    connection::MAX_FRAME_TIME,
     frame::{FIXED_HEADER_SIZE, MAX_FRAME_SIZE, MAX_HEADER_SIZE},
     message::{self, Header, ListenInstance, Message, MessageId, Properties, MAX_HEADER_COUNT},
     native_demux::{ChannelComposition, Dispatch, EnvelopeValidator, OutboundKind},
@@ -98,7 +98,7 @@ impl ChannelLimits {
             .ok_or(Error::InvalidInput("channel allocation limit overflow"))
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.max_operations == 0
             || self.max_replies == 0
             || self.max_ingress == 0
@@ -195,11 +195,26 @@ enum Outcome {
 /// not mutate/cancel this channel or perform I/O, blocking work or user callbacks.
 pub type WritePredicate = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Trusted, bounded session envelope preparation, never domain work or I/O.
-pub(crate) trait OutboundEnvelope: Send + Sync {
-    fn header(&self, message: &Message, original_reply: bool) -> Result<Option<Header>>;
-    fn requires_message_id(&self) -> bool;
+/// Trusted, bounded session envelope policy, never domain work or I/O.
+///
+/// Common control, correlation and consuming reply guards cannot be overridden.
+pub(crate) trait SessionEnvelope: Send + Sync {
+    fn header(&self, _: &Message, _: bool) -> Result<Option<Header>> {
+        Ok(None)
+    }
+    fn requires_message_id(&self) -> bool {
+        false
+    }
+    fn incoming(&self, message: &Message) -> Result<()> {
+        if has(message, message::IPC) {
+            return Err(Error::Protocol("IPC envelope on native channel"));
+        }
+        Ok(())
+    }
 }
+
+struct NativeEnvelope;
+impl SessionEnvelope for NativeEnvelope {}
 
 /// Opaque completion acknowledgment and retained result reservation.
 ///
@@ -308,8 +323,7 @@ struct Shared {
     /// Serializes actual first-write progress with cancellation/termination.
     /// Separate from inner so validity samples can safely read diagnostics.
     visibility: Mutex<()>,
-    outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
-    accepted_ipc: bool,
+    session_envelope: Arc<dyn SessionEnvelope>,
 }
 
 impl Shared {
@@ -433,76 +447,6 @@ impl Iterator for GatewayIngressSnapshot {
 impl ExactSizeIterator for GatewayIngressSnapshot {}
 
 impl GatewayChannel {
-    /// Adopt one accepted, explicitly trusted numeric-loopback IPC socket.
-    ///
-    /// Performs the client-only ListenInstance exchange before starting the same
-    /// bounded driver used by outgoing channels. IPC identity is admitted only
-    /// in this immutable server mode and must be validated by domain actors.
-    /// This does not authenticate local processes or supply a listener.
-    pub async fn accept_unsecured_loopback_ipc(
-        mut stream: TcpStream,
-        composition: ChannelComposition,
-        limits: ChannelLimits,
-        deadline: Instant,
-    ) -> Result<Self> {
-        limits.validate()?;
-        let endpoint = stream.peer_addr()?;
-        let local = stream.local_addr()?;
-        if !endpoint.ip().is_loopback() || !local.ip().is_loopback() {
-            return Err(Error::InvalidInput("accepted IPC requires loopback"));
-        }
-        check_deadline(deadline)?;
-        let process_id = uuid::Uuid::new_v4().to_bytes_le();
-        timeout_at(deadline, async {
-            let first = read_bounded(&mut stream, limits.max_frame_bytes).await?;
-            let props = envelope(&first, true)?;
-            if props.id == MessageId::default()
-                || ListenInstance::decode(&first.body)? != ListenInstance::default()
-                || props.actor != 1
-                || !props.action.is_empty()
-                || first.headers.iter().any(|h| {
-                    !matches!(
-                        h.id,
-                        message::ACTOR
-                            | message::ACTION
-                            | message::MESSAGE_ID
-                            | message::HIGH_PRIORITY
-                    )
-                })
-            {
-                return Err(Error::Protocol("invalid client-only ListenInstance"));
-            }
-            write_message(
-                &mut stream,
-                &Message::listen_instance(
-                    MessageId {
-                        guid: process_id,
-                        index: 1,
-                    },
-                    &ListenInstance {
-                        address: local.to_string(),
-                        instance: 1,
-                        nonce: process_id,
-                    },
-                )?,
-            )
-            .await?;
-            Ok(())
-        })
-        .await
-        .map_err(|_| Error::Timeout)??;
-        stream.set_nodelay(true)?;
-        Ok(Self::start_composed(
-            stream,
-            endpoint,
-            composition,
-            limits,
-            process_id,
-            ListenInstance::default(),
-            None,
-            true,
-        ))
-    }
     /// Connect a dedicated, explicitly trusted unsecured-development gateway.
     ///
     /// Only numeric loopback endpoints are allowed. The immutable composition
@@ -514,7 +458,14 @@ impl GatewayChannel {
         limits: ChannelLimits,
         deadline: Instant,
     ) -> Result<Self> {
-        Self::connect_with_envelope(endpoint, composition, limits, deadline, None).await
+        Self::connect_with_envelope(
+            endpoint,
+            composition,
+            limits,
+            deadline,
+            Arc::new(NativeEnvelope),
+        )
+        .await
     }
 
     pub(crate) async fn connect_with_envelope(
@@ -522,7 +473,7 @@ impl GatewayChannel {
         composition: ChannelComposition,
         limits: ChannelLimits,
         deadline: Instant,
-        outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
+        session_envelope: Arc<dyn SessionEnvelope>,
     ) -> Result<Self> {
         limits.validate()?;
         if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
@@ -547,6 +498,42 @@ impl GatewayChannel {
         let props = envelope(&message.message, true)?;
         let remote = control_instance(&message.message, &props)?;
         check_deadline(deadline)?;
+        Self::adopt_established(
+            stream,
+            composition,
+            limits,
+            process_id,
+            remote,
+            deadline,
+            session_envelope,
+        )
+    }
+
+    /// Publish exactly one established trusted-loopback socket.
+    ///
+    /// The session adapter must complete and validate its hello before calling.
+    /// Actual endpoint/finite-limit/deadline checks are repeated here; callers
+    /// cannot assert a different target or gain domain admission from adoption.
+    pub(crate) fn adopt_established(
+        stream: TcpStream,
+        composition: ChannelComposition,
+        limits: ChannelLimits,
+        process_id: [u8; 16],
+        remote: ListenInstance,
+        deadline: Instant,
+        session_envelope: Arc<dyn SessionEnvelope>,
+    ) -> Result<Self> {
+        limits.validate()?;
+        let endpoint = stream.peer_addr()?;
+        if !endpoint.ip().is_loopback()
+            || endpoint.port() == 0
+            || !stream.local_addr()?.ip().is_loopback()
+            || process_id == [0; 16]
+        {
+            return Err(Error::InvalidInput("invalid established loopback session"));
+        }
+        check_deadline(deadline)?;
+        stream.set_nodelay(true)?;
         Ok(Self::start_with_envelope(
             stream,
             endpoint,
@@ -554,7 +541,7 @@ impl GatewayChannel {
             limits,
             process_id,
             remote,
-            outbound_envelope,
+            session_envelope,
         ))
     }
 
@@ -574,7 +561,7 @@ impl GatewayChannel {
             limits,
             process_id,
             remote,
-            None,
+            Arc::new(NativeEnvelope),
         )
     }
 
@@ -586,30 +573,7 @@ impl GatewayChannel {
         limits: ChannelLimits,
         process_id: [u8; 16],
         remote: ListenInstance,
-        outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
-    ) -> Self {
-        Self::start_composed(
-            stream,
-            endpoint,
-            composition,
-            limits,
-            process_id,
-            remote,
-            outbound_envelope,
-            false,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn start_composed<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-        stream: S,
-        endpoint: SocketAddr,
-        composition: ChannelComposition,
-        limits: ChannelLimits,
-        process_id: [u8; 16],
-        remote: ListenInstance,
-        outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
-        accepted_ipc: bool,
+        session_envelope: Arc<dyn SessionEnvelope>,
     ) -> Self {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
@@ -644,8 +608,7 @@ impl GatewayChannel {
             dispose: Notify::new(),
             stopped: watch::channel(false).0,
             visibility: Mutex::new(()),
-            outbound_envelope,
-            accepted_ipc,
+            session_envelope,
         });
         let join = tokio::spawn(drive(stream, shared.clone()));
         Self {
@@ -888,7 +851,7 @@ fn local(error: Error) -> Error {
 /// Preserve and validate every record under the existing header/frame bounds.
 /// Only ExpectsReply retains the second-byte-identical exception; other fields
 /// stay unique. Domain reply eligibility belongs to the caller.
-fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
+pub(crate) fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
     let ids = [
         message::ACTOR,
         message::ACTION,
@@ -1040,10 +1003,9 @@ async fn submit(
     if crate::native_demux::is_control(props.actor) || has(&message, message::IPC) {
         return Err(Error::InvalidInput("reserved native transport envelope"));
     }
-    let session_header = match &shared.outbound_envelope {
-        Some(envelope) => envelope.header(&message, matches!(submission, Submission::Reply(..)))?,
-        None => None,
-    };
+    let session_header = shared
+        .session_envelope
+        .header(&message, matches!(submission, Submission::Reply(..)))?;
     match submission {
         Submission::Raw => (shared.composition.outbound)(&message, &props, OutboundKind::Raw)?,
         Submission::Reserved => {
@@ -1093,12 +1055,7 @@ async fn submit(
     if let Some(header) = session_header {
         message.headers.push(header);
     }
-    let requires_id = rpc
-        || shared.accepted_ipc
-        || shared
-            .outbound_envelope
-            .as_ref()
-            .is_some_and(|envelope| envelope.requires_message_id());
+    let requires_id = rpc || shared.session_envelope.requires_message_id();
     let lease = shared.budget.reserve(class)?;
     let token;
     {
@@ -1423,9 +1380,7 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
                 "unsupported role/security/reconnect control; no recovery",
             ));
         }
-        if has(&message, message::IPC) && !shared.accepted_ipc {
-            return Err(Error::Protocol("IPC envelope on native channel"));
-        }
+        shared.session_envelope.incoming(&message)?;
         let mut reply_authorize = None;
         let reply_id = match shared.composition.actors.select(&props)? {
             Dispatch::Actor(authorize) => {
