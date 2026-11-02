@@ -35,7 +35,8 @@ impl Fixture {
         )
         .unwrap();
         fs::copy(
-            env!("CARGO_BIN_EXE_hosting-local-app"),
+            std::env::var_os("CARGO_BIN_EXE_hosting-local-app")
+                .expect("Cargo or nextest must provide the application executable path at runtime"),
             package.join("LocalService/Code/hosting-local-app"),
         )
         .unwrap();
