@@ -282,6 +282,7 @@ struct Ingress {
 
 struct Inner {
     terminal: Option<Error>,
+    dispose_requested: bool,
     next_token: u64,
     next_index: u32,
     remote: ListenInstance,
@@ -302,6 +303,7 @@ struct Shared {
     process_id: [u8; 16],
     changed: Notify,
     stop: Notify,
+    dispose: Notify,
     stopped: watch::Sender<bool>,
     /// Serializes actual first-write progress with cancellation/termination.
     /// Separate from inner so validity samples can safely read diagnostics.
@@ -316,8 +318,13 @@ impl Shared {
     }
 
     fn terminate(&self, error: Error) {
+        self.end(error, false);
+    }
+
+    fn end(&self, error: Error, dispose: bool) {
         let _visibility = self.visibility.lock().unwrap();
         let mut inner = self.inner.lock().unwrap();
+        inner.dispose_requested |= dispose;
         if inner.terminal.is_none() {
             inner.terminal = Some(error);
             inner.entries.clear();
@@ -329,6 +336,9 @@ impl Shared {
         }
         drop(inner);
         self.stop.notify_waiters();
+        if dispose {
+            self.dispose.notify_waiters();
+        }
         self.changed.notify_waiters();
     }
 
@@ -604,6 +614,7 @@ impl GatewayChannel {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 terminal: None,
+                dispose_requested: false,
                 next_token: 1,
                 next_index: 2,
                 remote,
@@ -630,6 +641,7 @@ impl GatewayChannel {
             process_id,
             changed: Notify::new(),
             stop: Notify::new(),
+            dispose: Notify::new(),
             stopped: watch::channel(false).0,
             visibility: Mutex::new(()),
             outbound_envelope,
@@ -692,6 +704,16 @@ impl GatewayChannel {
     /// Initiate shutdown retaining the first terminal cause.
     pub fn abort_with_error(&self, error: Error) {
         self.owner.shared.terminate(error);
+    }
+
+    /// Irreversibly dispose the entire owned socket, including a started frame.
+    ///
+    /// Unlike ordinary abort/close, this permits truncating an uncertain suffix.
+    /// No part of the stream can be reused. It can escalate ordinary shutdown
+    /// without replacing its first cause. Use [`Self::closed`] to observe driver
+    /// exit; timeout/drop of that observer does not relinquish join ownership.
+    pub fn dispose(&self) {
+        self.owner.shared.end(Error::Closed, true);
     }
 
     /// Noninitiating bounded wait for the owned socket/driver to exit.
@@ -1719,19 +1741,17 @@ async fn drive<S: AsyncRead + AsyncWrite + Unpin>(stream: S, shared: Arc<Shared>
         stop.await;
     };
     let writing = async {
-        if !shared.accepted_ipc {
-            return send_loop(writer, &shared).await;
-        }
-        let stop = shared.stop.notified();
-        tokio::pin!(stop);
-        stop.as_mut().enable();
-        // Accepted Hosting retirement discards the entire socket, including any
-        // uncertain partial reply. Client writers must still finish their suffix.
-        if shared.error().is_some() {
-            return Ok(());
-        }
+        let disposed = async {
+            let disposed = shared.dispose.notified();
+            tokio::pin!(disposed);
+            disposed.as_mut().enable();
+            if !shared.inner.lock().unwrap().dispose_requested {
+                disposed.await;
+            }
+        };
         tokio::select! {
-            _ = stop => Ok(()),
+            biased;
+            _ = disposed => Ok(()),
             result = send_loop(writer, &shared) => result,
         }
     };

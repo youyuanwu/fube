@@ -1583,6 +1583,63 @@ async fn inert_target_receiver_envelope_context_do_not_keep_last_owner_workers_a
     assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn explicit_disposal_is_role_independent_durable_and_escalates_without_losing_join() {
+    for (started, escalate) in [(true, false), (true, true), (false, false)] {
+        let (channel, mut peer) = pair(16, false, limits());
+        let target = target(&channel);
+        let mut sending = channel.send_one_way(&target, msg("Raw", vec![5; 2048]), deadline());
+        let mut prefix = [0; 12];
+        if started {
+            pending(sending.as_mut()).await;
+            peer.read_exact(&mut prefix).await.unwrap();
+            assert!(validate_fixed(&prefix).unwrap().0 > 16);
+        }
+        if escalate {
+            channel.abort_with_error(Error::Protocol("original terminal cause"));
+            assert!(matches!(
+                channel.closed(Instant::now()).await,
+                Err(Error::Timeout)
+            ));
+            let mut observer = channel.closed(deadline());
+            pending(observer.as_mut()).await;
+            drop(observer);
+            assert!(!*channel.owner.shared.stopped.borrow());
+        }
+        // The unstarted case records disposal before the spawned driver polls.
+        channel.dispose();
+        channel.dispose();
+        assert!(channel.resolve_target("127.0.0.1:19000").is_err());
+        assert!(matches!(
+            channel
+                .send_one_way(&target, msg("Raw", vec![]), deadline())
+                .await,
+            Err(Error::Closed)
+        ));
+        let assert_cause = || {
+            assert!(matches!(
+                (escalate, channel.terminal_error()),
+                (true, Some(Error::Protocol("original terminal cause")))
+                    | (false, Some(Error::Closed))
+            ));
+        };
+        assert_cause();
+        assert!(sending.await.is_err());
+        channel.closed(deadline()).await.unwrap();
+        channel.closed(deadline()).await.unwrap();
+        assert_cause();
+        assert!(*channel.owner.shared.stopped.borrow());
+        let mut suffix = Vec::new();
+        peer.read_to_end(&mut suffix).await.unwrap();
+        if started {
+            assert!(prefix.len() + suffix.len() < validate_fixed(&prefix).unwrap().0);
+        } else {
+            assert!(suffix.is_empty());
+        }
+        assert_eq!(channel.owner.shared.budget.usage.lock().unwrap().bytes, 0);
+    }
+}
+
 #[tokio::test]
 async fn disconnect_security_controls_and_malformed_duplicate_replies_retire_without_recovery() {
     for mode in 0..3 {
