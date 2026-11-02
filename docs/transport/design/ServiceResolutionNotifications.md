@@ -384,7 +384,12 @@ This narrows the previous notification clear-TCP endpoint policy deliberately;
 non-loopback input now fails explicitly, without compatibility wrapping or
 widening the channel's trust/security profile.
 
-Use GatewayChannel's existing opted-in native MessageReceiver/ReplyContext.
+Use GatewayChannel's configured native MessageReceiver/ReplyContext.
+The notification client installs its exact incoming/reply envelope authorization
+through `ChannelComposition::duplex`, independently of the actor-only native
+demux. Actor registration alone never grants reply or outbound permission.
+The proposed actor/action Router/Registry is not this operational demux and is
+not required for the session.
 Normal request-only channels continue to reject unsupported reverse traffic.
 After controls, route the uncorrelated-notification marker before ordinary
 `RelatesTo` lookup. Only the supported authorized envelope enters pull ingress;

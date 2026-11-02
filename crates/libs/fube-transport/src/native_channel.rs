@@ -62,7 +62,7 @@ pub struct ChannelLimits {
     pub max_ingress: usize,
     pub max_frame_bytes: usize,
     pub max_retained_bytes: usize,
-    /// Lifetime outbound + notification ID history; exhaustion is terminal.
+    /// Lifetime outbound + authorized duplex ID history; exhaustion is terminal.
     pub max_history: usize,
 }
 
@@ -336,7 +336,7 @@ pub struct GatewayChannel {
     owner: Arc<Owner>,
 }
 
-/// Nonowning authorized pull capability for notification or upload ingress.
+/// Nonowning pull capability for configured, authorized application ingress.
 #[derive(Clone)]
 pub struct GatewayReceiver {
     shared: Weak<Shared>,
