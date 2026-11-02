@@ -316,6 +316,25 @@ scenario totals. Historical CI/native outcomes retain their old source identity.
 
 ## Standalone native runtime
 
+### Native-free owned local activation
+
+The [bounded local activation guide](cluster/HostingLocalActivation.md) and
+[minimal fixture](../crates/samples/hosting-local-app/README.md) describe the
+implemented registration-only package/process owner, not deployed RA/RAP:
+
+```sh
+env -u LD_LIBRARY_PATH -u FabricConfigFileName \
+  cargo test --locked -p hosting-local-app --test activation -- --test-threads=1
+cargo test --locked -p fube-local-host -p fube-hosting -p fube-test-host
+```
+
+The real Rust package/process/IPC tests are separate from release-native
+qualification below. Shared validation/materialization/supervision changes
+require both profiles; never inject native loader variables into the Rust child
+or relabel a historical receipt as current source.
+
+### Separate release-native regression
+
 Follow [native ABI prerequisites and commands](runtime/RustTestHost.md#22-prerequisites-and-commands):
 
 ```sh
