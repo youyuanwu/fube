@@ -50,11 +50,26 @@ use request_reply::NativeReplyContext;
 #[cfg(test)]
 use crate::frame::{validate_fixed, Frame};
 
-const ORDINARY: usize = 0;
-const REPLY: usize = 1;
-const INGRESS: usize = 2;
-const RECEIVE: usize = 3;
-const CLOSE: usize = 4;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BudgetClass {
+    Ordinary,
+    Reply,
+    Ingress,
+    Receive,
+    Close,
+}
+
+impl BudgetClass {
+    fn index(self) -> usize {
+        match self {
+            Self::Ordinary => 0,
+            Self::Reply => 1,
+            Self::Ingress => 2,
+            Self::Receive => 3,
+            Self::Close => 4,
+        }
+    }
+}
 
 /// Immutable finite limits, validated before connection establishment.
 ///
@@ -132,39 +147,42 @@ struct Budget {
 
 struct Lease {
     budget: Arc<Budget>,
-    class: usize,
+    class: BudgetClass,
     bytes: usize,
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
         let mut usage = self.budget.usage.lock().unwrap();
-        usage.counts[self.class] -= 1;
+        usage.counts[self.class.index()] -= 1;
         usage.bytes -= self.bytes;
     }
 }
 
 impl Budget {
-    fn reserve(self: &Arc<Self>, class: usize) -> Result<Arc<Lease>> {
+    fn reserve(self: &Arc<Self>, class: BudgetClass) -> Result<Arc<Lease>> {
         let count_limit = match class {
-            REPLY => self.limits.max_replies,
-            INGRESS => self.limits.max_ingress,
-            _ => self.limits.max_operations,
+            BudgetClass::Reply => self.limits.max_replies,
+            BudgetClass::Ingress => self.limits.max_ingress,
+            BudgetClass::Ordinary | BudgetClass::Receive | BudgetClass::Close => {
+                self.limits.max_operations
+            }
         };
-        let bytes = if class >= RECEIVE {
-            256
-        } else {
-            self.limits.slot_bytes()?
+        let bytes = match class {
+            BudgetClass::Receive | BudgetClass::Close => 256,
+            BudgetClass::Ordinary | BudgetClass::Reply | BudgetClass::Ingress => {
+                self.limits.slot_bytes()?
+            }
         };
         let mut usage = self.usage.lock().unwrap();
         let total = usage
             .bytes
             .checked_add(bytes)
             .ok_or(Error::ResourceLimit("channel bytes"))?;
-        if usage.counts[class] >= count_limit || total > self.limits.max_retained_bytes {
+        if usage.counts[class.index()] >= count_limit || total > self.limits.max_retained_bytes {
             return Err(Error::ResourceLimit("channel retained count/bytes"));
         }
-        usage.counts[class] += 1;
+        usage.counts[class.index()] += 1;
         usage.bytes = total;
         Ok(Arc::new(Lease {
             budget: self.clone(),
@@ -310,6 +328,29 @@ struct Inner {
     unmatched: usize,
 }
 
+impl Inner {
+    fn retire_pending(&mut self, id: Option<MessageId>) {
+        if let Some(id) = id {
+            self.pending.remove(&id);
+        }
+    }
+
+    fn settle(&mut self, token: u64, result: Result<Outcome>, now: Instant) {
+        if let Some(entry) = self.entries.get_mut(&token) {
+            if entry.result.is_none() {
+                entry.result = Some(if now >= entry.deadline {
+                    Err(Error::Timeout)
+                } else {
+                    result
+                });
+                entry.bytes = None;
+                let id = entry.id;
+                self.retire_pending(id);
+            }
+        }
+    }
+}
+
 struct Shared {
     inner: Mutex<Inner>,
     budget: Arc<Budget>,
@@ -358,19 +399,7 @@ impl Shared {
 
     fn finish(&self, token: u64, result: Result<Outcome>) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(entry) = inner.entries.get_mut(&token) {
-            if entry.result.is_none() {
-                entry.result = Some(if Instant::now() >= entry.deadline {
-                    Err(Error::Timeout)
-                } else {
-                    result
-                });
-                let id = entry.id;
-                if let Some(id) = id {
-                    inner.pending.remove(&id);
-                }
-            }
-        }
+        inner.settle(token, result, Instant::now());
         drop(inner);
         self.changed.notify_waiters();
     }
@@ -642,7 +671,7 @@ impl GatewayChannel {
     /// a started frame. Waiter admission is finite and nonowning.
     pub fn wait_terminal(&self, deadline: Instant) -> ChannelFuture<'_, Error> {
         Box::pin(async move {
-            let _waiter = self.owner.shared.budget.reserve(CLOSE)?;
+            let _waiter = self.owner.shared.budget.reserve(BudgetClass::Close)?;
             timeout_at(deadline, async {
                 loop {
                     let stopped = self.owner.shared.stop.notified();
@@ -684,7 +713,7 @@ impl GatewayChannel {
     /// The join handle stays owned if this observer times out or is dropped.
     pub fn closed(&self, deadline: Instant) -> ChannelFuture<'_, ()> {
         Box::pin(async move {
-            let _waiter = self.owner.shared.budget.reserve(CLOSE)?;
+            let _waiter = self.owner.shared.budget.reserve(BudgetClass::Close)?;
             timeout_at(deadline, async {
                 let mut join = self.owner.join.lock().await;
                 if let Some(handle) = join.as_mut() {
@@ -960,9 +989,7 @@ struct OperationGuard {
 
 fn retire(inner: &mut Inner, token: u64) {
     if let Some(entry) = inner.entries.remove(&token) {
-        if let Some(id) = entry.id {
-            inner.pending.remove(&id);
-        }
+        inner.retire_pending(entry.id);
     }
     inner.ordinary.retain(|queued| *queued != token);
     inner.replies.retain(|queued| *queued != token);
@@ -1016,9 +1043,9 @@ async fn submit(
     }
     let rpc = matches!(submission, Submission::Rpc);
     let class = if matches!(submission, Submission::Reply(..) | Submission::Reserved) {
-        REPLY
+        BudgetClass::Reply
     } else {
-        ORDINARY
+        BudgetClass::Ordinary
     };
     match submission {
         Submission::Raw | Submission::Reserved
@@ -1135,7 +1162,7 @@ async fn submit(
         if rpc {
             inner.pending.insert(id.unwrap(), token);
         }
-        if class == REPLY {
+        if class == BudgetClass::Reply {
             inner.replies.push_back(token);
         } else {
             inner.ordinary.push_back(token);
@@ -1305,7 +1332,7 @@ impl MessageReceiver for GatewayReceiver {
                 return Err(Error::Closed);
             }
             check_deadline(deadline)?;
-            let _waiter = shared.budget.reserve(RECEIVE)?;
+            let _waiter = shared.budget.reserve(BudgetClass::Receive)?;
             timeout_at(deadline, async {
                 loop {
                     let notified = shared.changed.notified();
@@ -1418,7 +1445,7 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
             Dispatch::Reply => None,
         };
         if let Some(reply_id) = reply_id {
-            let lease = shared.budget.reserve(INGRESS)?;
+            let lease = shared.budget.reserve(BudgetClass::Ingress)?;
             let (handoff, acknowledgment) = if shared.composition.ordered_ingress {
                 let (send, receive) = oneshot::channel();
                 (Some(send), Some(receive))
@@ -1469,7 +1496,7 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
             // Properties validates every occurrence and exposes the final
             // native-effective ID. Never try an earlier ID, even if final is
             // unknown/retired and an earlier one names a live neighbor.
-            let token = inner.pending.remove(&props.relates_to);
+            let token = inner.pending.get(&props.relates_to).copied();
             if token.is_none() {
                 inner.unmatched += 1;
                 if inner.unmatched > 1024 {
@@ -1537,16 +1564,17 @@ async fn send_loop<W: AsyncWrite + Unpin>(mut writer: W, shared: &Arc<Shared>) -
                 .pop_front()
                 .or_else(|| inner.ordinary.pop_front());
             token.and_then(|token| {
+                let now = Instant::now();
+                if inner
+                    .entries
+                    .get(&token)
+                    .is_some_and(|entry| now >= entry.deadline)
+                {
+                    inner.settle(token, Err(Error::Timeout), now);
+                }
                 let entry = inner.entries.get_mut(&token)?;
-                if Instant::now() >= entry.deadline || entry.result.is_some() {
+                if entry.result.is_some() {
                     entry.bytes = None;
-                    if entry.result.is_none() {
-                        entry.result = Some(Err(Error::Timeout));
-                    }
-                    let id = entry.id;
-                    if let Some(id) = id {
-                        inner.pending.remove(&id);
-                    }
                     return None;
                 }
                 Some((
@@ -1645,13 +1673,7 @@ async fn expire_loop(shared: &Arc<Shared>) {
                 .collect();
             let did_expire = !expired.is_empty();
             for token in expired {
-                let entry = inner.entries.get_mut(&token).unwrap();
-                entry.result = Some(Err(Error::Timeout));
-                entry.bytes = None;
-                let id = entry.id;
-                if let Some(id) = id {
-                    inner.pending.remove(&id);
-                }
+                inner.settle(token, Err(Error::Timeout), now);
             }
             (
                 inner

@@ -3,6 +3,7 @@ use crate::connection::{read_message, write_message};
 use crate::native_demux::{ActorDemux, ActorRegistration, DuplexPolicy};
 use std::{future::Future, pin::Pin, time::Duration};
 use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
+use BudgetClass::{Ingress as INGRESS, Ordinary as ORDINARY, Reply as REPLY};
 
 #[path = "native_channel_ipc_tests.rs"]
 mod ipc;
@@ -427,8 +428,8 @@ async fn until(mut predicate: impl FnMut() -> bool) {
     .expect("bounded driver progress");
 }
 
-fn count(channel: &GatewayChannel, class: usize) -> usize {
-    channel.owner.shared.budget.usage.lock().unwrap().counts[class]
+fn count(channel: &GatewayChannel, class: BudgetClass) -> usize {
+    channel.owner.shared.budget.usage.lock().unwrap().counts[class.index()]
 }
 
 fn upload_message(actor: i64) -> Message {
@@ -1255,53 +1256,112 @@ async fn supplied_ids_preserved_duplicates_late_cross_socket_replies_never_compl
 
 #[tokio::test]
 async fn completed_undelivered_results_retain_count_and_bytes_and_close_discards_payloads() {
-    let mut profile = limits();
-    profile.max_operations = 1;
-    let (channel, mut peer) = pair(4096, false, profile);
-    let target = target(&channel);
-    let mut request = channel.request(&target, msg("Rpc", vec![]), deadline());
-    pending(request.as_mut()).await;
-    let sent = read_message(&mut peer).await.unwrap();
-    write_message(
-        &mut peer,
-        &reply(sent.properties().unwrap().id, vec![9; 1024]),
-    )
-    .await
-    .unwrap();
-    until(|| {
-        channel
+    for dispose in [false, true] {
+        let mut profile = limits();
+        profile.max_operations = 1;
+        let (channel, mut peer) = pair(4096, false, profile);
+        let target = target(&channel);
+        let mut request = channel.request(&target, msg("Rpc", vec![]), deadline());
+        pending(request.as_mut()).await;
+        let sent = read_message(&mut peer).await.unwrap();
+        write_message(
+            &mut peer,
+            &reply(sent.properties().unwrap().id, vec![9; 1024]),
+        )
+        .await
+        .unwrap();
+        until(|| {
+            channel
+                .owner
+                .shared
+                .inner
+                .lock()
+                .unwrap()
+                .entries
+                .values()
+                .any(|entry| entry.result.is_some())
+        })
+        .await;
+        assert_eq!(count(&channel, ORDINARY), 1);
+        assert_eq!(
+            channel.owner.shared.budget.usage.lock().unwrap().bytes,
+            profile.slot_bytes().unwrap()
+        );
+        assert!(matches!(
+            channel
+                .send_one_way(&target, msg("Overload", vec![]), deadline())
+                .await,
+            Err(Error::ResourceLimit(_))
+        ));
+        if dispose {
+            channel.dispose();
+            channel.closed(deadline()).await.unwrap();
+        } else {
+            channel.close(deadline()).await.unwrap();
+        }
+        assert_eq!(count(&channel, ORDINARY), 0);
+        assert_eq!(channel.owner.shared.budget.usage.lock().unwrap().bytes, 0);
+        assert!(channel
             .owner
             .shared
             .inner
             .lock()
             .unwrap()
             .entries
-            .values()
-            .any(|entry| entry.result.is_some())
-    })
-    .await;
+            .is_empty());
+        assert!(matches!(request.await, Err(Error::Closed)));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ordinary_receive_and_terminal_waiters_have_independent_count_and_byte_charges() {
+    let profile = ChannelLimits {
+        max_operations: 1,
+        ..limits()
+    };
+    let (channel, mut peer) = pair(4096, true, profile);
+    let target = target(&channel);
+    let receiver = channel.receiver().unwrap();
+    let mut request = channel.request(&target, msg("Rpc", vec![]), deadline());
+    pending(request.as_mut()).await;
+    read_message(&mut peer).await.unwrap();
+    let mut receiving = receiver.receive(deadline());
+    pending(receiving.as_mut()).await;
+    let mut terminal = channel.wait_terminal(deadline());
+    pending(terminal.as_mut()).await;
+    let bytes = || channel.owner.shared.budget.usage.lock().unwrap().bytes;
     assert_eq!(count(&channel, ORDINARY), 1);
-    assert_eq!(
-        channel.owner.shared.budget.usage.lock().unwrap().bytes,
-        profile.slot_bytes().unwrap()
-    );
+    assert_eq!(count(&channel, BudgetClass::Receive), 1);
+    assert_eq!(count(&channel, BudgetClass::Close), 1);
+    assert_eq!(bytes(), profile.slot_bytes().unwrap() + 512);
+    assert!(bytes() + profile.slot_bytes().unwrap() < profile.max_retained_bytes);
     assert!(matches!(
         channel
-            .send_one_way(&target, msg("Overload", vec![]), deadline())
+            .request(&target, msg("Excess", vec![]), deadline())
             .await,
         Err(Error::ResourceLimit(_))
     ));
+    assert!(matches!(
+        receiver.receive(deadline()).await,
+        Err(Error::ResourceLimit(_))
+    ));
+    assert!(matches!(
+        channel.wait_terminal(deadline()).await,
+        Err(Error::ResourceLimit(_))
+    ));
+    drop(receiving);
+    assert_eq!(count(&channel, BudgetClass::Receive), 0);
+    assert_eq!(count(&channel, BudgetClass::Close), 1);
+    assert_eq!(count(&channel, ORDINARY), 1);
+    assert_eq!(bytes(), profile.slot_bytes().unwrap() + 256);
+    drop(terminal);
+    assert_eq!(count(&channel, BudgetClass::Close), 0);
+    assert_eq!(count(&channel, ORDINARY), 1);
+    assert_eq!(bytes(), profile.slot_bytes().unwrap());
+    drop(request);
+    until(|| count(&channel, ORDINARY) == 0).await;
     channel.close(deadline()).await.unwrap();
-    assert_eq!(count(&channel, ORDINARY), 0);
-    assert!(channel
-        .owner
-        .shared
-        .inner
-        .lock()
-        .unwrap()
-        .entries
-        .is_empty());
-    assert!(matches!(request.await, Err(Error::Closed)));
+    assert_eq!(bytes(), 0);
 }
 
 #[tokio::test]
@@ -2230,6 +2290,74 @@ async fn forwarded_correlation_unknown_final_id_never_falls_back_to_pending_earl
             channel.close(deadline()).await.unwrap();
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_final_relation_cannot_fall_back_to_a_live_earlier_neighbor() {
+    let (channel, mut peer) = pair(4096, false, limits());
+    let target = target(&channel);
+    let mut expired = channel.request(
+        &target,
+        msg("Expires", vec![]),
+        Instant::now() + Duration::from_millis(100),
+    );
+    pending(expired.as_mut()).await;
+    let expired_id = read_message(&mut peer)
+        .await
+        .unwrap()
+        .properties()
+        .unwrap()
+        .id;
+    let mut live = channel.request(&target, msg("Live", vec![]), deadline());
+    pending(live.as_mut()).await;
+    let live_id = read_message(&mut peer)
+        .await
+        .unwrap()
+        .properties()
+        .unwrap()
+        .id;
+    tokio::time::advance(Duration::from_millis(101)).await;
+    // Keep the expired observer alive and unpolled while the expiry worker
+    // settles it and retires only its correlation.
+    until(|| {
+        !channel
+            .owner
+            .shared
+            .inner
+            .lock()
+            .unwrap()
+            .pending
+            .contains_key(&expired_id)
+    })
+    .await;
+    assert_eq!(count(&channel, ORDINARY), 2);
+    write_message(
+        &mut peer,
+        &forwarded_reply(
+            &[live_id, expired_id],
+            Some(77),
+            Some("Forwarded"),
+            vec![99],
+        ),
+    )
+    .await
+    .unwrap();
+    until(|| channel.owner.shared.inner.lock().unwrap().unmatched == 1).await;
+    pending(live.as_mut()).await;
+    assert!(matches!(expired.await, Err(Error::Timeout)));
+    assert!(channel
+        .owner
+        .shared
+        .inner
+        .lock()
+        .unwrap()
+        .pending
+        .contains_key(&live_id));
+    write_message(&mut peer, &reply(live_id, vec![1]))
+        .await
+        .unwrap();
+    assert_eq!(live.await.unwrap().body, [1]);
+    channel.close(deadline()).await.unwrap();
 }
 
 #[tokio::test]
