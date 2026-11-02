@@ -59,6 +59,9 @@ pub(crate) struct ProviderEntry {
 
 /// Opaque native registry callback seam. No substitute registry metadata codec.
 pub(crate) trait RegistryCallbacks: Send + Sync {
+    fn preflight(&self, _: Option<&OperationData>, _: Option<&OperationData>) -> Result<()> {
+        Ok(())
+    }
     fn apply(
         &self,
         lsn: SequenceNumber,
@@ -88,6 +91,12 @@ pub(crate) struct CopiedMetadata {
 /// supplies decoded metadata only for initialized/resurrected directory entries;
 /// it does not implement factory/open/recover/hierarchy or persisted files.
 pub(crate) trait LocalStateCallbacks: Send + Sync + 'static {
+    fn publish(&self) -> Result<()> {
+        Ok(())
+    }
+    fn begins_in_set(&self) -> bool {
+        false
+    }
     fn prepare(&self, lsn: SequenceNumber, metadata: &[RegistryMetadata]) -> Result<()>;
     fn perform(&self, cancellation: Cancellation) -> ApiFuture<'_, ()>;
     fn complete(&self, cancellation: Cancellation) -> ApiFuture<'_, ()>;
@@ -111,6 +120,7 @@ struct AggregateCheckpoint {
 }
 
 pub(crate) struct ProviderDirectory {
+    snapshot_lock: std::sync::RwLock<()>,
     self_weak: Weak<Self>,
     pub(crate) entries: Mutex<BTreeMap<StateProviderId, ProviderEntry>>,
     pub(crate) faults: Arc<FaultState>,
@@ -123,6 +133,20 @@ pub(crate) struct ProviderDirectory {
 }
 
 impl ProviderDirectory {
+    pub(crate) fn preflight_record(
+        &self,
+        metadata: &OperationData,
+        data: Option<&OperationData>,
+    ) -> Result<()> {
+        let (id, user) = named::decode(metadata)?;
+        if id == REGISTRY_ID {
+            self.registry
+                .as_ref()
+                .ok_or_else(|| Status::NotImplemented.error())?
+                .preflight(user.as_ref(), data)?;
+        }
+        Ok(())
+    }
     pub(crate) fn preinitialized(
         entries: impl IntoIterator<Item = (StateProviderId, Arc<dyn IStateProvider2>)>,
         registry: Option<Arc<dyn RegistryCallbacks>>,
@@ -147,6 +171,7 @@ impl ProviderDirectory {
             }
         }
         Ok(Arc::new_cyclic(|self_weak| Self {
+            snapshot_lock: std::sync::RwLock::new(()),
             self_weak: self_weak.clone(),
             entries: Mutex::new(installed),
             faults: Arc::new(FaultState::default()),
@@ -176,6 +201,11 @@ impl ProviderDirectory {
             .lock()
             .expect("copy progress poisoned")
             .clone()
+    }
+    pub(crate) fn retire_checkpoint_metadata(&self, id: i64) {
+        let mut checkpoint = self.checkpoint.lock().unwrap();
+        checkpoint.prepared.retain(|entry| entry.id != id);
+        checkpoint.published.retain(|entry| entry.id != id);
     }
     pub(crate) fn checkpoint_metadata(&self) -> Vec<RegistryMetadata> {
         self.checkpoint
@@ -308,10 +338,25 @@ impl ITransactionStateManager for ProviderDirectory {
                 metadata,
                 context,
             )?;
-            self.manager()?
-                .admit_operation(transaction, metadata, undo, redo, context, Some(true))
+            Ok(self.manager()?.observe_async(
+                super::record::Record {
+                    lsn: -1,
+                    kind: super::record::RecordKind::Begin {
+                        transaction_id: transaction.get_transaction_id(),
+                        single: true,
+                        metadata: Some(metadata),
+                        undo,
+                        redo,
+                    },
+                },
+                Some(transaction),
+                context,
+            ))
         })();
-        KernelManager::observe_admission(admitted)
+        match admitted {
+            Ok(future) => future,
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
     }
     fn begin_transaction(
         &self,
@@ -495,6 +540,8 @@ impl IStateProviderManager for ProviderDirectory {
                 .collect();
             await_all(work).await?;
             local.perform(cancellation).await?;
+            let _snapshot = directory.snapshot_lock.write().unwrap();
+            local.publish()?;
             let mut checkpoint = directory
                 .checkpoint
                 .lock()
@@ -539,9 +586,10 @@ impl IStateProviderManager for ProviderDirectory {
         Box::pin(async { Err(Status::NotImplemented.error()) })
     }
     fn get_current_state(&self, target: i64) -> Result<Arc<dyn IOperationDataStream>> {
+        let _snapshot = self.snapshot_lock.read().unwrap();
         let local = self.local()?;
         let mut metadata = self.checkpoint_metadata();
-        metadata.sort_by(|left, right| right.name.cmp(&left.name));
+        metadata.sort_by(|left, right| right.name.encode_utf16().cmp(left.name.encode_utf16()));
         let registry = local.get_current_state(target, &metadata)?;
         let mut streams = Vec::new();
         for entry in metadata {
@@ -600,8 +648,8 @@ impl IStateProviderManager for ProviderDirectory {
                     if metadata.id == 0 || metadata.id == REGISTRY_ID {
                         return Err(Status::InvalidParameter.error());
                     }
-                    // Uninitialized entries require the excluded factory/open/
-                    // recover/hierarchy path, not an invented successful Begin.
+                    // Registry must return actually initialized/opened, cleanup-
+                    // owned entries; a missing lifecycle is never successful Begin.
                     let entry = directory
                         .entry(metadata.id)
                         .map_err(|_| Status::NotImplemented.error())?;
@@ -613,7 +661,9 @@ impl IStateProviderManager for ProviderDirectory {
                             return Err(Status::InvalidOperation.error());
                         }
                         directory.set_mode(metadata.id, ProviderMode::Active, None);
-                        entry.provider.begin_setting_current_state().await?;
+                        if !directory.local()?.begins_in_set() {
+                            entry.provider.begin_setting_current_state().await?;
+                        }
                         directory
                             .copy_progress
                             .lock()

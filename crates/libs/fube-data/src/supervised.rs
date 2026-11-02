@@ -15,6 +15,7 @@ use fube_runtime::extensions::{
 };
 use fube_runtime::ApiFuture as ServiceFuture;
 use std::sync::Arc;
+
 #[cfg(test)]
 use std::{
     future::Future,

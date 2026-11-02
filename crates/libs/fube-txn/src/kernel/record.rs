@@ -25,6 +25,9 @@ use std::sync::Arc;
 /// Supported native logical fields; transaction execution has a narrower gate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecordKind {
+    /// Local native physical boundary only. Never admitted to replication or
+    /// accepted by the logical wire decoder. 7=BeginCheckpoint, 12=Information.
+    Physical { native_type: i32, event: i32 },
     /// Native type 1; a single begin is itself the commit record.
     Begin {
         /// Signed native identity, including recognition-only atomic identities.
@@ -93,6 +96,12 @@ impl Record {
             RecordKind::End { .. } => 3,
             RecordKind::Barrier { .. } => 4,
             RecordKind::UpdateEpoch { .. } => 5,
+            RecordKind::Physical { .. } => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "physical record is not replication data",
+                ))
+            }
         };
         let mut wire = Wire::default();
         wire.section(&[&native_type.to_le_bytes(), &self.lsn.to_le_bytes()])?;
@@ -145,6 +154,7 @@ impl Record {
                     &timestamp_ticks.to_le_bytes(),
                 ])?;
             }
+            RecordKind::Physical { .. } => unreachable!("physical encoding rejected"),
         }
         OperationData::new(wire.segments)
     }
@@ -156,6 +166,32 @@ impl Record {
             segments: data.segments(),
             next: 0,
         };
+        let record = Self::read_one(&mut reader)?;
+        if reader.next != reader.segments.len() {
+            return Err(Error::InvalidInput("trailing native record segments"));
+        }
+        Ok(record)
+    }
+
+    /// Native LogRecord::ReadFromOperationDataBatch: concatenated logical
+    /// segmented records, after the caller removes the trailing copy-stage buffer.
+    pub(crate) fn decode_batch(data: &OperationData) -> Result<Vec<Self>> {
+        check_size(data.segments().len(), data.bytes())?;
+        let mut reader = Segments {
+            segments: data.segments(),
+            next: 0,
+        };
+        let mut records = Vec::new();
+        while reader.next < reader.segments.len() {
+            records.push(Self::read_one(&mut reader)?);
+        }
+        if records.is_empty() {
+            return Err(Error::InvalidInput("empty copied log batch"));
+        }
+        Ok(records)
+    }
+
+    fn read_one(reader: &mut Segments<'_>) -> Result<Self> {
         let common = reader.section(16)?;
         let native_type = read_u32(&common[..4])? as i32;
         let lsn = read_i64(&common[4..12])?;
@@ -218,9 +254,6 @@ impl Record {
             }
             _ => unreachable!(),
         };
-        if reader.next != reader.segments.len() {
-            return Err(Error::InvalidInput("trailing native record segments"));
-        }
         let record = Self { lsn, kind };
         record.validate()?;
         Ok(record)

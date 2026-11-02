@@ -289,8 +289,9 @@ impl CheckpointIo for Io {
     fn role(&self) -> ProcessingRole {
         *self.role.lock().unwrap()
     }
-    fn append(&self, record: PhysicalRecord) {
+    fn append(&self, record: PhysicalRecord) -> Result<()> {
         event(&self.journal, format!("Append:{record:?}"));
+        Ok(())
     }
     fn flush(&self, reason: FlushReason) -> VoidFuture<'_> {
         Box::pin(async move {

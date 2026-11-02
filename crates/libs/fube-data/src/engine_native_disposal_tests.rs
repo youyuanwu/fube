@@ -189,29 +189,38 @@ async fn issued_canonical_sync_configuration_and_remove_wait_exact_physical_disp
             if let Some(release) = remove_release {
                 release.send(()).unwrap();
             } else {
-                let current = config(EPOCH, vec![], 1).sdk().unwrap();
-                let control: Arc<dyn IPrimaryReplicator> = if root {
-                    Arc::new(crate::FabricReplicator {
-                        engine: primary.engine.clone(),
-                    })
-                } else {
-                    binding::NativeBinder(Arc::downgrade(&primary.engine))
-                        .bind_invocation(
-                            primary
-                                .native
-                                .capture_configuration(&current, None)
-                                .unwrap(),
-                        )
-                        .unwrap()
-                };
-                let permit = primary.engine.execution_runtime().try_reserve().unwrap();
-                configuration = Some(permit.run_owned(move || {
-                    let result: Result<()> =
-                        control.update_current_replica_set_configuration(current);
-                    result
+                // Issue a distinct native full-epoch configuration, rather than
+                // replaying a consumed/latest ledger record outside dispatch.
+                // The canonical SDK callback is still synchronous and must
+                // wait for the same physical stream destruction.
+                let host = primary.host.clone();
+                configuration = Some(tokio::spawn(async move {
+                    host.configure(config(
+                        Epoch {
+                            configuration_number: EPOCH.configuration_number + 1,
+                            ..EPOCH
+                        },
+                        vec![],
+                        1,
+                    ))
+                    .await
                 }));
             }
-            entered_rx.await.unwrap();
+            let entered = tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await;
+            if !matches!(entered, Ok(Ok(()))) {
+                let status = primary.native.status();
+                let snapshot = primary.engine.snapshot();
+                release.send(()).unwrap();
+                let result = match configuration.take() {
+                    Some(call) => Some(call.await.unwrap()),
+                    None => None,
+                };
+                provider.gate.lock().unwrap().take();
+                primary.engine.close(Cancellation::default()).await.unwrap();
+                let _ = build.await;
+                network.shutdown_checked().unwrap();
+                panic!("canonical disposal did not enter: {entered:?}; configuration {result:?}; native {status:?}; lower {snapshot:?}");
+            }
             assert_eq!(dropped.load(Ordering::SeqCst), 0);
             if let Some(call) = configuration.as_mut() {
                 assert!(
@@ -232,7 +241,7 @@ async fn issued_canonical_sync_configuration_and_remove_wait_exact_physical_disp
             assert_eq!(dropped.load(Ordering::SeqCst), 0);
             release.send(()).unwrap();
             if let Some(call) = configuration {
-                call.await.unwrap();
+                call.await.unwrap().unwrap();
             }
             if let Some(call) = native_remove {
                 call.await.unwrap().unwrap();

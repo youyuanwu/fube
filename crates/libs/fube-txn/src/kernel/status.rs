@@ -47,12 +47,18 @@ pub(crate) enum Status {
     NotImplemented,
     /// Source copy corruption.
     InternalDbCorruption,
+    /// Native state-manager read/access refusal.
+    NotReadable,
+    /// Native named provider absence.
+    NameDoesNotExist,
 }
 
 impl Status {
     /// Exact native HRESULT/NTSTATUS boundary value, not a Rust ordinal.
     pub(crate) fn code(self) -> i64 {
         let bits: u32 = match self {
+            Self::NotReadable => 0x80071c7c,
+            Self::NameDoesNotExist => 0x80071bc1,
             Self::NoWriteQuorum => 0x80071bc5,
             Self::NotPrimary => 0x80071bc6,
             Self::ReconfigurationPending => 0x80071bca,

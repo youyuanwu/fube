@@ -10,3 +10,6 @@ fube-data.workspace = true
 fube-runtime.workspace = true
 uuid.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+fube-rap-test-support.workspace = true

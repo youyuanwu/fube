@@ -33,7 +33,7 @@
 //! Callback futures are aborted and actually
 //! joined before transport disposal. Uncooperative synchronous user code or
 //! destructors are enrolled in the runtime's independent fatal watchdog by
-//! [`Engine::bind_partition`]. Standalone [`Engine::bind`] callers must supply
+//! [`Engine::bind_partition`]. Standalone test-only `Engine::bind` callers must supply
 //! their own blocking fence; a Tokio timeout cannot fence a blocked executor.
 //! This is the volatile legacy-null-EOS, trusted clear-TCP profile, not durable
 //! storage, persisted copy context, an election system, or a native qualification.
@@ -47,15 +47,15 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+#[cfg(test)]
+use fube_runtime::extensions::NativeControlBinding;
 use fube_runtime::extensions::{
     CallLane, CallOrigin, DisposalBatch, DisposalTracker, EpochDomains, ExecutionRuntime,
 };
 use fube_runtime::extensions::{
     CommandCleanup, DeferredCleanup, DisposalReceipt, OwnedDisposition, TerminalPermit,
 };
-use fube_runtime::extensions::{
-    NativeControlBinding, NativeInvocation, NativeInvocationKind, NativeRuntimeIntegration,
-};
+use fube_runtime::extensions::{NativeInvocation, NativeInvocationKind, NativeRuntimeIntegration};
 use fube_runtime::extensions::{OwnedCall, OwnedCallPermit};
 #[path = "engine_binding.rs"]
 mod binding;
@@ -96,6 +96,7 @@ mod tests;
 /// Diagnostic boundaries, never an independent grant of native write access.
 #[derive(Clone, Debug)]
 pub struct EngineSnapshot {
+    pub(crate) queue_initialized: bool,
     pub role: ReplicaRole,
     pub epoch: Option<Epoch>,
     pub progress: Progress,
@@ -244,6 +245,21 @@ fn maximum_copy_bytes(settings: &Settings) -> usize {
 
 struct Shared {
     #[cfg(test)]
+    initial_coalesced_primary: Mutex<Option<std_mpsc::SyncSender<()>>>,
+    #[cfg(test)]
+    initial_publication_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
+    secondary_progress_fault: AtomicBool,
+    opened: AtomicBool,
+    initial_progress: Mutex<Option<i64>>,
+    #[cfg(test)]
+    write_deadline: Mutex<Option<std::time::Instant>>,
+    #[cfg(test)]
+    write_now: Mutex<Option<std::time::Instant>>,
+    #[cfg(test)]
+    write_prelock: Mutex<Option<std_mpsc::SyncSender<()>>>,
+    #[cfg(test)]
+    write_reply_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
+    #[cfg(test)]
     epoch_entries: std::sync::atomic::AtomicUsize,
     streams: Mutex<StreamViews>,
     #[cfg(test)]
@@ -336,6 +352,9 @@ impl NativePreWrite {
 /// operations, joins callbacks/the engine thread, then joins peer transport.
 /// Captures already published to application code stay charged until dropped.
 pub struct Engine {
+    #[cfg(test)]
+    native_configuration: Mutex<Option<NativeInvocation>>,
+    self_weak: Weak<Engine>,
     endpoint: Endpoint,
     settings: Settings,
     commands: mpsc::Sender<AuthorizedCommand>,
@@ -350,6 +369,7 @@ pub struct Engine {
     owner_done: Mutex<Option<std_mpsc::Receiver<Result<()>>>>,
     disposal_done: Mutex<Option<DisposalReceipt>>,
     native_runtime: Option<NativeRuntimeIntegration>,
+    #[cfg(test)]
     native_binder: Mutex<Option<Arc<dyn NativeControlBinding>>>,
     native_progress: Mutex<Option<Arc<dyn fube_runtime::extensions::NativeProgressSource>>>,
     #[cfg(test)]
@@ -405,7 +425,7 @@ impl Engine {
                 "replication actor does not match native partition",
             ));
         }
-        Self::bind_with_capabilities(
+        Self::bind_integrated(
             actor,
             address,
             provider,
@@ -452,7 +472,29 @@ impl Engine {
         )
     }
 
+    #[cfg(test)]
     fn bind_with_capabilities(
+        actor: Actor,
+        address: &str,
+        provider: Arc<dyn IStateProvider>,
+        replay: Option<Arc<dyn ReplayCheckpointProvider>>,
+        settings: Settings,
+        native_control: Option<Arc<dyn NativeControlView>>,
+        capabilities: crate::extensions::StateProviderCapabilities,
+    ) -> Result<Arc<Self>> {
+        Self::bind_integrated(
+            actor,
+            address,
+            provider,
+            replay,
+            settings,
+            native_control,
+            capabilities,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_integrated(
         actor: Actor,
         address: &str,
         provider: Arc<dyn IStateProvider>,
@@ -494,8 +536,12 @@ impl Engine {
                 .map_or(1, |native| native.binding().generation),
         };
         let terminal = execution.reserve_terminal(origin)?;
-        let initial_permit =
-            execution.reserve(CallLane::Provider, origin, settings.callback_timeout, false)?;
+        let initial_permit = if native_runtime.is_some() {
+            None
+        } else {
+            Some(execution.reserve(CallLane::Provider, origin, settings.callback_timeout, false)?)
+        };
+        let deferred = native_runtime.is_some();
         let construction = if execution.is_current_entry() {
             None
         } else {
@@ -558,6 +604,21 @@ impl Engine {
         let (stop, stop_rx) = watch::channel(false);
         let shared = Arc::new(Shared {
             #[cfg(test)]
+            initial_coalesced_primary: Mutex::new(None),
+            #[cfg(test)]
+            initial_publication_pause: Mutex::new(None),
+            secondary_progress_fault: AtomicBool::new(false),
+            opened: AtomicBool::new(false),
+            initial_progress: Mutex::new(None),
+            #[cfg(test)]
+            write_deadline: Mutex::new(None),
+            #[cfg(test)]
+            write_now: Mutex::new(None),
+            #[cfg(test)]
+            write_prelock: Mutex::new(None),
+            #[cfg(test)]
+            write_reply_pause: Mutex::new(None),
+            #[cfg(test)]
             epoch_entries: std::sync::atomic::AtomicUsize::new(0),
             streams: Mutex::new(StreamViews { replication, copy }),
             #[cfg(test)]
@@ -567,6 +628,7 @@ impl Engine {
             stopped: AtomicBool::new(false),
             revision: AtomicU64::new(1),
             snapshot: Mutex::new(EngineSnapshot {
+                queue_initialized: false,
                 role: ReplicaRole::Unknown,
                 epoch: None,
                 progress: Progress::default(),
@@ -628,20 +690,26 @@ impl Engine {
                 };
                 let outcome = runtime.block_on(async move {
                     // Spawn also supervises a synchronous progress callback panic.
-                    let initial_provider = provider.clone();
-                    let mut initial = initial_permit
-                        .run_owned(move || initial_provider.get_last_committed_sequence_number());
-                    let initial = match timeout(state_settings.callback_timeout, &mut initial).await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            initial.cancel_and_wait().await;
-                            Err(Error::Timeout)
-                        }
+                    let initial = if deferred {
+                        OperationQueue::deferred(state_settings.clone())
+                    } else {
+                        let initial_provider = provider.clone();
+                        let mut initial = initial_permit
+                            .expect("standalone initial callback")
+                            .run_owned(move || {
+                                initial_provider.get_last_committed_sequence_number()
+                            });
+                        let initial =
+                            match timeout(state_settings.callback_timeout, &mut initial).await {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    initial.cancel_and_wait().await;
+                                    Err(Error::Timeout)
+                                }
+                            };
+                        initial.and_then(|n| OperationQueue::new(state_settings.clone(), n))
                     };
-                    let initial = match initial.and_then(|n| {
-                        OperationQueue::new(state_settings.clone(), n).map(|queue| (n, queue))
-                    }) {
+                    let initial = match initial {
                         Ok(initial) => initial,
                         Err(error) => {
                             let capture = state_shared.disposal.capture();
@@ -657,7 +725,7 @@ impl Engine {
                         provider,
                         state_settings,
                         state_shared,
-                        initial.1,
+                        initial,
                         ack_tx,
                         replication_tx,
                         copy_tx,
@@ -704,7 +772,10 @@ impl Engine {
             }
             return Err(error);
         }
-        let engine = Arc::new(Self {
+        let engine = Arc::new_cyclic(|self_weak| Self {
+            #[cfg(test)]
+            native_configuration: Mutex::new(None),
+            self_weak: self_weak.clone(),
             endpoint,
             settings,
             commands,
@@ -719,6 +790,7 @@ impl Engine {
             owner_done: Mutex::new(Some(done_rx)),
             disposal_done: Mutex::new(None),
             native_runtime,
+            #[cfg(test)]
             native_binder: Mutex::new(None),
             native_progress: Mutex::new(None),
             #[cfg(test)]
@@ -732,19 +804,15 @@ impl Engine {
             owns_execution,
         });
         if let Some(native) = &engine.native_runtime {
-            let binder: Arc<dyn NativeControlBinding> =
-                Arc::new(binding::NativeBinder(Arc::downgrade(&engine)));
-            if let Err(error) = native.install_binding(actor.incarnation, &binder) {
-                if engine
-                    .shutdown_owned()
-                    .and_then(|receipt| receipt.wait_blocking())
-                    .is_err()
-                {
-                    execution.retire();
-                }
-                return Err(error);
+            // Canonical runtime dispatch retains the service-returned object.
+            // A built-in lower is not a replacement-object custom binder.
+            #[cfg(test)]
+            {
+                // Internal lower negative/disposal fixtures only; not installed
+                // and not exposed to the txn/shared-test boundary.
+                *engine.native_binder.lock().unwrap() =
+                    Some(Arc::new(binding::NativeBinder(Arc::downgrade(&engine))));
             }
-            *engine.native_binder.lock().unwrap() = Some(binder);
             let source: Arc<dyn fube_runtime::extensions::NativeProgressSource> =
                 Arc::new(binding::NativeProgress(Arc::downgrade(&engine)));
             if let Err(error) = native.install_progress_source(&source) {
@@ -884,6 +952,7 @@ impl Engine {
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, Replication> {
         Box::pin(async move {
+            ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
             self.check()?;
             if expected_epoch.is_some_and(|epoch| {
                 epoch.data_loss_number < 0
@@ -897,6 +966,11 @@ impl Engine {
                     fube_runtime::ErrorKind::Canceled,
                     "replication canceled before admission",
                 ));
+            }
+            self.check_write_deadline()?;
+            #[cfg(test)]
+            if let Some(entered) = self.shared.write_prelock.lock().unwrap().take() {
+                let _ = entered.send(());
             }
             if data.bytes() > self.settings.operation_bytes
                 || data.segments().len() > self.settings.operation_segments
@@ -912,6 +986,8 @@ impl Engine {
                 // Serialize reservation changes and shutdown with producers,
                 // but never hold admission while awaiting owner/user work.
                 let _admission = self.shared.admission.lock().unwrap();
+                ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
+                self.check_write_deadline()?;
                 self.check()?;
                 let snapshot = self.shared.snapshot.lock().unwrap();
                 let copying = !snapshot.copy_done
@@ -945,13 +1021,14 @@ impl Engine {
                         )
                     })?;
                 drop(snapshot);
+                self.check_write_deadline()?;
                 self.writes
                     .try_send(Submit {
                         expected_epoch,
-                        data,
-                        charge,
+                        data: Some(data),
+                        charge: Some(charge),
                         cancellation,
-                        reply: reply.into(),
+                        reply: Some(reply.into()),
                     })
                     .map_err(|error| match error {
                         mpsc::error::TrySendError::Full(_) => Error::new(
@@ -961,10 +1038,37 @@ impl Engine {
                         mpsc::error::TrySendError::Closed(_) => Error::Closed,
                     })?;
             }
+
             // Once queued, learn whether admission happened before reporting
             // cancellation. The separately cancelable wait is intentionally later.
             result.await.map_err(|_| Error::Closed)?
         })
+    }
+
+    pub(crate) fn execution_identity(&self) -> u64 {
+        self.shared.engine_id
+    }
+
+    fn check_write_deadline(&self) -> Result<()> {
+        let now = std::time::Instant::now();
+        #[cfg(test)]
+        let now = self.shared.write_now.lock().unwrap().unwrap_or(now);
+        if self.shared.execution.is_current_entry()
+            && now >= self.shared.execution.blocking_deadline()?
+        {
+            return Err(Error::Timeout);
+        }
+        #[cfg(test)]
+        if self
+            .shared
+            .write_deadline
+            .lock()
+            .unwrap()
+            .is_some_and(|until| now >= until)
+        {
+            return Err(Error::Timeout);
+        }
+        Ok(())
     }
 
     fn check(&self) -> Result<()> {
@@ -1316,13 +1420,14 @@ fn same_endpoint(left: &Endpoint, right: &Endpoint) -> bool {
 
 struct Submit {
     expected_epoch: Option<Epoch>,
-    data: OperationData,
-    charge: Charge,
+    data: Option<OperationData>,
+    charge: Option<Charge>,
     cancellation: Cancellation,
-    reply: Reply<Replication>,
+    reply: Option<Reply<Replication>>,
 }
 
 enum Command {
+    InitialProgress(Option<OwnedCallPermit>, InitialQuery, Reply<i64>),
     #[cfg(feature = "qualification")]
     Probe {
         kind: String,
@@ -1357,6 +1462,32 @@ enum Command {
         Reply<()>,
         Instant,
     ),
+}
+
+#[derive(Clone)]
+struct InitialQuery {
+    native: Option<NativeRuntimeIntegration>,
+    cancellation: Cancellation,
+    revision: u64,
+    deadline: Instant,
+    fault: bool,
+}
+impl InitialQuery {
+    fn validate(&self, shared: &Shared) -> Result<()> {
+        if self.cancellation.is_cancelled()
+            || shared.stopped.load(Ordering::Acquire)
+            || shared.revision.load(Ordering::Acquire) != self.revision
+        {
+            return Err(Error::Closed);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(Error::Timeout);
+        }
+        if let Some(native) = &self.native {
+            native.validate()?;
+        }
+        Ok(())
+    }
 }
 struct AuthorizedCommand {
     command: Command,
@@ -1461,6 +1592,7 @@ impl Control {
 
 #[derive(Clone, Copy)]
 enum Job {
+    InitialProgress,
     Control,
     Replay {
         revision: u64,
@@ -1472,6 +1604,7 @@ enum Job {
 }
 
 enum JobValue {
+    InitialProgress(i64),
     Retired,
     Admission,
     Epoch,
@@ -1521,6 +1654,9 @@ struct ConfigurationReceipt {
 }
 
 struct Owner {
+    initial_progress: Option<i64>,
+    initial_replies: Vec<(InitialQuery, Reply<i64>)>,
+    initial_query: Option<InitialQuery>,
     endpoint: Endpoint,
     transport: PeerTransport,
     provider: Option<Arc<crate::supervised::OwnedProvider>>,
@@ -1595,6 +1731,9 @@ impl Owner {
     ) -> Self {
         let dispatched = queue.progress().applied;
         Self {
+            initial_progress: None,
+            initial_replies: Vec::new(),
+            initial_query: None,
             endpoint,
             transport,
             provider: Some(provider),
@@ -1720,6 +1859,8 @@ impl Owner {
             if shared.stopped.load(Ordering::Acquire) {
                 break;
             }
+            #[cfg(test)]
+            let wrote = matches!(&event, Event::Write(_));
             match event {
                 Event::Replies(_) => unreachable!(),
                 Event::Cleanup => {}
@@ -1746,8 +1887,32 @@ impl Owner {
             }
             self.publish();
             drop(_admission);
+            #[cfg(test)]
+            if wrote {
+                if let Some((entered, release)) =
+                    self.shared.write_reply_pause.lock().unwrap().take()
+                {
+                    let _ = entered.send(());
+                    release
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .expect("write reply probe released");
+                }
+            }
             let published_at = self.replay_rearm_pending.then(std::time::Instant::now);
-            self.replies.extend(replies.take());
+            // An accepted byte write must deliver its known lower identity even
+            // if Stop wins immediately after this publication boundary. Drain
+            // ready replies OUTSIDE admission before the next stop-biased loop.
+            // Disposal-dependent control replies remain pending as before.
+            for mut reply in replies.take() {
+                match reply
+                    .ready
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                {
+                    std::task::Poll::Ready(outcome) => reply.send.take().unwrap()(outcome),
+                    std::task::Poll::Pending => self.replies.push(reply),
+                }
+            }
             for start in self.starts.drain(..) {
                 if self.fault.is_none() {
                     let _ = start.send(());
@@ -1824,6 +1989,9 @@ impl Owner {
         }
         for waiter in self.catchups.drain(..) {
             let _ = waiter.reply.send(Err(error.clone()));
+        }
+        for (_, reply) in self.initial_replies.drain(..) {
+            let _ = reply.send(Err(error.clone()));
         }
         for waiter in self.removals.drain(..) {
             waiter.disposal.wait().await?;
@@ -1966,6 +2134,7 @@ impl Owner {
             progress.client_completed = 0;
         }
         *self.shared.snapshot.lock().unwrap() = EngineSnapshot {
+            queue_initialized: self.queue.is_initialized(),
             role: self.role,
             epoch: self.epoch,
             progress,
@@ -1985,9 +2154,9 @@ impl Owner {
         };
     }
 
-    fn submit(&mut self, write: Submit) {
+    fn submit(&mut self, mut write: Submit) {
         if write.cancellation.is_cancelled() {
-            let _ = write.reply.send(Err(Error::new(
+            let _ = write.reply.take().unwrap().send(Err(Error::new(
                 fube_runtime::ErrorKind::Canceled,
                 "replication canceled before sequence assignment",
             )));
@@ -2011,6 +2180,8 @@ impl Owner {
             };
             let _ = write
                 .reply
+                .take()
+                .unwrap()
                 .send(Err(Error::new(kind, "primary is not write ready")));
             return;
         }
@@ -2020,26 +2191,29 @@ impl Owner {
         {
             let _ = write
                 .reply
+                .take()
+                .unwrap()
                 .send(Err(Error::InvalidInput("native admission epoch changed")));
             return;
         }
         match self
             .queue
-            .enqueue(self.epoch.unwrap().primary(), write.data)
+            .enqueue(self.epoch.unwrap().primary(), write.data.take().unwrap())
         {
             Ok(sequence) => {
-                self.charges.insert(sequence, Arc::new(write.charge));
+                self.charges
+                    .insert(sequence, Arc::new(write.charge.take().unwrap()));
                 let (completion, receiver) = watch::channel(None);
                 self.completions.insert(sequence, completion);
                 self.publish();
-                let _ = write.reply.send(Ok(Replication {
+                let _ = write.reply.take().unwrap().send(Ok(Replication {
                     sequence,
                     completion: receiver,
                 }));
                 self.send_replication();
             }
             Err(error) => {
-                let _ = write.reply.send(Err(error));
+                let _ = write.reply.take().unwrap().send(Err(error));
             }
         }
     }
@@ -2054,6 +2228,67 @@ impl Owner {
         } = envelope;
         let _enrollment = cleanup.as_ref().map(|cleanup| cleanup.enter());
         match command {
+            Command::InitialProgress(execution, query, reply) => {
+                if let Err(error) = query.validate(&self.shared) {
+                    let _ = reply.send(Err(error));
+                } else if self.role != ReplicaRole::Unknown || self.control.is_some() {
+                    let _ =
+                        reply.send(Err(Error::InvalidInput("initial progress requires Opened")));
+                } else if let Some(initial) = self.initial_progress {
+                    let _ = reply.send(Ok(initial));
+                } else if self.initial_replies.len() >= self.settings.control_messages {
+                    let _ = reply.send(Err(Error::ResourceLimit("initial progress callers")));
+                } else {
+                    let running = !self.initial_replies.is_empty();
+                    if !running {
+                        self.initial_query = Some(query.clone());
+                    }
+                    self.initial_replies.push((query, reply));
+                    #[cfg(test)]
+                    if running
+                        && self
+                            .initial_replies
+                            .last()
+                            .is_some_and(|(query, _)| query.fault)
+                    {
+                        if let Some(entered) =
+                            self.shared.initial_coalesced_primary.lock().unwrap().take()
+                        {
+                            let _ = entered.send(());
+                        }
+                    }
+                    if !running {
+                        let provider = self.provider.as_ref().unwrap().clone();
+                        let deadline = self.settings.callback_timeout;
+                        let mut call = provider_call(
+                            execution.expect("initial callback reserved before command"),
+                            &mut self.starts,
+                            &mut self.dispositions,
+                            async move {
+                                provider
+                                    .get_last_committed_sequence_number()
+                                    .and_then(|initial| {
+                                        if initial < 0 || initial == i64::MAX {
+                                            Err(Error::InvalidInput("invalid initial LSN"))
+                                        } else {
+                                            Ok(JobValue::InitialProgress(initial))
+                                        }
+                                    })
+                            },
+                        );
+                        self.jobs.spawn(async move {
+                            let result = match timeout(deadline, &mut call).await {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    call.cancel_and_wait().await;
+                                    Err(Error::Timeout)
+                                }
+                            };
+                            (Job::InitialProgress, result)
+                        });
+                    }
+                }
+            }
             #[cfg(feature = "qualification")]
             Command::Probe {
                 kind,
@@ -2112,11 +2347,45 @@ impl Owner {
                     let _ = reply.send(Ok(()));
                     return;
                 }
+                if self.role == ReplicaRole::IdleSecondary
+                    && role == Some(ReplicaRole::ActiveSecondary)
+                {
+                    // ChangeRoleAsyncOperation.cpp:253–275 and
+                    // SecondaryReplicator.cpp:2110–2154: reuse the secondary,
+                    // not an epoch barrier/queue transfer. This lower's supported
+                    // profile requires explicit IOperation service ACKs (copy
+                    // completion below uses applied, not mere dequeue), so native
+                    // RequireServiceAck promotion completes immediately. It must
+                    // neither join copy/replication EOS nor invalidate captures.
+                    // The no-service-ACK dispatch-drain profile is not exposed by
+                    // Settings and is not emulated by waiting for application ACKs.
+                    self.role = ReplicaRole::ActiveSecondary;
+                    let _ = reply.send(Ok(()));
+                    return;
+                }
                 if self.control.is_some() {
                     let _ = reply.send(Err(Error::ResourceLimit("provider control callback")));
                     return;
                 }
                 let role = role.unwrap_or(self.role);
+                if self.role == ReplicaRole::Unknown
+                    && role == ReplicaRole::Primary
+                    && !self.queue.is_initialized()
+                {
+                    let Some(initial) = self.initial_progress else {
+                        let _ = reply.send(Err(Error::InvalidInput(
+                            "first primary progress is uninitialized",
+                        )));
+                        return;
+                    };
+                    if let Err(error) = self.queue.initialize(initial) {
+                        let _ = reply.send(Err(error.clone()));
+                        self.fail(error);
+                        return;
+                    }
+                    self.dispatched = initial;
+                    self.announced_completed = initial;
+                }
                 if self.secondary.is_some() && !self.copy_done {
                     let error = Error::Protocol("epoch or promotion during unfinished copy");
                     let _ = reply.send(Err(error.clone()));
@@ -3167,7 +3436,12 @@ impl Owner {
                 if self.transport.register_peer(&from).is_err() {
                     return;
                 }
-                if self.queue.reset(start - 1).is_err() {
+                let initialized = if self.queue.is_initialized() {
+                    self.queue.reset(start - 1)
+                } else {
+                    self.queue.initialize(start - 1)
+                };
+                if initialized.is_err() {
                     return;
                 }
                 self.shared.revision.fetch_add(1, Ordering::AcqRel);
@@ -4212,6 +4486,10 @@ impl Owner {
             }
         }
         let cleanup = match job {
+            Job::InitialProgress => self
+                .initial_replies
+                .first()
+                .and_then(|(_, r)| r.cleanup.clone()),
             Job::CopyOpen(actor, _) | Job::CopyNext(actor, _) => self
                 .peers
                 .get(&actor.replica)
@@ -4223,6 +4501,51 @@ impl Owner {
         };
         let _enrollment = cleanup.as_ref().map(|cleanup| cleanup.enter());
         match job {
+            Job::InitialProgress => {
+                #[cfg(test)]
+                let result = {
+                    let pause = self.shared.initial_publication_pause.lock().unwrap().take();
+                    match pause {
+                        Some((entered, release)) => {
+                            let _ = entered.send(());
+                            if release
+                                .recv_timeout(std::time::Duration::from_secs(2))
+                                .is_err()
+                            {
+                                Err(Error::Timeout)
+                            } else {
+                                result
+                            }
+                        }
+                        None => result,
+                    }
+                };
+                let query = self.initial_query.take().expect("initial query context");
+                let validity = query.validate(&self.shared);
+                let outcome = match validity.clone().and(result) {
+                    Ok(JobValue::InitialProgress(initial))
+                        if self.role == ReplicaRole::Unknown && self.control.is_none() =>
+                    {
+                        self.initial_progress = Some(initial);
+                        *self.shared.initial_progress.lock().unwrap() = Some(initial);
+                        Ok(initial)
+                    }
+                    Err(error) => Err(error),
+                    _ => Err(Error::Closed),
+                };
+                let fault = self
+                    .initial_replies
+                    .iter()
+                    .any(|(query, _)| query.fault && query.validate(&self.shared).is_ok());
+                for (query, reply) in self.initial_replies.drain(..) {
+                    let _ = reply.send(query.validate(&self.shared).and(outcome.clone()));
+                }
+                if fault && validity.is_ok() {
+                    if let Err(error) = outcome {
+                        self.fail(error);
+                    }
+                }
+            }
             Job::Replay {
                 revision,
                 sequence,
@@ -4762,14 +5085,71 @@ impl Owner {
 }
 
 impl Engine {
+    fn initial_query(&self, cancellation: Cancellation, fault: bool) -> Result<InitialQuery> {
+        let deadline = self
+            .shared
+            .execution
+            .current_deadline()
+            .map(Instant::from_std)
+            .unwrap_or_else(|_| Instant::now() + self.settings.callback_timeout)
+            .min(Instant::now() + self.settings.callback_timeout);
+        let query = InitialQuery {
+            native: self.native_runtime.clone(),
+            cancellation,
+            revision: self.shared.revision.load(Ordering::Acquire),
+            deadline,
+            fault,
+        };
+        query.validate(&self.shared)?;
+        Ok(query)
+    }
+    fn initial_progress_permit(&self) -> Result<OwnedCallPermit> {
+        if !self.shared.opened.load(Ordering::Acquire) {
+            return Err(Error::InvalidInput("replicator is not Opened"));
+        }
+        if let Some(native) = &self.native_runtime {
+            native.validate()?;
+        }
+        self.shared.execution.reserve(
+            CallLane::Provider,
+            CallOrigin {
+                engine: self.shared.engine_id,
+                generation: self.shared.generation,
+                session: 0,
+            },
+            self.settings.callback_timeout,
+            false,
+        )
+    }
+    fn initial_progress_sync(&self) -> Result<i64> {
+        let query = self.initial_query(Cancellation::default(), false)?;
+        if let Some(initial) = *self.shared.initial_progress.lock().unwrap() {
+            self.native_required()?.validate()?;
+            return Ok(initial);
+        }
+        let permit = self.initial_progress_permit()?;
+        let initial = self.request_blocking(None, |reply| {
+            Command::InitialProgress(Some(permit), query, reply)
+        })?;
+        self.native_required()?.validate()?;
+        Ok(initial)
+    }
     fn open(&self, cancellation: Cancellation) -> ServiceFuture<'_, String> {
-        Box::pin(async move {
-            self.check()?;
-            if cancellation.is_cancelled() {
-                return Err(Error::Closed);
-            }
-            Ok(self.endpoint.to_string())
-        })
+        let engine = self.self_weak.upgrade().expect("owned common control");
+        crate::owned_lifecycle::own(
+            &self.shared.execution,
+            Box::pin(async move {
+                if cancellation.is_cancelled() {
+                    return Err(Error::Closed);
+                }
+                engine.check()?;
+                if cancellation.is_cancelled() {
+                    return Err(Error::Closed);
+                }
+                engine.shared.opened.store(true, Ordering::Release);
+                Ok(engine.endpoint.to_string())
+            }),
+        )
     }
 
     fn change_role(
@@ -4778,16 +5158,37 @@ impl Engine {
         role: ReplicaRole,
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, ()> {
-        Box::pin(async move {
-            self.request(|reply| Command::Epoch {
-                execution: None,
-                epoch,
-                role: Some(role),
-                cancellation,
-                reply,
-            })
-            .await
-        })
+        let engine = self.self_weak.upgrade().expect("owned common control");
+        crate::owned_lifecycle::own(
+            &self.shared.execution,
+            Box::pin(async move {
+                if cancellation.is_cancelled() {
+                    return Err(Error::Closed);
+                }
+                if engine.native_runtime.is_some()
+                    && engine.snapshot().role == ReplicaRole::Unknown
+                    && role == ReplicaRole::Primary
+                    && engine.shared.initial_progress.lock().unwrap().is_none()
+                {
+                    let query = engine.initial_query(cancellation.clone(), true)?;
+                    let permit = engine.initial_progress_permit()?;
+                    engine
+                        .request(|reply| Command::InitialProgress(Some(permit), query, reply))
+                        .await?;
+                    engine.native_required()?.validate()?;
+                }
+                engine
+                    .request(|reply| Command::Epoch {
+                        execution: None,
+                        epoch,
+                        role: Some(role),
+                        cancellation: cancellation.clone(),
+                        reply,
+                    })
+                    .await?;
+                Ok(())
+            }),
+        )
     }
 
     fn update_epoch(&self, epoch: Epoch, cancellation: Cancellation) -> ServiceFuture<'_, ()> {
@@ -4806,6 +5207,52 @@ impl Engine {
     fn progress(&self) -> Result<ReplicationProgress> {
         self.check()?;
         let snapshot = self.snapshot();
+        if self.native_runtime.is_some() && snapshot.role == ReplicaRole::Unknown {
+            return Ok(ReplicationProgress {
+                first: 0,
+                last: self.initial_progress_sync()?,
+            });
+        }
+        if self.native_runtime.is_some()
+            && matches!(
+                snapshot.role,
+                ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+            )
+            && (self.shared.secondary_progress_fault.load(Ordering::Acquire)
+                || !snapshot.queue_initialized
+                || !snapshot.copy_done)
+        {
+            let reported = self
+                .shared
+                .secondary_progress_fault
+                .swap(true, Ordering::AcqRel);
+            let native = self.native_required()?.clone();
+            if let Ok(permit) = self.shared.execution.reserve(
+                CallLane::Provider,
+                CallOrigin::default(),
+                self.settings.callback_timeout,
+                false,
+            ) {
+                let _ = permit
+                    .run_future(async move {
+                        native
+                            .report_fault(fube_runtime::FaultType::Transient)
+                            .await
+                            .map(|_| ())
+                    })
+                    .wait();
+            }
+            // SecondaryReplicator.cpp:553–619,2157–2200. Native NotReady
+            // is FABRIC_E_NOT_PRIMARY+1; subsequent reported-fault calls fail.
+            return Err(Error::Remote {
+                code: if reported {
+                    0x80004005u32
+                } else {
+                    0x80071bc7u32
+                } as i32 as i64,
+                message: "secondary progress before replication queue/copy readiness".into(),
+            });
+        }
         let last = if snapshot.role == ReplicaRole::Primary {
             snapshot.progress.committed
         } else {
@@ -4887,17 +5334,21 @@ impl Engine {
     }
 
     fn close(&self, cancellation: Cancellation) -> ServiceFuture<'_, ()> {
-        Box::pin(async move {
-            self.shutdown()?.wait().await?;
-            if self.owns_execution && !self.shared.execution.is_current_entry() {
-                self.shared.execution.finish_standalone().await?;
-            }
-            if cancellation.is_cancelled() {
-                Err(Error::Closed)
-            } else {
-                Ok(())
-            }
-        })
+        let engine = self.self_weak.upgrade().expect("owned common control");
+        crate::owned_lifecycle::own(
+            &self.shared.execution,
+            Box::pin(async move {
+                engine.shutdown()?.wait().await?;
+                if engine.owns_execution && !engine.shared.execution.is_current_entry() {
+                    engine.shared.execution.finish_standalone().await?;
+                }
+                if cancellation.is_cancelled() {
+                    Err(Error::Closed)
+                } else {
+                    Ok(())
+                }
+            }),
+        )
     }
 
     fn abort(&self) {

@@ -384,6 +384,9 @@ impl IPrimaryReplicator for ReplicatorFixture {
     }
     fn update_current_replica_set_configuration(&self, current: ReplicaSetConfig) -> Result<()> {
         let proof = self.2.capture_configuration(&current, None)?;
+        if self.1 == 199 {
+            proof.enter()?;
+        }
         let current = proof.configuration().unwrap().0.descriptor()?;
         if self.1 < 20 {
             return Err(Error::Protocol(

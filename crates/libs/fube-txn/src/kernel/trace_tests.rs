@@ -83,6 +83,7 @@ fn log(manager: &KernelManager) -> Vec<(char, i64, Option<i64>)> {
                 } => 'A',
                 RecordKind::Barrier { .. } => '|',
                 RecordKind::UpdateEpoch { .. } => 'E',
+                RecordKind::Physical { .. } => 'P',
             };
             (kind, record.lsn, record.transaction_id())
         })
