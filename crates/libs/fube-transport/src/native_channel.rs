@@ -21,8 +21,7 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
+    io::{AsyncRead, AsyncWrite},
     sync::{oneshot, watch, Notify},
     task::JoinHandle,
     time::{timeout, timeout_at, Instant},
@@ -32,11 +31,11 @@ use crate::{
     channel::{
         ChannelFuture, IncomingMessage, MessageChannel, MessageReceiver, ReplyContext, RpcChannel,
     },
-    connection::{write_message, MAX_FRAME_TIME},
-    frame::{validate_fixed, Frame, FIXED_HEADER_SIZE, MAX_FRAME_SIZE, MAX_HEADER_SIZE},
+    connection::MAX_FRAME_TIME,
+    frame::{FIXED_HEADER_SIZE, MAX_FRAME_SIZE, MAX_HEADER_SIZE},
     message::{self, Header, ListenInstance, Message, MessageId, Properties, MAX_HEADER_COUNT},
     native_demux::{ChannelComposition, Dispatch, EnvelopeValidator, OutboundKind},
-    Error, Result,
+    raw_session, Error, Result,
 };
 
 #[cfg(test)]
@@ -46,6 +45,9 @@ mod tests;
 #[path = "native_request_reply.rs"]
 mod request_reply;
 use request_reply::NativeReplyContext;
+
+#[cfg(test)]
+use crate::frame::{validate_fixed, Frame};
 
 const ORDINARY: usize = 0;
 const REPLY: usize = 1;
@@ -448,26 +450,19 @@ impl GatewayChannel {
         }
         check_deadline(deadline)?;
         let process_id = uuid::Uuid::new_v4().to_bytes_le();
-        let (stream, remote) = timeout_at(deadline, async {
-            let mut stream = TcpStream::connect(endpoint).await?;
-            stream.set_nodelay(true)?;
-            write_message(
-                &mut stream,
-                &Message::listen_instance(
-                    MessageId {
-                        guid: process_id,
-                        index: 1,
-                    },
-                    &ListenInstance::default(),
-                )?,
-            )
-            .await?;
-            let message = read_bounded(&mut stream, limits.max_frame_bytes).await?;
-            let props = envelope(&message, true)?;
-            control_instance(&message, &props).map(|remote| (stream, remote))
-        })
-        .await
-        .map_err(|_| Error::Timeout)??;
+        let (stream, message) = raw_session::connect(
+            endpoint,
+            ListenInstance::default(),
+            MessageId {
+                guid: process_id,
+                index: 1,
+            },
+            raw_limits(limits.max_frame_bytes),
+            deadline,
+        )
+        .await?;
+        let props = envelope(&message, true)?;
+        let remote = control_instance(&message, &props)?;
         check_deadline(deadline)?;
         Ok(Self::start_with_envelope(
             stream,
@@ -1259,21 +1254,14 @@ impl MessageReceiver for GatewayReceiver {
 }
 
 async fn read_bounded<R: AsyncRead + Unpin>(reader: &mut R, limit: usize) -> Result<Message> {
-    let mut fixed = [0; FIXED_HEADER_SIZE];
-    reader.read_exact(&mut fixed[..1]).await?;
-    timeout(MAX_FRAME_TIME, async {
-        reader.read_exact(&mut fixed[1..]).await?;
-        let (size, _) = validate_fixed(&fixed)?;
-        if size > limit {
-            return Err(Error::ResourceLimit("channel inbound frame limit"));
-        }
-        let mut bytes = vec![0; size];
-        bytes[..FIXED_HEADER_SIZE].copy_from_slice(&fixed);
-        reader.read_exact(&mut bytes[FIXED_HEADER_SIZE..]).await?;
-        Message::from_frame(Frame::decode(&bytes)?)
-    })
-    .await
-    .map_err(|_| Error::Timeout)?
+    raw_session::read_message(reader, raw_limits(limit)).await
+}
+
+fn raw_limits(max_frame_bytes: usize) -> raw_session::Limits {
+    raw_session::Limits {
+        max_frame_bytes,
+        frame_time: MAX_FRAME_TIME,
+    }
 }
 
 fn control_instance(message: &Message, props: &Properties) -> Result<ListenInstance> {
@@ -1499,45 +1487,42 @@ async fn send_loop<W: AsyncWrite + Unpin>(mut writer: W, shared: &Arc<Shared>) -
         if let Some((token, bytes, _lease, rpc, deadline, valid)) = work {
             // Selection is not frame start. Until a positive write, validate
             // ownership/deadline under the same lock as cancellation/close.
-            let first = timeout_at(deadline, async {
-                loop {
-                    let changed = shared.changed.notified();
-                    tokio::pin!(changed);
-                    changed.as_mut().enable();
-                    tokio::select! {
-                        result = std::future::poll_fn(|cx| {
-                            let _visibility = shared.visibility.lock().unwrap();
-                            if valid.as_ref().is_some_and(|predicate| !predicate()) {
-                                return Poll::Ready(Ok(None));
-                            }
-                            let inner = shared.inner.lock().unwrap();
-                            let eligible = inner.terminal.is_none()
-                                && inner.entries.get(&token).is_some_and(|entry|
-                                    entry.result.is_none() && Instant::now() < entry.deadline);
-                            if !eligible { return Poll::Ready(Ok(None)); }
-                            match std::pin::Pin::new(&mut writer).poll_write(cx, &bytes) {
-                                Poll::Pending => Poll::Pending,
-                                Poll::Ready(Ok(0)) => Poll::Ready(Err(Error::Io(std::io::ErrorKind::WriteZero.into()))),
-                                Poll::Ready(Ok(size)) => {
-                                    if let Some(tracking) = &inner.entries[&token].tracking {
-                                        tracking.lock().unwrap().visible = true;
-                                    }
-                                    Poll::Ready(Ok(Some(size)))
-                                },
-                                Poll::Ready(Err(error)) => Poll::Ready(Err(Error::from(error))),
-                            }
-                        }) => return result,
-                        _ = changed => {},
+            let result = raw_session::write_frame(
+                &mut writer,
+                &bytes,
+                deadline,
+                raw_limits(shared.budget.limits.max_frame_bytes),
+                &shared.changed,
+                |write| {
+                    let _visibility = shared.visibility.lock().unwrap();
+                    if valid.as_ref().is_some_and(|predicate| !predicate()) {
+                        return None;
                     }
-                }
-            }).await;
-            let offset = match first {
-                Ok(Ok(Some(offset))) => offset,
-                Ok(Err(error)) => {
+                    let inner = shared.inner.lock().unwrap();
+                    let eligible = inner.terminal.is_none()
+                        && inner.entries.get(&token).is_some_and(|entry| {
+                            entry.result.is_none() && Instant::now() < entry.deadline
+                        });
+                    if !eligible {
+                        return None;
+                    }
+                    let result = write();
+                    if matches!(result, Poll::Ready(Ok(size)) if size > 0) {
+                        if let Some(tracking) = &inner.entries[&token].tracking {
+                            tracking.lock().unwrap().visible = true;
+                        }
+                    }
+                    Some(result)
+                },
+            )
+            .await;
+            match result {
+                Ok(true) => {}
+                Err(error) => {
                     shared.finish(token, Err(error.clone()));
                     return Err(error);
                 }
-                Ok(Ok(None)) | Err(_) => {
+                Ok(false) => {
                     shared.finish(
                         token,
                         Err(if Instant::now() >= deadline {
@@ -1548,17 +1533,10 @@ async fn send_loop<W: AsyncWrite + Unpin>(mut writer: W, shared: &Arc<Shared>) -
                     );
                     continue;
                 }
-            };
-            // A positive first write is irrevocable. Preserve the complete
-            // suffix despite observer abandonment, expiry or terminal close.
-            let result = timeout(MAX_FRAME_TIME, writer.write_all(&bytes[offset..]))
-                .await
-                .map_err(|_| Error::Timeout)?
-                .map_err(Error::from);
-            if !rpc || result.is_err() {
-                shared.finish(token, result.clone().map(|_| Outcome::Written));
             }
-            result?;
+            if !rpc {
+                shared.finish(token, Ok(Outcome::Written));
+            }
         } else {
             // Queue disposal/expiry may have left more keys to process.
             let more = {
@@ -1633,22 +1611,22 @@ impl Drop for DriverExit {
 async fn drive<S: AsyncRead + AsyncWrite + Unpin>(stream: S, shared: Arc<Shared>) {
     let _exit = DriverExit(shared.clone());
     let (reader, writer) = tokio::io::split(stream);
-    let reading = async {
+    let stopped = async {
         let stop = shared.stop.notified();
         tokio::pin!(stop);
         stop.as_mut().enable();
         if shared.error().is_some() {
             return;
         }
-        tokio::select! {
-            _ = stop => {},
-            result = receive_loop(reader, &shared) => shared.terminate(result.err().unwrap_or(Error::Closed)),
-        }
+        stop.await;
     };
-    let writing = async {
-        if let Err(error) = send_loop(writer, &shared).await {
-            shared.terminate(error);
-        }
-    };
-    tokio::join!(reading, writing, expire_loop(&shared));
+    tokio::join!(
+        raw_session::join_io(
+            receive_loop(reader, &shared),
+            send_loop(writer, &shared),
+            stopped,
+            |error| shared.terminate(error),
+        ),
+        expire_loop(&shared)
+    );
 }
