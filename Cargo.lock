@@ -332,12 +332,23 @@ dependencies = [
 name = "fube-hosting"
 version = "0.1.0"
 dependencies = [
+ "fube-local-host",
  "fube-ra",
  "fube-ra-store",
  "fube-transport",
  "serde",
  "socket2",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "fube-local-host"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "roxmltree",
+ "serde_json",
  "uuid",
 ]
 
@@ -405,12 +416,11 @@ name = "fube-test-host"
 version = "0.1.0"
 dependencies = [
  "fube-hosting",
+ "fube-local-host",
  "fube-node",
  "fube-ra",
  "fube-ra-store",
  "fube-transport",
- "libc",
- "roxmltree",
  "serde",
  "serde_json",
  "sha2",
@@ -521,6 +531,16 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hosting-local-app"
+version = "0.1.0"
+dependencies = [
+ "fube-hosting",
+ "fube-runtime",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "http"

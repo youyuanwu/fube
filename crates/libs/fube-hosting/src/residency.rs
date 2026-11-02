@@ -5,7 +5,8 @@
 //! [Deactivator.cpp](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Hosting2/Deactivator.cpp).
 //! Accounting admission is an explicit premise, not deployment or activation.
 //! Shared/exclusive identity selects accounting grace only. Physical execution,
-//! successful removal, failure reopening and physical End are not implemented.
+//! failure reopening and physical execution are not implemented. The explicit
+//! local completion seam accepts an owner's physical-cleanup premise, not OS proof.
 //!
 //! Native package-first increment can leave a package-only mutation when the
 //! application closes. Native normal decrement is application-first. Exact
@@ -262,6 +263,22 @@ pub struct ResidencyWork<'a> {
     pub captured_sequence: u64,
     pub due_ticks: i64,
     pub subject: ResidencySubject<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompletionSubject {
+    Application(ApplicationId),
+    Package(ResidencyAdmission),
+}
+
+/// Exact ledger/final/sequence snapshot. An owner may complete only after its
+/// physical and authority cleanup. This token is not itself cleanup evidence.
+#[derive(Debug)]
+pub struct LocalDeactivation {
+    ledger: u64,
+    id: u64,
+    sequence: u64,
+    subject: CompletionSubject,
 }
 
 /// Nonclone callback ownership; its bounded record survives owner Drop/shutdown.
@@ -1332,9 +1349,251 @@ impl Residency {
         self.callbacks.iter().map(|work| self.work_view(work))
     }
 
-    /// Retained guard-passed work; there is deliberately no physical End method.
+    /// Retained guard-passed work, independently of physical cleanup.
     pub fn final_obligations(&self) -> impl Iterator<Item = ResidencyWork<'_>> {
         self.finals.iter().map(|work| self.work_view(work))
+    }
+
+    pub fn local_deactivation(&self, id: u64) -> Result<LocalDeactivation> {
+        let work = self
+            .finals
+            .iter()
+            .find(|w| w.id == id)
+            .ok_or(Error::NotFound)?;
+        Ok(LocalDeactivation {
+            ledger: self.ledger,
+            id,
+            sequence: work.sequence,
+            subject: match work.subject {
+                Subject::Application(i) => {
+                    CompletionSubject::Application(self.applications[i].identity.clone())
+                }
+                Subject::Package(i) => {
+                    CompletionSubject::Package(self.packages[i].admission.clone())
+                }
+            },
+        })
+    }
+
+    /// Explicit shutdown, not an idle timer or a service Close reply. Outstanding
+    /// acquisition ownership prevents logical termination admission.
+    pub(crate) fn begin_local_termination(
+        &mut self,
+        expected: &ResidencyAdmission,
+    ) -> Result<LocalDeactivation> {
+        self.require_open()?;
+        let index = self.package_index(&expected.package)?;
+        if self.packages[index].admission != *expected
+            || expected.package.activation != Activation::SHARED
+            || self.packages[index].usage != 0
+            || self.acquisitions.iter().any(|a| a.package == index)
+        {
+            return Err(Error::InvalidState);
+        }
+        let app = self.packages[index].application;
+        if let Some(work) = self.finals.iter().find(|w| {
+            w.subject == Subject::Application(app) || w.subject == Subject::Package(index)
+        }) {
+            return self.local_deactivation(work.id);
+        }
+        if self.packages[index].closing || self.applications[app].closing {
+            return Err(Error::InvalidState);
+        }
+        if self.timers.len() + self.callbacks.len() + self.finals.len()
+            >= self.limits.final_obligations
+        {
+            return Err(Error::Capacity);
+        }
+        let total = self.reserve_bytes(WORK_CHARGE)?;
+        let next = self.next_work.checked_add(1).ok_or(Error::Capacity)?;
+        let id = self.next_work;
+        self.finals.push(Work {
+            id,
+            subject: Subject::Package(index),
+            sequence: self.packages[index].sequence,
+            due_ticks: self.now,
+        });
+        self.next_work = next;
+        self.logical_bytes = total;
+        self.packages[index].closing = true;
+        self.local_deactivation(id)
+    }
+
+    pub(crate) fn begin_empty_local_application_termination(
+        &mut self,
+        application: &ApplicationId,
+    ) -> Result<LocalDeactivation> {
+        self.require_open()?;
+        let index = self.application_index(application)?;
+        if self.packages.iter().any(|p| p.application == index)
+            || self.applications[index].usage != 0
+        {
+            return Err(Error::InvalidState);
+        }
+        if let Some(work) = self
+            .finals
+            .iter()
+            .find(|w| w.subject == Subject::Application(index))
+        {
+            return self.local_deactivation(work.id);
+        }
+        if self.applications[index].closing {
+            return Err(Error::InvalidState);
+        }
+        if self.timers.len() + self.callbacks.len() + self.finals.len()
+            >= self.limits.final_obligations
+        {
+            return Err(Error::Capacity);
+        }
+        let total = self.reserve_bytes(WORK_CHARGE)?;
+        let next = self.next_work.checked_add(1).ok_or(Error::Capacity)?;
+        let id = self.next_work;
+        self.finals.push(Work {
+            id,
+            subject: Subject::Application(index),
+            sequence: self.applications[index].sequence,
+            due_ticks: self.now,
+        });
+        self.next_work = next;
+        self.logical_bytes = total;
+        self.applications[index].closing = true;
+        self.local_deactivation(id)
+    }
+
+    /// Retire an exact final after the trusted owner supplies the exact cleaned
+    /// SharedProcess package premises. Failure changes nothing. Application-first
+    /// completion is a cascade and requires every remaining package's premise.
+    /// No running process, authority withdrawal or filesystem fact is inferred.
+    pub fn finish_local_deactivation(
+        &mut self,
+        token: &LocalDeactivation,
+        cleaned: &[ResidencyAdmission],
+    ) -> Result<()> {
+        self.require_open()?;
+        if token.ledger != self.ledger {
+            return Err(Error::InvalidInput);
+        }
+        let current = self.local_deactivation(token.id)?;
+        if current.sequence != token.sequence || current.subject != token.subject {
+            return Err(Error::InvalidState);
+        }
+        let mut packages = match &token.subject {
+            CompletionSubject::Package(expected) => {
+                let i = self.package_index(&expected.package)?;
+                let entry = &self.packages[i];
+                if !entry.closing
+                    || entry.sequence != token.sequence
+                    || entry.admission != *expected
+                {
+                    return Err(Error::InvalidState);
+                }
+                vec![i]
+            }
+            CompletionSubject::Application(expected) => {
+                let i = self.application_index(expected)?;
+                let entry = &self.applications[i];
+                if !entry.closing || entry.usage != 0 || entry.sequence != token.sequence {
+                    return Err(Error::InvalidState);
+                }
+                self.packages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.application == i)
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+        };
+        if cleaned.len() != packages.len() {
+            return Err(Error::InvalidInput);
+        }
+        for i in &packages {
+            let entry = &self.packages[*i];
+            if entry.usage != 0
+                || entry.admission.package.activation != Activation::SHARED
+                || self.acquisitions.iter().any(|a| a.package == *i)
+                || cleaned
+                    .iter()
+                    .filter(|premise| **premise == entry.admission)
+                    .count()
+                    != 1
+            {
+                return Err(Error::InvalidState);
+            }
+        }
+        let app_identity = match &token.subject {
+            CompletionSubject::Package(p) => &p.package.package.application,
+            CompletionSubject::Application(a) => a,
+        };
+        let app = self.application_index(app_identity)?;
+        packages.sort_unstable_by(|a, b| b.cmp(a));
+        for i in packages {
+            self.remove_local_package(i);
+        }
+        if matches!(token.subject, CompletionSubject::Application(_)) {
+            self.purge_work(Subject::Application(app));
+            let entry = self.applications.remove(app);
+            self.logical_bytes -= 96 + entry.identity.type_name.len();
+            for package in &mut self.packages {
+                if package.application > app {
+                    package.application -= 1;
+                }
+            }
+            for work in self
+                .timers
+                .iter_mut()
+                .chain(&mut self.callbacks)
+                .chain(&mut self.finals)
+            {
+                if let Subject::Application(i) = &mut work.subject {
+                    if *i > app {
+                        *i -= 1;
+                    }
+                }
+            }
+        } else if !self.packages.iter().any(|p| p.application == app)
+            && !self.applications[app].closing
+        {
+            let sequence = self.applications[app].sequence;
+            self.schedule_subject(Subject::Application(app), sequence);
+        }
+        Ok(())
+    }
+
+    fn purge_work(&mut self, subject: Subject) {
+        for queue in [&mut self.timers, &mut self.callbacks, &mut self.finals] {
+            let before = queue.len();
+            queue.retain(|w| w.subject != subject);
+            self.logical_bytes -= (before - queue.len()) * WORK_CHARGE;
+        }
+    }
+
+    fn remove_local_package(&mut self, index: usize) {
+        self.purge_work(Subject::Package(index));
+        let entry = self.packages.remove(index);
+        let a = entry.admission;
+        self.logical_bytes -= 160
+            + a.package.package.application.type_name.len()
+            + a.package.package.name.len()
+            + a.package.public_activation.len()
+            + a.service_name.len()
+            + a.application_name.len();
+        for record in &mut self.acquisitions {
+            if record.package > index {
+                record.package -= 1;
+            }
+        }
+        for work in self
+            .timers
+            .iter_mut()
+            .chain(&mut self.callbacks)
+            .chain(&mut self.finals)
+        {
+            if let Subject::Package(i) = &mut work.subject {
+                if *i > index {
+                    *i -= 1;
+                }
+            }
+        }
     }
 }
 

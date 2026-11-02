@@ -6,6 +6,11 @@ node, cluster or sandbox. It retains the Linux x86_64, pinned **SF 11.8.121.4**,
 trusted-loopback/no-TLS profile and existing minimum runtime API support.
 Only trusted packages and application code may run.
 
+The validator/materializer and Linux process supervisor are now shared through
+`fube-local-host`; native preflight, launch environment and scenario policy stay
+here. The separate [native-free local Hosting owner](../cluster/HostingLocalActivation.md)
+does not require these native libraries and does not qualify service callbacks.
+
 ## Package and invocation
 
 The input is an ordinary package directory:

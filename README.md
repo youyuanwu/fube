@@ -98,6 +98,7 @@ repeated native SDK copy reliability is not claimed.
 - [Basic pure-Rust cluster design: FM, RA/Hosting, authority and qualification milestones](docs/cluster/PureRustCluster.md)
 - [Rust node-side Hosting: implemented H1 registration model, native map and remaining integration gates](docs/cluster/RustHosting.md)
 - [Hosting factory registration and owned local node/RA events: APIs, gates and native evidence](docs/cluster/HostingRegistrationEvents.md)
+- [Owned local Hosting activation: minimal native-free package, residency and cleanup limits](docs/cluster/HostingLocalActivation.md)
 - [RA store P1: API, SQLite profile, cancellation and operational limits](docs/cluster/RaStore.md)
 - [RA protocol foundation: catalog, native codec evidence and minimal P2 execution](docs/cluster/RaProtocolFoundation.md)
 - [Native-derived RA stateless removal: close/report stages, tests and limits](docs/cluster/RaStatelessRemoval.md)

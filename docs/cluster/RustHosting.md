@@ -2,7 +2,8 @@
 
 **Status: H1 registration/lookup, H2 admitted accounting/scheduling and the narrow
 bootstrap H3 IPC/local leases and the bounded registration-events slice are
-implemented. Broader H3, H4 and deployed RA/RAP composition remain gated.**
+implemented, together with bounded H4 owned local package/process activation.
+Broader H3 and deployed RA/RAP composition remain gated.**
 [`fube-hosting`](../../crates/libs/fube-hosting/src/lib.rs) provides
 a native-derived, deterministically driven core plus a separately owned local
 IPC service, not a complete running node. H1's original model evidence is not
@@ -18,6 +19,8 @@ between interface definitions, H1 model implementations and gated live work.
 See [factory registration and owned local events](HostingRegistrationEvents.md)
 for the separate production actor-9/same-core lookup/node-owner profile, exact
 native readiness/health gates and new Rust/release-native execution boundaries.
+See [owned local activation](HostingLocalActivation.md) for the implemented
+registration-only package/process owner, H2 teardown and exact qualification limits.
 
 **Baselines:** repository `0748b9ab3a39530a57387fda23b5889e6e7a442c`;
 native Service Fabric `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`, inspected
@@ -81,7 +84,10 @@ The [application runtime](../runtime/RustStatelessRuntime.md) and
 of the boundary; neither establishes the combined Rust RA-to-Rust RAP path.
 Dated native evidence qualifies its exact source/profile, not every later change.
 
-Extract selectively, preserving the existing standalone profile:
+The local validator/materializer/supervisor now live below both Hosting and the
+native adapters in [`fube-local-host`](../../crates/libs/fube-local-host/src/lib.rs#L1-L30).
+Native preflight, environment and callback parsing stay in test-host. The
+following extraction map retains its original source provenance:
 
 | Existing source | Reuse/adapt | Keep outside the shared core |
 |---|---|---|
@@ -121,6 +127,8 @@ and corresponding tests. Finding a similarly named native class is insufficient.
 
 ```text
 fube-test-host -----------------> fube-hosting ---> fube-transport
+       |                              |
+       +------> fube-local-host <------+
 
 future node executable ---------> fube-hosting
                        ---------> fube-ra --------> fube-ra-store
@@ -143,7 +151,7 @@ daemon or universal plugin framework merely for this extraction.
 The [supplied port contracts](#supplied-port-contracts) now define request-only
 registration lookup, package residency, lookup-triggered activation/scheduling,
 and two typed owned event lanes. Host/runtime/type registration retains the
-existing H1 inherent/split-step APIs; termination and RAP stay gated rather than
+existing H1 inherent/split-step APIs; production RA termination/RAP stay gated rather than
 receiving success-shaped wrapper traits. PackageUsage and narrow PackageScheduling
 have deterministic H2 implementations; physical PackageLifecycle remains
 definition-only. Native lookup errors, optional returned registration
@@ -371,8 +379,9 @@ parity.
 
 **Implemented H3 subset:** [the bootstrap-only local service](#implemented-h3-bootstrap-only-local-ipc)
 now accepts external host/PID/package admission and supplies host/runtime
-registration plus finite local polling. Broader H3 type/report/control and H4
-activation remain gated; it is not live RA/RAP deployment.
+registration plus finite local polling. Broader report/control remains gated;
+the separately owned H4 local activation API does
+not enable live RA/RAP deployment.
 
 ### H4: owned activation and real stateless lifecycle
 
@@ -386,8 +395,9 @@ application-side RAP messages with a test peer: empty success without Abort,
 matching duplicate reuse without another factory/Open, and successful graceful
 Close with independently observed destruction before ACK. Genuine failure
 cleanup and authority checks remain unchanged. This bounded prerequisite is
-delivered; H4 owned activation, production RA/RAP and combined-path deployed
-qualification below remain gated. Hosting/test-host acceptance alone is not
+delivered. [H4 owned local activation](HostingLocalActivation.md) is now delivered
+separately; production RA/RAP and combined-path deployed qualification below
+remain gated. Hosting/test-host acceptance alone is not
 Rust lifecycle evidence.
 
 Port the selected native activation lifecycle with a trusted local-package
@@ -410,7 +420,7 @@ There is no direct service callback or role setter on the node.
 The delivered runtime prerequisite proves that a successful empty-endpoint Open stays
 Open without Abort, a matching duplicate Open returns the same empty endpoint
 without another factory/Open callback, and subsequent Close disposes the
-instance normally after successful graceful Close. H4 must still exercise this
+instance normally after successful graceful Close. A later deployed H4 slice must exercise this
 through its owned activation and production RA/RAP traffic using
 independent callback/resource observations, not a connection to the returned
 endpoint string. Nonempty samples or native-runtime test-host success do not
@@ -464,7 +474,7 @@ These are Rust execution/ownership adaptations, not extra native wire fields.
 | **H1: registration and lookup core** | New crate; native-derived host/runtime/type records, registration transitions, scoped lookup decisions, events and explicit package/clock adapters. | Deterministic source-derived scenarios and RA registration-bridge tests cover producer-specific spelling and separate host Finish/timeout reply/state outcomes. No IPC, process launch, real usage or deployed-parity claim. |
 | **H2: usage and deactivation** | Implemented admitted package/application accounting, exact residual ownership, deterministic grace/sequence scheduling and real-accounting RA test composition. | Tests cover mismatch disposition, exact release, retention and definite/unknown-store ordering. Physical final work remains owned; required live event consumers are still gated. |
 | **H3: IPC and local leases** | Extract/adapt accepted sessions and Hosting handlers; long-running bounded dispatch and finite local authority. | Actual protocol/lease tests and standalone native-host regression qualify the enabled profile. H3 is not yet a real Rust RA deployment. |
-| **H4: process activation and RA/RAP** | Dependent empty-endpoint `fube-runtime` alignment; shared validated deployment/process mechanics, native-free launch and selected native activation policy; real stateless Open/Close/Drop/resend. | Empty-endpoint Open/duplicate/Close passes runtime and real RA/RAP qualification. Independent app/resource observations, actual replies and separate exit/drain/reap evidence qualify the combined path, including crashes and lease loss. |
+| **H4: process activation and RA/RAP** | Bounded [owned local activation](HostingLocalActivation.md) and empty-endpoint Runtime prerequisite implemented. Production RA/RAP Open/Close/Drop/resend remains future work. | Local owner tests qualify real package/process/IPC registration and H2 teardown, not callbacks. Future combined-path qualification must prove actual RA/RAP replies, independent callback/resource observations and exit/drain/reap, including crashes and lease loss. |
 
 Each slice may require several PRs. Publish its source mapping, enabled
 capabilities, remaining dependencies and actual qualification separately.
@@ -635,8 +645,9 @@ it does not port unsolicited native Hosting event routing. Missing live RA
 RuntimeClosed/Enabled/Disabled consumers remain gated, and RuntimeClosed is
 never silently translated to HostDown. `require_live_composition` rejects live
 admission. H2 now supplies actual admitted acquisition/release and scheduling
-in its separate ledger below; broader H3 capabilities and H4 process/RAP ownership
-remain unfinished. The new bootstrap-only H3 evidence is recorded separately below.
+in its separate ledger below. This H1 delivery's historical evidence predates the
+separate registration-events and [owned local activation](HostingLocalActivation.md)
+profiles; neither enables production RA/RAP.
 The H1 delivery ran no complete native
 Hosting handler execution, new codec oracle, wire interoperability or deployed
 process qualification was run. Existing test-host/native evidence is unchanged;
@@ -757,8 +768,11 @@ returns an error, not successful ineligibility. Strictly newer timer sequences
 replace; removal/cancellation accepts stored sequence ≤ incoming. Dequeued
 callbacks separately require exact current sequence, zero usage and not closing;
 package access additionally requires an open/nonclosing application. Successful
-guard retains **final-deactivation obligations only**. No physical End, package
-removal, retry after physical failure or successful process teardown is supplied.
+guard retains **final-deactivation obligations only**; the accounting scheduler
+does not execute physical cleanup. The later
+[local owner and explicit completion seam](HostingLocalActivation.md#cleanup-boundaries)
+now retire exact package/application finals after owner-supplied cleanup premises,
+without claiming H2 independently observes processes or implements native recovery.
 
 `H2LookupAdapter` reserves the maximum fixed-payload scheduling outcome and all
 H1 outputs before one external call. No fallible publication follows that call.
@@ -884,10 +898,11 @@ drained exit through production Hosting. All five original native fixture profil
 also ran anew from the verified exact-head bundle; their lifecycle evidence still
 belongs to the fixture, not production Hosting.
 
-Type/factory registration, health/load/fault, lifecycle, context-update/reconnect/
-security and other host profiles are rejected/gated, never generic Success.
-Physical deployment/launch/removal, stateful hosting, live RA event consumers,
-full H3/H4 and the H4 empty-endpoint alignment remain out of scope. Actual native
+In this bootstrap-only profile, type/factory registration, health/load/fault,
+lifecycle, context-update/reconnect/security and other host profiles reject rather
+than return generic Success. The later factory-registration and local-activation
+profiles are documented separately; production RA/RAP and stateful Hosting remain
+out of scope. Actual native
 application frames are not complete original native node-handler execution,
 deployed interoperability or distributed Federation lease parity. Native expiry/
 hard-process fencing is not inferred from the short native bootstrap run.

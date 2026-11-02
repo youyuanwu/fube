@@ -1,7 +1,4 @@
-use crate::{
-    manifest::{self, escape, Package},
-    wire, HostError, Result,
-};
+use crate::{manifest::Package, wire, HostError, Result};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -23,6 +20,22 @@ pub struct Deployment {
     pub service_type: String,
     pub service_name: String,
     pub initialization: Vec<u8>,
+}
+
+fn rollback_layout<T>(
+    layout: &fube_local_host::deployment::Deployment,
+    result: Result<T>,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => match layout.release() {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(HostError(format!(
+                "{error}; retained root {}: {cleanup}",
+                layout.root.display()
+            ))),
+        },
+    }
 }
 
 impl Deployment {
@@ -94,97 +107,21 @@ impl Deployment {
     }
 
     pub fn from_manifest(parent: &Path, package: &Package) -> Result<Self> {
-        // Validate again immediately before copying. Package sources are trusted
-        // and must not be mutated concurrently (this is not a filesystem sandbox).
-        manifest::validate_tree(&package.source_code)?;
-        let parent = parent.canonicalize()?;
-        let root = parent.join(format!("native-host-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&root)?;
-        let deployment = root.join("deployment");
-        let application = deployment.join(package.application_id());
-        let code = application.join(format!(
-            "{}.{}.{}",
-            package.service_manifest, package.code_name, package.code_version
-        ));
-        let work = root.join("node-work");
-        for directory in [
-            &code,
-            &work,
-            &application.join("work"),
-            &application.join("log"),
-            &application.join("temp"),
-            &root.join("native-data"),
-            &root.join("native-objects"),
-        ] {
-            fs::create_dir_all(directory)?;
-        }
-        fn copy(source: &Path, destination: &Path) -> Result<()> {
-            for entry in fs::read_dir(source)? {
-                let entry = entry?;
-                let target = destination.join(entry.file_name());
-                let meta = fs::symlink_metadata(entry.path())?;
-                if meta.is_dir() {
-                    fs::create_dir(&target)?;
-                    copy(&entry.path(), &target)?;
-                } else if meta.is_file() {
-                    fs::copy(entry.path(), target)?;
-                } else {
-                    return Err(HostError(
-                        "code package changed: symlink/nonregular file".into(),
-                    ));
-                }
-            }
-            Ok(())
-        }
-        copy(&package.source_code, &code)?;
-        let namespace = manifest::NS;
-        let types_xml = package.types_xml();
-        let code_xml = package.code_xml();
-        fs::write(
-            application.join("App.1.0.xml"),
-            format!(
-                r#"<ApplicationPackage xmlns="{namespace}" ApplicationId="{}" ApplicationTypeName="{}" NameUri="{}" RolloutVersion="1.0"><DigestedEnvironment RolloutVersion="1.0"><Principals /><Policies /><Diagnostics /></DigestedEnvironment><DigestedCertificates RolloutVersion="1.0" /></ApplicationPackage>"#,
-                escape(&package.application_id()),
-                escape(&package.application_type),
-                escape(&package.application_name)
-            ),
+        let layout = fube_local_host::deployment::Deployment::from_manifest(parent, package)?;
+        let config = layout.root.join("FabricConfig.cfg");
+        rollback_layout(
+            &layout,
+            (|| {
+                fs::create_dir_all(layout.root.join("native-data"))?;
+                fs::create_dir_all(layout.root.join("native-objects"))?;
+                fs::write(&config, format!("[Common]\nObjectFolder={}\n[Trace/Console]\nLevel=4\n[Trace/Etw]\nLevel=0\n[Trace/File]\nLevel=0\n", layout.root.join("native-objects").display()))?;
+                Ok(())
+            })(),
         )?;
-        let resources = package.endpoints_xml(true);
-        fs::write(
-            application.join(format!("{}.Package.Current.xml", package.service_manifest)),
-            format!(
-                r#"<ServicePackage xmlns="{namespace}" Name="{}" ManifestVersion="{}" RolloutVersion="1.0"><DigestedServiceTypes RolloutVersion="1.0">{types_xml}</DigestedServiceTypes><DigestedCodePackage RolloutVersion="1.0">{code_xml}</DigestedCodePackage><DigestedResources RolloutVersion="1.0"><DigestedEndpoints>{resources}</DigestedEndpoints></DigestedResources><Diagnostics /></ServicePackage>"#,
-                escape(&package.service_manifest),
-                escape(&package.manifest_version)
-            ),
-        )?;
-        let endpoints = package.endpoints_xml(false);
-        fs::write(
-            application.join(format!(
-                "{}.Manifest.{}.xml",
-                package.service_manifest, package.manifest_version
-            )),
-            format!(
-                r#"<ServiceManifest xmlns="{namespace}" Name="{}" Version="{}">{types_xml}{code_xml}<Resources><Endpoints>{endpoints}</Endpoints></Resources></ServiceManifest>"#,
-                escape(&package.service_manifest),
-                escape(&package.manifest_version)
-            ),
-        )?;
-        fs::write(
-            application.join(format!("{}.Endpoints.txt", package.service_manifest)),
-            package.endpoint_file(),
-        )?;
-        fs::write(application.join("Application.Sids.txt"), "")?;
-        let config = root.join("FabricConfig.cfg");
-        fs::write(&config, format!("[Common]\nObjectFolder={}\n[Trace/Console]\nLevel=4\n[Trace/Etw]\nLevel=0\n[Trace/File]\nLevel=0\n", root.join("native-objects").display()))?;
         Ok(Self {
-            executable: code.join(&package.program),
-            arguments: package.arguments.clone(),
-            working_directory: if package.working_folder == "Work" {
-                application.join("work")
-            } else {
-                code.clone()
-            },
+            executable: layout.executable,
+            arguments: layout.arguments,
+            working_directory: layout.working_directory,
             identity: wire::code_context(
                 &package.application_type,
                 &package.application_name,
@@ -192,14 +129,14 @@ impl Deployment {
                 &package.code_name,
             ),
             service_type: package.service_type.clone(),
-            service_name: format!("{}/{}", package.application_name, package.service_name),
+            service_name: layout.service_name,
             initialization: Vec::new(),
-            root,
-            deployment,
-            work,
-            code,
+            root: layout.root,
+            deployment: layout.deployment,
+            work: layout.work,
+            code: layout.code,
             config,
-            application,
+            application: layout.application,
         })
     }
 }
@@ -255,6 +192,46 @@ pub fn preflight(runtime: &Path, app: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_setup_failure_rolls_back_only_its_reserved_root() {
+        let parent = std::env::temp_dir().join(format!("adapter-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&parent).unwrap();
+        let caller_package = parent.join("caller-package");
+        fs::create_dir(&caller_package).unwrap();
+        fs::write(caller_package.join("keep"), "unchanged").unwrap();
+        fs::copy("/bin/true", caller_package.join("program")).unwrap();
+        let package = Package {
+            application_type: "App".into(),
+            application_version: "1".into(),
+            application_name: "fabric:/App".into(),
+            service_manifest: "Service".into(),
+            manifest_version: "1".into(),
+            code_name: "Code".into(),
+            code_version: "1".into(),
+            service_type: "Type".into(),
+            service_name: "Singleton".into(),
+            program: "program".into(),
+            arguments: vec![],
+            argument_text: String::new(),
+            working_folder: "Work".into(),
+            endpoints: vec![],
+            source_code: caller_package.clone(),
+        };
+        let layout =
+            fube_local_host::deployment::Deployment::from_manifest(&parent, &package).unwrap();
+        assert!(layout.executable.is_file());
+        let root = layout.root.clone();
+        fs::create_dir(root.join("FabricConfig.cfg")).unwrap();
+        let result = fs::write(root.join("FabricConfig.cfg"), "configuration").map_err(Into::into);
+        assert!(rollback_layout(&layout, result).is_err());
+        assert!(!root.exists());
+        assert_eq!(
+            fs::read_to_string(caller_package.join("keep")).unwrap(),
+            "unchanged"
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
 
     #[test]
     fn private_bundle_is_unique_and_has_required_native_inputs() {

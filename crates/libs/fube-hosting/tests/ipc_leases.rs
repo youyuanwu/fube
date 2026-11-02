@@ -90,6 +90,100 @@ fn config(duration: Duration) -> Config {
         lease_duration: duration,
     }
 }
+
+#[tokio::test]
+async fn owned_launch_barrier_uses_actual_child_pid_and_preserves_one_session_context() {
+    for fault in 0..3 {
+        let mut server = Server::bind_suspended(
+            "127.0.0.1:0".parse().unwrap(),
+            config(Duration::from_secs(3)),
+        )
+        .unwrap();
+        assert!(server.start_admitted().is_err(), "no unknown-PID dispatch");
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        let mut child = None;
+        fube_local_host::process::OwnedApp::start(&mut child, command).unwrap();
+        let mut child = child.unwrap();
+        let mut a = admission();
+        a.host.pid = child.pid();
+        let owner = server
+            .registration_owner(RequiredCapabilities::default())
+            .unwrap();
+        let prepared = server
+            .admit_registration(&owner, a.clone(), vec!["Type".into()], "owned-launch")
+            .unwrap();
+        assert!(prepared.failure.is_none());
+        let mut socket = TcpStream::connect(server.address()).await.unwrap();
+        write_message(
+            &mut socket,
+            &Message::listen_instance(new_id(), &ListenInstance::default()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), read_message(&mut socket))
+                .await
+                .is_err(),
+            "handshake must remain behind startup admission barrier"
+        );
+        server.start_admitted().unwrap();
+        read_message(&mut socket).await.unwrap();
+        let mut peer = Peer {
+            socket,
+            admission: a.clone(),
+            runtime: uuid::Uuid::new_v4().to_string(),
+            guid: uuid::Uuid::new_v4().to_bytes_le(),
+            sequence: std::cell::Cell::new(0),
+        };
+        match fault {
+            0 => {
+                peer.admission.host.pid += 1;
+                let frame = peer.frame(15, "", vec![]);
+                assert!(
+                    peer.raw(frame).await.is_err(),
+                    "claimed foreign PID cannot own session"
+                );
+            }
+            1 => {
+                assert_eq!(peer.start(10_000_000).await.error, 0);
+                assert_eq!(peer.finish().await, 0);
+                peer.admission.code.package_sequence += 1;
+                let frame = peer.frame(
+                    9,
+                    "RegisterFabricRuntimeRequest",
+                    to_vec(&wire::RuntimeRequest {
+                        context: wire::RuntimeContext {
+                            id: peer.runtime.clone(),
+                            host: peer.admission.host.clone(),
+                            code: peer.admission.code.clone(),
+                        },
+                    })
+                    .unwrap(),
+                );
+                assert!(
+                    peer.raw(frame).await.is_err(),
+                    "package incarnation mismatch cannot mutate"
+                );
+            }
+            _ => {
+                peer.bootstrap().await;
+                let mut second = Peer::connect(&server, a).await;
+                let frame = second.frame(15, "", vec![]);
+                assert!(
+                    second.raw(frame).await.is_err(),
+                    "a second session cannot adopt the owned admission"
+                );
+                assert!(server.status(&prepared.lease).unwrap().registered_host);
+            }
+        }
+        prepared.lease.revoke();
+        server.stop().unwrap();
+        child.cleanup().unwrap();
+        assert!(child.status().group_drained && child.status().reaped);
+        assert!(server.status(&prepared.lease).unwrap().runtimes.is_empty());
+    }
+}
 struct Peer {
     socket: TcpStream,
     admission: Admission,
