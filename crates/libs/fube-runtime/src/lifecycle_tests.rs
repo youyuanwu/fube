@@ -14,9 +14,14 @@ use tokio::{
 
 #[derive(Default)]
 struct Calls {
+    factories: AtomicUsize,
     opens: AtomicUsize,
     closes: AtomicUsize,
     aborts: AtomicUsize,
+    drop_entered: AtomicUsize,
+    drops: AtomicUsize,
+    drop_blocked: AtomicBool,
+    drop_release: AtomicBool,
     partitions: Mutex<Vec<Partition>>,
     provider: Mutex<Option<crate::extensions::InstanceIntegrationProvider>>,
     release: Cancellation,
@@ -39,6 +44,7 @@ impl IStatelessServiceFactory for Factory {
         instance: i64,
     ) -> Result<Box<dyn IStatelessServiceInstance>> {
         assert_eq!(instance, 100);
+        self.0.factories.fetch_add(1, Ordering::SeqCst);
         let mode = initialization.first().copied().unwrap_or(0);
         if mode == 9 {
             return Err(Error::Remote {
@@ -87,6 +93,9 @@ impl IStatelessServiceInstance for Instance {
             }
             assert!(self.mode != 3, "callback panic regression");
             partition.ensure_valid()?;
+            if self.mode == 13 {
+                return Ok(String::new());
+            }
             Ok(format!("model://{}", partition.identity.partition_id))
         })
     }
@@ -123,6 +132,17 @@ impl IStatelessServiceInstance for Instance {
         }
     }
 }
+impl Drop for Instance {
+    fn drop(&mut self) {
+        self.calls.drop_entered.fetch_add(1, Ordering::SeqCst);
+        while self.calls.drop_blocked.load(Ordering::Acquire)
+            && !self.calls.drop_release.load(Ordering::Acquire)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.calls.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
 pub(crate) struct Harness {
     engine: Engine,
     peer: TcpStream,
@@ -134,6 +154,7 @@ impl Drop for Harness {
     fn drop(&mut self) {
         self.calls.release.cancel();
         self.calls.abort_release.store(true, Ordering::Release);
+        self.calls.drop_release.store(true, Ordering::Release);
     }
 }
 
@@ -1030,6 +1051,110 @@ async fn slow_event_subscribers_do_not_backpressure_native_queries() {
 }
 
 #[tokio::test]
+async fn empty_endpoint_open_duplicate_and_close_observe_callbacks_and_disposal() {
+    let mut h = Harness::new().await;
+    let request = h.request(1, 1, 13);
+    h.send("ReplicaOpen", &request).await;
+    let first: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
+    assert_eq!(first.error.error, 0, "empty endpoint is successful Open");
+    assert_eq!(first.unit.id.id, request.unit.id.id);
+    assert_eq!(first.local.id, request.local.id);
+    assert_eq!(first.local.instance, request.local.instance);
+    assert!(first.local.service_endpoint.is_empty());
+    assert_eq!(h.calls.factories.load(Ordering::SeqCst), 1);
+    assert_eq!(h.calls.opens.load(Ordering::SeqCst), 1);
+    assert_eq!(h.calls.aborts.load(Ordering::SeqCst), 0);
+    assert_eq!(h.calls.drops.load(Ordering::SeqCst), 0);
+    let partition = h.calls.partitions.lock().unwrap()[0].clone();
+    partition.ensure_valid().unwrap();
+
+    h.send("ReplicaOpen", &request).await;
+    let duplicate: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
+    assert_eq!(duplicate.error.error, 0);
+    assert_eq!(duplicate.unit.id.id, first.unit.id.id);
+    assert_eq!(duplicate.local.id, first.local.id);
+    assert_eq!(duplicate.local.instance, first.local.instance);
+    assert_eq!(
+        duplicate.local.service_endpoint,
+        first.local.service_endpoint
+    );
+    assert_eq!(h.calls.factories.load(Ordering::SeqCst), 1);
+    assert_eq!(h.calls.opens.load(Ordering::SeqCst), 1);
+    assert_eq!(h.calls.closes.load(Ordering::SeqCst), 0);
+    assert_eq!(h.calls.aborts.load(Ordering::SeqCst), 0);
+    assert_eq!(h.calls.drops.load(Ordering::SeqCst), 0);
+
+    h.calls.drop_blocked.store(true, Ordering::Release);
+    h.send("ReplicaClose", &request).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.calls.drop_entered.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(h.calls.closes.load(Ordering::SeqCst), 1);
+    assert_eq!(h.calls.aborts.load(Ordering::SeqCst), 0);
+    assert_eq!(h.calls.drops.load(Ordering::SeqCst), 0);
+    assert!(partition.ensure_valid().is_err());
+    // Probe the wire before any receive helper can wait for dispatch release.
+    h.no_reply().await;
+    h.calls.drop_release.store(true, Ordering::Release);
+    let message = tokio::time::timeout(Duration::from_secs(2), read_message(&mut h.peer))
+        .await
+        .unwrap()
+        .unwrap();
+    let properties = message.properties().unwrap();
+    assert_eq!(properties.actor, 12);
+    assert_eq!(properties.action, "ReplicaCloseReply");
+    let close: ProxyReply = from_slice(&message.body).unwrap();
+    assert_eq!(close.error.error, 0);
+    assert_eq!(close.unit.id.id, request.unit.id.id);
+    assert_eq!(close.local.id, request.local.id);
+    assert_eq!(close.local.instance, request.local.instance);
+    assert_eq!(h.calls.drops.load(Ordering::SeqCst), 1);
+    // Synchronize only after independently observing disposal-before-wire-ACK.
+    let operation = h.engine.shared.units.lock().unwrap()[&request.unit.id.id.0]
+        .operation
+        .clone();
+    drop(operation.acquire_owned().await.unwrap());
+    h.send("ReplicaClose", &request).await;
+    let duplicate_close: ProxyReply =
+        from_slice(&h.receive("ReplicaCloseReply").await.body).unwrap();
+    assert_eq!(duplicate_close.error.error, 0);
+    assert_eq!(h.calls.closes.load(Ordering::SeqCst), 1);
+    assert_eq!(h.calls.aborts.load(Ordering::SeqCst), 0);
+    assert_eq!(h.calls.drop_entered.load(Ordering::SeqCst), 1);
+    assert_eq!(h.calls.drops.load(Ordering::SeqCst), 1);
+    h.engine.quiesce().await.unwrap();
+    assert_eq!(h.calls.aborts.load(Ordering::SeqCst), 0);
+    assert_eq!(h.calls.drops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn true_open_and_factory_errors_remain_failed_and_dispose_created_instance() {
+    for (mode, error, opens, instances) in [(1, -456, 1, 1), (9, -123, 0, 0)] {
+        let mut h = Harness::new().await;
+        let request = h.request(1, 1, mode);
+        h.send("ReplicaOpen", &request).await;
+        let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
+        assert_eq!(reply.error.error, error);
+        assert!(reply.local.service_endpoint.is_empty());
+        assert_eq!(h.calls.factories.load(Ordering::SeqCst), 1);
+        assert_eq!(h.calls.opens.load(Ordering::SeqCst), opens);
+        assert_eq!(h.calls.closes.load(Ordering::SeqCst), 0);
+        assert_eq!(h.calls.aborts.load(Ordering::SeqCst), instances);
+        assert_eq!(h.calls.drops.load(Ordering::SeqCst), instances);
+        for partition in h.calls.partitions.lock().unwrap().iter() {
+            assert!(partition.ensure_valid().is_err());
+        }
+        h.engine.quiesce().await.unwrap();
+        assert_eq!(h.calls.aborts.load(Ordering::SeqCst), instances);
+        assert_eq!(h.calls.drops.load(Ordering::SeqCst), instances);
+    }
+}
+
+#[tokio::test]
 async fn open_readiness_query_duplicate_close_and_partition_invalidation() {
     let mut h = Harness::new().await;
     let mut request = h.request(1, 1, 0);
@@ -1374,46 +1499,54 @@ async fn named_partition_wire_decode_preserves_owned_model_identity() {
 
 #[tokio::test]
 async fn retired_authority_cannot_republish_cached_duplicate_endpoint() {
-    let mut h = Harness::new().await;
-    let request = h.request(1, 1, 0);
-    h.send("ReplicaOpen", &request).await;
-    h.receive("ReplicaOpenReply").await;
-    // Receipt of the frame can precede the original dispatch releasing its
-    // operation permit. Exercise the cached endpoint path, not busy rejection.
-    let operation = h
-        .engine
-        .shared
-        .units
-        .lock()
-        .unwrap()
-        .get(&request.unit.id.id.0)
-        .unwrap()
-        .operation
-        .clone();
-    drop(operation.acquire_owned().await.unwrap());
-    // Model an operation already admitted but not yet polled by its task.
-    h.engine.shared.authority.check().unwrap();
-    let admitted = IpcRequest {
-        message: Message {
-            headers: vec![
-                Header::actor(12).unwrap(),
-                Header::action("ReplicaOpen").unwrap(),
-                Header::message_id(MessageId {
-                    guid: [7; 16],
-                    index: 99,
-                })
-                .unwrap(),
-            ],
-            body: to_vec(&request).unwrap(),
-        },
-        reply: None,
-    };
-    h.engine.shared.authority.retire();
-    let result = dispatch(h.engine.shared.clone(), admitted).await;
-    assert!(matches!(result, Err(Error::Closed)), "{result:?}");
-    h.no_reply().await;
-    assert_eq!(h.calls.opens.load(Ordering::SeqCst), 1);
-    h.engine.quiesce().await.unwrap();
+    for mode in [0, 13] {
+        let mut h = Harness::new().await;
+        let request = h.request(1, 1, mode);
+        h.send("ReplicaOpen", &request).await;
+        let first: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
+        assert_eq!(first.error.error, 0);
+        assert_eq!(first.local.service_endpoint.is_empty(), mode == 13);
+        // Receipt of the frame can precede the original dispatch releasing its
+        // operation permit. Exercise the cached endpoint path, not busy rejection.
+        let operation = h
+            .engine
+            .shared
+            .units
+            .lock()
+            .unwrap()
+            .get(&request.unit.id.id.0)
+            .unwrap()
+            .operation
+            .clone();
+        drop(operation.acquire_owned().await.unwrap());
+        // Model an operation already admitted but not yet polled by its task.
+        h.engine.shared.authority.check().unwrap();
+        let admitted = IpcRequest {
+            message: Message {
+                headers: vec![
+                    Header::actor(12).unwrap(),
+                    Header::action("ReplicaOpen").unwrap(),
+                    Header::message_id(MessageId {
+                        guid: [7; 16],
+                        index: 99,
+                    })
+                    .unwrap(),
+                ],
+                body: to_vec(&request).unwrap(),
+            },
+            reply: None,
+        };
+        h.engine.shared.authority.retire();
+        let result = dispatch(h.engine.shared.clone(), admitted).await;
+        assert!(matches!(result, Err(Error::Closed)), "{result:?}");
+        h.no_reply().await;
+        assert_eq!(h.calls.factories.load(Ordering::SeqCst), 1);
+        assert_eq!(h.calls.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(h.calls.closes.load(Ordering::SeqCst), 0);
+        h.engine.quiesce().await.unwrap();
+        assert_eq!(h.calls.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(h.calls.drops.load(Ordering::SeqCst), 1);
+    }
 }
 
 pub(super) enum DispatchPoint {

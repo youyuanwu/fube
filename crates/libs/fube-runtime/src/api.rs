@@ -96,7 +96,8 @@ pub trait IStatelessServiceFactory: Send + Sync + 'static {
 /// Async Open/Close and synchronous Abort. Services own listener/task stop and
 /// join lifetimes; runtime supervision does not adopt arbitrary Tokio children.
 pub trait IStatelessServiceInstance: Send + Sync + 'static {
-    /// Return the actual opaque endpoint only after the listener is ready.
+    /// Return an opaque endpoint on success; it may be empty when no client
+    /// address is advertised. If advertising a listener, return only when ready.
     fn open(
         &self,
         partition: Arc<dyn IStatelessServicePartition>,
