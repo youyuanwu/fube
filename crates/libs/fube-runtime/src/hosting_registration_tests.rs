@@ -97,6 +97,7 @@ async fn run(mode: &str) {
     });
     if mode == "factory-blocked" {
         cfg.readiness = ra::HostingReadiness {
+            local_lifecycle: false,
             fm_ready: true,
             node_active: true,
             upgrading: false,

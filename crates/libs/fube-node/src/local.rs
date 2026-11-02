@@ -291,6 +291,19 @@ impl Node {
     pub fn statistics(&self) -> ra::Statistics {
         self.ra.statistics()
     }
+    /// Local execution is drained; externally pending FM obligations are still
+    /// explicitly retained, not acknowledged by this observation.
+    pub fn quiescent(&self) -> bool {
+        let stats = self.ra.statistics();
+        self.usage.is_empty()
+            && self.pending.is_empty()
+            && self.sending.is_none()
+            && self.effects.is_empty()
+            && self.held_reply.is_none()
+            && self.retained_delivery.is_none()
+            && stats.outstanding == 0
+            && stats.effects == 0
+    }
 
     fn room(&self) -> bool {
         self.pending.len() + self.commands.len() < SLOTS
@@ -922,11 +935,7 @@ impl Node {
         self.activation.terminate().map_err(Into::into)
     }
     pub async fn close_executor(&self, budget: Duration) -> Result<()> {
-        if !self.usage.is_empty()
-            || !self.pending.is_empty()
-            || self.sending.is_some()
-            || !self.effects.is_empty()
-        {
+        if !self.quiescent() {
             return Err(Error::Busy);
         }
         self.ra.close(budget).await?;

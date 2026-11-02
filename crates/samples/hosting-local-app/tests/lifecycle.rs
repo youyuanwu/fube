@@ -139,6 +139,13 @@ async fn until(node: &mut Node, mut predicate: impl FnMut(&Node) -> bool) -> Vec
     loop {
         node.drive()
             .unwrap_or_else(|e| panic!("{e:?}; {:?}", node.activation().logs()));
+        assert_eq!(
+            node.activation()
+                .process_status()
+                .unwrap()
+                .dropped_log_records,
+            0
+        );
         for receipt in node.take_command_receipts() {
             receipt.result.unwrap();
         }
@@ -159,13 +166,340 @@ async fn until(node: &mut Node, mut predicate: impl FnMut(&Node) -> bool) -> Vec
 async fn cleanup(node: &mut Node, store: &Store) {
     node.terminate().unwrap();
     until(node, |n| {
-        n.pending_commands() == 0
-            && n.retained_usage() == 0
-            && n.package_registration().health_sources_released > 0
+        n.quiescent() && n.package_registration().health_sources_released > 0
     })
     .await;
     node.close_executor(Duration::from_secs(3)).await.unwrap();
     store.close().await.unwrap();
+}
+fn resource(node: &Node) -> PathBuf {
+    node.activation()
+        .root()
+        .unwrap()
+        .join("deployment/HostingLocalApp_App1/work/local-instance.resource")
+}
+fn count(node: &Node, marker: &str) -> usize {
+    assert_eq!(
+        node.activation()
+            .process_status()
+            .unwrap()
+            .dropped_log_records,
+        0
+    );
+    node.activation()
+        .logs()
+        .iter()
+        .filter(|l| l.contains(marker))
+        .count()
+}
+fn native_free(node: &Node) {
+    let pid = node.activation().process_status().unwrap().pid;
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+    assert!(!maps.contains("libFabricRuntime") && !maps.contains("libFabricCommon"));
+    let env = fs::read(format!("/proc/{pid}/environ")).unwrap();
+    assert!(!env
+        .split(|b| *b == 0)
+        .any(|s| s.starts_with(b"LD_LIBRARY_PATH=") || s.starts_with(b"FabricConfigFileName=")));
+}
+async fn advance(node: &mut Node, duration: Duration) {
+    let start = std::time::Instant::now();
+    until(node, |_| start.elapsed() >= duration).await;
+}
+async fn replay(node: &mut Node, dispatch: &ra::Dispatched, stale: bool) {
+    let (action, registration, mut body, flags) = match &dispatch.effect {
+        ra::Effect::RuntimeOpen {
+            registration,
+            body,
+            flags,
+            ..
+        } => ("ReplicaOpen", registration, (**body).clone(), *flags),
+        ra::Effect::Close {
+            registration,
+            body,
+            flags,
+            ..
+        } => ("ReplicaClose", registration, (**body).clone(), *flags),
+        _ => panic!("only an actual captured RA lifecycle effect may be replayed"),
+    };
+    if stale {
+        body.replica.instance -= 1;
+    }
+    let send = node
+        .activation()
+        .host_lease()
+        .unwrap()
+        .send_lifecycle(
+            action,
+            fube_node::local::rap::request(registration, &body, flags).unwrap(),
+        )
+        .unwrap();
+    until(node, |_| send.result().is_some()).await;
+    send.result().unwrap().unwrap();
+    drop(send);
+    advance(node, Duration::from_millis(50)).await;
+}
+
+#[tokio::test]
+async fn actual_disposal_barrier_blocks_semantic_retirement_and_error_close_aborts_first() {
+    for error in [false, true] {
+        let fixture = Fixture::new();
+        let (mut node, store) = fixture
+            .node(if error {
+                "--close-error-block-dispose"
+            } else {
+                "--block-dispose"
+            })
+            .await;
+        until(&mut node, |n| n.package_registration().registered).await;
+        native_free(&node);
+        let b = body(&node);
+        node.add(b.clone()).unwrap();
+        until(&mut node, |n| {
+            n.snapshot(b.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| s.phase == ra::Phase::Ready)
+        })
+        .await;
+        assert!(resource(&node).is_file());
+        node.close(b.unit.id.clone(), ra::CloseMode::Close).unwrap();
+        until(&mut node, |n| count(n, "LOCAL_DISPOSE begin") == 1).await;
+        // Continue actual adapter and channel progress throughout the negative
+        // oracle. Merely not driving could conceal an already-sent early reply.
+        advance(&mut node, Duration::from_millis(150)).await;
+        let closing = node.snapshot(b.unit.id.guid.0).committed.unwrap();
+        assert_eq!(closing.phase, ra::Phase::Closing);
+        assert!(closing.usage.is_some());
+        assert_eq!(node.retained_usage(), 1);
+        assert!(resource(&node).is_file());
+        assert_eq!(count(&node, "LOCAL_CALLBACK close"), 1);
+        assert_eq!(count(&node, "LOCAL_CALLBACK abort"), usize::from(error));
+        assert_eq!(count(&node, "LOCAL_RESOURCE released"), 0);
+        assert!(
+            node.activation()
+                .session_status()
+                .unwrap()
+                .unwrap()
+                .connected
+        );
+        fs::write(
+            resource(&node).with_file_name("local-dispose.release"),
+            b"release actual destructor",
+        )
+        .unwrap();
+        until(&mut node, |n| {
+            n.snapshot(b.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| s.phase == ra::Phase::Closed)
+                && n.retained_usage() == 0
+        })
+        .await;
+        assert!(!resource(&node).exists());
+        assert_eq!(count(&node, "LOCAL_RESOURCE released"), 1);
+        assert_eq!(count(&node, "LOCAL_DISPOSE complete"), 1);
+        assert!(!node.activation().process_status().unwrap().exit_observed);
+        cleanup(&mut node, &store).await;
+    }
+}
+
+#[tokio::test]
+async fn actual_duplicate_stale_traffic_and_ra_replacement_require_a_new_authorized_resend() {
+    let fixture = Fixture::new();
+    let (mut node, store) = fixture.node("").await;
+    until(&mut node, |n| n.package_registration().registered).await;
+    let b = body(&node);
+    node.add(b.clone()).unwrap();
+    let effects = until(&mut node, |n| {
+        n.snapshot(b.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.phase == ra::Phase::Ready)
+    })
+    .await;
+    let open = effects
+        .iter()
+        .find(|r| matches!(r.dispatch.effect, ra::Effect::RuntimeOpen { .. }))
+        .unwrap()
+        .dispatch
+        .clone();
+    replay(&mut node, &open, false).await;
+    replay(&mut node, &open, true).await;
+    assert_eq!(count(&node, "LOCAL_CALLBACK create"), 1);
+    assert_eq!(count(&node, "LOCAL_CALLBACK open"), 1);
+    assert_eq!(node.retained_usage(), 1);
+    let mut next = b.clone();
+    next.replica.id += 1;
+    next.replica.instance += 1;
+    // Native replacement closes the old identity but does not remember/replay
+    // the incoming replacement Add as an autonomous new incarnation.
+    node.add(next.clone()).unwrap();
+    let effects = until(&mut node, |n| {
+        n.snapshot(b.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.phase == ra::Phase::Closed)
+            && n.retained_usage() == 0
+    })
+    .await;
+    let close = effects
+        .iter()
+        .find(|r| matches!(r.dispatch.effect, ra::Effect::Close { .. }))
+        .unwrap()
+        .dispatch
+        .clone();
+    assert_eq!(count(&node, "LOCAL_CALLBACK create"), 1);
+    assert!(!resource(&node).exists());
+    replay(&mut node, &close, false).await;
+    replay(&mut node, &open, false).await; // closed-proxy failure reply cannot revive RA.
+    assert_eq!(
+        node.snapshot(b.unit.id.guid.0).committed.unwrap().phase,
+        ra::Phase::Closed
+    );
+    assert_eq!(node.retained_usage(), 0);
+    node.add(next.clone()).unwrap(); // actual new authorized resend, not a saved launch.
+    until(&mut node, |n| {
+        n.snapshot(b.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.phase == ra::Phase::Ready && s.body.replica.id == next.replica.id)
+    })
+    .await;
+    replay(&mut node, &open, false).await;
+    replay(&mut node, &close, false).await; // actual old request on this same session.
+    assert_eq!(
+        node.snapshot(b.unit.id.guid.0)
+            .committed
+            .unwrap()
+            .body
+            .replica
+            .id,
+        next.replica.id
+    );
+    assert_eq!(count(&node, "LOCAL_CALLBACK create"), 2);
+    assert_eq!(count(&node, "LOCAL_CALLBACK open"), 2);
+    assert_eq!(count(&node, "LOCAL_CALLBACK close"), 1);
+    node.close(b.unit.id.clone(), ra::CloseMode::ForceAbort)
+        .unwrap();
+    until(&mut node, |n| {
+        n.snapshot(b.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.phase == ra::Phase::Closed)
+            && n.retained_usage() == 0
+    })
+    .await;
+    assert_eq!(count(&node, "LOCAL_CALLBACK abort"), 1);
+    assert_eq!(count(&node, "LOCAL_DISPOSE complete"), 2);
+    assert!(!resource(&node).exists());
+    cleanup(&mut node, &store).await;
+}
+
+#[tokio::test]
+async fn actual_crash_and_lease_loss_distinguish_opening_use_logical_retirement_and_reap() {
+    for opening in [false, true] {
+        for lease_loss in [false, true] {
+            let fixture = Fixture::new();
+            let (mut node, store) = fixture
+                .node(if opening { "--open-delay-ms 4000" } else { "" })
+                .await;
+            until(&mut node, |n| n.package_registration().registered).await;
+            native_free(&node);
+            let b = body(&node);
+            node.add(b.clone()).unwrap();
+            until(&mut node, |n| {
+                if opening {
+                    count(n, "LOCAL_CALLBACK open") == 1
+                } else {
+                    n.snapshot(b.unit.id.guid.0)
+                        .committed
+                        .is_some_and(|s| s.phase == ra::Phase::Ready)
+                }
+            })
+            .await;
+            assert!(resource(&node).exists());
+            let pid = node.activation().process_status().unwrap().pid;
+            if lease_loss {
+                node.activation().host_lease().unwrap().stop_renewal();
+            } else {
+                assert!(std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            until(&mut node, |n| {
+                n.snapshot(b.unit.id.guid.0).committed.is_some_and(|s| {
+                    if opening {
+                        s.phase == ra::Phase::Opening && s.runtime.is_none() && s.open_failures > 0
+                    } else {
+                        s.phase == ra::Phase::Closed && s.usage.is_none()
+                    }
+                }) && (opening || n.retained_usage() == 0)
+            })
+            .await;
+            assert!(
+                !node
+                    .activation()
+                    .session_status()
+                    .unwrap()
+                    .unwrap()
+                    .connected
+            );
+            assert_eq!(node.retained_usage(), usize::from(opening));
+            if opening {
+                node.close(b.unit.id.clone(), ra::CloseMode::Drop).unwrap();
+                until(&mut node, |n| {
+                    n.snapshot(b.unit.id.guid.0)
+                        .committed
+                        .is_some_and(|s| s.phase == ra::Phase::Closed)
+                        && n.retained_usage() == 0
+                })
+                .await;
+            }
+            // Logical host loss is not process death/reap. Observe the actual
+            // dead waitable leader before any cleanup can send a PGID signal.
+            until(&mut node, |_| {
+                fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z "))
+            })
+            .await;
+            assert!(!node.activation().process_status().unwrap().reaped);
+            assert_eq!(count(&node, "LOCAL_CALLBACK close"), 0);
+            assert_eq!(count(&node, "LOCAL_DISPOSE complete"), 0);
+            assert!(
+                resource(&node).exists(),
+                "no destructor receipt is fabricated for a hard exit"
+            );
+            let root = node.activation().root().unwrap().to_path_buf();
+            cleanup(&mut node, &store).await;
+            assert!(!root.exists());
+            let status = node.activation().process_status().unwrap();
+            assert!(status.exit_observed && status.group_drained && status.reaped);
+            assert_eq!(node.activation().residency().resources().logical_bytes, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn actual_runtime_unregister_consumes_distinct_events_without_host_exit_claim() {
+    let fixture = Fixture::new();
+    let (mut node, store) = fixture.node("--shutdown-after-ms 2000").await;
+    until(&mut node, |n| n.package_registration().registered).await;
+    let b = body(&node);
+    node.add(b.clone()).unwrap();
+    until(&mut node, |n| {
+        n.snapshot(b.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.phase == ra::Phase::Ready)
+    })
+    .await;
+    until(&mut node, |n| {
+        n.snapshot(b.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.phase == ra::Phase::Closed)
+            && n.retained_usage() == 0
+            && n.package_registration().unregistered_at.is_some()
+    })
+    .await;
+    assert!(!node.activation().process_status().unwrap().exit_observed);
+    assert_eq!(count(&node, "LOCAL_CALLBACK abort"), 1);
+    assert_eq!(count(&node, "LOCAL_DISPOSE complete"), 1);
+    assert!(!resource(&node).exists());
+    cleanup(&mut node, &store).await;
 }
 
 struct PausedSecondWrite {
