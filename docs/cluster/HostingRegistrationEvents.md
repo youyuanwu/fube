@@ -64,7 +64,7 @@ No enabled-health terminal local store is substituted for HM.
 
 The actual factory producer emits the ordered complete runtime context and
 type-instance identity. The production handler
-([ipc.rs:1643-1702](../../crates/libs/fube-hosting/src/ipc.rs#L1643-L1702)) checks the full
+([ipc.rs:1671-1730](../../crates/libs/fube-hosting/src/ipc.rs#L1671-L1730)) checks the full
 admitted wire context before H1 projection, declared type and exact current
 session/runtime ownership. Native semantic CI/UTF-16 identity is not replaced
 with blanket ASCII/Unicode folding. Transport route identity, semantic identity,
@@ -98,7 +98,7 @@ lifecycle admission now executes Registered retry, ordinary RuntimeClosed Close
 and HostClosed crash transitions within RA, with reserved effect capacity;
 it never translates RuntimeClosed into generic HostDown.
 
-[`LocalStatusConsumer`](../../crates/libs/fube-ra/src/hosting_events.rs#L188-L300)
+[`LocalStatusConsumer`](../../crates/libs/fube-ra/src/hosting_events.rs#L189-L301)
 uses native type CI keys, ten-minute sequence history with hourly cleanup,
 lower/equal-sequence staleness, opposite-status coalescing, Disabled priority
 and a separate downstream message counter. Local processing is not FM

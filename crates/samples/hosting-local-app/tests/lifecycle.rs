@@ -165,10 +165,8 @@ async fn until(node: &mut Node, mut predicate: impl FnMut(&Node) -> bool) -> Vec
 }
 async fn cleanup(node: &mut Node, store: &Store) {
     node.terminate().unwrap();
-    until(node, |n| {
-        n.quiescent() && n.package_registration().health_sources_released > 0
-    })
-    .await;
+    until(node, Node::quiescent).await;
+    assert!(node.package_registration().health_sources_released > 0);
     node.close_executor(Duration::from_secs(3)).await.unwrap();
     store.close().await.unwrap();
 }
@@ -665,7 +663,7 @@ async fn unsupported_and_near_wire_limit_adds_reject_before_selected_or_usage_ow
     let (mut node, store) = fixture.node("").await;
     until(&mut node, |n| n.package_registration().registered).await;
     let b = body(&node);
-    for variant in 0..6 {
+    for variant in 0..11 {
         let mut bad = b.clone();
         match variant {
             0 => bad.replica.current_role = 0,
@@ -673,7 +671,15 @@ async fn unsupported_and_near_wire_limit_adds_reject_before_selected_or_usage_ow
             2 => bad.replica.state = 0,
             3 => bad.replica.id = -1,
             4 => bad.replica.instance = -1,
-            _ => bad.service.constraints = "x".repeat(32_000),
+            5 => bad.service.constraints = "x".repeat(32_000),
+            6 => bad.unit.consistency.kind = 0,
+            7 => {
+                bad.unit.consistency.kind = 3;
+                bad.unit.consistency.name = "NotSingleton".into();
+            }
+            8 => bad.unit.consistency.kind = 2,
+            9 => bad.unit.consistency.low = 1,
+            _ => bad.unit.consistency.id.guid.0 = [9; 16],
         }
         assert!(node.add(bad).is_err());
         assert_eq!(node.statistics().accepted, 0);
@@ -814,7 +820,9 @@ async fn original_ra_lifetime_gate_retires_owned_session_before_and_after_regist
         if registered {
             until(&mut node, |n| n.package_registration().registered).await;
         }
-        node.close_executor(Duration::from_secs(3)).await.unwrap();
+        node.qualification_close_owner(Duration::from_secs(3))
+            .await
+            .unwrap();
         // No adapter drive/event is required for Hosting's independent gate.
         tokio::time::sleep(Duration::from_millis(400)).await;
         let status = node.activation().session_status().unwrap().unwrap();
@@ -829,6 +837,273 @@ async fn original_ra_lifetime_gate_retires_owned_session_before_and_after_regist
         assert!(node.terminate().unwrap());
         assert!(node.activation().cleanup_status().directory_released);
         store.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn public_shutdown_drains_upstream_obligations_before_executor_close() {
+    let fixture = Fixture::new();
+    let (mut node, store) = fixture.node("").await;
+    until(&mut node, |n| n.package_registration().registered).await;
+    assert_eq!(
+        node.close_executor(Duration::from_secs(3)).await,
+        Err(fube_node::local::Error::Busy),
+        "a momentary empty snapshot is not a stable producer stop"
+    );
+    assert!(node.terminate().unwrap());
+    assert!(
+        !node.quiescent(),
+        "upstream HostClosed/package/source work is not drained"
+    );
+    assert_eq!(
+        node.close_executor(Duration::from_secs(3)).await,
+        Err(fube_node::local::Error::Busy)
+    );
+    until(&mut node, Node::quiescent).await;
+    assert!(!node.package_registration().registered);
+    assert!(node.package_registration().unregistered_at.is_some());
+    assert_eq!(node.package_registration().health_sources_released, 1);
+    node.close_executor(Duration::from_secs(3)).await.unwrap();
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn physical_terminate_during_open_keeps_exact_drop_cleanup_after_serving_withdrawal() {
+    let fixture = Fixture::new();
+    let (mut node, store) = fixture.node("--open-delay-ms 4000").await;
+    until(&mut node, |n| n.package_registration().registered).await;
+    let b = body(&node);
+    node.add(b.clone()).unwrap();
+    until(&mut node, |n| count(n, "LOCAL_CALLBACK open") == 1).await;
+    let acquisition = node
+        .snapshot(b.unit.id.guid.0)
+        .committed
+        .unwrap()
+        .usage
+        .unwrap();
+    assert_eq!(
+        node.terminate(),
+        Err(fube_node::local::Error::Activation(
+            fube_hosting::local::LocalError::Busy
+        ))
+    );
+    until(&mut node, |n| {
+        n.snapshot(b.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.phase == ra::Phase::Opening && s.runtime.is_none())
+    })
+    .await;
+    assert_eq!(node.retained_usage(), 1);
+    assert!(node.add(b.clone()).is_err());
+    assert!(node.retry(b.unit.id.clone()).is_err());
+    assert!(node.activation().root().unwrap().exists());
+    node.close(b.unit.id.clone(), ra::CloseMode::Drop).unwrap();
+    let effects = until(&mut node, |n| {
+        n.snapshot(b.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.phase == ra::Phase::Closed)
+            && n.retained_usage() == 0
+    })
+    .await;
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|r| r.dispatch.effect == ra::Effect::ReleaseUsage { acquisition })
+            .count(),
+        1
+    );
+    cleanup(&mut node, &store).await;
+    assert!(node.activation().cleanup_status().directory_released);
+}
+
+#[tokio::test]
+async fn production_reply_adapter_preserves_stale_failed_and_native_nonfull_equality_admission() {
+    use fube_node::local::rap;
+    use fube_transport::serialization::serde::{from_slice, to_vec};
+    let fixture = Fixture::new();
+    let (mut node, store) = fixture.node("--block-dispose").await;
+    until(&mut node, |n| n.package_registration().registered).await;
+    let b = body(&node);
+    node.qualification_hold_replies(true);
+    node.add(b.clone()).unwrap();
+    until(&mut node, |n| count(n, "LOCAL_CALLBACK open") == 1).await;
+    let lease = node.activation().host_lease().unwrap();
+    // Take the genuine reply only after the actual callback completed, before
+    // the adapter consumes it. This is explicitly reply-admission qualification,
+    // not substituted positive callback/disposal evidence.
+    let actual = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(reply) = lease.take_lifecycle_reply() {
+                break reply;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let original: rap::Reply = from_slice(actual.body()).unwrap();
+    let use_id = node
+        .snapshot(b.unit.id.guid.0)
+        .committed
+        .unwrap()
+        .usage
+        .unwrap();
+    let mut stale = original.clone();
+    stale.local.instance -= 1;
+    node.qualification_ingress(
+        lease
+            .qualification_reply("ReplicaOpenReply", to_vec(&stale).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    advance(&mut node, Duration::from_millis(30)).await;
+    let state = node.snapshot(b.unit.id.guid.0).committed.unwrap();
+    assert_eq!(state.phase, ra::Phase::Opening);
+    assert_eq!(state.usage, Some(use_id));
+    let mut allowed = original.clone();
+    allowed.local.id += 100; // native Open admission deliberately does not require full equality.
+    allowed.local.node.id = [9; 16];
+    node.qualification_ingress(
+        lease
+            .qualification_reply("ReplicaOpenReply", to_vec(&allowed).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    until(&mut node, |n| {
+        n.snapshot(b.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.phase == ra::Phase::Ready)
+    })
+    .await;
+    assert_eq!(
+        node.snapshot(b.unit.id.guid.0)
+            .committed
+            .unwrap()
+            .body
+            .replica
+            .id,
+        b.replica.id
+    );
+    node.qualification_hold_replies(false);
+    node.close(b.unit.id.clone(), ra::CloseMode::Close).unwrap();
+    until(&mut node, |n| count(n, "LOCAL_DISPOSE begin") == 1).await;
+    let mut stale_close = original.clone();
+    stale_close.local.id -= 1;
+    node.qualification_ingress(
+        lease
+            .qualification_reply("ReplicaCloseReply", to_vec(&stale_close).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    advance(&mut node, Duration::from_millis(30)).await;
+    assert_eq!(
+        node.snapshot(b.unit.id.guid.0)
+            .committed
+            .unwrap()
+            .close_failures,
+        0
+    );
+    let mut failed = original;
+    failed.error.error = 0x80004005u32 as i32 as i64;
+    node.qualification_ingress(
+        lease
+            .qualification_reply("ReplicaCloseReply", to_vec(&failed).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    until(&mut node, |n| {
+        n.snapshot(b.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.close_failures == 1)
+    })
+    .await;
+    assert_eq!(node.retained_usage(), 1);
+    assert!(resource(&node).exists());
+    fs::write(
+        resource(&node).with_file_name("local-dispose.release"),
+        b"actual disposal",
+    )
+    .unwrap();
+    until(&mut node, |n| {
+        n.snapshot(b.unit.id.guid.0)
+            .committed
+            .is_some_and(|s| s.phase == ra::Phase::Closed)
+            && n.retained_usage() == 0
+    })
+    .await;
+    assert_eq!(count(&node, "LOCAL_DISPOSE complete"), 1);
+    cleanup(&mut node, &store).await;
+}
+
+#[tokio::test]
+async fn production_reply_adapter_rejects_malformed_and_foreign_session_without_losing_cleanup() {
+    use fube_node::local::rap;
+    use fube_transport::serialization::serde::{to_vec, ObjectArray};
+    for foreign in [false, true] {
+        let fixture = Fixture::new();
+        let other_fixture = Fixture::new();
+        let (mut node, store) = fixture.node("").await;
+        let (mut other, other_store) = other_fixture.node("").await;
+        until(&mut node, |n| n.package_registration().registered).await;
+        until(&mut other, |n| n.package_registration().registered).await;
+        let b = body(&node);
+        node.add(b.clone()).unwrap();
+        until(&mut node, |n| {
+            n.snapshot(b.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| s.phase == ra::Phase::Ready)
+        })
+        .await;
+        let before = node.snapshot(b.unit.id.guid.0).committed.unwrap();
+        let source = if foreign {
+            other.activation().host_lease().unwrap()
+        } else {
+            node.activation().host_lease().unwrap()
+        };
+        let bytes = if foreign {
+            to_vec(&rap::Reply {
+                unit: before.body.unit.clone(),
+                local: before.body.replica.clone(),
+                remote: ObjectArray(vec![]),
+                error: rap::ProxyError {
+                    error: 0,
+                    message: String::new(),
+                    api: Default::default(),
+                },
+                flags: 0,
+            })
+            .unwrap()
+        } else {
+            vec![1, 2, 3]
+        };
+        node.qualification_ingress(
+            source
+                .qualification_reply("ReplicaCloseReply", bytes)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(node.drive(), Err(fube_node::local::Error::Protocol));
+        assert_eq!(node.retained_usage(), 1);
+        assert_eq!(
+            node.snapshot(b.unit.id.guid.0)
+                .committed
+                .unwrap()
+                .body
+                .replica
+                .id,
+            before.body.replica.id
+        );
+        // First rejected opaque input stays diagnostic, not a head that blocks
+        // the actual HostClosed/native retirement/exact release after revocation.
+        until(&mut node, |n| {
+            n.snapshot(b.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| s.phase == ra::Phase::Closed)
+                && n.retained_usage() == 0
+        })
+        .await;
+        cleanup(&mut node, &store).await;
+        cleanup(&mut other, &other_store).await;
     }
 }
 

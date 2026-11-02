@@ -230,6 +230,26 @@ pub struct HostLease {
     entry: Arc<Entry>,
 }
 impl HostLease {
+    /// Fault injection only. The opaque source remains this exact owned Entry;
+    /// this never fabricates another host/PID/session or bypasses Node admission.
+    #[cfg(feature = "qualification")]
+    #[doc(hidden)]
+    pub fn qualification_reply(
+        &self,
+        action: &str,
+        body: Vec<u8>,
+    ) -> TransportResult<LifecycleReply> {
+        if !matches!(action, "ReplicaOpenReply" | "ReplicaCloseReply") || body.len() > MAX_INPUT {
+            return Err(protocol("invalid qualification reply"));
+        }
+        Ok(LifecycleReply {
+            entry: self.entry.clone(),
+            message: Message {
+                headers: vec![Header::actor(12)?, Header::action(action)?],
+                body,
+            },
+        })
+    }
     pub fn stop_renewal(&self) {
         self.entry.authority.stop_renewal();
     }
@@ -467,6 +487,14 @@ impl RegistrationOwner {
                 Delivery::Obligation(state.core.state.obligations.remove(0))
             }
         }))
+    }
+    /// Observation only; stable drain additionally requires the sole producer
+    /// owner to stop its session and finish declaration/source removal.
+    pub fn has_deliveries(&self) -> crate::Result<bool> {
+        let state = self.shared.state()?;
+        Ok(!state.core.state.closed_registered.is_empty()
+            || !state.core.state.enabled_disabled.is_empty()
+            || !state.core.state.obligations.is_empty())
     }
     pub fn take_operations(&self) -> crate::Result<Vec<OperationResult>> {
         let mut state = self.shared.state()?;

@@ -1,5 +1,6 @@
-//! Actual serialized local Hosting consumers. Required lifecycle/FM completion
-//! is explicitly unavailable; a local decision is not deployment or an ACK.
+//! Serialized Hosting consumers: explicit local lifecycle executes native
+//! transitions; the older decision-only/deployed/FM profile remains gated.
+//! Neither local processing nor retained external work is an FM/HM ACK.
 use super::*;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

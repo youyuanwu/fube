@@ -910,6 +910,37 @@ async fn saturated_lifecycle_preserves_lease_ingress_and_stop_settles_accepted_s
 }
 
 #[tokio::test]
+async fn semantic_reply_wrong_host_or_pid_never_enters_owned_inbox() {
+    for wrong_host in [false, true] {
+        let server = server(LOCAL_LEASE_DURATION);
+        let a = admission();
+        let lease = server.admit(a.clone()).unwrap();
+        let mut peer = Peer::connect(&server, a.clone()).await;
+        peer.bootstrap().await;
+        let mut reply = peer.frame(12, "ReplicaOpenReply", vec![7, 8]);
+        reply
+            .headers
+            .retain(|h| h.id != EXPECTS_REPLY && h.id != IPC);
+        reply.headers.push(
+            Header::object(IPC, |e| {
+                e.string(if wrong_host { "other-host" } else { &a.host.id })?;
+                e.u32(if wrong_host {
+                    a.host.pid
+                } else {
+                    a.host.pid + 1
+                });
+                Ok(())
+            })
+            .unwrap(),
+        );
+        write_message(&mut peer.socket, &reply).await.unwrap();
+        disconnected(&server, &lease).await;
+        assert!(lease.take_lifecycle_reply().is_none());
+        assert_eq!(server.status(&lease).unwrap().loss, Some(Loss::Protocol));
+    }
+}
+
+#[tokio::test]
 async fn semantic_lifecycle_is_one_way_on_the_owned_session_and_allows_priority_reordering() {
     let server = server(LOCAL_LEASE_DURATION);
     let a = admission();

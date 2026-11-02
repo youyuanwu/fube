@@ -191,6 +191,9 @@ pub struct Node {
     last_error: Option<Error>,
     route: Option<Route>,
     held_reply: Option<ipc::LifecycleReply>,
+    rejected_reply: Option<ipc::LifecycleReply>,
+    #[cfg(feature = "qualification")]
+    hold_replies: bool,
 }
 impl Node {
     /// Takes an unstarted Activation and creates its dedicated RA executor.
@@ -244,6 +247,9 @@ impl Node {
             last_error: None,
             route: None,
             held_reply: None,
+            rejected_reply: None,
+            #[cfg(feature = "qualification")]
+            hold_replies: false,
         })
     }
     pub fn start(
@@ -303,6 +309,7 @@ impl Node {
             && self.retained_delivery.is_none()
             && stats.outstanding == 0
             && stats.effects == 0
+            && self.activation.deliveries_drained()
     }
 
     fn room(&self) -> bool {
@@ -365,6 +372,11 @@ impl Node {
             || body.service.partitions != 1
             || body.service.target != 1
             || body.service.minimum != 1
+            || body.unit.consistency.kind != 1
+            || !body.unit.consistency.name.is_empty()
+            || body.unit.consistency.low != 0
+            || body.unit.consistency.high != 0
+            || body.unit.consistency.id != body.unit.id
             || identity.code.package_sequence <= 0
         {
             return Err(Error::Unsupported);
@@ -399,7 +411,17 @@ impl Node {
         Ok(id)
     }
     pub fn close(&mut self, unit: PartitionId, mode: ra::CloseMode) -> Result<u64> {
-        if !self.live.load(Ordering::SeqCst)
+        // Withdrawal forbids new serving work, not the existing owner's native
+        // Drop after matching host retirement. Never decrement on process exit.
+        let cleanup = mode == ra::CloseMode::Drop
+            && self.activation.cleanup_status().logical_retired
+            && self.ra.snapshot(unit.guid.0).committed.is_some_and(|s| {
+                s.phase == ra::Phase::Opening
+                    && s.runtime.is_none()
+                    && s.usage
+                        .is_some_and(|id| self.usage.iter().any(|u| u.lookup == id))
+            });
+        if (!self.live.load(Ordering::SeqCst) && !cleanup)
             || !self.ra.consumer_lifetime().is_accepting()
             || !matches!(
                 mode,
@@ -523,6 +545,9 @@ impl Node {
                 error,
                 Error::Protocol | Error::Unsupported | Error::OwnerLost
             ) {
+                if self.rejected_reply.is_none() {
+                    self.rejected_reply = self.held_reply.take();
+                }
                 self.stop_admission();
             }
         }
@@ -558,7 +583,10 @@ impl Node {
         if self.room() {
             self.delivery()?;
         }
-        if self.pending.is_empty() && Instant::now() >= self.retry_at {
+        if self.live.load(Ordering::SeqCst)
+            && self.pending.is_empty()
+            && Instant::now() >= self.retry_at
+        {
             self.retry_at = Instant::now() + RETRY;
             if let Some(body) = &self.selected {
                 let state = self.ra.snapshot(body.unit.id.guid.0);
@@ -802,6 +830,15 @@ impl Node {
         Ok(())
     }
     fn reply(&mut self) -> Result<()> {
+        #[cfg(feature = "qualification")]
+        if self.hold_replies && self.held_reply.is_none() {
+            return Ok(());
+        }
+        // Retain first malformed input diagnostically without blocking required
+        // HostClosed/cleanup consumers after authority retirement.
+        if self.rejected_reply.is_some() {
+            return Ok(());
+        }
         let Some(route) = &self.route else {
             return Ok(());
         };
@@ -935,11 +972,34 @@ impl Node {
         self.activation.terminate().map_err(Into::into)
     }
     pub async fn close_executor(&self, budget: Duration) -> Result<()> {
-        if !self.quiescent() {
+        if !self.activation.producers_stopped() || !self.quiescent() {
             return Err(Error::Busy);
         }
         self.ra.close(budget).await?;
         Ok(())
+    }
+    /// Deliberate RA-owner failure injection, never a production shutdown API.
+    #[cfg(feature = "qualification")]
+    #[doc(hidden)]
+    pub async fn qualification_close_owner(&self, budget: Duration) -> Result<()> {
+        self.ra.close(budget).await?;
+        Ok(())
+    }
+    /// Qualification-only input replacement using an opaque real Entry token.
+    /// Production delivery still comes exclusively from Hosting's inbox.
+    #[cfg(feature = "qualification")]
+    #[doc(hidden)]
+    pub fn qualification_ingress(&mut self, reply: ipc::LifecycleReply) -> Result<()> {
+        if self.held_reply.is_some() || !self.room() {
+            return Err(Error::Capacity);
+        }
+        self.held_reply = Some(reply);
+        Ok(())
+    }
+    #[cfg(feature = "qualification")]
+    #[doc(hidden)]
+    pub fn qualification_hold_replies(&mut self, hold: bool) {
+        self.hold_replies = hold;
     }
 }
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {

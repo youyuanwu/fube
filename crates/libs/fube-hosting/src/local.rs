@@ -396,6 +396,16 @@ impl Activation {
             name: self.package.as_ref()?.service_type.clone(),
         })
     }
+    /// Stable source fence for the sole local owner. No session or declaration
+    /// operation can produce more IPC/core deliveries after this boundary.
+    pub fn producers_stopped(&self) -> bool {
+        self.started.is_none() || (self.server_stopped && self.cleanup.declarations_removed)
+    }
+    pub fn deliveries_drained(&self) -> bool {
+        self.registration
+            .as_ref()
+            .is_none_or(|owner| owner.has_deliveries() == Ok(false))
+    }
     /// Exact owned-session control, not a reconnect or callback capability.
     pub fn host_lease(&self) -> Option<ipc::HostLease> {
         self.lease.clone()
