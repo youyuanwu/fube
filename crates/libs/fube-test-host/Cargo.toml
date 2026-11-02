@@ -4,14 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+fube-local-host = { path = "../fube-local-host" }
 fube-hosting = { path = "../fube-hosting" }
 fube-node = { path = "../fube-node" }
 fube-ra = { path = "../fube-ra" }
 fube-ra-store = { path = "../fube-ra-store" }
 tokio.workspace = true
-libc = "0.2"
 fube-transport.workspace = true
-roxmltree = "0.21"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11"

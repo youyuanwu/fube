@@ -6,6 +6,7 @@ license = "MIT"
 description = "Bounded Hosting2 registration, residency and bootstrap-only local IPC leases"
 
 [dependencies]
+fube-local-host = { path = "../fube-local-host" }
 uuid.workspace = true
 fube-transport.workspace = true
 serde.workspace = true

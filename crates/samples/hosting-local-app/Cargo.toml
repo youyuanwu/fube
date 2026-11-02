@@ -1,0 +1,12 @@
+[package]
+name = "hosting-local-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fube-runtime.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+fube-hosting = { path = "../../libs/fube-hosting" }

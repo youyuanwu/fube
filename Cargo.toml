@@ -4,6 +4,7 @@ members = [
   "crates/libs/fube-transport",
   "crates/libs/fube-client",
   "crates/libs/fube-test-host",
+  "crates/libs/fube-local-host",
   "crates/libs/fube-rap-test-support",
   "crates/libs/fube-runtime",
   "crates/libs/fube-data",
@@ -14,6 +15,7 @@ members = [
   "crates/libs/fube-node",
   "crates/samples/stateless-test-app",
   "crates/samples/rust-runtime-app",
+  "crates/samples/hosting-local-app",
   "crates/samples/native-replicator-oracle",
   "crates/tools/fube-cli",
 ]

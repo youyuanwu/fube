@@ -104,6 +104,7 @@ mod host;
 mod identity;
 pub mod ipc;
 mod lease;
+pub mod local;
 mod lookup;
 mod model;
 mod residency;

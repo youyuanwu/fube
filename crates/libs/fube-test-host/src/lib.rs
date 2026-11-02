@@ -37,7 +37,14 @@ pub fn validate_manifest(
     application_name: &str,
     parameters: &[(String, String)],
 ) -> Result<()> {
-    manifest::Package::load(package_directory, application_name, parameters).map(|_| ())
+    manifest::Package::load(package_directory, application_name, parameters)
+        .map(|_| ())
+        .map_err(Into::into)
+}
+impl From<fube_local_host::HostError> for HostError {
+    fn from(value: fube_local_host::HostError) -> Self {
+        Self(value.0)
+    }
 }
 
 #[derive(Debug)]

@@ -10,6 +10,10 @@ Current contracts are a [breaking SF/mssf alignment](SfApiAlignment.md).
 The native outcomes later in this page are **dated historical evidence at their
 recorded source/profile**, not qualification of the changed whole implementation.
 No live/deployed qualification was run in the current alignment workflow.
+The separate [owned local Hosting profile](../cluster/HostingLocalActivation.md)
+now runs a minimal native-free stateless package through actual process/IPC
+registration and H2 teardown. It does not replace the native deployment profile
+or qualify production RA/RAP service callbacks.
 
 ## Qualified profile
 

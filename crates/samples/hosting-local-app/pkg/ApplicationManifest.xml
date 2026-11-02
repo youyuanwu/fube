@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ApplicationManifest xmlns="http://schemas.microsoft.com/2011/01/fabric" ApplicationTypeName="HostingLocalApp" ApplicationTypeVersion="1.0">
+  <Parameters><Parameter Name="Arguments" DefaultValue=""/></Parameters>
+  <ServiceManifestImport><ServiceManifestRef ServiceManifestName="LocalService" ServiceManifestVersion="1.0"/></ServiceManifestImport>
+  <DefaultServices>
+    <Service Name="Singleton" ServicePackageActivationMode="SharedProcess">
+      <StatelessService ServiceTypeName="LocalStatelessType" InstanceCount="1"><SingletonPartition/></StatelessService>
+    </Service>
+  </DefaultServices>
+</ApplicationManifest>
