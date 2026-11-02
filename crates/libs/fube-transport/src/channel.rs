@@ -211,6 +211,11 @@ pub trait MessageChannel: Send + Sync + 'static {
     /// or repeated closes share terminal state. A deadline bounds waiting, not
     /// cleanup itself: timeout/drop after initiation does not undo shutdown or
     /// prove disposal; a subsequent close can wait again.
+    /// The native channel preserves a started frame through completion or its
+    /// independent watchdog. Its separate concrete
+    /// [`GatewayChannel::dispose`](crate::native_channel::GatewayChannel::dispose)
+    /// operation instead irreversibly retires the whole socket, permitting
+    /// truncation; ordinary close/observer cancellation does not select it.
     ///
     /// All capabilities of this owned logical foundation observe closure;
     /// targets, caller-owned envelopes and unused reply contexts cannot keep

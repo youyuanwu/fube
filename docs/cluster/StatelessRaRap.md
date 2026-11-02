@@ -37,6 +37,12 @@ Only committed `RuntimeOpen`/`Close` effects send actor12 `ReplicaOpen`/
 replies are semantic **one-way** traffic; only RAPQuery uses correlation.
 Transport write success is not service success
 ([lookup/release/effects](../../crates/libs/fube-node/src/local.rs#L603-L831)).
+Accepted IPC establishment/envelope policy belongs to `native_ipc`, not a
+Hosting mode in the shared channel. Hosting retains admission and lease
+authority and explicitly invokes whole-socket disposal when retiring a
+connection, so a backpressured uncertain reply cannot delay withdrawal or be
+reused. Ordinary channel abort/close still retains a started suffix; neither
+local write nor physical socket disposal is an RA/RAP semantic acknowledgment.
 
 Hosting privately constructs reply provenance from the exact admitted host/PID/
 connection. The adapter checks that source and captured runtime, then RA applies

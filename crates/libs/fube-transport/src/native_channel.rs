@@ -688,12 +688,15 @@ impl GatewayChannel {
         })
     }
 
-    /// Initiate irreversible bounded shutdown without awaiting driver exit.
+    /// Stop admission and initiate ordinary shutdown without awaiting driver exit.
+    ///
+    /// A started frame retains its suffix until completion or its independent
+    /// watchdog. Use [`Self::dispose`] only to retire the entire socket instead.
     pub fn abort(&self) {
         self.abort_with_error(Error::Closed);
     }
 
-    /// Initiate shutdown retaining the first terminal cause.
+    /// Initiate ordinary shutdown retaining the first terminal cause.
     pub fn abort_with_error(&self, error: Error) {
         self.owner.shared.terminate(error);
     }
