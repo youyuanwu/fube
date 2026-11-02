@@ -389,4 +389,17 @@ pub trait ReplyContext: Send + 'static {
     /// do not assume it came from the inbound TimeoutHeader. A terminal
     /// foundation returns Closed without sending, even for a retained context.
     fn reply(self: Box<Self>, message: Message, deadline: Instant) -> ChannelFuture<'static, ()>;
+
+    /// Consume an attempt with a bounded nonblocking pre-positive-write check.
+    ///
+    /// This is distinct from envelope authorization. Implementations without
+    /// this mechanism reject explicitly rather than silently ignoring a fence.
+    fn reply_fenced(
+        self: Box<Self>,
+        _message: Message,
+        _deadline: Instant,
+        _valid: crate::native_channel::WritePredicate,
+    ) -> ChannelFuture<'static, ()> {
+        Box::pin(async { Err(crate::Error::InvalidInput("fenced reply unsupported")) })
+    }
 }
