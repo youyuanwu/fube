@@ -134,6 +134,319 @@ fn ack(
     }
 }
 
+#[test]
+fn semantic_ack_decoder_preserves_full_legacy_invalid_matrix_and_remote_codes() {
+    use fube_transport::message::{
+        ACTION, ACTOR, CLIENT_VERSION, EXPECTS_REPLY, IPC, UNCORRELATED_REPLY,
+    };
+    for case in 0..30 {
+        let mut invalid = ack([3; 16], 25, Some(u64::MAX), 4, None);
+        match case {
+            0 => invalid.headers[0] = Header::actor(26).unwrap(),
+            1 => invalid.headers[0] = Header::actor(5).unwrap(),
+            2 => invalid.headers[1] = Header::action("OtherAction").unwrap(),
+            3 => invalid
+                .headers
+                .push(Header::boolean(UNCORRELATED_REPLY, true).unwrap()),
+            4 => invalid
+                .headers
+                .push(Header::boolean(EXPECTS_REPLY, true).unwrap()),
+            5 => invalid.headers.push(
+                Header::relates_to(MessageId {
+                    guid: [3; 16],
+                    index: 7,
+                })
+                .unwrap(),
+            ),
+            6 => invalid.headers.retain(|h| h.id != CLIENT_VERSION),
+            7 => invalid.headers[3] = Header::version(1, 1).unwrap(),
+            8 => invalid.headers.retain(|h| h.id != ACTIVITY),
+            9 => invalid.headers[2] = Header::activity([0; 16]).unwrap(),
+            10 => invalid.headers.push(invalid.headers[2].clone()),
+            11 => invalid.body = vec![0],
+            12 => invalid.headers[4].value = vec![0],
+            13 => {
+                invalid.headers[1] = Header::action("ClientOperationFailure").unwrap();
+                invalid.body = failure(0);
+            }
+            14 => invalid.headers[0] = Header::actor(27).unwrap(),
+            15 => invalid.headers.retain(|h| h.id != ACTOR),
+            16 => invalid.headers.retain(|h| h.id != ACTION),
+            17 => invalid.headers.retain(|h| h.id != wire::FILE_SEQUENCE),
+            18 => {
+                invalid.headers[2] = Header::object(ACTIVITY, |e| {
+                    e.object(|e| {
+                        e.guid(&[3; 16]);
+                        e.u64(1);
+                        Ok(())
+                    })
+                })
+                .unwrap()
+            }
+            19 => {
+                invalid.headers[4] = Header::object(wire::FILE_SEQUENCE, |e| {
+                    e.u64(0);
+                    e.boolean(true);
+                    e.u64(4);
+                    Ok(())
+                })
+                .unwrap()
+            }
+            20 => {
+                invalid.headers[1] = Header::action("ClientOperationFailure").unwrap();
+                invalid.body = vec![0];
+            }
+            21 => {
+                invalid.headers[1] = Header::action("ClientOperationFailure").unwrap();
+                invalid.body = failure(-1);
+                invalid.body.push(0);
+            }
+            22 | 23 => {
+                invalid.headers[1] = Header::action("ClientOperationFailure").unwrap();
+                invalid.body = failure(if case == 22 { i64::MAX } else { i64::MIN });
+            }
+            24 => invalid.headers.push(Header {
+                id: IPC,
+                value: vec![0],
+            }),
+            25 => invalid.headers.push(invalid.headers[3].clone()),
+            26 => invalid.headers.push(invalid.headers[4].clone()),
+            27 => invalid.headers.push(invalid.headers[0].clone()),
+            28 => invalid.headers.push(invalid.headers[1].clone()),
+            29 => invalid.headers[3] = Header::version(2, 2).unwrap(),
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(wire::decode_reply(&invalid), Err(Error::Protocol(_))),
+            "{case}"
+        );
+    }
+    for actor in [25, 27] {
+        let sequence = (actor == 25).then_some(0);
+        wire::decode_reply(&ack([3; 16], actor, sequence, 4, None))
+            .unwrap()
+            .result
+            .unwrap();
+        for code in [-2147017534, 1, i32::MAX as i64, i32::MIN as i64] {
+            assert!(matches!(
+                wire::decode_reply(&ack([3; 16], actor, sequence, 4, Some(code)))
+                    .unwrap().result,
+                Err(Error::Remote { code: actual, .. }) if actual == code
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn upload_endpoint_profile_rejects_nonloopback_zero_port_and_hostname() {
+    for address in [
+        "192.0.2.1:19000",
+        "[2001:db8::1]:19000",
+        "127.0.0.1:0",
+        "[::1]:0",
+    ] {
+        assert!(matches!(
+            ImageStoreClient::connect_clear(address.parse().unwrap(), Duration::from_secs(1)).await,
+            Err(Error::InvalidInput(_))
+        ));
+    }
+    assert!("localhost:19000".parse::<SocketAddr>().is_err());
+    let (client, _peer) = connected().await;
+    client.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn retained_terminal_cause_wins_over_queued_success_and_repeated_teardown() {
+    let (mut client, mut peer) = connected().await;
+    write_message(&mut peer, &ack([3; 16], 25, Some(u64::MAX), 4, None))
+        .await
+        .unwrap();
+    write_message(
+        &mut peer,
+        &Message::listen_instance(
+            MessageId {
+                guid: [8; 16],
+                index: 1,
+            },
+            &ListenInstance {
+                instance: 41,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    timeout_at(Instant::now() + Duration::from_secs(1), async {
+        while client.channel.remote_instance().instance != 41 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    client.channel.abort_with_error(Error::Timeout);
+    assert!(matches!(
+        client
+            .receive(
+                [3; 16],
+                Stage::Create,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .await,
+        Err(Error::Timeout)
+    ));
+    client.close().await.unwrap();
+    client.close().await.unwrap();
+    assert!(matches!(client.terminal_error(), Some(Error::Timeout)));
+    assert!(read_message(&mut peer).await.is_err());
+}
+
+#[tokio::test]
+async fn actor26_upload_does_not_consume_ordinary_id_history_or_authorize_rpc() {
+    let (client, mut peer) = connected().await;
+    let server = tokio::spawn(async move {
+        for _ in 0..4100 {
+            let message = read_message(&mut peer).await.unwrap();
+            let properties = message.properties().unwrap();
+            assert_eq!(properties.actor, 26);
+            assert_eq!(properties.id, MessageId::default());
+            assert_eq!(properties.relates_to, MessageId::default());
+            assert!(!properties.expects_reply && !properties.uncorrelated_reply);
+        }
+        assert!(read_message(&mut peer).await.is_err());
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for _ in 0..4100 {
+        client
+            .send("FileUploadCommitAck", [3; 16], vec![], vec![], deadline)
+            .await
+            .unwrap();
+    }
+    assert!(!client.is_closed());
+    client.close().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_upload_retires_only_its_owned_socket_not_query_or_notification_sessions() {
+    for profile in [GatewayProfile::Ordinary, GatewayProfile::Notifications] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let other_peer = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            read_message(&mut peer).await.unwrap();
+            write_message(
+                &mut peer,
+                &Message::listen_instance(
+                    MessageId {
+                        guid: [7; 16],
+                        index: 1,
+                    },
+                    &ListenInstance::default(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            peer
+        });
+        let channel = GatewayChannel::connect_unsecured_loopback(
+            endpoint,
+            profile,
+            ChannelLimits::default(),
+            Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        let target = channel.resolve_target(&endpoint.to_string()).unwrap();
+        let mut other_peer = other_peer.await.unwrap();
+        let (mut upload, mut upload_peer) = connected().await;
+        let package = Package::new();
+        let mut copy = Box::pin(upload.copy_application_package(&package.0, "pkg", None));
+        tokio::select! {
+            result = &mut copy => panic!("premature upload result {result:?}"),
+            _ = delete_request(&mut upload_peer, "pkg") => {},
+        }
+        drop(copy);
+        assert!(upload.is_closed());
+        upload.close().await.unwrap();
+        assert!(matches!(upload.terminal_error(), Some(Error::Closed)));
+        assert!(read_message(&mut upload_peer).await.is_err());
+        assert!(channel.terminal_error().is_none());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        if profile == GatewayProfile::Ordinary {
+            let mut query = channel.request(
+                &target,
+                Message {
+                    headers: vec![
+                        Header::actor(5).unwrap(),
+                        Header::action("QueryRequest").unwrap(),
+                    ],
+                    body: vec![],
+                },
+                deadline,
+            );
+            tokio::select! {
+                result = &mut query => panic!("premature ordinary result {result:?}"),
+                request = read_message(&mut other_peer) => {
+                    let request = request.unwrap();
+                    write_message(&mut other_peer, &Message {
+                        headers: vec![
+                            Header::actor(5).unwrap(), Header::action("QueryReply").unwrap(),
+                            Header::relates_to(request.properties().unwrap().id).unwrap(),
+                        ], body: vec![1],
+                    }).await.unwrap();
+                },
+            }
+            assert_eq!(query.await.unwrap().body, vec![1]);
+        } else {
+            let receiver = channel.receiver().unwrap();
+            write_message(
+                &mut other_peer,
+                &Message {
+                    headers: vec![
+                        Header::actor(5).unwrap(),
+                        Header::action("ServiceNotificationRequest").unwrap(),
+                        Header::message_id(MessageId {
+                            guid: [6; 16],
+                            index: 2,
+                        })
+                        .unwrap(),
+                        Header::boolean(fube_transport::message::EXPECTS_REPLY, true).unwrap(),
+                        Header::boolean(fube_transport::message::UNCORRELATED_REPLY, true).unwrap(),
+                    ],
+                    body: vec![],
+                },
+            )
+            .await
+            .unwrap();
+            let incoming = receiver.receive(deadline).await.unwrap();
+            assert!(incoming.reply.is_some());
+            let reply = incoming.reply.unwrap().reply(
+                Message {
+                    headers: vec![
+                        Header::actor(5).unwrap(),
+                        Header::action("ServiceNotificationReply").unwrap(),
+                    ],
+                    body: vec![],
+                },
+                deadline,
+            );
+            let (result, sent) = tokio::join!(reply, read_message(&mut other_peer));
+            result.unwrap();
+            assert_eq!(
+                sent.unwrap().properties().unwrap().relates_to,
+                MessageId {
+                    guid: [6; 16],
+                    index: 2
+                }
+            );
+        }
+        assert!(channel.terminal_error().is_none());
+        channel.close(deadline).await.unwrap();
+    }
+}
+
 async fn delete_request(peer: &mut TcpStream, path: &str) -> Message {
     let request = read_message(peer).await.unwrap();
     let p = request.properties().unwrap();
@@ -214,6 +527,10 @@ async fn delete_success(peer: &mut TcpStream, path: &str, missing: bool) {
 }
 
 fn created(message: &Message) -> (String, u64) {
+    let properties = message.properties().unwrap();
+    assert_eq!(properties.actor, 26);
+    assert_eq!(properties.id, MessageId::default());
+    assert_eq!(properties.relates_to, MessageId::default());
     assert_eq!(message.properties().unwrap().actor, 26);
     assert_eq!(message.properties().unwrap().action, "FileCreate");
     assert!(!message.properties().unwrap().expects_reply);

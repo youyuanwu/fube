@@ -12,7 +12,8 @@ use fube_transport::{
     connection::{deadline_after, MAX_FRAME_TIME},
     message::{Header, Message, HIGH_PRIORITY},
     native_channel::{
-        ChannelLimits, GatewayChannel, GatewayReceiver, GatewayTarget, RequestCancellation,
+        ChannelLimits, GatewayChannel, GatewayProfile, GatewayReceiver, GatewayTarget,
+        RequestCancellation,
     },
     serialization::serde::{to_vec, CountedValues, ObjectArray, Pointer},
 };
@@ -259,7 +260,7 @@ impl ServiceNotificationClient {
         let (pages, incoming) = mpsc::channel(MAX_PAGES);
         let channel = GatewayChannel::connect_unsecured_loopback(
             endpoint,
-            true,
+            GatewayProfile::Notifications,
             notification_limits(),
             deadline,
         )

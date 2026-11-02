@@ -167,7 +167,7 @@ async fn session() -> (Arc<Session>, mpsc::Receiver<Cleanup>, tokio::net::TcpStr
     });
     let channel = GatewayChannel::connect_unsecured_loopback(
         address,
-        true,
+        GatewayProfile::Notifications,
         notification_limits(),
         deadline_after(Duration::from_secs(3)).unwrap(),
     )

@@ -5,10 +5,11 @@
 //! foundation, **not** an `IFabricTransport` application-service API or an SF ABI.
 //! [`GatewayChannel`](crate::native_channel::GatewayChannel) implements raw/RPC
 //! and owned shutdown; its opted-in receiver and consuming context implement
-//! authorized native notification ingress/replies. This is not a general
-//! listener/IPC/upload/replication or secure transport implementation.
+//! authorized native notification ingress/replies. Its exclusive upload profile
+//! provides actor26 raw sends and bounded actor25/27 ingress without replies.
+//! This is not a general listener/IPC/replication or secure transport implementation.
 //! [`Connection`](crate::connection::Connection) does not implement these traits;
-//! its behavior, security limits and explicit roles remain unchanged.
+//! its unrelated IPC/reverse behavior and security limits remain unchanged.
 //!
 //! # Native component boundary (source facts)
 //!

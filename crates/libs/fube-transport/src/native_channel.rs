@@ -1,11 +1,11 @@
 //! Operational, owned native NamingGateway channels for unsecured loopback development.
 //!
 //! This is a separate backend for [`crate::channel`], not an adapter around
-//! Connection's envelope-building APIs. Only actor-5 outbound messages and
-//! ordinary gateway completions are supported. Explicit notification opt-in
-//! additionally authorizes native `ServiceNotificationRequest` envelopes and
-//! consuming `ServiceNotificationReply` capabilities. No listener, arbitrary
-//! reverse RPC, IPC, upload, replication, TLS, reconnect or replay is supplied.
+//! Connection's envelope-building APIs. Concrete profiles authorize ordinary
+//! gateway traffic, notifications with consuming reply capabilities, or upload
+//! one-way traffic with bounded raw acknowledgements and no reply capability.
+//! No listener, arbitrary reverse RPC, IPC, replication, TLS, reconnect or replay
+//! is supplied.
 //!
 //! Clear loopback is an explicit trust assumption, not authentication of local
 //! processes. Domain headers/body, including TimeoutHeader, remain caller-owned.
@@ -46,6 +46,17 @@ const REPLY: usize = 1;
 const INGRESS: usize = 2;
 const RECEIVE: usize = 3;
 const CLOSE: usize = 4;
+
+/// Exclusive envelope authority for one established gateway socket.
+///
+/// Upload semantics (actions, codecs and acknowledgement correlation) remain
+/// caller-owned. Upload ingress never grants ordinary or notification replies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayProfile {
+    Ordinary,
+    Notifications,
+    Upload,
+}
 
 /// Immutable finite limits, validated before connection establishment.
 ///
@@ -232,7 +243,7 @@ impl RequestCancellation {
 
 struct Ingress {
     message: Message,
-    id: MessageId,
+    reply_id: Option<MessageId>,
     _lease: Arc<Lease>,
 }
 
@@ -254,7 +265,7 @@ struct Shared {
     inner: Mutex<Inner>,
     budget: Arc<Budget>,
     target: Arc<GatewayTarget>,
-    notifications: bool,
+    profile: GatewayProfile,
     process_id: [u8; 16],
     changed: Notify,
     stop: Notify,
@@ -335,7 +346,7 @@ pub struct GatewayChannel {
     owner: Arc<Owner>,
 }
 
-/// Nonowning authorized pull capability, minted only by notification opt-in.
+/// Nonowning authorized pull capability for notification or upload ingress.
 #[derive(Clone)]
 pub struct GatewayReceiver {
     shared: Weak<Shared>,
@@ -375,12 +386,12 @@ impl ExactSizeIterator for GatewayIngressSnapshot {}
 impl GatewayChannel {
     /// Connect a dedicated, explicitly trusted unsecured-development gateway.
     ///
-    /// Only numeric loopback endpoints are allowed. `notifications` authorizes
-    /// the exact native notification protocol, not arbitrary reverse requests.
+    /// Only numeric loopback endpoints are allowed. The selected profile grants
+    /// concrete envelope authority, never arbitrary reverse requests.
     /// One deadline includes TCP connect and the ListenInstance exchange.
     pub async fn connect_unsecured_loopback(
         endpoint: SocketAddr,
-        notifications: bool,
+        profile: GatewayProfile,
         limits: ChannelLimits,
         deadline: Instant,
     ) -> Result<Self> {
@@ -414,19 +425,14 @@ impl GatewayChannel {
         .map_err(|_| Error::Timeout)??;
         check_deadline(deadline)?;
         Ok(Self::start(
-            stream,
-            endpoint,
-            notifications,
-            limits,
-            process_id,
-            remote,
+            stream, endpoint, profile, limits, process_id, remote,
         ))
     }
 
     fn start<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         stream: S,
         endpoint: SocketAddr,
-        notifications: bool,
+        profile: GatewayProfile,
         limits: ChannelLimits,
         process_id: [u8; 16],
         remote: ListenInstance,
@@ -456,7 +462,7 @@ impl GatewayChannel {
                 identity: Arc::new(()),
                 address: endpoint,
             }),
-            notifications,
+            profile,
             process_id,
             changed: Notify::new(),
             stop: Notify::new(),
@@ -476,8 +482,8 @@ impl GatewayChannel {
         if self.owner.shared.error().is_some() {
             return Err(Error::Closed);
         }
-        if !self.owner.shared.notifications {
-            return Err(Error::InvalidInput("notification ingress is not enabled"));
+        if self.owner.shared.profile == GatewayProfile::Ordinary {
+            return Err(Error::InvalidInput("gateway ingress is not enabled"));
         }
         Ok(GatewayReceiver {
             shared: Arc::downgrade(&self.owner.shared),
@@ -632,10 +638,23 @@ fn has(message: &Message, id: u16) -> bool {
     message.headers.iter().any(|header| header.id == id)
 }
 
-fn domain_gateway(message: &Message, props: &Properties) -> Result<()> {
-    if props.actor != 5 || props.action.is_empty() || has(message, message::IPC) {
+fn domain_gateway(
+    message: &Message,
+    props: &Properties,
+    profile: GatewayProfile,
+    submission: &Submission,
+) -> Result<()> {
+    let authorized = match profile {
+        GatewayProfile::Ordinary | GatewayProfile::Notifications => props.actor == 5,
+        GatewayProfile::Upload => match submission {
+            Submission::Raw => props.actor == 26,
+            Submission::Rpc => props.actor == 5,
+            Submission::Reply(_) => false,
+        },
+    };
+    if !authorized || props.action.is_empty() || has(message, message::IPC) {
         return Err(Error::InvalidInput(
-            "only native actor-5 gateway domain messages are authorized",
+            "native gateway profile does not authorize this submission",
         ));
     }
     Ok(())
@@ -728,7 +747,7 @@ async fn submit(
     }
     allocation_check(&message, shared.budget.limits)?;
     let props = envelope(&message, false).map_err(local)?;
-    domain_gateway(&message, &props)?;
+    domain_gateway(&message, &props, shared.profile, &submission)?;
     let rpc = matches!(submission, Submission::Rpc);
     let class = if matches!(submission, Submission::Reply(_)) {
         REPLY
@@ -995,11 +1014,13 @@ impl GatewayReceiver {
         IncomingMessage {
             message: ingress.message,
             source: shared.target.clone(),
-            reply: Some(Box::new(NotificationReply {
-                shared: Arc::downgrade(shared),
-                target: shared.target.clone(),
-                id: ingress.id,
-            })),
+            reply: ingress.reply_id.map(|id| {
+                Box::new(NotificationReply {
+                    shared: Arc::downgrade(shared),
+                    target: shared.target.clone(),
+                    id,
+                }) as Box<dyn ReplyContext>
+            }),
         }
     }
 
@@ -1111,8 +1132,33 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
                 "unsupported role/security/reconnect control; no recovery",
             ));
         }
+        if matches!(props.actor, 25 | 27) {
+            if shared.profile != GatewayProfile::Upload
+                || props.action.is_empty()
+                || props.relates_to != MessageId::default()
+                || props.expects_reply
+                || props.uncorrelated_reply
+                || props.fault.is_some()
+                || has(&message, message::IPC)
+            {
+                return Err(Error::Protocol("unauthorized native upload envelope"));
+            }
+            let lease = shared.budget.reserve(INGRESS)?;
+            let mut inner = shared.inner.lock().unwrap();
+            if inner.terminal.is_some() {
+                return Err(Error::Closed);
+            }
+            inner.ingress.push_back(Ingress {
+                message,
+                reply_id: None,
+                _lease: lease,
+            });
+            drop(inner);
+            shared.changed.notify_waiters();
+            continue;
+        }
         if props.uncorrelated_reply {
-            if !shared.notifications
+            if shared.profile != GatewayProfile::Notifications
                 || props.actor != 5
                 || props.action != "ServiceNotificationRequest"
                 || props.id == MessageId::default()
@@ -1138,7 +1184,7 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
                 })?;
             inner.ingress.push_back(Ingress {
                 message,
-                id: props.id,
+                reply_id: Some(props.id),
                 _lease: lease,
             });
             drop(inner);

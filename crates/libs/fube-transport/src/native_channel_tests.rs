@@ -38,12 +38,28 @@ fn pair(
     notifications: bool,
     limits: ChannelLimits,
 ) -> (GatewayChannel, DuplexStream) {
+    profile_pair(
+        capacity,
+        if notifications {
+            GatewayProfile::Notifications
+        } else {
+            GatewayProfile::Ordinary
+        },
+        limits,
+    )
+}
+
+fn profile_pair(
+    capacity: usize,
+    profile: GatewayProfile,
+    limits: ChannelLimits,
+) -> (GatewayChannel, DuplexStream) {
     static INDEX: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
     let (stream, peer) = duplex(capacity);
     let channel = GatewayChannel::start(
         stream,
         "127.0.0.1:19000".parse().unwrap(),
-        notifications,
+        profile,
         limits,
         {
             // Distinct from the constant-byte synthetic notification/peer IDs,
@@ -108,6 +124,274 @@ async fn until(mut predicate: impl FnMut() -> bool) {
 
 fn count(channel: &GatewayChannel, class: usize) -> usize {
     channel.owner.shared.budget.usage.lock().unwrap().counts[class]
+}
+
+fn upload_message(actor: i64) -> Message {
+    Message {
+        headers: vec![
+            Header::actor(actor).unwrap(),
+            Header::action("CallerOwnedDomainAction").unwrap(),
+        ],
+        // Deliberately not an upload codec: transport owns only the envelope.
+        body: vec![9, 8, 7],
+    }
+}
+
+#[tokio::test]
+async fn upload_raw_actors_preserve_envelopes_source_and_never_mint_reply_authority() {
+    let (channel, mut peer) = profile_pair(8192, GatewayProfile::Upload, limits());
+    let target = target(&channel);
+    let receiver = channel.receiver().unwrap();
+    let mut sending = channel.send_one_way(&target, upload_message(26), deadline());
+    pending(sending.as_mut()).await;
+    assert_eq!(read_message(&mut peer).await.unwrap(), upload_message(26));
+    sending.await.unwrap();
+    let history = channel.owner.shared.inner.lock().unwrap().history.len();
+    for actor in [25, 27] {
+        for id in [
+            None,
+            Some(MessageId {
+                guid: [44; 16],
+                index: 3,
+            }),
+        ] {
+            let mut ack = upload_message(actor);
+            if let Some(id) = id {
+                ack.headers.push(Header::message_id(id).unwrap());
+            }
+            write_message(&mut peer, &ack).await.unwrap();
+            let incoming = receiver.receive(deadline()).await.unwrap();
+            assert_eq!(incoming.message, ack);
+            assert!(Arc::ptr_eq(&incoming.source, &target));
+            assert!(incoming.reply.is_none());
+        }
+    }
+    assert_eq!(
+        channel.owner.shared.inner.lock().unwrap().history.len(),
+        history
+    );
+    channel.close(deadline()).await.unwrap();
+    assert_eq!(count(&channel, INGRESS), 0);
+}
+
+#[tokio::test]
+async fn upload_submission_authority_is_exclusive_lazy_and_source_bound() {
+    let (channel, mut peer) = profile_pair(8192, GatewayProfile::Upload, limits());
+    let target = target(&channel);
+    let (neighbor, _neighbor_peer) = profile_pair(8192, GatewayProfile::Upload, limits());
+    let foreign = self::target(&neighbor);
+    let mut invalid = channel.send_one_way(&foreign, upload_message(26), deadline());
+    assert_eq!(count(&channel, ORDINARY), 0);
+    assert!(matches!(
+        invalid.as_mut().await,
+        Err(Error::InvalidInput(_))
+    ));
+    for message in [
+        msg("WrongRawActor", vec![]),
+        upload_message(25),
+        upload_message(27),
+    ] {
+        assert!(matches!(
+            channel.send_one_way(&target, message, deadline()).await,
+            Err(Error::InvalidInput(_))
+        ));
+    }
+    assert!(matches!(
+        channel
+            .request(&target, upload_message(26), deadline())
+            .await,
+        Err(Error::InvalidInput(_))
+    ));
+    for id in [message::EXPECTS_REPLY, message::UNCORRELATED_REPLY] {
+        let mut message = upload_message(26);
+        message.headers.push(Header::boolean(id, true).unwrap());
+        assert!(matches!(
+            channel.send_one_way(&target, message, deadline()).await,
+            Err(Error::InvalidInput(_))
+        ));
+    }
+    let mut fabricated = upload_message(26);
+    fabricated.headers.push(
+        Header::relates_to(MessageId {
+            guid: [6; 16],
+            index: 1,
+        })
+        .unwrap(),
+    );
+    assert!(matches!(
+        channel.send_one_way(&target, fabricated, deadline()).await,
+        Err(Error::InvalidInput(_))
+    ));
+    let mut rpc = channel.request(&target, msg("ForwardMessage", vec![]), deadline());
+    pending(rpc.as_mut()).await;
+    let request = read_message(&mut peer).await.unwrap();
+    assert!(request.properties().unwrap().expects_reply);
+    write_message(&mut peer, &reply(request.properties().unwrap().id, vec![5]))
+        .await
+        .unwrap();
+    assert_eq!(rpc.await.unwrap().body, vec![5]);
+    assert_eq!(count(&channel, ORDINARY), 0);
+    channel.close(deadline()).await.unwrap();
+    neighbor.close(deadline()).await.unwrap();
+}
+
+#[tokio::test]
+async fn upload_ack_authority_cannot_fall_through_to_ordinary_correlation() {
+    for actor in [25, 27] {
+        for variant in 0..7 {
+            let (channel, mut peer) = profile_pair(8192, GatewayProfile::Upload, limits());
+            let target = target(&channel);
+            let mut rpc = channel.request(&target, msg("ForwardMessage", vec![]), deadline());
+            pending(rpc.as_mut()).await;
+            let request = read_message(&mut peer).await.unwrap();
+            let mut ack = upload_message(actor);
+            match variant {
+                0 => ack
+                    .headers
+                    .push(Header::relates_to(request.properties().unwrap().id).unwrap()),
+                1 => ack
+                    .headers
+                    .push(Header::boolean(message::EXPECTS_REPLY, true).unwrap()),
+                2 => ack
+                    .headers
+                    .push(Header::boolean(message::UNCORRELATED_REPLY, true).unwrap()),
+                3 => ack.headers.push(
+                    Header::object(message::FAULT, |e| {
+                        e.i64(0);
+                        e.boolean(false);
+                        Ok(())
+                    })
+                    .unwrap(),
+                ),
+                4 => ack.headers.push(Header {
+                    id: message::IPC,
+                    value: vec![0],
+                }),
+                5 => ack.headers.push(Header::actor(actor).unwrap()),
+                6 => {
+                    ack.headers.retain(|h| h.id != message::ACTION);
+                    ack.headers.push(Header::action("").unwrap());
+                }
+                _ => unreachable!(),
+            }
+            write_message(&mut peer, &ack).await.unwrap();
+            assert!(matches!(rpc.await, Err(Error::Protocol(_))));
+            assert!(matches!(channel.terminal_error(), Some(Error::Protocol(_))));
+            channel.close(deadline()).await.unwrap();
+        }
+    }
+    for profile in [GatewayProfile::Ordinary, GatewayProfile::Notifications] {
+        for actor in [25, 27] {
+            let (channel, mut peer) = profile_pair(8192, profile, limits());
+            write_message(&mut peer, &upload_message(actor))
+                .await
+                .unwrap();
+            until(|| channel.terminal_error().is_some()).await;
+            assert!(matches!(channel.terminal_error(), Some(Error::Protocol(_))));
+            channel.close(deadline()).await.unwrap();
+        }
+    }
+    let (channel, mut peer) = profile_pair(8192, GatewayProfile::Upload, limits());
+    write_message(&mut peer, &notification(1)).await.unwrap();
+    until(|| channel.terminal_error().is_some()).await;
+    assert!(matches!(channel.terminal_error(), Some(Error::Protocol(_))));
+    channel.close(deadline()).await.unwrap();
+}
+
+#[tokio::test]
+async fn upload_ingress_count_bytes_snapshot_and_control_progress_are_bounded() {
+    for bytes_exhausted in [false, true] {
+        let mut profile = limits();
+        profile.max_ingress = if bytes_exhausted { 4 } else { 2 };
+        if bytes_exhausted {
+            profile.max_retained_bytes = 2 * profile.slot_bytes().unwrap() + 512;
+        }
+        let (channel, mut peer) = profile_pair(8192, GatewayProfile::Upload, profile);
+        let receiver = channel.receiver().unwrap();
+        for actor in [25, 27] {
+            write_message(&mut peer, &upload_message(actor))
+                .await
+                .unwrap();
+        }
+        until(|| count(&channel, INGRESS) == 2).await;
+        let mut snapshot = receiver.drain_pending().unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(count(&channel, INGRESS), 2);
+        let control = Message::listen_instance(
+            MessageId {
+                guid: [9; 16],
+                index: 4,
+            },
+            &ListenInstance {
+                instance: 99,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        write_message(&mut peer, &control).await.unwrap();
+        until(|| channel.remote_instance().instance == 99).await;
+        // Removed from the queue does not mean the snapshot's leases are free.
+        write_message(&mut peer, &upload_message(25)).await.unwrap();
+        until(|| channel.terminal_error().is_some()).await;
+        assert!(matches!(
+            channel.terminal_error(),
+            Some(Error::ResourceLimit(_))
+        ));
+        assert_eq!(count(&channel, INGRESS), 2);
+        assert!(snapshot.next().unwrap().reply.is_none());
+        assert_eq!(count(&channel, INGRESS), 1);
+        drop(snapshot);
+        assert_eq!(count(&channel, INGRESS), 0);
+        channel.close(deadline()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn upload_full_ingress_does_not_block_already_reserved_rpc() {
+    let mut profile = limits();
+    profile.max_ingress = 1;
+    let (channel, mut peer) = profile_pair(8192, GatewayProfile::Upload, profile);
+    let target = target(&channel);
+    let mut rpc = channel.request(&target, msg("ForwardMessage", vec![]), deadline());
+    pending(rpc.as_mut()).await;
+    let request = read_message(&mut peer).await.unwrap();
+    write_message(&mut peer, &upload_message(25)).await.unwrap();
+    until(|| count(&channel, INGRESS) == 1).await;
+    write_message(&mut peer, &reply(request.properties().unwrap().id, vec![1]))
+        .await
+        .unwrap();
+    assert_eq!(rpc.await.unwrap().body, vec![1]);
+    assert_eq!(count(&channel, INGRESS), 1);
+    channel.close(deadline()).await.unwrap();
+}
+
+#[tokio::test]
+async fn upload_partial_write_retains_suffix_reservation_and_first_terminal_cause() {
+    let (channel, mut peer) = profile_pair(12, GatewayProfile::Upload, limits());
+    let target = target(&channel);
+    let message = upload_message(26);
+    let mut sending = channel.send_one_way(&target, message.clone(), deadline());
+    pending(sending.as_mut()).await;
+    let mut fixed = [0; FIXED_HEADER_SIZE];
+    peer.read_exact(&mut fixed).await.unwrap();
+    drop(sending);
+    channel.abort_with_error(Error::Timeout);
+    channel.abort_with_error(Error::Closed);
+    assert_eq!(count(&channel, ORDINARY), 1);
+    let size = validate_fixed(&fixed).unwrap().0;
+    let mut frame = vec![0; size];
+    frame[..FIXED_HEADER_SIZE].copy_from_slice(&fixed);
+    peer.read_exact(&mut frame[FIXED_HEADER_SIZE..])
+        .await
+        .unwrap();
+    assert_eq!(
+        Message::from_frame(Frame::decode(&frame).unwrap()).unwrap(),
+        message
+    );
+    channel.closed(deadline()).await.unwrap();
+    assert!(matches!(channel.terminal_error(), Some(Error::Timeout)));
+    assert_eq!(count(&channel, ORDINARY), 0);
+    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -1202,7 +1486,7 @@ async fn connection_establishment_enforces_profile_and_rejects_oversized_frame_b
     assert!(matches!(
         GatewayChannel::connect_unsecured_loopback(
             "192.0.2.1:19000".parse().unwrap(),
-            false,
+            GatewayProfile::Ordinary,
             limits(),
             deadline()
         )
@@ -1241,9 +1525,14 @@ async fn connection_establishment_enforces_profile_and_rejects_oversized_frame_b
         let mut eof = [0; 1];
         assert_eq!(stream.read(&mut eof).await.unwrap(), 0);
     });
-    let channel = GatewayChannel::connect_unsecured_loopback(endpoint, false, limits(), deadline())
-        .await
-        .unwrap();
+    let channel = GatewayChannel::connect_unsecured_loopback(
+        endpoint,
+        GatewayProfile::Ordinary,
+        limits(),
+        deadline(),
+    )
+    .await
+    .unwrap();
     assert_eq!(channel.remote_instance().instance, 33);
     until(|| channel.terminal_error().is_some()).await;
     assert!(matches!(

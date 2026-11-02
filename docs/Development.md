@@ -168,8 +168,10 @@ container-side package copy. The destination is the local directory's final
 name. The timeout is in seconds and bounds the whole CLI operation, including
 connection establishment. Native AtomicCopy replaces the destination directory
 and publishes completion markers after its contents; failure is not rollback.
-Only native `fabric:ImageStore` on an explicitly unsecured development cluster
-is supported. See [Rust FabricClient](transport/RustFabricClient.md) for the
+Only native `fabric:ImageStore` through an explicitly unsecured numeric-loopback
+gateway with a nonzero port is supported. Upload owns a separate native
+GatewayChannel; ACK decoding and package policy stay in the client.
+See [Rust FabricClient](transport/RustFabricClient.md) for the
 library API, transfer limits and cancellation behavior.
 
 The existing CI uploader remains unchanged. The opt-in live qualification

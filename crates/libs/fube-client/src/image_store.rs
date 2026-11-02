@@ -6,38 +6,46 @@ use std::{
 };
 
 use fube_transport::{
-    connection::{deadline_after, Connection},
-    file_transfer::{FileTransferReply, MAX_QUEUED_FILE_REPLIES},
+    channel::{MessageChannel, MessageReceiver, RpcChannel},
+    connection::{deadline_after, MAX_FRAME_TIME},
+    message::{Header, Message},
+    native_channel::{
+        ChannelLimits, GatewayChannel, GatewayProfile, GatewayReceiver, GatewayTarget,
+    },
 };
 use tokio::{
     fs::{self, File, ReadDir},
     io::AsyncReadExt,
-    sync::mpsc,
     time::{timeout_at, Instant},
 };
 
-use crate::{image_store_protocol as wire, Error, Result};
+use crate::{
+    image_store_protocol::{self as wire, FileTransferReply},
+    Error, Result,
+};
 
 const MAX_DEPTH: usize = 128;
 const MAX_ENTRIES: usize = 1_000_000;
 const MAX_STALE_REPLIES: usize = 64;
 
 /// Native `fabric:ImageStore` v1.2 uploader for explicitly unsecured development
-/// gateways. Owns a dedicated socket; no authentication or protocol fallback.
+/// numeric loopback gateways with a nonzero port. Owns a dedicated upload
+/// GatewayChannel; no authentication, reconnect or protocol fallback.
 pub struct ImageStoreClient {
-    connection: Connection,
-    replies: mpsc::Receiver<FileTransferReply>,
+    channel: GatewayChannel,
+    target: Arc<GatewayTarget>,
+    replies: GatewayReceiver,
     timeout: Duration,
 }
 
 struct OperationGuard {
-    connection: Connection,
+    channel: GatewayChannel,
     armed: bool,
 }
 impl Drop for OperationGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.connection.abort();
+            self.channel.abort();
         }
     }
 }
@@ -58,37 +66,39 @@ impl ImageStoreClient {
     /// Connect without TLS/authentication; timeout also defaults later copies.
     pub async fn connect_clear(endpoint: SocketAddr, timeout: Duration) -> Result<Self> {
         let deadline = deadline_after(timeout)?;
-        let (sender, replies) = mpsc::channel(MAX_QUEUED_FILE_REPLIES);
-        let connection = Connection::connect_file_transfer_clear(
+        let channel = GatewayChannel::connect_unsecured_loopback(
             endpoint,
+            GatewayProfile::Upload,
+            ChannelLimits {
+                max_ingress: 32,
+                max_retained_bytes: 1024 * 1024 * 1024,
+                ..ChannelLimits::default()
+            },
             deadline,
-            Arc::new(move |reply| {
-                sender.try_send(reply).map_err(|error| match error {
-                    mpsc::error::TrySendError::Full(_) => {
-                        Error::ResourceLimit("native upload reply handoff")
-                    }
-                    mpsc::error::TrySendError::Closed(_) => Error::Closed,
-                })
-            }),
         )
         .await?;
+        let target = channel.resolve_target(&endpoint.to_string())?;
+        let replies = channel.receiver()?;
         Ok(Self {
-            connection,
+            channel,
+            target,
             replies,
             timeout,
         })
     }
 
     pub fn is_closed(&self) -> bool {
-        self.connection.is_closed()
+        self.channel.terminal_error().is_some()
     }
 
     pub fn terminal_error(&self) -> Option<Error> {
-        self.connection.terminal_error()
+        self.channel.terminal_error()
     }
 
     pub async fn close(&self) -> Result<()> {
-        self.connection.close().await
+        self.channel
+            .close(Instant::now() + MAX_FRAME_TIME + Duration::from_secs(1))
+            .await
     }
 
     /// Replace the entire destination, upload descendants, then publish empty
@@ -103,7 +113,7 @@ impl ImageStoreClient {
         destination: &str,
         timeout: Option<Duration>,
     ) -> Result<()> {
-        if let Some(error) = self.connection.terminal_error() {
+        if let Some(error) = self.channel.terminal_error() {
             return Err(error);
         }
         let deadline = deadline_after(timeout.unwrap_or(self.timeout))?;
@@ -120,7 +130,7 @@ impl ImageStoreClient {
             .await
             .map_err(|_| Error::Timeout)??;
         let mut guard = OperationGuard {
-            connection: self.connection.clone(),
+            channel: self.channel.clone(),
             armed: true,
         };
         let mut session = None;
@@ -130,7 +140,7 @@ impl ImageStoreClient {
         if let Err(error) = &result {
             // Only session-scoped cleanup, only inside the original budget.
             if let Some(activity) = session {
-                if Instant::now() < deadline && !self.connection.is_closed() {
+                if Instant::now() < deadline && !self.is_closed() {
                     let _ = self
                         .send(
                             "FileUploadDeleteSession",
@@ -142,7 +152,7 @@ impl ImageStoreClient {
                         .await;
                 }
             }
-            self.connection.abort_with_error(error.clone());
+            self.channel.abort_with_error(error.clone());
         } else {
             guard.armed = false;
         }
@@ -158,18 +168,21 @@ impl ImageStoreClient {
         session: &mut Option<[u8; 16]>,
     ) -> Result<()> {
         let activity = uuid::Uuid::new_v4().to_bytes_le();
-        let (headers, body) = wire::delete(&destination, activity)?;
-        let deleted = self
-            .connection
-            .request_decoded(
-                "ForwardMessage",
-                5,
-                headers,
-                body,
-                deadline,
-                wire::decode_delete,
-            )
-            .await?;
+        let (mut headers, body) = wire::delete(&destination, activity)?;
+        headers.extend([
+            Header::actor(5)?,
+            Header::action("ForwardMessage")?,
+            Header::timeout(wire::remaining_ticks(deadline)?)?,
+        ]);
+        let message = self
+            .channel
+            .request(&self.target, Message { headers, body }, deadline)
+            .await
+            .map_err(|error| self.terminal_error().unwrap_or(error))?;
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
+        let deleted = wire::decode_delete(message)?;
         if deleted.is_some_and(|reply| reply != activity) {
             return Err(Error::Protocol(
                 "Delete success Activity does not match request",
@@ -256,9 +269,15 @@ impl ImageStoreClient {
     ) -> Result<()> {
         let mut headers = wire::headers(activity)?;
         headers.extend(extra);
-        self.connection
-            .send_file_transfer(action, headers, body, deadline)
+        headers.extend([
+            Header::actor(26)?,
+            Header::action(action)?,
+            Header::timeout(wire::remaining_ticks(deadline)?)?,
+        ]);
+        self.channel
+            .send_one_way(&self.target, Message { headers, body }, deadline)
             .await
+            .map_err(|error| self.terminal_error().unwrap_or(error))
     }
 
     async fn receive(
@@ -269,12 +288,15 @@ impl ImageStoreClient {
     ) -> Result<FileTransferReply> {
         let mut stale = 0;
         loop {
-            let reply = tokio::select! {
-                biased;
-                error = self.connection.closed() => return Err(error),
-                reply = timeout_at(deadline, self.replies.recv()) =>
-                    reply.map_err(|_| Error::Timeout)?.ok_or(Error::Closed)?,
-            };
+            let incoming = self
+                .replies
+                .receive(deadline)
+                .await
+                .map_err(|error| self.terminal_error().unwrap_or(error))?;
+            if let Some(error) = self.terminal_error() {
+                return Err(error);
+            }
+            let reply = wire::decode_reply(&incoming.message)?;
             if let Some(sequence) = reply.sequence {
                 negotiated_size(sequence.buffer_size)?;
             }

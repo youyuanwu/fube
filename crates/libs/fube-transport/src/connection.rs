@@ -35,9 +35,6 @@ const MAX_UNMATCHED_REPLIES: usize = 1024;
 #[path = "connection_duplex_tests.rs"]
 mod duplex_tests;
 #[cfg(test)]
-#[path = "connection_file_transfer_tests.rs"]
-mod file_transfer_tests;
-#[cfg(test)]
 #[path = "connection_ipc_tests.rs"]
 mod ipc_tests;
 
@@ -119,13 +116,7 @@ struct Shared {
     ipc: Option<IpcHandler>,
     ipc_identity: Option<Header>,
     controls: mpsc::Sender<Control>,
-    file_transfer: Option<FileTransferHandler>,
 }
-
-/// Explicit bounded, nonblocking native upload ingress. Invalid native schemas
-/// are rejected by the driver before this handler sees them.
-pub type FileTransferHandler =
-    Arc<dyn Fn(crate::file_transfer::FileTransferReply) -> Result<()> + Send + Sync>;
 
 /// Nonblocking bounded handoff for an explicitly selected application IPC role.
 /// An error retires the session. This never changes gateway dispatch policy.
@@ -412,17 +403,7 @@ pub struct Connection {
 
 impl Connection {
     pub async fn connect_clear(endpoint: SocketAddr, deadline: Instant) -> Result<Self> {
-        Self::connect_role(endpoint, deadline, None, None, None).await
-    }
-
-    /// Dedicated native v1.2 upload channel; ordinary correlated requests remain
-    /// available for routed FileStore management operations on this socket.
-    pub async fn connect_file_transfer_clear(
-        endpoint: SocketAddr,
-        deadline: Instant,
-        handler: FileTransferHandler,
-    ) -> Result<Self> {
-        Self::connect_role(endpoint, deadline, None, None, Some(handler)).await
+        Self::connect_role(endpoint, deadline, None, None).await
     }
 
     /// Explicitly opt into native notification reverse requests on a dedicated socket.
@@ -431,7 +412,7 @@ impl Connection {
         deadline: Instant,
         handler: ReverseHandler,
     ) -> Result<Self> {
-        Self::connect_role(endpoint, deadline, Some(handler), None, None).await
+        Self::connect_role(endpoint, deadline, Some(handler), None).await
     }
 
     /// Generic clear application IPC, separate from the gateway notification
@@ -452,7 +433,7 @@ impl Connection {
             e.u32(std::process::id());
             Ok(())
         })?;
-        Self::connect_role(endpoint, deadline, None, Some((handler, identity)), None).await
+        Self::connect_role(endpoint, deadline, None, Some((handler, identity))).await
     }
 
     async fn connect_role(
@@ -460,7 +441,6 @@ impl Connection {
         deadline: Instant,
         handler: Option<ReverseHandler>,
         ipc: Option<(IpcHandler, Header)>,
-        file_transfer: Option<FileTransferHandler>,
     ) -> Result<Self> {
         remaining_ticks(deadline)?;
         let process_id = uuid::Uuid::new_v4().to_bytes_le();
@@ -492,14 +472,7 @@ impl Connection {
         })
         .await
         .map_err(|_| Error::Timeout)??;
-        Ok(Self::start_roles(
-            stream,
-            remote,
-            process_id,
-            handler,
-            ipc,
-            file_transfer,
-        ))
+        Ok(Self::start_role(stream, remote, process_id, handler, ipc))
     }
 
     #[cfg(test)]
@@ -510,27 +483,12 @@ impl Connection {
         Self::start_role(stream, remote, process_id, None, None)
     }
 
-    #[cfg(test)]
     fn start_role<S>(
         stream: S,
         remote: ListenInstance,
         process_id: [u8; 16],
         reverse: Option<ReverseHandler>,
         ipc: Option<(IpcHandler, Header)>,
-    ) -> Self
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        Self::start_roles(stream, remote, process_id, reverse, ipc, None)
-    }
-
-    fn start_roles<S>(
-        stream: S,
-        remote: ListenInstance,
-        process_id: [u8; 16],
-        reverse: Option<ReverseHandler>,
-        ipc: Option<(IpcHandler, Header)>,
-        file_transfer: Option<FileTransferHandler>,
     ) -> Self
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -557,7 +515,6 @@ impl Connection {
             ipc,
             ipc_identity,
             controls,
-            file_transfer,
         });
         let (commands, receiver) = mpsc::channel(MAX_QUEUED_REQUESTS);
         tokio::spawn(drive(stream, shared.clone(), receiver, control_rx));
@@ -677,33 +634,6 @@ impl Connection {
             .clone()
             .ok_or(Error::InvalidInput("not an IPC session"))?;
         self.send_ordinary_one_way(actor, action, vec![identity], body, deadline, sent)
-            .await
-    }
-
-    /// Flush a native upload frame through ordinary bounded data capacity.
-    /// Neither content nor upload controls consume reserved IPC/reply slots.
-    pub async fn send_file_transfer(
-        &self,
-        action: &str,
-        mut headers: Vec<Header>,
-        body: Vec<u8>,
-        deadline: Instant,
-    ) -> Result<()> {
-        if self.handle.shared.file_transfer.is_none() {
-            return Err(Error::InvalidInput("not a native file-transfer session"));
-        }
-        if !matches!(
-            action,
-            "FileCreate"
-                | "FileContent"
-                | "FileUploadCommit"
-                | "FileUploadCommitAck"
-                | "FileUploadDeleteSession"
-        ) {
-            return Err(Error::InvalidInput("unsupported native upload action"));
-        }
-        headers.push(Header::timeout(remaining_ticks(deadline)?)?);
-        self.send_ordinary_one_way(26, action, headers, body, deadline, SendStatus::default())
             .await
     }
 
@@ -977,15 +907,6 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
                 }
                 _ => "unsupported transport control",
             }));
-        }
-        if let Some(handler) = &shared.file_transfer {
-            if matches!(properties.actor, 25 | 27) {
-                handler(crate::file_transfer::decode_reply(&reply)?)?;
-                continue;
-            }
-            if properties.relates_to == MessageId::default() {
-                return Err(Error::Protocol("unsupported native upload ingress"));
-            }
         }
         if properties.uncorrelated_reply {
             if let Some(handler) = &shared.reverse {

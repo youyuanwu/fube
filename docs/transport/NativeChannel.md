@@ -9,7 +9,7 @@ contracts](../../crates/libs/fube-transport/src/channel.rs) for one dedicated
 This is native Fabric TCP messaging, not `IFabricTransport`, UDP, actor36,
 a typed client, router or adapter around `Connection`.
 
-`GatewayChannel::connect_unsecured_loopback(endpoint, notifications, limits,
+`GatewayChannel::connect_unsecured_loopback(endpoint, profile, limits,
 deadline)` establishes TCP and the clear ListenInstance exchange inside one
 absolute deadline. It rejects non-loopback/zero-port endpoints and invalid
 limits. Clear loopback assumes trusted local peers; it does not authenticate
@@ -17,7 +17,16 @@ hostile local processes and does not qualify secure production clusters.
 Existing permissions, security controls and concrete connection roles are not
 disabled or widened.
 
-Only actor5 with a nonempty Action is authorized for outbound domain messages.
+`GatewayProfile` selects mutually exclusive envelope authority:
+
+| Profile | Outbound | Unsolicited ingress |
+| --- | --- | --- |
+| `Ordinary` | actor5 raw/RPC | none |
+| `Notifications` | actor5 raw/RPC and consuming notification reply | exact actor5 notification envelope |
+| `Upload` | actor26 raw and actor5 RPC | actor25/27 raw semantic ACK envelopes, **no reply capability** |
+
+Actions must be nonempty. Upload action/version/Activity/sequence/body policy
+belongs to ImageStoreClient, not the channel.
 Raw sends cannot bypass ordinary RPC or reply authority using ExpectsReply,
 RelatesTo or special-notification flags. Ordinary replies must come through
 this established socket. Their domain actor/action and body are opaque to the
@@ -60,10 +69,20 @@ original target/ID. A response must be actor5/`ServiceNotificationReply`;
 the context adds missing RelatesTo, accepts one matching value and rejects
 duplicates/contradictions, ExpectsReply=true or special reply flags.
 Domain processing-status encoding remains the caller's responsibility.
-Disabled mode refuses receiver creation and terminates on notification ingress.
+Ordinary mode refuses receiver creation. Ordinary and Upload profiles terminate
+on notification ingress.
+
+Upload ACKs are classified before ordinary matching. Nonempty effective
+RelatesTo, ExpectsReply, special notification flags, Fault and IPC are rejected,
+even if a relation names a pending management RPC. MessageId and RelatesTo may
+be absent. Accepted envelopes retain their original source and raw contents;
+they never mint a notification reply context or consume notification ID history.
+ImageStoreClient decodes semantic headers/body **at pull, before stale filtering**.
+An unread domain-invalid ACK with a valid transport envelope remains bounded
+raw ingress until pull; no idle domain-validation worker is added.
 
 **Not supported:** arbitrary reverse RPC/one-way ingress, activated-host IPC,
-listeners, other actors/transport roles, file upload, replication, actor36
+listeners, other actors/transport roles, replication, actor36
 application-service transport, TLS/claims/security negotiation, reconnect,
 retry, replay, failover, pools, middleware, code generation, routing/registry
 or typed codecs in the transport crate. The ordinary typed Client/ClientRequest
@@ -76,14 +95,14 @@ implementations for those roles.
 use fube_transport::{
     channel::{MessageChannel, RpcChannel},
     message::{Header, Message},
-    native_channel::{ChannelLimits, GatewayChannel},
+    native_channel::{ChannelLimits, GatewayChannel, GatewayProfile},
 };
 use tokio::time::{Duration, Instant};
 
 # async fn example() -> fube_transport::Result<()> {
 let end = Instant::now() + Duration::from_secs(30);
 let channel = GatewayChannel::connect_unsecured_loopback(
-    "127.0.0.1:19000".parse().unwrap(), false, ChannelLimits::default(), end,
+    "127.0.0.1:19000".parse().unwrap(), GatewayProfile::Ordinary, ChannelLimits::default(), end,
 ).await?;
 let target = channel.resolve_target("127.0.0.1:19000")?;
 let message = Message {
@@ -101,7 +120,8 @@ The example demonstrates binding, not a complete typed FabricClient protocol.
 Native notification setup and processing-status schemas remain above the
 foundation. Ordinary FabricClient uses the shared typed adapter above this
 foundation. ServiceNotificationClient owns a separate notification-enabled
-GatewayChannel/native session; image upload retains its independent Connection.
+GatewayChannel/native session; ImageStoreClient owns a separate Upload-profile
+GatewayChannel and directly pulls bounded ACK ingress.
 
 - Resolution is synchronous, performs no I/O and accepts only the configured
   numeric endpoint. It reuses one private target identity. Equal addresses or
@@ -225,6 +245,14 @@ slots cannot fit the ordinary 512 MiB ceiling. Client page-count overflow is
 notification ResourceLimit, memory exhaustion is Lagged; independently exhausted
 backend admission retains its Common(ResourceLimit) cause.
 
+The upload consumer uses **32 backend ingress slots** and a **1 GiB** finite
+reservation ceiling (not eager allocation), with no second handoff queue or
+worker. Ordinary operations retain their eight-slot default and consuming
+reply capacity is never used by upload content/controls. Upload raw frames omit
+ordinary MessageIds: their semantic ACKs correlate by client Activity/sequence,
+not transport ID. Actor5 management RPC still allocates an ordinary ID and
+retains the unchanged global lifetime-history rules.
+
 ## Native evidence and stronger Rust obligations
 
 Source baseline is locally inspected SF
@@ -301,13 +329,16 @@ GatewayReceiver/session consumers and the existing loss relay: one successful
 ACK is dropped, the same target logical page is retried under an observed fresh
 full MessageId, and a successful ACK is fully forwarded for that retry's exact
 ID without duplicate delivered versions. The receipt validator checks these
-bounded witnesses. Image-transfer remains an unmigrated Connection consumer.
+bounded witnesses. ImageStoreClient now uses its own Upload-profile channel;
+the maintained `tests.onebox.native_upload` journey separately compares native
+COM and Rust package copies, replacement, provisioning and deployed data.
 
 No fresh live pass is inferred from scaffolding removal, source inspection or
 deterministic checks. Exact-candidate live results require fresh maintained
 receipts. Isolated primary-address-only filtering with distinct nonempty
 addresses, secure clusters, arbitrary reverse RPC and unrelated runtime/
-upload/hosting qualification remain unclaimed.
+hosting qualification remain unclaimed. Upload source alignment and the
+maintained journey do not establish secure/replay/general image-store parity.
 
 [sf]: https://github.com/microsoft/service-fabric/commit/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d
 [rpc]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Transport/requestreply.cpp#L57-L122
