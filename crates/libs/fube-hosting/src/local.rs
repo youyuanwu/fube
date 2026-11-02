@@ -478,7 +478,7 @@ impl Activation {
         }
     }
     pub fn acquire_usage(&mut self) -> UsageIncrement<Acquisition> {
-        if !self.registered || self.stopping {
+        if !self.registered || self.stopping || self.failure.is_some() {
             return UsageIncrement::Rejected(Error::InvalidState);
         }
         let Some(premise) = self.premise.as_ref() else {

@@ -47,10 +47,16 @@ async fn main() {
     // These explicit fault modes are for owned-lifecycle qualification only.
     let args: Vec<_> = std::env::args().skip(1).collect();
     let delay = match args.as_slice() {
-        [flag, value] if flag == "--delay-ms" || flag == "--crash-after-ms" => Some((
-            flag.as_str(),
-            value.parse::<u64>().expect("integer milliseconds"),
-        )),
+        [flag, value]
+            if flag == "--delay-ms"
+                || flag == "--crash-after-ms"
+                || flag == "--shutdown-after-ms" =>
+        {
+            Some((
+                flag.as_str(),
+                value.parse::<u64>().expect("integer milliseconds"),
+            ))
+        }
         [] => None,
         [flag] if flag == "--no-register" || flag == "--exit-before-attach" => None,
         _ => panic!("unsupported fixture arguments"),
@@ -84,6 +90,13 @@ async fn main() {
     if let Some(("--crash-after-ms", ms)) = delay {
         tokio::time::sleep(Duration::from_millis(ms)).await;
         std::process::exit(23);
+    }
+    if let Some(("--shutdown-after-ms", ms)) = delay {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        _runtime
+            .shutdown()
+            .await
+            .expect("orderly Runtime/session shutdown");
     }
     std::future::pending::<()>().await;
 }

@@ -204,11 +204,19 @@ fn crash_before_and_after_registration_are_not_successful_cleanup() {
     let fixture = Fixture::new();
     for args in ["--exit-before-attach", "--crash-after-ms 100"] {
         let mut owner = fixture.owner(args);
+        let mut previous_acquisition = None;
         if args.starts_with("--crash-after") {
             owner.wait_registration(Duration::from_secs(5)).unwrap();
+            previous_acquisition = Some(acquire(&mut owner));
             std::thread::sleep(Duration::from_millis(250));
         }
         assert!(owner.wait_registration(Duration::from_secs(3)).is_err());
+        let acquisitions = owner.residency().resources().acquisitions;
+        assert!(matches!(
+            owner.acquire_usage(),
+            UsageIncrement::Rejected(Error::InvalidState)
+        ));
+        assert_eq!(owner.residency().resources().acquisitions, acquisitions);
         let pid = owner.process_status().unwrap().pid;
         let root = owner.root().unwrap().to_path_buf();
         assert!(
@@ -216,6 +224,13 @@ fn crash_before_and_after_registration_are_not_successful_cleanup() {
             "exit observation reserves leader"
         );
         assert!(root.exists());
+        if let Some(acquisition) = previous_acquisition {
+            assert_eq!(owner.terminate(), Err(LocalError::Busy));
+            assert!(matches!(
+                owner.release_usage(acquisition),
+                UsageRelease::Released
+            ));
+        }
         owner.terminate().unwrap();
         fixture.assert_released(&owner, pid, &root);
     }
@@ -339,5 +354,34 @@ fn live_owned_session_renews_finite_authority_across_multiple_lease_intervals() 
         UsageRelease::Released
     ));
     owner.terminate().unwrap();
+    fixture.assert_released(&owner, pid, &root);
+}
+
+#[test]
+fn terminal_session_loss_rejects_new_usage_but_keeps_existing_owner_releasable() {
+    let fixture = Fixture::new();
+    let mut owner = fixture.owner("--shutdown-after-ms 100");
+    owner.wait_registration(Duration::from_secs(5)).unwrap();
+    let acquisition = acquire(&mut owner);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(owner.poll_registration(), Err(LocalError::SessionLost));
+    assert!(
+        !owner.process_status().unwrap().exit_observed,
+        "orderly detached child remains alive"
+    );
+    let acquisitions = owner.residency().resources().acquisitions;
+    assert!(matches!(
+        owner.acquire_usage(),
+        UsageIncrement::Rejected(Error::InvalidState)
+    ));
+    assert_eq!(owner.residency().resources().acquisitions, acquisitions);
+    let pid = owner.process_status().unwrap().pid;
+    let root = owner.root().unwrap().to_path_buf();
+    assert_eq!(owner.terminate(), Err(LocalError::Busy));
+    assert!(matches!(
+        owner.release_usage(acquisition),
+        UsageRelease::Released
+    ));
+    assert!(owner.terminate().unwrap());
     fixture.assert_released(&owner, pid, &root);
 }

@@ -26,5 +26,6 @@ launch themselves rather than relying on a previously staged package.
 Default execution attaches/registers the declared `LocalStatelessType` and stays
 resident. The `Arguments` manifest parameter supports explicit qualification
 fault modes: `--exit-before-attach`, `--no-register`, `--delay-ms N` and
-`--crash-after-ms N`. These are fixture controls, not Hosting recovery policy.
+`--crash-after-ms N` and `--shutdown-after-ms N` (orderly Runtime/session detach,
+process stays alive). These are fixture controls, not Hosting recovery policy.
 The existing mixed `rust-runtime-app/pkg` is not a substitute for this profile.

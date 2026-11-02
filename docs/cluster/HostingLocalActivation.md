@@ -99,8 +99,10 @@ Open, Close or Abort calls exist in Hosting
 
 After registration, `acquire_usage` returns H2's complete `UsageIncrement`,
 including any exact unresolved owner. Retain the nonclone acquisition and release
-it through `release_usage`; dropping it does not decrement. Supply monotonic
-100ns observations to `drive_deactivation` and periodic `scan_unused` explicitly.
+it through `release_usage`; dropping it does not decrement. Known terminal
+process/session failure rejects new acquisitions without erasing previously
+accepted owners; those must still be released. Supply monotonic 100ns observations
+to `drive_deactivation` and periodic `scan_unused` explicitly.
 There is no background scheduler. Admission starts unused without a timer;
 last usage release schedules package idle teardown, and unused scans select the
 application first. Current H2 sequence/usage guards, not each service Close reply,
@@ -181,7 +183,7 @@ cargo test --locked -p fube-ra --test hosting_events
 cargo test --locked -p fube-runtime --lib
 ```
 
-The [real fixture tests](../../crates/samples/hosting-local-app/tests/activation.rs#L84-L343)
+The [real fixture tests](../../crates/samples/hosting-local-app/tests/activation.rs#L84-L387)
 run actual owned package/process/IPC registration, independently inspect native
 library absence and verify reap/root absence. They cover fresh identity,
 observation timeout, registration failure, launch error, crash, live lease
