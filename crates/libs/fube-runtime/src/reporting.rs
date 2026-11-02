@@ -2,8 +2,9 @@
 use crate::{api::FaultType, lease::Authority, wire::*};
 use crate::{Error, Result};
 use fube_transport::{
-    connection::{deadline_after, Connection, SendStatus},
+    connection::deadline_after,
     message::{Header, Message},
+    native_channel::WritePredicate,
     serialization::serde::{
         from_slice, to_vec, EmptyObjectArray, NativeEnum, ObjectArray, Pointer,
     },
@@ -140,7 +141,7 @@ pub(crate) enum HealthTarget {
     Replica,
 }
 pub(crate) struct Reporting {
-    connection: Connection,
+    connection: crate::channel_adapter::IpcChannel,
     valid: Arc<AtomicBool>,
     authority: Arc<Authority>,
     request: Mutex<ProxyRequest>,
@@ -205,7 +206,7 @@ impl Reporting {
         self.admission.try_acquire().unwrap()
     }
     pub(crate) fn new(
-        connection: Connection,
+        connection: crate::channel_adapter::IpcChannel,
         valid: Arc<AtomicBool>,
         authority: Arc<Authority>,
         request: ProxyRequest,
@@ -241,11 +242,9 @@ impl Reporting {
         }
         Ok(())
     }
-    fn fence(self: &Arc<Self>) -> SendStatus {
+    fn fence(self: &Arc<Self>) -> WritePredicate {
         let this = Arc::downgrade(self);
-        SendStatus::fenced(Arc::new(move || {
-            this.upgrade().is_some_and(|s| s.check().is_ok())
-        }))
+        Arc::new(move || this.upgrade().is_some_and(|s| s.check().is_ok()))
     }
     pub(crate) async fn load(self: &Arc<Self>, metrics: &[LoadMetric]) -> Result<()> {
         self.send_load(metrics, false).await
@@ -478,7 +477,7 @@ impl Reporting {
         let reply = tokio::select! {
             biased;
             _ = self.cancel.cancelled() => return Err(Error::Closed),
-            result = self.connection.request_decoded_tracked(
+            result = self.connection.request_validated(
                 "ReportHealth",
                 7,
                 headers,
@@ -628,9 +627,9 @@ impl Reporting {
             };
             let this = Arc::downgrade(&self);
             let token = current.clone();
-            let sent = SendStatus::fenced(Arc::new(move || {
+            let sent = Arc::new(move || {
                 token.load(Ordering::Acquire) && this.upgrade().is_some_and(|s| s.check().is_ok())
-            }));
+            });
             let operation = async {
                 let _permit = self
                     .global

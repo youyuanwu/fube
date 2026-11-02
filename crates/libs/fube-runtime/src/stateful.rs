@@ -6,7 +6,7 @@ use crate::{
 };
 use crate::{Error, OpenMode, Result};
 use fube_transport::{
-    connection::{deadline_after, Connection, IpcReplyContext, SendStatus},
+    connection::deadline_after,
     serialization::serde::{to_vec, Guid, ObjectArray, Pointer},
 };
 use std::{
@@ -77,7 +77,7 @@ pub(crate) struct Registry {
     factories: Mutex<HashMap<String, Arc<dyn IStatefulServiceFactory>>>,
     current: ActivationContextHandle,
     authority: Arc<Authority>,
-    connection: Connection,
+    connection: crate::channel_adapter::IpcChannel,
     live: Arc<Semaphore>,
     metrics: Arc<RuntimeMetrics>,
     reports: Arc<Semaphore>,
@@ -130,7 +130,7 @@ impl Registry {
     pub(crate) fn new(
         current: ActivationContextHandle,
         authority: Arc<Authority>,
-        connection: Connection,
+        connection: crate::channel_adapter::IpcChannel,
         live: Arc<Semaphore>,
         metrics: Arc<RuntimeMetrics>,
         reports: Arc<Semaphore>,
@@ -306,7 +306,7 @@ impl Registry {
         &self,
         action: &str,
         request: w::ProxyRequest,
-        correlation: Option<IpcReplyContext>,
+        correlation: Option<crate::channel_adapter::IpcResponse>,
     ) -> Result<()> {
         self.authority.check()?;
         if action == "RAPQuery" {
@@ -1148,12 +1148,12 @@ impl Registry {
                 "ProxyUpdateServiceDescriptionReply",
                 to_vec(&response)?,
                 deadline_after(Duration::from_secs(5))?,
-                SendStatus::fenced(Arc::new(move || {
+                Arc::new(move || {
                     frame_valid.load(Ordering::Acquire)
                         && authority
                             .upgrade()
                             .is_some_and(|authority| authority.check().is_ok())
-                })),
+                }),
             )
             .await
             .map_err(Error::from);
@@ -1306,7 +1306,7 @@ impl Registry {
                 action,
                 to_vec(&reply)?,
                 deadline_after(Duration::from_secs(5))?,
-                SendStatus::fenced(Arc::new(move || {
+                Arc::new(move || {
                     authority
                         .upgrade()
                         .is_some_and(|authority| authority.check().is_ok())
@@ -1317,7 +1317,7 @@ impl Registry {
                                     && cancellation.as_ref().is_none_or(|c| !c.is_cancelled())
                             },
                         )
-                })),
+                }),
             )
             .await
             .map_err(Error::from);

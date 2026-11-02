@@ -30,6 +30,7 @@ fn composition() -> ChannelComposition {
             incoming: allow,
             reply: allow,
         }),
+        ordered_ingress: false,
     }
 }
 fn ipc_pair(capacity: usize) -> (GatewayChannel, DuplexStream) {
@@ -553,4 +554,105 @@ async fn repeated_valid_zero_progress_polls_do_not_commit_any_send_kind() {
         channel.close(deadline()).await.unwrap();
         assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
     }
+}
+
+#[tokio::test]
+async fn reserved_semantic_sends_have_independent_finite_capacity_and_fences() {
+    let (stream, mut peer) = duplex(8192);
+    let channel = GatewayChannel::start_with_identity(
+        stream,
+        "127.0.0.1:19000".parse().unwrap(),
+        composition(),
+        ChannelLimits {
+            max_operations: 1,
+            max_replies: 1,
+            ..limits()
+        },
+        [100; 16],
+        ListenInstance::default(),
+        Some(identity()),
+    );
+    let target = target(&channel);
+    let mut request = channel.request(&target, msg("Rpc", vec![]), deadline());
+    pending(request.as_mut()).await;
+    let id = read_message(&mut peer)
+        .await
+        .unwrap()
+        .properties()
+        .unwrap()
+        .id;
+    assert!(matches!(
+        channel
+            .send_one_way(&target, msg("Full", vec![]), deadline())
+            .await,
+        Err(Error::ResourceLimit(_))
+    ));
+    let mut response = channel.send_reserved(&target, msg("Semantic", vec![]), deadline(), None);
+    pending(response.as_mut()).await;
+    let message = read_message(&mut peer).await.unwrap();
+    assert_eq!(
+        message.properties().unwrap().relates_to,
+        MessageId::default()
+    );
+    assert!(has(&message, message::IPC));
+    until(|| {
+        channel
+            .owner
+            .shared
+            .inner
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .any(|e| !e.rpc && e.result.is_some())
+    })
+    .await;
+    assert_eq!(count(&channel, REPLY), 1);
+    assert!(matches!(
+        channel
+            .send_reserved(&target, msg("Full", vec![]), deadline(), None)
+            .await,
+        Err(Error::ResourceLimit(_))
+    ));
+    response.await.unwrap();
+    assert!(matches!(
+        channel
+            .send_reserved(
+                &target,
+                msg("Obsolete", vec![]),
+                deadline(),
+                Some(Arc::new(|| false))
+            )
+            .await,
+        Err(Error::Closed)
+    ));
+    write_message(&mut peer, &reply(id, vec![])).await.unwrap();
+    request.await.unwrap();
+    channel.close(deadline()).await.unwrap();
+    assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ordered_ingress_handoff_timeout_preserves_first_terminal_cause() {
+    let (stream, mut peer) = duplex(8192);
+    let mut composition = composition();
+    composition.ordered_ingress = true;
+    let channel = GatewayChannel::start_with_identity(
+        stream,
+        "127.0.0.1:19000".parse().unwrap(),
+        composition,
+        limits(),
+        [100; 16],
+        ListenInstance::default(),
+        Some(identity()),
+    );
+    write_message(&mut peer, &command(1, true)).await.unwrap();
+    // No receiver acknowledges handoff. Its independent finite bound expires.
+    let cause = channel
+        .wait_terminal(Instant::now() + MAX_FRAME_TIME * 2)
+        .await
+        .unwrap();
+    assert!(matches!(cause, Error::Timeout));
+    assert!(matches!(channel.terminal_error(), Some(Error::Timeout)));
+    channel.close(deadline()).await.unwrap();
 }

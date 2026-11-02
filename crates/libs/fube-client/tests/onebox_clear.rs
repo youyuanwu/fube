@@ -422,12 +422,43 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
     // Test-only low-level native probe records the effective success envelope,
     // not packet fixtures. Production operations above all use FabricClient.
     let deadline = fube_transport::connection::deadline_after(DEFAULT_TIMEOUT).unwrap();
-    let probe = fube_transport::connection::Connection::connect_clear(
+    use fube_transport::{
+        channel::{MessageChannel, RpcChannel},
+        message::{Header, Message, Properties},
+        native_channel::{ChannelLimits, GatewayChannel},
+        native_demux::{ActorDemux, ChannelComposition, OutboundKind},
+    };
+    fn probe_outbound(
+        _: &Message,
+        p: &Properties,
+        kind: OutboundKind,
+    ) -> fube_transport::Result<()> {
+        if kind != OutboundKind::Rpc || p.actor != 5 || p.action != "QueryRequest" {
+            return Err(fube_transport::Error::InvalidInput(
+                "native query probe envelope",
+            ));
+        }
+        Ok(())
+    }
+    fn probe_reply(_: &Message, _: &Properties) -> fube_transport::Result<()> {
+        Ok(())
+    }
+    let probe = GatewayChannel::connect_unsecured_loopback(
         config.gateway.parse().unwrap(),
+        ChannelComposition {
+            outbound: probe_outbound,
+            ordinary_reply: probe_reply,
+            actors: ActorDemux::new(vec![]).unwrap(),
+            duplex: None,
+            requests: None,
+            ordered_ingress: false,
+        },
+        ChannelLimits::default(),
         deadline,
     )
     .await
     .unwrap();
+    let target = probe.resolve_target(&config.gateway).unwrap();
     let mut body = fube_transport::serialization::Encoder::new();
     body.object(|encoder| {
         encoder.object(|encoder| encoder.object_array::<()>(&[], |_, _| Ok(())))?;
@@ -436,14 +467,18 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
     .unwrap();
     let reply = probe
         .request(
-            "QueryRequest",
-            5,
-            vec![
-                fube_transport::message::Header::activity(uuid::Uuid::new_v4().to_bytes_le())
-                    .unwrap(),
-                fube_transport::message::Header::version(1, 1).unwrap(),
-            ],
-            body.finish(),
+            &target,
+            Message {
+                headers: vec![
+                    Header::actor(5).unwrap(),
+                    Header::action("QueryRequest").unwrap(),
+                    Header::timeout(i64::try_from(DEFAULT_TIMEOUT.as_nanos() / 100).unwrap())
+                        .unwrap(),
+                    Header::activity(uuid::Uuid::new_v4().to_bytes_le()).unwrap(),
+                    Header::version(1, 1).unwrap(),
+                ],
+                body: body.finish(),
+            },
             deadline,
         )
         .await
@@ -456,7 +491,7 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
         "effective_action": properties.action,
         "protocol_version": reply.protocol_version().unwrap(),
     });
-    probe.close().await.unwrap();
+    probe.close(deadline).await.unwrap();
     serde_json::json!({
         "native_node_count": baseline.items.len(), "independent_nodes": config.expected_nodes,
         "observation_unix_ms": config.observed_at_unix_ms,

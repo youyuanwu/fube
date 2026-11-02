@@ -11,8 +11,8 @@ use fube_transport::{
 
 use crate::{Error, Result};
 
-fn gateway_outbound(_: &Message, props: &Properties, _: OutboundKind) -> Result<()> {
-    if props.actor != 5 || props.action.is_empty() {
+fn gateway_outbound(_: &Message, props: &Properties, kind: OutboundKind) -> Result<()> {
+    if kind == OutboundKind::Reserved || props.actor != 5 || props.action.is_empty() {
         return Err(Error::InvalidInput("unauthorized gateway submission"));
     }
     Ok(())
@@ -36,6 +36,7 @@ pub(crate) fn ordinary() -> Result<ChannelComposition> {
         actors: ActorDemux::new(vec![])?,
         duplex: None,
         requests: None,
+        ordered_ingress: false,
     })
 }
 
@@ -74,6 +75,7 @@ fn upload_outbound(_: &Message, props: &Properties, kind: OutboundKind) -> Resul
     let actor = match kind {
         OutboundKind::Raw => 26,
         OutboundKind::Rpc => 5,
+        OutboundKind::Reserved => return Err(Error::InvalidInput("reserved upload send")),
     };
     if props.actor != actor || props.action.is_empty() {
         return Err(Error::InvalidInput("unauthorized upload submission"));
@@ -113,6 +115,7 @@ pub(crate) fn upload() -> Result<ChannelComposition> {
         )?,
         duplex: None,
         requests: None,
+        ordered_ingress: false,
     })
 }
 
@@ -124,6 +127,24 @@ mod tests {
         Message {
             headers: vec![],
             body: vec![],
+        }
+    }
+
+    #[test]
+    fn client_compositions_never_authorize_reserved_runtime_sends() {
+        let props = Properties {
+            actor: 5,
+            action: "QueryRequest".into(),
+            ..Default::default()
+        };
+        for composition in [
+            ordinary().unwrap(),
+            notifications().unwrap(),
+            upload().unwrap(),
+        ] {
+            assert!((composition.outbound)(&message(), &props, OutboundKind::Reserved).is_err());
+            assert!(!composition.ordered_ingress);
+            assert!(composition.requests.is_none());
         }
     }
 

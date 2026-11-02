@@ -4,7 +4,7 @@ use crate::{Error, Result};
 #[path = "lifecycle_tests.rs"]
 pub(crate) mod tests;
 use fube_transport::{
-    connection::{deadline_after, Connection, IpcRequest},
+    connection::deadline_after,
     serialization::serde::{from_slice, to_vec, Guid, ObjectArray, Pointer},
 };
 use std::{
@@ -63,7 +63,7 @@ struct Shared {
     active: AtomicUsize,
     activation: ActivationContext,
     authority: Arc<Authority>,
-    connection: Connection,
+    connection: crate::channel_adapter::IpcChannel,
     metrics: Arc<RuntimeMetrics>,
     reports: Arc<Semaphore>,
     execution: crate::extensions::ExecutionRuntime,
@@ -74,8 +74,8 @@ struct Shared {
 pub(crate) struct Engine {
     shared: Arc<Shared>,
     stop: watch::Sender<bool>,
-    task: JoinHandle<Option<mpsc::Receiver<IpcRequest>>>,
-    retired_incoming: Option<mpsc::Receiver<IpcRequest>>,
+    task: JoinHandle<Option<mpsc::Receiver<crate::channel_adapter::IpcMessage>>>,
+    retired_incoming: Option<mpsc::Receiver<crate::channel_adapter::IpcMessage>>,
     active_at_stop: bool,
 }
 struct FactorySlot {
@@ -182,8 +182,8 @@ impl Engine {
     pub(crate) fn start(
         current: crate::ActivationContextHandle,
         authority: Arc<Authority>,
-        connection: Connection,
-        incoming: mpsc::Receiver<IpcRequest>,
+        connection: crate::channel_adapter::IpcChannel,
+        incoming: mpsc::Receiver<crate::channel_adapter::IpcMessage>,
     ) -> Self {
         let execution = crate::extensions::ExecutionRuntime::new(
             authority.clone(),
@@ -194,8 +194,8 @@ impl Engine {
     pub(crate) fn start_with_execution(
         current: crate::ActivationContextHandle,
         authority: Arc<Authority>,
-        connection: Connection,
-        mut incoming: mpsc::Receiver<IpcRequest>,
+        connection: crate::channel_adapter::IpcChannel,
+        mut incoming: mpsc::Receiver<crate::channel_adapter::IpcMessage>,
         execution: crate::extensions::ExecutionRuntime,
     ) -> Self {
         let activation = (*current.snapshot()).clone();
@@ -485,7 +485,7 @@ fn unit(shared: &Shared, request: &ProxyRequest, create: bool) -> Result<Option<
     units.insert(request.unit.id.id.0, unit.clone());
     Ok(Some(unit))
 }
-async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
+async fn dispatch(shared: Arc<Shared>, incoming: crate::channel_adapter::IpcMessage) -> Result<()> {
     let props = incoming.message.properties()?;
     let request: ProxyRequest = from_slice(&incoming.message.body)?;
     let owner = {
@@ -554,12 +554,18 @@ async fn dispatch(shared: Arc<Shared>, incoming: IpcRequest) -> Result<()> {
         let reply = incoming
             .reply
             .ok_or(Error::Protocol("RAPQuery requires correlation"))?;
+        let authority = Arc::downgrade(&shared.authority);
         let result = reply
-            .reply(
+            .reply_with_action_fenced(
                 12,
                 Some("RAPQueryReply"),
                 to_vec(&query(&shared, &request)?)?,
                 deadline_after(Duration::from_secs(5))?,
+                Arc::new(move || {
+                    authority
+                        .upgrade()
+                        .is_some_and(|authority| authority.check().is_ok())
+                }),
             )
             .await
             .map_err(Error::from);
@@ -651,6 +657,15 @@ async fn reply(
     if action == "ReplicaOpenReply" && error.is_none() {
         shared.authority.check()?;
     }
+    let publish = action == "ReplicaOpenReply" && error.is_none();
+    let valid = shared
+        .units
+        .lock()
+        .unwrap()
+        .get(&request.unit.id.id.0)
+        .map(|unit| unit.state.lock().unwrap().valid.clone());
+    let frame_valid = valid.clone();
+    let authority = Arc::downgrade(&shared.authority);
     let mut local = request.local;
     local.service_endpoint = endpoint;
     let failed = error.is_some();
@@ -669,16 +684,38 @@ async fn reply(
             },
         },
     };
-    shared
+    let sent = shared
         .connection
         .send_one_way(
             12,
             action,
             to_vec(&body)?,
             deadline_after(Duration::from_secs(5))?,
+            Arc::new(move || {
+                authority
+                    .upgrade()
+                    .is_some_and(|authority| authority.check().is_ok())
+                    && (!publish
+                        || frame_valid
+                            .as_ref()
+                            .is_some_and(|valid| valid.load(Ordering::Acquire)))
+            }),
         )
         .await
-        .map_err(Error::from)
+        .map_err(Error::from);
+    match sent {
+        Err(Error::Closed)
+            if publish
+                && valid
+                    .as_ref()
+                    .is_some_and(|valid| !valid.load(Ordering::Acquire))
+                && shared.authority.check().is_ok()
+                && !shared.connection.is_closed() =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
 }
 async fn abort(
     service: Arc<dyn IStatelessServiceInstance>,
@@ -1000,16 +1037,35 @@ async fn update(shared: &Shared, unit: &Unit, request: ProxyRequest) -> Result<(
             service: state.request.service.clone(),
         }
     };
-    shared
+    let authority = Arc::downgrade(&shared.authority);
+    let valid = unit.state.lock().unwrap().valid.clone();
+    let frame_valid = valid.clone();
+    let sent = shared
         .connection
         .send_one_way(
             12,
             "ProxyUpdateServiceDescriptionReply",
             to_vec(&response)?,
             deadline_after(Duration::from_secs(5))?,
+            Arc::new(move || {
+                frame_valid.load(Ordering::Acquire)
+                    && authority
+                        .upgrade()
+                        .is_some_and(|authority| authority.check().is_ok())
+            }),
         )
         .await
-        .map_err(Error::from)
+        .map_err(Error::from);
+    match sent {
+        Err(Error::Closed)
+            if !valid.load(Ordering::Acquire)
+                && shared.authority.check().is_ok()
+                && !shared.connection.is_closed() =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
 }
 fn query(shared: &Shared, request: &ProxyRequest) -> Result<QueryReply> {
     let mut error = 0x80071d4au32 as i32 as i64;

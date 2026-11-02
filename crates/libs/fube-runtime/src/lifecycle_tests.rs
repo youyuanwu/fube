@@ -455,7 +455,7 @@ async fn health_saturation_leaves_poll_admission_and_rejects_overload() {
     let poll = tokio::spawn(async move {
         connection
             .request(
-                "GetProcessLeaseTTLRequest",
+                "",
                 15,
                 vec![],
                 vec![],
@@ -743,7 +743,7 @@ impl Harness {
                 .map_err(|_| fube_transport::Error::ResourceLimit("model ingress"))
         });
         let (client, peer) = tokio::join!(
-            Connection::connect_ipc_clear(
+            crate::channel_adapter::IpcChannel::connect(
                 address,
                 deadline_after(Duration::from_secs(2)).unwrap(),
                 &activation.host_id,
@@ -1521,7 +1521,8 @@ async fn retired_authority_cannot_republish_cached_duplicate_endpoint() {
         drop(operation.acquire_owned().await.unwrap());
         // Model an operation already admitted but not yet polled by its task.
         h.engine.shared.authority.check().unwrap();
-        let admitted = IpcRequest {
+        let admitted = crate::channel_adapter::IpcMessage {
+            received_at: std::time::Instant::now(),
             message: Message {
                 headers: vec![
                     Header::actor(12).unwrap(),
@@ -1546,6 +1547,86 @@ async fn retired_authority_cannot_republish_cached_duplicate_endpoint() {
         h.engine.quiesce().await.unwrap();
         assert_eq!(h.calls.aborts.load(Ordering::SeqCst), 1);
         assert_eq!(h.calls.drops.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn locally_revoked_queued_stateless_success_preserves_siblings_and_close_retry() {
+    use tokio::io::AsyncReadExt;
+    for update in [false, true] {
+        let mut h = Harness::new().await;
+        let mut request = h.request(1, 1, 0);
+        h.send("ReplicaOpen", &request).await;
+        h.receive("ReplicaOpenReply").await;
+        let sibling = h.request(2, 1, 0);
+        h.send("ReplicaOpen", &sibling).await;
+        h.receive("ReplicaOpenReply").await;
+        let unit = h.engine.shared.units.lock().unwrap()[&request.unit.id.id.0].clone();
+        drop(unit.operation.clone().acquire_owned().await.unwrap());
+        let valid = unit.state.lock().unwrap().valid.clone();
+        let connection = h.engine.shared.connection.clone();
+        let mut blocker = Box::pin(connection.send_one_way_fenced(
+            12,
+            "RAPReportLoad",
+            vec![0; fube_transport::frame::MAX_FRAME_SIZE - 4096],
+            deadline_after(Duration::from_secs(5)).unwrap(),
+            Arc::new(|| true),
+        ));
+        poll_pending_once(blocker.as_mut()).await;
+        let mut fixed = [0; fube_transport::frame::FIXED_HEADER_SIZE];
+        h.peer.read_exact(&mut fixed).await.unwrap();
+        if update {
+            request.service.update_version += 1;
+        }
+        h.send(
+            if update {
+                "ProxyUpdateServiceDescription"
+            } else {
+                "ReplicaOpen"
+            },
+            &request,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while unit.operation.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut close = request.clone();
+        close.flags = 4;
+        h.send("ReplicaClose", &close).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while valid.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let size = u32::from_le_bytes(fixed[..4].try_into().unwrap()) as usize;
+        h.peer
+            .read_exact(&mut vec![0; size - fixed.len()])
+            .await
+            .unwrap();
+        blocker.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while unit.operation.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        h.no_reply().await;
+        h.engine.shared.authority.check().unwrap();
+        assert!(!connection.is_closed());
+        h.send("RAPQuery", &sibling).await;
+        h.receive("RAPQueryReply").await;
+        h.send("ReplicaClose", &close).await;
+        h.receive("ReplicaCloseReply").await;
+        h.engine.shared.authority.check().unwrap();
+        assert!(!connection.is_closed());
+        h.engine.quiesce().await.unwrap();
     }
 }
 

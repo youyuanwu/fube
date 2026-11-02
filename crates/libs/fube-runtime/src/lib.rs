@@ -97,6 +97,7 @@
 //! ```
 
 mod api;
+mod channel_adapter;
 mod context;
 mod diagnostics;
 mod error;
@@ -129,9 +130,10 @@ use std::{
     time::{Duration, Instant as Monotonic},
 };
 
+use channel_adapter::{IpcChannel, IpcMessage};
 pub use error::{Error, ErrorKind, RejectedRegistrationInput, Result};
 use fube_transport::{
-    connection::{deadline_after, Connection, IpcRequest},
+    connection::deadline_after,
     serialization::serde::{from_slice, to_vec},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -195,7 +197,7 @@ pub struct Runtime {
     activation: ActivationContext,
     current: ActivationContextHandle,
     node: NodeContext,
-    connection: Connection,
+    connection: IpcChannel,
     authority: Arc<Authority>,
     tasks: Vec<JoinHandle<()>>,
     lifecycle: lifecycle::Engine,
@@ -218,7 +220,7 @@ fn success(reply: ErrorReply) -> Result<()> {
 }
 
 async fn call<T: serde::Serialize, R: serde::de::DeserializeOwned>(
-    connection: &Connection,
+    connection: &IpcChannel,
     actor: i64,
     action: &str,
     value: &T,
@@ -242,7 +244,7 @@ async fn call<T: serde::Serialize, R: serde::de::DeserializeOwned>(
     Ok(from_slice(&reply.body)?)
 }
 
-async fn poll_lease(connection: &Connection) -> Result<(Monotonic, i64)> {
+async fn poll_lease(connection: &IpcChannel) -> Result<(Monotonic, i64)> {
     let sent = Monotonic::now();
     let reply = connection
         .request(
@@ -331,9 +333,9 @@ impl Runtime {
         let controls_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ingress_ready = controls_ready.clone();
         let (control_tx, mut controls) =
-            mpsc::channel::<(Monotonic, IpcRequest)>(MAX_INCOMING_COMMANDS);
-        let (command_tx, incoming) = mpsc::channel::<IpcRequest>(MAX_INCOMING_COMMANDS);
-        let handler = Arc::new(move |request: IpcRequest| {
+            mpsc::channel::<(Monotonic, IpcMessage)>(MAX_INCOMING_COMMANDS);
+        let (command_tx, incoming) = mpsc::channel::<IpcMessage>(MAX_INCOMING_COMMANDS);
+        let handler = Arc::new(move |request: IpcMessage| {
             let p = request.message.properties()?;
             match p.actor {
                 8 => {
@@ -343,7 +345,7 @@ impl Runtime {
                         ingress_authority.retire();
                     }
                     control_tx
-                        .try_send((Monotonic::now(), request))
+                        .try_send((request.received_at, request))
                         .map_err(|_| {
                             fube_transport::Error::ResourceLimit("runtime control ingress")
                         })
@@ -356,7 +358,7 @@ impl Runtime {
                 )),
             }
         });
-        let connection = Connection::connect_ipc_clear(
+        let connection = IpcChannel::connect(
             activation.address,
             deadline_after(REGISTRATION_TIMEOUT)?,
             &activation.host_id,

@@ -9,7 +9,7 @@
 //! domain actor/action/envelope rules through [`native_demux`](crate::native_demux).
 //! Actor registration alone grants neither outbound nor reply authority.
 //! This is not a general listener/IPC/replication or secure transport implementation.
-//! [`Connection`](crate::connection::Connection) does not implement these traits;
+//! The retired legacy Connection did not implement these traits;
 //! its unrelated IPC/reverse behavior and security limits remain unchanged.
 //!
 //! # Native component boundary (source facts)
@@ -183,8 +183,8 @@ pub trait MessageChannel: Send + Sync + 'static {
     ///
     /// **Rust-profile contract:** preserve protocol headers/body; do not add
     /// ordinary RPC correlation or infer a protocol ACK. Enforce the configured
-    /// role before admission; this is not an adapter for the existing IPC-only
-    /// [`Connection::send_one_way`](crate::connection::Connection::send_one_way).
+    /// role before admission; this is not an adapter for the retired legacy
+    /// IPC-only envelope-building API.
     /// Success means the complete local message write finished, not that the
     /// peer received, decoded, processed, acknowledged or durably stored it.
     /// Failure/timeout after writing began may have an uncertain remote outcome.
@@ -223,7 +223,7 @@ pub trait MessageChannel: Send + Sync + 'static {
     /// [ClientServerTcpTransport.cpp:96–131](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/client/ClientServerTransport/ClientServerTcpTransport.cpp#L96-L131)
     /// has different close/abort teardown and skips externally owned transport.
     /// This is neither native Abort nor runtime service disposal, and does not
-    /// change existing [`Connection::abort`](crate::connection::Connection::abort).
+    /// change runtime service-disposal authority.
     fn close(&self, deadline: Instant) -> ChannelFuture<'_, ()>;
 }
 
@@ -339,6 +339,13 @@ pub trait MessageReceiver: Send + Sync + 'static {
 pub struct IncomingMessage<Target: Send + Sync + 'static> {
     /// Original owned wire headers/body; domain decoding remains above ingress.
     pub message: Message,
+    /// Monotonic complete-frame receipt time, preserved across queued handoff.
+    /// Diagnostic/deadline input only; editing it cannot mint reply authority.
+    pub received_at: Instant,
+    /// Optional ordered ingress handoff acknowledgment, not a reply grant.
+    /// Acknowledge only after the configured bounded handoff; reject/abort
+    /// before releasing malformed ingress. Dropping also releases the barrier.
+    pub handoff: Option<crate::native_channel::CompletionGuard>,
     /// Shared backend source identity/state, not a live-session guarantee.
     pub source: Arc<Target>,
     /// One authorized reply attempt, absent for ordinary one-way ingress.
