@@ -131,6 +131,73 @@ fn defaults_overrides_and_native_layout_are_not_fixture_constants() {
 }
 
 #[test]
+fn deployment_reservation_rejects_source_overlap_including_symlink_aliases() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new();
+    let mut package = fixture.load(&[]).unwrap();
+    let source = package.source_code.clone();
+    let alias = fixture.0.join("code-alias");
+    symlink(&source, &alias).unwrap();
+    for source_path in [&source, &alias] {
+        package.source_code = source_path.clone();
+        for parent in [
+            source.clone(),
+            source.join("bin"),
+            alias.clone(),
+            alias.join("bin"),
+            alias.join("bin/.."),
+        ] {
+            let before = fs::read_dir(&parent).unwrap().count();
+            let error = Deployment::reserve(&parent, &package).unwrap_err();
+            assert!(
+                error.0.contains("outside the source code package"),
+                "{error}"
+            );
+            assert_eq!(fs::read_dir(&parent).unwrap().count(), before);
+        }
+    }
+    assert!(source.join("bin/program").is_file());
+}
+
+#[test]
+fn deployment_materialization_rechecks_source_overlap_before_writing() {
+    let fixture = Fixture::new();
+    let mut package = fixture.load(&[]).unwrap();
+    let bundle = Deployment::reserve(&fixture.0, &package).unwrap();
+    for source in [fixture.0.clone(), bundle.root.clone()] {
+        package.source_code = source;
+        let error = bundle.materialize(&package).unwrap_err();
+        assert!(
+            error.0.contains("outside the source code package"),
+            "{error}"
+        );
+        assert_eq!(fs::read_dir(&bundle.root).unwrap().count(), 0);
+    }
+    bundle.release().unwrap();
+    assert!(fixture.0.join("OtherPackage/Bin/bin/program").is_file());
+}
+
+#[test]
+fn deployment_allows_symlinked_sibling_parent_with_source_name_prefix() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new();
+    let package = fixture.load(&[]).unwrap();
+    let sibling = fixture.0.join("OtherPackage/Bin-runs");
+    fs::create_dir(&sibling).unwrap();
+    let alias = fixture.0.join("runs-alias");
+    symlink(&sibling, &alias).unwrap();
+    let bundle = Deployment::from_manifest(&alias, &package).unwrap();
+    assert!(bundle.root.starts_with(sibling.canonicalize().unwrap()));
+    assert_eq!(
+        fs::read(&bundle.executable).unwrap(),
+        fs::read(package.source_code.join("bin/program")).unwrap()
+    );
+    bundle.release().unwrap();
+    assert!(package.source_code.join("bin/program").is_file());
+    assert_eq!(fs::read_dir(&sibling).unwrap().count(), 0);
+}
+
+#[test]
 fn unsupported_application_syntax_is_never_stripped() {
     let fixture = Fixture::new();
     for app in [
