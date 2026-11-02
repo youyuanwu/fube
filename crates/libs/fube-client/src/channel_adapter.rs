@@ -35,6 +35,7 @@ pub(crate) fn ordinary() -> Result<ChannelComposition> {
         ordinary_reply,
         actors: ActorDemux::new(vec![])?,
         duplex: None,
+        requests: None,
     })
 }
 
@@ -111,6 +112,7 @@ pub(crate) fn upload() -> Result<ChannelComposition> {
                 .collect(),
         )?,
         duplex: None,
+        requests: None,
     })
 }
 

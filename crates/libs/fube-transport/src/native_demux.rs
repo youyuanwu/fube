@@ -102,6 +102,15 @@ pub struct DuplexPolicy {
     pub reply: EnvelopeValidator,
 }
 
+/// Independent authorization for normal actor requests and their responses.
+///
+/// Unlike DuplexPolicy this never classifies IsUncorrelatedReply traffic.
+/// Actor registration alone cannot mint this private consuming grant.
+pub struct RequestPolicy {
+    pub incoming: EnvelopeValidator,
+    pub reply: EnvelopeValidator,
+}
+
 /// Connect-time composition of independent mechanism authorization.
 ///
 /// Explicit trusted policy is required even with no actor registrations.
@@ -113,6 +122,7 @@ pub struct ChannelComposition {
     pub ordinary_reply: EnvelopeValidator,
     pub actors: ActorDemux,
     pub duplex: Option<DuplexPolicy>,
+    pub requests: Option<RequestPolicy>,
 }
 
 #[cfg(test)]
