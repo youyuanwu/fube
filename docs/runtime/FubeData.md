@@ -65,6 +65,8 @@ paired atomically with bounded ingress accounting. Validated secondary state
 retains it for immediate and later application-apply ACKs. Registration,
 duplicate advertised listeners and actor/address relearning cannot replace
 that grant: retired responses fail locally rather than dial another session.
+EOF does not retract a fully received packet already delivered to the engine;
+its historical source identity survives, but its closed reply target cannot write.
 Native membership projection and ordinary outbound membership routes remain
 separate adapter authority. Local write receipts are not semantic ACKs.
 

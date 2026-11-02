@@ -150,7 +150,7 @@ async fn actual_secondary_start_copy_and_apply_ack_keep_the_nonselected_source_s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delayed_engine_ingress_cannot_reconstruct_a_retired_source_from_registration() {
+async fn delayed_engine_ingress_cannot_redirect_a_retired_response_via_registration() {
     delayed_ingress_case(true).await;
 }
 
@@ -212,7 +212,18 @@ async fn delayed_ingress_case(relearn: bool) {
     secondary.transport.register_peer(&primary).unwrap();
     let mut replacement = if relearn {
         let mut socket = native_socket(&secondary.endpoint().address, &published).await;
-        send(&mut socket, &primary, &secondary, Body::RequestAck).await;
+        // Relearn the identical source without granting a new response. This
+        // volatile profile ignores persisted-copy context acknowledgments.
+        send(
+            &mut socket,
+            &primary,
+            &secondary,
+            Body::CopyContextAck {
+                sequence: 1,
+                error: 0,
+            },
+        )
+        .await;
         until(|| {
             secondary.transport.diagnostics()["events"]["received_control"][0]
                 .as_u64()
@@ -238,9 +249,10 @@ async fn delayed_ingress_case(relearn: bool) {
             .is_err(),
         "old ingress cannot turn into a registered-address dial"
     );
-    assert!(
-        secondary.snapshot().observed_primary.is_none(),
-        "retired ingress never starts copy"
+    assert_eq!(
+        secondary.snapshot().observed_primary,
+        Some(primary.to_string()),
+        "fully received work remains delivered after EOF; its response still cannot redirect"
     );
     // A genuinely new source message is independently usable, not poisoned by
     // the stale ingress and not interpreted as remote acknowledgment.

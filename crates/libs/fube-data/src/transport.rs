@@ -80,7 +80,9 @@ pub(crate) struct SourceTarget {
 
 impl SourceTarget {
     pub(crate) fn matches(&self, source: &Endpoint) -> bool {
-        self.actor == source.actor && self.address == source.address && self.is_live()
+        // This proves the identity of already delivered work, not permission
+        // for a new write. EOF cannot retract a fully received packet.
+        self.actor == source.actor && self.address == source.address
     }
 
     pub(crate) fn is_live(&self) -> bool {
