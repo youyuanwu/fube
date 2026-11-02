@@ -126,6 +126,7 @@ struct Shared {
     origin: Instant,
     state: Mutex<State>,
     stop: AtomicBool,
+    accepting: AtomicBool,
     wake: Notify,
     used: Arc<AtomicUsize>,
     node_bytes: usize,
@@ -576,6 +577,21 @@ fn node_capacity(node: &NodeContext) -> usize {
 
 impl Server {
     pub fn bind(address: SocketAddr, config: Config) -> crate::Result<Self> {
+        Self::bind_with_admission_barrier(address, config, false)
+    }
+
+    /// Dedicated owned-launch listener. TCP can connect, but no session is
+    /// accepted/dispatched before `start_admitted` and actual-PID admission.
+    /// The unopened barrier expires after five seconds, retaining cleanup state.
+    pub fn bind_suspended(address: SocketAddr, config: Config) -> crate::Result<Self> {
+        Self::bind_with_admission_barrier(address, config, true)
+    }
+
+    fn bind_with_admission_barrier(
+        address: SocketAddr,
+        config: Config,
+        suspended: bool,
+    ) -> crate::Result<Self> {
         if node_capacity(&config.node) > ADMISSION_BYTES / 2 {
             return Err(crate::Error::Capacity);
         }
@@ -622,6 +638,7 @@ impl Server {
                 consumer: None,
             }),
             stop: AtomicBool::new(false),
+            accepting: AtomicBool::new(!suspended),
             wake: Notify::new(),
             used: Arc::new(AtomicUsize::new(0)),
             node_bytes,
@@ -656,6 +673,22 @@ impl Server {
     }
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    pub fn start_admitted(&self) -> crate::Result<()> {
+        let state = self.shared.state()?;
+        if self.shared.stop.load(Ordering::SeqCst) {
+            return Err(crate::Error::ObjectClosed);
+        }
+        if self.shared.origin.elapsed() >= IO_DEADLINE
+            || state.records.is_empty()
+            || state.records.iter().any(|r| !r.entry.authority.live())
+        {
+            return Err(crate::Error::InvalidState);
+        }
+        self.shared.accepting.store(true, Ordering::SeqCst);
+        self.shared.wake.notify_one();
+        Ok(())
     }
     /// Claim local delivery before factory admission. Reporting is explicitly
     /// disabled at construction; callers must own actual local consumers.
@@ -911,8 +944,10 @@ async fn serve(listener: TcpListener, shared: Arc<Shared>) {
         }
         tokio::select! {
             _ = shared.wake.notified() => {},
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(shared.origin + IO_DEADLINE)),
+                if !shared.accepting.load(Ordering::SeqCst) => { break; },
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
-            accepted = listener.accept(), if tasks.len() < shared.config.max_admissions => {
+            accepted = listener.accept(), if shared.accepting.load(Ordering::SeqCst) && tasks.len() < shared.config.max_admissions => {
                 let Ok((socket, peer)) = accepted else { break };
                 if !peer.ip().is_loopback() { continue }
                 let owned = shared.clone();
@@ -927,6 +962,7 @@ async fn serve(listener: TcpListener, shared: Arc<Shared>) {
             }
         }
     }
+    shared.stop.store(true, Ordering::SeqCst);
     // Cancel sockets first; aborted work is joined, then synchronously cleaned.
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}

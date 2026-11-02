@@ -1,4 +1,7 @@
-use std::os::{fd::AsRawFd, unix::process::CommandExt};
+use std::os::{
+    fd::AsRawFd,
+    unix::{ffi::OsStrExt, process::CommandExt},
+};
 use std::{
     collections::VecDeque,
     io::{Read, Write},
@@ -125,6 +128,42 @@ impl OwnedApp {
         if slot.is_some() {
             return Err(HostError("process slot already occupied".into()));
         }
+        // execvp/execvpe may run /bin/sh on ENOEXEC. This owner executes only the
+        // exact executable (or its explicit shebang interpreter), never that
+        // implicit shell fallback. Build all strings before fork; child setup
+        // uses fixed pointer arrays and async-signal-safe execve only.
+        use std::ffi::CString;
+        let cstring =
+            |bytes: &[u8]| CString::new(bytes).map_err(|_| HostError("NUL in launch input".into()));
+        let executable = cstring(command.get_program().as_bytes())?;
+        if !std::path::Path::new(command.get_program()).is_absolute() {
+            return Err(HostError("owned executable must be absolute".into()));
+        }
+        let mut arguments = vec![executable.clone()];
+        for arg in command.get_args() {
+            arguments.push(cstring(arg.as_bytes())?);
+        }
+        let mut environment = Vec::new();
+        for (key, value) in command.get_envs() {
+            if let Some(value) = value {
+                let mut bytes = key.as_bytes().to_vec();
+                bytes.push(b'=');
+                bytes.extend_from_slice(value.as_bytes());
+                environment.push(cstring(&bytes)?);
+            }
+        }
+        if arguments.len() > 129
+            || environment.len() > 64
+            || arguments
+                .iter()
+                .chain(&environment)
+                .map(|s| s.as_bytes_with_nul().len())
+                .sum::<usize>()
+                > 128 * 1024
+        {
+            return Err(HostError("launch input capacity exceeded".into()));
+        }
+        command.env_clear();
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -133,7 +172,7 @@ impl OwnedApp {
             command.process_group(0);
             // Parent-death containment and no potentially enormous native core.
             unsafe {
-                command.pre_exec(|| {
+                command.pre_exec(move || {
                     let parent = libc::getppid();
                     if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                         return Err(std::io::Error::last_os_error());
@@ -148,7 +187,16 @@ impl OwnedApp {
                     if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    Ok(())
+                    let mut argv = [std::ptr::null(); 130];
+                    for (i, arg) in arguments.iter().enumerate() {
+                        argv[i] = arg.as_ptr();
+                    }
+                    let mut envp = [std::ptr::null(); 65];
+                    for (i, value) in environment.iter().enumerate() {
+                        envp[i] = value.as_ptr();
+                    }
+                    libc::execve(executable.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                    Err(std::io::Error::last_os_error())
                 });
             }
         }
