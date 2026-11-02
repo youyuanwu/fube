@@ -32,7 +32,7 @@ use crate::{
     channel::{
         ChannelFuture, IncomingMessage, MessageChannel, MessageReceiver, ReplyContext, RpcChannel,
     },
-    connection::{write_message, MAX_FRAME_TIME},
+    connection::MAX_FRAME_TIME,
     frame::{FIXED_HEADER_SIZE, MAX_FRAME_SIZE, MAX_HEADER_SIZE},
     message::{self, Header, ListenInstance, Message, MessageId, Properties, MAX_HEADER_COUNT},
     native_demux::{ChannelComposition, Dispatch, EnvelopeValidator, OutboundKind},
@@ -50,11 +50,26 @@ use request_reply::NativeReplyContext;
 #[cfg(test)]
 use crate::frame::{validate_fixed, Frame};
 
-const ORDINARY: usize = 0;
-const REPLY: usize = 1;
-const INGRESS: usize = 2;
-const RECEIVE: usize = 3;
-const CLOSE: usize = 4;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BudgetClass {
+    Ordinary,
+    Reply,
+    Ingress,
+    Receive,
+    Close,
+}
+
+impl BudgetClass {
+    fn index(self) -> usize {
+        match self {
+            Self::Ordinary => 0,
+            Self::Reply => 1,
+            Self::Ingress => 2,
+            Self::Receive => 3,
+            Self::Close => 4,
+        }
+    }
+}
 
 /// Immutable finite limits, validated before connection establishment.
 ///
@@ -98,7 +113,7 @@ impl ChannelLimits {
             .ok_or(Error::InvalidInput("channel allocation limit overflow"))
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.max_operations == 0
             || self.max_replies == 0
             || self.max_ingress == 0
@@ -132,39 +147,42 @@ struct Budget {
 
 struct Lease {
     budget: Arc<Budget>,
-    class: usize,
+    class: BudgetClass,
     bytes: usize,
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
         let mut usage = self.budget.usage.lock().unwrap();
-        usage.counts[self.class] -= 1;
+        usage.counts[self.class.index()] -= 1;
         usage.bytes -= self.bytes;
     }
 }
 
 impl Budget {
-    fn reserve(self: &Arc<Self>, class: usize) -> Result<Arc<Lease>> {
+    fn reserve(self: &Arc<Self>, class: BudgetClass) -> Result<Arc<Lease>> {
         let count_limit = match class {
-            REPLY => self.limits.max_replies,
-            INGRESS => self.limits.max_ingress,
-            _ => self.limits.max_operations,
+            BudgetClass::Reply => self.limits.max_replies,
+            BudgetClass::Ingress => self.limits.max_ingress,
+            BudgetClass::Ordinary | BudgetClass::Receive | BudgetClass::Close => {
+                self.limits.max_operations
+            }
         };
-        let bytes = if class >= RECEIVE {
-            256
-        } else {
-            self.limits.slot_bytes()?
+        let bytes = match class {
+            BudgetClass::Receive | BudgetClass::Close => 256,
+            BudgetClass::Ordinary | BudgetClass::Reply | BudgetClass::Ingress => {
+                self.limits.slot_bytes()?
+            }
         };
         let mut usage = self.usage.lock().unwrap();
         let total = usage
             .bytes
             .checked_add(bytes)
             .ok_or(Error::ResourceLimit("channel bytes"))?;
-        if usage.counts[class] >= count_limit || total > self.limits.max_retained_bytes {
+        if usage.counts[class.index()] >= count_limit || total > self.limits.max_retained_bytes {
             return Err(Error::ResourceLimit("channel retained count/bytes"));
         }
-        usage.counts[class] += 1;
+        usage.counts[class.index()] += 1;
         usage.bytes = total;
         Ok(Arc::new(Lease {
             budget: self.clone(),
@@ -195,11 +213,26 @@ enum Outcome {
 /// not mutate/cancel this channel or perform I/O, blocking work or user callbacks.
 pub type WritePredicate = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Trusted, bounded session envelope preparation, never domain work or I/O.
-pub(crate) trait OutboundEnvelope: Send + Sync {
-    fn header(&self, message: &Message, original_reply: bool) -> Result<Option<Header>>;
-    fn requires_message_id(&self) -> bool;
+/// Trusted, bounded session envelope policy, never domain work or I/O.
+///
+/// Common control, correlation and consuming reply guards cannot be overridden.
+pub(crate) trait SessionEnvelope: Send + Sync {
+    fn header(&self, _: &Message, _: bool) -> Result<Option<Header>> {
+        Ok(None)
+    }
+    fn requires_message_id(&self) -> bool {
+        false
+    }
+    fn incoming(&self, message: &Message) -> Result<()> {
+        if has(message, message::IPC) {
+            return Err(Error::Protocol("IPC envelope on native channel"));
+        }
+        Ok(())
+    }
 }
+
+struct NativeEnvelope;
+impl SessionEnvelope for NativeEnvelope {}
 
 /// Opaque completion acknowledgment and retained result reservation.
 ///
@@ -282,6 +315,7 @@ struct Ingress {
 
 struct Inner {
     terminal: Option<Error>,
+    dispose_requested: bool,
     next_token: u64,
     next_index: u32,
     remote: ListenInstance,
@@ -294,6 +328,29 @@ struct Inner {
     unmatched: usize,
 }
 
+impl Inner {
+    fn retire_pending(&mut self, id: Option<MessageId>) {
+        if let Some(id) = id {
+            self.pending.remove(&id);
+        }
+    }
+
+    fn settle(&mut self, token: u64, result: Result<Outcome>, now: Instant) {
+        if let Some(entry) = self.entries.get_mut(&token) {
+            if entry.result.is_none() {
+                entry.result = Some(if now >= entry.deadline {
+                    Err(Error::Timeout)
+                } else {
+                    result
+                });
+                entry.bytes = None;
+                let id = entry.id;
+                self.retire_pending(id);
+            }
+        }
+    }
+}
+
 struct Shared {
     inner: Mutex<Inner>,
     budget: Arc<Budget>,
@@ -302,12 +359,12 @@ struct Shared {
     process_id: [u8; 16],
     changed: Notify,
     stop: Notify,
+    dispose: Notify,
     stopped: watch::Sender<bool>,
     /// Serializes actual first-write progress with cancellation/termination.
     /// Separate from inner so validity samples can safely read diagnostics.
     visibility: Mutex<()>,
-    outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
-    accepted_ipc: bool,
+    session_envelope: Arc<dyn SessionEnvelope>,
 }
 
 impl Shared {
@@ -316,8 +373,13 @@ impl Shared {
     }
 
     fn terminate(&self, error: Error) {
+        self.end(error, false);
+    }
+
+    fn end(&self, error: Error, dispose: bool) {
         let _visibility = self.visibility.lock().unwrap();
         let mut inner = self.inner.lock().unwrap();
+        inner.dispose_requested |= dispose;
         if inner.terminal.is_none() {
             inner.terminal = Some(error);
             inner.entries.clear();
@@ -329,24 +391,15 @@ impl Shared {
         }
         drop(inner);
         self.stop.notify_waiters();
+        if dispose {
+            self.dispose.notify_waiters();
+        }
         self.changed.notify_waiters();
     }
 
     fn finish(&self, token: u64, result: Result<Outcome>) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(entry) = inner.entries.get_mut(&token) {
-            if entry.result.is_none() {
-                entry.result = Some(if Instant::now() >= entry.deadline {
-                    Err(Error::Timeout)
-                } else {
-                    result
-                });
-                let id = entry.id;
-                if let Some(id) = id {
-                    inner.pending.remove(&id);
-                }
-            }
-        }
+        inner.settle(token, result, Instant::now());
         drop(inner);
         self.changed.notify_waiters();
     }
@@ -423,76 +476,6 @@ impl Iterator for GatewayIngressSnapshot {
 impl ExactSizeIterator for GatewayIngressSnapshot {}
 
 impl GatewayChannel {
-    /// Adopt one accepted, explicitly trusted numeric-loopback IPC socket.
-    ///
-    /// Performs the client-only ListenInstance exchange before starting the same
-    /// bounded driver used by outgoing channels. IPC identity is admitted only
-    /// in this immutable server mode and must be validated by domain actors.
-    /// This does not authenticate local processes or supply a listener.
-    pub async fn accept_unsecured_loopback_ipc(
-        mut stream: TcpStream,
-        composition: ChannelComposition,
-        limits: ChannelLimits,
-        deadline: Instant,
-    ) -> Result<Self> {
-        limits.validate()?;
-        let endpoint = stream.peer_addr()?;
-        let local = stream.local_addr()?;
-        if !endpoint.ip().is_loopback() || !local.ip().is_loopback() {
-            return Err(Error::InvalidInput("accepted IPC requires loopback"));
-        }
-        check_deadline(deadline)?;
-        let process_id = uuid::Uuid::new_v4().to_bytes_le();
-        timeout_at(deadline, async {
-            let first = read_bounded(&mut stream, limits.max_frame_bytes).await?;
-            let props = envelope(&first, true)?;
-            if props.id == MessageId::default()
-                || ListenInstance::decode(&first.body)? != ListenInstance::default()
-                || props.actor != 1
-                || !props.action.is_empty()
-                || first.headers.iter().any(|h| {
-                    !matches!(
-                        h.id,
-                        message::ACTOR
-                            | message::ACTION
-                            | message::MESSAGE_ID
-                            | message::HIGH_PRIORITY
-                    )
-                })
-            {
-                return Err(Error::Protocol("invalid client-only ListenInstance"));
-            }
-            write_message(
-                &mut stream,
-                &Message::listen_instance(
-                    MessageId {
-                        guid: process_id,
-                        index: 1,
-                    },
-                    &ListenInstance {
-                        address: local.to_string(),
-                        instance: 1,
-                        nonce: process_id,
-                    },
-                )?,
-            )
-            .await?;
-            Ok(())
-        })
-        .await
-        .map_err(|_| Error::Timeout)??;
-        stream.set_nodelay(true)?;
-        Ok(Self::start_composed(
-            stream,
-            endpoint,
-            composition,
-            limits,
-            process_id,
-            ListenInstance::default(),
-            None,
-            true,
-        ))
-    }
     /// Connect a dedicated, explicitly trusted unsecured-development gateway.
     ///
     /// Only numeric loopback endpoints are allowed. The immutable composition
@@ -504,7 +487,14 @@ impl GatewayChannel {
         limits: ChannelLimits,
         deadline: Instant,
     ) -> Result<Self> {
-        Self::connect_with_envelope(endpoint, composition, limits, deadline, None).await
+        Self::connect_with_envelope(
+            endpoint,
+            composition,
+            limits,
+            deadline,
+            Arc::new(NativeEnvelope),
+        )
+        .await
     }
 
     pub(crate) async fn connect_with_envelope(
@@ -512,7 +502,7 @@ impl GatewayChannel {
         composition: ChannelComposition,
         limits: ChannelLimits,
         deadline: Instant,
-        outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
+        session_envelope: Arc<dyn SessionEnvelope>,
     ) -> Result<Self> {
         limits.validate()?;
         if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
@@ -537,6 +527,42 @@ impl GatewayChannel {
         let props = envelope(&message.message, true)?;
         let remote = control_instance(&message.message, &props)?;
         check_deadline(deadline)?;
+        Self::adopt_established(
+            stream,
+            composition,
+            limits,
+            process_id,
+            remote,
+            deadline,
+            session_envelope,
+        )
+    }
+
+    /// Publish exactly one established trusted-loopback socket.
+    ///
+    /// The session adapter must complete and validate its hello before calling.
+    /// Actual endpoint/finite-limit/deadline checks are repeated here; callers
+    /// cannot assert a different target or gain domain admission from adoption.
+    pub(crate) fn adopt_established(
+        stream: TcpStream,
+        composition: ChannelComposition,
+        limits: ChannelLimits,
+        process_id: [u8; 16],
+        remote: ListenInstance,
+        deadline: Instant,
+        session_envelope: Arc<dyn SessionEnvelope>,
+    ) -> Result<Self> {
+        limits.validate()?;
+        let endpoint = stream.peer_addr()?;
+        if !endpoint.ip().is_loopback()
+            || endpoint.port() == 0
+            || !stream.local_addr()?.ip().is_loopback()
+            || process_id == [0; 16]
+        {
+            return Err(Error::InvalidInput("invalid established loopback session"));
+        }
+        check_deadline(deadline)?;
+        stream.set_nodelay(true)?;
         Ok(Self::start_with_envelope(
             stream,
             endpoint,
@@ -544,7 +570,7 @@ impl GatewayChannel {
             limits,
             process_id,
             remote,
-            outbound_envelope,
+            session_envelope,
         ))
     }
 
@@ -564,7 +590,7 @@ impl GatewayChannel {
             limits,
             process_id,
             remote,
-            None,
+            Arc::new(NativeEnvelope),
         )
     }
 
@@ -576,34 +602,12 @@ impl GatewayChannel {
         limits: ChannelLimits,
         process_id: [u8; 16],
         remote: ListenInstance,
-        outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
-    ) -> Self {
-        Self::start_composed(
-            stream,
-            endpoint,
-            composition,
-            limits,
-            process_id,
-            remote,
-            outbound_envelope,
-            false,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn start_composed<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-        stream: S,
-        endpoint: SocketAddr,
-        composition: ChannelComposition,
-        limits: ChannelLimits,
-        process_id: [u8; 16],
-        remote: ListenInstance,
-        outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
-        accepted_ipc: bool,
+        session_envelope: Arc<dyn SessionEnvelope>,
     ) -> Self {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 terminal: None,
+                dispose_requested: false,
                 next_token: 1,
                 next_index: 2,
                 remote,
@@ -630,10 +634,10 @@ impl GatewayChannel {
             process_id,
             changed: Notify::new(),
             stop: Notify::new(),
+            dispose: Notify::new(),
             stopped: watch::channel(false).0,
             visibility: Mutex::new(()),
-            outbound_envelope,
-            accepted_ipc,
+            session_envelope,
         });
         let join = tokio::spawn(drive(stream, shared.clone()));
         Self {
@@ -667,7 +671,7 @@ impl GatewayChannel {
     /// a started frame. Waiter admission is finite and nonowning.
     pub fn wait_terminal(&self, deadline: Instant) -> ChannelFuture<'_, Error> {
         Box::pin(async move {
-            let _waiter = self.owner.shared.budget.reserve(CLOSE)?;
+            let _waiter = self.owner.shared.budget.reserve(BudgetClass::Close)?;
             timeout_at(deadline, async {
                 loop {
                     let stopped = self.owner.shared.stop.notified();
@@ -684,14 +688,27 @@ impl GatewayChannel {
         })
     }
 
-    /// Initiate irreversible bounded shutdown without awaiting driver exit.
+    /// Stop admission and initiate ordinary shutdown without awaiting driver exit.
+    ///
+    /// A started frame retains its suffix until completion or its independent
+    /// watchdog. Use [`Self::dispose`] only to retire the entire socket instead.
     pub fn abort(&self) {
         self.abort_with_error(Error::Closed);
     }
 
-    /// Initiate shutdown retaining the first terminal cause.
+    /// Initiate ordinary shutdown retaining the first terminal cause.
     pub fn abort_with_error(&self, error: Error) {
         self.owner.shared.terminate(error);
+    }
+
+    /// Irreversibly dispose the entire owned socket, including a started frame.
+    ///
+    /// Unlike ordinary abort/close, this permits truncating an uncertain suffix.
+    /// No part of the stream can be reused. It can escalate ordinary shutdown
+    /// without replacing its first cause. Use [`Self::closed`] to observe driver
+    /// exit; timeout/drop of that observer does not relinquish join ownership.
+    pub fn dispose(&self) {
+        self.owner.shared.end(Error::Closed, true);
     }
 
     /// Noninitiating bounded wait for the owned socket/driver to exit.
@@ -699,7 +716,7 @@ impl GatewayChannel {
     /// The join handle stays owned if this observer times out or is dropped.
     pub fn closed(&self, deadline: Instant) -> ChannelFuture<'_, ()> {
         Box::pin(async move {
-            let _waiter = self.owner.shared.budget.reserve(CLOSE)?;
+            let _waiter = self.owner.shared.budget.reserve(BudgetClass::Close)?;
             timeout_at(deadline, async {
                 let mut join = self.owner.join.lock().await;
                 if let Some(handle) = join.as_mut() {
@@ -866,7 +883,7 @@ fn local(error: Error) -> Error {
 /// Preserve and validate every record under the existing header/frame bounds.
 /// Only ExpectsReply retains the second-byte-identical exception; other fields
 /// stay unique. Domain reply eligibility belongs to the caller.
-fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
+pub(crate) fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
     let ids = [
         message::ACTOR,
         message::ACTION,
@@ -975,9 +992,7 @@ struct OperationGuard {
 
 fn retire(inner: &mut Inner, token: u64) {
     if let Some(entry) = inner.entries.remove(&token) {
-        if let Some(id) = entry.id {
-            inner.pending.remove(&id);
-        }
+        inner.retire_pending(entry.id);
     }
     inner.ordinary.retain(|queued| *queued != token);
     inner.replies.retain(|queued| *queued != token);
@@ -1018,10 +1033,9 @@ async fn submit(
     if crate::native_demux::is_control(props.actor) || has(&message, message::IPC) {
         return Err(Error::InvalidInput("reserved native transport envelope"));
     }
-    let session_header = match &shared.outbound_envelope {
-        Some(envelope) => envelope.header(&message, matches!(submission, Submission::Reply(..)))?,
-        None => None,
-    };
+    let session_header = shared
+        .session_envelope
+        .header(&message, matches!(submission, Submission::Reply(..)))?;
     match submission {
         Submission::Raw => (shared.composition.outbound)(&message, &props, OutboundKind::Raw)?,
         Submission::Reserved => {
@@ -1032,9 +1046,9 @@ async fn submit(
     }
     let rpc = matches!(submission, Submission::Rpc);
     let class = if matches!(submission, Submission::Reply(..) | Submission::Reserved) {
-        REPLY
+        BudgetClass::Reply
     } else {
-        ORDINARY
+        BudgetClass::Ordinary
     };
     match submission {
         Submission::Raw | Submission::Reserved
@@ -1071,12 +1085,7 @@ async fn submit(
     if let Some(header) = session_header {
         message.headers.push(header);
     }
-    let requires_id = rpc
-        || shared.accepted_ipc
-        || shared
-            .outbound_envelope
-            .as_ref()
-            .is_some_and(|envelope| envelope.requires_message_id());
+    let requires_id = rpc || shared.session_envelope.requires_message_id();
     let lease = shared.budget.reserve(class)?;
     let token;
     {
@@ -1156,7 +1165,7 @@ async fn submit(
         if rpc {
             inner.pending.insert(id.unwrap(), token);
         }
-        if class == REPLY {
+        if class == BudgetClass::Reply {
             inner.replies.push_back(token);
         } else {
             inner.ordinary.push_back(token);
@@ -1326,7 +1335,7 @@ impl MessageReceiver for GatewayReceiver {
                 return Err(Error::Closed);
             }
             check_deadline(deadline)?;
-            let _waiter = shared.budget.reserve(RECEIVE)?;
+            let _waiter = shared.budget.reserve(BudgetClass::Receive)?;
             timeout_at(deadline, async {
                 loop {
                     let notified = shared.changed.notified();
@@ -1401,9 +1410,7 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
                 "unsupported role/security/reconnect control; no recovery",
             ));
         }
-        if has(&message, message::IPC) && !shared.accepted_ipc {
-            return Err(Error::Protocol("IPC envelope on native channel"));
-        }
+        shared.session_envelope.incoming(&message)?;
         let mut reply_authorize = None;
         let reply_id = match shared.composition.actors.select(&props)? {
             Dispatch::Actor(authorize) => {
@@ -1441,7 +1448,7 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
             Dispatch::Reply => None,
         };
         if let Some(reply_id) = reply_id {
-            let lease = shared.budget.reserve(INGRESS)?;
+            let lease = shared.budget.reserve(BudgetClass::Ingress)?;
             let (handoff, acknowledgment) = if shared.composition.ordered_ingress {
                 let (send, receive) = oneshot::channel();
                 (Some(send), Some(receive))
@@ -1492,7 +1499,7 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
             // Properties validates every occurrence and exposes the final
             // native-effective ID. Never try an earlier ID, even if final is
             // unknown/retired and an earlier one names a live neighbor.
-            let token = inner.pending.remove(&props.relates_to);
+            let token = inner.pending.get(&props.relates_to).copied();
             if token.is_none() {
                 inner.unmatched += 1;
                 if inner.unmatched > 1024 {
@@ -1560,16 +1567,17 @@ async fn send_loop<W: AsyncWrite + Unpin>(mut writer: W, shared: &Arc<Shared>) -
                 .pop_front()
                 .or_else(|| inner.ordinary.pop_front());
             token.and_then(|token| {
+                let now = Instant::now();
+                if inner
+                    .entries
+                    .get(&token)
+                    .is_some_and(|entry| now >= entry.deadline)
+                {
+                    inner.settle(token, Err(Error::Timeout), now);
+                }
                 let entry = inner.entries.get_mut(&token)?;
-                if Instant::now() >= entry.deadline || entry.result.is_some() {
+                if entry.result.is_some() {
                     entry.bytes = None;
-                    if entry.result.is_none() {
-                        entry.result = Some(Err(Error::Timeout));
-                    }
-                    let id = entry.id;
-                    if let Some(id) = id {
-                        inner.pending.remove(&id);
-                    }
                     return None;
                 }
                 Some((
@@ -1668,13 +1676,7 @@ async fn expire_loop(shared: &Arc<Shared>) {
                 .collect();
             let did_expire = !expired.is_empty();
             for token in expired {
-                let entry = inner.entries.get_mut(&token).unwrap();
-                entry.result = Some(Err(Error::Timeout));
-                entry.bytes = None;
-                let id = entry.id;
-                if let Some(id) = id {
-                    inner.pending.remove(&id);
-                }
+                inner.settle(token, Err(Error::Timeout), now);
             }
             (
                 inner
@@ -1719,19 +1721,17 @@ async fn drive<S: AsyncRead + AsyncWrite + Unpin>(stream: S, shared: Arc<Shared>
         stop.await;
     };
     let writing = async {
-        if !shared.accepted_ipc {
-            return send_loop(writer, &shared).await;
-        }
-        let stop = shared.stop.notified();
-        tokio::pin!(stop);
-        stop.as_mut().enable();
-        // Accepted Hosting retirement discards the entire socket, including any
-        // uncertain partial reply. Client writers must still finish their suffix.
-        if shared.error().is_some() {
-            return Ok(());
-        }
+        let disposed = async {
+            let disposed = shared.dispose.notified();
+            tokio::pin!(disposed);
+            disposed.as_mut().enable();
+            if !shared.inner.lock().unwrap().dispose_requested {
+                disposed.await;
+            }
+        };
         tokio::select! {
-            _ = stop => Ok(()),
+            biased;
+            _ = disposed => Ok(()),
             result = send_loop(writer, &shared) => result,
         }
     };

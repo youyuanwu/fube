@@ -382,6 +382,19 @@ readiness or stateful activation is implied. Shared Hosting/process changes
 retain all seven separate release-native actions below on a fresh clean-source
 bundle; those are not combined production Rust RA evidence.
 
+Channel/session-boundary changes additionally reuse the transport library's
+first-positive-write, ordinary suffix/join, explicit whole-socket disposal,
+accepted IPC/adoption, late-observation and independent-budget regressions.
+Run `cargo test --locked -p fube-transport --lib -- --test-threads=1` and the
+Hosting `ipc_leases` target, keeping its real-TCP withdrawal threshold unchanged.
+For shared raw I/O, the data adapter's tests are `transport::tests::` (or its full
+library), not only the engine's separate `transport_tests::` source-grant tests.
+Accepted IPC policy lives in `native_ipc`; Hosting explicitly disposes withdrawn
+connections. No session role changes ordinary abort/close suffix ownership.
+Native-data reports retain every structured evidence field in compact JSON;
+the existing proof-input byte limit and full semantic/provenance validation
+still apply. Bounded console summaries are not substitutes for those reports.
+
 ### Separate release-native regression
 
 Follow [native ABI prerequisites and commands](runtime/RustTestHost.md#22-prerequisites-and-commands):

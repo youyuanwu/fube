@@ -35,8 +35,10 @@ Adapters retain finite queue/byte ownership and choose priority. Their fence
 is sampled around every actual socket poll until the first positive write;
 selection and Pending do not commit visibility. After that write, the complete
 suffix and its charge stay owned until completion or independent frame failure,
-even on caller cancellation, operation expiry or close. Owners stop then join;
-they must not cancel/drop that writer future. Complete local write is never
+even on caller cancellation, operation expiry or ordinary close. Owners stop
+then join; they must not cancel/drop that writer future while retaining a
+reusable stream. The channel's explicit terminal whole-socket disposal below
+is a different operation, not observer cancellation. Complete local write is never
 remote receipt, acknowledgment or commit.
 
 Gateway correlation/history, request/reply grants and IPC identity remain above
@@ -172,25 +174,34 @@ Caller-supplied IPC headers and explicit empty IPC MessageIds reject. Correlated
 context replies instead carry their original RelatesTo and **no automatic IPC
 identity or new MessageId**, matching the separate native receiver-context path.
 
-The generic channel has no outgoing IPC-identity constructor or host/PID state. Its private,
-bounded session-envelope hook applies the captured protocol envelope on
-submission, including through cloned owners; it is not a public plugin or a
-domain executor. Collision-aware ID allocation/history, budgets and first-write
+The generic channel has no IPC-role constructor or host/PID state. Its private,
+bounded session-envelope seam validates inbound session envelopes and applies
+outbound header/missing-ID policy, including through cloned owners; it is not a
+public plugin or domain executor. Fixed common wire/control/correlation guards
+and consuming reply authority remain outside that policy. Collision-aware ID
+allocation/history, budgets and first-write
 fencing remain shared-driver mechanisms. The internal
 [`native_request_reply`](../../crates/libs/fube-transport/src/native_request_reply.rs)
 component owns the consuming source-bound reply context for both normal and
 special ingress. Runtime actor/action rules and control/health processing stay
 in the runtime adapter; only opaque ordering acknowledgments live below it.
 
-Hosting additionally adopts one accepted numeric-loopback socket through
-`accept_unsecured_loopback_ipc`, performing the client-only ListenInstance
-exchange and using this same driver. Immutable accepted mode permits IPC
-headers for Hosting's exact host/PID/session validation; normal gateway/client
-ingress still rejects them. Server semantic sends receive missing MessageIds,
-not RelatesTo. Its bounded no-eviction session ID history admits legitimate
-priority-lane reordering, rejects replay and retires on exhaustion. Terminal
-accepted-session retirement discards the entire socket (an uncertain partial
-reply is not reused); ordinary client started-suffix guarantees stay unchanged.
+Hosting calls
+[`native_ipc::accept_unsecured_loopback`](../../crates/libs/fube-transport/src/native_ipc.rs)
+for the restricted client-only ListenInstance exchange and accepted IPC envelope
+policy. A crate-private established-session adoption seam rechecks actual socket
+endpoints, finite limits, allocator identity and deadline before publishing the
+same channel driver. It does not expose arbitrary stream adoption or domain
+admission. Accepted IPC policy permits identity on actor ingress for Hosting's
+exact host/PID/session validation; normal gateway/client ingress and ordinary
+correlated replies still reject it. Server semantic sends receive missing
+MessageIds, not RelatesTo; original-context replies receive neither identity nor
+a new automatic ID. Hosting's bounded no-eviction session ID history admits
+legitimate priority-lane reordering, rejects replay and retires on exhaustion.
+Hosting explicitly invokes generic whole-socket `dispose()` at connection
+retirement, including authority withdrawal under backpressure; IPC role never
+selects shutdown behavior. An uncertain partial reply on that disposed socket
+is never reused. Ordinary abort/close started-suffix guarantees stay unchanged.
 Hosting reserves one ordinary lifecycle send, one ingress and one reserved
 response within its 4MiB connection scratch budget, leaving lease byte headroom.
 See [production local composition and regressions](../cluster/StatelessRaRap.md).
@@ -341,6 +352,12 @@ attempts fail Closed. No unused capability keeps workers alive after close.
 `abort()`/`abort_with_error()` initiate shutdown synchronously, preserving the
 first cause; `closed(deadline)` only observes the retained driver join and never
 initiates shutdown. Its timeout/drop also leaves the join handle owned.
+`dispose()` explicitly initiates irreversible **whole-socket** retirement and
+permits truncating a started frame; it is not operation/observer cancellation.
+It can escalate ordinary shutdown without replacing the first cause and cannot
+be downgraded or used to resume/reconnect the stream. New admission stops
+synchronously; `closed` observes physical driver exit. This operation is
+protocol-neutral and available independently of IPC policy.
 `wait_terminal(deadline)` separately observes the first terminal cause without
 waiting for a started frame's suffix or initiating shutdown; it is count/byte
 bounded like other close observers.
@@ -362,6 +379,13 @@ connect. Defaults:
 | Lifetime ID history, including local ListenInstance ID | 4096 |
 
 An operation stays counted while queued, pending or completed-undelivered.
+Deadline-aware once-only settlement and pending-correlation retirement are
+shared by completion, queue expiry and the expiry worker. An on-time settled
+result is not overwritten by later expiry; terminal shutdown/disposal still
+discards undelivered results and releases their entry reservations.
+The five private typed classes retain independent ordinary/reply/ingress/
+receive/close counters; count or waiter-byte policy never depends on numeric
+class ordering.
 A selected/started writer retains the same reservation independently of an
 abandoned observer. Each ordinary/reply/ingress slot conservatively reserves:
 `5 * max_frame_bytes + 4096 * size_of::<Header>() + 6 * 65535` bytes.

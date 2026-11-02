@@ -43,9 +43,7 @@ fn ipc_pair(capacity: usize) -> (GatewayChannel, DuplexStream) {
             limits(),
             [100; 16],
             ListenInstance::default(),
-            Some(Arc::new(
-                crate::native_ipc::IpcSession::new("host", 42).unwrap(),
-            )),
+            Arc::new(crate::native_ipc::IpcSession::new("host", 42).unwrap()),
         ),
         peer,
     )
@@ -61,6 +59,136 @@ fn command(index: u32, expects: bool) -> Message {
         Header::boolean(message::EXPECTS_REPLY, expects).unwrap(),
     ]);
     message
+}
+
+#[tokio::test]
+async fn accepted_ipc_owns_hello_identity_and_ids_without_bypassing_common_reply_guards() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let accepting = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        crate::native_ipc::accept_unsecured_loopback(stream, composition(), limits(), deadline())
+            .await
+            .unwrap()
+    });
+    let mut peer = TcpStream::connect(endpoint).await.unwrap();
+    write_message(
+        &mut peer,
+        &Message::listen_instance(
+            MessageId {
+                guid: [3; 16],
+                index: 1,
+            },
+            &ListenInstance::default(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let hello = read_message(&mut peer).await.unwrap();
+    let instance = ListenInstance::decode(&hello.body).unwrap();
+    assert_eq!(instance.address, endpoint.to_string());
+    assert_eq!(instance.instance, 1);
+    assert_eq!(instance.nonce, hello.properties().unwrap().id.guid);
+    assert_ne!(instance.nonce, [0; 16]);
+    let channel = accepting.await.unwrap();
+    let target = channel
+        .resolve_target(&peer.local_addr().unwrap().to_string())
+        .unwrap();
+    assert_eq!(target.address, peer.local_addr().unwrap());
+    let receiver = channel.receiver().unwrap();
+    let mut original = command(2, true);
+    original.headers.push(identity());
+    write_message(&mut peer, &original).await.unwrap();
+    let mut incoming = receiver.receive(deadline()).await.unwrap();
+    assert!(has(&incoming.message, message::IPC));
+    let (foreign, _) = ipc_pair(8192);
+    incoming.source = super::target(&foreign);
+    incoming.message = command(999, true);
+    let mut response = incoming
+        .reply
+        .unwrap()
+        .reply(msg("Response", vec![]), deadline());
+    pending(response.as_mut()).await;
+    let response_message = read_message(&mut peer).await.unwrap();
+    response.await.unwrap();
+    assert_eq!(
+        response_message.properties().unwrap().relates_to,
+        original.properties().unwrap().id
+    );
+    assert!(!has(&response_message, message::MESSAGE_ID));
+    assert!(!has(&response_message, message::IPC));
+    let mut one_way = channel.send_one_way(&target, msg("Semantic", vec![]), deadline());
+    pending(one_way.as_mut()).await;
+    let sent = read_message(&mut peer).await.unwrap();
+    one_way.await.unwrap();
+    assert_eq!(sent.properties().unwrap().id.guid, instance.nonce);
+    assert_eq!(sent.properties().unwrap().id.index, 2);
+    assert!(!has(&sent, message::IPC));
+    assert!(!has(&sent, message::RELATES_TO));
+    let mut spoof = msg("Spoof", vec![]);
+    spoof.headers.push(identity());
+    assert!(matches!(
+        channel.send_one_way(&target, spoof, deadline()).await,
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        channel
+            .send_one_way(&incoming.source, msg("Foreign", vec![]), deadline())
+            .await,
+        Err(Error::InvalidInput(_))
+    ));
+    let mut rpc = channel.request(&target, msg("Request", vec![]), deadline());
+    pending(rpc.as_mut()).await;
+    let id = read_message(&mut peer)
+        .await
+        .unwrap()
+        .properties()
+        .unwrap()
+        .id;
+    let mut invalid_reply = reply(id, vec![]);
+    invalid_reply.headers.push(identity());
+    write_message(&mut peer, &invalid_reply).await.unwrap();
+    assert!(matches!(
+        rpc.await,
+        Err(Error::Protocol("invalid ordinary native reply"))
+    ));
+    channel.closed(deadline()).await.unwrap();
+    foreign.close(deadline()).await.unwrap();
+}
+
+#[tokio::test]
+async fn established_adoption_rechecks_limits_deadline_and_allocator_identity() {
+    for case in 0..3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (accepted, peer) = tokio::join!(
+            listener.accept(),
+            TcpStream::connect(listener.local_addr().unwrap())
+        );
+        let (stream, _) = accepted.unwrap();
+        let mut peer = peer.unwrap();
+        let result = GatewayChannel::adopt_established(
+            stream,
+            composition(),
+            ChannelLimits {
+                max_operations: if case == 0 { 0 } else { 1 },
+                ..limits()
+            },
+            if case == 2 { [0; 16] } else { [100; 16] },
+            ListenInstance::default(),
+            if case == 1 {
+                Instant::now()
+            } else {
+                deadline()
+            },
+            Arc::new(NativeEnvelope),
+        );
+        match case {
+            1 => assert!(matches!(result, Err(Error::Timeout))),
+            _ => assert!(matches!(result, Err(Error::InvalidInput(_)))),
+        }
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+    }
 }
 
 #[tokio::test]
@@ -597,9 +725,7 @@ async fn reserved_semantic_sends_have_independent_finite_capacity_and_fences() {
         },
         [100; 16],
         ListenInstance::default(),
-        Some(Arc::new(
-            crate::native_ipc::IpcSession::new("host", 42).unwrap(),
-        )),
+        Arc::new(crate::native_ipc::IpcSession::new("host", 42).unwrap()),
     );
     let target = target(&channel);
     let mut request = channel.request(&target, msg("Rpc", vec![]), deadline());
@@ -673,9 +799,7 @@ async fn ordered_ingress_handoff_timeout_preserves_first_terminal_cause() {
         limits(),
         [100; 16],
         ListenInstance::default(),
-        Some(Arc::new(
-            crate::native_ipc::IpcSession::new("host", 42).unwrap(),
-        )),
+        Arc::new(crate::native_ipc::IpcSession::new("host", 42).unwrap()),
     );
     write_message(&mut peer, &command(1, true)).await.unwrap();
     // No receiver acknowledges handoff. Its independent finite bound expires.

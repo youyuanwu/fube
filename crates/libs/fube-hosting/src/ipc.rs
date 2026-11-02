@@ -1126,7 +1126,7 @@ async fn serve(listener: TcpListener, shared: Arc<Shared>) {
     if let Ok(mut state) = shared.state() {
         for i in 0..state.records.len() {
             if let Some(session) = state.records[i].entry.session.lock().unwrap().take() {
-                session.channel.abort();
+                session.channel.dispose();
             }
             state.records[i].entry.authority.revoke();
             state.records[i]
@@ -1246,7 +1246,7 @@ async fn connection(socket: TcpStream, shared: Arc<Shared>) -> Option<Arc<Entry>
             }
         }
         if let Some(session) = session {
-            session.channel.abort();
+            session.channel.dispose();
             let _ = session
                 .channel
                 .closed(tokio::time::Instant::now() + IO_DEADLINE)
@@ -1263,7 +1263,7 @@ async fn run_connection(
     claimed: &mut Option<Arc<Entry>>,
 ) -> TransportResult<()> {
     let peer = socket.peer_addr()?.to_string();
-    let channel = GatewayChannel::accept_unsecured_loopback_ipc(
+    let channel = fube_transport::native_ipc::accept_unsecured_loopback(
         socket,
         hosting_composition()?,
         ChannelLimits {
