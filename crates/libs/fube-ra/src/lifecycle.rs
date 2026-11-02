@@ -63,6 +63,13 @@ pub enum CloseMode {
     ForceAbort = 4,
     Drop = 5,
     AppHostDown = 6,
+    /// Native ordinary stateless Close (including matching RuntimeClosed).
+    Close = 7,
+}
+#[derive(Serialize, Deserialize)]
+pub(super) struct LocalCloseRequest {
+    pub unit: PartitionId,
+    pub mode: i64,
 }
 impl CloseMode {
     fn deletes(self) -> bool {
@@ -182,7 +189,7 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
         effects.push(Effect::Health(HealthEvent::Close));
     }
 }
-fn close_retry(state: &EntityState, effects: &mut Vec<Effect>) {
+pub(super) fn close_retry(state: &EntityState, effects: &mut Vec<Effect>) {
     if state.phase != Phase::Closing || state.close_mode == Some(CloseMode::Obliterate) {
         return;
     }
@@ -198,6 +205,8 @@ fn close_retry(state: &EntityState, effects: &mut Vec<Effect>) {
             registration: registration.clone(),
             flags: if state.close_mode.is_some_and(CloseMode::force) {
                 4
+            } else if state.close_mode == Some(CloseMode::Close) {
+                0
             } else {
                 8
             },
@@ -225,7 +234,7 @@ fn can_close(state: &EntityState, mode: CloseMode) -> bool {
     }
     true
 }
-fn start_close(
+pub(super) fn start_close(
     state: &mut EntityState,
     mode: CloseMode,
     token: u64,
@@ -399,6 +408,27 @@ pub(super) fn transition(
 ) -> Result<Transition> {
     let invalid = |_| Failure::Admission("invalid native lifecycle payload");
     match &work.kind {
+        Kind::LocalClose => {
+            let request: LocalCloseRequest = from_slice(&work.bytes).map_err(invalid)?;
+            let mode = match request.mode {
+                4 => CloseMode::ForceAbort,
+                5 => CloseMode::Drop,
+                7 => CloseMode::Close,
+                _ => return Err(Failure::Unsupported("unsupported local Close mode")),
+            };
+            if !admission.owner_ready || !admission.node_open {
+                return Ok(Transition::ignored(Disposition::IgnoredNotReady));
+            }
+            let Some(current) = current else {
+                return Ok(Transition::ignored(Disposition::IgnoredStale));
+            };
+            let mut state = current.clone();
+            let mut effects = Vec::new();
+            if !start_close(&mut state, mode, work.id, &mut effects) {
+                return Ok(Transition::ignored(Disposition::IgnoredPending));
+            }
+            Ok(changed(state, effects, true))
+        }
         Kind::Remove { source, generation } => {
             admit(source, generation, admission)?;
             if generation.number.older_than(&admission.generation) {

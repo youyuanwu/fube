@@ -390,6 +390,12 @@ impl Activation {
     pub fn premise(&self) -> Option<&ResidencyAdmission> {
         self.premise.as_ref()
     }
+    pub fn declared_type(&self) -> Option<ServiceTypeId> {
+        Some(ServiceTypeId {
+            package: self.premise.as_ref()?.package.package.clone(),
+            name: self.package.as_ref()?.service_type.clone(),
+        })
+    }
     /// Exact owned-session control, not a reconnect or callback capability.
     pub fn host_lease(&self) -> Option<ipc::HostLease> {
         self.lease.clone()

@@ -10,3 +10,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 fube-hosting = { path = "../../libs/fube-hosting" }
+fube-node = { path = "../../libs/fube-node" }
+fube-ra = { path = "../../libs/fube-ra" }
+fube-ra-store = { path = "../../libs/fube-ra-store" }
+fube-transport.workspace = true

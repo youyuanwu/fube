@@ -272,6 +272,11 @@ pub enum Command {
     Registered(Box<RegistrationCompletion>),
     CompleteClose(Box<CloseCompletion>),
     HostDown(Box<HostDown>),
+    /// Trusted local lifecycle authorization, not an FM network request.
+    CloseLocal {
+        unit: PartitionId,
+        mode: CloseMode,
+    },
     HostingRegistered(Box<HostingRegistered>),
     HostingRuntimeClosed(Box<HostingRuntimeClosed>),
     HostingHostClosed(Box<HostingHostClosed>),
@@ -322,6 +327,7 @@ enum Kind {
     Registered,
     CompleteClose,
     HostDown,
+    LocalClose,
     HostingRegistered,
     HostingRuntimeClosed,
     HostingHostClosed,
@@ -641,6 +647,14 @@ impl Executor {
                 (body.unit.id.guid.0, Kind::CompleteClose, to_vec(&body))
             }
             Command::HostDown(body) => (body.unit.guid.0, Kind::HostDown, to_vec(&body)),
+            Command::CloseLocal { unit, mode } => (
+                unit.guid.0,
+                Kind::LocalClose,
+                to_vec(&lifecycle::LocalCloseRequest {
+                    unit,
+                    mode: mode as i64,
+                }),
+            ),
             Command::HostingRegistered(body) => {
                 (body.unit.guid.0, Kind::HostingRegistered, to_vec(&body))
             }
@@ -693,7 +707,7 @@ impl Executor {
             Kind::Add { .. } => 2,
             Kind::Retry | Kind::RetryReport | Kind::RetryServiceDescription => 1,
             Kind::CompleteServiceDescription => 0,
-            Kind::HostingRegistered | Kind::HostingRuntimeClosed | Kind::HostingHostClosed => 0,
+            Kind::HostingRegistered | Kind::HostingRuntimeClosed | Kind::HostingHostClosed => 8,
             kind if kind.node_work() => 2,
             _ => 8,
         };
@@ -777,6 +791,15 @@ impl Executor {
         let mut view = lock(&self.shared.view);
         let effects = view.effects.drain(..).collect();
         view.stats.effects = 0;
+        effects
+    }
+    /// Transfer only pre-reserved downstream slots; the remainder retains its
+    /// original RA budget and ownership. No effects are skipped or re-created.
+    pub fn take_effects_up_to(&self, count: usize) -> Vec<Dispatched> {
+        let mut view = lock(&self.shared.view);
+        let count = count.min(view.effects.len());
+        let effects = view.effects.drain(..count).collect();
+        view.stats.effects = view.effects.len();
         effects
     }
     /// Close only this executor, not the caller-owned shared store.
@@ -1117,7 +1140,7 @@ fn transition(
             })
         }
         Kind::HostingRegistered | Kind::HostingRuntimeClosed | Kind::HostingHostClosed => {
-            hosting_events::consume(work, state, admission)
+            hosting_events::consume(work, state, admission, config)
         }
         _ => lifecycle::transition(work, state, admission, config),
     }

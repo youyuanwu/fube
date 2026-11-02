@@ -1072,6 +1072,7 @@ async fn submit(
         message.headers.push(header);
     }
     let requires_id = rpc
+        || shared.accepted_ipc
         || shared
             .outbound_envelope
             .as_ref()

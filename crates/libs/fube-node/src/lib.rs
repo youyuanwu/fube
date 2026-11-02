@@ -1,6 +1,7 @@
 //! Owned local registration composition, not a deployed node or FM/HM/RAP.
 //! Hosting has no dependency on this crate, RA, runtime or test-host.
 #![forbid(unsafe_code)]
+pub mod local;
 use fube_hosting::{self as hosting, ipc::*};
 use fube_ra::{entity as ra, protocol};
 use std::{
