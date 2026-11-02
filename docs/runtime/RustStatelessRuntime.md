@@ -13,7 +13,10 @@ No live/deployed qualification was run in the current alignment workflow.
 The separate [owned local Hosting profile](../cluster/HostingLocalActivation.md)
 now runs a minimal native-free stateless package through actual process/IPC
 registration and H2 teardown. It does not replace the native deployment profile
-or qualify production RA/RAP service callbacks.
+or qualify production RA/RAP service callbacks by itself. The separate
+[production local RA/RAP composition](../cluster/StatelessRaRap.md) now drives
+this runtime through actual owned activation/registration/lifecycle traffic and
+independently observes callbacks, resource disposal and physical cleanup.
 
 ## Qualified profile
 
@@ -74,7 +77,9 @@ executes Rust RAP Open, duplicate Open and successful graceful Close with
 independent factory/callback counts and blocked actual destruction before Close
 ACK. Error, cancellation and retired-authority fences remain in force.
 This delivers the [H4 runtime prerequisite](../cluster/RustHosting.md#h4-owned-activation-and-real-stateless-lifecycle),
-not H4 owned activation or production deployed RA/RAP interoperability.
+not by itself H4 owned activation or production deployed RA/RAP interoperability.
+The later [combined native-free qualification](../cluster/StatelessRaRap.md#native-free-qualification)
+is separate evidence; FM/HM/deployed readiness remains excluded.
 
 The [compiling Rustdoc example](../../crates/libs/fube-runtime/src/lib.rs#L12-L31)
 uses the actual public reservation/registration APIs. Direct unknown async

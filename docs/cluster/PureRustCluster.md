@@ -44,6 +44,13 @@ a trusted minimal package, launches its native-free Rust ExeHost, owns actual
 PID/package/session registration and drives H2 cleanup. This later slice does not
 enable this document's proposed FM/RA/RAP deployed-service architecture.
 
+**Local stateless lifecycle update (2026-11-02):**
+[production local RA/RAP](StatelessRaRap.md) composes that owned activation with
+committed RA effects, real one-way Rust RAP replies and exact H2 use. Native-free
+process tests now observe callbacks/disposal/resources, duplicate/stale traffic,
+crash/lease loss and physical cleanup together. This does not implement this
+document's FM/HM or deployed-cluster architecture.
+
 ## 1. Decisions and initial profile
 
 | Area | Decision |

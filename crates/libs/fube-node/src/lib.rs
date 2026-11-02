@@ -1,4 +1,7 @@
 //! Owned local registration composition, not a deployed node or FM/HM/RAP.
+//! The separate [`local`] owner composes production stateless local RA/RAP
+//! over Activation's owned session; this original prepared-registration owner
+//! retains its distinct readiness/capability gates.
 //! Hosting has no dependency on this crate, RA, runtime or test-host.
 #![forbid(unsafe_code)]
 pub mod local;

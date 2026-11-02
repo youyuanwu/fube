@@ -1,8 +1,9 @@
 # Owned local Hosting activation
 
 **Status:** bounded H4 local package/process activation is implemented. This is
-not a deployed Rust node, production RA/RAP service lifecycle or serving-readiness
-qualification. Native source semantics use Service Fabric
+not a deployed Rust node or serving-readiness qualification. The separate
+[production local RA/RAP composition](StatelessRaRap.md) drives actual service
+lifecycle through this same owned session. Native source semantics use Service Fabric
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`; release-native regression uses the
 separate Linux x86-64 SF **11.8.121.4** profile, not binaries asserted built from
 that source. See [Hosting design](RustHosting.md) and
@@ -58,7 +59,7 @@ sequences/version instance, and launches the exact executable with cleared
 environment. Shared mechanics live in `fube-local-host`; Hosting still forbids
 unsafe code and has no production dependency on test-host, Runtime, Node or RA.
 Native preflight/environment/scenarios remain test-host adapters
-([launch](../../crates/libs/fube-hosting/src/local.rs#L186-L355),
+([launch](../../crates/libs/fube-hosting/src/local.rs#L200-L372),
 [shared execve](../../crates/libs/fube-local-host/src/process.rs#L127-L243),
 [materialization](../../crates/libs/fube-local-host/src/deployment.rs#L26-L153)).
 Implicit ENOEXEC shell fallback is disabled; explicit trusted shebang
@@ -88,18 +89,21 @@ An actual configured registration deadline/failure revokes authority and retains
 cleanup ownership. Do not return an error from your wrapper while inadvertently
 dropping the owner. Drop is best effort, not a successful cleanup receipt or
 durable recovery protocol
-([observation](../../crates/libs/fube-hosting/src/local.rs#L384-L478),
-[cleanup](../../crates/libs/fube-hosting/src/local.rs#L551-L659)).
+([observation](../../crates/libs/fube-hosting/src/local.rs#L434-L529),
+[cleanup](../../crates/libs/fube-hosting/src/local.rs#L600-L702)).
 
 The dedicated IPC listener withholds acceptance/dispatch until actual spawned
 PID and complete package context are admitted. Host/runtime/type completion must
 match that PID, package sequence, runtime and claimed single session. A second
 connection cannot adopt it. These are trusted-loopback claims, **not OS peer
-authentication**. Registration never authorizes service Open. Only future
-production RA `RuntimeOpen`/RAP integration can do that; no new direct factory,
+authentication**. Registration never authorizes service Open. Only the
+[production local owner's](StatelessRaRap.md) committed RA `RuntimeOpen` permits
+the actual RAP request; no direct factory,
 Open, Close or Abort calls exist in Hosting
-([barrier](../../crates/libs/fube-hosting/src/ipc.rs#L583-L692),
-[completion](../../crates/libs/fube-hosting/src/local.rs#L403-L461)).
+([suspended listener](../../crates/libs/fube-hosting/src/ipc.rs#L702-L707),
+[acceptance barrier](../../crates/libs/fube-hosting/src/ipc.rs#L797-L811),
+[actual-PID admission](../../crates/libs/fube-hosting/src/local.rs#L348-L372),
+[completion](../../crates/libs/fube-hosting/src/local.rs#L434-L511)).
 
 After registration, `acquire_usage` returns H2's complete `UsageIncrement`,
 including any exact unresolved owner. Retain the nonclone acquisition and release
@@ -111,7 +115,7 @@ There is no background scheduler. Admission starts unused without a timer;
 last usage release schedules package idle teardown, and unused scans select the
 application first. Current H2 sequence/usage guards, not each service Close reply,
 decide idle teardown
-([usage/driver](../../crates/libs/fube-hosting/src/local.rs#L480-L550)).
+([usage/driver](../../crates/libs/fube-hosting/src/local.rs#L530-L599)).
 
 ## Cleanup boundaries
 
@@ -137,13 +141,14 @@ acquisition is released and cleanup retried. Directory failure retains the path.
 Physical failure leaves H2 finals/entries intact. `finish_local_deactivation` is
 an explicit trusted owner's completion premise, not H2 independently proving OS
 cleanup. Failed/foreign/stale/duplicate completion cannot erase a current owner
-([cleanup implementation](../../crates/libs/fube-hosting/src/local.rs#L559-L650),
+([cleanup implementation](../../crates/libs/fube-hosting/src/local.rs#L600-L702),
 [H2 completion](../../crates/libs/fube-hosting/src/residency.rs#L1357-L1599),
 [process reservation/drain/reap](../../crates/libs/fube-local-host/src/process.rs#L302-L431)).
 
 `take_outputs` transfers bounded local registration/status/obligation/operation
-records. Transfer is not downstream acknowledgment; this profile has no live
-RA/FM/HM consumer. Required health/application reporting, FM-status completion
+records. Transfer is not downstream acknowledgment; bare Activation has no live
+RA/FM/HM consumer. The separate local Node owns its required RA/H2 consumers,
+not FM/HM delivery. Required health/application reporting, FM-status completion
 or deployed lifecycle reject at construction. Process termination is not
 runtime/host unregister traffic, nor does an empty output lane mean serving
 readiness. No native recovery or RA retry/incarnation policy is introduced.
@@ -165,7 +170,7 @@ readiness. No native recovery or RA retry/incarnation policy is introduced.
 These are logical payload/operation budgets, not RSS or real-time scheduling
 guarantees. Mutations serialize through `&mut Activation`; there is no unbounded
 activation command queue. Caller-owned output/acquisition storage needs its own
-bounds. See [options](../../crates/libs/fube-hosting/src/local.rs#L51-L158),
+bounds. See [options](../../crates/libs/fube-hosting/src/local.rs#L51-L166),
 [supervisor](../../crates/libs/fube-local-host/src/process.rs#L18-L206) and
 [H2 limits](../../crates/libs/fube-hosting/src/residency.rs#L75-L119).
 
@@ -193,7 +198,7 @@ library absence and verify reap/root absence. They cover fresh identity,
 observation timeout, registration failure, launch error, crash, live lease
 renewal, H2 package/application teardown, Busy ownership and directory retry.
 [H2 completion tests](../../crates/libs/fube-hosting/tests/residency_completion.rs#L1-L254)
-and [physical-failure tests](../../crates/libs/fube-hosting/src/local.rs#L661-L758)
+and [physical-failure tests](../../crates/libs/fube-hosting/src/local.rs#L710-L808)
 cover retained finals and acquisition guards. Production capability gates stay
 closed. No successful Rust service callback execution is claimed by this
 registration-only fixture.
