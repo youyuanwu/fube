@@ -103,7 +103,7 @@ impl ReplicatorFactory {
         settings: Settings,
         capabilities: StateProviderCapabilities,
         host: HostServices,
-    ) -> Result<Arc<FabricReplicator>> {
+    ) -> Result<(Arc<FabricReplicator>, HostingEndpoint)> {
         let engine = crate::engine::Engine::bind_hosted(
             partition,
             crate::wire::Actor {
@@ -118,8 +118,31 @@ impl ReplicatorFactory {
             capabilities,
             host,
         )?;
-        Ok(Arc::new(FabricReplicator { engine }))
+        Ok((
+            Arc::new(FabricReplicator {
+                engine: engine.clone(),
+            }),
+            HostingEndpoint { engine },
+        ))
     }
+}
+
+/// Factory-retained ingress for exactly one lower owner. It cannot be obtained
+/// from any public replicator/state/diagnostic view, or retargeted to another.
+///
+/// ```compile_fail,E0616
+/// fn mint(r: &fube_data::FabricReplicator) {
+///     let _endpoint = fube_data::hosting::HostingEndpoint { engine: r.clone().engine };
+/// }
+/// ```
+/// ```compile_fail,E0308
+/// fn recover(r: fube_data::FabricReplicator) -> fube_data::hosting::HostingEndpoint {
+///     r.clone()
+/// }
+/// ```
+#[derive(Clone)]
+pub struct HostingEndpoint {
+    engine: Arc<crate::engine::Engine>,
 }
 
 impl FabricReplicator {
@@ -128,6 +151,12 @@ impl FabricReplicator {
     pub fn engine_for_test(&self) -> Arc<testing::Engine> {
         self.engine.clone()
     }
+    pub fn sample_progress(&self) -> Result<Progress> {
+        self.engine.progress()
+    }
+}
+
+impl HostingEndpoint {
     pub fn configure(
         &self,
         current: Configuration,
@@ -159,9 +188,6 @@ impl FabricReplicator {
     ) -> Result<()> {
         self.engine
             .remove_hosted(replica, purpose, cancellation, check)
-    }
-    pub fn sample_progress(&self) -> Result<Progress> {
-        self.engine.progress()
     }
 }
 

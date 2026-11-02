@@ -222,6 +222,9 @@ pub(super) struct Scope {
     pub(super) remaining: AtomicUsize,
     until: Instant,
     origin: CallOrigin,
+    ancestry: Arc<[u64]>,
+    scheduled_ancestry: Option<Result<Arc<[u64]>>>,
+    publication_ancestry: Vec<u64>,
     origins: Mutex<Vec<CallOrigin>>,
     parent: Option<Arc<Scope>>,
     error: Mutex<Option<Error>>,
@@ -250,7 +253,15 @@ impl Scope {
         until: Instant,
         invocation: Option<HostAssociation>,
     ) -> Arc<Self> {
-        Self::new_kind(active, parent, origin, until, false, false, invocation)
+        Self::new_kind(
+            active,
+            parent,
+            origin,
+            until,
+            (false, false),
+            invocation,
+            None,
+        )
     }
     fn new_reserved(
         active: Arc<Active>,
@@ -265,9 +276,9 @@ impl Scope {
             parent,
             origin,
             until,
-            parent_reserved,
-            true,
+            (parent_reserved, true),
             invocation,
+            None,
         )
     }
     fn new_kind(
@@ -275,9 +286,9 @@ impl Scope {
         parent: Option<Arc<Scope>>,
         origin: CallOrigin,
         until: Instant,
-        parent_reserved: bool,
-        cleanup: bool,
+        (parent_reserved, cleanup): (bool, bool),
         mut invocation: Option<HostAssociation>,
+        ancestry: Option<Arc<[u64]>>,
     ) -> Arc<Self> {
         if let Some(association) = &mut invocation {
             association.capture &= !cleanup;
@@ -294,6 +305,9 @@ impl Scope {
             active: Mutex::new(Some(active.clone())),
             remaining: AtomicUsize::new(1),
             origin,
+            ancestry: ancestry.unwrap_or_else(|| active.ancestry.clone()),
+            scheduled_ancestry: active.scheduled_ancestry.get().cloned(),
+            publication_ancestry: ENGINE_CALLBACKS.with(|engines| engines.borrow().clone()),
             origins: Mutex::new(vec![origin]),
             parent,
             error: Mutex::new(None),
@@ -327,12 +341,43 @@ impl Scope {
     }
     pub(super) fn contains_engine(&self, engine: u64) -> bool {
         engine != 0
-            && self
-                .origins
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|origin| origin.engine == engine)
+            && (self.ancestry.contains(&engine)
+                || self.scheduled_ancestry.as_ref().is_some_and(|ancestry| {
+                    ancestry
+                        .as_ref()
+                        .map_or(true, |engines| engines.contains(&engine))
+                })
+                || self.publication_ancestry.contains(&engine)
+                || self
+                    .origins
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|origin| origin.engine == engine)
+                || self
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.contains_engine(engine)))
+    }
+    pub(super) fn visit_engines(&self, add: &mut impl FnMut(u64) -> Result<()>) -> Result<()> {
+        for engine in self.ancestry.iter().copied() {
+            add(engine)?;
+        }
+        if let Some(ancestry) = &self.scheduled_ancestry {
+            for engine in ancestry.as_ref().map_err(Clone::clone)?.iter().copied() {
+                add(engine)?;
+            }
+        }
+        for engine in self.publication_ancestry.iter().copied() {
+            add(engine)?;
+        }
+        for origin in self.origins.lock().unwrap().iter() {
+            add(origin.engine)?;
+        }
+        if let Some(parent) = &self.parent {
+            parent.visit_engines(add)?;
+        }
+        Ok(())
     }
     fn enter(self: &Arc<Self>, origin: CallOrigin, cleanup: bool) -> Entry {
         self.add_origin(origin);
@@ -490,6 +535,15 @@ impl<T: Send + 'static> ConstructionReservation<T> {
     /// Retain the construction budget until explicit receiving-owner acceptance
     /// or actual rejected-result destruction.
     pub fn construct(self, value: T) -> ManagedObject<T> {
+        // A reservation can precede the actual construction callback.
+        let mut pending = self.slot.pending.lock().unwrap();
+        let binding = pending.as_mut().unwrap();
+        binding.ancestry = binding
+            .ancestry
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|ancestry| reentry_ancestry_with(self.slot.origin, None, None, ancestry));
+        drop(pending);
         ManagedObject {
             value: Some(value),
             slot: self.slot,
@@ -524,6 +578,7 @@ impl PublicationBatch {
 struct PendingPublication {
     active: Arc<Active>,
     scope: Option<Arc<Scope>>,
+    ancestry: Result<Arc<[u64]>>,
     until: Instant,
     invocation: Option<HostAssociation>,
 }
@@ -553,6 +608,7 @@ impl<T: Send + 'static> ReleaseSlot<T> {
         scope: Option<Arc<Scope>>,
         invocation: Option<HostAssociation>,
     ) {
+        let ancestry = reentry_ancestry_with(self.origin, Some(&active), scope.as_deref(), &[]);
         let until = scope
             .as_ref()
             .map_or_else(|| active.until(), |scope| scope.until.min(active.until()));
@@ -570,6 +626,7 @@ impl<T: Send + 'static> ReleaseSlot<T> {
         *self.pending.lock().unwrap() = Some(PendingPublication {
             active,
             scope,
+            ancestry,
             until,
             invocation,
         });
@@ -586,6 +643,9 @@ impl<T: Send + 'static> Publication for ReleaseSlot<T> {
         let mut pending = self.pending.lock().unwrap();
         if self.releasing.load(Ordering::Acquire) {
             return Err(Error::Closed);
+        }
+        if let Some(pending) = pending.as_ref() {
+            pending.ancestry.as_ref().map_err(Clone::clone)?;
         }
         if pending
             .as_ref()
@@ -624,13 +684,29 @@ impl<T: Send + 'static> Drop for ManagedObject<T> {
             let until = parent
                 .as_ref()
                 .map_or(pending.until, |parent| pending.until.min(parent.until));
-            Ok(Scope::new(
-                pending.active.clone(),
-                parent,
-                slot.origin,
-                until,
-                pending.invocation.clone(),
-            ))
+            // Keep the pending authority/deadline, but never let a stale
+            // permit hide the actual construction or release entry.
+            pending
+                .ancestry
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|ancestry| {
+                    let ancestry = reentry_ancestry_with(
+                        slot.origin,
+                        Some(&pending.active),
+                        pending.scope.as_deref(),
+                        ancestry,
+                    )?;
+                    Ok(Scope::new_kind(
+                        pending.active.clone(),
+                        parent,
+                        slot.origin,
+                        until,
+                        (false, true),
+                        pending.invocation.clone(),
+                        Some(ancestry),
+                    ))
+                })
         } else {
             slot.runtime.disposal_scope(slot.origin, None)
         };
@@ -1129,9 +1205,12 @@ impl ExecutionRuntime {
             .authority
             .clone()
             .reserve_callback_deadline(true)?;
+        let ancestry = reentry_ancestry(origin)?;
         self.inner.cleanup_owners.fetch_add(1, Ordering::AcqRel);
         let active = Arc::new(Active {
             origin,
+            ancestry,
+            scheduled_ancestry: std::sync::OnceLock::new(),
             generation: std::sync::atomic::AtomicU64::new(origin.generation),
             allow_cleanup: true,
             _deadline: Some(deadline),

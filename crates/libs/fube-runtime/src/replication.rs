@@ -6,8 +6,8 @@ use std::sync::Arc;
 use fube_data::{
     extensions::{ReplayCheckpointProvider, ReplicationEndpointOptions, StateProviderCapabilities},
     hosting::{
-        Configuration, HealthClient, HostServices, MembershipSource, MutationCheck, PreWrite,
-        Progress, Removal, Replica, ReplicatorFactory, StableFacts,
+        Configuration, HealthClient, HostServices, HostingEndpoint, MembershipSource,
+        MutationCheck, PreWrite, Progress, Removal, Replica, ReplicatorFactory, StableFacts,
     },
     FabricReplicator, IStateProvider, IStateReplicator, Settings,
 };
@@ -169,6 +169,7 @@ pub type NativeRemovePause = Arc<
 pub struct RuntimeReplicator {
     native: NativeRuntimeIntegration,
     lower: Arc<FabricReplicator>,
+    hosting: HostingEndpoint,
     _progress: Arc<dyn NativeProgressSource>,
     #[cfg(feature = "test-hooks")]
     pub native_configuration: Arc<std::sync::Mutex<Option<NativeInvocation>>>,
@@ -232,7 +233,7 @@ impl NativeRuntimeIntegration {
             self.identity().replica_id,
             endpoint.actor_incarnation,
         )?;
-        let lower = ReplicatorFactory::create(
+        let (lower, hosting) = ReplicatorFactory::create(
             partition_id,
             self.identity().replica_id,
             partition,
@@ -258,6 +259,7 @@ impl NativeRuntimeIntegration {
         Ok(Arc::new(RuntimeReplicator {
             native: self.clone(),
             lower,
+            hosting,
             _progress: progress,
             #[cfg(feature = "test-hooks")]
             native_configuration: Arc::default(),
@@ -286,8 +288,42 @@ impl RuntimeReplicator {
     /// Explicit non-SDK observations used by the data sample. This view does
     /// not capture or issue native controls. Transactional consumers need only
     /// the public primary/state views and separately supplied host execution.
+    /// The factory's hosting endpoint is retained privately, not recoverable
+    /// from this view, even with caller-authored validation and owned execution.
+    ///
+    /// ```compile_fail,E0599
+    /// use std::sync::Arc;
+    /// use fube_data::hosting::{Configuration, MutationCheck};
+    /// fn configure(r: &fube_runtime::RuntimeReplicator, c: Configuration, check: Arc<dyn MutationCheck>) {
+    ///     r.diagnostics().configure(c, None, None, Default::default(), check);
+    /// }
+    /// ```
+    /// ```compile_fail,E0599
+    /// use std::sync::Arc;
+    /// use fube_data::hosting::{Replica, MutationCheck};
+    /// async fn build(r: &fube_runtime::RuntimeReplicator, target: Replica, check: Arc<dyn MutationCheck>) {
+    ///     r.diagnostics().build(target, Default::default(), check).await;
+    /// }
+    /// ```
+    /// ```compile_fail,E0599
+    /// use std::sync::Arc;
+    /// use fube_data::hosting::{Replica, Removal, MutationCheck};
+    /// fn remove(r: &fube_runtime::RuntimeReplicator, target: Replica, check: Arc<dyn MutationCheck>) {
+    ///     r.diagnostics().remove(target, Removal::BuildRetryCleanup, Default::default(), check);
+    /// }
+    /// ```
+    /// ```compile_fail,E0616
+    /// fn recover(r: &fube_runtime::RuntimeReplicator) {
+    ///     let _live_owner_endpoint = r.clone().hosting;
+    /// }
+    /// ```
     pub fn diagnostics(&self) -> Arc<FabricReplicator> {
         self.lower.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hosting_for_test(&self) -> HostingEndpoint {
+        self.hosting.clone()
     }
 
     fn configure(
@@ -328,7 +364,7 @@ impl RuntimeReplicator {
         {
             *self.native_configuration.lock().unwrap() = Some(proof.clone());
         }
-        self.lower.configure(
+        self.hosting.configure(
             current,
             previous,
             prewrite,
@@ -431,14 +467,14 @@ impl IPrimaryReplicator for RuntimeReplicator {
                 if let Some((captured, release)) = self.native_build_pause.lock().unwrap().take() {
                     let _ = captured.send(proof.clone());
                     let future = self
-                        .lower
+                        .hosting
                         .build(target, cancel, Arc::new(ControlCheck(proof)));
                     return Box::pin(async move {
                         let _ = release.await;
                         future.await
                     });
                 }
-                self.lower
+                self.hosting
                     .build(target, cancel, Arc::new(ControlCheck(proof)))
             }
             Err(error) => Box::pin(async move { Err(error) }),
@@ -477,7 +513,7 @@ impl IPrimaryReplicator for RuntimeReplicator {
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .expect("native remove setup release");
         }
-        self.lower
+        self.hosting
             .remove(target, purpose, cancellation, Arc::new(ControlCheck(proof)))
     }
 }

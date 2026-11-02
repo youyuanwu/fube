@@ -18,6 +18,7 @@ async fn exact_runtime_control_check_rejects_revocation_at_actual_lower_queued_m
         "generation",
         "actor",
         "cancellation",
+        "lifetime",
         "remote",
         "authority",
     ] {
@@ -126,7 +127,7 @@ async fn exact_runtime_control_check_rejects_revocation_at_actual_lower_queued_m
         *engine.shared.command_enqueued.lock().unwrap() = Some(enqueued);
         let check: Arc<dyn MutationCheck> =
             Arc::new(crate::replication::ControlCheck(proof.clone()));
-        let control = data.clone();
+        let control = lower.hosting_for_test();
         let command = if remote {
             let target = crate::replication::project_descriptor(
                 &proof.replica().unwrap().descriptor().unwrap(),
@@ -607,6 +608,55 @@ async fn native_invocation_delayed_disposal_preserves_original_and_cannot_regran
             let _scope = crate::execution::invocation_scope(q)?;
             drop(object);
             Ok(())
+        })
+        .await
+        .unwrap();
+    receipt.wait().await.unwrap();
+    assert_eq!(*observed.lock().unwrap(), vec![(true, true, true)]);
+}
+
+#[tokio::test]
+async fn stale_permit_pending_cleanup_keeps_original_native_record_noncapturable() {
+    use crate::extensions::{CallOrigin, DisposalTracker, ObjectQuota};
+    let (_h, native, p, q) = scope_fixture().await;
+    let execution = native.execution();
+    let owned = execution.clone();
+    let original = p.clone();
+    let spare = execution
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || {
+            let _scope = crate::execution::invocation_scope(original)?;
+            owned.reserve_engine_callback(
+                CallOrigin {
+                    engine: 555,
+                    generation: 1,
+                    session: 0,
+                },
+                std::time::Instant::now() + Duration::from_secs(2),
+            )
+        })
+        .await
+        .unwrap();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let probe = InvocationRelease {
+        expected: Some(p.clone()),
+        attempted: native.clone(),
+        configuration: p.configuration().unwrap().0.sdk().unwrap(),
+        execution: execution.clone(),
+        observed: observed.clone(),
+    };
+    let receipt = execution
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || {
+            let _scope = crate::execution::invocation_scope(q)?;
+            let object = spare
+                .object_reservation(&ObjectQuota::new(1)?, &DisposalTracker::default())?
+                .construct(probe);
+            let receipt = object.receipt();
+            drop(object);
+            Ok(receipt)
         })
         .await
         .unwrap();

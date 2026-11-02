@@ -239,7 +239,9 @@ fn maximum_copy_bytes(settings: &Settings) -> usize {
 }
 
 pub struct Shared {
-    partition: Option<Arc<dyn fube_core::IStatefulServicePartition>>,
+    partition: Mutex<Option<Arc<crate::supervised::OwnedPartition>>>,
+    prequeue_calls: Mutex<Vec<OwnedCall<()>>>,
+    prequeue_changed: tokio::sync::Notify,
     #[cfg(any(test, feature = "test-hooks"))]
     pub initial_coalesced_primary: Mutex<Option<std_mpsc::SyncSender<()>>>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -254,6 +256,8 @@ pub struct Shared {
     pub write_now: Mutex<Option<std::time::Instant>>,
     #[cfg(any(test, feature = "test-hooks"))]
     pub write_prelock: Mutex<Option<std_mpsc::SyncSender<()>>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub write_prelock_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
     #[cfg(any(test, feature = "test-hooks"))]
     pub write_reply_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -277,25 +281,6 @@ pub struct Shared {
     engine_id: u64,
     generation: u64,
     shutdown_cleanup: Mutex<(bool, Option<DeferredCleanup>)>,
-}
-
-impl Shared {
-    fn check_write_access(&self) -> Result<()> {
-        use fube_core::{ErrorKind, ServicePartitionAccessStatus as Access};
-        let Some(partition) = &self.partition else {
-            return Ok(());
-        };
-        // ComProxyStatefulServicePartition maps a failed getter to NotPrimary.
-        // Rust also fails closed for a returned Invalid instead of coding-error
-        // termination (native Replicator::CheckWriteStatus).
-        let kind = match partition.get_write_status().unwrap_or(Access::NotPrimary) {
-            Access::Granted => return Ok(()),
-            Access::ReconfigurationPending => ErrorKind::ReconfigurationPending,
-            Access::NoWriteQuorum => ErrorKind::NoWriteQuorum,
-            Access::NotPrimary | Access::Invalid => ErrorKind::NotPrimary,
-        };
-        Err(Error::new(kind, "partition write access denied"))
-    }
 }
 
 #[cfg(test)]
@@ -540,6 +525,19 @@ impl Engine {
         )?);
         construction_guard.receipt = Some(provider.disposal_receipt());
         let provider_publication = provider.publication();
+        let partition = partition
+            .map(|partition| {
+                crate::supervised::OwnedPartition::new(
+                    &execution,
+                    partition,
+                    &disposal,
+                    origin,
+                    construction.as_ref(),
+                )
+                .map(Arc::new)
+            })
+            .transpose()?;
+        let partition_publication = partition.as_ref().map(|partition| partition.publication());
         let (transport, incoming) = PeerTransport::bind(address, settings.clone())?;
         let endpoint = Endpoint {
             actor,
@@ -559,7 +557,9 @@ impl Engine {
         let copy = Arc::new(OperationStream::new(copy_rx));
         let (stop, stop_rx) = watch::channel(false);
         let shared = Arc::new(Shared {
-            partition,
+            partition: Mutex::new(partition),
+            prequeue_calls: Mutex::new(Vec::new()),
+            prequeue_changed: tokio::sync::Notify::new(),
             #[cfg(any(test, feature = "test-hooks"))]
             initial_coalesced_primary: Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -573,6 +573,8 @@ impl Engine {
             write_now: Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
             write_prelock: Mutex::new(None),
+            #[cfg(any(test, feature = "test-hooks"))]
+            write_prelock_pause: Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
             write_reply_pause: Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -758,6 +760,9 @@ impl Engine {
             owns_execution,
         });
         provider_publication.accept()?;
+        if let Some(publication) = partition_publication {
+            publication.accept()?;
+        }
         construction_guard.committed = true;
         Ok(engine)
     }
@@ -881,96 +886,185 @@ impl Engine {
         Box::pin(async move {
             ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
             self.check()?;
-            self.shared.check_write_access()?;
-            if expected_epoch.is_some_and(|epoch| {
-                epoch.data_loss_number < 0
-                    || epoch.configuration_number < 0
-                    || epoch != epoch.primary()
-            }) {
-                return Err(Error::InvalidInput("invalid admission epoch"));
-            }
-            if cancellation.is_cancelled() {
-                return Err(Error::new(
-                    fube_core::ErrorKind::Canceled,
-                    "replication canceled before admission",
-                ));
-            }
-            self.check_write_deadline()?;
-            #[cfg(any(test, feature = "test-hooks"))]
-            if let Some(entered) = self.shared.write_prelock.lock().unwrap().take() {
-                let _ = entered.send(());
-            }
-            if data.bytes() > self.settings.operation_bytes
-                || data.segments().len() > self.settings.operation_segments
-                || data.retained_bytes() > self.settings.queue_bytes
-            {
-                return Err(Error::new(
-                    fube_core::ErrorKind::ReplicationOperationTooLarge,
-                    "operation limits",
-                ));
-            }
+            let mut deadline = std::time::Instant::now() + self.settings.callback_timeout;
+            let mut input = Some((data, cancellation));
             let (reply, result) = oneshot::channel();
-            {
-                // Serialize reservation changes and shutdown with producers,
-                // but never hold admission while awaiting owner/user work.
+            let mut reply = Some(Reply::from(reply));
+            let starts = {
+                // Enrollment and capture transfer share Stop's boundary. The
+                // start gate keeps all user code outside producer admission.
                 let _admission = self.shared.admission.lock().unwrap();
-                ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
-                self.check_write_deadline()?;
                 self.check()?;
-                let snapshot = self.shared.snapshot.lock().unwrap();
-                let copying = !snapshot.copy_done
-                    || snapshot.peers.iter().any(|peer| {
-                        peer.copy_horizon.is_some()
-                            && peer.copy_finish.is_none()
-                            && !peer.cleanup_required
+                let partition = self.shared.partition.lock().unwrap();
+                if let Some(partition) = partition.as_ref() {
+                    if self.shared.execution.is_current_entry() {
+                        deadline = deadline.min(self.shared.execution.current_deadline()?);
+                    }
+                    let origin = CallOrigin {
+                        engine: self.shared.engine_id,
+                        generation: self.shared.generation,
+                        session: 0,
+                    };
+                    let permit = self
+                        .shared
+                        .execution
+                        .reserve_engine_callback(origin, deadline)?;
+                    let assignment = self
+                        .shared
+                        .execution
+                        .reserve_engine_callback(origin, deadline)?;
+                    let partition = partition.clone();
+                    let engine = self.self_weak.upgrade().ok_or(Error::Closed)?;
+                    let mut starts = Vec::new();
+                    let mut dispositions = Vec::new();
+                    let (data, cancellation) = input.take().unwrap();
+                    let mut reply = reply.take();
+                    let call = provider_call(permit, &mut starts, &mut dispositions, async move {
+                        let outcome = partition.check_write_access().and_then(|()| {
+                            engine.enqueue_submit(
+                                expected_epoch,
+                                data,
+                                cancellation,
+                                Some((partition, assignment)),
+                                Some(deadline),
+                                &mut reply,
+                            )
+                        });
+                        if let Err(error) = outcome {
+                            let _ = reply.take().unwrap().send(Err(error));
+                        }
+                        Ok(())
                     });
-                let maximum = maximum_copy_bytes(&self.settings);
-                let primary_headroom =
-                    snapshot.role == ReplicaRole::Primary && maximum < self.settings.queue_bytes;
-                if primary_headroom && data.retained_bytes() > self.settings.queue_bytes - maximum {
-                    return Err(Error::ResourceLimit(
-                        "operation exceeds primary copy headroom",
-                    ));
-                }
-                let reserve_bytes = if copying || primary_headroom {
-                    maximum
+                    self.shared.prequeue_calls.lock().unwrap().push(call);
+                    Some(starts)
                 } else {
-                    0
-                };
-                let charge = self
-                    .shared
-                    .budget
-                    .acquire_reserved(data.retained_bytes(), u32::from(copying), reserve_bytes)
-                    .map_err(|cause| {
-                        Error::with_cause(
-                            fube_core::ErrorKind::ReplicationQueueFull,
-                            "replication admission budget",
-                            cause,
-                        )
-                    })?;
-                drop(snapshot);
-                self.check_write_deadline()?;
-                self.writes
-                    .try_send(Submit {
-                        expected_epoch,
-                        data: Some(data),
-                        charge: Some(charge),
-                        cancellation,
-                        reply: Some(reply.into()),
-                    })
-                    .map_err(|error| match error {
-                        mpsc::error::TrySendError::Full(_) => Error::new(
-                            fube_core::ErrorKind::ReplicationQueueFull,
-                            "write admission",
-                        ),
-                        mpsc::error::TrySendError::Closed(_) => Error::Closed,
-                    })?;
+                    None
+                }
+            };
+            if let Some(starts) = starts {
+                self.shared.prequeue_changed.notify_one();
+                for start in starts {
+                    let _ = start.send(());
+                }
+            } else {
+                let (data, cancellation) = input.take().unwrap();
+                self.enqueue_submit(expected_epoch, data, cancellation, None, None, &mut reply)?;
             }
-
-            // Once queued, learn whether admission happened before reporting
-            // cancellation. The separately cancelable wait is intentionally later.
+            // Only the known admission result reaches the observer. Neither
+            // capture release nor accepted identity delivery needs its repoll.
             result.await.map_err(|_| Error::Closed)?
         })
+    }
+
+    fn enqueue_submit(
+        &self,
+        expected_epoch: Option<Epoch>,
+        data: OperationData,
+        cancellation: Cancellation,
+        access: Option<(Arc<crate::supervised::OwnedPartition>, OwnedCallPermit)>,
+        access_deadline: Option<std::time::Instant>,
+        reply: &mut Option<Reply<Replication>>,
+    ) -> Result<()> {
+        if expected_epoch.is_some_and(|epoch| {
+            epoch.data_loss_number < 0 || epoch.configuration_number < 0 || epoch != epoch.primary()
+        }) {
+            return Err(Error::InvalidInput("invalid admission epoch"));
+        }
+        if cancellation.is_cancelled() {
+            return Err(Error::new(
+                fube_core::ErrorKind::Canceled,
+                "replication canceled before admission",
+            ));
+        }
+        if reply.as_ref().unwrap().is_closed() {
+            return Err(Error::Closed);
+        }
+        self.check_write_deadline()?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(entered) = self.shared.write_prelock.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some((entered, release)) = self.shared.write_prelock_pause.lock().unwrap().take() {
+            let _ = entered.send(());
+            release
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+        if data.bytes() > self.settings.operation_bytes
+            || data.segments().len() > self.settings.operation_segments
+            || data.retained_bytes() > self.settings.queue_bytes
+        {
+            return Err(Error::new(
+                fube_core::ErrorKind::ReplicationOperationTooLarge,
+                "operation limits",
+            ));
+        }
+        {
+            // Serialize reservation changes and shutdown with producers,
+            // but never hold admission while awaiting owner/user work.
+            let _admission = self.shared.admission.lock().unwrap();
+            self.check_write_deadline()?;
+            self.check()?;
+            let snapshot = self.shared.snapshot.lock().unwrap();
+            let copying = !snapshot.copy_done
+                || snapshot.peers.iter().any(|peer| {
+                    peer.copy_horizon.is_some()
+                        && peer.copy_finish.is_none()
+                        && !peer.cleanup_required
+                });
+            let maximum = maximum_copy_bytes(&self.settings);
+            let primary_headroom =
+                snapshot.role == ReplicaRole::Primary && maximum < self.settings.queue_bytes;
+            if primary_headroom && data.retained_bytes() > self.settings.queue_bytes - maximum {
+                return Err(Error::ResourceLimit(
+                    "operation exceeds primary copy headroom",
+                ));
+            }
+            let reserve_bytes = if copying || primary_headroom {
+                maximum
+            } else {
+                0
+            };
+            let charge = self
+                .shared
+                .budget
+                .acquire_reserved(data.retained_bytes(), u32::from(copying), reserve_bytes)
+                .map_err(|cause| {
+                    Error::with_cause(
+                        fube_core::ErrorKind::ReplicationQueueFull,
+                        "replication admission budget",
+                        cause,
+                    )
+                })?;
+            drop(snapshot);
+            self.check_write_deadline()?;
+            self.writes
+                .try_send(Submit {
+                    expected_epoch,
+                    access,
+                    access_deadline,
+                    data: Some(data),
+                    charge: Some(charge),
+                    cancellation,
+                    reply: reply.take(),
+                })
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(mut submit) => {
+                        *reply = submit.reply.take();
+                        Error::new(
+                            fube_core::ErrorKind::ReplicationQueueFull,
+                            "write admission",
+                        )
+                    }
+                    mpsc::error::TrySendError::Closed(mut submit) => {
+                        *reply = submit.reply.take();
+                        Error::Closed
+                    }
+                })?;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn execution_identity(&self) -> u64 {
@@ -1356,6 +1450,8 @@ fn same_endpoint(left: &Endpoint, right: &Endpoint) -> bool {
 
 struct Submit {
     expected_epoch: Option<Epoch>,
+    access: Option<(Arc<crate::supervised::OwnedPartition>, OwnedCallPermit)>,
+    access_deadline: Option<std::time::Instant>,
     data: Option<OperationData>,
     charge: Option<Charge>,
     cancellation: Cancellation,
@@ -1556,6 +1652,7 @@ enum JobValue {
 type ReadyReply = (Box<dyn FnOnce(Result<()>) + Send>, Result<()>);
 enum Event {
     Replies(Vec<ReadyReply>),
+    Prequeue(Result<()>),
     Cleanup,
     Deadline,
     Ack(ApplyAck),
@@ -1563,6 +1660,7 @@ enum Event {
     Job(Option<std::result::Result<(Job, Result<JobValue>), tokio::task::JoinError>>),
     Packet(Packet),
     Write(Submit),
+    WriteChecked(Option<std::result::Result<(Submit, Result<()>), tokio::task::JoinError>>),
     Retry,
 }
 
@@ -1624,6 +1722,7 @@ struct Owner {
     removals: Vec<Removal>,
     configurations: Vec<ConfigurationReceipt>,
     jobs: JoinSet<(Job, Result<JobValue>)>,
+    access_jobs: JoinSet<(Submit, Result<()>)>,
     replay_job: bool,
     replay_next: Instant,
     replay_rearm_pending: bool,
@@ -1715,6 +1814,7 @@ impl Owner {
             removals: Vec::new(),
             configurations: Vec::new(),
             jobs: JoinSet::new(),
+            access_jobs: JoinSet::new(),
             replay_job: false,
             replay_next: Instant::now(),
             replay_rearm_pending: false,
@@ -1794,7 +1894,26 @@ impl Owner {
                 result = self.jobs.join_next(), if !self.jobs.is_empty() => Event::Job(result),
                 Some(packet) = incoming.control.recv() => Event::Packet(packet),
                 Some(packet) = incoming.data.recv() => Event::Packet(packet),
-                Some(write) = writes.recv() => Event::Write(write),
+                result = std::future::poll_fn(|cx| {
+                    let mut calls = self.shared.prequeue_calls.lock().unwrap();
+                    let before = calls.len();
+                    let mut outcome = Ok(());
+                    calls.retain_mut(|call| match std::future::Future::poll(std::pin::Pin::new(call), cx) {
+                        std::task::Poll::Pending => true,
+                        std::task::Poll::Ready(result) => {
+                            if let Err(error) = result { outcome = Err(error); }
+                            false
+                        }
+                    });
+                    if calls.len() == before {
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(outcome)
+                    }
+                }) => Event::Prequeue(result),
+                _ = self.shared.prequeue_changed.notified() => Event::Prequeue(Ok(())),
+                result = self.access_jobs.join_next(), if !self.access_jobs.is_empty() => Event::WriteChecked(result),
+                Some(write) = writes.recv(), if self.access_jobs.is_empty() => Event::Write(write),
                 _ = retry.tick() => Event::Retry,
             };
             if let Event::Replies(replies) = event {
@@ -1812,9 +1931,15 @@ impl Owner {
                 break;
             }
             #[cfg(any(test, feature = "test-hooks"))]
-            let wrote = matches!(&event, Event::Write(_));
+            let wrote = matches!(&event, Event::Write(write) if write.access.is_none())
+                || matches!(&event, Event::WriteChecked(_));
             match event {
                 Event::Replies(_) => unreachable!(),
+                Event::Prequeue(result) => {
+                    if let Err(error) = result {
+                        self.fail(error);
+                    }
+                }
                 Event::Cleanup => {}
                 Event::Deadline => {}
                 Event::Ack(ack) => {
@@ -1829,7 +1954,46 @@ impl Owner {
                     None => {}
                 },
                 Event::Packet(packet) => self.packet(packet),
-                Event::Write(write) => self.submit(write),
+                Event::Write(mut write) => {
+                    if let Some((partition, permit)) = write.access.take() {
+                        let shared = self.shared.clone();
+                        let mut call = provider_call(
+                            permit,
+                            &mut self.starts,
+                            &mut self.dispositions,
+                            async move {
+                                #[cfg(any(test, feature = "test-hooks"))]
+                                if let Some((entered, release)) =
+                                    shared.write_assignment_pause.lock().unwrap().take()
+                                {
+                                    let _ = entered.send(());
+                                    release
+                                        .recv_timeout(std::time::Duration::from_secs(2))
+                                        .expect("assignment gate released");
+                                }
+                                let _ = &shared;
+                                partition.check_write_access()
+                            },
+                        );
+                        self.access_jobs.spawn(async move {
+                            let result = (&mut call).await;
+                            (write, result)
+                        });
+                    } else {
+                        self.submit(write);
+                    }
+                }
+                Event::WriteChecked(Some(Ok((mut write, result)))) => {
+                    if let Err(error) = result {
+                        let _ = write.reply.take().unwrap().send(Err(error));
+                    } else {
+                        self.submit(write);
+                    }
+                }
+                Event::WriteChecked(Some(Err(_))) => {
+                    self.fail(Error::Protocol("partition callback panicked"))
+                }
+                Event::WriteChecked(None) => {}
                 Event::Retry => self.retry(),
             }
             if self.fault.is_none() {
@@ -1884,8 +2048,12 @@ impl Owner {
                 );
             }
         }
-        self.shared.stopped.store(true, Ordering::Release);
-        self.shared.revision.fetch_add(1, Ordering::AcqRel);
+        let prequeue = {
+            let _admission = self.shared.admission.lock().unwrap();
+            self.shared.stopped.store(true, Ordering::Release);
+            self.shared.revision.fetch_add(1, Ordering::AcqRel);
+            std::mem::take(&mut *self.shared.prequeue_calls.lock().unwrap())
+        };
         if self.fault.is_some() {
             if let Some(view) = self.host.as_ref().map(|host| &host.health) {
                 // Poll notification first to install the runtime-owned retry
@@ -1925,12 +2093,22 @@ impl Owner {
             }
         }
         self.starts.clear();
+        let prequeue_dispositions: Vec<_> = prequeue.iter().map(OwnedCall::disposition).collect();
+        for record in &prequeue_dispositions {
+            record.cancel();
+        }
+        drop(prequeue);
         for record in &self.dispositions {
             record.cancel();
         }
         self.jobs.abort_all();
+        self.access_jobs.abort_all();
         while self.jobs.join_next().await.is_some() {}
+        while self.access_jobs.join_next().await.is_some() {}
         for record in self.dispositions.drain(..) {
+            record.wait().await;
+        }
+        for record in prequeue_dispositions {
             record.wait().await;
         }
         for reply in self.replies.drain(..) {
@@ -1992,7 +2170,15 @@ impl Owner {
     }
 
     async fn dispose_provider_resources(&mut self) -> Result<()> {
-        let resources = (self.provider.take(), std::mem::take(&mut self.peers));
+        let resources = (
+            self.provider.take(),
+            std::mem::take(&mut self.peers),
+            self.shared.partition.lock().unwrap().take(),
+        );
+        let partition_disposal = resources
+            .2
+            .as_ref()
+            .map(|partition| partition.disposal_receipt());
         let cleanup = {
             let mut cleanup = self.shared.shutdown_cleanup.lock().unwrap();
             cleanup.0 = true;
@@ -2016,7 +2202,11 @@ impl Owner {
                 }
             }
         };
-        receipt.wait().await
+        receipt.wait().await?;
+        if let Some(disposal) = partition_disposal {
+            disposal.wait().await?;
+        }
+        Ok(())
     }
 
     fn fail(&mut self, error: Error) {
@@ -2170,8 +2360,11 @@ impl Owner {
                 .send(Err(Error::InvalidInput("native admission epoch changed")));
             return;
         }
-        if let Err(error) = self.shared.check_write_access() {
-            let _ = write.reply.take().unwrap().send(Err(error));
+        if write
+            .access_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            let _ = write.reply.take().unwrap().send(Err(Error::Timeout));
             return;
         }
         match self

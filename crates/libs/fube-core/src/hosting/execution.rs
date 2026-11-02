@@ -59,6 +59,66 @@ struct EntryContext {
     release_budget: Option<Duration>,
     invocation: Option<HostAssociation>,
 }
+impl EntryContext {
+    fn contains_engine(&self, engine: u64) -> bool {
+        engine != 0
+            && (self.origin.engine == engine
+                || self.active.contains_engine(engine)
+                || self
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.contains_engine(engine)))
+    }
+}
+
+// Reentry identity is immutable, bounded and independent of host authorization.
+fn reentry_ancestry(origin: CallOrigin) -> Result<Arc<[u64]>> {
+    reentry_ancestry_with(origin, None, None, &[])
+}
+fn reentry_ancestry_with(
+    origin: CallOrigin,
+    active: Option<&Active>,
+    scope: Option<&owned::Scope>,
+    retained: &[u64],
+) -> Result<Arc<[u64]>> {
+    let mut engines = Vec::new();
+    let mut add = |engine| {
+        if engine != 0 && !engines.contains(&engine) {
+            if engines.len() == RECORDS {
+                return Err(Error::ResourceLimit("engine callback ancestry"));
+            }
+            engines.push(engine);
+        }
+        Ok(())
+    };
+    for engine in retained.iter().copied() {
+        add(engine)?;
+    }
+    if let Some(active) = active {
+        active.visit_engines(&mut add)?;
+    }
+    if let Some(scope) = scope {
+        scope.visit_engines(&mut add)?;
+    }
+    ENTRY.with(|entry| -> Result<()> {
+        if let Some(context) = entry.borrow().as_ref() {
+            context.active.visit_engines(&mut add)?;
+            add(context.origin.engine)?;
+            if let Some(scope) = &context.scope {
+                scope.visit_engines(&mut add)?;
+            }
+        }
+        Ok(())
+    })?;
+    ENGINE_CALLBACKS.with(|callbacks| -> Result<()> {
+        for engine in callbacks.borrow().iter().copied() {
+            add(engine)?;
+        }
+        Ok(())
+    })?;
+    add(origin.engine)?;
+    Ok(engines.into())
+}
 thread_local! {
     static ENTRY: RefCell<Option<EntryContext>> = const { RefCell::new(None) };
     // Reentry identity only. This grants no execution/native authority and must
@@ -109,6 +169,8 @@ impl Drop for Entry {
 
 struct Active {
     origin: CallOrigin,
+    ancestry: Arc<[u64]>,
+    scheduled_ancestry: std::sync::OnceLock<Result<Arc<[u64]>>>,
     generation: std::sync::atomic::AtomicU64,
     allow_cleanup: bool,
     _deadline: Option<Box<dyn ExecutionDeadline>>,
@@ -138,6 +200,25 @@ impl Drop for Active {
 }
 
 impl Active {
+    fn contains_engine(&self, engine: u64) -> bool {
+        self.ancestry.contains(&engine)
+            || self.scheduled_ancestry.get().is_some_and(|ancestry| {
+                ancestry
+                    .as_ref()
+                    .map_or(true, |engines| engines.contains(&engine))
+            })
+    }
+    fn visit_engines(&self, add: &mut impl FnMut(u64) -> Result<()>) -> Result<()> {
+        for engine in self.ancestry.iter().copied() {
+            add(engine)?;
+        }
+        if let Some(ancestry) = self.scheduled_ancestry.get() {
+            for engine in ancestry.as_ref().map_err(Clone::clone)?.iter().copied() {
+                add(engine)?;
+            }
+        }
+        Ok(())
+    }
     fn until(&self) -> Instant {
         *self.until.get_or_init(|| {
             let until = Instant::now() + self.budget;
@@ -467,9 +548,46 @@ impl ExecutionRuntime {
     pub fn reserve(
         &self,
         lane: CallLane,
+        origin: CallOrigin,
+        timeout: Duration,
+        cleanup: bool,
+    ) -> Result<OwnedCallPermit> {
+        self.reserve_inner(lane, origin, timeout, cleanup, false)
+    }
+    /// Schedule a callback to a distinct engine on this same execution owner.
+    /// Keep its explicit reentry identity, original deadline and host ancestry;
+    /// this consumes the existing provider/shared budgets, not another lane.
+    pub fn reserve_engine_callback(
+        &self,
+        origin: CallOrigin,
+        deadline: Instant,
+    ) -> Result<OwnedCallPermit> {
+        if origin.engine == 0 || origin.generation == 0 {
+            return Err(Error::InvalidInput("invalid callback engine identity"));
+        }
+        Self::reject_engine_reentry(origin.engine)?;
+        if Self::in_owned_entry() && !self.is_current_entry() {
+            return Err(Error::InvalidInput("callback execution owner mismatch"));
+        }
+        let deadline = if self.is_current_entry() {
+            deadline.min(self.current_deadline()?)
+        } else {
+            deadline
+        };
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return Err(Error::Timeout);
+        }
+        self.reserve_inner(CallLane::Provider, origin, timeout, false, true)?
+            .with_deadline(deadline)
+    }
+    fn reserve_inner(
+        &self,
+        lane: CallLane,
         mut origin: CallOrigin,
         timeout: Duration,
         cleanup: bool,
+        engine_callback: bool,
     ) -> Result<OwnedCallPermit> {
         let _admission = self.inner.admission.lock().unwrap();
         if self.inner.stopping.load(Ordering::Acquire) {
@@ -486,13 +604,14 @@ impl ExecutionRuntime {
         let recursive = ENTRY.with(|entry| {
             let entry = entry.borrow();
             if let Some(parent) = entry.as_ref() {
-                if parent.origin.engine != 0 {
+                if parent.origin.engine != 0 && !engine_callback {
                     origin = parent.origin;
                 } else if origin.generation == 0 {
                     origin.generation = parent.origin.generation;
                 }
                 Arc::ptr_eq(&parent.active.authority, &self.inner.authority)
                     && parent.active.lane == Some(lane)
+                    && !engine_callback
             } else {
                 false
             }
@@ -500,6 +619,7 @@ impl ExecutionRuntime {
         if recursive {
             return Err(Error::InvalidInput("recursive execution reservation"));
         }
+        let ancestry = reentry_ancestry(origin)?;
         let admission = match lane {
             CallLane::Native => &self.inner.native_records,
             CallLane::Provider => &self.inner.provider_records,
@@ -531,6 +651,8 @@ impl ExecutionRuntime {
             scheduled,
             active: Arc::new(Active {
                 origin,
+                ancestry,
+                scheduled_ancestry: std::sync::OnceLock::new(),
                 generation: std::sync::atomic::AtomicU64::new(origin.generation),
                 allow_cleanup: cleanup,
                 _deadline: Some(deadline),
@@ -564,12 +686,8 @@ impl ExecutionRuntime {
                 None => Err(Error::InvalidInput("invalid execution context")),
                 Some(context)
                     if engine.is_some_and(|id| {
-                        id != 0
-                            && (id == context.origin.engine
-                                || context
-                                    .scope
-                                    .as_ref()
-                                    .is_some_and(|scope| scope.contains_engine(id)))
+                        context.contains_engine(id)
+                            || ENGINE_CALLBACKS.with(|engines| engines.borrow().contains(&id))
                     }) =>
                 {
                     Err(Error::InvalidInput("same-engine execution reentry"))
@@ -583,13 +701,11 @@ impl ExecutionRuntime {
             return Err(Error::InvalidInput("same-engine publication reentry"));
         }
         ENTRY.with(|entry| {
-            if entry.borrow().as_ref().is_some_and(|context| {
-                context.origin.engine == engine
-                    || context
-                        .scope
-                        .as_ref()
-                        .is_some_and(|scope| scope.contains_engine(engine))
-            }) {
+            if entry
+                .borrow()
+                .as_ref()
+                .is_some_and(|context| context.contains_engine(engine))
+            {
                 Err(Error::InvalidInput("same-engine execution reentry"))
             } else {
                 Ok(())
@@ -703,6 +819,21 @@ pub struct OwnedCallPermit {
     scheduled: OwnedSemaphorePermit,
 }
 impl OwnedCallPermit {
+    /// Clamp this reservation to an original absolute deadline before transferring
+    /// captures. Queueing or a second callback must not restart its timeout.
+    pub fn with_deadline(self, deadline: Instant) -> Result<Self> {
+        let until = deadline.min(Instant::now() + self.active.budget);
+        if Instant::now() >= until {
+            return Err(Error::Timeout);
+        }
+        self.active
+            .until
+            .set(until)
+            .map_err(|_| Error::InvalidInput("execution reservation deadline already frozen"))?;
+        self.active._deadline.as_ref().unwrap().arm_until(until);
+        Ok(self)
+    }
+
     /// Eagerly transfer a synchronous call and its captures to owned execution.
     /// Await the returned observation, not the SDK method's synchronous Result.
     /// Reserve before captures; dropping the observer cancels, not rollback or
@@ -717,6 +848,22 @@ impl OwnedCallPermit {
         self,
         future: impl Future<Output = Result<T>> + Send + 'static,
     ) -> OwnedCall<T> {
+        // A permit can be reserved before entering a publication/callback.
+        // Freeze that live scheduling ancestry too, before accepting captures.
+        let ancestry = reentry_ancestry(self.origin).and_then(|current| {
+            let mut engines = current.to_vec();
+            self.active.visit_engines(&mut |engine| {
+                if !engines.contains(&engine) {
+                    if engines.len() == RECORDS {
+                        return Err(Error::ResourceLimit("engine callback ancestry"));
+                    }
+                    engines.push(engine);
+                }
+                Ok(())
+            })?;
+            Ok(engines.into())
+        });
+        self.active.scheduled_ancestry.set(ancestry).unwrap();
         let until = self.active.until();
         let (cleanup, cleanup_rx) = oneshot::channel();
         let (decision, decision_rx) = oneshot::channel();
@@ -909,6 +1056,9 @@ impl<T: Send + 'static> Future for Root<T> {
                 (future, state.active.as_ref().unwrap().clone())
             };
             let polled = self.0.entered(&active, false, || {
+                if let Some(Err(error)) = active.scheduled_ancestry.get() {
+                    return Poll::Ready(Err(error.clone()));
+                }
                 if !active.allow_cleanup && active.authority.check().is_err() {
                     return Poll::Ready(Err(Error::Closed));
                 }

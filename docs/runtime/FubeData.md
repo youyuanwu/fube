@@ -89,16 +89,43 @@ application construction. The shared RAP harness has no direct data dependency
 or data-specific API.
 
 The lower independently checks public partition write access
-[before submission](../../crates/libs/fube-data/src/engine.rs#L881-L885) and
-[before queue assignment](../../crates/libs/fube-data/src/engine.rs#L2168-L2180),
+[before submission](../../crates/libs/fube-data/src/engine.rs#L880-L955) and
+[queued check and owner assignment](../../crates/libs/fube-data/src/engine.rs#L1958-L2000),
 not merely role or readiness. Failed access getters normalize to NotPrimary
 as native's partition proxy does. ReconfigurationPending/NoWriteQuorum remain
 distinct. Returned Invalid also fails closed as NotPrimary in Rust; native's
 unknown-status switch is a coding error, so this is not switch parity
-([access mapping](../../crates/libs/fube-data/src/engine.rs#L282-L303),
+([access mapping](../../crates/libs/fube-data/src/supervised.rs#L247-L265),
 [native proxy][sf-partition-write], [native switch][sf-access-switch]).
 Denied admission consumes no LSN; later revocation does not undo accepted work.
 Upper transient-cache preflight is unchanged.
+The retained public partition wrapper is managed alongside provider resources.
+Both access reads, including normalization and typed-error release, run on
+owner-matched finite execution outside admission/owner mutexes. The queued read
+retains the original absolute deadline and immutable, bounded engine ancestry;
+distinct-engine hops cannot hide a live parent from reentry guards or later
+callback reservations. Existing publication identities also follow scheduled
+work and cleanup, without granting host authority.
+Unaccepted construction results also retain the bounded union of their pending
+permit and actual construction/release Active, recursive scopes, and publication
+ancestry. This includes unused permits reserved before the live callback and
+objects constructed outside it but released inside it. Overflow rejects
+publication acceptance and fences unsafe release rather than omitting identities.
+The original pending deadline and host-context record remain unchanged; cleanup
+cannot use that retained record for fresh capture or authorization.
+Pre-queue callback enrollment and capture transfer are serialized against Stop,
+but neither the getter nor its observation runs under admission. The owner
+observes these finite callbacks independently of the submitting future, which
+retains only the admission result channel. It continues commands/ACKs/Stop.
+Close/Abort joins pre-queue and assignment callbacks, then waits for the managed
+partition's actual release receipt, not merely an internal Arc drop, even with
+unpolled results or retained public state/diagnostic views.
+See [managed partition ownership](../../crates/libs/fube-data/src/supervised.rs#L224-L266),
+[finite callback reservation](../../crates/libs/fube-core/src/hosting/execution.rs#L560-L681),
+[reentry ancestry](../../crates/libs/fube-core/src/hosting/execution.rs#L75-L121),
+[pending construction](../../crates/libs/fube-core/src/hosting/execution_owned.rs#L534-L552),
+[pending cleanup](../../crates/libs/fube-core/src/hosting/execution_owned.rs#L578-L734),
+and [physical resource disposal](../../crates/libs/fube-data/src/engine.rs#L2172-L2210).
 
 The native construction helper changed location; migrate
 `FabricReplicator::create(partition, native, ...)` to
@@ -110,17 +137,22 @@ sample's raw `diagnostics()` view as the canonical lower control.
 - `NativeRuntimeIntegration::create_replicator` consumes a canonical partition,
   provider, optional replay, endpoint and validated settings in service Open.
   Runtime validates identity and its one-engine claim, invokes the
-  replication-defined factory, and returns a `RuntimeReplicator`.
+  replication-defined factory, and returns a `RuntimeReplicator`. The factory
+  returns a public facade plus a separately constructed, per-owner hosting
+  endpoint. Runtime retains that endpoint privately; facade/diagnostic/state
+  clones cannot obtain it or mint a same-owner endpoint.
   Its public control and state-replicator views share one private engine/listener;
   no standalone public control authority is supplied
-  ([construction](../../crates/libs/fube-runtime/src/replication.rs#L180-L270)).
+  ([construction](../../crates/libs/fube-runtime/src/replication.rs#L181-L272)).
   Native
   partition `CreateReplicator`, mssf `try_get_com`, COM proxy/ABI and mutable
   native settings are not supported SDK members. Normal configuration/Build/
   Remove reaches that same owner through the actual returned composite and
   runtime-owned lower adapter, not a replacement binder. Direct SDK
   configuration/Build/Remove on the raw data facade is unsupported; diagnostics
-  cannot capture authority. Supported explicit custom runtime bindings are
+  expose no inherent hosting configure/Build/Remove methods and cannot capture
+  authority. A caller-created separate factory owner cannot retarget its
+  endpoint to this live owner. Supported explicit custom runtime bindings are
   separate and retain their selected-view behavior.
 - `IStateProvider` supplies synchronous `get_last_committed_sequence_number`,
   `get_copy_context`/`get_copy_state` factories, async `update_epoch` and
@@ -352,14 +384,14 @@ queue into a new secondary, not every terminal close
 **R0 correction:** terminal None retires pending observers before session
 cleanup, does not reconcile a provider or reset commitment, and releases owned
 queue storage. Actual secondary demotion still requires commitment
-([control admission](../../crates/libs/fube-data/src/engine.rs#L2128-L2177),
-[terminal completion](../../crates/libs/fube-data/src/engine.rs#L4105-L4121),
+([terminal admission](../../crates/libs/fube-data/src/engine.rs#L2577-L2612),
+[terminal completion](../../crates/libs/fube-data/src/engine.rs#L4523-L4541),
 [queue retirement](../../crates/libs/fube-data/src/queue.rs#L73-L79)).
 The [pending-write regression](../../crates/libs/fube-data/src/engine_tests.rs#L4696-L4728)
 observes assigned1/committed0, failed completion and unchanged provider state.
 Terminal retirement also cancels/joins an in-flight optional replay before
 publication
-([ownership gate](../../crates/libs/fube-data/src/engine.rs#L4053-L4071),
+([ownership gate](../../crates/libs/fube-data/src/engine.rs#L4470-L4506),
 [regression](../../crates/libs/fube-data/src/engine_tests.rs#L6103-L6147)).
 Callback-free retirement does not reserve another provider slot before canceling
 the callbacks occupying that budget; the
@@ -385,9 +417,9 @@ requirement for an already represented prefix
 **R0 correction:** newly created/recreated sessions initialize receive/apply/
 highest from the entered, frozen runtime descriptor's CurrentProgress.
 Repeated descriptors preserve live counters; diagnostics cannot attest a vote
-([issued initialization](../../crates/libs/fube-data/src/engine.rs#L2636-L2653),
-[canonical proof](../../crates/libs/fube-runtime/src/replication.rs#L293-L339)).
-The [issued sender regression](../../crates/libs/fube-runtime/tests/replication_native.rs#L813-L919)
+([issued initialization](../../crates/libs/fube-data/src/engine.rs#L3079-L3090),
+[canonical proof](../../crates/libs/fube-runtime/src/replication.rs#L329-L375)).
+The [issued sender regression](../../crates/libs/fube-runtime/tests/replication_native.rs#L812-L918)
 proves ALL at20 with no replay/fresh ACK, repeated and recreated descriptors,
 and LSN21 still pending without a real ACK. The diagnostic-prefix test remains
 a negative authority witness, not the source-conformance path.
@@ -416,8 +448,8 @@ Idle-build retention remains an independent source obligation.
 tail for commit/release/ALL. Remote-PC-q1 instead uses minimum APPLY for both
 commit and release; idle retention remains independent
 ([quorum rules](../../crates/libs/fube-data/src/quorum.rs#L23-L90),
-[ALL](../../crates/libs/fube-data/src/engine.rs#L4004-L4008),
-[retention](../../crates/libs/fube-data/src/engine.rs#L4563-L4630)).
+[ALL](../../crates/libs/fube-data/src/engine.rs#L4418-L4442),
+[retention](../../crates/libs/fube-data/src/engine.rs#L5022-L5082)).
 ALL uses CC, not combined PC commit or WRITE required-target constraints.
 The [sentinel/PC regression](../../crates/libs/fube-data/src/quorum.rs#L167-L202)
 and [idle retention test](../../crates/libs/fube-data/src/engine_tests.rs#L318-L395)
@@ -444,8 +476,8 @@ close senders successfully, then await actual service ACKs. EOS does not depend
 on the last ACK, so an upper EOS-triggered flush can finish. Demotion replaces
 views on the same engine with an already-copied transferred prefix; old views
 remain terminal and revision checks fence captures
-([EOS before ACK gate](../../crates/libs/fube-data/src/engine.rs#L4087-L4124),
-[fresh views](../../crates/libs/fube-data/src/engine.rs#L4462-L4498)).
+([EOS before ACK gate](../../crates/libs/fube-data/src/engine.rs#L4506-L4544),
+[fresh views](../../crates/libs/fube-data/src/engine.rs#L4936-L4961)).
 The [64-capture/gap/epoch-barrier test](../../crates/libs/fube-data/src/engine_tests.rs#L960-L1071)
 and [empty/nonempty cycles](../../crates/libs/fube-data/src/engine_tests.rs#L1074-L1158)
 prove EOS-before-ACK ordering. The
@@ -471,7 +503,7 @@ retriable failure
 and **0x80071c2f operation-too-large**, including causes, native conversion,
 uncertainty and transport round trips
 ([shared errors](../../crates/libs/fube-core/src/error.rs#L31-L41),
-[admission](../../crates/libs/fube-data/src/engine.rs#L890-L957),
+[admission](../../crates/libs/fube-data/src/engine.rs#L957-L1069),
 [queue stages](../../crates/libs/fube-data/src/queue.rs#L80-L102)).
 These exact codes come from [FabricTypes.h:119–136,226–236][sf-admission-codes]
 and [EnumOperators.cpp:85–128][sf-admission-conversion].
@@ -529,17 +561,17 @@ epochs return without copy/control gates or provider calls. New secondary/role
 admission controls drain lower work without a provider getter/equality check.
 Original-operation barriers and primary provider controls preserve the callback's
 actual success/error without reimposing upper/lower tail equality
-([admission minimum](../../crates/libs/fube-data/src/engine.rs#L2082-L2122),
-[callback result](../../crates/libs/fube-data/src/engine.rs#L4172-L4187)).
+([admission minimum](../../crates/libs/fube-data/src/engine.rs#L2496-L2530),
+[callback result](../../crates/libs/fube-data/src/engine.rs#L4860-L4895)).
 The [upper100/lower90 overlap test](../../crates/libs/fube-data/src/engine_tests.rs#L3540-L3625)
 keeps actual copied bytes, delays real ACKs, observes no duplicate callback/getter
 or truncation, then drains 91–100. The
 [represented-provider duplicate tests](../../crates/libs/fube-data/src/engine_tests.rs#L3627-L3690)
 exercise promotion and original-operation barriers without post-callback getters.
 The [new incompatible epoch negatives](../../crates/libs/fube-data/src/engine_tests.rs#L3692-L3749)
-preserve real provider errors. The [owned canonical lower-entry test](../../crates/libs/fube-runtime/tests/replication_native.rs#L1292-L1367)
+preserve real provider errors. The [owned canonical lower-entry test](../../crates/libs/fube-runtime/tests/replication_native.rs#L1291-L1366)
 separately proves RAP's duplicate suppression and actual lower no-op execution;
-[traffic-epoch and saturated-entry regressions](../../crates/libs/fube-runtime/tests/replication_native.rs#L1371-L1488)
+[traffic-epoch and saturated-entry regressions](../../crates/libs/fube-runtime/tests/replication_native.rs#L1370-L1487)
 cover newer StartCopy/replication admission during unfinished copy, equal success,
 stale rejection and callback-free execution under the shared record limit.
 These are offline fixtures, not a V2 log kernel or deployed qualification.
@@ -560,7 +592,7 @@ remain explicit profile limits.
 supports_copy_until_latest_lsn: true })`. This is explicit construction, not SDK
 trait discovery, peer negotiation or type inference
 ([capability](../../crates/libs/fube-data/src/extensions.rs#L89-L97),
-[helper](../../crates/libs/fube-runtime/src/replication.rs#L180-L270)).
+[helper](../../crates/libs/fube-runtime/src/replication.rs#L181-L272)).
 Latest selects inclusive assigned horizon and replication start assigned+1;
 classic retains max(committed,previous quorum)+1. Provider supervision and the
 enumeration-EOS finish tail remain unchanged. The
@@ -575,8 +607,8 @@ uses that success or queries the provider, then creates the INITIAL queue at
 tail+1. Getter failures retry; first-Primary failures fault lower. Initial
 secondary starts from transmission and role transfer preserves queue authority,
 not an activated rebase
-([constructor contract](../../crates/libs/fube-runtime/src/replication.rs#L180-L204),
-[getters](../../crates/libs/fube-data/src/engine.rs#L5049-L5225)).
+([constructor contract](../../crates/libs/fube-runtime/src/replication.rs#L181-L205),
+[getters](../../crates/libs/fube-data/src/engine.rs#L5250-L5426)).
 The public SDK/bootstrap witnesses retain actual tails1/27→assigned2/28 and
 getter/error/first-Primary coverage. Their markers are **not native record
 serialization or persisted recovery**. See [A1 composition](FubeTxnA1.md) for

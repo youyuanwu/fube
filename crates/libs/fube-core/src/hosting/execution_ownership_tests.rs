@@ -6,6 +6,395 @@ fn runtime() -> ExecutionRuntime {
 }
 
 #[tokio::test]
+async fn queued_second_callback_retains_absolute_deadline_and_cannot_refreeze_it() {
+    let runtime = runtime();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let permit = runtime
+            .reserve(
+                CallLane::Provider,
+                CallOrigin::default(),
+                Duration::from_secs(2),
+                false,
+            )
+            .unwrap()
+            .with_deadline(deadline)
+            .unwrap();
+        let owner = runtime.clone();
+        assert_eq!(
+            permit
+                .run_owned(move || owner.current_deadline())
+                .await
+                .unwrap(),
+            deadline
+        );
+    }
+    let permit = runtime
+        .try_reserve()
+        .unwrap()
+        .with_deadline(deadline)
+        .unwrap();
+    assert!(permit
+        .with_deadline(deadline + Duration::from_secs(1))
+        .is_err());
+    assert!(runtime
+        .try_reserve()
+        .unwrap()
+        .with_deadline(Instant::now())
+        .is_err());
+    runtime.finish_standalone().await.unwrap();
+}
+
+#[tokio::test]
+async fn distinct_engine_callback_uses_existing_provider_budget_owner_deadline_and_reentry_guard() {
+    let runtime = runtime();
+    let root = CallOrigin {
+        engine: 11,
+        session: 0,
+        generation: 1,
+    };
+    let child = CallOrigin { engine: 22, ..root };
+    let owner = runtime.clone();
+    runtime
+        .reserve(CallLane::Provider, root, Duration::from_secs(1), false)
+        .unwrap()
+        .run_future(async move {
+            let deadline = owner.current_deadline()?;
+            assert!(owner
+                .reserve(CallLane::Provider, child, Duration::from_secs(1), false)
+                .is_err());
+            assert!(owner.reserve_engine_callback(root, deadline).is_err());
+            let callback = owner.reserve_engine_callback(child, deadline)?;
+            let callback_owner = owner.clone();
+            callback
+                .run_owned(move || {
+                    assert_eq!(ExecutionRuntime::current_origin(), Some(child));
+                    assert_eq!(callback_owner.current_deadline()?, deadline);
+                    assert!(ExecutionRuntime::reject_engine_reentry(child.engine).is_err());
+                    assert!(ExecutionRuntime::check_entry(Some(root.engine)).is_err());
+                    assert!(ExecutionRuntime::reject_engine_reentry(root.engine).is_err());
+                    assert!(callback_owner
+                        .reserve_engine_callback(root, deadline)
+                        .is_err());
+                    assert!(callback_owner
+                        .reserve_engine_callback(child, deadline)
+                        .is_err());
+                    Ok(())
+                })
+                .await
+        })
+        .await
+        .unwrap();
+    runtime.finish_standalone().await.unwrap();
+}
+
+#[tokio::test]
+async fn callback_ancestry_survives_yields_publication_scopes_and_dropped_observer_cleanup() {
+    struct Probe {
+        owner: ExecutionRuntime,
+        engines: Vec<u64>,
+        dropped: Option<oneshot::Sender<()>>,
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            assert!(ExecutionRuntime::is_cleanup_entry());
+            for engine in &self.engines {
+                assert!(ExecutionRuntime::check_entry(Some(*engine)).is_err());
+                assert!(ExecutionRuntime::reject_engine_reentry(*engine).is_err());
+                assert!(self
+                    .owner
+                    .reserve_engine_callback(
+                        CallOrigin {
+                            engine: *engine,
+                            generation: 1,
+                            session: 0
+                        },
+                        self.owner.current_deadline().unwrap(),
+                    )
+                    .is_err());
+            }
+            self.dropped.take().unwrap().send(()).unwrap();
+        }
+    }
+    let runtime = runtime();
+    let foreign = self::runtime();
+    let a = CallOrigin {
+        engine: 11,
+        generation: 1,
+        session: 0,
+    };
+    let b = CallOrigin { engine: 22, ..a };
+    let c = CallOrigin { engine: 33, ..a };
+    let owner = runtime.clone();
+    let foreign_owner = foreign.clone();
+    let root_permit = runtime
+        .reserve(CallLane::Provider, a, Duration::from_secs(2), false)
+        .unwrap();
+    let child_permit = runtime
+        .reserve_engine_callback(b, Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    let root = ExecutionRuntime::engine_publication(7, || {
+        Ok(root_permit.run_future(async move {
+            let deadline = owner.current_deadline()?;
+            assert!(foreign_owner.reserve_engine_callback(b, deadline).is_err());
+            let child_owner = owner.clone();
+            child_permit
+                .run_future(async move {
+                    tokio::task::yield_now().await;
+                    for engine in [7, a.engine, b.engine] {
+                        assert!(ExecutionRuntime::check_entry(Some(engine)).is_err());
+                        assert!(ExecutionRuntime::reject_engine_reentry(engine).is_err());
+                        assert!(child_owner
+                            .reserve_engine_callback(CallOrigin { engine, ..a }, deadline)
+                            .is_err());
+                    }
+                    let grandchild_owner = child_owner.clone();
+                    let tracker = DisposalTracker::default();
+                    let (dropped, received) = oneshot::channel();
+                    let (ready, completed) = oneshot::channel();
+                    let observer = child_owner
+                        .reserve_engine_callback(c, deadline)?
+                        .run_future(async move {
+                            tokio::task::yield_now().await;
+                            assert_eq!(ExecutionRuntime::current_origin(), Some(c));
+                            for engine in [7, a.engine, b.engine, c.engine] {
+                                assert!(ExecutionRuntime::check_entry(Some(engine)).is_err());
+                                assert!(ExecutionRuntime::reject_engine_reentry(engine).is_err());
+                                assert!(grandchild_owner
+                                    .reserve_engine_callback(CallOrigin { engine, ..a }, deadline)
+                                    .is_err());
+                            }
+                            let object = grandchild_owner
+                                .reserve_construction(&ObjectQuota::new(1)?, &tracker)?
+                                .construct(Probe {
+                                    owner: grandchild_owner.clone(),
+                                    engines: vec![7, a.engine, b.engine, c.engine],
+                                    dropped: Some(dropped),
+                                });
+                            ready.send(()).unwrap();
+                            Ok(object)
+                        });
+                    completed.await.unwrap();
+                    tokio::task::yield_now().await;
+                    drop(observer);
+                    received.await.unwrap();
+                    Ok(())
+                })
+                .await
+        }))
+    })
+    .unwrap();
+    root.await.unwrap();
+    runtime.finish_standalone().await.unwrap();
+    foreign.finish_standalone().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_permit_pending_cleanup_unions_construction_and_release_callback_ancestry() {
+    struct Probe {
+        owner: ExecutionRuntime,
+        engines: Vec<u64>,
+        deadline: Instant,
+        dropped: Option<oneshot::Sender<()>>,
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            assert!(ExecutionRuntime::is_cleanup_entry());
+            assert_eq!(self.owner.current_deadline().unwrap(), self.deadline);
+            for engine in &self.engines {
+                assert!(ExecutionRuntime::check_entry(Some(*engine)).is_err());
+                assert!(ExecutionRuntime::reject_engine_reentry(*engine).is_err());
+                assert!(self
+                    .owner
+                    .reserve_engine_callback(
+                        CallOrigin {
+                            engine: *engine,
+                            generation: 1,
+                            session: 0,
+                        },
+                        self.deadline,
+                    )
+                    .is_err());
+            }
+            self.dropped.take().unwrap().send(()).unwrap();
+        }
+    }
+    struct Construction {
+        owner: ExecutionRuntime,
+        spare: Arc<OwnedCallPermit>,
+        children: Vec<CallOrigin>,
+        reservation: Option<ConstructionReservation<Probe>>,
+        probe: Option<Probe>,
+        object: Option<ManagedObject<Probe>>,
+        release_outside: bool,
+    }
+    fn callbacks(mut construction: Construction) -> OwnedFuture<Option<ManagedObject<Probe>>> {
+        Box::pin(async move {
+            tokio::task::yield_now().await;
+            if !construction.children.is_empty() {
+                let child = construction.children.remove(0);
+                return construction
+                    .owner
+                    .reserve_engine_callback(child, construction.owner.current_deadline()?)?
+                    .run_future(callbacks(construction))
+                    .await;
+            }
+            let object = match construction.object.take() {
+                Some(object) => object,
+                None => {
+                    let reservation = match construction.reservation.take() {
+                        Some(reservation) => reservation,
+                        None => construction.spare.object_reservation(
+                            &ObjectQuota::new(1)?,
+                            &DisposalTracker::default(),
+                        )?,
+                    };
+                    reservation.construct(construction.probe.take().unwrap())
+                }
+            };
+            if construction.release_outside {
+                return Ok(Some(object));
+            }
+            let receipt = object.receipt();
+            drop(object);
+            receipt.wait().await?;
+            Ok(None)
+        })
+    }
+    for depth in [2, 3] {
+        for pattern in ["inside", "constructed-outside", "reserved-outside"] {
+            let runtime = runtime();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let origin = |engine| CallOrigin {
+                engine,
+                generation: 1,
+                session: 0,
+            };
+            let spare = Arc::new(
+                runtime
+                    .reserve_engine_callback(origin(99), deadline)
+                    .unwrap(),
+            );
+            let root = runtime
+                .reserve(
+                    CallLane::Provider,
+                    origin(11),
+                    Duration::from_secs(3),
+                    false,
+                )
+                .unwrap();
+            let (dropped, received) = oneshot::channel();
+            let probe = Probe {
+                owner: runtime.clone(),
+                engines: [
+                    vec![7, 99, 11, 22],
+                    if depth == 3 { vec![33] } else { vec![] },
+                ]
+                .concat(),
+                deadline,
+                dropped: Some(dropped),
+            };
+            let mut construction = Construction {
+                owner: runtime.clone(),
+                spare: spare.clone(),
+                children: if depth == 3 {
+                    vec![origin(22), origin(33)]
+                } else {
+                    vec![origin(22)]
+                },
+                reservation: None,
+                probe: Some(probe),
+                object: None,
+                release_outside: pattern == "reserved-outside",
+            };
+            if pattern != "inside" {
+                let reservation = spare
+                    .object_reservation(&ObjectQuota::new(1).unwrap(), &DisposalTracker::default())
+                    .unwrap();
+                if pattern == "constructed-outside" {
+                    construction.object =
+                        Some(reservation.construct(construction.probe.take().unwrap()));
+                } else {
+                    construction.reservation = Some(reservation);
+                }
+            }
+            // The publication tag exists only at scheduling, not on workers.
+            let object = ExecutionRuntime::engine_publication(7, || {
+                Ok(root.run_future(callbacks(construction)))
+            })
+            .unwrap()
+            .await
+            .unwrap();
+            if let Some(object) = object {
+                let receipt = object.receipt();
+                drop(object);
+                receipt.wait().await.unwrap();
+            }
+            received.await.unwrap();
+            drop(spare);
+            runtime.finish_standalone().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn cleanup_ancestry_overflow_does_not_leak_owner_count_or_reservations() {
+    fn publications<T>(engines: &[u64], body: &mut dyn FnMut() -> Result<T>) -> Result<T> {
+        match engines.split_first() {
+            Some((engine, rest)) => {
+                ExecutionRuntime::engine_publication(*engine, || publications(rest, body))
+            }
+            None => body(),
+        }
+    }
+    let runtime = runtime();
+    let foreign = self::runtime();
+    let mut permit = Some(
+        publications(&(1..=32).collect::<Vec<_>>(), &mut || {
+            runtime.reserve(
+                CallLane::Provider,
+                CallOrigin {
+                    engine: 1,
+                    generation: 1,
+                    session: 0,
+                },
+                Duration::from_secs(2),
+                false,
+            )
+        })
+        .unwrap(),
+    );
+    let other = foreign.clone();
+    let call = publications(&(33..=64).collect::<Vec<_>>(), &mut || {
+        let other = other.clone();
+        Ok(permit.take().unwrap().run_owned(move || {
+            ExecutionRuntime::engine_publication(65, || {
+                for _ in 0..2 {
+                    assert!(matches!(
+                        other.reserve_cleanup(Duration::from_millis(250)),
+                        Err(Error::ResourceLimit("engine callback ancestry"))
+                    ));
+                    assert!(other.cleanup_quiescent());
+                    assert_eq!(other.inner.cleanup_owners.load(Ordering::Acquire), 0);
+                    assert_eq!(other.inner.outstanding.available_permits(), RECORDS);
+                    other.inner.authority.check()?;
+                }
+                Ok(())
+            })
+        }))
+    })
+    .unwrap();
+    call.await.unwrap();
+    let cleanup = foreign.reserve_cleanup(Duration::from_millis(250)).unwrap();
+    assert!(!foreign.cleanup_quiescent());
+    cleanup.run(|| Ok(())).wait().await.unwrap();
+    runtime.finish_standalone().await.unwrap();
+    foreign.finish_standalone().await.unwrap();
+    assert!(foreign.cleanup_quiescent());
+}
+
+#[tokio::test]
 async fn finite_provider_dormant_object_terminal_and_cleanup_reservations_cannot_grow_backlogs() {
     let runtime = runtime();
     let mut held = Vec::new();

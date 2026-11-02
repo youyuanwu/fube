@@ -202,7 +202,12 @@ authority. Trusted clear transport remains a **trust-profile limitation**.
 The helper lives in **fube-runtime**, not an extra SDK partition method. It
 composes a replication-defined factory and returns a runtime adapter and shared
 state view over one engine. Data has no runtime/RAP implementation dependency;
-shared contracts and neutral execution live in core. Runtime retains lease/
+the factory's separate per-owner hosting endpoint is retained privately by
+runtime, not exposed by the public data facade or diagnostics. Retained public
+partition wrappers, access getters and typed-error release use bounded
+owner-matched execution; actual queued access retains the original deadline
+outside owner/admission locks, and final wrapper release joins physical cleanup.
+Shared contracts and neutral execution live in core. Runtime retains lease/
 watchdog/proof interpretation and exact mutation-time validation. The actual
 returned composite is never replaced by a lower binder. Native internal factory,
 health and optional query interfaces are permitted; see
@@ -305,9 +310,9 @@ Native-source revision/version skew is not resolved by a successful source fixtu
 [R-health]: ../../crates/libs/fube-core/src/sdk/reporting.rs#L1-L46
 [R-register]: ../../crates/libs/fube-runtime/src/lib.rs#L566-L623
 [R-example]: ../../crates/libs/fube-runtime/src/lib.rs#L12-L31
-[R-entry]: ../../crates/libs/fube-core/src/hosting/execution_owned.rs#L987-L1028
+[R-entry]: ../../crates/libs/fube-core/src/hosting/execution_owned.rs#L1074-L1108
 [R-error]: ../../crates/libs/fube-core/src/error.rs#L19-L81
-[R-binding]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L152-L255
+[R-binding]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L152-L256
 [RT]: ../../crates/libs/fube-runtime/tests/sdk_contracts.rs#L274-L491
 [R-values]: ../../crates/libs/fube-runtime/src/stateful_api_tests.rs#L1-L245
 [R-life-tests]: ../../crates/libs/fube-runtime/src/lifecycle_tests.rs#L1-L140
@@ -326,9 +331,9 @@ Native-source revision/version skew is not resolved by a successful source fixtu
 [D-memory]: ../../crates/libs/fube-data/src/provider.rs#L597-L676
 [D-memory-tests]: ../../crates/libs/fube-data/src/provider.rs#L678-L1009
 [DT]: ../../crates/libs/fube-runtime/tests/replication_sdk.rs#L241-L638
-[D-native-tests]: ../../crates/libs/fube-runtime/tests/replication_native.rs#L813-L1082
+[D-native-tests]: ../../crates/libs/fube-runtime/tests/replication_native.rs#L812-L1081
 [D-disposal]: ../../crates/libs/fube-runtime/tests/support/replication_disposal_tests.rs#L68-L245
-[D-hosted]: ../../crates/libs/fube-runtime/src/replication.rs#L162-L339
+[D-hosted]: ../../crates/libs/fube-runtime/src/replication.rs#L162-L375
 [D-wire-tests]: ../../crates/libs/fube-data/src/wire_tests.rs#L1-L40
 [D-model]: ../../crates/libs/fube-rap-test-support/src/lib.rs#L243-L365
 [APP-write]: ../../crates/samples/rust-runtime-app/src/data.rs#L263-L323

@@ -120,7 +120,7 @@ live in `fube-core`, while runtime retains lease/watchdog/proof interpretation.
 Normal built-in construction installs no
 replacement-object binder. Explicit custom framework bindings retain their
 existing selected-view behavior; txn and its helper never install one
-([stateful_binding.rs:724–841](../../crates/libs/fube-runtime/src/stateful_binding.rs#L724-L841)).
+([native dispatch](../../crates/libs/fube-runtime/src/stateful_binding.rs#L725-L842)).
 Original record-current/one-use, actor, revision, remote sequence, generation,
 native lifetime, actual lease and deadline fences remain; no newer record is
 selected to repair a stale scoped proof. This is internal host plumbing, not a
@@ -139,7 +139,7 @@ uses transmitted start; promotion/demotion transfer lower queue authority.
 An incomplete initial secondary's progress query preserves native NotReady/fault
 disposition; it is not a fabricated zero/readiness value.
 There is no activated-queue rebase
-([engine.rs:5088–5248](../../crates/libs/fube-data/src/engine.rs#L5088-L5248),
+([lower progress](../../crates/libs/fube-data/src/engine.rs#L5289-L5449),
 [actual registered bootstrap test](../../crates/libs/fube-txn/src/kernel/runtime_bootstrap_tests.rs#L797-L860)).
 Native callers are Replicator.cpp:296–390,
 Replicator.ChangeRoleAsyncOperation.cpp:127–252 and
@@ -151,7 +151,7 @@ secondary. This lower's fixed explicit-service-ACK profile completes lower
 promotion immediately, without epoch rebase, stream/capture replacement or
 waiting for application ACK/live replication EOS. Upper promotion still awaits
 its copy completion, not live replication completion
-([engine.rs:2328–2342](../../crates/libs/fube-data/src/engine.rs#L2328-L2342),
+([existing-secondary admission](../../crates/libs/fube-data/src/engine.rs#L2529-L2543),
 [runtime.rs:469–487](../../crates/libs/fube-txn/src/kernel/runtime.rs#L469-L487)).
 Pinned SecondaryReplicator.cpp:2110–2154 distinguishes this RequireServiceAck
 branch from the unsupported no-service-ACK dispatch-drain branch.

@@ -222,6 +222,7 @@ impl NativeInvocation {
                 *self.unit.actor.lock().unwrap() = Some(uuid::Uuid::new_v4());
             }
             "cancellation" => self.issued.cancellation.cancel(),
+            "lifetime" => self.issued.lifetime.cancel(),
             "remote" => {
                 let (node, _) = self.issued.remote.expect("remote-issued invocation");
                 self.unit

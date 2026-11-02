@@ -121,7 +121,7 @@ have source-contract tests; native recovery validation remains pending.
 Supported lower construction is
 `native.create_replicator(partition, provider, replay, endpoint, settings)` in
 the owning service Open callback
-([helper](../../crates/libs/fube-runtime/src/replication.rs#L180-L270)).
+([helper](../../crates/libs/fube-runtime/src/replication.rs#L181-L272)).
 Runtime claims identity/one engine and invokes data's replication-defined
 factory, then wraps that same lower. The actual service-returned composite/
 forwarder remains RAP's canonical target. SDK/errors and generic finite execution
@@ -130,6 +130,12 @@ of original control/cleanup records. Data cannot access NativeRuntimeIntegration
 NativeInvocation or RAP diagnostics. This is native-style interface separation,
 including narrow internal factory/health seams, not SDK-only purity or a new
 native ABI. See [the boundary and access mapping](FubeData.md#runtimereplication-boundary).
+The factory-created per-owner hosting endpoint stays private in the runtime
+adapter, separate from public diagnostics/state views. The retained partition
+wrapper's getter/error disposal and final capture release participate in finite
+owner-matched supervision; the actual queued access read uses its original
+deadline outside owner/admission locks. These are Rust hosting guarantees, not
+additional native interoperability qualification.
 
 The data profile's executed native qualification now also covers primary
 failure/replacement, copy and per-unit isolation; see [its exact evidence and

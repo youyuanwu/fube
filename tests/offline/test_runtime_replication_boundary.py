@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import unittest
+import re
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -73,6 +74,29 @@ class RuntimeReplicationBoundary(unittest.TestCase):
                 r"feature\s*=\s*\"(?:qualification|test-hooks)\"",
                 str(source),
             )
+
+    def test_factory_endpoint_never_published_by_live_owner_views(self):
+        hosting = (ROOT / "crates/libs/fube-data/src/hosting.rs").read_text()
+        facade = (ROOT / "crates/libs/fube-data/src/fabric_replicator.rs").read_text()
+        runtime = (ROOT / "crates/libs/fube-runtime/src/replication.rs").read_text()
+        self.assertIn("Result<(Arc<FabricReplicator>, HostingEndpoint)>", hosting)
+        self.assertRegex(hosting, r"pub struct HostingEndpoint\s*\{\s*engine:")
+        self.assertNotRegex(facade, r"\bHostingEndpoint\b")
+        public_facade_impl = hosting.split("impl FabricReplicator {", 1)[1].split(
+            "impl HostingEndpoint {", 1
+        )[0]
+        self.assertNotRegex(public_facade_impl, r"pub fn (configure|build|remove)\b")
+        self.assertRegex(runtime, r"\n\s+hosting: HostingEndpoint,")
+        for source in (ROOT / "crates/libs/fube-data/src").glob("*.rs"):
+            self.assertNotRegex(
+                source.read_text(), r"(?:pub|pub\(crate\)) fn \w+\([^)]*\)[^{;]*->\s*(?:Arc<)?HostingEndpoint",
+                str(source),
+            )
+        # Real rustdoc compile-fail witnesses accompany structural graph checks:
+        # they refer to existing public types/methods, not missing imports.
+        for method in ("configure", "build", "remove"):
+            self.assertIn(f"r.diagnostics().{method}(", runtime)
+        self.assertEqual(len(re.findall(r"compile_fail,E0599", runtime)), 3)
 
 
 if __name__ == "__main__":

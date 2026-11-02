@@ -173,10 +173,15 @@ are split into `IReplicator` and `IPrimaryReplicator`
 `RuntimeReplicator` wraps one `FabricReplicator` lower and shares that private
 engine among public control/state views. Runtime owns native proof capture and
 queued validation; replication receives only lower facts and narrow host
-interfaces. Production dependencies are runtime → data → core/transport; shared
+interfaces. The factory returns a separate per-owner hosting endpoint retained
+privately by runtime; no public lower/state/diagnostic view can recover it.
+Partition access callbacks and typed-error disposal run on bounded owner-matched
+execution, with the original deadline at actual queued assignment. Partition
+capture release joins physical Close/Abort disposal, not delayed facade Drop.
+Production dependencies are runtime → data → core/transport; shared
 SDK/error/neutral execution types live in core. Native factory/health/optional
 query seams are allowed; this is not an SDK-only architecture
-([runtime adapter](../../crates/libs/fube-runtime/src/replication.rs#L162-L270),
+([runtime adapter](../../crates/libs/fube-runtime/src/replication.rs#L162-L272),
 [boundary](FubeData.md#runtimereplication-boundary)). The
 engine, old concrete streams and old traits are no longer public construction
 or compatibility paths
@@ -288,7 +293,7 @@ record/shared one-use flag over the exact service-returned composite; public
 configuration/Remove delegation and eager Build construction/owned polling reach
 the canonical lower method with that exact proof and Remove purpose, including
 BuildRetryCleanup
-([stateful_binding.rs:724–841][f-native-dispatch],
+([native dispatch][f-native-dispatch],
 [composite.rs:180–218](../../crates/libs/fube-txn/src/kernel/composite.rs#L180-L218)).
 Record-current, actor/revision/remote/generation, native lifetime, actual lease and
 deadline fences survive capture/admission/completion; an invalid scoped proof
@@ -569,7 +574,7 @@ durable-log implementation for C. A memory flush is not disk durability.
 provider operations; the operation ACK closure holds a permit and data charge
 until capture disposal
 ([api.rs:26–40][f-capture-init],
-[engine.rs:3483–3536][f-captures]).
+[operation capture ownership][f-captures]).
 Retaining every operation until commit can prevent a transaction's end record
 from arriving—even if early operations have been ACKed but their captures have
 not been released. Copy bytes into charged upper ownership, ACK, and drop the
@@ -602,7 +607,7 @@ Neither reference memory flush nor proposed A ACK means disk durability.
 Dropping a current lower `ReplicationCompletion::wait` does not undo admission
 ([api.rs:232–259][f-wait]); current lower quorum completion is independent of
 provider local application
-([engine.rs:4404–4464][f-quorum]).
+([lower quorum completion][f-quorum]).
 The upper owner must therefore outlive the requesting socket/future, complete
 or fence its work, and retain all admitted-record ownership.
 
@@ -725,7 +730,7 @@ The old private `create_with_lifecycle`/lower-accessor recipe is withdrawn;
 do not separately call either layer's lifecycle.
 See the [constructible usage and execution-entry rule](FubeTxnA1.md)
 ([shared factory contract][f-factory],
-[runtime construction](../../crates/libs/fube-runtime/src/replication.rs#L180-L270),
+[runtime construction](../../crates/libs/fube-runtime/src/replication.rs#L181-L272),
 [stateful_binding.rs:160–180][f-native-capture]).
 There is no supported public standalone `Engine`, extra partition
 CreateReplicator method, SDK discovery hook, or second lower owner.
@@ -759,7 +764,7 @@ a variant of fresh construction.
 253–275 promotes the existing secondary; SecondaryReplicator.cpp:2110–2154
 completes immediately for RequireServiceAck. This lower already has that fixed
 explicit-service-ACK profile; no no-service-ACK setting is exposed. The
-[public lower branch](../../crates/libs/fube-data/src/engine.rs#L2328-L2342)
+[public lower branch](../../crates/libs/fube-data/src/engine.rs#L2529-L2543)
 does not wait for upper application ACK/live replication EOS, rebase epoch or
 replace captures/streams. Upper role separately waits copy completion
 ([runtime.rs:469–487](../../crates/libs/fube-txn/src/kernel/runtime.rs#L469-L487)).
@@ -820,7 +825,7 @@ promotion closes dispatch queues and waits for their source drain
 ([SecondaryReplicator.CloseAsyncOperation.cpp:41–104][n-secondary-close]).
 R0 freezes old-generation ingress, dispatches eligible contiguous buffered records,
 closes senders successfully, then waits for actual service ACKs
-([lower dispatch close](../../crates/libs/fube-data/src/engine.rs#L4087-L4124)).
+([lower dispatch close](../../crates/libs/fube-data/src/engine.rs#L4506-L4544)).
 It deliberately does not wait for ACKs before EOS: §5.3 can flush/process after
 observing EOS. Its empty/nonempty role-cycle and 64-capture tests pass.
 A later demotion needs a fresh copy/replication generation in the same engine,
@@ -890,8 +895,8 @@ and same-engine reentry fail rather than turning a queued operation into
 success
 ([SfApiAlignment.md:133–163][f-owned-execution],
 [neutral reservation][f-reserve],
-[578–588][f-run-owned],
-[482–498][f-reentry]).
+[owned execution][f-run-owned],
+[reentry guards][f-reentry]).
 Use the supplied bounded runtime/provider/cleanup ownership facilities; do not
 add an independent scheduler. Upper pumps, listeners and arbitrary spawned
 descendants remain service-owned and must be stopped/joined on Close/Abort.
@@ -921,10 +926,10 @@ This is an existing local provider capability, not a new peer negotiation.
 
 **Implemented R0 capability:** `StateProviderCapabilities` is supplied to
 `native.create_replicator_with_capabilities`
-([construction](../../crates/libs/fube-runtime/src/replication.rs#L204-L270)).
+([construction](../../crates/libs/fube-runtime/src/replication.rs#L205-L272)).
 Its true flag selects assigned+1 replication start and inclusive assigned
 provider horizon; default classic still selects max(committed,previous quorum)+1
-([selection](../../crates/libs/fube-data/src/engine.rs#L3005-L3009)).
+([selection](../../crates/libs/fube-data/src/engine.rs#L3198-L3203)).
 The provider factory keeps the exact requested argument, volatile null context,
 supervision/bounds and enumeration-EOS finish-tail snapshot. A staged upper
 provider owns checkpoint horizon extension and its metadata, not a fabricated
@@ -940,7 +945,7 @@ progress-vector/head/tail context. Fube's current volatile receiver ignores
 persisted context messages
 ([CopyStream.cpp:165–215][n-copy-null],
 [LoggingReplicatorImpl.cpp:1603–1649][n-copy-factory],
-[engine.rs:3342–3343][f-copy-context]).
+[volatile copy-context dispatch][f-copy-context]).
 A qualifies the native volatile path; C must add the source persisted context
 and rejoin paths before enabling Existing-open.
 
@@ -1030,10 +1035,10 @@ barrier capacity inside an upper transaction log.
 Quorum completion and queue release are also distinct **current** behaviors:
 waiters resolve at quorum, while release additionally depends on current/
 previous `all_received` and copy/idle-build retention owners
-([engine.rs:4404–4464][f-quorum]). The observable snapshot exposes progress,
+([lower quorum completion][f-quorum]). The observable snapshot exposes progress,
 owned operations and owned bytes
 through `ReplicatorDiagnostics`
-([engine.rs:98–114][f-snapshot-fields], [779–791][f-snapshot],
+([snapshot fields][f-snapshot-fields], [snapshot observation][f-snapshot],
 [extensions.rs:88–103][f-diagnostics]).
 Admission still makes its own authoritative resource reservation, including
 outgoing-copy headroom
@@ -1051,7 +1056,7 @@ Finite Rust record, transaction/context, provider-version, checkpoint and copy
 quotas must account for payloads, descriptors and retained captures. These are
 explicit admission limits, not a replacement commit algorithm. Validate
 record/copy sizing against the existing lower queue and copy reservations
-([engine.rs:238–243][f-copy-reserve]).
+([lower copy sizing][f-copy-reserve]).
 Reserve owned capacity before taking user/provider captures, and retain charges
 until actual disposal. Do not allocate unlimited transaction/log owners.
 An admitted earlier record cannot be forgotten because a later record hits a
@@ -1298,43 +1303,43 @@ relative to this document; native references are pinned to the baseline in §2.
 [f-epoch-admission]: ../../crates/libs/fube-data/src/extensions.rs#L76-L86
 [f-capabilities]: ../../crates/libs/fube-data/src/extensions.rs#L14-L95
 [f-diagnostics]: ../../crates/libs/fube-data/src/extensions.rs#L88-L103
-[f-native-install]: ../../crates/libs/fube-data/src/engine.rs#L708-L735
-[f-initial-progress]: ../../crates/libs/fube-data/src/engine.rs#L5049-L5225
-[f-native-dispatch]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L724-L841
+[f-native-install]: ../../crates/libs/fube-data/src/engine.rs#L739-L766
+[f-initial-progress]: ../../crates/libs/fube-data/src/engine.rs#L5250-L5426
+[f-native-dispatch]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L725-L842
 [f-native-progress]: ../../crates/libs/fube-runtime/src/stateful_reconfiguration.rs#L245-L280
-[f-progress-install]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L309-L323
-[f-binding-install]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L525-L542
+[f-progress-install]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L369-L384
+[f-binding-install]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L594-L613
 [f-native-capture]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L160-L180
-[f-bound-controls]: ../../crates/libs/fube-runtime/src/replication.rs#L293-L482
+[f-bound-controls]: ../../crates/libs/fube-runtime/src/replication.rs#L329-L518
 [f-progress-getters]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L88-L96
 [f-owned-execution]: SfApiAlignment.md#L133-L163
-[f-reserve]: ../../crates/libs/fube-core/src/hosting/execution.rs#L454-L551
-[f-run-owned]: ../../crates/libs/fube-core/src/hosting/execution.rs#L710-L763
-[f-reentry]: ../../crates/libs/fube-core/src/hosting/execution.rs#L575-L614
+[f-reserve]: ../../crates/libs/fube-core/src/hosting/execution.rs#L548-L681
+[f-run-owned]: ../../crates/libs/fube-core/src/hosting/execution.rs#L841-L913
+[f-reentry]: ../../crates/libs/fube-core/src/hosting/execution.rs#L682-L714
 [f-values]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L8-L36
 [f-epoch-domains]: ../../crates/libs/fube-runtime/src/extensions.rs#L9-L25
 [f-errors]: ../../crates/libs/fube-core/src/error.rs#L273-L335
 [f-error-ownership]: ../../crates/libs/fube-core/src/error.rs#L1-L12
-[f-admission-errors]: ../../crates/libs/fube-data/src/engine.rs#L869-L915
+[f-admission-errors]: ../../crates/libs/fube-data/src/engine.rs#L957-L1069
 [f-queue-errors]: ../../crates/libs/fube-data/src/queue.rs#L73-L80
 [f-resource-code]: ../../crates/libs/fube-core/src/error.rs#L213-L224
-[f-promotion-stream]: ../../crates/libs/fube-data/src/engine.rs#L4332-L4343
-[f-epoch-equality]: ../../crates/libs/fube-data/src/engine.rs#L4288-L4293
+[f-promotion-stream]: ../../crates/libs/fube-data/src/engine.rs#L4506-L4544
+[f-epoch-equality]: ../../crates/libs/fube-data/src/engine.rs#L2507-L2520
 [f-order]: ../../crates/libs/fube-data/src/lib.rs#L13-L32
 [f-owned-sample]: ../../crates/samples/rust-runtime-app/src/data.rs#L258-L317
 [f-progress]: ../../crates/libs/fube-data/src/api.rs#L384-L398
 [f-progress-note]: ../../crates/libs/fube-data/src/lib.rs#L27-L32
 [f-capture-init]: ../../crates/libs/fube-data/src/api.rs#L26-L40
-[f-captures]: ../../crates/libs/fube-data/src/engine.rs#L3483-L3536
+[f-captures]: ../../crates/libs/fube-data/src/engine.rs#L4007-L4059
 [f-wait]: ../../crates/libs/fube-data/src/api.rs#L232-L259
-[f-quorum]: ../../crates/libs/fube-data/src/engine.rs#L4404-L4464
+[f-quorum]: ../../crates/libs/fube-data/src/engine.rs#L5022-L5082
 [f-snapshot-fields]: ../../crates/libs/fube-data/src/engine.rs#L98-L114
-[f-snapshot]: ../../crates/libs/fube-data/src/engine.rs#L779-L791
-[f-admission-budget]: ../../crates/libs/fube-data/src/engine.rs#L849-L927
-[f-copy-reserve]: ../../crates/libs/fube-data/src/engine.rs#L238-L243
-[f-copy-factory]: ../../crates/libs/fube-data/src/supervised.rs#L268-L286
-[f-copy-context]: ../../crates/libs/fube-data/src/engine.rs#L3342-L3343
-[f-classic-copy-start]: ../../crates/libs/fube-data/src/engine.rs#L2693-L2702
+[f-snapshot]: ../../crates/libs/fube-data/src/engine.rs#L805-L813
+[f-admission-budget]: ../../crates/libs/fube-data/src/engine.rs#L1000-L1069
+[f-copy-reserve]: ../../crates/libs/fube-data/src/engine.rs#L232-L239
+[f-copy-factory]: ../../crates/libs/fube-data/src/supervised.rs#L313-L332
+[f-copy-context]: ../../crates/libs/fube-data/src/engine.rs#L3864-L3868
+[f-classic-copy-start]: ../../crates/libs/fube-data/src/engine.rs#L3327-L3350
 [f-settings]: ../../crates/libs/fube-data/src/api.rs#L12-L74
 [f-transport]: ../../crates/libs/fube-data/src/transport.rs#L429-L486
 [f-transport-class]: ../../crates/libs/fube-data/src/transport.rs#L613-L618

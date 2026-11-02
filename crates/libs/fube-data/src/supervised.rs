@@ -220,6 +220,50 @@ pub(crate) struct OwnedProvider {
     streams: ObjectQuota,
     tracker: DisposalTracker,
 }
+
+pub(crate) struct OwnedPartition(ManagedObject<Arc<dyn fube_core::IStatefulServicePartition>>);
+impl OwnedPartition {
+    pub(crate) fn new(
+        runtime: &ExecutionRuntime,
+        partition: Arc<dyn fube_core::IStatefulServicePartition>,
+        tracker: &DisposalTracker,
+        origin: fube_core::hosting::CallOrigin,
+        construction: Option<&fube_core::hosting::OwnedCallPermit>,
+    ) -> Result<Self> {
+        let quota = ObjectQuota::new(1)?;
+        let reservation = if let Some(construction) = construction {
+            construction.object_reservation(&quota, tracker)?
+        } else {
+            runtime.reserve_construction_with_origin(&quota, tracker, origin)?
+        };
+        Ok(Self(reservation.construct(partition)))
+    }
+    pub(crate) fn publication(&self) -> fube_core::hosting::ObjectPublication {
+        self.0.publication()
+    }
+    pub(crate) fn disposal_receipt(&self) -> fube_core::hosting::DisposalReceipt {
+        self.0.receipt()
+    }
+    pub(crate) fn check_write_access(&self) -> Result<()> {
+        use fube_core::{ErrorKind, ServicePartitionAccessStatus as Access};
+        // Both the getter and release of its typed error run in the owning
+        // finite callback, never in the owner/admission critical section.
+        let access = match self.0.get().get_write_status() {
+            Ok(access) => access,
+            Err(error) => {
+                drop(error);
+                Access::NotPrimary
+            }
+        };
+        let kind = match access {
+            Access::Granted => return Ok(()),
+            Access::ReconfigurationPending => ErrorKind::ReconfigurationPending,
+            Access::NoWriteQuorum => ErrorKind::NoWriteQuorum,
+            Access::NotPrimary | Access::Invalid => ErrorKind::NotPrimary,
+        };
+        Err(crate::Error::new(kind, "partition write access denied"))
+    }
+}
 struct ProviderCapabilities {
     provider: Arc<dyn IStateProvider>,
     replay: Option<Arc<dyn ReplayCheckpointProvider>>,
