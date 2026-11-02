@@ -9,7 +9,7 @@
 //! routing, an `IFabricTransport` port, an SF ABI, or an operational framework.
 //! No constructor, registration storage, matching, dispatch, closure adapter,
 //! codec, executor or lifecycle implementation is supplied. Existing
-//! [`Connection`](crate::connection::Connection) behavior/security/roles and
+//! runtime domain behavior/security/roles and
 //! client/runtime/data protocol schemas remain unchanged.
 //!
 //! # Native evidence, not Rust guarantees

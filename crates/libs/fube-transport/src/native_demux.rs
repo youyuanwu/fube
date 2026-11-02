@@ -24,6 +24,9 @@ pub type EnvelopeValidator = fn(&Message, &Properties) -> Result<()>;
 pub enum OutboundKind {
     Raw,
     Rpc,
+    /// Explicitly authorized semantic one-way control/reply traffic.
+    /// This does not confer an inbound request's correlation authority.
+    Reserved,
 }
 
 /// Explicit sender authorization; actor registration never supplies this.
@@ -102,6 +105,15 @@ pub struct DuplexPolicy {
     pub reply: EnvelopeValidator,
 }
 
+/// Independent authorization for normal actor requests and their responses.
+///
+/// Unlike DuplexPolicy this never classifies IsUncorrelatedReply traffic.
+/// Actor registration alone cannot mint this private consuming grant.
+pub struct RequestPolicy {
+    pub incoming: EnvelopeValidator,
+    pub reply: EnvelopeValidator,
+}
+
 /// Connect-time composition of independent mechanism authorization.
 ///
 /// Explicit trusted policy is required even with no actor registrations.
@@ -113,6 +125,10 @@ pub struct ChannelComposition {
     pub ordinary_reply: EnvelopeValidator,
     pub actors: ActorDemux,
     pub duplex: Option<DuplexPolicy>,
+    pub requests: Option<RequestPolicy>,
+    /// Pause later wire delivery until a receiver acknowledges bounded ingress
+    /// handoff. No handler or domain work executes in transport.
+    pub ordered_ingress: bool,
 }
 
 #[cfg(test)]

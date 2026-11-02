@@ -776,7 +776,11 @@ async fn serve(
                 let closing = matches!(command.action, Action::Close);
                 let mut request = match command.action { Action::Open | Action::Close => local.as_ref().unwrap().clone(), _ => control(local.as_ref().unwrap()) };
                 let action = match command.action {
-                    Action::Open => "ReplicaOpen",
+                    Action::Open => {
+                        // Model startup is one final native Open attempt, even if its frame is retried.
+                        request.flags = 4;
+                        "ReplicaOpen"
+                    },
                     Action::Close => "ReplicaClose",
                     Action::Configure(configuration) => {
                         request.flags = 1; // native end-reconfiguration/current configuration
@@ -913,5 +917,50 @@ impl Artifacts {
 impl Drop for Artifacts {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailingFactory(Arc<AtomicUsize>);
+
+    impl IStatefulServiceFactory for FailingFactory {
+        fn create_replica(
+            &self,
+            _: String,
+            _: String,
+            _: &[u8],
+            _: uuid::Uuid,
+            _: i64,
+        ) -> Result<Box<dyn fube_runtime::IStatefulServiceReplica>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(Error::InvalidInput("controlled model factory failure"))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_open_retries_do_not_repeat_single_attempt_factory() {
+        let creations = Arc::new(AtomicUsize::new(0));
+        let observed = creations.clone();
+        let (host, opened) = Host::start_source_outcome(
+            uuid::Uuid::new_v4(),
+            ReplicaSource {
+                replica_id: 1,
+                native_incarnation: 11,
+                node_id: [1; 16],
+                node_instance: 1,
+            },
+            ReplicaRole::Primary,
+            move |_| Box::new(FailingFactory(observed)),
+        )
+        .await;
+        let retried = host.request(Action::Open).await;
+        drop(host);
+        assert!(opened.is_err());
+        assert!(retried.is_err());
+        assert_eq!(creations.load(Ordering::Relaxed), 1);
     }
 }

@@ -341,7 +341,7 @@ fn domain_failure(reply: &Message) -> Result<()> {
         ));
     }
     // The domain code is required. Native's code-only trailing suffix is valid;
-    // a present diagnostic must decode. Excluded Connection policy is unchanged.
+    // a present diagnostic must decode. Runtime IPC/domain error policy is separate.
     #[derive(serde::Deserialize)]
     struct Failure {
         code: i64,

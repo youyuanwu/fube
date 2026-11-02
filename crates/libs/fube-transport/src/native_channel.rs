@@ -1,11 +1,12 @@
 //! Operational, owned native channels for unsecured loopback development.
 //!
-//! This is a separate backend for [`crate::channel`], not an adapter around
-//! Connection's envelope-building APIs. Connect-time composition separates native
+//! This is the operational backend for [`crate::channel`], not an adapter around
+//! the retired legacy envelope-building APIs. Connect-time composition separates native
 //! actor ingress, ordinary correlation and authorized special duplex handling.
 //! Consumer actor/action/envelope authorization is supplied by client adapters.
-//! No listener, arbitrary reverse RPC, IPC, replication, TLS, reconnect or replay
-//! is supplied.
+//! IPC session envelopes are composed by [`crate::native_ipc`]; separately
+//! authorized normal-request replies are shared request/reply machinery.
+//! No listener, replication, TLS, reconnect or replay is supplied.
 //!
 //! Clear loopback is an explicit trust assumption, not authentication of local
 //! processes. Domain headers/body, including TimeoutHeader, remain caller-owned.
@@ -22,7 +23,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    sync::{watch, Notify},
+    sync::{oneshot, watch, Notify},
     task::JoinHandle,
     time::{timeout, timeout_at, Instant},
 };
@@ -41,6 +42,10 @@ use crate::{
 #[cfg(test)]
 #[path = "native_channel_tests.rs"]
 mod tests;
+
+#[path = "native_request_reply.rs"]
+mod request_reply;
+use request_reply::NativeReplyContext;
 
 const ORDINARY: usize = 0;
 const REPLY: usize = 1;
@@ -178,6 +183,35 @@ pub struct GatewayTarget {
 enum Outcome {
     Written,
     Message(Message),
+    Held(Message, CompletionGuard),
+}
+
+/// Bounded, nonblocking per-attempt validity sample, not a domain decoder.
+///
+/// Runs outside the shared-state mutex. It may inspect diagnostics but must
+/// not mutate/cancel this channel or perform I/O, blocking work or user callbacks.
+pub type WritePredicate = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Trusted, bounded session envelope preparation, never domain work or I/O.
+pub(crate) trait OutboundEnvelope: Send + Sync {
+    fn header(&self, message: &Message, original_reply: bool) -> Result<Option<Header>>;
+    fn requires_message_id(&self) -> bool;
+}
+
+/// Opaque completion acknowledgment and retained result reservation.
+///
+/// An opted-in reader waits until acknowledgment/drop before delivering later
+/// frames. Keeping this after acknowledgment retains only the result budget,
+/// never socket ownership. It cannot grant sender or reply authority.
+pub struct CompletionGuard {
+    release: Option<oneshot::Sender<()>>,
+    _lease: Arc<Lease>,
+}
+
+impl CompletionGuard {
+    pub fn acknowledge(&mut self) {
+        self.release.take();
+    }
 }
 
 struct Entry {
@@ -188,6 +222,8 @@ struct Entry {
     result: Option<Result<Outcome>>,
     lease: Arc<Lease>,
     tracking: Option<Arc<Mutex<RequestState>>>,
+    valid: Option<WritePredicate>,
+    hold_reply: bool,
 }
 
 #[derive(Default)]
@@ -213,6 +249,7 @@ impl RequestCancellation {
     /// Retraction before the lazy request's first poll prevents submission.
     pub fn cancel_unsent(&self) -> bool {
         let shared = self.shared.upgrade();
+        let _visibility = shared.as_ref().map(|s| s.visibility.lock().unwrap());
         let mut inner = shared.as_ref().map(|s| s.inner.lock().unwrap());
         let mut state = self.state.lock().unwrap();
         if state.visible {
@@ -224,7 +261,7 @@ impl RequestCancellation {
         }
         drop(state);
         drop(inner);
-        if let Some(shared) = shared {
+        if let Some(shared) = &shared {
             shared.changed.notify_waiters();
         }
         true
@@ -233,7 +270,10 @@ impl RequestCancellation {
 
 struct Ingress {
     message: Message,
+    received_at: Instant,
     reply_id: Option<MessageId>,
+    reply_authorize: Option<EnvelopeValidator>,
+    handoff: Option<oneshot::Sender<()>>,
     _lease: Arc<Lease>,
 }
 
@@ -260,6 +300,10 @@ struct Shared {
     changed: Notify,
     stop: Notify,
     stopped: watch::Sender<bool>,
+    /// Serializes actual first-write progress with cancellation/termination.
+    /// Separate from inner so validity samples can safely read diagnostics.
+    visibility: Mutex<()>,
+    outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
 }
 
 impl Shared {
@@ -268,6 +312,7 @@ impl Shared {
     }
 
     fn terminate(&self, error: Error) {
+        let _visibility = self.visibility.lock().unwrap();
         let mut inner = self.inner.lock().unwrap();
         if inner.terminal.is_none() {
             inner.terminal = Some(error);
@@ -385,6 +430,16 @@ impl GatewayChannel {
         limits: ChannelLimits,
         deadline: Instant,
     ) -> Result<Self> {
+        Self::connect_with_envelope(endpoint, composition, limits, deadline, None).await
+    }
+
+    pub(crate) async fn connect_with_envelope(
+        endpoint: SocketAddr,
+        composition: ChannelComposition,
+        limits: ChannelLimits,
+        deadline: Instant,
+        outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
+    ) -> Result<Self> {
         limits.validate()?;
         if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
             return Err(Error::InvalidInput(
@@ -414,16 +469,18 @@ impl GatewayChannel {
         .await
         .map_err(|_| Error::Timeout)??;
         check_deadline(deadline)?;
-        Ok(Self::start(
+        Ok(Self::start_with_envelope(
             stream,
             endpoint,
             composition,
             limits,
             process_id,
             remote,
+            outbound_envelope,
         ))
     }
 
+    #[cfg(test)]
     fn start<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         stream: S,
         endpoint: SocketAddr,
@@ -431,6 +488,27 @@ impl GatewayChannel {
         limits: ChannelLimits,
         process_id: [u8; 16],
         remote: ListenInstance,
+    ) -> Self {
+        Self::start_with_envelope(
+            stream,
+            endpoint,
+            composition,
+            limits,
+            process_id,
+            remote,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_envelope<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+        stream: S,
+        endpoint: SocketAddr,
+        composition: ChannelComposition,
+        limits: ChannelLimits,
+        process_id: [u8; 16],
+        remote: ListenInstance,
+        outbound_envelope: Option<Arc<dyn OutboundEnvelope>>,
     ) -> Self {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
@@ -462,6 +540,8 @@ impl GatewayChannel {
             changed: Notify::new(),
             stop: Notify::new(),
             stopped: watch::channel(false).0,
+            visibility: Mutex::new(()),
+            outbound_envelope,
         });
         let join = tokio::spawn(drive(stream, shared.clone()));
         Self {
@@ -489,6 +569,27 @@ impl GatewayChannel {
 
     pub fn terminal_error(&self) -> Option<Error> {
         self.owner.shared.error()
+    }
+
+    /// Observe first-cause terminal state without initiating close or joining
+    /// a started frame. Waiter admission is finite and nonowning.
+    pub fn wait_terminal(&self, deadline: Instant) -> ChannelFuture<'_, Error> {
+        Box::pin(async move {
+            let _waiter = self.owner.shared.budget.reserve(CLOSE)?;
+            timeout_at(deadline, async {
+                loop {
+                    let stopped = self.owner.shared.stop.notified();
+                    tokio::pin!(stopped);
+                    stopped.as_mut().enable();
+                    if let Some(error) = self.terminal_error() {
+                        return Ok(error);
+                    }
+                    stopped.await;
+                }
+            })
+            .await
+            .map_err(|_| Error::Timeout)?
+        })
     }
 
     /// Initiate irreversible bounded shutdown without awaiting driver exit.
@@ -529,6 +630,16 @@ impl GatewayChannel {
         message: Message,
         deadline: Instant,
     ) -> (ChannelFuture<'a, Message>, RequestCancellation) {
+        self.request_tracked_fenced(target, message, deadline, None)
+    }
+
+    pub fn request_tracked_fenced<'a>(
+        &'a self,
+        target: &'a GatewayTarget,
+        message: Message,
+        deadline: Instant,
+        valid: Option<WritePredicate>,
+    ) -> (ChannelFuture<'a, Message>, RequestCancellation) {
         let state = Arc::new(Mutex::new(RequestState::default()));
         let cancellation = RequestCancellation {
             shared: Arc::downgrade(&self.owner.shared),
@@ -542,14 +653,99 @@ impl GatewayChannel {
                 deadline,
                 Submission::Rpc,
                 Some(state),
+                valid,
+                false,
             )
             .await?
             {
                 Outcome::Message(message) => Ok(message),
-                Outcome::Written => unreachable!(),
+                _ => unreachable!(),
             }
         });
         (future, cancellation)
+    }
+
+    /// RPC with opaque, ordered validation handoff; no domain code runs here.
+    /// The caller must poll independently of its observer, acknowledge a valid
+    /// result, or abort before releasing malformed protocol completion.
+    pub fn request_held<'a>(
+        &'a self,
+        target: &'a GatewayTarget,
+        message: Message,
+        deadline: Instant,
+        valid: Option<WritePredicate>,
+    ) -> ChannelFuture<'a, (Message, CompletionGuard)> {
+        Box::pin(async move {
+            match submit(
+                &self.owner.shared,
+                target,
+                message,
+                deadline,
+                Submission::Rpc,
+                None,
+                valid,
+                true,
+            )
+            .await?
+            {
+                Outcome::Held(message, guard) => Ok((message, guard)),
+                _ => unreachable!(),
+            }
+        })
+    }
+
+    pub fn send_one_way_fenced<'a>(
+        &'a self,
+        target: &'a GatewayTarget,
+        message: Message,
+        deadline: Instant,
+        valid: WritePredicate,
+    ) -> ChannelFuture<'a, ()> {
+        Box::pin(async move {
+            match submit(
+                &self.owner.shared,
+                target,
+                message,
+                deadline,
+                Submission::Raw,
+                None,
+                Some(valid),
+                false,
+            )
+            .await?
+            {
+                Outcome::Written => Ok(()),
+                _ => unreachable!(),
+            }
+        })
+    }
+
+    /// Semantic one-way control traffic using separately bounded reply slots.
+    /// Requires explicit Reserved authorization; never adds RelatesTo.
+    pub fn send_reserved<'a>(
+        &'a self,
+        target: &'a GatewayTarget,
+        message: Message,
+        deadline: Instant,
+        valid: Option<WritePredicate>,
+    ) -> ChannelFuture<'a, ()> {
+        Box::pin(async move {
+            match submit(
+                &self.owner.shared,
+                target,
+                message,
+                deadline,
+                Submission::Reserved,
+                None,
+                valid,
+                false,
+            )
+            .await?
+            {
+                Outcome::Written => Ok(()),
+                _ => unreachable!(),
+            }
+        })
     }
 
     /// Latest native ListenInstance; diagnostic only, not renewed authority.
@@ -675,6 +871,7 @@ fn allocation_check(message: &Message, limits: ChannelLimits) -> Result<()> {
 
 enum Submission {
     Raw,
+    Reserved,
     Rpc,
     Reply(MessageId, EnvelopeValidator),
 }
@@ -696,6 +893,7 @@ fn retire(inner: &mut Inner, token: u64) {
 
 impl Drop for OperationGuard {
     fn drop(&mut self) {
+        let _visibility = self.shared.visibility.lock().unwrap();
         let mut inner = self.shared.inner.lock().unwrap();
         retire(&mut inner, self.token);
         drop(inner);
@@ -703,6 +901,7 @@ impl Drop for OperationGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit(
     shared: &Arc<Shared>,
     target: &GatewayTarget,
@@ -710,6 +909,8 @@ async fn submit(
     deadline: Instant,
     submission: Submission,
     tracking: Option<Arc<Mutex<RequestState>>>,
+    valid: Option<WritePredicate>,
+    hold_reply: bool,
 ) -> Result<Outcome> {
     if shared.error().is_some() {
         return Err(Error::Closed);
@@ -725,19 +926,26 @@ async fn submit(
     if crate::native_demux::is_control(props.actor) || has(&message, message::IPC) {
         return Err(Error::InvalidInput("reserved native transport envelope"));
     }
+    let session_header = match &shared.outbound_envelope {
+        Some(envelope) => envelope.header(&message, matches!(submission, Submission::Reply(..)))?,
+        None => None,
+    };
     match submission {
         Submission::Raw => (shared.composition.outbound)(&message, &props, OutboundKind::Raw)?,
+        Submission::Reserved => {
+            (shared.composition.outbound)(&message, &props, OutboundKind::Reserved)?
+        }
         Submission::Rpc => (shared.composition.outbound)(&message, &props, OutboundKind::Rpc)?,
         Submission::Reply(_, authorize) => authorize(&message, &props)?,
     }
     let rpc = matches!(submission, Submission::Rpc);
-    let class = if matches!(submission, Submission::Reply(..)) {
+    let class = if matches!(submission, Submission::Reply(..) | Submission::Reserved) {
         REPLY
     } else {
         ORDINARY
     };
     match submission {
-        Submission::Raw
+        Submission::Raw | Submission::Reserved
             if props.expects_reply
                 || props.uncorrelated_reply
                 || props.relates_to != MessageId::default() =>
@@ -766,8 +974,16 @@ async fn submit(
                 message.headers.push(Header::relates_to(id)?);
             }
         }
-        Submission::Raw => {}
+        Submission::Raw | Submission::Reserved => {}
     }
+    if let Some(header) = session_header {
+        message.headers.push(header);
+    }
+    let requires_id = rpc
+        || shared
+            .outbound_envelope
+            .as_ref()
+            .is_some_and(|envelope| envelope.requires_message_id());
     let lease = shared.budget.reserve(class)?;
     let token;
     {
@@ -781,7 +997,7 @@ async fn submit(
             return Err(Error::Closed);
         }
         let mut id = (props.id != MessageId::default()).then_some(props.id);
-        if rpc && id.is_none() {
+        if requires_id && id.is_none() && !matches!(submission, Submission::Reply(..)) {
             loop {
                 let Some(next) = inner.next_index.checked_add(1) else {
                     drop(tracked);
@@ -837,6 +1053,8 @@ async fn submit(
                 result: None,
                 lease,
                 tracking: tracking.clone(),
+                valid,
+                hold_reply,
             },
         );
         if let Some(state) = tracked.as_mut() {
@@ -918,11 +1136,13 @@ impl MessageChannel for GatewayChannel {
                 deadline,
                 Submission::Raw,
                 None,
+                None,
+                false,
             )
             .await?
             {
                 Outcome::Written => Ok(()),
-                Outcome::Message(_) => unreachable!(),
+                _ => unreachable!(),
             }
         })
     }
@@ -951,39 +1171,13 @@ impl RpcChannel for GatewayChannel {
                 deadline,
                 Submission::Rpc,
                 None,
+                None,
+                false,
             )
             .await?
             {
                 Outcome::Message(message) => Ok(message),
-                Outcome::Written => unreachable!(),
-            }
-        })
-    }
-}
-
-struct DuplexReply {
-    shared: Weak<Shared>,
-    target: Arc<GatewayTarget>,
-    id: MessageId,
-    authorize: EnvelopeValidator,
-}
-
-impl ReplyContext for DuplexReply {
-    fn reply(self: Box<Self>, message: Message, deadline: Instant) -> ChannelFuture<'static, ()> {
-        Box::pin(async move {
-            let shared = self.shared.upgrade().ok_or(Error::Closed)?;
-            match submit(
-                &shared,
-                &self.target,
-                message,
-                deadline,
-                Submission::Reply(self.id, self.authorize),
-                None,
-            )
-            .await?
-            {
-                Outcome::Written => Ok(()),
-                Outcome::Message(_) => unreachable!(),
+                _ => unreachable!(),
             }
         })
     }
@@ -993,15 +1187,20 @@ impl GatewayReceiver {
     fn transfer(shared: &Arc<Shared>, ingress: Ingress) -> IncomingMessage<GatewayTarget> {
         IncomingMessage {
             message: ingress.message,
+            received_at: ingress.received_at,
+            handoff: ingress.handoff.map(|release| CompletionGuard {
+                release: Some(release),
+                _lease: ingress._lease.clone(),
+            }),
             source: shared.target.clone(),
             reply: ingress.reply_id.map(|id| {
-                Box::new(DuplexReply {
+                Box::new(NativeReplyContext {
                     shared: Arc::downgrade(shared),
                     target: shared.target.clone(),
                     id,
                     // This is private ingress state, populated only after
                     // configured duplex authorization in the receive loop.
-                    authorize: shared.composition.duplex.as_ref().unwrap().reply,
+                    authorize: ingress.reply_authorize.unwrap(),
                 }) as Box<dyn ReplyContext>
             }),
         }
@@ -1098,6 +1297,7 @@ fn control_instance(message: &Message, props: &Properties) -> Result<ListenInsta
 async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>) -> Result<()> {
     loop {
         let message = read_bounded(&mut reader, shared.budget.limits.max_frame_bytes).await?;
+        let received_at = Instant::now();
         let props = envelope(&message, true)?;
         if props.actor == 1 {
             let remote = control_instance(&message, &props)?;
@@ -1118,10 +1318,24 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
         if has(&message, message::IPC) {
             return Err(Error::Protocol("IPC envelope on native channel"));
         }
+        let mut reply_authorize = None;
         let reply_id = match shared.composition.actors.select(&props)? {
             Dispatch::Actor(authorize) => {
                 authorize(&message, &props)?;
-                Some(None)
+                if props.expects_reply {
+                    if let Some(policy) = &shared.composition.requests {
+                        if props.id == MessageId::default() || props.fault.is_some() {
+                            return Err(Error::Protocol("invalid native actor request"));
+                        }
+                        (policy.incoming)(&message, &props)?;
+                        reply_authorize = Some(policy.reply);
+                        Some(Some(props.id))
+                    } else {
+                        Some(None)
+                    }
+                } else {
+                    Some(None)
+                }
             }
             Dispatch::Reply if props.uncorrelated_reply => {
                 let duplex = shared
@@ -1135,33 +1349,49 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
                     ));
                 }
                 (duplex.incoming)(&message, &props)?;
+                reply_authorize = Some(duplex.reply);
                 Some(Some(props.id))
             }
             Dispatch::Reply => None,
         };
         if let Some(reply_id) = reply_id {
             let lease = shared.budget.reserve(INGRESS)?;
-            let mut inner = shared.inner.lock().unwrap();
-            if inner.terminal.is_some() {
-                return Err(Error::Closed);
+            let (handoff, acknowledgment) = if shared.composition.ordered_ingress {
+                let (send, receive) = oneshot::channel();
+                (Some(send), Some(receive))
+            } else {
+                (None, None)
+            };
+            {
+                let mut inner = shared.inner.lock().unwrap();
+                if inner.terminal.is_some() {
+                    return Err(Error::Closed);
+                }
+                if let Some(id) = reply_id {
+                    shared
+                        .remember(&mut inner, id)
+                        .map_err(|error| match error {
+                            Error::InvalidInput(_) => {
+                                Error::Protocol("duplicate or colliding request ID")
+                            }
+                            other => other,
+                        })?;
+                }
+                inner.ingress.push_back(Ingress {
+                    message,
+                    received_at,
+                    reply_id,
+                    reply_authorize,
+                    handoff,
+                    _lease: lease,
+                });
             }
-            if let Some(id) = reply_id {
-                shared
-                    .remember(&mut inner, id)
-                    .map_err(|error| match error {
-                        Error::InvalidInput(_) => {
-                            Error::Protocol("duplicate or colliding duplex ID")
-                        }
-                        other => other,
-                    })?;
-            }
-            inner.ingress.push_back(Ingress {
-                message,
-                reply_id,
-                _lease: lease,
-            });
-            drop(inner);
             shared.changed.notify_waiters();
+            if let Some(acknowledgment) = acknowledgment {
+                let _ = timeout(MAX_FRAME_TIME, acknowledgment)
+                    .await
+                    .map_err(|_| Error::Timeout)?;
+            }
             continue;
         }
         if props.relates_to == MessageId::default()
@@ -1188,14 +1418,43 @@ async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>)
             token
         };
         if let Some(token) = token {
+            let held = {
+                let inner = shared.inner.lock().unwrap();
+                inner
+                    .entries
+                    .get(&token)
+                    .filter(|entry| entry.hold_reply)
+                    .map(|entry| (entry.deadline, entry.lease.clone()))
+            };
+            let mut acknowledgment = None;
             let result = match props.fault.filter(|fault| fault.code != 0) {
                 Some(fault) => Err(Error::Remote {
                     code: fault.code,
                     message: "native transport Fault".into(),
                 }),
-                None => Ok(Outcome::Message(message)),
+                None => match held {
+                    Some((deadline, lease)) => {
+                        let (release, receive) = oneshot::channel();
+                        acknowledgment = Some((deadline, receive));
+                        Ok(Outcome::Held(
+                            message,
+                            CompletionGuard {
+                                release: Some(release),
+                                _lease: lease,
+                            },
+                        ))
+                    }
+                    None => Ok(Outcome::Message(message)),
+                },
             };
             shared.finish(token, result);
+            if let Some((deadline, receive)) = acknowledgment {
+                // Generic ordered handoff, never a domain callback. Deadline
+                // and outer driver-stop selection bound abandoned validation.
+                let _ = timeout_at(deadline, receive)
+                    .await
+                    .map_err(|_| Error::Timeout)?;
+            }
         }
     }
 }
@@ -1233,10 +1492,11 @@ async fn send_loop<W: AsyncWrite + Unpin>(mut writer: W, shared: &Arc<Shared>) -
                     entry.lease.clone(),
                     entry.rpc,
                     entry.deadline,
+                    entry.valid.clone(),
                 ))
             })
         };
-        if let Some((token, bytes, _lease, rpc, deadline)) = work {
+        if let Some((token, bytes, _lease, rpc, deadline, valid)) = work {
             // Selection is not frame start. Until a positive write, validate
             // ownership/deadline under the same lock as cancellation/close.
             let first = timeout_at(deadline, async {
@@ -1246,6 +1506,10 @@ async fn send_loop<W: AsyncWrite + Unpin>(mut writer: W, shared: &Arc<Shared>) -
                     changed.as_mut().enable();
                     tokio::select! {
                         result = std::future::poll_fn(|cx| {
+                            let _visibility = shared.visibility.lock().unwrap();
+                            if valid.as_ref().is_some_and(|predicate| !predicate()) {
+                                return Poll::Ready(Ok(None));
+                            }
                             let inner = shared.inner.lock().unwrap();
                             let eligible = inner.terminal.is_none()
                                 && inner.entries.get(&token).is_some_and(|entry|

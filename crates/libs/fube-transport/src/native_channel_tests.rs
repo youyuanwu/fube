@@ -4,6 +4,11 @@ use crate::native_demux::{ActorDemux, ActorRegistration, DuplexPolicy};
 use std::{future::Future, pin::Pin, time::Duration};
 use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
+#[path = "native_channel_ipc_tests.rs"]
+mod ipc;
+#[path = "native_channel_transfer_tests.rs"]
+mod transfer;
+
 // Test-only consumer fixtures, not a production transport profile. Independent
 // nonconsumer compositions below verify that mechanisms do not know these rules.
 #[derive(Clone, Copy)]
@@ -84,6 +89,8 @@ fn fixture_composition(profile: GatewayProfile) -> ChannelComposition {
             incoming: fixture_notification,
             reply: fixture_notification_reply,
         }),
+        requests: None,
+        ordered_ingress: false,
     }
 }
 
@@ -140,6 +147,8 @@ fn independent_pair() -> (GatewayChannel, DuplexStream) {
                     incoming: independent_duplex,
                     reply: independent_response,
                 }),
+                requests: None,
+                ordered_ingress: false,
             },
             limits(),
             [100; 16],
