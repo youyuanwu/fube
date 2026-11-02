@@ -3,7 +3,13 @@ name = "fube-runtime"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Not needed by supported applications or transactional consumers.
+test-hooks = ["fube-data/test-hooks"]
+
 [dependencies]
+fube-core.workspace = true
+fube-data.workspace = true
 fube-transport.workspace = true
 serde.workspace = true
 tokio.workspace = true
@@ -12,6 +18,10 @@ libc = "0.2"
 roxmltree = "0.21"
 
 [dev-dependencies]
+serde_json.workspace = true
+fube-rap-test-support.workspace = true
+# Integration tests use the same nominal runtime types as the RAP harness.
+fube-runtime = { path = ".", features = ["test-hooks"] }
 fube-hosting = { path = "../fube-hosting" }
 fube-node = { path = "../fube-node" }
 fube-ra = { path = "../fube-ra" }

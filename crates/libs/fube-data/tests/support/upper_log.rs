@@ -3,7 +3,7 @@
 use super::data_contract::{
     Cancellation, Epoch, Error, IOperationDataStream, IStateProvider, OperationData, Result,
 };
-use fube_runtime::{ApiFuture, ErrorKind};
+use fube_core::{ApiFuture, ErrorKind};
 use std::{
     collections::VecDeque,
     sync::{

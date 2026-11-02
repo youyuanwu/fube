@@ -8,14 +8,13 @@ description = "Owned volatile Service Fabric classic V1 replication engine"
 [features]
 # Outbound negative-path fixtures, never membership/role setters.
 qualification = []
+# Implementation regression ingress for runtime-owned adapter tests only.
+test-hooks = []
 
 [dependencies]
-fube-runtime.workspace = true
+fube-core.workspace = true
 fube-transport.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
-fube-rap-test-support.workspace = true

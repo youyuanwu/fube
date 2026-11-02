@@ -13,7 +13,8 @@
 //! The primary service owns its local mutation and must apply an admitted
 //! sequence before publishing its result. Like native classic replication, the
 //! primary's local membership vote is not a secondary-stream ACK. Partition
-//! lifetime/access checks remain the application's independent responsibility.
+//! write-access checks run independently at submit and assignment; application
+//! lifetime/read-access checks remain independently required.
 //!
 //! One joined owner thread supervises one epoch/data-loss callback, at most 64
 //! copy enumerations, and at most 64 operation captures across both streams.
@@ -33,7 +34,7 @@
 //! Callback futures are aborted and actually
 //! joined before transport disposal. Uncooperative synchronous user code or
 //! destructors are enrolled in the runtime's independent fatal watchdog by
-//! [`Engine::bind_partition`]. Standalone test-only `Engine::bind` callers must supply
+//! [`Engine::bind_hosted`]. Standalone test-only `Engine::bind` callers must supply
 //! their own blocking fence; a Tokio timeout cannot fence a blocked executor.
 //! This is the volatile legacy-null-EOS, trusted clear-TCP profile, not durable
 //! storage, persisted copy context, an election system, or a native qualification.
@@ -47,24 +48,21 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-#[cfg(test)]
-use fube_runtime::extensions::NativeControlBinding;
-use fube_runtime::extensions::{
+use fube_core::hosting::{
     CallLane, CallOrigin, DisposalBatch, DisposalTracker, EpochDomains, ExecutionRuntime,
 };
-use fube_runtime::extensions::{
+use fube_core::hosting::{
     CommandCleanup, DeferredCleanup, DisposalReceipt, OwnedDisposition, TerminalPermit,
 };
-use fube_runtime::extensions::{NativeInvocation, NativeInvocationKind, NativeRuntimeIntegration};
-use fube_runtime::extensions::{OwnedCall, OwnedCallPermit};
+use fube_core::hosting::{OwnedCall, OwnedCallPermit};
 #[path = "engine_binding.rs"]
 mod binding;
-use fube_runtime::extensions::{
-    ConfigurationStage, FaultDelivery, NativeReplicaDescriptor as ReplicaInformation,
-    NativeReplicaSetConfiguration as ReplicaSetConfiguration, ReplicaDiagnostics as ReplicaStatus,
-    ReplicaLifecycle, ReplicaRemoval, ReplicationProgress,
+use crate::hosting::{
+    Configuration as ReplicaSetConfiguration, HostServices, MutationCheck,
+    PreWrite as NativePreWrite, Progress as ReplicationProgress, Removal as ReplicaRemoval,
+    Replica as ReplicaInformation, StableFacts,
 };
-use fube_runtime::{
+use fube_core::{
     ApiFuture as ServiceFuture, IPrimaryReplicator, IReplicator,
     ReplicaInformation as SdkReplicaInformation, ReplicaSetConfig,
     ReplicaSetQuorumMode as CatchUpMode,
@@ -86,9 +84,6 @@ use crate::{
     OperationData, OperationStream, Progress, ReplicaRole, Result, Settings,
 };
 
-#[cfg(test)]
-#[path = "engine_native_tests.rs"]
-mod native_tests;
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 mod tests;
@@ -167,7 +162,7 @@ pub struct Replication {
 
 impl Replication {
     /// Canceling this wait is ambiguous: the admitted write remains owned.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub async fn wait(&mut self, cancellation: Cancellation) -> Result<i64> {
         loop {
             if let Some(result) = self.completion.borrow_and_update().clone() {
@@ -175,7 +170,7 @@ impl Replication {
             }
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Err(Error::new(fube_runtime::ErrorKind::Canceled, "replication completion wait canceled").uncertain()),
+                _ = cancellation.cancelled() => return Err(Error::new(fube_core::ErrorKind::Canceled, "replication completion wait canceled").uncertain()),
                 result = self.completion.changed() => result.map_err(|_| Error::Closed)?,
             }
         }
@@ -243,30 +238,40 @@ fn maximum_copy_bytes(settings: &Settings) -> usize {
         .min(settings.queue_bytes)
 }
 
-struct Shared {
-    #[cfg(test)]
-    initial_coalesced_primary: Mutex<Option<std_mpsc::SyncSender<()>>>,
-    #[cfg(test)]
-    initial_publication_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
+pub struct Shared {
+    partition: Mutex<Option<Arc<crate::supervised::OwnedPartition>>>,
+    prequeue_calls: Mutex<Vec<OwnedCall<()>>>,
+    prequeue_changed: tokio::sync::Notify,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub initial_coalesced_primary: Mutex<Option<std_mpsc::SyncSender<()>>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub initial_publication_pause:
+        Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
     secondary_progress_fault: AtomicBool,
     opened: AtomicBool,
-    initial_progress: Mutex<Option<i64>>,
-    #[cfg(test)]
-    write_deadline: Mutex<Option<std::time::Instant>>,
-    #[cfg(test)]
-    write_now: Mutex<Option<std::time::Instant>>,
-    #[cfg(test)]
-    write_prelock: Mutex<Option<std_mpsc::SyncSender<()>>>,
-    #[cfg(test)]
-    write_reply_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
-    #[cfg(test)]
-    epoch_entries: std::sync::atomic::AtomicUsize,
+    pub initial_progress: Mutex<Option<i64>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub write_deadline: Mutex<Option<std::time::Instant>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub write_now: Mutex<Option<std::time::Instant>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub write_prelock: Mutex<Option<std_mpsc::SyncSender<()>>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub write_prelock_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub write_reply_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub write_assignment_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub command_enqueued: Mutex<Option<std_mpsc::SyncSender<()>>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub epoch_entries: std::sync::atomic::AtomicUsize,
     streams: Mutex<StreamViews>,
     #[cfg(test)]
     copy_job_pause: Mutex<Option<(std_mpsc::SyncSender<()>, std_mpsc::Receiver<()>)>>,
     events: broadcast::Sender<crate::extensions::ReplicationEvent>,
-    admission: Mutex<()>,
-    stopped: AtomicBool,
+    pub admission: Mutex<()>,
+    pub stopped: AtomicBool,
     revision: AtomicU64,
     snapshot: Mutex<EngineSnapshot>,
     budget: Budget,
@@ -276,6 +281,18 @@ struct Shared {
     engine_id: u64,
     generation: u64,
     shutdown_cleanup: Mutex<(bool, Option<DeferredCleanup>)>,
+}
+
+#[cfg(test)]
+trait FixtureControl: Send + Sync {
+    fn execution(&self) -> Result<Option<ExecutionRuntime>> {
+        Ok(None)
+    }
+    fn observe(&self) -> Result<StableFacts>;
+    fn prewrite(&self) -> Result<Option<NativePreWrite>> {
+        Ok(None)
+    }
+    fn report_fault(&self, fault: fube_core::FaultType) -> ServiceFuture<'_, ()>;
 }
 
 struct StreamViews {
@@ -289,53 +306,7 @@ impl StreamViews {
     }
 }
 
-trait NativeControlView: Send + Sync {
-    fn integration(&self) -> Result<Option<NativeRuntimeIntegration>> {
-        Ok(None)
-    }
-    fn execution(&self) -> Result<Option<ExecutionRuntime>> {
-        Ok(None)
-    }
-    fn status(&self) -> Result<ReplicaStatus>;
-    fn report_fault(&self, fault: fube_runtime::FaultType) -> ServiceFuture<'_, FaultDelivery>;
-}
-
-impl NativeControlView for NativeRuntimeIntegration {
-    fn integration(&self) -> Result<Option<NativeRuntimeIntegration>> {
-        Ok(Some(self.clone()))
-    }
-    fn execution(&self) -> Result<Option<ExecutionRuntime>> {
-        Ok(Some(NativeRuntimeIntegration::execution(self)))
-    }
-    fn status(&self) -> Result<ReplicaStatus> {
-        NativeRuntimeIntegration::status(self)
-    }
-    fn report_fault(&self, fault: fube_runtime::FaultType) -> ServiceFuture<'_, FaultDelivery> {
-        NativeRuntimeIntegration::report_fault(self, fault)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct NativePreWrite {
-    current: Epoch,
-    previous: Epoch,
-}
-
 impl NativePreWrite {
-    #[cfg(test)]
-    fn from_status(status: ReplicaStatus) -> Option<Self> {
-        (status.lifecycle == ReplicaLifecycle::Open
-            && status.replicator_open
-            && status.current_role == ReplicaRole::ActiveSecondary
-            && status.service_role == ReplicaRole::Primary
-            && status.replicator_role == ReplicaRole::Primary
-            && status.configuration_stage == ConfigurationStage::PreWriteRevoke)
-            .then_some(Self {
-                current: status.current_epoch.primary(),
-                previous: status.previous_epoch.primary(),
-            })
-    }
-
     fn matches(
         self,
         current: &ReplicaSetConfiguration,
@@ -352,97 +323,72 @@ impl NativePreWrite {
 /// operations, joins callbacks/the engine thread, then joins peer transport.
 /// Captures already published to application code stay charged until dropped.
 pub struct Engine {
-    #[cfg(test)]
-    native_configuration: Mutex<Option<NativeInvocation>>,
     self_weak: Weak<Engine>,
     endpoint: Endpoint,
     settings: Settings,
     commands: mpsc::Sender<AuthorizedCommand>,
     writes: mpsc::Sender<Submit>,
     stop: watch::Sender<bool>,
-    shared: Arc<Shared>,
+    pub shared: Arc<Shared>,
     thread: Mutex<Option<JoinHandle<()>>>,
     transport: PeerTransport,
-    #[cfg(test)]
-    native_control: Option<Arc<dyn NativeControlView>>,
     terminal: Mutex<Option<TerminalPermit>>,
     owner_done: Mutex<Option<std_mpsc::Receiver<Result<()>>>>,
     disposal_done: Mutex<Option<DisposalReceipt>>,
-    native_runtime: Option<NativeRuntimeIntegration>,
+    host: Option<HostServices>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub scalar_progress_reads: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
-    native_binder: Mutex<Option<Arc<dyn NativeControlBinding>>>,
-    native_progress: Mutex<Option<Arc<dyn fube_runtime::extensions::NativeProgressSource>>>,
-    #[cfg(test)]
-    native_root_dispatch: AtomicBool,
-    #[cfg(test)]
-    native_build_pause: Mutex<Option<(oneshot::Sender<NativeInvocation>, oneshot::Receiver<()>)>>,
-    #[cfg(test)]
-    scalar_progress_reads: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
-    native_remove_pause: Mutex<Option<(oneshot::Sender<NativeInvocation>, std_mpsc::Receiver<()>)>>,
+    fixture_control: Option<Arc<dyn FixtureControl>>,
     owns_execution: bool,
 }
 
 impl Engine {
     /// Bind an SF-activated replica and enroll every provider callback,
     /// enumeration and owned capture disposal in the runtime's existing fence.
-    /// Qualified activated applications must use this entry point.
+    /// Called by the replication factory after the runtime validates construction.
     ///
     /// Call from the runtime-owned service Open callback: the enclosing runtime
     /// guard also supervises rejected argument destruction/initialization errors.
     /// Accounting does not grant application access or authorize late results.
-    /// The partition's native status also authorizes pre-write-revoke membership
-    /// metadata ahead of UpdateEpoch, never an engine epoch or access change.
+    /// The host projects pre-write-revoke metadata separately from an actual
+    /// epoch change; the lower has no access to the host's status or proof.
     /// Terminal engine faults report a native transient fault through this same
     /// generation; normal Close/Abort do not. Delivery is not a replacement ack.
     #[allow(clippy::too_many_arguments)]
-    pub fn bind_partition(
-        partition: std::sync::Arc<dyn fube_runtime::IStatefulServicePartition>,
-        native: NativeRuntimeIntegration,
+    pub fn bind_hosted(
+        partition: std::sync::Arc<dyn fube_core::IStatefulServicePartition>,
         actor: Actor,
         address: &str,
         provider: Arc<dyn IStateProvider>,
         replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         settings: Settings,
         capabilities: crate::extensions::StateProviderCapabilities,
+        host: HostServices,
     ) -> Result<Arc<Self>> {
         settings.validate()?;
-        let information = partition.get_partition_information()?;
-        native.validate()?;
-        let partition_id = match information {
-            fube_runtime::ServicePartitionInformation::Singleton(info) => info.id,
-            fube_runtime::ServicePartitionInformation::Int64Range(info) => info.id,
-            fube_runtime::ServicePartitionInformation::Named(info) => info.id,
-            fube_runtime::ServicePartitionInformation::Invalid => {
-                return Err(Error::InvalidInput("invalid partition information"))
-            }
-        };
-        if partition_id != native.binding().identity.partition_id
-            || actor.partition != native.binding().identity.partition_id
-            || actor.replica != native.binding().identity.replica_id
-        {
-            return Err(Error::InvalidInput(
-                "replication actor does not match native partition",
-            ));
-        }
+        host.validity.validate()?;
         Self::bind_integrated(
             actor,
             address,
             provider,
             replay,
             settings,
-            Some(Arc::new(native)),
+            Some(host),
             capabilities,
+            Some(partition),
+            #[cfg(test)]
+            None,
         )
     }
 
     /// Standalone binding for internal source/algorithm fixtures. This is not a
     /// standalone SF primary-control authority: canonical configuration, Build
     /// and removal require runtime/partition-issued native context and fail
-    /// explicitly without it. Use `bind_partition` for supported SF controls.
+    /// explicitly without it. Use the runtime factory helper for supported controls.
     /// The caller is responsible for a blocking callback/destructor fence:
     /// Tokio deadlines alone cannot supervise synchronous provider code.
-    /// SF-activated qualification must instead use [`Self::bind_partition`].
+    /// Activated construction instead uses [`Self::bind_hosted`].
     #[cfg(test)]
     pub fn bind(
         actor: Actor,
@@ -459,7 +405,7 @@ impl Engine {
         address: &str,
         provider: Arc<dyn IStateProvider>,
         settings: Settings,
-        native_control: Option<Arc<dyn NativeControlView>>,
+        native_control: Option<Arc<dyn FixtureControl>>,
     ) -> Result<Arc<Self>> {
         Self::bind_with_capabilities(
             actor,
@@ -479,7 +425,7 @@ impl Engine {
         provider: Arc<dyn IStateProvider>,
         replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         settings: Settings,
-        native_control: Option<Arc<dyn NativeControlView>>,
+        native_control: Option<Arc<dyn FixtureControl>>,
         capabilities: crate::extensions::StateProviderCapabilities,
     ) -> Result<Arc<Self>> {
         Self::bind_integrated(
@@ -488,8 +434,10 @@ impl Engine {
             provider,
             replay,
             settings,
-            native_control,
+            None,
             capabilities,
+            None,
+            native_control,
         )
     }
 
@@ -500,24 +448,19 @@ impl Engine {
         provider: Arc<dyn IStateProvider>,
         replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         settings: Settings,
-        native_control: Option<Arc<dyn NativeControlView>>,
+        host: Option<HostServices>,
         capabilities: crate::extensions::StateProviderCapabilities,
+        partition: Option<Arc<dyn fube_core::IStatefulServicePartition>>,
+        #[cfg(test)] fixture_control: Option<Arc<dyn FixtureControl>>,
     ) -> Result<Arc<Self>> {
         settings.validate()?;
-        let native_runtime = native_control
-            .as_ref()
-            .map(|view| view.integration())
-            .transpose()?
-            .flatten();
-        if let Some(native) = &native_runtime {
-            native.execution().check_constructor()?;
-            native.reserve_engine(actor.partition, actor.replica, actor.incarnation)?;
-        }
-        let supplied_execution = native_control
+        let supplied_execution = host.as_ref().map(|host| host.execution.clone());
+        #[cfg(test)]
+        let supplied_execution = supplied_execution.or(fixture_control
             .as_ref()
             .map(|view| view.execution())
             .transpose()?
-            .flatten();
+            .flatten());
         let owns_execution = supplied_execution.is_none();
         let execution = match supplied_execution {
             Some(runtime) => runtime,
@@ -531,17 +474,15 @@ impl Engine {
         let origin = CallOrigin {
             engine: engine_id,
             session: 0,
-            generation: native_runtime
-                .as_ref()
-                .map_or(1, |native| native.binding().generation),
+            generation: host.as_ref().map_or(1, |host| host.generation),
         };
         let terminal = execution.reserve_terminal(origin)?;
-        let initial_permit = if native_runtime.is_some() {
+        let initial_permit = if host.is_some() {
             None
         } else {
             Some(execution.reserve(CallLane::Provider, origin, settings.callback_timeout, false)?)
         };
-        let deferred = native_runtime.is_some();
+        let deferred = host.is_some();
         let construction = if execution.is_current_entry() {
             None
         } else {
@@ -584,6 +525,19 @@ impl Engine {
         )?);
         construction_guard.receipt = Some(provider.disposal_receipt());
         let provider_publication = provider.publication();
+        let partition = partition
+            .map(|partition| {
+                crate::supervised::OwnedPartition::new(
+                    &execution,
+                    partition,
+                    &disposal,
+                    origin,
+                    construction.as_ref(),
+                )
+                .map(Arc::new)
+            })
+            .transpose()?;
+        let partition_publication = partition.as_ref().map(|partition| partition.publication());
         let (transport, incoming) = PeerTransport::bind(address, settings.clone())?;
         let endpoint = Endpoint {
             actor,
@@ -603,22 +557,31 @@ impl Engine {
         let copy = Arc::new(OperationStream::new(copy_rx));
         let (stop, stop_rx) = watch::channel(false);
         let shared = Arc::new(Shared {
-            #[cfg(test)]
+            partition: Mutex::new(partition),
+            prequeue_calls: Mutex::new(Vec::new()),
+            prequeue_changed: tokio::sync::Notify::new(),
+            #[cfg(any(test, feature = "test-hooks"))]
             initial_coalesced_primary: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             initial_publication_pause: Mutex::new(None),
             secondary_progress_fault: AtomicBool::new(false),
             opened: AtomicBool::new(false),
             initial_progress: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             write_deadline: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             write_now: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             write_prelock: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
+            write_prelock_pause: Mutex::new(None),
+            #[cfg(any(test, feature = "test-hooks"))]
             write_reply_pause: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
+            write_assignment_pause: Mutex::new(None),
+            #[cfg(any(test, feature = "test-hooks"))]
+            command_enqueued: Mutex::new(None),
+            #[cfg(any(test, feature = "test-hooks"))]
             epoch_entries: std::sync::atomic::AtomicUsize::new(0),
             streams: Mutex::new(StreamViews { replication, copy }),
             #[cfg(test)]
@@ -660,7 +623,9 @@ impl Engine {
         let state_transport = transport.clone();
         let state_settings = settings.clone();
         let state_streams = shared.clone();
-        let state_native_control = native_control.clone();
+        let state_host = host.clone();
+        #[cfg(test)]
+        let state_fixture_control = fixture_control.clone();
         let (ready, readiness) = std_mpsc::sync_channel(1);
         let (done, done_rx) = std_mpsc::sync_channel(1);
         let thread = thread::Builder::new()
@@ -729,8 +694,10 @@ impl Engine {
                         ack_tx,
                         replication_tx,
                         copy_tx,
-                        state_native_control,
+                        state_host,
                         capabilities,
+                        #[cfg(test)]
+                        state_fixture_control,
                     );
                     owner.publish();
                     let outcome = if ready.send(Ok(())).is_ok() {
@@ -747,7 +714,7 @@ impl Engine {
                 done.1 = outcome;
             })?;
         if let Err(error) = readiness.recv().unwrap_or(Err(Error::Closed)) {
-            if native_runtime.is_some() {
+            if host.is_some() {
                 let mut terminal = terminal;
                 let record = terminal.begin()?;
                 let receipt = record.run(move || {
@@ -773,8 +740,6 @@ impl Engine {
             return Err(error);
         }
         let engine = Arc::new_cyclic(|self_weak| Self {
-            #[cfg(test)]
-            native_configuration: Mutex::new(None),
             self_weak: self_weak.clone(),
             endpoint,
             settings,
@@ -784,50 +749,20 @@ impl Engine {
             shared,
             thread: Mutex::new(Some(thread)),
             transport,
-            #[cfg(test)]
-            native_control,
             terminal: Mutex::new(Some(terminal)),
             owner_done: Mutex::new(Some(done_rx)),
             disposal_done: Mutex::new(None),
-            native_runtime,
-            #[cfg(test)]
-            native_binder: Mutex::new(None),
-            native_progress: Mutex::new(None),
-            #[cfg(test)]
-            native_root_dispatch: AtomicBool::new(false),
-            #[cfg(test)]
-            native_build_pause: Mutex::new(None),
-            #[cfg(test)]
+            host,
+            #[cfg(any(test, feature = "test-hooks"))]
             scalar_progress_reads: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
-            native_remove_pause: Mutex::new(None),
+            fixture_control,
             owns_execution,
         });
-        if let Some(native) = &engine.native_runtime {
-            // Canonical runtime dispatch retains the service-returned object.
-            // A built-in lower is not a replacement-object custom binder.
-            #[cfg(test)]
-            {
-                // Internal lower negative/disposal fixtures only; not installed
-                // and not exposed to the txn/shared-test boundary.
-                *engine.native_binder.lock().unwrap() =
-                    Some(Arc::new(binding::NativeBinder(Arc::downgrade(&engine))));
-            }
-            let source: Arc<dyn fube_runtime::extensions::NativeProgressSource> =
-                Arc::new(binding::NativeProgress(Arc::downgrade(&engine)));
-            if let Err(error) = native.install_progress_source(&source) {
-                if engine
-                    .shutdown_owned()
-                    .and_then(|receipt| receipt.wait_blocking())
-                    .is_err()
-                {
-                    execution.retire();
-                }
-                return Err(error);
-            }
-            *engine.native_progress.lock().unwrap() = Some(source);
-        }
         provider_publication.accept()?;
+        if let Some(publication) = partition_publication {
+            publication.accept()?;
+        }
         construction_guard.committed = true;
         Ok(engine)
     }
@@ -836,12 +771,9 @@ impl Engine {
     fn native_prewrite(&self) -> Result<Option<NativePreWrite>> {
         // Capture the runtime-owned view before entering the owner queue and
         // without holding engine locks (the runtime has its own status lock).
-        Ok(self
-            .native_control
+        self.fixture_control
             .as_ref()
-            .map(|view| view.status())
-            .transpose()?
-            .and_then(NativePreWrite::from_status))
+            .map_or(Ok(None), |view| view.prewrite())
     }
 
     pub fn endpoint(&self) -> Endpoint {
@@ -954,95 +886,185 @@ impl Engine {
         Box::pin(async move {
             ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
             self.check()?;
-            if expected_epoch.is_some_and(|epoch| {
-                epoch.data_loss_number < 0
-                    || epoch.configuration_number < 0
-                    || epoch != epoch.primary()
-            }) {
-                return Err(Error::InvalidInput("invalid admission epoch"));
-            }
-            if cancellation.is_cancelled() {
-                return Err(Error::new(
-                    fube_runtime::ErrorKind::Canceled,
-                    "replication canceled before admission",
-                ));
-            }
-            self.check_write_deadline()?;
-            #[cfg(test)]
-            if let Some(entered) = self.shared.write_prelock.lock().unwrap().take() {
-                let _ = entered.send(());
-            }
-            if data.bytes() > self.settings.operation_bytes
-                || data.segments().len() > self.settings.operation_segments
-                || data.retained_bytes() > self.settings.queue_bytes
-            {
-                return Err(Error::new(
-                    fube_runtime::ErrorKind::ReplicationOperationTooLarge,
-                    "operation limits",
-                ));
-            }
+            let mut deadline = std::time::Instant::now() + self.settings.callback_timeout;
+            let mut input = Some((data, cancellation));
             let (reply, result) = oneshot::channel();
-            {
-                // Serialize reservation changes and shutdown with producers,
-                // but never hold admission while awaiting owner/user work.
+            let mut reply = Some(Reply::from(reply));
+            let starts = {
+                // Enrollment and capture transfer share Stop's boundary. The
+                // start gate keeps all user code outside producer admission.
                 let _admission = self.shared.admission.lock().unwrap();
-                ExecutionRuntime::reject_engine_reentry(self.shared.engine_id)?;
-                self.check_write_deadline()?;
                 self.check()?;
-                let snapshot = self.shared.snapshot.lock().unwrap();
-                let copying = !snapshot.copy_done
-                    || snapshot.peers.iter().any(|peer| {
-                        peer.copy_horizon.is_some()
-                            && peer.copy_finish.is_none()
-                            && !peer.cleanup_required
+                let partition = self.shared.partition.lock().unwrap();
+                if let Some(partition) = partition.as_ref() {
+                    if self.shared.execution.is_current_entry() {
+                        deadline = deadline.min(self.shared.execution.current_deadline()?);
+                    }
+                    let origin = CallOrigin {
+                        engine: self.shared.engine_id,
+                        generation: self.shared.generation,
+                        session: 0,
+                    };
+                    let permit = self
+                        .shared
+                        .execution
+                        .reserve_engine_callback(origin, deadline)?;
+                    let assignment = self
+                        .shared
+                        .execution
+                        .reserve_engine_callback(origin, deadline)?;
+                    let partition = partition.clone();
+                    let engine = self.self_weak.upgrade().ok_or(Error::Closed)?;
+                    let mut starts = Vec::new();
+                    let mut dispositions = Vec::new();
+                    let (data, cancellation) = input.take().unwrap();
+                    let mut reply = reply.take();
+                    let call = provider_call(permit, &mut starts, &mut dispositions, async move {
+                        let outcome = partition.check_write_access().and_then(|()| {
+                            engine.enqueue_submit(
+                                expected_epoch,
+                                data,
+                                cancellation,
+                                Some((partition, assignment)),
+                                Some(deadline),
+                                &mut reply,
+                            )
+                        });
+                        if let Err(error) = outcome {
+                            let _ = reply.take().unwrap().send(Err(error));
+                        }
+                        Ok(())
                     });
-                let maximum = maximum_copy_bytes(&self.settings);
-                let primary_headroom =
-                    snapshot.role == ReplicaRole::Primary && maximum < self.settings.queue_bytes;
-                if primary_headroom && data.retained_bytes() > self.settings.queue_bytes - maximum {
-                    return Err(Error::ResourceLimit(
-                        "operation exceeds primary copy headroom",
-                    ));
-                }
-                let reserve_bytes = if copying || primary_headroom {
-                    maximum
+                    self.shared.prequeue_calls.lock().unwrap().push(call);
+                    Some(starts)
                 } else {
-                    0
-                };
-                let charge = self
-                    .shared
-                    .budget
-                    .acquire_reserved(data.retained_bytes(), u32::from(copying), reserve_bytes)
-                    .map_err(|cause| {
-                        Error::with_cause(
-                            fube_runtime::ErrorKind::ReplicationQueueFull,
-                            "replication admission budget",
-                            cause,
-                        )
-                    })?;
-                drop(snapshot);
-                self.check_write_deadline()?;
-                self.writes
-                    .try_send(Submit {
-                        expected_epoch,
-                        data: Some(data),
-                        charge: Some(charge),
-                        cancellation,
-                        reply: Some(reply.into()),
-                    })
-                    .map_err(|error| match error {
-                        mpsc::error::TrySendError::Full(_) => Error::new(
-                            fube_runtime::ErrorKind::ReplicationQueueFull,
-                            "write admission",
-                        ),
-                        mpsc::error::TrySendError::Closed(_) => Error::Closed,
-                    })?;
+                    None
+                }
+            };
+            if let Some(starts) = starts {
+                self.shared.prequeue_changed.notify_one();
+                for start in starts {
+                    let _ = start.send(());
+                }
+            } else {
+                let (data, cancellation) = input.take().unwrap();
+                self.enqueue_submit(expected_epoch, data, cancellation, None, None, &mut reply)?;
             }
-
-            // Once queued, learn whether admission happened before reporting
-            // cancellation. The separately cancelable wait is intentionally later.
+            // Only the known admission result reaches the observer. Neither
+            // capture release nor accepted identity delivery needs its repoll.
             result.await.map_err(|_| Error::Closed)?
         })
+    }
+
+    fn enqueue_submit(
+        &self,
+        expected_epoch: Option<Epoch>,
+        data: OperationData,
+        cancellation: Cancellation,
+        access: Option<(Arc<crate::supervised::OwnedPartition>, OwnedCallPermit)>,
+        access_deadline: Option<std::time::Instant>,
+        reply: &mut Option<Reply<Replication>>,
+    ) -> Result<()> {
+        if expected_epoch.is_some_and(|epoch| {
+            epoch.data_loss_number < 0 || epoch.configuration_number < 0 || epoch != epoch.primary()
+        }) {
+            return Err(Error::InvalidInput("invalid admission epoch"));
+        }
+        if cancellation.is_cancelled() {
+            return Err(Error::new(
+                fube_core::ErrorKind::Canceled,
+                "replication canceled before admission",
+            ));
+        }
+        if reply.as_ref().unwrap().is_closed() {
+            return Err(Error::Closed);
+        }
+        self.check_write_deadline()?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(entered) = self.shared.write_prelock.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some((entered, release)) = self.shared.write_prelock_pause.lock().unwrap().take() {
+            let _ = entered.send(());
+            release
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+        if data.bytes() > self.settings.operation_bytes
+            || data.segments().len() > self.settings.operation_segments
+            || data.retained_bytes() > self.settings.queue_bytes
+        {
+            return Err(Error::new(
+                fube_core::ErrorKind::ReplicationOperationTooLarge,
+                "operation limits",
+            ));
+        }
+        {
+            // Serialize reservation changes and shutdown with producers,
+            // but never hold admission while awaiting owner/user work.
+            let _admission = self.shared.admission.lock().unwrap();
+            self.check_write_deadline()?;
+            self.check()?;
+            let snapshot = self.shared.snapshot.lock().unwrap();
+            let copying = !snapshot.copy_done
+                || snapshot.peers.iter().any(|peer| {
+                    peer.copy_horizon.is_some()
+                        && peer.copy_finish.is_none()
+                        && !peer.cleanup_required
+                });
+            let maximum = maximum_copy_bytes(&self.settings);
+            let primary_headroom =
+                snapshot.role == ReplicaRole::Primary && maximum < self.settings.queue_bytes;
+            if primary_headroom && data.retained_bytes() > self.settings.queue_bytes - maximum {
+                return Err(Error::ResourceLimit(
+                    "operation exceeds primary copy headroom",
+                ));
+            }
+            let reserve_bytes = if copying || primary_headroom {
+                maximum
+            } else {
+                0
+            };
+            let charge = self
+                .shared
+                .budget
+                .acquire_reserved(data.retained_bytes(), u32::from(copying), reserve_bytes)
+                .map_err(|cause| {
+                    Error::with_cause(
+                        fube_core::ErrorKind::ReplicationQueueFull,
+                        "replication admission budget",
+                        cause,
+                    )
+                })?;
+            drop(snapshot);
+            self.check_write_deadline()?;
+            self.writes
+                .try_send(Submit {
+                    expected_epoch,
+                    access,
+                    access_deadline,
+                    data: Some(data),
+                    charge: Some(charge),
+                    cancellation,
+                    reply: reply.take(),
+                })
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(mut submit) => {
+                        *reply = submit.reply.take();
+                        Error::new(
+                            fube_core::ErrorKind::ReplicationQueueFull,
+                            "write admission",
+                        )
+                    }
+                    mpsc::error::TrySendError::Closed(mut submit) => {
+                        *reply = submit.reply.take();
+                        Error::Closed
+                    }
+                })?;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn execution_identity(&self) -> u64 {
@@ -1051,14 +1073,14 @@ impl Engine {
 
     fn check_write_deadline(&self) -> Result<()> {
         let now = std::time::Instant::now();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let now = self.shared.write_now.lock().unwrap().unwrap_or(now);
         if self.shared.execution.is_current_entry()
             && now >= self.shared.execution.blocking_deadline()?
         {
             return Err(Error::Timeout);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         if self
             .shared
             .write_deadline
@@ -1087,7 +1109,7 @@ impl Engine {
     }
     async fn request_authorized<T: Send + 'static>(
         &self,
-        proof: Option<NativeInvocation>,
+        proof: Option<Arc<dyn MutationCheck>>,
         make: impl FnOnce(Reply<T>) -> Command,
     ) -> Result<T> {
         self.check()?;
@@ -1126,6 +1148,10 @@ impl Engine {
                 mpsc::error::TrySendError::Full(_) => Error::ResourceLimit("control admission"),
                 mpsc::error::TrySendError::Closed(_) => Error::Closed,
             })?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(enqueued) = self.shared.command_enqueued.lock().unwrap().take() {
+            let _ = enqueued.send(());
+        }
         let result = result.await.map_err(|_| Error::Closed)?;
         if let Some(proof) = &proof {
             proof.validate().map_err(Error::uncertain)?;
@@ -1139,7 +1165,7 @@ impl Engine {
 
     fn request_blocking<T: Send + 'static>(
         &self,
-        proof: Option<NativeInvocation>,
+        proof: Option<Arc<dyn MutationCheck>>,
         make: impl FnOnce(Reply<T>) -> Command,
     ) -> Result<T> {
         let deadline = self
@@ -1170,6 +1196,10 @@ impl Engine {
                 mpsc::error::TrySendError::Full(_) => Error::ResourceLimit("control admission"),
                 mpsc::error::TrySendError::Closed(_) => Error::Closed,
             })?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(enqueued) = self.shared.command_enqueued.lock().unwrap().take() {
+            let _ = enqueued.send(());
+        }
         let result =
             receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
         closed.store(true, Ordering::Release);
@@ -1181,7 +1211,7 @@ impl Engine {
             proof.validate().map_err(Error::uncertain)?;
         }
         result.map_err(|error| {
-            if error.kind() == fube_runtime::ErrorKind::Timeout {
+            if error.kind() == fube_core::ErrorKind::Timeout {
                 error.uncertain()
             } else {
                 error
@@ -1420,6 +1450,8 @@ fn same_endpoint(left: &Endpoint, right: &Endpoint) -> bool {
 
 struct Submit {
     expected_epoch: Option<Epoch>,
+    access: Option<(Arc<crate::supervised::OwnedPartition>, OwnedCallPermit)>,
+    access_deadline: Option<std::time::Instant>,
     data: Option<OperationData>,
     charge: Option<Charge>,
     cancellation: Cancellation,
@@ -1466,7 +1498,7 @@ enum Command {
 
 #[derive(Clone)]
 struct InitialQuery {
-    native: Option<NativeRuntimeIntegration>,
+    validity: Option<Arc<dyn MutationCheck>>,
     cancellation: Cancellation,
     revision: u64,
     deadline: Instant,
@@ -1483,15 +1515,15 @@ impl InitialQuery {
         if Instant::now() >= self.deadline {
             return Err(Error::Timeout);
         }
-        if let Some(native) = &self.native {
-            native.validate()?;
+        if let Some(validity) = &self.validity {
+            validity.validate()?;
         }
         Ok(())
     }
 }
 struct AuthorizedCommand {
     command: Command,
-    proof: Option<NativeInvocation>,
+    proof: Option<Arc<dyn MutationCheck>>,
     cleanup: Option<Arc<CommandCleanup>>,
 }
 
@@ -1611,7 +1643,7 @@ enum JobValue {
     Loss(bool, Option<i64>),
     CopyOpen(
         Arc<dyn IOperationDataStream>,
-        fube_runtime::extensions::ObjectPublication,
+        fube_core::hosting::ObjectPublication,
     ),
     CopyNext(Option<OperationData>, Charge),
     Replay(Option<ReplayOperation>, Charge),
@@ -1620,6 +1652,7 @@ enum JobValue {
 type ReadyReply = (Box<dyn FnOnce(Result<()>) + Send>, Result<()>);
 enum Event {
     Replies(Vec<ReadyReply>),
+    Prequeue(Result<()>),
     Cleanup,
     Deadline,
     Ack(ApplyAck),
@@ -1627,6 +1660,7 @@ enum Event {
     Job(Option<std::result::Result<(Job, Result<JobValue>), tokio::task::JoinError>>),
     Packet(Packet),
     Write(Submit),
+    WriteChecked(Option<std::result::Result<(Submit, Result<()>), tokio::task::JoinError>>),
     Retry,
 }
 
@@ -1688,6 +1722,7 @@ struct Owner {
     removals: Vec<Removal>,
     configurations: Vec<ConfigurationReceipt>,
     jobs: JoinSet<(Job, Result<JobValue>)>,
+    access_jobs: JoinSet<(Submit, Result<()>)>,
     replay_job: bool,
     replay_next: Instant,
     replay_rearm_pending: bool,
@@ -1695,7 +1730,9 @@ struct Owner {
     replication_tx: Option<mpsc::Sender<Operation>>,
     copy_tx: Option<mpsc::Sender<Operation>>,
     fault: Option<Error>,
-    native_control: Option<Arc<dyn NativeControlView>>,
+    host: Option<HostServices>,
+    #[cfg(test)]
+    fixture_control: Option<Arc<dyn FixtureControl>>,
     starts: Vec<oneshot::Sender<()>>,
     dispositions: Vec<OwnedDisposition>,
     replies: Vec<DeferredReply>,
@@ -1715,6 +1752,17 @@ impl Drop for Owner {
 }
 
 impl Owner {
+    fn membership(&self) -> Result<StableFacts> {
+        if let Some(host) = &self.host {
+            return host.membership.observe();
+        }
+        #[cfg(test)]
+        if let Some(view) = &self.fixture_control {
+            return view.observe();
+        }
+        Ok(StableFacts::default())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         endpoint: Endpoint,
@@ -1726,8 +1774,9 @@ impl Owner {
         ack_tx: mpsc::Sender<ApplyAck>,
         replication_tx: mpsc::Sender<Operation>,
         copy_tx: mpsc::Sender<Operation>,
-        native_control: Option<Arc<dyn NativeControlView>>,
+        host: Option<HostServices>,
         capabilities: crate::extensions::StateProviderCapabilities,
+        #[cfg(test)] fixture_control: Option<Arc<dyn FixtureControl>>,
     ) -> Self {
         let dispatched = queue.progress().applied;
         Self {
@@ -1765,6 +1814,7 @@ impl Owner {
             removals: Vec::new(),
             configurations: Vec::new(),
             jobs: JoinSet::new(),
+            access_jobs: JoinSet::new(),
             replay_job: false,
             replay_next: Instant::now(),
             replay_rearm_pending: false,
@@ -1772,7 +1822,9 @@ impl Owner {
             replication_tx: Some(replication_tx),
             copy_tx: Some(copy_tx),
             fault: None,
-            native_control,
+            host,
+            #[cfg(test)]
+            fixture_control,
             starts: Vec::new(),
             dispositions: Vec::new(),
             replies: Vec::new(),
@@ -1842,7 +1894,26 @@ impl Owner {
                 result = self.jobs.join_next(), if !self.jobs.is_empty() => Event::Job(result),
                 Some(packet) = incoming.control.recv() => Event::Packet(packet),
                 Some(packet) = incoming.data.recv() => Event::Packet(packet),
-                Some(write) = writes.recv() => Event::Write(write),
+                result = std::future::poll_fn(|cx| {
+                    let mut calls = self.shared.prequeue_calls.lock().unwrap();
+                    let before = calls.len();
+                    let mut outcome = Ok(());
+                    calls.retain_mut(|call| match std::future::Future::poll(std::pin::Pin::new(call), cx) {
+                        std::task::Poll::Pending => true,
+                        std::task::Poll::Ready(result) => {
+                            if let Err(error) = result { outcome = Err(error); }
+                            false
+                        }
+                    });
+                    if calls.len() == before {
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(outcome)
+                    }
+                }) => Event::Prequeue(result),
+                _ = self.shared.prequeue_changed.notified() => Event::Prequeue(Ok(())),
+                result = self.access_jobs.join_next(), if !self.access_jobs.is_empty() => Event::WriteChecked(result),
+                Some(write) = writes.recv(), if self.access_jobs.is_empty() => Event::Write(write),
                 _ = retry.tick() => Event::Retry,
             };
             if let Event::Replies(replies) = event {
@@ -1859,10 +1930,16 @@ impl Owner {
             if shared.stopped.load(Ordering::Acquire) {
                 break;
             }
-            #[cfg(test)]
-            let wrote = matches!(&event, Event::Write(_));
+            #[cfg(any(test, feature = "test-hooks"))]
+            let wrote = matches!(&event, Event::Write(write) if write.access.is_none())
+                || matches!(&event, Event::WriteChecked(_));
             match event {
                 Event::Replies(_) => unreachable!(),
+                Event::Prequeue(result) => {
+                    if let Err(error) = result {
+                        self.fail(error);
+                    }
+                }
                 Event::Cleanup => {}
                 Event::Deadline => {}
                 Event::Ack(ack) => {
@@ -1877,7 +1954,46 @@ impl Owner {
                     None => {}
                 },
                 Event::Packet(packet) => self.packet(packet),
-                Event::Write(write) => self.submit(write),
+                Event::Write(mut write) => {
+                    if let Some((partition, permit)) = write.access.take() {
+                        let shared = self.shared.clone();
+                        let mut call = provider_call(
+                            permit,
+                            &mut self.starts,
+                            &mut self.dispositions,
+                            async move {
+                                #[cfg(any(test, feature = "test-hooks"))]
+                                if let Some((entered, release)) =
+                                    shared.write_assignment_pause.lock().unwrap().take()
+                                {
+                                    let _ = entered.send(());
+                                    release
+                                        .recv_timeout(std::time::Duration::from_secs(2))
+                                        .expect("assignment gate released");
+                                }
+                                let _ = &shared;
+                                partition.check_write_access()
+                            },
+                        );
+                        self.access_jobs.spawn(async move {
+                            let result = (&mut call).await;
+                            (write, result)
+                        });
+                    } else {
+                        self.submit(write);
+                    }
+                }
+                Event::WriteChecked(Some(Ok((mut write, result)))) => {
+                    if let Err(error) = result {
+                        let _ = write.reply.take().unwrap().send(Err(error));
+                    } else {
+                        self.submit(write);
+                    }
+                }
+                Event::WriteChecked(Some(Err(_))) => {
+                    self.fail(Error::Protocol("partition callback panicked"))
+                }
+                Event::WriteChecked(None) => {}
                 Event::Retry => self.retry(),
             }
             if self.fault.is_none() {
@@ -1887,7 +2003,7 @@ impl Owner {
             }
             self.publish();
             drop(_admission);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             if wrote {
                 if let Some((entered, release)) =
                     self.shared.write_reply_pause.lock().unwrap().take()
@@ -1932,21 +2048,39 @@ impl Owner {
                 );
             }
         }
-        self.shared.stopped.store(true, Ordering::Release);
-        self.shared.revision.fetch_add(1, Ordering::AcqRel);
+        let prequeue = {
+            let _admission = self.shared.admission.lock().unwrap();
+            self.shared.stopped.store(true, Ordering::Release);
+            self.shared.revision.fetch_add(1, Ordering::AcqRel);
+            std::mem::take(&mut *self.shared.prequeue_calls.lock().unwrap())
+        };
         if self.fault.is_some() {
-            if let Some(view) = &self.native_control {
+            if let Some(view) = self.host.as_ref().map(|host| &host.health) {
                 // Poll notification first to install the runtime-owned retry
                 // stage even when Close/Abort has already requested shutdown.
                 // Never wait for our own native disposal to release a receipt.
                 tokio::select! {
                     biased;
-                    _ = view.report_fault(fube_runtime::FaultType::Transient) => {},
+                    _ = view.report_fault(fube_core::FaultType::Transient) => {},
                     _ = async {
                         if !*stop.borrow_and_update() {
                             let _ = stop.changed().await;
                         }
                     } => {},
+                }
+            }
+            #[cfg(test)]
+            if self.host.is_none() {
+                if let Some(view) = &self.fixture_control {
+                    tokio::select! {
+                        biased;
+                        _ = view.report_fault(fube_core::FaultType::Transient) => {},
+                        _ = async {
+                            if !*stop.borrow_and_update() {
+                                let _ = stop.changed().await;
+                            }
+                        } => {},
+                    }
                 }
             }
         }
@@ -1959,12 +2093,22 @@ impl Owner {
             }
         }
         self.starts.clear();
+        let prequeue_dispositions: Vec<_> = prequeue.iter().map(OwnedCall::disposition).collect();
+        for record in &prequeue_dispositions {
+            record.cancel();
+        }
+        drop(prequeue);
         for record in &self.dispositions {
             record.cancel();
         }
         self.jobs.abort_all();
+        self.access_jobs.abort_all();
         while self.jobs.join_next().await.is_some() {}
+        while self.access_jobs.join_next().await.is_some() {}
         for record in self.dispositions.drain(..) {
+            record.wait().await;
+        }
+        for record in prequeue_dispositions {
             record.wait().await;
         }
         for reply in self.replies.drain(..) {
@@ -2026,7 +2170,15 @@ impl Owner {
     }
 
     async fn dispose_provider_resources(&mut self) -> Result<()> {
-        let resources = (self.provider.take(), std::mem::take(&mut self.peers));
+        let resources = (
+            self.provider.take(),
+            std::mem::take(&mut self.peers),
+            self.shared.partition.lock().unwrap().take(),
+        );
+        let partition_disposal = resources
+            .2
+            .as_ref()
+            .map(|partition| partition.disposal_receipt());
         let cleanup = {
             let mut cleanup = self.shared.shutdown_cleanup.lock().unwrap();
             cleanup.0 = true;
@@ -2050,7 +2202,11 @@ impl Owner {
                 }
             }
         };
-        receipt.wait().await
+        receipt.wait().await?;
+        if let Some(disposal) = partition_disposal {
+            disposal.wait().await?;
+        }
+        Ok(())
     }
 
     fn fail(&mut self, error: Error) {
@@ -2155,18 +2311,26 @@ impl Owner {
     }
 
     fn submit(&mut self, mut write: Submit) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some((entered, release)) = self.shared.write_assignment_pause.lock().unwrap().take()
+        {
+            let _ = entered.send(());
+            release
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("assignment gate released");
+        }
         if write.cancellation.is_cancelled() {
             let _ = write.reply.take().unwrap().send(Err(Error::new(
-                fube_runtime::ErrorKind::Canceled,
+                fube_core::ErrorKind::Canceled,
                 "replication canceled before sequence assignment",
             )));
             return;
         }
         if !self.ready() {
             let kind = if self.role != ReplicaRole::Primary {
-                fube_runtime::ErrorKind::NotPrimary
+                fube_core::ErrorKind::NotPrimary
             } else if self.fault.is_some() || self.shared.stopped.load(Ordering::Acquire) {
-                fube_runtime::ErrorKind::ObjectClosed
+                fube_core::ErrorKind::ObjectClosed
             } else if !self.reconciled
                 || !self.copy_done
                 || self.control.is_some()
@@ -2174,9 +2338,9 @@ impl Owner {
                     !c.local_member || c.write_quorum == 0 || Some(c.epoch.primary()) != self.epoch
                 })
             {
-                fube_runtime::ErrorKind::ReconfigurationPending
+                fube_core::ErrorKind::ReconfigurationPending
             } else {
-                fube_runtime::ErrorKind::NoWriteQuorum
+                fube_core::ErrorKind::NoWriteQuorum
             };
             let _ = write
                 .reply
@@ -2194,6 +2358,13 @@ impl Owner {
                 .take()
                 .unwrap()
                 .send(Err(Error::InvalidInput("native admission epoch changed")));
+            return;
+        }
+        if write
+            .access_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            let _ = write.reply.take().unwrap().send(Err(Error::Timeout));
             return;
         }
         match self
@@ -2244,7 +2415,7 @@ impl Owner {
                         self.initial_query = Some(query.clone());
                     }
                     self.initial_replies.push((query, reply));
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-hooks"))]
                     if running
                         && self
                             .initial_replies
@@ -2308,7 +2479,7 @@ impl Owner {
                 cancellation,
                 reply,
             } => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 self.shared.epoch_entries.fetch_add(1, Ordering::AcqRel);
                 if cancellation.is_cancelled() {
                     let _ = reply.send(Err(Error::Closed));
@@ -3566,7 +3737,7 @@ impl Owner {
                         }
                         Ok(false) => {}
                         Err(error)
-                            if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull
+                            if error.kind() == fube_core::ErrorKind::ReplicationQueueFull
                                 || matches!(error, Error::ResourceLimit("receive gap")) =>
                         {
                             break
@@ -3647,7 +3818,7 @@ impl Owner {
                     }
                     Ok(false) => {}
                     Err(error)
-                        if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull
+                        if error.kind() == fube_core::ErrorKind::ReplicationQueueFull
                             || matches!(error, Error::ResourceLimit("receive gap")) =>
                     {
                         return
@@ -4051,45 +4222,24 @@ impl Owner {
         if self.role != ReplicaRole::ActiveSecondary || !self.copy_done || self.control.is_some() {
             return Ok(());
         }
-        let Some(status) = self
-            .native_control
-            .as_ref()
-            .and_then(|view| view.status().ok())
-        else {
+        let Some((epoch, primary)) = self.membership()?.primary else {
             return Ok(());
         };
-        if status.lifecycle != ReplicaLifecycle::Open
-            || !status.replicator_open
-            || status.current_role != ReplicaRole::ActiveSecondary
-            || status.replicator_role != ReplicaRole::ActiveSecondary
-            || status.service_role != ReplicaRole::ActiveSecondary
-            || Some(status.current_epoch.primary()) != self.epoch
-        {
+        if Some(epoch) != self.epoch {
             return Ok(());
         }
-        let mut primaries = status
-            .configuration
-            .iter()
-            .filter(|peer| peer.role == ReplicaRole::Primary && peer.up && peer.ready);
-        let Some(primary) = primaries.next() else {
-            return Ok(());
-        };
-        if primaries.next().is_some() {
-            return Err(Error::Protocol("ambiguous native primary"));
-        }
-        let mut endpoint = self.validate_replica(primary)?;
+        let mut endpoint = self.validate_replica(&primary)?;
         // REFrom has actor/address only; public transport IDs are not identity.
         endpoint.transport_id = None;
         if self.secondary.as_ref().is_some_and(|copy| {
-            same_endpoint(&copy.primary, &endpoint)
-                && copy.primary_epoch == status.current_epoch.primary()
+            same_endpoint(&copy.primary, &endpoint) && copy.primary_epoch == epoch
         }) {
             return Ok(());
         }
         if self
             .secondary
             .as_ref()
-            .is_some_and(|copy| copy.primary_epoch > status.current_epoch.primary())
+            .is_some_and(|copy| copy.primary_epoch > epoch)
         {
             return Ok(());
         }
@@ -4101,14 +4251,14 @@ impl Owner {
         self.transport.register_peer(&endpoint)?;
         if let Some(copy) = self.secondary.as_mut() {
             copy.primary = endpoint;
-            copy.primary_epoch = status.current_epoch.primary();
+            copy.primary_epoch = epoch;
         } else {
             // This is an already reconciled active replica, NOT a new copy.
             // No provider data, progress or ACK is synthesized.
             self.secondary = Some(SecondaryCopy {
                 primary: endpoint,
-                primary_epoch: status.current_epoch.primary(),
-                copy_epoch: status.current_epoch.primary(),
+                primary_epoch: epoch,
+                copy_epoch: epoch,
                 horizon: self.queue.progress().applied,
                 queue: OperationQueue::new(self.settings.clone(), 1)?,
                 charges: BTreeMap::new(),
@@ -4132,24 +4282,10 @@ impl Owner {
             && self.reconciled
             && self.copy_done
         {
-            if let Some(status) = self
-                .native_control
-                .as_ref()
-                .and_then(|view| view.status().ok())
-            {
-                if status.lifecycle == ReplicaLifecycle::Open
-                    && status.replicator_open
-                    && status.current_role == ReplicaRole::Primary
-                    && status.service_role == ReplicaRole::Primary
-                    && status.replicator_role == ReplicaRole::Primary
-                    && status.configuration_stage == ConfigurationStage::Current
-                    && status.catch_up == fube_runtime::extensions::CatchUpResult::Completed
-                    && status.minimum_replica_set_size == 1
-                    && status.configuration.is_empty()
-                    && Some(status.current_epoch.primary()) == self.epoch
-                {
+            if let Some(epoch) = self.membership().ok().and_then(|facts| facts.singleton) {
+                if Some(epoch) == self.epoch {
                     self.current = Some(ReplicaSetConfiguration {
-                        epoch: status.current_epoch.primary(),
+                        epoch,
                         replicas: Vec::new(),
                         write_quorum: 1,
                         local_member: true,
@@ -4502,7 +4638,7 @@ impl Owner {
         let _enrollment = cleanup.as_ref().map(|cleanup| cleanup.enter());
         match job {
             Job::InitialProgress => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 let result = {
                     let pause = self.shared.initial_publication_pause.lock().unwrap().take();
                     match pause {
@@ -5094,7 +5230,7 @@ impl Engine {
             .unwrap_or_else(|_| Instant::now() + self.settings.callback_timeout)
             .min(Instant::now() + self.settings.callback_timeout);
         let query = InitialQuery {
-            native: self.native_runtime.clone(),
+            validity: self.host.as_ref().map(|host| host.validity.clone()),
             cancellation,
             revision: self.shared.revision.load(Ordering::Acquire),
             deadline,
@@ -5107,9 +5243,7 @@ impl Engine {
         if !self.shared.opened.load(Ordering::Acquire) {
             return Err(Error::InvalidInput("replicator is not Opened"));
         }
-        if let Some(native) = &self.native_runtime {
-            native.validate()?;
-        }
+        self.validate_host()?;
         self.shared.execution.reserve(
             CallLane::Provider,
             CallOrigin {
@@ -5124,14 +5258,14 @@ impl Engine {
     fn initial_progress_sync(&self) -> Result<i64> {
         let query = self.initial_query(Cancellation::default(), false)?;
         if let Some(initial) = *self.shared.initial_progress.lock().unwrap() {
-            self.native_required()?.validate()?;
+            self.validate_host()?;
             return Ok(initial);
         }
         let permit = self.initial_progress_permit()?;
         let initial = self.request_blocking(None, |reply| {
             Command::InitialProgress(Some(permit), query, reply)
         })?;
-        self.native_required()?.validate()?;
+        self.validate_host()?;
         Ok(initial)
     }
     fn open(&self, cancellation: Cancellation) -> ServiceFuture<'_, String> {
@@ -5165,7 +5299,7 @@ impl Engine {
                 if cancellation.is_cancelled() {
                     return Err(Error::Closed);
                 }
-                if engine.native_runtime.is_some()
+                if engine.host.is_some()
                     && engine.snapshot().role == ReplicaRole::Unknown
                     && role == ReplicaRole::Primary
                     && engine.shared.initial_progress.lock().unwrap().is_none()
@@ -5175,7 +5309,7 @@ impl Engine {
                     engine
                         .request(|reply| Command::InitialProgress(Some(permit), query, reply))
                         .await?;
-                    engine.native_required()?.validate()?;
+                    engine.validate_host()?;
                 }
                 engine
                     .request(|reply| Command::Epoch {
@@ -5204,16 +5338,16 @@ impl Engine {
         })
     }
 
-    fn progress(&self) -> Result<ReplicationProgress> {
+    pub fn progress(&self) -> Result<ReplicationProgress> {
         self.check()?;
         let snapshot = self.snapshot();
-        if self.native_runtime.is_some() && snapshot.role == ReplicaRole::Unknown {
+        if self.host.is_some() && snapshot.role == ReplicaRole::Unknown {
             return Ok(ReplicationProgress {
                 first: 0,
                 last: self.initial_progress_sync()?,
             });
         }
-        if self.native_runtime.is_some()
+        if self.host.is_some()
             && matches!(
                 snapshot.role,
                 ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
@@ -5226,7 +5360,7 @@ impl Engine {
                 .shared
                 .secondary_progress_fault
                 .swap(true, Ordering::AcqRel);
-            let native = self.native_required()?.clone();
+            let health = self.host.as_ref().ok_or(Error::Closed)?.health.clone();
             if let Ok(permit) = self.shared.execution.reserve(
                 CallLane::Provider,
                 CallOrigin::default(),
@@ -5235,8 +5369,8 @@ impl Engine {
             ) {
                 let _ = permit
                     .run_future(async move {
-                        native
-                            .report_fault(fube_runtime::FaultType::Transient)
+                        health
+                            .report_fault(fube_core::FaultType::Transient)
                             .await
                             .map(|_| ())
                     })
@@ -5284,8 +5418,8 @@ impl Engine {
         })
     }
 
-    #[cfg(test)]
-    fn update_catch_up_configuration(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn update_catch_up_configuration(
         &self,
         current: ReplicaSetConfiguration,
         previous: ReplicaSetConfiguration,
@@ -5294,8 +5428,8 @@ impl Engine {
         self.configure_authorized(current, Some(previous), cancellation, Ok(None))
     }
 
-    #[cfg(test)]
-    fn update_current_configuration(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn update_current_configuration(
         &self,
         current: ReplicaSetConfiguration,
         cancellation: Cancellation,
@@ -5303,7 +5437,7 @@ impl Engine {
         self.configure_authorized(current, None, cancellation, Ok(None))
     }
 
-    fn wait_for_catch_up(
+    pub fn wait_for_catch_up(
         &self,
         mode: CatchUpMode,
         cancellation: Cancellation,
@@ -5314,17 +5448,17 @@ impl Engine {
         })
     }
 
-    #[cfg(test)]
-    fn build_replica(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn build_replica(
         &self,
         replica: ReplicaInformation,
         cancellation: Cancellation,
     ) -> ServiceFuture<'_, ()> {
-        self.build_authorized(replica, cancellation, Ok(None))
+        self.build_authorized(replica, cancellation, None)
     }
 
-    #[cfg(test)]
-    fn remove_replica(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn remove_replica(
         &self,
         replica: ReplicaInformation,
         reason: ReplicaRemoval,

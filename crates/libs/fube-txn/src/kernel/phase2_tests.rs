@@ -689,7 +689,6 @@ use super::{
 };
 use crate::*;
 use fube_data::extensions::ReplicationEndpointOptions;
-use fube_data::IStateReplicator;
 use fube_rap_test_support as rap;
 use fube_runtime::{
     extensions::{
@@ -1128,7 +1127,15 @@ impl fube_data::IStateProvider for CopySource {
     }
 }
 type SourceCreated = Arc<
-    Mutex<Option<oneshot::Sender<(Arc<fube_data::FabricReplicator>, NativeRuntimeIntegration)>>>,
+    Mutex<
+        Option<
+            oneshot::Sender<(
+                Arc<dyn IPrimaryReplicator>,
+                Arc<dyn fube_data::IStateReplicator>,
+                NativeRuntimeIntegration,
+            )>,
+        >,
+    >,
 >;
 struct SourceFactory {
     native: NativeIntegrationProvider,
@@ -1164,9 +1171,8 @@ impl IStatefulServiceReplica for SourceReplica {
         _: Cancellation,
     ) -> ApiFuture<'_, Box<dyn IPrimaryReplicator>> {
         Box::pin(async move {
-            let lower = fube_data::FabricReplicator::create(
+            let lower = self.native.create_replicator(
                 partition,
-                self.native.clone(),
                 self.provider.clone(),
                 None,
                 ReplicationEndpointOptions {
@@ -1180,7 +1186,11 @@ impl IStatefulServiceReplica for SourceReplica {
                 .unwrap()
                 .take()
                 .unwrap()
-                .send((lower.clone(), self.native.clone()))
+                .send((
+                    lower.clone(),
+                    lower.get_state_replicator(),
+                    self.native.clone(),
+                ))
                 .ok();
             Ok(Box::new((*lower).clone()) as Box<dyn IPrimaryReplicator>)
         })
@@ -1195,7 +1205,8 @@ impl IStatefulServiceReplica for SourceReplica {
 }
 struct Source {
     host: Arc<rap::Host>,
-    lower: Arc<fube_data::FabricReplicator>,
+    lower: Arc<dyn IPrimaryReplicator>,
+    state: Arc<dyn fube_data::IStateReplicator>,
     provider: Arc<CopySource>,
 }
 impl Source {
@@ -1227,7 +1238,7 @@ impl Source {
             })
         })
         .await;
-        let (lower, _) = recv.await.unwrap();
+        let (lower, state, _) = recv.await.unwrap();
         host.configure(NativeReplicaSetConfiguration {
             epoch: epoch(),
             replicas: vec![],
@@ -1239,13 +1250,13 @@ impl Source {
         Self {
             host,
             lower,
+            state,
             provider,
         }
     }
     async fn replicate(&self, record: Record) -> i64 {
-        use fube_data::IStateReplicator;
         let mut admitted = self
-            .lower
+            .state
             .replicate(record.encode().unwrap(), Cancellation::default())
             .await
             .unwrap();
@@ -2197,7 +2208,7 @@ async fn phase2_failed_replication_flush_never_acks_and_unsupported_copy_batch_p
                     .write_error =
                     Some(Error::InvalidInput("controlled replication flush failure"));
                 let admitted = source
-                    .lower
+                    .state
                     .replicate(single(700, 1).encode().unwrap(), Cancellation::default())
                     .await
                     .unwrap();

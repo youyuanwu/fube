@@ -225,6 +225,23 @@ The live tests are ignored by ordinary `cargo test`. Offline model tests do not
 establish native wire compatibility. Unsupported host platforms fail before
 Python test discovery.
 
+For the [runtime/replication boundary](runtime/FubeData.md#runtimereplication-boundary),
+use serial offline gates (no cluster, native build or nextest archive):
+
+```sh
+CARGO_BUILD_JOBS=1 cargo test --locked -p fube-core -p fube-runtime -- --test-threads=1
+CARGO_BUILD_JOBS=1 cargo test --locked -p fube-data -p fube-txn -p fube-rap-test-support -p rust-runtime-app -- --test-threads=1
+CARGO_BUILD_JOBS=1 cargo test --locked -p fube-txn --test public_runtime -- --test-threads=1
+python3 -m unittest tests.offline.test_runtime_replication_boundary -v
+```
+
+The separate default-feature txn command checks the actual direct/forwarding
+service-returned routes without sample feature unification. Native proof/
+construction/disposal regressions now belong to runtime's `replication_native`
+and `replication_sdk` integration targets; pure lower algorithms remain in data.
+Optional implementation `test-hooks` is not a supported application construction
+path and is absent from default txn dependencies.
+
 The [Hosting H1 core](cluster/RustHosting.md#implemented-h1-model) adds ordinary
 native-free registration, lookup, event/bound and RA-bridge tests to the
 existing workspace/archive selections. `cargo check --locked -p fube-hosting
@@ -263,7 +280,7 @@ not blindly retried. Ordinary workspace tests keep existing live tests ignored.
 The callback/shutdown qualification corrections preserve synchronous native
 `Invoke` and once-only End while handing off the existing oracle worker during
 blocking callbacks ([context owner](../crates/samples/native-replicator-oracle/src/async_context.rs#L299-L357)).
-The [data model host](../crates/libs/fube-data/tests/support/rap_model.rs#L264-L417)
+The [shared runtime model host](../crates/libs/fube-rap-test-support/src/lib.rs#L366-L375)
 retains pending probe results, then observes actual ReplicaClose before guarded
 Runtime shutdown. Active-callback fencing, actor authority and native Runtime
 semantics are not relaxed. The causal regression uses an actually entered

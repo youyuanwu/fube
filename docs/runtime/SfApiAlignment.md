@@ -87,7 +87,7 @@ offline evidence, not native deployment.
 | `report_fault`, `FaultType` → [native][N-runtime] / [mssf][M-stateless]; [Rustdoc][R-api], [R-partition], [fault tests][R-fault-tests] | **M** sync Result, Invalid/Permanent/Transient | **M/R** public Permanent1/Transient2 explicitly maps RAP Transient1/Permanent2; Invalid rejected before coalescing | **L** immutable initial write/coalesced result, **not** replacement/recovery ACK | **E/L** later bounded retries/coalescing/permanent supersession and delivery snapshots are separate observations (D09/D21) |
 | `Epoch` → [mssf][M-stateful-types] / [native types][N-types]; [Rustdoc][R-epoch], [R-values], [DT] | **M** public field roles; **R** no inherent `primary()` | **M** public INVALID(-1,-1), ZERO(0,0) valid; **L** RAP invalidzero is contextual absence, not global zero replacement (D20) | **M/L** full low bits retained for authority; primary mask only at explicit boundary | **E** `EpochDomains` follows native internal rule, exposing trait is fube choice |
 | `ReplicaInformation`, `ReplicaSetConfig`, `ReplicaStatus`, `ReplicaSetQuorumMode`, `ReplicaRole` → [mssf descriptor types][M-stateful-types] / [actual role definition][M-roles]; [Rustdoc][R-descriptors], [R-values], [D-native-tests] | **M/R** SDK-shaped fields, config write_quorum u32, explicit enums | **M** remote unknown LSN -1 vs initialized local0; **R** public Primary2/Idle3/Active4 vs RAP Primary4/Idle2/Secondary3 | **M** descriptor only, never native proof; local votes/PC/CC retained privately | **U/L** ActiveAuxiliary, IdleAuxiliary and PrimaryAuxiliary each unavailable; no enum casts/compat aliases (D05/D20/D21) |
-| Native partition `CreateReplicator`, mssf `try_get_com`, mutable native replicator settings → [native][N-runtime] / [mssf][M-stateful]; [current partition Rustdoc][R-partition], [DT] | **U** no such fube SDK members (not methods returning fake success) | **U** no arbitrary COM pointers/settings accepted | **U** no native creation/COM result | **E/L** data-layer `FabricReplicator::create` instead; preserves data → runtime dependency (D11) |
+| Native partition `CreateReplicator`, mssf `try_get_com`, mutable native replicator settings → [native][N-runtime] / [mssf][M-stateful]; [current partition Rustdoc][R-partition], [DT] | **U** no such fube SDK members (not methods returning fake success) | **U** no arbitrary COM pointers/settings accepted | **U** no native creation/COM result | **E/L** runtime generation-bound helper composes the replication-defined factory; runtime → data → core/transport (D11) |
 | `Error`, `ErrorKind`, `Result`, `ApiFuture`, `Cancellation` → native HRESULT / [mssf][M-stateless]; [errors][R-error], [RT] | **R** shared typed Rust errors, object-safe boxed futures/owned token (D01/D22) | **L** actual InvalidArgument/Unsupported/context/access/cancel/timeout/resource/native/provider/transport causes, no text guessing | **L** `is_uncertain` and advisory cancel do not mean rollback/disposal; rejected registration box recoverable once | **E/L** arbitrary user error causes are managed captures; release before owner shutdown, not full HRESULT/COM equivalence |
 
 Individual version-skew exclusions, not aliases or capability expansion:
@@ -109,7 +109,7 @@ inspected mssf runtime does not itself implement this built-in replication API.
 
 | Current family / method → reference; Rustdoc / regression | Signature / synchrony | Values / acceptance | Completion | Supported capability |
 |---|---|---|---|---|
-| `FabricReplicator::create`, `get_state_replicator` → managed [FabricReplicator][N-fabric]; [Rustdoc][D-fabric], [DT] | **E/R** fube-data helper takes partition, native integration, provider, optional replay, endpoint, Settings; sync Result<Arc<Self>>; views implement canonical controls | **L** native-issued matching authority required before listener/provider activation, no standalone primary controls | **L** one engine/listener/owner; views share it, not independent construction | **L** managed composition responsibility, **not** native partition-construction location/signature/ABI (D11) |
+| `NativeRuntimeIntegration::create_replicator`, `RuntimeReplicator::get_state_replicator` → managed [FabricReplicator][N-fabric]; [adapter][D-hosted], [DT] | **E/R** runtime helper takes partition, provider, optional replay, endpoint, Settings; sync Result<Arc<RuntimeReplicator>>; public control/state views | **L** matching native identity and one-engine claim before listener/provider activation, no standalone primary controls | **L** one engine/listener/owner; runtime adapter owns proof capture and queued validation, data receives lower facts | **L** managed composition responsibility and native internal-factory direction, **not** native partition-construction signature/COM ABI (D11) |
 | `IStateReplicator::replicate` / `ReplicationAdmission` → native Begin/EndReplicate, managed [out-LSN][N-state-replicator]; [Rustdoc][D-replicate], [DT] | **R** async bounded admission yields early LSN + separate completion instead of COM out-parameter | **L** finite limits reject before admission with **no LSN consumed**; current native authority required | **M/L** early admitted identity != quorum completion (D14); accepted work/local apply remain application-owned across disconnect | **L** nonzero ordered sequences in volatile profile, no rollback on drop/cancel |
 | `ReplicationCompletion::wait` → native EndReplicate / [managed guidance][N-state-replicator]; [Rustdoc][D-completion], [sample][APP-write], [DT] | **R** separately awaitable observer | **L** included sample applies locally before wait; custom applications own apply/retry policy (D13) | **L** selected current/previous quorum result, not prepare → quorum → ordered local commit parity; cancel/timeout after admission ambiguous | **L** neither universal network commitment nor disk durability; application-owned admission pump survives HTTP disconnect |
 | `get_copy_stream` / `get_replication_stream` → native/managed [state replicator][N-state-replicator]; [Rustdoc][D-replicate], [DT] | **M/R** immediate fallible sync Arc<dyn IOperationStream> getters | **L** owner's bounded single consumer, both streams require service ACK | **M** getter != enumeration, receive != apply/ACK | **L** RequireServiceAck=true mandatory, unlike native volatile implicit-ACK default (D15) |
@@ -187,7 +187,7 @@ necessary retained limitation**; it was corrected in `6b397e3`.
 
 ## C3: canonical controls and private issued authority
 
-`FabricReplicator::create` requires real runtime/partition-issued integration.
+`NativeRuntimeIntegration::create_replicator` requires real runtime/partition-issued integration.
 Root and bound **canonical** configuration/build/remove reach the same owner.
 Private immutable records preserve node/replica/actor incarnations, generation,
 revision, current/previous epochs, local membership and quorums, plus
@@ -199,8 +199,20 @@ member or old-contract-taking public adapter. The
 issuance, not deployed SF or globally unforgeable/cryptographically authenticated
 authority. Trusted clear transport remains a **trust-profile limitation**.
 
-The helper lives in **fube-data**, not an extra SDK partition method, and returns
-one shared control/state facade. Native partition CreateReplicator, mssf
+The helper lives in **fube-runtime**, not an extra SDK partition method. It
+composes a replication-defined factory and returns a runtime adapter and shared
+state view over one engine. Data has no runtime/RAP implementation dependency;
+the factory's separate per-owner hosting endpoint is retained privately by
+runtime, not exposed by the public data facade or diagnostics. Retained public
+partition wrappers, access getters and typed-error release use bounded
+owner-matched execution; actual queued access retains the original deadline
+outside owner/admission locks, and final wrapper release joins physical cleanup.
+Shared contracts and neutral execution live in core. Runtime retains lease/
+watchdog/proof interpretation and exact mutation-time validation. The actual
+returned composite is never replaced by a lower binder. Native internal factory,
+health and optional query interfaces are permitted; see
+[source correspondence](FubeData.md#runtimereplication-boundary).
+Native partition CreateReplicator, mssf
 try_get_com, arbitrary native settings and COM source/ABI compatibility are
 unavailable, not silently emulated.
 
@@ -222,7 +234,7 @@ an umbrella exception permitting another dialect.
 | D08 | Target-specific exact health result; direct-send both Immediate values, no batching/retry parity. |
 | D09 | Fault initial result vs bounded retry/coalescing/supersession/observations. |
 | D10 | Strict metric/text/value/retention profile; canonical seconds/zero-infinite/zero-auto, no public subsecond convenience. |
-| D11 | Data-layer helper instead of native partition/COM/settings capability; construction-location/shape/ABI difference. |
+| D11 | Runtime helper composes replication-defined factory instead of SDK partition/COM/settings capability; construction-shape/ABI difference, not data → runtime coupling. |
 | D12 | Included provider's last-committed name reports locally applied history, potentially ahead of quorum. |
 | D13 | Primary apply precedes wait, not managed prepare/quorum/ordered local commit parity. |
 | D14 | Early LSN separate completion; no LSN on pre-admission rejection; after-admission cancellation ambiguous. |
@@ -287,25 +299,25 @@ Native-source revision/version skew is not resolved by a successful source fixtu
 [M-health]: https://github.com/youyuanwu/service-fabric-rs-fork/blob/35555883476ac5f78f5f53ef0215b6a32e43b574/crates/libs/core/src/types/runtime/health.rs
 [M-metrics]: https://github.com/youyuanwu/service-fabric-rs-fork/blob/35555883476ac5f78f5f53ef0215b6a32e43b574/crates/libs/core/src/types/common/metrics.rs
 [M-runtime]: https://github.com/youyuanwu/service-fabric-rs-fork/blob/35555883476ac5f78f5f53ef0215b6a32e43b574/crates/libs/core/src/runtime/runtime_wrapper.rs
-[R-api]: ../../crates/libs/fube-runtime/src/api.rs#L84-L150
-[R-info]: ../../crates/libs/fube-runtime/src/api.rs#L32-L60
-[R-stateful]: ../../crates/libs/fube-runtime/src/stateful_api.rs#L117-L150
-[R-control]: ../../crates/libs/fube-runtime/src/stateful_api.rs#L165-L190
-[R-primary]: ../../crates/libs/fube-runtime/src/stateful_api.rs#L194-L232
-[R-partition]: ../../crates/libs/fube-runtime/src/stateful_api.rs#L314-L359
-[R-epoch]: ../../crates/libs/fube-runtime/src/stateful_api.rs#L30-L58
-[R-descriptors]: ../../crates/libs/fube-runtime/src/stateful_api.rs#L235-L281
-[R-health]: ../../crates/libs/fube-runtime/src/reporting.rs#L29-L72
+[R-api]: ../../crates/libs/fube-core/src/sdk/stateless.rs#L81-L146
+[R-info]: ../../crates/libs/fube-core/src/sdk/stateless.rs#L29-L76
+[R-stateful]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L38-L73
+[R-control]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L75-L100
+[R-primary]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L103-L147
+[R-partition]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L201-L266
+[R-epoch]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L8-L36
+[R-descriptors]: ../../crates/libs/fube-core/src/sdk/stateful.rs#L150-L199
+[R-health]: ../../crates/libs/fube-core/src/sdk/reporting.rs#L1-L46
 [R-register]: ../../crates/libs/fube-runtime/src/lib.rs#L566-L623
 [R-example]: ../../crates/libs/fube-runtime/src/lib.rs#L12-L31
-[R-entry]: ../../crates/libs/fube-runtime/src/execution_owned.rs#L942-L987
-[R-error]: ../../crates/libs/fube-runtime/src/error.rs#L19-L75
-[R-binding]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L152-L255
+[R-entry]: ../../crates/libs/fube-core/src/hosting/execution_owned.rs#L1074-L1108
+[R-error]: ../../crates/libs/fube-core/src/error.rs#L19-L81
+[R-binding]: ../../crates/libs/fube-runtime/src/stateful_binding.rs#L152-L256
 [RT]: ../../crates/libs/fube-runtime/tests/sdk_contracts.rs#L274-L491
 [R-values]: ../../crates/libs/fube-runtime/src/stateful_api_tests.rs#L1-L245
 [R-life-tests]: ../../crates/libs/fube-runtime/src/lifecycle_tests.rs#L1-L140
 [R-fault-tests]: ../../crates/libs/fube-runtime/src/lifecycle_tests.rs#L113-L270
-[R-execution-tests]: ../../crates/libs/fube-runtime/src/execution_tests.rs#L113-L565
+[R-execution-tests]: ../../crates/libs/fube-core/src/hosting/execution_tests.rs#L1-L712
 [SL]: ../../crates/libs/fube-runtime/src/reporting_tests.rs#L335-L518
 [SR]: ../../crates/libs/fube-runtime/src/stateful_reporting_tests.rs#L28-L598
 [D-fabric]: ../../crates/libs/fube-data/src/fabric_replicator.rs#L19-L70
@@ -318,10 +330,11 @@ Native-source revision/version skew is not resolved by a successful source fixtu
 [D-settings]: ../../crates/libs/fube-data/src/api.rs#L12-L75
 [D-memory]: ../../crates/libs/fube-data/src/provider.rs#L597-L676
 [D-memory-tests]: ../../crates/libs/fube-data/src/provider.rs#L678-L1009
-[DT]: ../../crates/libs/fube-data/tests/sdk_contracts.rs#L271-L648
-[D-native-tests]: ../../crates/libs/fube-data/src/engine_native_tests.rs#L227-L414
-[D-disposal]: ../../crates/libs/fube-data/src/engine_native_disposal_tests.rs#L68-L245
+[DT]: ../../crates/libs/fube-runtime/tests/replication_sdk.rs#L241-L638
+[D-native-tests]: ../../crates/libs/fube-runtime/tests/replication_native.rs#L812-L1081
+[D-disposal]: ../../crates/libs/fube-runtime/tests/support/replication_disposal_tests.rs#L68-L245
+[D-hosted]: ../../crates/libs/fube-runtime/src/replication.rs#L162-L375
 [D-wire-tests]: ../../crates/libs/fube-data/src/wire_tests.rs#L1-L40
-[D-model]: ../../crates/libs/fube-data/tests/support/rap_model.rs#L227-L270
+[D-model]: ../../crates/libs/fube-rap-test-support/src/lib.rs#L243-L365
 [APP-write]: ../../crates/samples/rust-runtime-app/src/data.rs#L263-L323
 [APP-register]: ../../crates/samples/rust-runtime-app/src/main.rs#L628-L672

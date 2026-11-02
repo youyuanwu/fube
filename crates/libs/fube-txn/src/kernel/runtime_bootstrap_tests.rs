@@ -6,7 +6,7 @@ use super::{
 use crate::{ApiFuture, Cancellation, Epoch, Result};
 use fube_data::{
     extensions::{ReplicationEndpointOptions, StateProviderCapabilities},
-    FabricReplicator, IStateProvider, IStateReplicator,
+    IStateProvider, IStateReplicator,
 };
 use fube_rap_test_support as rap;
 use fube_runtime::{
@@ -314,9 +314,8 @@ impl IStatefulServiceReplica for Replica {
         Box::pin(async move {
             mode.validate()?;
             let bridge = Arc::new(Bridge(Arc::downgrade(&self.core)));
-            let lower = FabricReplicator::create_with_capabilities(
+            let lower = self.native.create_replicator_with_capabilities(
                 partition,
-                self.native.clone(),
                 bridge.clone(),
                 None,
                 ReplicationEndpointOptions {

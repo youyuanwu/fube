@@ -185,10 +185,7 @@ impl Engine {
         connection: Connection,
         incoming: mpsc::Receiver<IpcRequest>,
     ) -> Self {
-        let execution = crate::extensions::ExecutionRuntime::new(
-            authority.clone(),
-            tokio::runtime::Handle::current(),
-        );
+        let execution = crate::execution::new(authority.clone(), tokio::runtime::Handle::current());
         Self::start_with_execution(current, authority, connection, incoming, execution)
     }
     pub(crate) fn start_with_execution(

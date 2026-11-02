@@ -114,7 +114,15 @@ mod managed_participants;
 mod model_tests;
 mod package_context;
 mod packages;
+mod replication;
 mod reporting;
+pub use replication::RuntimeReplicator;
+#[cfg(feature = "test-hooks")]
+pub mod replication_testing {
+    pub use crate::replication::{
+        project_configuration, project_descriptor, NativeBuildPause, NativeRemovePause,
+    };
+}
 mod stateful;
 mod stateful_api;
 mod wire;
@@ -322,7 +330,7 @@ impl Runtime {
         authority: Arc<Authority>,
         activation: Option<ActivationContext>,
     ) -> Result<Self> {
-        let execution = extensions::ExecutionRuntime::new(authority.clone(), application);
+        let execution = execution::new(authority.clone(), application);
         let mut activation = match activation {
             Some(activation) => activation,
             None => ActivationContext::from_environment()?,
@@ -739,7 +747,7 @@ impl Runtime {
         )?;
         tokio::time::timeout(Duration::from_millis(400), async move {
             let mut host = permit.run_future(self.shutdown_quiesce()).await?;
-            host.execution.shutdown().await?;
+            execution::shutdown(&host.execution, &host.authority).await?;
             if let Some((stop, core)) = host.core.take() {
                 let _ = stop.send(());
                 core.join_finished().await?;

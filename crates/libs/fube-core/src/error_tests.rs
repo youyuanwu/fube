@@ -1,5 +1,5 @@
 use super::*;
-use crate::extensions::ExecutionRuntime;
+use crate::hosting::ExecutionRuntime;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Condvar,
@@ -130,7 +130,7 @@ async fn cleanup_and_terminal_errors_preserve_causes_until_final_owned_drop() {
 }
 #[tokio::test]
 async fn cleanup_error_preserves_cause_with_independent_ancestor_sibling_and_publication() {
-    use crate::extensions::{CallLane, CallOrigin, DisposalTracker, ObjectQuota};
+    use crate::hosting::{CallLane, CallOrigin, DisposalTracker, ObjectQuota};
     use std::time::Duration;
 
     for scenario in ["ancestor", "sibling", "publication"] {

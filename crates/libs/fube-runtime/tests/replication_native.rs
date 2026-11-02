@@ -1,16 +1,178 @@
 //! Native-RAP MODEL ingress exercises the actual issued root/bound SDK paths.
-use super::*;
-use crate::{MemoryProvider, Mutation};
-use fube_runtime::extensions::{NativeIntegrationProvider, NativeRuntimeIntegration};
+use fube_data as data_contract;
+use fube_data::hosting::Removal;
+use fube_data::{
+    hosting::testing::PeerTransport,
+    wire::{Actor, Body, Endpoint, Packet, WireOperation},
+};
+use fube_data::{
+    IOperationDataStream, IStateProvider, MemoryProvider, Mutation, OperationData, Settings,
+};
+use fube_runtime::extensions::{
+    CallLane, CallOrigin, NativeIntegrationProvider, NativeReplicaDescriptor as ReplicaInformation,
+    NativeReplicaSetConfiguration as ReplicaSetConfiguration, NativeRuntimeIntegration,
+};
+use fube_runtime::*;
+use fube_runtime::{
+    extensions::{NativeInvocation, NativeInvocationKind, ReplicaRemoval, ReplicationProgress},
+    replication_testing::{
+        project_configuration, project_descriptor, NativeBuildPause, NativeRemovePause,
+    },
+};
+use fube_runtime::{
+    ApiFuture as ServiceFuture, ReplicaInformation as SdkReplicaInformation,
+    ReplicaSetQuorumMode as CatchUpMode,
+};
 use fube_runtime::{
     IStatefulServiceFactory, IStatefulServicePartition, IStatefulServiceReplica, OpenMode,
 };
-#[path = "engine_native_disposal_tests.rs"]
+use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc as std_mpsc, Mutex,
+};
+use tokio::sync::oneshot;
+#[path = "support/replication_disposal_tests.rs"]
 mod disposal;
+#[path = "support/partition_access.rs"]
+mod partition_access;
+#[path = "../../fube-data/tests/support/upper_log.rs"]
+mod upper_log;
 use fube_rap_test_support as rap;
+use partition_access::{AccessControl, AccessPartition};
+
+struct Engine {
+    control: Arc<RuntimeReplicator>,
+    lower: Arc<fube_data::hosting::testing::Engine>,
+    native_configuration: Arc<Mutex<Option<NativeInvocation>>>,
+    native_build_pause: NativeBuildPause,
+    native_remove_pause: NativeRemovePause,
+}
+impl Engine {
+    fn new(control: Arc<RuntimeReplicator>) -> Self {
+        Self {
+            lower: control.diagnostics().engine_for_test(),
+            native_configuration: control.native_configuration.clone(),
+            native_build_pause: control.native_build_pause.clone(),
+            native_remove_pause: control.native_remove_pause.clone(),
+            control,
+        }
+    }
+    fn update_current_configuration(
+        &self,
+        config: ReplicaSetConfiguration,
+        cancel: Cancellation,
+    ) -> ServiceFuture<'_, ()> {
+        let config = project_configuration(&crate::extensions::NativeReplicaSet::from(&config));
+        Box::pin(async move {
+            self.lower
+                .update_current_configuration(config?, cancel)
+                .await
+        })
+    }
+    fn progress(&self) -> Result<ReplicationProgress> {
+        let progress = self.lower.progress()?;
+        Ok(ReplicationProgress {
+            first: progress.first,
+            last: progress.last,
+        })
+    }
+    fn build_replica(
+        &self,
+        target: ReplicaInformation,
+        cancel: Cancellation,
+    ) -> ServiceFuture<'_, ()> {
+        self.lower
+            .build_replica(project_descriptor(&target), cancel)
+    }
+    fn remove_replica(
+        &self,
+        target: ReplicaInformation,
+        purpose: ReplicaRemoval,
+        cancel: Cancellation,
+    ) -> ServiceFuture<'_, ()> {
+        self.lower.remove_replica(
+            project_descriptor(&target),
+            match purpose {
+                ReplicaRemoval::Idle => Removal::Idle,
+                ReplicaRemoval::BuildRetryCleanup => Removal::BuildRetryCleanup,
+            },
+            cancel,
+        )
+    }
+}
+impl std::ops::Deref for Engine {
+    type Target = fube_data::hosting::testing::Engine;
+    fn deref(&self) -> &Self::Target {
+        &self.lower
+    }
+}
+impl IReplicator for Engine {
+    fn open(&self, cancel: Cancellation) -> ServiceFuture<'_, String> {
+        self.control.open(cancel)
+    }
+    fn close(&self, cancel: Cancellation) -> ServiceFuture<'_, ()> {
+        self.control.close(cancel)
+    }
+    fn change_role(
+        &self,
+        epoch: Epoch,
+        role: ReplicaRole,
+        cancel: Cancellation,
+    ) -> ServiceFuture<'_, ()> {
+        self.control.change_role(epoch, role, cancel)
+    }
+    fn update_epoch(&self, epoch: Epoch, cancel: Cancellation) -> ServiceFuture<'_, ()> {
+        self.control.update_epoch(epoch, cancel)
+    }
+    fn get_current_progress(&self) -> Result<i64> {
+        self.control.get_current_progress()
+    }
+    fn get_catch_up_capability(&self) -> Result<i64> {
+        self.control.get_catch_up_capability()
+    }
+    fn abort(&self) {
+        self.control.abort();
+    }
+}
+
+mod fixtures {
+    use super::*;
+    pub struct Provider {
+        pub last: std::sync::atomic::AtomicI64,
+    }
+    impl Provider {
+        pub fn with_initial(last: i64) -> Self {
+            Self { last: last.into() }
+        }
+    }
+    impl IStateProvider for Provider {
+        fn get_last_committed_sequence_number(&self) -> Result<i64> {
+            Ok(self.last.load(Ordering::Acquire))
+        }
+        fn update_epoch(&self, _: Epoch, _: i64, _: Cancellation) -> ServiceFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn on_data_loss(&self, _: Cancellation) -> ServiceFuture<'_, bool> {
+            Box::pin(async { Ok(false) })
+        }
+        fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
+            MemoryProvider::new().get_copy_context()
+        }
+        fn get_copy_state(
+            &self,
+            horizon: i64,
+            context: Option<Arc<dyn IOperationDataStream>>,
+        ) -> Result<Arc<dyn IOperationDataStream>> {
+            MemoryProvider::new().get_copy_state(horizon, context)
+        }
+    }
+}
 
 type Created = Arc<Mutex<Option<oneshot::Sender<(Arc<Engine>, NativeRuntimeIntegration)>>>>;
 struct Factory {
+    forwarding: bool,
+    access: Option<Arc<AccessControl>>,
     native: NativeIntegrationProvider,
     provider: Arc<dyn IStateProvider>,
     settings: Settings,
@@ -20,6 +182,8 @@ struct Factory {
     retry_open_progress: bool,
 }
 struct Replica {
+    forwarding: bool,
+    access: Option<Arc<AccessControl>>,
     native: NativeRuntimeIntegration,
     provider: Arc<dyn IStateProvider>,
     settings: Settings,
@@ -28,7 +192,7 @@ struct Replica {
     sample_open_progress: bool,
     retry_open_progress: bool,
 }
-struct OpenedSampler(Arc<crate::FabricReplicator>, bool);
+struct OpenedSampler(Arc<RuntimeReplicator>, bool);
 impl IReplicator for OpenedSampler {
     fn open(&self, cancel: Cancellation) -> ServiceFuture<'_, String> {
         Box::pin(async move {
@@ -108,6 +272,8 @@ impl IStatefulServiceFactory for Factory {
         replica: i64,
     ) -> Result<Box<dyn IStatefulServiceReplica>> {
         Ok(Box::new(Replica {
+            forwarding: self.forwarding,
+            access: self.access.clone(),
             native: self.native.capture(partition, replica)?,
             provider: self.provider.clone(),
             settings: self.settings.clone(),
@@ -128,23 +294,32 @@ impl IStatefulServiceReplica for Replica {
         Box::pin(async move {
             mode.validate()?;
             *self.opening_cancel.lock().unwrap() = Some(cancellation);
-            let fabric = crate::FabricReplicator::create(
+            let partition: Arc<dyn IStatefulServicePartition> = match &self.access {
+                Some(access) => Arc::new(AccessPartition {
+                    inner: partition,
+                    access: access.clone(),
+                }),
+                None => partition,
+            };
+            let fabric = self.native.create_replicator(
                 partition,
-                self.native.clone(),
                 self.provider.clone(),
                 None,
-                crate::extensions::ReplicationEndpointOptions {
+                fube_data::extensions::ReplicationEndpointOptions {
                     listen_address: "127.0.0.1:0".into(),
                     actor_incarnation: uuid::Uuid::new_v4(),
                 },
                 self.settings.clone(),
             )?;
             if let Some(send) = self.created.lock().unwrap().take() {
-                let _ = send.send((fabric.engine.clone(), self.native.clone()));
+                let _ = send.send((Arc::new(Engine::new(fabric.clone())), self.native.clone()));
             }
             if self.sample_open_progress {
                 return Ok(Box::new(OpenedSampler(fabric, self.retry_open_progress))
                     as Box<dyn IPrimaryReplicator>);
+            }
+            if self.forwarding {
+                return Ok(Box::new(rap::DelegatingPrimary(fabric)) as Box<dyn IPrimaryReplicator>);
             }
             Ok(Box::new((*fabric).clone()) as Box<dyn IPrimaryReplicator>)
         })
@@ -210,6 +385,8 @@ impl Fixture {
         let standard = source == self::source(source.replica_id);
         let factory = move |native| -> Box<dyn IStatefulServiceFactory> {
             Box::new(Factory {
+                forwarding: !root,
+                access: None,
                 native,
                 provider: supplied,
                 settings,
@@ -227,7 +404,6 @@ impl Fixture {
             rap::Host::start_source(partition, source, role, factory).await
         };
         let (engine, native) = receive.await.unwrap();
-        engine.native_root_dispatch.store(root, Ordering::Release);
         Self {
             engine,
             provider,
@@ -322,7 +498,6 @@ async fn until(mut condition: impl FnMut() -> bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrective_reserved_deadline_rechecked_after_contended_write_lock() {
-    use std::task::{Context, Poll, Waker};
     for root in [false, true] {
         let p = Fixture::using(
             uuid::Uuid::new_v4(),
@@ -331,48 +506,54 @@ async fn corrective_reserved_deadline_rechecked_after_contended_write_lock() {
             root,
             (
                 MemoryProvider::new(),
-                Arc::new(tests::Provider::with_initial(1)),
+                Arc::new(fixtures::Provider::with_initial(1)),
                 Settings::default(),
             ),
         )
         .await;
         p.host.configure(config(EPOCH, vec![], 1)).await.unwrap();
+        let (entered, prelock) = std_mpsc::sync_channel(1);
+        let (resume_write, paused_write) = std_mpsc::sync_channel(1);
+        *p.engine.shared.write_prelock_pause.lock().unwrap() = Some((entered, paused_write));
         let (held, holding) = std_mpsc::sync_channel(1);
         let (release, resumed) = std_mpsc::sync_channel(1);
+        let (hold, before_hold) = std_mpsc::sync_channel(1);
         let shared = p.engine.shared.clone();
         let lock = std::thread::spawn(move || {
+            before_hold
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
             let _guard = shared.admission.lock().unwrap();
             held.send(()).unwrap();
             resumed
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .unwrap();
         });
-        holding
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
-        let (entered, prelock) = std_mpsc::sync_channel(1);
-        *p.engine.shared.write_prelock.lock().unwrap() = Some(entered);
         // Controlled time boundary avoids expiring native host authority. The
         // same check also uses the real reserved-entry deadline in production.
         *p.engine.shared.write_deadline.lock().unwrap() =
             Some(std::time::Instant::now() + std::time::Duration::from_millis(50));
         let engine = p.engine.clone();
         let submit = std::thread::spawn(move || {
-            let mut future = engine.submit(
-                OperationData::new(vec![vec![1]]).unwrap(),
-                Cancellation::default(),
-            );
-            match future
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-            {
-                Poll::Ready(Err(error)) => Some(error),
-                _ => None,
-            }
+            // Enrollment must finish before contention at enqueue admission.
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(engine.submit(
+                    OperationData::new(vec![vec![1]]).unwrap(),
+                    Cancellation::default(),
+                ))
+                .err()
         });
         prelock
             .recv_timeout(std::time::Duration::from_secs(1))
             .unwrap();
+        hold.send(()).unwrap();
+        holding
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        resume_write.send(()).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         release.send(()).unwrap();
         lock.join().unwrap();
@@ -380,7 +561,7 @@ async fn corrective_reserved_deadline_rechecked_after_contended_write_lock() {
             .join()
             .unwrap()
             .expect("expired write must not enqueue");
-        assert_eq!(error.kind(), fube_runtime::ErrorKind::Timeout);
+        assert_eq!(error.kind(), crate::ErrorKind::Timeout);
         assert_eq!(p.engine.snapshot().progress.assigned, 1);
         assert_eq!(p.engine.snapshot().owned_operations, 0);
         *p.engine.shared.write_deadline.lock().unwrap() = None;
@@ -396,27 +577,29 @@ async fn corrective_real_reserved_entry_deadline_branch_uses_current_authority()
         false,
         (
             MemoryProvider::new(),
-            Arc::new(tests::Provider::with_initial(1)),
+            Arc::new(fixtures::Provider::with_initial(1)),
             Settings::default(),
         ),
     )
     .await;
     p.host.configure(config(EPOCH, vec![], 1)).await.unwrap();
+    let (entered, prelock) = std_mpsc::sync_channel(1);
+    let (resume_write, paused_write) = std_mpsc::sync_channel(1);
+    *p.engine.shared.write_prelock_pause.lock().unwrap() = Some((entered, paused_write));
     let (held, holding) = std_mpsc::sync_channel(1);
     let (release, resumed) = std_mpsc::sync_channel(1);
+    let (hold, before_hold) = std_mpsc::sync_channel(1);
     let shared = p.engine.shared.clone();
     let lock = std::thread::spawn(move || {
+        before_hold
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
         let _guard = shared.admission.lock().unwrap();
         held.send(()).unwrap();
         resumed
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
     });
-    holding
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .unwrap();
-    let (entered, prelock) = std_mpsc::sync_channel(1);
-    *p.engine.shared.write_prelock.lock().unwrap() = Some(entered);
     let permit = p
         .native
         .execution()
@@ -443,6 +626,11 @@ async fn corrective_real_reserved_entry_deadline_branch_uses_current_authority()
     prelock
         .recv_timeout(std::time::Duration::from_secs(1))
         .unwrap();
+    hold.send(()).unwrap();
+    holding
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    resume_write.send(()).unwrap();
     // Exercise the REAL reserved-entry deadline predicate with controlled now,
     // not the synthetic deadline predicate. Hard authority expiry remains
     // separately covered by isolated runtime process-fence regressions.
@@ -450,10 +638,7 @@ async fn corrective_real_reserved_entry_deadline_branch_uses_current_authority()
         Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
     release.send(()).unwrap();
     lock.join().unwrap();
-    assert_eq!(
-        call.await.unwrap_err().kind(),
-        fube_runtime::ErrorKind::Timeout
-    );
+    assert_eq!(call.await.unwrap_err().kind(), crate::ErrorKind::Timeout);
     *p.engine.shared.write_now.lock().unwrap() = None;
     assert_eq!(p.engine.snapshot().progress.assigned, 1);
     assert_eq!(p.engine.snapshot().owned_operations, 0);
@@ -461,7 +646,6 @@ async fn corrective_real_reserved_entry_deadline_branch_uses_current_authority()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fidelity_ordinary_queue_full_has_no_log_record_category_or_reserved_capacity() {
-    use crate::IStateReplicator;
     for root in [false, true] {
         let settings = Settings {
             queue_operations: 4,
@@ -477,14 +661,12 @@ async fn fidelity_ordinary_queue_full_has_no_log_record_category_or_reserved_cap
             root,
             (
                 MemoryProvider::new(),
-                Arc::new(tests::Provider::with_initial(1)),
+                Arc::new(fixtures::Provider::with_initial(1)),
                 settings.clone(),
             ),
         )
         .await;
-        let lower = crate::FabricReplicator {
-            engine: p.engine.clone(),
-        };
+        let lower = p.engine.control.get_state_replicator();
         let data = OperationData::with_settings(vec![vec![1]], &settings).unwrap();
         let (network, _incoming) = PeerTransport::bind("127.0.0.1:0", settings.clone()).unwrap();
         let mut peer = p.descriptor(ReplicaRole::ActiveSecondary);
@@ -563,10 +745,7 @@ async fn fidelity_ordinary_queue_full_has_no_log_record_category_or_reserved_cap
                 .await
                 .err()
                 .unwrap();
-            assert_eq!(
-                rejected.kind(),
-                fube_runtime::ErrorKind::ReplicationQueueFull
-            );
+            assert_eq!(rejected.kind(), crate::ErrorKind::ReplicationQueueFull);
             assert_eq!(p.engine.snapshot().progress.assigned, 5);
         }
         p.host.configure(config(EPOCH, vec![], 1)).await.unwrap();
@@ -596,7 +775,6 @@ async fn fidelity_ordinary_queue_full_has_no_log_record_category_or_reserved_cap
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_lower_identity_survives_stop_before_deferred_reply_poll() {
-    use crate::IStateReplicator;
     let p = Fixture::using(
         uuid::Uuid::new_v4(),
         source(1),
@@ -604,7 +782,7 @@ async fn accepted_lower_identity_survives_stop_before_deferred_reply_poll() {
         false,
         (
             MemoryProvider::new(),
-            Arc::new(tests::Provider::with_initial(1)),
+            Arc::new(fixtures::Provider::with_initial(1)),
             Settings::default(),
         ),
     )
@@ -613,9 +791,7 @@ async fn accepted_lower_identity_survives_stop_before_deferred_reply_poll() {
     let (entered, published) = std_mpsc::sync_channel(1);
     let (release, resumed) = std_mpsc::sync_channel(1);
     *p.engine.shared.write_reply_pause.lock().unwrap() = Some((entered, resumed));
-    let lower = crate::FabricReplicator {
-        engine: p.engine.clone(),
-    };
+    let lower = p.engine.control.get_state_replicator();
     let write = tokio::spawn(async move {
         lower
             .replicate(
@@ -649,7 +825,7 @@ async fn accepted_lower_identity_survives_stop_before_deferred_reply_poll() {
 async fn issued_new_and_recreated_senders_use_current_progress_but_repeats_keep_live_counters() {
     for root in [false, true] {
         let partition = uuid::Uuid::new_v4();
-        let log = Arc::new(tests::Provider::with_initial(20));
+        let log = Arc::new(fixtures::Provider::with_initial(20));
         let p = Fixture::using(
             partition,
             source(1),
@@ -964,6 +1140,8 @@ async fn initial_progress_completed_callback_cannot_publish_after_native_cancel_
                 ReplicaRole::Primary,
                 move |native| {
                     Box::new(Factory {
+                        forwarding: false,
+                        access: None,
                         native,
                         provider: supplied,
                         settings,
@@ -1019,6 +1197,8 @@ async fn initial_progress_completed_callback_cannot_publish_after_native_cancel_
             ReplicaRole::Primary,
             move |native| {
                 Box::new(Factory {
+                    forwarding: false,
+                    access: None,
                     native,
                     provider: supplied,
                     settings: Settings::default(),
@@ -1069,6 +1249,8 @@ async fn cancelled_coalesced_primary_does_not_fault_valid_opened_getter_retry() 
             ReplicaRole::Primary,
             move |native| {
                 Box::new(Factory {
+                    forwarding: false,
+                    access: None,
                     native,
                     provider: supplied,
                     settings: Settings::default(),
@@ -1106,7 +1288,7 @@ async fn cancelled_coalesced_primary_does_not_fault_valid_opened_getter_retry() 
     let (host, opened) = started.await.unwrap();
     assert_eq!(
         primary_result.unwrap_err().kind(),
-        fube_runtime::ErrorKind::ObjectClosed
+        crate::ErrorKind::ObjectClosed
     );
     assert!(
         opened.is_ok(),
@@ -1121,8 +1303,8 @@ async fn cancelled_coalesced_primary_does_not_fault_valid_opened_getter_retry() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owned_native_bound_duplicate_secondary_epoch_enters_lower_while_copy_ack_is_pending() {
     let partition = uuid::Uuid::new_v4();
-    let source = tests::upper_log::UpperLog::new(EPOCH, 100);
-    let upper = tests::upper_log::UpperLog::new(EPOCH, 1);
+    let source = upper_log::UpperLog::new(EPOCH, 100);
+    let upper = upper_log::UpperLog::new(EPOCH, 1);
     let p = Fixture::using(
         partition,
         self::source(1),
@@ -1201,7 +1383,7 @@ async fn owned_native_bound_duplicate_secondary_epoch_enters_lower_while_copy_ac
 async fn owned_lower_secondary_controls_use_traffic_admission_epoch_without_provider_slots() {
     for start_newer in [false, true] {
         let partition = uuid::Uuid::new_v4();
-        let upper = tests::upper_log::UpperLog::new(EPOCH, 1);
+        let upper = upper_log::UpperLog::new(EPOCH, 1);
         let s = Fixture::using(
             partition,
             source(2),

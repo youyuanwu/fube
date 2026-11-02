@@ -1,566 +1,176 @@
-#[tokio::test]
-async fn every_sibling_and_nested_release_acknowledges_its_own_tracker() {
-    let runtime = runtime();
-    for shared_tracker in [false, true] {
-        let first = DisposalTracker::default();
-        let second = if shared_tracker {
-            first.clone()
-        } else {
-            DisposalTracker::default()
-        };
-        let quota = ObjectQuota::new(2).unwrap();
-        let a = runtime.reserve_object(&quota, &first).unwrap();
-        let b = runtime.reserve_object(&quota, &second).unwrap();
-        let (entered, mut entered_rx) = tokio::sync::mpsc::channel(2);
-        let release = Arc::new((Mutex::new(false), Condvar::new()));
-        struct Value(tokio::sync::mpsc::Sender<()>, Arc<(Mutex<bool>, Condvar)>);
-        impl Drop for Value {
-            fn drop(&mut self) {
-                self.0.try_send(()).unwrap();
-                let ready = self.1 .0.lock().unwrap();
-                let (ready, _) = self
-                    .1
-                     .1
-                    .wait_timeout_while(ready, Duration::from_secs(2), |v| !*v)
-                    .unwrap();
-                assert!(*ready);
-            }
-        }
-        let released = release.clone();
-        let call = runtime.try_reserve().unwrap().run_owned(move || {
-            let a = a.publish(Value(entered.clone(), released.clone()));
-            let b = b.publish(Value(entered, released));
-            drop((a, b));
-            Ok(())
-        });
-        for _ in 0..2 {
-            tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        }
-        *release.0.lock().unwrap() = true;
-        release.1.notify_all();
-        call.await.unwrap();
-        assert!(first.is_drained());
-        assert!(second.is_drained());
-    }
-    let outer_tracker = DisposalTracker::default();
-    let inner_tracker = DisposalTracker::default();
-    let quota = ObjectQuota::new(2).unwrap();
-    let outer = runtime.reserve_object(&quota, &outer_tracker).unwrap();
-    let inner = runtime.reserve_object(&quota, &inner_tracker).unwrap();
-    let call = runtime.try_reserve().unwrap().run_owned(move || {
-        drop(outer.publish(inner.publish(5usize)));
-        Ok(())
-    });
-    call.await.unwrap();
-    assert!(outer_tracker.is_drained() && inner_tracker.is_drained());
-    runtime.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn cancellation_between_result_check_and_commit_disposes_result_before_finished() {
-    let runtime = runtime();
-    let (release, resume) = mpsc::sync_channel(1);
-    let pause = Arc::new(CleanupPause {
-        entered: Notify::new(),
-        resume: Mutex::new(resume),
-    });
-    *runtime.inner.cleanup_pause.lock().unwrap() = Some(pause.clone());
-    let (dropped, mut drop_rx) = tokio::sync::oneshot::channel();
-    struct Value(Option<tokio::sync::oneshot::Sender<String>>);
-    impl Drop for Value {
-        fn drop(&mut self) {
-            let _ = self
-                .0
-                .take()
-                .unwrap()
-                .send(std::thread::current().name().unwrap().to_owned());
-        }
-    }
-    let call = runtime
-        .try_reserve()
-        .unwrap()
-        .run_owned(move || Ok(Value(Some(dropped))));
-    tokio::time::timeout(Duration::from_secs(1), pause.entered.notified())
-        .await
-        .unwrap();
-    let disposition = call.disposition();
-    disposition.cancel();
-    assert!(!disposition.is_finished());
-    assert!(matches!(
-        drop_rx.try_recv(),
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-    ));
-    release.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(1), call.cancel_and_wait())
-        .await
-        .unwrap();
-    assert_eq!(drop_rx.await.unwrap(), "fube-owned-cleanup");
-    assert!(disposition.is_finished());
-    runtime.shutdown().await.unwrap();
-}
-
 use super::*;
-use std::sync::{atomic::AtomicUsize, mpsc};
-
-fn runtime() -> ExecutionRuntime {
-    ExecutionRuntime::standalone(tokio::runtime::Handle::current()).unwrap()
-}
+use std::time::{Duration, Instant};
 
 #[tokio::test]
-async fn capture_free_reservation_shares_64_slots_and_unused_permit_has_no_user_value() {
-    let runtime = runtime();
-    let mut permits = Vec::new();
-    for lane in [CallLane::Native, CallLane::Provider] {
-        for _ in 0..32 {
-            permits.push(
-                runtime
-                    .reserve(lane, CallOrigin::default(), Duration::from_secs(30), false)
-                    .unwrap(),
-            );
-        }
+async fn neutral_authority_backend_keeps_runtime_slots_deadlines_and_thread_accounting() {
+    let authority = Authority::new(Instant::now() - Duration::from_secs(1), 1_000_000_000).unwrap();
+    let backend: Arc<dyn fube_core::hosting::ExecutionAuthority> = authority.clone();
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        held.push(backend.clone().reserve_callback_deadline(false).unwrap());
     }
-    let caller_value = Box::new(73);
     assert!(matches!(
-        runtime.try_reserve(),
-        Err(Error::ResourceLimit(_))
+        authority.reserve_callback_deadline(false),
+        Err(Error::ResourceLimit("callback deadline slots"))
     ));
-    assert!(matches!(
-        runtime.reserve(
-            CallLane::Provider,
-            CallOrigin::default(),
-            Duration::from_secs(30),
-            false
-        ),
-        Err(Error::ResourceLimit(_))
-    ));
-    assert_eq!(*caller_value, 73);
-    assert_eq!(runtime.inner.outstanding.available_permits(), 0);
-    drop(permits);
-    assert_eq!(runtime.inner.outstanding.available_permits(), 64);
-    runtime.shutdown().await.unwrap();
+    drop(held);
+    let deadline = backend.clone().reserve_callback_deadline(false).unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    deadline.arm_until(until);
+    assert!(authority.remaining().unwrap() <= Duration::from_secs(2));
+    deadline.set_effective_until(until + Duration::from_secs(10));
+    assert!(authority.remaining().unwrap() <= Duration::from_secs(2));
+    let expired = Instant::now() - Duration::from_millis(10);
+    deadline.set_effective_until(expired);
+    drop(deadline);
+    assert_eq!(authority.retired_at_for_test(), Some(expired));
+    assert!(authority
+        .renew(Instant::now(), 1_000_000_000, Instant::now())
+        .is_err());
+    let earlier = expired - Duration::from_millis(10);
+    backend.retire_at(earlier);
+    backend.retire_at(until);
+    assert_eq!(authority.retired_at_for_test(), Some(earlier));
+
+    let thread = backend.own_thread(std::thread::spawn(|| {}));
+    thread.join_finished().await.unwrap();
+    thread.join_finished().await.unwrap();
+    authority.disarm().unwrap();
+    assert!(backend.clone().reserve_callback_deadline(true).is_err());
 }
 
 #[tokio::test]
-async fn accepted_root_construction_poll_and_capture_drop_leave_observer_executor() {
-    let runtime = runtime();
-    let (dropped, drop_rx) = mpsc::sync_channel(1);
-    struct Capture(mpsc::SyncSender<String>);
-    impl Drop for Capture {
-        fn drop(&mut self) {
-            self.0
-                .send(std::thread::current().name().unwrap().to_owned())
-                .unwrap();
-        }
-    }
-    let capture = Capture(dropped);
-    let call = runtime.try_reserve().unwrap().run_future(async move {
-        assert_eq!(std::thread::current().name(), Some("fube-native-call"));
-        let _capture = capture;
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        assert_eq!(std::thread::current().name(), Some("fube-native-call"));
-        Ok(17)
-    });
-    assert_eq!(call.await.unwrap(), 17);
-    // The Rust async future may destroy a completed local on its final poll;
-    // this is still the accepted blocking lane under the active root guard.
-    let thread = drop_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert!(thread == "fube-native-call" || thread == "fube-owned-cleanup");
-    runtime.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn eager_unobserved_result_is_disposed_on_reserved_cleanup() {
-    let runtime = runtime();
-    let (entered, entered_rx) = tokio::sync::oneshot::channel();
-    let (dropped, mut dropped_rx) = tokio::sync::oneshot::channel();
-    struct Value(Option<tokio::sync::oneshot::Sender<String>>);
-    impl Drop for Value {
-        fn drop(&mut self) {
-            let _ = self
-                .0
-                .take()
-                .unwrap()
-                .send(std::thread::current().name().unwrap().to_owned());
-        }
-    }
-    let call = runtime.try_reserve().unwrap().run_owned(move || {
-        entered.send(()).unwrap();
-        Ok(Value(Some(dropped)))
-    });
-    entered_rx.await.unwrap(); // Submission happened without polling `call`.
-    drop(call);
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), &mut dropped_rx)
-            .await
-            .unwrap()
-            .unwrap(),
-        "fube-owned-cleanup"
-    );
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let notified = runtime.inner.changed.notified();
-            if runtime.inner.outstanding.available_permits() == 64 {
-                break;
-            }
-            notified.await;
-        }
-    })
-    .await
-    .unwrap();
-    runtime.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn coalesced_wakes_never_poll_the_pinned_root_concurrently() {
-    let runtime = runtime();
-    struct Repeated {
-        polls: usize,
-        active: Arc<AtomicUsize>,
-    }
-    impl Future for Repeated {
-        type Output = Result<usize>;
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            assert_eq!(self.active.fetch_add(1, Ordering::SeqCst), 0);
-            self.polls += 1;
-            for _ in 0..100 {
-                cx.waker().wake_by_ref();
-            }
-            self.active.fetch_sub(1, Ordering::SeqCst);
-            if self.polls == 100 {
-                Poll::Ready(Ok(self.polls))
-            } else {
-                Poll::Pending
-            }
-        }
-    }
-    let call = runtime.try_reserve().unwrap().run_future(Repeated {
-        polls: 0,
-        active: Arc::new(AtomicUsize::new(0)),
-    });
-    assert_eq!(call.await.unwrap(), 100);
-    runtime.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn implicit_application_spawn_is_not_a_lane_or_internal_core_task() {
-    let runtime = runtime();
-    let value = runtime
+async fn borrowed_execution_shutdown_requires_the_exact_host_backend() {
+    let authority = Authority::new(Instant::now(), 1_000_000_000).unwrap();
+    let execution = new(authority.clone(), tokio::runtime::Handle::current());
+    assert!(execution.finish_standalone().await.is_err());
+    let foreign = Authority::new(Instant::now(), 1_000_000_000).unwrap();
+    assert!(shutdown(&execution, &foreign).await.is_err());
+    execution
         .try_reserve()
         .unwrap()
-        .run_future(async {
-            let thread = tokio::spawn(async {
-                std::thread::current()
-                    .name()
-                    .unwrap_or("application")
-                    .to_owned()
+        .run_owned(|| Ok(()))
+        .await
+        .unwrap();
+    shutdown(&execution, &authority).await.unwrap();
+    assert!(execution.try_reserve().is_err());
+    authority.disarm().unwrap();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InvocationHelper {
+    Invoke,
+    Creation,
+    Cleanup,
+}
+
+async fn invoke_helper(
+    helper: InvocationHelper,
+    execution: &ExecutionRuntime,
+    operation: impl std::future::Future<Output = Result<()>> + Send + 'static,
+) -> Result<()> {
+    let timeout = Duration::from_secs(1);
+    match helper {
+        InvocationHelper::Invoke => execution.invoke(timeout, operation).await,
+        InvocationHelper::Creation => {
+            let ((), publication) = execution.invoke_creation(timeout, operation).await?;
+            publication.accept()
+        }
+        InvocationHelper::Cleanup => execution.invoke_cleanup(timeout, operation).await,
+    }
+}
+
+async fn invocation_helpers_keep_exact_owner(foreign_native: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let authority = Authority::new(Instant::now(), 1_000_000_000).unwrap();
+    let execution = new(authority.clone(), tokio::runtime::Handle::current());
+    let foreign_authority =
+        foreign_native.then(|| Authority::new(Instant::now(), 1_000_000_000).unwrap());
+    let foreign = match &foreign_authority {
+        Some(authority) => new(authority.clone(), tokio::runtime::Handle::current()),
+        None => ExecutionRuntime::standalone(tokio::runtime::Handle::current()).unwrap(),
+    };
+    for helper in [
+        InvocationHelper::Invoke,
+        InvocationHelper::Creation,
+        InvocationHelper::Cleanup,
+    ] {
+        let owner = execution.clone();
+        let other = foreign.clone();
+        let polled = Arc::new(AtomicBool::new(false));
+        let observed = polled.clone();
+        foreign
+            .try_reserve()
+            .unwrap()
+            .run_future(async move {
+                assert!(other.is_current_entry());
+                assert!(!owner.is_current_entry());
+                let deadline = other.current_deadline()?;
+                let origin = ExecutionRuntime::current_origin();
+                let cleanup = ExecutionRuntime::is_cleanup_entry();
+                let error = invoke_helper(helper, &owner, async move {
+                    observed.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
+                assert_eq!(error.kind(), crate::ErrorKind::InvalidExecutionContext);
+                assert!(other.is_current_entry());
+                assert!(!owner.is_current_entry());
+                assert_eq!(other.current_deadline()?, deadline);
+                assert!(owner.current_deadline().is_err());
+                assert_eq!(ExecutionRuntime::current_origin(), origin);
+                assert_eq!(ExecutionRuntime::is_cleanup_entry(), cleanup);
+                Ok(())
             })
             .await
             .unwrap();
-            assert_ne!(thread, "fube-native-call");
-            assert_ne!(thread, "fube-host-core");
-            assert_ne!(thread, "fube-engine");
-            assert_ne!(thread, "fube-peer");
-            Ok(())
-        })
-        .await;
-    value.unwrap();
-    runtime.shutdown().await.unwrap();
-}
+        assert!(!polled.load(Ordering::SeqCst), "{helper:?}");
 
-#[tokio::test]
-async fn published_object_is_dormant_and_final_disposal_has_a_separate_budget() {
-    let runtime = runtime();
-    let tracker = DisposalTracker::default();
-    let quota = ObjectQuota::new(1).unwrap();
-    let ticket = runtime.reserve_object(&quota, &tracker).unwrap();
-    let object = runtime
-        .reserve(
-            CallLane::Native,
-            CallOrigin::default(),
-            Duration::from_millis(50),
-            false,
-        )
-        .unwrap()
-        .run_owned(move || Ok(ticket.publish(41usize)))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    runtime.inner.authority.check().unwrap();
-    assert_eq!(runtime.inner.outstanding.available_permits(), 64);
-    assert_eq!(*object.get(), 41);
-    assert_eq!(
-        runtime.inner.dormant.available_permits(),
-        DORMANT_TICKETS - 1
-    );
-    drop(object);
-    tracker.drained().await;
-    runtime.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn root_result_waits_for_its_managed_child_actual_destructor() {
-    let runtime = runtime();
-    let tracker = DisposalTracker::default();
-    let quota = ObjectQuota::new(1).unwrap();
-    let (entered, entered_rx) = tokio::sync::oneshot::channel();
-    let (release, release_rx) = mpsc::sync_channel(1);
-    struct Value(Option<tokio::sync::oneshot::Sender<()>>, mpsc::Receiver<()>);
-    impl Drop for Value {
-        fn drop(&mut self) {
-            assert_eq!(std::thread::current().name(), Some("fube-owned-cleanup"));
-            self.0.take().unwrap().send(()).unwrap();
-            self.1.recv_timeout(Duration::from_secs(2)).unwrap();
-        }
-    }
-    let ticket = runtime.reserve_object(&quota, &tracker).unwrap();
-    let mut call = runtime.try_reserve().unwrap().run_owned(move || {
-        let object = ticket.publish(Value(Some(entered), release_rx));
-        drop(object);
-        Ok(())
-    });
-    entered_rx.await.unwrap();
-    assert!(tokio::time::timeout(Duration::from_millis(20), &mut call)
-        .await
-        .is_err());
-    release.send(()).unwrap();
-    call.await.unwrap();
-    runtime.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn cancellation_drops_child_owning_result_before_waiting_for_its_child() {
-    let runtime = runtime();
-    let owner = runtime.clone();
-    let (returned, returned_rx) = tokio::sync::oneshot::channel();
-    let mut call = runtime.try_reserve().unwrap().run_owned(move || {
-        let child = owner.reserve_cleanup(Duration::from_secs(30))?;
-        returned.send(()).unwrap();
-        Ok(child)
-    });
-    let disposition = call.disposition();
-    returned_rx.await.unwrap();
-    assert!(tokio::time::timeout(Duration::from_millis(20), &mut call)
-        .await
-        .is_err());
-    drop(call);
-    tokio::time::timeout(Duration::from_secs(1), disposition.wait())
-        .await
-        .unwrap();
-    assert!(disposition.is_finished());
-    tokio::time::timeout(Duration::from_secs(1), runtime.shutdown())
-        .await
-        .unwrap()
-        .unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn full_native_workers_do_not_occupy_provider_or_reserved_cleanup_workers() {
-    let runtime = runtime();
-    let release = Arc::new((Mutex::new(false), Condvar::new()));
-    let (entered, mut entered_rx) = tokio::sync::mpsc::channel(32);
-    let mut native = Vec::new();
-    for _ in 0..32 {
-        let release = release.clone();
-        let entered = entered.clone();
-        native.push(runtime.try_reserve().unwrap().run_owned(move || {
-            entered.try_send(()).unwrap();
-            let (lock, changed) = &*release;
-            let ready = lock.lock().unwrap();
-            let (ready, timeout) = changed
-                .wait_timeout_while(ready, Duration::from_secs(3), |ready| !*ready)
-                .unwrap();
-            assert!(*ready && !timeout.timed_out());
-            Ok(())
-        }));
-    }
-    for _ in 0..32 {
-        tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
-            .await
+        let owner = execution.clone();
+        let other = foreign.clone();
+        execution
+            .try_reserve()
             .unwrap()
-            .unwrap();
-    }
-    let provider = runtime
-        .reserve(
-            CallLane::Provider,
-            CallOrigin::default(),
-            Duration::from_secs(30),
-            false,
-        )
-        .unwrap()
-        .run_owned(|| {
-            assert_eq!(std::thread::current().name(), Some("fube-provider-call"));
-            Ok(())
-        });
-    tokio::time::timeout(Duration::from_secs(1), provider)
-        .await
-        .unwrap()
-        .unwrap();
-    let tracker = DisposalTracker::default();
-    let quota = ObjectQuota::new(1).unwrap();
-    let ticket = runtime.reserve_object(&quota, &tracker).unwrap();
-    let (dropped, drop_rx) = tokio::sync::oneshot::channel();
-    struct Value(Option<tokio::sync::oneshot::Sender<String>>);
-    impl Drop for Value {
-        fn drop(&mut self) {
-            let _ = self
-                .0
-                .take()
-                .unwrap()
-                .send(std::thread::current().name().unwrap().to_owned());
-        }
-    }
-    drop(ticket.publish(Value(Some(dropped))));
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), drop_rx)
-            .await
-            .unwrap()
-            .unwrap(),
-        "fube-owned-cleanup"
-    );
-    *release.0.lock().unwrap() = true;
-    release.1.notify_all();
-    for call in native {
-        call.await.unwrap();
-    }
-    runtime.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn queued_cancellation_disposes_captures_without_readmitting_stale_tasks() {
-    let runtime = runtime();
-    let release = Arc::new((Mutex::new(false), Condvar::new()));
-    let (entered, mut entered_rx) = tokio::sync::mpsc::channel(32);
-    let mut running = Vec::new();
-    for _ in 0..32 {
-        let release = release.clone();
-        let entered = entered.clone();
-        running.push(
-            runtime
-                .reserve(
-                    CallLane::Provider,
-                    CallOrigin::default(),
-                    Duration::from_secs(30),
-                    false,
-                )
-                .unwrap()
-                .run_owned(move || {
-                    entered.try_send(()).unwrap();
-                    let ready = release.0.lock().unwrap();
-                    let (ready, _) = release
-                        .1
-                        .wait_timeout_while(ready, Duration::from_secs(5), |ready| !*ready)
-                        .unwrap();
-                    assert!(*ready);
+            .run_future(async move {
+                let deadline = owner.current_deadline()?;
+                let origin = ExecutionRuntime::current_origin();
+                let current = owner.clone();
+                invoke_helper(helper, &owner, async move {
+                    assert!(current.is_current_entry());
+                    assert!(!other.is_current_entry());
+                    assert!(current.current_deadline()? <= deadline);
+                    assert!(other.current_deadline().is_err());
+                    assert_eq!(ExecutionRuntime::current_origin(), origin);
+                    tokio::task::yield_now().await;
+                    assert!(current.is_current_entry());
+                    assert!(!other.is_current_entry());
                     Ok(())
-                }),
-        );
-    }
-    for _ in 0..32 {
-        tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    }
-    let (dropped, mut drop_rx) = tokio::sync::mpsc::channel(32);
-    struct Capture(tokio::sync::mpsc::Sender<()>);
-    impl Drop for Capture {
-        fn drop(&mut self) {
-            assert_eq!(std::thread::current().name(), Some("fube-owned-cleanup"));
-            self.0.try_send(()).unwrap();
-        }
-    }
-    let mut queued = Vec::new();
-    for _ in 0..32 {
-        let capture = Capture(dropped.clone());
-        queued.push(
-            runtime
-                .reserve(
-                    CallLane::Provider,
-                    CallOrigin::default(),
-                    Duration::from_secs(30),
-                    false,
-                )
-                .unwrap()
-                .run_future(async move {
-                    let _capture = capture;
-                    panic!("canceled queued application root was polled");
-                    #[allow(unreachable_code)]
-                    Ok(())
-                }),
-        );
-    }
-    let dispositions: Vec<_> = queued.iter().map(OwnedCall::disposition).collect();
-    drop(queued);
-    for disposition in dispositions {
-        tokio::time::timeout(Duration::from_secs(2), disposition.wait())
+                })
+                .await
+            })
             .await
             .unwrap();
     }
-    for _ in 0..32 {
-        tokio::time::timeout(Duration::from_secs(2), drop_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            runtime.try_reserve(),
-            Err(Error::ResourceLimit(_))
-        ));
+    shutdown(&execution, &authority).await.unwrap();
+    authority.disarm().unwrap();
+    if let Some(authority) = foreign_authority {
+        shutdown(&foreign, &authority).await.unwrap();
+        authority.disarm().unwrap();
+    } else {
+        foreign.finish_standalone().await.unwrap();
     }
-    *release.0.lock().unwrap() = true;
-    release.1.notify_all();
-    for call in running {
-        call.await.unwrap();
-    }
-    let permits: Vec<_> = (0..64)
-        .map(|_| {
-            runtime
-                .reserve(
-                    CallLane::Provider,
-                    CallOrigin::default(),
-                    Duration::from_secs(30),
-                    false,
-                )
-                .unwrap()
-        })
-        .collect();
-    drop(permits);
-    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn canceled_shutdown_observer_retains_tasks_and_can_resume_real_joins() {
-    let runtime = runtime();
-    let (entered, entered_rx) = tokio::sync::oneshot::channel();
-    let call = runtime.try_reserve().unwrap().run_future(async {
-        entered.send(()).unwrap();
-        std::future::pending::<Result<()>>().await
-    });
-    entered_rx.await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(10), runtime.shutdown())
-            .await
-            .is_err()
-    );
-    call.cancel_and_wait().await;
-    tokio::time::timeout(Duration::from_secs(2), runtime.shutdown())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(
-        *runtime.inner.joins.lock().await,
-        ShutdownJoins::Complete
-    ));
-    for tasks in [
-        &runtime.inner.native,
-        &runtime.inner.provider,
-        &runtime.inner.cleanup,
-    ] {
-        let state = tasks.state.lock().unwrap();
-        assert!(state.runtime.is_none() && state.joins.is_empty() && state.tickets.is_empty());
-    }
+async fn invocation_helpers_reject_foreign_standalone_and_keep_exact_native_owner() {
+    invocation_helpers_keep_exact_owner(false).await;
+}
+
+#[tokio::test]
+async fn invocation_helpers_reject_foreign_native_and_keep_exact_native_owner() {
+    invocation_helpers_keep_exact_owner(true).await;
 }
 
 #[test]
@@ -571,14 +181,14 @@ fn parentless_final_release_at_full64_is_fenced_without_inline_drop() {
             .enable_all()
             .build()
             .unwrap();
-        let runtime = ExecutionRuntime::standalone(app.handle().clone()).unwrap();
-        runtime.inner.authority.watchdog().unwrap();
+        let authority = Authority::new(Instant::now(), 100_000_000).unwrap();
+        authority.watchdog().unwrap();
+        let runtime = new(authority, app.handle().clone());
         let quota = ObjectQuota::new(1).unwrap();
         let tracker = DisposalTracker::default();
         struct MustRemainOwned;
         impl Drop for MustRemainOwned {
             fn drop(&mut self) {
-                // This entire adversarial witness is confined to the child.
                 unsafe { libc::_exit(84) }
             }
         }
@@ -597,8 +207,11 @@ fn parentless_final_release_at_full64_is_fenced_without_inline_drop() {
             }
         }
         drop(object);
-        assert_eq!(runtime.inner.outstanding.available_permits(), 0);
-        assert_eq!(tracker.pending.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            runtime.try_reserve(),
+            Err(Error::ResourceLimit(_))
+        ));
+        assert!(!tracker.is_drained());
         std::hint::black_box(&permits);
         loop {
             std::thread::park_timeout(Duration::from_secs(1));

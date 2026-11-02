@@ -491,7 +491,7 @@ impl PeerTransport {
     pub fn shutdown(&self) {
         self.handle.shutdown();
     }
-    pub(crate) fn shutdown_checked(&self) -> Result<()> {
+    pub fn shutdown_checked(&self) -> Result<()> {
         self.handle.shutdown_checked()
     }
     pub(crate) fn request_stop(&self) {

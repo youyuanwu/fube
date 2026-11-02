@@ -18,58 +18,16 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
-pub const MAX_REPORT_METRICS: usize = 64;
-pub const MAX_REPORT_NAME_UNITS: usize = 4096;
+pub use fube_core::sdk::{
+    HealthInformation, HealthReportSendOption, HealthState, LoadMetric, MoveCost,
+    MAX_REPORT_METRICS, MAX_REPORT_NAME_UNITS,
+};
 /// Leaves ordinary transport admission available for independent lease polls.
 pub const MAX_CONCURRENT_REPORTS: usize = 16;
 const REPORT_TIMEOUT: Duration = Duration::from_secs(30);
 const FAULT_RETRY: Duration = Duration::from_secs(30);
 static SEQUENCE: AtomicI64 = AtomicI64::new(0);
 
-/// A custom metric declared in the current native service description.
-#[derive(Debug, Clone)]
-pub struct LoadMetric {
-    pub name: String,
-    /// Native application reporting requires a value strictly less than INT_MAX.
-    pub value: u32,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Pinned native costs 0–3. Newer mssf VeryHigh is intentionally unavailable.
-pub enum MoveCost {
-    Zero,
-    Low,
-    Medium,
-    High,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HealthState {
-    Invalid,
-    Ok,
-    Warning,
-    Error,
-}
-/// UTF-8 health values. TTL is in seconds; zero is infinite. Sequence zero is
-/// process-auto; negative values are invalid. This profile directly sends both
-/// Immediate values and awaits an exact HM result, not SDK batching admission.
-/// Only Ok/Warning/Error are accepted. Source/property are nonempty bounded
-/// UTF-16-compatible text without NUL; System* and DeleteProperty are reserved.
-/// Descriptions above 4096 UTF-16 units are rejected, not truncated.
-#[derive(Debug, Clone)]
-pub struct HealthInformation {
-    pub source_id: String,
-    pub property: String,
-    pub time_to_live_seconds: u32,
-    pub state: HealthState,
-    pub description: String,
-    pub sequence_number: i64,
-    pub remove_when_expired: bool,
-}
-#[derive(Debug, Clone)]
-/// Both values directly send, with no intentional reporting-interval delay.
-/// This is not SDK default batching/retry parity or guaranteed HM delivery.
-pub struct HealthReportSendOption {
-    pub immediate: bool,
-}
 impl TryFrom<&HealthInformation> for HealthReport {
     type Error = Error;
     fn try_from(value: &HealthInformation) -> Result<Self> {
@@ -186,7 +144,7 @@ impl Reporting {
         &self,
         future: impl std::future::Future<Output = Result<T>> + Send + 'static,
     ) -> Result<T> {
-        let deadline = crate::extensions::ExecutionRuntime::blocking_deadline_for(&self.authority)?
+        let deadline = crate::execution::blocking_deadline_for(&self.authority)?
             .min(std::time::Instant::now() + REPORT_TIMEOUT);
         self.check()?;
         let (send, receive) = std::sync::mpsc::sync_channel(1);

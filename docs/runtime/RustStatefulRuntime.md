@@ -58,8 +58,8 @@ rejected.
    A published address or a cached
    role alone is not permission to serve. Shutdown is explicit and awaited.
 
-API: [factory/lifecycle/control Rustdoc](../../crates/libs/fube-runtime/src/stateful_api.rs#L117-L232),
-[object-safe partitions](../../crates/libs/fube-runtime/src/stateful_api.rs#L314-L359),
+API: [factory/lifecycle/control contracts](../../crates/libs/fube-core/src/sdk/stateful.rs#L47-L168),
+[object-safe partitions](../../crates/libs/fube-core/src/sdk/stateful.rs#L201-L266),
 [registration](../../crates/libs/fube-runtime/src/lib.rs#L595-L623).
 All selected reporting routes are implemented; storage is the separate data layer.
 Canonical sync configuration/removal must run on an owned blocking entry; they
@@ -109,7 +109,7 @@ acknowledgment, persistence or replacement**.
 bounded retry/error/cancellation snapshot. Retries run on the installing Runtime
 executor until unit disposal, not on a calling provider/engine executor; stale
 handles and retired process authority cannot start queued fault frames.
-The native-bound `fube-data::FabricReplicator` reports one transient
+The lower reports through a narrow runtime-owned health adapter, which sends one transient
 notification for a terminal engine fault (including an internal provider
 barrier failure without an active RAP callback), never for normal Close/Abort
 or ordinary write backpressure/cancellation. Close/Abort cancels its receipt
@@ -117,6 +117,25 @@ wait and joins owned cleanup; the Runtime retains only fault DTOs/authority/
 connection state for retries, not service/replicator participants. Standalone
 out-of-host construction has no native reporting authority. These fault-delivery paths
 have source-contract tests; native recovery validation remains pending.
+
+Supported lower construction is
+`native.create_replicator(partition, provider, replay, endpoint, settings)` in
+the owning service Open callback
+([helper](../../crates/libs/fube-runtime/src/replication.rs#L181-L272)).
+Runtime claims identity/one engine and invokes data's replication-defined
+factory, then wraps that same lower. The actual service-returned composite/
+forwarder remains RAP's canonical target. SDK/errors and generic finite execution
+live in `fube-core`; runtime retains lease/callback slots/watchdog and interpretation
+of original control/cleanup records. Data cannot access NativeRuntimeIntegration,
+NativeInvocation or RAP diagnostics. This is native-style interface separation,
+including narrow internal factory/health seams, not SDK-only purity or a new
+native ABI. See [the boundary and access mapping](FubeData.md#runtimereplication-boundary).
+The factory-created per-owner hosting endpoint stays private in the runtime
+adapter, separate from public diagnostics/state views. The retained partition
+wrapper's getter/error disposal and final capture release participate in finite
+owner-matched supervision; the actual queued access read uses its original
+deadline outside owner/admission locks. These are Rust hosting guarantees, not
+additional native interoperability qualification.
 
 The data profile's executed native qualification now also covers primary
 failure/replacement, copy and per-unit isolation; see [its exact evidence and
@@ -215,7 +234,7 @@ replicator roles. Access uses native role/stage/minimum/PC/CC availability rules
 then the partition overlays lifetime and host authority. Pre-write revocation
 cannot be undone by a same-epoch retry. Granted diagnostics **do not introduce
 an application write operation**; canonical `ReplicaStatus` is only Invalid/Down/Up
-([access state machine](../../crates/libs/fube-runtime/src/stateful_api.rs#L406-L519)).
+([access state machine](../../crates/libs/fube-runtime/src/stateful_api.rs#L168-L276)).
 
 The sample's service route requires live authority, matching desired/service/
 replicator Primary roles and granted read access; its diagnostic route is

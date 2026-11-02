@@ -10,10 +10,10 @@
 
 use crate::extensions::{ReplayCheckpointProvider, ReplayOperation};
 use crate::{Cancellation, Epoch, IOperationDataStream, IStateProvider, OperationData, Result};
-use fube_runtime::extensions::{
+use fube_core::hosting::{
     DisposalTracker, ExecutionRuntime, ManagedObject, ObjectQuota, ObjectReservation,
 };
-use fube_runtime::ApiFuture as ServiceFuture;
+use fube_core::ApiFuture as ServiceFuture;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -220,6 +220,50 @@ pub(crate) struct OwnedProvider {
     streams: ObjectQuota,
     tracker: DisposalTracker,
 }
+
+pub(crate) struct OwnedPartition(ManagedObject<Arc<dyn fube_core::IStatefulServicePartition>>);
+impl OwnedPartition {
+    pub(crate) fn new(
+        runtime: &ExecutionRuntime,
+        partition: Arc<dyn fube_core::IStatefulServicePartition>,
+        tracker: &DisposalTracker,
+        origin: fube_core::hosting::CallOrigin,
+        construction: Option<&fube_core::hosting::OwnedCallPermit>,
+    ) -> Result<Self> {
+        let quota = ObjectQuota::new(1)?;
+        let reservation = if let Some(construction) = construction {
+            construction.object_reservation(&quota, tracker)?
+        } else {
+            runtime.reserve_construction_with_origin(&quota, tracker, origin)?
+        };
+        Ok(Self(reservation.construct(partition)))
+    }
+    pub(crate) fn publication(&self) -> fube_core::hosting::ObjectPublication {
+        self.0.publication()
+    }
+    pub(crate) fn disposal_receipt(&self) -> fube_core::hosting::DisposalReceipt {
+        self.0.receipt()
+    }
+    pub(crate) fn check_write_access(&self) -> Result<()> {
+        use fube_core::{ErrorKind, ServicePartitionAccessStatus as Access};
+        // Both the getter and release of its typed error run in the owning
+        // finite callback, never in the owner/admission critical section.
+        let access = match self.0.get().get_write_status() {
+            Ok(access) => access,
+            Err(error) => {
+                drop(error);
+                Access::NotPrimary
+            }
+        };
+        let kind = match access {
+            Access::Granted => return Ok(()),
+            Access::ReconfigurationPending => ErrorKind::ReconfigurationPending,
+            Access::NoWriteQuorum => ErrorKind::NoWriteQuorum,
+            Access::NotPrimary | Access::Invalid => ErrorKind::NotPrimary,
+        };
+        Err(crate::Error::new(kind, "partition write access denied"))
+    }
+}
 struct ProviderCapabilities {
     provider: Arc<dyn IStateProvider>,
     replay: Option<Arc<dyn ReplayCheckpointProvider>>,
@@ -227,12 +271,12 @@ struct ProviderCapabilities {
 fn provider_error(error: crate::Error) -> crate::Error {
     if matches!(
         error.kind(),
-        fube_runtime::ErrorKind::Canceled | fube_runtime::ErrorKind::Timeout
+        fube_core::ErrorKind::Canceled | fube_core::ErrorKind::Timeout
     ) {
         return error;
     }
     crate::Error::with_cause(
-        fube_runtime::ErrorKind::Provider,
+        fube_core::ErrorKind::Provider,
         format!("provider callback failed: {error}"),
         error,
     )
@@ -244,8 +288,8 @@ impl OwnedProvider {
         replay: Option<Arc<dyn ReplayCheckpointProvider>>,
         streams: usize,
         tracker: DisposalTracker,
-        origin: fube_runtime::extensions::CallOrigin,
-        construction: Option<&fube_runtime::extensions::OwnedCallPermit>,
+        origin: fube_core::hosting::CallOrigin,
+        construction: Option<&fube_core::hosting::OwnedCallPermit>,
     ) -> Result<Self> {
         let quota = ObjectQuota::new(1)?;
         let reservation = if let Some(construction) = construction {
@@ -260,10 +304,10 @@ impl OwnedProvider {
             tracker,
         })
     }
-    pub(crate) fn publication(&self) -> fube_runtime::extensions::ObjectPublication {
+    pub(crate) fn publication(&self) -> fube_core::hosting::ObjectPublication {
         self.inner.publication()
     }
-    pub(crate) fn disposal_receipt(&self) -> fube_runtime::extensions::DisposalReceipt {
+    pub(crate) fn disposal_receipt(&self) -> fube_core::hosting::DisposalReceipt {
         self.inner.receipt()
     }
     pub(crate) fn copy_state_constructed(
@@ -271,7 +315,7 @@ impl OwnedProvider {
         up_to: i64,
     ) -> Result<(
         Arc<dyn IOperationDataStream>,
-        fube_runtime::extensions::ObjectPublication,
+        fube_core::hosting::ObjectPublication,
     )> {
         let reserved = self
             .runtime

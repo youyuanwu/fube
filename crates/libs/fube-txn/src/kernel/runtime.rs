@@ -27,7 +27,7 @@ use crate::{
 };
 use fube_data::{
     extensions::{ReplicationEndpointOptions, StateProviderCapabilities},
-    FabricReplicator, IOperationStream, IStateProvider, IStateReplicator, Settings,
+    IOperationStream, IStateProvider, IStateReplicator, Settings,
 };
 use fube_runtime::{
     extensions::{ExecutionRuntime, NativeRuntimeIntegration},
@@ -170,9 +170,8 @@ impl VolatileRuntime {
             fault_reports: AtomicI64::new(0),
         });
         let adapter = Arc::new(Adapter(Arc::downgrade(&runtime)));
-        let lower = FabricReplicator::create_with_capabilities(
+        let lower = native.create_replicator_with_capabilities(
             partition,
-            native.clone(),
             adapter,
             None,
             endpoint,

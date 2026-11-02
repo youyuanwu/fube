@@ -1,6 +1,186 @@
 //! Real RAP-admission/issuer fixtures, not a deployed/native qualification.
 use super::*;
-use crate::extensions::{NativeControlBinding, NativeInvocation, NativeInvocationKind};
+use crate::extensions::{
+    CallLane, CallOrigin, ExecutionRuntime, NativeControlBinding, NativeInvocation,
+    NativeInvocationKind,
+};
+use std::time::Instant;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_runtime_control_check_rejects_revocation_at_actual_lower_queued_mutation() {
+    use crate::extensions::EpochDomains;
+    use fube_data::{
+        extensions::ReplicationEndpointOptions, hosting::MutationCheck, MemoryProvider,
+    };
+    for cause in [
+        "supersession",
+        "revision",
+        "generation",
+        "actor",
+        "cancellation",
+        "lifetime",
+        "remote",
+        "authority",
+    ] {
+        let mut h = Harness::new().await;
+        let calls = register(&h);
+        let open = request(&h, 2, 1, 20);
+        h.send("ReplicaOpen", &open).await;
+        h.receive("ReplicaOpenReply").await;
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        let native = calls.partitions.lock().unwrap()[0].clone();
+        let actor = uuid::Uuid::new_v4();
+        let (partition, _) = native.observe_report().unwrap();
+        let constructor = native.clone();
+        let lower = native
+            .execution()
+            .try_reserve()
+            .unwrap()
+            .run_owned(move || {
+                constructor.create_replicator(
+                    partition,
+                    MemoryProvider::new(),
+                    None,
+                    ReplicationEndpointOptions {
+                        listen_address: "127.0.0.1:0".into(),
+                        actor_incarnation: actor,
+                    },
+                    Default::default(),
+                )
+            })
+            .await
+            .unwrap();
+        let epoch = native.status().unwrap().current_epoch.primary();
+        let common = lower.clone();
+        native
+            .execution()
+            .try_reserve()
+            .unwrap()
+            .run_future(async move {
+                common.open(Cancellation::default()).await?;
+                common
+                    .change_role(epoch, ReplicaRole::Primary, Cancellation::default())
+                    .await
+            })
+            .await
+            .unwrap();
+        let issued = Arc::new(Mutex::new(Vec::new()));
+        let binder: Arc<dyn NativeControlBinding> = Arc::new(CaptureBinder {
+            calls: calls.clone(),
+            issued: issued.clone(),
+            mode: 20,
+        });
+        native.install_binding(actor, &binder).unwrap();
+        calls.configuration_failure.store(true, Ordering::Release);
+        let mut target = peer(&open.local, 3);
+        target.replication_endpoint = fube_data::wire::Endpoint {
+            actor: fube_data::wire::Actor {
+                partition: native.identity().partition_id,
+                replica: target.id,
+                incarnation: uuid::Uuid::new_v4(),
+            },
+            address: "127.0.0.1:43210".into(),
+            transport_id: None,
+        }
+        .to_string();
+        let remote = cause == "remote";
+        if remote {
+            target.current_role = 2;
+            target.previous_role = 0;
+        }
+        let action = if remote {
+            "ReplicatorBuildIdleReplica"
+        } else {
+            "UpdateConfiguration"
+        };
+        let input = control(
+            &open,
+            action,
+            if remote {
+                vec![target]
+            } else {
+                vec![open.local.clone(), target]
+            },
+        );
+        h.send(action, &input).await;
+        h.receive(if remote {
+            "ReplicatorBuildIdleReplicaReply"
+        } else {
+            "UpdateConfigurationReply"
+        })
+        .await;
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        let proof = issued.lock().unwrap().last().unwrap().clone();
+        proof.validate().unwrap();
+        let data = lower.diagnostics();
+        let engine = data.engine_for_test();
+        let (held, holding) = std::sync::mpsc::sync_channel(1);
+        let (release, blocked) = std::sync::mpsc::sync_channel(1);
+        let shared = engine.shared.clone();
+        let lock = std::thread::spawn(move || {
+            let _guard = shared.admission.lock().unwrap();
+            held.send(()).unwrap();
+            blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        holding.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (enqueued, queued) = std::sync::mpsc::sync_channel(1);
+        *engine.shared.command_enqueued.lock().unwrap() = Some(enqueued);
+        let check: Arc<dyn MutationCheck> =
+            Arc::new(crate::replication::ControlCheck(proof.clone()));
+        let control = lower.hosting_for_test();
+        let command = if remote {
+            let target = crate::replication::project_descriptor(
+                &proof.replica().unwrap().descriptor().unwrap(),
+            );
+            native
+                .execution()
+                .try_reserve()
+                .unwrap()
+                .run_future(
+                    async move { control.build(target, Cancellation::default(), check).await },
+                )
+        } else {
+            let config =
+                crate::replication::project_configuration(proof.configuration().unwrap().0)
+                    .unwrap();
+            native
+                .execution()
+                .try_reserve()
+                .unwrap()
+                .run_owned(move || {
+                    control.configure(config, None, None, Cancellation::default(), check)
+                })
+        };
+        queued.recv_timeout(Duration::from_secs(2)).unwrap();
+        if cause == "supersession" {
+            h.send(action, &input).await;
+            h.receive("UpdateConfigurationReply").await;
+            h.engine.shared.stateful.wait_idle([2; 16]).await;
+            let replacement = issued.lock().unwrap().last().unwrap().clone();
+            assert!(proof.same_revision(&replacement));
+            replacement.validate().unwrap();
+        } else {
+            proof.invalidate_for_queue_test(cause);
+        }
+        assert!(proof.validate().is_err(), "{cause}");
+        release.send(()).unwrap();
+        lock.join().unwrap();
+        assert_eq!(
+            command.await.unwrap_err().kind(),
+            crate::ErrorKind::ObjectClosed,
+            "{cause}"
+        );
+        assert!(
+            engine.snapshot().peers.is_empty(),
+            "{cause} mutated lower membership"
+        );
+        assert_eq!(engine.snapshot().epoch, Some(epoch));
+        assert_eq!(engine.snapshot().progress.assigned, 0);
+        let lower = lower.clone();
+        // Close uses the already-owned terminal reservation even after revocation.
+        lower.close(Cancellation::default()).await.unwrap();
+    }
+}
 
 struct CaptureBinder {
     calls: Arc<StatefulCalls>,
@@ -257,8 +437,8 @@ struct InvocationRelease {
 }
 impl Drop for InvocationRelease {
     fn drop(&mut self) {
-        use crate::extensions::{CallLane, CallOrigin, ExecutionRuntime};
-        let current = ExecutionRuntime::current_invocation();
+        use crate::extensions::{CallLane, CallOrigin};
+        let current = crate::execution::current_invocation();
         let retained = match (&self.expected, current) {
             (Some(expected), Some(current)) => expected.same_instance(&current),
             (None, None) => true,
@@ -294,8 +474,107 @@ impl Drop for InvocationRelease {
 }
 
 #[tokio::test]
+async fn caller_supplied_opaque_context_cannot_establish_native_invocation_scope() {
+    let (_h, native, proof, _) = scope_fixture().await;
+    let execution = native.execution();
+    let owner = execution.clone();
+    let foreign: Arc<dyn fube_core::hosting::ExecutionAuthority> =
+        Authority::new(Instant::now(), 1_000_000_000).unwrap();
+    let configuration = proof.configuration().unwrap().0.sdk().unwrap();
+    execution
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || {
+            assert!(matches!(
+                owner.host_context_scope(&foreign, Arc::new(proof)),
+                Err(Error::InvalidInput("host context authority mismatch"))
+            ));
+            assert!(crate::execution::current_invocation().is_none());
+            assert!(native.capture_configuration(&configuration, None).is_err());
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+async fn rejected_borrowed_context_does_not_follow_child(completed: bool) {
+    use std::sync::atomic::AtomicUsize;
+
+    struct DropProbe(Arc<AtomicUsize>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let (_h, native, proof, _) = scope_fixture().await;
+    let execution = native.execution();
+    let owner = execution.clone();
+    let foreign: Arc<dyn fube_core::hosting::ExecutionAuthority> =
+        Authority::new(Instant::now(), 1_000_000_000).unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let probe = Arc::new(DropProbe(drops.clone()));
+    let weak = Arc::downgrade(&probe);
+    let observed = drops.clone();
+    let expected = proof.clone();
+    let child = execution
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || {
+            let _scope = crate::execution::invocation_scope(proof.clone())?;
+            assert!(matches!(
+                owner.host_context_scope(&foreign, probe),
+                Err(Error::InvalidInput("host context authority mismatch"))
+            ));
+            assert_eq!(observed.load(Ordering::SeqCst), 1);
+            assert!(ExecutionRuntime::current_host_context::<DropProbe>().is_none());
+            assert!(crate::execution::current_invocation()
+                .unwrap()
+                .same_instance(&proof));
+            owner.reserve(
+                CallLane::Provider,
+                CallOrigin::default(),
+                Duration::from_secs(1),
+                false,
+            )
+        })
+        .await
+        .unwrap();
+    assert!(weak.upgrade().is_none());
+    if completed {
+        child
+            .run_future(async move {
+                for _ in 0..2 {
+                    assert!(ExecutionRuntime::current_host_context::<DropProbe>().is_none());
+                    assert!(crate::execution::current_invocation()
+                        .unwrap()
+                        .same_instance(&expected));
+                    tokio::task::yield_now().await;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+    } else {
+        drop(child);
+    }
+    assert!(weak.upgrade().is_none());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn borrowed_context_injection_is_rejected_before_returning_unused_child_permit() {
+    rejected_borrowed_context_does_not_follow_child(false).await;
+}
+
+#[tokio::test]
+async fn borrowed_context_injection_is_rejected_before_completing_child_call() {
+    rejected_borrowed_context_does_not_follow_child(true).await;
+}
+
+#[tokio::test]
 async fn native_invocation_delayed_disposal_preserves_original_and_cannot_regrant_capture() {
-    use crate::extensions::{DisposalTracker, ExecutionRuntime, ObjectQuota};
+    use crate::extensions::{DisposalTracker, ObjectQuota};
     let (_h, native, p, q) = scope_fixture().await;
     let execution = native.execution();
     let owned = execution.clone();
@@ -313,7 +592,7 @@ async fn native_invocation_delayed_disposal_preserves_original_and_cannot_regran
         .try_reserve()
         .unwrap()
         .run_owned(move || {
-            let _scope = ExecutionRuntime::invocation_scope(expected)?;
+            let _scope = crate::execution::invocation_scope(expected)?;
             let object = owned
                 .reserve_construction(&ObjectQuota::new(1)?, &DisposalTracker::default())?
                 .construct(probe);
@@ -326,7 +605,7 @@ async fn native_invocation_delayed_disposal_preserves_original_and_cannot_regran
         .try_reserve()
         .unwrap()
         .run_owned(move || {
-            let _scope = ExecutionRuntime::invocation_scope(q)?;
+            let _scope = crate::execution::invocation_scope(q)?;
             drop(object);
             Ok(())
         })
@@ -337,8 +616,57 @@ async fn native_invocation_delayed_disposal_preserves_original_and_cannot_regran
 }
 
 #[tokio::test]
+async fn stale_permit_pending_cleanup_keeps_original_native_record_noncapturable() {
+    use crate::extensions::{CallOrigin, DisposalTracker, ObjectQuota};
+    let (_h, native, p, q) = scope_fixture().await;
+    let execution = native.execution();
+    let owned = execution.clone();
+    let original = p.clone();
+    let spare = execution
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || {
+            let _scope = crate::execution::invocation_scope(original)?;
+            owned.reserve_engine_callback(
+                CallOrigin {
+                    engine: 555,
+                    generation: 1,
+                    session: 0,
+                },
+                std::time::Instant::now() + Duration::from_secs(2),
+            )
+        })
+        .await
+        .unwrap();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let probe = InvocationRelease {
+        expected: Some(p.clone()),
+        attempted: native.clone(),
+        configuration: p.configuration().unwrap().0.sdk().unwrap(),
+        execution: execution.clone(),
+        observed: observed.clone(),
+    };
+    let receipt = execution
+        .try_reserve()
+        .unwrap()
+        .run_owned(move || {
+            let _scope = crate::execution::invocation_scope(q)?;
+            let object = spare
+                .object_reservation(&ObjectQuota::new(1)?, &DisposalTracker::default())?
+                .construct(probe);
+            let receipt = object.receipt();
+            drop(object);
+            Ok(receipt)
+        })
+        .await
+        .unwrap();
+    receipt.wait().await.unwrap();
+    assert_eq!(*observed.lock().unwrap(), vec![(true, true, true)]);
+}
+
+#[tokio::test]
 async fn native_concurrent_reserved_entries_keep_exact_proof_without_ambient_leak() {
-    use crate::extensions::{CallLane, CallOrigin, ExecutionRuntime};
+    use crate::extensions::{CallLane, CallOrigin};
     let (_h, native, p, q) = scope_fixture().await;
     let execution = native.execution();
     let owned = execution.clone();
@@ -351,7 +679,7 @@ async fn native_concurrent_reserved_entries_keep_exact_proof_without_ambient_lea
         .try_reserve()
         .unwrap()
         .run_owned(move || {
-            let _p = ExecutionRuntime::invocation_scope(p)?;
+            let _p = crate::execution::invocation_scope(p)?;
             Ok(owned
                 .reserve(
                     CallLane::Provider,
@@ -375,7 +703,7 @@ async fn native_concurrent_reserved_entries_keep_exact_proof_without_ambient_lea
         .try_reserve()
         .unwrap()
         .run_owned(move || {
-            let _q = ExecutionRuntime::invocation_scope(q)?;
+            let _q = crate::execution::invocation_scope(q)?;
             source.capture_build(&target)
         })
         .await
@@ -391,13 +719,12 @@ async fn native_concurrent_reserved_entries_keep_exact_proof_without_ambient_lea
         .is_err());
     release.send(()).unwrap();
     assert!(child.await.unwrap().same_instance(&expected));
-    assert!(ExecutionRuntime::current_invocation().is_none());
+    assert!(crate::execution::current_invocation().is_none());
 }
 
 #[tokio::test]
 async fn native_invocation_foreign_cleanup_has_no_proof_and_nested_reservation_stays_non_authorizing(
 ) {
-    use crate::extensions::ExecutionRuntime;
     let (_a, native_a, p, _) = scope_fixture().await;
     let (_b, native_b, _, _) = scope_fixture().await;
     let execution = native_a.execution();
@@ -414,7 +741,7 @@ async fn native_invocation_foreign_cleanup_has_no_proof_and_nested_reservation_s
         .try_reserve()
         .unwrap()
         .run_owned(move || {
-            let _scope = ExecutionRuntime::invocation_scope(p)?;
+            let _scope = crate::execution::invocation_scope(p)?;
             Ok(foreign
                 .reserve_cleanup(Duration::from_secs(1))?
                 .dispose(probe))
@@ -427,7 +754,7 @@ async fn native_invocation_foreign_cleanup_has_no_proof_and_nested_reservation_s
 
 #[tokio::test]
 async fn native_invocation_reserved_continuation_nesting_unwind_and_lease_are_exact() {
-    use crate::extensions::{CallLane, CallOrigin, ExecutionRuntime};
+    use crate::extensions::{CallLane, CallOrigin};
     let (h, native, p, q) = scope_fixture().await;
     let execution = native.execution();
     let owned = execution.clone();
@@ -438,13 +765,13 @@ async fn native_invocation_reserved_continuation_nesting_unwind_and_lease_are_ex
         .try_reserve()
         .unwrap()
         .run_owned(move || {
-            let _p = ExecutionRuntime::invocation_scope(p.clone())?;
+            let _p = crate::execution::invocation_scope(p.clone())?;
             let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _q = ExecutionRuntime::invocation_scope(q).unwrap();
+                let _q = crate::execution::invocation_scope(q).unwrap();
                 panic!("owned scope unwind probe");
             }));
             assert!(unwind.is_err());
-            assert!(ExecutionRuntime::current_invocation()
+            assert!(crate::execution::current_invocation()
                 .unwrap()
                 .same_instance(&p));
             let child = owned
@@ -463,7 +790,7 @@ async fn native_invocation_reserved_continuation_nesting_unwind_and_lease_are_ex
     assert!(captured.same_instance(&expected));
     captured.enter().unwrap();
     assert!(expected.enter().is_err());
-    assert!(ExecutionRuntime::current_invocation().is_none());
+    assert!(crate::execution::current_invocation().is_none());
     h.engine.shared.execution.retire();
     assert!(native.validate().is_err());
     assert!(captured.validate().is_err());
@@ -513,7 +840,7 @@ async fn native_same_epoch_configuration_reissue_revokes_original_without_revisi
 
 #[tokio::test]
 async fn native_pending_disposal_under_foreign_invocation_retains_original_not_releasing_thread() {
-    use crate::extensions::{DisposalTracker, ExecutionRuntime, ObjectQuota};
+    use crate::extensions::{DisposalTracker, ObjectQuota};
     let (_a, native_a, p, _) = scope_fixture().await;
     let (_b, native_b, q, _) = scope_fixture().await;
     let execution = native_a.execution();
@@ -532,7 +859,7 @@ async fn native_pending_disposal_under_foreign_invocation_retains_original_not_r
         .try_reserve()
         .unwrap()
         .run_owned(move || {
-            let _scope = ExecutionRuntime::invocation_scope(expected)?;
+            let _scope = crate::execution::invocation_scope(expected)?;
             let object = owned
                 .reserve_construction(&ObjectQuota::new(1)?, &DisposalTracker::default())?
                 .construct(probe);
@@ -545,7 +872,7 @@ async fn native_pending_disposal_under_foreign_invocation_retains_original_not_r
         .try_reserve()
         .unwrap()
         .run_owned(move || {
-            let _q = ExecutionRuntime::invocation_scope(q)?;
+            let _q = crate::execution::invocation_scope(q)?;
             drop(object);
             Ok(())
         })

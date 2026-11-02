@@ -108,12 +108,8 @@ async fn promoted_prefix_without_retained_suffix_accepts_bounded_existing_peer_r
     let remote = endpoint(&transport, partition, 2);
     transport.register_peer(&primary.endpoint()).unwrap();
     let peer = ReplicaInformation {
-        node_id: [2; 16],
-        node_instance: 1,
         replica_id: 2,
         incarnation: 1,
-        role: ReplicaRole::ActiveSecondary,
-        previous_role: ReplicaRole::ActiveSecondary,
         up: true,
         ready: true,
         address: remote.to_string(),
@@ -255,7 +251,6 @@ async fn qualification_packets_do_not_assign_change_membership_or_apply_obsolete
         .await
         .unwrap();
     let mut member = descriptor(&secondary);
-    member.role = ReplicaRole::ActiveSecondary;
     member.ready = true;
     primary
         .update_current_configuration(configuration(vec![member], true, 2), cancel())
@@ -408,7 +403,6 @@ async fn successful_idle_build_retains_continuing_writes_until_cc_adoption() {
         primary.transport.diagnostics()
     );
     let mut member = descriptor(&target);
-    member.role = ReplicaRole::ActiveSecondary;
     member.ready = true;
     target
         .change_role(EPOCH, ReplicaRole::ActiveSecondary, cancel())
@@ -1749,7 +1743,7 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
                     Ok(write) => break write,
                     // Retry only pre-admission backpressure while the peer is
                     // still unacknowledged, never an accepted operation.
-                    Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull => {
+                    Err(error) if error.kind() == fube_core::ErrorKind::ReplicationQueueFull => {
                         tokio::task::yield_now().await;
                     }
                     Err(error) => panic!("write admission after replay failed: {error}"),
@@ -1880,11 +1874,7 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
     let mut engines = Vec::new();
     let mut views = Vec::new();
     for (index, provider) in providers.iter().enumerate() {
-        let mut initial_status = prewrite_status();
-        initial_status.current_epoch = EPOCH;
-        initial_status.current_role = ReplicaRole::None;
-        initial_status.service_role = ReplicaRole::None;
-        initial_status.replicator_role = ReplicaRole::None;
+        let initial_status = FixtureFacts::default();
         let view = Arc::new(SourceNativeView(Mutex::new(Ok(initial_status))));
         let engine = Engine::bind_with_capabilities(
             Actor {
@@ -1945,34 +1935,12 @@ async fn three_copied_engines_complete_repeated_no_write_native_selected_promoti
             .await
             .unwrap();
         for (index, view) in views.iter().enumerate() {
-            let mut status = prewrite_status();
-            let role = if index == new_primary {
-                ReplicaRole::Primary
-            } else {
-                ReplicaRole::ActiveSecondary
-            };
-            status.current_epoch = epoch;
-            status.current_role = role;
-            status.service_role = role;
-            status.replicator_role = role;
-            status.configuration_stage = ConfigurationStage::CatchUp;
-            status.configuration = engines
-                .iter()
-                .enumerate()
-                .filter(|(other, _)| *other != index)
-                .map(|(other, engine)| {
-                    let mut peer = descriptor(engine);
-                    peer.role = if other == new_primary {
-                        ReplicaRole::Primary
-                    } else {
-                        ReplicaRole::ActiveSecondary
-                    };
-                    // Deliberately no native progress attestation: this regression
-                    // must get actual fresh network ACKs, not catch-up-only proof.
-                    peer.progress = ReplicationProgress::EMPTY;
-                    peer
-                })
-                .collect();
+            let mut status = FixtureFacts::default();
+            if index != new_primary {
+                let mut primary = descriptor(&engines[new_primary]);
+                primary.progress = ReplicationProgress::EMPTY;
+                status.stable.primary = Some((epoch, primary));
+            }
             *view.0.lock().unwrap() = Ok(status);
         }
         let mut cc = configuration(
@@ -2067,10 +2035,7 @@ async fn diagnostic_prefix_cannot_initialize_sender_or_authorize_new_writes() {
     peer.replica_id = 2;
     peer.address = remote.to_string();
     peer.progress.last = 20;
-    let mut status = prewrite_status();
-    status.current_epoch = EPOCH;
-    status.current_role = ReplicaRole::Primary;
-    status.configuration = vec![peer.clone()];
+    let status = FixtureFacts::default();
     *view.0.lock().unwrap() = Ok(status);
     p.update_current_configuration(configuration(vec![peer], true, 2), cancel())
         .await
@@ -2397,15 +2362,6 @@ pub(super) struct Provider {
     checkpoint_gate: Mutex<Option<Arc<Semaphore>>>,
 }
 
-impl Provider {
-    pub(super) fn with_initial(last: i64) -> Self {
-        Self {
-            last: AtomicI64::new(last),
-            ..Self::default()
-        }
-    }
-}
-
 impl ReplayCheckpointProvider for Provider {
     fn replication_checkpoint(
         &self,
@@ -2513,12 +2469,8 @@ fn engine_with_settings(
 
 fn descriptor(engine: &Engine) -> ReplicaInformation {
     ReplicaInformation {
-        node_id: [engine.endpoint.actor.replica as u8; 16],
-        node_instance: 1,
         replica_id: engine.endpoint.actor.replica,
         incarnation: 1,
-        role: ReplicaRole::ActiveSecondary,
-        previous_role: ReplicaRole::ActiveSecondary,
         up: true,
         ready: true,
         address: engine.endpoint.to_string(),
@@ -2540,55 +2492,42 @@ fn configuration(
     }
 }
 
-// Runtime status shapes from stateful_reconfiguration.rs:admit_epoch,
-// configuration and catch_up. These are source fixtures, not a native node.
-struct SourceNativeView(Mutex<Result<ReplicaStatus>>);
+#[derive(Clone, Default)]
+struct FixtureFacts {
+    stable: StableFacts,
+    prewrite: Option<NativePreWrite>,
+}
+struct SourceNativeView(Mutex<Result<FixtureFacts>>);
 
-impl NativeControlView for SourceNativeView {
-    fn status(&self) -> Result<ReplicaStatus> {
-        self.0.lock().unwrap().clone()
+impl FixtureControl for SourceNativeView {
+    fn observe(&self) -> Result<StableFacts> {
+        self.0.lock().unwrap().clone().map(|facts| facts.stable)
     }
-    fn report_fault(
-        &self,
-        _: fube_runtime::FaultType,
-    ) -> ServiceFuture<'_, fube_runtime::extensions::FaultDelivery> {
+    fn prewrite(&self) -> Result<Option<NativePreWrite>> {
+        self.0.lock().unwrap().clone().map(|facts| facts.prewrite)
+    }
+    fn report_fault(&self, _: fube_core::FaultType) -> ServiceFuture<'_, ()> {
         Box::pin(async { Err(Error::Closed) })
     }
 }
 
-fn prewrite_status() -> ReplicaStatus {
-    ReplicaStatus {
-        lifecycle: ReplicaLifecycle::Open,
-        service_role: ReplicaRole::Primary,
-        replicator_role: ReplicaRole::Primary,
-        replicator_open: true,
-        current_role: ReplicaRole::ActiveSecondary,
-        current_epoch: Epoch {
-            configuration_number: NEXT_EPOCH.configuration_number + 7,
-            ..NEXT_EPOCH
-        },
-        previous_epoch: Epoch {
-            configuration_number: EPOCH.configuration_number + 3,
-            ..EPOCH
-        },
-        configuration_stage: ConfigurationStage::PreWriteRevoke,
-        catch_up: fube_runtime::extensions::CatchUpResult::NotStarted,
-        minimum_replica_set_size: 1,
-        configuration: vec![],
-        service_address: String::new(),
-        replication_address: String::new(),
-        progress: ReplicationProgress::EMPTY,
+fn prewrite_status() -> FixtureFacts {
+    FixtureFacts {
+        prewrite: Some(NativePreWrite {
+            current: NEXT_EPOCH,
+            previous: EPOCH,
+        }),
+        ..FixtureFacts::default()
     }
 }
 
-fn primary_status() -> ReplicaStatus {
-    ReplicaStatus {
-        current_role: ReplicaRole::Primary,
-        current_epoch: EPOCH,
-        previous_epoch: Epoch::INVALID,
-        configuration_stage: ConfigurationStage::Current,
-        catch_up: fube_runtime::extensions::CatchUpResult::Completed,
-        ..prewrite_status()
+fn primary_status() -> FixtureFacts {
+    FixtureFacts {
+        stable: StableFacts {
+            singleton: Some(EPOCH),
+            primary: None,
+        },
+        prewrite: None,
     }
 }
 
@@ -2615,7 +2554,7 @@ fn engine_with_native_view(
 #[tokio::test]
 async fn native_singleton_requires_stable_runtime_membership_not_primary_role_alone() {
     let mut native = primary_status();
-    native.minimum_replica_set_size = 2;
+    native.stable.singleton = None;
     let view = Arc::new(SourceNativeView(Mutex::new(Ok(native))));
     let provider = Arc::new(Provider::default());
     let node = engine_with_native_view(Uuid::new_v4(), 1, provider.clone(), view.clone());
@@ -2627,13 +2566,11 @@ async fn native_singleton_requires_stable_runtime_membership_not_primary_role_al
         !node.snapshot().ready,
         "min2 cannot become a singleton from role"
     );
-    let variants: &[fn(&mut ReplicaStatus)] = &[
-        |s: &mut ReplicaStatus| s.lifecycle = ReplicaLifecycle::Closing,
-        |s: &mut ReplicaStatus| s.configuration_stage = ConfigurationStage::CatchUp,
-        |s: &mut ReplicaStatus| s.catch_up = fube_runtime::extensions::CatchUpResult::NotStarted,
-        |s: &mut ReplicaStatus| s.current_epoch = NEXT_EPOCH,
-        |s: &mut ReplicaStatus| s.replicator_open = false,
-        |s: &mut ReplicaStatus| s.service_role = ReplicaRole::ActiveSecondary,
+    // Host eligibility predicates are tested with the runtime projection.
+    // The lower consumes only eligible values and checks their epoch.
+    let variants: &[fn(&mut FixtureFacts)] = &[
+        |s| s.stable.singleton = None,
+        |s| s.stable.singleton = Some(NEXT_EPOCH),
     ];
     for mutate in variants {
         let mut status = primary_status();
@@ -2857,9 +2794,7 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
     let revision = p.shared.revision.load(Ordering::Acquire);
     let mut current = previous.clone();
     current.epoch = NEXT_EPOCH;
-    let mut status = prewrite_status();
-    status.configuration = vec![descriptor(&s)];
-    status.configuration[0].role = ReplicaRole::Primary;
+    let status = prewrite_status();
     *view.0.lock().unwrap() = Ok(status.clone());
     p.update_catch_up_configuration(current.clone(), previous.clone(), cancel())
         .await
@@ -2895,37 +2830,27 @@ async fn native_prewrite_source_sequence_keeps_old_epoch_receipts_until_update_e
     assert_eq!(s.snapshot().epoch, Some(EPOCH));
     assert_eq!(pp.epochs.lock().unwrap().as_slice(), provider_epochs);
 
-    status.configuration_stage = ConfigurationStage::CatchUp;
-    assert_eq!(
-        status.access().1,
-        fube_runtime::ServicePartitionAccessStatus::ReconfigurationPending
-    );
-    *view.0.lock().unwrap() = Ok(status);
+    *view.0.lock().unwrap() = Ok(FixtureFacts::default());
     p.update_epoch(NEXT_EPOCH, cancel()).await.unwrap();
     until(|| p.snapshot().epoch == Some(NEXT_EPOCH) && p.snapshot().ready).await;
     assert!(pp.epochs.lock().unwrap().contains(&(NEXT_EPOCH, 1)));
     // Engine readiness after UpdateEpoch is not the independent native gate.
-    assert_eq!(
-        view.status().unwrap().access().1,
-        fube_runtime::ServicePartitionAccessStatus::ReconfigurationPending
-    );
     p.update_catch_up_configuration(current, previous, cancel())
         .await
         .unwrap();
     p.wait_for_catch_up(CatchUpMode::All, cancel())
         .await
         .unwrap();
-    let mut status = view.status().unwrap();
-    status.catch_up = fube_runtime::extensions::CatchUpResult::Completed;
-    *view.0.lock().unwrap() = Ok(status);
     p.change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
         .await
         .unwrap();
-    let mut status = view.status().unwrap();
-    status.service_role = ReplicaRole::ActiveSecondary;
-    status.replicator_role = ReplicaRole::ActiveSecondary;
-    status.configuration_stage = ConfigurationStage::Current;
-    *view.0.lock().unwrap() = Ok(status);
+    *view.0.lock().unwrap() = Ok(FixtureFacts {
+        stable: StableFacts {
+            singleton: None,
+            primary: Some((NEXT_EPOCH, descriptor(&s))),
+        },
+        prewrite: None,
+    });
     s.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
         .await
         .unwrap();
@@ -2981,22 +2906,13 @@ async fn native_prewrite_rejects_wrong_views_future_pc_and_stale_cc_without_muta
     let revision = p.shared.revision.load(Ordering::Acquire);
     let mut current = configuration(vec![descriptor(&s)], true, 2);
     current.epoch = NEXT_EPOCH;
-    let variants: &[fn(&mut ReplicaStatus)] = &[
-        |s| s.configuration_stage = ConfigurationStage::Current,
-        |s| s.configuration_stage = ConfigurationStage::CatchUp,
-        |s| s.current_role = ReplicaRole::Primary,
-        |s| s.current_role = ReplicaRole::IdleSecondary,
-        |s| s.service_role = ReplicaRole::ActiveSecondary,
-        |s| s.replicator_role = ReplicaRole::ActiveSecondary,
-        |s| s.replicator_open = false,
-        |s| s.lifecycle = ReplicaLifecycle::Opening,
-        |s| s.lifecycle = ReplicaLifecycle::Closing,
-        |s| s.lifecycle = ReplicaLifecycle::Closed,
-        |s| s.current_epoch = EPOCH,
-        |s| s.current_epoch.configuration_number += 0x1_0000_0000,
-        |s| s.current_epoch.data_loss_number += 1,
-        |s| s.previous_epoch = NEXT_EPOCH,
-        |s| s.previous_epoch = Epoch::INVALID,
+    let variants: &[fn(&mut FixtureFacts)] = &[
+        |s| s.prewrite = None,
+        |s| s.prewrite.as_mut().unwrap().current = EPOCH,
+        |s| s.prewrite.as_mut().unwrap().current.configuration_number += 0x1_0000_0000,
+        |s| s.prewrite.as_mut().unwrap().current.data_loss_number += 1,
+        |s| s.prewrite.as_mut().unwrap().previous = NEXT_EPOCH,
+        |s| s.prewrite.as_mut().unwrap().previous = Epoch::INVALID,
     ];
     for (index, change) in variants.iter().enumerate() {
         let mut status = prewrite_status();
@@ -3131,10 +3047,7 @@ async fn unqualified_configuration_cannot_advance_or_rewind_native_epoch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catchup() {
-    let mut status = primary_status();
-    status.service_role = ReplicaRole::ActiveSecondary;
-    status.replicator_role = ReplicaRole::ActiveSecondary;
-    status.current_role = ReplicaRole::ActiveSecondary;
+    let status = FixtureFacts::default();
     let view = Arc::new(SourceNativeView(Mutex::new(Ok(status))));
     let (old, p, provider) = pair_with_native_view(Some(view.clone())).await;
     old.change_role(NEXT_EPOCH, ReplicaRole::ActiveSecondary, cancel())
@@ -3143,13 +3056,7 @@ async fn new_primary_e2_cc_and_e1_pc_keep_separate_ack_quorums_and_current_catch
     p.change_role(NEXT_EPOCH, ReplicaRole::Primary, cancel())
         .await
         .unwrap();
-    let mut status = primary_status();
-    status.current_epoch = NEXT_EPOCH;
-    status.previous_epoch = EPOCH;
-    status.configuration_stage = ConfigurationStage::CatchUp;
-    status.catch_up = fube_runtime::extensions::CatchUpResult::NotStarted;
-    status.configuration = vec![descriptor(&old)];
-    *view.0.lock().unwrap() = Ok(status);
+    *view.0.lock().unwrap() = Ok(FixtureFacts::default());
     let mut current = configuration(vec![], true, 1);
     current.epoch = NEXT_EPOCH;
     let mut inactive = configuration(vec![], false, 0);
@@ -3438,7 +3345,7 @@ async fn bounded_admission_and_callback_capture_exhaustion_preserve_control_capa
     assert!(matches!(
         p.submit(OperationData::new(vec![vec![3]]).unwrap(), cancel())
             .await,
-        Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull
+        Err(error) if error.kind() == fube_core::ErrorKind::ReplicationQueueFull
     ));
     assert_eq!(p.snapshot().progress.assigned, 2);
     let stream = s.replication_stream();
@@ -4006,7 +3913,7 @@ impl IStateProvider for ControlledProvider {
 }
 
 struct FaultNativeView {
-    faults: Mutex<Vec<fube_runtime::FaultType>>,
+    faults: Mutex<Vec<fube_core::FaultType>>,
     pending: bool,
     active: Arc<AtomicUsize>,
     disposed: Arc<AtomicUsize>,
@@ -4023,14 +3930,11 @@ impl FaultNativeView {
     }
 }
 
-impl NativeControlView for FaultNativeView {
-    fn status(&self) -> Result<ReplicaStatus> {
-        Ok(primary_status())
+impl FixtureControl for FaultNativeView {
+    fn observe(&self) -> Result<StableFacts> {
+        Ok(primary_status().stable)
     }
-    fn report_fault(
-        &self,
-        fault: fube_runtime::FaultType,
-    ) -> ServiceFuture<'_, fube_runtime::extensions::FaultDelivery> {
+    fn report_fault(&self, fault: fube_core::FaultType) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
             self.faults.lock().unwrap().push(fault);
             self.active.fetch_add(1, Ordering::AcqRel);
@@ -4041,13 +3945,7 @@ impl NativeControlView for FaultNativeView {
             if self.pending {
                 std::future::pending::<()>().await;
             }
-            Ok(fube_runtime::extensions::FaultDelivery {
-                fault,
-                attempts: 1,
-                last_error: None,
-                cancelled: false,
-                superseded_transient: false,
-            })
+            Ok(())
         })
     }
 }
@@ -4126,7 +4024,7 @@ async fn internal_provider_fault_notifies_once_and_pending_receipt_cannot_block_
                 .unwrap();
             assert_eq!(
                 *view.faults.lock().unwrap(),
-                vec![fube_runtime::FaultType::Transient]
+                vec![fube_core::FaultType::Transient]
             );
             assert_eq!(view.active.load(Ordering::Acquire), 0);
             assert_eq!(view.disposed.load(Ordering::Acquire), 1);
@@ -4166,7 +4064,7 @@ async fn normal_shutdown_never_notifies_fault_and_standalone_has_no_native_view(
         assert_eq!(view.disposed.load(Ordering::Acquire), 0);
     }
     let standalone = engine(Uuid::new_v4(), 1, Arc::new(Provider::default()));
-    assert!(standalone.native_control.is_none());
+    assert!(standalone.fixture_control.is_none());
     abort_owned(&standalone).await;
     let view = Arc::new(FaultNativeView::new(true));
     let startup_error = Engine::bind_with_native_control(
@@ -5462,7 +5360,7 @@ async fn outgoing_budget_repro_requires_eos_or_explicit_preassignment_write_reje
             assert_eq!(write.wait(cancel()).await.unwrap(), 1);
             Some(write)
         }
-        Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull => {
+        Err(error) if error.kind() == fube_core::ErrorKind::ReplicationQueueFull => {
             assert_eq!(p.snapshot().progress.assigned, 0);
             assert_eq!(p.snapshot().progress.committed, 0);
             None
@@ -5590,7 +5488,7 @@ async fn outgoing_copy_and_real_idle_ack_progress_with_admitted_or_rejected_live
                 assert_eq!(p.snapshot().progress.completed, 0);
                 1
             }
-            Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull => {
+            Err(error) if error.kind() == fube_core::ErrorKind::ReplicationQueueFull => {
                 assert!(!admits);
                 assert_eq!(p.snapshot().progress.assigned, 0);
                 assert_eq!(p.snapshot().progress.committed, 0);
@@ -5680,7 +5578,7 @@ async fn empty_primary_permanent_copy_headroom_rejection_is_not_retriable_queue_
             .await
             .err()
             .expect("permanent primary headroom cannot be recovered by retry");
-        assert_eq!(error.kind(), fube_runtime::ErrorKind::ResourceExhausted);
+        assert_eq!(error.kind(), fube_core::ErrorKind::ResourceExhausted);
         assert_eq!(p.snapshot().progress.assigned, 0);
         assert_eq!(p.snapshot().owned_bytes, 0);
     }
@@ -5744,7 +5642,7 @@ async fn outgoing_future_copy_headroom_survives_concurrent_build_and_write_admis
     // cannot consume the next copy slot, even before a future build is known.
     assert!(matches!(
         p.submit(data.clone(), cancel()).await,
-        Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull
+        Err(error) if error.kind() == fube_core::ErrorKind::ReplicationQueueFull
     ));
     assert_eq!(p.snapshot().progress.assigned, 1);
     assert_eq!(p.snapshot().owned_bytes, data.retained_bytes());
@@ -5761,7 +5659,7 @@ async fn outgoing_future_copy_headroom_survives_concurrent_build_and_write_admis
             for _ in 0..32 {
                 assert!(matches!(
                     owner.submit(data.clone(), cancel()).await,
-                    Err(error) if error.kind() == fube_runtime::ErrorKind::ReplicationQueueFull
+                    Err(error) if error.kind() == fube_core::ErrorKind::ReplicationQueueFull
                 ));
                 let snapshot = owner.snapshot();
                 assert!(snapshot.owned_operations <= settings.queue_operations);
@@ -5921,6 +5819,8 @@ async fn outgoing_build_admission_counts_pending_writes_before_installing_any_pe
                 p.writes
                     .try_send(Submit {
                         expected_epoch: None,
+                        access: None,
+                        access_deadline: None,
                         data: Some(data.clone()),
                         charge: Some(charge),
                         cancellation: cancel(),
@@ -6020,7 +5920,7 @@ async fn outgoing_build_on_retained_write_budget_fails_without_losing_write_or_c
     let canceled = cancel();
     canceled.cancel();
     let error = write.wait(canceled).await.unwrap_err();
-    assert_eq!(error.kind(), fube_runtime::ErrorKind::Canceled);
+    assert_eq!(error.kind(), fube_core::ErrorKind::Canceled);
     assert!(error.is_uncertain());
     assert!(matches!(
         timeout(

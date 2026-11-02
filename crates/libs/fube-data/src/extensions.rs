@@ -4,13 +4,13 @@
 //! fube behavior; they are not ported SDK callbacks. Execution/native-binding/
 //! cleanup integration is newly written fube infrastructure using standard Tokio.
 use crate::{Cancellation, Epoch, IOperation, OperationData, Result};
-use fube_runtime::ApiFuture;
+use fube_core::ApiFuture;
 use std::sync::Arc;
 
 pub use crate::api::Progress;
 pub use crate::engine::{EngineSnapshot, PeerSnapshot};
 
-pub use fube_runtime::extensions::EpochDomains;
+pub use fube_core::hosting::EpochDomains;
 
 /// Best-effort fube diagnostics, not native control or compatibility evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +115,7 @@ pub trait ReplicatorDiagnostics {
     fn execution_identity(&self) -> u64;
     fn snapshot(&self) -> EngineSnapshot;
     fn endpoint(&self) -> crate::wire::Endpoint;
-    fn execution_runtime(&self) -> fube_runtime::extensions::ExecutionRuntime;
+    fn execution_runtime(&self) -> fube_core::hosting::ExecutionRuntime;
     fn get_copy_stream_with_origin(&self) -> Result<Arc<dyn OperationOriginStream>>;
     fn get_replication_stream_with_origin(&self) -> Result<Arc<dyn OperationOriginStream>>;
     #[cfg(feature = "qualification")]
@@ -137,7 +137,7 @@ impl ReplicatorDiagnostics for crate::FabricReplicator {
     fn endpoint(&self) -> crate::wire::Endpoint {
         self.endpoint()
     }
-    fn execution_runtime(&self) -> fube_runtime::extensions::ExecutionRuntime {
+    fn execution_runtime(&self) -> fube_core::hosting::ExecutionRuntime {
         self.execution()
     }
     fn get_copy_stream_with_origin(&self) -> Result<Arc<dyn OperationOriginStream>> {

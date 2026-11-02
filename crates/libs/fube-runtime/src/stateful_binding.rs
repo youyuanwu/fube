@@ -204,6 +204,46 @@ pub struct NativeInvocation {
 }
 impl NativeInvocation {
     #[cfg(test)]
+    pub(crate) fn invalidate_for_queue_test(&self, cause: &str) {
+        match cause {
+            "revision" => {
+                self.issued.revision.fetch_add(1, Ordering::AcqRel);
+            }
+            "generation" => {
+                self.unit
+                    .state
+                    .upgrade()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .generation += 1;
+            }
+            "actor" => {
+                *self.unit.actor.lock().unwrap() = Some(uuid::Uuid::new_v4());
+            }
+            "cancellation" => self.issued.cancellation.cancel(),
+            "lifetime" => self.issued.lifetime.cancel(),
+            "remote" => {
+                let (node, _) = self.issued.remote.expect("remote-issued invocation");
+                self.unit
+                    .state
+                    .upgrade()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .remotes
+                    .get_mut(&node)
+                    .unwrap()
+                    .sequence += 1;
+            }
+            "authority" => self
+                .unit
+                .authority
+                .retire_at(std::time::Instant::now() + Duration::from_secs(10)),
+            _ => panic!("unknown invalidation cause"),
+        }
+    }
+    #[cfg(test)]
     pub(crate) fn same_instance(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.issued, &other.issued) && Arc::ptr_eq(&self.entered, &other.entered)
     }
@@ -214,6 +254,12 @@ impl NativeInvocation {
     }
     pub(crate) fn in_own_execution(&self) -> bool {
         self.unit.execution.is_current_entry()
+    }
+    pub(crate) fn execution(&self) -> crate::extensions::ExecutionRuntime {
+        self.unit.execution.clone()
+    }
+    pub(crate) fn authority(&self) -> Arc<Authority> {
+        self.unit.authority.clone()
     }
     pub fn cancellation(&self) -> Cancellation {
         self.issued.cancellation.clone()
@@ -490,7 +536,7 @@ impl NativeRuntimeIntegration {
                 "cleanup cannot capture native invocation",
             ));
         }
-        let invocation = crate::extensions::ExecutionRuntime::capturable_invocation()
+        let invocation = crate::execution::capturable_invocation()
             .ok_or(Error::InvalidInput("no current native invocation"))?;
         if !Arc::ptr_eq(&self.0, &invocation.unit) {
             return Err(Error::InvalidInput(
@@ -658,6 +704,20 @@ pub(super) struct IssueInput {
     pub remote: Option<([u8; 16], u64)>,
     pub cancellation: Cancellation,
 }
+pub(crate) fn prewrite_projection(
+    status: &ReplicaDiagnostics,
+) -> Option<(NativeEpoch, NativeEpoch)> {
+    (status.lifecycle == ReplicaLifecycle::Open
+        && status.replicator_open
+        && status.current_role == ReplicaRole::ActiveSecondary
+        && status.service_role == ReplicaRole::Primary
+        && status.replicator_role == ReplicaRole::Primary
+        && status.configuration_stage == ConfigurationStage::PreWriteRevoke)
+        .then_some((
+            NativeEpoch::from(&status.current_epoch.primary()),
+            NativeEpoch::from(&status.previous_epoch.primary()),
+        ))
+}
 pub(super) fn issue(
     unit: &Unit,
     request: &w::ProxyRequest,
@@ -675,16 +735,7 @@ pub(super) fn issue(
     let state = unit.state.lock().unwrap();
     let native = state.native.as_ref().ok_or(Error::Closed)?;
     let status = state.status.lock().unwrap();
-    let prewrite = (status.lifecycle == ReplicaLifecycle::Open
-        && status.replicator_open
-        && status.current_role == ReplicaRole::ActiveSecondary
-        && status.service_role == ReplicaRole::Primary
-        && status.replicator_role == ReplicaRole::Primary
-        && status.configuration_stage == ConfigurationStage::PreWriteRevoke)
-        .then_some((
-            NativeEpoch::from(&status.current_epoch.primary()),
-            NativeEpoch::from(&status.previous_epoch.primary()),
-        ));
+    let prewrite = prewrite_projection(&status);
     let issued = Arc::new(Issued {
         is_current: AtomicBool::new(true),
         kind,
@@ -758,7 +809,7 @@ impl<T> std::future::Future for InvocationFuture<'_, T> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let scope = crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone());
+        let scope = crate::execution::invocation_scope(self.invocation.clone());
         match scope {
             Ok(_scope) => self.work.as_mut().poll(cx),
             Err(error) => std::task::Poll::Ready(Err(error)),
@@ -802,14 +853,12 @@ impl IPrimaryReplicator for InvocationControl {
         cc: crate::ReplicaSetConfig,
         pc: crate::ReplicaSetConfig,
     ) -> Result<()> {
-        let _scope =
-            crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone())?;
+        let _scope = crate::execution::invocation_scope(self.invocation.clone())?;
         self.control
             .update_catch_up_replica_set_configuration(cc, pc)
     }
     fn update_current_replica_set_configuration(&self, cc: crate::ReplicaSetConfig) -> Result<()> {
-        let _scope =
-            crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone())?;
+        let _scope = crate::execution::invocation_scope(self.invocation.clone())?;
         self.control.update_current_replica_set_configuration(cc)
     }
     fn wait_for_catch_up_quorum(
@@ -824,7 +873,7 @@ impl IPrimaryReplicator for InvocationControl {
         replica: crate::ReplicaInformation,
         cancel: Cancellation,
     ) -> crate::ApiFuture<'_, ()> {
-        let scope = crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone());
+        let scope = crate::execution::invocation_scope(self.invocation.clone());
         match scope {
             Ok(_scope) => Box::pin(InvocationFuture {
                 work: self.control.build_replica(replica, cancel),
@@ -834,8 +883,7 @@ impl IPrimaryReplicator for InvocationControl {
         }
     }
     fn remove_replica(&self, id: i64) -> Result<()> {
-        let _scope =
-            crate::extensions::ExecutionRuntime::invocation_scope(self.invocation.clone())?;
+        let _scope = crate::execution::invocation_scope(self.invocation.clone())?;
         self.control.remove_replica(id)
     }
 }

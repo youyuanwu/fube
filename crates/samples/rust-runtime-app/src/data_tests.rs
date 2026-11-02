@@ -211,9 +211,8 @@ impl IStatefulServiceReplica for ModelReplica {
     ) -> ServiceFuture<'_, Box<dyn IPrimaryReplicator>> {
         Box::pin(async move {
             mode.validate()?;
-            let engine = FabricReplicator::create(
+            let engine = self.native.create_replicator(
                 partition,
-                self.native.clone(),
                 self.provider.clone(),
                 Some(self.replay.clone()),
                 ReplicationEndpointOptions {
@@ -223,7 +222,7 @@ impl IStatefulServiceReplica for ModelReplica {
                 Settings::default(),
             )?;
             if let Some(send) = self.result.lock().unwrap().take() {
-                let _ = send.send((engine.clone(), self.native.clone()));
+                let _ = send.send((engine.diagnostics(), self.native.clone()));
             }
             Ok(Box::new((*engine).clone()) as Box<dyn IPrimaryReplicator>)
         })
