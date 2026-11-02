@@ -34,7 +34,7 @@ Ok(control)
 
 `provider_factory` implements `IStateProvider2Factory`; `data_loss_handler`
 implements `IDataLossHandler`. No test Host/private provider is necessary.
-[External behavioral usage](../../crates/libs/fube-txn/tests/public_runtime.rs#L264)
+[External behavioral usage](../../crates/libs/fube-txn/tests/public_runtime.rs#L435)
 shows registered construction with actual native-issued controls.
 Do **not** separately open/role-change/close either layer: the returned
 [composite](../../crates/libs/fube-txn/src/kernel/composite.rs#L51-L178)
@@ -209,11 +209,29 @@ overflow/finite safety errors are Rust differences, not native allocator parity.
 
 ## Validation
 
-[Public behavioral test](../../crates/libs/fube-txn/tests/public_runtime.rs#L446)
+[Public behavioral test](../../crates/libs/fube-txn/tests/public_runtime.rs#L702)
 constructs the supported owner in a registered service, creates provider IDs,
 executes incremental transactions, triggers native MB checkpoint policy, performs
 actual null-context Full Build with one lower capture, distinguishes empty/absent
 streams/EOS/Dispose, then replicates new increments and commits registry deletion.
+It now discovers/initializes a real child, copies its state and ID through Full,
+and distinguishes roots-only/all enumeration. Both direct-composite and ordinary
+public-delegating return routes run these same observations.
+An accepted commit observer is dropped while provider Apply is held; after gate
+release the public transaction commits, Unlock occurs, explicit Dispose succeeds,
+and subsequent one-capture public progress advances
+([observer witness](../../crates/libs/fube-txn/tests/public_runtime.rs#L640-L698)).
+Public control recording also verifies two actual completed Builds with the
+native retry's Remove between them, explicit later Remove, projected epoch,
+one data-loss callback/result and actual Close. A separate real incomplete
+secondary getter returns native NotReady; application Add is refused, and
+actual native terminal Close/Abort fallback owns cleanup
+([control/error witness](../../crates/libs/fube-txn/tests/public_runtime.rs#L893-L1047)).
+The post-success externally rejected Build/retry discriminator uses **normal
+default Settings**; fresh Full, observer Drop and subsequent Barrier/progress
+retain `provider_operations=1`. Repeated already-completed copy under a single
+capture window is not a qualified progress guarantee; do not infer it from
+default-profile retry success or hide it with a protected EOS/Barrier pool.
 [Registry tests](../../crates/libs/fube-txn/src/kernel/phase4_registry_tests.rs#L1)
 add owned observer-drop, key ordering, abort/dispose, native timeout/token/retry,
 hierarchy, post-Open failure cleanup, copy/promotion high-water and Close drains.
