@@ -386,6 +386,29 @@ class BundleTests(ProjectFiles):
                 data.build_bundle(self.root / "changed")
         self.assertFalse((self.root / "changed/build-info.json").exists())
 
+    def test_explicit_target_is_shared_by_nested_and_native_packaging_without_fallback(self):
+        target = self.root / "owned-target"
+        native = target / "debug/native-replicator-oracle"
+        native.parent.mkdir(parents=True)
+        native.write_bytes(executable("native-replicator-oracle"))
+        def commands(*args, **kwargs):
+            if args[:2] == ("readelf", "-d"):
+                return DYNAMIC
+            self.assertEqual(args[:3], ("cargo", "tree", "--locked"))
+            return GRAPHS["runtime_observer" if args[-1] == "fube-client" else args[-1]]
+        def legacy(directory, selected):
+            self.assertEqual(selected, target)
+            self.make_legacy(directory)
+        with patch.object(data.runtime, "build_bundle", side_effect=legacy), \
+             patch.object(data.runtime, "clean_source_revision", return_value="a" * 40), \
+             patch.object(data.runtime, "run", side_effect=commands):
+            data.build_bundle(self.root / "selected", target)
+            bundle = data.load_bundle(self.root / "selected")
+            self.assertEqual((bundle.directory / "bin/native-replicator-oracle").read_bytes(), native.read_bytes())
+            native.unlink()
+            with self.assertRaises(FileNotFoundError):
+                data.build_bundle(self.root / "missing-selected", target)
+
     def test_new_package_preserves_rust_defaults_and_no_mixed_default_stateless(self):
         bundle = data.load_bundle(self.bundle())
         with patch.object(data, "ROOT", self.root):

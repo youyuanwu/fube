@@ -214,6 +214,14 @@ cargo test --locked --workspace --all-features --doc
 python3 -m unittest discover -s tests/offline -t . -p 'test_*.py'
 ```
 
+For task-owned alternate Cargo output storage, build with `CARGO_TARGET_DIR`
+and pass that same root explicitly to the maintained data/runtime
+`--build-bundle ... --target-dir ...` or standalone native-runtime
+`package --output ... --target-dir ...` producer. The default remains `target/`.
+Missing selected outputs fail without falling back to default binaries; source,
+inventory, hash and no-build consumer checks are unchanged. This moves Cargo
+and bundle storage, not Docker's native data volumes.
+
 The [RA protocol foundation](cluster/RaProtocolFoundation.md) adds ordinary
 native-free Rust tests and offline catalog/input-validator tests to these same
 workspace/offline selections. Its separate [native source-baseline codec

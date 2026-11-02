@@ -140,15 +140,18 @@ class Bundle:
             "rust-runtime-app" if kind == "rust" else "native-replicator-oracle"))
 
 
-def build_bundle(directory: Path) -> None:
+def build_bundle(directory: Path, target_dir: Path | None = None) -> None:
     revision = runtime.clean_source_revision()
     require(not directory.exists() and not directory.is_symlink(), "bundle destination must be NEW")
     directory.mkdir(parents=True, exist_ok=False)
-    runtime.build_bundle(directory / "legacy")
+    if target_dir is None:
+        runtime.build_bundle(directory / "legacy")
+    else:
+        runtime.build_bundle(directory / "legacy", target_dir)
     sources = {
         "rust-runtime-app": directory / "legacy/rust-runtime-app",
         "runtime_observer": directory / "legacy/runtime_observer",
-        "native-replicator-oracle": ROOT / "target/debug/native-replicator-oracle",
+        "native-replicator-oracle": (target_dir if target_dir is not None else ROOT / "target") / "debug/native-replicator-oracle",
     }
     graphs = {name: runtime.run("cargo", "tree", "--locked", "-p",
                                "fube-client" if name == "runtime_observer" else name)
@@ -3489,6 +3492,7 @@ def main(argv=None) -> None:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--build-bundle", type=Path, help="package existing Cargo outputs; NEW directory, clean source")
     mode.add_argument("--prebuilt", type=Path, help="strict bundle; no Cargo or compiler fallback")
+    parser.add_argument("--target-dir", type=Path, help="explicit Cargo output root for --build-bundle only")
     parser.add_argument("--profile", choices=MANIFEST.profiles)
     parser.add_argument("--existing-owner", help="exact caller-owned allocation capability; retain allocation")
     parser.add_argument("--report", type=Path, help="NEW evidence file, never overwrite")
@@ -3500,9 +3504,14 @@ def main(argv=None) -> None:
     if args.build_bundle is not None:
         if args.name or args.existing_owner or args.profile or args.report or args.summary:
             parser.error("--build-bundle is not qualification; do not combine options")
-        build_bundle(args.build_bundle)
+        if args.target_dir is None:
+            build_bundle(args.build_bundle)
+        else:
+            build_bundle(args.build_bundle, args.target_dir.resolve(strict=True))
         print(json.dumps({"status": "BUILT", "bundle": str(args.build_bundle)}))
         return
+    if args.target_dir is not None:
+        parser.error("--target-dir requires --build-bundle")
     if not args.name or not re.fullmatch(r"[a-z][a-z0-9-]{0,39}", args.name) or not args.profile or not args.report:
         parser.error("qualification requires a unique name, --profile and --report NEWFILE")
     if args.existing_owner is not None and not re.fullmatch(r"[a-f0-9]{32}", args.existing_owner):

@@ -101,13 +101,15 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(file, "sha256").hexdigest()
 
 
-def built_binaries() -> Binaries:
-    for path in (DEFAULT_APP, DEFAULT_OBSERVER):
+def built_binaries(target_dir: Path | None = None) -> Binaries:
+    app = target_dir / "debug/rust-runtime-app" if target_dir is not None else DEFAULT_APP
+    observer = target_dir / "debug/examples/runtime_observer" if target_dir is not None else DEFAULT_OBSERVER
+    for path in (app, observer):
         if not path.is_file() or path.is_symlink() or not os.access(path, os.X_OK):
             raise RuntimeError(f"missing executable build output: {path}; run cargo build upstream")
     graph = run("cargo", "tree", "--locked", "-p", "rust-runtime-app")
     validate_dependency_graph(graph)
-    return Binaries(DEFAULT_APP, DEFAULT_OBSERVER, graph)
+    return Binaries(app, observer, graph)
 
 
 def clean_source_revision() -> str:
@@ -119,9 +121,9 @@ def clean_source_revision() -> str:
     return revision
 
 
-def build_bundle(directory: Path) -> None:
+def build_bundle(directory: Path, target_dir: Path | None = None) -> None:
     revision = clean_source_revision()
-    binaries = built_binaries()
+    binaries = built_binaries() if target_dir is None else built_binaries(target_dir)
     directory.mkdir(parents=True, exist_ok=False)
     hashes = {}
     for source, name in ((binaries.app, "rust-runtime-app"), (binaries.observer, "runtime_observer")):
@@ -1273,6 +1275,7 @@ def main() -> None:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--build-bundle", type=Path, help="package existing Cargo outputs/evidence; never compile")
     mode.add_argument("--prebuilt", type=Path, help="use a verified binary bundle; never build or invoke Cargo")
+    parser.add_argument("--target-dir", type=Path, help="explicit Cargo output root for --build-bundle only")
     parser.add_argument("--existing-owner", help="exact owner capability; never destroy caller-owned onebox")
     parser.add_argument("--restart-service", help="qualify replacement of an explicitly named existing owned service")
     parser.add_argument("--full",action="store_true",help="native shared-process/control/callback/authority qualification")
@@ -1282,9 +1285,14 @@ def main() -> None:
     if args.build_bundle is not None:
         if args.name or args.existing_owner or args.restart_service or args.full or args.stateful or args.report:
             parser.error("--build-bundle cannot be combined with qualification options")
-        build_bundle(args.build_bundle)
+        if args.target_dir is None:
+            build_bundle(args.build_bundle)
+        else:
+            build_bundle(args.build_bundle, args.target_dir.resolve(strict=True))
         print(json.dumps({"bundle": str(args.build_bundle), "status": "BUILT"}))
         return
+    if args.target_dir is not None:
+        parser.error("--target-dir requires --build-bundle")
     if args.name is None:
         parser.error("an allocation name is required for qualification")
     if args.prebuilt is None:

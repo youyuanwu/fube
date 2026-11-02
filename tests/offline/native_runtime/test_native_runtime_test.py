@@ -241,6 +241,23 @@ class PrebuiltTests(unittest.TestCase):
                 profile.package_bundle(self.root / "missing-output")
             run.assert_not_called()
 
+    def test_explicit_target_packages_only_selected_outputs_without_fallback(self):
+        target = self.root / "owned-target"
+        for name, relative in profile.BINARY_OUTPUTS.items():
+            path = target / pathlib.Path(relative).relative_to("target")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"selected-" + name.encode())
+            path.chmod(0o755)
+        bundle = self.root / "selected"
+        with patch.object(profile.subprocess, "run", side_effect=AssertionError("must not compile")):
+            profile.package_bundle(bundle, target)
+        loaded = profile.load_bundle(bundle)
+        for name, path in loaded.items():
+            self.assertEqual(path.read_bytes(), b"selected-" + name.encode())
+        (target / "debug/fube-test-host").unlink()
+        with self.assertRaisesRegex(ValueError, "missing executable build output"):
+            profile.package_bundle(self.root / "no-fallback", target)
+
 
 if __name__ == "__main__":
     unittest.main()

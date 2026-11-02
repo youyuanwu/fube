@@ -18,6 +18,32 @@ hostile local processes and does not qualify secure production clusters.
 Existing permissions, security controls and concrete connection roles are not
 disabled or widened.
 
+### Shared raw sessions, distinct adapters
+
+The channel and replication peers now use the same operational
+[`raw_session`](../../crates/libs/fube-transport/src/raw_session.rs) establishment,
+staged reader, fenced frame writer and joined I/O lifetime. Raw sessions support
+initiating sockets (zero ListenInstance nonce) and accepted sockets (fresh
+listen-side nonce). One absolute establishment budget includes connect and both
+hello directions. This does **not** make `GatewayChannel` an arbitrary peer
+server: its numeric-loopback and composition checks remain in force.
+
+The raw reader validates fixed lengths before allocation, then offers a bounded
+header-stage admission/drain decision before body allocation. Idle waiting has
+no inactivity timeout; a started frame has one finite progress watchdog.
+Adapters retain finite queue/byte ownership and choose priority. Their fence
+is sampled around every actual socket poll until the first positive write;
+selection and Pending do not commit visibility. After that write, the complete
+suffix and its charge stay owned until completion or independent frame failure,
+even on caller cancellation, operation expiry or close. Owners stop then join;
+they must not cancel/drop that writer future. Complete local write is never
+remote receipt, acknowledgment or commit.
+
+Gateway correlation/history, request/reply grants and IPC identity remain above
+raw I/O. Replication codecs, routes, semantic ACK/retry/copy/reconfiguration and
+independent control/data admission remain in `fube-data`; neither profile is
+forced through the other's protocol.
+
 The former `GatewayProfile` API is removed, with no compatibility wrapper.
 `native_demux::ChannelComposition` installs independent stateless envelope
 validators for outbound raw/RPC/reserved one-way sends, ordinary replies, actor
