@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Parser, Subcommand};
-use fube_client::{Error, ImageStoreClient, Result};
+use fube_client::{Error, ImageStoreClient, ImageStoreClientOptions, Result};
 
 #[derive(Parser)]
 #[command(version, about = "Native Service Fabric development CLI")]
@@ -65,7 +65,16 @@ async fn run(arguments: Arguments) -> Result<()> {
             .checked_duration_since(tokio::time::Instant::now())
             .filter(|remaining| !remaining.is_zero())
             .ok_or(Error::Timeout)?;
-        let mut client = ImageStoreClient::connect_clear(arguments.endpoint, remaining).await?;
+        let channel = ImageStoreClient::endpoint_clear(arguments.endpoint)?
+            .connect_timeout(remaining)
+            .connect()
+            .await?;
+        let mut client = ImageStoreClient::new(
+            channel,
+            ImageStoreClientOptions {
+                default_timeout: budget,
+            },
+        )?;
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())
             .filter(|remaining| !remaining.is_zero())

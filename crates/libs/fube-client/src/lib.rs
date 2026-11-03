@@ -41,7 +41,7 @@ pub use deployed_code_packages::*;
 pub use deployed_replicas::*;
 pub use deployed_service_packages::*;
 pub use health::*;
-pub use image_store::ImageStoreClient;
+pub use image_store::{ImageStoreClient, ImageStoreClientOptions};
 pub use naming_uri::NamingUri;
 pub use nodes::*;
 pub use notifications::*;
