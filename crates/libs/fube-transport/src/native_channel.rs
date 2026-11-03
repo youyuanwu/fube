@@ -231,7 +231,7 @@ pub(crate) trait SessionEnvelope: Send + Sync {
     }
 }
 
-struct NativeEnvelope;
+pub(crate) struct NativeEnvelope;
 impl SessionEnvelope for NativeEnvelope {}
 
 /// Opaque completion acknowledgment and retained result reservation.
@@ -487,14 +487,10 @@ impl GatewayChannel {
         limits: ChannelLimits,
         deadline: Instant,
     ) -> Result<Self> {
-        Self::connect_with_envelope(
-            endpoint,
-            composition,
-            limits,
-            deadline,
-            Arc::new(NativeEnvelope),
-        )
-        .await
+        crate::Endpoint::unsecured_loopback(endpoint, composition)?
+            .channel_limits(limits)
+            .connect_until(deadline)
+            .await
     }
 
     pub(crate) async fn connect_with_envelope(
@@ -646,6 +642,18 @@ impl GatewayChannel {
                 join: tokio::sync::Mutex::new(Some(join)),
             }),
         }
+    }
+
+    /// Clone this connection's original, inert target after a terminal sample.
+    ///
+    /// This does no I/O and never derives identity from advertised metadata.
+    /// Success is not lasting liveness or permission: every submission still
+    /// checks connection affinity, terminal state and installed policies.
+    pub fn target(&self) -> Result<Arc<GatewayTarget>> {
+        if self.owner.shared.error().is_some() {
+            return Err(Error::Closed);
+        }
+        Ok(self.owner.shared.target.clone())
     }
 
     /// Obtain the paired nonowning receiver; disabled mode fails explicitly.

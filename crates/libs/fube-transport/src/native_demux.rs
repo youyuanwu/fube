@@ -33,12 +33,14 @@ pub enum OutboundKind {
 pub type OutboundValidator = fn(&Message, &Properties, OutboundKind) -> Result<()>;
 
 /// One actor's ingress selection and authorization, without reply authority.
+#[derive(Clone)]
 pub struct ActorRegistration {
     pub actor: i64,
     pub authorize: EnvelopeValidator,
 }
 
 /// Immutable, finite native actor table. Action is not a lookup key.
+#[derive(Clone)]
 pub struct ActorDemux {
     actors: Box<[ActorRegistration]>,
 }
@@ -100,6 +102,7 @@ impl ActorDemux {
 ///
 /// The channel captures `reply` only after `incoming` succeeds. Neither actor
 /// registration nor public IncomingMessage assembly can create that context.
+#[derive(Clone)]
 pub struct DuplexPolicy {
     pub incoming: EnvelopeValidator,
     pub reply: EnvelopeValidator,
@@ -109,6 +112,7 @@ pub struct DuplexPolicy {
 ///
 /// Unlike DuplexPolicy this never classifies IsUncorrelatedReply traffic.
 /// Actor registration alone cannot mint this private consuming grant.
+#[derive(Clone)]
 pub struct RequestPolicy {
     pub incoming: EnvelopeValidator,
     pub reply: EnvelopeValidator,
@@ -120,6 +124,7 @@ pub struct RequestPolicy {
 /// Ordinary reply policy runs before request-table lookup, allowing adapters to
 /// reject contradictory domain envelopes without changing native classification.
 /// Common transport/correlation/affinity validation cannot be overridden.
+#[derive(Clone)]
 pub struct ChannelComposition {
     pub outbound: OutboundValidator,
     pub ordinary_reply: EnvelopeValidator,

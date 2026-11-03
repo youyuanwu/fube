@@ -92,10 +92,15 @@ async fn accepted_ipc_owns_hello_identity_and_ids_without_bypassing_common_reply
     assert_eq!(instance.nonce, hello.properties().unwrap().id.guid);
     assert_ne!(instance.nonce, [0; 16]);
     let channel = accepting.await.unwrap();
-    let target = channel
-        .resolve_target(&peer.local_addr().unwrap().to_string())
-        .unwrap();
+    let target = channel.target().unwrap();
     assert_eq!(target.address, peer.local_addr().unwrap());
+    assert_ne!(target.address, endpoint);
+    assert!(Arc::ptr_eq(
+        &target,
+        &channel
+            .resolve_target(&peer.local_addr().unwrap().to_string())
+            .unwrap()
+    ));
     let receiver = channel.receiver().unwrap();
     let mut original = command(2, true);
     original.headers.push(identity());

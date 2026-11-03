@@ -17,7 +17,7 @@ use crate::{
     message::{self, Header, ListenInstance, Message, MessageId},
     native_channel::{envelope, ChannelLimits, GatewayChannel, SessionEnvelope},
     native_demux::ChannelComposition,
-    raw_session, Error, Result,
+    raw_session, Endpoint, Error, Result,
 };
 
 /// Establish the supported clear-loopback IPC session on a shared channel.
@@ -33,7 +33,10 @@ pub async fn connect_unsecured_loopback(
     host_id: &str,
 ) -> Result<GatewayChannel> {
     let session = Arc::new(IpcSession::new(host_id, std::process::id())?);
-    GatewayChannel::connect_with_envelope(endpoint, composition, limits, deadline, session).await
+    Endpoint::unsecured_loopback(endpoint, composition)?
+        .channel_limits(limits)
+        .connect_with_envelope_until(deadline, session)
+        .await
 }
 
 /// Establish one accepted, explicitly trusted numeric-loopback IPC session.
