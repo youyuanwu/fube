@@ -108,8 +108,7 @@ pub struct GatewayDescription {
 /// Eight admitted typed calls are retained through result transfer/drop; excess
 /// calls fail immediately. Protocol/domain failures do not abort the owner.
 /// Every remote operation accepts an optional whole-operation timeout:
-/// `None` uses [`ClientOptions::default_timeout`] (or the duration supplied to
-/// [`Self::connect_clear`]), while
+/// `None` uses [`ClientOptions::default_timeout`], while
 /// `Some(duration)` overrides it for that call. `None` is not an infinite timeout.
 ///
 /// ```no_run
@@ -154,10 +153,6 @@ impl FabricClient {
     /// clones. A target sample is not a lasting liveness guarantee.
     pub fn new(channel: Channel, options: ClientOptions) -> Result<Self> {
         let budget = options.budget()?;
-        Self::bind(channel, options, budget)
-    }
-
-    fn bind(channel: Channel, options: ClientOptions, budget: typed::ClientBudget) -> Result<Self> {
         let target = channel.target()?;
         Ok(Self {
             channel,
@@ -181,34 +176,6 @@ impl FabricClient {
             CallContext { deadline },
         )
         .await
-    }
-
-    /// Connect explicitly without TLS or authentication.
-    ///
-    /// `timeout` also supplies the default for subsequent operations that pass
-    /// `None`. There is no insecure fallback, automatic reconnect, or replay.
-    /// Only numeric nonzero-port loopback endpoints are allowed. Notifications
-    /// are disabled on this owner; notification clients own separate opted-in
-    /// GatewayChannels; image-transfer clients own separate upload channels.
-    pub async fn connect_clear(endpoint: SocketAddr, timeout: Duration) -> Result<Self> {
-        let deadline = deadline_after(timeout)?;
-        let options = ClientOptions {
-            default_timeout: timeout,
-            ..ClientOptions::default()
-        };
-        let budget = options.budget()?;
-        // Preserve the legacy caller's absolute budget through local binding.
-        // This absolute-deadline entry uses Endpoint's same private dial path.
-        let channel = Channel::connect_unsecured_loopback(
-            endpoint,
-            channel_adapter::ordinary()?,
-            ChannelLimits::default(),
-            deadline,
-        )
-        .await?;
-        let client = Self::bind(channel, options, budget)?;
-        typed::check_deadline(deadline)?;
-        Ok(client)
     }
 
     /// Discover the native gateway's full node identity.

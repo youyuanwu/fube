@@ -195,9 +195,20 @@ async fn empty_list_successes_support_default_and_explicit_timeouts() {
         }
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for kind in QueryKind::ALL {
         kind.call(&client, None).await.unwrap();
         kind.call(&client, Some(TIMEOUT_DURATION)).await.unwrap();
@@ -295,9 +306,20 @@ async fn native_errors_from_each_new_query_leave_shared_connection_usable() {
         }
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for kind in QueryKind::ALL {
         assert!(matches!(
             kind.call(&client, None).await,
@@ -393,9 +415,20 @@ async fn invalid_new_query_options_send_nothing_and_preserve_connection() {
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for kind in QueryKind::ALL {
         for timeout in [Duration::ZERO, Duration::MAX] {
             assert!(matches!(

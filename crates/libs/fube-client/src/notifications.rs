@@ -305,27 +305,6 @@ impl ServiceNotificationClient {
         Self::start_before_deadline(channel, options.default_timeout, deadline).await
     }
 
-    /// Establish an independent unsecured numeric-loopback gateway/native session.
-    /// Non-loopback and zero-port endpoints are rejected. This deliberately
-    /// narrows the previous clear-TCP policy; advertised private addresses are
-    /// never dialed and an ordinary FabricClient's channel is never adopted.
-    /// `timeout` is one absolute budget across establishment and native startup,
-    /// and also the subsequent operation/processing-ACK default.
-    pub async fn connect_clear(
-        endpoint: SocketAddr,
-        timeout: Duration,
-    ) -> NotificationResult<Self> {
-        let deadline = deadline_after(timeout)?;
-        let channel = GatewayChannel::connect_unsecured_loopback(
-            endpoint,
-            crate::channel_adapter::notifications()?,
-            notification_limits(),
-            deadline,
-        )
-        .await?;
-        Self::start_before_deadline(channel, timeout, deadline).await
-    }
-
     async fn start_before_deadline(
         channel: Channel,
         timeout: Duration,

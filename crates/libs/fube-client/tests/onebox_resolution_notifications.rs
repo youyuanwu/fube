@@ -79,9 +79,18 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
         return Err("owned onebox runtime/readiness mismatch".into());
     }
 
-    let ordinary = FabricClient::connect_clear(config.endpoint, Duration::from_secs(60))
+    let channel = FabricClient::endpoint_clear(config.endpoint)?
+        .connect_timeout(Duration::from_secs(60))
+        .connect()
         .await
         .map_err(|e| format!("ordinary establishment: {e}"))?;
+    let ordinary = FabricClient::new(
+        channel,
+        ClientOptions {
+            default_timeout: Duration::from_secs(60),
+            ..Default::default()
+        },
+    )?;
     let channel = ServiceNotificationClient::endpoint_clear(config.endpoint)?
         .connect_timeout(Duration::from_secs(60))
         .connect()
@@ -95,10 +104,24 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
     )
     .await
     .map_err(|e| format!("first notification startup: {e}"))?;
-    let mut independent =
-        ServiceNotificationClient::connect_clear(config.endpoint, Duration::from_secs(60))
-            .await
-            .map_err(|e| format!("second notification establishment: {e}"))?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let channel = ServiceNotificationClient::endpoint_clear(config.endpoint)?
+        .connect_until(deadline)
+        .await
+        .map_err(|e| format!("second notification establishment: {e}"))?;
+    let mut independent = tokio::time::timeout_at(
+        deadline,
+        ServiceNotificationClient::start(
+            channel,
+            NotificationClientOptions {
+                startup_timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
+                default_timeout: Duration::from_secs(60),
+            },
+        ),
+    )
+    .await
+    .map_err(|_| Error::Timeout)?
+    .map_err(|e| format!("second notification startup: {e}"))?;
     if !observed
         .iter()
         .any(|n| n["Name"] == notifications.gateway().node_name)
@@ -112,8 +135,22 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
     let stateless: NamingUri = format!("{app}/Stateless").parse()?;
     let stateful: NamingUri = format!("{app}/Stateful").parse()?;
     let proxy = loss_proxy::LossProxy::start(config.endpoint).await?;
-    let mut retry_client =
-        ServiceNotificationClient::connect_clear(proxy.address, Duration::from_secs(60)).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let channel = ServiceNotificationClient::endpoint_clear(proxy.address)?
+        .connect_until(deadline)
+        .await?;
+    let mut retry_client = tokio::time::timeout_at(
+        deadline,
+        ServiceNotificationClient::start(
+            channel,
+            NotificationClientOptions {
+                startup_timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
+                default_timeout: Duration::from_secs(60),
+            },
+        ),
+    )
+    .await
+    .map_err(|_| Error::Timeout)??;
     let prefix = notifications
         .register_filter(
             &ServiceNotificationFilter {

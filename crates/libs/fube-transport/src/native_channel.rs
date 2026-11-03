@@ -522,23 +522,6 @@ impl Iterator for GatewayIngressSnapshot {
 impl ExactSizeIterator for GatewayIngressSnapshot {}
 
 impl GatewayChannel {
-    /// Connect a dedicated, explicitly trusted unsecured-development gateway.
-    ///
-    /// Only numeric loopback endpoints are allowed. The immutable composition
-    /// authorizes envelopes independently of actor selection.
-    /// One deadline includes TCP connect and the ListenInstance exchange.
-    pub async fn connect_unsecured_loopback(
-        endpoint: SocketAddr,
-        composition: ChannelComposition,
-        limits: ChannelLimits,
-        deadline: Instant,
-    ) -> Result<Self> {
-        crate::Endpoint::unsecured_loopback(endpoint, composition)?
-            .channel_limits(limits)
-            .connect_until(deadline)
-            .await
-    }
-
     pub(crate) async fn connect_with_envelope(
         endpoint: SocketAddr,
         composition: ChannelComposition,

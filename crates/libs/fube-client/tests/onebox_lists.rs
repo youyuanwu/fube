@@ -85,8 +85,17 @@ async fn scenario(mut journal: Journal) -> Result<Value> {
     http.prepare(&mut journal, &path).await?;
     http.wait_ready(&journal).await?;
     let observed_apps = http.applications(&journal).await?;
-    let client =
-        FabricClient::connect_clear("127.0.0.1:19000".parse()?, Duration::from_secs(30)).await?;
+    let channel = FabricClient::endpoint_clear("127.0.0.1:19000".parse()?)?
+        .connect_timeout(Duration::from_secs(30))
+        .connect()
+        .await?;
+    let client = FabricClient::new(
+        channel,
+        ClientOptions {
+            default_timeout: Duration::from_secs(30),
+            ..Default::default()
+        },
+    )?;
     let mut app_query = ApplicationQueryDescription {
         parameters: ApplicationQueryParameters {
             filter: ApplicationListFilter::TypeName(journal.type_name.clone()),

@@ -202,9 +202,20 @@ async fn health_options_encode_sorted_json_and_preserve_omission_false_and_raw_b
         })
         .await;
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for (policy, filter) in cases {
         let mut query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("Node_Å😀"));
         query.parameters.health_policy = policy.map(|value| NodeHealthPolicy {
@@ -411,9 +422,20 @@ async fn health_native_failures_are_local_and_healthy_queries_reuse_the_connecti
         })
         .await;
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n"));
     for index in 0..3 {
         let outcome = client.get_node_health(&query, None).await;
@@ -456,9 +478,20 @@ async fn health_local_invalid_names_and_timeouts_send_nothing() {
         })
         .await;
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for name in [
         "".into(),
         "a\0b".into(),
@@ -523,9 +556,20 @@ async fn health_malformed_success_is_call_local_and_pending_neighbor_succeeds() 
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let query = NodeHealthQueryDescription::new(NodeHealthQueryParameters::new("n"));
     let health = client.get_node_health(&query, None);
     let neighbor = client.name_exists("fabric:/neighbor", None);
@@ -576,9 +620,20 @@ async fn health_reordered_mixed_operations_and_late_cancelled_malformed_replies(
         }
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let clone = client.clone();
     let pending = tokio::spawn(async move {
         clone

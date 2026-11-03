@@ -899,9 +899,20 @@ async fn native_list_errors_are_local_and_allow_mixed_reuse() {
         }
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(matches!(
         client.get_application_list(&Default::default(), None).await,
         Err(ClientError::Domain(DomainFailure {
@@ -980,9 +991,20 @@ async fn mixed_lists_ping_and_name_complete_out_of_order_on_one_stream() {
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let apps = ApplicationQueryDescription::default();
     let services = ServiceQueryDescription::new(ServiceQueryParameters::new(
         "fabric:/Model".parse().unwrap(),
@@ -1047,9 +1069,20 @@ async fn malformed_list_is_call_local_and_pending_neighbor_succeeds() {
             std::io::ErrorKind::UnexpectedEof
         );
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let c = client.clone();
     let first =
         tokio::spawn(async move { c.get_application_list(&Default::default(), None).await });
@@ -1116,9 +1149,20 @@ async fn explicit_service_paging_stops_at_empty_terminal_page_without_hidden_req
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let mut query = ServiceQueryDescription::new(ServiceQueryParameters::new(
         "fabric:/Model".parse().unwrap(),
     ));
@@ -1219,9 +1263,20 @@ async fn timed_out_list_ignores_late_malformed_reply_and_preserves_reuse() {
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(matches!(
         client
             .get_application_list(&Default::default(), Some(Duration::from_millis(75)))

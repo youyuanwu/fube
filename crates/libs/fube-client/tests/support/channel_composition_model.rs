@@ -27,6 +27,35 @@ fn options(calls: usize) -> ClientOptions {
 }
 
 #[tokio::test]
+async fn endpoint_absolute_deadline_controls_dial_without_renewing_the_budget() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = FabricClient::endpoint_clear(listener.local_addr().unwrap())
+        .unwrap()
+        .connect_timeout(Duration::from_millis(1));
+    assert!(matches!(
+        endpoint.connect_until(Instant::now()).await,
+        Err(Error::Timeout)
+    ));
+    assert!(timeout(Duration::from_millis(20), listener.accept())
+        .await
+        .is_err());
+    let server = tokio::spawn(async move {
+        sleep(Duration::from_millis(20)).await;
+        let mut peer = establish(listener).await;
+        assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+    });
+    let channel = endpoint
+        .connect_until(Instant::now() + TIMEOUT_DURATION)
+        .await
+        .unwrap();
+    channel
+        .close(Instant::now() + TIMEOUT_DURATION)
+        .await
+        .unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn stub_failure_is_pre_application_and_drops_only_its_consumed_owner() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = FabricClient::endpoint_clear(listener.local_addr().unwrap()).unwrap();

@@ -66,7 +66,10 @@ impl Endpoint {
         self.connect_until(deadline).await
     }
 
-    pub(crate) async fn connect_until(&self, deadline: Instant) -> Result<Channel> {
+    /// Establish using a caller-owned absolute deadline instead of the configured
+    /// connection timeout. This lets connection setup share an enclosing budget
+    /// with subsequent protocol startup without renewing it.
+    pub async fn connect_until(&self, deadline: Instant) -> Result<Channel> {
         self.connect_with_envelope_until(deadline, Arc::new(NativeEnvelope))
             .await
     }

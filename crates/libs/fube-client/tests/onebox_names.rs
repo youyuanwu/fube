@@ -1,7 +1,7 @@
 //! Self-contained native writes; HTTP observes and cleans only the pre-owned name.
 use std::{path::Path, time::Duration};
 
-use fube_client::{ClientError, DomainFailure, Error, FabricClient};
+use fube_client::{ClientError, ClientOptions, DomainFailure, Error, FabricClient};
 use serde_json::{json, Value};
 
 #[path = "support/name_oracle.rs"]
@@ -75,8 +75,17 @@ async fn lifecycle() -> Result<Value> {
     let mut journal = Journal::new(owner()?, std::env::var("MSSF_TEST_ARCHIVE_SHA256")?)?;
     journal.reserve(&path)?;
     confirm_absent(&mut journal, &path, &http).await?;
-    let client =
-        FabricClient::connect_clear("127.0.0.1:19000".parse()?, Duration::from_secs(30)).await?;
+    let channel = FabricClient::endpoint_clear("127.0.0.1:19000".parse()?)?
+        .connect_timeout(Duration::from_secs(30))
+        .connect()
+        .await?;
+    let client = FabricClient::new(
+        channel,
+        ClientOptions {
+            default_timeout: Duration::from_secs(30),
+            ..Default::default()
+        },
+    )?;
     assert!(!client.name_exists(&journal.name, None).await?);
     mutate(&client, &mut journal, &path, false, None).await?;
     assert!(http.exists(&journal.name).await?);

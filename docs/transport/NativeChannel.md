@@ -10,9 +10,9 @@ NamingGateway clients or activated-host IPC.
 This is native Fabric TCP messaging, not `IFabricTransport`, UDP, actor36,
 a typed client, router or adapter around `Connection`.
 
-`GatewayChannel::connect_unsecured_loopback(endpoint, composition, limits,
-deadline)` establishes TCP and the clear ListenInstance exchange inside one
-absolute deadline. It rejects non-loopback/zero-port endpoints and invalid
+`Endpoint::connect()` or `Endpoint::connect_until(deadline)` establishes TCP and
+the clear ListenInstance exchange inside one absolute deadline. Endpoint setup
+rejects non-loopback/zero-port addresses; connection setup rejects invalid
 limits. Clear loopback assumes trusted local peers; it does not authenticate
 hostile local processes and does not qualify secure production clusters.
 Existing permissions, security controls and concrete connection roles are not
@@ -31,7 +31,9 @@ default connection duration is 30 seconds, independent of the frame watchdog.
 `connect_timeout` and `channel_limits` are validated before dial; each borrowed
 `Endpoint::connect()` establishes a fresh connection, identity and ID history
 within one absolute deadline. Channel clones instead share the original owner.
-The older absolute-deadline constructor uses the same private connection path.
+`Endpoint::connect_until(deadline)` uses the same private connection path with a
+caller-owned absolute budget instead of the configured connection timeout.
+Channel has no public dialing constructor; clients consume an established Channel.
 
 `Channel::target()` clones the original captured actual-peer target after a
 terminal sample. It does not parse an address, consult advertised ListenInstance,
@@ -344,12 +346,12 @@ receipts below cannot qualify a changed runtime/channel build.
 ## Ownership and operations
 
 ```rust,no_run
-use fube_client::{FabricClient, DEFAULT_TIMEOUT};
+use fube_client::{ClientOptions, FabricClient};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let client = FabricClient::connect_clear(
-    "127.0.0.1:19000".parse().unwrap(), DEFAULT_TIMEOUT,
-).await?;
+let endpoint = FabricClient::endpoint_clear("127.0.0.1:19000".parse()?)?;
+let channel = endpoint.connect().await?;
+let client = FabricClient::new(channel, ClientOptions::default())?;
 let _gateway = client.ping(None).await?; // typed domain result, not a raw write ACK
 client.close().await?;
 # Ok(())

@@ -1897,13 +1897,10 @@ async fn complete_write_after_deadline_is_timeout_and_late_reply_never_becomes_s
 async fn connection_establishment_enforces_profile_and_rejects_oversized_frame_before_tail() {
     use tokio::net::TcpListener;
     assert!(matches!(
-        GatewayChannel::connect_unsecured_loopback(
+        crate::Endpoint::unsecured_loopback(
             "192.0.2.1:19000".parse().unwrap(),
             fixture_composition(GatewayProfile::Ordinary),
-            limits(),
-            deadline()
-        )
-        .await,
+        ),
         Err(Error::InvalidInput(_))
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1938,12 +1935,13 @@ async fn connection_establishment_enforces_profile_and_rejects_oversized_frame_b
         let mut eof = [0; 1];
         assert_eq!(stream.read(&mut eof).await.unwrap(), 0);
     });
-    let channel = GatewayChannel::connect_unsecured_loopback(
+    let channel = crate::Endpoint::unsecured_loopback(
         endpoint,
         fixture_composition(GatewayProfile::Ordinary),
-        limits(),
-        deadline(),
     )
+    .unwrap()
+    .channel_limits(limits())
+    .connect_until(deadline())
     .await
     .unwrap();
     assert_eq!(channel.remote_instance().instance, 33);

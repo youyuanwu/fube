@@ -265,9 +265,21 @@ async fn thirty_two_filter_slots_include_pending_cleanup() {
         }
         assert!(read_message(&mut s).await.is_err());
     });
-    let client = ServiceNotificationClient::connect_clear(addr, WAIT)
+    let channel = ServiceNotificationClient::endpoint_clear(addr)
+        .unwrap()
+        .connect_timeout(WAIT)
+        .connect()
         .await
         .unwrap();
+    let client = ServiceNotificationClient::start(
+        channel,
+        NotificationClientOptions {
+            startup_timeout: WAIT,
+            default_timeout: WAIT,
+        },
+    )
+    .await
+    .unwrap();
     let mut guards = Vec::new();
     for _ in 0..32 {
         guards.push(client.register_filter(&filter(), None).await.unwrap());
@@ -315,15 +327,33 @@ async fn failed_or_cancelled_construction_closes_candidate_socket() {
             let _ = seen.send(());
             assert!(read_message(&mut s).await.is_err());
         });
+        let timeout = if cancel {
+            WAIT
+        } else {
+            Duration::from_millis(100)
+        };
+        let channel = ServiceNotificationClient::endpoint_clear(addr)
+            .unwrap()
+            .connect_timeout(timeout)
+            .connect()
+            .await
+            .unwrap();
+        let opening = ServiceNotificationClient::start(
+            channel,
+            NotificationClientOptions {
+                startup_timeout: timeout,
+                default_timeout: timeout,
+            },
+        );
         if cancel {
             tokio::select! {
                 biased;
                 _=wait=>{},
-                result=ServiceNotificationClient::connect_clear(addr,WAIT)=>panic!("unexpected construction result: {}",result.is_ok()),
+                result=opening=>panic!("unexpected construction result: {}",result.is_ok()),
             }
         } else {
             assert!(matches!(
-                ServiceNotificationClient::connect_clear(addr, Duration::from_millis(100)).await,
+                opening.await,
                 Err(NotificationError::Common(Error::Timeout))
             ));
         }
@@ -429,7 +459,19 @@ async fn larger_preconfirmation_burst_preserves_backend_resource_limit_without_p
             .is_err());
         sent.send(()).unwrap();
     });
-    let mut opening = Box::pin(ServiceNotificationClient::connect_clear(address, WAIT));
+    let channel = ServiceNotificationClient::endpoint_clear(address)
+        .unwrap()
+        .connect_timeout(WAIT)
+        .connect()
+        .await
+        .unwrap();
+    let mut opening = Box::pin(ServiceNotificationClient::start(
+        channel,
+        NotificationClientOptions {
+            startup_timeout: WAIT,
+            default_timeout: WAIT,
+        },
+    ));
     tokio::select! {
         biased;
         _ = ready => {},
@@ -461,9 +503,21 @@ async fn legitimate_empty_initial_sync_is_acked_without_an_application_event() {
         acked.send(()).unwrap();
         assert!(read_message(&mut peer).await.is_err());
     });
-    let mut client = ServiceNotificationClient::connect_clear(address, WAIT)
+    let channel = ServiceNotificationClient::endpoint_clear(address)
+        .unwrap()
+        .connect_timeout(WAIT)
+        .connect()
         .await
         .unwrap();
+    let mut client = ServiceNotificationClient::start(
+        channel,
+        NotificationClientOptions {
+            startup_timeout: WAIT,
+            default_timeout: WAIT,
+        },
+    )
+    .await
+    .unwrap();
     sync_done.await.unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(30), client.recv())
@@ -475,11 +529,11 @@ async fn legitimate_empty_initial_sync_is_acked_without_an_application_event() {
 }
 
 #[tokio::test]
-async fn notification_connect_rejects_nonloopback_and_zero_port_without_dialing() {
+async fn notification_endpoint_rejects_nonloopback_and_zero_port_without_dialing() {
     for endpoint in ["192.0.2.1:19000", "127.0.0.1:0"] {
         assert!(matches!(
-            ServiceNotificationClient::connect_clear(endpoint.parse().unwrap(), WAIT).await,
-            Err(NotificationError::Common(Error::InvalidInput(_)))
+            ServiceNotificationClient::endpoint_clear(endpoint.parse().unwrap()),
+            Err(Error::InvalidInput(_))
         ));
     }
 }
@@ -497,9 +551,21 @@ async fn repeated_transport_id_is_terminal_not_a_second_native_retry_authority()
         write_message(&mut peer, &page(10, 1, 1)).await.unwrap();
         assert!(read_message(&mut peer).await.is_err());
     });
-    let mut client = ServiceNotificationClient::connect_clear(address, WAIT)
+    let channel = ServiceNotificationClient::endpoint_clear(address)
+        .unwrap()
+        .connect_timeout(WAIT)
+        .connect()
         .await
         .unwrap();
+    let mut client = ServiceNotificationClient::start(
+        channel,
+        NotificationClientOptions {
+            startup_timeout: WAIT,
+            default_timeout: WAIT,
+        },
+    )
+    .await
+    .unwrap();
     assert!(client.recv().await.unwrap().is_ok());
     delivered.send(()).unwrap();
     assert!(matches!(
@@ -560,12 +626,35 @@ async fn independent_public_clients_survive_other_client_close_and_connection_fa
                     .unwrap();
             }
         });
-        let ordinary = FabricClient::connect_clear(ordinary_address, WAIT)
+        let channel = FabricClient::endpoint_clear(ordinary_address)
+            .unwrap()
+            .connect_timeout(WAIT)
+            .connect()
             .await
             .unwrap();
-        let mut client = ServiceNotificationClient::connect_clear(addr, WAIT)
+        let ordinary = FabricClient::new(
+            channel,
+            fube_client::ClientOptions {
+                default_timeout: WAIT,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let channel = ServiceNotificationClient::endpoint_clear(addr)
+            .unwrap()
+            .connect_timeout(WAIT)
+            .connect()
             .await
             .unwrap();
+        let mut client = ServiceNotificationClient::start(
+            channel,
+            NotificationClientOptions {
+                startup_timeout: WAIT,
+                default_timeout: WAIT,
+            },
+        )
+        .await
+        .unwrap();
         if !ordinary_fails {
             published.send(()).unwrap();
         }
@@ -723,9 +812,21 @@ async fn registration_cancellation_after_send_retires_session() {
         let _ = seen.send(());
         assert!(read_message(&mut s).await.is_err());
     });
-    let mut client = ServiceNotificationClient::connect_clear(addr, WAIT)
+    let channel = ServiceNotificationClient::endpoint_clear(addr)
+        .unwrap()
+        .connect_timeout(WAIT)
+        .connect()
         .await
         .unwrap();
+    let mut client = ServiceNotificationClient::start(
+        channel,
+        NotificationClientOptions {
+            startup_timeout: WAIT,
+            default_timeout: WAIT,
+        },
+    )
+    .await
+    .unwrap();
     let f = filter();
     tokio::select! {
         biased;

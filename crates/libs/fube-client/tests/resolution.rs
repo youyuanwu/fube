@@ -159,7 +159,20 @@ async fn keys_refresh_binding_and_versions() {
             // Wait for close so the caller may perform local rejections.
             assert!(read_message(&mut s).await.is_err());
         });
-        let client = FabricClient::connect_clear(addr, WAIT).await.unwrap();
+        let channel = FabricClient::endpoint_clear(addr)
+            .unwrap()
+            .connect_timeout(WAIT)
+            .connect()
+            .await
+            .unwrap();
+        let client = FabricClient::new(
+            channel,
+            fube_client::ClientOptions {
+                default_timeout: WAIT,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let name = NamingUri::parse("fabric:/App/Service").unwrap();
         let first = client
             .resolve_service_partition(&name, &key, None, None)
@@ -266,7 +279,20 @@ async fn groups_malformed_and_mismatched_replies_are_call_local() {
             .unwrap();
             assert!(read_message(&mut s).await.is_err());
         });
-        let client = FabricClient::connect_clear(addr, WAIT).await.unwrap();
+        let channel = FabricClient::endpoint_clear(addr)
+            .unwrap()
+            .connect_timeout(WAIT)
+            .connect()
+            .await
+            .unwrap();
+        let client = FabricClient::new(
+            channel,
+            fube_client::ClientOptions {
+                default_timeout: WAIT,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let name = "fabric:/App/Service".parse().unwrap();
         let (outcome, neighbor) = tokio::join!(
             client.resolve_service_partition(&name, &PartitionKey::Singleton, None, None),
