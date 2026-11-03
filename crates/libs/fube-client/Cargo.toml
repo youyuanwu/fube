@@ -12,6 +12,7 @@ tokio.workspace = true
 uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 time.workspace = true
 reqwest.workspace = true
 openapi-service-fabric.workspace = true
