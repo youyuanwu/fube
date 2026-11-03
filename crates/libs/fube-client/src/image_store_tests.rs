@@ -56,6 +56,169 @@ async fn connected() -> (ImageStoreClient, TcpStream) {
     (client, peer.await.unwrap())
 }
 
+async fn established(endpoint: Endpoint, listener: TcpListener) -> (Channel, TcpStream) {
+    let peer = tokio::spawn(async move {
+        let (mut peer, _) = listener.accept().await.unwrap();
+        read_message(&mut peer).await.unwrap();
+        write_message(
+            &mut peer,
+            &Message::listen_instance(
+                MessageId {
+                    guid: [8; 16],
+                    index: 1,
+                },
+                &ListenInstance {
+                    address: "127.0.0.1:19000".into(),
+                    ..ListenInstance::default()
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        peer
+    });
+    let channel = endpoint.connect().await.unwrap();
+    (channel, peer.await.unwrap())
+}
+
+#[tokio::test]
+async fn local_composition_validates_before_binding_and_only_drops_supplied_handle() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let endpoint = ImageStoreClient::endpoint_clear(address)
+        .unwrap()
+        .connect_timeout(Duration::from_secs(3));
+    let (channel, mut peer) = established(endpoint, listener).await;
+    for timeout in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
+        assert!(matches!(
+            ImageStoreClient::new(
+                channel.clone(),
+                ImageStoreClientOptions {
+                    default_timeout: timeout,
+                },
+            ),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(channel.target().is_ok());
+    }
+    let options = ImageStoreClientOptions {
+        default_timeout: Duration::from_secs(7),
+    };
+    let client = ImageStoreClient::new(channel.clone(), options).unwrap();
+    assert_eq!(client.timeout, Duration::from_secs(7));
+    assert!(Arc::ptr_eq(&client.target, &channel.target().unwrap()));
+    assert_ne!(channel.remote_instance().address, address.to_string());
+    assert_eq!(
+        ImageStoreClientOptions::default().default_timeout,
+        crate::DEFAULT_TIMEOUT
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), read_message(&mut peer))
+            .await
+            .is_err()
+    );
+    drop(client);
+    assert!(channel.target().is_ok());
+    let client = ImageStoreClient::new(channel.clone(), options).unwrap();
+    client.close().await.unwrap();
+    assert!(matches!(
+        ImageStoreClient::new(channel.clone(), options),
+        Err(Error::Closed)
+    ));
+    // Invalid defaults take precedence even when local target binding would fail.
+    assert!(matches!(
+        ImageStoreClient::new(
+            channel.clone(),
+            ImageStoreClientOptions {
+                default_timeout: Duration::ZERO,
+            },
+        ),
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(channel.terminal_error(), Some(Error::Closed)));
+    use tokio::io::AsyncReadExt;
+    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+
+    let (client, _) = connected().await;
+    assert_eq!(client.timeout, Duration::from_secs(3));
+}
+
+#[tokio::test]
+async fn local_composition_preserves_inbox_policy_and_terminal_provenance() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = crate::FabricClient::endpoint_clear(listener.local_addr().unwrap()).unwrap();
+    let (channel, mut peer) = established(endpoint, listener).await;
+    assert!(matches!(
+        ImageStoreClient::new(channel.clone(), ImageStoreClientOptions::default()),
+        Err(Error::InvalidInput("gateway ingress is not enabled"))
+    ));
+    assert!(channel.target().is_ok());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), read_message(&mut peer))
+            .await
+            .is_err()
+    );
+    channel.abort_with_error(Error::Timeout);
+    assert!(matches!(
+        ImageStoreClient::new(channel.clone(), ImageStoreClientOptions::default()),
+        Err(Error::Closed)
+    ));
+    assert!(matches!(channel.terminal_error(), Some(Error::Timeout)));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = Endpoint::unsecured_loopback(
+        listener.local_addr().unwrap(),
+        crate::channel_adapter::notifications().unwrap(),
+    )
+    .unwrap();
+    let (channel, mut peer) = established(endpoint, listener).await;
+    let client =
+        ImageStoreClient::new(channel.clone(), ImageStoreClientOptions::default()).unwrap();
+    assert!(matches!(
+        client
+            .send(
+                "FileCreate",
+                [1; 16],
+                vec![],
+                vec![],
+                deadline_after(Duration::from_secs(1)).unwrap(),
+            )
+            .await,
+        Err(Error::InvalidInput("unauthorized gateway submission"))
+    ));
+    assert!(channel.target().is_ok());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), read_message(&mut peer))
+            .await
+            .is_err()
+    );
+    client.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn convenience_publication_uses_original_absolute_deadline() {
+    let (client, _peer) = connected().await;
+    let channel = client.channel.clone();
+    drop(client);
+    let deadline = Instant::now();
+    assert!(matches!(
+        ImageStoreClient::bind_before_deadline(
+            channel.clone(),
+            ImageStoreClientOptions {
+                default_timeout: Duration::from_secs(7),
+            },
+            deadline,
+        ),
+        Err(Error::Timeout)
+    ));
+    assert!(channel.target().is_ok());
+    channel
+        .close(deadline_after(Duration::from_secs(1)).unwrap())
+        .await
+        .unwrap();
+}
+
 fn activity(message: &Message) -> [u8; 16] {
     message
         .headers
@@ -1034,6 +1197,7 @@ async fn deadline_and_future_drop_after_create_content_and_commit_retire_client(
             let package = Package::new();
             package.file("file", b"abc");
             let (mut client, mut peer) = connected().await;
+            let retained = client.channel.clone();
             let (reached, milestone) = oneshot::channel();
             let server = tokio::spawn(async move {
                 delete_success(&mut peer, "pkg", false).await;
@@ -1080,6 +1244,8 @@ async fn deadline_and_future_drop_after_create_content_and_commit_retire_client(
             }
             drop(upload);
             assert!(client.is_closed());
+            assert!(retained.terminal_error().is_some());
+            assert!(matches!(retained.target(), Err(Error::Closed)));
             assert!(client
                 .copy_application_package(&package.0, "pkg", None)
                 .await
@@ -1094,6 +1260,17 @@ async fn whole_deadline_includes_root_delete_and_drop_during_delete() {
     for drop_future in [false, true] {
         let package = Package::new();
         let (mut client, mut peer) = connected().await;
+        let retained = client.channel.clone();
+        if !drop_future {
+            drop(client);
+            client = ImageStoreClient::new(
+                retained.clone(),
+                ImageStoreClientOptions {
+                    default_timeout: Duration::from_millis(100),
+                },
+            )
+            .unwrap();
+        }
         let (tx, rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             delete_request(&mut peer, "pkg").await;
@@ -1103,7 +1280,7 @@ async fn whole_deadline_includes_root_delete_and_drop_during_delete() {
         let mut copy = Box::pin(client.copy_application_package(
             &package.0,
             "pkg",
-            Some(Duration::from_millis(100)),
+            drop_future.then_some(Duration::from_millis(100)),
         ));
         tokio::select! {
             result = &mut copy => panic!("premature Delete completion {result:?}"),
@@ -1114,6 +1291,7 @@ async fn whole_deadline_includes_root_delete_and_drop_during_delete() {
         }
         drop(copy);
         assert!(client.is_closed());
+        assert!(retained.terminal_error().is_some());
         server.await.unwrap();
     }
 }
@@ -1209,6 +1387,7 @@ async fn chunk_ack_is_not_commit_success_and_primary_error_survives_cleanup_fail
     let package = Package::new();
     package.file("file", b"abc");
     let (mut client, mut peer) = connected().await;
+    let retained = client.channel.clone();
     let server = tokio::spawn(async move {
         delete_success(&mut peer, "pkg", false).await;
         let create = read_message(&mut peer).await.unwrap();
@@ -1254,6 +1433,13 @@ async fn chunk_ack_is_not_commit_success_and_primary_error_survives_cleanup_fail
         })
     ));
     assert!(client.is_closed());
+    assert!(matches!(
+        retained.terminal_error(),
+        Some(Error::Remote {
+            code: -2147017534,
+            ..
+        })
+    ));
     server.await.unwrap();
 }
 

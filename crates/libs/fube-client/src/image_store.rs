@@ -27,6 +27,29 @@ const MAX_DEPTH: usize = 128;
 const MAX_ENTRIES: usize = 1_000_000;
 const MAX_STALE_REPLIES: usize = 64;
 
+/// Local upload-operation defaults, independent of endpoint establishment.
+#[derive(Debug, Clone, Copy)]
+pub struct ImageStoreClientOptions {
+    /// Whole-copy timeout used when an upload passes `None`; never infinite.
+    pub default_timeout: Duration,
+}
+
+impl Default for ImageStoreClientOptions {
+    fn default() -> Self {
+        Self {
+            default_timeout: crate::DEFAULT_TIMEOUT,
+        }
+    }
+}
+
+fn upload_limits() -> ChannelLimits {
+    ChannelLimits {
+        max_ingress: 32,
+        max_retained_bytes: 1024 * 1024 * 1024,
+        ..ChannelLimits::default()
+    }
+}
+
 /// Native `fabric:ImageStore` v1.2 uploader for explicitly unsecured development
 /// numeric loopback gateways with a nonzero port. Owns a dedicated upload
 /// GatewayChannel; no authentication, reconnect or protocol fallback.
@@ -69,28 +92,62 @@ impl ImageStoreClient {
     pub fn endpoint_clear(address: SocketAddr) -> Result<Endpoint> {
         Ok(
             Endpoint::unsecured_loopback(address, crate::channel_adapter::upload()?)?
-                .channel_limits(ChannelLimits {
-                    max_ingress: 32,
-                    max_retained_bytes: 1024 * 1024 * 1024,
-                    ..ChannelLimits::default()
-                }),
+                .channel_limits(upload_limits()),
         )
     }
 
-    /// Connect without TLS/authentication; timeout also defaults later copies.
-    pub async fn connect_clear(endpoint: SocketAddr, timeout: Duration) -> Result<Self> {
-        let channel = Self::endpoint_clear(endpoint)?
-            .connect_timeout(timeout)
-            .connect()
-            .await?;
+    /// Bind locally to an established channel's original target and ACK inbox.
+    ///
+    /// Validates operation defaults before binding. No dialing, native session
+    /// request or permission change occurs; binding does not prove upload
+    /// authorization or future liveness. Local failure drops only the supplied
+    /// handle, without explicitly retiring retained raw clones.
+    ///
+    /// The connection must be dedicated to at most one uploader/protocol
+    /// consumer. Raw receivers remain repeatable and consumptive; competing
+    /// consumers can steal semantic ACKs. The uploader is mutable and serial.
+    /// Ordinary drop releases its owner handle; explicit upload cancellation
+    /// or uncertain failure still retires the connection despite raw clones.
+    pub fn new(channel: Channel, options: ImageStoreClientOptions) -> Result<Self> {
+        deadline_after(options.default_timeout)?;
         let target = channel.target()?;
         let replies = channel.receiver()?;
         Ok(Self {
             channel,
             target,
             replies,
-            timeout,
+            timeout: options.default_timeout,
         })
+    }
+
+    fn bind_before_deadline(
+        channel: Channel,
+        options: ImageStoreClientOptions,
+        deadline: Instant,
+    ) -> Result<Self> {
+        let client = Self::new(channel, options)?;
+        crate::typed::check_deadline(deadline)?;
+        Ok(client)
+    }
+
+    /// Connect without TLS/authentication; timeout also defaults later copies.
+    /// One absolute budget covers establishment and local binding.
+    pub async fn connect_clear(endpoint: SocketAddr, timeout: Duration) -> Result<Self> {
+        let deadline = deadline_after(timeout)?;
+        let channel = Channel::connect_unsecured_loopback(
+            endpoint,
+            crate::channel_adapter::upload()?,
+            upload_limits(),
+            deadline,
+        )
+        .await?;
+        Self::bind_before_deadline(
+            channel,
+            ImageStoreClientOptions {
+                default_timeout: timeout,
+            },
+            deadline,
+        )
     }
 
     pub fn is_closed(&self) -> bool {
@@ -108,7 +165,8 @@ impl ImageStoreClient {
     }
 
     /// Replace the entire destination, upload descendants, then publish empty
-    /// `_.dir` markers postorder. `None` uses the connection timeout, not infinity.
+    /// `_.dir` markers postorder. `None` uses the configured operation default
+    /// (or legacy `connect_clear` duration), not infinity.
     ///
     /// Sources are not snapshotted. Symlinks/special entries are unsupported.
     /// Failures may leave partial remote content; session cleanup is not rollback.

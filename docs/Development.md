@@ -173,6 +173,10 @@ gateway with a nonzero port is supported. Upload owns a separate native
 GatewayChannel; ACK decoding and package policy stay in the client. Client adapters
 install envelope authorization and raw ACK actor registrations; the channel's
 native actor demux is independent of gateway/upload protocol values.
+The maintained CLI configures `ImageStoreClient::endpoint_clear`, establishes
+its actual `Channel`, and binds synchronously with explicit
+`ImageStoreClientOptions` before the upload operation. Binding sends no native
+request; the CLI's original whole-operation deadline remains enclosing.
 See [Rust FabricClient](transport/RustFabricClient.md) for the
 library API, transfer limits and cancellation behavior.
 
@@ -197,6 +201,9 @@ The native SDK reference runs inside the owned SF container and uses real mssf
 bindings; sfctl is used only for management/cleanup. The test removes its unique
 workloads and temporary packages, but retains the caller-owned onebox. It
 prints the outcome rather than writing/uploading success reports.
+This live scenario proves native upload/content, not injected cancellation;
+the focused ImageStore framed-peer tests exercise cancellation at upload stages.
+Destroy a task-owned onebox afterward using its original controller capability.
 
 ## Native-free checks
 
