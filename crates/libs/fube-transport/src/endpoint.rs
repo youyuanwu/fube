@@ -76,13 +76,14 @@ impl Endpoint {
         deadline: Instant,
         session: Arc<dyn SessionEnvelope>,
     ) -> Result<Channel> {
-        Channel::connect_with_envelope(
+        let channel = Channel::connect_with_envelope(
             self.address,
             self.composition.clone(),
             self.limits,
             deadline,
             session,
         )
-        .await
+        .await?;
+        Channel::publish_before_deadline(channel, deadline)
     }
 }

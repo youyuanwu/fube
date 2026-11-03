@@ -191,16 +191,24 @@ impl FabricClient {
     /// are disabled on this owner; notification clients own separate opted-in
     /// GatewayChannels; image-transfer clients own separate upload channels.
     pub async fn connect_clear(endpoint: SocketAddr, timeout: Duration) -> Result<Self> {
+        let deadline = deadline_after(timeout)?;
         let options = ClientOptions {
             default_timeout: timeout,
             ..ClientOptions::default()
         };
         let budget = options.budget()?;
-        let channel = Self::endpoint_clear(endpoint)?
-            .connect_timeout(timeout)
-            .connect()
-            .await?;
-        Self::bind(channel, options, budget)
+        // Preserve the legacy caller's absolute budget through local binding.
+        // This absolute-deadline entry uses Endpoint's same private dial path.
+        let channel = Channel::connect_unsecured_loopback(
+            endpoint,
+            channel_adapter::ordinary()?,
+            ChannelLimits::default(),
+            deadline,
+        )
+        .await?;
+        let client = Self::bind(channel, options, budget)?;
+        typed::check_deadline(deadline)?;
+        Ok(client)
     }
 
     /// Discover the native gateway's full node identity.

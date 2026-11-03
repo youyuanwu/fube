@@ -135,3 +135,30 @@ async fn invalid_endpoint_settings_never_dial_and_connect_budget_includes_hello(
     assert!(matches!(result, Err(Error::Timeout)));
     assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn publication_expiry_after_successful_hello_drops_unpublished_owner_and_joins() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = Endpoint::unsecured_loopback(
+        listener.local_addr().unwrap(),
+        fixture_composition(GatewayProfile::Ordinary),
+    )
+    .unwrap();
+    let (channel, mut peer) = connect(&endpoint, &listener).await;
+    let target = channel.target().unwrap();
+    let weak = Arc::downgrade(&channel.owner.shared);
+    let mut stopped = channel.owner.shared.stopped.subscribe();
+    tokio::time::pause();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    // Reproduce preemption after successful hello/owner construction, before
+    // the final publication guard. No real-time race or production hook.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(matches!(
+        GatewayChannel::publish_before_deadline(channel, deadline),
+        Err(Error::Timeout)
+    ));
+    stopped.wait_for(|value| *value).await.unwrap();
+    until(|| weak.upgrade().is_none()).await;
+    assert_eq!(target.address, listener.local_addr().unwrap());
+    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+}

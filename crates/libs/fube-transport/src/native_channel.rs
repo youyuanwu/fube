@@ -563,15 +563,25 @@ impl GatewayChannel {
         }
         check_deadline(deadline)?;
         stream.set_nodelay(true)?;
-        Ok(Self::start_with_envelope(
-            stream,
-            endpoint,
-            composition,
-            limits,
-            process_id,
-            remote,
-            session_envelope,
-        ))
+        Self::publish_before_deadline(
+            Self::start_with_envelope(
+                stream,
+                endpoint,
+                composition,
+                limits,
+                process_id,
+                remote,
+                session_envelope,
+            ),
+            deadline,
+        )
+    }
+
+    pub(crate) fn publish_before_deadline(channel: Self, deadline: Instant) -> Result<Self> {
+        // Owner allocation/driver publication belongs to establishment too.
+        // On expiry, normal drop of this unpublished owner initiates cleanup.
+        check_deadline(deadline)?;
+        Ok(channel)
     }
 
     #[cfg(test)]
