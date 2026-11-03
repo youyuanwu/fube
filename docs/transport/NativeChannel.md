@@ -84,6 +84,43 @@ raw I/O. Replication codecs, routes, semantic ACK/retry/copy/reconfiguration and
 independent control/data admission remain in `fube-data`; neither profile is
 forced through the other's protocol.
 
+### Internal established connection engine
+
+Channel's crate-private
+[`raw_session::engine`](../../crates/libs/fube-transport/src/raw_session/engine.rs)
+owns the established socket/task scope, bounded raw frame progress, priority
+write jobs, local-write receipts, common envelope/controls, first terminal cause
+and ordinary-close versus whole-socket-disposal/join core. Dialed and accepted
+Channels enter this **same** driver only after their explicitly selected session
+hello/admission; the restricted accepted IPC constructor is unchanged. This is
+not a public parallel Connection or arbitrary stream-adoption API.
+
+Transport state and opaque Channel policy are separate typed responsibilities
+under one coordinator. Channel admission inserts metadata and one encoded job
+atomically. That job carries a clone of the **original** admitted reservation,
+not a new permit, queue or result channel. Reserved/reply jobs precede ordinary
+jobs; selected bytes retain that reservation through the full started suffix.
+Channel still owns pending correlation/reply deadlines, ID allocation/history,
+consuming grants, session envelopes, actor authorization and domain handoff.
+
+Every initial socket attempt takes the visibility gate, samples trusted send
+authority outside the coordinator, then holds the coordinator across Channel
+eligibility, the actual socket poll and positive-only visibility recording.
+This preserves cancellation/expiry/terminal coordination without claiming an
+atomic transaction over independently owned domain authority. Local receipts
+become operation results only through Channel policy; an RPC still awaits its
+authorized correlated reply.
+
+The engine consumes common controls before inline Channel policy delivery.
+Ordered/held handoff is awaited before reading any later frame, including a
+control; there is no read-ahead inbox. Policy expiry runs in the same owned
+driver scope but stays above the engine. A domain-established Protocol cause
+and an I/O failure use one first-cause transition; disposal escalation cannot
+replace it. Join observers borrow the retained task handle, so their timeout
+or cancellation cannot detach its cleanup ownership. Raw peer replication keeps
+its independent owner, header admission and control/data queues over the
+unchanged public raw primitives.
+
 The former `GatewayProfile` API is removed, with no compatibility wrapper.
 `native_demux::ChannelComposition` installs independent stateless envelope
 validators for outbound raw/RPC/reserved one-way sends, ordinary replies, actor

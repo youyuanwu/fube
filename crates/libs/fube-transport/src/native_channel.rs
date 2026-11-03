@@ -6,6 +6,10 @@
 //! Consumer actor/action/envelope authorization is supplied by client adapters.
 //! IPC session envelopes are composed by [`crate::native_ipc`]; separately
 //! authorized normal-request replies are shared request/reply machinery.
+//! The private raw-session engine owns socket/task progress, admitted write
+//! jobs, common controls and joining. Channel policy shares its coordinator
+//! for atomic initial-write eligibility, but keeps correlation, IDs, grants
+//! and session/actor authorization above that engine.
 //! No listener, replication, TLS, reconnect or replay is supplied.
 //!
 //! Clear loopback is an explicit trust assumption, not authentication of local
