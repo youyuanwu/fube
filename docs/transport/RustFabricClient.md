@@ -169,7 +169,8 @@ cargo run -p fube-client --example onebox -- \
   --events-filter 8 --warning-as-error true
 ```
 
-The example prints the gateway's advertised address and full node identity.
+The example's `ping` demonstrates two concurrent calls through explicit stub
+clones on one connection, printing both advertised addresses/full node identities.
 `node-list` prints one page and its continuation token, not an implicit complete
 cluster inventory.
 The advertised address can be the container's private address rather than the

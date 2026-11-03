@@ -162,11 +162,15 @@ async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     )?;
     match operation {
         Operation::Ping => {
-            let gateway = client.ping(None).await?;
-            println!(
-                "gateway={} node_name={} node_id={:x} node_instance={}",
-                gateway.address, gateway.node_name, gateway.node_id, gateway.node_instance
-            );
+            // Explicit stub clones share one channel and typed admission budget.
+            let cloned = client.clone();
+            let (first, second) = tokio::try_join!(client.ping(None), cloned.ping(None))?;
+            for gateway in [first, second] {
+                println!(
+                    "gateway={} node_name={} node_id={:x} node_instance={}",
+                    gateway.address, gateway.node_name, gateway.node_id, gateway.node_instance
+                );
+            }
         }
         Operation::NodeList => {
             // Explicit single page: never imply this is the complete membership.
