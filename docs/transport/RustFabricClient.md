@@ -1092,8 +1092,9 @@ live. No TLS or cross-release compatibility is claimed.
 
 Both clients live in `fube-client`, but neither owns the other or shares its
 socket/session. Notification-only applications need no `FabricClient`; multiple
-notification clients can coexist. Each connection duration sets that client's
-remote-operation default. `None` uses that default, not infinity.
+notification clients can coexist. With `connect_clear`, each connection duration
+also sets that client's remote-operation default. `None` uses the session default,
+not infinity.
 
 ```rust
 use fube_client::{
@@ -1125,6 +1126,58 @@ ordinary.close().await?;
 # Ok(())
 # }
 ```
+
+Notification transport also composes through the same shared Endpoint/Channel:
+
+```rust
+use fube_client::{NotificationClientOptions, ServiceNotificationClient};
+use std::time::Duration;
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let endpoint = ServiceNotificationClient::endpoint_clear(
+    "127.0.0.1:19000".parse()?,
+)?; // Local configuration only; installs notification-specific transport policy.
+let channel = endpoint.connect_timeout(Duration::from_secs(10)).connect().await?;
+let changes = ServiceNotificationClient::start(channel, NotificationClientOptions {
+    startup_timeout: Duration::from_secs(15),
+    default_timeout: Duration::from_secs(30),
+}).await?; // Real native NotificationClientConnectionRequest.
+changes.close(None).await?;
+# Ok(())
+# }
+```
+
+These are three distinct operations: Endpoint configuration performs no I/O;
+`Endpoint::connect` establishes transport; notification `start` asynchronously
+creates a fresh native session. Unlike ordinary `FabricClient::new`, `start` is
+not local stub binding. It uses `Channel::target()` (the original established
+target), not the gateway address advertised in the native reply. The factory
+returns the shared transport `Result<Endpoint>`; startup and subsequent protocol
+operations return `NotificationResult`.
+
+`NotificationClientOptions` defaults both budgets to 30 seconds. The Endpoint's
+connection timeout, startup budget and later-operation default are independent.
+Startup uses one absolute deadline from polling through owner publication,
+including early-ingress admission. `connect_clear(address, duration)` retains
+one absolute deadline across transport establishment **and** native startup,
+and keeps that duration for later operations and processing ACKs.
+
+Use a **dedicated notification-authorized Channel**, with no other protocol
+session or competing receivers. `start` cannot add notification permissions or
+silently adopt an ordinary session; having some receiver-enabled policy is not
+proof of notification authorization. Generic Channel receiver acquisition and
+clone/concurrent-read semantics are unchanged, but competing notification
+consumers are unsupported because they can steal ordered pages/reply contexts.
+
+Both startup options validate locally before protocol responsibility begins.
+Invalid options or dropping an unpolled startup future only drop the supplied
+handle, without explicitly aborting retained clones (normal last-owner shutdown
+still applies). Once validated startup begins, failure or cancellation retires
+the candidate shared Channel. After publication, owner drop, explicit close and
+terminal failure likewise retire the Channel even if raw clones remain. Retaining
+a clone does not keep a retired native notification session usable. Shutdown can
+outlive an expired operation deadline while the existing started-frame watchdog
+and worker/socket teardown finish.
 
 Keep the returned registration bound to a variable. Dropping it initiates
 bounded asynchronous cleanup; `let _ = register_filter(...).await?` immediately

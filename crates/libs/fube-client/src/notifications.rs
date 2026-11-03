@@ -27,8 +27,8 @@ use crate::{
     notification_protocol as wire,
     notification_state::{Memory, Progress, Receiver, MAX_CLEANUPS, MAX_FILTERS, MAX_PAGES},
     resolution::Generation,
-    Error, GatewayDescription, NamingUri, Result, ServiceEndpoint, ServiceEndpointVersion,
-    ServiceKind,
+    Channel, Endpoint, Error, GatewayDescription, NamingUri, Result, ServiceEndpoint,
+    ServiceEndpointVersion, ServiceKind,
 };
 
 #[cfg(test)]
@@ -81,6 +81,24 @@ impl From<Error> for NotificationError {
 /// assert!(matches!(result, Err(NotificationError::Common(Error::Timeout))));
 /// ```
 pub type NotificationResult<T> = std::result::Result<T, NotificationError>;
+
+/// Independent native-session startup and subsequent operation budgets.
+#[derive(Debug, Clone)]
+pub struct NotificationClientOptions {
+    /// One absolute budget from polling `start` through session publication.
+    pub startup_timeout: Duration,
+    /// Default for later operations and processing ACKs; `None` is not infinity.
+    pub default_timeout: Duration,
+}
+
+impl Default for NotificationClientOptions {
+    fn default() -> Self {
+        Self {
+            startup_timeout: Duration::from_secs(30),
+            default_timeout: Duration::from_secs(30),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ServiceNotificationFilter {
@@ -246,17 +264,58 @@ pub struct ServiceNotificationClient {
     gateway: GatewayDescription,
 }
 impl ServiceNotificationClient {
+    /// Configure notification-authorized clear-loopback transport locally, without I/O.
+    /// `Endpoint::connect` establishes transport, not a native notification session.
+    pub fn endpoint_clear(endpoint: SocketAddr) -> Result<Endpoint> {
+        Ok(
+            Endpoint::unsecured_loopback(endpoint, crate::channel_adapter::notifications()?)?
+                .channel_limits(notification_limits()),
+        )
+    }
+
+    /// Start a dedicated native notification session on an established Channel.
+    ///
+    /// This performs the asynchronous `NotificationClientConnectionRequest`; it
+    /// is not ordinary local stub binding and does not change installed permissions.
+    /// Use a notification-authorized endpoint and no competing protocol receivers
+    /// or sessions. Receiver acquisition alone does not prove notification permission.
+    ///
+    /// Both options validate before protocol responsibility begins. Invalid options
+    /// or an unpolled future only drop the supplied handle, without explicitly
+    /// aborting retained clones. After validation, startup failure/cancellation,
+    /// owner drop, close, or terminal failure retires the shared Channel even if raw
+    /// clones remain. A raw clone cannot keep a retired notification session alive.
+    ///
+    /// ```
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// use fube_client::{NotificationClientOptions, ServiceNotificationClient};
+    /// let endpoint = ServiceNotificationClient::endpoint_clear("127.0.0.1:19000".parse()?)?;
+    /// let channel = endpoint.connect().await?;
+    /// let client = ServiceNotificationClient::start(channel, NotificationClientOptions::default()).await?;
+    /// client.close(None).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn start(
+        channel: Channel,
+        options: NotificationClientOptions,
+    ) -> NotificationResult<Self> {
+        deadline_after(options.default_timeout)?;
+        let deadline = deadline_after(options.startup_timeout)?;
+        Self::start_before_deadline(channel, options.default_timeout, deadline).await
+    }
+
     /// Establish an independent unsecured numeric-loopback gateway/native session.
     /// Non-loopback and zero-port endpoints are rejected. This deliberately
     /// narrows the previous clear-TCP policy; advertised private addresses are
     /// never dialed and an ordinary FabricClient's channel is never adopted.
+    /// `timeout` is one absolute budget across establishment and native startup,
+    /// and also the subsequent operation/processing-ACK default.
     pub async fn connect_clear(
         endpoint: SocketAddr,
         timeout: Duration,
     ) -> NotificationResult<Self> {
         let deadline = deadline_after(timeout)?;
-        let receiver = Arc::new(Receiver::default());
-        let (pages, incoming) = mpsc::channel(MAX_PAGES);
         let channel = GatewayChannel::connect_unsecured_loopback(
             endpoint,
             crate::channel_adapter::notifications()?,
@@ -264,12 +323,26 @@ impl ServiceNotificationClient {
             deadline,
         )
         .await?;
+        Self::start_before_deadline(channel, timeout, deadline).await
+    }
+
+    async fn start_before_deadline(
+        channel: Channel,
+        timeout: Duration,
+        deadline: Instant,
+    ) -> NotificationResult<Self> {
         let mut candidate = Candidate {
             channel: channel.clone(),
             armed: true,
         };
-        let target = channel.resolve_target(&endpoint.to_string())?;
-        let native = channel.receiver()?;
+        let receiver = Arc::new(Receiver::default());
+        let (pages, incoming) = mpsc::channel(MAX_PAGES);
+        let target = channel
+            .target()
+            .map_err(|error| channel.terminal_error().unwrap_or(error))?;
+        let native = channel
+            .receiver()
+            .map_err(|error| channel.terminal_error().unwrap_or(error))?;
         let id = Uuid::new_v4().to_string();
         let body = to_vec(&wire::Connect {
             client: &id,
@@ -342,12 +415,27 @@ impl ServiceNotificationClient {
                 worker_session.receiver.fail(error.into());
             }
         });
-        candidate.armed = false;
-        Ok(Self {
+        let client = Self {
             session,
             worker: Some(worker),
             gateway,
-        })
+        }
+        .publish_before_deadline(deadline)?;
+        candidate.armed = false;
+        Ok(client)
+    }
+
+    fn publish_before_deadline(self, deadline: Instant) -> NotificationResult<Self> {
+        if let Some(error) = self.session.receiver.error() {
+            return Err(error);
+        }
+        if let Some(error) = self.session.channel.terminal_error() {
+            return Err(error.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Timeout.into());
+        }
+        Ok(self)
     }
 
     /// Actual identity returned by this session, which may differ behind a load balancer.

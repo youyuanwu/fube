@@ -8,6 +8,8 @@ use fube_transport::{
 };
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+#[path = "support/notification_composition_tests.rs"]
+mod composition;
 #[path = "support/notification_ingress_tests.rs"]
 mod ingress;
 #[path = "support/gateway_peer.rs"]
@@ -367,7 +369,13 @@ async fn connect_confirmation_cannot_overtake_prepublication_page_admission() {
             }
             assert!(read_message(&mut peer).await.is_err());
         });
-        let opening = ServiceNotificationClient::connect_clear(address, WAIT);
+        let raw = ServiceNotificationClient::endpoint_clear(address)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let opening =
+            ServiceNotificationClient::start(raw.clone(), NotificationClientOptions::default());
         tokio::pin!(opening);
         tokio::select! {
             biased;
@@ -390,6 +398,7 @@ async fn connect_confirmation_cannot_overtake_prepublication_page_admission() {
             client.close(None).await.unwrap();
         }
         task.await.unwrap();
+        assert!(raw.target().is_err());
     }
 }
 
@@ -643,9 +652,7 @@ async fn early_update_retry_explicit_and_drop_cleanup_and_surviving_guard_close(
         .unwrap();
         assert!(read_message(&mut s).await.is_err());
     });
-    let mut client = ServiceNotificationClient::connect_clear(addr, WAIT)
-        .await
-        .unwrap();
+    let (mut client, raw) = composition::open(addr).await;
     assert_eq!(client.gateway().address, "private.example:19000");
     let one = client.register_filter(&filter(), None).await.unwrap();
     assert!(client.recv().await.unwrap().unwrap().endpoints.is_empty());
@@ -666,6 +673,7 @@ async fn early_update_retry_explicit_and_drop_cleanup_and_surviving_guard_close(
         Err(NotificationError::Common(Error::Closed))
     ));
     task.await.unwrap();
+    assert!(raw.target().is_err());
 }
 
 #[tokio::test]
@@ -691,9 +699,7 @@ async fn full_delivery_reports_terminal_once_and_does_not_ack_lost_page_success(
         ack(&mut s, 2, false).await;
         assert!(read_message(&mut s).await.is_err());
     });
-    let mut client = ServiceNotificationClient::connect_clear(addr, WAIT)
-        .await
-        .unwrap();
+    let (mut client, raw) = composition::open(addr).await;
     let _guard = client.register_filter(&filter(), None).await.unwrap();
     registered.send(()).unwrap();
     task.await.unwrap();
@@ -702,6 +708,7 @@ async fn full_delivery_reports_terminal_once_and_does_not_ack_lost_page_success(
         Some(Err(NotificationError::Lagged))
     ));
     assert!(client.recv().await.is_none());
+    assert!(raw.target().is_err());
 }
 
 #[tokio::test]
@@ -751,9 +758,20 @@ async fn cleanup_timeout_is_terminal_and_owner_drop_closes_with_guards_alive() {
             }
             assert!(read_message(&mut s).await.is_err());
         });
-        let mut client = ServiceNotificationClient::connect_clear(addr, Duration::from_millis(100))
+        let raw = ServiceNotificationClient::endpoint_clear(addr)
+            .unwrap()
+            .connect()
             .await
             .unwrap();
+        let mut client = ServiceNotificationClient::start(
+            raw.clone(),
+            NotificationClientOptions {
+                startup_timeout: WAIT,
+                default_timeout: Duration::from_millis(100),
+            },
+        )
+        .await
+        .unwrap();
         let guard = client.register_filter(&filter(), Some(WAIT)).await.unwrap();
         if explicit {
             assert!(guard
@@ -770,5 +788,6 @@ async fn cleanup_timeout_is_terminal_and_owner_drop_closes_with_guards_alive() {
             drop(guard);
         }
         task.await.unwrap();
+        assert!(raw.target().is_err());
     }
 }

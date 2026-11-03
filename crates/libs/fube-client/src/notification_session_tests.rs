@@ -5,6 +5,82 @@ use fube_transport::{
 };
 use tokio::net::TcpListener;
 
+#[tokio::test]
+async fn publication_expiry_after_native_connect_retires_owner_with_raw_clone_retained() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_message(&mut stream).await.unwrap();
+        write_message(
+            &mut stream,
+            &Message::listen_instance(
+                MessageId {
+                    guid: [9; 16],
+                    index: 1,
+                },
+                &ListenInstance::default(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let request = read_message(&mut stream).await.unwrap();
+        assert_eq!(
+            request.properties().unwrap().action,
+            "NotificationClientConnectionRequest"
+        );
+        let connected = wire::Connected {
+            generation: Generation::default(),
+            last_deleted: 0,
+            gateway: wire::Gateway {
+                address: String::new(),
+                node: wire::NodeInstance {
+                    id: crate::NodeId { high: 0, low: 0 },
+                    instance: 1,
+                },
+                name: "publication-peer".into(),
+            },
+        };
+        write_message(
+            &mut stream,
+            &Message {
+                headers: vec![
+                    Header::actor(5).unwrap(),
+                    Header::action("NotificationClientConnectionReply").unwrap(),
+                    Header::relates_to(request.properties().unwrap().id).unwrap(),
+                ],
+                body: to_vec(&connected).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(read_message(&mut stream).await.is_err());
+    });
+    let raw = ServiceNotificationClient::endpoint_clear(address)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let client =
+        ServiceNotificationClient::start(raw.clone(), NotificationClientOptions::default())
+            .await
+            .unwrap();
+    assert_eq!(client.gateway().node_name, "publication-peer");
+    tokio::time::pause();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    // Reproduce preemption after successful native Connect/owner construction
+    // at the actual production publication boundary, as Endpoint tests do.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(matches!(
+        client.publish_before_deadline(deadline),
+        Err(NotificationError::Common(Error::Timeout))
+    ));
+    raw.closed(teardown_deadline()).await.unwrap();
+    assert!(raw.target().is_err());
+    peer.await.unwrap();
+}
+
 #[test]
 fn scoped_errors_preserve_common_sources_cloning_and_domain_diagnostics() {
     fn send_sync<T: Send + Sync>() {}
