@@ -82,10 +82,19 @@ async fn scenario(config: Config, mut journal: Journal) -> Result<Value> {
     let ordinary = FabricClient::connect_clear(config.endpoint, Duration::from_secs(60))
         .await
         .map_err(|e| format!("ordinary establishment: {e}"))?;
-    let mut notifications =
-        ServiceNotificationClient::connect_clear(config.endpoint, Duration::from_secs(60))
-            .await
-            .map_err(|e| format!("first notification establishment: {e}"))?;
+    let channel = ServiceNotificationClient::endpoint_clear(config.endpoint)?
+        .connect_timeout(Duration::from_secs(60))
+        .connect()
+        .await?;
+    let mut notifications = ServiceNotificationClient::start(
+        channel,
+        NotificationClientOptions {
+            startup_timeout: Duration::from_secs(45),
+            default_timeout: Duration::from_secs(60),
+        },
+    )
+    .await
+    .map_err(|e| format!("first notification startup: {e}"))?;
     let mut independent =
         ServiceNotificationClient::connect_clear(config.endpoint, Duration::from_secs(60))
             .await
