@@ -735,18 +735,7 @@ async fn tracked_selected_zero_progress_retracts_before_drop_and_after_expiry() 
             Instant::now() + Duration::from_secs(1),
         );
         pending(future.as_mut()).await;
-        until(|| {
-            channel
-                .owner
-                .shared
-                .inner
-                .lock()
-                .unwrap()
-                .entries
-                .values()
-                .any(|entry| entry.bytes.is_none() && entry.result.is_none())
-        })
-        .await;
+        until(|| channel.owner.shared.selected_unsettled()).await;
         if expire {
             tokio::time::advance(Duration::from_secs(1)).await;
             assert!(matches!(future.await, Err(Error::Timeout)));
@@ -2009,18 +1998,7 @@ async fn selected_zero_byte_writes_retract_on_drop_or_expiry_for_raw_rpc_and_rep
                     .reply(msg("ServiceNotificationReply", vec![2]), end),
             };
             pending(operation.as_mut()).await;
-            until(|| {
-                channel
-                    .owner
-                    .shared
-                    .inner
-                    .lock()
-                    .unwrap()
-                    .entries
-                    .values()
-                    .any(|entry| entry.bytes.is_none() && entry.result.is_none())
-            })
-            .await;
+            until(|| channel.owner.shared.selected_unsettled()).await;
             if expire {
                 tokio::time::advance(Duration::from_secs(1)).await;
                 assert!(matches!(operation.await, Err(Error::Timeout)));

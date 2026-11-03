@@ -383,18 +383,7 @@ async fn authority_fences_are_resampled_after_zero_progress_for_every_send_kind(
                 .reply_fenced(msg("Reply", vec![]), deadline(), predicate),
         };
         pending(operation.as_mut()).await;
-        until(|| {
-            channel
-                .owner
-                .shared
-                .inner
-                .lock()
-                .unwrap()
-                .entries
-                .values()
-                .any(|entry| entry.bytes.is_none() && entry.result.is_none())
-        })
-        .await;
+        until(|| channel.owner.shared.selected_unsettled()).await;
         valid.store(false, Ordering::Release);
         read_message(&mut peer).await.unwrap();
         assert!(matches!(operation.await, Err(Error::Closed)));

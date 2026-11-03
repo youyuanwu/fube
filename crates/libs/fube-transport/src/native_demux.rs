@@ -48,9 +48,7 @@ pub struct ActorDemux {
 /// Maximum number of connect-time actor registrations.
 pub const MAX_ACTOR_REGISTRATIONS: usize = 32;
 
-pub(crate) fn is_control(actor: i64) -> bool {
-    matches!(actor, 1 | 21 | 29 | 35 | 36)
-}
+pub(crate) use crate::raw_session::engine::is_control;
 
 pub(crate) enum Dispatch {
     Actor(EnvelopeValidator),

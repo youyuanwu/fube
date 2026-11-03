@@ -1,8 +1,12 @@
 //! Operational clear-TCP session I/O shared by gateway and peer adapters.
 //!
-//! This layer has no actor, RPC, IPC, routing or acknowledgment policy. Adapters
-//! own finite queues and retain their admission charges while awaiting a write.
-//! Canceling an established write future is not safe: owners must join it.
+//! Public raw primitives have no actor, RPC, IPC, routing or acknowledgment
+//! policy. Adapters own finite queues and retain their charges through writes.
+//! The crate-private engine child owns Channel's established socket/task,
+//! scheduling and common controls, with opaque synchronized policy hooks.
+//! Peer replication continues using these public raw primitives directly.
+//! Canceling an established write future is not safe: owners must join it
+//! unless irreversibly disposing the entire socket.
 
 use std::{future::Future, io, net::SocketAddr, sync::Mutex, task::Poll, time::Duration};
 
@@ -19,6 +23,8 @@ use crate::{
     message::{ListenInstance, Message, MessageId},
     Error, Result,
 };
+
+pub(crate) mod engine;
 
 /// Direction determines the native listen-side nonce, not replica identity.
 #[derive(Clone, Copy, Debug)]

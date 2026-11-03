@@ -6,6 +6,10 @@
 //! Consumer actor/action/envelope authorization is supplied by client adapters.
 //! IPC session envelopes are composed by [`crate::native_ipc`]; separately
 //! authorized normal-request replies are shared request/reply machinery.
+//! The private raw-session engine owns socket/task progress, admitted write
+//! jobs, common controls and joining. Channel policy shares its coordinator
+//! for atomic initial-write eligibility, but keeps correlation, IDs, grants
+//! and session/actor authorization above that engine.
 //! No listener, replication, TLS, reconnect or replay is supplied.
 //!
 //! Clear loopback is an explicit trust assumption, not authentication of local
@@ -16,15 +20,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     mem::size_of,
     net::SocketAddr,
+    ops::Deref,
     sync::{Arc, Mutex, Weak},
-    task::Poll,
 };
 
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
-    sync::{oneshot, watch, Notify},
-    task::JoinHandle,
+    sync::oneshot,
     time::{timeout, timeout_at, Instant},
 };
 
@@ -36,7 +39,11 @@ use crate::{
     frame::{FIXED_HEADER_SIZE, MAX_FRAME_SIZE, MAX_HEADER_SIZE},
     message::{self, Header, ListenInstance, Message, MessageId, Properties, MAX_HEADER_COUNT},
     native_demux::{ChannelComposition, Dispatch, EnvelopeValidator, OutboundKind},
-    raw_session, Error, Result,
+    raw_session::{
+        self,
+        engine::{self, control_instance, envelope, has},
+    },
+    Error, Result,
 };
 
 #[cfg(test)]
@@ -254,11 +261,9 @@ struct Entry {
     deadline: Instant,
     id: Option<MessageId>,
     rpc: bool,
-    bytes: Option<Vec<u8>>,
     result: Option<Result<Outcome>>,
     lease: Arc<Lease>,
     tracking: Option<Arc<Mutex<RequestState>>>,
-    valid: Option<WritePredicate>,
     hold_reply: bool,
 }
 
@@ -313,22 +318,19 @@ struct Ingress {
     _lease: Arc<Lease>,
 }
 
-struct Inner {
-    terminal: Option<Error>,
-    dispose_requested: bool,
+struct ChannelState {
     next_token: u64,
     next_index: u32,
-    remote: ListenInstance,
     entries: HashMap<u64, Entry>,
     pending: HashMap<MessageId, u64>,
-    ordinary: VecDeque<u64>,
-    replies: VecDeque<u64>,
     ingress: VecDeque<Ingress>,
     history: HashSet<MessageId>,
     unmatched: usize,
 }
 
-impl Inner {
+type Inner = engine::Coordinated<ChannelState>;
+
+impl ChannelState {
     fn retire_pending(&mut self, id: Option<MessageId>) {
         if let Some(id) = id {
             self.pending.remove(&id);
@@ -343,7 +345,6 @@ impl Inner {
                 } else {
                     result
                 });
-                entry.bytes = None;
                 let id = entry.id;
                 self.retire_pending(id);
             }
@@ -351,25 +352,90 @@ impl Inner {
     }
 }
 
+impl Inner {
+    fn settle(&mut self, token: u64, result: Result<Outcome>, now: Instant) {
+        self.policy.settle(token, result, now);
+        // An early reply/expiry retires queued bytes atomically. Selected jobs
+        // remain engine-owned and recheck this policy before a positive write.
+        self.transport.remove(token);
+    }
+}
+
+impl engine::Policy for ChannelState {
+    type Charge = Arc<Lease>;
+
+    fn eligible(&self, token: u64, now: Instant) -> bool {
+        self.entries
+            .get(&token)
+            .is_some_and(|entry| entry.result.is_none() && now < entry.deadline)
+    }
+
+    fn started(&self, token: u64) {
+        if let Some(tracking) = &self.entries[&token].tracking {
+            tracking.lock().unwrap().visible = true;
+        }
+    }
+
+    fn receipt(&mut self, token: u64, receipt: engine::Receipt, now: Instant) {
+        let result = match receipt {
+            engine::Receipt::Written => {
+                if self.entries.get(&token).is_none_or(|entry| entry.rpc) {
+                    return;
+                }
+                Ok(Outcome::Written)
+            }
+            engine::Receipt::Rejected => Err(
+                if self
+                    .entries
+                    .get(&token)
+                    .is_some_and(|entry| now >= entry.deadline)
+                {
+                    Error::Timeout
+                } else {
+                    Error::Closed
+                },
+            ),
+            engine::Receipt::Failed(error) => Err(error),
+        };
+        self.settle(token, result, now);
+    }
+
+    fn retire(&mut self) {
+        self.entries.clear();
+        self.pending.clear();
+        self.ingress.clear();
+        self.history.clear();
+    }
+}
+
 struct Shared {
-    inner: Mutex<Inner>,
+    core: Arc<engine::Core<ChannelState>>,
     budget: Arc<Budget>,
     target: Arc<GatewayTarget>,
     composition: ChannelComposition,
     process_id: [u8; 16],
-    changed: Notify,
-    stop: Notify,
-    dispose: Notify,
-    stopped: watch::Sender<bool>,
-    /// Serializes actual first-write progress with cancellation/termination.
-    /// Separate from inner so validity samples can safely read diagnostics.
-    visibility: Mutex<()>,
     session_envelope: Arc<dyn SessionEnvelope>,
 }
 
+impl Deref for Shared {
+    type Target = engine::Core<ChannelState>;
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
 impl Shared {
+    #[cfg(test)]
+    fn selected_unsettled(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .entries
+            .iter()
+            .any(|(token, entry)| !inner.transport.queued(*token) && entry.result.is_none())
+    }
+
     fn error(&self) -> Option<Error> {
-        self.inner.lock().unwrap().terminal.clone()
+        self.core.error()
     }
 
     fn terminate(&self, error: Error) {
@@ -377,24 +443,7 @@ impl Shared {
     }
 
     fn end(&self, error: Error, dispose: bool) {
-        let _visibility = self.visibility.lock().unwrap();
-        let mut inner = self.inner.lock().unwrap();
-        inner.dispose_requested |= dispose;
-        if inner.terminal.is_none() {
-            inner.terminal = Some(error);
-            inner.entries.clear();
-            inner.pending.clear();
-            inner.ordinary.clear();
-            inner.replies.clear();
-            inner.ingress.clear();
-            inner.history.clear();
-        }
-        drop(inner);
-        self.stop.notify_waiters();
-        if dispose {
-            self.dispose.notify_waiters();
-        }
-        self.changed.notify_waiters();
+        self.core.end(error, dispose);
     }
 
     fn finish(&self, token: u64, result: Result<Outcome>) {
@@ -418,14 +467,7 @@ impl Shared {
 
 struct Owner {
     shared: Arc<Shared>,
-    /// Borrow the handle while awaiting so timeout/drop cannot detach cleanup.
-    join: tokio::sync::Mutex<Option<JoinHandle<()>>>,
-}
-
-impl Drop for Owner {
-    fn drop(&mut self) {
-        self.shared.terminate(Error::Closed);
-    }
+    connection: engine::Owner<ChannelState>,
 }
 
 /// Cloneable lifecycle owner of one established native connection.
@@ -615,23 +657,21 @@ impl GatewayChannel {
         session_envelope: Arc<dyn SessionEnvelope>,
     ) -> Self {
         let shared = Arc::new(Shared {
-            inner: Mutex::new(Inner {
-                terminal: None,
-                dispose_requested: false,
-                next_token: 1,
-                next_index: 2,
+            core: engine::Core::new(
+                ChannelState {
+                    next_token: 1,
+                    next_index: 2,
+                    entries: HashMap::new(),
+                    pending: HashMap::new(),
+                    ingress: VecDeque::new(),
+                    history: HashSet::from([MessageId {
+                        guid: process_id,
+                        index: 1,
+                    }]),
+                    unmatched: 0,
+                },
                 remote,
-                entries: HashMap::new(),
-                pending: HashMap::new(),
-                ordinary: VecDeque::new(),
-                replies: VecDeque::new(),
-                ingress: VecDeque::new(),
-                history: HashSet::from([MessageId {
-                    guid: process_id,
-                    index: 1,
-                }]),
-                unmatched: 0,
-            }),
+            ),
             budget: Arc::new(Budget {
                 limits,
                 usage: Mutex::new(Usage::default()),
@@ -642,19 +682,12 @@ impl GatewayChannel {
             }),
             composition,
             process_id,
-            changed: Notify::new(),
-            stop: Notify::new(),
-            dispose: Notify::new(),
-            stopped: watch::channel(false).0,
-            visibility: Mutex::new(()),
             session_envelope,
         });
-        let join = tokio::spawn(drive(stream, shared.clone()));
+        let connection =
+            engine::Owner::start(stream, shared.clone(), raw_limits(limits.max_frame_bytes));
         Self {
-            owner: Arc::new(Owner {
-                shared,
-                join: tokio::sync::Mutex::new(Some(join)),
-            }),
+            owner: Arc::new(Owner { shared, connection }),
         }
     }
 
@@ -739,17 +772,7 @@ impl GatewayChannel {
     pub fn closed(&self, deadline: Instant) -> ChannelFuture<'_, ()> {
         Box::pin(async move {
             let _waiter = self.owner.shared.budget.reserve(BudgetClass::Close)?;
-            timeout_at(deadline, async {
-                let mut join = self.owner.join.lock().await;
-                if let Some(handle) = join.as_mut() {
-                    let result = handle.await;
-                    *join = None;
-                    result.map_err(|_| Error::Protocol("channel driver task failed"))?;
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|_| Error::Timeout)?
+            self.owner.connection.closed(deadline).await
         })
     }
 
@@ -881,7 +904,14 @@ impl GatewayChannel {
 
     /// Latest native ListenInstance; diagnostic only, not renewed authority.
     pub fn remote_instance(&self) -> ListenInstance {
-        self.owner.shared.inner.lock().unwrap().remote.clone()
+        self.owner
+            .shared
+            .inner
+            .lock()
+            .unwrap()
+            .transport
+            .remote
+            .clone()
     }
 }
 
@@ -898,68 +928,6 @@ fn local(error: Error) -> Error {
         Error::Protocol(reason) => Error::InvalidInput(reason),
         other => other,
     }
-}
-
-/// Caller fields remain unique. Received native common-header scanning uses
-/// the final RelatesTo (MessageHeaders.cpp:765-824 at pinned SF 3988b451).
-/// Preserve and validate every record under the existing header/frame bounds.
-/// Only ExpectsReply retains the second-byte-identical exception; other fields
-/// stay unique. Domain reply eligibility belongs to the caller.
-pub(crate) fn envelope(message: &Message, native_inbound: bool) -> Result<Properties> {
-    let ids = [
-        message::ACTOR,
-        message::ACTION,
-        message::MESSAGE_ID,
-        message::RELATES_TO,
-        message::EXPECTS_REPLY,
-        message::UNCORRELATED_REPLY,
-        message::FAULT,
-        message::HIGH_PRIORITY,
-        message::IPC,
-    ];
-    let mut seen: [Option<&Header>; 9] = [None; 9];
-    let mut repeated = [false; 9];
-    if message.headers.len() > MAX_HEADER_COUNT {
-        return Err(Error::Protocol("header count exceeds limit"));
-    }
-    for header in &message.headers {
-        if let Some(index) = ids.iter().position(|id| *id == header.id) {
-            if native_inbound && header.id == message::RELATES_TO {
-                continue;
-            }
-            if let Some(previous) = seen[index] {
-                if !native_inbound
-                    || !matches!(header.id, message::RELATES_TO | message::EXPECTS_REPLY)
-                    || previous.value != header.value
-                    || repeated[index]
-                {
-                    let reason = if native_inbound
-                        && repeated[index]
-                        && matches!(header.id, message::RELATES_TO | message::EXPECTS_REPLY)
-                    {
-                        "more than two native correlation headers"
-                    } else {
-                        match header.id {
-                            message::RELATES_TO => "contradictory native RelatesTo header",
-                            message::EXPECTS_REPLY => "contradictory native ExpectsReply header",
-                            message::MESSAGE_ID => "duplicate native MessageId header",
-                            message::ACTOR => "duplicate native Actor header",
-                            message::ACTION => "duplicate native Action header",
-                            _ => "duplicate or contradictory transport envelope header",
-                        }
-                    };
-                    return Err(Error::Protocol(reason));
-                }
-                repeated[index] = true;
-            }
-            seen[index] = Some(header);
-        }
-    }
-    message.properties()
-}
-
-fn has(message: &Message, id: u16) -> bool {
-    message.headers.iter().any(|header| header.id == id)
 }
 
 fn allocation_check(message: &Message, limits: ChannelLimits) -> Result<()> {
@@ -1016,8 +984,7 @@ fn retire(inner: &mut Inner, token: u64) {
     if let Some(entry) = inner.entries.remove(&token) {
         inner.retire_pending(entry.id);
     }
-    inner.ordinary.retain(|queued| *queued != token);
-    inner.replies.retain(|queued| *queued != token);
+    inner.transport.remove(token);
 }
 
 impl Drop for OperationGuard {
@@ -1112,7 +1079,7 @@ async fn submit(
     let token;
     {
         let mut inner = shared.inner.lock().unwrap();
-        if let Some(error) = &inner.terminal {
+        if let Some(error) = &inner.transport.terminal {
             return Err(error.clone());
         }
         check_deadline(deadline)?;
@@ -1173,11 +1140,9 @@ async fn submit(
                 deadline,
                 id,
                 rpc,
-                bytes: Some(bytes),
                 result: None,
-                lease,
+                lease: lease.clone(),
                 tracking: tracking.clone(),
-                valid,
                 hold_reply,
             },
         );
@@ -1187,11 +1152,16 @@ async fn submit(
         if rpc {
             inner.pending.insert(id.unwrap(), token);
         }
-        if class == BudgetClass::Reply {
-            inner.replies.push_back(token);
-        } else {
-            inner.ordinary.push_back(token);
-        }
+        inner.transport.enqueue(
+            engine::WriteJob {
+                token,
+                bytes,
+                deadline,
+                valid,
+                charge: lease,
+            },
+            class == BudgetClass::Reply,
+        );
     }
     drop(message);
     let _guard = OperationGuard {
@@ -1206,7 +1176,7 @@ async fn submit(
             notified.as_mut().enable();
             {
                 let mut inner = shared.inner.lock().unwrap();
-                if let Some(error) = &inner.terminal {
+                if let Some(error) = &inner.transport.terminal {
                     return Err(error.clone());
                 }
                 if let Some(result) = inner
@@ -1338,7 +1308,7 @@ impl GatewayReceiver {
     pub fn drain_pending(&self) -> Result<GatewayIngressSnapshot> {
         let shared = self.shared.upgrade().ok_or(Error::Closed)?;
         let mut inner = shared.inner.lock().unwrap();
-        if let Some(error) = &inner.terminal {
+        if let Some(error) = &inner.transport.terminal {
             return Err(error.clone());
         }
         let pending = std::mem::take(&mut inner.ingress);
@@ -1365,7 +1335,7 @@ impl MessageReceiver for GatewayReceiver {
                     notified.as_mut().enable();
                     {
                         let mut inner = shared.inner.lock().unwrap();
-                        if let Some(error) = &inner.terminal {
+                        if let Some(error) = &inner.transport.terminal {
                             return Err(error.clone());
                         }
                         check_deadline(deadline)?;
@@ -1382,10 +1352,6 @@ impl MessageReceiver for GatewayReceiver {
     }
 }
 
-async fn read_bounded<R: AsyncRead + Unpin>(reader: &mut R, limit: usize) -> Result<Message> {
-    raw_session::read_message(reader, raw_limits(limit)).await
-}
-
 fn raw_limits(max_frame_bytes: usize) -> raw_session::Limits {
     raw_session::Limits {
         max_frame_bytes,
@@ -1393,289 +1359,172 @@ fn raw_limits(max_frame_bytes: usize) -> raw_session::Limits {
     }
 }
 
-fn control_instance(message: &Message, props: &Properties) -> Result<ListenInstance> {
-    if let Some(fault) = props.fault.filter(|fault| fault.code != 0) {
-        return Err(Error::Remote {
-            code: fault.code,
-            message: "native connection control fault".into(),
-        });
-    }
-    if props.actor != 1
-        || !props.action.is_empty()
-        || props.expects_reply
-        || props.uncorrelated_reply
-        || props.relates_to != MessageId::default()
-    {
-        return Err(Error::Protocol("expected native ListenInstance control"));
-    }
-    ListenInstance::decode(&message.body)
-}
-
-async fn receive_loop<R: AsyncRead + Unpin>(mut reader: R, shared: &Arc<Shared>) -> Result<()> {
-    loop {
-        let message = read_bounded(&mut reader, shared.budget.limits.max_frame_bytes).await?;
-        let received_at = Instant::now();
-        let props = envelope(&message, true)?;
-        if props.actor == 1 {
-            let remote = control_instance(&message, &props)?;
-            shared.inner.lock().unwrap().remote = remote;
-            continue;
-        }
-        if matches!(props.actor, 21 | 29 | 35 | 36) {
-            if let Some(fault) = props.fault.filter(|fault| fault.code != 0) {
-                return Err(Error::Remote {
-                    code: fault.code,
-                    message: "native transport control fault".into(),
-                });
-            }
-            return Err(Error::Protocol(
-                "unsupported role/security/reconnect control; no recovery",
-            ));
-        }
-        shared.session_envelope.incoming(&message)?;
-        let mut reply_authorize = None;
-        let reply_id = match shared.composition.actors.select(&props)? {
-            Dispatch::Actor(authorize) => {
-                authorize(&message, &props)?;
-                if props.expects_reply {
-                    if let Some(policy) = &shared.composition.requests {
-                        if props.id == MessageId::default() || props.fault.is_some() {
-                            return Err(Error::Protocol("invalid native actor request"));
-                        }
-                        (policy.incoming)(&message, &props)?;
-                        reply_authorize = Some(policy.reply);
-                        Some(Some(props.id))
-                    } else {
-                        Some(None)
+async fn receive_message(
+    message: Message,
+    props: Properties,
+    received_at: Instant,
+    shared: &Arc<Shared>,
+) -> Result<()> {
+    shared.session_envelope.incoming(&message)?;
+    let mut reply_authorize = None;
+    let reply_id = match shared.composition.actors.select(&props)? {
+        Dispatch::Actor(authorize) => {
+            authorize(&message, &props)?;
+            if props.expects_reply {
+                if let Some(policy) = &shared.composition.requests {
+                    if props.id == MessageId::default() || props.fault.is_some() {
+                        return Err(Error::Protocol("invalid native actor request"));
                     }
+                    (policy.incoming)(&message, &props)?;
+                    reply_authorize = Some(policy.reply);
+                    Some(Some(props.id))
                 } else {
                     Some(None)
                 }
-            }
-            Dispatch::Reply if props.uncorrelated_reply => {
-                let duplex = shared
-                    .composition
-                    .duplex
-                    .as_ref()
-                    .ok_or(Error::Protocol("native duplex ingress is not enabled"))?;
-                if props.id == MessageId::default() {
-                    return Err(Error::Protocol(
-                        "duplex ingress requires original MessageId",
-                    ));
-                }
-                (duplex.incoming)(&message, &props)?;
-                reply_authorize = Some(duplex.reply);
-                Some(Some(props.id))
-            }
-            Dispatch::Reply => None,
-        };
-        if let Some(reply_id) = reply_id {
-            let lease = shared.budget.reserve(BudgetClass::Ingress)?;
-            let (handoff, acknowledgment) = if shared.composition.ordered_ingress {
-                let (send, receive) = oneshot::channel();
-                (Some(send), Some(receive))
             } else {
-                (None, None)
-            };
-            {
-                let mut inner = shared.inner.lock().unwrap();
-                if inner.terminal.is_some() {
-                    return Err(Error::Closed);
-                }
-                if let Some(id) = reply_id {
-                    shared
-                        .remember(&mut inner, id)
-                        .map_err(|error| match error {
-                            Error::InvalidInput(_) => {
-                                Error::Protocol("duplicate or colliding request ID")
-                            }
-                            other => other,
-                        })?;
-                }
-                inner.ingress.push_back(Ingress {
-                    message,
-                    received_at,
-                    reply_id,
-                    reply_authorize,
-                    handoff,
-                    _lease: lease,
-                });
+                Some(None)
             }
-            shared.changed.notify_waiters();
-            if let Some(acknowledgment) = acknowledgment {
-                let _ = timeout(MAX_FRAME_TIME, acknowledgment)
-                    .await
-                    .map_err(|_| Error::Timeout)?;
-            }
-            continue;
         }
-        if props.relates_to == MessageId::default()
-            || props.expects_reply
-            || has(&message, message::IPC)
+        Dispatch::Reply if props.uncorrelated_reply => {
+            let duplex = shared
+                .composition
+                .duplex
+                .as_ref()
+                .ok_or(Error::Protocol("native duplex ingress is not enabled"))?;
+            if props.id == MessageId::default() {
+                return Err(Error::Protocol(
+                    "duplex ingress requires original MessageId",
+                ));
+            }
+            (duplex.incoming)(&message, &props)?;
+            reply_authorize = Some(duplex.reply);
+            Some(Some(props.id))
+        }
+        Dispatch::Reply => None,
+    };
+    if let Some(reply_id) = reply_id {
+        let lease = shared.budget.reserve(BudgetClass::Ingress)?;
+        let (handoff, acknowledgment) = if shared.composition.ordered_ingress {
+            let (send, receive) = oneshot::channel();
+            (Some(send), Some(receive))
+        } else {
+            (None, None)
+        };
         {
-            return Err(Error::Protocol("invalid ordinary native reply"));
-        }
-        (shared.composition.ordinary_reply)(&message, &props)?;
-        let token = {
             let mut inner = shared.inner.lock().unwrap();
-            // Properties validates every occurrence and exposes the final
-            // native-effective ID. Never try an earlier ID, even if final is
-            // unknown/retired and an earlier one names a live neighbor.
-            let token = inner.pending.get(&props.relates_to).copied();
-            if token.is_none() {
-                inner.unmatched += 1;
-                if inner.unmatched > 1024 {
-                    return Err(Error::Protocol("too many unmatched replies"));
-                }
-            } else {
-                inner.unmatched = 0;
+            if inner.transport.terminal.is_some() {
+                return Err(Error::Closed);
             }
-            token
-        };
-        if let Some(token) = token {
-            let held = {
-                let inner = shared.inner.lock().unwrap();
-                inner
-                    .entries
-                    .get(&token)
-                    .filter(|entry| entry.hold_reply)
-                    .map(|entry| (entry.deadline, entry.lease.clone()))
-            };
-            let mut acknowledgment = None;
-            let result = match props.fault.filter(|fault| fault.code != 0) {
-                Some(fault) => Err(Error::Remote {
-                    code: fault.code,
-                    message: "native transport Fault".into(),
-                }),
-                None => match held {
-                    Some((deadline, lease)) => {
-                        let (release, receive) = oneshot::channel();
-                        acknowledgment = Some((deadline, receive));
-                        Ok(Outcome::Held(
-                            message,
-                            CompletionGuard {
-                                release: Some(release),
-                                _lease: lease,
-                            },
-                        ))
-                    }
-                    None => Ok(Outcome::Message(message)),
-                },
-            };
-            shared.finish(token, result);
-            if let Some((deadline, receive)) = acknowledgment {
-                // Generic ordered handoff, never a domain callback. Deadline
-                // and outer driver-stop selection bound abandoned validation.
-                let _ = timeout_at(deadline, receive)
-                    .await
-                    .map_err(|_| Error::Timeout)?;
-            }
-        }
-    }
-}
-
-async fn send_loop<W: AsyncWrite + Unpin>(mut writer: W, shared: &Arc<Shared>) -> Result<()> {
-    loop {
-        let notified = shared.changed.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        let work = {
-            let mut inner = shared.inner.lock().unwrap();
-            if inner.terminal.is_some() {
-                return Ok(());
-            }
-            let token = inner
-                .replies
-                .pop_front()
-                .or_else(|| inner.ordinary.pop_front());
-            token.and_then(|token| {
-                let now = Instant::now();
-                if inner
-                    .entries
-                    .get(&token)
-                    .is_some_and(|entry| now >= entry.deadline)
-                {
-                    inner.settle(token, Err(Error::Timeout), now);
-                }
-                let entry = inner.entries.get_mut(&token)?;
-                if entry.result.is_some() {
-                    entry.bytes = None;
-                    return None;
-                }
-                Some((
-                    token,
-                    entry.bytes.take()?,
-                    entry.lease.clone(),
-                    entry.rpc,
-                    entry.deadline,
-                    entry.valid.clone(),
-                ))
-            })
-        };
-        if let Some((token, bytes, _lease, rpc, deadline, valid)) = work {
-            // Selection is not frame start. Until a positive write, validate
-            // ownership/deadline under the same lock as cancellation/close.
-            let result = raw_session::write_frame(
-                &mut writer,
-                &bytes,
-                deadline,
-                raw_limits(shared.budget.limits.max_frame_bytes),
-                &shared.changed,
-                |write| {
-                    let _visibility = shared.visibility.lock().unwrap();
-                    if valid.as_ref().is_some_and(|predicate| !predicate()) {
-                        return None;
-                    }
-                    let inner = shared.inner.lock().unwrap();
-                    let eligible = inner.terminal.is_none()
-                        && inner.entries.get(&token).is_some_and(|entry| {
-                            entry.result.is_none() && Instant::now() < entry.deadline
-                        });
-                    if !eligible {
-                        return None;
-                    }
-                    let result = write();
-                    if matches!(result, Poll::Ready(Ok(size)) if size > 0) {
-                        if let Some(tracking) = &inner.entries[&token].tracking {
-                            tracking.lock().unwrap().visible = true;
+            if let Some(id) = reply_id {
+                shared
+                    .remember(&mut inner, id)
+                    .map_err(|error| match error {
+                        Error::InvalidInput(_) => {
+                            Error::Protocol("duplicate or colliding request ID")
                         }
-                    }
-                    Some(result)
-                },
-            )
-            .await;
-            match result {
-                Ok(true) => {}
-                Err(error) => {
-                    shared.finish(token, Err(error.clone()));
-                    return Err(error);
-                }
-                Ok(false) => {
-                    shared.finish(
-                        token,
-                        Err(if Instant::now() >= deadline {
-                            Error::Timeout
-                        } else {
-                            Error::Closed
-                        }),
-                    );
-                    continue;
-                }
+                        other => other,
+                    })?;
             }
-            if !rpc {
-                shared.finish(token, Ok(Outcome::Written));
+            inner.ingress.push_back(Ingress {
+                message,
+                received_at,
+                reply_id,
+                reply_authorize,
+                handoff,
+                _lease: lease,
+            });
+        }
+        shared.changed.notify_waiters();
+        if let Some(acknowledgment) = acknowledgment {
+            let _ = timeout(MAX_FRAME_TIME, acknowledgment)
+                .await
+                .map_err(|_| Error::Timeout)?;
+        }
+        return Ok(());
+    }
+    if props.relates_to == MessageId::default()
+        || props.expects_reply
+        || has(&message, message::IPC)
+    {
+        return Err(Error::Protocol("invalid ordinary native reply"));
+    }
+    (shared.composition.ordinary_reply)(&message, &props)?;
+    let token = {
+        let mut inner = shared.inner.lock().unwrap();
+        // Properties validates every occurrence and exposes the final
+        // native-effective ID. Never try an earlier ID, even if final is
+        // unknown/retired and an earlier one names a live neighbor.
+        let token = inner.pending.get(&props.relates_to).copied();
+        if token.is_none() {
+            inner.unmatched += 1;
+            if inner.unmatched > 1024 {
+                return Err(Error::Protocol("too many unmatched replies"));
             }
         } else {
-            // Queue disposal/expiry may have left more keys to process.
-            let more = {
-                let inner = shared.inner.lock().unwrap();
-                !inner.ordinary.is_empty() || !inner.replies.is_empty()
-            };
-            if more {
-                continue;
-            }
-            notified.await;
+            inner.unmatched = 0;
         }
+        token
+    };
+    if let Some(token) = token {
+        let held = {
+            let inner = shared.inner.lock().unwrap();
+            inner
+                .entries
+                .get(&token)
+                .filter(|entry| entry.hold_reply)
+                .map(|entry| (entry.deadline, entry.lease.clone()))
+        };
+        let mut acknowledgment = None;
+        let result = match props.fault.filter(|fault| fault.code != 0) {
+            Some(fault) => Err(Error::Remote {
+                code: fault.code,
+                message: "native transport Fault".into(),
+            }),
+            None => match held {
+                Some((deadline, lease)) => {
+                    let (release, receive) = oneshot::channel();
+                    acknowledgment = Some((deadline, receive));
+                    Ok(Outcome::Held(
+                        message,
+                        CompletionGuard {
+                            release: Some(release),
+                            _lease: lease,
+                        },
+                    ))
+                }
+                None => Ok(Outcome::Message(message)),
+            },
+        };
+        shared.finish(token, result);
+        if let Some((deadline, receive)) = acknowledgment {
+            // Generic ordered handoff, never a domain callback. Deadline
+            // and outer driver-stop selection bound abandoned validation.
+            let _ = timeout_at(deadline, receive)
+                .await
+                .map_err(|_| Error::Timeout)?;
+        }
+    }
+    Ok(())
+}
+
+impl engine::Driver for Shared {
+    type Policy = ChannelState;
+
+    fn core(&self) -> &Arc<engine::Core<ChannelState>> {
+        &self.core
+    }
+
+    async fn receive(
+        self: Arc<Self>,
+        message: Message,
+        props: Properties,
+        received_at: Instant,
+    ) -> Result<()> {
+        receive_message(message, props, received_at, &self).await
+    }
+
+    async fn maintain(self: Arc<Self>) {
+        expire_loop(&self).await;
     }
 }
 
@@ -1686,7 +1535,7 @@ async fn expire_loop(shared: &Arc<Shared>) {
         notified.as_mut().enable();
         let (deadline, did_expire) = {
             let mut inner = shared.inner.lock().unwrap();
-            if inner.terminal.is_some() {
+            if inner.transport.terminal.is_some() {
                 return;
             }
             let now = Instant::now();
@@ -1720,51 +1569,4 @@ async fn expire_loop(shared: &Arc<Shared>) {
             None => notified.await,
         }
     }
-}
-
-struct DriverExit(Arc<Shared>);
-impl Drop for DriverExit {
-    fn drop(&mut self) {
-        self.0.terminate(Error::Closed);
-        self.0.stopped.send_replace(true);
-    }
-}
-
-async fn drive<S: AsyncRead + AsyncWrite + Unpin>(stream: S, shared: Arc<Shared>) {
-    let _exit = DriverExit(shared.clone());
-    let (reader, writer) = tokio::io::split(stream);
-    let stopped = async {
-        let stop = shared.stop.notified();
-        tokio::pin!(stop);
-        stop.as_mut().enable();
-        if shared.error().is_some() {
-            return;
-        }
-        stop.await;
-    };
-    let writing = async {
-        let disposed = async {
-            let disposed = shared.dispose.notified();
-            tokio::pin!(disposed);
-            disposed.as_mut().enable();
-            if !shared.inner.lock().unwrap().dispose_requested {
-                disposed.await;
-            }
-        };
-        tokio::select! {
-            biased;
-            _ = disposed => Ok(()),
-            result = send_loop(writer, &shared) => result,
-        }
-    };
-    tokio::join!(
-        raw_session::join_io(
-            receive_loop(reader, &shared),
-            writing,
-            stopped,
-            |error| shared.terminate(error),
-            Error::Closed,
-        ),
-        expire_loop(&shared)
-    );
 }
