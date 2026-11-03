@@ -15,9 +15,10 @@ use tokio::{
 use crate::{
     connection::{write_message, MAX_FRAME_TIME},
     message::{self, Header, ListenInstance, Message, MessageId},
-    native_channel::{envelope, ChannelLimits, GatewayChannel, SessionEnvelope},
+    native_channel::{ChannelLimits, GatewayChannel, SessionEnvelope},
     native_demux::ChannelComposition,
-    raw_session, Endpoint, Error, Result,
+    raw_session::{self, engine::envelope},
+    Endpoint, Error, Result,
 };
 
 /// Establish the supported clear-loopback IPC session on a shared channel.

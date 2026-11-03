@@ -20,6 +20,8 @@ use crate::{
     Error, Result,
 };
 
+pub(crate) mod engine;
+
 /// Direction determines the native listen-side nonce, not replica identity.
 #[derive(Clone, Copy, Debug)]
 pub enum Role {
