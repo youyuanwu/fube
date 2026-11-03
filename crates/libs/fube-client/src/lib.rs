@@ -56,17 +56,41 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use contracts::ClientFuture;
 use fube_transport::{
-    channel::MessageChannel,
-    connection::deadline_after,
-    native_channel::{ChannelLimits, GatewayChannel, GatewayTarget},
+    channel::MessageChannel, connection::deadline_after, native_channel::GatewayTarget,
 };
 use tokio::time::Instant;
 use uuid::Uuid;
 
-pub use fube_transport::{Error, Result};
+pub use fube_transport::{Channel, ChannelLimits, Endpoint, Error, Result};
 
 /// Default connection and per-operation timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Local typed-stub defaults, independent of connection settings.
+///
+/// Limits are conservative counters, not allocated memory. Stub clones share
+/// these limits; explicitly constructing another stub creates a fresh budget.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientOptions {
+    pub default_timeout: Duration,
+    pub limits: ClientLimits,
+}
+
+impl Default for ClientOptions {
+    fn default() -> Self {
+        Self {
+            default_timeout: DEFAULT_TIMEOUT,
+            limits: ClientLimits::default(),
+        }
+    }
+}
+
+impl ClientOptions {
+    fn budget(&self) -> Result<typed::ClientBudget> {
+        deadline_after(self.default_timeout)?;
+        typed::ClientBudget::new(self.limits)
+    }
+}
 
 /// Identity returned by the native gateway, not by a management endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,35 +103,70 @@ pub struct GatewayDescription {
 
 /// Cloneable client for the native clear-TCP development profile.
 ///
-/// Clones explicitly share one GatewayChannel lifecycle owner and terminal state.
+/// Clones explicitly share one Channel lifecycle owner, typed budget and terminal state.
 /// A [`GatewayClient`] instead borrows a supplied foundation without adopting it.
 /// Eight admitted typed calls are retained through result transfer/drop; excess
 /// calls fail immediately. Protocol/domain failures do not abort the owner.
 /// Every remote operation accepts an optional whole-operation timeout:
-/// `None` uses the timeout configured by [`Self::connect_clear`], while
+/// `None` uses [`ClientOptions::default_timeout`] (or the duration supplied to
+/// [`Self::connect_clear`]), while
 /// `Some(duration)` overrides it for that call. `None` is not an infinite timeout.
 ///
 /// ```no_run
 /// use std::time::Duration;
-/// use fube_client::{FabricClient, DEFAULT_TIMEOUT};
+/// use fube_client::{ClientOptions, FabricClient, DEFAULT_TIMEOUT};
+/// use fube_transport::{channel::MessageChannel, connection::deadline_after};
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let client = FabricClient::connect_clear("127.0.0.1:19000".parse().unwrap(), DEFAULT_TIMEOUT).await?;
-/// let gateway = client.ping(None).await?;
-/// let exists = client.name_exists("fabric:/MyApplication", Some(Duration::from_secs(5))).await?;
-/// client.close().await?;
+/// let endpoint = FabricClient::endpoint_clear("127.0.0.1:19000".parse().unwrap())?
+///     .connect_timeout(Duration::from_secs(10));
+/// let channel = endpoint.connect().await?;
+/// let client = FabricClient::new(channel.clone(), ClientOptions::default())?;
+/// let cloned = client.clone(); // same typed admission budget, no new handshake
+/// let (gateway, exists) = tokio::try_join!(
+///     client.ping(None),
+///     cloned.name_exists("fabric:/MyApplication", Some(Duration::from_secs(5))),
+/// )?;
+/// channel.close(deadline_after(DEFAULT_TIMEOUT)?).await?; // shared shutdown
 /// # Ok(())
 /// # }
 /// ```
 #[derive(Clone)]
 pub struct FabricClient {
-    channel: GatewayChannel,
+    channel: Channel,
     target: Arc<GatewayTarget>,
     budget: typed::ClientBudget,
     timeout: Duration,
 }
 
 impl FabricClient {
+    /// Configure an ordinary clear-loopback connection without opening it.
+    ///
+    /// Authorization is installed by connection setup, not by stub binding.
+    pub fn endpoint_clear(address: SocketAddr) -> Result<Endpoint> {
+        Endpoint::unsecured_loopback(address, channel_adapter::ordinary()?)
+    }
+
+    /// Bind locally to an established channel and its original target.
+    ///
+    /// No handshake, application message or permission change occurs. Invalid
+    /// options drop only the consumed handle, never explicitly close retained
+    /// clones. A target sample is not a lasting liveness guarantee.
+    pub fn new(channel: Channel, options: ClientOptions) -> Result<Self> {
+        let budget = options.budget()?;
+        Self::bind(channel, options, budget)
+    }
+
+    fn bind(channel: Channel, options: ClientOptions, budget: typed::ClientBudget) -> Result<Self> {
+        let target = channel.target()?;
+        Ok(Self {
+            channel,
+            target,
+            budget,
+            timeout: options.default_timeout,
+        })
+    }
+
     /// Resolve on the gateway without retaining endpoint results in this client.
     pub async fn resolve_service_partition(
         &self,
@@ -133,21 +192,23 @@ impl FabricClient {
     /// GatewayChannels; image-transfer clients own separate upload channels.
     pub async fn connect_clear(endpoint: SocketAddr, timeout: Duration) -> Result<Self> {
         let deadline = deadline_after(timeout)?;
-        let channel = GatewayChannel::connect_unsecured_loopback(
+        let options = ClientOptions {
+            default_timeout: timeout,
+            ..ClientOptions::default()
+        };
+        let budget = options.budget()?;
+        // Preserve the legacy caller's absolute budget through local binding.
+        // This absolute-deadline entry uses Endpoint's same private dial path.
+        let channel = Channel::connect_unsecured_loopback(
             endpoint,
             channel_adapter::ordinary()?,
             ChannelLimits::default(),
             deadline,
         )
         .await?;
-        let target = channel.resolve_target(&endpoint.to_string())?;
+        let client = Self::bind(channel, options, budget)?;
         typed::check_deadline(deadline)?;
-        Ok(Self {
-            channel,
-            target,
-            budget: typed::default_budget(),
-            timeout,
-        })
+        Ok(client)
     }
 
     /// Discover the native gateway's full node identity.
@@ -427,8 +488,8 @@ impl FabricClient {
 }
 
 impl Client for FabricClient {
-    type Channel = GatewayChannel;
-    fn binding(&self) -> ClientBinding<'_, GatewayChannel> {
+    type Channel = Channel;
+    fn binding(&self) -> ClientBinding<'_, Channel> {
         ClientBinding {
             channel: &self.channel,
             target: &self.target,

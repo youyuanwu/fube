@@ -10,11 +10,11 @@ use fube_transport::{
     channel::{MessageChannel, MessageReceiver, ReplyContext},
     connection::MAX_FRAME_TIME,
     message::{Header, Message, MessageId, Properties},
-    native_channel::{ChannelLimits, GatewayChannel, GatewayTarget, WritePredicate},
+    native_channel::{GatewayTarget, WritePredicate},
     native_demux::{
         ActorDemux, ActorRegistration, ChannelComposition, OutboundKind, RequestPolicy,
     },
-    native_ipc, Error, Result,
+    native_ipc, Channel, ChannelLimits, Error, Result,
 };
 use tokio::{
     sync::{mpsc, oneshot, watch, Mutex, Semaphore},
@@ -224,7 +224,7 @@ fn composition() -> Result<ChannelComposition> {
 }
 
 struct Owner {
-    channel: GatewayChannel,
+    channel: Channel,
     target: Arc<GatewayTarget>,
     work: mpsc::Sender<Work>,
     slots: Arc<Semaphore>,
@@ -267,7 +267,7 @@ impl IpcChannel {
             host_id,
         )
         .await?;
-        let target = channel.resolve_target(&address.to_string())?;
+        let target = channel.target()?;
         let receiver = channel.receiver()?;
         let (send, mut work) = mpsc::channel::<Work>(OPERATIONS);
         let (stopped, observed) = watch::channel(false);

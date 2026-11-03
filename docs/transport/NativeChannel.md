@@ -18,6 +18,44 @@ hostile local processes and does not qualify secure production clusters.
 Existing permissions, security controls and concrete connection roles are not
 disabled or widened.
 
+### Endpoint, Channel and adapters
+
+`fube_transport::{Endpoint, Channel, ChannelLimits}` exposes the existing backend:
+`Channel` and `native_channel::GatewayChannel` are the **same implementation**,
+not two transports. `Endpoint::unsecured_loopback(address, composition)` requires
+explicit trusted authorization. Adapter factories such as
+`FabricClient::endpoint_clear` and `ImageStoreClient::endpoint_clear` choose that
+policy outside core; there is no default business profile or profile query.
+Construction, setters and bounded configuration clones perform no I/O. The
+default connection duration is 30 seconds, independent of the frame watchdog.
+`connect_timeout` and `channel_limits` are validated before dial; each borrowed
+`Endpoint::connect()` establishes a fresh connection, identity and ID history
+within one absolute deadline. Channel clones instead share the original owner.
+The older absolute-deadline constructor uses the same private connection path.
+
+`Channel::target()` clones the original captured actual-peer target after a
+terminal sample. It does not parse an address, consult advertised ListenInstance,
+connect, grant permission or promise lasting liveness. All submit-time affinity,
+session, policy and terminal checks still apply. This single-connection
+capability is not a new default-target requirement on generic multi-target
+`MessageChannel` implementations.
+
+Outgoing IPC still uses `native_ipc` to instantiate actual host/PID session state
+per connection; accepted IPC uses accepted-socket setup, not an Endpoint dial.
+Both return the same Channel, and runtime/Hosting consume its neutral target.
+Accepted targets refer to the actual ephemeral peer, never the listening or
+advertised address. Session envelopes/adoption remain private. Registration,
+leases, upload sequences and admission are domain operations, not stub handshakes.
+
+Shared abstraction does **not** make arbitrary sessions interchangeable or permit
+competing protocol pumps. Repeatable receiver acquisition, receiver Clone and
+concurrent distinct-message receive remain supported; receivers share one queue,
+not subscriptions or an exclusive claim. Upload privately retains one mutable
+serial inbox; runtime clones share one adapter driver; Hosting retains one
+accepted handler. Raw clones neither duplicate those owners nor prevent explicit
+upload/runtime retirement or Hosting whole-socket disposal from closing them.
+See [ordinary stub composition](RustFabricClient.md#endpoint-channel-and-local-stub).
+
 ### Shared raw sessions, distinct adapters
 
 The channel and replication peers now use the same operational

@@ -84,6 +84,72 @@ GetNodeHealth instead returns actor **HM (16)** and action
 
 ## 2. Run against a disposable onebox
 
+### Endpoint, Channel and local stub
+
+```rust,no_run
+use std::time::Duration;
+use fube_client::{ClientOptions, FabricClient};
+use fube_transport::{channel::MessageChannel, connection::deadline_after};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let endpoint = FabricClient::endpoint_clear("127.0.0.1:19000".parse()?)?
+    .connect_timeout(Duration::from_secs(10));
+let channel = endpoint.connect().await?;
+let client = FabricClient::new(channel.clone(), ClientOptions {
+    default_timeout: Duration::from_secs(30),
+    ..ClientOptions::default()
+})?;
+let other = client.clone();
+let (gateway, exists) = tokio::try_join!(
+    client.ping(None),
+    other.name_exists("fabric:/Example", Some(Duration::from_secs(5))),
+)?;
+channel.close(deadline_after(Duration::from_secs(30))?).await?;
+# Ok(())
+# }
+```
+
+`Channel` is the actual `fube_transport::native_channel::GatewayChannel`, also
+re-exported with `Endpoint`/`ChannelLimits` from `fube-client`, not an
+ordinary-only facade. Its `target()` captures the original actual connection,
+not the gateway's advertised address. Stub binding is synchronous/local: no dial,
+hello, ping or capability grant. Unsupported operations still fail via installed
+policy before visibility. `GatewayClient` remains an explicitly borrowed view.
+
+Endpoint configuration/Clone opens no socket; repeated `connect()` calls create
+independent transport owners. Connection timeout is independent of stub-default
+and per-call durations. Each call starts a fresh whole-operation deadline;
+`None` is finite, and `Some(duration)` overrides only that operation.
+`FabricClient::connect_clear(address, duration)` remains the common-path
+convenience: duration applies to both establishment and later default calls;
+default limits and wire behavior are unchanged.
+
+Invalid Endpoint settings fail pre-dial; invalid `ClientOptions` fail
+pre-application on a possibly already connected channel. Failed `new` normally
+drops only its consumed handle, never explicitly closes retained clones;
+last-owner cleanup still applies. `target()` samples terminal state, not lasting
+health. Drop of one stub does not close surviving owners. Explicit channel close
+uses an absolute deadline and closes all users; `FabricClient::close()` derives
+that wait from its operation default. Timeout/drop after send can leave the
+remote outcome unknown; local write is not receipt, semantic ACK or commit.
+
+Stub clones share typed `ClientLimits`; distinct explicit `new` calls get separate
+local budgets/defaults while sharing transport count/bytes, target, ID history and
+terminal state. Local versus Transport overload remains fail-fast with unchanged
+error provenance and no waiting queue. `CLIENT_SLOT_BYTES` is a conservative
+**4 GiB + 16 MiB counter reservation per typed call**, not an actual allocation
+or RSS estimate. Separate stubs do not promise pooled typed-memory accounting.
+
+ImageStore's actual connect path uses its own Endpoint factory and common target,
+but keeps a dedicated mutable serial session, one private receiver, actor26 raw
+sends/actor25–27 semantic ACKs, delete RPC and cancellation retirement. Runtime/
+Hosting likewise use the same backend after their outgoing/accepted native IPC
+setup, without creating new inbox pumps. Raw receiver Clone/concurrent receive
+is supported, not safe arbitrary session sharing; explicit domain retirement
+can close retained raw observers. See [common composition](NativeChannel.md).
+
+### Disposable onebox commands
+
 Use the repository's Rust toolchain. A native SDK or C++ build is unnecessary.
 The [Ubuntu onebox guide](../UbuntuOnebox.md) supplies Docker prerequisites.
 Run from the repository root:
@@ -103,7 +169,8 @@ cargo run -p fube-client --example onebox -- \
   --events-filter 8 --warning-as-error true
 ```
 
-The example prints the gateway's advertised address and full node identity.
+The example's `ping` demonstrates two concurrent calls through explicit stub
+clones on one connection, printing both advertised addresses/full node identities.
 `node-list` prints one page and its continuation token, not an implicit complete
 cluster inventory.
 The advertised address can be the container's private address rather than the

@@ -203,6 +203,9 @@ mod workload_lists;
 #[path = "support/topology_model.rs"]
 mod topology_lists;
 
+#[path = "support/channel_composition_model.rs"]
+mod channel_composition;
+
 fn body(fields: impl FnOnce(&mut Encoder) -> fube_transport::Result<()>) -> Vec<u8> {
     let mut encoder = Encoder::new();
     encoder.object(fields).unwrap();

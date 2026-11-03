@@ -43,6 +43,10 @@ authority and explicitly invokes whole-socket disposal when retiring a
 connection, so a backpressured uncertain reply cannot delay withdrawal or be
 reused. Ordinary channel abort/close still retains a started suffix; neither
 local write nor physical socket disposal is an RA/RAP semantic acknowledgment.
+The returned `fube_transport::Channel` is the existing backend. Its neutral
+`target()` refers to the accepted socket's actual ephemeral peer, not the
+listener/advertised address. Hosting still owns the single private receiver;
+channel/Session clones add no independent handler or admission authority.
 
 Hosting privately constructs reply provenance from the exact admitted host/PID/
 connection. The adapter checks that source and captured runtime, then RA applies

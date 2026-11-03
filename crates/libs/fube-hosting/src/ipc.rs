@@ -6,14 +6,14 @@
 //! capability are not implied. Node composition owns actual event consumers.
 use crate::{lease::Authority, wire, Hosting};
 use fube_transport::{
-    channel::{MessageChannel, MessageReceiver},
+    channel::MessageReceiver,
     message::{self, Header, Message, MessageId},
-    native_channel::{ChannelLimits, GatewayChannel, GatewayTarget},
+    native_channel::GatewayTarget,
     native_demux::{
         ActorDemux, ActorRegistration, ChannelComposition, OutboundKind, RequestPolicy,
     },
     serialization::serde::{from_slice_with_budget, to_vec},
-    Error as TransportError, Result as TransportResult,
+    Channel, ChannelLimits, Error as TransportError, Result as TransportResult,
 };
 use serde::{de::DeserializeOwned, Deserialize};
 use std::{
@@ -115,7 +115,7 @@ struct Entry {
 }
 #[derive(Clone)]
 struct Session {
-    channel: GatewayChannel,
+    channel: Channel,
     target: Arc<GatewayTarget>,
     executor: tokio::runtime::Handle,
 }
@@ -1262,7 +1262,6 @@ async fn run_connection(
     shared: &Arc<Shared>,
     claimed: &mut Option<Arc<Entry>>,
 ) -> TransportResult<()> {
-    let peer = socket.peer_addr()?.to_string();
     let channel = fube_transport::native_ipc::accept_unsecured_loopback(
         socket,
         hosting_composition()?,
@@ -1278,7 +1277,7 @@ async fn run_connection(
     )
     .await?;
     let receiver = channel.receiver()?;
-    let target = channel.resolve_target(&peer)?;
+    let target = channel.target()?;
     let mut guid = None;
     let mut seen = HashSet::new();
     loop {

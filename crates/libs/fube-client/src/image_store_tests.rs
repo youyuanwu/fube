@@ -350,7 +350,7 @@ async fn cancelled_upload_retires_only_its_owned_socket_not_query_or_notificatio
             .unwrap();
             peer
         });
-        let channel = GatewayChannel::connect_unsecured_loopback(
+        let channel = Channel::connect_unsecured_loopback(
             endpoint,
             if notifications {
                 crate::channel_adapter::notifications().unwrap()
