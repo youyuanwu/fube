@@ -197,12 +197,13 @@ async fn silent_establishment_is_deadline_bound() {
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
     assert!(matches!(
-        GatewayChannel::connect_unsecured_loopback(
+        crate::Endpoint::unsecured_loopback(
             address,
             fixture_composition(GatewayProfile::Ordinary),
-            limits(),
-            Instant::now() + Duration::from_millis(30)
         )
+        .unwrap()
+        .channel_limits(limits())
+        .connect_until(Instant::now() + Duration::from_millis(30))
         .await,
         Err(Error::Timeout)
     ));

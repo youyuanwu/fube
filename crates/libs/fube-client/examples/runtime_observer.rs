@@ -1,6 +1,6 @@
 //! Independent native resolution and application RPC oracle, not runtime state.
 use fube_client::{
-    DeployedCodePackageQueryDescription, DeployedCodePackageQueryParameters,
+    ClientOptions, DeployedCodePackageQueryDescription, DeployedCodePackageQueryParameters,
     DeployedReplicaQueryDescription, DeployedReplicaQueryParameters, FabricClient, NamingUri,
     PartitionKey, PartitionQueryDescription, PartitionQueryParameters, ReplicaQueryDescription,
     ReplicaQueryParameters, ServiceEndpointRole, ServiceKind,
@@ -270,7 +270,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    let client = FabricClient::connect_clear(args[0].parse()?, Duration::from_secs(10)).await?;
+    let channel = FabricClient::endpoint_clear(args[0].parse()?)?
+        .connect_timeout(Duration::from_secs(10))
+        .connect()
+        .await?;
+    let client = FabricClient::new(
+        channel,
+        ClientOptions {
+            default_timeout: Duration::from_secs(10),
+            ..Default::default()
+        },
+    )?;
     let name: NamingUri = args[1].parse()?;
     if args.len() == 4 && args[2] == "--deployed-replicas" {
         let application: NamingUri = args[1]

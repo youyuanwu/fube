@@ -120,9 +120,11 @@ Endpoint configuration/Clone opens no socket; repeated `connect()` calls create
 independent transport owners. Connection timeout is independent of stub-default
 and per-call durations. Each call starts a fresh whole-operation deadline;
 `None` is finite, and `Some(duration)` overrides only that operation.
-`FabricClient::connect_clear(address, duration)` remains the common-path
-convenience: duration applies to both establishment and later default calls;
-default limits and wire behavior are unchanged.
+All clients are constructed from an established Channel. The address-taking
+client shortcuts and Channel dialing shortcut are removed; Endpoint owns dialing.
+Use `Endpoint::connect_until(deadline)` when establishment shares a caller-owned
+absolute budget with subsequent startup. Set operation defaults in client options,
+not connection settings; default limits and wire behavior are unchanged.
 
 Invalid Endpoint settings fail pre-dial; invalid `ClientOptions` fail
 pre-application on a possibly already connected channel. Failed `new` normally
@@ -235,11 +237,12 @@ just onebox destroy poc --confirm poc
 ## 3. Rust API and lifecycle
 
 ```rust,no_run
-use fube_client::{FabricClient, DEFAULT_TIMEOUT};
+use fube_client::{ClientOptions, FabricClient};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let endpoint = "127.0.0.1:19000".parse().expect("IP socket endpoint");
-let client = FabricClient::connect_clear(endpoint, DEFAULT_TIMEOUT).await?;
+let channel = FabricClient::endpoint_clear(endpoint)?.connect().await?;
+let client = FabricClient::new(channel, ClientOptions::default())?;
 let clone = client.clone();
 let (gateway, exists) = tokio::try_join!(
     client.ping(None),
@@ -272,7 +275,7 @@ ResolutionRequest use existing codecs. Resolution retains owned selection and
 minimal previous refresh metadata, never a cloned endpoint cache.
 
 Every remote operation takes a final `timeout: Option<Duration>` argument.
-`None` uses the default configured by `connect_clear`; `Some(duration)` overrides
+`None` uses `ClientOptions::default_timeout`; `Some(duration)` overrides
 it for that call, including `ping` and `name_exists`. `None` does **not** mean
 infinite. Explicit durations must satisfy the same finite positive bounds as
 the configured default. There are no separate `_with_timeout` methods.
@@ -418,8 +421,8 @@ client.close().await?;
 operation defaults and acquires the original connection target and private ACK
 receiver: no dial, native session request, hidden startup or permission change.
 Options default to **30 seconds**, independently of endpoint establishment.
-Legacy `connect_clear(address, duration)` remains available and uses that duration
-both for its absolute establishment/binding budget and as the later copy default.
+Only `new(Channel, ImageStoreClientOptions)` constructs an uploader; Endpoint
+owns connection establishment, separately from the later copy default.
 
 Use a dedicated upload connection with at most one uploader/protocol consumer.
 Raw channel clones and repeatable/cloned raw receivers remain available, but
@@ -1115,21 +1118,23 @@ live. No TLS or cross-release compatibility is claimed.
 
 Both clients live in `fube-client`, but neither owns the other or shares its
 socket/session. Notification-only applications need no `FabricClient`; multiple
-notification clients can coexist. With `connect_clear`, each connection duration
-also sets that client's remote-operation default. `None` uses the session default,
-not infinity.
+notification clients can coexist. Each is constructed from its own Channel;
+options set remote-operation defaults independently of dialing. `None` uses the
+session default, not infinity.
 
 ```rust
 use fube_client::{
-    FabricClient, NamingUri, PartitionKey, ServiceNotificationClient,
-    ServiceNotificationFilter, DEFAULT_TIMEOUT,
+    ClientOptions, FabricClient, NamingUri, NotificationClientOptions, PartitionKey,
+    ServiceNotificationClient, ServiceNotificationFilter,
 };
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let endpoint = "127.0.0.1:19000".parse().unwrap();
-let ordinary = FabricClient::connect_clear(endpoint, DEFAULT_TIMEOUT).await?;
+let channel = FabricClient::endpoint_clear(endpoint)?.connect().await?;
+let ordinary = FabricClient::new(channel, ClientOptions::default())?;
+let channel = ServiceNotificationClient::endpoint_clear(endpoint)?.connect().await?;
 let mut changes =
-    ServiceNotificationClient::connect_clear(endpoint, DEFAULT_TIMEOUT).await?;
+    ServiceNotificationClient::start(channel, NotificationClientOptions::default()).await?;
 let name: NamingUri = "fabric:/MyApp/MyService".parse()?;
 let registration = changes.register_filter(&ServiceNotificationFilter {
     name: name.clone(), name_prefix: false, primary_only: false,
@@ -1181,9 +1186,31 @@ operations return `NotificationResult`.
 `NotificationClientOptions` defaults both budgets to 30 seconds. The Endpoint's
 connection timeout, startup budget and later-operation default are independent.
 Startup uses one absolute deadline from polling through owner publication,
-including early-ingress admission. `connect_clear(address, duration)` retains
-one absolute deadline across transport establishment **and** native startup,
-and keeps that duration for later operations and processing ACKs.
+including early-ingress admission. To retain one budget across transport setup
+and native startup, compose both beneath a caller-owned deadline:
+
+```rust,no_run
+use fube_client::{NotificationClientOptions, ServiceNotificationClient};
+use std::time::Duration;
+use tokio::time::{timeout_at, Instant};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let deadline = Instant::now() + Duration::from_secs(30);
+let changes = timeout_at(deadline, async {
+    let channel = ServiceNotificationClient::endpoint_clear("127.0.0.1:19000".parse()?)?
+        .connect_until(deadline).await?;
+    ServiceNotificationClient::start(channel, NotificationClientOptions {
+        startup_timeout: deadline.saturating_duration_since(Instant::now()),
+        default_timeout: Duration::from_secs(30),
+    }).await.map_err(Box::<dyn std::error::Error>::from)
+}).await??;
+changes.close(None).await?;
+# Ok(())
+# }
+```
+
+The outer deadline also bounds startup publication; it never renews the dial
+budget. Startup cancellation retains the existing candidate-retirement behavior.
 
 Use a **dedicated notification-authorized Channel**, with no other protocol
 session or competing receivers. `start` cannot add notification permissions or
@@ -1230,9 +1257,9 @@ Explicit close attempts deregistration under one deadline and awaits task/socket
 stop even on cleanup failure. Owner drop initiates shutdown; remote disconnect
 cleanup is eventual, not an immediate deregistration guarantee.
 
-**Notification connect-policy break:** `connect_clear(SocketAddr, Duration)`
-now accepts only explicit numeric loopback/nonzero-port NamingGateway endpoints,
-matching GatewayChannel's existing unsecured profile. Previously accepted
+**Notification endpoint policy:** `endpoint_clear(SocketAddr)` accepts only
+explicit numeric loopback/nonzero-port NamingGateway endpoints, matching the
+existing unsecured profile. Previously accepted
 non-loopback addresses now fail InvalidInput. No hostname/advertised-address
 fallback, compatibility wrapper or TLS/claims/security expansion is supplied.
 The native session/filter API and error types otherwise remain unchanged.

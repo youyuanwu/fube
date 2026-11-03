@@ -120,36 +120,6 @@ impl ImageStoreClient {
         })
     }
 
-    fn bind_before_deadline(
-        channel: Channel,
-        options: ImageStoreClientOptions,
-        deadline: Instant,
-    ) -> Result<Self> {
-        let client = Self::new(channel, options)?;
-        crate::typed::check_deadline(deadline)?;
-        Ok(client)
-    }
-
-    /// Connect without TLS/authentication; timeout also defaults later copies.
-    /// One absolute budget covers establishment and local binding.
-    pub async fn connect_clear(endpoint: SocketAddr, timeout: Duration) -> Result<Self> {
-        let deadline = deadline_after(timeout)?;
-        let channel = Channel::connect_unsecured_loopback(
-            endpoint,
-            crate::channel_adapter::upload()?,
-            upload_limits(),
-            deadline,
-        )
-        .await?;
-        Self::bind_before_deadline(
-            channel,
-            ImageStoreClientOptions {
-                default_timeout: timeout,
-            },
-            deadline,
-        )
-    }
-
     pub fn is_closed(&self) -> bool {
         self.channel.terminal_error().is_some()
     }
@@ -165,8 +135,8 @@ impl ImageStoreClient {
     }
 
     /// Replace the entire destination, upload descendants, then publish empty
-    /// `_.dir` markers postorder. `None` uses the configured operation default
-    /// (or legacy `connect_clear` duration), not infinity.
+    /// `_.dir` markers postorder. `None` uses the configured operation default,
+    /// not infinity.
     ///
     /// Sources are not snapshotted. Symlinks/special entries are unsupported.
     /// Failures may leave partial remote content; session cleanup is not rollback.

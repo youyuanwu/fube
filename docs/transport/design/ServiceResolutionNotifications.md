@@ -32,8 +32,10 @@ commit [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native-revision].
 
 Signatures below describe the implemented Rust API shapes; the snippets omit
 imports and private fields rather than being standalone declarations.
-Each client's `connect_clear(endpoint, timeout)` takes a
-required duration that bounds establishment and sets its own operation default.
+Each client consumes an established Channel. Configure its protocol-specific
+Endpoint, dial with `connect()` or `connect_until(deadline)`, then call
+`FabricClient::new` or `ServiceNotificationClient::start` with explicit options.
+Connection, notification startup and later operation budgets are independent.
 Subsequent remote operations follow the current timeout convention: `None` uses
 that client's configured default, not infinity; `Some(duration)` supplies one
 whole-operation override. There are no `_with_timeout` variants.
@@ -123,9 +125,11 @@ pub struct ServiceNotificationClient {
 }
 
 impl ServiceNotificationClient {
-    pub async fn connect_clear(
-        endpoint: SocketAddr,
-        timeout: Duration,
+    pub fn endpoint_clear(endpoint: SocketAddr) -> Result<Endpoint>;
+
+    pub async fn start(
+        channel: Channel,
+        options: NotificationClientOptions,
     ) -> NotificationResult<Self>;
 
     pub async fn register_filter(
@@ -211,9 +215,11 @@ asynchronous cleanup and failure contract is defined in section 6.3.
 
 ```rust
 let endpoint: SocketAddr = "127.0.0.1:19000".parse()?;
-let client = FabricClient::connect_clear(endpoint, DEFAULT_TIMEOUT).await?;
+let channel = FabricClient::endpoint_clear(endpoint)?.connect().await?;
+let client = FabricClient::new(channel, ClientOptions::default())?;
+let channel = ServiceNotificationClient::endpoint_clear(endpoint)?.connect().await?;
 let mut notifications =
-    ServiceNotificationClient::connect_clear(endpoint, DEFAULT_TIMEOUT).await?;
+    ServiceNotificationClient::start(channel, NotificationClientOptions::default()).await?;
 let name: NamingUri = "fabric:/MyApp/MyService".parse()?;
 let registration = notifications
     .register_filter(
@@ -364,10 +370,10 @@ Application
 ```
 
 Constructing a `FabricClient` never opens notification transport.
-`ServiceNotificationClient::connect_clear` establishes its own connection using
-an explicit numeric-loopback/nonzero-port unsecured endpoint, then connects the
-native notification session. It needs no existing ordinary connection or second
-public open step. This follows the native separation of normal/high-priority
+Its Endpoint factory configures an explicit numeric-loopback/nonzero-port
+unsecured connection. The caller establishes that Channel, then
+`ServiceNotificationClient::start` connects the native notification session.
+It needs no existing ordinary client. This follows the native separation of normal/high-priority
 connections while making ownership and failure isolation explicit. Do not dial
 an advertised private gateway address merely because it appeared in a reply.
 
@@ -428,9 +434,10 @@ Version-range value vectors remain native object arrays. Reuse the bounded
 
 A fresh notification client starts a session with a new native client ID, no
 filters, and native empty generation/version state.
-`ServiceNotificationClient::connect_clear` returns after transport establishment,
-the native session connection, and required synchronization complete, all under
-its one establishment deadline. It does not wait for a user-visible endpoint
+`ServiceNotificationClient::start` consumes an established Channel and returns
+after native session connection and required synchronization complete under its
+startup deadline. Callers can share an enclosing absolute deadline with Endpoint
+establishment. It does not wait for a user-visible endpoint
 update. Empty protocol-only pages update bookkeeping and are acknowledged
 without inventing an application event.
 

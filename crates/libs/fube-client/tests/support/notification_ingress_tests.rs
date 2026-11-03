@@ -44,9 +44,21 @@ async fn cancelling_explicit_cleanup_wait_does_not_lose_worker_ownership() {
         .unwrap();
         assert!(read_message(&mut s).await.is_err());
     });
-    let client = ServiceNotificationClient::connect_clear(address, WAIT)
+    let channel = ServiceNotificationClient::endpoint_clear(address)
+        .unwrap()
+        .connect_timeout(WAIT)
+        .connect()
         .await
         .unwrap();
+    let client = ServiceNotificationClient::start(
+        channel,
+        NotificationClientOptions {
+            startup_timeout: WAIT,
+            default_timeout: WAIT,
+        },
+    )
+    .await
+    .unwrap();
     let guard = client.register_filter(&filter(), None).await.unwrap();
     tokio::select! {
         biased;
@@ -78,9 +90,21 @@ async fn close_timeout_still_stops_socket_and_invalidates_surviving_guard() {
         unregister(&remove, &id);
         assert!(read_message(&mut s).await.is_err());
     });
-    let client = ServiceNotificationClient::connect_clear(address, WAIT)
+    let channel = ServiceNotificationClient::endpoint_clear(address)
+        .unwrap()
+        .connect_timeout(WAIT)
+        .connect()
         .await
         .unwrap();
+    let client = ServiceNotificationClient::start(
+        channel,
+        NotificationClientOptions {
+            startup_timeout: WAIT,
+            default_timeout: WAIT,
+        },
+    )
+    .await
+    .unwrap();
     let guard = client.register_filter(&filter(), None).await.unwrap();
     assert!(matches!(
         client.close(Some(Duration::from_millis(20))).await,
@@ -146,9 +170,21 @@ async fn definitive_registration_error_is_not_unknown_and_all_filter_flags_are_p
         }
         assert!(read_message(&mut s).await.is_err());
     });
-    let client = ServiceNotificationClient::connect_clear(address, WAIT)
+    let channel = ServiceNotificationClient::endpoint_clear(address)
+        .unwrap()
+        .connect_timeout(WAIT)
+        .connect()
         .await
         .unwrap();
+    let client = ServiceNotificationClient::start(
+        channel,
+        NotificationClientOptions {
+            startup_timeout: WAIT,
+            default_timeout: WAIT,
+        },
+    )
+    .await
+    .unwrap();
     assert!(matches!(
         client.register_filter(&filter(), None).await,
         Err(NotificationError::Common(Error::Remote { .. }))
@@ -187,8 +223,21 @@ async fn thirty_three_pages_during_connection_overflow_bounded_ingress() {
         }
         assert!(read_message(&mut s).await.is_err());
     });
+    let channel = ServiceNotificationClient::endpoint_clear(address)
+        .unwrap()
+        .connect_timeout(WAIT)
+        .connect()
+        .await
+        .unwrap();
     assert!(matches!(
-        ServiceNotificationClient::connect_clear(address, WAIT).await,
+        ServiceNotificationClient::start(
+            channel,
+            NotificationClientOptions {
+                startup_timeout: WAIT,
+                default_timeout: WAIT,
+            },
+        )
+        .await,
         Err(NotificationError::ResourceLimit(_))
     ));
     task.await.unwrap();
@@ -210,8 +259,21 @@ async fn constructor_preserves_notification_ingress_lag_before_session_reply() {
         }
         assert!(read_message(&mut stream).await.is_err());
     });
+    let channel = ServiceNotificationClient::endpoint_clear(address)
+        .unwrap()
+        .connect_timeout(Duration::from_secs(10))
+        .connect()
+        .await
+        .unwrap();
     assert!(matches!(
-        ServiceNotificationClient::connect_clear(address, Duration::from_secs(10)).await,
+        ServiceNotificationClient::start(
+            channel,
+            NotificationClientOptions {
+                startup_timeout: Duration::from_secs(10),
+                default_timeout: Duration::from_secs(10),
+            },
+        )
+        .await,
         Err(NotificationError::Lagged)
     ));
     task.await.unwrap();
@@ -242,9 +304,21 @@ async fn decoded_storage_overflow_sends_failure_ack_and_terminates_without_deliv
         ack(&mut stream, 91, false).await;
         assert!(read_message(&mut stream).await.is_err());
     });
-    let mut client = ServiceNotificationClient::connect_clear(address, WAIT)
+    let channel = ServiceNotificationClient::endpoint_clear(address)
+        .unwrap()
+        .connect_timeout(WAIT)
+        .connect()
         .await
         .unwrap();
+    let mut client = ServiceNotificationClient::start(
+        channel,
+        NotificationClientOptions {
+            startup_timeout: WAIT,
+            default_timeout: WAIT,
+        },
+    )
+    .await
+    .unwrap();
     let _registration = client.register_filter(&filter(), None).await.unwrap();
     registered.send(()).unwrap();
     assert!(matches!(
@@ -276,9 +350,21 @@ async fn fatal_update_before_registration_resumes_can_fail_a_successful_gateway_
         ack(&mut stream, 92, false).await;
         assert!(read_message(&mut stream).await.is_err());
     });
-    let mut client = ServiceNotificationClient::connect_clear(address, WAIT)
+    let channel = ServiceNotificationClient::endpoint_clear(address)
+        .unwrap()
+        .connect_timeout(WAIT)
+        .connect()
         .await
         .unwrap();
+    let mut client = ServiceNotificationClient::start(
+        channel,
+        NotificationClientOptions {
+            startup_timeout: WAIT,
+            default_timeout: WAIT,
+        },
+    )
+    .await
+    .unwrap();
     let description = filter();
     let mut pending = Box::pin(client.register_filter(&description, None));
     tokio::select! {

@@ -241,14 +241,11 @@ async fn session() -> (Arc<Session>, mpsc::Receiver<Cleanup>, tokio::net::TcpStr
         .unwrap();
         peer
     });
-    let channel = GatewayChannel::connect_unsecured_loopback(
-        address,
-        crate::channel_adapter::notifications().unwrap(),
-        notification_limits(),
-        deadline_after(Duration::from_secs(3)).unwrap(),
-    )
-    .await
-    .unwrap();
+    let channel = ServiceNotificationClient::endpoint_clear(address)
+        .unwrap()
+        .connect_until(deadline_after(Duration::from_secs(3)).unwrap())
+        .await
+        .unwrap();
     let target = channel.resolve_target(&address.to_string()).unwrap();
     let (cleanup, cleanups) = mpsc::channel(MAX_CLEANUPS);
     (

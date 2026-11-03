@@ -106,9 +106,20 @@ async fn naming_deadline_precedes_and_includes_caller_conversion() {
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(matches!(
         client
             .name_exists(InvalidConversion, Some(Duration::ZERO))
@@ -181,9 +192,20 @@ async fn naming_conversion_input_is_not_retained_across_rpc() {
         .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(client.name_exists(Input(released), None).await.unwrap());
     client.close().await.unwrap();
     server.await.unwrap();
@@ -290,9 +312,20 @@ async fn single_reply(
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     (client, server)
 }
 
@@ -314,9 +347,20 @@ async fn reusable_reply(
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     (client, server)
 }
 
@@ -403,9 +447,20 @@ async fn sequential_ping_and_naming_use_native_headers_and_keep_bool_independent
         }
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(
         client.ping(None).await.unwrap(),
         GatewayDescription {
@@ -490,9 +545,20 @@ async fn all_operations_select_optional_timeout_and_reject_invalid_overrides_wit
         write_message(&mut stream, &response).await.unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for (timeout, valid) in [
         (None, true),
         (Some(Duration::from_secs(1)), true),
@@ -607,9 +673,20 @@ async fn ping_and_name_exists_timeout_overrides_expire_without_retiring_connecti
             write_message(&mut stream, &response).await.unwrap();
             assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
         });
-        let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+        let channel = FabricClient::endpoint_clear(endpoint)
+            .unwrap()
+            .connect_timeout(TIMEOUT_DURATION)
+            .connect()
             .await
             .unwrap();
+        let client = FabricClient::new(
+            channel,
+            fube_client::ClientOptions {
+                default_timeout: TIMEOUT_DURATION,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(1), async {
             let timeout = Some(Duration::from_millis(250));
             if ping {
@@ -975,9 +1052,20 @@ async fn input_error_does_not_send_and_native_error_does_not_poison_complete_str
         }
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(matches!(
         client.name_exists("fabric:/invalid?", None).await,
         Err(ClientError::Local(Error::InvalidInput(_)))
@@ -1002,7 +1090,11 @@ async fn client_validates_timeout_before_connecting() {
     let endpoint: SocketAddr = "127.0.0.1:1".parse().unwrap();
     for timeout in [Duration::ZERO, Duration::from_nanos(99), Duration::MAX] {
         assert!(matches!(
-            FabricClient::connect_clear(endpoint, timeout).await,
+            FabricClient::endpoint_clear(endpoint)
+                .unwrap()
+                .connect_timeout(timeout)
+                .connect()
+                .await,
             Err(Error::InvalidInput(_))
         ));
     }
@@ -1479,9 +1571,20 @@ mod node_queries {
             }
             assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
         });
-        let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+        let channel = FabricClient::endpoint_clear(endpoint)
+            .unwrap()
+            .connect_timeout(TIMEOUT_DURATION)
+            .connect()
             .await
             .unwrap();
+        let client = FabricClient::new(
+            channel,
+            fube_client::ClientOptions {
+                default_timeout: TIMEOUT_DURATION,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         for (query, _) in cases {
             assert_eq!(
                 client.get_node_list(&query, None).await.unwrap(),
@@ -1571,9 +1674,20 @@ mod node_queries {
             }
             assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
         });
-        let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+        let channel = FabricClient::endpoint_clear(endpoint)
+            .unwrap()
+            .connect_timeout(TIMEOUT_DURATION)
+            .connect()
             .await
             .unwrap();
+        let client = FabricClient::new(
+            channel,
+            fube_client::ClientOptions {
+                default_timeout: TIMEOUT_DURATION,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let mut query = NodeQueryDescription {
             paging: Paging {
                 max_results: NonZeroU64::new(1),
@@ -1614,9 +1728,20 @@ mod node_queries {
                 .unwrap();
             assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
         });
-        let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+        let channel = FabricClient::endpoint_clear(endpoint)
+            .unwrap()
+            .connect_timeout(TIMEOUT_DURATION)
+            .connect()
             .await
             .unwrap();
+        let client = FabricClient::new(
+            channel,
+            fube_client::ClientOptions {
+                default_timeout: TIMEOUT_DURATION,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         for limit in [i64::MAX as u64 + 1, u64::MAX] {
             let query = NodeQueryDescription {
                 paging: Paging {
@@ -1944,9 +2069,20 @@ mod node_queries {
                 .unwrap();
             assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
         });
-        let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+        let channel = FabricClient::endpoint_clear(endpoint)
+            .unwrap()
+            .connect_timeout(TIMEOUT_DURATION)
+            .connect()
             .await
             .unwrap();
+        let client = FabricClient::new(
+            channel,
+            fube_client::ClientOptions {
+                default_timeout: TIMEOUT_DURATION,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         for (index, diagnostic) in ["", "", "native transport Fault", "invalid continuation"]
             .into_iter()
             .enumerate()
@@ -2010,9 +2146,20 @@ mod node_queries {
                 .unwrap();
             assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
         });
-        let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+        let channel = FabricClient::endpoint_clear(endpoint)
+            .unwrap()
+            .connect_timeout(TIMEOUT_DURATION)
+            .connect()
             .await
             .unwrap();
+        let client = FabricClient::new(
+            channel,
+            fube_client::ClientOptions {
+                default_timeout: TIMEOUT_DURATION,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let clone = client.clone();
         let query = NodeQueryDescription::default();
         let nodes = client.get_node_list(&query, None);
@@ -2074,9 +2221,20 @@ mod node_queries {
                 .unwrap();
             assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
         });
-        let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+        let channel = FabricClient::endpoint_clear(endpoint)
+            .unwrap()
+            .connect_timeout(TIMEOUT_DURATION)
+            .connect()
             .await
             .unwrap();
+        let client = FabricClient::new(
+            channel,
+            fube_client::ClientOptions {
+                default_timeout: TIMEOUT_DURATION,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let (a_client, b_client, name_client, ping_client) = (
             client.clone(),
             client.clone(),
@@ -2158,9 +2316,20 @@ mod node_queries {
                 .unwrap();
                 assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
             });
-            let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+            let channel = FabricClient::endpoint_clear(endpoint)
+                .unwrap()
+                .connect_timeout(TIMEOUT_DURATION)
+                .connect()
                 .await
                 .unwrap();
+            let client = FabricClient::new(
+                channel,
+                fube_client::ClientOptions {
+                    default_timeout: TIMEOUT_DURATION,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             let query_client = client.clone();
             let nodes = tokio::spawn(async move {
                 query_client

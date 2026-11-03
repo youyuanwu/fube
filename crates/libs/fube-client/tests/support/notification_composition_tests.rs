@@ -182,7 +182,7 @@ async fn preexisting_terminal_start_preserves_recorded_common_cause() {
 }
 
 #[tokio::test]
-async fn independent_start_and_operation_budgets_and_legacy_default_reach_native_headers() {
+async fn independent_start_and_operation_budgets_reach_native_headers() {
     for composed in [false, true] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -218,20 +218,20 @@ async fn independent_start_and_operation_budgets_and_legacy_default_reach_native
             }
             assert!(read_message(&mut stream).await.is_err());
         });
-        let client = if composed {
-            let channel = ServiceNotificationClient::endpoint_clear(address)
-                .unwrap()
-                .connect()
-                .await
-                .unwrap();
-            ServiceNotificationClient::start(channel, options(WAIT, Duration::from_millis(100)))
-                .await
-                .unwrap()
+        let channel = ServiceNotificationClient::endpoint_clear(address)
+            .unwrap()
+            .connect_timeout(WAIT)
+            .connect()
+            .await
+            .unwrap();
+        let operation_timeout = if composed {
+            Duration::from_millis(100)
         } else {
-            ServiceNotificationClient::connect_clear(address, WAIT)
-                .await
-                .unwrap()
+            WAIT
         };
+        let client = ServiceNotificationClient::start(channel, options(WAIT, operation_timeout))
+            .await
+            .unwrap();
         let guard = client.register_filter(&filter(), None).await.unwrap();
         guard.unregister(None).await.unwrap();
         client.close(None).await.unwrap();
@@ -240,7 +240,7 @@ async fn independent_start_and_operation_budgets_and_legacy_default_reach_native
 }
 
 #[tokio::test]
-async fn compatibility_dial_and_native_start_share_one_absolute_budget() {
+async fn caller_owned_dial_and_native_start_share_one_absolute_budget() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
@@ -278,9 +278,20 @@ async fn compatibility_dial_and_native_start_share_one_absolute_budget() {
         .await;
         assert!(read_message(&mut stream).await.is_err());
     });
+    let deadline = Instant::now() + Duration::from_millis(700);
+    let opening = tokio::time::timeout_at(deadline, async {
+        let channel = ServiceNotificationClient::endpoint_clear(address)?
+            .connect_until(deadline)
+            .await?;
+        ServiceNotificationClient::start(
+            channel,
+            options(deadline.saturating_duration_since(Instant::now()), WAIT),
+        )
+        .await
+    });
     assert!(matches!(
-        ServiceNotificationClient::connect_clear(address, Duration::from_millis(700)).await,
-        Err(NotificationError::Common(Error::Timeout))
+        opening.await,
+        Err(_) | Ok(Err(NotificationError::Common(Error::Timeout)))
     ));
     task.await.unwrap();
 }

@@ -104,9 +104,20 @@ async fn exact_native_write_requests_all_entry_points_and_empty_replies() {
         }
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let name: fube_client::NamingUri = "fabric:/App_1/Name-2".parse().unwrap();
     client.create_name(&name, None).await.unwrap();
     write(&client, false, TIMEOUT_DURATION).await.unwrap();
@@ -146,9 +157,20 @@ async fn native_duplicate_and_missing_are_explicit_and_operation_local() {
         }
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for (delete, code) in [(false, DUPLICATE), (true, MISSING)] {
         assert!(matches!(
             write(&client, delete, TIMEOUT_DURATION).await,
@@ -177,9 +199,20 @@ async fn invalid_uri_and_budget_never_send_writes_and_keep_connection() {
         .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for name in [
         "".into(),
         "fabric:/".into(),
@@ -264,9 +297,20 @@ async fn malformed_write_is_call_local_and_pending_neighbor_succeeds() {
             .unwrap();
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let mutation = client.delete_name("fabric:/App_1/Name-2", None);
     let neighbor = client.name_exists("fabric:/neighbor", None);
     tokio::pin!(mutation, neighbor);
@@ -311,9 +355,20 @@ async fn reordered_concurrent_writes_and_read_share_one_driver() {
         }
         assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
     });
-    let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(TIMEOUT_DURATION)
+        .connect()
         .await
         .unwrap();
+    let client = FabricClient::new(
+        channel,
+        fube_client::ClientOptions {
+            default_timeout: TIMEOUT_DURATION,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let (create, delete, exists) = tokio::join!(
         client.create_name("fabric:/App_1/Name-2", None),
         client.delete_name("fabric:/App_1/Name-2", None),
@@ -357,9 +412,20 @@ async fn peer_observed_cancel_and_timeout_never_replay_writes_or_decode_late_rep
                 .unwrap();
                 assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
             });
-            let client = FabricClient::connect_clear(endpoint, TIMEOUT_DURATION)
+            let channel = FabricClient::endpoint_clear(endpoint)
+                .unwrap()
+                .connect_timeout(TIMEOUT_DURATION)
+                .connect()
                 .await
                 .unwrap();
+            let client = FabricClient::new(
+                channel,
+                fube_client::ClientOptions {
+                    default_timeout: TIMEOUT_DURATION,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             let clone = client.clone();
             let pending = tokio::spawn(async move {
                 write(

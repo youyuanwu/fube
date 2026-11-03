@@ -7,7 +7,7 @@ use std::{
 };
 
 use fube_client::{
-    ClientError, DomainFailure, Error, FabricClient, HealthEvaluation, HealthEvent,
+    ClientError, ClientOptions, DomainFailure, Error, FabricClient, HealthEvaluation, HealthEvent,
     HealthEventsFilter, HealthState, NodeHealth, NodeHealthPolicy, NodeHealthQueryDescription,
     NodeHealthQueryParameters, NodeQueryDescription,
 };
@@ -256,8 +256,17 @@ async fn assert_native_node_health() -> Result<(PathBuf, Value)> {
         config.archive_sha256
     );
     assert_independent_fixture(&config);
-    let client =
-        FabricClient::connect_clear(config.gateway.parse()?, Duration::from_secs(30)).await?;
+    let channel = FabricClient::endpoint_clear(config.gateway.parse()?)?
+        .connect_timeout(Duration::from_secs(30))
+        .connect()
+        .await?;
+    let client = FabricClient::new(
+        channel,
+        ClientOptions {
+            default_timeout: Duration::from_secs(30),
+            ..Default::default()
+        },
+    )?;
     let mut evidence = vec![];
     for snapshot in &config.snapshots {
         assert!(

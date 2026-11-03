@@ -50,9 +50,19 @@ async fn connected() -> (ImageStoreClient, TcpStream) {
         .unwrap();
         peer
     });
-    let client = ImageStoreClient::connect_clear(endpoint, Duration::from_secs(3))
+    let channel = ImageStoreClient::endpoint_clear(endpoint)
+        .unwrap()
+        .connect_timeout(Duration::from_secs(3))
+        .connect()
         .await
         .unwrap();
+    let client = ImageStoreClient::new(
+        channel,
+        ImageStoreClientOptions {
+            default_timeout: Duration::from_secs(3),
+        },
+    )
+    .unwrap();
     (client, peer.await.unwrap())
 }
 
@@ -194,29 +204,6 @@ async fn local_composition_preserves_inbox_policy_and_terminal_provenance() {
             .is_err()
     );
     client.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn convenience_publication_uses_original_absolute_deadline() {
-    let (client, _peer) = connected().await;
-    let channel = client.channel.clone();
-    drop(client);
-    let deadline = Instant::now();
-    assert!(matches!(
-        ImageStoreClient::bind_before_deadline(
-            channel.clone(),
-            ImageStoreClientOptions {
-                default_timeout: Duration::from_secs(7),
-            },
-            deadline,
-        ),
-        Err(Error::Timeout)
-    ));
-    assert!(channel.target().is_ok());
-    channel
-        .close(deadline_after(Duration::from_secs(1)).unwrap())
-        .await
-        .unwrap();
 }
 
 fn activity(message: &Message) -> [u8; 16] {
@@ -409,7 +396,7 @@ async fn upload_endpoint_profile_rejects_nonloopback_zero_port_and_hostname() {
         "[::1]:0",
     ] {
         assert!(matches!(
-            ImageStoreClient::connect_clear(address.parse().unwrap(), Duration::from_secs(1)).await,
+            ImageStoreClient::endpoint_clear(address.parse().unwrap()),
             Err(Error::InvalidInput(_))
         ));
     }
@@ -513,16 +500,16 @@ async fn cancelled_upload_retires_only_its_owned_socket_not_query_or_notificatio
             .unwrap();
             peer
         });
-        let channel = Channel::connect_unsecured_loopback(
+        let channel = Endpoint::unsecured_loopback(
             endpoint,
             if notifications {
                 crate::channel_adapter::notifications().unwrap()
             } else {
                 crate::channel_adapter::ordinary().unwrap()
             },
-            ChannelLimits::default(),
-            Instant::now() + Duration::from_secs(3),
         )
+        .unwrap()
+        .connect_until(Instant::now() + Duration::from_secs(3))
         .await
         .unwrap();
         let target = channel.resolve_target(&endpoint.to_string()).unwrap();

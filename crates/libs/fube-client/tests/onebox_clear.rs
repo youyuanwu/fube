@@ -7,7 +7,7 @@ use std::{
 };
 
 use fube_client::{
-    ClientError, DomainFailure, FabricClient, GatewayDescription, HealthState, Node,
+    ClientError, ClientOptions, DomainFailure, FabricClient, GatewayDescription, HealthState, Node,
     NodeDeactivationIntent, NodeDeactivationStatus, NodeListPage, NodeQueryDescription,
     NodeQueryParameters, NodeStatus, NodeStatusFilter, Paging, DEFAULT_TIMEOUT,
 };
@@ -425,8 +425,8 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
     use fube_transport::{
         channel::{MessageChannel, RpcChannel},
         message::{Header, Message, Properties},
-        native_channel::{ChannelLimits, GatewayChannel},
         native_demux::{ActorDemux, ChannelComposition, OutboundKind},
+        Endpoint,
     };
     fn probe_outbound(
         _: &Message,
@@ -443,7 +443,7 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
     fn probe_reply(_: &Message, _: &Properties) -> fube_transport::Result<()> {
         Ok(())
     }
-    let probe = GatewayChannel::connect_unsecured_loopback(
+    let probe = Endpoint::unsecured_loopback(
         config.gateway.parse().unwrap(),
         ChannelComposition {
             outbound: probe_outbound,
@@ -453,9 +453,9 @@ async fn assert_node_queries(client: &FabricClient, config: &Config) -> serde_js
             requests: None,
             ordered_ingress: false,
         },
-        ChannelLimits::default(),
-        deadline,
     )
+    .unwrap()
+    .connect_until(deadline)
     .await
     .unwrap();
     let target = probe.resolve_target(&config.gateway).unwrap();
@@ -556,13 +556,18 @@ async fn assert_idle_proxy_disconnect(
         .expect("bound entire proxy forwarding lifetime");
     });
 
-    let client = timeout(
+    let channel = timeout(
         DEFAULT_TIMEOUT + SHUTDOWN_TIMEOUT,
-        FabricClient::connect_clear(proxy_endpoint, DEFAULT_TIMEOUT),
+        FabricClient::endpoint_clear(proxy_endpoint)
+            .expect("configure test-owned proxy")
+            .connect_timeout(DEFAULT_TIMEOUT)
+            .connect(),
     )
     .await
     .expect("bound native connection through proxy")
     .expect("connect through test-owned proxy");
+    let client = FabricClient::new(channel, ClientOptions::default())
+        .expect("bind client to test-owned proxy channel");
     let gateway = timeout(DEFAULT_TIMEOUT + SHUTDOWN_TIMEOUT, client.ping(None))
         .await
         .expect("bound real native ping through proxy")
@@ -623,9 +628,14 @@ async fn onebox_ping_name_exists_and_node_list() {
         .validate()
         .expect("validate independent onebox fixtures");
     assert_fresh(&config);
-    let client = FabricClient::connect_clear(endpoint, DEFAULT_TIMEOUT)
+    let channel = FabricClient::endpoint_clear(endpoint)
+        .expect("configure native clear gateway")
+        .connect_timeout(DEFAULT_TIMEOUT)
+        .connect()
         .await
         .expect("connect explicitly to native clear gateway");
+    let client = FabricClient::new(channel, ClientOptions::default())
+        .expect("bind client to native gateway channel");
     let gateway = client.ping(None).await.expect("native correlated ping");
     assert_independent_gateway(&gateway, &config, node_id);
     assert!(client

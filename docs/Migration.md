@@ -1,5 +1,29 @@
 # Migration and provenance
 
+## Explicit Endpoint, Channel and client construction
+
+All clients now consume an established Channel. The address-taking convenience
+constructors are removed, without deprecated wrappers or compatibility aliases.
+
+| Removed API | Current composition |
+|---|---|
+| `FabricClient::connect_clear(address, timeout)` | `FabricClient::endpoint_clear(address)` -> Endpoint connect -> `FabricClient::new(channel, ClientOptions)` |
+| `ImageStoreClient::connect_clear(address, timeout)` | `ImageStoreClient::endpoint_clear(address)` -> Endpoint connect -> `ImageStoreClient::new(channel, ImageStoreClientOptions)` |
+| `ServiceNotificationClient::connect_clear(address, timeout)` | `ServiceNotificationClient::endpoint_clear(address)` -> Endpoint connect -> async `ServiceNotificationClient::start(channel, NotificationClientOptions)` |
+| `Channel::connect_unsecured_loopback(address, composition, limits, deadline)` | `Endpoint::unsecured_loopback(address, composition)?.channel_limits(limits).connect_until(deadline)` |
+
+`Endpoint::connect_timeout` governs dialing; client options govern subsequent
+operations, and notification options separately govern real native startup.
+To retain the old shared establishment/startup budget, pass an absolute deadline
+to `Endpoint::connect_until` and enclose startup in `tokio::time::timeout_at` with
+that same deadline; use the remaining duration for notification startup.
+See the [construction and deadline examples](transport/RustFabricClient.md#uncached-resolution-and-independent-notifications).
+
+Protocol-specific endpoint factories still install immutable authorization.
+Client construction cannot upgrade permissions. Dedicated notification/upload
+inboxes, clone ownership and cancellation/retirement semantics are unchanged.
+IPC's separate session setup and replication's raw-session API are unaffected.
+
 ## Breaking runtime and data API migration
 
 The current runtime/data API follows SF/mssf canonical responsibilities with
