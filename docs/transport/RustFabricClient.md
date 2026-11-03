@@ -398,21 +398,44 @@ the success message is printed only after package completion.
 
 ```rust,no_run
 use std::{path::Path, time::Duration};
-use fube_client::ImageStoreClient;
+use fube_client::{ImageStoreClient, ImageStoreClientOptions};
 
 # async fn upload() -> fube_client::Result<()> {
-let endpoint = "127.0.0.1:19000".parse().expect("native IP socket endpoint");
-let mut client = ImageStoreClient::connect_clear(endpoint, Duration::from_secs(300)).await?;
+let address = "127.0.0.1:19000".parse().expect("native IP socket endpoint");
+let endpoint = ImageStoreClient::endpoint_clear(address)?
+    .connect_timeout(Duration::from_secs(10));
+let channel = endpoint.connect().await?;
+let mut client = ImageStoreClient::new(channel, ImageStoreClientOptions {
+    default_timeout: Duration::from_secs(300),
+})?;
 client.copy_application_package(Path::new("./MyApp"), "MyApp", None).await?;
 client.close().await?;
 # Ok(())
 # }
 ```
 
+`new` consumes the actual established `Channel` synchronously. It only validates
+operation defaults and acquires the original connection target and private ACK
+receiver: no dial, native session request, hidden startup or permission change.
+Options default to **30 seconds**, independently of endpoint establishment.
+Legacy `connect_clear(address, duration)` remains available and uses that duration
+both for its absolute establishment/binding budget and as the later copy default.
+
+Use a dedicated upload connection with at most one uploader/protocol consumer.
+Raw channel clones and repeatable/cloned raw receivers remain available, but
+competing consumers can steal semantic ACKs; they are unsupported for this session.
+Binding does not reserve exclusive inbox ownership or upgrade an ordinary
+channel's permissions. Invalid options or unavailable inbox only drop the supplied
+handle, without explicitly aborting retained raw clones. Normal uploader drop
+likewise releases its owner handle; existing last-owner cleanup still applies.
+Explicit upload cancellation or uncertain failure retires the shared connection
+even when raw clones survive. No new uploader drop policy is introduced.
+
 `copy_application_package(&mut self, source: &Path, destination: &str,
 timeout: Option<Duration>) -> Result<()>` serializes copies through its mutable
 receiver and uses the existing `fube_transport::Error`/`Result`.
-`None` uses the configured connection duration; `Some(duration)` overrides the
+`None` uses `ImageStoreClientOptions::default_timeout` (or the legacy connection
+duration); `Some(duration)` overrides the
 copy budget, never meaning infinity. Unlike the CLI's enclosing deadline,
 library connection establishment and a later copy each have their own deadline.
 The copy deadline spans local preparation, root Delete, content, file commits
