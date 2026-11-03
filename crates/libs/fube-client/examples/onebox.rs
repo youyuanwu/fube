@@ -1,10 +1,10 @@
 use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
 
 use fube_client::{
-    ApplicationDefinitionKindFilter, ApplicationListFilter, ApplicationQueryDescription, Error,
-    FabricClient, HealthEventsFilter, NamingUri, NodeHealthPolicy, NodeHealthQueryDescription,
-    NodeHealthQueryParameters, NodeQueryDescription, Result, ServiceListFilter,
-    ServiceQueryDescription, ServiceQueryParameters, DEFAULT_TIMEOUT,
+    ApplicationDefinitionKindFilter, ApplicationListFilter, ApplicationQueryDescription,
+    ClientOptions, Error, FabricClient, HealthEventsFilter, NamingUri, NodeHealthPolicy,
+    NodeHealthQueryDescription, NodeHealthQueryParameters, NodeQueryDescription, Result,
+    ServiceListFilter, ServiceQueryDescription, ServiceQueryParameters, DEFAULT_TIMEOUT,
 };
 
 const USAGE: &str =
@@ -151,7 +151,15 @@ fn arguments(mut args: Vec<String>) -> Result<(SocketAddr, Operation, Duration)>
 
 async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (endpoint, operation, timeout) = arguments(std::env::args().skip(1).collect())?;
-    let client = FabricClient::connect_clear(endpoint, timeout).await?;
+    let endpoint = FabricClient::endpoint_clear(endpoint)?.connect_timeout(timeout);
+    let channel = endpoint.connect().await?;
+    let client = FabricClient::new(
+        channel,
+        ClientOptions {
+            default_timeout: timeout,
+            ..ClientOptions::default()
+        },
+    )?;
     match operation {
         Operation::Ping => {
             let gateway = client.ping(None).await?;

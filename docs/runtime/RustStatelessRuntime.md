@@ -18,6 +18,14 @@ or qualify production RA/RAP service callbacks by itself. The separate
 this runtime through actual owned activation/registration/lifecycle traffic and
 independently observes callbacks, resource disposal and physical cleanup.
 
+Runtime IPC establishes the same public `fube_transport::Channel` backend as
+ordinary clients and upload, then takes its original `target()`. Actual host/PID
+envelopes remain in outgoing `native_ipc` setup; registration/lease/RA-RAP work
+stays above transport. Adapter clones share one logical owner and ordered ingress
+driver, not independent inbox pumps. The last logical runtime-owner retirement
+can close surviving raw observers; this is not a public arbitrary-Channel runtime
+constructor or interchangeable-session promise.
+
 ## Qualified profile
 
 | Boundary | Qualification |

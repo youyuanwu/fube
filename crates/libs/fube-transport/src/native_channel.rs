@@ -428,7 +428,11 @@ impl Drop for Owner {
     }
 }
 
-/// Cloneable lifecycle owner of one native gateway foundation.
+/// Cloneable lifecycle owner of one established native connection.
+///
+/// Also exported as [`crate::Channel`], for ordinary clients, raw upload and
+/// outgoing/accepted IPC. Shared type does not imply interchangeable session
+/// state or permission; construction of a typed stub grants no authorization.
 ///
 /// Only these owner clones retain live ownership. GatewayReceiver, target and
 /// reply contexts are nonowning. A typed façade should borrow this owner, not

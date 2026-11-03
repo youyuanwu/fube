@@ -103,23 +103,31 @@ pub struct GatewayDescription {
 
 /// Cloneable client for the native clear-TCP development profile.
 ///
-/// Clones explicitly share one GatewayChannel lifecycle owner and terminal state.
+/// Clones explicitly share one Channel lifecycle owner, typed budget and terminal state.
 /// A [`GatewayClient`] instead borrows a supplied foundation without adopting it.
 /// Eight admitted typed calls are retained through result transfer/drop; excess
 /// calls fail immediately. Protocol/domain failures do not abort the owner.
 /// Every remote operation accepts an optional whole-operation timeout:
-/// `None` uses the timeout configured by [`Self::connect_clear`], while
+/// `None` uses [`ClientOptions::default_timeout`] (or the duration supplied to
+/// [`Self::connect_clear`]), while
 /// `Some(duration)` overrides it for that call. `None` is not an infinite timeout.
 ///
 /// ```no_run
 /// use std::time::Duration;
-/// use fube_client::{FabricClient, DEFAULT_TIMEOUT};
+/// use fube_client::{ClientOptions, FabricClient, DEFAULT_TIMEOUT};
+/// use fube_transport::{channel::MessageChannel, connection::deadline_after};
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let client = FabricClient::connect_clear("127.0.0.1:19000".parse().unwrap(), DEFAULT_TIMEOUT).await?;
-/// let gateway = client.ping(None).await?;
-/// let exists = client.name_exists("fabric:/MyApplication", Some(Duration::from_secs(5))).await?;
-/// client.close().await?;
+/// let endpoint = FabricClient::endpoint_clear("127.0.0.1:19000".parse().unwrap())?
+///     .connect_timeout(Duration::from_secs(10));
+/// let channel = endpoint.connect().await?;
+/// let client = FabricClient::new(channel.clone(), ClientOptions::default())?;
+/// let cloned = client.clone(); // same typed admission budget, no new handshake
+/// let (gateway, exists) = tokio::try_join!(
+///     client.ping(None),
+///     cloned.name_exists("fabric:/MyApplication", Some(Duration::from_secs(5))),
+/// )?;
+/// channel.close(deadline_after(DEFAULT_TIMEOUT)?).await?; // shared shutdown
 /// # Ok(())
 /// # }
 /// ```
