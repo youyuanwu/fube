@@ -39,6 +39,31 @@ contract migrations, **not replication-algorithm changes or new durability**.
 Historical native runs below and in runtime guides qualify only their old exact
 source/profile; current alignment deployed validation is **NOT RUN**.
 
+### Peer ingress receivers
+
+`fube_data::transport::Incoming` no longer exposes raw `control`/`data` receiver
+fields. Migrate low-level consumers together; no compatibility side queues exist.
+
+| Previous use | Explicit payload receive |
+|---|---|
+| `incoming.control.recv()` | `incoming.recv_control()` |
+| `incoming.data.recv()` | `incoming.recv_data()` |
+| Selecting both receiver fields | One `incoming.recv()`, then inspect `Packet.body` |
+
+The combined method prefers ready control. Each method is cancellation-safe and
+releases transport byte accounting before returning a `Packet`; holding the
+payload does not retain that lease. Dropping `Incoming` releases both queued
+classes. The bounded queues and class-specific admission/drop policies remain.
+
+Class-specific receives drain their buffered class before returning `None`.
+Combined receive preserves control-first closure: empty closed control returns
+`None` even with buffered data; `recv_data()` can drain that remainder. One
+socket's EOF does not close these transport-wide queues. Calls borrow all of
+`Incoming` mutably, so use the combined method rather than selecting two class
+methods simultaneously. Public payload consumers receive no source/reply grant;
+the private engine handoff retains only original weak session identity, with
+independent engine-retention accounting.
+
 ## Original repository import
 
 This repository imports the Fabric client, transport, runtime/host documentation,

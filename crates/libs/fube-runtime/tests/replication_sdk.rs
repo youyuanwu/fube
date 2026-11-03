@@ -958,7 +958,7 @@ async fn canonical_destination_some_empty_is_not_legacy_eos_and_ack_gap_is_prese
         target: 2,
         start: 1,
     });
-    tokio::time::timeout(Duration::from_secs(2), incoming.control.recv())
+    tokio::time::timeout(Duration::from_secs(2), incoming.recv_control())
         .await
         .unwrap()
         .unwrap();

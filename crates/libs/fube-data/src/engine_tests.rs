@@ -860,7 +860,7 @@ async fn all_sixty_four_copy_callbacks_allow_callback_free_terminal_retirement_a
     timeout(std::time::Duration::from_secs(5), async {
         while stream.active.load(Ordering::Acquire) < 64 {
             tokio::select! {
-                Some(packet) = incoming.control.recv() => {
+                Some(packet) = incoming.recv_control() => {
                     if let Body::StartCopy { target, .. } = packet.body {
                         let destination = &replicas[(target - 2) as usize].1;
                         raw_send(&network, destination, &p, Body::Ack {
@@ -957,14 +957,7 @@ async fn promotion_drains_contiguous_received_before_discarding_only_out_of_orde
     let provider = Arc::new(Provider::default());
     let (secondary, network, primary, mut incoming) =
         initialized_raw_secondary(provider.clone()).await;
-    let drainer = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                packet = incoming.control.recv() => if packet.is_none() { break; },
-                packet = incoming.data.recv() => if packet.is_none() { break; },
-            }
-        }
-    });
+    let drainer = tokio::spawn(async move { while incoming.recv().await.is_some() {} });
     for sequence in 1..=64 {
         raw_send(
             &network,
@@ -1336,7 +1329,7 @@ async fn configured_peer_retirement_releases_session_capacity_before_replacement
         until(|| p.snapshot().peers.len() == 1 && p.snapshot().peers[0].replica == id).await;
         assert_eq!(p.snapshot().peers[0].replica, id);
         assert!(matches!(
-            timeout(std::time::Duration::from_secs(2), incoming.control.recv())
+            timeout(std::time::Duration::from_secs(2), incoming.recv_control())
                 .await
                 .unwrap()
                 .unwrap()
@@ -1533,12 +1526,14 @@ async fn copied_primary_replays_only_authentic_prefix_to_an_unbound_native_behav
     // genuine replication packet sets its target; duplicate enqueue is harmless.
     let replay = timeout(std::time::Duration::from_secs(2), async {
         loop {
-            tokio::select! {
-                packet = incoming.control.recv() => {
-                    assert!(matches!(packet.unwrap().body, Body::RequestAck));
-                    // No target, therefore no ACK and no invented progress.
+            let packet = incoming.recv().await.unwrap();
+            match &packet.body {
+                // No target, therefore no ACK and no invented progress.
+                Body::RequestAck => {}
+                Body::Replication { .. } | Body::Copy { .. } | Body::CopyContext { .. } => {
+                    break packet
                 }
-                packet = incoming.data.recv() => break packet.unwrap(),
+                _ => panic!("unexpected replay control"),
             }
         }
     })
@@ -1703,7 +1698,7 @@ async fn replay_none_some_and_transport_failure_are_paced_and_leave_one_slot_for
         }
         if mode == "some" {
             assert!(matches!(
-                timeout(std::time::Duration::from_secs(1), incoming.data.recv())
+                timeout(std::time::Duration::from_secs(1), incoming.recv_data())
                     .await
                     .unwrap()
                     .unwrap()
@@ -1807,7 +1802,7 @@ async fn replay_cooldown_is_observable_after_provider_completion_and_publication
     ));
     let releasing = std::time::Instant::now();
     gate.add_permits(1);
-    let replay = timeout(std::time::Duration::from_secs(1), incoming.data.recv())
+    let replay = timeout(std::time::Duration::from_secs(1), incoming.recv_data())
         .await
         .unwrap()
         .unwrap();
@@ -2227,7 +2222,7 @@ async fn copy_gap_empty_data_duplicate_and_legacy_eos_require_every_explicit_app
             start: 1,
         },
     );
-    timeout(std::time::Duration::from_secs(2), incoming.control.recv())
+    timeout(std::time::Duration::from_secs(2), incoming.recv_control())
         .await
         .unwrap()
         .unwrap();
@@ -4287,7 +4282,7 @@ async fn retransmission_recovers_after_actual_tcp_disconnect_without_send_as_com
         .submit(OperationData::new(vec![vec![4, 5, 6]]).unwrap(), cancel())
         .await
         .unwrap();
-    let first = timeout(std::time::Duration::from_secs(3), incoming.data.recv())
+    let first = timeout(std::time::Duration::from_secs(3), incoming.recv_data())
         .await
         .unwrap()
         .unwrap();
@@ -4297,7 +4292,7 @@ async fn retransmission_recovers_after_actual_tcp_disconnect_without_send_as_com
     peer.shutdown();
     let (replacement, mut incoming) = PeerTransport::bind(&address, Settings::default()).unwrap();
     replacement.register_peer(&p.endpoint()).unwrap();
-    let retry = timeout(std::time::Duration::from_secs(4), incoming.data.recv())
+    let retry = timeout(std::time::Duration::from_secs(4), incoming.recv_data())
         .await
         .unwrap()
         .unwrap();
@@ -4716,7 +4711,7 @@ async fn copying_raw_secondary(
             start: 1,
         },
     );
-    timeout(std::time::Duration::from_secs(2), incoming.control.recv())
+    timeout(std::time::Duration::from_secs(2), incoming.recv_control())
         .await
         .unwrap()
         .unwrap();
@@ -5318,7 +5313,7 @@ async fn outgoing_budget_repro_requires_eos_or_explicit_preassignment_write_reje
     timeout(std::time::Duration::from_secs(2), async {
         loop {
             if matches!(
-                incoming.control.recv().await.unwrap().body,
+                incoming.recv_control().await.unwrap().body,
                 Body::StartCopy { .. }
             ) {
                 break;
@@ -5342,7 +5337,7 @@ async fn outgoing_budget_repro_requires_eos_or_explicit_preassignment_write_reje
         )
     };
     ack(0, 0);
-    let first = timeout(std::time::Duration::from_secs(2), incoming.data.recv())
+    let first = timeout(std::time::Duration::from_secs(2), incoming.recv_data())
         .await
         .unwrap()
         .unwrap();
@@ -5379,13 +5374,16 @@ async fn outgoing_budget_repro_requires_eos_or_explicit_preassignment_write_reje
             let snapshot = p.snapshot();
             assert!(snapshot.owned_operations <= settings.queue_operations);
             assert!(snapshot.owned_bytes <= settings.queue_bytes);
-            tokio::select! {
-                Some(packet) = incoming.data.recv() => {
-                    if matches!(packet.body, Body::Copy { sequence: 2, last: true, .. }) {
-                        break;
-                    }
-                },
-                _ = incoming.control.recv() => {},
+            let packet = incoming.recv().await.expect("peer closed before copy EOS");
+            if matches!(
+                packet.body,
+                Body::Copy {
+                    sequence: 2,
+                    last: true,
+                    ..
+                }
+            ) {
+                break;
             }
         }
     })
@@ -5397,7 +5395,7 @@ async fn outgoing_budget_repro_requires_eos_or_explicit_preassignment_write_reje
         timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if let Body::Replication { operations, .. } =
-                    incoming.data.recv().await.unwrap().body
+                    incoming.recv_data().await.unwrap().body
                 {
                     if operations
                         .iter()

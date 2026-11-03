@@ -61,14 +61,14 @@ async fn removing_one_shared_address_actor_keeps_the_other_actor_socket_usable()
         .unwrap()
         .await
         .unwrap();
-    assert_eq!(receive(&mut incoming_b.control).await.to, actor(2));
+    assert_eq!(receive(incoming_b.recv_control()).await.to, actor(2));
     a.unregister_peer(&actor(2)).unwrap();
     let second = a
         .send_observed(request(&a.address, 1, 3))
         .unwrap()
         .await
         .unwrap();
-    assert_eq!(receive(&mut incoming_b.control).await.to, actor(3));
+    assert_eq!(receive(incoming_b.recv_control()).await.to, actor(3));
     assert_eq!(first.session, second.session);
     drop(first);
     drop(second);
@@ -116,8 +116,8 @@ fn operation(address: &str, from: i64, to: i64, bytes: usize) -> Packet {
     }
 }
 
-async fn receive(receiver: &mut mpsc::Receiver<Packet>) -> Packet {
-    timeout(std::time::Duration::from_secs(3), receiver.recv())
+async fn receive(receiver: impl std::future::Future<Output = Option<Packet>>) -> Packet {
+    timeout(std::time::Duration::from_secs(3), receiver)
         .await
         .expect("packet deadline")
         .expect("live incoming channel")
@@ -178,6 +178,12 @@ async fn ingress_grant_survives_registration_but_never_session_retirement_or_rel
     write_message(&mut source, &request(published, 2, 1).encode(true).unwrap())
         .await
         .unwrap();
+    // Obtain authority through genuine earlier ingress from this exact session.
+    let (marker, old_grant) = incoming.recv_bound().await.unwrap();
+    assert!(old_grant.matches(&marker.from));
+    write_message(&mut source, &request(published, 2, 1).encode(true).unwrap())
+        .await
+        .unwrap();
     // Leave the old packet queued until after its original session retires.
     timeout(std::time::Duration::from_secs(2), async {
         while incoming.control.is_empty() {
@@ -186,14 +192,6 @@ async fn ingress_grant_survives_registration_but_never_session_retirement_or_rel
     })
     .await
     .unwrap();
-    let old_grant = incoming
-        .control_received
-        .lock()
-        .unwrap()
-        .front()
-        .unwrap()
-        .source
-        .clone();
     drop(source);
     timeout(std::time::Duration::from_secs(2), async {
         while old_grant.is_live() {
@@ -215,12 +213,16 @@ async fn ingress_grant_survives_registration_but_never_session_retirement_or_rel
     )
     .await
     .unwrap();
-    let (_, queued_old) = incoming.recv_bound().await.unwrap();
+    let (old_packet, queued_old) = incoming.recv_bound().await.unwrap();
+    assert_eq!(old_packet, marker);
+    assert!(queued_old.matches(&old_packet.from));
+    assert!(Weak::ptr_eq(&queued_old.state, &old_grant.state));
     assert!(!queued_old.is_live());
     assert!(transport
         .send_bound(request(transport.address(), 1, 2), &queued_old)
         .is_err());
     let (_, current) = incoming.recv_bound().await.unwrap();
+    assert!(!Weak::ptr_eq(&current.state, &queued_old.state));
     transport.register_peer(&endpoint(published, 2)).unwrap();
     transport
         .send_bound(request(transport.address(), 1, 2), &current)
@@ -258,7 +260,7 @@ fn bind_without_runtime_and_last_owner_drop_joins_and_releases_listener() {
     assert!(start.elapsed() < std::time::Duration::from_millis(250));
     assert!(std::net::TcpStream::connect(address).is_err());
     assert!(matches!(
-        incoming.control.try_recv(),
+        incoming.try_recv_control(),
         Err(mpsc::error::TryRecvError::Disconnected)
     ));
 }
@@ -270,7 +272,7 @@ async fn real_fabric_tcp_is_duplex_and_reuses_an_accepted_socket() {
     a.register_peer(&endpoint(b.address(), 2)).unwrap();
     let sent = operation(a.address(), 1, 2, 1024);
     a.send(sent.clone()).unwrap();
-    assert_eq!(receive(&mut b_in.data).await, sent);
+    assert_eq!(receive(b_in.recv_data()).await, sent);
     // No registration on b: its accepted reader learned the sender actor and
     // its writer must continuously progress on the same duplex connection.
     let ack = Packet {
@@ -285,9 +287,9 @@ async fn real_fabric_tcp_is_duplex_and_reuses_an_accepted_socket() {
         },
     };
     b.send(ack.clone()).unwrap();
-    assert_eq!(receive(&mut a_in.control).await, ack);
+    assert_eq!(receive(a_in.recv_control()).await, ack);
     a.send(request(a.address(), 1, 2)).unwrap();
-    assert_eq!(receive(&mut b_in.control).await.body, Body::RequestAck);
+    assert_eq!(receive(b_in.recv_control()).await.body, Body::RequestAck);
     a.shutdown();
     b.shutdown();
 }
@@ -304,7 +306,7 @@ async fn observed_invalid_frame_completion_keeps_exact_bytes_tuple_and_bounded_c
     write_message(&mut socket, &request(published, 2, 1).encode(true).unwrap())
         .await
         .unwrap();
-    receive(&mut incoming.control).await;
+    receive(incoming.recv_control()).await;
     let mut invalid = request(transport.address(), 1, 2);
     invalid.from.actor.incarnation = Uuid::new_v4();
     let completion = transport.send_observed(invalid.clone()).unwrap();
@@ -509,7 +511,7 @@ async fn fragmented_native_listen_instance_and_header_in_body_packets() {
         socket.write_all(chunk).await.unwrap();
         tokio::task::yield_now().await;
     }
-    assert_eq!(receive(&mut incoming.data).await, packet);
+    assert_eq!(receive(incoming.recv_data()).await, packet);
     transport.send(request(transport.address(), 1, 2)).unwrap();
     let response = read_message(&mut socket).await.unwrap();
     assert_eq!(
@@ -526,27 +528,246 @@ async fn saturated_incoming_data_preserves_control_and_never_acknowledges() {
         operation_bytes: 4096,
         queue_operations: 1,
         queue_bytes: 8192,
+        control_messages: 1,
         ..Settings::default()
     };
     let (transport, mut incoming) = PeerTransport::bind("127.0.0.1:0", settings).unwrap();
     let published = "127.0.0.1:32102";
     let mut socket = native_socket(transport.address(), published).await;
     let data = operation(published, 2, 1, 1024).encode(true).unwrap();
-    for _ in 0..64 {
+    write_message(&mut socket, &data).await.unwrap();
+    write_message(&mut socket, &request(published, 2, 1).encode(true).unwrap())
+        .await
+        .unwrap();
+    receive(incoming.recv_control()).await;
+    let data_free = transport.handle.network.data.bytes.available_permits();
+    assert!(data_free < 8192);
+    for _ in 0..63 {
         write_message(&mut socket, &data).await.unwrap();
     }
     write_message(&mut socket, &request(published, 2, 1).encode(true).unwrap())
         .await
         .unwrap();
-    assert_eq!(receive(&mut incoming.control).await.body, Body::RequestAck);
+    assert_eq!(
+        receive(incoming.recv_control()).await.body,
+        Body::RequestAck
+    );
     assert_eq!(incoming.data.len(), 1);
+    assert_eq!(
+        transport.handle.network.data.bytes.available_permits(),
+        data_free
+    );
     assert!(timeout(
         std::time::Duration::from_millis(30),
         read_message(&mut socket)
     )
     .await
     .is_err());
+    // Control saturation is terminal, but rejection must retain only the
+    // already queued item, not the failed admission or its source.
+    write_message(&mut socket, &request(published, 2, 1).encode(true).unwrap())
+        .await
+        .unwrap();
+    timeout(std::time::Duration::from_secs(2), async {
+        while incoming.control.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let control_free = transport.handle.network.control.bytes.available_permits();
+    write_message(&mut socket, &request(published, 2, 1).encode(true).unwrap())
+        .await
+        .unwrap();
+    expect_closed(&mut socket).await;
+    assert_eq!(incoming.control.len(), 1);
+    assert_eq!(
+        transport.handle.network.control.bytes.available_permits(),
+        control_free
+    );
+    assert_eq!(
+        transport.handle.network.data.bytes.available_permits(),
+        data_free
+    );
+    drop(incoming);
+    assert_eq!(
+        transport.handle.network.data.bytes.available_permits(),
+        8192
+    );
+    assert_eq!(
+        transport.handle.network.control.bytes.available_permits(),
+        Settings::default().control_bytes
+    );
     transport.shutdown();
+}
+
+#[tokio::test]
+async fn incoming_cancel_priority_try_receive_and_drop_own_both_classes() {
+    let settings = Settings {
+        operation_bytes: 4096,
+        queue_bytes: 4096,
+        control_bytes: 4096,
+        queue_operations: 2,
+        control_messages: 2,
+        ..Settings::default()
+    };
+    let (transport, mut incoming) = PeerTransport::bind("127.0.0.1:0", settings).unwrap();
+    let published = "127.0.0.1:32114";
+    let mut socket = native_socket(transport.address(), published).await;
+    let wait = std::time::Duration::from_millis(1);
+    assert!(timeout(wait, incoming.recv_control()).await.is_err());
+    assert!(timeout(wait, incoming.recv_data()).await.is_err());
+    assert!(timeout(wait, incoming.recv()).await.is_err());
+    assert!(timeout(wait, incoming.recv_bound()).await.is_err());
+
+    println!(
+        "owned ingress layout: Packet={}, SourceTarget={}, permit={}, Ingress={}",
+        std::mem::size_of::<Packet>(),
+        std::mem::size_of::<SourceTarget>(),
+        std::mem::size_of::<OwnedSemaphorePermit>(),
+        std::mem::size_of::<Ingress>()
+    );
+    for (control_actor, data_actor) in [(2, 3), (4, 5), (6, 7), (8, 9)] {
+        let control = request(published, control_actor, 1);
+        let data = operation(published, data_actor, 1, 64);
+        write_message(&mut socket, &data.encode(true).unwrap())
+            .await
+            .unwrap();
+        write_message(&mut socket, &control.encode(true).unwrap())
+            .await
+            .unwrap();
+        timeout(std::time::Duration::from_secs(2), async {
+            while incoming.control.len() != 1 || incoming.data.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(transport.handle.network.control.bytes.available_permits() < 4096);
+        assert!(transport.handle.network.data.bytes.available_permits() < 4096);
+        match control_actor {
+            2 => {
+                let (received, source) = incoming.recv_bound().await.unwrap();
+                assert_eq!(received, control, "ready control wins over data");
+                assert!(source.matches(&received.from));
+                assert!(source.is_live());
+                assert_eq!(
+                    transport.handle.network.control.bytes.available_permits(),
+                    4096
+                );
+                assert_eq!(incoming.data.len(), 1);
+                let received_data = receive(incoming.recv_data()).await;
+                assert_eq!(received_data, data);
+                assert_eq!(
+                    transport.handle.network.data.bytes.available_permits(),
+                    4096
+                );
+                assert!(
+                    source.is_live(),
+                    "identity does not depend on the byte lease"
+                );
+            }
+            4 => {
+                let received = incoming.try_recv_control().unwrap();
+                assert_eq!(received, control);
+                assert_eq!(
+                    transport.handle.network.control.bytes.available_permits(),
+                    4096
+                );
+                let received_data = incoming.try_recv_data().unwrap();
+                assert_eq!(received_data, data);
+                assert_eq!(
+                    transport.handle.network.data.bytes.available_permits(),
+                    4096
+                );
+                assert!(matches!(
+                    incoming.try_recv_control(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                assert!(matches!(
+                    incoming.try_recv_data(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+            }
+            6 => {
+                let received = receive(incoming.recv()).await;
+                assert_eq!(
+                    received, control,
+                    "public combined receive prefers ready control"
+                );
+                assert_eq!(
+                    transport.handle.network.control.bytes.available_permits(),
+                    4096
+                );
+                assert_eq!(incoming.data.len(), 1);
+                assert_eq!(receive(incoming.recv_data()).await, data);
+                assert_eq!(
+                    transport.handle.network.data.bytes.available_permits(),
+                    4096
+                );
+            }
+            _ => break, // Both remaining envelopes are deliberately undrained.
+        }
+    }
+    drop(incoming);
+    assert_eq!(
+        transport.handle.network.control.bytes.available_permits(),
+        4096
+    );
+    assert_eq!(
+        transport.handle.network.data.bytes.available_permits(),
+        4096
+    );
+    assert!(!transport.handle.stopped.load(Ordering::Acquire));
+    transport.shutdown();
+}
+
+#[tokio::test]
+async fn incoming_closed_control_wakes_pending_receive_without_discarding_buffered_data() {
+    use std::future::Future;
+    let (transport, mut incoming) =
+        PeerTransport::bind("127.0.0.1:0", Settings::default()).unwrap();
+    let published = "127.0.0.1:32115";
+    let mut socket = native_socket(transport.address(), published).await;
+    let data = operation(published, 2, 1, 64);
+    write_message(&mut socket, &data.encode(true).unwrap())
+        .await
+        .unwrap();
+    timeout(std::time::Duration::from_secs(2), async {
+        while incoming.data.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    {
+        let mut pending = std::pin::pin!(incoming.recv_control());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                pending.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        transport.shutdown();
+        assert!(timeout(std::time::Duration::from_secs(2), pending)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    assert!(incoming.recv().await.is_none());
+    assert!(incoming.recv_bound().await.is_none());
+    assert_eq!(incoming.data.len(), 1);
+    let received = receive(incoming.recv_data()).await;
+    assert_eq!(received, data);
+    assert_eq!(
+        transport.handle.network.data.bytes.available_permits(),
+        Settings::default().queue_bytes
+    );
+    assert!(incoming.recv_data().await.is_none());
+    assert!(matches!(
+        incoming.try_recv_data(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
 }
 
 #[tokio::test]
@@ -569,12 +790,18 @@ async fn aggregate_bytes_include_queued_incoming_and_empty_segment_metadata() {
     write_message(&mut socket, &request(published, 2, 1).encode(true).unwrap())
         .await
         .unwrap();
-    receive(&mut incoming.control).await;
+    receive(incoming.recv_control()).await;
     assert!(matches!(
         transport.send(operation(transport.address(), 1, 2, 1250)),
         Err(Error::ResourceLimit(_))
     ));
-    receive(&mut incoming.data).await;
+    let received = receive(incoming.recv_data()).await;
+    assert_eq!(received, packet);
+    // No subsequent admission is allowed to reconcile a forgotten lease.
+    assert_eq!(
+        transport.handle.network.data.bytes.available_permits(),
+        2048
+    );
     transport
         .send(operation(transport.address(), 1, 2, 1250))
         .unwrap();
@@ -594,7 +821,7 @@ async fn aggregate_bytes_include_queued_incoming_and_empty_segment_metadata() {
     write_message(&mut socket, &request(published, 2, 1).encode(true).unwrap())
         .await
         .unwrap();
-    receive(&mut incoming.control).await;
+    receive(incoming.recv_control()).await;
     assert!(incoming.data.is_empty());
     transport.shutdown();
 }
@@ -648,7 +875,7 @@ async fn data_admission_exhaustion_does_not_consume_control_capacity() {
         Body::RequestAck
     );
     // A received packet is not an implicit semantic receipt.
-    assert!(incoming.control.try_recv().is_err());
+    assert!(incoming.try_recv_control().is_err());
     transport.shutdown();
 }
 
@@ -678,7 +905,12 @@ async fn control_bytes_are_aggregated_and_released_after_receive() {
         transport.send(request(transport.address(), 1, 2)),
         Err(Error::ResourceLimit(_))
     ));
-    receive(&mut incoming.control).await;
+    let received = receive(incoming.recv_control()).await;
+    assert_eq!(received.body, Body::RequestAck);
+    assert_eq!(
+        transport.handle.network.control.bytes.available_permits(),
+        512
+    );
     transport.send(request(transport.address(), 1, 2)).unwrap();
     assert_eq!(
         Packet::decode(&read_message(&mut socket).await.unwrap())
@@ -704,7 +936,7 @@ async fn accepted_and_initiated_sockets_share_one_connection_limit() {
     )
     .await
     .unwrap();
-    receive(&mut incoming.control).await;
+    receive(incoming.recv_control()).await;
     let mut second = TcpStream::connect(transport.address()).await.unwrap();
     assert!(timeout(
         std::time::Duration::from_millis(40),
@@ -774,7 +1006,7 @@ async fn malformed_security_and_identity_only_retire_the_offending_session() {
     write_message(&mut good, &request(published, 2, 1).encode(true).unwrap())
         .await
         .unwrap();
-    receive(&mut incoming.control).await;
+    receive(incoming.recv_control()).await;
     transport.shutdown();
 }
 
@@ -815,7 +1047,7 @@ async fn invalid_listener_address_releases_its_session_and_byte_charge() {
     write_message(&mut good, &request(published, 2, 1).encode(true).unwrap())
         .await
         .unwrap();
-    receive(&mut incoming.control).await;
+    receive(incoming.recv_control()).await;
     transport.shutdown();
 }
 
@@ -862,7 +1094,10 @@ async fn native_zero_instance_acceptor_and_directional_nonce_are_wire_compatible
         reply
     });
     transport.send(request(transport.address(), 1, 2)).unwrap();
-    assert_eq!(receive(&mut incoming.control).await, server.await.unwrap());
+    assert_eq!(
+        receive(incoming.recv_control()).await,
+        server.await.unwrap()
+    );
     transport.shutdown();
 }
 
@@ -885,13 +1120,13 @@ async fn partial_frame_and_handshake_deadlines_release_connection_slots() {
     write_message(&mut good, &request(published, 2, 1).encode(true).unwrap())
         .await
         .unwrap();
-    receive(&mut incoming.control).await;
+    receive(incoming.recv_control()).await;
     // Idle, fully exchanged peers do not time out.
     sleep(std::time::Duration::from_millis(150)).await;
     write_message(&mut good, &request(published, 2, 1).encode(true).unwrap())
         .await
         .unwrap();
-    receive(&mut incoming.control).await;
+    receive(incoming.recv_control()).await;
     transport.shutdown();
 }
 
@@ -907,7 +1142,7 @@ async fn shutdown_is_terminal_synchronous_and_drains_a_backpressured_writer() {
     write_message(&mut socket, &request(published, 2, 1).encode(true).unwrap())
         .await
         .unwrap();
-    receive(&mut incoming.control).await;
+    receive(incoming.recv_control()).await;
     for _ in 0..32 {
         let _ = transport.send(operation(transport.address(), 1, 2, 1024 * 1024 - 1));
     }
@@ -969,7 +1204,7 @@ async fn shutdown_is_terminal_synchronous_and_drains_a_backpressured_writer() {
             .available_permits(),
         32
     );
-    assert!(incoming.control.recv().await.is_none());
+    assert!(incoming.recv_control().await.is_none());
     assert!(std::net::TcpStream::connect(transport.address()).is_err());
 }
 

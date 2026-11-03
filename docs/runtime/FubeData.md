@@ -60,8 +60,15 @@ than abort-dropping it. A blocked peer can therefore delay joined shutdown up
 to that finite watchdog; idle reads still have no inactivity timeout.
 
 Incoming class admission still occurs before body allocation; rejected data
-is drained without ACK. The engine receives a private source-session grant
-paired atomically with bounded ingress accounting. Validated secondary state
+is drained without ACK. Each private queued item owns its packet, byte lease
+and original weak source-session grant together. Receive or queued-item disposal
+releases the transport lease immediately; engine retention has its own independent
+charge. Public low-level consumers use `Incoming::recv`, `recv_control` or
+`recv_data`, never raw receivers or reply grants (see the
+[migration guide](../Migration.md#peer-ingress-receivers)). Combined receive
+prefers ready control, including closed-control termination; class receives can
+drain their own buffered remainder. The private engine handoff keeps the grant
+without retaining the transport lease or a live socket owner. Validated secondary state
 retains it for immediate and later application-apply ACKs. Registration,
 duplicate advertised listeners and actor/address relearning cannot replace
 that grant: retired responses fail locally rather than dial another session.

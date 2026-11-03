@@ -15,7 +15,7 @@
 //! nor admission slots. Within each class incoming and outgoing bytes aggregate.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     net::{SocketAddr, TcpListener as StdListener, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -62,10 +62,8 @@ pub(crate) mod tests;
 /// A consumer must continuously drain both channels. A full data channel drops
 /// data without acknowledging it; replication retransmission remains external.
 pub struct Incoming {
-    pub control: mpsc::Receiver<Packet>,
-    pub data: mpsc::Receiver<Packet>,
-    control_received: Arc<Mutex<VecDeque<ReceivedCharge>>>,
-    data_received: Arc<Mutex<VecDeque<ReceivedCharge>>>,
+    control: mpsc::Receiver<Ingress>,
+    data: mpsc::Receiver<Ingress>,
 }
 
 /// Internal ingress capability. A route lookup cannot recreate this grant.
@@ -92,40 +90,49 @@ impl SourceTarget {
     }
 }
 
-struct ReceivedCharge {
+struct Ingress {
+    packet: Packet,
     _permit: OwnedSemaphorePermit,
     source: SourceTarget,
 }
 
 impl Incoming {
-    async fn receive_bound(
-        receiver: &mut mpsc::Receiver<Packet>,
-        charges: &Mutex<VecDeque<ReceivedCharge>>,
-    ) -> Option<(Packet, SourceTarget)> {
-        std::future::poll_fn(|cx| {
-            let mut charges = charges.lock().unwrap();
-            // Public fixture consumers may have transferred older packets.
-            while charges.len() > receiver.len() {
-                charges.pop_front();
-            }
-            match receiver.poll_recv(cx) {
-                std::task::Poll::Ready(Some(packet)) => {
-                    let charge = charges.pop_front().expect("paired ingress admission");
-                    std::task::Poll::Ready(Some((packet, charge.source)))
-                }
-                std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-                std::task::Poll::Pending => std::task::Poll::Pending,
-            }
-        })
-        .await
+    /// Receives a payload, preferring ready control over data. Cancellation
+    /// consumes nothing. An empty closed control queue returns `None` even if
+    /// data remains buffered; use [`Self::recv_data`] to drain that remainder.
+    pub async fn recv(&mut self) -> Option<Packet> {
+        self.recv_bound().await.map(|(packet, _)| packet)
+    }
+
+    /// Receives only control, releasing its transport byte lease at transfer.
+    /// Cancellation consumes nothing; buffered control drains before `None`.
+    pub async fn recv_control(&mut self) -> Option<Packet> {
+        self.control.recv().await.map(|ingress| ingress.packet)
+    }
+
+    /// Receives only data, releasing its transport byte lease at transfer.
+    /// Cancellation consumes nothing; buffered data drains before `None`.
+    pub async fn recv_data(&mut self) -> Option<Packet> {
+        self.data.recv().await.map(|ingress| ingress.packet)
+    }
+
+    #[cfg(test)]
+    fn try_recv_control(&mut self) -> std::result::Result<Packet, mpsc::error::TryRecvError> {
+        self.control.try_recv().map(|ingress| ingress.packet)
+    }
+
+    #[cfg(test)]
+    fn try_recv_data(&mut self) -> std::result::Result<Packet, mpsc::error::TryRecvError> {
+        self.data.try_recv().map(|ingress| ingress.packet)
     }
 
     pub(crate) async fn recv_bound(&mut self) -> Option<(Packet, SourceTarget)> {
-        tokio::select! {
+        let ingress = tokio::select! {
             biased;
-            packet = Self::receive_bound(&mut self.control, &self.control_received) => packet,
-            packet = Self::receive_bound(&mut self.data, &self.data_received) => packet,
-        }
+            ingress = self.control.recv() => ingress,
+            ingress = self.data.recv() => ingress,
+        };
+        ingress.map(|ingress| (ingress.packet, ingress.source))
     }
 }
 
@@ -171,25 +178,11 @@ struct Network {
 struct Class {
     bytes: Arc<Semaphore>,
     outgoing_slots: Arc<Semaphore>,
-    incoming: mpsc::WeakSender<Packet>,
-    // Packet's public channel type has no embedded permit. Reconcile against
-    // channel occupancy under this lock before every admission.
-    received: Arc<Mutex<VecDeque<ReceivedCharge>>>,
+    incoming: mpsc::WeakSender<Ingress>,
 }
 
 impl Class {
-    fn reap_locked(&self, received: &mut VecDeque<ReceivedCharge>) {
-        let queued = self
-            .incoming
-            .upgrade()
-            .map_or(0, |sender| sender.max_capacity() - sender.capacity());
-        while received.len() > queued {
-            received.pop_front();
-        }
-    }
-
     fn reserve(&self, bytes: usize) -> Result<OwnedSemaphorePermit> {
-        self.reap_locked(&mut self.received.lock().unwrap());
         self.bytes
             .clone()
             .try_acquire_many_owned(
@@ -206,18 +199,17 @@ impl Class {
         permit: OwnedSemaphorePermit,
         source: SourceTarget,
     ) -> Result<()> {
-        let mut received = self.received.lock().unwrap();
-        self.reap_locked(&mut received);
         let sender = self.incoming.upgrade().ok_or(Error::Closed)?;
-        sender.try_send(packet).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => Error::ResourceLimit("incoming peer queue"),
-            mpsc::error::TrySendError::Closed(_) => Error::Closed,
-        })?;
-        received.push_back(ReceivedCharge {
-            _permit: permit,
-            source,
-        });
-        Ok(())
+        sender
+            .try_send(Ingress {
+                packet,
+                _permit: permit,
+                source,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => Error::ResourceLimit("incoming peer queue"),
+                mpsc::error::TrySendError::Closed(_) => Error::Closed,
+            })
     }
 }
 
@@ -335,8 +327,6 @@ impl PeerTransport {
         let (out_control, control_rx) = mpsc::channel(settings.control_messages);
         let (stop, stop_rx) = watch::channel(false);
         let (route_revision, _) = watch::channel(0);
-        let data_received = Arc::new(Mutex::new(VecDeque::new()));
-        let control_received = Arc::new(Mutex::new(VecDeque::new()));
         let network = Arc::new(Network {
             retired_addresses: Mutex::new(HashSet::new()),
             outgoing_addresses: Mutex::new(HashMap::new()),
@@ -346,13 +336,11 @@ impl PeerTransport {
                 bytes: Arc::new(Semaphore::new(settings.queue_bytes)),
                 outgoing_slots: Arc::new(Semaphore::new(settings.queue_operations)),
                 incoming: in_data.downgrade(),
-                received: data_received.clone(),
             },
             control: Class {
                 bytes: Arc::new(Semaphore::new(settings.control_bytes)),
                 outgoing_slots: Arc::new(Semaphore::new(settings.control_messages)),
                 incoming: in_control.downgrade(),
-                received: control_received.clone(),
             },
             local: ListenInstance {
                 address: address.clone(),
@@ -414,12 +402,7 @@ impl PeerTransport {
                     network,
                 }),
             },
-            Incoming {
-                control,
-                data,
-                control_received,
-                data_received,
-            },
+            Incoming { control, data },
         ))
     }
 
@@ -1159,8 +1142,8 @@ async fn run_session_inner(
                 address: packet.from.address.clone(),
                 state: Arc::downgrade(&state),
             };
-            let charge = (packet_bytes(&packet)
-                + std::mem::size_of::<ReceivedCharge>()
+            let charge = (packet_bytes(&packet) - std::mem::size_of::<Packet>()
+                + std::mem::size_of::<Ingress>()
                 + source.address.len()
                 + source.route.address.len())
             .max(frame.charge);

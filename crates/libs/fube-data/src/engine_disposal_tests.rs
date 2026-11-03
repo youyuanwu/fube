@@ -34,7 +34,7 @@ async fn actual_owner_and_peer_ack_progress_while_entire_application_executor_is
                     start: 1,
                 },
             );
-            timeout(std::time::Duration::from_secs(1), incoming.control.recv())
+            timeout(std::time::Duration::from_secs(1), incoming.recv_control())
                 .await
                 .unwrap()
                 .unwrap();
@@ -53,8 +53,7 @@ async fn actual_owner_and_peer_ack_progress_while_entire_application_executor_is
             timeout(std::time::Duration::from_secs(1), async {
                 loop {
                     let packet = incoming
-                        .control
-                        .recv()
+                        .recv_control()
                         .await
                         .expect("peer closed before ACK");
                     if matches!(
@@ -327,7 +326,7 @@ async fn delayed_command_disposal(configure: bool, cancelled: bool, closing: boo
     let build =
         tokio::spawn(async move { building.build_replica(building_replica, cancel()).await });
     loop {
-        let packet = timeout(std::time::Duration::from_secs(1), incoming.control.recv())
+        let packet = timeout(std::time::Duration::from_secs(1), incoming.recv_control())
             .await
             .unwrap()
             .unwrap();
@@ -352,7 +351,7 @@ async fn delayed_command_disposal(configure: bool, cancelled: bool, closing: boo
         // The sole payload charge fills queue_operations. No next poll can
         // start; this is a genuinely idle, retained user stream, not a canceled
         // observer mistaken for disposal.
-        timeout(std::time::Duration::from_secs(1), incoming.data.recv())
+        timeout(std::time::Duration::from_secs(1), incoming.recv_data())
             .await
             .unwrap()
             .unwrap();
@@ -463,7 +462,7 @@ async fn deferred_remove_transfers_accepted_cleanup_at_full_shared64_after_enume
     let building_replica = replica.clone();
     let build =
         tokio::spawn(async move { building.build_replica(building_replica, cancel()).await });
-    timeout(std::time::Duration::from_secs(1), incoming.control.recv())
+    timeout(std::time::Duration::from_secs(1), incoming.recv_control())
         .await
         .unwrap()
         .unwrap();

@@ -164,7 +164,7 @@ async fn issued_canonical_sync_configuration_and_remove_wait_exact_physical_disp
                     .build_replica(owned_peer, Cancellation::default())
                     .await
             });
-            tokio::time::timeout(std::time::Duration::from_secs(1), incoming.control.recv())
+            tokio::time::timeout(std::time::Duration::from_secs(1), incoming.recv_control())
                 .await
                 .unwrap()
                 .unwrap();
@@ -181,7 +181,7 @@ async fn issued_canonical_sync_configuration_and_remove_wait_exact_physical_disp
                     },
                 })
                 .unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(1), incoming.data.recv())
+            tokio::time::timeout(std::time::Duration::from_secs(1), incoming.recv_data())
                 .await
                 .unwrap()
                 .unwrap();
