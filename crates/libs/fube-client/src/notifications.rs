@@ -285,6 +285,17 @@ impl ServiceNotificationClient {
     /// aborting retained clones. After validation, startup failure/cancellation,
     /// owner drop, close, or terminal failure retires the shared Channel even if raw
     /// clones remain. A raw clone cannot keep a retired notification session alive.
+    ///
+    /// ```
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// use fube_client::{NotificationClientOptions, ServiceNotificationClient};
+    /// let endpoint = ServiceNotificationClient::endpoint_clear("127.0.0.1:19000".parse()?)?;
+    /// let channel = endpoint.connect().await?;
+    /// let client = ServiceNotificationClient::start(channel, NotificationClientOptions::default()).await?;
+    /// client.close(None).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn start(
         channel: Channel,
         options: NotificationClientOptions,
@@ -298,6 +309,8 @@ impl ServiceNotificationClient {
     /// Non-loopback and zero-port endpoints are rejected. This deliberately
     /// narrows the previous clear-TCP policy; advertised private addresses are
     /// never dialed and an ordinary FabricClient's channel is never adopted.
+    /// `timeout` is one absolute budget across establishment and native startup,
+    /// and also the subsequent operation/processing-ACK default.
     pub async fn connect_clear(
         endpoint: SocketAddr,
         timeout: Duration,
