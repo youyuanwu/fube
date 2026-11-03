@@ -127,7 +127,7 @@ pub struct ClientBudget {
     usage: Arc<Mutex<Usage>>,
 }
 impl ClientBudget {
-    fn new(limits: ClientLimits) -> Result<Self> {
+    pub(crate) fn new(limits: ClientLimits) -> Result<Self> {
         if limits.max_calls == 0
             || limits.max_retained_bytes < CLIENT_SLOT_BYTES
             || limits.max_calls.checked_mul(CLIENT_SLOT_BYTES).is_none()
@@ -190,10 +190,6 @@ impl<C: RpcChannel + ?Sized> Client for GatewayClient<'_, C> {
     ) -> ClientFuture<'a, R::Response, R::DomainError> {
         call(self.binding(), &self.budget, request, context)
     }
-}
-
-pub(crate) fn default_budget() -> ClientBudget {
-    ClientBudget::new(ClientLimits::default()).expect("valid fixed client defaults")
 }
 
 pub(crate) fn check_deadline(deadline: Instant) -> Result<()> {

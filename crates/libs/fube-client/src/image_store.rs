@@ -9,7 +9,8 @@ use fube_transport::{
     channel::{MessageChannel, MessageReceiver, RpcChannel},
     connection::{deadline_after, MAX_FRAME_TIME},
     message::{Header, Message},
-    native_channel::{ChannelLimits, GatewayChannel, GatewayReceiver, GatewayTarget},
+    native_channel::{GatewayReceiver, GatewayTarget},
+    Channel, ChannelLimits, Endpoint,
 };
 use tokio::{
     fs::{self, File, ReadDir},
@@ -30,14 +31,14 @@ const MAX_STALE_REPLIES: usize = 64;
 /// numeric loopback gateways with a nonzero port. Owns a dedicated upload
 /// GatewayChannel; no authentication, reconnect or protocol fallback.
 pub struct ImageStoreClient {
-    channel: GatewayChannel,
+    channel: Channel,
     target: Arc<GatewayTarget>,
     replies: GatewayReceiver,
     timeout: Duration,
 }
 
 struct OperationGuard {
-    channel: GatewayChannel,
+    channel: Channel,
     armed: bool,
 }
 impl Drop for OperationGuard {
@@ -61,21 +62,28 @@ struct Directory {
 }
 
 impl ImageStoreClient {
+    /// Configure upload authorization and ingress limits without dialing.
+    ///
+    /// The resulting raw channel is not a cloneable upload session. The actual
+    /// uploader keeps a dedicated connection and one private serial inbox.
+    pub fn endpoint_clear(address: SocketAddr) -> Result<Endpoint> {
+        Ok(
+            Endpoint::unsecured_loopback(address, crate::channel_adapter::upload()?)?
+                .channel_limits(ChannelLimits {
+                    max_ingress: 32,
+                    max_retained_bytes: 1024 * 1024 * 1024,
+                    ..ChannelLimits::default()
+                }),
+        )
+    }
+
     /// Connect without TLS/authentication; timeout also defaults later copies.
     pub async fn connect_clear(endpoint: SocketAddr, timeout: Duration) -> Result<Self> {
-        let deadline = deadline_after(timeout)?;
-        let channel = GatewayChannel::connect_unsecured_loopback(
-            endpoint,
-            crate::channel_adapter::upload()?,
-            ChannelLimits {
-                max_ingress: 32,
-                max_retained_bytes: 1024 * 1024 * 1024,
-                ..ChannelLimits::default()
-            },
-            deadline,
-        )
-        .await?;
-        let target = channel.resolve_target(&endpoint.to_string())?;
+        let channel = Self::endpoint_clear(endpoint)?
+            .connect_timeout(timeout)
+            .connect()
+            .await?;
+        let target = channel.target()?;
         let replies = channel.receiver()?;
         Ok(Self {
             channel,
