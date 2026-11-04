@@ -84,6 +84,30 @@ fn admission() -> ra::Admission {
         fabric_upgrading: false,
     }
 }
+
+#[tokio::test]
+async fn stateless_node_rejects_stateful_registration_profile_before_activation() {
+    let fixture = Fixture::new();
+    let store = Arc::new(
+        Store::new(Box::new(MemoryBackend::new()), Settings::default())
+            .await
+            .unwrap(),
+    );
+    let mut options = Options::new(fixture.parent.clone());
+    options.profile = fube_hosting::local::Profile::VolatileStatefulRegistration;
+    assert!(matches!(
+        Node::new(
+            Activation::new(options).unwrap(),
+            store.clone(),
+            admission(),
+            ra::Settings::default()
+        ),
+        Err(fube_node::local::Error::Unsupported)
+    ));
+    assert_eq!(fs::read_dir(&fixture.parent).unwrap().count(), 1);
+    store.close().await.unwrap();
+}
+
 fn body(node: &Node) -> AddInstance {
     let a = node.activation();
     let premise = a.premise().unwrap();

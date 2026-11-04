@@ -419,7 +419,14 @@ impl Drop for Fixture {
     }
 }
 async fn until(cluster: &mut Cluster, predicate: impl Fn(&Cluster) -> bool) {
-    let end = Instant::now() + Duration::from_secs(12);
+    until_with_budget(cluster, Duration::from_secs(12), predicate).await;
+}
+async fn until_with_budget(
+    cluster: &mut Cluster,
+    budget: Duration,
+    predicate: impl Fn(&Cluster) -> bool,
+) {
+    let end = Instant::now() + budget;
     loop {
         cluster.drive().await;
         if predicate(cluster) {
@@ -499,7 +506,13 @@ async fn executable_nodes_preserve_uncertainty_sibling_contact_and_clean_handoff
             .unwrap();
         assert_eq!(outcome["state"], "pending");
     }
-    until(&mut cluster, |cluster| {
+    // Native notification eligibility starts at monotonic zero. A fresh runner
+    // may need the full type interval plus a retry before its first notification.
+    let settings = fube_ra::entity::Settings::default();
+    let notification_budget = Duration::from_millis(
+        settings.notification_type_ms + settings.notification_retry_ms,
+    ) + Duration::from_secs(12);
+    until_with_budget(&mut cluster, notification_budget, |cluster| {
         cluster
             .ledger
             .placements

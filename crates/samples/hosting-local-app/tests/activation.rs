@@ -1,6 +1,6 @@
 //! Real native-free package/process/IPC execution through production Hosting.
 use fube_hosting::{
-    local::{Activation, LocalError, Options},
+    local::{Activation, LocalError, Options, Profile},
     *,
 };
 use std::{
@@ -42,6 +42,20 @@ impl Fixture {
         .unwrap();
         Self { parent, package }
     }
+    fn stateful() -> Self {
+        let fixture = Self::new();
+        fs::write(
+            fixture.package.join("ApplicationManifest.xml"),
+            include_str!("../pkg-stateful/ApplicationManifest.xml"),
+        )
+        .unwrap();
+        fs::write(
+            fixture.package.join("LocalService/ServiceManifest.xml"),
+            include_str!("../pkg-stateful/LocalService/ServiceManifest.xml"),
+        )
+        .unwrap();
+        fixture
+    }
     fn options(&self) -> Options {
         let mut options = Options::new(self.parent.clone());
         options.residency.shared_grace = GracePeriod::Finite(10);
@@ -80,6 +94,176 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.parent).unwrap();
     }
+}
+
+#[test]
+fn owned_stateful_factory_registers_and_resolves_without_replica_lifecycle() {
+    let fixture = Fixture::stateful();
+    let mut options = fixture.options();
+    options.profile = Profile::VolatileStatefulRegistration;
+    options.lease_duration = Duration::from_secs(2);
+    let mut owner = Activation::new(options).unwrap();
+    owner.start(&fixture.package, "fabric:/Local", &[]).unwrap();
+    owner
+        .wait_registration(Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("{e}: {:?}", owner.logs()));
+    let pid = owner.process_status().unwrap().pid;
+    let root = owner.root().unwrap().to_path_buf();
+    let identity = owner.identity().unwrap();
+    let premise = owner.premise().unwrap();
+    let request = LookupRequest {
+        service_type: owner.declared_type().unwrap(),
+        version: premise.version.clone(),
+        activation: fube_hosting::Activation::SHARED,
+        service_name: premise.service_name.clone(),
+        application_name: premise.application_name.clone(),
+        should_activate: false,
+    };
+    let lookup = owner.lookup_registration(&request).unwrap();
+    assert_eq!(lookup.result, Ok(()));
+    let registration = lookup.candidate.unwrap();
+    let status = owner.session_status().unwrap().unwrap();
+    assert!(status.connected && status.registered_host);
+    assert_eq!(status.runtimes.len(), 1);
+    assert_eq!(
+        registration.type_instance.service_type,
+        request.service_type
+    );
+    assert_eq!(registration.host_id, identity.host_id);
+    assert_eq!(registration.process_id, pid);
+    assert_eq!(registration.runtime_id, status.runtimes[0].runtime_id);
+    assert_eq!(
+        registration.package_instance_sequence,
+        identity.code.package_sequence
+    );
+    assert_eq!(registration.version, premise.version);
+    let mut foreign = request.clone();
+    foreign.service_type.name = "UndeclaredType".into();
+    assert_eq!(
+        owner.lookup_registration(&foreign).unwrap().result,
+        Err(Error::TypeNotRegistered)
+    );
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+    assert!(!maps.contains("libFabricRuntime") && !maps.contains("libFabricCommon"));
+    let environment = fs::read(format!("/proc/{pid}/environ")).unwrap();
+    assert!(!environment.split(|b| *b == 0).any(|item| {
+        item.starts_with(b"LD_LIBRARY_PATH=") || item.starts_with(b"FabricConfigFileName=")
+    }));
+    let lease = owner.host_lease().unwrap();
+    for action in ["ReplicaOpen", "ReplicaClose"] {
+        assert!(matches!(
+            lease.send_lifecycle(action, vec![]),
+            Err(fube_transport::Error::Protocol(_))
+        ));
+    }
+    std::thread::sleep(Duration::from_millis(4500));
+    assert!(owner.poll_registration().unwrap(), "{:?}", owner.logs());
+    assert_eq!(
+        owner
+            .lookup_registration(&request)
+            .unwrap()
+            .candidate
+            .unwrap()
+            .runtime_id,
+        registration.runtime_id,
+        "finite renewal must retain the original registered runtime"
+    );
+    let logs = owner.logs();
+    assert!(logs
+        .iter()
+        .any(|line| line.contains("LOCAL_STATEFUL_REGISTERED")));
+    assert!(!logs.iter().any(|line| line.contains("LOCAL_CALLBACK")));
+    assert_eq!(owner.process_status().unwrap().dropped_log_records, 0);
+    assert_eq!(owner.residency().resources().acquisitions, 0);
+    assert!(owner.terminate().unwrap());
+    fixture.assert_released(&owner, pid, &root);
+}
+
+#[test]
+fn stateful_registration_cannot_renew_after_local_authority_withdrawal() {
+    let fixture = Fixture::stateful();
+    let mut options = fixture.options();
+    options.profile = Profile::VolatileStatefulRegistration;
+    options.lease_duration = Duration::from_secs(2);
+    let mut owner = Activation::new(options).unwrap();
+    owner.start(&fixture.package, "fabric:/Local", &[]).unwrap();
+    owner.wait_registration(Duration::from_secs(5)).unwrap();
+    let pid = owner.process_status().unwrap().pid;
+    let root = owner.root().unwrap().to_path_buf();
+    owner.host_lease().unwrap().stop_renewal();
+    let end = std::time::Instant::now() + Duration::from_secs(6);
+    while owner.poll_registration().is_ok() {
+        assert!(
+            std::time::Instant::now() < end,
+            "finite authority must expire"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!owner
+        .logs()
+        .iter()
+        .any(|line| line.contains("LOCAL_CALLBACK")));
+    assert!(owner.terminate().unwrap());
+    fixture.assert_released(&owner, pid, &root);
+}
+
+#[test]
+fn stateful_package_requires_explicit_profile_and_rejects_persistence_before_launch() {
+    let fixture = Fixture::stateful();
+    let mut owner = Activation::new(fixture.options()).unwrap();
+    assert!(owner.start(&fixture.package, "fabric:/Local", &[]).is_err());
+    assert!(owner.root().is_none() && owner.process_status().is_none());
+    let service = fixture.package.join("LocalService/ServiceManifest.xml");
+    let xml = fs::read_to_string(&service).unwrap();
+    fs::write(
+        &service,
+        xml.replace("HasPersistedState=\"false\"", "HasPersistedState=\"true\""),
+    )
+    .unwrap();
+    let mut options = fixture.options();
+    options.profile = Profile::VolatileStatefulRegistration;
+    let mut owner = Activation::new(options).unwrap();
+    assert!(owner.start(&fixture.package, "fabric:/Local", &[]).is_err());
+    assert!(owner.root().is_none() && owner.process_status().is_none());
+    assert_eq!(fs::read_dir(&fixture.parent).unwrap().count(), 1);
+}
+
+#[test]
+fn stateful_factory_cannot_register_a_type_outside_the_admitted_package() {
+    let fixture = Fixture::stateful();
+    for path in [
+        "ApplicationManifest.xml",
+        "LocalService/ServiceManifest.xml",
+    ] {
+        let path = fixture.package.join(path);
+        let xml = fs::read_to_string(&path).unwrap();
+        fs::write(
+            path,
+            xml.replace("LocalStatefulType", "DifferentDeclaredType"),
+        )
+        .unwrap();
+    }
+    let mut options = fixture.options();
+    options.profile = Profile::VolatileStatefulRegistration;
+    let mut owner = Activation::new(options).unwrap();
+    owner.start(&fixture.package, "fabric:/Local", &[]).unwrap();
+    assert!(owner.wait_registration(Duration::from_secs(5)).is_err());
+    let outputs = owner.take_outputs().unwrap().unwrap();
+    assert!(
+        outputs.operations.iter().any(|operation| {
+            operation.action == "RegisterServiceTypeRequest"
+                && operation.primary == Err(Error::InvalidServiceType)
+        }),
+        "{outputs:?}"
+    );
+    assert!(!owner
+        .logs()
+        .iter()
+        .any(|line| line.contains("LOCAL_STATEFUL_REGISTERED") || line.contains("LOCAL_CALLBACK")));
+    let pid = owner.process_status().unwrap().pid;
+    let root = owner.root().unwrap().to_path_buf();
+    assert!(owner.terminate().unwrap());
+    fixture.assert_released(&owner, pid, &root);
 }
 
 #[test]

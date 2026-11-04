@@ -367,6 +367,14 @@ qualification below. Shared validation/materialization/supervision changes
 require both profiles; never inject native loader variables into the Rust child
 or relabel a historical receipt as current source.
 
+The same activation target includes the explicit
+[volatile stateful registration-only profile](cluster/HostingLocalActivation.md#opt-in-volatile-stateful-registration):
+real stateful factory registration and lookup, no replica callback, finite
+renewal/withdrawal, unsupported package rejection and owned physical cleanup.
+The lifecycle target additionally rejects this profile before stateless Node
+construction. These tests are native-free Hosting evidence, not stateful
+RA/RAP deployment or M2 qualification.
+
 ### Owned local stateless RA/RAP
 
 The [production local lifecycle guide](cluster/StatelessRaRap.md) separates

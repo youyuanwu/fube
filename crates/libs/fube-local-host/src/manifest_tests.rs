@@ -9,6 +9,18 @@ const SERVICE: &str = r#"<ServiceManifest xmlns="http://schemas.microsoft.com/20
 <ServiceTypes><StatelessServiceType ServiceTypeName="OtherType"/></ServiceTypes>
 <CodePackage Name="Bin" Version="v4"><EntryPoint><ExeHost><Program>bin/program</Program><Arguments>[Args]</Arguments></ExeHost></EntryPoint></CodePackage>
 <Resources><Endpoints><Endpoint Name="Control" Protocol="tcp" Type="Internal" Port="32123"/></Endpoints></Resources></ServiceManifest>"#;
+fn stateful_manifests() -> (String, String) {
+    (
+        APP.replace("StatelessService", "StatefulService").replace(
+            r#"InstanceCount="[Count]""#,
+            r#"TargetReplicaSetSize="[Count]" MinReplicaSetSize="1""#,
+        ),
+        SERVICE.replace(
+            r#"<StatelessServiceType ServiceTypeName="OtherType"/>"#,
+            r#"<StatefulServiceType ServiceTypeName="OtherType" HasPersistedState="false"/>"#,
+        ),
+    )
+}
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -128,6 +140,138 @@ fn defaults_overrides_and_native_layout_are_not_fixture_constants() {
         }
     }
     fs::remove_dir_all(bundle.root).unwrap();
+}
+
+#[test]
+fn volatile_stateful_registration_requires_opt_in_and_materializes_both_type_declarations() {
+    let fixture = Fixture::new();
+    let (app, service) = stateful_manifests();
+    fixture.write(&app, &service);
+    assert!(
+        fixture.load(&[]).is_err(),
+        "default admission stays stateless"
+    );
+    let package = Package::load_with_profile(
+        &fixture.0,
+        "fabric:/Local",
+        &[],
+        Profile::VolatileStatefulRegistration,
+    )
+    .unwrap();
+    let bundle = Deployment::from_manifest(&std::env::temp_dir(), &package).unwrap();
+    for file in [
+        "OtherPackage.Manifest.v3.xml",
+        "OtherPackage.Package.Current.xml",
+    ] {
+        let xml = fs::read_to_string(bundle.application.join(file)).unwrap();
+        let doc = document(&xml).unwrap();
+        let declaration = doc
+            .descendants()
+            .find(|n| n.has_tag_name((NS, "StatefulServiceType")))
+            .unwrap();
+        assert_eq!(declaration.attribute("ServiceTypeName"), Some("OtherType"));
+        assert_eq!(declaration.attribute("HasPersistedState"), Some("false"));
+        assert!(!doc
+            .descendants()
+            .any(|n| n.has_tag_name((NS, "StatelessServiceType"))));
+    }
+    bundle.release().unwrap();
+}
+
+#[test]
+fn stateful_registration_rejects_persistence_mismatches_and_broader_package_shapes() {
+    let fixture = Fixture::new();
+    let (app, service) = stateful_manifests();
+    for (app, service) in [
+        (APP.into(), SERVICE.into()),
+        (app.clone(), SERVICE.into()),
+        (APP.into(), service.clone()),
+        (
+            app.clone(),
+            service.replace(
+                r#"HasPersistedState="false""#,
+                r#"HasPersistedState="true""#,
+            ),
+        ),
+        (
+            app.clone(),
+            service.replace(r#" HasPersistedState="false""#, ""),
+        ),
+        (
+            app.replace(r#"MinReplicaSetSize="1""#, r#"MinReplicaSetSize="2""#),
+            service.clone(),
+        ),
+        (
+            app.replace(
+                r#"TargetReplicaSetSize="[Count]""#,
+                r#"TargetReplicaSetSize="3""#,
+            ),
+            service.clone(),
+        ),
+        (
+            app.replace("<SingletonPartition/>", "<UniformInt64Partition/>"),
+            service.clone(),
+        ),
+        (
+            app.replace("SharedProcess", "ExclusiveProcess"),
+            service.clone(),
+        ),
+        (
+            app.clone(),
+            service.replace(
+                "ServiceTypeName=\"OtherType\"",
+                "ServiceTypeName=\"WrongType\"",
+            ),
+        ),
+        (
+            app.clone(),
+            service.replace(
+                "</ServiceTypes>",
+                "<StatelessServiceType ServiceTypeName=\"Second\"/></ServiceTypes>",
+            ),
+        ),
+        (
+            app.clone(),
+            service.replace(
+                "</CodePackage>",
+                "</CodePackage><CodePackage Name=\"Second\" Version=\"1\"/>",
+            ),
+        ),
+        (
+            app.clone(),
+            service.replace(
+                "<Resources>",
+                "<ConfigPackage Name=\"Config\" Version=\"1\"/><Resources>",
+            ),
+        ),
+        (
+            app.clone(),
+            service.replace(
+                "<Resources>",
+                "<DataPackage Name=\"Data\" Version=\"1\"/><Resources>",
+            ),
+        ),
+    ] {
+        fixture.write(&app, &service);
+        assert!(
+            Package::load_with_profile(
+                &fixture.0,
+                "fabric:/Local",
+                &[],
+                Profile::VolatileStatefulRegistration,
+            )
+            .is_err(),
+            "{app}\n{service}"
+        );
+    }
+    fixture.write(&app, &service);
+    assert!(Package::load_with_profile(
+        &fixture.0,
+        "fabric:/Local",
+        &[("Count".into(), "2".into())],
+        Profile::VolatileStatefulRegistration,
+    )
+    .is_err());
 }
 
 #[test]

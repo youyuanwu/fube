@@ -11,6 +11,14 @@ pub const NS: &str = "http://schemas.microsoft.com/2011/01/fabric";
 const XML_LIMIT: u64 = 1024 * 1024;
 type Parameters = BTreeMap<String, String>;
 
+/// Exact package admission, not permission to open a service or replica.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Profile {
+    #[default]
+    Stateless,
+    VolatileStatefulRegistration,
+}
+
 #[derive(Debug)]
 pub struct Endpoint {
     pub name: String,
@@ -19,6 +27,7 @@ pub struct Endpoint {
 
 #[derive(Debug)]
 pub struct Package {
+    pub profile: Profile,
     pub application_type: String,
     pub application_version: String,
     pub application_name: String,
@@ -201,6 +210,15 @@ impl Package {
         application_name: &str,
         overrides: &[(String, String)],
     ) -> Result<Self> {
+        Self::load_with_profile(directory, application_name, overrides, Profile::Stateless)
+    }
+
+    pub fn load_with_profile(
+        directory: &Path,
+        application_name: &str,
+        overrides: &[(String, String)],
+        profile: Profile,
+    ) -> Result<Self> {
         let suffix = application_name
             .strip_prefix("fabric:/")
             .ok_or_else(|| invalid("application name must start with fabric:/"))?;
@@ -283,11 +301,15 @@ impl Package {
         let defaults = one(app, "DefaultServices")?;
         shape(defaults, "DefaultServices", &[], &["Service"])?;
         let service = one(defaults, "Service")?;
+        let (service_kind, type_kind) = match profile {
+            Profile::Stateless => ("StatelessService", "StatelessServiceType"),
+            Profile::VolatileStatefulRegistration => ("StatefulService", "StatefulServiceType"),
+        };
         shape(
             service,
             "Service",
             &["Name", "ServicePackageActivationMode"],
-            &["StatelessService"],
+            &[service_kind],
         )?;
         let service_name = id_attr(service, "Name", &params)?;
         if let Some(activation) = service.attribute("ServicePackageActivationMode") {
@@ -296,20 +318,35 @@ impl Package {
                 "only SharedProcess activation is supported",
             )?;
         }
-        let stateless = one(service, "StatelessService")?;
+        let description = one(service, service_kind)?;
+        let service_attributes: &[&str] = match profile {
+            Profile::Stateless => &["ServiceTypeName", "InstanceCount"],
+            Profile::VolatileStatefulRegistration => &[
+                "ServiceTypeName",
+                "TargetReplicaSetSize",
+                "MinReplicaSetSize",
+            ],
+        };
         shape(
-            stateless,
-            "StatelessService",
-            &["ServiceTypeName", "InstanceCount"],
+            description,
+            service_kind,
+            service_attributes,
             &["SingletonPartition"],
         )?;
-        let service_type = id_attr(stateless, "ServiceTypeName", &params)?;
-        require(
-            attr(stateless, "InstanceCount", &params)? == "1",
-            "only InstanceCount=1 is supported",
-        )?;
+        let service_type = id_attr(description, "ServiceTypeName", &params)?;
+        match profile {
+            Profile::Stateless => require(
+                attr(description, "InstanceCount", &params)? == "1",
+                "only InstanceCount=1 is supported",
+            )?,
+            Profile::VolatileStatefulRegistration => require(
+                attr(description, "TargetReplicaSetSize", &params)? == "1"
+                    && attr(description, "MinReplicaSetSize", &params)? == "1",
+                "only volatile stateful target/minimum=1/1 is supported",
+            )?,
+        }
         shape(
-            one(stateless, "SingletonPartition")?,
+            one(description, "SingletonPartition")?,
             "SingletonPartition",
             &[],
             &[],
@@ -335,12 +372,22 @@ impl Package {
             "service manifest import identity/version mismatch",
         )?;
         let types = one(manifest, "ServiceTypes")?;
-        shape(types, "ServiceTypes", &[], &["StatelessServiceType"])?;
-        let declared = one(types, "StatelessServiceType")?;
-        shape(declared, "StatelessServiceType", &["ServiceTypeName"], &[])?;
+        shape(types, "ServiceTypes", &[], &[type_kind])?;
+        let declared = one(types, type_kind)?;
+        let type_attributes: &[&str] = match profile {
+            Profile::Stateless => &["ServiceTypeName"],
+            Profile::VolatileStatefulRegistration => &["ServiceTypeName", "HasPersistedState"],
+        };
+        shape(declared, type_kind, type_attributes, &[])?;
+        if profile == Profile::VolatileStatefulRegistration {
+            require(
+                attr(declared, "HasPersistedState", &params)? == "false",
+                "stateful registration requires explicit HasPersistedState=false",
+            )?;
+        }
         require(
             id_attr(declared, "ServiceTypeName", &params)? == service_type,
-            "default service type is not the declared stateless type",
+            "default service type is not the declared type",
         )?;
         let code = one(manifest, "CodePackage")?;
         shape(code, "CodePackage", &["Name", "Version"], &["EntryPoint"])?;
@@ -428,6 +475,7 @@ impl Package {
             )?;
         }
         Ok(Self {
+            profile,
             application_type,
             application_version,
             application_name: application_name.into(),
@@ -451,10 +499,17 @@ impl Package {
     }
 
     pub fn types_xml(&self) -> String {
-        format!(
-            r#"<ServiceTypes><StatelessServiceType ServiceTypeName="{}" /></ServiceTypes>"#,
-            escape(&self.service_type)
-        )
+        let declaration = match self.profile {
+            Profile::Stateless => format!(
+                r#"<StatelessServiceType ServiceTypeName="{}" />"#,
+                escape(&self.service_type)
+            ),
+            Profile::VolatileStatefulRegistration => format!(
+                r#"<StatefulServiceType ServiceTypeName="{}" HasPersistedState="false" />"#,
+                escape(&self.service_type)
+            ),
+        };
+        format!("<ServiceTypes>{declaration}</ServiceTypes>")
     }
 
     pub fn code_xml(&self) -> String {

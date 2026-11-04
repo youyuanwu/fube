@@ -12,7 +12,7 @@ that source. See [Hosting design](RustHosting.md) and
 ## Profile and package
 
 The public [`local::Activation`](../../crates/libs/fube-hosting/src/local.rs#L92-L185)
-owns one trusted local application, one SharedProcess service package, one
+defaults to one trusted local application, one SharedProcess service package, one
 stateless singleton service/type with InstanceCount=1, and one ExeHost code
 package. Linux trusted numeric-loopback/no-TLS IPC is required. There is no
 cross-owner placement catalog: callers must not activate competing hosts for the
@@ -40,7 +40,7 @@ retains the [manifest profile](../runtime/ManifestTestHost.md#exact-supported-xm
 allowlisted XML/attributes/namespaces, bounded literal parameters and whitespace
 argv, Work or CodePackage working folder, optional fixed internal TCP endpoint
 metadata, safe relative identifiers, executable regular Program and no code-tree
-symlinks/nonregular files. Config/data, stateful, multiple imports/code packages,
+symlinks/nonregular files. Config/data, stateful replica lifecycle, multiple imports/code packages,
 exclusive activation, setup/guest/DLL/container, unsupported policies/topology,
 ImageStore downloads and resource governance are not enabled. Endpoint metadata
 does not reserve ports. Inputs must stay trusted and immutable through copy;
@@ -49,6 +49,40 @@ this is not a hostile filesystem or malicious-same-user sandbox.
 The existing run parent must resolve outside the source Code directory.
 Canonical path checks reject equal or nested paths, including symlink aliases,
 before reserving a root, and recheck separation before materialization.
+
+### Opt-in volatile stateful registration
+
+Set `Options::profile` to
+`fube_hosting::local::Profile::VolatileStatefulRegistration` before constructing
+the owner. This admits exactly one `StatefulService` with `SingletonPartition`,
+explicit target/minimum **1/1**, and one matching `StatefulServiceType` with
+explicit `HasPersistedState="false"`. The remaining package, host/security and
+process ownership restrictions above are unchanged. The default profile and
+native test-host `Package::load` remain stateless-only; this is not automatic
+profile detection or mixed-package admission.
+
+Materialization preserves the stateful declaration in both the service manifest
+and digested service-package XML. The real application attaches normally and
+registers its stateful factory through actor 9 on the exact owned PID/package/
+runtime/session. Lookup is a registration fact, not replica readiness. Native
+type-registration messages carry the type identity/context, not a new
+stateful-kind field; no wire schema is added.
+
+The [separate minimal fixture](../../crates/samples/hosting-local-app/pkg-stateful)
+registers `LocalStatefulType`; its `create_replica` records an observation and
+returns an explicit unsupported-profile error if unexpectedly invoked.
+Registration never calls it. This profile rejects the stateless local Node
+composition and lifecycle sends on its returned `HostLease`, before any RAP
+Open/Close is submitted. Lease renewal/withdrawal and explicit owned cleanup
+remain available. No stateful RA/RAP lifecycle, primary role, application data,
+config/data packages, replication or recovery is enabled.
+
+The native-free `hosting-local-app` activation tests execute actual registration,
+same-runtime lookup and renewal across multiple finite lease intervals, reject
+undeclared registration and persisted admission, verify no replica callback, and
+independently check reaping/group drainage/root removal. A separate authority
+withdrawal test observes terminal expiry and cleanup. These are not deployed
+native stateful qualification or M2 completion.
 
 ## Ownership and usage
 

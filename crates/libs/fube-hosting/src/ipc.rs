@@ -228,8 +228,13 @@ impl Shared {
 #[derive(Clone)]
 pub struct HostLease {
     entry: Arc<Entry>,
+    lifecycle_enabled: bool,
 }
 impl HostLease {
+    pub(crate) fn registration_only(mut self) -> Self {
+        self.lifecycle_enabled = false;
+        self
+    }
     /// Fault injection only. The opaque source remains this exact owned Entry;
     /// this never fabricates another host/PID/session or bypasses Node admission.
     #[cfg(feature = "qualification")]
@@ -258,7 +263,11 @@ impl HostLease {
     }
     /// Begin a bounded semantic one-way send on this exact admitted session.
     /// Success of the returned observer means only a complete local frame write.
+    /// Registration-only activation handles reject before submitting any work.
     pub fn send_lifecycle(&self, action: &str, body: Vec<u8>) -> TransportResult<LifecycleSend> {
+        if !self.lifecycle_enabled {
+            return Err(protocol("registration-only Hosting profile"));
+        }
         if !matches!(action, "ReplicaOpen" | "ReplicaClose") || body.len() > MAX_INPUT {
             return Err(protocol("unsupported local lifecycle action/body"));
         }
@@ -1004,7 +1013,10 @@ impl Server {
             results: VecDeque::new(),
             registration_consumer: None,
         });
-        Ok(HostLease { entry })
+        Ok(HostLease {
+            entry,
+            lifecycle_enabled: true,
+        })
     }
     /// Release/replacement is explicit and fail-closed. A connected incarnation,
     /// retained failure/output or member host cannot be overwritten.
