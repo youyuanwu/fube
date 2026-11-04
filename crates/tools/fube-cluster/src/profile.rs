@@ -285,6 +285,52 @@ pub fn add_body(launch: &Launch, profile: &ActualProfile) -> AddInstance {
     body
 }
 
+/// Trusted local original-owner observation, deliberately outside native
+/// schemas. Semantic Remove and this exact positive proof are separate inputs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetirementReceipt {
+    pub deployment: String,
+    pub session: String,
+    #[serde(with = "json_node")]
+    pub node: NodeInstance,
+    #[serde(with = "json_node")]
+    pub fm: NodeInstance,
+    #[serde(with = "json_generation")]
+    pub generation: GenerationHeader,
+    pub node_pid: u32,
+    pub app_pid: u32,
+    pub runtime_root: PathBuf,
+    pub disposal: fube_node::local::InstanceDisposal,
+}
+impl RetirementReceipt {
+    pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
+        let proof = &self.disposal;
+        if self.deployment != launch.deployment
+            || self.session != launch.session
+            || self.node != launch.node
+            || self.fm != launch.fm
+            || self.generation != launch.generation
+            || self.node_pid != node_pid
+            || self.app_pid != profile.app_pid
+            || self.runtime_root != profile.runtime_root
+            || proof.body.unit != add_body(launch, profile).unit
+            || proof.body.service != add_body(launch, profile).service
+            || proof.body.replica.node != launch.node
+            || proof.body.replica.version != profile.version
+            || proof.command == 0
+            || proof.ra_operation == 0
+            || proof.lookup == 0
+            || proof.acquisition == 0
+            || proof.host.is_empty()
+            || proof.runtime.is_empty()
+        {
+            return Err("retirement proof does not match original owner/profile".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CleanupReceipt {

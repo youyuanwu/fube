@@ -107,6 +107,19 @@ error follows the existing runtime Abort/disposal path before semantic success;
 actual failed/absent semantic completion instead retains RA retry/ownership.
 Service Close alone leaves a healthy shared host resident.
 
+[`instance_disposal`](../../crates/libs/fube-node/src/local.rs#L421) exposes a
+bounded positive observation for that exact retired instance. It requires a
+successful original-runtime Close reply admitted through the original IPC
+Entry/lease, its Applied RA command, and release of the original paired
+acquisition. Command, RA operation, lookup and acquisition IDs are distinct
+lineages, not interchangeable authority. It rechecks current committed identity,
+unfenced original owner, drained local work and live unchanged host/session.
+A Closed snapshot, Remove response, zero count or PID disappearance cannot
+construct it; successor admission invalidates it. Caller-owned external
+replica/report escrow and semantic deletion remain separate prerequisites.
+The [foreground cluster](MinimalFmCluster.md) joins those prerequisites before
+recreation without restarting the FM, Node or app host.
+
 `terminate` is a separate explicit physical cleanup request. With live usage it
 can kill/drain/reap yet return Busy, retaining exact accounting and the directory.
 Drive actual HostClosed/RA/exact-use work and retry cleanup. If termination

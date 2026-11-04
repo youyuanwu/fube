@@ -138,6 +138,18 @@ struct Expected {
     node_pid: u32,
     app_pid: u32,
     node_id: String,
+    node_start: String,
+    app_start: String,
+}
+fn process_start(pid: u32) -> String {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    stat.rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .to_string()
 }
 impl Expected {
     fn capture(root: &Path, node: usize) -> Self {
@@ -147,24 +159,39 @@ impl Expected {
         let id: [u8; 16] = serde_json::from_value(launch["node"]["id"].clone()).unwrap();
         let high = u64::from_le_bytes(id[..8].try_into().unwrap());
         let low = u64::from_le_bytes(id[8..].try_into().unwrap());
+        let node_pid = actual["pid"].as_u64().unwrap() as u32;
+        let app_pid = actual["profile"]["app_pid"].as_u64().unwrap() as u32;
         Self {
             launch,
-            node_pid: actual["pid"].as_u64().unwrap() as u32,
-            app_pid: actual["profile"]["app_pid"].as_u64().unwrap() as u32,
+            node_pid,
+            app_pid,
             node_id: format!("{high:016x}{low:016x}"),
+            node_start: process_start(node_pid),
+            app_start: process_start(app_pid),
         }
     }
     fn assert_response(&self, actual: &Value) {
+        self.assert_lifetime(actual, 0);
+    }
+    fn assert_lifetime(&self, actual: &Value, ordinal: i64) {
         assert_eq!(actual["profile"], "fube-cluster-stateless-v1");
         assert_eq!(actual["node"], self.node_id);
         assert_eq!(actual["node_instance"], self.launch["node"]["instance"]);
         assert_eq!(actual["node_pid"], self.node_pid);
         assert_eq!(actual["app_pid"], self.app_pid);
         assert_eq!(actual["partition"], self.launch["partition"]);
-        assert_eq!(actual["replica"], self.launch["replica"]);
-        assert_eq!(actual["incarnation"], self.launch["incarnation"]);
+        assert_eq!(
+            actual["replica"],
+            self.launch["replica"].as_i64().unwrap() + ordinal
+        );
+        assert_eq!(
+            actual["incarnation"],
+            self.launch["incarnation"].as_i64().unwrap() + ordinal
+        );
         assert_eq!(actual["service"], "fabric:/Cluster/Service");
         assert_eq!(actual["service_type"], "ClusterStatelessType");
+        assert_eq!(process_start(self.node_pid), self.node_start);
+        assert_eq!(process_start(self.app_pid), self.app_start);
     }
     fn assert_gone(&self) {
         assert!(!Path::new(&format!("/proc/{}", self.node_pid)).exists());
@@ -189,7 +216,7 @@ fn poll(owner: &mut Foreground, next: &mut usize, predicate: impl Fn(&Value) -> 
 }
 
 #[test]
-fn actual_foreground_two_node_profile_contact_delete_and_clean_relaunch() {
+fn actual_foreground_reuses_both_nodes_with_fresh_instances_and_clean_relaunch() {
     let parent = support::parent();
     assert!(parent.is_absolute() && parent.is_dir());
     let root = parent.join(format!("foreground-{}", uuid::Uuid::new_v4()));
@@ -204,6 +231,7 @@ fn actual_foreground_two_node_profile_contact_delete_and_clean_relaunch() {
     assert_ne!(one.node_pid, two.node_pid);
     assert_ne!(one.app_pid, two.app_pid);
     assert_ne!(one.node_pid, owner.child.id());
+    let fm_start = process_start(owner.child.id());
     for pid in [one.node_pid, two.node_pid, one.app_pid, two.app_pid] {
         let maps = fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
         assert!(!maps.contains("libFabricRuntime") && !maps.contains("libFabricCommon"));
@@ -244,10 +272,8 @@ fn actual_foreground_two_node_profile_contact_delete_and_clean_relaunch() {
         one.launch["partition"],
         "swapped endpoint oracle"
     );
-    assert_eq!(
-        owner.command(&json!({"op":"c1","action":"create","node":1}))["state"],
-        "complete"
-    );
+    let first_result = owner.command(&json!({"op":"c1","action":"create","node":1}));
+    assert_eq!(first_result["state"], "complete");
     assert_eq!(
         owner.command(&json!({"op":"c1","action":"create","node":2}))["state"],
         "rejected"
@@ -275,8 +301,68 @@ fn actual_foreground_two_node_profile_contact_delete_and_clean_relaunch() {
     two.assert_response(&contact(&second));
     assert_eq!(
         owner.command(&json!({"op":"recreate","action":"create","node":1}))["state"],
-        "rejected"
+        "pending"
     );
+    let running = poll(&mut owner, &mut next, |status| {
+        status["nodes"][0]["observed"] == "running"
+    });
+    let new_first = running["nodes"][0]["endpoint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    one.assert_lifetime(&contact(&new_first), 1);
+    two.assert_response(&contact(&second));
+    assert_eq!(
+        owner.command(&json!({"op":"c1","action":"create","node":1})),
+        first_result
+    );
+    assert_eq!(
+        owner.command(&json!({"op":"d2","action":"delete","node":2}))["state"],
+        "pending"
+    );
+    let retired = poll(&mut owner, &mut next, |status| {
+        status["nodes"][1]["observed"] == "absent"
+    });
+    assert_eq!(retired["nodes"][1]["reusable"], true);
+    assert_eq!(retired["nodes"][1]["retired_lifetimes"], 1);
+    assert!(TcpStream::connect(&second).is_err());
+    one.assert_lifetime(&contact(&new_first), 1);
+    assert_eq!(
+        owner.command(&json!({"op":"recreate2","action":"create","node":2}))["state"],
+        "pending"
+    );
+    let running = poll(&mut owner, &mut next, |status| {
+        status["nodes"][1]["observed"] == "running"
+    });
+    let new_second = running["nodes"][1]["endpoint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    two.assert_lifetime(&contact(&new_second), 1);
+    one.assert_lifetime(&contact(&new_first), 1);
+    assert_eq!(process_start(owner.child.id()), fm_start);
+    for node in 1..=2 {
+        assert_eq!(
+            owner.command(
+                &json!({"op":format!("final-delete{node}"),"action":"delete","node":node})
+            )["state"],
+            "pending"
+        );
+    }
+    let retired = poll(&mut owner, &mut next, |status| {
+        status["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node["observed"] == "absent")
+    });
+    for node in retired["nodes"].as_array().unwrap() {
+        assert_eq!(node["reusable"], true);
+        assert_eq!(node["retired_lifetimes"], 2);
+    }
+    assert!(TcpStream::connect(&new_first).is_err());
+    assert!(TcpStream::connect(&new_second).is_err());
+    assert_eq!(process_start(owner.child.id()), fm_start);
     owner.finish();
     one.assert_gone();
     two.assert_gone();
