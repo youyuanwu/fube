@@ -21,6 +21,8 @@ CASES = {
     "empty-service-type-notification", "rich-service-type-notification",
     "empty-service-type-notification-reply", "partial-service-type-notification-reply",
     "action-ServiceTypeNotification", "action-ServiceTypeNotificationReply", "priority-false",
+    "fresh-node-up", "rich-node-up", "fresh-node-up-ack", "rich-node-up-ack",
+    "action-NodeUp", "action-NodeUpAck", "actor-13", "direct-ptop", "rich-ptop",
 }
 
 
@@ -41,8 +43,9 @@ def validate(bundle, expected_head, expected_source):
     calculated_source = hashlib.sha256(
         json.dumps(manifest.get("source_inputs", {}), sort_keys=True).encode()
     ).hexdigest()
-    if (calculated_source != expected_source or manifest.get("schema_types") != 43
-            or manifest.get("schema_fields") != 129
+    if (calculated_source != expected_source or manifest.get("schema_types") != 59
+            or manifest.get("schema_fields") != 199
+            or manifest.get("native_constants") != {"PToP": 0x8013, "PToPDirect": 0}
             or not manifest.get("native_sources")):
         raise ValueError("source/schema manifest mismatch")
     expected_files = {"schema.h", "native-oracle", "ra-conformance"} | {

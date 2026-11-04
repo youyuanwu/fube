@@ -1,0 +1,7 @@
+<ServiceManifest Name="ClusterService" Version="1.0"
+  xmlns="http://schemas.microsoft.com/2011/01/fabric">
+  <ServiceTypes><StatelessServiceType ServiceTypeName="ClusterStatelessType" /></ServiceTypes>
+  <CodePackage Name="Code" Version="1.0">
+    <EntryPoint><ExeHost><Program>cluster-stateless-app</Program><WorkingFolder>Work</WorkingFolder></ExeHost></EntryPoint>
+  </CodePackage>
+</ServiceManifest>

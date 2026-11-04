@@ -2,13 +2,275 @@
 mod support;
 
 use fube_ra::protocol::*;
-use fube_transport::serialization::serde::{from_slice, to_vec};
+use fube_transport::{
+    message::{Header, Message, ACTION, ACTOR, HIGH_PRIORITY},
+    serialization::serde::{from_slice, to_vec, CountedStrings, ObjectArray},
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{fmt::Debug, fs, path::Path};
+use support::Rich;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Scalar<T> {
     value: T,
+}
+
+// Schema-only adapter for the cluster tool's private PToP shape. This example
+// does not execute its Link/session admission or claim Federation compatibility.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+struct PToP {
+    from: NodeInstance,
+    to: NodeInstance,
+    actor: i64,
+    from_ring: String,
+    to_ring: String,
+    exact_instance: bool,
+}
+
+fn filled<T: Default + Rich>(c: &mut i32) -> T {
+    let mut value = T::default();
+    value.rich(c);
+    value
+}
+
+fn enumeration(c: &mut i32) -> i64 {
+    *c += 1;
+    i64::from(*c % 5)
+}
+
+macro_rules! rich_fields {
+    ($t:ty: $($field:ident),+ $(,)?) => {
+        impl Rich for $t {
+            fn rich(&mut self, c: &mut i32) { $(self.$field.rich(c);)+ }
+        }
+    };
+}
+rich_fields!(FabricCodeVersion: major, minor, build, hotfix);
+rich_fields!(FabricConfigVersion: value);
+rich_fields!(FabricVersion: code, config);
+rich_fields!(FabricVersionInstance: version, instance);
+rich_fields!(ServicePackageInfo: package, version);
+rich_fields!(ServicePackageResourceGovernance: governed, legacy_cpu_cores, memory_mb, cpu_cores);
+
+fn strings(c: &mut i32) -> CountedStrings<Vec<String>> {
+    CountedStrings(vec![filled(c), filled(c)])
+}
+
+fn entry<K: Default + Rich, V: Default + Rich>(c: &mut i32) -> MapEntry<K, V> {
+    MapEntry {
+        key: filled(c),
+        value: filled(c),
+    }
+}
+
+fn rich_uri(c: &mut i32) -> Uri {
+    Uri {
+        kind: enumeration(c),
+        scheme: filled(c),
+        authority: filled(c),
+        host_kind: enumeration(c),
+        host: filled(c),
+        port: filled(c),
+        path: filled(c),
+        query: filled(c),
+        fragment: filled(c),
+        segments: strings(c),
+    }
+}
+
+fn fresh_version() -> FabricVersionInstance {
+    FabricVersionInstance {
+        version: FabricVersion {
+            code: FabricCodeVersion {
+                major: 1,
+                minor: 0,
+                build: 960,
+                hotfix: 0,
+            },
+            config: FabricConfigVersion {
+                value: "__default__".into(),
+            },
+        },
+        instance: 0,
+    }
+}
+
+fn fresh_node_up() -> NodeUp {
+    NodeUp {
+        node: NodeDescription {
+            name: "node-2".into(),
+            node_type: "stateless".into(),
+            address: "127.0.0.2".into(),
+            cluster_connection_port: 45000,
+            version: fresh_version(),
+            ..NodeDescription::default()
+        },
+        packages: ObjectArray(vec![]),
+        any_replica_found: false,
+    }
+}
+
+fn rich_node_up() -> NodeUp {
+    let c = &mut 0;
+    let mut node = NodeDescription {
+        upgrade_domain: filled(c),
+        fault_domains: ObjectArray(vec![rich_uri(c), rich_uri(c)]),
+        properties: ObjectArray(vec![entry(c)]),
+        capacity_ratios: ObjectArray(vec![entry(c)]),
+        capacities: ObjectArray(vec![entry(c)]),
+        version: filled(c),
+        name: filled(c),
+        node_type: filled(c),
+        address: filled(c),
+        cluster_connection_port: filled(c),
+        http_gateway_port: 0,
+    };
+    *c += 1;
+    node.http_gateway_port = 60000 + *c as u16;
+    let packages = filled(c);
+    let _: bool = filled(c);
+    NodeUp {
+        node,
+        packages,
+        any_replica_found: true,
+    }
+}
+
+fn rich_package_upgrade(c: &mut i32) -> ServicePackageUpgradeSpecification {
+    ServicePackageUpgradeSpecification {
+        package_name: filled(c),
+        rollout: filled(c),
+        code_package_info_included: filled(c),
+        code_package_names: strings(c),
+    }
+}
+
+fn rich_removal(c: &mut i32) -> ServiceTypeRemovalSpecification {
+    ServiceTypeRemovalSpecification {
+        package_name: filled(c),
+        rollout: filled(c),
+        type_names: CountedStrings(vec![filled(c)]),
+    }
+}
+
+fn rich_upgrade(c: &mut i32) -> UpgradeDescription {
+    UpgradeDescription {
+        specification: ApplicationUpgradeSpecification {
+            application: filled(c),
+            version: filled(c),
+            instance: filled(c),
+            upgrade_type: enumeration(c),
+            monitored: filled(c),
+            packages: ObjectArray(vec![rich_package_upgrade(c), rich_package_upgrade(c)]),
+            application_name: filled(c),
+            removed_types: ObjectArray(vec![rich_removal(c), rich_removal(c)]),
+            manual: filled(c),
+            resource_governance: ObjectArray(vec![entry(c)]),
+            container_images: ObjectArray(vec![MapEntry {
+                key: filled(c),
+                value: CodePackageContainerImages { images: strings(c) },
+            }]),
+            networks: strings(c),
+        },
+    }
+}
+
+fn rich_ack() -> NodeUpAck {
+    let c = &mut 0;
+    let upgrades = ObjectArray(vec![rich_upgrade(c), rich_upgrade(c)]);
+    let version = filled(c);
+    let _: bool = filled(c);
+    NodeUpAck {
+        upgrades,
+        version,
+        activated: false,
+        activation_sequence: filled(c),
+    }
+}
+
+fn direct_ptop() -> PToP {
+    PToP {
+        from: NodeInstance {
+            id: [0x11; 16],
+            instance: 0x8000_0000_0000_0001,
+        },
+        to: NodeInstance {
+            id: [0x22; 16],
+            instance: 0x8000_0000_0000_0002,
+        },
+        actor: 0,
+        from_ring: String::new(),
+        to_ring: String::new(),
+        exact_instance: true,
+    }
+}
+
+fn rich_ptop() -> PToP {
+    let c = &mut 0;
+    let from = filled(c);
+    let to = filled(c);
+    let _ = enumeration(c);
+    let from_ring = filled(c);
+    let to_ring = filled(c);
+    let _: bool = filled(c);
+    PToP {
+        from,
+        to,
+        actor: 2,
+        from_ring,
+        to_ring,
+        exact_instance: false,
+    }
+}
+
+fn native_envelope(input: &Path, body: &str, ack: bool) -> Message {
+    let mut headers: Vec<_> = [
+        (ACTOR, if ack { "actor-13" } else { "actor-11" }),
+        (
+            ACTION,
+            if ack {
+                "action-NodeUpAck"
+            } else {
+                "action-NodeUp"
+            },
+        ),
+        (HIGH_PRIORITY, "priority"),
+    ]
+    .into_iter()
+    .map(|(id, name)| Header {
+        id,
+        value: fs::read(input.join(format!("{name}.bin"))).unwrap(),
+    })
+    .collect();
+    if ack {
+        headers.push(Header {
+            id: GENERATION_HEADER,
+            value: fs::read(input.join("fm-generation.bin")).unwrap(),
+        });
+    }
+    Message {
+        headers,
+        body: fs::read(input.join(format!("{body}.bin"))).unwrap(),
+    }
+}
+
+fn factory_contract(native: &Message, rust: &Message) {
+    let expected = native.properties().unwrap();
+    let actual = rust.properties().unwrap();
+    assert_eq!(actual.actor, expected.actor);
+    assert_eq!(actual.action, expected.action);
+    assert_eq!(actual.high_priority, expected.high_priority);
+    assert_eq!(rust.headers.len(), native.headers.len());
+}
+
+fn reject_prefixes<T: DeserializeOwned>(input: &Path, name: &str) {
+    let bytes = fs::read(input.join(format!("{name}.bin"))).unwrap();
+    for end in 0..bytes.len() {
+        assert!(
+            from_slice::<T>(&bytes[..end]).is_err(),
+            "{name}: prefix {end}"
+        );
+    }
 }
 
 fn check<T: Serialize + DeserializeOwned + Debug + PartialEq>(
@@ -75,7 +337,7 @@ fn main() {
         "fmm-generation",
         support::rich_generation(true),
     );
-    for value in [10_i64, 11, 12] {
+    for value in [10_i64, 11, 12, 13] {
         check(input, output, &format!("actor-{value}"), Scalar { value });
     }
     check(
@@ -134,6 +396,8 @@ fn main() {
         "ReplicaUpReply",
         "ServiceTypeNotification",
         "ServiceTypeNotificationReply",
+        "NodeUp",
+        "NodeUpAck",
     ] {
         check(
             input,
@@ -169,6 +433,47 @@ fn main() {
         support::partial_notification_reply(),
     );
     check(input, output, "priority-false", Scalar { value: false });
+    for (name, expected, fresh) in [
+        ("fresh-node-up", fresh_node_up(), true),
+        ("rich-node-up", rich_node_up(), false),
+    ] {
+        check(input, output, name, expected.clone());
+        let native = native_envelope(input, name, false);
+        let decoded = decode_node_up(&native).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(decoded.validate_fresh_stateless().is_ok(), fresh);
+        let made = node_up_message(&expected).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(decode_node_up(&made).unwrap(), expected);
+        reject_prefixes::<NodeUp>(input, name);
+    }
+    let fresh_ack = NodeUpAck {
+        upgrades: ObjectArray(vec![]),
+        version: fresh_version(),
+        activated: true,
+        activation_sequence: 7,
+    };
+    for (name, expected, fresh) in [
+        ("fresh-node-up-ack", fresh_ack, true),
+        ("rich-node-up-ack", rich_ack(), false),
+    ] {
+        check(input, output, name, expected.clone());
+        let native = native_envelope(input, name, true);
+        let (decoded, generation) = decode_node_up_ack(&native).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(generation, support::rich_generation(false));
+        assert_eq!(
+            decoded.validate_fresh_activated(&fresh_version()).is_ok(),
+            fresh
+        );
+        let made = node_up_ack_message(&expected, &generation).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(decode_node_up_ack(&made).unwrap(), (expected, generation));
+        reject_prefixes::<NodeUpAck>(input, name);
+    }
+    check(input, output, "direct-ptop", direct_ptop());
+    check(input, output, "rich-ptop", rich_ptop());
+    reject_prefixes::<PToP>(input, "rich-ptop");
     for name in [
         "rich-service-type-notification",
         "partial-service-type-notification-reply",
@@ -194,5 +499,5 @@ fn main() {
             }
         }
     }
-    println!("36 cases verified; all selected-body proper prefixes rejected");
+    println!("45 cases verified; all selected-body proper prefixes rejected");
 }

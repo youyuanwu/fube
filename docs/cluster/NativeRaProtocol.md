@@ -22,12 +22,23 @@ native-stream evidence; complete handlers/runtime/traces remain staged.
 The inventory alone does not establish protocol implementation.
 `AddInstance`/`AddInstanceReply`, `RemoveInstance`/`RemoveInstanceReply` and
 `ReplicaUp`/`ReplicaUpReply` and
-`ServiceTypeNotification`/`ServiceTypeNotificationReply` are the eight selected
-action codecs (58 required boundary actions remain unselected);
+`ServiceTypeNotification`/`ServiceTypeNotificationReply` are the original eight
+selected action codecs. The [minimal FM profile](MinimalFmCluster.md) adds full
+`NodeUp`/`NodeUpAck` schema closure and fixed fresh-empty bootstrap (ten selected
+action codecs; 56 required boundary actions remain unselected).
 the bounded entity slice does not implement Hosting or authorize serving.
 The implementation mapping below supplies actual Rust mappings and evidence
 as each phase lands. A native test anchor is a reference to existing source, not a
 claim that the test was run.
+
+The minimal trusted native-free FM adapter now connects these selected stateless
+exchanges to real local RA/Hosting/RAP and independent application contact.
+Its bootstrap completes the final empty ReplicaUp/Reply before Node admission;
+other rebuild/FMM and unsupported families remain staged. The historical entity
+seam mapping below does not itself describe that separate runnable profile.
+The maintained source-stream oracle now has 45 inputs, 59 types/199 fields and
+49 bundle files, preserving the original 36 cases. It is not deployed native
+FM/Federation evidence; see the [oracle disclosure](../../tests/ra_protocol/README.md).
 
 ### Reconciled counts
 

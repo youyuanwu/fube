@@ -1,0 +1,13 @@
+<ApplicationManifest ApplicationTypeName="ClusterStatelessApp" ApplicationTypeVersion="1.0"
+  xmlns="http://schemas.microsoft.com/2011/01/fabric">
+  <ServiceManifestImport>
+    <ServiceManifestRef ServiceManifestName="ClusterService" ServiceManifestVersion="1.0" />
+  </ServiceManifestImport>
+  <DefaultServices>
+    <Service Name="Service">
+      <StatelessService ServiceTypeName="ClusterStatelessType" InstanceCount="1">
+        <SingletonPartition />
+      </StatelessService>
+    </Service>
+  </DefaultServices>
+</ApplicationManifest>
