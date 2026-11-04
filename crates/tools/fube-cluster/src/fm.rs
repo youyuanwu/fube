@@ -53,6 +53,12 @@ pub enum Bootstrap {
     Admitted,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingPhase {
+    Create,
+    Delete,
+}
+
 #[derive(Clone)]
 pub struct Placement {
     pub launch: Launch,
@@ -67,6 +73,7 @@ pub struct Placement {
     pub error: Option<String>,
     pub link_alive: bool,
     pub catalog_notified: bool,
+    pending: Option<PendingPhase>,
 }
 #[derive(Clone)]
 pub struct Operation {
@@ -99,6 +106,7 @@ impl Placement {
             error: None,
             link_alive: true,
             catalog_notified: false,
+            pending: None,
         }
     }
     pub fn admit_profile(&mut self, profile: ActualProfile) -> Result<()> {
@@ -253,6 +261,7 @@ impl Ledger {
                 placement.desired = Desired::Running;
                 placement.observed = Observed::Pending;
                 placement.create_op = Some(command.op.clone());
+                placement.pending = Some(PendingPhase::Create);
                 Accepted::Create(index, Box::new(body))
             }
             "delete" => {
@@ -267,9 +276,21 @@ impl Ledger {
                     );
                 }
                 let body = placement.body()?;
+                let superseded = if placement.pending == Some(PendingPhase::Create) {
+                    placement.create_op.clone()
+                } else {
+                    None
+                };
                 placement.desired = Desired::Absent;
                 placement.observed = Observed::Pending;
                 placement.delete_op = Some(command.op.clone());
+                placement.pending = Some(PendingPhase::Delete);
+                if let Some(op) = superseded {
+                    self.complete(
+                        &op,
+                        json!({"op":op,"state":"unknown","error":"create superseded by deletion"}),
+                    );
+                }
                 Accepted::Delete(index, Box::new(RemoveInstance::new(body, false)))
             }
             "status" => Accepted::Status,
@@ -301,6 +322,7 @@ impl Ledger {
     pub fn lost(&mut self, index: usize, error: String) {
         let placement = &mut self.placements[index];
         placement.link_alive = false;
+        placement.pending = None;
         placement.observed = Observed::Unknown;
         placement.error = Some(error.clone());
         let operations = [placement.create_op.clone(), placement.delete_op.clone()];
@@ -311,6 +333,24 @@ impl Ledger {
                 &operation,
                 json!({"op":operation,"state":"unknown","error":error}),
             );
+        }
+    }
+    pub fn down(&mut self, index: usize) {
+        let placement = &mut self.placements[index];
+        // A delayed down observation cannot undo confirmed disposal.
+        if placement.observed == Observed::Absent {
+            return;
+        }
+        let error = "native report says original replica is down; replacement forbidden";
+        placement.observed = Observed::Unknown;
+        placement.endpoint = None;
+        placement.error = Some(error.into());
+        if placement.pending == Some(PendingPhase::Create) {
+            placement.pending = None;
+        }
+        let operations = [placement.create_op.clone(), placement.delete_op.clone()];
+        for op in operations.into_iter().flatten() {
+            self.complete(&op, json!({"op":op,"state":"unknown","error":error}));
         }
     }
     pub fn reply(&mut self, index: usize, body: AddInstanceReply, removing: bool) -> Result<()> {
@@ -335,8 +375,42 @@ impl Ledger {
         }
         .clone()
         .ok_or("unsolicited semantic reply")?;
+        let mut endpoint = None;
+        if body.error == 0 {
+            if removing {
+                if placement.desired != Desired::Absent || body.replica.state != 3 {
+                    return Err("Remove reply is not the requested disposed instance".into());
+                }
+            } else {
+                if body.replica.state != 2 || !body.replica.up {
+                    return Err("Add reply is not a ready replica".into());
+                }
+                let address: SocketAddr = body
+                    .replica
+                    .service_endpoint
+                    .parse()
+                    .map_err(|_| "non-numeric app endpoint")?;
+                if !address.ip().is_loopback()
+                    || address.port() == 0
+                    || !body.replica.replication_endpoint.is_empty()
+                {
+                    return Err("unsupported app endpoint".into());
+                }
+                endpoint = Some(address.to_string());
+            }
+        }
+        let phase = if removing {
+            PendingPhase::Delete
+        } else {
+            PendingPhase::Create
+        };
+        if placement.pending != Some(phase) {
+            return Ok(());
+        }
+        placement.pending = None;
         if body.error != 0 {
             placement.observed = Observed::Error;
+            placement.endpoint = None;
             placement.error = Some(format!("native semantic error {}", body.error));
             self.complete(
                 &op,
@@ -345,31 +419,13 @@ impl Ledger {
             return Ok(());
         }
         if removing {
-            if placement.desired != Desired::Absent || body.replica.state != 3 {
-                return Err("Remove reply is not the requested disposed instance".into());
-            }
             placement.observed = Observed::Absent;
             placement.endpoint = None;
         } else {
-            if body.replica.state != 2 || !body.replica.up {
-                return Err("Add reply is not a ready replica".into());
-            }
-            let endpoint: SocketAddr = body
-                .replica
-                .service_endpoint
-                .parse()
-                .map_err(|_| "non-numeric app endpoint")?;
-            if !endpoint.ip().is_loopback()
-                || endpoint.port() == 0
-                || !body.replica.replication_endpoint.is_empty()
-            {
-                return Err("unsupported app endpoint".into());
-            }
-            if placement.desired == Desired::Running {
-                placement.observed = Observed::Running;
-                placement.endpoint = Some(endpoint.to_string());
-            }
+            placement.observed = Observed::Running;
+            placement.endpoint = endpoint;
         }
+        placement.error = None;
         self.complete(
             &op,
             json!({"op":op,"state":"complete",

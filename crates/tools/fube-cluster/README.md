@@ -75,7 +75,11 @@ small interlock files to bypass failed cleanup.
 ## Qualification contract
 
 No nested Cargo invocation, native fixture or implicit build happens in tests.
-The parent runner builds both binaries first and provides existing owned roots:
+Build workspace binaries before archiving. The existing nextest configuration
+explicitly includes the fixed sample app. Tests resolve binaries at runtime from
+the remapped target, and create unique private fixtures under the normal
+temporary parent. No custom developer variables are required by the archive
+consumer. Optional explicit overrides for local runs are:
 
 ```sh
 export FUBE_CLUSTER_APP="$CARGO_TARGET_DIR/debug/cluster-stateless-app"
@@ -84,11 +88,14 @@ export FUBE_CLUSTER_TEST_ROOT="/absolute/task-owned/runs"
 cargo test --locked -p fube-cluster -- --test-threads=1
 ```
 
-Missing executables/root are failures, not silently passing skips. Unit tests
+Missing prebuilt executables/invalid parents are failures, not passing skips.
+The same archived group must run after extraction elsewhere, with the original
+producer target unavailable. Unit tests
 protect exact semantic identities, bootstrap/catalog admission, duplicate and
 capacity behavior. Real executable-node tests fault the original Channel and
 original OwnedApp capability, checking uncertainty with a live endpoint, stale
-generation rejection, sibling isolation, partial-start rollback, lost-node
+generation rejection, phase-eligible terminal completion, semantic report retry
+until actual RA stage clearance, sibling isolation, partial-start rollback, lost-node
 receipt refusal and clean-vs-dirty relaunch. The CLI test launches the real
 foreground executable and both real nodes; its endpoint oracle is captured from
 original launch/activation metadata before create. It verifies all actual app

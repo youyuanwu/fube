@@ -14,6 +14,7 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
+mod support;
 
 struct Foreground {
     child: Child,
@@ -23,9 +24,8 @@ struct Foreground {
 }
 impl Foreground {
     fn start(root: &Path) -> Self {
-        let app = std::env::var_os("FUBE_CLUSTER_APP")
-            .expect("set FUBE_CLUSTER_APP to the prebuilt cluster-stateless-app executable");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fube-cluster"));
+        let app = support::binary("cluster-stateless-app", "FUBE_CLUSTER_APP");
+        let mut command = Command::new(support::binary("fube-cluster", "FUBE_CLUSTER_NODE_EXE"));
         command
             .arg("--root")
             .arg(root)
@@ -190,10 +190,7 @@ fn poll(owner: &mut Foreground, next: &mut usize, predicate: impl Fn(&Value) -> 
 
 #[test]
 fn actual_foreground_two_node_profile_contact_delete_and_clean_relaunch() {
-    let parent = PathBuf::from(
-        std::env::var_os("FUBE_CLUSTER_TEST_ROOT")
-            .expect("set FUBE_CLUSTER_TEST_ROOT to an existing private task-owned run root"),
-    );
+    let parent = support::parent();
     assert!(parent.is_absolute() && parent.is_dir());
     let root = parent.join(format!("foreground-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&root).unwrap();

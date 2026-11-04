@@ -307,10 +307,7 @@ impl Cluster {
                 if !body.replicas.0.is_empty()
                     && self.ledger.placements[index].bootstrap == Bootstrap::Admitted
                 {
-                    self.ledger.placements[index].observed = fm::Observed::Unknown;
-                    self.ledger.placements[index].error = Some(
-                        "native report says original replica is down; replacement forbidden".into(),
-                    );
+                    self.ledger.down(index);
                 }
                 link.send(replica_up_reply_message(&response, &generation).map_err(err)?)
                     .await?;
@@ -579,4 +576,186 @@ pub async fn internal_node(config: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    include!("tests.rs");
+
+    #[tokio::test]
+    async fn report_retry_owns_current_stage_until_real_ra_clearance() {
+        let fixture = Fixture::new("report-retry");
+        let mut cluster = Cluster::new(fixture.config()).unwrap();
+        cluster.prepare().unwrap();
+        let result = node::report_tests::run(&cluster.ledger.placements[0].launch)
+            .await
+            .unwrap();
+        assert_eq!(cluster.shutdown().await["clean"], true);
+        result.unwrap();
+    }
+
+    mod reply_regressions {
+        use super::*;
+
+        fn failed(mut reply: AddInstanceReply) -> AddInstanceReply {
+            reply.error = -7;
+            reply
+        }
+
+        fn disposed(mut reply: AddInstanceReply) -> AddInstanceReply {
+            reply.replica.state = 3;
+            reply.replica.up = false;
+            reply.replica.version = VersionInstance::invalid();
+            reply.replica.service_endpoint.clear();
+            reply
+        }
+
+        #[test]
+        fn terminal_create_and_delete_results_reject_same_identity_rewrites() {
+            let mut ledger = ledger();
+            ledger.accept(command("create", "create", Some(1))).unwrap();
+            let ready = ready_reply(&ledger.placements[0]);
+            ledger.reply(0, failed(ready.clone()), false).unwrap();
+            let terminal = ledger.status();
+            for reply in [failed(ready.clone()), ready.clone()] {
+                ledger.reply(0, reply, false).unwrap();
+                assert_eq!(ledger.status(), terminal);
+            }
+            assert_eq!(
+                ledger.result("create"),
+                json!({
+                    "op":"create", "state":"error", "native_error":-7
+                })
+            );
+            assert_eq!(ledger.placements[0].observed, Observed::Error);
+            assert_eq!(ledger.placements[0].endpoint, None);
+            assert_eq!(
+                ledger.placements[0].error.as_deref(),
+                Some("native semantic error -7")
+            );
+
+            ledger.accept(command("delete", "delete", Some(1))).unwrap();
+            let removed = disposed(ready.clone());
+            ledger.reply(0, removed.clone(), true).unwrap();
+            let terminal = ledger.status();
+            for (reply, removing) in [
+                (ready.clone(), false),
+                (failed(ready.clone()), false),
+                (removed, true),
+                (failed(ready), true),
+            ] {
+                ledger.reply(0, reply, removing).unwrap();
+                assert_eq!(ledger.status(), terminal);
+            }
+            assert_eq!(ledger.placements[0].observed, Observed::Absent);
+            assert_eq!(ledger.placements[0].endpoint, None);
+            assert_eq!(ledger.placements[0].error, None);
+            assert_eq!(
+                ledger.result("delete"),
+                json!({
+                    "op":"delete", "state":"complete", "observed":"absent"
+                })
+            );
+
+            ledger
+                .accept(command("create2", "create", Some(2)))
+                .unwrap();
+            let ready = ready_reply(&ledger.placements[1]);
+            ledger.reply(1, ready.clone(), false).unwrap();
+            ledger
+                .accept(command("delete2", "delete", Some(2)))
+                .unwrap();
+            ledger.reply(1, failed(ready.clone()), true).unwrap();
+            let terminal = ledger.status();
+            for reply in [failed(ready.clone()), disposed(ready)] {
+                ledger.reply(1, reply, true).unwrap();
+                assert_eq!(ledger.status(), terminal);
+            }
+            assert_eq!(
+                ledger.result("delete2"),
+                json!({
+                    "op":"delete2", "state":"error", "native_error":-7
+                })
+            );
+            assert_eq!(ledger.placements[1].observed, Observed::Error);
+            assert_eq!(ledger.placements[1].endpoint, None);
+        }
+
+        #[test]
+        fn delete_supersedes_pending_create_but_only_its_own_reply_settles() {
+            let mut ledger = ledger();
+            ledger.accept(command("create", "create", Some(1))).unwrap();
+            let ready = ready_reply(&ledger.placements[0]);
+            ledger.accept(command("delete", "delete", Some(1))).unwrap();
+            let pending = ledger.status();
+            for reply in [ready.clone(), failed(ready.clone())] {
+                ledger.reply(0, reply, false).unwrap();
+                assert_eq!(ledger.status(), pending);
+            }
+            assert_eq!(ledger.result("create")["state"], "unknown");
+            assert_eq!(ledger.result("delete")["state"], "pending");
+            ledger.reply(0, disposed(ready), true).unwrap();
+            assert_eq!(ledger.placements[0].observed, Observed::Absent);
+            assert_eq!(ledger.result("delete")["state"], "complete");
+        }
+
+        #[test]
+        fn admitted_down_revokes_add_completion_and_retained_serving_observation() {
+            for already_ready in [false, true] {
+                let mut ledger = ledger();
+                ledger.accept(command("create", "create", Some(1))).unwrap();
+                let ready = ready_reply(&ledger.placements[0]);
+                if already_ready {
+                    ledger.reply(0, ready.clone(), false).unwrap();
+                    let settled = ledger.status();
+                    for reply in [ready.clone(), failed(ready.clone())] {
+                        ledger.reply(0, reply, false).unwrap();
+                        assert_eq!(ledger.status(), settled);
+                    }
+                }
+                let body = ledger.placements[0].body().unwrap();
+                let report = ReplicaUp {
+                    replicas: ObjectArray(vec![FailoverUnitInfo {
+                        unit: body.unit,
+                        service: body.service,
+                        replicas: ObjectArray(vec![ReplicaInfo {
+                            description: Replica {
+                                up: false,
+                                state: 2,
+                                version: VersionInstance::invalid(),
+                                ..body.replica
+                            },
+                            ..ReplicaInfo::default()
+                        }]),
+                        ..FailoverUnitInfo::default()
+                    }]),
+                    ..ReplicaUp::default()
+                };
+                ledger.placements[0].report(&report).unwrap();
+                ledger.down(0);
+                let down = ledger.status();
+                for reply in [ready.clone(), failed(ready.clone())] {
+                    ledger.reply(0, reply, false).unwrap();
+                    assert_eq!(ledger.status(), down);
+                }
+                assert_eq!(ledger.placements[0].desired, Desired::Running);
+                assert_eq!(ledger.placements[0].observed, Observed::Unknown);
+                assert_eq!(ledger.placements[0].endpoint, None);
+                assert_eq!(
+                    ledger.placements[0].error.as_deref(),
+                    Some("native report says original replica is down; replacement forbidden")
+                );
+                assert_eq!(ledger.result("create")["state"], "unknown");
+                assert!(
+                    matches!(ledger.accept(command("create", "create", Some(1))).unwrap(),
+                    Accepted::Duplicate(outcome) if outcome["state"] == "unknown")
+                );
+                ledger.accept(command("delete", "delete", Some(1))).unwrap();
+                ledger.down(0);
+                ledger.reply(0, disposed(ready), true).unwrap();
+                assert_eq!(ledger.placements[0].observed, Observed::Absent);
+                assert_eq!(ledger.result("delete")["state"], "complete");
+                let absent = ledger.status();
+                ledger.down(0);
+                assert_eq!(ledger.status(), absent);
+            }
+        }
+    }
+}

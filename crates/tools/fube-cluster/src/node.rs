@@ -32,16 +32,56 @@ enum SemanticAck {
     Notification(ServiceTypeNotification),
     Report(ReplicaUp),
 }
+const REPORT_RETRY: Duration = Duration::from_secs(15);
+
+fn report_cleared(node: &Node, entity: ra::EntityId) -> bool {
+    let snapshot = node.snapshot(entity);
+    !snapshot.fenced
+        && snapshot
+            .committed
+            .is_some_and(|state| state.fm_stage == ra::FmStage::None || state.local_deleted)
+}
+
+fn current_report(node: &Node, entity: ra::EntityId, body: &ReplicaUp) -> bool {
+    let snapshot = node.snapshot(entity);
+    if snapshot.fenced {
+        return false;
+    }
+    let Some(state) = snapshot.committed else {
+        return false;
+    };
+    if state.fm_stage == ra::FmStage::None || state.local_deleted {
+        return false;
+    }
+    let Some(info) = body.dropped.0.first().or_else(|| body.replicas.0.first()) else {
+        return false;
+    };
+    info.unit == state.body.unit
+        && info.service == state.body.service
+        && info.replicas.0.len() == 1
+        && info.replicas.0[0].description.node == state.body.replica.node
+        && info.replicas.0[0].description.id == state.body.replica.id
+        && info.replicas.0[0].description.instance == state.body.replica.instance
+}
+
 fn ticks(ticks: i64) -> Duration {
     Duration::from_nanos((ticks.max(0) as u64).saturating_mul(100))
 }
 impl Adapter {
     fn capture(&mut self, node: &mut Node) {
         for dispatch in node.take_external_up_to(32 - self.escrow.len()) {
+            if matches!(dispatch.effect, ra::Effect::RequestReportRetry)
+                && self.escrow.iter().any(|item| {
+                    item.original.entity == dispatch.entity
+                        && matches!(item.original.effect, ra::Effect::RequestReportRetry)
+                })
+            {
+                continue; // The retained current-stage owner also owns this retry request.
+            }
             let delay = match &dispatch.effect {
                 ra::Effect::RequestServiceTypeWork { after_ticks, .. }
                 | ra::Effect::ArmServiceTypeRetry { after_ticks, .. } => ticks(*after_ticks),
-                ra::Effect::RequestReportRetry => Duration::from_secs(15),
+                ra::Effect::RequestReportRetry => REPORT_RETRY,
                 _ => Duration::ZERO,
             };
             self.escrow.push_back(Escrow {
@@ -86,7 +126,14 @@ impl Adapter {
                             }
                         }
                         SemanticAck::Report(body) => {
-                            if self.report_pending.as_ref() == Some(&body) {
+                            if self.report_pending.as_ref() == Some(&body)
+                                && body
+                                    .dropped
+                                    .0
+                                    .first()
+                                    .or_else(|| body.replicas.0.first())
+                                    .is_some_and(|info| report_cleared(node, info.unit.id.guid.0))
+                            {
                                 self.report_pending = None;
                             }
                         }
@@ -98,14 +145,53 @@ impl Adapter {
                 .iter()
                 .position(|item| item.submitted == Some(receipt.id))
             {
-                self.escrow.remove(index);
+                let item = &mut self.escrow[index];
+                if matches!(item.original.effect, ra::Effect::RequestReportRetry) {
+                    if disposition == ra::Disposition::Applied {
+                        // Keep this pass in flight until its report dispatch is
+                        // sent or superseded; the receipt is not a semantic ACK.
+                        item.sent = true;
+                    } else {
+                        item.submitted = None;
+                        item.due = Instant::now() + REPORT_RETRY;
+                    }
+                } else {
+                    self.escrow.remove(index);
+                }
             }
         }
         Ok(())
     }
+    fn finish_report_pass(&mut self, entity: ra::EntityId, delay: Duration) {
+        if let Some(item) = self.escrow.iter_mut().find(|item| {
+            item.original.entity == entity
+                && matches!(item.original.effect, ra::Effect::RequestReportRetry)
+        }) {
+            item.submitted = None;
+            item.sent = false;
+            item.due = Instant::now() + delay;
+        }
+    }
+    fn retire_reports(&mut self, node: &Node) {
+        self.escrow.retain(|item| {
+            !matches!(item.original.effect, ra::Effect::RequestReportRetry)
+                || (item.submitted.is_some() && !item.sent)
+                || !report_cleared(node, item.original.entity)
+        });
+        if self.report_pending.as_ref().is_some_and(|body| {
+            body.dropped
+                .0
+                .first()
+                .or_else(|| body.replicas.0.first())
+                .is_some_and(|info| report_cleared(node, info.unit.id.guid.0))
+        }) {
+            self.report_pending = None;
+        }
+    }
     async fn advance(&mut self, node: &mut Node, link: Option<&Link>) -> Result<()> {
         self.capture(node);
         self.commands(node)?;
+        self.retire_reports(node);
         if let Some(link) = link {
             if let Some(reply) = self.replies.front() {
                 let message = match &reply.effect {
@@ -156,9 +242,14 @@ impl Adapter {
                     }
                     Some(FmWork::ServiceTypeRetryTimer(*timer))
                 }
-                ra::Effect::RequestReportRetry => Some(FmWork::RetryReport(PartitionId {
-                    guid: fube_transport::serialization::serde::Guid(entity),
-                })),
+                ra::Effect::RequestReportRetry => {
+                    if link.is_none() {
+                        continue;
+                    }
+                    Some(FmWork::RetryReport(PartitionId {
+                        guid: fube_transport::serialization::serde::Guid(entity),
+                    }))
+                }
                 ra::Effect::ServiceTypeWorkCaptured { work, body } => {
                     if !sent {
                         if let Some(body) = body {
@@ -181,22 +272,34 @@ impl Adapter {
                     Some(FmWork::CompleteServiceTypeWork(*work))
                 }
                 ra::Effect::ReplicaUp(body) => {
+                    let snapshot = node.snapshot(entity);
+                    if node.pending_commands() != 0
+                        || snapshot.fenced
+                        || snapshot.committed.is_none()
+                    {
+                        continue;
+                    }
+                    if !current_report(node, entity, body) {
+                        self.escrow.remove(index);
+                        self.finish_report_pass(entity, Duration::ZERO);
+                        return Ok(());
+                    }
+                    if self.escrow.iter().any(|item| {
+                        item.original.entity == entity
+                            && matches!(item.original.effect, ra::Effect::RequestReportRetry)
+                            && item.submitted.is_some()
+                            && !item.sent
+                    }) {
+                        continue;
+                    }
                     let Some(link) = link else {
                         continue;
                     };
-                    if self
-                        .report_pending
-                        .as_ref()
-                        .is_some_and(|prior| prior != body.as_ref())
-                    {
-                        return Err(
-                            "unsupported replaced report remains semantically pending".into()
-                        );
-                    }
                     self.report_pending = Some((**body).clone());
                     link.send(replica_up_message(body, Owner::Fm).map_err(err)?)
                         .await?;
                     self.escrow.remove(index);
+                    self.finish_report_pass(entity, REPORT_RETRY);
                     return Ok(());
                 }
                 _ => continue, // Unsupported original work remains retained.
@@ -709,4 +812,479 @@ async fn cleanup(
         adapter_pending: adapter.pending(),
         semantic_pending: adapter.semantic_pending(),
     })
+}
+
+#[cfg(test)]
+pub(crate) mod report_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Traffic {
+        reports: Vec<ReplicaUp>,
+        added: bool,
+    }
+
+    async fn links(launch: &Launch) -> Result<(Link, Link)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
+        let endpoint = fube_transport::Endpoint::unsecured_loopback(
+            listener.local_addr().map_err(err)?,
+            wire::composition(true).map_err(err)?,
+        )
+        .map_err(err)?
+        .channel_limits(wire::limits());
+        let (fm, node) = tokio::join!(endpoint.connect_until(wire::deadline()), async {
+            let (stream, _) = listener.accept().await.map_err(err)?;
+            fube_transport::accept_unsecured_loopback(
+                stream,
+                wire::composition(false).map_err(err)?,
+                wire::limits(),
+                wire::deadline(),
+            )
+            .await
+            .map_err(err)
+        });
+        Ok((
+            Link::new(
+                fm.map_err(err)?,
+                launch.fm.clone(),
+                launch.node.clone(),
+                launch.generation.clone(),
+            )?,
+            Link::new(
+                node?,
+                launch.node.clone(),
+                launch.fm.clone(),
+                launch.generation.clone(),
+            )?,
+        ))
+    }
+
+    async fn receive(
+        launch: &Launch,
+        node: &mut Node,
+        adapter: &mut Adapter,
+        link: &Link,
+    ) -> Result<()> {
+        if let Some(mut incoming) = link
+            .receive(Instant::now() + Duration::from_millis(1))
+            .await?
+        {
+            if let Some(ack) = receive_command(launch, node, &incoming.message)? {
+                adapter.acknowledgements.push(ack);
+            }
+            if let Some(handoff) = incoming.handoff.as_mut() {
+                handoff.acknowledge();
+            }
+        }
+        Ok(())
+    }
+
+    async fn step(
+        launch: &Launch,
+        node: &mut Node,
+        adapter: &mut Adapter,
+        fm: &Link,
+        link: &Link,
+        traffic: &mut Traffic,
+    ) -> Result<()> {
+        node.drive().map_err(err)?;
+        adapter.advance(node, Some(link)).await?;
+        receive(launch, node, adapter, link).await?;
+        if let Some(mut incoming) = fm
+            .receive(Instant::now() + Duration::from_millis(1))
+            .await?
+        {
+            match incoming.message.properties().map_err(err)?.action.as_str() {
+                "ServiceTypeNotification" => {
+                    let body = decode_service_type_notification(&incoming.message).map_err(err)?;
+                    fm.send(
+                        service_type_notification_reply_message(&body, &launch.generation)
+                            .map_err(err)?,
+                    )
+                    .await?;
+                }
+                "AddInstanceReply" => {
+                    let (body, _) = decode_add_instance_reply(&incoming.message).map_err(err)?;
+                    if body.error != 0
+                        || body.replica.state != 2
+                        || body.replica.node != launch.node
+                        || body.replica.instance != launch.incarnation
+                        || body.replica.service_endpoint.is_empty()
+                    {
+                        return Err(
+                            "real sample did not semantically open the expected replica".into()
+                        );
+                    }
+                    traffic.added = true;
+                }
+                "ReplicaUp" => {
+                    let (body, owner) = decode_replica_up(&incoming.message).map_err(err)?;
+                    if owner != Owner::Fm || traffic.reports.len() == 16 {
+                        return Err("unexpected report authority or unbounded retry".into());
+                    }
+                    traffic.reports.push(body);
+                }
+                other => return Err(format!("unexpected FM test ingress {other}")),
+            }
+            if let Some(handoff) = incoming.handoff.as_mut() {
+                handoff.acknowledge();
+            }
+        }
+        Ok(())
+    }
+
+    async fn until(
+        launch: &Launch,
+        node: &mut Node,
+        adapter: &mut Adapter,
+        fm: &Link,
+        link: &Link,
+        traffic: &mut Traffic,
+        ready: impl Fn(&Node, &Adapter, &Traffic) -> bool,
+    ) -> Result<()> {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !ready(node, adapter, traffic) {
+            if Instant::now() >= end {
+                return Err("live adapter/RA progress deadline".into());
+            }
+            step(launch, node, adapter, fm, link, traffic).await?;
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+
+    fn timer(adapter: &mut Adapter) -> Result<&mut Escrow> {
+        let mut owners = adapter
+            .escrow
+            .iter_mut()
+            .filter(|item| matches!(item.original.effect, ra::Effect::RequestReportRetry));
+        let owner = owners
+            .next()
+            .ok_or("report retry owner disappeared before semantic clearance")?;
+        if owners.next().is_some() {
+            return Err("more than one current report retry owner".into());
+        }
+        Ok(owner)
+    }
+
+    async fn queued_report(
+        launch: &Launch,
+        node: &mut Node,
+        adapter: &mut Adapter,
+        fm: &Link,
+        link: &Link,
+        traffic: &mut Traffic,
+    ) -> Result<()> {
+        timer(adapter)?.due = Instant::now();
+        until(launch, node, adapter, fm, link, traffic, |_, adapter, _| {
+            adapter.escrow.iter().any(|item| {
+                matches!(item.original.effect, ra::Effect::RequestReportRetry)
+                    && item.submitted.is_some()
+            })
+        })
+        .await?;
+        let end = Instant::now() + Duration::from_secs(3);
+        while node.pending_commands() != 0
+            || !node
+                .external_pending()
+                .iter()
+                .any(|item| matches!(item.effect, ra::Effect::ReplicaUp(_)))
+        {
+            if Instant::now() >= end {
+                return Err("RA did not produce the accepted report pass".into());
+            }
+            node.drive().map_err(err)?;
+            tokio::task::yield_now().await;
+        }
+        adapter.capture(node);
+        Ok(())
+    }
+
+    async fn acknowledge_without_sending_captured_report(
+        launch: &Launch,
+        node: &mut Node,
+        adapter: &mut Adapter,
+        fm: &Link,
+        link: &Link,
+        body: &ReplicaUp,
+    ) -> Result<()> {
+        fm.send(replica_up_reply_message(body, &launch.generation).map_err(err)?)
+            .await?;
+        let end = Instant::now() + Duration::from_secs(3);
+        let before = adapter.acknowledgements.len();
+        while adapter.acknowledgements.len() == before {
+            if Instant::now() >= end {
+                return Err("semantic ACK did not cross the original live channel".into());
+            }
+            receive(launch, node, adapter, link).await?;
+        }
+        while node.pending_commands() != 0 {
+            if Instant::now() >= end {
+                return Err("semantic ACK did not commit in RA".into());
+            }
+            node.drive().map_err(err)?;
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+
+    async fn exercise(
+        launch: &Launch,
+        node: &mut Node,
+        adapter: &mut Adapter,
+        fm: &Link,
+        link: &Link,
+    ) -> Result<()> {
+        let body = add_body(launch, &actual_profile(node)?);
+        let entity = body.unit.id.guid.0;
+        let mut traffic = Traffic::default();
+        fm.send(add_instance_message(&body, &launch.generation).map_err(err)?)
+            .await?;
+        until(
+            launch,
+            node,
+            adapter,
+            fm,
+            link,
+            &mut traffic,
+            |node, _, traffic| {
+                traffic.added
+                    && node
+                        .snapshot(entity)
+                        .committed
+                        .is_some_and(|s| s.phase == ra::Phase::Ready)
+            },
+        )
+        .await?;
+        node.close(body.unit.id.clone(), ra::CloseMode::Drop)
+            .map_err(err)?;
+        until(
+            launch,
+            node,
+            adapter,
+            fm,
+            link,
+            &mut traffic,
+            |node, adapter, _| {
+                node.pending_commands() == 0
+                    && node.snapshot(entity).committed.is_some_and(|s| {
+                        s.phase == ra::Phase::Closed && s.fm_stage == ra::FmStage::ReplicaDropped
+                    })
+                    && adapter
+                        .escrow
+                        .iter()
+                        .any(|item| matches!(item.original.effect, ra::Effect::RequestReportRetry))
+            },
+        )
+        .await?;
+        let original = timer(adapter)?.original.clone();
+        for count in 1..=3 {
+            timer(adapter)?.due = Instant::now();
+            until(
+                launch,
+                node,
+                adapter,
+                fm,
+                link,
+                &mut traffic,
+                |_, _, traffic| traffic.reports.len() == count,
+            )
+            .await?;
+            if timer(adapter)?.original != original
+                || timer(adapter)?.submitted.is_some()
+                || adapter.report_pending.as_ref() != traffic.reports.first()
+                || !node
+                    .snapshot(entity)
+                    .committed
+                    .is_some_and(|s| s.fm_stage == ra::FmStage::ReplicaDropped && !s.local_deleted)
+            {
+                return Err("write/pass receipt lost the original unresolved report owner".into());
+            }
+        }
+        let first = traffic.reports[0].clone();
+        if first.dropped.0.len() != 1 || first.dropped.0[0].replicas.0.len() != 1 {
+            return Err("report must describe exactly the original dropped replica".into());
+        }
+        let info = &first.dropped.0[0];
+        if first.last
+            || first.from_fmm
+            || !first.replicas.0.is_empty()
+            || info.unit != body.unit
+            || info.service != body.service
+            || info.replicas.0[0].description
+                != (Replica {
+                    node: launch.node.clone(),
+                    id: launch.replica,
+                    instance: launch.incarnation,
+                    up: false,
+                    state: 3,
+                    ..Replica::default()
+                })
+            || traffic.reports.iter().any(|report| report != &first)
+        {
+            return Err("repeated report changed its expected native authority/body".into());
+        }
+
+        let mut stale = first.clone();
+        stale.dropped.0[0].replicas.0[0].description.id += 1;
+        let mut nonclearing = first.clone();
+        nonclearing.replicas.0 = std::mem::take(&mut nonclearing.dropped.0);
+        nonclearing.replicas.0[0].replicas.0[0].description.state = 2;
+        nonclearing.replicas.0[0].replicas.0[0].description.up = true;
+        for rejected in [stale, nonclearing.clone()] {
+            acknowledge_without_sending_captured_report(launch, node, adapter, fm, link, &rejected)
+                .await?;
+            adapter.advance(node, Some(link)).await?;
+            if !node
+                .snapshot(entity)
+                .committed
+                .is_some_and(|s| s.fm_stage == ra::FmStage::ReplicaDropped && !s.local_deleted)
+                || adapter.report_pending.as_ref() != Some(&first)
+            {
+                return Err(
+                    "stale/foreign/nonclearing ACK retired current report semantics".into(),
+                );
+            }
+            let count = traffic.reports.len() + 1;
+            timer(adapter)?.due = Instant::now();
+            until(
+                launch,
+                node,
+                adapter,
+                fm,
+                link,
+                &mut traffic,
+                |_, _, traffic| traffic.reports.len() == count,
+            )
+            .await?;
+            if traffic.reports.last() != Some(&first) || timer(adapter)?.original != original {
+                return Err("nonclearing ACK stopped or changed the next report retry".into());
+            }
+        }
+        let pending = node.pending_commands();
+        let mut foreign_source = launch.fm.clone();
+        foreign_source.instance += 1;
+        if !matches!(
+            node.fm_work(FmWork::ReplicaUpReply(
+                first.clone(),
+                foreign_source,
+                launch.generation.clone()
+            )),
+            Err(fube_node::local::Error::Protocol)
+        ) {
+            return Err("foreign FM incarnation admitted".into());
+        }
+        let mut stale_generation = launch.generation.clone();
+        stale_generation.number.generation -= 1;
+        if receive_command(
+            launch,
+            node,
+            &replica_up_reply_message(&first, &stale_generation).map_err(err)?,
+        )
+        .is_ok()
+            || node.pending_commands() != pending
+        {
+            return Err("stale generation changed accepted adapter work".into());
+        }
+
+        // Freeze an old dispatch, then commit a newer current description
+        // without clearing the report stage. The old body must never escape.
+        queued_report(launch, node, adapter, fm, link, &mut traffic).await?;
+        nonclearing.replicas.0[0].service.update_version += 1;
+        acknowledge_without_sending_captured_report(launch, node, adapter, fm, link, &nonclearing)
+            .await?;
+        let count = traffic.reports.len() + 1;
+        until(
+            launch,
+            node,
+            adapter,
+            fm,
+            link,
+            &mut traffic,
+            |_, _, traffic| traffic.reports.len() == count,
+        )
+        .await?;
+        let mut current = first;
+        current.dropped.0[0].service.update_version += 1;
+        if traffic.reports.last() != Some(&current)
+            || adapter.report_pending.as_ref() != Some(&current)
+        {
+            return Err("adapter replayed a superseded captured report body".into());
+        }
+
+        queued_report(launch, node, adapter, fm, link, &mut traffic).await?;
+        acknowledge_without_sending_captured_report(launch, node, adapter, fm, link, &current)
+            .await?;
+        let count = traffic.reports.len();
+        for _ in 0..6 {
+            step(launch, node, adapter, fm, link, &mut traffic).await?;
+        }
+        if traffic.reports.len() != count
+            || adapter.report_pending.is_some()
+            || adapter.escrow.iter().any(|item| {
+                matches!(
+                    item.original.effect,
+                    ra::Effect::RequestReportRetry | ra::Effect::ReplicaUp(_)
+                )
+            })
+            || !node
+                .snapshot(entity)
+                .committed
+                .is_some_and(|s| s.fm_stage == ra::FmStage::None && s.local_deleted)
+        {
+            return Err("real RA clearance failed to stop retries/stale captured sends".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn run(launch: &Launch) -> Result<Result<()>> {
+        private_dir(&launch.directory)?;
+        private_dir(&launch.directory.join("hosting"))?;
+        let mut options = Options::new(launch.directory.join("hosting"));
+        options.node = Some(NodeContext {
+            id: node_hex(&launch.node),
+            instance: launch.node.instance,
+            name: launch.name(),
+        });
+        let store = Arc::new(
+            Store::new(Box::new(MemoryBackend::new()), Settings::default())
+                .await
+                .map_err(err)?,
+        );
+        let mut node = Node::new(
+            Activation::new(options).map_err(err)?,
+            store.clone(),
+            ra::Admission {
+                local_node: launch.node.clone(),
+                fm_source: launch.fm.clone(),
+                generation: launch.generation.number.clone(),
+                owner_ready: true,
+                node_open: true,
+                node_activated: true,
+                fabric_upgrading: false,
+            },
+            ra::Settings {
+                max_outstanding: 32,
+                max_service_types: 1,
+                notification_batch_count: 1,
+                notification_batch_bytes: LIMIT,
+                max_queued_bytes: 2 * 1024 * 1024,
+                ..ra::Settings::default()
+            },
+        )
+        .map_err(err)?;
+        let mut adapter = Adapter::default();
+        let result = async {
+            node.start(&launch.package, APPLICATION, &[]).map_err(err)?;
+            let (fm, link) = links(launch).await?;
+            let result = exercise(launch, &mut node, &mut adapter, &fm, &link).await;
+            let fm_closed = fm.close().await;
+            let node_closed = link.close().await;
+            result.and(fm_closed).and(node_closed)
+        }
+        .await;
+        let cleaned = cleanup(launch, &mut node, &store, &mut adapter).await;
+        cleaned?;
+        Ok(result)
+    }
 }

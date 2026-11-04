@@ -1,5 +1,10 @@
 nextest-version = { required = "0.9.133" }
 
+[profile.default]
+archive.include = [
+    { path = "debug/cluster-stateless-app", relative-to = "target", on-missing = "error" },
+]
+
 [test-groups]
 onebox = { max-threads = 1 }
 

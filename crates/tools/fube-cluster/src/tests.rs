@@ -212,15 +212,15 @@ fn finite_identities_are_not_evicted_and_uncertainty_retains_authority() {
     assert!(command("x", "create", Some(3)).validate().is_err());
 }
 
+#[path = "../tests/support/mod.rs"]
+mod support;
+
 struct Fixture {
     root: PathBuf,
 }
 impl Fixture {
     fn new(label: &str) -> Self {
-        let parent = PathBuf::from(
-            std::env::var_os("FUBE_CLUSTER_TEST_ROOT")
-                .expect("set FUBE_CLUSTER_TEST_ROOT to an existing private task-owned run root"),
-        );
+        let parent = support::parent();
         assert!(parent.is_absolute() && parent.is_dir());
         let root = parent.join(format!("{label}-{}", uuid::Uuid::new_v4()));
         Self { root }
@@ -228,12 +228,8 @@ impl Fixture {
     fn config(&self) -> Config {
         Config {
             root: self.root.clone(),
-            app: PathBuf::from(std::env::var_os("FUBE_CLUSTER_APP").expect(
-                "build cluster-stateless-app and set FUBE_CLUSTER_APP to its absolute executable",
-            )),
-            executable: PathBuf::from(std::env::var_os("FUBE_CLUSTER_NODE_EXE").expect(
-                "build fube-cluster and set FUBE_CLUSTER_NODE_EXE to its absolute executable",
-            )),
+            app: support::binary("cluster-stateless-app", "FUBE_CLUSTER_APP"),
+            executable: support::binary("fube-cluster", "FUBE_CLUSTER_NODE_EXE"),
         }
     }
 }
