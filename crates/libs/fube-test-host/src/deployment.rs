@@ -202,6 +202,7 @@ mod tests {
         fs::write(caller_package.join("keep"), "unchanged").unwrap();
         fs::copy("/bin/true", caller_package.join("program")).unwrap();
         let package = Package {
+            profile: fube_local_host::manifest::Profile::Stateless,
             application_type: "App".into(),
             application_version: "1".into(),
             application_name: "fabric:/App".into(),

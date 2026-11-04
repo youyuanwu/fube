@@ -4,6 +4,9 @@
 bootstrap H3 IPC/local leases and the bounded registration-events slice are
 implemented, together with bounded H4 owned local package/process activation
 and [production local stateless RA/RAP](StatelessRaRap.md).
+An explicit [volatile stateful registration-only profile](HostingLocalActivation.md#opt-in-volatile-stateful-registration)
+now admits one 1/1 type and real factory registration/lookup; replica lifecycle
+and stateful deployment remain unsupported.
 Broader H3 and deployed RA/RAP composition remain gated.**
 [`fube-hosting`](../../crates/libs/fube-hosting/src/lib.rs) provides
 a native-derived, deterministically driven core plus a separately owned local
@@ -919,7 +922,9 @@ protocol. Initial recovery follows the cluster's fresh-deployment/fencing
 policy; reconstructing a registration from disk is not permission to trust a
 live process or resume its lease. It does not change `fube-data` volatility.
 
-Stateful Hosting integration, runtime-event consumers outside the enabled
+Stateful replica lifecycle/RA integration beyond the
+[registration-only profile](HostingLocalActivation.md#opt-in-volatile-stateful-registration),
+runtime-event consumers outside the enabled
 [local stateless profile](StatelessRaRap.md), upgrades,
 broader package/activation profiles, health aggregation, remote security and
 owner/process-loss qualification remain explicit staged work. Full native

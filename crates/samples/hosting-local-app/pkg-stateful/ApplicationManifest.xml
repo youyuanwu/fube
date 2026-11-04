@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ApplicationManifest xmlns="http://schemas.microsoft.com/2011/01/fabric" ApplicationTypeName="HostingLocalStatefulApp" ApplicationTypeVersion="1.0">
+  <ServiceManifestImport><ServiceManifestRef ServiceManifestName="LocalService" ServiceManifestVersion="1.0"/></ServiceManifestImport>
+  <DefaultServices>
+    <Service Name="Singleton" ServicePackageActivationMode="SharedProcess">
+      <StatefulService ServiceTypeName="LocalStatefulType" TargetReplicaSetSize="1" MinReplicaSetSize="1"><SingletonPartition/></StatefulService>
+    </Service>
+  </DefaultServices>
+</ApplicationManifest>

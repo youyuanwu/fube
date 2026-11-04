@@ -4,6 +4,7 @@
 //! cleanup errors preserve every resource here; owner abandonment/abrupt death
 //! and escaped descendants have no durable recovery guarantee.
 use crate::{ipc, wire, *};
+pub use fube_local_host::manifest::Profile;
 use fube_local_host::{
     deployment::Deployment,
     manifest::Package,
@@ -50,6 +51,8 @@ type LocalResult<T> = std::result::Result<T, LocalError>;
 #[derive(Debug, Clone)]
 pub struct Options {
     pub run_parent: PathBuf,
+    /// Stateless by default. Stateful admission enables registration only.
+    pub profile: Profile,
     pub registration_timeout: Duration,
     pub cleanup_budget: Duration,
     pub lease_duration: Duration,
@@ -69,6 +72,7 @@ impl Options {
     pub fn new(run_parent: PathBuf) -> Self {
         Self {
             run_parent,
+            profile: Profile::Stateless,
             registration_timeout: Duration::from_secs(30),
             cleanup_budget: Duration::from_secs(10),
             lease_duration: ipc::LOCAL_LEASE_DURATION,
@@ -189,6 +193,9 @@ impl Activation {
         &mut self,
         gate: std::sync::Arc<dyn ipc::RegistrationConsumerGate>,
     ) -> LocalResult<()> {
+        if self.options.profile != Profile::Stateless {
+            return Err(Error::UnsupportedCapability.into());
+        }
         if self.started.is_some() {
             return Err(Error::InvalidState.into());
         }
@@ -207,7 +214,12 @@ impl Activation {
         if self.package.is_some() || self.stopping {
             return Err(LocalError::AlreadyStarted);
         }
-        let package = Package::load(directory, application_name, parameters)?;
+        let package = Package::load_with_profile(
+            directory,
+            application_name,
+            parameters,
+            self.options.profile,
+        )?;
         self.package = Some(package);
         self.started = Some(Instant::now());
         let result = self.start_inner();
@@ -392,7 +404,10 @@ impl Activation {
             self.identity.as_ref().expect("identity").host_id.as_str(),
         )?;
         self.declared = prepared.admitted;
-        self.lease = Some(prepared.lease);
+        self.lease = Some(match self.options.profile {
+            Profile::Stateless => prepared.lease,
+            Profile::VolatileStatefulRegistration => prepared.lease.registration_only(),
+        });
         if let Some((_, error)) = prepared.failure {
             return Err(error.into());
         }
@@ -402,6 +417,9 @@ impl Activation {
 
     pub fn identity(&self) -> Option<&LaunchIdentity> {
         self.identity.as_ref()
+    }
+    pub fn profile(&self) -> Profile {
+        self.options.profile
     }
     pub fn root(&self) -> Option<&Path> {
         self.deployment.as_ref().map(|d| d.root.as_path())

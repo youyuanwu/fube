@@ -1,7 +1,8 @@
-//! Explicitly minimal native-free stateless package fixture.
+//! Explicitly minimal native-free local Hosting package fixtures.
 use fube_runtime::{
-    ApiFuture, Cancellation, Error, IStatelessServiceFactory, IStatelessServiceInstance,
-    IStatelessServicePartition, Result, Runtime,
+    ApiFuture, Cancellation, Error, IStatefulServiceFactory, IStatefulServiceReplica,
+    IStatelessServiceFactory, IStatelessServiceInstance, IStatelessServicePartition, Result,
+    Runtime,
 };
 use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
 
@@ -12,6 +13,7 @@ struct Mode {
     open_delay: u64,
 }
 struct Factory(Mode);
+struct StatefulFactory;
 struct Instance {
     mode: Mode,
     resource: PathBuf,
@@ -21,6 +23,19 @@ fn marker(value: &str) {
     std::io::stdout()
         .flush()
         .expect("flush lifecycle observation");
+}
+impl IStatefulServiceFactory for StatefulFactory {
+    fn create_replica(
+        &self,
+        _: String,
+        _: String,
+        _: &[u8],
+        _: uuid::Uuid,
+        _: i64,
+    ) -> Result<Box<dyn IStatefulServiceReplica>> {
+        marker("LOCAL_CALLBACK create_replica");
+        Err(Error::Protocol("registration-only stateful fixture"))
+    }
 }
 impl IStatelessServiceFactory for Factory {
     fn create_instance(
@@ -109,6 +124,7 @@ async fn main() {
         }
         [] => None,
         [flag] if flag == "--no-register" || flag == "--exit-before-attach" => None,
+        [flag] if flag == "--stateful-register" => None,
         [flag] if flag == "--block-dispose" || flag == "--close-error-block-dispose" => None,
         [flag, _] if flag == "--open-delay-ms" => None,
         _ => panic!("unsupported fixture arguments"),
@@ -133,6 +149,7 @@ async fn main() {
             0
         },
     };
+    let stateful_registration = args.first().is_some_and(|s| s == "--stateful-register");
     let _runtime = if args.first().is_some_and(|s| s == "--no-register") {
         runtime
     } else {
@@ -141,10 +158,18 @@ async fn main() {
             .try_reserve()
             .expect("execution reservation")
             .run_owned(move || {
-                runtime.register_stateless_service_factory(
-                    "LocalStatelessType",
-                    Box::new(Factory(mode)),
-                )?;
+                if stateful_registration {
+                    runtime.register_stateful_service_factory(
+                        "LocalStatefulType",
+                        Box::new(StatefulFactory),
+                    )?;
+                    marker("LOCAL_STATEFUL_REGISTERED");
+                } else {
+                    runtime.register_stateless_service_factory(
+                        "LocalStatelessType",
+                        Box::new(Factory(mode)),
+                    )?;
+                }
                 Ok(runtime)
             })
             .await

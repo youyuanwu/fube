@@ -51,6 +51,12 @@ process tests now observe callbacks/disposal/resources, duplicate/stale traffic,
 crash/lease loss and physical cleanup together. This does not implement this
 document's FM/HM or deployed-cluster architecture.
 
+**Stateful registration update (2026-11-04):**
+[Owned local Hosting](HostingLocalActivation.md#opt-in-volatile-stateful-registration)
+now has an explicit volatile 1/1 stateful registration-only profile. Real factory
+registration/lookup, finite authority and cleanup do not enable stateful
+RA/RAP Open, a primary, application data or this document's M2 milestone.
+
 ## 1. Decisions and initial profile
 
 | Area | Decision |

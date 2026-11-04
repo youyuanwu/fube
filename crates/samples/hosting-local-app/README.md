@@ -38,3 +38,21 @@ the bounded destructor barrier waits at most five seconds for
 observe the resource and zero log eviction. A hard exit is not a destructor
 receipt; physical directory cleanup is checked separately.
 The existing mixed `rust-runtime-app/pkg` is not a substitute for this profile.
+
+## Stateful registration-only fixture
+
+`pkg-stateful/` is a separate single-type volatile singleton package: target/
+minimum 1/1 and explicit `HasPersistedState="false"`, without config/data packages.
+Stage its two manifests with the same executable and set
+`fube_hosting::local::Options::profile` to
+`Profile::VolatileStatefulRegistration`. The default remains stateless.
+
+Its fixed `--stateful-register` argument registers `LocalStatefulType` through
+the ordinary runtime API and real actor-9 Hosting IPC. Registration emits
+`LOCAL_STATEFUL_REGISTERED` only after successful completion. The stateful
+factory emits `LOCAL_CALLBACK create_replica` and fails explicitly if called;
+this profile must never create/open a replica. Local Node composition and
+lifecycle sends reject; finite local leases and owned teardown remain real.
+The existing activation/lifecycle test commands above include this profile's
+registration, lookup, authority-loss, prelaunch rejection and lifecycle-gate
+tests. No stateful primary, data or recovery behavior is claimed.

@@ -257,7 +257,8 @@ impl Node {
         admission: ra::Admission,
         mut settings: ra::Settings,
     ) -> Result<Self> {
-        if activation.identity().is_some()
+        if activation.profile() != h::local::Profile::Stateless
+            || activation.identity().is_some()
             || !admission.owner_ready
             || !admission.node_open
             || !admission.node_activated
