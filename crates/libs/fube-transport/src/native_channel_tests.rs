@@ -5,6 +5,8 @@ use std::{future::Future, pin::Pin, time::Duration};
 use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 use BudgetClass::{Ingress as INGRESS, Ordinary as ORDINARY, Reply as REPLY};
 
+#[path = "accepted_channel_tests.rs"]
+mod accepted;
 #[path = "endpoint_tests.rs"]
 mod endpoint;
 #[path = "native_channel_ipc_tests.rs"]

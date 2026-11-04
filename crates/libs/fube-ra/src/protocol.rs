@@ -12,6 +12,9 @@ use fube_transport::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod bootstrap;
+pub use bootstrap::*;
+
 pub const GENERATION_HEADER: u16 = 0x8018;
 pub const RA_ACTOR: i64 = 12;
 pub const FM_ACTOR: i64 = 11;

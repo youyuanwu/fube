@@ -10,9 +10,10 @@ The producer compiles the **unmodified** native `FabricStream.cpp`,
 `FabricSerializable.cpp`, `FabricSerializableStream.cpp`,
 `FabricSerializationTypes.cpp`, `ByteCompressor.h` and
 `Common/FabricSerializationHelper.h`. It mechanically extracts field macros
-and member declarations for 43 schema types/129 members, including the selected
+and member declarations for 59 schema types/199 members, including the selected
 Add, inherited DeleteReplica, reply, ReplicaUp/Reply and service-type
-notification request/reply bodies.
+notification request/reply bodies, NodeUp/Ack's complete schema closure and the
+six-field Federation PToP header value.
 The native helper macros generate their actual Write/Read methods. Nested
 fields are not inferred from Rust or encoded as handwritten wire bytes.
 
@@ -24,13 +25,18 @@ methods/dependencies and expose fields for fixture construction/comparison.
 The actual stream and field macros retain native encoding/decoding behavior.
 Clang MS extensions/delayed templates and a two-byte WCHAR profile are explicit.
 The fixture avoids system-width wchar string functions under `-fshort-wchar`.
+Native map helpers necessarily copy strings through `char_traits`. The platform
+adapter provides two-byte `wmemcpy`/`wmemmove`/`wmemset` raw-memory operations
+instead of the host libc's four-byte wchar ABI. These are storage adapters,
+not serialization algorithms; native field macros and streams are unmodified.
 
 This is **source-baseline native-stream conformance with schema adapters**,
 not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 36 inputs:
+The C++ producer independently constructs expected values and emits 45 inputs.
+The existing 36 cases and their contracts are retained:
 default/rich AddInstance, default/error AddInstanceReply, default/rich Remove
 (force false/true), default/rich removal reply, explicit-empty/rich ReplicaUp
 (both nonempty lists, all last/fromFMM combinations), FM/FMM generation,
@@ -46,12 +52,52 @@ Nondefault cases cover GUID/raw NodeId, high-bit instances, negative LSN/epochs,
 UTF-16/surrogates, enums/errors, all service collections and null/Invalid/both
 derived scaling variants. Rust rejects every proper prefix of rich body
 fixtures including both rich force bodies and the rich/partial notification
-bodies; native rejects six truncated bodies.
+bodies; native rejects nine truncated bodies, including NodeUp, Ack and PToP.
 Non-polymorphic Delete inheritance invokes base rich traversal and native
 base/derived scopes, not a flattened or nested replacement. ReplicaUp's empty
 native constructor leaves scalar booleans uninitialized; the empty fixture
 explicitly initializes them, and is not labeled a native-default guarantee.
 ReplicaInfo's rich fixture initializes its intermediate role explicitly.
+
+### Bootstrap and source identity header extension
+
+Nine cases add fresh/rich NodeUp, fresh/rich NodeUpAck, both literal actions,
+RS actor=13, direct PToP and rich PToP. The fresh fixtures explicitly initialize
+empty inventories, `anyReplicaFound=false`, the static native default fabric
+version `1.0.960.0:__default__:0`, actual node metadata and activation sequence 7.
+They are not assertions about uninitialized native constructor fields.
+
+The rich NodeUp has both fault-domain URI objects, all three nonempty node maps,
+both package inventory entries and `anyReplicaFound=true`. The rich Ack has two
+upgrades with every application/package upgrade, removal, resource-governance,
+container-image and network field populated; activation is false and the sequence
+is negative. Native field equality checks the complete content in both directions.
+Rust also invokes the production bounded NodeUp/Ack decoders and factories with
+native-produced actor/action/priority/generation header values: fresh profiles
+are accepted, rich unsupported profiles are rejected **after retaining all
+decoded fields**. Every proper prefix of all four bootstrap bodies and rich
+PToP is rejected by Rust. This catches omitted/reordered fields, collapsed Uri
+or version objects, false empty inventories and incorrect collection scopes.
+
+The actual native map helper serializes `std::map` through an object array of
+`ArrayPair` objects, each with its own key/value scope. Native maps and sets
+remain `std::map`/`std::set`, not handwritten pair codecs or replacement bytes.
+String vectors (including sets via the native helper) instead use a UInt32
+count followed by strings. Maps and sets use **one entry** per rich collection:
+this exercises their nonempty wire scopes without invoking the host's
+four-byte-wchar comparator under `-fshort-wchar`. The structured package-key
+adapter throws if comparison is attempted; no map/set ordering, duplicate-key
+semantics or native identifier-comparison qualification is claimed here.
+
+PToP values exercise distinct source/destination NodeInstances with high-bit
+incarnations, actor/ring fields and both exact-instance boolean values.
+`MessageHeaderId.h`'s `PToP=0x8013` and `PToPActor.h`'s `Direct=0` are extracted
+and required by the consumer manifest contract. The Rust PToP type is an
+explicit **schema-only adapter**, not execution of the cluster tool's private
+Link implementation or its deployment/session admission. Factory source files
+and native constants are included in native input hashes. None of these cases
+executes native NodeUp handlers, an FM/RA runtime, a deployed SF release or a
+Federation transport; those remain separate evidence classes.
 
 ## Explicit production
 
@@ -61,14 +107,17 @@ Compile the Rust example with the current source identity; the producer
 rejects an unbound/stale executable:
 
 ```sh
-mkdir -p build/ra-stateless-opening-tmp
-export TMPDIR="$PWD/build/ra-stateless-opening-tmp"
+# Supply exclusive task-owned RAM target/scratch roots and a fresh bundle path.
+# Measure fit first; keep the task's existing build/evidence/security caps.
+: "${CARGO_TARGET_DIR:?explicit owned Cargo target root required}"
+: "${TMPDIR:?explicit owned scratch root required}"
+: "${RA_BUNDLE:?fresh owned bundle path required}"
 FUBE_RA_SOURCE_DIGEST=$(python3 -c 'from tests.ra_protocol.producer import source_digest; print(source_digest()[0])') \
   cargo build --locked -p fube-ra --example ra_conformance
 python3 -m tests.ra_protocol.producer \
   --native /path/to/clean/service-fabric \
-  --out /absolute/new/bundle --cxx /path/to/clang++ \
-  --rust "$PWD/target/debug/examples/ra_conformance"
+  --out "$RA_BUNDLE" --cxx /path/to/clang++ \
+  --rust "$CARGO_TARGET_DIR/debug/examples/ra_conformance"
 ```
 
 Producer compilation is intentional, never a consumer fallback. It records
@@ -89,8 +138,8 @@ env PATH=/nonexistent /usr/bin/python3 -m tests.ra_protocol.consumer \
   --expected-head COMMIT --expected-source SOURCE_DIGEST
 ```
 
-The bundle has exactly 36 `native/*.bin`, `schema.h`, `native-oracle`,
-`ra-conformance` and `manifest.json` (40 files total). No other files are
+The bundle has exactly 45 `native/*.bin`, `schema.h`, `native-oracle`,
+`ra-conformance` and `manifest.json` (49 files total). No other files are
 accepted. The consumer verifies exact coverage/type/member counts, regular files, hashes,
 provenance and both compiled source identities **before** execution. Missing,
 modified, wrong-source and symlink inputs fail; it imports no producer and
@@ -112,8 +161,8 @@ final delivery produces again at the clean reviewed implementation head.
 
 ## Separate actual-native helper evidence
 
-The helper producer is **not part of, and does not change**, the 36-case,
-43-type/129-field wire bundle or its compiler-free consumer. It compiles
+The helper producer is **not part of, and does not change**, the 45-case,
+59-type/199-field wire bundle or its compiler-free consumer. It compiles
 unmodified `pal/wc16.c`, `RetryableErrorState.cpp` and
 `RetryableErrorStateThresholdCollection.cpp`. Identifier, `LargeInteger`,
 `NodeId`, `GenerationNumber`, `CheckGenerationHeader` and `GetGenerationState`

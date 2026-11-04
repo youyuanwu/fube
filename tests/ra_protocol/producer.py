@@ -11,7 +11,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .schema import MODELS, REVISION, generate
+from .schema import EXTRA_NATIVE_INPUTS, MODELS, REVISION, generate, native_constants
 
 ROOT = Path(__file__).resolve().parents[2]
 NATIVE = ROOT / "tests/ra_protocol/native"
@@ -83,6 +83,7 @@ def produce(native, out, cxx, rust):
     native_paths |= {prod / "src/Common/FabricSerializationHelper.h",
                      prod / "ktl/src/linuxinc/kstatus.h"}
     native_paths |= {prod / "src" / row[1] for row in MODELS}
+    native_paths |= {prod / "src" / path for path in EXTRA_NATIVE_INPUTS}
     native_hashes = {str(p.relative_to(native)): digest(p) for p in sorted(native_paths)}
     manifest = {
         "format": 1, "evidence": "source-baseline-native-stream-with-schema-adapters",
@@ -93,6 +94,7 @@ def produce(native, out, cxx, rust):
         "native_sources": native_hashes, "compiler_flags": FLAGS,
         "compiler_version": subprocess.check_output([str(cxx), "--version"], text=True),
         "schema_types": len(models), "schema_fields": sum(len(m[4]) for m in models),
+        "native_constants": native_constants(native),
         "cases": sorted(p.stem for p in (out / "native").glob("*.bin")),
         "files": {str(p.relative_to(out)): digest(p) for p in sorted(out.rglob("*"))
                   if p.is_file()},

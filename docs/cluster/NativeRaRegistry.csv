@@ -1,6 +1,6 @@
 symbol,action,registry_line,factory_actor,boundary,classification,direction,ra_metadata,body,evidence,status
-NodeUp,NodeUp,32,FM,true,registration,common-to-owner,OP,NodeUpMessageBody,common/NodeUpOperation.cpp:45|fm/FailoverManager.cpp:1077;1739,staged
-NodeUpAck,NodeUpAck,33,RS,true,registration,owner-to-common-correlated,OP,NodeUpAckMessageBody,fm/FailoverManager.cpp:1769|common/NodeUpOperation.cpp:30;50|ra/ReconfigurationAgent.cpp:1501,staged
+NodeUp,NodeUp,32,FM,true,registration,common-to-owner,OP,NodeUpMessageBody,common/NodeUpOperation.cpp:45|fm/FailoverManager.cpp:1077;1739,selected-bootstrap-codec+trusted-fresh-empty-adapter;native-runtime-staged
+NodeUpAck,NodeUpAck,33,RS,true,registration,owner-to-common-correlated,OP,NodeUpAckMessageBody,fm/FailoverManager.cpp:1769|common/NodeUpOperation.cpp:30;50|ra/ReconfigurationAgent.cpp:1501,selected-bootstrap-codec+trusted-fresh-empty-adapter;native-runtime-staged
 ChangeNotification,ChangeNotification,36,FM,false,token-change,common-to-FM,-,ChangeNotificationMessageBody,ChangeNotificationOperation.cpp:61|fm/FailoverManager.cpp:1081;1914,not-RA-boundary
 ChangeNotificationAck,ChangeNotificationAck,37,RS,false,token-change,FM-to-common-correlated,-,empty,fm/FailoverManager.cpp:1968|ChangeNotificationOperation.cpp:28,not-RA-boundary
 ChangeNotificationChallenge,ChangeNotificationChallenge,38,RS,false,token-change,FM-to-common-correlated,-,ChangeNotificationChallenge,fm/FailoverManager.cpp:1965|ChangeNotificationOperation.cpp:76,not-RA-boundary

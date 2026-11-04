@@ -57,6 +57,28 @@ MODELS = [
     ("ActorHeader", "Transport/ActorHeader.h", ""),
     ("ActionHeader", "Transport/ActionHeader.h", ""),
     ("HighPriorityHeader", "Transport/HighPriorityHeader.h", ""),
+    ("FabricCodeVersion", "Common/FabricCodeVersion.h", ""),
+    ("FabricConfigVersion", "Common/FabricConfigVersion.h", ""),
+    ("FabricVersion", "Common/FabricVersion.h", ""),
+    ("FabricVersionInstance", "Common/FabricVersionInstance.h", ""),
+    ("Uri", "Common/Uri.h", ""),
+    ("NodeDescription", COMMON + "NodeDescription.h", ""),
+    ("ServicePackageInfo", COMMON + "NodeUpMessageBody.h", ""),
+    ("NodeUpMessageBody", COMMON + "NodeUpMessageBody.h", ""),
+    ("ServicePackageUpgradeSpecification", MODEL + "ServicePackageUpgradeSpecification.h", ""),
+    ("ServiceTypeRemovalSpecification", MODEL + "ServiceTypeRemovalSpecification.h", ""),
+    ("ServicePackageResourceGovernanceDescription", MODEL + "ServicePackageResourceGovernanceDescription.h", ""),
+    ("CodePackageContainersImagesDescription", MODEL + "CodePackageContainersImagesDescription.h", ""),
+    ("ApplicationUpgradeSpecification", MODEL + "ApplicationUpgradeSpecification.h", ""),
+    ("UpgradeDescription", COMMON + "UpgradeDescription.h", ""),
+    ("NodeUpAckMessageBody", COMMON + "NodeUpAckMessageBody.h", ""),
+    ("PToPHeader", "Federation/PToPHeader.h", ""),
+]
+
+EXTRA_NATIVE_INPUTS = [
+    "Common/FabricVersionConstants.cpp", "Federation/PToPActor.h",
+    "Transport/MessageHeaderId.h", "Transport/Actor.h",
+    COMMON + "RSMessage.cpp", COMMON + "RSMessage.h",
 ]
 
 ENUMS = {
@@ -65,11 +87,13 @@ ENUMS = {
     "FABRIC_SERVICE_LOAD_METRIC_WEIGHT", "FABRIC_PLACEMENT_POLICY_TYPE",
     "ScalingTriggerKind::Enum", "ScalingMechanismKind::Enum",
     "ServicePackageActivationMode::Enum", "ServiceModel::ServicePackageActivationMode::Enum", "Actor::Enum",
+    "UriType::Enum", "UriHostType::Enum", "UpgradeType::Enum", "PToPActor::Enum",
 }
 SCALARS = {
     "Common::Guid": "GuidValue", "Guid": "GuidValue", "GUID": "GUID",
     "int64": "LONG64", "__int64": "LONG64", "FABRIC_SEQUENCE_NUMBER": "LONG64", "uint64": "ULONG64", "int32": "LONG", "int": "LONG", "uint32": "ULONG",
     "ULONG": "ULONG", "uint": "ULONG", "bool": "bool", "double": "double",
+    "unsigned short": "USHORT",
     "wstring": "std::wstring", "std::wstring": "std::wstring",
     "ScalingTriggerSPtr": "std::shared_ptr<ScalingTrigger>",
     "ScalingMechanismSPtr": "std::shared_ptr<ScalingMechanism>",
@@ -98,10 +122,13 @@ def adapted(native_type):
         return "Enum"
     if native_type in SCALARS:
         return SCALARS[native_type]
-    match = re.fullmatch(r"(?:std::)?vector<\s*(.*?)\s*>", native_type)
+    match = re.fullmatch(r"(?:std::)?(vector|set)<\s*(.*?)\s*>", native_type)
     if match:
-        item = "byte" if match[1] == "byte" else adapted(match[1])
-        return f"std::vector<{item}>"
+        item = "byte" if match[2] == "byte" else adapted(match[2])
+        return f"std::{match[1]}<{item}>"
+    match = re.fullmatch(r"(?:std::)?map<\s*([^,<>]+)\s*,\s*([^,<>]+)\s*>", native_type)
+    if match:
+        return f"std::map<{adapted(match[1])}, {adapted(match[2])}>"
     simple = native_type.rsplit("::", 1)[-1]
     if simple == "NodeId" or simple in {item[0] for item in MODELS}:
         return simple
@@ -112,6 +139,20 @@ def extract(native):
     result = []
     for name, path, base in MODELS:
         text = (native / "src/prod/src" / path).read_text()
+        # NodeUpMessageBody.h declares both ServicePackageInfo and NodeUp.
+        # Limit the macro/member lookup to the requested native class.
+        native_name = "Guid" if name == "GuidValue" else name
+        declaration = re.search(rf"\b(?:class|struct)\s+{native_name}\b[^;{{]*\{{", text)
+        if not declaration:
+            raise ValueError(f"{path}: missing native class {name}")
+        start = declaration.end()
+        depth, end = 1, start
+        while depth and end < len(text):
+            depth += (text[end] == "{") - (text[end] == "}")
+            end += 1
+        if depth:
+            raise ValueError(f"{path}: unclosed native class {name}")
+        text = text[declaration.start():end]
         if base:
             if not re.search(rf"(?:class|struct)\s+{name}\s*:\s*public\s+(?:\w+::)*{base}\b", text):
                 raise ValueError(f"{path}: native inheritance no longer matches {base}")
@@ -126,8 +167,8 @@ def extract(native):
         declarations = []
         for field in fields:
             matches = sorted({t.strip() for t in re.findall(
-                rf"^[ \t]*([\w:<>, \t]+?)\s+{field}\s*;", text, re.M
-            ) if t.strip() != "return" and "<<" not in t})
+                rf"^[ \t]*([\w:<>, \t]+?)\s+{field}\s*(?:=\s*[^;]+)?;", text, re.M
+            ) if t.strip() and t.strip() != "return" and "<<" not in t})
             if len(matches) != 1:
                 raise ValueError(f"{path}: expected one declaration of {field}: {matches}")
             declarations.append((field, matches[0].strip(), adapted(matches[0])))
@@ -135,12 +176,30 @@ def extract(native):
     return result
 
 
+def native_constants(native):
+    root = native / "src/prod/src"
+    result = {}
+    for key, path, member in [
+        ("PToP", "Transport/MessageHeaderId.h", "PToP"),
+        ("PToPDirect", "Federation/PToPActor.h", "Direct"),
+    ]:
+        matches = re.findall(rf"\b{member}\s*=\s*(0x[0-9a-fA-F]+|\d+)\s*,", (root / path).read_text())
+        if len(matches) != 1:
+            raise ValueError(f"{path}: expected one explicit {member} value")
+        result[key] = int(matches[0], 0)
+    if result != {"PToP": 0x8013, "PToPDirect": 0}:
+        raise ValueError("native PToP header/actor contract changed")
+    return result
+
+
 def generate(native, destination):
     models = extract(native)
+    constants = native_constants(native)
     output = [
         "// Generated from pinned native headers; source macro/member provenance below.",
         "#pragma once", "#include <Serialization.h>", "#include <FabricSerializationHelper.h>",
         "enum class Enum : LONG { Zero = 0 };",
+        f"constexpr LONG PTOP_DIRECT_ACTOR = {constants['PToPDirect']};",
         "inline void rich(Enum& v,int& c) { v=Enum(++c%5); }",
         "struct NodeId { ULONG64 high_ = 0, low_ = 0; };",
         "inline void rich(NodeId& v,int& c) { ++c; for(size_t i=0;i<16;++i)reinterpret_cast<UCHAR*>(&v)[i]=(c+i)%256; }",
@@ -151,8 +210,15 @@ def generate(native, destination):
         "template<class T> bool same(const T& a, const T& b) { return a == b; }",
         "template<class T> bool same(const std::vector<T>& a, const std::vector<T>& b) {",
         " if(a.size()!=b.size())return false; for(size_t i=0;i<a.size();++i)if(!same(a[i],b[i]))return false; return true; }",
+        "template<class K,class V> bool same(const std::map<K,V>& a,const std::map<K,V>& b) {",
+        " if(a.size()!=b.size())return false; auto j=b.begin(); for(const auto& i:a) {",
+        " if(!same(i.first,j->first)||!same(i.second,j->second))return false; ++j; } return true; }",
+        "template<class T> bool same(const std::set<T>& a,const std::set<T>& b) {",
+        " if(a.size()!=b.size())return false; auto j=b.begin(); for(const auto& i:a)if(!same(i,*j++))return false; return true; }",
         "template<class T> bool same(const std::shared_ptr<T>& a,const std::shared_ptr<T>& b) {",
         " return (!a&&!b)||(a&&b&&a->matches(*b)); }",
+        "// NodeDescription.h:93; native uint is adapted to ULONG.",
+        "DEFINE_USER_MAP_UTILITY(std::wstring, ULONG);",
     ]
     for name, path, base, macro, fields in models:
         inheritance = "" if base is None else f" : {base or 'Serialization::FabricSerializable'}"
@@ -166,6 +232,13 @@ def generate(native, destination):
             output.append(
                 " ReplicaDescription() { packageVersionInstance_.version_.appVersion_.value_.major_=0;"
                 " packageVersionInstance_.version_.value_.major_=0; }"
+            )
+        if name == "ServicePackageIdentifier":
+            # Single-entry structured maps never compare keys at runtime.
+            # Supply only the type requirement, not native identifier semantics.
+            output.append(
+                " bool operator<(const ServicePackageIdentifier&) const {"
+                ' throw std::runtime_error("fixture requires singleton structured maps"); }'
             )
         if name in {"ScalingTrigger", "ScalingMechanism"}:
             output += [
@@ -188,6 +261,10 @@ def generate(native, destination):
         ]
         if name not in {"GuidValue", "TimeSpan", "ErrorCode"}:
             output.append(f"DEFINE_USER_ARRAY_UTILITY({name});")
+        if name == "ServicePackageResourceGovernanceDescription":
+            output.append("DEFINE_USER_MAP_UTILITY(ServicePackageIdentifier, ServicePackageResourceGovernanceDescription);")
+        if name == "CodePackageContainersImagesDescription":
+            output.append("DEFINE_USER_MAP_UTILITY(ServicePackageIdentifier, CodePackageContainersImagesDescription);")
     output += ['#include "scaling.inc"']
     # Rich fixture traversal follows native macro order, not declaration order.
     # Field values are supplied by fixture.cpp, independently of Rust.

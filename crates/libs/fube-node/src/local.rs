@@ -141,12 +141,26 @@ pub struct PackageRegistration {
 #[derive(Clone)]
 enum Work {
     Add(Arc<AddInstance>),
+    Fm(FmWork),
     Close(PartitionId, ra::CloseMode),
     Registered(ra::RegistrationCompletion),
     Open(ra::OpenCompletion),
     Closed(ra::CloseCompletion),
     Event(ipc::Delivery, ra::EntityId),
     Retry(PartitionId, bool),
+}
+/// Narrow network adapter commands. The adapter owns the admitted session;
+/// source/generation are still validated here and by the RA. Captured work is
+/// never semantic acknowledgement.
+#[derive(Clone)]
+pub enum FmWork {
+    Remove(Box<RemoveInstance>, NodeInstance, GenerationHeader),
+    ReplicaUpReply(ReplicaUp, NodeInstance, GenerationHeader),
+    ServiceTypeReply(ServiceTypeNotification, NodeInstance, GenerationHeader),
+    CaptureServiceTypeWork(u64),
+    CompleteServiceTypeWork(u64),
+    ServiceTypeRetryTimer(u64),
+    RetryReport(PartitionId),
 }
 struct Pending {
     id: u64,
@@ -275,6 +289,54 @@ impl Node {
     }
     pub fn external_pending(&self) -> &[ra::Dispatched] {
         &self.external
+    }
+    /// Transfer original external obligations into a bounded FM adapter escrow.
+    /// This does not acknowledge them. The caller must retain each transferred
+    /// item until its scheduling/send responsibility completes; semantic
+    /// notification/report pending state remains in RA until a matched reply.
+    pub fn take_external_up_to(&mut self, maximum: usize) -> Vec<ra::Dispatched> {
+        self.external
+            .drain(..maximum.min(self.external.len()))
+            .collect()
+    }
+    fn admit_fm(&self, source: &NodeInstance, generation: &GenerationHeader) -> Result<()> {
+        if source != &self.admission.fm_source
+            || generation.for_fm_replica
+            || generation.number != self.admission.generation
+        {
+            return Err(Error::Protocol);
+        }
+        Ok(())
+    }
+    /// A fixed-profile FM session cannot silently widen local Add authority.
+    pub fn add_from_fm(
+        &mut self,
+        body: AddInstance,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        self.admit_fm(source, generation)?;
+        self.add(body)
+    }
+    pub fn fm_work(&mut self, work: FmWork) -> Result<u64> {
+        match &work {
+            FmWork::Remove(body, source, generation) => {
+                self.admit_fm(source, generation)?;
+                if self
+                    .selected
+                    .as_ref()
+                    .is_none_or(|b| b.unit.id != body.replica.0.unit.id)
+                {
+                    return Err(Error::Unsupported);
+                }
+            }
+            FmWork::ReplicaUpReply(_, source, generation)
+            | FmWork::ServiceTypeReply(_, source, generation) => {
+                self.admit_fm(source, generation)?;
+            }
+            _ => {}
+        }
+        self.enqueue(Work::Fm(work))
     }
     pub fn package_registration(&self) -> &PackageRegistration {
         &self.package_registration
@@ -457,6 +519,35 @@ impl Node {
                     number: self.admission.generation.clone(),
                     for_fm_replica: false,
                 },
+            },
+            Work::Fm(work) => match work {
+                FmWork::Remove(body, source, generation) => ra::Command::Remove {
+                    body: body.clone(),
+                    source: source.clone(),
+                    generation: generation.clone(),
+                },
+                FmWork::ReplicaUpReply(body, source, generation) => ra::Command::ReplicaUpReply {
+                    body: Box::new(body.clone()),
+                    source: source.clone(),
+                    generation: generation.clone(),
+                },
+                FmWork::ServiceTypeReply(body, source, generation) => {
+                    ra::Command::ServiceTypeReply {
+                        body: Box::new(body.clone()),
+                        source: source.clone(),
+                        generation: generation.clone(),
+                    }
+                }
+                FmWork::CaptureServiceTypeWork(work) => {
+                    ra::Command::CaptureServiceTypeWork { work: *work }
+                }
+                FmWork::CompleteServiceTypeWork(work) => {
+                    ra::Command::CompleteServiceTypeWork { work: *work }
+                }
+                FmWork::ServiceTypeRetryTimer(timer) => {
+                    ra::Command::ServiceTypeRetryTimer { timer: *timer }
+                }
+                FmWork::RetryReport(unit) => ra::Command::RetryReport(unit.clone()),
             },
             Work::Close(unit, mode) => ra::Command::CloseLocal {
                 unit: unit.clone(),

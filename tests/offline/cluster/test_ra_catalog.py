@@ -92,7 +92,7 @@ class CatalogTests(unittest.TestCase):
 
     def test_no_enabled_capability_claim_from_inventory(self):
         records = {r["symbol"]: r for r in rows()}
-        for action in ["AddInstance", "AddInstanceReply", "RemoveInstance",
+        for action in ["NodeUp", "NodeUpAck", "AddInstance", "AddInstanceReply", "RemoveInstance",
                        "RemoveInstanceReply", "ReplicaUp", "ReplicaUpReply",
                        "ServiceTypeNotification", "ServiceTypeNotificationReply"]:
             self.assertIn("selected", records[action]["status"])
@@ -104,8 +104,8 @@ class CatalogTests(unittest.TestCase):
         removal = (ROOT / "docs/cluster/RaStatelessRemoval.md").read_text()
         for term in [REVISION, "Obliterate", "ReplicaUp", "ForceDelete", "StaleRequest",
                      "not execution", "trusted", "format 2", "volatile",
-                     "queued/in-flight Open", "40 files"]:
-            if term == "40 files":
+                     "queued/in-flight Open", "49 files"]:
+            if term == "49 files":
                 self.assertIn(term, (ROOT / "tests/ra_protocol/README.md").read_text())
             else:
                 self.assertIn(term, removal)
@@ -120,7 +120,7 @@ class CatalogTests(unittest.TestCase):
             self.assertIn(term, replacement)
         records = {r["symbol"]: r for r in rows()}
         self.assertIn("drop-resend-replacement", records["AddInstance"]["status"])
-        self.assertEqual(sum("selected" in r["status"] for r in records.values()), 8)
+        self.assertEqual(sum("selected" in r["status"] for r in records.values()), 10)
 
 
 if __name__ == "__main__":

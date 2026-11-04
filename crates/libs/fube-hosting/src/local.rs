@@ -55,6 +55,15 @@ pub struct Options {
     pub lease_duration: Duration,
     pub residency: ResidencyConfig,
     pub required: ipc::RequiredCapabilities,
+    /// Actual caller-owned node identity for the app's runtime context. None
+    /// preserves the existing standalone local-activation profile.
+    pub node: Option<NodeContext>,
+}
+#[derive(Debug, Clone)]
+pub struct NodeContext {
+    pub id: String,
+    pub instance: u64,
+    pub name: String,
 }
 impl Options {
     pub fn new(run_parent: PathBuf) -> Self {
@@ -65,6 +74,7 @@ impl Options {
             lease_duration: ipc::LOCAL_LEASE_DURATION,
             residency: ResidencyConfig::default(),
             required: ipc::RequiredCapabilities::default(),
+            node: None,
         }
     }
 }
@@ -116,6 +126,16 @@ impl Activation {
     /// Side-effect-free. Unsupported downstream capabilities reject here, not
     /// after writing a deployment or launching a process.
     pub fn new(options: Options) -> LocalResult<Self> {
+        if options.node.as_ref().is_some_and(|node| {
+            node.id.is_empty()
+                || node.id.len() > 32
+                || !node.id.bytes().all(|b| b.is_ascii_hexdigit())
+                || node.instance == 0
+                || node.name.is_empty()
+                || node.name.len() > 128
+        }) {
+            return Err(LocalError::InvalidOptions);
+        }
         if options.registration_timeout.is_zero()
             || options.run_parent.to_str().is_none()
             || options.registration_timeout > Duration::from_secs(30)
@@ -265,13 +285,21 @@ impl Activation {
             code: code.clone(),
         });
         let node = wire::StartReply {
-            node_id: "1".into(),
+            node_id: self
+                .options
+                .node
+                .as_ref()
+                .map_or_else(|| "1".into(), |n| n.id.clone()),
             node_pid: std::process::id(),
             lease_handle: 0,
             lease_duration: 0,
             error: 0,
-            node_instance: 1,
-            node_name: "local-activation".into(),
+            node_instance: self.options.node.as_ref().map_or(1, |n| n.instance),
+            node_name: self
+                .options
+                .node
+                .as_ref()
+                .map_or_else(|| "local-activation".into(), |n| n.name.clone()),
             node_type: "local".into(),
             client_address: "127.0.0.1:19000".into(),
             deployment: deployment.deployment.to_string_lossy().into(),
