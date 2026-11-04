@@ -259,6 +259,7 @@ async fn actual_disposal_barrier_blocks_semantic_retirement_and_error_close_abor
         })
         .await;
         assert!(resource(&node).is_file());
+        assert!(node.instance_disposal().is_none());
         node.close(b.unit.id.clone(), ra::CloseMode::Close).unwrap();
         until(&mut node, |n| count(n, "LOCAL_DISPOSE begin") == 1).await;
         // Continue actual adapter and channel progress throughout the negative
@@ -272,6 +273,10 @@ async fn actual_disposal_barrier_blocks_semantic_retirement_and_error_close_abor
         assert_eq!(count(&node, "LOCAL_CALLBACK close"), 1);
         assert_eq!(count(&node, "LOCAL_CALLBACK abort"), usize::from(error));
         assert_eq!(count(&node, "LOCAL_RESOURCE released"), 0);
+        assert!(
+            node.instance_disposal().is_none(),
+            "held real disposer cannot issue proof"
+        );
         assert!(
             node.activation()
                 .session_status()
@@ -295,7 +300,23 @@ async fn actual_disposal_barrier_blocks_semantic_retirement_and_error_close_abor
         assert_eq!(count(&node, "LOCAL_RESOURCE released"), 1);
         assert_eq!(count(&node, "LOCAL_DISPOSE complete"), 1);
         assert!(!node.activation().process_status().unwrap().exit_observed);
+        until(&mut node, |n| n.instance_disposal().is_some()).await;
+        let proof = node.instance_disposal().unwrap();
+        let mut expected_unit = b.unit.clone();
+        // The native-created FT takes target/minimum from its service.
+        expected_unit.target = 1;
+        expected_unit.minimum = 1;
+        assert_eq!(proof.body.unit, expected_unit);
+        assert_eq!(proof.body.replica.id, 40);
+        assert_eq!(proof.body.replica.instance, 50);
+        assert!(proof.command > 0 && proof.ra_operation > 0);
+        assert!(proof.lookup > 0 && proof.acquisition > 0);
+        assert!(!proof.host.is_empty() && !proof.runtime.is_empty());
         cleanup(&mut node, &store).await;
+        assert!(
+            node.instance_disposal().is_none(),
+            "retired owner cannot reauthorize"
+        );
     }
 }
 
@@ -352,6 +373,10 @@ async fn actual_duplicate_stale_traffic_and_ra_replacement_require_a_new_authori
     );
     assert_eq!(node.retained_usage(), 0);
     node.add(next.clone()).unwrap(); // actual new authorized resend, not a saved launch.
+    assert!(
+        node.instance_disposal().is_none(),
+        "new authority invalidates old proof"
+    );
     until(&mut node, |n| {
         n.snapshot(b.unit.id.guid.0)
             .committed
@@ -360,6 +385,10 @@ async fn actual_duplicate_stale_traffic_and_ra_replacement_require_a_new_authori
     .await;
     replay(&mut node, &open, false).await;
     replay(&mut node, &close, false).await; // actual old request on this same session.
+    assert!(
+        node.instance_disposal().is_none(),
+        "old reply cannot prove current cleanup"
+    );
     assert_eq!(
         node.snapshot(b.unit.id.guid.0)
             .committed

@@ -304,6 +304,12 @@ impl Cluster {
                     return Err("FMM report unsupported".into());
                 }
                 let response = self.ledger.placements[index].report(&body)?;
+                let Some(response) = response else {
+                    if let Some(handoff) = incoming.handoff.as_mut() {
+                        handoff.acknowledge();
+                    }
+                    return Ok(()); // Known retired lifetime: no semantic ACK or link loss.
+                };
                 if !body.replicas.0.is_empty()
                     && self.ledger.placements[index].bootstrap == Bootstrap::Admitted
                 {
@@ -359,6 +365,7 @@ impl Cluster {
                 Ok(()) => self.pump(index).await,
                 Err(error) => Err(error),
             };
+            let result = result.and_then(|()| self.read_retirement(index));
             if let Err(error) = result {
                 self.ledger.lost(index, error);
                 if let Some(link) = &self.children[index].link {
@@ -366,6 +373,16 @@ impl Cluster {
                 }
             }
         }
+    }
+    fn read_retirement(&mut self, index: usize) -> Result<()> {
+        let child = &self.children[index];
+        let path = child.launch.directory.join("retirement.json");
+        let node_pid = child
+            .process
+            .as_ref()
+            .ok_or("original node owner absent")?
+            .pid();
+        self.ledger.read_retirement(index, &path, node_pid)
     }
     pub fn status(&self) -> Value {
         let mut status = self.ledger.status();
@@ -591,6 +608,18 @@ mod tests {
         result.unwrap();
     }
 
+    #[tokio::test]
+    async fn retired_requests_and_report_ack_cross_original_channel_without_touching_successor() {
+        let fixture = Fixture::new("retired-replay");
+        let mut cluster = Cluster::new(fixture.config()).unwrap();
+        cluster.prepare().unwrap();
+        let result = node::report_tests::run_reuse(&cluster.ledger.placements[0].launch)
+            .await
+            .unwrap();
+        assert_eq!(cluster.shutdown().await["clean"], true);
+        result.unwrap();
+    }
+
     mod reply_regressions {
         use super::*;
 
@@ -621,7 +650,8 @@ mod tests {
             assert_eq!(
                 ledger.result("create"),
                 json!({
-                    "op":"create", "state":"error", "native_error":-7
+                    "op":"create", "state":"error", "native_error":-7,
+                    "replica":1, "incarnation":801
                 })
             );
             assert_eq!(ledger.placements[0].observed, Observed::Error);
@@ -634,6 +664,9 @@ mod tests {
             ledger.accept(command("delete", "delete", Some(1))).unwrap();
             let removed = disposed(ready.clone());
             ledger.reply(0, removed.clone(), true).unwrap();
+            ledger
+                .retirement(0, retirement(&ledger.placements[0]), 555)
+                .unwrap();
             let terminal = ledger.status();
             for (reply, removing) in [
                 (ready.clone(), false),
@@ -650,7 +683,8 @@ mod tests {
             assert_eq!(
                 ledger.result("delete"),
                 json!({
-                    "op":"delete", "state":"complete", "observed":"absent"
+                    "op":"delete", "state":"complete", "observed":"absent",
+                    "replica":1, "incarnation":801, "cleanup":"verified_original_instance"
                 })
             );
 
@@ -671,7 +705,8 @@ mod tests {
             assert_eq!(
                 ledger.result("delete2"),
                 json!({
-                    "op":"delete2", "state":"error", "native_error":-7
+                    "op":"delete2", "state":"error", "native_error":-7,
+                    "replica":2, "incarnation":802
                 })
             );
             assert_eq!(ledger.placements[1].observed, Observed::Error);
@@ -692,6 +727,13 @@ mod tests {
             assert_eq!(ledger.result("create")["state"], "unknown");
             assert_eq!(ledger.result("delete")["state"], "pending");
             ledger.reply(0, disposed(ready), true).unwrap();
+            assert_eq!(ledger.result("delete")["state"], "pending");
+            assert!(ledger
+                .accept(command("before-proof", "create", Some(1)))
+                .is_err());
+            ledger
+                .retirement(0, retirement(&ledger.placements[0]), 555)
+                .unwrap();
             assert_eq!(ledger.placements[0].observed, Observed::Absent);
             assert_eq!(ledger.result("delete")["state"], "complete");
         }
@@ -750,6 +792,9 @@ mod tests {
                 ledger.accept(command("delete", "delete", Some(1))).unwrap();
                 ledger.down(0);
                 ledger.reply(0, disposed(ready), true).unwrap();
+                ledger
+                    .retirement(0, retirement(&ledger.placements[0]), 555)
+                    .unwrap();
                 assert_eq!(ledger.placements[0].observed, Observed::Absent);
                 assert_eq!(ledger.result("delete")["state"], "complete");
                 let absent = ledger.status();

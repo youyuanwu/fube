@@ -35,8 +35,11 @@ to retrieve its retained outcome; reuse with different content is rejected.
 Status operation retries return their original snapshot. At most 64 operation
 identities are retained without eviction, with 4096-byte input lines, 64-KiB
 output objects and strict
-unknown-field rejection. Each node gets one creation lifetime, even after
-delete/failure/loss. A reported endpoint is numeric loopback; independently send
+unknown-field rejection. Each node has one current instance lifetime.
+After verified deletion, create again with a **new operation ID** on the same
+live node; replica and RA-instance IDs both strictly increase. Old completed
+operation retries retain their original lifetime/endpoint. Loss or unproved
+cleanup does not enable recreation. A reported endpoint is numeric loopback; independently send
 exactly `identity\n` and read its bounded JSON/newline identity response.
 
 Native NodeUp/Ack and the final empty ReplicaUp/Reply precede RA construction.
@@ -60,6 +63,22 @@ absence. Unsupported/staged effects and semantic obligations are counted,
 retained and never acknowledged merely because a write or send pass finished.
 Original external-effect escrow is 32 slots; reply receipts, scheduling
 completions and semantic pending maps have separate finite bounds.
+
+Deletion joins the exact semantic Remove with a bounded local `retirement.json`
+from the original Node. That receipt requires original-runtime service disposal,
+the exact Applied Close command, original Hosting acquisition release and drained
+predecessor replica work. A written frame, Closed snapshot, Remove response,
+zero usage count or missing PID is not a substitute. Missing proof keeps delete
+pending; old/cross-owner receipts cannot authorize another lifetime. Known
+retired native traffic is ignored without acknowledging current work or closing
+its healthy original link.
+
+The app host/factory/package/runtime and retained partition tombstones remain
+under their original owners. Only the service instance and its listener retire
+between cycles; the public stateless instance ID equals the fresh ReplicaId,
+not the separate RA incarnation. The FM and nodes never restart for recreation.
+Unproved pending-Open cleanup may remain nonreusable. All existing finite
+operation/message/escrow limits remain; this is not unlimited-cycle operation.
 
 **Always reuse the same profile root for this ownership domain.** An exclusive
 lock and atomically published dirty marker precede startup. Only verified
@@ -99,7 +118,10 @@ until actual RA stage clearance, sibling isolation, partial-start rollback, lost
 receipt refusal and clean-vs-dirty relaunch. The CLI test launches the real
 foreground executable and both real nodes; its endpoint oracle is captured from
 original launch/activation metadata before create. It verifies all actual app
-identity fields, rejects a swapped sibling, observes disposal and independently
-checks process/runtime removal. Dirty lost-owner fixtures intentionally retain
+identity fields and monotone lifetimes, rejects a swapped sibling, completes two
+lifetimes per node while checking original process start identities and sibling
+contact, observes disposal and independently checks final process/runtime
+removal. Consumer tests reject serialized stale/cross-owner retirement proofs
+and check both Remove/proof arrival orders. Dirty lost-owner fixtures intentionally retain
 their failed-handoff domain and evidence. These tests are native-free evidence, not
 deployed native FM/Federation qualification.

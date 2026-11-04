@@ -76,6 +76,145 @@ fn ready_reply(placement: &fm::Placement) -> AddInstanceReply {
         error: 0,
     }
 }
+    fn remove_reply(placement: &fm::Placement) -> AddInstanceReply {
+        let mut reply = ready_reply(placement);
+        reply.replica.state = 3;
+        reply.replica.up = false;
+        reply.replica.version = VersionInstance::invalid();
+        reply.replica.service_endpoint.clear();
+        reply
+    }
+    fn retirement(placement: &fm::Placement) -> RetirementReceipt {
+        RetirementReceipt {
+            deployment: placement.launch.deployment.clone(),
+            session: placement.launch.session.clone(),
+            node: placement.launch.node.clone(),
+            fm: placement.launch.fm.clone(),
+            generation: placement.launch.generation.clone(),
+            node_pid: 555,
+            app_pid: placement.profile.as_ref().unwrap().app_pid,
+            runtime_root: placement.profile.as_ref().unwrap().runtime_root.clone(),
+            disposal: fube_node::local::InstanceDisposal {
+                body: placement.body().unwrap(),
+                host: "original-host".into(),
+                runtime: "original-runtime".into(),
+                command: 8,
+                ra_operation: 19,
+                lookup: 3,
+                acquisition: 42,
+            },
+        }
+    }
+
+    #[test]
+    fn serialized_retirement_join_rejects_missing_old_and_cross_owner_proofs_in_both_orders() {
+        let parent = support::parent();
+        let root = parent.join(format!("receipt-{}", uuid::Uuid::new_v4()));
+        private_dir(&root).unwrap();
+        let path = root.join("retirement.json");
+        for proof_first in [false, true] {
+            let mut ledger = ledger();
+            ledger.accept(command("a", "create", Some(1))).unwrap();
+            let first = ready_reply(&ledger.placements[0]);
+            ledger.reply(0, first.clone(), false).unwrap();
+            let first_result = ledger.result("a");
+            ledger.accept(command("d", "delete", Some(1))).unwrap();
+            let old_proof = retirement(&ledger.placements[0]);
+            let removed = remove_reply(&ledger.placements[0]);
+            if proof_first {
+                write_json(&path, &old_proof).unwrap();
+                ledger.read_retirement(0, &path, 555).unwrap();
+                assert_eq!(ledger.result("d")["state"], "pending");
+                assert!(ledger.accept(command("early", "create", Some(1))).is_err());
+                ledger.reply(0, removed, true).unwrap();
+            } else {
+                let _ = fs::remove_file(&path);
+                ledger.reply(0, removed, true).unwrap();
+                ledger.read_retirement(0, &path, 555).unwrap();
+                assert_eq!(ledger.result("d")["state"], "pending");
+                assert!(ledger.accept(command("early", "create", Some(1))).is_err());
+                write_json(&path, &old_proof).unwrap();
+                ledger.read_retirement(0, &path, 555).unwrap();
+            }
+            assert_eq!(ledger.result("d")["cleanup"], "verified_original_instance");
+            let deleted = ledger.result("d");
+            ledger.accept(command("b", "create", Some(1))).unwrap();
+            assert_eq!(ledger.placements[0].replica, first.replica.id + 1);
+            assert_eq!(ledger.placements[0].incarnation, first.replica.instance + 1);
+            ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
+            ledger.accept(command("e", "delete", Some(1))).unwrap();
+            ledger.reply(0, remove_reply(&ledger.placements[0]), true).unwrap();
+            // The serialized, otherwise valid old proof cannot discharge B.
+            write_json(&path, &old_proof).unwrap();
+            ledger.read_retirement(0, &path, 555).unwrap();
+            assert_eq!(ledger.result("e")["state"], "pending");
+            let identity = (ledger.placements[0].replica, ledger.placements[0].incarnation);
+            let operations = ledger.operations.len();
+            assert!(ledger.accept(command("premature", "create", Some(1))).is_err());
+            assert_eq!(ledger.operations.len(), operations);
+            assert_eq!((ledger.placements[0].replica, ledger.placements[0].incarnation), identity);
+            let current = retirement(&ledger.placements[0]);
+            let mut sibling = current.clone();
+            sibling.session = ledger.placements[1].launch.session.clone();
+            write_json(&path, &sibling).unwrap();
+            assert!(ledger.read_retirement(0, &path, 555).is_err());
+            assert_eq!(ledger.result("e")["state"], "pending");
+            write_json(&path, &current).unwrap();
+            ledger.read_retirement(0, &path, 555).unwrap();
+            assert_eq!(ledger.result("e")["state"], "complete");
+            ledger.accept(command("c", "create", Some(1))).unwrap();
+            ledger.lost(0, "current link lost".into());
+            assert_eq!(ledger.result("a"), first_result, "predecessor snapshot is frozen");
+            assert_eq!(ledger.result("d"), deleted);
+            assert!(matches!(ledger.accept(command("a", "create", Some(1))).unwrap(),
+                Accepted::Duplicate(value) if value == first_result));
+            assert!(ledger.accept(command("a", "create", Some(2))).is_err());
+            assert!(ledger.accept(command("after-loss", "create", Some(1))).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retired_native_frames_do_not_mutate_successor_and_identity_overflow_does_not_consume_history() {
+        let mut ledger = ledger();
+        ledger.accept(command("a", "create", Some(1))).unwrap();
+        let old = ready_reply(&ledger.placements[0]);
+        ledger.reply(0, old.clone(), false).unwrap();
+        ledger.accept(command("d", "delete", Some(1))).unwrap();
+        let removed = remove_reply(&ledger.placements[0]);
+        ledger.reply(0, removed.clone(), true).unwrap();
+        ledger.retirement(0, retirement(&ledger.placements[0]), 555).unwrap();
+        ledger.accept(command("b", "create", Some(1))).unwrap();
+        let current = ready_reply(&ledger.placements[0]);
+        ledger.reply(0, current.clone(), false).unwrap();
+        let status = ledger.status();
+        ledger.reply(0, old, false).unwrap();
+        ledger.reply(0, removed.clone(), true).unwrap();
+        let report = ReplicaUp {
+            dropped: ObjectArray(vec![FailoverUnitInfo {
+                unit: removed.unit,
+                service: ledger.placements[0].body().unwrap().service,
+                replicas: ObjectArray(vec![ReplicaInfo {
+                    description: removed.replica,
+                    intermediate_role: 1,
+                }]),
+                ..FailoverUnitInfo::default()
+            }]),
+            ..ReplicaUp::default()
+        };
+        assert!(ledger.placements[0].report(&report).unwrap().is_none());
+        assert_eq!(ledger.status(), status);
+        assert!(ledger.placements[0].link_alive);
+        ledger.accept(command("e", "delete", Some(1))).unwrap();
+        ledger.reply(0, remove_reply(&ledger.placements[0]), true).unwrap();
+        ledger.retirement(0, retirement(&ledger.placements[0]), 555).unwrap();
+        ledger.placements[0].incarnation = i64::MAX;
+        let prior = ledger.operations.len();
+        let replica = ledger.placements[0].replica;
+        assert!(ledger.accept(command("overflow", "create", Some(1))).is_err());
+        assert_eq!(ledger.operations.len(), prior);
+        assert_eq!(ledger.placements[0].replica, replica);
+    }
 
 #[test]
 fn private_launch_metadata_roundtrip_does_not_use_native_byte_array_json_visitors() {
@@ -143,7 +282,8 @@ fn semantic_completion_is_exact_and_writes_never_complete_an_operation() {
     disposed.replica.version = VersionInstance::invalid();
     disposed.replica.service_endpoint.clear();
     ledger.reply(0, disposed, true).unwrap();
-    assert_eq!(ledger.placements[0].observed, Observed::Absent);
+    assert_eq!(ledger.placements[0].observed, Observed::Pending);
+    assert_eq!(ledger.result("d")["state"], "pending");
     assert!(ledger.accept(command("new", "create", Some(1))).is_err());
 }
 
@@ -175,7 +315,7 @@ fn notification_catalog_uses_generated_version_and_unsupported_work_is_not_echoe
     ledger.placements[0].bootstrap = Bootstrap::FinalUpload;
     assert_eq!(
         ledger.placements[0].report(&final_upload).unwrap(),
-        final_upload
+        Some(final_upload.clone())
     );
     let mut unsupported = final_upload;
     unsupported.from_fmm = true;
@@ -210,6 +350,42 @@ fn finite_identities_are_not_evicted_and_uncertainty_retains_authority() {
     )
     .is_err());
     assert!(command("x", "create", Some(3)).validate().is_err());
+
+    let mut repeated = self::ledger();
+    for cycle in 0..2 {
+        repeated.accept(command(&format!("c{cycle}"), "create", Some(1))).unwrap();
+        repeated.reply(0, ready_reply(&repeated.placements[0]), false).unwrap();
+        repeated.accept(command(&format!("d{cycle}"), "delete", Some(1))).unwrap();
+        repeated.reply(0, remove_reply(&repeated.placements[0]), true).unwrap();
+        repeated.retirement(0, retirement(&repeated.placements[0]), 555).unwrap();
+    }
+    let old = repeated.result("c0");
+    let replica = repeated.placements[0].replica;
+    for index in 4..64 {
+        repeated.accept(command(&format!("s{index}"), "status", None)).unwrap();
+    }
+    assert!(repeated.accept(command("capacity", "create", Some(1))).is_err());
+    assert_eq!(repeated.placements[0].replica, replica);
+    assert_eq!(repeated.operations.len(), 64);
+    assert!(matches!(repeated.accept(command("c0", "create", Some(1))).unwrap(),
+        Accepted::Duplicate(value) if value == old));
+    assert!(repeated.accept(command("c0", "create", Some(2))).is_err());
+}
+
+#[test]
+fn semantic_remove_then_disconnect_cannot_be_repaired_by_a_late_local_receipt() {
+    let mut ledger = ledger();
+    ledger.accept(command("c", "create", Some(1))).unwrap();
+    ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
+    ledger.accept(command("d", "delete", Some(1))).unwrap();
+    let proof = retirement(&ledger.placements[0]);
+    ledger.reply(0, remove_reply(&ledger.placements[0]), true).unwrap();
+    assert_eq!(ledger.result("d")["state"], "pending");
+    ledger.lost(0, "original channel lost before proof".into());
+    ledger.retirement(0, proof, 555).unwrap();
+    assert_eq!(ledger.result("d")["state"], "unknown");
+    assert!(!ledger.placements[0].reusable);
+    assert!(ledger.accept(command("unsafe", "create", Some(1))).is_err());
 }
 
 #[path = "../tests/support/mod.rs"]

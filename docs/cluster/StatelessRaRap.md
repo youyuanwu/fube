@@ -10,7 +10,7 @@ regressions are not binaries asserted built from that pin.
 
 ## Composition and admission
 
-[`fube_node::local::Node`](../../crates/libs/fube-node/src/local.rs#L201-L260)
+[`fube_node::local::Node`](../../crates/libs/fube-node/src/local.rs#L225-L308)
 takes an **unstarted** `Activation`, a store and trusted local RA admission.
 It creates a dedicated serialized RA executor and binds its original terminal
 consumer lifetime **before** activation admission. Hosting remains independent
@@ -24,7 +24,7 @@ factory. Add preflights exact package/type/version/service, stateless InBuild
 identity, immutable description and a **60KiB** canonical-body limit, reserving
 4KiB for RAP/RA/frame overhead. Unsupported updates/impossible incarnations
 reject before RA submission or acquisition
-([admission](../../crates/libs/fube-node/src/local.rs#L333-L425)).
+([admission](../../crates/libs/fube-node/src/local.rs#L477-L562)).
 This trusted local input is not an implemented FM network authority.
 
 ## Actual lifecycle and ownership
@@ -36,7 +36,7 @@ Only committed `RuntimeOpen`/`Close` effects send actor12 `ReplicaOpen`/
 `ReplicaClose`. Drop uses flag8, Abort flag4 and ordinary Close flag0. Lifecycle
 replies are semantic **one-way** traffic; only RAPQuery uses correlation.
 Transport write success is not service success
-([lookup/release/effects](../../crates/libs/fube-node/src/local.rs#L603-L831)).
+([lookup/release/effects](../../crates/libs/fube-node/src/local.rs#L791-L1025)).
 Accepted IPC establishment/envelope policy belongs to `native_ipc`, not a
 Hosting mode in the shared channel. Hosting retains admission and lease
 authority and explicitly invokes whole-socket disposal when retiring a
@@ -54,8 +54,8 @@ native epoch/incarnation/state admission, not full packet equality. Empty
 endpoints remain successful. Duplicate/stale work cannot recreate an instance or
 release a current use. Replacement Drop retires the old identity and requires a
 new authorized Add resend
-([reply](../../crates/libs/fube-node/src/local.rs#L832-L895),
-[combined replay](../../crates/samples/hosting-local-app/tests/lifecycle.rs#L303-L388)).
+([reply](../../crates/libs/fube-node/src/local.rs#L1026-L1126),
+[combined replay](../../crates/samples/hosting-local-app/tests/lifecycle.rs#L324-L417)).
 
 Required local Registered retry, exact RuntimeClosed ordinary Close and
 HostClosed crash consumers execute inside serialized RA transitions without
@@ -67,7 +67,7 @@ that is **not** an FM ACK. Required health/application reports, FM completion an
 deployed lifecycle still reject at construction; unsupported report/control
 traffic has no generic successful fallback
 ([events](../../crates/libs/fube-ra/src/hosting_events.rs#L112-L175),
-[local obligations](../../crates/libs/fube-node/src/local.rs#L896-L960)).
+[local obligations](../../crates/libs/fube-node/src/local.rs#L1128-L1191)).
 Native upgrade/reactivation registration-timeout orchestration is not enabled.
 
 ## Driving, bounds and errors
@@ -78,7 +78,7 @@ and process/watchdog supervision remain independently owned. Observation timeout
 drop never cancels accepted work. There are 32 retained command, effect/receipt
 and acquisition slots each, and 32 external pending slots; saturation retains
 work upstream rather than dropping a drained batch
-([progress](../../crates/libs/fube-node/src/local.rs#L483-L602)).
+([progress](../../crates/libs/fube-node/src/local.rs#L662-L789)).
 
 Accepted Hosting channels reuse the shared bounded stream driver. One ordinary
 lifecycle send leaves ingress and reserved response byte headroom within the
@@ -98,7 +98,7 @@ usage and require recovery outside this profile. Do not replace the worker/store
 resubmit accepted work or manufacture release. The final-Close Unknown regression
 proves late original completion/exact release without another durable write or
 Store recovery
-([regression](../../crates/samples/hosting-local-app/tests/lifecycle.rs#L735-L811)).
+([regression](../../crates/samples/hosting-local-app/tests/lifecycle.rs#L764-L840)).
 
 ## Service retirement versus physical cleanup
 
@@ -106,6 +106,19 @@ Successful Close is accepted only after real runtime disposal. A graceful callba
 error follows the existing runtime Abort/disposal path before semantic success;
 actual failed/absent semantic completion instead retains RA retry/ownership.
 Service Close alone leaves a healthy shared host resident.
+
+[`instance_disposal`](../../crates/libs/fube-node/src/local.rs#L421) exposes a
+bounded positive observation for that exact retired instance. It requires a
+successful original-runtime Close reply admitted through the original IPC
+Entry/lease, its Applied RA command, and release of the original paired
+acquisition. Command, RA operation, lookup and acquisition IDs are distinct
+lineages, not interchangeable authority. It rechecks current committed identity,
+unfenced original owner, drained local work and live unchanged host/session.
+A Closed snapshot, Remove response, zero count or PID disappearance cannot
+construct it; successor admission invalidates it. Caller-owned external
+replica/report escrow and semantic deletion remain separate prerequisites.
+The [foreground cluster](MinimalFmCluster.md) joins those prerequisites before
+recreation without restarting the FM, Node or app host.
 
 `terminate` is a separate explicit physical cleanup request. With live usage it
 can kill/drain/reap yet return Busy, retaining exact accounting and the directory.
@@ -118,7 +131,7 @@ reopening Add/retry/serving authority or decrementing directly on exit.
 declaration/source removal complete), so a momentary empty snapshot cannot race
 new closure production. External pending FM work is not an ACK. Exit, waitable-leader reservation, group drain, direct-child
 reap and directory release remain separate observations
-([cleanup APIs](../../crates/libs/fube-node/src/local.rs#L962-L981)).
+([cleanup APIs](../../crates/libs/fube-node/src/local.rs#L1200-L1212)).
 Abandoned owners/escaped descendants have no durable recovery guarantee.
 
 ## Native-free qualification
@@ -139,7 +152,7 @@ existence/removal, empty endpoint, duplicate/stale traffic, replacement resend,
 Abort/error fallback, runtime unregister, opening/Ready crashes and lease loss,
 original pending/Unknown work, and physical cleanup
 ([fixture](../../crates/samples/hosting-local-app/src/main.rs#L13-L96),
-[qualification](../../crates/samples/hosting-local-app/tests/lifecycle.rs#L180-L1185)).
+[qualification](../../crates/samples/hosting-local-app/tests/lifecycle.rs#L180-L1214)).
 Hard exit is **not** a destructor receipt; physical directory cleanup is distinct.
 Focused response-side tests separately exercise malformed/stale/failed replies,
 native-admissible non-full equality and foreign Entry identity. Explicit

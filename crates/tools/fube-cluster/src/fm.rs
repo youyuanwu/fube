@@ -1,4 +1,4 @@
-use crate::profile::{add_body, ActualProfile, Launch, Result};
+use crate::profile::{add_body, ActualProfile, Launch, Result, RetirementReceipt};
 use fube_ra::protocol::*;
 use fube_transport::serialization::serde::ObjectArray;
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,12 @@ pub struct Placement {
     pub error: Option<String>,
     pub link_alive: bool,
     pub catalog_notified: bool,
+    pub replica: i64,
+    pub incarnation: i64,
+    pub retired: Vec<(i64, i64)>,
+    pub reusable: bool,
+    pub retirement: Option<RetirementReceipt>,
+    remove_received: bool,
     pending: Option<PendingPhase>,
 }
 #[derive(Clone)]
@@ -94,6 +100,8 @@ pub enum Accepted {
 impl Placement {
     pub fn new(launch: Launch) -> Self {
         Self {
+            replica: launch.replica,
+            incarnation: launch.incarnation,
             launch,
             profile: None,
             bootstrap: Bootstrap::NodeUp,
@@ -106,6 +114,10 @@ impl Placement {
             error: None,
             link_alive: true,
             catalog_notified: false,
+            retired: vec![],
+            reusable: false,
+            retirement: None,
+            remove_received: false,
             pending: None,
         }
     }
@@ -119,10 +131,28 @@ impl Placement {
         Ok(())
     }
     pub fn body(&self) -> Result<AddInstance> {
-        Ok(add_body(
+        self.body_for(self.replica, self.incarnation)
+    }
+    fn body_for(&self, replica: i64, incarnation: i64) -> Result<AddInstance> {
+        let mut body = add_body(
             &self.launch,
             self.profile.as_ref().ok_or("profile not admitted")?,
-        ))
+        );
+        body.replica.id = replica;
+        body.replica.instance = incarnation;
+        Ok(body)
+    }
+    fn retired_replica(&self, replica: &Replica, canonical: bool) -> Result<bool> {
+        if self.retired.contains(&(replica.id, replica.instance)) {
+            exact_replica(
+                &self.body_for(replica.id, replica.instance)?.replica,
+                replica,
+                canonical,
+            )?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
     pub fn notification(&self, body: &ServiceTypeNotification) -> Result<ServiceTypeNotification> {
         if self.bootstrap != Bootstrap::Admitted || body.infos.0.len() > 1 {
@@ -138,7 +168,7 @@ impl Placement {
         }
         Ok(body.clone())
     }
-    pub fn report(&self, body: &ReplicaUp) -> Result<ReplicaUp> {
+    pub fn report(&self, body: &ReplicaUp) -> Result<Option<ReplicaUp>> {
         if body.from_fmm {
             return Err("FMM upload unsupported".into());
         }
@@ -146,7 +176,7 @@ impl Placement {
             if !body.last || !body.replicas.0.is_empty() || !body.dropped.0.is_empty() {
                 return Err("fresh final upload must be empty and final".into());
             }
-            return Ok(body.clone());
+            return Ok(Some(body.clone()));
         }
         if self.bootstrap != Bootstrap::Admitted
             || body.last
@@ -165,6 +195,11 @@ impl Placement {
                     return Err("foreign/stale report partition or service".into());
                 }
                 let replica = &info.replicas.0[0].description;
+                if self.retired_replica(replica, true)? {
+                    // Valid old lineage is not a protocol/link failure and is
+                    // not an ACK of the successor's semantic obligations.
+                    return Ok(None);
+                }
                 exact_replica(&expected.replica, replica, true)?;
                 if dropped {
                     // This ephemeral FM can semantically forget the exact
@@ -178,24 +213,26 @@ impl Placement {
                 }
             }
         }
-        Ok(ReplicaUp {
+        Ok(Some(ReplicaUp {
             replicas: ObjectArray(body.replicas.0.clone()),
             dropped: ObjectArray(body.dropped.0.clone()),
             last: false,
             from_fmm: false,
-        })
+        }))
     }
     pub fn status(&self) -> Value {
         json!({
             "node": self.launch.placement, "node_id": crate::profile::node_hex(&self.launch.node),
             "node_instance": self.launch.node.instance, "session": self.launch.session,
-            "partition": self.launch.partition, "replica": self.launch.replica,
-            "incarnation": self.launch.incarnation, "service": crate::profile::SERVICE,
+            "partition": self.launch.partition, "replica": self.replica,
+            "incarnation": self.incarnation, "service": crate::profile::SERVICE,
             "service_type": crate::profile::TYPE,
             "desired": self.desired, "observed": self.observed,
             "endpoint": self.endpoint, "created_lifetime": self.created,
             "link_alive": self.link_alive, "error": self.error,
             "catalog_notified": self.catalog_notified,
+            "reusable":self.reusable, "retired_lifetimes":self.retired.len(),
+            "retirement":self.retirement,
             "app_pid": self.profile.as_ref().map(|p| p.app_pid),
             "runtime_root": self.profile.as_ref().map(|p| &p.runtime_root),
         })
@@ -219,6 +256,18 @@ fn exact_replica(expected: &Replica, actual: &Replica, canonical: bool) -> Resul
     Ok(())
 }
 impl Ledger {
+    pub fn read_retirement(
+        &mut self,
+        index: usize,
+        path: &std::path::Path,
+        node_pid: u32,
+    ) -> Result<()> {
+        if !path.try_exists().map_err(crate::profile::err)? {
+            return Ok(());
+        }
+        let receipt = crate::profile::read_json(path)?;
+        self.retirement(index, receipt, node_pid)
+    }
     pub fn new(launches: [Launch; 2]) -> Self {
         let [one, two] = launches;
         Self {
@@ -250,14 +299,32 @@ impl Ledger {
                 let placement = &mut self.placements[index];
                 if placement.bootstrap != Bootstrap::Admitted
                     || !placement.link_alive
-                    || placement.created
+                    || (placement.created && !placement.reusable)
                 {
                     return Err(
-                        "node unadmitted, uncertain, or creation lifetime already consumed".into(),
+                        "node unadmitted, uncertain, or predecessor cleanup not verified".into(),
                     );
+                }
+                if placement.created {
+                    let replica = placement
+                        .replica
+                        .checked_add(1)
+                        .ok_or("replica identity exhausted")?;
+                    let incarnation = placement
+                        .incarnation
+                        .checked_add(1)
+                        .ok_or("instance identity exhausted")?;
+                    placement.replica = replica;
+                    placement.incarnation = incarnation;
                 }
                 let body = placement.body()?;
                 placement.created = true;
+                placement.reusable = false;
+                placement.retirement = None;
+                placement.remove_received = false;
+                placement.delete_op = None;
+                placement.endpoint = None;
+                placement.error = None;
                 placement.desired = Desired::Running;
                 placement.observed = Observed::Pending;
                 placement.create_op = Some(command.op.clone());
@@ -297,10 +364,13 @@ impl Ledger {
             "quit" => Accepted::Quit,
             _ => unreachable!(),
         };
-        self.operations.push(Operation {
-            outcome: json!({"op":command.op,"state":"pending"}),
-            command,
-        });
+        let mut outcome = json!({"op":command.op,"state":"pending"});
+        if let Some(node) = command.node {
+            let placement = &self.placements[usize::from(node - 1)];
+            outcome["replica"] = json!(placement.replica);
+            outcome["incarnation"] = json!(placement.incarnation);
+        }
+        self.operations.push(Operation { outcome, command });
         Ok(accepted)
     }
     pub fn result(&self, op: &str) -> Value {
@@ -310,12 +380,19 @@ impl Ledger {
             .map(|item| item.outcome.clone())
             .unwrap_or_else(|| json!({"state":"rejected"}))
     }
-    pub fn complete(&mut self, op: &str, outcome: Value) {
+    pub fn complete(&mut self, op: &str, mut outcome: Value) {
         if let Some(operation) = self
             .operations
             .iter_mut()
             .find(|item| item.command.op == op)
         {
+            for key in ["replica", "incarnation"] {
+                if outcome.get(key).is_none() {
+                    if let Some(value) = operation.outcome.get(key) {
+                        outcome[key] = value.clone();
+                    }
+                }
+            }
             operation.outcome = outcome;
         }
     }
@@ -325,7 +402,11 @@ impl Ledger {
         placement.pending = None;
         placement.observed = Observed::Unknown;
         placement.error = Some(error.clone());
-        let operations = [placement.create_op.clone(), placement.delete_op.clone()];
+        let operations = if placement.reusable {
+            [None, None]
+        } else {
+            [placement.create_op.clone(), placement.delete_op.clone()]
+        };
         for operation in operations.into_iter().flatten() {
             // Even earlier serving observations cannot establish current life
             // after session loss. Desired authority and tombstones stay intact.
@@ -362,6 +443,9 @@ impl Ledger {
         let expected = placement.body()?;
         if body.unit != expected.unit {
             return Err("foreign/stale reply partition or epoch".into());
+        }
+        if placement.retired_replica(&body.replica, removing && body.error == 0)? {
+            return Ok(());
         }
         exact_replica(
             &expected.replica,
@@ -407,8 +491,11 @@ impl Ledger {
         if placement.pending != Some(phase) {
             return Ok(());
         }
-        placement.pending = None;
+        if removing && placement.remove_received {
+            return Ok(());
+        }
         if body.error != 0 {
+            placement.pending = None;
             placement.observed = Observed::Error;
             placement.endpoint = None;
             placement.error = Some(format!("native semantic error {}", body.error));
@@ -419,19 +506,74 @@ impl Ledger {
             return Ok(());
         }
         if removing {
-            placement.observed = Observed::Absent;
-            placement.endpoint = None;
+            placement.remove_received = true;
+            self.finish_delete(index);
+            return Ok(());
         } else {
+            placement.pending = None;
             placement.observed = Observed::Running;
             placement.endpoint = endpoint;
         }
         placement.error = None;
-        self.complete(
-            &op,
-            json!({"op":op,"state":"complete",
-            "observed":if removing {"absent"} else {"running"}}),
-        );
+        let outcome = json!({"op":op,"state":"complete",
+            "observed":"running", "replica":placement.replica,
+            "incarnation":placement.incarnation, "endpoint":placement.endpoint});
+        self.complete(&op, outcome);
         Ok(())
+    }
+    /// Called only by the production bounded sidecar reader, while the
+    /// original node/link is still owned and live. Arrival order is irrelevant.
+    pub fn retirement(
+        &mut self,
+        index: usize,
+        proof: RetirementReceipt,
+        node_pid: u32,
+    ) -> Result<()> {
+        let placement = &mut self.placements[index];
+        proof.validate(
+            &placement.launch,
+            placement.profile.as_ref().ok_or("missing profile")?,
+            node_pid,
+        )?;
+        let replica = &proof.disposal.body.replica;
+        if placement.retired.contains(&(replica.id, replica.instance)) {
+            return Ok(());
+        }
+        if replica.id != placement.replica || replica.instance != placement.incarnation {
+            return Err("unrecognized retirement lifetime".into());
+        }
+        if !placement.link_alive
+            || placement.desired != Desired::Absent
+            || placement.pending != Some(PendingPhase::Delete)
+        {
+            return Ok(());
+        }
+        placement.retirement = Some(proof);
+        self.finish_delete(index);
+        Ok(())
+    }
+    fn finish_delete(&mut self, index: usize) {
+        let placement = &mut self.placements[index];
+        if !placement.link_alive
+            || placement.pending != Some(PendingPhase::Delete)
+            || !placement.remove_received
+            || placement.retirement.is_none()
+        {
+            return;
+        }
+        placement.pending = None;
+        placement.observed = Observed::Absent;
+        placement.endpoint = None;
+        placement.error = None;
+        placement.reusable = true;
+        placement
+            .retired
+            .push((placement.replica, placement.incarnation));
+        let op = placement.delete_op.clone().unwrap();
+        let outcome = json!({"op":op,"state":"complete","observed":"absent",
+            "replica":placement.replica,"incarnation":placement.incarnation,
+            "cleanup":"verified_original_instance"});
+        self.complete(&op, outcome);
     }
     pub fn status(&self) -> Value {
         json!({"nodes":self.placements.iter().map(Placement::status).collect::<Vec<_>>(),

@@ -324,6 +324,22 @@ impl Adapter {
             .map_or(0, |body| body.infos.0.len())
             + usize::from(self.report_pending.is_some())
     }
+    fn replica_drained(&self, node: &Node) -> bool {
+        let replica_work = |dispatch: &ra::Dispatched| {
+            matches!(
+                dispatch.effect,
+                ra::Effect::RequestReportRetry | ra::Effect::ReplicaUp(_)
+            )
+        };
+        self.replies.is_empty()
+            && self.report_pending.is_none()
+            && !self
+                .acknowledgements
+                .iter()
+                .any(|(_, ack)| matches!(ack, SemanticAck::Report(_)))
+            && !self.escrow.iter().any(|item| replica_work(&item.original))
+            && !node.external_pending().iter().any(replica_work)
+    }
 }
 
 async fn control_line(input: &mut BufReader<tokio::io::Stdin>) -> Result<Option<Vec<u8>>> {
@@ -515,6 +531,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     let mut link = Some(link);
     let mut failure = startup.err();
     let mut next_observation = Instant::now();
+    let mut published_retirement = None;
     if failure.is_none() {
         loop {
             // Owned stop remains independent of FM connectivity. Link loss is
@@ -570,6 +587,43 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         if let Some(old) = link.take() {
                             let _ = old.close().await;
                         }
+                    }
+                }
+            }
+            if link.is_some() && adapter.error.is_none() && adapter.replica_drained(&node) {
+                if let Some(disposal) = node.instance_disposal() {
+                    let state = node.snapshot(disposal.body.unit.id.guid.0);
+                    let deleted = !state.fenced
+                        && state.committed.is_some_and(|s| {
+                            s.local_deleted && s.cleanup_pending && s.fm_stage == ra::FmStage::None
+                        });
+                    let lifetime = (disposal.body.replica.id, disposal.body.replica.instance);
+                    if deleted && published_retirement != Some(lifetime) {
+                        let profile = match actual_profile(&node) {
+                            Ok(profile) => profile,
+                            Err(error) => {
+                                failure = Some(error);
+                                break;
+                            }
+                        };
+                        let receipt = RetirementReceipt {
+                            deployment: launch.deployment.clone(),
+                            session: launch.session.clone(),
+                            node: launch.node.clone(),
+                            fm: launch.fm.clone(),
+                            generation: launch.generation.clone(),
+                            node_pid: std::process::id(),
+                            app_pid: profile.app_pid,
+                            runtime_root: profile.runtime_root,
+                            disposal,
+                        };
+                        if let Err(error) =
+                            write_json(&launch.directory.join("retirement.json"), &receipt)
+                        {
+                            failure = Some(error);
+                            break;
+                        }
+                        published_retirement = Some(lifetime);
                     }
                 }
             }
@@ -822,6 +876,9 @@ pub(crate) mod report_tests {
     struct Traffic {
         reports: Vec<ReplicaUp>,
         added: bool,
+        removed: bool,
+        add_reply: Option<AddInstanceReply>,
+        remove_reply: Option<AddInstanceReply>,
     }
 
     async fn links(launch: &Launch) -> Result<(Link, Link)> {
@@ -916,6 +973,7 @@ pub(crate) mod report_tests {
                         );
                     }
                     traffic.added = true;
+                    traffic.add_reply = Some(body);
                 }
                 "ReplicaUp" => {
                     let (body, owner) = decode_replica_up(&incoming.message).map_err(err)?;
@@ -923,6 +981,14 @@ pub(crate) mod report_tests {
                         return Err("unexpected report authority or unbounded retry".into());
                     }
                     traffic.reports.push(body);
+                }
+                "RemoveInstanceReply" => {
+                    let (body, _) = decode_remove_instance_reply(&incoming.message).map_err(err)?;
+                    if body.error != 0 || body.replica.state != 3 {
+                        return Err("real removal did not dispose the instance".into());
+                    }
+                    traffic.removed = true;
+                    traffic.remove_reply = Some(body);
                 }
                 other => return Err(format!("unexpected FM test ingress {other}")),
             }
@@ -1237,7 +1303,186 @@ pub(crate) mod report_tests {
         Ok(())
     }
 
+    async fn exercise_reuse(
+        launch: &Launch,
+        node: &mut Node,
+        adapter: &mut Adapter,
+        fm: &Link,
+        link: &Link,
+    ) -> Result<()> {
+        let body = add_body(launch, &actual_profile(node)?);
+        let entity = body.unit.id.guid.0;
+        let mut traffic = Traffic::default();
+        let mut ledger = crate::fm::Ledger::new([launch.clone(), launch.clone()]);
+        ledger.placements[0].bootstrap = crate::fm::Bootstrap::Metadata;
+        ledger.placements[0].admit_profile(actual_profile(node)?)?;
+        let command = |op: &str, action: &str| crate::fm::Command {
+            op: op.into(),
+            action: action.into(),
+            node: Some(1),
+        };
+        ledger.accept(command("a", "create"))?;
+        fm.send(add_instance_message(&body, &launch.generation).map_err(err)?)
+            .await?;
+        until(launch, node, adapter, fm, link, &mut traffic, |_, _, t| {
+            t.added
+        })
+        .await?;
+        let old_reply = traffic.add_reply.clone().unwrap();
+        ledger.reply(0, old_reply.clone(), false)?;
+        let endpoint = node
+            .snapshot(entity)
+            .committed
+            .unwrap()
+            .body
+            .replica
+            .service_endpoint
+            .clone();
+        fm.send(
+            remove_instance_message(
+                &RemoveInstance::new(body.clone(), false),
+                &launch.generation,
+            )
+            .map_err(err)?,
+        )
+        .await?;
+        until(launch, node, adapter, fm, link, &mut traffic, |n, a, t| {
+            t.removed && a.replica_drained(n) && n.instance_disposal().is_some()
+        })
+        .await?;
+        assert!(std::net::TcpStream::connect(&endpoint).is_err());
+        assert!(adapter.replica_drained(node));
+        let proof = node.instance_disposal().unwrap();
+        assert_eq!(proof.body.replica.id, launch.replica);
+        ledger.accept(command("d", "delete"))?;
+        let old_remove = traffic.remove_reply.clone().unwrap();
+        ledger.reply(0, old_remove.clone(), true)?;
+        let profile = actual_profile(node)?;
+        ledger.retirement(
+            0,
+            RetirementReceipt {
+                deployment: launch.deployment.clone(),
+                session: launch.session.clone(),
+                node: launch.node.clone(),
+                fm: launch.fm.clone(),
+                generation: launch.generation.clone(),
+                node_pid: std::process::id(),
+                app_pid: profile.app_pid,
+                runtime_root: profile.runtime_root,
+                disposal: proof,
+            },
+            std::process::id(),
+        )?;
+        let mut next = launch.clone();
+        next.replica += 1;
+        next.incarnation += 1;
+        let successor = add_body(&next, &actual_profile(node)?);
+        traffic.added = false;
+        ledger.accept(command("b", "create"))?;
+        fm.send(add_instance_message(&successor, &launch.generation).map_err(err)?)
+            .await?;
+        until(&next, node, adapter, fm, link, &mut traffic, |_, _, t| {
+            t.added
+        })
+        .await?;
+        ledger.reply(0, traffic.add_reply.clone().unwrap(), false)?;
+        let before = node.snapshot(entity).committed.unwrap();
+        assert_eq!(before.body.replica.id, launch.replica + 1);
+        assert_eq!(before.body.replica.instance, launch.incarnation + 1);
+        assert!(node.instance_disposal().is_none());
+        // Actual predecessor requests/ACKs over the same original Channel.
+        let old_report = ReplicaUp {
+            dropped: fube_transport::serialization::serde::ObjectArray(vec![FailoverUnitInfo {
+                unit: body.unit.clone(),
+                service: body.service.clone(),
+                replicas: fube_transport::serialization::serde::ObjectArray(vec![ReplicaInfo {
+                    description: Replica {
+                        state: 3,
+                        up: false,
+                        version: VersionInstance::invalid(),
+                        ..body.replica.clone()
+                    },
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        for message in [
+            add_instance_message(&body, &launch.generation).map_err(err)?,
+            remove_instance_message(
+                &RemoveInstance::new(body.clone(), false),
+                &launch.generation,
+            )
+            .map_err(err)?,
+            replica_up_reply_message(&old_report, &launch.generation).map_err(err)?,
+        ] {
+            fm.send(message).await?;
+            for _ in 0..12 {
+                step(&next, node, adapter, fm, link, &mut traffic).await?;
+            }
+            let after = node.snapshot(entity).committed.unwrap();
+            assert_eq!(after.phase, ra::Phase::Ready);
+            assert_eq!(after.body, before.body);
+            assert!(node.instance_disposal().is_none());
+            assert!(adapter.report_pending.is_none());
+        }
+        // Replay actual captured old completions and an old native report from
+        // the original node-side Link. Source/PToP/generation/schema checks
+        // still run; none may mutate the successor or dispose its session.
+        let settled = ledger.status();
+        for message in [
+            add_instance_reply_message(&old_reply, Owner::Fm).map_err(err)?,
+            remove_instance_reply_message(&old_remove, Owner::Fm).map_err(err)?,
+            replica_up_message(&old_report, Owner::Fm).map_err(err)?,
+        ] {
+            link.send(message).await?;
+            let mut incoming = fm
+                .receive(wire::deadline())
+                .await?
+                .ok_or("replay missing")?;
+            wire::predecode(&incoming.message)?;
+            match incoming.message.properties().map_err(err)?.action.as_str() {
+                "AddInstanceReply" => ledger.reply(
+                    0,
+                    decode_add_instance_reply(&incoming.message).map_err(err)?.0,
+                    false,
+                )?,
+                "RemoveInstanceReply" => ledger.reply(
+                    0,
+                    decode_remove_instance_reply(&incoming.message)
+                        .map_err(err)?
+                        .0,
+                    true,
+                )?,
+                "ReplicaUp" => assert!(ledger.placements[0]
+                    .report(&decode_replica_up(&incoming.message).map_err(err)?.0)?
+                    .is_none()),
+                _ => return Err("wrong replay action".into()),
+            }
+            assert_eq!(ledger.status(), settled);
+            if let Some(handoff) = incoming.handoff.as_mut() {
+                handoff.acknowledge();
+            }
+        }
+        // A fresh valid duplicate over that same session still completes.
+        traffic.added = false;
+        fm.send(add_instance_message(&successor, &launch.generation).map_err(err)?)
+            .await?;
+        until(&next, node, adapter, fm, link, &mut traffic, |_, _, t| {
+            t.added
+        })
+        .await?;
+        Ok(())
+    }
+
     pub(crate) async fn run(launch: &Launch) -> Result<Result<()>> {
+        run_case(launch, false).await
+    }
+    pub(crate) async fn run_reuse(launch: &Launch) -> Result<Result<()>> {
+        run_case(launch, true).await
+    }
+    async fn run_case(launch: &Launch, reuse: bool) -> Result<Result<()>> {
         private_dir(&launch.directory)?;
         private_dir(&launch.directory.join("hosting"))?;
         let mut options = Options::new(launch.directory.join("hosting"));
@@ -1277,7 +1522,11 @@ pub(crate) mod report_tests {
         let result = async {
             node.start(&launch.package, APPLICATION, &[]).map_err(err)?;
             let (fm, link) = links(launch).await?;
-            let result = exercise(launch, &mut node, &mut adapter, &fm, &link).await;
+            let result = if reuse {
+                exercise_reuse(launch, &mut node, &mut adapter, &fm, &link).await
+            } else {
+                exercise(launch, &mut node, &mut adapter, &fm, &link).await
+            };
             let fm_closed = fm.close().await;
             let node_closed = link.close().await;
             result.and(fm_closed).and(node_closed)

@@ -181,6 +181,44 @@ struct Route {
     lease: ipc::HostLease,
 }
 
+/// Positive original-runtime instance-disposal lineage. This is a trusted-local
+/// observation, not a native reply or permission to adopt a process. IDs belong
+/// to distinct namespaces; only the retained original owners authorize release.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstanceDisposal {
+    #[serde(with = "disposal_body")]
+    pub body: AddInstance,
+    pub host: String,
+    pub runtime: String,
+    pub command: u64,
+    pub ra_operation: u64,
+    pub lookup: u64,
+    pub acquisition: u64,
+}
+mod disposal_body {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        body: &AddInstance,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        to_vec(body)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<AddInstance, D::Error> {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        decode(&bytes).map_err(|error| serde::de::Error::custom(format!("{error:?}")))
+    }
+}
+struct DisposalWitness {
+    proof: InstanceDisposal,
+    applied: bool,
+    released: bool,
+}
+
 /// One singleton service/package owner. Finite adapter escrow: 32 commands,
 /// effects/receipts and acquisitions each, 64KiB wire bodies, 32 external pending
 /// obligations. Canonical decode bounds allocation before command acceptance.
@@ -206,6 +244,7 @@ pub struct Node {
     route: Option<Route>,
     held_reply: Option<ipc::LifecycleReply>,
     rejected_reply: Option<ipc::LifecycleReply>,
+    disposal: Option<DisposalWitness>,
     #[cfg(feature = "qualification")]
     hold_replies: bool,
 }
@@ -262,6 +301,7 @@ impl Node {
             route: None,
             held_reply: None,
             rejected_reply: None,
+            disposal: None,
             #[cfg(feature = "qualification")]
             hold_replies: false,
         })
@@ -374,6 +414,48 @@ impl Node {
             && self.activation.deliveries_drained()
     }
 
+    /// The original runtime awaited owned disposal before its successful Close
+    /// reply. Publish only after that exact command committed and the original
+    /// paired acquisition was released. Replica FM escrow is separately owned
+    /// by the caller and must also retire before admitting a successor.
+    pub fn instance_disposal(&self) -> Option<InstanceDisposal> {
+        let witness = self.disposal.as_ref()?;
+        if !witness.applied
+            || !witness.released
+            || !self.live.load(Ordering::SeqCst)
+            || !self.ra.consumer_lifetime().is_accepting()
+            || !self.quiescent()
+            || !self.commands.is_empty()
+            || !self.receipts.is_empty()
+            || self.rejected_reply.is_some()
+            || self.last_error.is_some()
+            || !self.activation.session_status().ok().flatten()?.connected
+            || self.activation.process_status()?.exit_observed
+        {
+            return None;
+        }
+        let snapshot = self.ra.snapshot(witness.proof.body.unit.id.guid.0);
+        let state = snapshot.committed?;
+        let old = &witness.proof.body;
+        if snapshot.fenced
+            || state.phase != ra::Phase::Closed
+            || state.body.unit != old.unit
+            || state.body.service != old.service
+            || state.body.replica.node != old.replica.node
+            || state.body.replica.id != old.replica.id
+            || state.body.replica.instance != old.replica.instance
+            || state.runtime.is_some()
+            || state.usage.is_some()
+            || !state.registration_lookups.is_empty()
+            || !self.usage.is_empty()
+            || self.route.as_ref()?.runtime != witness.proof.runtime
+            || self.activation.identity()?.host_id != witness.proof.host
+        {
+            return None;
+        }
+        Some(witness.proof.clone())
+    }
+
     fn room(&self) -> bool {
         self.pending.len() + self.commands.len() < SLOTS
     }
@@ -467,6 +549,12 @@ impl Node {
             return Err(Error::Unsupported);
         }
         let id = self.enqueue(Work::Add(Arc::new(body.clone())))?;
+        if self.disposal.as_ref().is_some_and(|witness| {
+            body.replica.id > witness.proof.body.replica.id
+                && body.replica.instance > witness.proof.body.replica.instance
+        }) {
+            self.disposal = None;
+        }
         if self.selected.is_none() {
             self.selected = Some(body);
         }
@@ -609,6 +697,15 @@ impl Node {
                     }
                 }
                 let front = self.pending.pop_front().unwrap();
+                if let Some(witness) = &mut self.disposal {
+                    if witness.proof.command == front.id
+                        && matches!(front.work, Work::Closed(_))
+                        && result == Ok(ra::Disposition::Applied)
+                    {
+                        witness.proof.ra_operation = front.ticket.as_ref().unwrap().id;
+                        witness.applied = true;
+                    }
+                }
                 self.commands.push_back(CommandReceipt {
                     id: front.id,
                     result,
@@ -694,6 +791,7 @@ impl Node {
     fn release(&mut self, index: usize) -> Result<()> {
         let use_ = &mut self.usage[index];
         let owner = use_.owner.take().ok_or(Error::Protocol)?;
+        let lineage = (use_.lookup, owner.id(), use_.paired);
         let result = if use_.paired {
             self.activation.release_usage(owner)
         } else {
@@ -702,6 +800,11 @@ impl Node {
         match result {
             h::UsageRelease::Released => {
                 self.usage.remove(index);
+                if let Some(witness) = &mut self.disposal {
+                    if lineage == (witness.proof.lookup, witness.proof.acquisition, true) {
+                        witness.released = true;
+                    }
+                }
                 Ok(())
             }
             h::UsageRelease::Unresolved { ownership, .. } => {
@@ -980,7 +1083,45 @@ impl Node {
             }),
             _ => return Err(Error::Unsupported),
         };
-        self.enqueue(work)?;
+        // Capture provenance only for an exact currently eligible successful
+        // original-runtime Close, never from Closed/host-down/Remove accounting.
+        let witness = if matches!(&work, Work::Closed(event) if event.error == 0
+            && event.unit == state.body.unit
+            && event.replica.node == state.body.replica.node
+            && event.replica.id == state.body.replica.id
+            && event.replica.instance == state.body.replica.instance)
+            && state.phase == ra::Phase::Closing
+            && state.close_mode != Some(ra::CloseMode::Obliterate)
+            && state.body.replica.up
+            && self.disposal.is_none()
+        {
+            state.usage.and_then(|lookup| {
+                self.usage
+                    .iter()
+                    .find(|use_| use_.lookup == lookup && use_.paired)
+                    .and_then(|use_| use_.owner.as_ref())
+                    .map(|owner| DisposalWitness {
+                        proof: InstanceDisposal {
+                            body: (*state.body).clone(),
+                            host: registration.host.clone(),
+                            runtime: registration.runtime.clone(),
+                            command: 0,
+                            ra_operation: 0,
+                            lookup,
+                            acquisition: owner.id(),
+                        },
+                        applied: false,
+                        released: false,
+                    })
+            })
+        } else {
+            None
+        };
+        let id = self.enqueue(work)?;
+        if let Some(mut witness) = witness {
+            witness.proof.command = id;
+            self.disposal = Some(witness);
+        }
         self.held_reply = None;
         Ok(())
     }
