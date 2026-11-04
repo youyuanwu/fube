@@ -36,3 +36,22 @@ The prior [minimal-cluster decisions](./minimal-fm-cluster.md) remain in force:
 no automatic reconnect/recovery/failover, arbitrary profiles, stateful
 orchestration or full M1/native FM/Federation parity claim. Required correctness
 and compatibility qualification are not deferred.
+
+### RSL-002: Normalize included cluster-test formatting
+- Status: PROPOSED
+- Reason: Implementation-review advisory IR-002 identified indentation and
+  compressed assertions in the textually included cluster test file, not a
+  functional, assertion-quality or required-check gap. The read-only MVP triage
+  classified this as optional readability polish; it is not an approved change
+  or a completed fix.
+- MVP alternative: Preserve the compiled, inspected lifecycle assertions and
+  current execution evidence. Workspace formatting checks pass but do not
+  normalize every textually included file; do not imply otherwise.
+- Revisit when: A separately approved readability cleanup is requested, or an
+  authorized behavioral edit already touches the same test portions.
+- Evidence: Source review of `crates/tools/fube-cluster/src/tests.rs`, included
+  by `src/lib.rs`, at `b14fc7ceb93ea9a24158f0e70416dbcc891ed73a`
+  found substantive stale-proof, two-input-join, replay, history and overflow
+  assertions. They passed in the maintained archived suite and focused cluster
+  execution. IR-002 remains a nonblocking proposal, not accepted deferral,
+  user approval, permission to remove tests or a waiver of required formatting.
