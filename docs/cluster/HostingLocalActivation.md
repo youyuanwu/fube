@@ -96,8 +96,8 @@ This is trusted local authorization, not an implemented FM or peer request.
 
 The original committed RA lookup/acquisition and `RuntimeOpen` effect drive
 actor-12 `ReplicaOpen` on the admitted Hosting session. Existing application RAP
-creates the replica, opens its public custom-replicator control, and selects
-IdleSecondary. The semantic one-way reply completes Open after the state update
+creates the replica, opens its service-returned public replicator control, and
+selects IdleSecondary. The semantic one-way reply completes Open after the state update
 commits. The RA's internal `Phase::Ready` means this Open completed; the native
 replica stays **Idle/InBuild**, with no serving endpoint or write authority.
 Only a local `LocalStatefulOpenReply` observation is produced, never a fabricated
@@ -121,8 +121,8 @@ Native semantic authority remains pin
 `ReconfigurationAgent.cpp:883-930` distinguishes stateless, Primary and peer
 completion; `FailoverUnit.cpp:5472-5551` also owns terminal reporting. This local
 profile reuses the existing proxy schemas/runtime, not
-those network processors or a new wire protocol. The fixture implements public
-SF-style stateful/control interfaces with a real owned loopback listener and
+those network processors or a new wire protocol. The default lifecycle fixture
+implements public SF-style stateful/control interfaces with a real owned loopback listener and
 resource file; all data, quorum, copy/build and primary-only controls explicitly
 fail. It is not a replication engine or M2 qualification.
 
@@ -132,6 +132,34 @@ duplicate/stale traffic, original usage, lease loss during Opening/Open, and
 physical cleanup. RA model tests separately hold actual commits and reject
 foreign/Primary completions. Registration-only tests still prove no callback
 and rejected lifecycle sends.
+
+#### Opt-in real-data Idle lifecycle
+
+The same package/profile also supports the explicit fixture argument
+`--stateful-lifecycle --data-replicator`. It captures the normal runtime integration
+at factory creation and constructs the existing `fube-data` engine during service
+Open through `NativeRuntimeIntegration::create_replicator`, with the public
+partition and a minimal observed in-memory provider. RAP invokes the actual
+service-returned `RuntimeReplicator`; neither RA nor Hosting links application
+objects or obtains private data-engine control.
+
+The replica remains Idle/InBuild with no serving endpoint. Two valid public
+`IStateReplicator` writes fail as NotPrimary and leave the engine's sequence
+progress and owned-operation budgets unchanged. Tests observe the real engine's
+Idle/non-ready state, exact native-shaped replication endpoint and actual
+listener, duplicate/stale traffic and one original H2 acquisition.
+Graceful Close, close-error Abort and direct ForceAbort release the listener and
+join provider/service disposal before semantic Close and exact H2 release.
+Separate held provider and service destructors retain the original Closing/use
+obligation; the application remains locally leased while held.
+
+Opening/Open lease-loss tests construct the actual engine before withdrawing
+renewal. They independently observe its socket disappear and the waitable process
+exit, without asserting a graceful provider/service destructor receipt. Physical
+process-group drainage, reap and root removal remain separate checks.
+The custom-control and registration-only modes stay unchanged. This adds no
+Primary/configuration/build/copy, acknowledged data, FM/peer choreography,
+recovery or native stateful/M2 qualification.
 
 ## Ownership and usage
 

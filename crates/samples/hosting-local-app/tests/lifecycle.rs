@@ -297,6 +297,258 @@ async fn replay(node: &mut Node, dispatch: &ra::Dispatched, stale: bool) {
     advance(node, Duration::from_millis(50)).await;
 }
 
+fn data_endpoint(node: &Node) -> fube_data::wire::Endpoint {
+    assert_eq!(count(node, "LOCAL_DATA constructed endpoint="), 1);
+    node.activation()
+        .logs()
+        .iter()
+        .find_map(|line| {
+            line.split_once("LOCAL_DATA constructed endpoint=")
+                .map(|(_, endpoint)| endpoint.trim().parse().unwrap())
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn stateful_real_data_idle_denies_writes_and_joins_actual_provider_and_service_disposal() {
+    for (mode, args) in [
+        (ra::CloseMode::Close, "--block-provider-dispose"),
+        (ra::CloseMode::Close, "--block-dispose"),
+        (ra::CloseMode::Close, "--close-error-block-dispose"),
+        (ra::CloseMode::ForceAbort, "--block-dispose"),
+    ] {
+        let provider_barrier = args == "--block-provider-dispose";
+        let aborted = args == "--close-error-block-dispose" || mode == ra::CloseMode::ForceAbort;
+        let fixture = Fixture::stateful();
+        let (mut node, store) = fixture.node(&format!("--data-replicator {args}")).await;
+        until(&mut node, |n| n.package_registration().registered).await;
+        native_free(&node);
+        assert_eq!(count(&node, "LOCAL_DATA constructed"), 0);
+        let mut b = body(&node);
+        b.unit.current.configuration = (1 << 32) + 5;
+        let mut primary = b.clone();
+        primary.replica.current_role = 4;
+        assert!(node.open_stateful(primary).is_err());
+        assert_eq!(node.retained_usage(), 0);
+        node.open_stateful(b.clone()).unwrap();
+        let effects = until(&mut node, |n| {
+            n.snapshot(b.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| s.phase == ra::Phase::Ready)
+        })
+        .await;
+        let open = effects
+            .iter()
+            .find(|r| matches!(r.dispatch.effect, ra::Effect::RuntimeOpen { .. }))
+            .unwrap()
+            .dispatch
+            .clone();
+        let opened = node.snapshot(b.unit.id.guid.0).committed.unwrap();
+        assert_eq!(
+            (opened.body.replica.current_role, opened.body.replica.state),
+            (2, 1)
+        );
+        assert_eq!(opened.body.unit.current, b.unit.current);
+        assert!(opened.body.replica.service_endpoint.is_empty());
+        let endpoint = data_endpoint(&node);
+        assert_eq!(
+            opened.body.replica.replication_endpoint,
+            endpoint.to_string()
+        );
+        let address = endpoint.address;
+        assert!(std::net::TcpStream::connect(&address).is_ok());
+        assert_eq!(
+            count(
+                &node,
+                "LOCAL_DATA idle role=IdleSecondary ready=false assigned=0"
+            ),
+            1
+        );
+        assert_eq!(
+            count(&node, "LOCAL_DATA write_denied NotPrimary assigned=0"),
+            2
+        );
+        assert_eq!(count(&node, "LOCAL_CONTROL acquired"), 0);
+        assert_eq!(count(&node, "LOCAL_DATA_PROVIDER acquired"), 1);
+        let provider_resource = resource(&node).with_file_name("local-provider.resource");
+        assert!(provider_resource.is_file());
+        assert!(effects
+            .iter()
+            .any(|r| matches!(r.dispatch.effect, ra::Effect::LocalStatefulOpenReply(_))));
+        assert!(!effects
+            .iter()
+            .any(|r| matches!(r.dispatch.effect, ra::Effect::Reply(_))));
+        node.open_stateful(b.clone()).unwrap();
+        replay(&mut node, &open, false).await;
+        replay(&mut node, &open, true).await;
+        assert_eq!(count(&node, "LOCAL_CALLBACK create_replica"), 1);
+        assert_eq!(count(&node, "LOCAL_DATA constructed"), 1);
+        assert_eq!(count(&node, "LOCAL_DATA write_denied"), 2);
+        assert_eq!(node.retained_usage(), 1);
+        node.close(b.unit.id.clone(), mode).unwrap();
+        let effects = until(&mut node, |n| {
+            count(
+                n,
+                if provider_barrier {
+                    "LOCAL_DATA_PROVIDER dispose begin"
+                } else {
+                    "LOCAL_DISPOSE begin"
+                },
+            ) == 1
+        })
+        .await;
+        let close = effects
+            .iter()
+            .find(|r| matches!(r.dispatch.effect, ra::Effect::Close { .. }))
+            .unwrap()
+            .dispatch
+            .clone();
+        advance(&mut node, Duration::from_millis(150)).await;
+        assert_eq!(
+            node.snapshot(b.unit.id.guid.0).committed.unwrap().phase,
+            ra::Phase::Closing
+        );
+        assert_eq!(node.retained_usage(), 1);
+        assert!(node.instance_disposal().is_none());
+        assert!(resource(&node).is_file());
+        assert!(
+            node.activation()
+                .session_status()
+                .unwrap()
+                .unwrap()
+                .connected
+        );
+        if provider_barrier {
+            assert!(provider_resource.is_file());
+            assert_eq!(count(&node, "LOCAL_DATA_PROVIDER disposed"), 0);
+            assert_eq!(count(&node, "LOCAL_DATA retired"), 0);
+        } else {
+            assert!(!provider_resource.exists());
+            assert_eq!(count(&node, "LOCAL_DATA_PROVIDER disposed empty"), 1);
+            assert_eq!(count(&node, "LOCAL_DATA retired"), 1);
+            assert!(std::net::TcpStream::connect(&address).is_err());
+        }
+        fs::write(
+            resource(&node).with_file_name(if provider_barrier {
+                "local-provider-dispose.release"
+            } else {
+                "local-dispose.release"
+            }),
+            b"release actual disposer",
+        )
+        .unwrap();
+        until(&mut node, |n| n.instance_disposal().is_some()).await;
+        assert!(!resource(&node).exists() && !provider_resource.exists());
+        assert!(std::net::TcpStream::connect(&address).is_err());
+        assert_eq!(count(&node, "LOCAL_DATA_PROVIDER disposed empty"), 1);
+        assert_eq!(count(&node, "LOCAL_DATA retired"), 1);
+        assert_eq!(count(&node, "LOCAL_DISPOSE complete"), 1);
+        assert_eq!(count(&node, "LOCAL_CALLBACK abort"), usize::from(aborted));
+        assert_eq!(node.retained_usage(), 0);
+        assert_eq!(
+            node.snapshot(b.unit.id.guid.0).committed.unwrap().fm_stage,
+            ra::FmStage::None
+        );
+        assert_eq!(
+            node.external_pending()
+                .iter()
+                .filter(|effect| {
+                    matches!(effect.effect, ra::Effect::StatefulClosePending { .. })
+                })
+                .count(),
+            1
+        );
+        assert!(!node.activation().process_status().unwrap().exit_observed);
+        replay(&mut node, &close, false).await;
+        replay(&mut node, &open, false).await;
+        assert_eq!(count(&node, "LOCAL_DATA constructed"), 1);
+        assert_eq!(count(&node, "LOCAL_DATA_PROVIDER disposed"), 1);
+        assert_eq!(node.retained_usage(), 0);
+        assert!(node.open_stateful(b.clone()).is_err());
+        let root = node.activation().root().unwrap().to_path_buf();
+        cleanup(&mut node, &store).await;
+        assert!(!root.exists());
+        let status = node.activation().process_status().unwrap();
+        assert!(status.exit_observed && status.group_drained && status.reaped);
+        assert_eq!(node.activation().residency().resources().logical_bytes, 0);
+    }
+}
+
+#[tokio::test]
+async fn stateful_real_data_lease_loss_fences_opening_and_idle_without_disposal_receipts() {
+    for opening in [false, true] {
+        let fixture = Fixture::stateful();
+        let (mut node, store) = fixture
+            .node(if opening {
+                "--data-replicator --open-delay-ms 4000"
+            } else {
+                "--data-replicator"
+            })
+            .await;
+        until(&mut node, |n| n.package_registration().registered).await;
+        native_free(&node);
+        let b = body(&node);
+        node.open_stateful(b.clone()).unwrap();
+        until(&mut node, |n| {
+            if opening {
+                count(n, "LOCAL_DATA constructed") == 1
+            } else {
+                n.snapshot(b.unit.id.guid.0)
+                    .committed
+                    .is_some_and(|s| s.phase == ra::Phase::Ready)
+            }
+        })
+        .await;
+        let address = data_endpoint(&node).address;
+        assert!(std::net::TcpStream::connect(&address).is_ok());
+        assert_eq!(
+            count(&node, "LOCAL_DATA write_denied"),
+            if opening { 0 } else { 2 }
+        );
+        let pid = node.activation().process_status().unwrap().pid;
+        node.activation().host_lease().unwrap().stop_renewal();
+        until(&mut node, |n| {
+            n.snapshot(b.unit.id.guid.0).committed.is_some_and(|s| {
+                if opening {
+                    s.phase == ra::Phase::Opening && s.runtime.is_none() && s.open_failures > 0
+                } else {
+                    s.phase == ra::Phase::Closed && s.usage.is_none()
+                }
+            }) && (opening || n.retained_usage() == 0)
+        })
+        .await;
+        assert_eq!(node.retained_usage(), usize::from(opening));
+        assert!(node.instance_disposal().is_none());
+        if opening {
+            node.close(b.unit.id.clone(), ra::CloseMode::Drop).unwrap();
+            until(&mut node, |n| {
+                n.snapshot(b.unit.id.guid.0)
+                    .committed
+                    .is_some_and(|s| s.phase == ra::Phase::Closed)
+                    && n.retained_usage() == 0
+            })
+            .await;
+        }
+        // Observe the engine socket independently from the waitable leader.
+        until(&mut node, |_| {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z "))
+                && std::net::TcpStream::connect(&address).is_err()
+        })
+        .await;
+        assert_eq!(count(&node, "LOCAL_DATA_PROVIDER disposed"), 0);
+        assert_eq!(count(&node, "LOCAL_DISPOSE complete"), 0);
+        assert!(resource(&node).is_file());
+        assert!(resource(&node)
+            .with_file_name("local-provider.resource")
+            .is_file());
+        let root = node.activation().root().unwrap().to_path_buf();
+        cleanup(&mut node, &store).await;
+        assert!(!root.exists());
+        let status = node.activation().process_status().unwrap();
+        assert!(status.exit_observed && status.group_drained && status.reaped);
+    }
+}
+
 #[tokio::test]
 async fn stateful_idle_open_close_replay_and_actual_disposal_preserve_nonprimary_authority() {
     for error in [false, true] {

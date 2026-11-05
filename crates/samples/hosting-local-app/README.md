@@ -74,3 +74,31 @@ controls. It is not a data-replicator implementation. Final service/control
 disposal is independently observed before semantic Close and H2 release.
 The existing lifecycle test command includes replay, disposal/close-error and
 Opening/Open lease-loss qualification for this separate profile.
+
+### Opt-in real-data Idle lifecycle
+
+Use the same profile/package and set `Arguments` to
+`--stateful-lifecycle --data-replicator`, optionally followed by the existing
+callback/disposal fault mode. Without this flag the custom control above remains
+unchanged; the registration-only manifest default never selects data.
+
+The factory captures the runtime's normal `NativeIntegrationProvider`, and service
+Open calls `NativeRuntimeIntegration::create_replicator` with the public partition
+and an observed `MemoryProvider`. RAP uses the actual service-returned
+`RuntimeReplicator`; there is no engine/test-hook binder or direct role setter.
+IdleSecondary observes the real engine as non-ready and attempts two valid writes
+through `IStateReplicator`. Both fail as NotPrimary without changing progress or
+owning operations. No serving endpoint, Primary, configuration, copy/build,
+FM/peer control or recovery capability is added.
+
+The lifecycle target verifies the complete native-shaped replication endpoint,
+actual listener reachability/release, replay and exact H2 use. Graceful Close,
+close-error Abort and direct ForceAbort join actual provider/service disposal
+before semantic completion. `--block-provider-dispose` holds the provider's
+destructor for at most five seconds until `local-provider-dispose.release`
+appears; its independently observed resource is `local-provider.resource`.
+The existing `--block-dispose` holds the service separately. Lease loss during
+construction/Open or Idle hard-fences the process and removes its engine socket,
+without fabricating destructor receipts; owned physical cleanup removes the
+remaining files. This is local native-free Idle engine evidence, not replicated
+writes, native stateful interoperability or M2 completion.
