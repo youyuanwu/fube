@@ -8,6 +8,8 @@ An explicit [volatile stateful registration-only profile](HostingLocalActivation
 now admits one 1/1 type and real factory registration/lookup. A separate
 [volatile stateful local lifecycle profile](HostingLocalActivation.md#opt-in-volatile-stateful-local-lifecycle)
 adds RA-authorized Idle Open/Close, not Primary, replication or stateful deployment.
+Its opt-in real-data fixture now exercises normal `fube-data` construction,
+denied writes and joined disposal while remaining Idle/non-serving.
 Broader H3 and deployed RA/RAP composition remain gated.**
 [`fube-hosting`](../../crates/libs/fube-hosting/src/lib.rs) provides
 a native-derived, deterministically driven core plus a separately owned local

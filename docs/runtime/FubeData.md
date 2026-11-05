@@ -85,6 +85,12 @@ The **default remains empty-state**. Exact service initialization bytes
 the data harness creates services with those bytes, preserving unrelated
 stateless registration. This is not an environment role override.
 
+A separate [owned local Idle fixture](../cluster/HostingLocalActivation.md#opt-in-real-data-idle-lifecycle)
+now uses normal public runtime construction with the real engine under committed
+local RA/RAP Open/Close. Its native-free evidence covers denied writes without
+sequence consumption, listener/provider/service disposal and finite lease-loss
+fencing, not Primary/configuration, replicated data/copy or deployed native parity.
+
 ## Owned API and provider obligations
 
 ### Runtime/replication boundary

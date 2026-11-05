@@ -1,15 +1,20 @@
 //! Explicitly minimal native-free local Hosting package fixtures.
+use fube_data::{
+    extensions::ReplicationEndpointOptions, IOperationDataStream, IStateProvider, MemoryProvider,
+    Mutation,
+};
 use fube_runtime::{
+    extensions::{NativeIntegrationProvider, NativeRuntimeIntegration},
     ApiFuture, Cancellation, Epoch, Error, IPrimaryReplicator, IReplicator,
     IStatefulServiceFactory, IStatefulServicePartition, IStatefulServiceReplica,
     IStatelessServiceFactory, IStatelessServiceInstance, IStatelessServicePartition, OpenMode,
     ReplicaInformation, ReplicaRole, ReplicaSetConfig, ReplicaSetQuorumMode, Result, Runtime,
-    ServicePartitionAccessStatus,
+    RuntimeReplicator, ServicePartitionAccessStatus,
 };
 use std::{
     io::Write,
     net::TcpListener,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -17,17 +22,26 @@ use std::{
 #[derive(Clone, Copy, Default)]
 struct Mode {
     block_dispose: bool,
+    block_provider_dispose: bool,
     close_error: bool,
     open_delay: u64,
 }
 struct Factory(Mode);
 struct StatefulFactory {
     lifecycle: bool,
+    native: Option<NativeIntegrationProvider>,
     mode: Mode,
 }
 struct StatefulReplica {
     resource: Instance,
     partition: Mutex<Option<Arc<dyn IStatefulServicePartition>>>,
+    native: Option<NativeRuntimeIntegration>,
+    data: Mutex<Option<Arc<RuntimeReplicator>>>,
+}
+struct ObservedProvider {
+    memory: Arc<MemoryProvider>,
+    resource: PathBuf,
+    block_dispose: bool,
 }
 struct LocalControl(Mutex<Option<TcpListener>>);
 struct Instance {
@@ -40,19 +54,34 @@ fn marker(value: &str) {
         .flush()
         .expect("flush lifecycle observation");
 }
+fn wait_for_disposal_release(release: &Path) {
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while !release.exists() {
+        assert!(
+            std::time::Instant::now() < end,
+            "bounded fixture disposal barrier timed out"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
 impl IStatefulServiceFactory for StatefulFactory {
     fn create_replica(
         &self,
         _: String,
         _: String,
         _: &[u8],
-        _: uuid::Uuid,
-        _: i64,
+        partition: uuid::Uuid,
+        replica: i64,
     ) -> Result<Box<dyn IStatefulServiceReplica>> {
         marker("LOCAL_CALLBACK create_replica");
         if !self.lifecycle {
             return Err(Error::Protocol("registration-only stateful fixture"));
         }
+        let native = self
+            .native
+            .as_ref()
+            .map(|native| native.capture(partition, replica))
+            .transpose()?;
         let resource =
             PathBuf::from(std::env::var_os("Fabric_Folder_App_Work").expect("owned work folder"))
                 .join("local-instance.resource");
@@ -65,6 +94,8 @@ impl IStatefulServiceFactory for StatefulFactory {
                 resource,
             },
             partition: Mutex::new(None),
+            native,
+            data: Mutex::new(None),
         }))
     }
 }
@@ -81,10 +112,41 @@ impl IStatefulServiceReplica for StatefulReplica {
                 partition.get_write_status()?,
                 ServicePartitionAccessStatus::Granted
             );
-            *self.partition.lock().unwrap() = Some(partition);
+            *self.partition.lock().unwrap() = Some(partition.clone());
             marker("LOCAL_CALLBACK open");
+            let control: Box<dyn IPrimaryReplicator> = if let Some(native) = &self.native {
+                let resource = self
+                    .resource
+                    .resource
+                    .with_file_name("local-provider.resource");
+                std::fs::write(&resource, b"actual data-provider-owned resource")
+                    .expect("acquire data provider resource");
+                let provider = Arc::new(ObservedProvider {
+                    memory: MemoryProvider::new(),
+                    resource,
+                    block_dispose: self.resource.mode.block_provider_dispose,
+                });
+                marker("LOCAL_DATA_PROVIDER acquired");
+                let control = native.create_replicator(
+                    partition,
+                    provider,
+                    None,
+                    ReplicationEndpointOptions {
+                        listen_address: "127.0.0.1:0".into(),
+                        actor_incarnation: uuid::Uuid::new_v4(),
+                    },
+                    fube_data::Settings::default(),
+                )?;
+                marker(&format!(
+                    "LOCAL_DATA constructed endpoint={}",
+                    control.endpoint()
+                ));
+                *self.data.lock().unwrap() = Some(control.clone());
+                Box::new((*control).clone())
+            } else {
+                Box::new(LocalControl(Mutex::new(None)))
+            };
             tokio::time::sleep(Duration::from_millis(self.resource.mode.open_delay)).await;
-            let control: Box<dyn IPrimaryReplicator> = Box::new(LocalControl(Mutex::new(None)));
             Ok(control)
         })
     }
@@ -112,15 +174,115 @@ impl IStatefulServiceReplica for StatefulReplica {
                     ServicePartitionAccessStatus::Granted
                 );
                 marker("LOCAL_ACCESS denied");
+                let data = self.data.lock().unwrap().clone();
+                if let Some(data) = data {
+                    let before = data.snapshot();
+                    assert_eq!(before.role, ReplicaRole::IdleSecondary);
+                    assert!(!before.ready && !before.closed);
+                    assert!(before.fault.is_none() && before.peers.is_empty());
+                    marker(&format!(
+                        "LOCAL_DATA idle role={:?} ready={} assigned={}",
+                        before.role, before.ready, before.progress.assigned
+                    ));
+                    let state = data.get_state_replicator();
+                    for attempt in 0..2 {
+                        let operation = Mutation {
+                            id: format!("idle-write-{attempt}"),
+                            key: "value".into(),
+                            value: "must not be admitted".into(),
+                        }
+                        .operation()?;
+                        let error = state
+                            .replicate(operation, Cancellation::default())
+                            .await
+                            .err()
+                            .expect("Idle write must reject");
+                        assert_eq!(error.kind(), fube_runtime::ErrorKind::NotPrimary);
+                        let after = data.snapshot();
+                        assert_eq!(after.progress, before.progress);
+                        assert_eq!((after.owned_operations, after.owned_bytes), (0, 0));
+                        marker(&format!(
+                            "LOCAL_DATA write_denied {:?} assigned={}",
+                            error.kind(),
+                            after.progress.assigned
+                        ));
+                    }
+                }
             }
             Ok(String::new())
         })
     }
     fn close(&self, cancel: Cancellation) -> ApiFuture<'_, ()> {
+        self.release_data();
         IStatelessServiceInstance::close(&self.resource, cancel)
     }
     fn abort(&self) {
+        self.release_data();
         marker("LOCAL_CALLBACK abort");
+    }
+}
+impl StatefulReplica {
+    fn release_data(&self) {
+        if let Some(data) = self.data.lock().unwrap().take() {
+            let snapshot = data.snapshot();
+            assert!(
+                snapshot.closed,
+                "RAP must retire the lower before the service"
+            );
+            assert_eq!(
+                (
+                    snapshot.provider_callbacks,
+                    snapshot.owned_operations,
+                    snapshot.owned_bytes
+                ),
+                (0, 0, 0)
+            );
+            let error = data
+                .get_state_replicator()
+                .get_replication_stream()
+                .err()
+                .expect("retired data owner must reject stream access");
+            assert_eq!(error.kind(), fube_runtime::ErrorKind::ObjectClosed);
+            marker("LOCAL_DATA retired");
+        }
+    }
+}
+impl IStateProvider for ObservedProvider {
+    fn get_last_committed_sequence_number(&self) -> Result<i64> {
+        self.memory.get_last_committed_sequence_number()
+    }
+    fn update_epoch(&self, epoch: Epoch, previous: i64, cancel: Cancellation) -> ApiFuture<'_, ()> {
+        self.memory.update_epoch(epoch, previous, cancel)
+    }
+    fn on_data_loss(&self, cancel: Cancellation) -> ApiFuture<'_, bool> {
+        self.memory.on_data_loss(cancel)
+    }
+    fn get_copy_context(&self) -> Result<Arc<dyn IOperationDataStream>> {
+        self.memory.get_copy_context()
+    }
+    fn get_copy_state(
+        &self,
+        horizon: i64,
+        context: Option<Arc<dyn IOperationDataStream>>,
+    ) -> Result<Arc<dyn IOperationDataStream>> {
+        self.memory.get_copy_state(horizon, context)
+    }
+}
+impl Drop for ObservedProvider {
+    fn drop(&mut self) {
+        marker("LOCAL_DATA_PROVIDER dispose begin");
+        if self.block_dispose {
+            wait_for_disposal_release(
+                &self
+                    .resource
+                    .with_file_name("local-provider-dispose.release"),
+            );
+        }
+        let state = self.memory.snapshot();
+        assert_eq!(state.last, 0);
+        assert!(state.values.is_empty() && state.results.is_empty());
+        std::fs::remove_file(&self.resource).expect("dispose actual data provider resource");
+        marker("LOCAL_DATA_PROVIDER disposed empty");
     }
 }
 impl LocalControl {
@@ -265,15 +427,7 @@ impl Drop for Instance {
     fn drop(&mut self) {
         marker("LOCAL_DISPOSE begin");
         if self.mode.block_dispose {
-            let release = self.resource.with_file_name("local-dispose.release");
-            let end = std::time::Instant::now() + Duration::from_secs(5);
-            while !release.exists() {
-                assert!(
-                    std::time::Instant::now() < end,
-                    "bounded fixture disposal barrier timed out"
-                );
-                std::thread::sleep(Duration::from_millis(2));
-            }
+            wait_for_disposal_release(&self.resource.with_file_name("local-dispose.release"));
         }
         std::fs::remove_file(&self.resource).expect("dispose actual fixture resource");
         marker("LOCAL_RESOURCE released");
@@ -291,6 +445,9 @@ async fn main() {
     } else {
         &args[..]
     };
+    let data_replicator =
+        stateful_lifecycle && args.first().is_some_and(|s| s == "--data-replicator");
+    let args = if data_replicator { &args[1..] } else { args };
     let delay = match args {
         [flag, value]
             if flag == "--delay-ms"
@@ -306,6 +463,7 @@ async fn main() {
         [flag] if flag == "--no-register" || flag == "--exit-before-attach" => None,
         [flag] if flag == "--stateful-register" => None,
         [flag] if flag == "--block-dispose" || flag == "--close-error-block-dispose" => None,
+        [flag] if flag == "--block-provider-dispose" && data_replicator => None,
         [flag, _] if flag == "--open-delay-ms" => None,
         _ => panic!("unsupported fixture arguments"),
     };
@@ -320,6 +478,9 @@ async fn main() {
         block_dispose: args
             .first()
             .is_some_and(|s| s == "--block-dispose" || s == "--close-error-block-dispose"),
+        block_provider_dispose: args
+            .first()
+            .is_some_and(|s| s == "--block-provider-dispose"),
         close_error: args
             .first()
             .is_some_and(|s| s == "--close-error-block-dispose"),
@@ -330,6 +491,7 @@ async fn main() {
         },
     };
     let stateful_registration = args.first().is_some_and(|s| s == "--stateful-register");
+    let native = data_replicator.then(|| runtime.native_integration_provider());
     let _runtime = if args.first().is_some_and(|s| s == "--no-register") {
         runtime
     } else {
@@ -343,6 +505,7 @@ async fn main() {
                         "LocalStatefulType",
                         Box::new(StatefulFactory {
                             lifecycle: stateful_lifecycle,
+                            native,
                             mode,
                         }),
                     )?;

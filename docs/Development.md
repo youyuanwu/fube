@@ -384,6 +384,14 @@ rejects foreign/Primary completions. These are local native-free lifecycle
 tests, not FM/peer stateful or data/copy/quorum qualification. Run the existing
 affected targets and quality/native-regression gates below.
 
+Its opt-in `--stateful-lifecycle --data-replicator` fixture additionally exercises
+the actual `fube-data` engine through normal public construction. The same
+lifecycle target checks denied Idle writes without sequence consumption, the
+native-shaped replication endpoint and actual listener, separate held provider/
+service disposal, direct ForceAbort and Opening/Open lease loss. Hard process
+fencing is not a graceful destructor receipt. No acknowledged data, Primary,
+copy/build, FM/peer or recovery evidence is implied; custom-control tests remain.
+
 ### Owned local stateless RA/RAP
 
 The [production local lifecycle guide](cluster/StatelessRaRap.md) separates

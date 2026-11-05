@@ -11,6 +11,9 @@ now drives real Idle Open/Close through committed RA effects and existing Rust
 RAP. Idle remains InBuild, not a primary or serving Ready. Trusted local
 authorization is not a ported FM/peer handler; P4 choreography, data/copy/quorum
 evidence and stateful recovery remain unsupported.
+An opt-in real-data fixture now connects that same local path to the existing
+`fube-data` engine through normal public construction, verifying denied Idle
+writes and joined cleanup without widening RA authorization or completing P4.
 
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's

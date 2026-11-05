@@ -64,6 +64,14 @@ local RA effects and real application RAP. Finite authority, duplicate/stale
 handling, exact H2 release and physical cleanup are exercised together. This
 does not provide FM/peer stateful control, a primary, replication/data or M2.
 
+**Local Idle data-engine update (2026-11-05):**
+The same profile's opt-in real-data fixture now constructs the existing
+`fube-data` replicator through normal public runtime integration. Native-free
+process tests observe denied Idle writes without sequence consumption, the actual
+replication listener, joined provider/service disposal and Opening/Open lease-loss
+fencing. This connects local RA/RAP to the real engine, not Primary authority,
+acknowledged writes, copy/build, FM/peer control, recovery or M2 completion.
+
 ## 1. Decisions and initial profile
 
 | Area | Decision |
