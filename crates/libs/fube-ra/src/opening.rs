@@ -176,7 +176,7 @@ fn fail(state: &mut EntityState, error: i64, effects: &mut Vec<Effect>) {
     }
     release_usage(state, effects);
     effects.push(Effect::Health(HealthEvent::Close));
-    effects.push(reply(&captured, error));
+    effects.push(reply(&captured, error, state.fm_primary));
 }
 pub(super) fn registration_success(event: &RegistrationCompletion) -> bool {
     event.error == 0
@@ -366,6 +366,9 @@ pub(super) fn complete(
     }
     state.open_failures = 0;
     state.last_retry_error = 0;
-    effects.push(reply(&state.body, 0));
+    if state.fm_primary {
+        state.primary_deactivation = Some((state.body.unit.current, 0));
+    }
+    effects.push(reply(&state.body, 0, state.fm_primary));
     Ok(lifecycle::changed(state, effects, true))
 }

@@ -1,4 +1,4 @@
-# Bounded native-free stateless cluster
+# Bounded native-free FM cluster
 
 This tool owns one in-memory FM and exactly two child processes running the
 existing local RA/Hosting/runtime. It supports only the fixed
@@ -6,12 +6,42 @@ existing local RA/Hosting/runtime. It supports only the fixed
 not native Federation interoperability, full M1, recovery, failover or a general
 service host.
 
+An explicit `--stateful-singleton` variant admits the existing
+`hosting-local-app` volatile package and one fresh 1/1 Primary lifetime per node.
+The two nodes host independent singleton partitions, not two replicas or an HA
+configuration. Stateless remains the default.
+
 Build both executables, then run:
 
 ```sh
 fube-cluster --root /absolute/private/profile-root \
   --app /absolute/cluster-stateless-app
 ```
+
+For initial stateful FM control:
+
+```sh
+fube-cluster --root /absolute/private/stateful-profile \
+  --app /absolute/hosting-local-app --stateful-singleton
+```
+
+Use `create`, `status` and `quit` in this variant. `AddPrimary`/`AddPrimaryReply`
+use the native shared ReplicaMessageBody/ReplicaReplyMessageBody schemas and
+distinct actions; no local Open observation becomes an FM acknowledgment.
+FM stays pending until the exact original semantic Primary/Ready reply.
+The original creating-primary request retries under native default per-replica
+10/60-second minimum/maximum action intervals, without changing identity or
+reopening the replica. Dynamic FM configuration is not enabled by this profile.
+Independently send `write\n` then `read\n` to the reported application endpoint.
+The bounded fixture accepts one fixed nonzero public mutation, applies its
+admitted sequence before awaiting quorum completion, and returns progress/value.
+It rejects writes before runtime/engine role, epoch, readiness and access agree.
+This is volatile singleton acknowledgment, not durability or replicated copy.
+
+Stateful `delete`, replacement/recreation, promotion, `DoReconfiguration`,
+copy/build, FMM and recovery remain explicitly gated. `quit` uses the original
+owned local cleanup path, retaining terminal stateful reporting as pending
+escrow rather than manufacturing DeleteReplica/ReplicaUp acknowledgments.
 
 The root is operator-owned and private (0700). Its parent must already exist.
 All materialized packages, runtime roots, node controls and scratch stay beneath
@@ -102,6 +132,7 @@ consumer. Optional explicit overrides for local runs are:
 
 ```sh
 export FUBE_CLUSTER_APP="$CARGO_TARGET_DIR/debug/cluster-stateless-app"
+export FUBE_CLUSTER_STATEFUL_APP="$CARGO_TARGET_DIR/debug/hosting-local-app"
 export FUBE_CLUSTER_NODE_EXE="$CARGO_TARGET_DIR/debug/fube-cluster"
 export FUBE_CLUSTER_TEST_ROOT="/absolute/task-owned/runs"
 cargo test --locked -p fube-cluster -- --test-threads=1
@@ -125,3 +156,7 @@ removal. Consumer tests reject serialized stale/cross-owner retirement proofs
 and check both Remove/proof arrival orders. Dirty lost-owner fixtures intentionally retain
 their failed-handoff domain and evidence. These tests are native-free evidence, not
 deployed native FM/Federation qualification.
+Stateful tests additionally exercise the real foreground FM/RA processes,
+acknowledged public write/readback, dropped AddPrimaryReply with original-lifetime
+retry, native retry-interval boundaries and gated deletion/replacement. The
+archive includes both fixed app binaries; no consumer-side build fallback exists.

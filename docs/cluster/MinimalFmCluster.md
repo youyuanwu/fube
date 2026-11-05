@@ -4,6 +4,11 @@
 and one fixed stateless application profile. Explicit placement only; no
 automatic recovery, reconnect, failover or native FM/Federation parity.
 
+The explicit `--stateful-singleton` variant now enables fresh FM-authorized
+volatile 1/1 Primary creation, using the separate `hosting-local-app` package.
+Each of the two configured nodes can host one independent singleton partition;
+this does not form a multi-replica set. Stateless remains default.
+
 The [launcher guide](../../crates/tools/fube-cluster/README.md) defines invocation,
 bounded JSON commands, independent application contact and cleanup receipts.
 It uses the production local Node/RA/Hosting/runtime, memory store and common
@@ -82,6 +87,38 @@ cleanup remains nonreusable. Original FM/node processes do not restart.
 Loss of the FM link makes observation unknown; the app may remain serving.
 Original node and app owners remain responsible for cleanup through independent
 owner control. No replacement is authorized by link or node PID disappearance.
+
+## Initial stateful FM control
+
+Run the same executable with `--app /absolute/hosting-local-app
+--stateful-singleton`, then use `create`, `status` and `quit`.
+`AddPrimary`/`AddPrimaryReply` preserve native action/actor/priority, shared
+ReplicaMessageBody/ReplicaReplyMessageBody and request-generation/reply-owner
+asymmetry. The node uses `Profile::VolatileStatefulFmPrimary` and a distinct RA
+network command, not redirection to trusted-local Primary authorization.
+
+Native source pin `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` is authoritative:
+`ReconfigurationAgent.cpp:1731-1847,4313-4342` supplies processor/precheck and
+Ready-duplicate behavior; `FailoverUnit.cpp:5337-5350` sets initial Primary
+deactivation info to `(CurrentConfigurationEpoch, 0)`.
+`fm/FailoverUnitMessageProcessor.cpp:46-62` completes an expected creating/up
+Primary on the matching node incarnation. `fm/PendingTask.cpp:165-175`,
+`fm/Replica.cpp:661-667` and `common/FailoverConfig.h:78-82` define pending
+Primary retry with default 10/60-second per-replica intervals. This fixed
+profile retains those native predicates/defaults, not dynamic FM configuration.
+
+RA registration/Open and the final Primary/Ready reply remain commit-gated.
+Unknown store completion holds the original reply/duplicate until resolution.
+Ready duplicate requests reply from the existing FT without adopting the
+request epoch or acquiring another use. Closed/stale requests retain dropped
+reporting obligations; unsupported replacement/reopen paths fail admission.
+FM does not turn a transport write into readiness. An independent application
+client verifies one public admitted/applied/acknowledged write and readback.
+
+Stateful FM deletion, reconfiguration, FMM, copy/build, multi-replica movement
+and recovery remain gated. Owned local shutdown joins resource/listener disposal,
+exact usage and physical cleanup while retaining stateful reporting escrow.
+Cleanup receipts do not imply native terminal-report acknowledgment.
 
 ## Shutdown and restart safety
 

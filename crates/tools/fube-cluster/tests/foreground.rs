@@ -24,7 +24,14 @@ struct Foreground {
 }
 impl Foreground {
     fn start(root: &Path) -> Self {
-        let app = support::binary("cluster-stateless-app", "FUBE_CLUSTER_APP");
+        Self::start_profile(root, false)
+    }
+    fn start_profile(root: &Path, stateful: bool) -> Self {
+        let app = if stateful {
+            support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP")
+        } else {
+            support::binary("cluster-stateless-app", "FUBE_CLUSTER_APP")
+        };
         let mut command = Command::new(support::binary("fube-cluster", "FUBE_CLUSTER_NODE_EXE"));
         command
             .arg("--root")
@@ -36,6 +43,9 @@ impl Foreground {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        if stateful {
+            command.arg("--stateful-singleton");
+        }
         let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -133,6 +143,70 @@ fn contact(endpoint: &str) -> Value {
     assert!(bytes.len() <= 4096 && bytes.last() == Some(&b'\n'));
     serde_json::from_slice(&bytes).unwrap()
 }
+#[test]
+fn foreground_stateful_singleton_uses_fm_primary_completion_and_real_acknowledged_data() {
+    let root = support::parent().join(format!("fm-primary-{}", uuid::Uuid::new_v4()));
+    let mut foreground = Foreground::start_profile(&root, true);
+    assert_eq!(foreground.read()["event"], "ready");
+    let pending = foreground.command(&json!({"op":"primary","action":"create","node":1}));
+    assert_eq!(pending["state"], "pending");
+    let expected = Expected::capture(&root, 1);
+    let mut completed = None;
+    for attempt in 0..40 {
+        let status =
+            foreground.command(&json!({"op":format!("status-{attempt}"),"action":"status"}));
+        if status["status"]["nodes"][0]["observed"] == "running" {
+            completed = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let status = completed.expect("matched FM AddPrimaryReply did not complete");
+    let endpoint = status["status"]["nodes"][0]["endpoint"].as_str().unwrap();
+    let request = |command: &[u8]| {
+        let mut socket = TcpStream::connect(endpoint).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        socket.write_all(command).unwrap();
+        let mut response = String::new();
+        socket.take(512).read_to_string(&mut response).unwrap();
+        response
+    };
+    let mut ready = false;
+    for _ in 0..40 {
+        let response = request(b"read\n");
+        if response.starts_with("OK ") {
+            ready = true;
+            break;
+        }
+        assert_eq!(response, "ERR NotPrimary\n");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready);
+    let written = request(b"write\n");
+    assert_eq!(written, "OK role=Primary epoch=1:4294967297 read=Granted write=Granted ready=true assigned=1 applied=1 committed=1 value=acknowledged\n");
+    assert_eq!(request(b"read\n"), written);
+    let duplicate = foreground.command(&json!({"op":"primary","action":"create","node":1}));
+    assert_eq!(duplicate["state"], "complete");
+    assert_eq!(duplicate["replica"], pending["replica"]);
+    assert_eq!(duplicate["incarnation"], pending["incarnation"]);
+    assert_eq!(
+        foreground.command(&json!({"op":"unsupported-delete","action":"delete","node":1}))["state"],
+        "rejected"
+    );
+    assert_eq!(
+        foreground.command(&json!({"op":"replacement","action":"create","node":1}))["state"],
+        "rejected"
+    );
+    assert_eq!(process_start(expected.node_pid), expected.node_start);
+    assert_eq!(process_start(expected.app_pid), expected.app_start);
+    foreground.finish();
+    assert!(!Path::new(&format!("/proc/{}", expected.app_pid)).exists());
+    assert!(TcpStream::connect(endpoint).is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
 struct Expected {
     launch: Value,
     node_pid: u32,

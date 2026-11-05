@@ -23,6 +23,8 @@ CASES = {
     "action-ServiceTypeNotification", "action-ServiceTypeNotificationReply", "priority-false",
     "fresh-node-up", "rich-node-up", "fresh-node-up-ack", "rich-node-up-ack",
     "action-NodeUp", "action-NodeUpAck", "actor-13", "direct-ptop", "rich-ptop",
+    "default-primary", "rich-primary", "default-primary-reply", "rich-primary-reply",
+    "action-AddPrimary", "action-AddPrimaryReply",
 }
 
 

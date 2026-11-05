@@ -35,7 +35,7 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 45 inputs.
+The C++ producer independently constructs expected values and emits 51 inputs.
 The existing 36 cases and their contracts are retained:
 default/rich AddInstance, default/error AddInstanceReply, default/rich Remove
 (force false/true), default/rich removal reply, explicit-empty/rich ReplicaUp
@@ -58,6 +58,14 @@ base/derived scopes, not a flattened or nested replacement. ReplicaUp's empty
 native constructor leaves scalar booleans uninitialized; the empty fixture
 explicitly initializes them, and is not labeled a native-default guarantee.
 ReplicaInfo's rich fixture initializes its intermediate role explicitly.
+
+Six AddPrimary cases retain the original 45 and add default/rich request and
+reply bodies plus both literal actions. The native body types remain
+ReplicaMessageBody and ReplicaReplyMessageBody, so schema counts stay
+59 types/199 fields. Rust checks production AddPrimary factories/decoders
+against native-produced action/actor/priority/generation bytes, including
+FM/FMM reply-owner asymmetry and proper-prefix rejection. Header/schema support
+does not enable FMM execution or claim full native AddPrimary handler parity.
 
 ### Bootstrap and source identity header extension
 
@@ -138,8 +146,8 @@ env PATH=/nonexistent /usr/bin/python3 -m tests.ra_protocol.consumer \
   --expected-head COMMIT --expected-source SOURCE_DIGEST
 ```
 
-The bundle has exactly 45 `native/*.bin`, `schema.h`, `native-oracle`,
-`ra-conformance` and `manifest.json` (49 files total). No other files are
+The bundle has exactly 51 `native/*.bin`, `schema.h`, `native-oracle`,
+`ra-conformance` and `manifest.json` (55 files total). No other files are
 accepted. The consumer verifies exact coverage/type/member counts, regular files, hashes,
 provenance and both compiled source identities **before** execution. Missing,
 modified, wrong-source and symlink inputs fail; it imports no producer and
@@ -161,7 +169,7 @@ final delivery produces again at the clean reviewed implementation head.
 
 ## Separate actual-native helper evidence
 
-The helper producer is **not part of, and does not change**, the 45-case,
+The helper producer is **not part of, and does not change**, the 51-case,
 59-type/199-field wire bundle or its compiler-free consumer. It compiles
 unmodified `pal/wc16.c`, `RetryableErrorState.cpp` and
 `RetryableErrorStateThresholdCollection.cpp`. Identifier, `LargeInteger`,

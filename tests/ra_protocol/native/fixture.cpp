@@ -127,6 +127,23 @@ int main(int argc,char** argv) {
             reply.errorCode_.value_=Enum(error);
             run(mode,dir,"rich-reply-"+std::to_string(error),reply);
         }
+        ReplicaMessageBody primary;
+        run(mode,dir,"default-primary",primary);
+        c=0; rich(primary,c);
+        primary.replica_.currentConfigurationRole_=Enum(4);
+        primary.replica_.previousConfigurationRole_=Enum(1);
+        primary.replica_.state_=Enum(1);
+        primary.replica_.isUp_=true;
+        run(mode,dir,"rich-primary",primary);
+        ReplicaReplyMessageBody primary_reply;
+        run(mode,dir,"default-primary-reply",primary_reply);
+        c=0; rich(primary_reply,c);
+        primary_reply.replica_.currentConfigurationRole_=Enum(4);
+        primary_reply.replica_.previousConfigurationRole_=Enum(1);
+        primary_reply.replica_.state_=Enum(2);
+        primary_reply.replica_.isUp_=true;
+        primary_reply.errorCode_.value_=Enum(0);
+        run(mode,dir,"rich-primary-reply",primary_reply);
         GenerationHeader generation;
         run(mode,dir,"default-generation",generation);
         c=0; rich(generation,c); generation.isForFMReplica_=false;
@@ -163,7 +180,7 @@ int main(int argc,char** argv) {
             up.isLastReplicaUpMessage_=last!=0; up.isFromFMM_=fmm!=0;
             run(mode,dir,"rich-replica-up-"+std::to_string(last)+"-"+std::to_string(fmm),up);
         }
-        for(auto name:{u"RemoveInstance",u"RemoveInstanceReply",u"ReplicaUp",u"ReplicaUpReply"}) {
+        for(auto name:{u"RemoveInstance",u"RemoveInstanceReply",u"ReplicaUp",u"ReplicaUpReply",u"AddPrimary",u"AddPrimaryReply"}) {
             action.action_=text(name);
             std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
             run(mode,dir,"action-"+ascii,action);

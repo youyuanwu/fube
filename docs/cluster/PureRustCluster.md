@@ -83,6 +83,15 @@ mixed/config/data packaging, request-ledger qualification, recovery or M2 comple
 
 ## 1. Decisions and initial profile
 
+**Initial stateful FM control update (2026-11-05):**
+The [minimal FM tool](MinimalFmCluster.md#initial-stateful-fm-control) now has an
+explicit fresh volatile 1/1 variant using real AddPrimary/Reply, committed
+RA/RAP bootstrap, native initial deactivation/duplicate/retry semantics and
+independent acknowledged application write/readback. Each configured node hosts
+one independent singleton lifetime, not a multi-replica set. Stateful deletion,
+terminal-report delivery, reconfiguration/peer control, recovery and complete
+P4/M2 remain staged.
+
 | Area | Decision |
 |---|---|
 | Processes | One non-HA FM; several independent RA+Hosting processes; owned application processes beneath each RA. |

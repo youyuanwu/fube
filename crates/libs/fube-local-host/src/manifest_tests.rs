@@ -155,6 +155,7 @@ fn volatile_stateful_registration_requires_opt_in_and_materializes_both_type_dec
         Profile::VolatileStatefulRegistration,
         Profile::VolatileStatefulLifecycle,
         Profile::VolatileStatefulPrimaryLifecycle,
+        Profile::VolatileStatefulFmPrimary,
     ] {
         let package =
             Package::load_with_profile(&fixture.0, "fabric:/Local", &[], profile).unwrap();
@@ -258,6 +259,7 @@ fn stateful_registration_rejects_persistence_mismatches_and_broader_package_shap
             Profile::VolatileStatefulRegistration,
             Profile::VolatileStatefulLifecycle,
             Profile::VolatileStatefulPrimaryLifecycle,
+            Profile::VolatileStatefulFmPrimary,
         ] {
             assert!(
                 Package::load_with_profile(&fixture.0, "fabric:/Local", &[], profile).is_err(),

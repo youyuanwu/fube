@@ -19,6 +19,11 @@ now authorizes one fresh volatile 1/1 lifetime through committed existing RAP
 Open, with exact Ready completion, an acknowledged public write/readback and
 joined Close/lease-loss cleanup. It does not promote/adopt the Idle lifetime,
 implement FM AddPrimary/peer handlers or complete P4/M2.
+A later [fresh stateful FM control increment](MinimalFmCluster.md#initial-stateful-fm-control)
+now enables native-shaped AddPrimary/Reply with source-derived commit, initial
+deactivation, duplicate/stale and retry semantics over actual FM/RA channels.
+This is one volatile singleton lifetime per admitted node, not DeleteReplica,
+DoReconfiguration, peer control, recovery or complete P4/M2.
 
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's

@@ -6,6 +6,7 @@ mod wire;
 
 pub use fm::Command;
 pub use profile::Result;
+pub use profile::ServiceProfile;
 
 use fm::{Accepted, Bootstrap, Ledger};
 use fube_local_host::process::OwnedApp;
@@ -22,6 +23,7 @@ use tokio::time::Instant;
 use wire::Link;
 
 pub struct Config {
+    pub profile: ServiceProfile,
     pub root: PathBuf,
     pub app: PathBuf,
     pub executable: PathBuf,
@@ -68,6 +70,7 @@ impl Cluster {
             for_fm_replica: false,
         };
         let launches = [1, 2].map(|placement| Launch {
+            profile: config.profile,
             deployment: interlock.deployment.clone(),
             session: uuid::Uuid::new_v4().to_string(),
             capability: uuid::Uuid::new_v4().to_string(),
@@ -112,6 +115,26 @@ impl Cluster {
     }
     fn assemble(&self) -> Result<()> {
         let package = self.config.root.join("deployment/package");
+        if self.config.profile == ServiceProfile::StatefulSingleton {
+            private_dir(&package)?;
+            private_dir(&package.join("LocalService"))?;
+            private_dir(&package.join("LocalService/Code"))?;
+            fs::write(
+                package.join("ApplicationManifest.xml"),
+                include_bytes!(
+                    "../../../samples/hosting-local-app/pkg-stateful/ApplicationManifest.xml"
+                ),
+            )
+            .map_err(err)?;
+            fs::write(package.join("LocalService/ServiceManifest.xml"),
+                include_bytes!("../../../samples/hosting-local-app/pkg-stateful/LocalService/ServiceManifest.xml")).map_err(err)?;
+            fs::copy(
+                &self.config.app,
+                package.join("LocalService/Code/hosting-local-app"),
+            )
+            .map_err(err)?;
+            return Ok(());
+        }
         private_dir(&package)?;
         private_dir(&package.join("ClusterService"))?;
         private_dir(&package.join("ClusterService/Code"))?;
@@ -332,10 +355,17 @@ impl Cluster {
                 )
                 .await?;
             }
-            "AddInstanceReply" | "RemoveInstanceReply" => {
+            "AddInstanceReply" | "AddPrimaryReply" | "RemoveInstanceReply" => {
                 let removing = action == "RemoveInstanceReply";
+                let primary =
+                    self.children[index].launch.profile == ServiceProfile::StatefulSingleton;
+                if primary != (action == "AddPrimaryReply") {
+                    return Err("reply action does not match admitted lifecycle profile".into());
+                }
                 let (body, owner) = if removing {
                     decode_remove_instance_reply(&incoming.message)
+                } else if primary {
+                    decode_add_primary_reply(&incoming.message)
                 } else {
                     decode_add_instance_reply(&incoming.message)
                 }
@@ -366,6 +396,10 @@ impl Cluster {
                 Err(error) => Err(error),
             };
             let result = result.and_then(|()| self.read_retirement(index));
+            let result = match result {
+                Ok(()) => self.retry_primary(index).await,
+                Err(error) => Err(error),
+            };
             if let Err(error) = result {
                 self.ledger.lost(index, error);
                 if let Some(link) = &self.children[index].link {
@@ -373,6 +407,19 @@ impl Cluster {
                 }
             }
         }
+    }
+    async fn retry_primary(&mut self, index: usize) -> Result<()> {
+        let Some(body) = self.ledger.primary_retry(index, Instant::now())? else {
+            return Ok(());
+        };
+        let child = &self.children[index];
+        let message = add_primary_message(&body, &child.launch.generation).map_err(err)?;
+        child
+            .link
+            .as_ref()
+            .ok_or("original Primary link absent")?
+            .send(message)
+            .await
     }
     fn read_retirement(&mut self, index: usize) -> Result<()> {
         let child = &self.children[index];
@@ -423,8 +470,14 @@ impl Cluster {
         match self.ledger.accept(command)? {
             Accepted::Duplicate(outcome) => return Ok(outcome),
             Accepted::Create(index, body) => {
-                let message = add_instance_message(&body, &self.children[index].launch.generation)
-                    .map_err(err)?;
+                let factory =
+                    if self.children[index].launch.profile == ServiceProfile::StatefulSingleton {
+                        add_primary_message
+                    } else {
+                        add_instance_message
+                    };
+                let message =
+                    factory(&body, &self.children[index].launch.generation).map_err(err)?;
                 let result = self.children[index]
                     .link
                     .as_ref()

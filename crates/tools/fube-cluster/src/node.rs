@@ -98,7 +98,9 @@ impl Adapter {
                 if matches!(receipt.disposition, LocalDisposition::LocalResponse)
                     && matches!(
                         receipt.dispatch.effect,
-                        ra::Effect::Reply(_) | ra::Effect::RemoveReply(_)
+                        ra::Effect::Reply(_)
+                            | ra::Effect::PrimaryReply(_)
+                            | ra::Effect::RemoveReply(_)
                     )
                 {
                     self.replies.push_back(receipt.dispatch);
@@ -196,6 +198,7 @@ impl Adapter {
             if let Some(reply) = self.replies.front() {
                 let message = match &reply.effect {
                     ra::Effect::Reply(body) => add_instance_reply_message(body, Owner::Fm),
+                    ra::Effect::PrimaryReply(body) => add_primary_reply_message(body, Owner::Fm),
                     ra::Effect::RemoveReply(body) => remove_instance_reply_message(body, Owner::Fm),
                     _ => return Err("unimplemented semantic reply retained".into()),
                 }
@@ -479,6 +482,9 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     // bootstrap exchanges completed for this original session.
     private_dir(&launch.directory.join("hosting"))?;
     let mut options = Options::new(launch.directory.join("hosting"));
+    if launch.profile == ServiceProfile::StatefulSingleton {
+        options.profile = fube_hosting::local::Profile::VolatileStatefulFmPrimary;
+    }
     options.node = Some(NodeContext {
         id: node_hex(&launch.node),
         instance: launch.node.instance,
@@ -518,7 +524,14 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     )
     .map_err(err)?;
     let mut adapter = Adapter::default();
-    let started = node.start(&launch.package, APPLICATION, &[]).map_err(err);
+    let arguments = if launch.profile == ServiceProfile::StatefulSingleton {
+        vec![("Arguments".into(), "--stateful-primary".into())]
+    } else {
+        vec![]
+    };
+    let started = node
+        .start(&launch.package, APPLICATION, &arguments)
+        .map_err(err);
     let startup = if started.is_ok() {
         actual_profile(&node).and_then(|profile| {
             profile.validate(launch)?;
@@ -717,6 +730,11 @@ fn receive_command(
         "AddInstance" => {
             let (body, generation) = decode_add_instance(message).map_err(err)?;
             node.add_from_fm(body, &launch.fm, &generation)
+                .map_err(err)?;
+        }
+        "AddPrimary" => {
+            let (body, generation) = decode_add_primary(message).map_err(err)?;
+            node.add_primary_from_fm(body, &launch.fm, &generation)
                 .map_err(err)?;
         }
         "RemoveInstance" => {
