@@ -17,6 +17,9 @@ impl Fixture {
     fn stateful() -> Self {
         Self::with_profile(fube_hosting::local::Profile::VolatileStatefulLifecycle)
     }
+    fn primary() -> Self {
+        Self::with_profile(fube_hosting::local::Profile::VolatileStatefulPrimaryLifecycle)
+    }
     fn with_profile(profile: fube_hosting::local::Profile) -> Self {
         let parent = std::env::temp_dir().join(format!("ra-rap-{}", uuid::Uuid::new_v4()));
         let package = parent.join("input");
@@ -70,10 +73,14 @@ impl Fixture {
             ra::Settings::default(),
         )
         .unwrap();
-        let args = if self.profile == fube_hosting::local::Profile::VolatileStatefulLifecycle {
-            format!("--stateful-lifecycle {args}")
-        } else {
-            args.to_owned()
+        let args = match self.profile {
+            fube_hosting::local::Profile::VolatileStatefulLifecycle => {
+                format!("--stateful-lifecycle {args}")
+            }
+            fube_hosting::local::Profile::VolatileStatefulPrimaryLifecycle => {
+                format!("--stateful-primary {args}")
+            }
+            _ => args.to_owned(),
         };
         node.start(
             &self.package,
@@ -180,9 +187,18 @@ fn body(node: &Node) -> AddInstance {
     b.service.partitions = 1;
     b.service.target = 1;
     b.service.minimum = 1;
-    if a.profile() == fube_hosting::local::Profile::VolatileStatefulLifecycle {
+    if matches!(
+        a.profile(),
+        fube_hosting::local::Profile::VolatileStatefulLifecycle
+            | fube_hosting::local::Profile::VolatileStatefulPrimaryLifecycle
+    ) {
         b.service.stateful = true;
-        b.replica.current_role = 2;
+        b.replica.current_role =
+            if a.profile() == fube_hosting::local::Profile::VolatileStatefulPrimaryLifecycle {
+                4
+            } else {
+                2
+            };
     }
     b
 }
@@ -307,6 +323,274 @@ fn data_endpoint(node: &Node) -> fube_data::wire::Endpoint {
                 .map(|(_, endpoint)| endpoint.trim().parse().unwrap())
         })
         .unwrap()
+}
+
+fn primary_endpoint(node: &Node) -> String {
+    node.activation()
+        .logs()
+        .iter()
+        .find_map(|line| {
+            line.split_once("LOCAL_PRIMARY listening endpoint=")
+                .map(|(_, endpoint)| endpoint.trim().to_owned())
+        })
+        .expect("actual app listener observation")
+}
+async fn primary_request(address: &str, command: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(command.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream
+            .take(512)
+            .read_to_string(&mut response)
+            .await
+            .unwrap();
+        response
+    })
+    .await
+    .expect("bounded independent app client")
+}
+async fn primary_ready(node: &mut Node, address: &str) {
+    let end = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        until(node, |_| true).await;
+        let response = primary_request(address, "read\n").await;
+        if response.starts_with("OK ") {
+            assert!(response.contains("read=Granted write=Granted ready=true"));
+            return;
+        }
+        assert_eq!(response, "ERR NotPrimary\n");
+        assert!(std::time::Instant::now() < end, "primary readiness timeout");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+#[tokio::test]
+async fn stateful_initial_primary_applies_acknowledges_and_reads_one_write_before_joined_close() {
+    for args in ["--block-provider-dispose", "--block-dispose"] {
+        let fixture = Fixture::primary();
+        let (mut node, store) = fixture.node(args).await;
+        until(&mut node, |n| n.package_registration().registered).await;
+        native_free(&node);
+        let mut b = body(&node);
+        b.unit.current.configuration = (1 << 32) + 5;
+        assert!(node.open_stateful(b.clone()).is_err());
+        assert!(node.add(b.clone()).is_err());
+        for invalid in 0..3 {
+            let mut rejected = b.clone();
+            match invalid {
+                0 => rejected.replica.current_role = 2,
+                1 => rejected.service.minimum = 2,
+                _ => rejected.unit.previous = b.unit.current,
+            }
+            assert!(node.open_stateful_primary(rejected).is_err());
+        }
+        assert_eq!(node.retained_usage(), 0);
+        node.open_stateful_primary(b.clone()).unwrap();
+        let effects = until(&mut node, |n| {
+            n.snapshot(b.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| s.phase == ra::Phase::Ready)
+        })
+        .await;
+        let open = effects
+            .iter()
+            .find(|receipt| matches!(receipt.dispatch.effect, ra::Effect::RuntimeOpen { .. }))
+            .unwrap()
+            .dispatch
+            .clone();
+        assert!(effects.iter().any(|receipt| matches!(
+            receipt.dispatch.effect,
+            ra::Effect::LocalStatefulOpenReply(_)
+        )));
+        assert!(!effects
+            .iter()
+            .any(|receipt| matches!(receipt.dispatch.effect, ra::Effect::Reply(_))));
+        let opened = node.snapshot(b.unit.id.guid.0).committed.unwrap();
+        assert_eq!(
+            (opened.body.replica.current_role, opened.body.replica.state),
+            (4, 2)
+        );
+        let address = primary_endpoint(&node);
+        let replication = data_endpoint(&node).address;
+        assert_eq!(opened.body.replica.service_endpoint, address);
+        assert_eq!(
+            opened.body.replica.replication_endpoint,
+            data_endpoint(&node).to_string()
+        );
+        assert!(std::net::TcpStream::connect(&replication).is_ok());
+        assert_eq!(
+            count(&node, "LOCAL_PRIMARY write_denied before_ready assigned=0"),
+            1
+        );
+        primary_ready(&mut node, &address).await;
+        let response = primary_request(&address, "write\n").await;
+        assert_eq!(response, "OK role=Primary epoch=1:4294967301 read=Granted write=Granted ready=true assigned=1 applied=1 committed=1 value=acknowledged\n");
+        assert_eq!(primary_request(&address, "read\n").await, response);
+        node.open_stateful_primary(b.clone()).unwrap();
+        replay(&mut node, &open, false).await;
+        replay(&mut node, &open, true).await;
+        assert_eq!(count(&node, "LOCAL_CALLBACK create_replica"), 1);
+        assert_eq!(count(&node, "LOCAL_PRIMARY acknowledged sequence=1"), 1);
+        assert_eq!(node.retained_usage(), 1);
+        node.close(b.unit.id.clone(), ra::CloseMode::Close).unwrap();
+        let provider_barrier = args == "--block-provider-dispose";
+        let effects = until(&mut node, |n| {
+            count(
+                n,
+                if provider_barrier {
+                    "LOCAL_DATA_PROVIDER dispose begin"
+                } else {
+                    "LOCAL_DISPOSE begin"
+                },
+            ) == 1
+        })
+        .await;
+        let close = effects
+            .iter()
+            .find(|receipt| matches!(receipt.dispatch.effect, ra::Effect::Close { .. }))
+            .unwrap()
+            .dispatch
+            .clone();
+        advance(&mut node, Duration::from_millis(150)).await;
+        assert_eq!(
+            node.snapshot(b.unit.id.guid.0).committed.unwrap().phase,
+            ra::Phase::Closing
+        );
+        assert_eq!(node.retained_usage(), 1);
+        assert!(node.instance_disposal().is_none());
+        assert!(
+            node.activation()
+                .session_status()
+                .unwrap()
+                .unwrap()
+                .connected
+        );
+        let provider_resource = resource(&node).with_file_name("local-provider.resource");
+        if provider_barrier {
+            assert!(provider_resource.is_file());
+            for command in ["write\n", "read\n"] {
+                let response = primary_request(&address, command).await;
+                assert!(
+                    response == "ERR NotPrimary\n" || response == "ERR ObjectClosed\n",
+                    "{response}"
+                );
+            }
+        } else {
+            assert!(!provider_resource.exists());
+            assert!(std::net::TcpStream::connect(&address).is_err());
+            assert_eq!(count(&node, "LOCAL_PRIMARY released"), 1);
+        }
+        fs::write(
+            resource(&node).with_file_name(if provider_barrier {
+                "local-provider-dispose.release"
+            } else {
+                "local-dispose.release"
+            }),
+            b"release actual disposer",
+        )
+        .unwrap();
+        until(&mut node, |n| n.instance_disposal().is_some()).await;
+        assert_eq!(count(&node, "LOCAL_DATA_PROVIDER disposed written"), 1);
+        assert_eq!(count(&node, "LOCAL_PRIMARY released"), 1);
+        assert_eq!(count(&node, "LOCAL_DISPOSE complete"), 1);
+        assert!(!resource(&node).exists() && !provider_resource.exists());
+        assert!(std::net::TcpStream::connect(&address).is_err());
+        assert!(std::net::TcpStream::connect(&replication).is_err());
+        assert_eq!(node.retained_usage(), 0);
+        assert_eq!(
+            node.external_pending()
+                .iter()
+                .filter(|effect| matches!(effect.effect, ra::Effect::StatefulClosePending { .. }))
+                .count(),
+            1
+        );
+        replay(&mut node, &close, false).await;
+        replay(&mut node, &open, false).await;
+        assert_eq!(count(&node, "LOCAL_CALLBACK create_replica"), 1);
+        assert!(node.open_stateful_primary(b.clone()).is_err());
+        let root = node.activation().root().unwrap().to_path_buf();
+        cleanup(&mut node, &store).await;
+        assert!(!root.exists());
+        let status = node.activation().process_status().unwrap();
+        assert!(status.exit_observed && status.group_drained && status.reaped);
+        assert_eq!(node.activation().residency().resources().logical_bytes, 0);
+    }
+}
+
+#[tokio::test]
+async fn stateful_initial_primary_lease_loss_fences_opening_and_serving_without_adoption() {
+    for opening in [true, false] {
+        let fixture = Fixture::primary();
+        let (mut node, store) = fixture
+            .node(if opening { "--open-delay-ms 4000" } else { "" })
+            .await;
+        until(&mut node, |n| n.package_registration().registered).await;
+        let mut b = body(&node);
+        b.unit.current.configuration = (1 << 32) + 5;
+        node.open_stateful_primary(b.clone()).unwrap();
+        until(&mut node, |n| {
+            if opening {
+                count(n, "LOCAL_PRIMARY listening") == 1
+            } else {
+                n.snapshot(b.unit.id.guid.0)
+                    .committed
+                    .is_some_and(|s| s.phase == ra::Phase::Ready)
+            }
+        })
+        .await;
+        let address = primary_endpoint(&node);
+        let replication = data_endpoint(&node).address;
+        if opening {
+            assert_eq!(
+                primary_request(&address, "write\n").await,
+                "ERR NotPrimary\n"
+            );
+            assert_eq!(count(&node, "LOCAL_PRIMARY acknowledged"), 0);
+        } else {
+            primary_ready(&mut node, &address).await;
+            assert!(primary_request(&address, "write\n")
+                .await
+                .contains("assigned=1 applied=1 committed=1 value=acknowledged"));
+        }
+        let pid = node.activation().process_status().unwrap().pid;
+        node.activation().host_lease().unwrap().stop_renewal();
+        until(&mut node, |n| {
+            n.snapshot(b.unit.id.guid.0).committed.is_some_and(|s| {
+                if opening {
+                    s.phase == ra::Phase::Opening && s.runtime.is_none() && s.open_failures > 0
+                } else {
+                    s.phase == ra::Phase::Closed && s.usage.is_none()
+                }
+            }) && (opening || n.retained_usage() == 0)
+        })
+        .await;
+        assert_eq!(node.retained_usage(), usize::from(opening));
+        assert!(node.instance_disposal().is_none());
+        if opening {
+            node.close(b.unit.id.clone(), ra::CloseMode::Drop).unwrap();
+            until(&mut node, |n| n.retained_usage() == 0).await;
+        }
+        until(&mut node, |_| {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z "))
+                && std::net::TcpStream::connect(&address).is_err()
+                && std::net::TcpStream::connect(&replication).is_err()
+        })
+        .await;
+        assert_eq!(count(&node, "LOCAL_DATA_PROVIDER disposed"), 0);
+        assert_eq!(count(&node, "LOCAL_DISPOSE complete"), 0);
+        assert!(resource(&node).is_file());
+        assert!(resource(&node)
+            .with_file_name("local-provider.resource")
+            .is_file());
+        assert!(node.open_stateful_primary(b).is_err());
+        let root = node.activation().root().unwrap().to_path_buf();
+        cleanup(&mut node, &store).await;
+        assert!(!root.exists());
+        let status = node.activation().process_status().unwrap();
+        assert!(status.exit_observed && status.group_drained && status.reaped);
+    }
 }
 
 #[tokio::test]
@@ -751,15 +1035,16 @@ async fn stateful_lease_loss_fences_open_and_opening_without_fabricating_disposa
 
 #[tokio::test]
 async fn stateful_lifecycle_activation_requires_the_original_consumer_before_launch() {
-    let fixture = Fixture::stateful();
-    let mut options = Options::new(fixture.parent.clone());
-    options.profile = fixture.profile;
-    let mut activation = Activation::new(options).unwrap();
-    assert!(activation
-        .start(&fixture.package, "fabric:/Local", &[])
-        .is_err());
-    assert!(activation.root().is_none());
-    assert!(activation.process_status().is_none());
+    for fixture in [Fixture::stateful(), Fixture::primary()] {
+        let mut options = Options::new(fixture.parent.clone());
+        options.profile = fixture.profile;
+        let mut activation = Activation::new(options).unwrap();
+        assert!(activation
+            .start(&fixture.package, "fabric:/Local", &[])
+            .is_err());
+        assert!(activation.root().is_none());
+        assert!(activation.process_status().is_none());
+    }
 }
 
 #[tokio::test]

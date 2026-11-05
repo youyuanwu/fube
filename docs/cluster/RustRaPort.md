@@ -14,6 +14,11 @@ evidence and stateful recovery remain unsupported.
 An opt-in real-data fixture now connects that same local path to the existing
 `fube-data` engine through normal public construction, verifying denied Idle
 writes and joined cleanup without widening RA authorization or completing P4.
+A distinct [trusted-local initial Primary slice](HostingLocalActivation.md#opt-in-initial-singleton-primary-lifecycle)
+now authorizes one fresh volatile 1/1 lifetime through committed existing RAP
+Open, with exact Ready completion, an acknowledged public write/readback and
+joined Close/lease-loss cleanup. It does not promote/adopt the Idle lifetime,
+implement FM AddPrimary/peer handlers or complete P4/M2.
 
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's

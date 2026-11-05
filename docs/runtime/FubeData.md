@@ -95,6 +95,13 @@ fencing, not Primary/configuration, replicated data/copy or deployed native pari
 
 ### Runtime/replication boundary
 
+The separate [local initial singleton Primary fixture](../cluster/HostingLocalActivation.md#opt-in-initial-singleton-primary-lifecycle)
+now adds one public admitted/applied/acknowledged mutation and independent client
+readback through normal runtime construction. RA/RAP owns bootstrap authority;
+the application applies its accepted sequence before awaiting quorum completion.
+This is volatile local 1/1 evidence, not multi-replica copy/ACK, request-ledger,
+recovery, native stateful or complete M2 qualification.
+
 Native separation is **interface-based**, not “SDK-only”: RAP retains common/
 primary interfaces of the service-returned object and optionally queries
 `IFabricInternalReplicator`; replication uses public partition/provider proxies

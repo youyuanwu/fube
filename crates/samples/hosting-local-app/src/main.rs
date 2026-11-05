@@ -4,7 +4,9 @@ use fube_data::{
     Mutation,
 };
 use fube_runtime::{
-    extensions::{NativeIntegrationProvider, NativeRuntimeIntegration},
+    extensions::{
+        EpochDomains, NativeIntegrationProvider, NativeRuntimeIntegration, ReplicaLifecycle,
+    },
     ApiFuture, Cancellation, Epoch, Error, IPrimaryReplicator, IReplicator,
     IStatefulServiceFactory, IStatefulServicePartition, IStatefulServiceReplica,
     IStatelessServiceFactory, IStatelessServiceInstance, IStatelessServicePartition, OpenMode,
@@ -16,11 +18,14 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    thread::JoinHandle,
     time::Duration,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Clone, Copy, Default)]
 struct Mode {
+    primary: bool,
     block_dispose: bool,
     block_provider_dispose: bool,
     close_error: bool,
@@ -37,11 +42,24 @@ struct StatefulReplica {
     partition: Mutex<Option<Arc<dyn IStatefulServicePartition>>>,
     native: Option<NativeRuntimeIntegration>,
     data: Mutex<Option<Arc<RuntimeReplicator>>>,
+    primary: Mutex<Option<PrimaryService>>,
 }
 struct ObservedProvider {
     memory: Arc<MemoryProvider>,
     resource: PathBuf,
     block_dispose: bool,
+    primary: bool,
+}
+struct PrimaryService {
+    address: String,
+    stopped: Cancellation,
+    thread: Option<JoinHandle<()>>,
+}
+struct PrimaryState {
+    native: NativeRuntimeIntegration,
+    partition: Arc<dyn IStatefulServicePartition>,
+    data: Arc<RuntimeReplicator>,
+    memory: Arc<MemoryProvider>,
 }
 struct LocalControl(Mutex<Option<TcpListener>>);
 struct Instance {
@@ -96,6 +114,7 @@ impl IStatefulServiceFactory for StatefulFactory {
             partition: Mutex::new(None),
             native,
             data: Mutex::new(None),
+            primary: Mutex::new(None),
         }))
     }
 }
@@ -125,10 +144,12 @@ impl IStatefulServiceReplica for StatefulReplica {
                     memory: MemoryProvider::new(),
                     resource,
                     block_dispose: self.resource.mode.block_provider_dispose,
+                    primary: self.resource.mode.primary,
                 });
+                let memory = provider.memory.clone();
                 marker("LOCAL_DATA_PROVIDER acquired");
                 let control = native.create_replicator(
-                    partition,
+                    partition.clone(),
                     provider,
                     None,
                     ReplicationEndpointOptions {
@@ -142,6 +163,19 @@ impl IStatefulServiceReplica for StatefulReplica {
                     control.endpoint()
                 ));
                 *self.data.lock().unwrap() = Some(control.clone());
+                if self.resource.mode.primary {
+                    let service = PrimaryService::start(PrimaryState {
+                        native: native.clone(),
+                        partition,
+                        data: control.clone(),
+                        memory,
+                    })?;
+                    marker(&format!(
+                        "LOCAL_PRIMARY listening endpoint={}",
+                        service.address
+                    ));
+                    *self.primary.lock().unwrap() = Some(service);
+                }
                 Box::new((*control).clone())
             } else {
                 Box::new(LocalControl(Mutex::new(None)))
@@ -152,12 +186,46 @@ impl IStatefulServiceReplica for StatefulReplica {
     }
     fn change_role(&self, role: ReplicaRole, _: Cancellation) -> ApiFuture<'_, String> {
         Box::pin(async move {
-            if !matches!(role, ReplicaRole::IdleSecondary | ReplicaRole::None) {
+            if !matches!(role, ReplicaRole::IdleSecondary | ReplicaRole::None)
+                && !(role == ReplicaRole::Primary && self.resource.mode.primary)
+            {
                 return Err(Error::Protocol(
                     "fixture prohibits Primary/secondary promotion",
                 ));
             }
             marker(&format!("LOCAL_CALLBACK role {role:?}"));
+            if role == ReplicaRole::Primary {
+                let data = self.data.lock().unwrap().clone().expect("real data owner");
+                let before = data.snapshot();
+                assert_eq!(before.role, ReplicaRole::Primary);
+                assert!(!before.ready);
+                let operation = Mutation {
+                    id: "before-ready".into(),
+                    key: "value".into(),
+                    value: "must not be admitted".into(),
+                }
+                .operation()?;
+                let error = data
+                    .get_state_replicator()
+                    .replicate(operation, Cancellation::default())
+                    .await
+                    .err()
+                    .expect("write before service role completion must reject");
+                assert_eq!(
+                    error.kind(),
+                    fube_runtime::ErrorKind::ReconfigurationPending
+                );
+                assert_eq!(data.snapshot().progress, before.progress);
+                marker("LOCAL_PRIMARY write_denied before_ready assigned=0");
+                return Ok(self
+                    .primary
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .expect("owned primary listener")
+                    .address
+                    .clone());
+            }
             if role == ReplicaRole::IdleSecondary {
                 let partition = self
                     .partition
@@ -223,6 +291,9 @@ impl IStatefulServiceReplica for StatefulReplica {
 }
 impl StatefulReplica {
     fn release_data(&self) {
+        if let Some(mut primary) = self.primary.lock().unwrap().take() {
+            primary.join();
+        }
         if let Some(data) = self.data.lock().unwrap().take() {
             let snapshot = data.snapshot();
             assert!(
@@ -279,10 +350,190 @@ impl Drop for ObservedProvider {
             );
         }
         let state = self.memory.snapshot();
-        assert_eq!(state.last, 0);
-        assert!(state.values.is_empty() && state.results.is_empty());
+        if self.primary && state.last != 0 {
+            assert_eq!(state.last, 1);
+            assert_eq!(
+                state.values.get("value").map(String::as_str),
+                Some("acknowledged")
+            );
+            assert_eq!(state.results.get("primary-write"), Some(&1));
+            assert_eq!((state.values.len(), state.results.len()), (1, 1));
+        } else {
+            assert_eq!(state.last, 0);
+            assert!(state.values.is_empty() && state.results.is_empty());
+        }
         std::fs::remove_file(&self.resource).expect("dispose actual data provider resource");
-        marker("LOCAL_DATA_PROVIDER disposed empty");
+        marker(if state.last == 0 {
+            "LOCAL_DATA_PROVIDER disposed empty"
+        } else {
+            "LOCAL_DATA_PROVIDER disposed written"
+        });
+    }
+}
+impl PrimaryState {
+    fn authority(&self, write: bool) -> Result<()> {
+        let native = self.native.status()?;
+        let engine = self.data.snapshot();
+        let access = if write {
+            self.partition.get_write_status()?
+        } else {
+            self.partition.get_read_status()?
+        };
+        if native.lifecycle != ReplicaLifecycle::Open
+            || !native.replicator_open
+            || native.current_role != ReplicaRole::Primary
+            || native.service_role != ReplicaRole::Primary
+            || native.replicator_role != ReplicaRole::Primary
+            || engine.role != ReplicaRole::Primary
+            || !engine.ready
+            || engine.closed
+            || engine.fault.is_some()
+            || engine.epoch != Some(native.current_epoch.primary())
+            || access != ServicePartitionAccessStatus::Granted
+        {
+            return Err(Error::new(
+                fube_runtime::ErrorKind::NotPrimary,
+                "fixture is not serving",
+            ));
+        }
+        Ok(())
+    }
+    async fn request(&self, request: &[u8], stopped: Cancellation) -> Result<String> {
+        match request {
+            b"write\n" => {
+                self.authority(true)?;
+                let mutation = Mutation {
+                    id: "primary-write".into(),
+                    key: "value".into(),
+                    value: "acknowledged".into(),
+                };
+                if self.memory.admission(&mutation)?.is_some() {
+                    return Err(Error::InvalidInput(
+                        "fixture permits one acknowledged write",
+                    ));
+                }
+                let operation =
+                    mutation.operation_for_epoch(self.native.status()?.current_epoch.primary())?;
+                let mut admission = self
+                    .data
+                    .get_state_replicator()
+                    .replicate(operation.clone(), stopped.clone())
+                    .await?;
+                let sequence = admission.sequence_number;
+                self.memory.apply_replication(sequence, &operation)?;
+                assert_eq!(admission.completion.wait(stopped).await?, sequence);
+                self.authority(true)?;
+                marker(&format!("LOCAL_PRIMARY acknowledged sequence={sequence}"));
+            }
+            b"read\n" => self.authority(false)?,
+            _ => return Err(Error::InvalidInput("fixture accepts only read/write")),
+        }
+        let native = self.native.status()?;
+        let engine = self.data.snapshot();
+        let provider = self.memory.snapshot();
+        Ok(format!(
+            "OK role=Primary epoch={}:{} read={:?} write={:?} ready={} assigned={} applied={} committed={} value={}\n",
+            native.current_epoch.data_loss_number,
+            native.current_epoch.configuration_number,
+            self.partition.get_read_status()?,
+            self.partition.get_write_status()?,
+            engine.ready,
+            engine.progress.assigned,
+            provider.last,
+            engine.progress.committed,
+            provider.values.get("value").map_or("", String::as_str),
+        ))
+    }
+}
+impl PrimaryService {
+    fn start(state: PrimaryState) -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?.to_string();
+        listener.set_nonblocking(true)?;
+        let stopped = Cancellation::default();
+        let stop = stopped.clone();
+        let (ready, readiness) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("local-primary".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("primary fixture runtime");
+                runtime.block_on(async {
+                    let listener = match tokio::net::TcpListener::from_std(listener) {
+                        Ok(listener) => listener,
+                        Err(error) => {
+                            ready.send(Err(error)).expect("report listener failure");
+                            return;
+                        }
+                    };
+                    ready.send(Ok(())).expect("report owned listener startup");
+                    loop {
+                        let accepted = tokio::select! {
+                            biased;
+                            _ = stop.cancelled() => break,
+                            accepted = listener.accept() => accepted,
+                        };
+                        let (mut stream, _) = accepted.expect("primary listener accept");
+                        let mut bytes = Vec::new();
+                        let input = tokio::time::timeout(Duration::from_secs(2), async {
+                            for _ in 0..16 {
+                                let byte = stream.read_u8().await?;
+                                bytes.push(byte);
+                                if byte == b'\n' {
+                                    break;
+                                }
+                            }
+                            Ok::<_, std::io::Error>(())
+                        })
+                        .await;
+                        let result = match input {
+                            Ok(Ok(())) => state.request(&bytes, stop.clone()).await,
+                            Ok(Err(error)) => Err(error.into()),
+                            Err(_) => Err(Error::Timeout),
+                        };
+                        let response = match result {
+                            Ok(response) => response,
+                            Err(error) => {
+                                marker(&format!("LOCAL_PRIMARY request_error {error}"));
+                                format!("ERR {:?}\n", error.kind())
+                            }
+                        };
+                        if let Err(error) = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            stream.write_all(response.as_bytes()),
+                        )
+                        .await
+                        .map_err(|_| Error::Timeout)
+                        .and_then(|result| result.map_err(Error::from))
+                        {
+                            marker(&format!("LOCAL_PRIMARY response_error {error}"));
+                        }
+                    }
+                });
+                marker("LOCAL_PRIMARY released");
+            })?;
+        if let Err(error) = readiness.recv().expect("primary listener startup receipt") {
+            thread.join().expect("join failed listener startup");
+            return Err(error.into());
+        }
+        Ok(Self {
+            address,
+            stopped,
+            thread: Some(thread),
+        })
+    }
+    fn join(&mut self) {
+        self.stopped.cancel();
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("join actual primary listener");
+        }
+    }
+}
+impl Drop for PrimaryService {
+    fn drop(&mut self) {
+        self.join();
     }
 }
 impl LocalControl {
@@ -439,15 +690,17 @@ impl Drop for Instance {
 async fn main() {
     // These explicit fault modes are for owned-lifecycle qualification only.
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let stateful_lifecycle = args.first().is_some_and(|s| s == "--stateful-lifecycle");
+    let primary = args.first().is_some_and(|s| s == "--stateful-primary");
+    let stateful_lifecycle = primary || args.first().is_some_and(|s| s == "--stateful-lifecycle");
     let args = if stateful_lifecycle {
         &args[1..]
     } else {
         &args[..]
     };
-    let data_replicator =
-        stateful_lifecycle && args.first().is_some_and(|s| s == "--data-replicator");
-    let args = if data_replicator { &args[1..] } else { args };
+    let explicit_data =
+        !primary && stateful_lifecycle && args.first().is_some_and(|s| s == "--data-replicator");
+    let data_replicator = primary || explicit_data;
+    let args = if explicit_data { &args[1..] } else { args };
     let delay = match args {
         [flag, value]
             if flag == "--delay-ms"
@@ -475,6 +728,7 @@ async fn main() {
     }
     let runtime = Runtime::attach().await.expect("owned Hosting attach");
     let mode = Mode {
+        primary,
         block_dispose: args
             .first()
             .is_some_and(|s| s == "--block-dispose" || s == "--close-error-block-dispose"),

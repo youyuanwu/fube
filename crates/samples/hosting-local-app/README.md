@@ -102,3 +102,37 @@ construction/Open or Idle hard-fences the process and removes its engine socket,
 without fabricating destructor receipts; owned physical cleanup removes the
 remaining files. This is local native-free Idle engine evidence, not replicated
 writes, native stateful interoperability or M2 completion.
+
+## Initial singleton Primary lifecycle fixture
+
+Reuse `pkg-stateful/` with the separate
+`Profile::VolatileStatefulPrimaryLifecycle`, compose the original local `Node`
+before launch, and override `Arguments` with `--stateful-primary`. This mode
+always uses the real data replicator. Call `Node::open_stateful_primary` with a
+fresh volatile 1/1 Primary/InBuild description and no previous configuration,
+then `Node::close`. The registration-only and Idle profiles do not gain Primary
+authority; promotion, replacement, reopen and adoption remain rejected.
+
+Committed RA effects drive the existing RAP initial-Primary Open sequence and
+the actual service-returned public replicator. A write during the service role
+callback fails as ReconfigurationPending without consuming a sequence.
+An owned, joined numeric-loopback application listener accepts only `read\n`
+and `write\n`, with a 16-byte input bound and finite network waits. Before serving,
+the listener requires agreement on runtime/service/replicator/engine roles,
+epoch, readiness and public partition access. `write` submits one fixed nonzero
+mutation through `IStateReplicator`, locally applies its admitted sequence to
+`MemoryProvider`, then awaits the separate quorum completion. An independent
+client verifies sequence/application/completion progress and reads back the value.
+This is volatile local application and singleton acknowledgment, not durability
+or secondary application/copy ACK evidence. Repeated writes explicitly reject;
+request-ledger retry semantics are not qualified by this fixture.
+
+The lifecycle target holds provider and service disposal separately while local
+leases continue. Reads/writes reject during provider retirement; application and
+replication listeners close, actual resources release and the original H2 use
+retires before successful semantic Close. Duplicate/stale Open/Close cannot
+recreate serving authority. Opening and serving lease loss independently verify
+both sockets disappear and the original process exits, then verify physical
+cleanup without claiming graceful destructor receipts or recovered data.
+FM/peer control, configuration changes, copy/build, mixed/config/data packages,
+recovery, native stateful qualification and full P4/M2 remain unsupported.

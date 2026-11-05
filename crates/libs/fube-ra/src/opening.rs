@@ -315,17 +315,25 @@ pub(super) fn complete(
     if current.body.service.stateful {
         if event.replica.node != current.body.replica.node
             || event.replica.id != current.body.replica.id
-            || event.replica.current_role != 2
+            || event.replica.current_role != current.body.replica.current_role
+            || event.replica.previous_role != current.body.replica.previous_role
+            || !event.replica.up
             || event.unit != current.body.unit
         {
             return Ok(Transition::ignored(Disposition::IgnoredStale));
         }
         if event.error == PROXY_STATE_CHANGED_ON_DATA_LOSS
             || (event.error == 0
-                && (event.replica.state != 1 || !event.replica.service_endpoint.is_empty()))
+                && (event.replica.state != 1
+                    || if current.body.replica.current_role == 4 {
+                        event.replica.service_endpoint.is_empty()
+                            || event.replica.replication_endpoint.is_empty()
+                    } else {
+                        !event.replica.service_endpoint.is_empty()
+                    }))
         {
             return Err(Failure::Admission(
-                "Idle Open cannot publish Primary/data-loss readiness",
+                "local Open requires exact initial role/endpoints without data-loss change",
             ));
         }
     }
@@ -337,8 +345,12 @@ pub(super) fn complete(
     // Native applies Ready and endpoints before the separate current-policy clear.
     state.phase = Phase::Ready;
     lifecycle::mutate_body(&mut state, |body| {
-        // Native ProcessReplicaOpenReply leaves a newly opened Idle InBuild.
-        body.replica.state = if body.service.stateful { 1 } else { 2 };
+        // Native initial Primary becomes Ready; a newly opened Idle stays InBuild.
+        body.replica.state = if body.service.stateful && body.replica.current_role == 2 {
+            1
+        } else {
+            2
+        };
         body.replica.service_endpoint = event.replica.service_endpoint;
         body.replica.replication_endpoint = event.replica.replication_endpoint;
     });

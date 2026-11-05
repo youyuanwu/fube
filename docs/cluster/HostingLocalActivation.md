@@ -161,6 +161,56 @@ The custom-control and registration-only modes stay unchanged. This adds no
 Primary/configuration/build/copy, acknowledged data, FM/peer choreography,
 recovery or native stateful/M2 qualification.
 
+### Opt-in initial singleton Primary lifecycle
+
+`Profile::VolatileStatefulPrimaryLifecycle` is a separate trusted-local profile
+with the same strict volatile stateful 1/1 package constraints and mandatory
+original-consumer-before-launch gate. The fixture argument `--stateful-primary`
+selects normal real-data construction. `Node::open_stateful_primary` authorizes
+one fresh Primary/InBuild lifetime with an invalid/absent previous configuration,
+not promotion of an existing Idle replica. Registration-only and Idle admission
+remain unchanged; FM AddPrimary, peer control, replacement, reopen/adoption,
+configuration changes, persisted replicas and recovery still reject.
+
+The original committed lookup/acquisition and `RuntimeOpen` drive the existing
+RAP initial-Primary sequence through the service-returned public replicator.
+At native source pin `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`,
+`Reliability/Failover/ra/ProxyActionsList.cpp:44-54` defines OpenPartition,
+ReconfigurationStarting, OpenReplica, OpenReplicator, ChangeReplicatorRole,
+ChangeReplicaRole, ReportAnyDataLoss and ReconfigurationEnding.
+`ReconfigurationAgentProxy.cpp:300-449` selects that distinct New-mode path;
+`FailoverUnit.cpp:5250-5330` makes the successful initial Primary Ready.
+No blanket UpdateConfiguration, direct engine role setter or fabricated
+data-loss completion substitutes for that sequence. This local profile rejects
+state-changed-on-data-loss completion instead of enabling its upstream protocol.
+
+RA accepts only matching original identity, role, epoch, native-shaped InBuild
+reply and nonempty service/replication endpoints, then commits Primary/Ready
+before publishing its local `LocalStatefulOpenReply`. This is not a native
+AddPrimaryReply or FM acknowledgment. Model tests hold real commits, veto the
+initial insert, reject foreign/late/invalid completions and verify exact usage
+release after committed Close.
+
+The fixture owns an actual joined numeric-loopback application listener.
+Public writes before service role completion fail as ReconfigurationPending
+without sequence consumption. Application requests additionally require runtime,
+service, replicator and engine Primary roles, matching epoch, readiness and
+public partition access. An independent client submits one fixed nonzero public
+`IStateReplicator` mutation; the application applies the admitted sequence to its
+provider before waiting for the separate quorum result. The client verifies
+assigned/applied/committed progress and reads back the value. This is singleton
+volatile acknowledgment, not a replicated secondary ACK or durability claim.
+
+Real-process tests hold provider and service disposal independently, observe
+access denial during retirement, join both listeners/resources before semantic
+Close and exact H2 release, and retain `StatefulClosePending` external reporting.
+Duplicate/stale traffic cannot reopen or resurrect endpoints. Opening/serving
+lease loss independently checks both sockets and the waitable process exit,
+then owned group drainage/reap/root removal; hard fencing does not fabricate
+provider/service destructor receipts. Request-ledger retry/ambiguity semantics,
+mixed/config/data packages, FM/peer choreography, copy/build, recovery and native
+stateful/P4/M2 qualification remain outside this slice.
+
 ## Ownership and usage
 
 Construction validates options/capabilities without filesystem/process side

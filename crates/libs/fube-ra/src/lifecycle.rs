@@ -680,7 +680,7 @@ pub(super) fn transition(
             if current.body.service.stateful
                 && (event.unit != current.body.unit
                     || event.replica.node != current.body.replica.node
-                    || event.replica.current_role != 2)
+                    || event.replica.current_role != current.body.replica.current_role)
             {
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             }

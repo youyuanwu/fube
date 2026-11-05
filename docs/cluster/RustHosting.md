@@ -10,6 +10,10 @@ now admits one 1/1 type and real factory registration/lookup. A separate
 adds RA-authorized Idle Open/Close, not Primary, replication or stateful deployment.
 Its opt-in real-data fixture now exercises normal `fube-data` construction,
 denied writes and joined disposal while remaining Idle/non-serving.
+A separate [initial singleton Primary profile](HostingLocalActivation.md#opt-in-initial-singleton-primary-lifecycle)
+now uses committed local RA/RAP Open, one acknowledged public write/readback and
+joined disposal/lease-loss fencing. This does not enable FM/peer control,
+promotion/adoption, native stateful deployment or full M2.
 Broader H3 and deployed RA/RAP composition remain gated.**
 [`fube-hosting`](../../crates/libs/fube-hosting/src/lib.rs) provides
 a native-derived, deterministically driven core plus a separately owned local

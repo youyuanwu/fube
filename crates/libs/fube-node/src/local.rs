@@ -142,6 +142,7 @@ pub struct PackageRegistration {
 enum Work {
     Add(Arc<AddInstance>),
     StatefulOpen(Arc<AddInstance>),
+    PrimaryOpen(Arc<AddInstance>),
     Fm(FmWork),
     Close(PartitionId, ra::CloseMode),
     Registered(ra::RegistrationCompletion),
@@ -486,16 +487,24 @@ impl Node {
         if self.activation.profile() != h::local::Profile::Stateless {
             return Err(Error::Unsupported);
         }
-        self.authorize_open(body, false)
+        self.authorize_open(body, 1)
     }
     /// One volatile Idle lifetime. No primary, replacement, build or FM/peer authority.
     pub fn open_stateful(&mut self, body: AddInstance) -> Result<u64> {
         if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle {
             return Err(Error::Unsupported);
         }
-        self.authorize_open(body, true)
+        self.authorize_open(body, 2)
     }
-    fn authorize_open(&mut self, body: AddInstance, stateful: bool) -> Result<u64> {
+    /// One fresh volatile 1/1 Primary lifetime, never promotion/adoption or FM authority.
+    pub fn open_stateful_primary(&mut self, body: AddInstance) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulPrimaryLifecycle {
+            return Err(Error::Unsupported);
+        }
+        self.authorize_open(body, 4)
+    }
+    fn authorize_open(&mut self, body: AddInstance, role: i64) -> Result<u64> {
+        let stateful = role != 1;
         if !self.live.load(Ordering::SeqCst) || !self.ra.consumer_lifetime().is_accepting() {
             return Err(Error::Busy);
         }
@@ -524,7 +533,7 @@ impl Node {
             || body.service.application != premise.application_name
             || body.service.name != premise.service_name
             || body.replica.node != self.admission.local_node
-            || body.replica.current_role != if stateful { 2 } else { 1 }
+            || body.replica.current_role != role
             || body.replica.state != 1
             || !body.replica.up
             || body.replica.id < 0
@@ -544,6 +553,9 @@ impl Node {
             || body.unit.consistency.id != body.unit.id
             || identity.code.package_sequence <= 0
         {
+            return Err(Error::Unsupported);
+        }
+        if role == 4 && body.unit.previous != Epoch::default() {
             return Err(Error::Unsupported);
         }
         if stateful
@@ -589,10 +601,10 @@ impl Node {
         {
             return Err(Error::Unsupported);
         }
-        let work = if stateful {
-            Work::StatefulOpen(Arc::new(body.clone()))
-        } else {
-            Work::Add(Arc::new(body.clone()))
+        let work = match role {
+            4 => Work::PrimaryOpen(Arc::new(body.clone())),
+            2 => Work::StatefulOpen(Arc::new(body.clone())),
+            _ => Work::Add(Arc::new(body.clone())),
         };
         let id = self.enqueue(work)?;
         if self.disposal.as_ref().is_some_and(|witness| {
@@ -647,6 +659,7 @@ impl Node {
     fn build(&self, work: &Work) -> ra::Command {
         match work {
             Work::StatefulOpen(body) => ra::Command::OpenLocalStateful(Box::new((**body).clone())),
+            Work::PrimaryOpen(body) => ra::Command::OpenLocalPrimary(Box::new((**body).clone())),
             Work::Add(body) => ra::Command::Add {
                 body: Box::new((**body).clone()),
                 source: self.admission.fm_source.clone(),
@@ -1139,7 +1152,8 @@ impl Node {
             && event.unit == state.body.unit
             && event.replica.node == state.body.replica.node
             && event.replica.id == state.body.replica.id
-            && event.replica.instance == state.body.replica.instance)
+            && event.replica.instance == state.body.replica.instance
+            && event.replica.current_role == state.body.replica.current_role)
             && state.phase == ra::Phase::Closing
             && state.close_mode != Some(ra::CloseMode::Obliterate)
             && state.body.replica.up
