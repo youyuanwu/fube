@@ -151,31 +151,31 @@ fn volatile_stateful_registration_requires_opt_in_and_materializes_both_type_dec
         fixture.load(&[]).is_err(),
         "default admission stays stateless"
     );
-    let package = Package::load_with_profile(
-        &fixture.0,
-        "fabric:/Local",
-        &[],
+    for profile in [
         Profile::VolatileStatefulRegistration,
-    )
-    .unwrap();
-    let bundle = Deployment::from_manifest(&std::env::temp_dir(), &package).unwrap();
-    for file in [
-        "OtherPackage.Manifest.v3.xml",
-        "OtherPackage.Package.Current.xml",
+        Profile::VolatileStatefulLifecycle,
     ] {
-        let xml = fs::read_to_string(bundle.application.join(file)).unwrap();
-        let doc = document(&xml).unwrap();
-        let declaration = doc
-            .descendants()
-            .find(|n| n.has_tag_name((NS, "StatefulServiceType")))
-            .unwrap();
-        assert_eq!(declaration.attribute("ServiceTypeName"), Some("OtherType"));
-        assert_eq!(declaration.attribute("HasPersistedState"), Some("false"));
-        assert!(!doc
-            .descendants()
-            .any(|n| n.has_tag_name((NS, "StatelessServiceType"))));
+        let package =
+            Package::load_with_profile(&fixture.0, "fabric:/Local", &[], profile).unwrap();
+        let bundle = Deployment::from_manifest(&std::env::temp_dir(), &package).unwrap();
+        for file in [
+            "OtherPackage.Manifest.v3.xml",
+            "OtherPackage.Package.Current.xml",
+        ] {
+            let xml = fs::read_to_string(bundle.application.join(file)).unwrap();
+            let doc = document(&xml).unwrap();
+            let declaration = doc
+                .descendants()
+                .find(|n| n.has_tag_name((NS, "StatefulServiceType")))
+                .unwrap();
+            assert_eq!(declaration.attribute("ServiceTypeName"), Some("OtherType"));
+            assert_eq!(declaration.attribute("HasPersistedState"), Some("false"));
+            assert!(!doc
+                .descendants()
+                .any(|n| n.has_tag_name((NS, "StatelessServiceType"))));
+        }
+        bundle.release().unwrap();
     }
-    bundle.release().unwrap();
 }
 
 #[test]
@@ -253,16 +253,15 @@ fn stateful_registration_rejects_persistence_mismatches_and_broader_package_shap
         ),
     ] {
         fixture.write(&app, &service);
-        assert!(
-            Package::load_with_profile(
-                &fixture.0,
-                "fabric:/Local",
-                &[],
-                Profile::VolatileStatefulRegistration,
-            )
-            .is_err(),
-            "{app}\n{service}"
-        );
+        for profile in [
+            Profile::VolatileStatefulRegistration,
+            Profile::VolatileStatefulLifecycle,
+        ] {
+            assert!(
+                Package::load_with_profile(&fixture.0, "fabric:/Local", &[], profile).is_err(),
+                "{app}\n{service}"
+            );
+        }
     }
     fixture.write(&app, &service);
     assert!(Package::load_with_profile(

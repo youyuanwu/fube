@@ -57,6 +57,13 @@ now has an explicit volatile 1/1 stateful registration-only profile. Real factor
 registration/lookup, finite authority and cleanup do not enable stateful
 RA/RAP Open, a primary, application data or this document's M2 milestone.
 
+**Local stateful lifecycle update (2026-11-05):**
+A separate [explicit volatile lifecycle profile](HostingLocalActivation.md#opt-in-volatile-stateful-local-lifecycle)
+now opens one replica as Idle/InBuild and closes/disposes it through committed
+local RA effects and real application RAP. Finite authority, duplicate/stale
+handling, exact H2 release and physical cleanup are exercised together. This
+does not provide FM/peer stateful control, a primary, replication/data or M2.
+
 ## 1. Decisions and initial profile
 
 | Area | Decision |

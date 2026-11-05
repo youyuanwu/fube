@@ -112,6 +112,16 @@ pub(super) fn changed(state: EntityState, effects: Vec<Effect>, durable: bool) -
     }
 }
 pub(super) fn canonical(state: &EntityState, dropped: bool) -> Replica {
+    if state.body.service.stateful {
+        let mut replica = state.body.replica.clone();
+        replica.up = !dropped;
+        if dropped {
+            replica.state = 3;
+            replica.service_endpoint.clear();
+            replica.replication_endpoint.clear();
+        }
+        return replica;
+    }
     Replica {
         node: state.body.replica.node.clone(),
         id: state.body.replica.id,
@@ -177,7 +187,14 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
         effects.push(Effect::ReleaseRegistration(registration));
     }
     opening::release_usage(state, effects);
-    if !state.local_deleted {
+    if state.body.service.stateful {
+        // Native FinishCloseLocalReplica also owns terminal reliability reporting.
+        // Retain the obligation without running the stateless ReplicaUp adapter.
+        effects.push(Effect::StatefulClosePending {
+            body: state.body.clone(),
+            mode,
+        });
+    } else if !state.local_deleted {
         state.fm_stage = if mode == CloseMode::AppHostDown {
             FmStage::ReplicaDown
         } else {
@@ -437,6 +454,9 @@ pub(super) fn transition(
             let request: RemoveInstance = from_slice(&work.bytes).map_err(invalid)?;
             let body = request.replica.0;
             check_stateless(&body, admission)?;
+            if current.is_some_and(|state| state.body.service.stateful) {
+                return Err(Failure::Unsupported("stateful FM removal is disabled"));
+            }
             if !admission.node_open || !admission.owner_ready {
                 return Ok(Transition::ignored(Disposition::IgnoredNotReady));
             }
@@ -654,6 +674,13 @@ pub(super) fn transition(
                 || event.replica.id != current.body.replica.id
                 || event.replica.instance != current.body.replica.instance
                 || event.unit.current.older_than(current.body.unit.current)
+            {
+                return Ok(Transition::ignored(Disposition::IgnoredStale));
+            }
+            if current.body.service.stateful
+                && (event.unit != current.body.unit
+                    || event.replica.node != current.body.replica.node
+                    || event.replica.current_role != 2)
             {
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             }

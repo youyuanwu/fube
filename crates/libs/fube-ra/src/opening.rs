@@ -312,6 +312,23 @@ pub(super) fn complete(
     {
         return Ok(Transition::ignored(Disposition::IgnoredStale));
     }
+    if current.body.service.stateful {
+        if event.replica.node != current.body.replica.node
+            || event.replica.id != current.body.replica.id
+            || event.replica.current_role != 2
+            || event.unit != current.body.unit
+        {
+            return Ok(Transition::ignored(Disposition::IgnoredStale));
+        }
+        if event.error == PROXY_STATE_CHANGED_ON_DATA_LOSS
+            || (event.error == 0
+                && (event.replica.state != 1 || !event.replica.service_endpoint.is_empty()))
+        {
+            return Err(Failure::Admission(
+                "Idle Open cannot publish Primary/data-loss readiness",
+            ));
+        }
+    }
     if event.error != 0 && event.error != PROXY_STATE_CHANGED_ON_DATA_LOSS {
         return runtime_failure(current.clone(), event.error, event.detail, config);
     }
@@ -320,7 +337,8 @@ pub(super) fn complete(
     // Native applies Ready and endpoints before the separate current-policy clear.
     state.phase = Phase::Ready;
     lifecycle::mutate_body(&mut state, |body| {
-        body.replica.state = 2;
+        // Native ProcessReplicaOpenReply leaves a newly opened Idle InBuild.
+        body.replica.state = if body.service.stateful { 1 } else { 2 };
         body.replica.service_endpoint = event.replica.service_endpoint;
         body.replica.replication_endpoint = event.replica.replication_endpoint;
     });

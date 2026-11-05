@@ -1,4 +1,5 @@
-//! Minimal stateless entity execution, not a running RA, Hosting adapter or outbox.
+//! Bounded entity execution, not a running RA, Hosting adapter or outbox.
+//! Stateless native messages and separate trusted-local volatile Idle lifecycle.
 //!
 //! One owned supervisor hosts bounded per-entity workers independently of caller
 //! runtimes. Native source grounding: EntityState/LockedEntityPtr, EntityMap and
@@ -256,6 +257,8 @@ pub enum Command {
         source: NodeInstance,
         generation: GenerationHeader,
     },
+    /// Trusted local volatile Idle Open, not AddPrimary/CreateReplica network admission.
+    OpenLocalStateful(Box<AddInstance>),
     CompleteOpen(Box<OpenCompletion>),
     /// Explicit new retry work, not an automatic duplicate dispatch.
     RetryOpen(PartitionId),
@@ -314,6 +317,7 @@ enum Kind {
         source: NodeInstance,
         generation: GenerationHeader,
     },
+    OpenLocalStateful,
     Complete,
     Retry,
     Remove {
@@ -362,6 +366,7 @@ impl Kind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Opening,
+    /// Open completed. A local stateful Idle remains native InBuild, not serving Ready.
     Ready,
     Closing,
     Closed,
@@ -414,6 +419,13 @@ pub enum Effect {
         usage: Option<u64>,
     },
     Reply(Box<AddInstanceReply>),
+    /// Local observation only; never serialize this as AddInstance/CreateReplicaReply.
+    LocalStatefulOpenReply(Box<AddInstanceReply>),
+    /// Retained terminal reporting obligation. No stateful FM/peer codec or ACK is enabled.
+    StatefulClosePending {
+        body: Arc<AddInstance>,
+        mode: CloseMode,
+    },
     RuntimeOpen {
         token: u64,
         body: Arc<AddInstance>,
@@ -610,6 +622,9 @@ impl Executor {
                 (entity, Kind::Add { source, generation }, to_vec(&body))
             }
             Command::CompleteOpen(body) => (body.unit.id.guid.0, Kind::Complete, to_vec(&body)),
+            Command::OpenLocalStateful(body) => {
+                (body.unit.id.guid.0, Kind::OpenLocalStateful, to_vec(&body))
+            }
             Command::RetryOpen(unit) => (unit.guid.0, Kind::Retry, to_vec(&unit)),
             Command::Remove {
                 body,
@@ -704,7 +719,7 @@ impl Executor {
             // Ready always owns an active runtime in this executor: Add can
             // capture update + Close (or duplicate reply), but cannot release
             // resources synchronously. Closed Add reports + stale-replies at most.
-            Kind::Add { .. } => 2,
+            Kind::Add { .. } | Kind::OpenLocalStateful => 2,
             Kind::Retry | Kind::RetryReport | Kind::RetryServiceDescription => 1,
             Kind::CompleteServiceDescription => 0,
             Kind::HostingRegistered | Kind::HostingRuntimeClosed | Kind::HostingHostClosed => 8,
@@ -981,11 +996,16 @@ impl Transition {
     }
 }
 fn reply(body: &AddInstance, error: i64) -> Effect {
-    Effect::Reply(Box::new(AddInstanceReply {
+    let reply = Box::new(AddInstanceReply {
         unit: body.unit.clone(),
         replica: body.replica.clone(),
         error,
-    }))
+    });
+    if body.service.stateful {
+        Effect::LocalStatefulOpenReply(reply)
+    } else {
+        Effect::Reply(reply)
+    }
 }
 fn transition(
     work: &Submission,
@@ -997,41 +1017,88 @@ fn transition(
     match &work.kind {
         #[cfg(feature = "qualification")]
         Kind::QualificationTerminate => panic!("explicit qualification worker termination"),
-        Kind::Add { source, generation } => {
+        Kind::Add { .. } | Kind::OpenLocalStateful => {
             let body: AddInstance = from_slice(&work.bytes).map_err(decode_error)?;
-            if source != &admission.fm_source || body.replica.node != admission.local_node {
+            let local_stateful = matches!(work.kind, Kind::OpenLocalStateful);
+            if body.replica.node != admission.local_node {
                 return Err(Failure::Admission(
                     "configured session/node incarnation mismatch",
                 ));
             }
-            if generation.for_fm_replica {
-                return Err(Failure::Unsupported(
-                    "FM-service/FMM is not a stateless profile",
-                ));
-            }
-            if generation.number.older_than(&admission.generation) {
-                return Ok(Transition::ignored(Disposition::IgnoredStale));
+            if let Kind::Add { source, generation } = &work.kind {
+                if source != &admission.fm_source {
+                    return Err(Failure::Admission(
+                        "configured session/node incarnation mismatch",
+                    ));
+                }
+                if generation.for_fm_replica {
+                    return Err(Failure::Unsupported(
+                        "FM-service/FMM is not a stateless profile",
+                    ));
+                }
+                if generation.number.older_than(&admission.generation) {
+                    return Ok(Transition::ignored(Disposition::IgnoredStale));
+                }
             }
             if !admission.node_open || !admission.owner_ready {
                 return Ok(Transition::ignored(Disposition::IgnoredNotReady));
             }
-            if body.service.stateful
+            if body.service.stateful != local_stateful
                 || body.service.persisted
                 || body.service.group
-                || body.replica.current_role != 1
+                || body.replica.current_role != if local_stateful { 2 } else { 1 }
                 || body.replica.state != 1
                 || !body.replica.up
                 || body.replica.id < 0
                 || body.replica.instance < 0
                 || body.replica.version != body.service.version
             {
+                return Err(Failure::Unsupported(if local_stateful {
+                    "not the admitted volatile Idle InBuild package profile"
+                } else {
+                    "not the admitted stateless InBuild package profile"
+                }));
+            }
+            if local_stateful
+                && (body.replica.previous_role != 1
+                    || body.service.partitions != 1
+                    || body.service.target != 1
+                    || body.service.minimum != 1
+                    || body.service.activation_mode != 0
+                    || !body.service.scaling.0.is_empty()
+                    || body.unit.consistency.kind != 1
+                    || body.unit.consistency.id != body.unit.id
+                    || !body.unit.consistency.name.is_empty()
+                    || body.unit.consistency.low != 0
+                    || body.unit.consistency.high != 0
+                    || body.unit.current.configuration <= 0
+                    || body.unit.current.data_loss < 0
+                    || !body.replica.service_endpoint.is_empty()
+                    || !body.replica.replication_endpoint.is_empty())
+            {
                 return Err(Failure::Unsupported(
-                    "not the admitted stateless InBuild package profile",
+                    "only local volatile singleton Idle Open",
                 ));
             }
             // Native locked-entity TCP admission precedes processor prechecks,
             // description updates and identity decisions. No receipt-time latch.
             if let Some(current) = state {
+                if current.body.service.stateful != local_stateful {
+                    return Err(Failure::Unsupported(
+                        "cannot change entity lifecycle profile",
+                    ));
+                }
+                if local_stateful
+                    && (current.body.replica.id != body.replica.id
+                        || current.body.replica.instance != body.replica.instance
+                        || current.body.service != body.service
+                        || current.body.unit.current != body.unit.current
+                        || current.phase == Phase::Closed)
+                {
+                    return Err(Failure::Unsupported(
+                        "stateful replacement/reopen/configuration is disabled",
+                    ));
+                }
                 if matches!(current.phase, Phase::Opening | Phase::Closing) {
                     return Ok(Transition::ignored(Disposition::IgnoredPending));
                 }
@@ -1064,6 +1131,13 @@ fn transition(
                 });
             }
             if let Some(current) = state {
+                if local_stateful {
+                    return Ok(Transition {
+                        update: Update::None,
+                        effects: vec![reply(&current.body, 0)],
+                        disposition: Disposition::Applied,
+                    });
+                }
                 return lifecycle::add_existing(work, current, &body);
             }
             let body = Arc::new(lifecycle::create_body(body));

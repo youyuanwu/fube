@@ -17,6 +17,7 @@ pub enum Profile {
     #[default]
     Stateless,
     VolatileStatefulRegistration,
+    VolatileStatefulLifecycle,
 }
 
 #[derive(Debug)]
@@ -303,7 +304,9 @@ impl Package {
         let service = one(defaults, "Service")?;
         let (service_kind, type_kind) = match profile {
             Profile::Stateless => ("StatelessService", "StatelessServiceType"),
-            Profile::VolatileStatefulRegistration => ("StatefulService", "StatefulServiceType"),
+            Profile::VolatileStatefulRegistration | Profile::VolatileStatefulLifecycle => {
+                ("StatefulService", "StatefulServiceType")
+            }
         };
         shape(
             service,
@@ -321,7 +324,7 @@ impl Package {
         let description = one(service, service_kind)?;
         let service_attributes: &[&str] = match profile {
             Profile::Stateless => &["ServiceTypeName", "InstanceCount"],
-            Profile::VolatileStatefulRegistration => &[
+            Profile::VolatileStatefulRegistration | Profile::VolatileStatefulLifecycle => &[
                 "ServiceTypeName",
                 "TargetReplicaSetSize",
                 "MinReplicaSetSize",
@@ -339,7 +342,7 @@ impl Package {
                 attr(description, "InstanceCount", &params)? == "1",
                 "only InstanceCount=1 is supported",
             )?,
-            Profile::VolatileStatefulRegistration => require(
+            Profile::VolatileStatefulRegistration | Profile::VolatileStatefulLifecycle => require(
                 attr(description, "TargetReplicaSetSize", &params)? == "1"
                     && attr(description, "MinReplicaSetSize", &params)? == "1",
                 "only volatile stateful target/minimum=1/1 is supported",
@@ -376,13 +379,15 @@ impl Package {
         let declared = one(types, type_kind)?;
         let type_attributes: &[&str] = match profile {
             Profile::Stateless => &["ServiceTypeName"],
-            Profile::VolatileStatefulRegistration => &["ServiceTypeName", "HasPersistedState"],
+            Profile::VolatileStatefulRegistration | Profile::VolatileStatefulLifecycle => {
+                &["ServiceTypeName", "HasPersistedState"]
+            }
         };
         shape(declared, type_kind, type_attributes, &[])?;
-        if profile == Profile::VolatileStatefulRegistration {
+        if profile != Profile::Stateless {
             require(
                 attr(declared, "HasPersistedState", &params)? == "false",
-                "stateful registration requires explicit HasPersistedState=false",
+                "stateful admission requires explicit HasPersistedState=false",
             )?;
         }
         require(
@@ -504,7 +509,7 @@ impl Package {
                 r#"<StatelessServiceType ServiceTypeName="{}" />"#,
                 escape(&self.service_type)
             ),
-            Profile::VolatileStatefulRegistration => format!(
+            Profile::VolatileStatefulRegistration | Profile::VolatileStatefulLifecycle => format!(
                 r#"<StatefulServiceType ServiceTypeName="{}" HasPersistedState="false" />"#,
                 escape(&self.service_type)
             ),

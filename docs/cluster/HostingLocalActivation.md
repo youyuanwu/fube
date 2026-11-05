@@ -84,6 +84,55 @@ independently check reaping/group drainage/root removal. A separate authority
 withdrawal test observes terminal expiry and cleanup. These are not deployed
 native stateful qualification or M2 completion.
 
+### Opt-in volatile stateful local lifecycle
+
+`Profile::VolatileStatefulLifecycle` admits the same strict package, but requires
+an original consumer gate before launch. Compose an unstarted `Activation` with
+`fube_node::local::Node::new`, start/register it, then call `open_stateful` with
+the matching package/service/version/node identity, a valid current epoch,
+native Idle role **2**, InBuild state **1**, and target/minimum **1/1**.
+This is trusted local authorization, not an implemented FM or peer request.
+`add`, `add_from_fm` and `fm_work` do not enable stateful network control.
+
+The original committed RA lookup/acquisition and `RuntimeOpen` effect drive
+actor-12 `ReplicaOpen` on the admitted Hosting session. Existing application RAP
+creates the replica, opens its public custom-replicator control, and selects
+IdleSecondary. The semantic one-way reply completes Open after the state update
+commits. The RA's internal `Phase::Ready` means this Open completed; the native
+replica stays **Idle/InBuild**, with no serving endpoint or write authority.
+Only a local `LocalStatefulOpenReply` observation is produced, never a fabricated
+`AddInstanceReply`, `AddPrimaryReply` or `CreateReplicaReply` network send.
+
+Ordinary `close` drives the same committed actor-12 Close path. Runtime control
+and service cleanup/final disposal precede semantic completion; the original H2
+acquisition is released exactly once. Drop/Abort remain bounded cleanup options.
+Duplicate/stale traffic cannot recreate the lifetime or release usage twice.
+Replacement, reopen/adoption, primary/configuration/build/data-loss work and
+persisted replicas reject. Finite leases, original store uncertainty fences and
+independently verified process/group/reap/directory cleanup remain unchanged.
+Local terminal state retains a typed `StatefulClosePending` reporting obligation
+in `external_pending`, not a stateless `ReplicaUp` send or native FM/peer
+completion. Those network handlers/choreography remain gated P4 work, not
+synthesized ACKs; local quiescence/disposal does not acknowledge that escrow.
+
+Native semantic authority remains pin
+`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`:
+`Reliability/Failover/ra/FailoverUnit.cpp:5250-5330` selects InBuild for Idle Open;
+`ReconfigurationAgent.cpp:883-930` distinguishes stateless, Primary and peer
+completion; `FailoverUnit.cpp:5472-5551` also owns terminal reporting. This local
+profile reuses the existing proxy schemas/runtime, not
+those network processors or a new wire protocol. The fixture implements public
+SF-style stateful/control interfaces with a real owned loopback listener and
+resource file; all data, quorum, copy/build and primary-only controls explicitly
+fail. It is not a replication engine or M2 qualification.
+
+The lifecycle tests observe native-free real Open/Close, public access denial,
+control-listener release, a held service destructor, close-error Abort/disposal,
+duplicate/stale traffic, original usage, lease loss during Opening/Open, and
+physical cleanup. RA model tests separately hold actual commits and reject
+foreign/Primary completions. Registration-only tests still prove no callback
+and rejected lifecycle sends.
+
 ## Ownership and usage
 
 Construction validates options/capabilities without filesystem/process side

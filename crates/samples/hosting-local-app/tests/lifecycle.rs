@@ -8,20 +8,35 @@ use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 struct Fixture {
     parent: PathBuf,
     package: PathBuf,
+    profile: fube_hosting::local::Profile,
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_profile(fube_hosting::local::Profile::Stateless)
+    }
+    fn stateful() -> Self {
+        Self::with_profile(fube_hosting::local::Profile::VolatileStatefulLifecycle)
+    }
+    fn with_profile(profile: fube_hosting::local::Profile) -> Self {
         let parent = std::env::temp_dir().join(format!("ra-rap-{}", uuid::Uuid::new_v4()));
         let package = parent.join("input");
         fs::create_dir_all(package.join("LocalService/Code")).unwrap();
         fs::write(
             package.join("ApplicationManifest.xml"),
-            include_str!("../pkg/ApplicationManifest.xml"),
+            if profile == fube_hosting::local::Profile::Stateless {
+                include_str!("../pkg/ApplicationManifest.xml")
+            } else {
+                include_str!("../pkg-stateful/ApplicationManifest.xml")
+            },
         )
         .unwrap();
         fs::write(
             package.join("LocalService/ServiceManifest.xml"),
-            include_str!("../pkg/LocalService/ServiceManifest.xml"),
+            if profile == fube_hosting::local::Profile::Stateless {
+                include_str!("../pkg/LocalService/ServiceManifest.xml")
+            } else {
+                include_str!("../pkg-stateful/LocalService/ServiceManifest.xml")
+            },
         )
         .unwrap();
         fs::copy(
@@ -29,7 +44,11 @@ impl Fixture {
             package.join("LocalService/Code/hosting-local-app"),
         )
         .unwrap();
-        Self { parent, package }
+        Self {
+            parent,
+            package,
+            profile,
+        }
     }
     async fn node(&self, args: &str) -> (Node, Arc<Store>) {
         let store = Arc::new(
@@ -42,6 +61,7 @@ impl Fixture {
     }
     fn with_store(&self, args: &str, store: Arc<Store>) -> Node {
         let mut options = Options::new(self.parent.clone());
+        options.profile = self.profile;
         options.lease_duration = Duration::from_secs(2);
         let mut node = Node::new(
             Activation::new(options).unwrap(),
@@ -50,10 +70,15 @@ impl Fixture {
             ra::Settings::default(),
         )
         .unwrap();
+        let args = if self.profile == fube_hosting::local::Profile::VolatileStatefulLifecycle {
+            format!("--stateful-lifecycle {args}")
+        } else {
+            args.to_owned()
+        };
         node.start(
             &self.package,
             "fabric:/Local",
-            &[("Arguments".into(), args.into())],
+            &[("Arguments".into(), args)],
         )
         .unwrap();
         node
@@ -155,6 +180,10 @@ fn body(node: &Node) -> AddInstance {
     b.service.partitions = 1;
     b.service.target = 1;
     b.service.minimum = 1;
+    if a.profile() == fube_hosting::local::Profile::VolatileStatefulLifecycle {
+        b.service.stateful = true;
+        b.replica.current_role = 2;
+    }
     b
 }
 async fn until(node: &mut Node, mut predicate: impl FnMut(&Node) -> bool) -> Vec<EffectReceipt> {
@@ -195,10 +224,17 @@ async fn cleanup(node: &mut Node, store: &Store) {
     store.close().await.unwrap();
 }
 fn resource(node: &Node) -> PathBuf {
-    node.activation()
-        .root()
+    let application_type = &node
+        .activation()
+        .premise()
         .unwrap()
-        .join("deployment/HostingLocalApp_App1/work/local-instance.resource")
+        .package
+        .package
+        .application
+        .type_name;
+    node.activation().root().unwrap().join(format!(
+        "deployment/{application_type}_App1/work/local-instance.resource"
+    ))
 }
 fn count(node: &Node, marker: &str) -> usize {
     assert_eq!(
@@ -259,6 +295,219 @@ async fn replay(node: &mut Node, dispatch: &ra::Dispatched, stale: bool) {
     send.result().unwrap().unwrap();
     drop(send);
     advance(node, Duration::from_millis(50)).await;
+}
+
+#[tokio::test]
+async fn stateful_idle_open_close_replay_and_actual_disposal_preserve_nonprimary_authority() {
+    for error in [false, true] {
+        let fixture = Fixture::stateful();
+        let (mut node, store) = fixture
+            .node(if error {
+                "--close-error-block-dispose"
+            } else {
+                "--block-dispose"
+            })
+            .await;
+        until(&mut node, |n| n.package_registration().registered).await;
+        native_free(&node);
+        assert_eq!(count(&node, "LOCAL_CALLBACK create_replica"), 0);
+        let b = body(&node);
+        assert!(matches!(
+            node.add(b.clone()),
+            Err(fube_node::local::Error::Unsupported)
+        ));
+        let mut primary = b.clone();
+        primary.replica.current_role = 4;
+        let mut secondary = b.clone();
+        secondary.replica.current_role = 3;
+        let mut epoch = b.clone();
+        epoch.unit.current.configuration = 0;
+        let mut stateless = b.clone();
+        stateless.service.stateful = false;
+        for rejected in [primary, secondary, epoch, stateless] {
+            assert!(matches!(
+                node.open_stateful(rejected),
+                Err(fube_node::local::Error::Unsupported)
+            ));
+        }
+        let mut persisted = b.clone();
+        persisted.service.persisted = true;
+        assert!(node.open_stateful(persisted).is_err());
+        let mut larger = b.clone();
+        larger.service.target = 3;
+        assert!(node.open_stateful(larger).is_err());
+        assert_eq!(node.retained_usage(), 0);
+        node.open_stateful(b.clone()).unwrap();
+        let effects = until(&mut node, |n| {
+            n.snapshot(b.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| s.phase == ra::Phase::Ready)
+        })
+        .await;
+        let open = effects
+            .iter()
+            .find(|r| matches!(r.dispatch.effect, ra::Effect::RuntimeOpen { .. }))
+            .unwrap()
+            .dispatch
+            .clone();
+        let opened = node.snapshot(b.unit.id.guid.0).committed.unwrap();
+        assert_eq!(
+            (opened.body.replica.current_role, opened.body.replica.state),
+            (2, 1)
+        );
+        assert!(opened.body.replica.service_endpoint.is_empty());
+        let address = opened.body.replica.replication_endpoint.clone();
+        assert!(std::net::TcpStream::connect(&address).is_ok());
+        assert_eq!(count(&node, "LOCAL_ACCESS denied"), 1);
+        assert_eq!(count(&node, "LOCAL_CALLBACK role IdleSecondary"), 1);
+        assert_eq!(count(&node, "LOCAL_CONTROL role IdleSecondary"), 1);
+        assert!(effects
+            .iter()
+            .any(|r| matches!(r.dispatch.effect, ra::Effect::LocalStatefulOpenReply(_))));
+        assert!(!effects
+            .iter()
+            .any(|r| matches!(r.dispatch.effect, ra::Effect::Reply(_))));
+        node.open_stateful(b.clone()).unwrap();
+        replay(&mut node, &open, false).await;
+        replay(&mut node, &open, true).await;
+        assert_eq!(count(&node, "LOCAL_CALLBACK create_replica"), 1);
+        assert_eq!(count(&node, "LOCAL_CALLBACK open"), 1);
+        assert_eq!(node.retained_usage(), 1);
+        node.close(b.unit.id.clone(), ra::CloseMode::Close).unwrap();
+        let effects = until(&mut node, |n| count(n, "LOCAL_DISPOSE begin") == 1).await;
+        let close = effects
+            .iter()
+            .find(|r| matches!(r.dispatch.effect, ra::Effect::Close { .. }))
+            .unwrap()
+            .dispatch
+            .clone();
+        advance(&mut node, Duration::from_millis(150)).await;
+        assert_eq!(
+            node.snapshot(b.unit.id.guid.0).committed.unwrap().phase,
+            ra::Phase::Closing
+        );
+        assert_eq!(node.retained_usage(), 1);
+        assert!(resource(&node).is_file());
+        assert!(node.instance_disposal().is_none());
+        assert_eq!(count(&node, "LOCAL_CONTROL released"), 1);
+        assert!(std::net::TcpStream::connect(&address).is_err());
+        fs::write(
+            resource(&node).with_file_name("local-dispose.release"),
+            b"dispose",
+        )
+        .unwrap();
+        until(&mut node, |n| n.instance_disposal().is_some()).await;
+        assert_eq!(count(&node, "LOCAL_CALLBACK abort"), usize::from(error));
+        assert_eq!(count(&node, "LOCAL_CONTROL disposed"), 1);
+        assert_eq!(count(&node, "LOCAL_DISPOSE complete"), 1);
+        assert!(!resource(&node).exists());
+        assert_eq!(node.retained_usage(), 0);
+        assert_eq!(
+            node.snapshot(b.unit.id.guid.0).committed.unwrap().fm_stage,
+            ra::FmStage::None
+        );
+        assert_eq!(
+            node.external_pending()
+                .iter()
+                .filter(|effect| matches!(effect.effect, ra::Effect::StatefulClosePending { .. }))
+                .count(),
+            1
+        );
+        replay(&mut node, &close, false).await;
+        replay(&mut node, &open, false).await;
+        assert_eq!(count(&node, "LOCAL_CALLBACK create_replica"), 1);
+        assert_eq!(count(&node, "LOCAL_DISPOSE complete"), 1);
+        assert!(
+            node.open_stateful(b.clone()).is_err(),
+            "no stateful reopen/adoption"
+        );
+        assert_eq!(count(&node, "LOCAL_CALLBACK role Primary"), 0);
+        let root = node.activation().root().unwrap().to_path_buf();
+        cleanup(&mut node, &store).await;
+        assert!(!root.exists());
+        let status = node.activation().process_status().unwrap();
+        assert!(status.exit_observed && status.group_drained && status.reaped);
+        assert_eq!(node.activation().residency().resources().logical_bytes, 0);
+    }
+}
+
+#[tokio::test]
+async fn stateful_lease_loss_fences_open_and_opening_without_fabricating_disposal() {
+    for opening in [false, true] {
+        let fixture = Fixture::stateful();
+        let (mut node, store) = fixture
+            .node(if opening { "--open-delay-ms 4000" } else { "" })
+            .await;
+        until(&mut node, |n| n.package_registration().registered).await;
+        let b = body(&node);
+        node.open_stateful(b.clone()).unwrap();
+        until(&mut node, |n| {
+            if opening {
+                count(n, "LOCAL_CALLBACK open") == 1
+            } else {
+                n.snapshot(b.unit.id.guid.0)
+                    .committed
+                    .is_some_and(|s| s.phase == ra::Phase::Ready)
+            }
+        })
+        .await;
+        let pid = node.activation().process_status().unwrap().pid;
+        node.activation().host_lease().unwrap().stop_renewal();
+        until(&mut node, |n| {
+            n.snapshot(b.unit.id.guid.0).committed.is_some_and(|s| {
+                if opening {
+                    s.phase == ra::Phase::Opening && s.runtime.is_none() && s.open_failures > 0
+                } else {
+                    s.phase == ra::Phase::Closed && s.usage.is_none()
+                }
+            }) && (opening || n.retained_usage() == 0)
+        })
+        .await;
+        assert!(
+            !node
+                .activation()
+                .session_status()
+                .unwrap()
+                .unwrap()
+                .connected
+        );
+        assert_eq!(node.retained_usage(), usize::from(opening));
+        assert!(node.instance_disposal().is_none());
+        if opening {
+            node.close(b.unit.id.clone(), ra::CloseMode::Drop).unwrap();
+            until(&mut node, |n| {
+                n.snapshot(b.unit.id.guid.0)
+                    .committed
+                    .is_some_and(|s| s.phase == ra::Phase::Closed)
+                    && n.retained_usage() == 0
+            })
+            .await;
+        }
+        until(&mut node, |_| {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z "))
+        })
+        .await;
+        assert_eq!(count(&node, "LOCAL_DISPOSE complete"), 0);
+        assert!(resource(&node).is_file());
+        let root = node.activation().root().unwrap().to_path_buf();
+        cleanup(&mut node, &store).await;
+        assert!(!root.exists());
+        let status = node.activation().process_status().unwrap();
+        assert!(status.exit_observed && status.group_drained && status.reaped);
+    }
+}
+
+#[tokio::test]
+async fn stateful_lifecycle_activation_requires_the_original_consumer_before_launch() {
+    let fixture = Fixture::stateful();
+    let mut options = Options::new(fixture.parent.clone());
+    options.profile = fixture.profile;
+    let mut activation = Activation::new(options).unwrap();
+    assert!(activation
+        .start(&fixture.package, "fabric:/Local", &[])
+        .is_err());
+    assert!(activation.root().is_none());
+    assert!(activation.process_status().is_none());
 }
 
 #[tokio::test]

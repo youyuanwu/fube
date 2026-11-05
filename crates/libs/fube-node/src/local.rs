@@ -1,4 +1,4 @@
-//! Production, caller-driven stateless RA/RAP on one owned local activation.
+//! Production, caller-driven bounded local RA/RAP on one owned activation.
 //!
 //! This is trusted local command authority, not FM/HM serving readiness.
 //! `drive` advances retained adapter work; observation/drop never cancels it.
@@ -141,6 +141,7 @@ pub struct PackageRegistration {
 #[derive(Clone)]
 enum Work {
     Add(Arc<AddInstance>),
+    StatefulOpen(Arc<AddInstance>),
     Fm(FmWork),
     Close(PartitionId, ra::CloseMode),
     Registered(ra::RegistrationCompletion),
@@ -257,7 +258,7 @@ impl Node {
         admission: ra::Admission,
         mut settings: ra::Settings,
     ) -> Result<Self> {
-        if activation.profile() != h::local::Profile::Stateless
+        if activation.profile() == h::local::Profile::VolatileStatefulRegistration
             || activation.identity().is_some()
             || !admission.owner_ready
             || !admission.node_open
@@ -356,10 +357,16 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::Stateless {
+            return Err(Error::Unsupported);
+        }
         self.admit_fm(source, generation)?;
         self.add(body)
     }
     pub fn fm_work(&mut self, work: FmWork) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::Stateless {
+            return Err(Error::Unsupported);
+        }
         match &work {
             FmWork::Remove(body, source, generation) => {
                 self.admit_fm(source, generation)?;
@@ -476,6 +483,19 @@ impl Node {
     /// Authorize a supported local Add, never registration-as-readiness.
     /// Description updates and foreign package/profile inputs reject before RA.
     pub fn add(&mut self, body: AddInstance) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::Stateless {
+            return Err(Error::Unsupported);
+        }
+        self.authorize_open(body, false)
+    }
+    /// One volatile Idle lifetime. No primary, replacement, build or FM/peer authority.
+    pub fn open_stateful(&mut self, body: AddInstance) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle {
+            return Err(Error::Unsupported);
+        }
+        self.authorize_open(body, true)
+    }
+    fn authorize_open(&mut self, body: AddInstance, stateful: bool) -> Result<u64> {
         if !self.live.load(Ordering::SeqCst) || !self.ra.consumer_lifetime().is_accepting() {
             return Err(Error::Busy);
         }
@@ -504,12 +524,12 @@ impl Node {
             || body.service.application != premise.application_name
             || body.service.name != premise.service_name
             || body.replica.node != self.admission.local_node
-            || body.replica.current_role != 1
+            || body.replica.current_role != if stateful { 2 } else { 1 }
             || body.replica.state != 1
             || !body.replica.up
             || body.replica.id < 0
             || body.replica.instance < 0
-            || body.service.stateful
+            || body.service.stateful != stateful
             || body.service.persisted
             || body.service.group
             || body.service.activation_mode != 0
@@ -526,12 +546,32 @@ impl Node {
         {
             return Err(Error::Unsupported);
         }
+        if stateful
+            && (body.replica.previous_role != 1
+                || body.unit.current.configuration <= 0
+                || body.unit.current.data_loss < 0
+                || !body.replica.service_endpoint.is_empty()
+                || !body.replica.replication_endpoint.is_empty())
+        {
+            return Err(Error::Unsupported);
+        }
         if let Some(selected) = &self.selected {
             if body.unit.id != selected.unit.id || body.service != selected.service {
                 return Err(Error::Unsupported);
             }
         }
         let current = self.ra.snapshot(body.unit.id.guid.0).committed;
+        if stateful
+            && (self
+                .selected
+                .as_ref()
+                .is_some_and(|selected| selected != &body)
+                || current
+                    .as_ref()
+                    .is_some_and(|state| state.phase == ra::Phase::Closed))
+        {
+            return Err(Error::Unsupported);
+        }
         // `selected` is the immutable admitted profile, NOT current replica
         // authority. An ignored stale Add cannot replace committed identity.
         let reference = current
@@ -549,7 +589,12 @@ impl Node {
         {
             return Err(Error::Unsupported);
         }
-        let id = self.enqueue(Work::Add(Arc::new(body.clone())))?;
+        let work = if stateful {
+            Work::StatefulOpen(Arc::new(body.clone()))
+        } else {
+            Work::Add(Arc::new(body.clone()))
+        };
+        let id = self.enqueue(work)?;
         if self.disposal.as_ref().is_some_and(|witness| {
             body.replica.id > witness.proof.body.replica.id
                 && body.replica.instance > witness.proof.body.replica.instance
@@ -601,6 +646,7 @@ impl Node {
     }
     fn build(&self, work: &Work) -> ra::Command {
         match work {
+            Work::StatefulOpen(body) => ra::Command::OpenLocalStateful(Box::new((**body).clone())),
             Work::Add(body) => ra::Command::Add {
                 body: Box::new((**body).clone()),
                 source: self.admission.fm_source.clone(),
@@ -998,8 +1044,11 @@ impl Node {
             ra::Effect::Health(_) | ra::Effect::OpeningHealth(_) => {
                 LocalDisposition::HealthProcessingDisabled
             }
-            ra::Effect::Reply(_) | ra::Effect::RemoveReply(_) => LocalDisposition::LocalResponse,
+            ra::Effect::Reply(_)
+            | ra::Effect::LocalStatefulOpenReply(_)
+            | ra::Effect::RemoveReply(_) => LocalDisposition::LocalResponse,
             ra::Effect::RequestReportRetry
+            | ra::Effect::StatefulClosePending { .. }
             | ra::Effect::ReplicaUp(_)
             | ra::Effect::RequestServiceTypeWork { .. }
             | ra::Effect::ServiceTypeWorkCaptured { .. }
