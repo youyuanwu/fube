@@ -375,6 +375,15 @@ The lifecycle target additionally rejects this profile before stateless Node
 construction. These tests are native-free Hosting evidence, not stateful
 RA/RAP deployment or M2 qualification.
 
+The lifecycle target also covers the separately admitted
+[volatile Idle Open/Close profile](cluster/HostingLocalActivation.md#opt-in-volatile-stateful-local-lifecycle):
+real public stateful/control callbacks, no Primary/write authority, held final
+disposal, close-error cleanup, duplicate/stale traffic, exact usage release and
+lease loss during Opening/Open. The RA entity target holds actual commits and
+rejects foreign/Primary completions. These are local native-free lifecycle
+tests, not FM/peer stateful or data/copy/quorum qualification. Run the existing
+affected targets and quality/native-regression gates below.
+
 ### Owned local stateless RA/RAP
 
 The [production local lifecycle guide](cluster/StatelessRaRap.md) separates
@@ -393,7 +402,7 @@ Also run the affected core/runtime/Hosting/Node/RA/store/local-host/transport
 library and integration targets, the offline suite (including runtime/data
 separation), and workspace locked all-target/all-feature check/Clippy, binaries/
 examples build, formatting, Rustdoc and doctests. No deployed FM/HM/serving
-readiness or stateful activation is implied. Shared Hosting/process changes
+readiness or stateful cluster deployment is implied. Shared Hosting/process changes
 retain all seven separate release-native actions below on a fresh clean-source
 bundle; those are not combined production Rust RA evidence.
 

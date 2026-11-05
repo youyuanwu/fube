@@ -8,6 +8,11 @@ Native semantic authority is source pin
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`; separate SF11.8.121.4 release
 regressions are not binaries asserted built from that pin.
 
+The same owner has a separately admitted
+[volatile Idle stateful Open/Close profile](HostingLocalActivation.md#opt-in-volatile-stateful-local-lifecycle).
+The stateless default and this guide's native FM/replacement behavior are
+unchanged; stateful local authorization does not enable those network handlers.
+
 ## Composition and admission
 
 [`fube_node::local::Node`](../../crates/libs/fube-node/src/local.rs#L225-L308)

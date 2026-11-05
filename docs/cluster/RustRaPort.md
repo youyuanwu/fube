@@ -6,6 +6,12 @@
 [stateless Drop/FM-resend replacement](RaStatelessReplacement.md) are implemented;
 full P2 infrastructure, P3–P5 and RA/runtime recovery are not.**
 
+The separate [local volatile stateful lifecycle slice](HostingLocalActivation.md#opt-in-volatile-stateful-local-lifecycle)
+now drives real Idle Open/Close through committed RA effects and existing Rust
+RAP. Idle remains InBuild, not a primary or serving Ready. Trusted local
+authorization is not a ported FM/peer handler; P4 choreography, data/copy/quorum
+evidence and stateful recovery remain unsupported.
+
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's
 key/value-store boundary, implement an embedded SQLite backend, and port its

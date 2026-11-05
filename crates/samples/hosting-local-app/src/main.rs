@@ -1,10 +1,18 @@
 //! Explicitly minimal native-free local Hosting package fixtures.
 use fube_runtime::{
-    ApiFuture, Cancellation, Error, IStatefulServiceFactory, IStatefulServiceReplica,
-    IStatelessServiceFactory, IStatelessServiceInstance, IStatelessServicePartition, Result,
-    Runtime,
+    ApiFuture, Cancellation, Epoch, Error, IPrimaryReplicator, IReplicator,
+    IStatefulServiceFactory, IStatefulServicePartition, IStatefulServiceReplica,
+    IStatelessServiceFactory, IStatelessServiceInstance, IStatelessServicePartition, OpenMode,
+    ReplicaInformation, ReplicaRole, ReplicaSetConfig, ReplicaSetQuorumMode, Result, Runtime,
+    ServicePartitionAccessStatus,
 };
-use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    io::Write,
+    net::TcpListener,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 #[derive(Clone, Copy, Default)]
 struct Mode {
@@ -13,7 +21,15 @@ struct Mode {
     open_delay: u64,
 }
 struct Factory(Mode);
-struct StatefulFactory;
+struct StatefulFactory {
+    lifecycle: bool,
+    mode: Mode,
+}
+struct StatefulReplica {
+    resource: Instance,
+    partition: Mutex<Option<Arc<dyn IStatefulServicePartition>>>,
+}
+struct LocalControl(Mutex<Option<TcpListener>>);
 struct Instance {
     mode: Mode,
     resource: PathBuf,
@@ -34,7 +50,165 @@ impl IStatefulServiceFactory for StatefulFactory {
         _: i64,
     ) -> Result<Box<dyn IStatefulServiceReplica>> {
         marker("LOCAL_CALLBACK create_replica");
-        Err(Error::Protocol("registration-only stateful fixture"))
+        if !self.lifecycle {
+            return Err(Error::Protocol("registration-only stateful fixture"));
+        }
+        let resource =
+            PathBuf::from(std::env::var_os("Fabric_Folder_App_Work").expect("owned work folder"))
+                .join("local-instance.resource");
+        std::fs::write(&resource, b"actual replica-owned resource")
+            .expect("acquire stateful fixture resource");
+        marker("LOCAL_RESOURCE acquired");
+        Ok(Box::new(StatefulReplica {
+            resource: Instance {
+                mode: self.mode,
+                resource,
+            },
+            partition: Mutex::new(None),
+        }))
+    }
+}
+impl IStatefulServiceReplica for StatefulReplica {
+    fn open(
+        &self,
+        mode: OpenMode,
+        partition: Arc<dyn IStatefulServicePartition>,
+        _: Cancellation,
+    ) -> ApiFuture<'_, Box<dyn IPrimaryReplicator>> {
+        Box::pin(async move {
+            assert_eq!(mode, OpenMode::New);
+            assert_ne!(
+                partition.get_write_status()?,
+                ServicePartitionAccessStatus::Granted
+            );
+            *self.partition.lock().unwrap() = Some(partition);
+            marker("LOCAL_CALLBACK open");
+            tokio::time::sleep(Duration::from_millis(self.resource.mode.open_delay)).await;
+            let control: Box<dyn IPrimaryReplicator> = Box::new(LocalControl(Mutex::new(None)));
+            Ok(control)
+        })
+    }
+    fn change_role(&self, role: ReplicaRole, _: Cancellation) -> ApiFuture<'_, String> {
+        Box::pin(async move {
+            if !matches!(role, ReplicaRole::IdleSecondary | ReplicaRole::None) {
+                return Err(Error::Protocol(
+                    "fixture prohibits Primary/secondary promotion",
+                ));
+            }
+            marker(&format!("LOCAL_CALLBACK role {role:?}"));
+            if role == ReplicaRole::IdleSecondary {
+                let partition = self
+                    .partition
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("opened partition");
+                assert_ne!(
+                    partition.get_read_status()?,
+                    ServicePartitionAccessStatus::Granted
+                );
+                assert_ne!(
+                    partition.get_write_status()?,
+                    ServicePartitionAccessStatus::Granted
+                );
+                marker("LOCAL_ACCESS denied");
+            }
+            Ok(String::new())
+        })
+    }
+    fn close(&self, cancel: Cancellation) -> ApiFuture<'_, ()> {
+        IStatelessServiceInstance::close(&self.resource, cancel)
+    }
+    fn abort(&self) {
+        marker("LOCAL_CALLBACK abort");
+    }
+}
+impl LocalControl {
+    fn release(&self) {
+        if let Some(listener) = self.0.lock().unwrap().take() {
+            drop(listener);
+            marker("LOCAL_CONTROL released");
+        }
+    }
+}
+impl IReplicator for LocalControl {
+    fn open(&self, _: Cancellation) -> ApiFuture<'_, String> {
+        Box::pin(async {
+            let listener =
+                TcpListener::bind("127.0.0.1:0").expect("bind actual fixture control listener");
+            let address = listener
+                .local_addr()
+                .expect("fixture control address")
+                .to_string();
+            *self.0.lock().unwrap() = Some(listener);
+            marker("LOCAL_CONTROL acquired");
+            Ok(address)
+        })
+    }
+    fn change_role(&self, _: Epoch, role: ReplicaRole, _: Cancellation) -> ApiFuture<'_, ()> {
+        Box::pin(async move {
+            if !matches!(role, ReplicaRole::IdleSecondary | ReplicaRole::None) {
+                return Err(Error::Protocol("fixture control prohibits promotion"));
+            }
+            marker(&format!("LOCAL_CONTROL role {role:?}"));
+            Ok(())
+        })
+    }
+    fn update_epoch(&self, _: Epoch, _: Cancellation) -> ApiFuture<'_, ()> {
+        Box::pin(async { Err(Error::Protocol("fixture has no epoch/data capability")) })
+    }
+    fn get_current_progress(&self) -> Result<i64> {
+        Err(Error::Protocol("fixture has no data progress"))
+    }
+    fn get_catch_up_capability(&self) -> Result<i64> {
+        Err(Error::Protocol("fixture has no retained history"))
+    }
+    fn close(&self, _: Cancellation) -> ApiFuture<'_, ()> {
+        Box::pin(async {
+            self.release();
+            Ok(())
+        })
+    }
+    fn abort(&self) {
+        marker("LOCAL_CONTROL abort");
+        self.release();
+    }
+}
+impl IPrimaryReplicator for LocalControl {
+    fn on_data_loss(&self, _: Cancellation) -> ApiFuture<'_, bool> {
+        Box::pin(async { Err(Error::Protocol("fixture has no data-loss capability")) })
+    }
+    fn update_catch_up_replica_set_configuration(
+        &self,
+        _: ReplicaSetConfig,
+        _: ReplicaSetConfig,
+    ) -> Result<()> {
+        Err(Error::Protocol("fixture has no configuration capability"))
+    }
+    fn update_current_replica_set_configuration(&self, _: ReplicaSetConfig) -> Result<()> {
+        Err(Error::Protocol("fixture has no configuration capability"))
+    }
+    fn wait_for_catch_up_quorum(
+        &self,
+        _: ReplicaSetQuorumMode,
+        _: Cancellation,
+    ) -> ApiFuture<'_, ()> {
+        Box::pin(async { Err(Error::Protocol("fixture has no quorum capability")) })
+    }
+    fn build_replica(&self, _: ReplicaInformation, _: Cancellation) -> ApiFuture<'_, ()> {
+        Box::pin(async { Err(Error::Protocol("fixture has no build capability")) })
+    }
+    fn remove_replica(&self, _: i64) -> Result<()> {
+        Err(Error::Protocol("fixture has no peer-removal capability"))
+    }
+}
+impl Drop for LocalControl {
+    fn drop(&mut self) {
+        assert!(
+            self.0.lock().unwrap().is_none(),
+            "control listener was not disposed"
+        );
+        marker("LOCAL_CONTROL disposed");
     }
 }
 impl IStatelessServiceFactory for Factory {
@@ -111,7 +285,13 @@ impl Drop for Instance {
 async fn main() {
     // These explicit fault modes are for owned-lifecycle qualification only.
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let delay = match args.as_slice() {
+    let stateful_lifecycle = args.first().is_some_and(|s| s == "--stateful-lifecycle");
+    let args = if stateful_lifecycle {
+        &args[1..]
+    } else {
+        &args[..]
+    };
+    let delay = match args {
         [flag, value]
             if flag == "--delay-ms"
                 || flag == "--crash-after-ms"
@@ -158,10 +338,13 @@ async fn main() {
             .try_reserve()
             .expect("execution reservation")
             .run_owned(move || {
-                if stateful_registration {
+                if stateful_registration || stateful_lifecycle {
                     runtime.register_stateful_service_factory(
                         "LocalStatefulType",
-                        Box::new(StatefulFactory),
+                        Box::new(StatefulFactory {
+                            lifecycle: stateful_lifecycle,
+                            mode,
+                        }),
                     )?;
                     marker("LOCAL_STATEFUL_REGISTERED");
                 } else {

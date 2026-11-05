@@ -5,8 +5,9 @@ bootstrap H3 IPC/local leases and the bounded registration-events slice are
 implemented, together with bounded H4 owned local package/process activation
 and [production local stateless RA/RAP](StatelessRaRap.md).
 An explicit [volatile stateful registration-only profile](HostingLocalActivation.md#opt-in-volatile-stateful-registration)
-now admits one 1/1 type and real factory registration/lookup; replica lifecycle
-and stateful deployment remain unsupported.
+now admits one 1/1 type and real factory registration/lookup. A separate
+[volatile stateful local lifecycle profile](HostingLocalActivation.md#opt-in-volatile-stateful-local-lifecycle)
+adds RA-authorized Idle Open/Close, not Primary, replication or stateful deployment.
 Broader H3 and deployed RA/RAP composition remain gated.**
 [`fube-hosting`](../../crates/libs/fube-hosting/src/lib.rs) provides
 a native-derived, deterministically driven core plus a separately owned local
@@ -67,6 +68,7 @@ service-type/activation key. Reject unsupported placement collisions rather than
 inventing private activation identities to force separate processes.
 Do not silently enable exclusive activation, multiple code packages, config/data
 packages or stateful deployment because their identity types already exist.
+The explicit local stateful profiles do not widen these default limits.
 
 Remote/TLS profiles, containers, nonactivated hosts, guest/DLL hosting, native
 image-store downloads, executable upgrades and resource governance are separate

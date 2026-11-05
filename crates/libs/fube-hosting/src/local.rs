@@ -51,7 +51,7 @@ type LocalResult<T> = std::result::Result<T, LocalError>;
 #[derive(Debug, Clone)]
 pub struct Options {
     pub run_parent: PathBuf,
-    /// Stateless by default. Stateful admission enables registration only.
+    /// Stateless by default. Stateful registration and local lifecycle are separate opt-ins.
     pub profile: Profile,
     pub registration_timeout: Duration,
     pub cleanup_budget: Duration,
@@ -193,7 +193,7 @@ impl Activation {
         &mut self,
         gate: std::sync::Arc<dyn ipc::RegistrationConsumerGate>,
     ) -> LocalResult<()> {
-        if self.options.profile != Profile::Stateless {
+        if self.options.profile == Profile::VolatileStatefulRegistration {
             return Err(Error::UnsupportedCapability.into());
         }
         if self.started.is_some() {
@@ -211,6 +211,11 @@ impl Activation {
         application_name: &str,
         parameters: &[(String, String)],
     ) -> LocalResult<()> {
+        if self.options.profile == Profile::VolatileStatefulLifecycle
+            && self.consumer_gate.is_none()
+        {
+            return Err(Error::UnsupportedCapability.into());
+        }
         if self.package.is_some() || self.stopping {
             return Err(LocalError::AlreadyStarted);
         }
@@ -405,7 +410,7 @@ impl Activation {
         )?;
         self.declared = prepared.admitted;
         self.lease = Some(match self.options.profile {
-            Profile::Stateless => prepared.lease,
+            Profile::Stateless | Profile::VolatileStatefulLifecycle => prepared.lease,
             Profile::VolatileStatefulRegistration => prepared.lease.registration_only(),
         });
         if let Some((_, error)) = prepared.failure {

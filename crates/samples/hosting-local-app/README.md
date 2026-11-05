@@ -47,7 +47,7 @@ Stage its two manifests with the same executable and set
 `fube_hosting::local::Options::profile` to
 `Profile::VolatileStatefulRegistration`. The default remains stateless.
 
-Its fixed `--stateful-register` argument registers `LocalStatefulType` through
+Its default `--stateful-register` argument registers `LocalStatefulType` through
 the ordinary runtime API and real actor-9 Hosting IPC. Registration emits
 `LOCAL_STATEFUL_REGISTERED` only after successful completion. The stateful
 factory emits `LOCAL_CALLBACK create_replica` and fails explicitly if called;
@@ -56,3 +56,21 @@ lifecycle sends reject; finite local leases and owned teardown remain real.
 The existing activation/lifecycle test commands above include this profile's
 registration, lookup, authority-loss, prelaunch rejection and lifecycle-gate
 tests. No stateful primary, data or recovery behavior is claimed.
+
+## Stateful Idle lifecycle fixture
+
+Reuse `pkg-stateful/`, set `Options::profile` to
+`Profile::VolatileStatefulLifecycle`, and compose the original local `Node`
+before launch. Override the `Arguments` parameter with `--stateful-lifecycle`
+(optionally followed by the existing callback/disposal fault mode). Register,
+then authorize `Node::open_stateful` and `Node::close`; the registration-only
+profile and its callback-failing factory remain unchanged.
+
+The fixture owns a real service resource and loopback control listener through
+the public stateful/custom-replicator interfaces. It only supports IdleSecondary
+and cleanup-to-None, returns no serving endpoint, observes denied read/write
+access, and explicitly rejects data, quorum, copy/build, configuration and Primary
+controls. It is not a data-replicator implementation. Final service/control
+disposal is independently observed before semantic Close and H2 release.
+The existing lifecycle test command includes replay, disposal/close-error and
+Opening/Open lease-loss qualification for this separate profile.
