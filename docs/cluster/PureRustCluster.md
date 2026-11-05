@@ -72,6 +72,15 @@ replication listener, joined provider/service disposal and Opening/Open lease-lo
 fencing. This connects local RA/RAP to the real engine, not Primary authority,
 acknowledged writes, copy/build, FM/peer control, recovery or M2 completion.
 
+**Local initial Primary update (2026-11-05):**
+A separate [trusted-local 1/1 Primary lifecycle](HostingLocalActivation.md#opt-in-initial-singleton-primary-lifecycle)
+now drives the native-derived initial-Primary Open through committed RA effects
+and existing RAP/public replicator interfaces. Independent application clients
+verify one nonzero admitted/applied/acknowledged write and readback. Exact usage,
+joined provider/service/listener cleanup, stale traffic and Opening/serving
+lease loss are exercised. This is not promotion/adoption, FM/peer choreography,
+mixed/config/data packaging, request-ledger qualification, recovery or M2 completion.
+
 ## 1. Decisions and initial profile
 
 | Area | Decision |

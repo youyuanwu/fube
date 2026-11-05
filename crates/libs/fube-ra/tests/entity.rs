@@ -386,6 +386,254 @@ async fn local_stateful_idle_open_is_commit_gated_and_cannot_enable_primary_or_n
     finish(&store, &executor).await;
 }
 
+#[tokio::test]
+async fn local_initial_primary_requires_exact_committed_bootstrap_and_cannot_promote_or_reopen() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    let mut request = body(1);
+    request.service.stateful = true;
+    request.service.partitions = 1;
+    request.service.target = 1;
+    request.service.minimum = 1;
+    request.replica.current_role = 4;
+    request.unit.current.configuration = (1 << 32) + 5;
+    let mut previous = request.clone();
+    previous.unit.previous = request.unit.current;
+    assert!(matches!(
+        executor
+            .submit(Command::OpenLocalPrimary(Box::new(previous)))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    assert!(matches!(
+        executor
+            .submit(add(request.clone()))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    assert_eq!(hooks.calls.load(Ordering::SeqCst), 0);
+    let (entered, release) = hooks.pause(true);
+    let vetoed = executor
+        .submit(Command::OpenLocalPrimary(Box::new(request.clone())))
+        .unwrap();
+    tokio::time::timeout(WAIT, entered).await.unwrap().unwrap();
+    assert!(executor.snapshot([1; 16]).committed.is_none());
+    assert!(executor.take_effects().is_empty());
+    release.send(()).unwrap();
+    assert!(matches!(vetoed.wait(WAIT).await, Err(Failure::Store(_))));
+    assert!(executor.snapshot([1; 16]).committed.is_none());
+    assert!(executor.take_effects().is_empty());
+
+    let (entered, release) = hooks.pause(false);
+    let open = executor
+        .submit(Command::OpenLocalPrimary(Box::new(request.clone())))
+        .unwrap();
+    tokio::time::timeout(WAIT, entered).await.unwrap().unwrap();
+    assert!(executor.snapshot([1; 16]).committed.is_none());
+    assert!(executor.take_effects().is_empty());
+    release.send(()).unwrap();
+    open.wait(WAIT).await.unwrap();
+    let issued = effects(&executor);
+    assert!(matches!(issued.as_slice(), [Effect::Open { .. }]));
+    registered(&executor, &request, open.id).await;
+    let normalized = (*executor.snapshot([1; 16]).committed.unwrap().body).clone();
+    let mut result = complete(&normalized, open.id);
+    result.replica.replication_endpoint = "127.0.0.1:12345".into();
+    for foreign in 0..6 {
+        let mut event = result.clone();
+        match foreign {
+            0 => event.replica.node.instance += 1,
+            1 => event.replica.id -= 1,
+            2 => event.replica.instance -= 1,
+            3 => event.unit.current.configuration += 1,
+            4 => event.replica.current_role = 2,
+            _ => event.replica.up = false,
+        }
+        assert_eq!(
+            executor
+                .submit(Command::CompleteOpen(Box::new(event)))
+                .unwrap()
+                .wait(WAIT)
+                .await,
+            Ok(Disposition::IgnoredStale)
+        );
+        assert!(executor.take_effects().is_empty());
+    }
+    for invalid in 0..4 {
+        let mut event = result.clone();
+        match invalid {
+            0 => event.replica.service_endpoint.clear(),
+            1 => event.replica.replication_endpoint.clear(),
+            2 => event.replica.state = 2,
+            _ => event.error = PROXY_STATE_CHANGED_ON_DATA_LOSS,
+        }
+        assert!(matches!(
+            executor
+                .submit(Command::CompleteOpen(Box::new(event)))
+                .unwrap()
+                .wait(WAIT)
+                .await,
+            Err(Failure::Admission(_))
+        ));
+        assert_eq!(
+            executor.snapshot([1; 16]).committed.unwrap().phase,
+            Phase::Opening
+        );
+        assert!(executor.take_effects().is_empty());
+    }
+    let (entered, release) = hooks.pause(false);
+    let completion = executor
+        .submit(Command::CompleteOpen(Box::new(result.clone())))
+        .unwrap();
+    tokio::time::timeout(WAIT, entered).await.unwrap().unwrap();
+    assert_eq!(
+        executor.snapshot([1; 16]).committed.unwrap().phase,
+        Phase::Opening
+    );
+    assert!(executor.take_effects().is_empty());
+    release.send(()).unwrap();
+    completion.wait(WAIT).await.unwrap();
+    let opened = executor.snapshot([1; 16]).committed.unwrap();
+    assert_eq!(
+        (opened.body.replica.current_role, opened.body.replica.state),
+        (4, 2)
+    );
+    assert_eq!(
+        opened.body.replica.service_endpoint,
+        result.replica.service_endpoint
+    );
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::LocalStatefulOpenReply(_)]
+    ));
+    let mut idle = request.clone();
+    idle.replica.current_role = 2;
+    assert!(matches!(
+        executor
+            .submit(Command::OpenLocalStateful(Box::new(idle)))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    let mut updated = request.clone();
+    updated.unit.current.configuration += 1;
+    assert!(matches!(
+        executor
+            .submit(Command::OpenLocalPrimary(Box::new(updated)))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    executor
+        .submit(Command::OpenLocalPrimary(Box::new(request.clone())))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::LocalStatefulOpenReply(_)]
+    ));
+    assert_eq!(
+        executor.snapshot([1; 16]).committed.unwrap().usage,
+        opened.usage
+    );
+    assert_eq!(
+        executor
+            .submit(Command::CompleteOpen(Box::new(result)))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Ok(Disposition::IgnoredStale)
+    );
+    assert!(executor.take_effects().is_empty());
+    executor
+        .submit(Command::CloseLocal {
+            unit: request.unit.id.clone(),
+            mode: CloseMode::Close,
+        })
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::Close { flags: 0, .. }]
+    ));
+    let closing = executor.snapshot([1; 16]).committed.unwrap();
+    let closed = CloseCompletion {
+        unit: closing.body.unit.clone(),
+        replica: closing.body.replica.clone(),
+        error: 0,
+    };
+    let mut wrong_role = closed.clone();
+    wrong_role.replica.current_role = 2;
+    assert_eq!(
+        executor
+            .submit(Command::CompleteClose(Box::new(wrong_role)))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Ok(Disposition::IgnoredStale)
+    );
+    let (entered, release) = hooks.pause(false);
+    let close = executor
+        .submit(Command::CompleteClose(Box::new(closed.clone())))
+        .unwrap();
+    tokio::time::timeout(WAIT, entered).await.unwrap().unwrap();
+    assert_eq!(
+        executor.snapshot([1; 16]).committed.unwrap().usage,
+        opened.usage
+    );
+    assert!(executor.take_effects().is_empty());
+    release.send(()).unwrap();
+    close.wait(WAIT).await.unwrap();
+    let released = effects(&executor);
+    assert_eq!(
+        released
+            .iter()
+            .filter(|effect| matches!(effect, Effect::ReleaseUsage { .. }))
+            .count(),
+        1
+    );
+    assert!(released
+        .iter()
+        .any(|effect| matches!(effect, Effect::StatefulClosePending { .. })));
+    assert_eq!(
+        executor
+            .snapshot([1; 16])
+            .committed
+            .unwrap()
+            .body
+            .replica
+            .service_endpoint,
+        ""
+    );
+    assert_eq!(
+        executor
+            .submit(Command::CompleteClose(Box::new(closed)))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Ok(Disposition::IgnoredStale)
+    );
+    assert!(executor.take_effects().is_empty());
+    assert!(matches!(
+        executor
+            .submit(Command::OpenLocalPrimary(Box::new(request)))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    finish(&store, &executor).await;
+}
+
 struct TestClock(AtomicI64);
 impl TestClock {
     fn new() -> Arc<Self> {

@@ -259,6 +259,8 @@ pub enum Command {
     },
     /// Trusted local volatile Idle Open, not AddPrimary/CreateReplica network admission.
     OpenLocalStateful(Box<AddInstance>),
+    /// Trusted local fresh 1/1 Primary Open, not promotion or FM AddPrimary admission.
+    OpenLocalPrimary(Box<AddInstance>),
     CompleteOpen(Box<OpenCompletion>),
     /// Explicit new retry work, not an automatic duplicate dispatch.
     RetryOpen(PartitionId),
@@ -318,6 +320,7 @@ enum Kind {
         generation: GenerationHeader,
     },
     OpenLocalStateful,
+    OpenLocalPrimary,
     Complete,
     Retry,
     Remove {
@@ -625,6 +628,9 @@ impl Executor {
             Command::OpenLocalStateful(body) => {
                 (body.unit.id.guid.0, Kind::OpenLocalStateful, to_vec(&body))
             }
+            Command::OpenLocalPrimary(body) => {
+                (body.unit.id.guid.0, Kind::OpenLocalPrimary, to_vec(&body))
+            }
             Command::RetryOpen(unit) => (unit.guid.0, Kind::Retry, to_vec(&unit)),
             Command::Remove {
                 body,
@@ -719,7 +725,7 @@ impl Executor {
             // Ready always owns an active runtime in this executor: Add can
             // capture update + Close (or duplicate reply), but cannot release
             // resources synchronously. Closed Add reports + stale-replies at most.
-            Kind::Add { .. } | Kind::OpenLocalStateful => 2,
+            Kind::Add { .. } | Kind::OpenLocalStateful | Kind::OpenLocalPrimary => 2,
             Kind::Retry | Kind::RetryReport | Kind::RetryServiceDescription => 1,
             Kind::CompleteServiceDescription => 0,
             Kind::HostingRegistered | Kind::HostingRuntimeClosed | Kind::HostingHostClosed => 8,
@@ -1017,9 +1023,15 @@ fn transition(
     match &work.kind {
         #[cfg(feature = "qualification")]
         Kind::QualificationTerminate => panic!("explicit qualification worker termination"),
-        Kind::Add { .. } | Kind::OpenLocalStateful => {
+        Kind::Add { .. } | Kind::OpenLocalStateful | Kind::OpenLocalPrimary => {
             let body: AddInstance = from_slice(&work.bytes).map_err(decode_error)?;
-            let local_stateful = matches!(work.kind, Kind::OpenLocalStateful);
+            let local_stateful =
+                matches!(work.kind, Kind::OpenLocalStateful | Kind::OpenLocalPrimary);
+            let role = match work.kind {
+                Kind::OpenLocalStateful => 2,
+                Kind::OpenLocalPrimary => 4,
+                _ => 1,
+            };
             if body.replica.node != admission.local_node {
                 return Err(Failure::Admission(
                     "configured session/node incarnation mismatch",
@@ -1046,7 +1058,7 @@ fn transition(
             if body.service.stateful != local_stateful
                 || body.service.persisted
                 || body.service.group
-                || body.replica.current_role != if local_stateful { 2 } else { 1 }
+                || body.replica.current_role != role
                 || body.replica.state != 1
                 || !body.replica.up
                 || body.replica.id < 0
@@ -1054,7 +1066,7 @@ fn transition(
                 || body.replica.version != body.service.version
             {
                 return Err(Failure::Unsupported(if local_stateful {
-                    "not the admitted volatile Idle InBuild package profile"
+                    "not the admitted local volatile InBuild package profile"
                 } else {
                     "not the admitted stateless InBuild package profile"
                 }));
@@ -1077,7 +1089,12 @@ fn transition(
                     || !body.replica.replication_endpoint.is_empty())
             {
                 return Err(Failure::Unsupported(
-                    "only local volatile singleton Idle Open",
+                    "only local volatile singleton initial Open",
+                ));
+            }
+            if role == 4 && body.unit.previous != Epoch::default() {
+                return Err(Failure::Unsupported(
+                    "initial Primary cannot inherit a previous configuration",
                 ));
             }
             // Native locked-entity TCP admission precedes processor prechecks,
@@ -1091,6 +1108,7 @@ fn transition(
                 if local_stateful
                     && (current.body.replica.id != body.replica.id
                         || current.body.replica.instance != body.replica.instance
+                        || current.body.replica.current_role != role
                         || current.body.service != body.service
                         || current.body.unit.current != body.unit.current
                         || current.phase == Phase::Closed)

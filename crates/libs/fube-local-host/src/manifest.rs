@@ -18,6 +18,7 @@ pub enum Profile {
     Stateless,
     VolatileStatefulRegistration,
     VolatileStatefulLifecycle,
+    VolatileStatefulPrimaryLifecycle,
 }
 
 #[derive(Debug)]
@@ -304,7 +305,9 @@ impl Package {
         let service = one(defaults, "Service")?;
         let (service_kind, type_kind) = match profile {
             Profile::Stateless => ("StatelessService", "StatelessServiceType"),
-            Profile::VolatileStatefulRegistration | Profile::VolatileStatefulLifecycle => {
+            Profile::VolatileStatefulRegistration
+            | Profile::VolatileStatefulLifecycle
+            | Profile::VolatileStatefulPrimaryLifecycle => {
                 ("StatefulService", "StatefulServiceType")
             }
         };
@@ -324,7 +327,9 @@ impl Package {
         let description = one(service, service_kind)?;
         let service_attributes: &[&str] = match profile {
             Profile::Stateless => &["ServiceTypeName", "InstanceCount"],
-            Profile::VolatileStatefulRegistration | Profile::VolatileStatefulLifecycle => &[
+            Profile::VolatileStatefulRegistration
+            | Profile::VolatileStatefulLifecycle
+            | Profile::VolatileStatefulPrimaryLifecycle => &[
                 "ServiceTypeName",
                 "TargetReplicaSetSize",
                 "MinReplicaSetSize",
@@ -342,7 +347,9 @@ impl Package {
                 attr(description, "InstanceCount", &params)? == "1",
                 "only InstanceCount=1 is supported",
             )?,
-            Profile::VolatileStatefulRegistration | Profile::VolatileStatefulLifecycle => require(
+            Profile::VolatileStatefulRegistration
+            | Profile::VolatileStatefulLifecycle
+            | Profile::VolatileStatefulPrimaryLifecycle => require(
                 attr(description, "TargetReplicaSetSize", &params)? == "1"
                     && attr(description, "MinReplicaSetSize", &params)? == "1",
                 "only volatile stateful target/minimum=1/1 is supported",
@@ -379,7 +386,9 @@ impl Package {
         let declared = one(types, type_kind)?;
         let type_attributes: &[&str] = match profile {
             Profile::Stateless => &["ServiceTypeName"],
-            Profile::VolatileStatefulRegistration | Profile::VolatileStatefulLifecycle => {
+            Profile::VolatileStatefulRegistration
+            | Profile::VolatileStatefulLifecycle
+            | Profile::VolatileStatefulPrimaryLifecycle => {
                 &["ServiceTypeName", "HasPersistedState"]
             }
         };
@@ -509,7 +518,9 @@ impl Package {
                 r#"<StatelessServiceType ServiceTypeName="{}" />"#,
                 escape(&self.service_type)
             ),
-            Profile::VolatileStatefulRegistration | Profile::VolatileStatefulLifecycle => format!(
+            Profile::VolatileStatefulRegistration
+            | Profile::VolatileStatefulLifecycle
+            | Profile::VolatileStatefulPrimaryLifecycle => format!(
                 r#"<StatefulServiceType ServiceTypeName="{}" HasPersistedState="false" />"#,
                 escape(&self.service_type)
             ),

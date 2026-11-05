@@ -392,6 +392,17 @@ service disposal, direct ForceAbort and Opening/Open lease loss. Hard process
 fencing is not a graceful destructor receipt. No acknowledged data, Primary,
 copy/build, FM/peer or recovery evidence is implied; custom-control tests remain.
 
+The separate `--stateful-primary` fixture requires
+`Profile::VolatileStatefulPrimaryLifecycle` and
+`Node::open_stateful_primary` for one fresh volatile 1/1 lifetime. Its lifecycle
+tests use independent application clients for public write admission, actual
+provider application, separate quorum completion and value readback, plus denied
+pre-readiness writes, joined provider/service/listener disposal and Opening/
+serving lease loss. RA tests hold/veto actual commits and reject mismatched
+completions, promotion/reconfiguration and reopen. This is trusted-local initial
+Primary evidence, not FM AddPrimary/peer choreography, native stateful
+qualification, request-ledger/recovery or full P4/M2.
+
 ### Owned local stateless RA/RAP
 
 The [production local lifecycle guide](cluster/StatelessRaRap.md) separates
@@ -409,7 +420,7 @@ env -u LD_LIBRARY_PATH -u FabricConfigFileName \
 Also run the affected core/runtime/Hosting/Node/RA/store/local-host/transport
 library and integration targets, the offline suite (including runtime/data
 separation), and workspace locked all-target/all-feature check/Clippy, binaries/
-examples build, formatting, Rustdoc and doctests. No deployed FM/HM/serving
+examples build, formatting, Rustdoc and doctests. No deployed FM/HM-authorized
 readiness or stateful cluster deployment is implied. Shared Hosting/process changes
 retain all seven separate release-native actions below on a fresh clean-source
 bundle; those are not combined production Rust RA evidence.
