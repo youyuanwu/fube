@@ -1,4 +1,4 @@
-"""Explicit actual-native helper producer, separate from the 36-case wire gate.
+"""Explicit actual-native helper producer, separate from the 58-case wire gate.
 
 Compiles original PAL C and retry-policy TUs, plus verbatim identifier and
 generation methods. --rust optionally compares an explicitly prebuilt,

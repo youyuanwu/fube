@@ -25,6 +25,9 @@ CASES = {
     "action-NodeUp", "action-NodeUpAck", "actor-13", "direct-ptop", "rich-ptop",
     "default-primary", "rich-primary", "default-primary-reply", "rich-primary-reply",
     "action-AddPrimary", "action-AddPrimaryReply",
+    "default-delete-replica", "rich-delete-replica", "default-delete-replica-reply",
+    "rich-delete-replica-reply-0", "rich-delete-replica-reply--2147017398",
+    "action-DeleteReplica", "action-DeleteReplicaReply",
 }
 
 

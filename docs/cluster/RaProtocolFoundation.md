@@ -11,7 +11,9 @@ adapter, full P2/P3 implementation or restart protocol.
 Later [minimal FM composition](MinimalFmCluster.md) runs these components with
 real RA/Hosting processes. Its [initial stateful profile](MinimalFmCluster.md#initial-stateful-fm-control)
 now adds distinct AddPrimary/Reply codecs and source-derived fresh-Primary
-processing, without completing broader stateful reliability or recovery.
+processing. Distinct DeleteReplica/Reply codecs reuse the existing inherited
+DeleteReplicaMessageBody and ReplicaReplyMessageBody schemas for the next normal
+FM deletion slice, without completing broader stateful reliability or recovery.
 
 ## Inventory and scope
 
@@ -26,38 +28,49 @@ deprecated handling, current no-ops and source endpoint gaps are classified.
 Every RA–FM and RA–RA exchange remains mandatory eventual scope. Replacing
 Federation delivery does not remove peer CreateReplica/GetLSN/Deactivate/Activate
 or peer DoReconfiguration continuation. Catalog completeness is not complete
-codec/handler/native-trace coverage. The remaining 54 actions have no enabled
-Rust action codec/handler capability; the selected twelve include bootstrap
-NodeUp/Ack and initial AddPrimary/Reply alongside the original eight. Complete runtime
+codec/handler/native-trace coverage. The remaining 52 actions have no enabled
+Rust action codec/handler capability; the selected fourteen include bootstrap
+NodeUp/Ack, initial AddPrimary/Reply and normal DeleteReplica/Reply alongside
+the original eight. Selected wire support is not handler qualification. Complete runtime
 lifecycle/behavioral qualification remains unfinished.
 
 ## Codec evidence
 
-[protocol.rs:41–585](../../crates/libs/fube-ra/src/protocol.rs#L41-L585)
+[protocol.rs](../../crates/libs/fube-ra/src/protocol.rs)
 models the selected bodies and their full nested descriptions, native defaults,
 raw NodeId/GUID, enum/error widths, collections, polymorphic scaling and relevant
 headers. It reuses the bounded transport Fabric codec, not a new serializer.
 Native request generation and FM/FMM identity remain distinct; the actual
-AddInstanceReply/RemoveInstanceReply/ReplicaUp senders do not require the
+AddInstanceReply/RemoveInstanceReply/AddPrimaryReply/DeleteReplicaReply/ReplicaUp senders do not require the
 request's generation header. Remove inherits the base scope plus force;
 ReplicaUp/Reply retain full normal/dropped FT lists and both flags.
+DeleteReplica aliases RemoveInstance's inherited schema but has a distinct
+native action, RA=12 destination, high priority and required generation;
+DeleteReplicaReply aliases the existing reply schema but targets FM=11 or the
+FMM=10 owner with no mandatory generation. Priority remains factory metadata,
+not semantic admission. Alias/owner support does not enable force deletion,
+recreation/reconfiguration, FMM execution or recovery.
 
 [The explicit oracle](../../tests/ra_protocol/README.md) compiles unmodified
 native stream/compressor/helper code and mechanically extracts native field
-macros/declarations for 43 schema types/129 members. Its disclosed test platform
+macros/declarations for 59 schema types/199 members. Its disclosed test platform
 support replaces allocator/container/raw byte storage, **not wire algorithms**.
 Schema adapters omit unrelated C++ production methods/dependencies. This is
 **source-baseline native-stream conformance with schema adapters**, not execution
 of the full original production RA classes/handlers or interoperability with
 independently pinned SF qualification binaries.
 
-Executed evidence includes 36 native→Rust exact-field cases and 36 Rust→actual
+Executed evidence includes 58 native→Rust exact-field cases and 58 Rust→actual
 native decoder comparisons, default/nondefault bodies, semantic errors,
 UTF-16/surrogates, high-bit identities and nonempty inherited/polymorphic fields.
-Rust rejects every proper prefix of rich Add/reply and both force removal
-fixtures and both rich notification bodies; native rejects six truncated bodies.
+All original 51 cases are preserved, including the original 36-case inventory.
+Seven DeleteReplica/Reply cases add default/rich normal deletion, default reply,
+rich success/StaleRequest replies and both literal actions without new schemas.
+Rust rejects every proper prefix of rich Add/reply, both force removal fixtures,
+both rich notification bodies, all four bootstrap and AddPrimary bodies, rich
+PToP and all five new deletion bodies; native rejects eleven truncated bodies.
 Native input hashes, generated schemas, compiler flags and
-prebuilt digests are recorded in the producer bundle. Acceptance runs verified
+prebuilt digests are recorded in the exact 62-file producer bundle. Acceptance runs verified
 prebuilt inputs with no compiler/native installation/build fallback.
 
 ## Entity API and admission
@@ -192,7 +205,7 @@ Real public Store backends and entered/release
 barriers prove no premature state/effects/reply, definite insert/update failure,
 unknown late success/failure, unrelated memory progress, retained caller
 ownership, per-execution single dispatch and real SQLite aggregate commit.
-[14 schema tests](../../crates/libs/fube-ra/tests/protocol.rs) cover defaults,
+[17 schema tests](../../crates/libs/fube-ra/tests/protocol.rs) cover defaults,
 full nested fields, errors, headers, malformed input, bounds and pointer tags.
 Offline validator-model bytes are explicitly **not native fixtures**.
 Additional [real-ticket fault regressions](../../crates/libs/fube-ra/src/entity.rs#L1260)

@@ -158,6 +158,7 @@ enum Work {
 #[derive(Clone)]
 pub enum FmWork {
     Remove(Box<RemoveInstance>, NodeInstance, GenerationHeader),
+    DeleteReplica(Box<DeleteReplica>, NodeInstance, GenerationHeader),
     ReplicaUpReply(ReplicaUp, NodeInstance, GenerationHeader),
     ServiceTypeReply(ServiceTypeNotification, NodeInstance, GenerationHeader),
     CaptureServiceTypeWork(u64),
@@ -373,12 +374,16 @@ impl Node {
         if !stateless
             && !matches!(
                 work,
-                FmWork::ServiceTypeReply(..)
+                FmWork::DeleteReplica(..)
+                    | FmWork::ServiceTypeReply(..)
                     | FmWork::CaptureServiceTypeWork(_)
                     | FmWork::CompleteServiceTypeWork(_)
                     | FmWork::ServiceTypeRetryTimer(_)
             )
         {
+            return Err(Error::Unsupported);
+        }
+        if stateless && matches!(work, FmWork::DeleteReplica(..)) {
             return Err(Error::Unsupported);
         }
         match &work {
@@ -388,6 +393,24 @@ impl Node {
                     .selected
                     .as_ref()
                     .is_none_or(|b| b.unit.id != body.replica.0.unit.id)
+                {
+                    return Err(Error::Unsupported);
+                }
+            }
+            FmWork::DeleteReplica(body, source, generation) => {
+                self.admit_fm(source, generation)?;
+                let selected = self.selected.as_ref().ok_or(Error::Unsupported)?;
+                let incoming = &body.replica.0;
+                if !self.live.load(Ordering::SeqCst)
+                    || !self.ra.consumer_lifetime().is_accepting()
+                    || body.deletion.0.force
+                    || incoming.unit.id != selected.unit.id
+                    || incoming.unit.consistency != selected.unit.consistency
+                    || incoming.service != selected.service
+                    || incoming.replica.node != self.admission.local_node
+                    || incoming.replica.id < 0
+                    || incoming.replica.instance < 0
+                    || to_vec(body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
                 {
                     return Err(Error::Unsupported);
                 }
@@ -603,6 +626,9 @@ impl Node {
             }
         }
         let current = self.ra.snapshot(body.unit.id.guid.0).committed;
+        if fm.is_some() && current.as_ref().is_some_and(|state| state.local_deleted) {
+            return Err(Error::Unsupported);
+        }
         if stateful
             && fm.is_none()
             && (self
@@ -717,6 +743,11 @@ impl Node {
             },
             Work::Fm(work) => match work {
                 FmWork::Remove(body, source, generation) => ra::Command::Remove {
+                    body: body.clone(),
+                    source: source.clone(),
+                    generation: generation.clone(),
+                },
+                FmWork::DeleteReplica(body, source, generation) => ra::Command::DeleteReplica {
                     body: body.clone(),
                     source: source.clone(),
                     generation: generation.clone(),
@@ -1107,7 +1138,8 @@ impl Node {
             ra::Effect::Reply(_)
             | ra::Effect::PrimaryReply(_)
             | ra::Effect::LocalStatefulOpenReply(_)
-            | ra::Effect::RemoveReply(_) => LocalDisposition::LocalResponse,
+            | ra::Effect::RemoveReply(_)
+            | ra::Effect::DeleteReplicaReply(_) => LocalDisposition::LocalResponse,
             ra::Effect::RequestReportRetry
             | ra::Effect::StatefulClosePending { .. }
             | ra::Effect::StatefulDroppedPending(_)

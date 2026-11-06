@@ -189,6 +189,147 @@ fn removal_inherits_base_scope_and_has_distinct_action_and_reply() {
 }
 
 #[test]
+fn delete_replica_preserves_inherited_body_and_distinct_factory_owner_asymmetry() {
+    let mut primary = support::rich_request();
+    primary.service.stateful = true;
+    primary.service.persisted = false;
+    primary.unit.target = 1;
+    primary.unit.minimum = 1;
+    primary.service.target = 1;
+    primary.service.minimum = 1;
+    primary.replica.current_role = 4;
+    primary.replica.state = 2;
+    let body = DeleteReplica::new(primary, false);
+    for from_fmm in [false, true] {
+        let generation = support::rich_generation(from_fmm);
+        let message = delete_replica_message(&body, &generation).unwrap();
+        let properties = message.properties().unwrap();
+        assert_eq!(properties.actor, RA_ACTOR);
+        assert_eq!(properties.action, "DeleteReplica");
+        assert!(properties.high_priority);
+        assert_eq!(
+            decode_delete_replica(&message).unwrap(),
+            (body.clone(), generation)
+        );
+        assert!(decode_remove_instance(&message).is_err());
+        assert!(decode_add_primary(&message).is_err());
+        assert_eq!(
+            message.body,
+            remove_instance_message(&body, &GenerationHeader::default())
+                .unwrap()
+                .body
+        );
+    }
+    for error in [0, -2_147_017_398] {
+        let mut reply = support::rich_reply(error);
+        reply.replica = Replica {
+            node: reply.replica.node,
+            id: reply.replica.id,
+            instance: reply.replica.instance,
+            state: 3,
+            up: false,
+            ..Replica::default()
+        };
+        for owner in [Owner::Fm, Owner::Fmm] {
+            let message = delete_replica_reply_message(&reply, owner).unwrap();
+            let properties = message.properties().unwrap();
+            assert_eq!(
+                properties.actor,
+                if owner == Owner::Fm {
+                    FM_ACTOR
+                } else {
+                    FMM_ACTOR
+                }
+            );
+            assert_eq!(properties.action, "DeleteReplicaReply");
+            assert!(properties.high_priority);
+            assert!(!message.headers.iter().any(|h| h.id == GENERATION_HEADER));
+            assert_eq!(
+                decode_delete_replica_reply(&message).unwrap(),
+                (reply.clone(), owner)
+            );
+            assert!(decode_remove_instance_reply(&message).is_err());
+            assert!(decode_add_primary_reply(&message).is_err());
+        }
+    }
+}
+
+#[test]
+fn delete_replica_decoders_reject_invalid_headers_and_body_framing() {
+    let request = delete_replica_message(
+        &support::rich_remove(false),
+        &support::rich_generation(false),
+    )
+    .unwrap();
+    let reply = delete_replica_reply_message(&support::rich_reply(0), Owner::Fm).unwrap();
+    for (original, is_reply) in [(request, false), (reply, true)] {
+        let decode = |message: &fube_transport::message::Message| {
+            if is_reply {
+                decode_delete_replica_reply(message).map(|_| ())
+            } else {
+                decode_delete_replica(message).map(|_| ())
+            }
+        };
+        let mut required = vec![ACTOR, ACTION, HIGH_PRIORITY];
+        if !is_reply {
+            required.push(GENERATION_HEADER);
+        }
+        for id in required {
+            let mut missing = original.clone();
+            missing.headers.retain(|h| h.id != id);
+            assert!(decode(&missing).is_err());
+            let mut duplicate = original.clone();
+            duplicate.headers.push(
+                original
+                    .headers
+                    .iter()
+                    .find(|h| h.id == id)
+                    .unwrap()
+                    .clone(),
+            );
+            assert!(decode(&duplicate).is_err());
+            let mut malformed = original.clone();
+            malformed
+                .headers
+                .iter_mut()
+                .find(|h| h.id == id)
+                .unwrap()
+                .value
+                .clear();
+            assert!(decode(&malformed).is_err());
+        }
+        let mut wrong = original.clone();
+        wrong.headers[0] = Header::actor(if is_reply { RA_ACTOR } else { FM_ACTOR }).unwrap();
+        assert!(decode(&wrong).is_err());
+        wrong.headers[0] = original.headers[0].clone();
+        for action in [
+            "RemoveInstance",
+            "RemoveInstanceReply",
+            "AddPrimary",
+            "AddPrimaryReply",
+        ] {
+            wrong.headers[1] = Header::action(action).unwrap();
+            assert!(decode(&wrong).is_err());
+        }
+        for end in 0..original.body.len() {
+            let mut truncated = original.clone();
+            truncated.body.truncate(end);
+            assert!(decode(&truncated).is_err());
+        }
+        let mut trailing = original.clone();
+        trailing.body.push(0);
+        assert!(decode(&trailing).is_err());
+        let mut bad_size = original.clone();
+        bad_size.body[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode(&bad_size).is_err());
+        // Priority is factory metadata, not semantic deletion admission.
+        let mut low = original;
+        low.headers[2] = Header::boolean(HIGH_PRIORITY, false).unwrap();
+        assert!(decode(&low).is_ok());
+    }
+}
+
+#[test]
 fn replica_up_full_lists_flags_and_reply_factory_are_distinct() {
     for last in [false, true] {
         for from_fmm in [false, true] {

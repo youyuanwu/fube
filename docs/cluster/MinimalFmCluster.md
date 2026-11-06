@@ -91,7 +91,7 @@ owner control. No replacement is authorized by link or node PID disappearance.
 ## Initial stateful FM control
 
 Run the same executable with `--app /absolute/hosting-local-app
---stateful-singleton`, then use `create`, `status` and `quit`.
+--stateful-singleton`, then use `create`, `status`, `delete` and `quit`.
 `AddPrimary`/`AddPrimaryReply` preserve native action/actor/priority, shared
 ReplicaMessageBody/ReplicaReplyMessageBody and request-generation/reply-owner
 asymmetry. The node uses `Profile::VolatileStatefulFmPrimary` and a distinct RA
@@ -115,10 +115,43 @@ reporting obligations; unsupported replacement/reopen paths fail admission.
 FM does not turn a transport write into readiness. An independent application
 client verifies one public admitted/applied/acknowledged write and readback.
 
-Stateful FM deletion, reconfiguration, FMM, copy/build, multi-replica movement
-and recovery remain gated. Owned local shutdown joins resource/listener disposal,
+Stateful force deletion, recreation, reconfiguration, FMM, copy/build,
+multi-replica movement and recovery remain gated. Owned local shutdown joins resource/listener disposal,
 exact usage and physical cleanup while retaining stateful reporting escrow.
 Cleanup receipts do not imply native terminal-report acknowledgment.
+
+### Normal singleton deletion
+
+After the original FM Primary creation completes, `delete` sends
+`DeleteReplica` with the native DeleteReplicaMessageBody and `force=false`.
+The separate Node/RA command retains network authority; it is neither local
+Close authorization nor a stateless RemoveInstance redirect. Local stateful
+profiles and the stateless profile do not gain this command.
+
+Pinned `ReconfigurationAgent.cpp:777-835,2239-2242` supplies DeleteLocalReplica:
+normal deletion rejects an older current epoch and requires the local ReplicaId,
+not equality with the FM's possibly older replica instance.
+`ReconfigurationAgent.cpp:671-707` sends DeleteReplicaReply after successful
+Delete close. `FailoverUnit.cpp:5472-5544` drops volatile state and deliberately
+does not schedule a ReplicaDown/ReplicaDropped report for normal Delete.
+The reply uses a fresh native dropped description (None roles, invalid package
+and LSNs, no endpoints), not the former Primary/Ready description.
+`fm/PendingTask.cpp:32-46` and `fm/FailoverUnitMessageProcessor.cpp:224-255`
+supply the deleting-FT action and successful deleted-replica processing.
+
+RA marks deletion and finishes Close only behind their respective commits.
+Real RAP disposal joins the provider, service and application/replication
+listeners. FM joins the matching successful reply with the same original-node
+disposal/Applied-Close/exact-H2-release receipt used by the stateless profile.
+A missing reply or proof leaves deletion pending; lost replies retry under the
+same native 10/60-second action predicates without another use or lifetime.
+Failed/unknown commits cannot publish deletion completion or release.
+
+The deleted tombstone, app host, factory and package remain resident under
+their original owners; **stateful recreation stays rejected** even after
+verified deletion. Duplicate operator operations retain their original outcome.
+Spontaneous Close/app-host-loss reports remain separately staged, not
+acknowledged by this normal deletion slice.
 
 ## Shutdown and restart safety
 
@@ -149,7 +182,8 @@ escaped-descendant adoption or durable crash-recovery mechanism.
   owner loss, physical cleanup and clean/dirty relaunch. Original-session replay
   also exercises stale requests, replies, reports and ACKs across recreation.
 - [Native source-stream oracle](../../tests/ra_protocol/README.md) separately
-  describes the 45-case/59-type/199-field codec-adapter evidence. Source schema
+  describes the maintained 59-type/199-field codec-adapter evidence, including
+  distinct AddPrimary and DeleteReplica actions. Source schema
   and codec execution are not deployed native handler/interoperability evidence.
 - Existing runtime/client/data profiles and required native regressions remain
   separate; no unrun native qualification follows from native-free success.

@@ -79,6 +79,12 @@ EXTRA_NATIVE_INPUTS = [
     "Common/FabricVersionConstants.cpp", "Federation/PToPActor.h",
     "Transport/MessageHeaderId.h", "Transport/Actor.h",
     COMMON + "RSMessage.cpp", COMMON + "RSMessage.h",
+    COMMON + "ReplicaRole.h", COMMON + "ReplicaStates.h",
+    COMMON + "ReplicaDescription.cpp", "Common/ErrorCodeValue.h",
+    "Reliability/Failover/fm/SendMessageAction.cpp",
+    "Reliability/Failover/ra/Communication.FMTransport.h",
+    "Reliability/Failover/ra/Infrastructure.MessageUtility.h",
+    "Reliability/Failover/FederationWrapper.cpp",
 ]
 
 ENUMS = {

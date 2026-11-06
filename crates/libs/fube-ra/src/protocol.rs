@@ -362,6 +362,9 @@ impl RemoveInstance {
     }
 }
 pub type RemoveInstanceReply = AddInstanceReply;
+/// DeleteReplica uses the same inherited native body, with a distinct action.
+pub type DeleteReplica = RemoveInstance;
+pub type DeleteReplicaReply = AddInstanceReply;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicaInfo {
@@ -478,6 +481,15 @@ pub fn remove_instance_message(
 pub fn remove_instance_reply_message(body: &RemoveInstanceReply, owner: Owner) -> Result<Message> {
     reliability_message(body, "RemoveInstanceReply", owner_actor(owner), true, None)
 }
+pub fn delete_replica_message(
+    body: &DeleteReplica,
+    generation: &GenerationHeader,
+) -> Result<Message> {
+    reliability_message(body, "DeleteReplica", RA_ACTOR, true, Some(generation))
+}
+pub fn delete_replica_reply_message(body: &DeleteReplicaReply, owner: Owner) -> Result<Message> {
+    reliability_message(body, "DeleteReplicaReply", owner_actor(owner), true, None)
+}
 pub fn replica_up_message(body: &ReplicaUp, owner: Owner) -> Result<Message> {
     reliability_message(body, "ReplicaUp", owner_actor(owner), true, None)
 }
@@ -584,6 +596,24 @@ pub fn decode_remove_instance(message: &Message) -> Result<(RemoveInstance, Gene
 }
 pub fn decode_remove_instance_reply(message: &Message) -> Result<(RemoveInstanceReply, Owner)> {
     let actor = check_factory(message, "RemoveInstanceReply", &[FM_ACTOR, FMM_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        if actor == FM_ACTOR {
+            Owner::Fm
+        } else {
+            Owner::Fmm
+        },
+    ))
+}
+pub fn decode_delete_replica(message: &Message) -> Result<(DeleteReplica, GenerationHeader)> {
+    check_factory(message, "DeleteReplica", &[RA_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+    ))
+}
+pub fn decode_delete_replica_reply(message: &Message) -> Result<(DeleteReplicaReply, Owner)> {
+    let actor = check_factory(message, "DeleteReplicaReply", &[FM_ACTOR, FMM_ACTOR])?;
     Ok((
         from_slice(&message.body)?,
         if actor == FM_ACTOR {

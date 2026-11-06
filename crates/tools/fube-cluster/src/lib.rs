@@ -355,14 +355,28 @@ impl Cluster {
                 )
                 .await?;
             }
-            "AddInstanceReply" | "AddPrimaryReply" | "RemoveInstanceReply" => {
-                let removing = action == "RemoveInstanceReply";
+            "AddInstanceReply"
+            | "AddPrimaryReply"
+            | "RemoveInstanceReply"
+            | "DeleteReplicaReply" => {
+                let removing = matches!(
+                    action.as_str(),
+                    "RemoveInstanceReply" | "DeleteReplicaReply"
+                );
                 let primary =
                     self.children[index].launch.profile == ServiceProfile::StatefulSingleton;
-                if primary != (action == "AddPrimaryReply") {
+                let expected_action = match (primary, removing) {
+                    (true, true) => "DeleteReplicaReply",
+                    (true, false) => "AddPrimaryReply",
+                    (false, true) => "RemoveInstanceReply",
+                    (false, false) => "AddInstanceReply",
+                };
+                if action != expected_action {
                     return Err("reply action does not match admitted lifecycle profile".into());
                 }
-                let (body, owner) = if removing {
+                let (body, owner) = if primary && removing {
+                    decode_delete_replica_reply(&incoming.message)
+                } else if removing {
                     decode_remove_instance_reply(&incoming.message)
                 } else if primary {
                     decode_add_primary_reply(&incoming.message)
@@ -400,6 +414,10 @@ impl Cluster {
                 Ok(()) => self.retry_primary(index).await,
                 Err(error) => Err(error),
             };
+            let result = match result {
+                Ok(()) => self.retry_deletion(index).await,
+                Err(error) => Err(error),
+            };
             if let Err(error) = result {
                 self.ledger.lost(index, error);
                 if let Some(link) = &self.children[index].link {
@@ -418,6 +436,19 @@ impl Cluster {
             .link
             .as_ref()
             .ok_or("original Primary link absent")?
+            .send(message)
+            .await
+    }
+    async fn retry_deletion(&mut self, index: usize) -> Result<()> {
+        let Some(body) = self.ledger.deletion_retry(index, Instant::now())? else {
+            return Ok(());
+        };
+        let child = &self.children[index];
+        let message = delete_replica_message(&body, &child.launch.generation).map_err(err)?;
+        child
+            .link
+            .as_ref()
+            .ok_or("original deletion link absent")?
             .send(message)
             .await
     }
@@ -489,9 +520,14 @@ impl Cluster {
                 }
             }
             Accepted::Delete(index, body) => {
+                let factory =
+                    if self.children[index].launch.profile == ServiceProfile::StatefulSingleton {
+                        delete_replica_message
+                    } else {
+                        remove_instance_message
+                    };
                 let message =
-                    remove_instance_message(&body, &self.children[index].launch.generation)
-                        .map_err(err)?;
+                    factory(&body, &self.children[index].launch.generation).map_err(err)?;
                 let result = self.children[index]
                     .link
                     .as_ref()

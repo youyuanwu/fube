@@ -42,7 +42,9 @@ class InputTests(unittest.TestCase):
         (self.bundle / "manifest.json").write_text(json.dumps(self.manifest))
 
     def test_inventory_model_is_valid_not_an_execution_claim(self):
-        self.assertEqual(len(validate(self.bundle, "a" * 40, self.source)["cases"]), 51)
+        manifest = validate(self.bundle, "a" * 40, self.source)
+        self.assertEqual(len(manifest["cases"]), 58)
+        self.assertEqual(len(manifest["files"]) + 1, 62)
 
     def test_exact_schema_counts_and_extra_files_are_rejected(self):
         for key in ["schema_types", "schema_fields"]:
@@ -128,6 +130,33 @@ class InputTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         consume(self.bundle, self.root / "output", "a" * 40, self.source)
                     path.write_bytes(b"tampered bootstrap fixture")
+                    with self.assertRaises(ValueError):
+                        consume(self.bundle, self.root / "output", "a" * 40, self.source)
+                    path.write_bytes(original)
+            identity.assert_not_called()
+        self.assertFalse((self.root / "output").exists())
+
+    def test_delete_replica_coverage_and_tamper_fail_before_execution(self):
+        names = [
+            "default-delete-replica", "rich-delete-replica", "default-delete-replica-reply",
+            "rich-delete-replica-reply-0", "rich-delete-replica-reply--2147017398",
+            "action-DeleteReplica", "action-DeleteReplicaReply",
+        ]
+        with patch("tests.ra_protocol.consumer.subprocess.check_output") as identity:
+            for name in names:
+                with self.subTest(case=name):
+                    self.manifest["cases"].remove(name)
+                    self.save()
+                    with self.assertRaises(ValueError):
+                        consume(self.bundle, self.root / "output", "a" * 40, self.source)
+                    self.manifest["cases"] = sorted(CASES)
+                    self.save()
+                    path = self.bundle / f"native/{name}.bin"
+                    original = path.read_bytes()
+                    path.unlink()
+                    with self.assertRaises(ValueError):
+                        consume(self.bundle, self.root / "output", "a" * 40, self.source)
+                    path.write_bytes(b"tampered DeleteReplica fixture")
                     with self.assertRaises(ValueError):
                         consume(self.bundle, self.root / "output", "a" * 40, self.source)
                     path.write_bytes(original)

@@ -274,6 +274,11 @@ pub enum Command {
         source: NodeInstance,
         generation: GenerationHeader,
     },
+    DeleteReplica {
+        body: Box<DeleteReplica>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
     ReplicaUpReply {
         body: Box<ReplicaUp>,
         source: NodeInstance,
@@ -336,6 +341,10 @@ enum Kind {
         source: NodeInstance,
         generation: GenerationHeader,
     },
+    DeleteReplica {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
     ReplicaUpReply {
         source: NodeInstance,
         generation: GenerationHeader,
@@ -392,7 +401,7 @@ pub struct EntityState {
     /// Original reply responsibility survives async registration/Open and retries.
     /// Session-only: there is no recovery/adoption loader.
     pub fm_primary: bool,
-    /// Native initial Primary ReplicaDeactivationInfo(CurrentConfigurationEpoch, 0).
+    /// Native FM Primary deactivation info, including the dropped tombstone sentinel.
     pub primary_deactivation: Option<(Epoch, i64)>,
     pub phase: Phase,
     pub open_token: u64,
@@ -439,7 +448,7 @@ pub enum Effect {
     PrimaryReply(Box<AddPrimaryReply>),
     /// Local observation only; never serialize this as AddInstance/CreateReplicaReply.
     LocalStatefulOpenReply(Box<AddInstanceReply>),
-    /// Retained terminal reporting obligation. No stateful FM/peer codec or ACK is enabled.
+    /// Retained terminal reporting obligation; stateful report delivery/ACK remains gated.
     StatefulClosePending {
         body: Arc<AddInstance>,
         mode: CloseMode,
@@ -478,6 +487,7 @@ pub enum Effect {
     RequestReportRetry,
     ReplicaUp(Box<ReplicaUp>),
     RemoveReply(Box<RemoveInstanceReply>),
+    DeleteReplicaReply(Box<DeleteReplicaReply>),
     /// Zero enqueues immediately; otherwise arm the BGM's remaining-delay timer.
     RequestServiceTypeWork {
         work: u64,
@@ -665,6 +675,15 @@ impl Executor {
             } => (
                 body.replica.0.unit.id.guid.0,
                 Kind::Remove { source, generation },
+                to_vec(&body),
+            ),
+            Command::DeleteReplica {
+                body,
+                source,
+                generation,
+            } => (
+                body.replica.0.unit.id.guid.0,
+                Kind::DeleteReplica { source, generation },
                 to_vec(&body),
             ),
             Command::ReplicaUpReply {

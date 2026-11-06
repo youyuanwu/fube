@@ -227,12 +227,19 @@ retry and unknown store completion; a local observation is never serialized as
 an FM reply. Native initial deactivation info is `(current configuration epoch,
 0)`. Matching Ready duplicates reply from the retained FT without recreating
 the lifetime or replacing its epoch. Closed/stale traffic retains typed dropped
-reporting rather than synthesizing an ACK. Stateful deletion/reconfiguration,
-replacement/reopen, FMM and recovery remain gated.
+reporting rather than synthesizing an ACK. Normal FM `DeleteReplica` now
+drives committed real RAP Close and returns a native canonical
+`DeleteReplicaReply` only after disposal. FM additionally requires the original
+Node's Applied-Close/exact-H2-release proof. Normal Delete creates no terminal
+report obligation; spontaneous Close/app-host-loss reporting remains staged.
+Stateful force deletion/reconfiguration, replacement/reopen, FMM and recovery
+remain gated; local profiles still reject network deletion.
 
 Real foreground/channel tests exercise exact semantic completion, a lost reply
-and original-lifetime retry, public acknowledged write/readback and physical
-cleanup. A separate real-process lease-loss test observes hard fencing and
+and original-lifetime retry, public acknowledged write/readback, normal FM
+deletion, lost deletion replies and physical cleanup. Held provider and service
+disposal each prevent Close completion, deletion replies and usage release.
+A separate real-process lease-loss test observes hard fencing and
 retained terminal reporting without claiming graceful destructor receipts.
 
 ## Ownership and usage

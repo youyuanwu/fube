@@ -162,11 +162,26 @@ fn report(state: &EntityState) -> ReplicaUp {
 }
 fn semantic_reply(state: &EntityState, mode: CloseMode, effects: &mut Vec<Effect>) {
     if mode == CloseMode::Delete && state.phase == Phase::Closed && state.local_deleted {
-        effects.push(Effect::RemoveReply(Box::new(RemoveInstanceReply {
+        // Native CreateDroppedReplicaDescription uses fresh None roles, invalid
+        // package/LSNs and empty endpoints, not the former Primary description.
+        let replica = Replica {
+            node: state.body.replica.node.clone(),
+            id: state.body.replica.id,
+            instance: state.body.replica.instance,
+            up: false,
+            state: 3,
+            ..Replica::default()
+        };
+        let body = Box::new(RemoveInstanceReply {
             unit: state.body.unit.clone(),
-            replica: canonical(state, true),
+            replica,
             error: 0,
-        })));
+        });
+        effects.push(if state.fm_primary {
+            Effect::DeleteReplicaReply(body)
+        } else {
+            Effect::RemoveReply(body)
+        });
     }
 }
 fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
@@ -188,12 +203,17 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
     }
     opening::release_usage(state, effects);
     if state.body.service.stateful {
-        // Native FinishCloseLocalReplica also owns terminal reliability reporting.
-        // Retain the obligation without running the stateless ReplicaUp adapter.
-        effects.push(Effect::StatefulClosePending {
-            body: state.body.clone(),
-            mode,
-        });
+        if state.fm_primary {
+            state.primary_deactivation = Some((Epoch::default(), -2));
+        }
+        // Native normal Delete completes via DeleteReplicaReply, not a dropped
+        // report. Other close modes still retain their unimplemented FM work.
+        if mode != CloseMode::Delete {
+            effects.push(Effect::StatefulClosePending {
+                body: state.body.clone(),
+                mode,
+            });
+        }
     } else if !state.local_deleted {
         state.fm_stage = if mode == CloseMode::AppHostDown {
             FmStage::ReplicaDown
@@ -419,6 +439,9 @@ pub(super) fn create_body(mut body: AddInstance) -> AddInstance {
 
 /// ReconfigurationAgent.cpp:1731-1847, bounded to one original volatile lifetime.
 pub(super) fn primary_existing(current: &EntityState, body: &AddPrimary) -> Result<Transition> {
+    if current.local_deleted {
+        return Err(Failure::Unsupported("stateful recreation is gated"));
+    }
     if body.service != current.body.service || body.replica.id > current.body.replica.id {
         return Err(Failure::Unsupported(
             "stateful replacement/description changes are gated",
@@ -474,21 +497,44 @@ pub(super) fn transition(
             }
             Ok(changed(state, effects, true))
         }
-        Kind::Remove { source, generation } => {
+        Kind::Remove { source, generation } | Kind::DeleteReplica { source, generation } => {
             admit(source, generation, admission)?;
             if generation.number.older_than(&admission.generation) {
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             }
             let request: RemoveInstance = from_slice(&work.bytes).map_err(invalid)?;
             let body = request.replica.0;
-            check_stateless(&body, admission)?;
-            if current.is_some_and(|state| state.body.service.stateful) {
-                return Err(Failure::Unsupported("stateful FM removal is disabled"));
+            let stateful = matches!(work.kind, Kind::DeleteReplica { .. });
+            if stateful {
+                let Some(original) = current.filter(|state| state.fm_primary) else {
+                    return Err(Failure::Unsupported(
+                        "stateful deletion requires the original FM Primary lifetime",
+                    ));
+                };
+                if request.deletion.0.force
+                    || !body.service.stateful
+                    || body.service != original.body.service
+                    || body.replica.node != admission.local_node
+                    || body.unit.consistency != original.body.unit.consistency
+                    || body.replica.id < 0
+                    || body.replica.instance < 0
+                    || (original.phase == Phase::Closed
+                        && body.replica.id > original.body.replica.id)
+                {
+                    return Err(Failure::Unsupported(
+                        "only original volatile singleton normal deletion is enabled",
+                    ));
+                }
+            } else {
+                check_stateless(&body, admission)?;
+                if current.is_some_and(|state| state.body.service.stateful) {
+                    return Err(Failure::Unsupported("stateful RemoveInstance is disabled"));
+                }
             }
             if !admission.node_open || !admission.owner_ready {
                 return Ok(Transition::ignored(Disposition::IgnoredNotReady));
             }
-            if let Some(current) = current {
+            if let Some(current) = current.filter(|_| !stateful) {
                 if current.phase != Phase::Closed
                     && body.replica.id == current.body.replica.id
                     && body.replica.instance > current.body.replica.instance
@@ -840,6 +886,11 @@ pub(super) fn transition(
             let Some(current) = current else {
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             };
+            if current.body.service.stateful {
+                return Err(Failure::Unsupported(
+                    "stateful terminal-report ACK is gated",
+                ));
+            }
             if info.replicas.0.len() != 1 {
                 return Err(Failure::Unsupported("one local replica per FT is enabled"));
             }

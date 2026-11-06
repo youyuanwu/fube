@@ -320,7 +320,7 @@ pub fn add_body(launch: &Launch, profile: &ActualProfile) -> AddInstance {
 }
 
 /// Trusted local original-owner observation, deliberately outside native
-/// schemas. Semantic Remove and this exact positive proof are separate inputs.
+/// schemas. Semantic RemoveInstance/DeleteReplica and this proof are separate inputs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetirementReceipt {
