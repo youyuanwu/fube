@@ -448,7 +448,7 @@ pub enum Effect {
     PrimaryReply(Box<AddPrimaryReply>),
     /// Local observation only; never serialize this as AddInstance/CreateReplicaReply.
     LocalStatefulOpenReply(Box<AddInstanceReply>),
-    /// Retained terminal reporting obligation; stateful report delivery/ACK remains gated.
+    /// Retained terminal reporting outside the FM singleton AppHostDown slice.
     StatefulClosePending {
         body: Arc<AddInstance>,
         mode: CloseMode,

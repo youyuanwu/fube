@@ -26,6 +26,11 @@ Normal FM DeleteReplica/Reply now closes that original volatile lifetime with
 source-derived epoch/ReplicaId checks, canonical dropped replies, native retry
 and separately joined disposal/accounting proof. Force deletion, recreation,
 DoReconfiguration, peer control, recovery and complete P4/M2 remain gated.
+The [unexpected singleton loss slice](MinimalFmCluster.md#unexpected-singleton-app-host-loss)
+now delivers AppHostDown's ReplicaDown-stage/dropped-list ReplicaUp and its
+processed-list acknowledgment, including native closed-FT deletion afterward.
+This records lost volatile state, not disposal/recovery; other terminal report
+origins and broader stateful choreography remain staged.
 
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's

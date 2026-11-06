@@ -143,6 +143,17 @@ fn mark_deleted(state: &mut EntityState) {
         state.cleanup_pending = true;
     }
 }
+fn dropped_description(state: &EntityState) -> Replica {
+    // Native CreateDroppedReplicaDescription resets roles, package, LSNs and endpoints.
+    Replica {
+        node: state.body.replica.node.clone(),
+        id: state.body.replica.id,
+        instance: state.body.replica.instance,
+        up: false,
+        state: 3,
+        ..Replica::default()
+    }
+}
 fn report(state: &EntityState) -> ReplicaUp {
     ReplicaUp {
         dropped: ObjectArray(vec![FailoverUnitInfo {
@@ -151,7 +162,7 @@ fn report(state: &EntityState) -> ReplicaUp {
             intermediate: Epoch::default(), // native Epoch::InvalidEpoch() == (0,0)
             report_from_primary: false,
             replicas: ObjectArray(vec![ReplicaInfo {
-                description: canonical(state, true),
+                description: dropped_description(state),
                 intermediate_role: 1,
             }]),
             // Native TryGetConfigurationInternal deliberately uses false here.
@@ -162,19 +173,9 @@ fn report(state: &EntityState) -> ReplicaUp {
 }
 fn semantic_reply(state: &EntityState, mode: CloseMode, effects: &mut Vec<Effect>) {
     if mode == CloseMode::Delete && state.phase == Phase::Closed && state.local_deleted {
-        // Native CreateDroppedReplicaDescription uses fresh None roles, invalid
-        // package/LSNs and empty endpoints, not the former Primary description.
-        let replica = Replica {
-            node: state.body.replica.node.clone(),
-            id: state.body.replica.id,
-            instance: state.body.replica.instance,
-            up: false,
-            state: 3,
-            ..Replica::default()
-        };
         let body = Box::new(RemoveInstanceReply {
             unit: state.body.unit.clone(),
-            replica,
+            replica: dropped_description(state),
             error: 0,
         });
         effects.push(if state.fm_primary {
@@ -206,9 +207,12 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
         if state.fm_primary {
             state.primary_deactivation = Some((Epoch::default(), -2));
         }
-        // Native normal Delete completes via DeleteReplicaReply, not a dropped
-        // report. Other close modes still retain their unimplemented FM work.
-        if mode != CloseMode::Delete {
+        if state.fm_primary && mode == CloseMode::AppHostDown && !state.local_deleted {
+            // Native OnReplicaDown(false, instance) retains ReplicaDown stage,
+            // while the closed volatile FT is serialized in ReplicaUp's dropped list.
+            state.fm_stage = FmStage::ReplicaDown;
+            effects.push(Effect::RequestReportRetry);
+        } else if mode != CloseMode::Delete {
             effects.push(Effect::StatefulClosePending {
                 body: state.body.clone(),
                 mode,
@@ -886,17 +890,34 @@ pub(super) fn transition(
             let Some(current) = current else {
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             };
-            if current.body.service.stateful {
-                return Err(Failure::Unsupported(
-                    "stateful terminal-report ACK is gated",
-                ));
-            }
             if info.replicas.0.len() != 1 {
                 return Err(Failure::Unsupported("one local replica per FT is enabled"));
             }
             let replica = &info.replicas.0[0].description;
             if replica.id != current.body.replica.id {
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
+            }
+            if current.body.service.stateful {
+                if !current.fm_primary {
+                    return Err(Failure::Unsupported(
+                        "local stateful terminal-report ACK is gated",
+                    ));
+                }
+                if current.phase != Phase::Closed
+                    || (current.fm_stage != FmStage::ReplicaDown && current.report_sequence == 0)
+                    || info.unit != current.body.unit
+                    || replica.node != current.body.replica.node
+                    || replica.instance != current.body.replica.instance
+                    || replica.up
+                    || (dropped && replica.state != 3)
+                {
+                    return Ok(Transition::ignored(Disposition::IgnoredStale));
+                }
+                if info.service != current.body.service {
+                    return Err(Failure::Unsupported(
+                        "stateful loss description changes are gated",
+                    ));
+                }
             }
             let mut state = current.clone();
             let mut effects = Vec::new();

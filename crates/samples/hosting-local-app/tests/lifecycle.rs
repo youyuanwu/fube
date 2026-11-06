@@ -803,7 +803,7 @@ async fn stateful_fm_delete_waits_for_real_provider_and_service_disposal_before_
 }
 
 #[tokio::test]
-async fn stateful_fm_primary_lease_loss_retains_real_authority_and_terminal_reporting_boundaries() {
+async fn stateful_fm_primary_lease_loss_retains_down_reporting_without_disposal_proof() {
     let fixture = Fixture::fm_primary();
     let (mut node, store) = fixture.node("").await;
     until(&mut node, |node| node.package_registration().registered).await;
@@ -853,6 +853,13 @@ async fn stateful_fm_primary_lease_loss_retains_real_authority_and_terminal_repo
     assert!(node.instance_disposal().is_none());
     assert_eq!(count(&node, "LOCAL_DATA_PROVIDER disposed"), 0);
     assert!(node
+        .external_pending()
+        .iter()
+        .any(|effect| matches!(effect.effect, ra::Effect::RequestReportRetry)));
+    let closed = node.snapshot(body.unit.id.guid.0).committed.unwrap();
+    assert_eq!(closed.fm_stage, ra::FmStage::ReplicaDown);
+    assert!(!closed.local_deleted && !closed.cleanup_pending);
+    assert!(!node
         .external_pending()
         .iter()
         .any(|effect| matches!(effect.effect, ra::Effect::StatefulClosePending { .. })));

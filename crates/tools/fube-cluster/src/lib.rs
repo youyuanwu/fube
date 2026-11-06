@@ -326,7 +326,7 @@ impl Cluster {
                 if owner != Owner::Fm {
                     return Err("FMM report unsupported".into());
                 }
-                let response = self.ledger.placements[index].report(&body)?;
+                let response = self.ledger.report(index, &body)?;
                 let Some(response) = response else {
                     if let Some(handoff) = incoming.handoff.as_mut() {
                         handoff.acknowledge();

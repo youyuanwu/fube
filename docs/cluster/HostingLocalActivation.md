@@ -231,7 +231,12 @@ reporting rather than synthesizing an ACK. Normal FM `DeleteReplica` now
 drives committed real RAP Close and returns a native canonical
 `DeleteReplicaReply` only after disposal. FM additionally requires the original
 Node's Applied-Close/exact-H2-release proof. Normal Delete creates no terminal
-report obligation; spontaneous Close/app-host-loss reporting remains staged.
+report obligation. Original FM singleton AppHostDown now retains native
+ReplicaDown stage and sends a canonical dropped ReplicaUp entry, including
+lease-loss fencing. A committed eligible ReplicaUpReply clears that reporting
+owner and can delete the already closed FT; it never creates original-runtime
+disposal proof or permission to recreate. Other local Close/Drop and closed-
+AddPrimary reporting remain staged.
 Stateful force deletion/reconfiguration, replacement/reopen, FMM and recovery
 remain gated; local profiles still reject network deletion.
 
@@ -239,8 +244,10 @@ Real foreground/channel tests exercise exact semantic completion, a lost reply
 and original-lifetime retry, public acknowledged write/readback, normal FM
 deletion, lost deletion replies and physical cleanup. Held provider and service
 disposal each prevent Close completion, deletion replies and usage release.
-A separate real-process lease-loss test observes hard fencing and
-retained terminal reporting without claiming graceful destructor receipts.
+A separate real-process lease-loss test observes hard fencing and retained
+down-stage reporting without claiming graceful destructor receipts. Real-channel
+compositions exercise canonical processed-list ACKs, lost-ACK retry and
+metadata-only deletion while independently checking sibling service.
 
 ## Ownership and usage
 
