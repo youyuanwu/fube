@@ -375,6 +375,8 @@ impl Node {
             && !matches!(
                 work,
                 FmWork::DeleteReplica(..)
+                    | FmWork::ReplicaUpReply(..)
+                    | FmWork::RetryReport(_)
                     | FmWork::ServiceTypeReply(..)
                     | FmWork::CaptureServiceTypeWork(_)
                     | FmWork::CompleteServiceTypeWork(_)
@@ -420,6 +422,32 @@ impl Node {
                 self.admit_fm(source, generation)?;
             }
             _ => {}
+        }
+        if !stateless {
+            match &work {
+                FmWork::RetryReport(unit) => {
+                    if self
+                        .selected
+                        .as_ref()
+                        .is_none_or(|body| &body.unit.id != unit)
+                    {
+                        return Err(Error::Unsupported);
+                    }
+                }
+                FmWork::ReplicaUpReply(body, ..) => {
+                    let info = body.replicas.0.first().or_else(|| body.dropped.0.first());
+                    if body.last
+                        || body.from_fmm
+                        || body.replicas.0.len() + body.dropped.0.len() != 1
+                        || self.selected.as_ref().is_none_or(|selected| {
+                            info.is_none_or(|info| info.unit.id != selected.unit.id)
+                        })
+                    {
+                        return Err(Error::Unsupported);
+                    }
+                }
+                _ => {}
+            }
         }
         self.enqueue(Work::Fm(work))
     }

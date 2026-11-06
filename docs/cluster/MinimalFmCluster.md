@@ -150,8 +150,55 @@ Failed/unknown commits cannot publish deletion completion or release.
 The deleted tombstone, app host, factory and package remain resident under
 their original owners; **stateful recreation stays rejected** even after
 verified deletion. Duplicate operator operations retain their original outcome.
-Spontaneous Close/app-host-loss reports remain separately staged, not
-acknowledged by this normal deletion slice.
+Normal deletion does not acknowledge unrelated terminal reporting escrow.
+
+### Unexpected singleton app-host loss
+
+The FM singleton profile now reports original app-host loss, including finite
+lease fencing, over real `ReplicaUp`/`ReplicaUpReply` delivery. Ordinary local
+Close/Drop and closed-AddPrimary reporting remain separately staged; local Idle
+and local-Primary profiles do not gain FM reporting authority.
+
+Pinned `FailoverUnit.cpp:5472-5544` and `FMMessageState.cpp:148-176` distinguish
+the state from its payload: AppHostDown calls OnReplicaDown(false, instance),
+retaining **ReplicaDown stage**, but the closed volatile FT has a fresh dropped
+description in ReplicaUp's **dropped list** (`FailoverUnit.cpp:4015-4050,5806-5856`).
+Publication and the exact original H2 release remain behind the actual Close
+commit. A store veto/unknown outcome cannot release usage or publish the report.
+
+FM processes that exact original report as lost volatile state, not operator
+deletion. `ReplicaUpdateTask.cpp:68-93,302-337` returns it in the **processed
+list** of ReplicaUpReply, not an echo of the incoming dropped list.
+`ReconfigurationAgent.cpp:3325-3408` and `FailoverUnit.cpp:5734-5774` then clear
+only the eligible down-stage obligation. The canonical processed reply also
+authorizes native Delete of the already closed FT, producing DeleteReplicaReply;
+a dropped-list reply instead uses closed ForceDelete without that reply.
+This metadata-only follow-up does not enable force deletion of a live replica.
+
+The owned stateful adapter requests its first report immediately and retries
+unacknowledged reports at the pinned default 30-second FMMessageRetryInterval
+(`common/FailoverConfig.h:398-410`), retaining the original lifetime and captured
+work. This fixed single-FT scheduler does not add dynamic FM configuration,
+native jitter or a general multi-FT batching scheduler. Wrong incarnation,
+up-state, epoch or session replies cannot clear this bounded original-profile
+obligation. Failed/unknown acknowledgment commits retain the original state,
+retry owner and queued work; duplicates acquire no second use.
+
+Status exposes `observed: "lost"` with no endpoint, while desired placement
+remains separate. `loss_reported` records FM processing and
+`native_replica_deleted` records the later native metadata reply.
+Neither means original-runtime disposal, an `absent` observation, a retirement
+receipt, recovered data or permission to recreate. FM can retry normal
+DeleteReplica for the same lost closed lifetime until that metadata reply,
+without completing an operator deletion lacking its independent disposal proof.
+The original Activation still owns physical cleanup.
+
+Real-process/channel tests cover app crash and lease expiry, public acknowledged
+write/readback before loss, a genuinely lost acknowledgment and the 30-second
+retry, stale/duplicate replies and an independently serving sibling. Hard exit
+does not manufacture provider/service destructor receipts. These are native-free
+composition tests with selected trusted premises, not deployed native handler
+or Federation-interoperability qualification.
 
 ## Shutdown and restart safety
 

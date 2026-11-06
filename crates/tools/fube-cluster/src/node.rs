@@ -33,6 +33,19 @@ enum SemanticAck {
     Report(ReplicaUp),
 }
 const REPORT_RETRY: Duration = Duration::from_secs(15);
+const LOSS_REPORT_RETRY: Duration = Duration::from_secs(30);
+
+fn report_retry(node: &Node, entity: ra::EntityId) -> Duration {
+    if node
+        .snapshot(entity)
+        .committed
+        .is_some_and(|state| state.fm_primary)
+    {
+        LOSS_REPORT_RETRY
+    } else {
+        REPORT_RETRY
+    }
+}
 
 fn report_cleared(node: &Node, entity: ra::EntityId) -> bool {
     let snapshot = node.snapshot(entity);
@@ -81,6 +94,14 @@ impl Adapter {
             let delay = match &dispatch.effect {
                 ra::Effect::RequestServiceTypeWork { after_ticks, .. }
                 | ra::Effect::ArmServiceTypeRetry { after_ticks, .. } => ticks(*after_ticks),
+                ra::Effect::RequestReportRetry
+                    if node
+                        .snapshot(dispatch.entity)
+                        .committed
+                        .is_some_and(|s| s.fm_primary) =>
+                {
+                    Duration::ZERO
+                }
                 ra::Effect::RequestReportRetry => REPORT_RETRY,
                 _ => Duration::ZERO,
             };
@@ -129,8 +150,11 @@ impl Adapter {
                             }
                         }
                         SemanticAck::Report(body) => {
-                            if self.report_pending.as_ref() == Some(&body)
-                                && body
+                            if self.report_pending.as_ref().is_some_and(|pending| {
+                                let sent = pending.dropped.0.first().or_else(|| pending.replicas.0.first());
+                                let ack = body.dropped.0.first().or_else(|| body.replicas.0.first());
+                                matches!((sent, ack), (Some(sent), Some(ack)) if sent.unit.id == ack.unit.id)
+                            }) && body
                                     .dropped
                                     .0
                                     .first()
@@ -156,7 +180,7 @@ impl Adapter {
                         item.sent = true;
                     } else {
                         item.submitted = None;
-                        item.due = Instant::now() + REPORT_RETRY;
+                        item.due = Instant::now() + report_retry(node, item.original.entity);
                     }
                 } else {
                     self.escrow.remove(index);
@@ -306,7 +330,7 @@ impl Adapter {
                     link.send(replica_up_message(body, Owner::Fm).map_err(err)?)
                         .await?;
                     self.escrow.remove(index);
-                    self.finish_report_pass(entity, REPORT_RETRY);
+                    self.finish_report_pass(entity, report_retry(node, entity));
                     return Ok(());
                 }
                 _ => continue, // Unsupported original work remains retained.
@@ -994,8 +1018,13 @@ pub(crate) mod report_tests {
                     )
                     .await?;
                 }
-                "AddInstanceReply" => {
-                    let (body, _) = decode_add_instance_reply(&incoming.message).map_err(err)?;
+                action @ ("AddInstanceReply" | "AddPrimaryReply") => {
+                    let (body, _) = if action == "AddPrimaryReply" {
+                        decode_add_primary_reply(&incoming.message)
+                    } else {
+                        decode_add_instance_reply(&incoming.message)
+                    }
+                    .map_err(err)?;
                     if body.error != 0
                         || body.replica.state != 2
                         || body.replica.node != launch.node
@@ -1016,8 +1045,13 @@ pub(crate) mod report_tests {
                     }
                     traffic.reports.push(body);
                 }
-                "RemoveInstanceReply" => {
-                    let (body, _) = decode_remove_instance_reply(&incoming.message).map_err(err)?;
+                action @ ("RemoveInstanceReply" | "DeleteReplicaReply") => {
+                    let (body, _) = if action == "DeleteReplicaReply" {
+                        decode_delete_replica_reply(&incoming.message)
+                    } else {
+                        decode_remove_instance_reply(&incoming.message)
+                    }
+                    .map_err(err)?;
                     if body.error != 0 || body.replica.state != 3 {
                         return Err("real removal did not dispose the instance".into());
                     }
@@ -1510,16 +1544,290 @@ pub(crate) mod report_tests {
         Ok(())
     }
 
+    async fn data_request(endpoint: &str, command: &[u8]) -> Result<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut socket = tokio::net::TcpStream::connect(endpoint)
+                .await
+                .map_err(err)?;
+            socket.write_all(command).await.map_err(err)?;
+            let mut response = String::new();
+            socket
+                .take(512)
+                .read_to_string(&mut response)
+                .await
+                .map_err(err)?;
+            Ok(response)
+        })
+        .await
+        .map_err(err)?
+    }
+
+    async fn exercise_stateful_loss(
+        launch: &Launch,
+        node: &mut Node,
+        adapter: &mut Adapter,
+        fm: &Link,
+        link: &Link,
+        ledger: &mut crate::fm::Ledger,
+        lease_loss: bool,
+    ) -> Result<()> {
+        use crate::fm::{Accepted, Bootstrap, Command, Observed};
+        let index = usize::from(launch.placement - 1);
+        ledger.placements[index].bootstrap = Bootstrap::Metadata;
+        ledger.placements[index].admit_profile(actual_profile(node)?)?;
+        let Accepted::Create(_, body) = ledger.accept(Command {
+            op: "loss-primary".into(),
+            action: "create".into(),
+            node: Some(launch.placement),
+        })?
+        else {
+            return Err("original Primary create not accepted".into());
+        };
+        let entity = body.unit.id.guid.0;
+        let mut traffic = Traffic::default();
+        fm.send(add_primary_message(&body, &launch.generation).map_err(err)?)
+            .await?;
+        until(
+            launch,
+            node,
+            adapter,
+            fm,
+            link,
+            &mut traffic,
+            |_, _, traffic| traffic.added,
+        )
+        .await?;
+        ledger.reply(
+            index,
+            traffic.add_reply.clone().ok_or("missing Primary reply")?,
+            false,
+        )?;
+        let endpoint = ledger.placements[index]
+            .endpoint
+            .clone()
+            .ok_or("missing Primary endpoint")?;
+        let ready_end = Instant::now() + Duration::from_secs(2);
+        loop {
+            let response = data_request(&endpoint, b"read\n").await?;
+            if response.starts_with("OK ") {
+                break;
+            }
+            if response != "ERR NotPrimary\n" || Instant::now() >= ready_end {
+                return Err(format!("public Primary readiness failed: {response}"));
+            }
+            step(launch, node, adapter, fm, link, &mut traffic).await?;
+        }
+        let written = data_request(&endpoint, b"write\n").await?;
+        if !written.contains("assigned=1 applied=1 committed=1 value=acknowledged")
+            || data_request(&endpoint, b"read\n").await? != written
+        {
+            return Err("independent public write/readback did not complete".into());
+        }
+        if lease_loss {
+            node.activation()
+                .host_lease()
+                .ok_or("missing original lease")?
+                .stop_renewal();
+        }
+        until(
+            launch,
+            node,
+            adapter,
+            fm,
+            link,
+            &mut traffic,
+            |_, _, traffic| !traffic.reports.is_empty(),
+        )
+        .await?;
+        let report = traffic.reports[0].clone();
+        let state = node
+            .snapshot(entity)
+            .committed
+            .ok_or("lost FT disappeared")?;
+        if state.phase != ra::Phase::Closed
+            || state.fm_stage != ra::FmStage::ReplicaDown
+            || state.local_deleted
+            || node.retained_usage() != 0
+            || node.instance_disposal().is_some()
+            || adapter.report_pending.as_ref() != Some(&report)
+        {
+            return Err("loss did not retain the exact native Down reporting owner".into());
+        }
+        let reply = ledger
+            .report(index, &report)?
+            .ok_or("loss report was not processed")?;
+        if reply.replicas != report.dropped
+            || !reply.dropped.0.is_empty()
+            || ledger.placements[index].observed != Observed::Lost
+            || ledger.placements[index].retirement.is_some()
+        {
+            return Err("FM did not process loss into the native processed list".into());
+        }
+        if timer(adapter)?
+            .due
+            .saturating_duration_since(Instant::now())
+            < Duration::from_secs(25)
+        {
+            return Err(
+                "stateful report retry did not retain the native 30-second interval".into(),
+            );
+        }
+        for stale in 0..3 {
+            let mut invalid = reply.clone();
+            let info = &mut invalid.replicas.0[0];
+            match stale {
+                0 => info.replicas.0[0].description.up = true,
+                1 => info.replicas.0[0].description.instance -= 1,
+                _ => info.unit.current.configuration -= 1,
+            }
+            acknowledge_without_sending_captured_report(launch, node, adapter, fm, link, &invalid)
+                .await?;
+            adapter.advance(node, Some(link)).await?;
+            if node
+                .snapshot(entity)
+                .committed
+                .is_none_or(|s| s.fm_stage != ra::FmStage::ReplicaDown)
+                || adapter.report_pending.is_none()
+                || node.instance_disposal().is_some()
+            {
+                return Err("stale ACK retired the original loss obligation".into());
+            }
+        }
+        if lease_loss {
+            // Intentionally lose the first valid ACK; run the actual native-default timer.
+            let retry_end = Instant::now() + Duration::from_secs(35);
+            while traffic.reports.len() == 1 {
+                if Instant::now() >= retry_end {
+                    return Err("lost ACK did not retry".into());
+                }
+                step(launch, node, adapter, fm, link, &mut traffic).await?;
+            }
+            if traffic.reports[1] != report || node.retained_usage() != 0 {
+                return Err("retry changed lifetime or acquired another use".into());
+            }
+        }
+        fm.send(replica_up_reply_message(&reply, &launch.generation).map_err(err)?)
+            .await?;
+        until(
+            launch,
+            node,
+            adapter,
+            fm,
+            link,
+            &mut traffic,
+            |node, adapter, traffic| traffic.removed && adapter.replica_drained(node),
+        )
+        .await?;
+        let state = node
+            .snapshot(entity)
+            .committed
+            .ok_or("closed FT disappeared")?;
+        if state.fm_stage != ra::FmStage::None
+            || !state.local_deleted
+            || !state.cleanup_pending
+            || node.instance_disposal().is_some()
+            || node.retained_usage() != 0
+        {
+            return Err("native loss ACK did not delete only the closed metadata".into());
+        }
+        ledger.reply(
+            index,
+            traffic
+                .remove_reply
+                .clone()
+                .ok_or("missing native DeleteReplicaReply")?,
+            true,
+        )?;
+        if ledger.placements[index].observed != Observed::Lost
+            || ledger.placements[index].reusable
+            || ledger.placements[index].retirement.is_some()
+        {
+            return Err("native deletion was mistaken for disposal/recovery".into());
+        }
+        let before = traffic.reports.len();
+        fm.send(replica_up_reply_message(&reply, &launch.generation).map_err(err)?)
+            .await?;
+        for _ in 0..20 {
+            step(launch, node, adapter, fm, link, &mut traffic).await?;
+        }
+        if traffic.reports.len() != before
+            || !adapter.replica_drained(node)
+            || node.instance_disposal().is_some()
+        {
+            return Err("duplicate ACK resurrected report work or disposal proof".into());
+        }
+        if ledger
+            .accept(Command {
+                op: "replacement".into(),
+                action: "create".into(),
+                node: Some(launch.placement),
+            })
+            .is_ok()
+        {
+            return Err("loss authorized replacement".into());
+        }
+        let logs = node.activation().logs().join("\n");
+        if logs.contains("LOCAL_DATA_PROVIDER disposed") || logs.contains("LOCAL_DISPOSE complete")
+        {
+            return Err("hard process loss fabricated graceful destructor receipts".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn run_stateful_loss(
+        launch: &Launch,
+        ledger: &mut crate::fm::Ledger,
+        lease_loss: bool,
+    ) -> Result<Result<()>> {
+        let (mut node, store) = create_node(launch).await?;
+        let mut adapter = Adapter::default();
+        let result = async {
+            let args = if lease_loss {
+                "--stateful-primary"
+            } else {
+                "--stateful-primary --crash-after-ms 5000"
+            };
+            node.start(
+                &launch.package,
+                APPLICATION,
+                &[("Arguments".into(), args.into())],
+            )
+            .map_err(err)?;
+            let (fm, link) = links(launch).await?;
+            let result = exercise_stateful_loss(
+                launch,
+                &mut node,
+                &mut adapter,
+                &fm,
+                &link,
+                ledger,
+                lease_loss,
+            )
+            .await;
+            let fm_closed = fm.close().await;
+            let node_closed = link.close().await;
+            result.and(fm_closed).and(node_closed)
+        }
+        .await;
+        cleanup(launch, &mut node, &store, &mut adapter).await?;
+        Ok(result)
+    }
+
     pub(crate) async fn run(launch: &Launch) -> Result<Result<()>> {
         run_case(launch, false).await
     }
     pub(crate) async fn run_reuse(launch: &Launch) -> Result<Result<()>> {
         run_case(launch, true).await
     }
-    async fn run_case(launch: &Launch, reuse: bool) -> Result<Result<()>> {
+    async fn create_node(launch: &Launch) -> Result<(Node, Arc<Store>)> {
         private_dir(&launch.directory)?;
         private_dir(&launch.directory.join("hosting"))?;
         let mut options = Options::new(launch.directory.join("hosting"));
+        if launch.profile == crate::ServiceProfile::StatefulSingleton {
+            options.profile = fube_hosting::local::Profile::VolatileStatefulFmPrimary;
+            options.lease_duration = Duration::from_secs(2);
+        }
         options.node = Some(NodeContext {
             id: node_hex(&launch.node),
             instance: launch.node.instance,
@@ -1530,7 +1838,7 @@ pub(crate) mod report_tests {
                 .await
                 .map_err(err)?,
         );
-        let mut node = Node::new(
+        let node = Node::new(
             Activation::new(options).map_err(err)?,
             store.clone(),
             ra::Admission {
@@ -1552,6 +1860,10 @@ pub(crate) mod report_tests {
             },
         )
         .map_err(err)?;
+        Ok((node, store))
+    }
+    async fn run_case(launch: &Launch, reuse: bool) -> Result<Result<()>> {
+        let (mut node, store) = create_node(launch).await?;
         let mut adapter = Adapter::default();
         let result = async {
             node.start(&launch.package, APPLICATION, &[]).map_err(err)?;

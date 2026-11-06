@@ -412,6 +412,12 @@ barriers and original-lifetime action retry. Normal DeleteReplica/Reply now
 uses the same original lifetime, committed Close, held provider/service disposal
 and exact original H2 release. Lost deletion replies retry without recreation;
 FM requires both semantic completion and the source-bound Node disposal proof.
+Original singleton app-host loss now also has real ReplicaUp/Reply delivery:
+native Down stage with a dropped payload, processed-list ACK and closed-FT
+metadata deletion, never a graceful-disposal or recovery receipt. Focused
+`fm_stateful_loss`, `stateful_loss_is` and `stateful_app_loss` cases cover actual
+commit veto/unknown outcomes, real app crash/lease expiry, stale/duplicate ACKs,
+the native-default 30-second lost-ACK retry and independent sibling data.
 Run the `fube-cluster` unit and
 foreground targets as well as RA protocol/entity and local-app lifecycle tests.
 Archived tests require both fixed app binaries; the nextest inventory declares

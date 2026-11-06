@@ -49,6 +49,21 @@ remain explicitly gated. `quit` uses the original
 owned local cleanup path, retaining terminal stateful reporting as pending
 escrow rather than manufacturing ReplicaUp acknowledgments.
 
+Unexpected original singleton app-host loss (including lease fencing) now sends
+non-final ReplicaUp with a canonical dropped entry while RA retains native
+ReplicaDown stage. FM replies in the processed list and status becomes `lost`,
+with no endpoint; it does not become `absent` or reusable. The stateful report
+retry uses the native default 30-second interval, stopping only after committed
+semantic processing or independently authorized deletion.
+
+Native ACK processing can delete the already closed FT and send
+DeleteReplicaReply; `native_replica_deleted` is metadata completion, **not**
+original-runtime disposal or recovered volatile data. Missing native cleanup
+replies can trigger normal DeleteReplica retries for that same closed lifetime.
+`loss_reported` and native deletion never supply a retirement receipt or permit
+recreation. Other local Close/Drop and closed-AddPrimary reporting stays staged.
+See [source semantics and qualification limits](../../../docs/cluster/MinimalFmCluster.md#unexpected-singleton-app-host-loss).
+
 The root is operator-owned and private (0700). Its parent must already exist.
 All materialized packages, runtime roots, node controls and scratch stay beneath
 it. Only trusted numeric-loopback communication is supported. There is no
@@ -168,3 +183,8 @@ retry, native retry-interval boundaries, FM normal deletion with both disposal
 barriers, a lost DeleteReplicaReply, independent sibling contact and gated
 force deletion/recreation. The
 archive includes both fixed app binaries; no consumer-side build fallback exists.
+Owned app-crash/lease-loss compositions additionally exercise real FM channels,
+native processed-versus-dropped reply semantics, a lost ACK with the actual
+30-second retry, metadata-only DeleteReplicaReply and unaffected sibling data.
+They retain their selected trusted construction premises rather than claiming
+full native handler execution or unexpected-loss CLI/Federation parity.

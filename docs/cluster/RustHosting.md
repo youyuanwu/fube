@@ -21,6 +21,10 @@ the production Node/RA/RAP.
 It preserves the original finite lease/accounting/cleanup boundaries and does
 not widen local profiles or enable force deletion, stateful recreation,
 reconfiguration or recovery.
+Original FM singleton app-host loss now converges through committed
+ReplicaUp/Reply reporting and closed-FT metadata deletion, separately from
+original Activation cleanup and graceful disposal proof; other terminal
+reporting remains staged.
 [`fube-hosting`](../../crates/libs/fube-hosting/src/lib.rs) provides
 a native-derived, deterministically driven core plus a separately owned local
 IPC service, not a complete running node. H1's original model evidence is not

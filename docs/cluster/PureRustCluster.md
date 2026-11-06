@@ -91,9 +91,11 @@ independent acknowledged application write/readback. Each configured node hosts
 one independent singleton lifetime, not a multi-replica set.
 Normal FM DeleteReplica/Reply now retires that same lifetime through committed
 RAP Close and separately joined original disposal/accounting proof. The deleted
-tombstone remains nonreusable. Stateful force deletion/recreation, spontaneous
-terminal-report delivery, reconfiguration/peer control, recovery and complete
-P4/M2 remain staged.
+tombstone remains nonreusable. Original singleton AppHostDown reporting now
+delivers ReplicaUp/Reply with native down-stage/dropped-payload and processed-
+reply semantics. FM exposes lost volatile data, not recovered/reusable state.
+Other terminal reporting, stateful force deletion/recreation, reconfiguration/
+peer control, recovery and complete P4/M2 remain staged.
 
 | Area | Decision |
 |---|---|

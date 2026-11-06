@@ -1644,6 +1644,207 @@ fn ack(mut report: ReplicaUp, in_dropped: bool) -> Command {
 }
 
 #[tokio::test]
+async fn fm_stateful_loss_reports_dropped_with_down_stage_and_follows_native_ack_lists() {
+    for in_dropped in [false, true] {
+        let (store, executor, hooks) = setup(WAIT).await;
+        let request = primary_body();
+        make_ready(&executor, &request).await;
+        let host = state(&executor).runtime.as_ref().unwrap().host.clone();
+        run(
+            &executor,
+            Command::HostDown(Box::new(HostDown {
+                unit: request.unit.id.clone(),
+                host,
+            })),
+        )
+        .await;
+        let closed = state(&executor);
+        assert_eq!(
+            (closed.phase, closed.fm_stage),
+            (Phase::Closed, FmStage::ReplicaDown)
+        );
+        assert!(!closed.local_deleted && !closed.cleanup_pending);
+        assert!(closed.runtime.is_none() && closed.usage.is_none());
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [
+                Effect::ReleaseRegistration(_),
+                Effect::ReleaseUsage { .. },
+                Effect::RequestReportRetry,
+                Effect::Health(HealthEvent::Close)
+            ]
+        ));
+        run(&executor, Command::RetryReport(request.unit.id.clone())).await;
+        let Effect::ReplicaUp(report) = effects(&executor).remove(0) else {
+            panic!("native report");
+        };
+        assert!(report.replicas.0.is_empty() && !report.last && !report.from_fmm);
+        let info = &report.dropped.0[0];
+        assert_eq!(
+            info.replicas.0[0].description,
+            Replica {
+                node: admission().local_node,
+                id: request.replica.id,
+                instance: request.replica.instance,
+                state: 3,
+                up: false,
+                ..Replica::default()
+            }
+        );
+        assert!(!info.local_deleted && !info.report_from_primary);
+        assert_eq!(info.intermediate, Epoch::default());
+        let pending = state(&executor);
+        for stale in 0..5 {
+            let mut invalid = (*report).clone();
+            let info = &mut invalid.dropped.0[0];
+            match stale {
+                0 => info.replicas.0[0].description.up = true,
+                1 => info.replicas.0[0].description.instance -= 1,
+                2 => info.replicas.0[0].description.node.instance += 1,
+                3 => info.unit.current.configuration -= 1,
+                _ => info.replicas.0[0].description.id += 1,
+            }
+            assert_eq!(
+                run(&executor, ack(invalid, in_dropped)).await,
+                Disposition::IgnoredStale
+            );
+            assert!(Arc::ptr_eq(&pending, &state(&executor)));
+            assert!(effects(&executor).is_empty());
+        }
+        run(&executor, ack((*report).clone(), in_dropped)).await;
+        assert_eq!(
+            (state(&executor).phase, state(&executor).fm_stage),
+            (Phase::Closed, FmStage::None)
+        );
+        assert!(state(&executor).local_deleted && state(&executor).cleanup_pending);
+        let terminal = effects(&executor);
+        if in_dropped {
+            assert!(terminal.is_empty()); // Closed ForceDelete has no semantic reply.
+        } else {
+            assert!(
+                matches!(terminal.as_slice(), [Effect::DeleteReplicaReply(body)]
+                if body.error == 0 && body.replica == info.replicas.0[0].description)
+            );
+        }
+        let writes = operations(&hooks).len();
+        run(&executor, ack((*report).clone(), in_dropped)).await;
+        assert_eq!(operations(&hooks).len(), writes);
+        assert!(effects(&executor)
+            .iter()
+            .all(|effect| matches!(effect, Effect::DeleteReplicaReply(_))));
+        assert_eq!(
+            run(&executor, Command::RetryReport(request.unit.id.clone())).await,
+            Disposition::IgnoredPending
+        );
+        assert!(effects(&executor).is_empty());
+        assert!(matches!(
+            executor
+                .submit(primary_add(request))
+                .unwrap()
+                .wait(WAIT)
+                .await,
+            Err(Failure::Unsupported(_))
+        ));
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn fm_stateful_loss_and_ack_keep_private_proposals_until_actual_commit_resolution() {
+    for ack_stage in [false, true] {
+        for (unknown, fail) in [(false, true), (true, false), (true, true)] {
+            let (store, executor, hooks) = setup(if unknown {
+                Duration::from_millis(50)
+            } else {
+                WAIT
+            })
+            .await;
+            let request = primary_body();
+            make_ready(&executor, &request).await;
+            let host = state(&executor).runtime.as_ref().unwrap().host.clone();
+            let loss = || {
+                Command::HostDown(Box::new(HostDown {
+                    unit: request.unit.id.clone(),
+                    host: host.clone(),
+                }))
+            };
+            let report = if ack_stage {
+                run(&executor, loss()).await;
+                effects(&executor);
+                run(&executor, Command::RetryReport(request.unit.id.clone())).await;
+                let Effect::ReplicaUp(report) = effects(&executor).remove(0) else {
+                    panic!("report");
+                };
+                Some(report)
+            } else {
+                None
+            };
+            let command = || match &report {
+                Some(report) => ack((**report).clone(), false),
+                None => loss(),
+            };
+            let old = state(&executor);
+            let writes = operations(&hooks).len();
+            let (entered, release) = hooks.pause(fail);
+            let original = executor.submit(command()).unwrap();
+            entered.await.unwrap();
+            assert!(Arc::ptr_eq(&old, &state(&executor)));
+            assert!(effects(&executor).is_empty());
+            let queued = if unknown && !fail {
+                Some(executor.submit(command()).unwrap())
+            } else {
+                None
+            };
+            if unknown {
+                assert_eq!(original.wait(WAIT).await, Err(Failure::Unknown));
+                assert!(executor.snapshot([1; 16]).fenced);
+                if let Some(queued) = &queued {
+                    assert_eq!(queued.status(), Status::Pending);
+                }
+                assert!(effects(&executor).is_empty());
+            }
+            assert_eq!(operations(&hooks).len(), writes + 1);
+            release.send(()).unwrap();
+            let result = original.resolve(WAIT).await;
+            if fail {
+                assert!(matches!(result, Err(Failure::Store(_))));
+                assert!(Arc::ptr_eq(&old, &state(&executor)));
+                assert!(effects(&executor).is_empty());
+            } else {
+                assert_eq!(result, Ok(Disposition::Applied));
+                queued.unwrap().resolve(WAIT).await.unwrap();
+                let actions = executor.take_effects();
+                assert_eq!(actions[0].operation, original.id);
+                if ack_stage {
+                    assert!(state(&executor).local_deleted);
+                    assert_eq!(state(&executor).fm_stage, FmStage::None);
+                    assert!(actions
+                        .iter()
+                        .all(|effect| matches!(effect.effect, Effect::DeleteReplicaReply(_))));
+                } else {
+                    assert_eq!(state(&executor).fm_stage, FmStage::ReplicaDown);
+                    assert_eq!(
+                        actions
+                            .iter()
+                            .filter(|effect| matches!(effect.effect, Effect::ReleaseUsage { .. }))
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        actions
+                            .iter()
+                            .filter(|effect| matches!(effect.effect, Effect::RequestReportRetry))
+                            .count(),
+                        1
+                    );
+                }
+            }
+            finish(&store, &executor).await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn native_stateful_delete_uses_original_epoch_id_and_canonical_reply_without_report_ack() {
     let (store, executor, hooks) = setup(WAIT).await;
     let request = primary_body();

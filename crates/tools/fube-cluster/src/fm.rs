@@ -44,6 +44,7 @@ pub enum Observed {
     Absent,
     Pending,
     Running,
+    Lost,
     Unknown,
     Error,
 }
@@ -80,6 +81,7 @@ pub struct Placement {
     pub retired: Vec<(i64, i64)>,
     pub reusable: bool,
     pub retirement: Option<RetirementReceipt>,
+    pub loss_reported: bool,
     remove_received: bool,
     pending: Option<PendingPhase>,
     action_updated_at: Option<Instant>,
@@ -121,6 +123,7 @@ impl Placement {
             retired: vec![],
             reusable: false,
             retirement: None,
+            loss_reported: false,
             remove_received: false,
             pending: None,
             action_updated_at: None,
@@ -207,6 +210,18 @@ impl Placement {
                     return Ok(None);
                 }
                 exact_replica(&expected.replica, replica, true)?;
+                if self.launch.profile == crate::ServiceProfile::StatefulSingleton {
+                    if !dropped
+                        || replica != &dropped_replica(&expected.replica)
+                        || info.local_deleted
+                        || info.report_from_primary
+                        || info.intermediate != Epoch::default()
+                        || info.replicas.0[0].intermediate_role != 1
+                    {
+                        return Err("unsupported stateful loss report".into());
+                    }
+                    continue;
+                }
                 if dropped {
                     // This ephemeral FM can semantically forget the exact
                     // dropped instance only after desired deletion. Unexpected
@@ -218,6 +233,13 @@ impl Placement {
                     return Err("unsupported normal report semantics".into());
                 }
             }
+        }
+        if self.launch.profile == crate::ServiceProfile::StatefulSingleton {
+            // Native ProcessDroppedReplica's result is processed_, not dropped_.
+            return Ok(Some(ReplicaUp {
+                replicas: body.dropped.clone(),
+                ..ReplicaUp::default()
+            }));
         }
         Ok(Some(ReplicaUp {
             replicas: ObjectArray(body.replicas.0.clone()),
@@ -239,9 +261,20 @@ impl Placement {
             "catalog_notified": self.catalog_notified,
             "reusable":self.reusable, "retired_lifetimes":self.retired.len(),
             "retirement":self.retirement,
+            "loss_reported":self.loss_reported, "native_replica_deleted":self.remove_received,
             "app_pid": self.profile.as_ref().map(|p| p.app_pid),
             "runtime_root": self.profile.as_ref().map(|p| &p.runtime_root),
         })
+    }
+}
+fn dropped_replica(replica: &Replica) -> Replica {
+    Replica {
+        node: replica.node.clone(),
+        id: replica.id,
+        instance: replica.instance,
+        up: false,
+        state: 3,
+        ..Replica::default()
     }
 }
 fn exact_replica(expected: &Replica, actual: &Replica, canonical: bool) -> Result<()> {
@@ -262,6 +295,35 @@ fn exact_replica(expected: &Replica, actual: &Replica, canonical: bool) -> Resul
     Ok(())
 }
 impl Ledger {
+    pub fn report(&mut self, index: usize, body: &ReplicaUp) -> Result<Option<ReplicaUp>> {
+        if !self.placements[index].link_alive {
+            return Err("report requires the original live node session".into());
+        }
+        let response = self.placements[index].report(body)?;
+        let placement = &mut self.placements[index];
+        if response.is_some()
+            && placement.bootstrap == Bootstrap::Admitted
+            && placement.launch.profile == crate::ServiceProfile::StatefulSingleton
+        {
+            if !placement.loss_reported {
+                placement.action_updated_at = Some(Instant::now());
+            }
+            placement.loss_reported = true;
+            placement.observed = Observed::Lost;
+            placement.endpoint = None;
+            placement.reusable = false;
+            let error = "original volatile singleton lost; no recovery or replacement";
+            placement.error = Some(error.into());
+            if placement.pending == Some(PendingPhase::Create) {
+                placement.pending = None;
+            }
+            let operations = [placement.create_op.clone(), placement.delete_op.clone()];
+            for op in operations.into_iter().flatten() {
+                self.complete(&op, json!({"op":op,"state":"lost","error":error}));
+            }
+        }
+        Ok(response)
+    }
     pub fn read_retirement(
         &mut self,
         index: usize,
@@ -327,6 +389,7 @@ impl Ledger {
                 placement.created = true;
                 placement.reusable = false;
                 placement.retirement = None;
+                placement.loss_reported = false;
                 placement.remove_received = false;
                 placement.delete_op = None;
                 placement.endpoint = None;
@@ -478,6 +541,20 @@ impl Ledger {
             &body.replica,
             removing && body.error == 0,
         )?;
+        if removing && placement.loss_reported {
+            if body.error != 0 {
+                placement.error = Some(format!("native loss cleanup error {}", body.error));
+                return Ok(());
+            }
+            if body.replica != dropped_replica(&expected.replica) {
+                return Err("loss cleanup reply is not the native dropped description".into());
+            }
+            // Native ACK processing deletes the closed FT and sends DeleteReplicaReply.
+            // This confirms native metadata deletion, never original-runtime disposal.
+            placement.remove_received = true;
+            self.finish_delete(index);
+            return Ok(());
+        }
         let op = if removing {
             &placement.delete_op
         } else {
@@ -492,15 +569,7 @@ impl Ledger {
                     return Err("Remove reply is not the requested disposed instance".into());
                 }
                 if placement.launch.profile == crate::ServiceProfile::StatefulSingleton
-                    && body.replica
-                        != (Replica {
-                            node: expected.replica.node.clone(),
-                            id: expected.replica.id,
-                            instance: expected.replica.instance,
-                            up: false,
-                            state: 3,
-                            ..Replica::default()
-                        })
+                    && body.replica != dropped_replica(&expected.replica)
                 {
                     return Err("DeleteReplica reply is not the native dropped description".into());
                 }
@@ -585,6 +654,9 @@ impl Ledger {
         if replica.id != placement.replica || replica.instance != placement.incarnation {
             return Err("unrecognized retirement lifetime".into());
         }
+        if placement.loss_reported {
+            return Err("volatile loss is not original-runtime disposal".into());
+        }
         if !placement.link_alive
             || placement.desired != Desired::Absent
             || placement.pending != Some(PendingPhase::Delete)
@@ -599,6 +671,7 @@ impl Ledger {
         let placement = &mut self.placements[index];
         if !placement.link_alive
             || placement.pending != Some(PendingPhase::Delete)
+            || placement.loss_reported
             || !placement.remove_received
             || placement.retirement.is_none()
         {
@@ -648,7 +721,8 @@ impl Ledger {
         let placement = &mut self.placements[index];
         if placement.launch.profile != crate::ServiceProfile::StatefulSingleton
             || !placement.link_alive
-            || placement.pending != Some(phase)
+            || (placement.pending != Some(phase)
+                && !(phase == PendingPhase::Delete && placement.loss_reported))
         {
             return Ok(None);
         }

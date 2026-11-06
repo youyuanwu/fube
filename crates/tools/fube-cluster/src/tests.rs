@@ -687,6 +687,119 @@ async fn stateful_delete_lost_reply_retries_original_lifetime_after_independent_
     assert!(!profile.runtime_root.exists());
 }
 
+fn stateful_loss_report(placement: &fm::Placement) -> ReplicaUp {
+    let body = placement.body().unwrap();
+    ReplicaUp {
+        dropped: ObjectArray(vec![FailoverUnitInfo {
+            unit: body.unit, service: body.service,
+            intermediate: Epoch::default(), report_from_primary: false,
+            replicas: ObjectArray(vec![ReplicaInfo {
+                description: remove_reply(placement).replica, intermediate_role: 1,
+            }]),
+            local_deleted: false,
+        }]),
+        ..ReplicaUp::default()
+    }
+}
+
+#[test]
+fn stateful_loss_is_processed_not_echoed_and_native_deletion_never_supplies_disposal_proof() {
+    for deleting in [false, true] {
+        let mut ledger = stateful_ledger();
+        ledger.accept(command("create", "create", Some(1))).unwrap();
+        ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
+        let original = ledger.placements[0].body().unwrap();
+        if deleting { ledger.accept(command("delete", "delete", Some(1))).unwrap(); }
+        let report = stateful_loss_report(&ledger.placements[0]);
+        for forged in 0..5 {
+            let mut invalid = report.clone();
+            let info = &mut invalid.dropped.0[0];
+            match forged {
+                0 => info.replicas.0[0].description.up = true,
+                1 => info.replicas.0[0].description.instance -= 1,
+                2 => info.replicas.0[0].description.current_role = 4,
+                3 => info.local_deleted = true,
+                _ => info.unit.current.configuration += 1,
+            }
+            assert!(ledger.report(0, &invalid).is_err());
+            assert!(!ledger.placements[0].loss_reported);
+        }
+        let ack = ledger.report(0, &report).unwrap().unwrap();
+        assert_eq!(ack.replicas, report.dropped);
+        assert!(ack.dropped.0.is_empty() && !ack.last && !ack.from_fmm);
+        assert_eq!(ledger.placements[0].observed, Observed::Lost);
+        assert_eq!(ledger.placements[0].desired, if deleting { Desired::Absent } else { Desired::Running });
+        assert!(ledger.placements[0].link_alive && ledger.placements[0].endpoint.is_none());
+        assert!(ledger.placements[0].retirement.is_none() && !ledger.placements[0].reusable);
+        assert_eq!(ledger.result("create")["state"], "lost");
+        let now = Instant::now();
+        assert!(ledger.deletion_retry(0, now + Duration::from_secs(9)).unwrap().is_none());
+        assert_eq!(ledger.deletion_retry(0, now + Duration::from_secs(11)).unwrap().unwrap(),
+            DeleteReplica::new(original, false));
+        ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
+        assert_eq!(ledger.placements[0].observed, Observed::Lost);
+        assert_eq!(ledger.report(0, &report).unwrap(), Some(ack));
+        let mut failed = ready_reply(&ledger.placements[0]);
+        failed.error = -7;
+        ledger.reply(0, failed, true).unwrap();
+        assert!(ledger.placements[0].error.as_ref().unwrap().contains("-7"));
+        assert_eq!(ledger.placements[0].status()["native_replica_deleted"], false);
+        ledger.reply(0, remove_reply(&ledger.placements[0]), true).unwrap();
+        ledger.reply(0, remove_reply(&ledger.placements[0]), true).unwrap();
+        assert_eq!(ledger.placements[0].status()["native_replica_deleted"], true);
+        assert!(ledger.deletion_retry(0, now + Duration::from_secs(200)).unwrap().is_none());
+        assert!(ledger.retirement(0, retirement(&ledger.placements[0]), 555).is_err());
+        assert_eq!(ledger.placements[0].observed, Observed::Lost);
+        assert!(!ledger.placements[0].reusable && ledger.placements[0].retirement.is_none());
+        assert!(ledger.placements[0].retired.is_empty());
+        assert!(ledger.accept(command("replacement", "create", Some(1))).is_err());
+        assert!(ledger.accept(command("fresh-delete", "delete", Some(1))).is_err());
+        if deleting { assert_eq!(ledger.result("delete")["state"], "lost"); }
+    }
+}
+
+#[tokio::test]
+async fn stateful_app_loss_and_lost_ack_retire_only_original_reporting_without_touching_sibling() {
+    for lease_loss in [false, true] {
+        let fixture = Fixture::new("stateful-loss");
+        let mut config = fixture.config();
+        config.profile = ServiceProfile::StatefulSingleton;
+        config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+        let mut cluster = Cluster::new(config).unwrap();
+        cluster.prepare().unwrap();
+        cluster.spawn(0).await.unwrap();
+        cluster.execute(command("sibling", "create", Some(1))).await.unwrap();
+        until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Running).await;
+        let sibling = cluster.ledger.placements[0].endpoint.clone().unwrap();
+        let sibling_pid = cluster.children[0].metadata.as_ref().unwrap().profile.as_ref().unwrap().app_pid;
+        let request = |command: &[u8]| {
+            let mut socket = TcpStream::connect(&sibling).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            socket.write_all(command).unwrap();
+            let mut response = String::new();
+            socket.take(512).read_to_string(&mut response).unwrap();
+            response
+        };
+        until(&mut cluster, |_| request(b"read\n").starts_with("OK ")).await;
+        let written = request(b"write\n");
+        assert!(written.contains("assigned=1 applied=1 committed=1 value=acknowledged"), "{written}");
+        let launch = cluster.ledger.placements[1].launch.clone();
+        let result = node::report_tests::run_stateful_loss(&launch, &mut cluster.ledger, lease_loss).await;
+        assert_eq!(request(b"read\n"), written);
+        cluster.children[0].process.as_mut().unwrap().check_alive().unwrap();
+        assert_eq!(cluster.children[0].metadata.as_ref().unwrap().profile.as_ref().unwrap().app_pid, sibling_pid);
+        let loss = cluster.ledger.placements[1].status();
+        assert_eq!(loss["observed"], "lost");
+        assert_eq!(loss["loss_reported"], true);
+        assert_eq!(loss["native_replica_deleted"], true);
+        assert_eq!(loss["reusable"], false);
+        assert!(loss["retirement"].is_null());
+        assert_eq!(cluster.shutdown().await["clean"], true);
+        assert!(gone(sibling_pid));
+        result.unwrap().unwrap();
+    }
+}
+
 fn gone(pid: u32) -> bool {
     !Path::new(&format!("/proc/{pid}")).exists()
 }
