@@ -23,8 +23,10 @@ not widen local profiles or enable force deletion, stateful recreation,
 reconfiguration or recovery.
 Original FM singleton app-host loss now converges through committed
 ReplicaUp/Reply reporting and closed-FT metadata deletion, separately from
-original Activation cleanup and graceful disposal proof; other terminal
-reporting remains staged.
+original Activation cleanup and graceful disposal proof. Graceful Close of the
+original FM singleton now also reports through the native Down-stage path after
+committed real RAP disposal and exact release; local-only profiles, Drop/Abort
+and closed-AddPrimary reporting remain unchanged/gated.
 [`fube-hosting`](../../crates/libs/fube-hosting/src/lib.rs) provides
 a native-derived, deterministically driven core plus a separately owned local
 IPC service, not a complete running node. H1's original model evidence is not

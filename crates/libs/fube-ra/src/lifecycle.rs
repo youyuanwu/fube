@@ -63,7 +63,7 @@ pub enum CloseMode {
     ForceAbort = 4,
     Drop = 5,
     AppHostDown = 6,
-    /// Native ordinary stateless Close (including matching RuntimeClosed).
+    /// Native ordinary Close (including matching RuntimeClosed).
     Close = 7,
 }
 #[derive(Serialize, Deserialize)]
@@ -207,7 +207,10 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
         if state.fm_primary {
             state.primary_deactivation = Some((Epoch::default(), -2));
         }
-        if state.fm_primary && mode == CloseMode::AppHostDown && !state.local_deleted {
+        if state.fm_primary
+            && matches!(mode, CloseMode::Close | CloseMode::AppHostDown)
+            && !state.local_deleted
+        {
             // Native OnReplicaDown(false, instance) retains ReplicaDown stage,
             // while the closed volatile FT is serialized in ReplicaUp's dropped list.
             state.fm_stage = FmStage::ReplicaDown;
@@ -915,7 +918,7 @@ pub(super) fn transition(
                 }
                 if info.service != current.body.service {
                     return Err(Failure::Unsupported(
-                        "stateful loss description changes are gated",
+                        "stateful down-report description changes are gated",
                     ));
                 }
             }

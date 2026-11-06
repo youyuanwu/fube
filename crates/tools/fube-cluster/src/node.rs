@@ -33,7 +33,7 @@ enum SemanticAck {
     Report(ReplicaUp),
 }
 const REPORT_RETRY: Duration = Duration::from_secs(15);
-const LOSS_REPORT_RETRY: Duration = Duration::from_secs(30);
+const STATEFUL_REPORT_RETRY: Duration = Duration::from_secs(30);
 
 fn report_retry(node: &Node, entity: ra::EntityId) -> Duration {
     if node
@@ -41,7 +41,7 @@ fn report_retry(node: &Node, entity: ra::EntityId) -> Duration {
         .committed
         .is_some_and(|state| state.fm_primary)
     {
-        LOSS_REPORT_RETRY
+        STATEFUL_REPORT_RETRY
     } else {
         REPORT_RETRY
     }
@@ -930,6 +930,14 @@ async fn cleanup(
 pub(crate) mod report_tests {
     use super::*;
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum StatefulDown {
+        Crash,
+        LeaseLoss,
+        CloseProvider,
+        CloseService,
+    }
+
     #[derive(Default)]
     struct Traffic {
         reports: Vec<ReplicaUp>,
@@ -1563,14 +1571,36 @@ pub(crate) mod report_tests {
         .map_err(err)?
     }
 
-    async fn exercise_stateful_loss(
+    fn release_disposal(node: &Node, mode: StatefulDown) -> Result<()> {
+        let application = &node
+            .activation()
+            .premise()
+            .ok_or("missing package")?
+            .package
+            .package
+            .application
+            .type_name;
+        let path = node
+            .activation()
+            .root()
+            .ok_or("missing owned root")?
+            .join(format!("deployment/{application}_App1/work"))
+            .join(if mode == StatefulDown::CloseProvider {
+                "local-provider-dispose.release"
+            } else {
+                "local-dispose.release"
+            });
+        fs::write(path, b"release original disposer").map_err(err)
+    }
+
+    async fn exercise_stateful_down(
         launch: &Launch,
         node: &mut Node,
         adapter: &mut Adapter,
         fm: &Link,
         link: &Link,
         ledger: &mut crate::fm::Ledger,
-        lease_loss: bool,
+        mode: StatefulDown,
     ) -> Result<()> {
         use crate::fm::{Accepted, Bootstrap, Command, Observed};
         let index = usize::from(launch.placement - 1);
@@ -1624,7 +1654,65 @@ pub(crate) mod report_tests {
         {
             return Err("independent public write/readback did not complete".into());
         }
-        if lease_loss {
+        let graceful = matches!(
+            mode,
+            StatefulDown::CloseProvider | StatefulDown::CloseService
+        );
+        let replication_endpoint = traffic
+            .add_reply
+            .as_ref()
+            .ok_or("missing original reply")?
+            .replica
+            .replication_endpoint
+            .clone();
+        let replication_address = replication_endpoint
+            .split_once('/')
+            .ok_or("replication endpoint lacks native actor suffix")?
+            .0;
+        if graceful {
+            node.close(body.unit.id.clone(), ra::CloseMode::Close)
+                .map_err(err)?;
+            let marker = if mode == StatefulDown::CloseProvider {
+                "LOCAL_DATA_PROVIDER dispose begin"
+            } else {
+                "LOCAL_DISPOSE begin"
+            };
+            until(
+                launch,
+                node,
+                adapter,
+                fm,
+                link,
+                &mut traffic,
+                |node, _, _| {
+                    node.activation()
+                        .logs()
+                        .iter()
+                        .any(|line| line.contains(marker))
+                },
+            )
+            .await?;
+            node.close(body.unit.id.clone(), ra::CloseMode::Close)
+                .map_err(err)?;
+            for _ in 0..20 {
+                step(launch, node, adapter, fm, link, &mut traffic).await?;
+            }
+            if node.snapshot(entity).committed.is_none_or(|state| {
+                state.phase != ra::Phase::Closing
+                    || state.usage.is_none()
+                    || state.fm_stage != ra::FmStage::None
+            }) || node.retained_usage() != 1
+                || node.instance_disposal().is_some()
+                || !traffic.reports.is_empty()
+                || traffic.removed
+                || adapter.report_pending.is_some()
+            {
+                return Err(
+                    "held graceful disposal published completion/report or released usage".into(),
+                );
+            }
+            release_disposal(node, mode)?;
+        } else if mode == StatefulDown::LeaseLoss {
             node.activation()
                 .host_lease()
                 .ok_or("missing original lease")?
@@ -1649,10 +1737,33 @@ pub(crate) mod report_tests {
             || state.fm_stage != ra::FmStage::ReplicaDown
             || state.local_deleted
             || node.retained_usage() != 0
-            || node.instance_disposal().is_some()
+            || node.instance_disposal().is_some() != graceful
             || adapter.report_pending.as_ref() != Some(&report)
         {
-            return Err("loss did not retain the exact native Down reporting owner".into());
+            return Err("Close/loss did not retain the exact native Down reporting owner".into());
+        }
+        let disposal = node.instance_disposal();
+        if let Some(proof) = &disposal {
+            if proof.body.replica.id != body.replica.id
+                || proof.body.replica.instance != body.replica.instance
+                || proof.body.replica.current_role != 4
+                || proof.body.unit != body.unit
+                || tokio::net::TcpStream::connect(&endpoint).await.is_ok()
+                || tokio::net::TcpStream::connect(replication_address)
+                    .await
+                    .is_ok()
+            {
+                return Err(
+                    "graceful disposal lacks original lineage or joined listener release".into(),
+                );
+            }
+            if node
+                .activation()
+                .process_status()
+                .is_none_or(|status| status.exit_observed)
+            {
+                return Err("graceful Close lost the original app host".into());
+            }
         }
         let reply = ledger
             .report(index, &report)?
@@ -1689,12 +1800,12 @@ pub(crate) mod report_tests {
                 .committed
                 .is_none_or(|s| s.fm_stage != ra::FmStage::ReplicaDown)
                 || adapter.report_pending.is_none()
-                || node.instance_disposal().is_some()
+                || node.instance_disposal().is_some() != graceful
             {
                 return Err("stale ACK retired the original loss obligation".into());
             }
         }
-        if lease_loss {
+        if matches!(mode, StatefulDown::LeaseLoss | StatefulDown::CloseProvider) {
             // Intentionally lose the first valid ACK; run the actual native-default timer.
             let retry_end = Instant::now() + Duration::from_secs(35);
             while traffic.reports.len() == 1 {
@@ -1726,10 +1837,20 @@ pub(crate) mod report_tests {
         if state.fm_stage != ra::FmStage::None
             || !state.local_deleted
             || !state.cleanup_pending
-            || node.instance_disposal().is_some()
+            || node.instance_disposal().is_some() != graceful
             || node.retained_usage() != 0
         {
-            return Err("native loss ACK did not delete only the closed metadata".into());
+            return Err("native down ACK did not delete only the closed metadata".into());
+        }
+        if let Some(original) = &disposal {
+            let after = node
+                .instance_disposal()
+                .ok_or("ACK lost the original disposal proof")?;
+            if serde_json::to_value(original).map_err(err)?
+                != serde_json::to_value(after).map_err(err)?
+            {
+                return Err("metadata ACK changed original disposal lineage".into());
+            }
         }
         ledger.reply(
             index,
@@ -1745,6 +1866,29 @@ pub(crate) mod report_tests {
         {
             return Err("native deletion was mistaken for disposal/recovery".into());
         }
+        if let Some(disposal) = &disposal {
+            let profile = actual_profile(node)?;
+            let receipt = RetirementReceipt {
+                deployment: launch.deployment.clone(),
+                session: launch.session.clone(),
+                node: launch.node.clone(),
+                fm: launch.fm.clone(),
+                generation: launch.generation.clone(),
+                node_pid: std::process::id(),
+                app_pid: profile.app_pid,
+                runtime_root: profile.runtime_root,
+                disposal: disposal.clone(),
+            };
+            let path = launch.directory.join("retirement.json");
+            write_json(&path, &receipt)?;
+            let before = ledger.status();
+            ledger.read_retirement(index, &path, std::process::id())?;
+            if ledger.status() != before || !ledger.placements[index].link_alive {
+                return Err(
+                    "valid unsolicited disposal retired loss or broke the live session".into(),
+                );
+            }
+        }
         let before = traffic.reports.len();
         fm.send(replica_up_reply_message(&reply, &launch.generation).map_err(err)?)
             .await?;
@@ -1753,7 +1897,7 @@ pub(crate) mod report_tests {
         }
         if traffic.reports.len() != before
             || !adapter.replica_drained(node)
-            || node.instance_disposal().is_some()
+            || node.instance_disposal().is_some() != graceful
         {
             return Err("duplicate ACK resurrected report work or disposal proof".into());
         }
@@ -1768,25 +1912,47 @@ pub(crate) mod report_tests {
             return Err("loss authorized replacement".into());
         }
         let logs = node.activation().logs().join("\n");
-        if logs.contains("LOCAL_DATA_PROVIDER disposed") || logs.contains("LOCAL_DISPOSE complete")
+        if graceful {
+            for marker in [
+                "LOCAL_CALLBACK create_replica",
+                "LOCAL_DATA_PROVIDER disposed written",
+                "LOCAL_PRIMARY released",
+                "LOCAL_DISPOSE complete",
+            ] {
+                if logs.lines().filter(|line| line.contains(marker)).count() != 1 {
+                    return Err(format!(
+                        "graceful disposal did not complete exactly once: {marker}"
+                    ));
+                }
+            }
+            if node
+                .activation()
+                .process_status()
+                .is_none_or(|status| status.exit_observed)
+            {
+                return Err("metadata ACK lost the original app host".into());
+            }
+        } else if logs.contains("LOCAL_DATA_PROVIDER disposed")
+            || logs.contains("LOCAL_DISPOSE complete")
         {
             return Err("hard process loss fabricated graceful destructor receipts".into());
         }
         Ok(())
     }
 
-    pub(crate) async fn run_stateful_loss(
+    pub(crate) async fn run_stateful_down(
         launch: &Launch,
         ledger: &mut crate::fm::Ledger,
-        lease_loss: bool,
+        mode: StatefulDown,
     ) -> Result<Result<()>> {
         let (mut node, store) = create_node(launch).await?;
         let mut adapter = Adapter::default();
         let result = async {
-            let args = if lease_loss {
-                "--stateful-primary"
-            } else {
-                "--stateful-primary --crash-after-ms 5000"
+            let args = match mode {
+                StatefulDown::Crash => "--stateful-primary --crash-after-ms 5000",
+                StatefulDown::LeaseLoss => "--stateful-primary",
+                StatefulDown::CloseProvider => "--stateful-primary --block-provider-dispose",
+                StatefulDown::CloseService => "--stateful-primary --block-dispose",
             };
             node.start(
                 &launch.package,
@@ -1795,19 +1961,20 @@ pub(crate) mod report_tests {
             )
             .map_err(err)?;
             let (fm, link) = links(launch).await?;
-            let result = exercise_stateful_loss(
-                launch,
-                &mut node,
-                &mut adapter,
-                &fm,
-                &link,
-                ledger,
-                lease_loss,
-            )
-            .await;
+            let result =
+                exercise_stateful_down(launch, &mut node, &mut adapter, &fm, &link, ledger, mode)
+                    .await;
+            let released = if matches!(
+                mode,
+                StatefulDown::CloseProvider | StatefulDown::CloseService
+            ) {
+                release_disposal(&node, mode)
+            } else {
+                Ok(())
+            };
             let fm_closed = fm.close().await;
             let node_closed = link.close().await;
-            result.and(fm_closed).and(node_closed)
+            result.and(released).and(fm_closed).and(node_closed)
         }
         .await;
         cleanup(launch, &mut node, &store, &mut adapter).await?;
