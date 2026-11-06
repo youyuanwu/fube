@@ -218,7 +218,7 @@ impl Placement {
                         || info.intermediate != Epoch::default()
                         || info.replicas.0[0].intermediate_role != 1
                     {
-                        return Err("unsupported stateful loss report".into());
+                        return Err("unsupported stateful down report".into());
                     }
                     continue;
                 }
@@ -655,7 +655,9 @@ impl Ledger {
             return Err("unrecognized retirement lifetime".into());
         }
         if placement.loss_reported {
-            return Err("volatile loss is not original-runtime disposal".into());
+            // Graceful Close can supply genuine disposal after a dropped report.
+            // Its validated sidecar is not retirement/recovery authority.
+            return Ok(());
         }
         if !placement.link_alive
             || placement.desired != Desired::Absent

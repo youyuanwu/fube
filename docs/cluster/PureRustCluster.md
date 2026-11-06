@@ -93,8 +93,11 @@ Normal FM DeleteReplica/Reply now retires that same lifetime through committed
 RAP Close and separately joined original disposal/accounting proof. The deleted
 tombstone remains nonreusable. Original singleton AppHostDown reporting now
 delivers ReplicaUp/Reply with native down-stage/dropped-payload and processed-
-reply semantics. FM exposes lost volatile data, not recovered/reusable state.
-Other terminal reporting, stateful force deletion/recreation, reconfiguration/
+reply semantics. Graceful Close of the original FM singleton now shares that
+native Down-stage path after committed RAP disposal, with its positive Node
+proof independent from metadata ACKs. FM exposes lost volatile data, not
+recovered/reusable state.
+Drop/Abort and closed-AddPrimary reporting, stateful force deletion/recreation, reconfiguration/
 peer control, recovery and complete P4/M2 remain staged.
 
 | Area | Decision |

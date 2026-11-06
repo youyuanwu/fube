@@ -748,7 +748,12 @@ fn stateful_loss_is_processed_not_echoed_and_native_deletion_never_supplies_disp
         ledger.reply(0, remove_reply(&ledger.placements[0]), true).unwrap();
         assert_eq!(ledger.placements[0].status()["native_replica_deleted"], true);
         assert!(ledger.deletion_retry(0, now + Duration::from_secs(200)).unwrap().is_none());
-        assert!(ledger.retirement(0, retirement(&ledger.placements[0]), 555).is_err());
+        let before = ledger.status();
+        ledger.retirement(0, retirement(&ledger.placements[0]), 555).unwrap();
+        assert_eq!(ledger.status(), before);
+        let mut foreign = retirement(&ledger.placements[0]);
+        foreign.node.instance += 1;
+        assert!(ledger.retirement(0, foreign, 555).is_err());
         assert_eq!(ledger.placements[0].observed, Observed::Lost);
         assert!(!ledger.placements[0].reusable && ledger.placements[0].retirement.is_none());
         assert!(ledger.placements[0].retired.is_empty());
@@ -759,8 +764,10 @@ fn stateful_loss_is_processed_not_echoed_and_native_deletion_never_supplies_disp
 }
 
 #[tokio::test]
-async fn stateful_app_loss_and_lost_ack_retire_only_original_reporting_without_touching_sibling() {
-    for lease_loss in [false, true] {
+async fn stateful_app_down_and_lost_ack_retire_only_original_reporting_without_touching_sibling() {
+    use node::report_tests::StatefulDown;
+    for mode in [StatefulDown::Crash, StatefulDown::LeaseLoss,
+        StatefulDown::CloseProvider, StatefulDown::CloseService] {
         let fixture = Fixture::new("stateful-loss");
         let mut config = fixture.config();
         config.profile = ServiceProfile::StatefulSingleton;
@@ -784,7 +791,7 @@ async fn stateful_app_loss_and_lost_ack_retire_only_original_reporting_without_t
         let written = request(b"write\n");
         assert!(written.contains("assigned=1 applied=1 committed=1 value=acknowledged"), "{written}");
         let launch = cluster.ledger.placements[1].launch.clone();
-        let result = node::report_tests::run_stateful_loss(&launch, &mut cluster.ledger, lease_loss).await;
+        let result = node::report_tests::run_stateful_down(&launch, &mut cluster.ledger, mode).await;
         assert_eq!(request(b"read\n"), written);
         cluster.children[0].process.as_mut().unwrap().check_alive().unwrap();
         assert_eq!(cluster.children[0].metadata.as_ref().unwrap().profile.as_ref().unwrap().app_pid, sibling_pid);

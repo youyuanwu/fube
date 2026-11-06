@@ -61,7 +61,15 @@ DeleteReplicaReply; `native_replica_deleted` is metadata completion, **not**
 original-runtime disposal or recovered volatile data. Missing native cleanup
 replies can trigger normal DeleteReplica retries for that same closed lifetime.
 `loss_reported` and native deletion never supply a retirement receipt or permit
-recreation. Other local Close/Drop and closed-AddPrimary reporting stays staged.
+recreation. Graceful `CloseMode::Close` of the original FM singleton while its
+FM session remains live now uses that same Down-stage/dropped-payload reporting
+and ACK path, after real RAP disposal and committed exact usage release.
+Positive Node disposal proof remains separate from metadata acknowledgment;
+FM still records lost volatile state, not recovery or reusable absence.
+Valid unsolicited disposal sidecars cannot retire that loss or break its live
+session; malformed/cross-owner proofs still reject.
+This enables no new CLI operation or local-only-profile authority.
+Drop/Abort and closed-AddPrimary reporting stay staged.
 See [source semantics and qualification limits](../../../docs/cluster/MinimalFmCluster.md#unexpected-singleton-app-host-loss).
 
 The root is operator-owned and private (0700). Its parent must already exist.
@@ -188,3 +196,7 @@ native processed-versus-dropped reply semantics, a lost ACK with the actual
 30-second retry, metadata-only DeleteReplicaReply and unaffected sibling data.
 They retain their selected trusted construction premises rather than claiming
 full native handler execution or unexpected-loss CLI/Federation parity.
+The same composition covers graceful Close with separately held provider and
+service disposal, no premature report/release, original-host survival and both
+listener releases, stale/duplicate/lost ACKs and unchanged original disposal
+proof. Close uses native ReplicaDown stage; it does not enable Drop/Abort reports.

@@ -29,8 +29,11 @@ DoReconfiguration, peer control, recovery and complete P4/M2 remain gated.
 The [unexpected singleton loss slice](MinimalFmCluster.md#unexpected-singleton-app-host-loss)
 now delivers AppHostDown's ReplicaDown-stage/dropped-list ReplicaUp and its
 processed-list acknowledgment, including native closed-FT deletion afterward.
-This records lost volatile state, not disposal/recovery; other terminal report
-origins and broader stateful choreography remain staged.
+The [graceful singleton Close slice](MinimalFmCluster.md#graceful-singleton-close-reporting)
+now uses the same native Down-stage/report/ACK path after real RAP disposal and
+committed Close, keeping original disposal proof independent.
+FM records lost volatile state, not recovery/reuse; Drop/Abort and closed-
+AddPrimary reporting and broader stateful choreography remain staged.
 
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's

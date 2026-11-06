@@ -155,9 +155,10 @@ Normal deletion does not acknowledge unrelated terminal reporting escrow.
 ### Unexpected singleton app-host loss
 
 The FM singleton profile now reports original app-host loss, including finite
-lease fencing, over real `ReplicaUp`/`ReplicaUpReply` delivery. Ordinary local
-Close/Drop and closed-AddPrimary reporting remain separately staged; local Idle
-and local-Primary profiles do not gain FM reporting authority.
+lease fencing, over real `ReplicaUp`/`ReplicaUpReply` delivery. Graceful Close
+of that same lifetime is covered separately below; Drop/Abort and closed-
+AddPrimary reporting remain staged. Local Idle and local-Primary profiles do
+not gain FM reporting authority.
 
 Pinned `FailoverUnit.cpp:5472-5544` and `FMMessageState.cpp:148-176` distinguish
 the state from its payload: AppHostDown calls OnReplicaDown(false, instance),
@@ -199,6 +200,43 @@ retry, stale/duplicate replies and an independently serving sibling. Hard exit
 does not manufacture provider/service destructor receipts. These are native-free
 composition tests with selected trusted premises, not deployed native handler
 or Federation-interoperability qualification.
+
+### Graceful singleton Close reporting
+
+While the original FM session remains live, the existing local Node `close`
+with `CloseMode::Close` now reports the original FM-created volatile singleton.
+This is not a new FM command or CLI operation, and local-only profiles remain
+unchanged. Normal operator `delete` still uses DeleteReplica/Reply without
+scheduling a terminal report.
+
+Pinned `FailoverUnit.cpp:5472-5544` calls OnReplicaDown for ordinary Close,
+just as for AppHostDown; Drop/Abort instead call OnDropped. Thus graceful
+volatile Close retains **ReplicaDown stage**, not ReplicaDropped, while sending
+the same canonical dropped ReplicaUp entry. Successful real RAP disposal and
+the actual Close commit precede report scheduling and exact original H2 release.
+Held provider/service disposal and failed/unknown commits cannot publish
+completion, release usage or start reporting.
+
+The existing immediate/30-second retry, processed-list ReplicaUpReply and
+closed-FT DeleteReplicaReply path then converge without reopening or acquiring
+another use. A dropped-list ACK instead performs closed ForceDelete with no
+semantic deletion reply. Stale/duplicate ACKs preserve original ownership.
+Graceful disposal proof remains an independently joined original-runtime
+observation; metadata ACK processing neither creates nor replaces it.
+FM still records the dropped volatile lifetime as `lost`, not `absent`,
+recovered or reusable, even when Node separately has positive disposal proof.
+An unsolicited original disposal sidecar is validated and ignored for
+retirement, not treated as a link failure; malformed/cross-owner proofs still
+reject. Neither proof arrival order can recover the dropped volatile data.
+
+Real-process/channel tests hold provider and service disposal separately,
+verify acknowledged public write/readback before Close, independently observe
+both listeners retire while the original host remains alive, lose a valid ACK
+and exercise the native-default retry, and verify unchanged original disposal
+lineage and independently serving sibling data. RA tests cover both ACK lists
+and actual store veto/unknown resolution. Drop/Abort, closed-AddPrimary
+reporting, recreation/reconfiguration and recovery remain gated. These tests
+do not establish full native handler or native FM/Federation interoperability.
 
 ## Shutdown and restart safety
 

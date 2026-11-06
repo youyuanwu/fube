@@ -235,8 +235,11 @@ report obligation. Original FM singleton AppHostDown now retains native
 ReplicaDown stage and sends a canonical dropped ReplicaUp entry, including
 lease-loss fencing. A committed eligible ReplicaUpReply clears that reporting
 owner and can delete the already closed FT; it never creates original-runtime
-disposal proof or permission to recreate. Other local Close/Drop and closed-
-AddPrimary reporting remain staged.
+disposal proof or permission to recreate. Graceful Close of that original FM
+singleton now uses the same native Down-stage reporting after committed RAP
+disposal and exact H2 release; independently joined Node disposal proof survives
+metadata ACK processing. Local-only Close, Drop/Abort and closed-AddPrimary
+reporting remain staged.
 Stateful force deletion/reconfiguration, replacement/reopen, FMM and recovery
 remain gated; local profiles still reject network deletion.
 
