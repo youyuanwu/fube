@@ -1,4 +1,4 @@
-use fube_cluster::{Cluster, Command, Config, Result};
+use fube_cluster::{Cluster, Command, Config, Result, ServiceProfile};
 use serde_json::json;
 use std::{io::Write, path::PathBuf, time::Duration};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -60,8 +60,9 @@ fn output(value: &serde_json::Value) -> Result<()> {
         .and_then(|()| lock.flush())
         .map_err(|error| error.to_string())
 }
-async fn foreground(root: PathBuf, app: PathBuf) -> Result<bool> {
+async fn foreground(root: PathBuf, app: PathBuf, profile: ServiceProfile) -> Result<bool> {
     let mut cluster = Cluster::new(Config {
+        profile,
         root,
         app,
         executable: std::env::current_exe().map_err(|error| error.to_string())?,
@@ -128,13 +129,25 @@ async fn run() -> Result<bool> {
         fube_cluster::internal_node(&PathBuf::from(&arguments[1])).await?;
         return Ok(true);
     }
-    if arguments.len() != 4 || arguments[0] != "--root" || arguments[2] != "--app" {
+    let profile = if arguments.len() == 5 && arguments[4] == "--stateful-singleton" {
+        ServiceProfile::StatefulSingleton
+    } else if arguments.len() == 4 {
+        ServiceProfile::Stateless
+    } else {
+        return Err("expected optional --stateful-singleton after --root/--app".into());
+    };
+    if arguments[0] != "--root" || arguments[2] != "--app" {
         return Err(
             "usage: fube-cluster --root /private/profile --app /absolute/cluster-stateless-app"
                 .into(),
         );
     }
-    foreground(PathBuf::from(&arguments[1]), PathBuf::from(&arguments[3])).await
+    foreground(
+        PathBuf::from(&arguments[1]),
+        PathBuf::from(&arguments[3]),
+        profile,
+    )
+    .await
 }
 fn main() {
     let runtime = tokio::runtime::Builder::new_current_thread()

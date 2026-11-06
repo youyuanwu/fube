@@ -74,12 +74,37 @@ fn malformed_missing_duplicate_and_wrong_factory_headers_fail() {
             .push(message.headers.iter().find(|h| h.id == id).unwrap().clone());
         assert!(decode_add_instance(&message).is_err());
     }
+
     let mut message = original.clone();
     message.headers[0] = Header::actor(FM_ACTOR).unwrap();
     assert!(decode_add_instance(&message).is_err());
     let mut message = original;
     message.headers[3].value.truncate(3);
     assert!(decode_add_instance(&message).is_err());
+}
+
+#[test]
+fn add_primary_has_distinct_actions_and_native_request_reply_asymmetry() {
+    let body = support::rich_request();
+    let generation = support::rich_generation(false);
+    let message = add_primary_message(&body, &generation).unwrap();
+    assert_eq!(decode_add_primary(&message).unwrap(), (body, generation));
+    assert!(decode_add_instance(&message).is_err());
+    for id in [ACTOR, ACTION, HIGH_PRIORITY, GENERATION_HEADER] {
+        let mut missing = message.clone();
+        missing.headers.retain(|header| header.id != id);
+        assert!(decode_add_primary(&missing).is_err());
+    }
+    for owner in [Owner::Fm, Owner::Fmm] {
+        let body = support::rich_reply(-2_147_017_398);
+        let message = add_primary_reply_message(&body, owner).unwrap();
+        assert!(!message
+            .headers
+            .iter()
+            .any(|header| header.id == GENERATION_HEADER));
+        assert_eq!(decode_add_primary_reply(&message).unwrap(), (body, owner));
+        assert!(decode_add_instance_reply(&message).is_err());
+    }
 }
 
 #[test]

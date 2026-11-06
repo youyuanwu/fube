@@ -353,7 +353,7 @@ pub(super) fn add_existing(
             start_close(&mut state, CloseMode::Drop, work.id, &mut effects);
             durable = true;
         } else if state.body.replica.instance == body.replica.instance {
-            effects.push(reply(&state.body, 0));
+            effects.push(reply(&state.body, 0, state.fm_primary));
         }
     } else {
         debug_assert_eq!(state.phase, Phase::Closed);
@@ -394,7 +394,7 @@ pub(super) fn add_existing(
         if body.replica.instance < state.body.replica.instance {
             let mut reply_body = body.clone();
             reply_body.unit = state.body.unit.clone();
-            effects.push(reply(&reply_body, STALE_REQUEST));
+            effects.push(reply(&reply_body, STALE_REQUEST, state.fm_primary));
         }
     }
     Ok(if durable {
@@ -415,6 +415,34 @@ pub(super) fn create_body(mut body: AddInstance) -> AddInstance {
     body.unit.target = body.service.target;
     body.unit.minimum = body.service.minimum;
     body
+}
+
+/// ReconfigurationAgent.cpp:1731-1847, bounded to one original volatile lifetime.
+pub(super) fn primary_existing(current: &EntityState, body: &AddPrimary) -> Result<Transition> {
+    if body.service != current.body.service || body.replica.id > current.body.replica.id {
+        return Err(Failure::Unsupported(
+            "stateful replacement/description changes are gated",
+        ));
+    }
+    let mut effects = Vec::new();
+    if current.phase == Phase::Ready && body.replica.instance == current.body.replica.instance {
+        effects.push(reply(&current.body, 0, true));
+    } else if current.phase == Phase::Closed {
+        if body.replica.instance > current.body.replica.instance {
+            return Err(Failure::Unsupported("stateful reopen/adoption is gated"));
+        }
+        effects.push(Effect::StatefulDroppedPending(current.body.clone()));
+        if body.replica.instance < current.body.replica.instance {
+            let mut captured = body.clone();
+            captured.unit = current.body.unit.clone();
+            effects.push(reply(&captured, STALE_REQUEST, true));
+        }
+    }
+    Ok(Transition {
+        update: Update::None,
+        effects,
+        disposition: Disposition::Applied,
+    })
 }
 
 pub(super) fn transition(
@@ -472,6 +500,8 @@ pub(super) fn transition(
             }
             let mut state = current.cloned().unwrap_or_else(|| EntityState {
                 requested_version: body.service.version.clone(),
+                fm_primary: false,
+                primary_deactivation: None,
                 // TryCreateFailoverUnit constructs from ID, consistency and
                 // service, NOT the incoming previous epoch/target/minimum.
                 body: Arc::new(AddInstance {

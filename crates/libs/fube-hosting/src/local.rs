@@ -213,7 +213,9 @@ impl Activation {
     ) -> LocalResult<()> {
         if matches!(
             self.options.profile,
-            Profile::VolatileStatefulLifecycle | Profile::VolatileStatefulPrimaryLifecycle
+            Profile::VolatileStatefulLifecycle
+                | Profile::VolatileStatefulPrimaryLifecycle
+                | Profile::VolatileStatefulFmPrimary
         ) && self.consumer_gate.is_none()
         {
             return Err(Error::UnsupportedCapability.into());
@@ -414,7 +416,8 @@ impl Activation {
         self.lease = Some(match self.options.profile {
             Profile::Stateless
             | Profile::VolatileStatefulLifecycle
-            | Profile::VolatileStatefulPrimaryLifecycle => prepared.lease,
+            | Profile::VolatileStatefulPrimaryLifecycle
+            | Profile::VolatileStatefulFmPrimary => prepared.lease,
             Profile::VolatileStatefulRegistration => prepared.lease.registration_only(),
         });
         if let Some((_, error)) = prepared.failure {

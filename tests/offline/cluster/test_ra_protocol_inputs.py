@@ -42,7 +42,7 @@ class InputTests(unittest.TestCase):
         (self.bundle / "manifest.json").write_text(json.dumps(self.manifest))
 
     def test_inventory_model_is_valid_not_an_execution_claim(self):
-        self.assertEqual(len(validate(self.bundle, "a" * 40, self.source)["cases"]), 45)
+        self.assertEqual(len(validate(self.bundle, "a" * 40, self.source)["cases"]), 51)
 
     def test_exact_schema_counts_and_extra_files_are_rejected(self):
         for key in ["schema_types", "schema_fields"]:

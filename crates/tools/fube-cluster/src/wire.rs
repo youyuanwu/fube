@@ -54,6 +54,7 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
                 | "ReplicaUp"
                 | "ServiceTypeNotification"
                 | "AddInstanceReply"
+                | "AddPrimaryReply"
                 | "RemoveInstanceReply"
         )
         || props.expects_reply != (props.action == "NodeUp")
@@ -71,7 +72,11 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
         || props.high_priority != (props.action != "ServiceTypeNotificationReply")
         || !matches!(
             props.action.as_str(),
-            "AddInstance" | "RemoveInstance" | "ReplicaUpReply" | "ServiceTypeNotificationReply"
+            "AddInstance"
+                | "AddPrimary"
+                | "RemoveInstance"
+                | "ReplicaUpReply"
+                | "ServiceTypeNotificationReply"
         )
     {
         return Err(fube_transport::Error::Protocol("unsupported node ingress"));
@@ -175,13 +180,13 @@ pub fn predecode(message: &Message) -> Result<()> {
         "NodeUpAck" => {
             decode::<NodeUpAck>(&message.body)?;
         }
-        "AddInstance" => {
+        "AddInstance" | "AddPrimary" => {
             decode::<AddInstance>(&message.body)?;
         }
         "RemoveInstance" => {
             decode::<RemoveInstance>(&message.body)?;
         }
-        "AddInstanceReply" | "RemoveInstanceReply" => {
+        "AddInstanceReply" | "AddPrimaryReply" | "RemoveInstanceReply" => {
             decode::<AddInstanceReply>(&message.body)?;
         }
         "ReplicaUp" | "ReplicaUpReply" => {

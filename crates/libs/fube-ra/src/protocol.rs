@@ -334,6 +334,9 @@ pub struct AddInstanceReply {
     pub replica: Replica,
     pub error: i64,
 }
+/// AddPrimary uses the same native ReplicaMessageBody, not a new wire schema.
+pub type AddPrimary = AddInstance;
+pub type AddPrimaryReply = AddInstanceReply;
 
 /// DeleteReplicaMessageBody inherits ReplicaMessageBody's scope, then adds force.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -505,6 +508,12 @@ fn owner_actor(owner: Owner) -> i64 {
         Owner::Fmm => FMM_ACTOR,
     }
 }
+pub fn add_primary_message(body: &AddPrimary, generation: &GenerationHeader) -> Result<Message> {
+    reliability_message(body, "AddPrimary", RA_ACTOR, true, Some(generation))
+}
+pub fn add_primary_reply_message(body: &AddPrimaryReply, owner: Owner) -> Result<Message> {
+    reliability_message(body, "AddPrimaryReply", owner_actor(owner), true, None)
+}
 
 fn unique(message: &Message, id: u16) -> Result<&Header> {
     let mut headers = message.headers.iter().filter(|h| h.id == id);
@@ -538,6 +547,24 @@ pub fn decode_add_instance(message: &Message) -> Result<(AddInstance, Generation
 pub fn decode_add_instance_reply(message: &Message) -> Result<(AddInstanceReply, Owner)> {
     let actor = check_factory(message, "AddInstanceReply", &[FM_ACTOR, FMM_ACTOR])?;
     // The actual FMTransport reply helper does not require GenerationHeader.
+    Ok((
+        from_slice(&message.body)?,
+        if actor == FM_ACTOR {
+            Owner::Fm
+        } else {
+            Owner::Fmm
+        },
+    ))
+}
+pub fn decode_add_primary(message: &Message) -> Result<(AddPrimary, GenerationHeader)> {
+    check_factory(message, "AddPrimary", &[RA_ACTOR])?;
+    Ok((
+        from_slice(&message.body)?,
+        from_slice(&unique(message, GENERATION_HEADER)?.value)?,
+    ))
+}
+pub fn decode_add_primary_reply(message: &Message) -> Result<(AddPrimaryReply, Owner)> {
+    let actor = check_factory(message, "AddPrimaryReply", &[FM_ACTOR, FMM_ACTOR])?;
     Ok((
         from_slice(&message.body)?,
         if actor == FM_ACTOR {

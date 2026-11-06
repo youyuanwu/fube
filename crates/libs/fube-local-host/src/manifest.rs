@@ -19,6 +19,7 @@ pub enum Profile {
     VolatileStatefulRegistration,
     VolatileStatefulLifecycle,
     VolatileStatefulPrimaryLifecycle,
+    VolatileStatefulFmPrimary,
 }
 
 #[derive(Debug)]
@@ -307,9 +308,8 @@ impl Package {
             Profile::Stateless => ("StatelessService", "StatelessServiceType"),
             Profile::VolatileStatefulRegistration
             | Profile::VolatileStatefulLifecycle
-            | Profile::VolatileStatefulPrimaryLifecycle => {
-                ("StatefulService", "StatefulServiceType")
-            }
+            | Profile::VolatileStatefulPrimaryLifecycle
+            | Profile::VolatileStatefulFmPrimary => ("StatefulService", "StatefulServiceType"),
         };
         shape(
             service,
@@ -329,7 +329,8 @@ impl Package {
             Profile::Stateless => &["ServiceTypeName", "InstanceCount"],
             Profile::VolatileStatefulRegistration
             | Profile::VolatileStatefulLifecycle
-            | Profile::VolatileStatefulPrimaryLifecycle => &[
+            | Profile::VolatileStatefulPrimaryLifecycle
+            | Profile::VolatileStatefulFmPrimary => &[
                 "ServiceTypeName",
                 "TargetReplicaSetSize",
                 "MinReplicaSetSize",
@@ -349,7 +350,8 @@ impl Package {
             )?,
             Profile::VolatileStatefulRegistration
             | Profile::VolatileStatefulLifecycle
-            | Profile::VolatileStatefulPrimaryLifecycle => require(
+            | Profile::VolatileStatefulPrimaryLifecycle
+            | Profile::VolatileStatefulFmPrimary => require(
                 attr(description, "TargetReplicaSetSize", &params)? == "1"
                     && attr(description, "MinReplicaSetSize", &params)? == "1",
                 "only volatile stateful target/minimum=1/1 is supported",
@@ -388,9 +390,8 @@ impl Package {
             Profile::Stateless => &["ServiceTypeName"],
             Profile::VolatileStatefulRegistration
             | Profile::VolatileStatefulLifecycle
-            | Profile::VolatileStatefulPrimaryLifecycle => {
-                &["ServiceTypeName", "HasPersistedState"]
-            }
+            | Profile::VolatileStatefulPrimaryLifecycle
+            | Profile::VolatileStatefulFmPrimary => &["ServiceTypeName", "HasPersistedState"],
         };
         shape(declared, type_kind, type_attributes, &[])?;
         if profile != Profile::Stateless {
@@ -520,7 +521,8 @@ impl Package {
             ),
             Profile::VolatileStatefulRegistration
             | Profile::VolatileStatefulLifecycle
-            | Profile::VolatileStatefulPrimaryLifecycle => format!(
+            | Profile::VolatileStatefulPrimaryLifecycle
+            | Profile::VolatileStatefulFmPrimary => format!(
                 r#"<StatefulServiceType ServiceTypeName="{}" HasPersistedState="false" />"#,
                 escape(&self.service_type)
             ),

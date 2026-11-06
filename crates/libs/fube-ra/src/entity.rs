@@ -257,6 +257,11 @@ pub enum Command {
         source: NodeInstance,
         generation: GenerationHeader,
     },
+    AddPrimary {
+        body: Box<AddPrimary>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
     /// Trusted local volatile Idle Open, not AddPrimary/CreateReplica network admission.
     OpenLocalStateful(Box<AddInstance>),
     /// Trusted local fresh 1/1 Primary Open, not promotion or FM AddPrimary admission.
@@ -316,6 +321,10 @@ enum Kind {
     #[cfg(feature = "qualification")]
     QualificationTerminate,
     Add {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    AddPrimary {
         source: NodeInstance,
         generation: GenerationHeader,
     },
@@ -380,6 +389,11 @@ pub struct EntityState {
     /// Admitted creation package, distinct from Hosting's selected version.
     /// Session-only: no restart/adoption loader is provided.
     pub requested_version: VersionInstance,
+    /// Original reply responsibility survives async registration/Open and retries.
+    /// Session-only: there is no recovery/adoption loader.
+    pub fm_primary: bool,
+    /// Native initial Primary ReplicaDeactivationInfo(CurrentConfigurationEpoch, 0).
+    pub primary_deactivation: Option<(Epoch, i64)>,
     pub phase: Phase,
     pub open_token: u64,
     /// Volatile retry bookkeeping; not a native disk record or durable outbox.
@@ -422,6 +436,7 @@ pub enum Effect {
         usage: Option<u64>,
     },
     Reply(Box<AddInstanceReply>),
+    PrimaryReply(Box<AddPrimaryReply>),
     /// Local observation only; never serialize this as AddInstance/CreateReplicaReply.
     LocalStatefulOpenReply(Box<AddInstanceReply>),
     /// Retained terminal reporting obligation. No stateful FM/peer codec or ACK is enabled.
@@ -429,6 +444,8 @@ pub enum Effect {
         body: Arc<AddInstance>,
         mode: CloseMode,
     },
+    /// Native closed AddPrimary's dropped report, retained without a fake FM ACK.
+    StatefulDroppedPending(Arc<AddPrimary>),
     RuntimeOpen {
         token: u64,
         body: Arc<AddInstance>,
@@ -624,6 +641,15 @@ impl Executor {
                 let entity = body.unit.id.guid.0;
                 (entity, Kind::Add { source, generation }, to_vec(&body))
             }
+            Command::AddPrimary {
+                body,
+                source,
+                generation,
+            } => (
+                body.unit.id.guid.0,
+                Kind::AddPrimary { source, generation },
+                to_vec(&body),
+            ),
             Command::CompleteOpen(body) => (body.unit.id.guid.0, Kind::Complete, to_vec(&body)),
             Command::OpenLocalStateful(body) => {
                 (body.unit.id.guid.0, Kind::OpenLocalStateful, to_vec(&body))
@@ -725,7 +751,10 @@ impl Executor {
             // Ready always owns an active runtime in this executor: Add can
             // capture update + Close (or duplicate reply), but cannot release
             // resources synchronously. Closed Add reports + stale-replies at most.
-            Kind::Add { .. } | Kind::OpenLocalStateful | Kind::OpenLocalPrimary => 2,
+            Kind::Add { .. }
+            | Kind::AddPrimary { .. }
+            | Kind::OpenLocalStateful
+            | Kind::OpenLocalPrimary => 2,
             Kind::Retry | Kind::RetryReport | Kind::RetryServiceDescription => 1,
             Kind::CompleteServiceDescription => 0,
             Kind::HostingRegistered | Kind::HostingRuntimeClosed | Kind::HostingHostClosed => 8,
@@ -1001,13 +1030,15 @@ impl Transition {
         }
     }
 }
-fn reply(body: &AddInstance, error: i64) -> Effect {
+fn reply(body: &AddInstance, error: i64, fm_primary: bool) -> Effect {
     let reply = Box::new(AddInstanceReply {
         unit: body.unit.clone(),
         replica: body.replica.clone(),
         error,
     });
-    if body.service.stateful {
+    if fm_primary {
+        Effect::PrimaryReply(reply)
+    } else if body.service.stateful {
         Effect::LocalStatefulOpenReply(reply)
     } else {
         Effect::Reply(reply)
@@ -1023,13 +1054,17 @@ fn transition(
     match &work.kind {
         #[cfg(feature = "qualification")]
         Kind::QualificationTerminate => panic!("explicit qualification worker termination"),
-        Kind::Add { .. } | Kind::OpenLocalStateful | Kind::OpenLocalPrimary => {
+        Kind::Add { .. }
+        | Kind::AddPrimary { .. }
+        | Kind::OpenLocalStateful
+        | Kind::OpenLocalPrimary => {
             let body: AddInstance = from_slice(&work.bytes).map_err(decode_error)?;
+            let fm_primary = matches!(work.kind, Kind::AddPrimary { .. });
             let local_stateful =
-                matches!(work.kind, Kind::OpenLocalStateful | Kind::OpenLocalPrimary);
+                fm_primary || matches!(work.kind, Kind::OpenLocalStateful | Kind::OpenLocalPrimary);
             let role = match work.kind {
                 Kind::OpenLocalStateful => 2,
-                Kind::OpenLocalPrimary => 4,
+                Kind::OpenLocalPrimary | Kind::AddPrimary { .. } => 4,
                 _ => 1,
             };
             if body.replica.node != admission.local_node {
@@ -1037,7 +1072,9 @@ fn transition(
                     "configured session/node incarnation mismatch",
                 ));
             }
-            if let Kind::Add { source, generation } = &work.kind {
+            if let Kind::Add { source, generation } | Kind::AddPrimary { source, generation } =
+                &work.kind
+            {
                 if source != &admission.fm_source {
                     return Err(Failure::Admission(
                         "configured session/node incarnation mismatch",
@@ -1045,7 +1082,7 @@ fn transition(
                 }
                 if generation.for_fm_replica {
                     return Err(Failure::Unsupported(
-                        "FM-service/FMM is not a stateless profile",
+                        "FM-service/FMM is outside the admitted application profile",
                     ));
                 }
                 if generation.number.older_than(&admission.generation) {
@@ -1092,7 +1129,7 @@ fn transition(
                     "only local volatile singleton initial Open",
                 ));
             }
-            if role == 4 && body.unit.previous != Epoch::default() {
+            if role == 4 && !fm_primary && body.unit.previous != Epoch::default() {
                 return Err(Failure::Unsupported(
                     "initial Primary cannot inherit a previous configuration",
                 ));
@@ -1105,7 +1142,13 @@ fn transition(
                         "cannot change entity lifecycle profile",
                     ));
                 }
+                if current.fm_primary != fm_primary {
+                    return Err(Failure::Unsupported(
+                        "cannot change original reply authority",
+                    ));
+                }
                 if local_stateful
+                    && !fm_primary
                     && (current.body.replica.id != body.replica.id
                         || current.body.replica.instance != body.replica.instance
                         || current.body.replica.current_role != role
@@ -1144,15 +1187,18 @@ fn transition(
             if !admission.node_activated {
                 return Ok(Transition {
                     update: Update::None,
-                    effects: vec![reply(&body, RA_NOT_READY)],
+                    effects: vec![reply(&body, RA_NOT_READY, fm_primary)],
                     disposition: Disposition::Applied,
                 });
             }
             if let Some(current) = state {
+                if fm_primary {
+                    return lifecycle::primary_existing(current, &body);
+                }
                 if local_stateful {
                     return Ok(Transition {
                         update: Update::None,
-                        effects: vec![reply(&current.body, 0)],
+                        effects: vec![reply(&current.body, 0, false)],
                         disposition: Disposition::Applied,
                     });
                 }
@@ -1163,6 +1209,8 @@ fn transition(
                 update: Update::Durable(EntityState {
                     body: body.clone(),
                     requested_version: body.service.version.clone(),
+                    fm_primary,
+                    primary_deactivation: fm_primary.then_some((body.unit.current, 0)),
                     phase: Phase::Opening,
                     open_token: work.id,
                     retry_attempts: 0,

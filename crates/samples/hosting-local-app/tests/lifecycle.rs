@@ -20,6 +20,9 @@ impl Fixture {
     fn primary() -> Self {
         Self::with_profile(fube_hosting::local::Profile::VolatileStatefulPrimaryLifecycle)
     }
+    fn fm_primary() -> Self {
+        Self::with_profile(fube_hosting::local::Profile::VolatileStatefulFmPrimary)
+    }
     fn with_profile(profile: fube_hosting::local::Profile) -> Self {
         let parent = std::env::temp_dir().join(format!("ra-rap-{}", uuid::Uuid::new_v4()));
         let package = parent.join("input");
@@ -77,7 +80,8 @@ impl Fixture {
             fube_hosting::local::Profile::VolatileStatefulLifecycle => {
                 format!("--stateful-lifecycle {args}")
             }
-            fube_hosting::local::Profile::VolatileStatefulPrimaryLifecycle => {
+            fube_hosting::local::Profile::VolatileStatefulPrimaryLifecycle
+            | fube_hosting::local::Profile::VolatileStatefulFmPrimary => {
                 format!("--stateful-primary {args}")
             }
             _ => args.to_owned(),
@@ -191,14 +195,18 @@ fn body(node: &Node) -> AddInstance {
         a.profile(),
         fube_hosting::local::Profile::VolatileStatefulLifecycle
             | fube_hosting::local::Profile::VolatileStatefulPrimaryLifecycle
+            | fube_hosting::local::Profile::VolatileStatefulFmPrimary
     ) {
         b.service.stateful = true;
-        b.replica.current_role =
-            if a.profile() == fube_hosting::local::Profile::VolatileStatefulPrimaryLifecycle {
-                4
-            } else {
-                2
-            };
+        b.replica.current_role = if matches!(
+            a.profile(),
+            fube_hosting::local::Profile::VolatileStatefulPrimaryLifecycle
+                | fube_hosting::local::Profile::VolatileStatefulFmPrimary
+        ) {
+            4
+        } else {
+            2
+        };
     }
     b
 }
@@ -591,6 +599,65 @@ async fn stateful_initial_primary_lease_loss_fences_opening_and_serving_without_
         let status = node.activation().process_status().unwrap();
         assert!(status.exit_observed && status.group_drained && status.reaped);
     }
+}
+
+#[tokio::test]
+async fn stateful_fm_primary_lease_loss_retains_real_authority_and_terminal_reporting_boundaries() {
+    let fixture = Fixture::fm_primary();
+    let (mut node, store) = fixture.node("").await;
+    until(&mut node, |node| node.package_registration().registered).await;
+    let mut body = body(&node);
+    body.unit.current.configuration = (1 << 32) + 5;
+    assert!(node.open_stateful_primary(body.clone()).is_err());
+    let generation = GenerationHeader {
+        number: admission().generation,
+        for_fm_replica: false,
+    };
+    node.add_primary_from_fm(body.clone(), &admission().fm_source, &generation)
+        .unwrap();
+    let effects = until(&mut node, |node| {
+        node.snapshot(body.unit.id.guid.0)
+            .committed
+            .is_some_and(|state| state.phase == ra::Phase::Ready)
+    })
+    .await;
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect.dispatch.effect, ra::Effect::PrimaryReply(_))));
+    assert!(!effects.iter().any(|effect| matches!(
+        effect.dispatch.effect,
+        ra::Effect::LocalStatefulOpenReply(_)
+    )));
+    let address = primary_endpoint(&node);
+    let replication = data_endpoint(&node).address;
+    primary_ready(&mut node, &address).await;
+    assert!(primary_request(&address, "write\n")
+        .await
+        .contains("assigned=1 applied=1 committed=1"));
+    let pid = node.activation().process_status().unwrap().pid;
+    node.activation().host_lease().unwrap().stop_renewal();
+    until(&mut node, |node| {
+        node.snapshot(body.unit.id.guid.0)
+            .committed
+            .is_some_and(|state| state.phase == ra::Phase::Closed)
+            && node.retained_usage() == 0
+    })
+    .await;
+    until(&mut node, |_| {
+        fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat.contains(") Z "))
+            && std::net::TcpStream::connect(&address).is_err()
+            && std::net::TcpStream::connect(&replication).is_err()
+    })
+    .await;
+    assert!(node.instance_disposal().is_none());
+    assert_eq!(count(&node, "LOCAL_DATA_PROVIDER disposed"), 0);
+    assert!(node
+        .external_pending()
+        .iter()
+        .any(|effect| matches!(effect.effect, ra::Effect::StatefulClosePending { .. })));
+    let root = node.activation().root().unwrap().to_path_buf();
+    cleanup(&mut node, &store).await;
+    assert!(!root.exists());
 }
 
 #[tokio::test]

@@ -143,6 +143,7 @@ enum Work {
     Add(Arc<AddInstance>),
     StatefulOpen(Arc<AddInstance>),
     PrimaryOpen(Arc<AddInstance>),
+    AddPrimary(Arc<AddPrimary>, NodeInstance, GenerationHeader),
     Fm(FmWork),
     Close(PartitionId, ra::CloseMode),
     Registered(ra::RegistrationCompletion),
@@ -365,7 +366,19 @@ impl Node {
         self.add(body)
     }
     pub fn fm_work(&mut self, work: FmWork) -> Result<u64> {
-        if self.activation.profile() != h::local::Profile::Stateless {
+        let stateless = self.activation.profile() == h::local::Profile::Stateless;
+        if !stateless && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary {
+            return Err(Error::Unsupported);
+        }
+        if !stateless
+            && !matches!(
+                work,
+                FmWork::ServiceTypeReply(..)
+                    | FmWork::CaptureServiceTypeWork(_)
+                    | FmWork::CompleteServiceTypeWork(_)
+                    | FmWork::ServiceTypeRetryTimer(_)
+            )
+        {
             return Err(Error::Unsupported);
         }
         match &work {
@@ -487,23 +500,40 @@ impl Node {
         if self.activation.profile() != h::local::Profile::Stateless {
             return Err(Error::Unsupported);
         }
-        self.authorize_open(body, 1)
+        self.authorize_open(body, 1, None)
     }
     /// One volatile Idle lifetime. No primary, replacement, build or FM/peer authority.
     pub fn open_stateful(&mut self, body: AddInstance) -> Result<u64> {
         if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle {
             return Err(Error::Unsupported);
         }
-        self.authorize_open(body, 2)
+        self.authorize_open(body, 2, None)
     }
     /// One fresh volatile 1/1 Primary lifetime, never promotion/adoption or FM authority.
     pub fn open_stateful_primary(&mut self, body: AddInstance) -> Result<u64> {
         if self.activation.profile() != h::local::Profile::VolatileStatefulPrimaryLifecycle {
             return Err(Error::Unsupported);
         }
-        self.authorize_open(body, 4)
+        self.authorize_open(body, 4, None)
     }
-    fn authorize_open(&mut self, body: AddInstance, role: i64) -> Result<u64> {
+    pub fn add_primary_from_fm(
+        &mut self,
+        body: AddPrimary,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary {
+            return Err(Error::Unsupported);
+        }
+        self.admit_fm(source, generation)?;
+        self.authorize_open(body, 4, Some((source.clone(), generation.clone())))
+    }
+    fn authorize_open(
+        &mut self,
+        body: AddInstance,
+        role: i64,
+        fm: Option<(NodeInstance, GenerationHeader)>,
+    ) -> Result<u64> {
         let stateful = role != 1;
         if !self.live.load(Ordering::SeqCst) || !self.ra.consumer_lifetime().is_accepting() {
             return Err(Error::Busy);
@@ -555,7 +585,7 @@ impl Node {
         {
             return Err(Error::Unsupported);
         }
-        if role == 4 && body.unit.previous != Epoch::default() {
+        if role == 4 && fm.is_none() && body.unit.previous != Epoch::default() {
             return Err(Error::Unsupported);
         }
         if stateful
@@ -574,6 +604,7 @@ impl Node {
         }
         let current = self.ra.snapshot(body.unit.id.guid.0).committed;
         if stateful
+            && fm.is_none()
             && (self
                 .selected
                 .as_ref()
@@ -581,6 +612,14 @@ impl Node {
                 || current
                     .as_ref()
                     .is_some_and(|state| state.phase == ra::Phase::Closed))
+        {
+            return Err(Error::Unsupported);
+        }
+        if fm.is_some()
+            && self.selected.as_ref().is_some_and(|selected| {
+                body.replica.id > selected.replica.id
+                    || body.replica.instance > selected.replica.instance
+            })
         {
             return Err(Error::Unsupported);
         }
@@ -601,9 +640,12 @@ impl Node {
         {
             return Err(Error::Unsupported);
         }
-        let work = match role {
-            4 => Work::PrimaryOpen(Arc::new(body.clone())),
-            2 => Work::StatefulOpen(Arc::new(body.clone())),
+        let work = match (role, fm) {
+            (4, Some((source, generation))) => {
+                Work::AddPrimary(Arc::new(body.clone()), source, generation)
+            }
+            (4, None) => Work::PrimaryOpen(Arc::new(body.clone())),
+            (2, _) => Work::StatefulOpen(Arc::new(body.clone())),
             _ => Work::Add(Arc::new(body.clone())),
         };
         let id = self.enqueue(work)?;
@@ -660,6 +702,11 @@ impl Node {
         match work {
             Work::StatefulOpen(body) => ra::Command::OpenLocalStateful(Box::new((**body).clone())),
             Work::PrimaryOpen(body) => ra::Command::OpenLocalPrimary(Box::new((**body).clone())),
+            Work::AddPrimary(body, source, generation) => ra::Command::AddPrimary {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
             Work::Add(body) => ra::Command::Add {
                 body: Box::new((**body).clone()),
                 source: self.admission.fm_source.clone(),
@@ -1058,10 +1105,12 @@ impl Node {
                 LocalDisposition::HealthProcessingDisabled
             }
             ra::Effect::Reply(_)
+            | ra::Effect::PrimaryReply(_)
             | ra::Effect::LocalStatefulOpenReply(_)
             | ra::Effect::RemoveReply(_) => LocalDisposition::LocalResponse,
             ra::Effect::RequestReportRetry
             | ra::Effect::StatefulClosePending { .. }
+            | ra::Effect::StatefulDroppedPending(_)
             | ra::Effect::ReplicaUp(_)
             | ra::Effect::RequestServiceTypeWork { .. }
             | ra::Effect::ServiceTypeWorkCaptured { .. }

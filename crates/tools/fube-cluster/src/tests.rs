@@ -9,6 +9,7 @@ use std::{
 
 fn launches() -> [Launch; 2] {
     [1, 2].map(|placement| Launch {
+        profile: ServiceProfile::Stateless,
         deployment: "00000000-0000-4000-8000-000000000001".into(),
         session: format!("00000000-0000-4000-8000-00000000000{}", placement + 1),
         capability: uuid::Uuid::new_v4().to_string(),
@@ -403,6 +404,7 @@ impl Fixture {
     }
     fn config(&self) -> Config {
         Config {
+            profile: ServiceProfile::Stateless,
             root: self.root.clone(),
             app: support::binary("cluster-stateless-app", "FUBE_CLUSTER_APP"),
             executable: support::binary("fube-cluster", "FUBE_CLUSTER_NODE_EXE"),
@@ -469,6 +471,80 @@ fn assert_identity(actual: &Value, launch: &Launch, node_pid: u32, app_pid: u32)
     assert_eq!(actual["replica"], launch.replica);
     assert_eq!(actual["incarnation"], launch.incarnation as u64);
 }
+#[tokio::test]
+async fn stateful_add_primary_lost_reply_retries_the_original_native_lifetime() {
+    let fixture = Fixture::new("primary-retry");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::StatefulSingleton;
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    cluster.start().await.unwrap();
+    cluster.execute(command("primary", "create", Some(1))).await.unwrap();
+    let end = Instant::now() + Duration::from_secs(8);
+    let original = loop {
+        let link = cluster.children[0].link.as_ref().unwrap();
+        if let Some(mut incoming) = link.receive(Instant::now() + Duration::from_millis(10)).await.unwrap() {
+            let action = incoming.message.properties().unwrap().action;
+            let reply = match action.as_str() {
+                "AddPrimaryReply" => Some(decode_add_primary_reply(&incoming.message).unwrap().0),
+                "ServiceTypeNotification" => {
+                    let body = decode_service_type_notification(&incoming.message).unwrap();
+                    let admitted = cluster.ledger.placements[0].notification(&body).unwrap();
+                    link.send(service_type_notification_reply_message(&admitted,
+                        &cluster.children[0].launch.generation).unwrap()).await.unwrap();
+                    None
+                }
+                other => panic!("unexpected original Primary ingress {other}"),
+            };
+            if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
+            if let Some(reply) = reply { break reply; } // Intentionally lose semantic processing, not the live link.
+        }
+        assert!(Instant::now() < end, "initial Primary reply not observed");
+    };
+    assert_eq!(cluster.ledger.placements[0].observed, Observed::Pending);
+    assert!(cluster.ledger.placements[0].endpoint.is_none());
+    let app_pid = cluster.children[0].metadata.as_ref().unwrap().profile.as_ref().unwrap().app_pid;
+    until_with_budget(&mut cluster, Duration::from_secs(15), |cluster|
+        cluster.ledger.placements[0].observed == Observed::Running).await;
+    let placement = &cluster.ledger.placements[0];
+    assert_eq!((placement.replica, placement.incarnation), (original.replica.id, original.replica.instance));
+    assert_eq!(placement.endpoint.as_ref().unwrap(), &original.replica.service_endpoint);
+    let endpoint = placement.endpoint.clone().unwrap();
+    let mut socket = TcpStream::connect(&endpoint).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    socket.write_all(b"write\n").unwrap();
+    let mut response = String::new();
+    socket.take(512).read_to_string(&mut response).unwrap();
+    assert!(response.contains("assigned=1 applied=1 committed=1 value=acknowledged"), "{response}");
+    assert!(cluster.ledger.primary_retry(0, Instant::now() + Duration::from_secs(100)).unwrap().is_none());
+    assert!(cluster.shutdown().await["clean"] == true);
+    assert!(gone(app_pid));
+    assert!(TcpStream::connect(&endpoint).is_err());
+}
+
+#[test]
+fn stateful_primary_retry_preserves_native_minimum_and_maximum_action_intervals() {
+    let mut launches = launches();
+    for launch in &mut launches { launch.profile = ServiceProfile::StatefulSingleton; }
+    let mut ledger = Ledger::new(launches);
+    for placement in &mut ledger.placements {
+        placement.bootstrap = Bootstrap::Metadata;
+        let mut actual = profile(&placement.launch);
+        actual.service = placement.launch.profile.service().into();
+        actual.service_type = fixed_type_for(placement.launch.profile);
+        placement.admit_profile(actual).unwrap();
+    }
+    ledger.accept(command("create", "create", Some(1))).unwrap();
+    let initial = ledger.placements[0].body().unwrap();
+    let now = Instant::now();
+    assert!(ledger.primary_retry(0, now + Duration::from_secs(9)).unwrap().is_none());
+    assert_eq!(ledger.primary_retry(0, now + Duration::from_secs(11)).unwrap().unwrap(), initial);
+    assert!(ledger.primary_retry(0, now + Duration::from_secs(61)).unwrap().is_none());
+    assert_eq!(ledger.primary_retry(0, now + Duration::from_secs(72)).unwrap().unwrap(), initial);
+    assert!(ledger.accept(command("delete", "delete", Some(1))).is_err());
+    assert!(ledger.accept(command("replacement", "create", Some(1))).is_err());
+}
+
 fn gone(pid: u32) -> bool {
     !Path::new(&format!("/proc/{pid}")).exists()
 }

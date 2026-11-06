@@ -13,6 +13,21 @@ pub const LIMIT: usize = 64 * 1024;
 pub const APPLICATION: &str = "fabric:/Cluster";
 pub const SERVICE: &str = "fabric:/Cluster/Service";
 pub const TYPE: &str = "ClusterStatelessType";
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceProfile {
+    #[default]
+    Stateless,
+    StatefulSingleton,
+}
+impl ServiceProfile {
+    pub fn service(self) -> &'static str {
+        match self {
+            Self::Stateless => SERVICE,
+            Self::StatefulSingleton => "fabric:/Cluster/Singleton",
+        }
+    }
+}
 
 pub fn err(error: impl std::fmt::Debug) -> String {
     format!("{error:?}")
@@ -145,6 +160,8 @@ mod json_generation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Launch {
+    #[serde(default)]
+    pub profile: ServiceProfile,
     pub deployment: String,
     pub session: String,
     pub capability: String,
@@ -218,8 +235,8 @@ pub struct ActualProfile {
 }
 impl ActualProfile {
     pub fn validate(&self, launch: &Launch) -> Result<()> {
-        if self.service != SERVICE
-            || self.service_type != fixed_type()
+        if self.service != launch.profile.service()
+            || self.service_type != fixed_type_for(launch.profile)
             || self.code_package != "Code"
             || self.version.version != PackageVersion::default()
             || self.version.instance == 0
@@ -244,16 +261,28 @@ impl ActualProfile {
     }
 }
 
+#[cfg(test)]
 pub fn fixed_type() -> ServiceType {
+    fixed_type_for(ServiceProfile::Stateless)
+}
+pub fn fixed_type_for(profile: ServiceProfile) -> ServiceType {
+    let (application, package, name) = match profile {
+        ServiceProfile::Stateless => ("ClusterStatelessApp", "ClusterService", TYPE),
+        ServiceProfile::StatefulSingleton => (
+            "HostingLocalStatefulApp",
+            "LocalService",
+            "LocalStatefulType",
+        ),
+    };
     ServiceType {
         package: PackageId {
             application: ApplicationId {
-                type_name: "ClusterStatelessApp".into(),
+                type_name: application.into(),
                 number: 1,
             },
-            name: "ClusterService".into(),
+            name: package.into(),
         },
-        name: TYPE.into(),
+        name: name.into(),
     }
 }
 
@@ -274,7 +303,7 @@ pub fn add_body(launch: &Launch, profile: &ActualProfile) -> AddInstance {
     body.replica.instance = launch.incarnation;
     body.replica.state = 1;
     body.replica.version = profile.version.clone();
-    body.service.name = SERVICE.into();
+    body.service.name = launch.profile.service().into();
     body.service.application = APPLICATION.into();
     body.service.instance = 1;
     body.service.service_type = profile.service_type.clone();
@@ -282,6 +311,11 @@ pub fn add_body(launch: &Launch, profile: &ActualProfile) -> AddInstance {
     body.service.partitions = 1;
     body.service.target = 1;
     body.service.minimum = 1;
+    if launch.profile == ServiceProfile::StatefulSingleton {
+        body.service.stateful = true;
+        body.replica.current_role = 4;
+        body.unit.current.configuration = (1 << 32) + 1;
+    }
     body
 }
 

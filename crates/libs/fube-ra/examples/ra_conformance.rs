@@ -311,6 +311,81 @@ fn main() {
     check(input, output, "default-request", AddInstance::default());
     check(input, output, "rich-request", support::rich_request());
     check(input, output, "default-reply", AddInstanceReply::default());
+    let mut primary = support::rich_request();
+    primary.replica.current_role = 4;
+    primary.replica.previous_role = 1;
+    primary.replica.state = 1;
+    primary.replica.up = true;
+    let mut primary_reply = support::rich_reply(0);
+    primary_reply.replica.current_role = 4;
+    primary_reply.replica.previous_role = 1;
+    primary_reply.replica.state = 2;
+    primary_reply.replica.up = true;
+    check(input, output, "default-primary", AddPrimary::default());
+    check(input, output, "rich-primary", primary.clone());
+    check(
+        input,
+        output,
+        "default-primary-reply",
+        AddPrimaryReply::default(),
+    );
+    check(input, output, "rich-primary-reply", primary_reply.clone());
+    for (name, body) in [
+        ("default-primary", AddPrimary::default()),
+        ("rich-primary", primary),
+    ] {
+        let native = Message {
+            headers: [
+                (ACTOR, "actor-12"),
+                (ACTION, "action-AddPrimary"),
+                (HIGH_PRIORITY, "priority"),
+                (GENERATION_HEADER, "fm-generation"),
+            ]
+            .into_iter()
+            .map(|(id, name)| Header {
+                id,
+                value: fs::read(input.join(format!("{name}.bin"))).unwrap(),
+            })
+            .collect(),
+            body: fs::read(input.join(format!("{name}.bin"))).unwrap(),
+        };
+        let generation = support::rich_generation(false);
+        assert_eq!(
+            decode_add_primary(&native).unwrap(),
+            (body.clone(), generation.clone())
+        );
+        factory_contract(&native, &add_primary_message(&body, &generation).unwrap());
+        assert!(decode_add_instance(&native).is_err());
+        reject_prefixes::<AddPrimary>(input, name);
+    }
+    for (name, body) in [
+        ("default-primary-reply", AddPrimaryReply::default()),
+        ("rich-primary-reply", primary_reply),
+    ] {
+        for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
+            let native = Message {
+                headers: [
+                    (ACTOR, actor),
+                    (ACTION, "action-AddPrimaryReply"),
+                    (HIGH_PRIORITY, "priority"),
+                ]
+                .into_iter()
+                .map(|(id, name)| Header {
+                    id,
+                    value: fs::read(input.join(format!("{name}.bin"))).unwrap(),
+                })
+                .collect(),
+                body: fs::read(input.join(format!("{name}.bin"))).unwrap(),
+            };
+            assert_eq!(
+                decode_add_primary_reply(&native).unwrap(),
+                (body.clone(), owner)
+            );
+            factory_contract(&native, &add_primary_reply_message(&body, owner).unwrap());
+            assert!(decode_add_instance_reply(&native).is_err());
+        }
+        reject_prefixes::<AddPrimaryReply>(input, name);
+    }
     for error in [0, -2_147_017_398, -2_147_017_441] {
         check(
             input,
@@ -394,6 +469,8 @@ fn main() {
         "RemoveInstanceReply",
         "ReplicaUp",
         "ReplicaUpReply",
+        "AddPrimary",
+        "AddPrimaryReply",
         "ServiceTypeNotification",
         "ServiceTypeNotificationReply",
         "NodeUp",
@@ -499,5 +576,5 @@ fn main() {
             }
         }
     }
-    println!("45 cases verified; all selected-body proper prefixes rejected");
+    println!("51 cases verified; all selected-body proper prefixes rejected");
 }

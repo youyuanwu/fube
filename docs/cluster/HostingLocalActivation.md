@@ -211,6 +211,30 @@ provider/service destructor receipts. Request-ledger retry/ambiguity semantics,
 mixed/config/data packages, FM/peer choreography, copy/build, recovery and native
 stateful/P4/M2 qualification remain outside this slice.
 
+### FM-authorized fresh Primary
+
+`Profile::VolatileStatefulFmPrimary` separately admits the same strict volatile
+1/1 package and original-consumer-before-launch gate. Local
+`open_stateful_primary` does not authorize this profile; only
+`add_primary_from_fm` accepts its matched fixed FM source/generation and issues
+the distinct RA `AddPrimary` command. Registration-only, Idle and local Primary
+profiles still reject FM Primary control.
+
+The [minimal FM cluster](MinimalFmCluster.md#initial-stateful-fm-control) now
+drives this path over actual native-shaped `AddPrimary`/`AddPrimaryReply` frames.
+The RA retains original network reply responsibility across registration, Open,
+retry and unknown store completion; a local observation is never serialized as
+an FM reply. Native initial deactivation info is `(current configuration epoch,
+0)`. Matching Ready duplicates reply from the retained FT without recreating
+the lifetime or replacing its epoch. Closed/stale traffic retains typed dropped
+reporting rather than synthesizing an ACK. Stateful deletion/reconfiguration,
+replacement/reopen, FMM and recovery remain gated.
+
+Real foreground/channel tests exercise exact semantic completion, a lost reply
+and original-lifetime retry, public acknowledged write/readback and physical
+cleanup. A separate real-process lease-loss test observes hard fencing and
+retained terminal reporting without claiming graceful destructor receipts.
+
 ## Ownership and usage
 
 Construction validates options/capabilities without filesystem/process side

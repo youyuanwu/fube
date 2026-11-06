@@ -634,6 +634,276 @@ async fn local_initial_primary_requires_exact_committed_bootstrap_and_cannot_pro
     finish(&store, &executor).await;
 }
 
+fn primary_add(request: AddPrimary) -> Command {
+    Command::AddPrimary {
+        body: Box::new(request),
+        source: admission().fm_source,
+        generation: GenerationHeader {
+            number: admission().generation,
+            for_fm_replica: false,
+        },
+    }
+}
+
+#[tokio::test]
+async fn fm_add_primary_preserves_native_commit_retry_reply_and_closed_stale_semantics() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    let mut request = body(1);
+    request.service.stateful = true;
+    request.service.partitions = 1;
+    request.service.target = 1;
+    request.service.minimum = 1;
+    request.replica.current_role = 4;
+    request.unit.current.configuration = (1 << 32) + 5;
+    let mut generation = admission().generation;
+    generation.generation -= 1;
+    assert_eq!(
+        executor
+            .submit(Command::AddPrimary {
+                body: Box::new(request.clone()),
+                source: admission().fm_source,
+                generation: GenerationHeader {
+                    number: generation,
+                    for_fm_replica: false
+                },
+            })
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Ok(Disposition::IgnoredStale)
+    );
+    assert!(matches!(
+        executor
+            .submit(Command::AddPrimary {
+                body: Box::new(request.clone()),
+                source: admission().fm_source,
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: true
+                },
+            })
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    let mut foreign_source = admission().fm_source;
+    foreign_source.instance += 1;
+    assert!(matches!(
+        executor
+            .submit(Command::AddPrimary {
+                body: Box::new(request.clone()),
+                source: foreign_source,
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false
+                },
+            })
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Admission(_))
+    ));
+    assert!(executor.snapshot([1; 16]).committed.is_none());
+    let (entered, release) = hooks.pause(true);
+    let vetoed = executor.submit(primary_add(request.clone())).unwrap();
+    tokio::time::timeout(WAIT, entered).await.unwrap().unwrap();
+    assert!(executor.snapshot([1; 16]).committed.is_none());
+    assert!(executor.take_effects().is_empty());
+    release.send(()).unwrap();
+    assert!(matches!(vetoed.wait(WAIT).await, Err(Failure::Store(_))));
+    let (entered, release) = hooks.pause(false);
+    let accepted = executor.submit(primary_add(request.clone())).unwrap();
+    tokio::time::timeout(WAIT, entered).await.unwrap().unwrap();
+    assert!(executor.snapshot([1; 16]).committed.is_none());
+    assert!(executor.take_effects().is_empty());
+    release.send(()).unwrap();
+    accepted.wait(WAIT).await.unwrap();
+    let opened = executor.snapshot([1; 16]).committed.unwrap();
+    assert!(opened.fm_primary);
+    assert_eq!(opened.primary_deactivation, Some((request.unit.current, 0)));
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::Open { .. }]
+    ));
+    assert_eq!(
+        executor
+            .submit(primary_add(request.clone()))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Ok(Disposition::IgnoredPending)
+    );
+    assert!(executor.take_effects().is_empty());
+    registered(&executor, &request, accepted.id).await;
+    let normalized = (*executor.snapshot([1; 16]).committed.unwrap().body).clone();
+    let mut reply = complete(&normalized, accepted.id);
+    reply.replica.replication_endpoint = "127.0.0.1:12345".into();
+    let mut forged = reply.clone();
+    forged.replica.current_role = 2;
+    assert_eq!(
+        executor
+            .submit(Command::CompleteOpen(Box::new(forged)))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Ok(Disposition::IgnoredStale)
+    );
+    let (entered, release) = hooks.pause(false);
+    let completion = executor
+        .submit(Command::CompleteOpen(Box::new(reply.clone())))
+        .unwrap();
+    tokio::time::timeout(WAIT, entered).await.unwrap().unwrap();
+    assert_eq!(
+        executor.snapshot([1; 16]).committed.unwrap().phase,
+        Phase::Opening
+    );
+    assert!(executor.take_effects().is_empty());
+    release.send(()).unwrap();
+    completion.wait(WAIT).await.unwrap();
+    let effects_after = effects(&executor);
+    assert!(matches!(
+        effects_after.as_slice(),
+        [Effect::PrimaryReply(_)]
+    ));
+    let ready = executor.snapshot([1; 16]).committed.unwrap();
+    assert_eq!(
+        (ready.body.replica.current_role, ready.body.replica.state),
+        (4, 2)
+    );
+    assert_eq!(ready.primary_deactivation, Some((request.unit.current, 0)));
+    // Native Ready duplicate replies from the existing FT, not the new request epoch.
+    let mut duplicate = request.clone();
+    duplicate.unit.current.configuration += 1;
+    executor
+        .submit(primary_add(duplicate))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::PrimaryReply(body)] if body.unit == ready.body.unit)
+    );
+    assert_eq!(
+        executor.snapshot([1; 16]).committed.unwrap().usage,
+        ready.usage
+    );
+    assert!(matches!(
+        executor
+            .submit(Command::OpenLocalPrimary(Box::new(request.clone())))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    executor
+        .submit(Command::CloseLocal {
+            unit: request.unit.id.clone(),
+            mode: CloseMode::Close,
+        })
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    effects(&executor);
+    let closing = executor.snapshot([1; 16]).committed.unwrap();
+    executor
+        .submit(Command::CompleteClose(Box::new(CloseCompletion {
+            unit: closing.body.unit.clone(),
+            replica: closing.body.replica.clone(),
+            error: 0,
+        })))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    assert_eq!(
+        effects(&executor)
+            .iter()
+            .filter(|effect| matches!(effect, Effect::ReleaseUsage { .. }))
+            .count(),
+        1
+    );
+    executor
+        .submit(primary_add(request.clone()))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::StatefulDroppedPending(_)]
+    ));
+    let mut stale = request.clone();
+    stale.replica.instance -= 1;
+    executor
+        .submit(primary_add(stale))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    assert!(matches!(effects(&executor).as_slice(),
+        [Effect::StatefulDroppedPending(_), Effect::PrimaryReply(body)] if body.error == STALE_REQUEST));
+    request.replica.instance += 1;
+    assert!(matches!(
+        executor
+            .submit(primary_add(request))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    assert!(executor.take_effects().is_empty());
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn fm_add_primary_unknown_completion_holds_original_reply_and_duplicate_until_resolution() {
+    let (store, executor, hooks) = setup(Duration::from_millis(50)).await;
+    let mut request = body(1);
+    request.service.stateful = true;
+    request.service.partitions = 1;
+    request.service.target = 1;
+    request.service.minimum = 1;
+    request.replica.current_role = 4;
+    let accepted = executor.submit(primary_add(request.clone())).unwrap();
+    accepted.wait(WAIT).await.unwrap();
+    effects(&executor);
+    registered(&executor, &request, accepted.id).await;
+    let old = executor.snapshot([1; 16]).committed.unwrap();
+    let normalized = (*old.body).clone();
+    let mut reply = complete(&normalized, accepted.id);
+    reply.replica.replication_endpoint = "127.0.0.1:12345".into();
+    let (entered, release) = hooks.pause(false);
+    let completed = executor
+        .submit(Command::CompleteOpen(Box::new(reply)))
+        .unwrap();
+    entered.await.unwrap();
+    assert_eq!(completed.wait(WAIT).await, Err(Failure::Unknown));
+    let duplicate = executor.submit(primary_add(request)).unwrap();
+    assert_eq!(duplicate.status(), Status::Pending);
+    let held = executor.snapshot([1; 16]);
+    assert!(held.fenced && Arc::ptr_eq(&old, &held.committed.unwrap()));
+    assert!(executor.take_effects().is_empty());
+    release.send(()).unwrap();
+    completed.resolve(WAIT).await.unwrap();
+    duplicate.resolve(WAIT).await.unwrap();
+    let replies = executor.take_effects();
+    assert_eq!(replies.len(), 2);
+    assert_eq!(
+        (replies[0].operation, replies[1].operation),
+        (completed.id, duplicate.id)
+    );
+    assert!(replies
+        .iter()
+        .all(|effect| matches!(effect.effect, Effect::PrimaryReply(ref body) if body.error == 0)));
+    assert_eq!(
+        executor.snapshot([1; 16]).committed.unwrap().usage,
+        old.usage
+    );
+    finish(&store, &executor).await;
+}
+
 struct TestClock(AtomicI64);
 impl TestClock {
     fn new() -> Arc<Self> {

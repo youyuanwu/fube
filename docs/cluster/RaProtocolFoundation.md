@@ -8,6 +8,11 @@ helpers](RaStatelessReplacement.md), and a bounded P2 entity-execution
 seam above [P1 storage](RaStore.md). It is **not a running RA**, FM, Hosting
 adapter, full P2/P3 implementation or restart protocol.
 
+Later [minimal FM composition](MinimalFmCluster.md) runs these components with
+real RA/Hosting processes. Its [initial stateful profile](MinimalFmCluster.md#initial-stateful-fm-control)
+now adds distinct AddPrimary/Reply codecs and source-derived fresh-Primary
+processing, without completing broader stateful reliability or recovery.
+
 ## Inventory and scope
 
 [NativeRaProtocol.md](NativeRaProtocol.md) and its
@@ -21,8 +26,9 @@ deprecated handling, current no-ops and source endpoint gaps are classified.
 Every RA–FM and RA–RA exchange remains mandatory eventual scope. Replacing
 Federation delivery does not remove peer CreateReplica/GetLSN/Deactivate/Activate
 or peer DoReconfiguration continuation. Catalog completeness is not complete
-codec/handler/native-trace coverage. The remaining 58 actions have no enabled
-Rust action codec/handler capability; even the selected eight actions' complete runtime
+codec/handler/native-trace coverage. The remaining 54 actions have no enabled
+Rust action codec/handler capability; the selected twelve include bootstrap
+NodeUp/Ack and initial AddPrimary/Reply alongside the original eight. Complete runtime
 lifecycle/behavioral qualification remains unfinished.
 
 ## Codec evidence

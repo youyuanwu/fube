@@ -4,6 +4,8 @@ use fube_transport::serialization::serde::ObjectArray;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::time::Instant;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -80,6 +82,8 @@ pub struct Placement {
     pub retirement: Option<RetirementReceipt>,
     remove_received: bool,
     pending: Option<PendingPhase>,
+    primary_created_at: Option<Instant>,
+    primary_last_action: Option<Instant>,
 }
 #[derive(Clone)]
 pub struct Operation {
@@ -119,6 +123,8 @@ impl Placement {
             retirement: None,
             remove_received: false,
             pending: None,
+            primary_created_at: None,
+            primary_last_action: None,
         }
     }
     pub fn admit_profile(&mut self, profile: ActualProfile) -> Result<()> {
@@ -248,8 +254,8 @@ fn exact_replica(expected: &Replica, actual: &Replica, canonical: bool) -> Resul
             } else {
                 expected.version.clone()
             }
-        || actual.current_role != 1
-        || actual.previous_role != 1
+        || actual.current_role != expected.current_role
+        || actual.previous_role != expected.previous_role
     {
         return Err("foreign/stale replica incarnation/version".into());
     }
@@ -329,11 +335,19 @@ impl Ledger {
                 placement.observed = Observed::Pending;
                 placement.create_op = Some(command.op.clone());
                 placement.pending = Some(PendingPhase::Create);
+                if placement.launch.profile == crate::ServiceProfile::StatefulSingleton {
+                    let now = Instant::now();
+                    placement.primary_created_at = Some(now);
+                    placement.primary_last_action = Some(now);
+                }
                 Accepted::Create(index, Box::new(body))
             }
             "delete" => {
                 let index = usize::from(command.node.unwrap() - 1);
                 let placement = &mut self.placements[index];
+                if placement.launch.profile == crate::ServiceProfile::StatefulSingleton {
+                    return Err("stateful FM deletion is gated; use original owned shutdown".into());
+                }
                 if !placement.created
                     || !placement.link_alive
                     || placement.desired != Desired::Running
@@ -476,7 +490,11 @@ impl Ledger {
                     .map_err(|_| "non-numeric app endpoint")?;
                 if !address.ip().is_loopback()
                     || address.port() == 0
-                    || !body.replica.replication_endpoint.is_empty()
+                    || if placement.launch.profile == crate::ServiceProfile::StatefulSingleton {
+                        body.replica.replication_endpoint.is_empty()
+                    } else {
+                        !body.replica.replication_endpoint.is_empty()
+                    }
                 {
                     return Err("unsupported app endpoint".into());
                 }
@@ -582,6 +600,33 @@ impl Ledger {
                     json!({"op":op.command.op,"state":op.outcome["state"],"kind":"status"})
                 } else { op.outcome.clone() }).collect::<Vec<_>>(),
             "operation_capacity":64, "retained_operations":self.operations.len(),
-            "unsupported":"all native families outside the selected fresh stateless profile"})
+            "unsupported":"all native families outside the selected fixed lifecycle profile"})
+    }
+    /// Native Replica::CanGenerateAction and PendingTask's creating-primary branch.
+    pub fn primary_retry(&mut self, index: usize, now: Instant) -> Result<Option<AddPrimary>> {
+        let placement = &mut self.placements[index];
+        if placement.launch.profile != crate::ServiceProfile::StatefulSingleton
+            || !placement.link_alive
+            || placement.pending != Some(PendingPhase::Create)
+        {
+            return Ok(None);
+        }
+        let created = placement
+            .primary_created_at
+            .ok_or("missing original Primary retry owner")?;
+        let last = placement
+            .primary_last_action
+            .ok_or("missing original Primary action time")?;
+        let interval = if now > created + Duration::from_secs(60) {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(10)
+        };
+        if now <= last + interval {
+            return Ok(None);
+        }
+        let body = placement.body()?;
+        placement.primary_last_action = Some(now);
+        Ok(Some(body))
     }
 }
