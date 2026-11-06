@@ -22,8 +22,10 @@ implement FM AddPrimary/peer handlers or complete P4/M2.
 A later [fresh stateful FM control increment](MinimalFmCluster.md#initial-stateful-fm-control)
 now enables native-shaped AddPrimary/Reply with source-derived commit, initial
 deactivation, duplicate/stale and retry semantics over actual FM/RA channels.
-This is one volatile singleton lifetime per admitted node, not DeleteReplica,
-DoReconfiguration, peer control, recovery or complete P4/M2.
+Normal FM DeleteReplica/Reply now closes that original volatile lifetime with
+source-derived epoch/ReplicaId checks, canonical dropped replies, native retry
+and separately joined disposal/accounting proof. Force deletion, recreation,
+DoReconfiguration, peer control, recovery and complete P4/M2 remain gated.
 
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's

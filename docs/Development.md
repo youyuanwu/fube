@@ -408,12 +408,17 @@ qualification, request-ledger/recovery or full P4/M2.
 The minimal FM tool also supports `--stateful-singleton` with the prebuilt
 `hosting-local-app`. Its native-shaped AddPrimary/Reply path has distinct
 network authorization, native initial Primary deactivation info, commit/unknown
-barriers and original-lifetime action retry. Run the `fube-cluster` unit and
+barriers and original-lifetime action retry. Normal DeleteReplica/Reply now
+uses the same original lifetime, committed Close, held provider/service disposal
+and exact original H2 release. Lost deletion replies retry without recreation;
+FM requires both semantic completion and the source-bound Node disposal proof.
+Run the `fube-cluster` unit and
 foreground targets as well as RA protocol/entity and local-app lifecycle tests.
 Archived tests require both fixed app binaries; the nextest inventory declares
 them explicitly. Use the native source-stream producer/consumer in
-[the RA oracle guide](../tests/ra_protocol/README.md) for all 51 cases, including
-AddPrimary body/action/factory conformance. This is source-stream/schema-adapter
+[the RA oracle guide](../tests/ra_protocol/README.md) for the complete maintained
+inventory, including AddPrimary and DeleteReplica body/action/factory
+conformance. This is source-stream/schema-adapter
 evidence, not a full native handler trace or deployed native FM interoperability.
 
 The [production local lifecycle guide](cluster/StatelessRaRap.md) separates

@@ -144,7 +144,7 @@ fn contact(endpoint: &str) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 #[test]
-fn foreground_stateful_singleton_uses_fm_primary_completion_and_real_acknowledged_data() {
+fn foreground_stateful_singleton_creates_writes_reads_and_deletes_through_fm_control() {
     let root = support::parent().join(format!("fm-primary-{}", uuid::Uuid::new_v4()));
     let mut foreground = Foreground::start_profile(&root, true);
     assert_eq!(foreground.read()["event"], "ready");
@@ -162,9 +162,12 @@ fn foreground_stateful_singleton_uses_fm_primary_completion_and_real_acknowledge
         std::thread::sleep(Duration::from_millis(250));
     }
     let status = completed.expect("matched FM AddPrimaryReply did not complete");
-    let endpoint = status["status"]["nodes"][0]["endpoint"].as_str().unwrap();
+    let endpoint = status["status"]["nodes"][0]["endpoint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let request = |command: &[u8]| {
-        let mut socket = TcpStream::connect(endpoint).unwrap();
+        let mut socket = TcpStream::connect(&endpoint).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -191,9 +194,30 @@ fn foreground_stateful_singleton_uses_fm_primary_completion_and_real_acknowledge
     assert_eq!(duplicate["state"], "complete");
     assert_eq!(duplicate["replica"], pending["replica"]);
     assert_eq!(duplicate["incarnation"], pending["incarnation"]);
+    let delete = foreground.command(&json!({"op":"delete","action":"delete","node":1}));
+    assert_eq!(delete["state"], "pending");
+    assert_eq!(delete["replica"], pending["replica"]);
+    assert_eq!(delete["incarnation"], pending["incarnation"]);
+    let mut deleted = None;
+    for attempt in 0..40 {
+        let status =
+            foreground.command(&json!({"op":format!("delete-status-{attempt}"),"action":"status"}));
+        if status["status"]["nodes"][0]["observed"] == "absent" {
+            deleted = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let status = deleted.expect("DeleteReplicaReply plus original-node disposal did not complete");
+    let node = &status["status"]["nodes"][0];
+    assert_eq!(node["reusable"], false);
+    assert_eq!(node["retired_lifetimes"], 1);
+    assert_eq!(node["retirement"]["app_pid"], expected.app_pid);
+    assert_eq!(node["retirement"]["node_pid"], expected.node_pid);
+    assert!(TcpStream::connect(&endpoint).is_err());
     assert_eq!(
-        foreground.command(&json!({"op":"unsupported-delete","action":"delete","node":1}))["state"],
-        "rejected"
+        foreground.command(&json!({"op":"delete","action":"delete","node":1}))["state"],
+        "complete"
     );
     assert_eq!(
         foreground.command(&json!({"op":"replacement","action":"create","node":1}))["state"],
@@ -203,7 +227,7 @@ fn foreground_stateful_singleton_uses_fm_primary_completion_and_real_acknowledge
     assert_eq!(process_start(expected.app_pid), expected.app_start);
     foreground.finish();
     assert!(!Path::new(&format!("/proc/{}", expected.app_pid)).exists());
-    assert!(TcpStream::connect(endpoint).is_err());
+    assert!(TcpStream::connect(&endpoint).is_err());
     fs::remove_dir_all(root).unwrap();
 }
 

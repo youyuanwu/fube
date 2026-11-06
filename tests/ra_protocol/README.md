@@ -35,7 +35,7 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 51 inputs.
+The C++ producer independently constructs expected values and emits 58 inputs.
 The existing 36 cases and their contracts are retained:
 default/rich AddInstance, default/error AddInstanceReply, default/rich Remove
 (force false/true), default/rich removal reply, explicit-empty/rich ReplicaUp
@@ -52,7 +52,8 @@ Nondefault cases cover GUID/raw NodeId, high-bit instances, negative LSN/epochs,
 UTF-16/surrogates, enums/errors, all service collections and null/Invalid/both
 derived scaling variants. Rust rejects every proper prefix of rich body
 fixtures including both rich force bodies and the rich/partial notification
-bodies; native rejects nine truncated bodies, including NodeUp, Ack and PToP.
+bodies; native rejects eleven truncated bodies, including NodeUp, Ack, PToP
+and the distinct DeleteReplica/Reply fixtures.
 Non-polymorphic Delete inheritance invokes base rich traversal and native
 base/derived scopes, not a flattened or nested replacement. ReplicaUp's empty
 native constructor leaves scalar booleans uninitialized; the empty fixture
@@ -66,6 +67,52 @@ ReplicaMessageBody and ReplicaReplyMessageBody, so schema counts stay
 against native-produced action/actor/priority/generation bytes, including
 FM/FMM reply-owner asymmetry and proper-prefix rejection. Header/schema support
 does not enable FMM execution or claim full native AddPrimary handler parity.
+
+### Normal DeleteReplica/Reply extension
+
+Seven cases retain all prior 51 inputs:
+`default-delete-replica`, `rich-delete-replica`,
+`default-delete-replica-reply`, `rich-delete-replica-reply-0`,
+`rich-delete-replica-reply--2147017398`, `action-DeleteReplica` and
+`action-DeleteReplicaReply`. The rich request explicitly selects force=false,
+volatile stateful service and 1/1 sizes, Primary/Ready/up replica fields. Rich
+reply fixtures exercise None/None/Dropped/down fields and success/StaleRequest
+primitive error values. The dropped replica is freshly initialized as in native
+`ReplicaDescription.cpp:93–101`: invalid package version/LSNs and empty endpoints,
+with only identity, Dropped state and down flag changed. Other nondefault fields remain synthetic schema stress
+values, not proof of an executable FM lifecycle or a captured runtime reply.
+Existing RemoveInstance force=false/true fixtures and every original adapter
+remain unchanged.
+
+Native [DeleteReplicaMessageBody.h:10–55](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/common/DeleteReplicaMessageBody.h#L10-L55)
+inherits ReplicaMessageBody (`fudesc_`, `replica_`, `service_`) and adds only
+`isForce_`. The request alias preserves those native base/derived scopes.
+The reply alias retains ReplicaReplyMessageBody (`fudesc_`, `replica_`,
+`errorCode_`). No new schema type is invented: counts remain 59 types/199 fields.
+Replica role and state values come from the pinned common `ReplicaRole.h`
+and `ReplicaStates.h`, not declaration-order guesses in Rust.
+
+[RSMessage.cpp:86–87,288–299](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/common/RSMessage.cpp#L86-L87)
+and `RSMessage.h:260–267` pin literal actions, destination actor RA=12 for
+DeleteReplica and FM=11 for DeleteReplicaReply, with high priority=true.
+`fm/SendMessageAction.cpp:28–47` adds the request's actual FM generation/owner
+header. `ra/Communication.FMTransport.h:45–63,118–135` and
+`ra/Infrastructure.MessageUtility.h:15–23` do not add a reply generation;
+`FederationWrapper.cpp:162–195` rewrites its destination actor to FMM=10 when
+sent to that owner. These native source files are included in the manifest's
+input hashes.
+
+Rust exercises the production `delete_replica_message`/`decode_delete_replica`
+and `delete_replica_reply_message`/`decode_delete_replica_reply` with
+native-produced actor/action/priority/generation bytes, both generation-owner
+flags and both reply owners. Factory comparisons verify actor/action/priority
+and generation presence; decoding verifies the generation's fields.
+Cross-action decoding rejects the shared-schema RemoveInstance and AddPrimary
+actions. Rust rejects every proper prefix of all five new bodies; the actual
+native decoder executes two additional truncated-body rejections. This is
+wire/schema evidence only, not original handler execution, native FM
+interoperability, or authorization of force deletion, recreation,
+reconfiguration, FMM execution or recovery.
 
 ### Bootstrap and source identity header extension
 
@@ -146,8 +193,8 @@ env PATH=/nonexistent /usr/bin/python3 -m tests.ra_protocol.consumer \
   --expected-head COMMIT --expected-source SOURCE_DIGEST
 ```
 
-The bundle has exactly 51 `native/*.bin`, `schema.h`, `native-oracle`,
-`ra-conformance` and `manifest.json` (55 files total). No other files are
+The bundle has exactly 58 `native/*.bin`, `schema.h`, `native-oracle`,
+`ra-conformance` and `manifest.json` (62 files total). No other files are
 accepted. The consumer verifies exact coverage/type/member counts, regular files, hashes,
 provenance and both compiled source identities **before** execution. Missing,
 modified, wrong-source and symlink inputs fail; it imports no producer and
@@ -169,7 +216,7 @@ final delivery produces again at the clean reviewed implementation head.
 
 ## Separate actual-native helper evidence
 
-The helper producer is **not part of, and does not change**, the 51-case,
+The helper producer is **not part of, and does not change**, the 58-case,
 59-type/199-field wire bundle or its compiler-free consumer. It compiles
 unmodified `pal/wc16.c`, `RetryableErrorState.cpp` and
 `RetryableErrorStateThresholdCollection.cpp`. Identifier, `LargeInteger`,

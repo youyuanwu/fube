@@ -56,6 +56,7 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
                 | "AddInstanceReply"
                 | "AddPrimaryReply"
                 | "RemoveInstanceReply"
+                | "DeleteReplicaReply"
         )
         || props.expects_reply != (props.action == "NodeUp")
         || props.high_priority != (props.action != "ServiceTypeNotification")
@@ -75,6 +76,7 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
             "AddInstance"
                 | "AddPrimary"
                 | "RemoveInstance"
+                | "DeleteReplica"
                 | "ReplicaUpReply"
                 | "ServiceTypeNotificationReply"
         )
@@ -183,10 +185,10 @@ pub fn predecode(message: &Message) -> Result<()> {
         "AddInstance" | "AddPrimary" => {
             decode::<AddInstance>(&message.body)?;
         }
-        "RemoveInstance" => {
+        "RemoveInstance" | "DeleteReplica" => {
             decode::<RemoveInstance>(&message.body)?;
         }
-        "AddInstanceReply" | "AddPrimaryReply" | "RemoveInstanceReply" => {
+        "AddInstanceReply" | "AddPrimaryReply" | "RemoveInstanceReply" | "DeleteReplicaReply" => {
             decode::<AddInstanceReply>(&message.body)?;
         }
         "ReplicaUp" | "ReplicaUpReply" => {

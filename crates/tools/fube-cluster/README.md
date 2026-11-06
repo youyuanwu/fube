@@ -25,7 +25,7 @@ fube-cluster --root /absolute/private/stateful-profile \
   --app /absolute/hosting-local-app --stateful-singleton
 ```
 
-Use `create`, `status` and `quit` in this variant. `AddPrimary`/`AddPrimaryReply`
+Use `create`, `status`, `delete` and `quit` in this variant. `AddPrimary`/`AddPrimaryReply`
 use the native shared ReplicaMessageBody/ReplicaReplyMessageBody schemas and
 distinct actions; no local Open observation becomes an FM acknowledgment.
 FM stays pending until the exact original semantic Primary/Ready reply.
@@ -38,10 +38,16 @@ admitted sequence before awaiting quorum completion, and returns progress/value.
 It rejects writes before runtime/engine role, epoch, readiness and access agree.
 This is volatile singleton acknowledgment, not durability or replicated copy.
 
-Stateful `delete`, replacement/recreation, promotion, `DoReconfiguration`,
-copy/build, FMM and recovery remain explicitly gated. `quit` uses the original
+Normal stateful `delete` is admitted only after the original Primary creation
+completes. It sends native `DeleteReplica(force=false)` and waits for the
+matching `DeleteReplicaReply` plus original Node disposal/accounting proof.
+Lost replies retry the same lifetime with native 10/60-second action intervals.
+Normal Delete produces no terminal ReplicaDown/ReplicaDropped-report ACK.
+The deleted tombstone remains retained; stateful replacement/recreation,
+force deletion, promotion, `DoReconfiguration`, copy/build, FMM and recovery
+remain explicitly gated. `quit` uses the original
 owned local cleanup path, retaining terminal stateful reporting as pending
-escrow rather than manufacturing DeleteReplica/ReplicaUp acknowledgments.
+escrow rather than manufacturing ReplicaUp acknowledgments.
 
 The root is operator-owned and private (0700). Its parent must already exist.
 All materialized packages, runtime roots, node controls and scratch stay beneath
@@ -66,7 +72,7 @@ Status operation retries return their original snapshot. At most 64 operation
 identities are retained without eviction, with 4096-byte input lines, 64-KiB
 output objects and strict
 unknown-field rejection. Each node has one current instance lifetime.
-After verified deletion, create again with a **new operation ID** on the same
+In the stateless profile only, after verified deletion, create again with a **new operation ID** on the same
 live node; replica and RA-instance IDs both strictly increase. Old completed
 operation retries retain their original lifetime/endpoint. Loss or unproved
 cleanup does not enable recreation. A reported endpoint is numeric loopback; independently send
@@ -94,7 +100,7 @@ retained and never acknowledged merely because a write or send pass finished.
 Original external-effect escrow is 32 slots; reply receipts, scheduling
 completions and semantic pending maps have separate finite bounds.
 
-Deletion joins the exact semantic Remove with a bounded local `retirement.json`
+Deletion joins the exact semantic RemoveInstance/DeleteReplica reply with a bounded local `retirement.json`
 from the original Node. That receipt requires original-runtime service disposal,
 the exact Applied Close command, original Hosting acquisition release and drained
 predecessor replica work. A written frame, Closed snapshot, Remove response,
@@ -158,5 +164,7 @@ their failed-handoff domain and evidence. These tests are native-free evidence, 
 deployed native FM/Federation qualification.
 Stateful tests additionally exercise the real foreground FM/RA processes,
 acknowledged public write/readback, dropped AddPrimaryReply with original-lifetime
-retry, native retry-interval boundaries and gated deletion/replacement. The
+retry, native retry-interval boundaries, FM normal deletion with both disposal
+barriers, a lost DeleteReplicaReply, independent sibling contact and gated
+force deletion/recreation. The
 archive includes both fixed app binaries; no consumer-side build fallback exists.

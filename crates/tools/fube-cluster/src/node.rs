@@ -101,6 +101,7 @@ impl Adapter {
                         ra::Effect::Reply(_)
                             | ra::Effect::PrimaryReply(_)
                             | ra::Effect::RemoveReply(_)
+                            | ra::Effect::DeleteReplicaReply(_)
                     )
                 {
                     self.replies.push_back(receipt.dispatch);
@@ -200,6 +201,9 @@ impl Adapter {
                     ra::Effect::Reply(body) => add_instance_reply_message(body, Owner::Fm),
                     ra::Effect::PrimaryReply(body) => add_primary_reply_message(body, Owner::Fm),
                     ra::Effect::RemoveReply(body) => remove_instance_reply_message(body, Owner::Fm),
+                    ra::Effect::DeleteReplicaReply(body) => {
+                        delete_replica_reply_message(body, Owner::Fm)
+                    }
                     _ => return Err("unimplemented semantic reply retained".into()),
                 }
                 .map_err(err)?;
@@ -331,7 +335,10 @@ impl Adapter {
         let replica_work = |dispatch: &ra::Dispatched| {
             matches!(
                 dispatch.effect,
-                ra::Effect::RequestReportRetry | ra::Effect::ReplicaUp(_)
+                ra::Effect::RequestReportRetry
+                    | ra::Effect::ReplicaUp(_)
+                    | ra::Effect::StatefulClosePending { .. }
+                    | ra::Effect::StatefulDroppedPending(_)
             )
         };
         self.replies.is_empty()
@@ -740,6 +747,15 @@ fn receive_command(
         "RemoveInstance" => {
             let (body, generation) = decode_remove_instance(message).map_err(err)?;
             node.fm_work(FmWork::Remove(
+                Box::new(body),
+                launch.fm.clone(),
+                generation,
+            ))
+            .map_err(err)?;
+        }
+        "DeleteReplica" => {
+            let (body, generation) = decode_delete_replica(message).map_err(err)?;
+            node.fm_work(FmWork::DeleteReplica(
                 Box::new(body),
                 launch.fm.clone(),
                 generation,

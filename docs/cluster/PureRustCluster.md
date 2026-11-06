@@ -88,7 +88,10 @@ The [minimal FM tool](MinimalFmCluster.md#initial-stateful-fm-control) now has a
 explicit fresh volatile 1/1 variant using real AddPrimary/Reply, committed
 RA/RAP bootstrap, native initial deactivation/duplicate/retry semantics and
 independent acknowledged application write/readback. Each configured node hosts
-one independent singleton lifetime, not a multi-replica set. Stateful deletion,
+one independent singleton lifetime, not a multi-replica set.
+Normal FM DeleteReplica/Reply now retires that same lifetime through committed
+RAP Close and separately joined original disposal/accounting proof. The deleted
+tombstone remains nonreusable. Stateful force deletion/recreation, spontaneous
 terminal-report delivery, reconfiguration/peer control, recovery and complete
 P4/M2 remain staged.
 

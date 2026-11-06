@@ -283,9 +283,9 @@ fn native_free(node: &Node) {
         .split(|b| *b == 0)
         .any(|s| s.starts_with(b"LD_LIBRARY_PATH=") || s.starts_with(b"FabricConfigFileName=")));
 }
-async fn advance(node: &mut Node, duration: Duration) {
+async fn advance(node: &mut Node, duration: Duration) -> Vec<EffectReceipt> {
     let start = std::time::Instant::now();
-    until(node, |_| start.elapsed() >= duration).await;
+    until(node, |_| start.elapsed() >= duration).await
 }
 async fn replay(node: &mut Node, dispatch: &ra::Dispatched, stale: bool) {
     let (action, registration, mut body, flags) = match &dispatch.effect {
@@ -385,6 +385,16 @@ async fn stateful_initial_primary_applies_acknowledges_and_reads_one_write_befor
         b.unit.current.configuration = (1 << 32) + 5;
         assert!(node.open_stateful(b.clone()).is_err());
         assert!(node.add(b.clone()).is_err());
+        assert!(node
+            .fm_work(fube_node::local::FmWork::DeleteReplica(
+                Box::new(DeleteReplica::new(b.clone(), false)),
+                admission().fm_source,
+                GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false
+                },
+            ))
+            .is_err());
         for invalid in 0..3 {
             let mut rejected = b.clone();
             match invalid {
@@ -593,6 +603,197 @@ async fn stateful_initial_primary_lease_loss_fences_opening_and_serving_without_
             .with_file_name("local-provider.resource")
             .is_file());
         assert!(node.open_stateful_primary(b).is_err());
+        let root = node.activation().root().unwrap().to_path_buf();
+        cleanup(&mut node, &store).await;
+        assert!(!root.exists());
+        let status = node.activation().process_status().unwrap();
+        assert!(status.exit_observed && status.group_drained && status.reaped);
+    }
+}
+
+#[tokio::test]
+async fn stateful_fm_delete_waits_for_real_provider_and_service_disposal_before_reply_and_release()
+{
+    for args in ["--block-provider-dispose", "--block-dispose"] {
+        let fixture = Fixture::fm_primary();
+        let (mut node, store) = fixture.node(args).await;
+        until(&mut node, |n| n.package_registration().registered).await;
+        native_free(&node);
+        let mut request = body(&node);
+        request.unit.current.configuration = (1 << 32) + 5;
+        let generation = GenerationHeader {
+            number: admission().generation,
+            for_fm_replica: false,
+        };
+        node.add_primary_from_fm(request.clone(), &admission().fm_source, &generation)
+            .unwrap();
+        until(&mut node, |n| {
+            n.snapshot(request.unit.id.guid.0)
+                .committed
+                .is_some_and(|s| s.phase == ra::Phase::Ready)
+        })
+        .await;
+        let address = primary_endpoint(&node);
+        let replication = data_endpoint(&node).address;
+        primary_ready(&mut node, &address).await;
+        let written = primary_request(&address, "write\n").await;
+        assert!(written.contains("assigned=1 applied=1 committed=1 value=acknowledged"));
+        assert_eq!(primary_request(&address, "read\n").await, written);
+        for invalid in 0..4 {
+            let mut body = DeleteReplica::new(request.clone(), false);
+            let mut source = admission().fm_source;
+            let mut header = generation.clone();
+            match invalid {
+                0 => body.deletion.0.force = true,
+                1 => source.instance += 1,
+                2 => header.for_fm_replica = true,
+                _ => header.number.generation -= 1,
+            }
+            assert!(node
+                .fm_work(fube_node::local::FmWork::DeleteReplica(
+                    Box::new(body),
+                    source,
+                    header
+                ))
+                .is_err());
+        }
+        assert!(node
+            .fm_work(fube_node::local::FmWork::Remove(
+                Box::new(RemoveInstance::new(request.clone(), false)),
+                admission().fm_source,
+                generation.clone()
+            ))
+            .is_err());
+        node.fm_work(fube_node::local::FmWork::DeleteReplica(
+            Box::new(DeleteReplica::new(request.clone(), false)),
+            admission().fm_source,
+            generation.clone(),
+        ))
+        .unwrap();
+        let provider_barrier = args == "--block-provider-dispose";
+        let dispatched = until(&mut node, |n| {
+            count(
+                n,
+                if provider_barrier {
+                    "LOCAL_DATA_PROVIDER dispose begin"
+                } else {
+                    "LOCAL_DISPOSE begin"
+                },
+            ) == 1
+        })
+        .await;
+        let close = dispatched
+            .iter()
+            .find(|r| matches!(r.dispatch.effect, ra::Effect::Close { flags: 8, .. }))
+            .unwrap()
+            .dispatch
+            .clone();
+        assert!(!dispatched
+            .iter()
+            .any(|r| matches!(r.dispatch.effect, ra::Effect::DeleteReplicaReply(_))));
+        let delayed = advance(&mut node, Duration::from_millis(150)).await;
+        assert!(!delayed
+            .iter()
+            .any(|r| matches!(r.dispatch.effect, ra::Effect::DeleteReplicaReply(_))));
+        assert_eq!(
+            node.snapshot(request.unit.id.guid.0)
+                .committed
+                .unwrap()
+                .phase,
+            ra::Phase::Closing
+        );
+        assert_eq!(node.retained_usage(), 1);
+        assert!(node.instance_disposal().is_none());
+        assert_eq!(count(&node, "LOCAL_CALLBACK create_replica"), 1);
+        if provider_barrier {
+            assert!(resource(&node)
+                .with_file_name("local-provider.resource")
+                .is_file());
+            for command in ["write\n", "read\n"] {
+                let response = primary_request(&address, command).await;
+                assert!(
+                    response == "ERR NotPrimary\n" || response == "ERR ObjectClosed\n",
+                    "{response}"
+                );
+            }
+        } else {
+            assert!(!resource(&node)
+                .with_file_name("local-provider.resource")
+                .exists());
+            assert!(std::net::TcpStream::connect(&address).is_err());
+        }
+        // A duplicate retains the same Closing lifetime, not another Close or use.
+        node.fm_work(fube_node::local::FmWork::DeleteReplica(
+            Box::new(DeleteReplica::new(request.clone(), false)),
+            admission().fm_source,
+            generation.clone(),
+        ))
+        .unwrap();
+        fs::write(
+            resource(&node).with_file_name(if provider_barrier {
+                "local-provider-dispose.release"
+            } else {
+                "local-dispose.release"
+            }),
+            b"release actual disposer",
+        )
+        .unwrap();
+        let completed = until(&mut node, |n| n.instance_disposal().is_some()).await;
+        assert_eq!(
+            completed
+                .iter()
+                .filter(|r| matches!(r.dispatch.effect, ra::Effect::DeleteReplicaReply(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            completed
+                .iter()
+                .filter(|r| matches!(r.dispatch.effect, ra::Effect::ReleaseUsage { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(node.retained_usage(), 0);
+        assert_eq!(count(&node, "LOCAL_DATA_PROVIDER disposed written"), 1);
+        assert_eq!(count(&node, "LOCAL_PRIMARY released"), 1);
+        assert_eq!(count(&node, "LOCAL_DISPOSE complete"), 1);
+        assert!(node.external_pending().iter().all(|d| !matches!(
+            d.effect,
+            ra::Effect::StatefulClosePending { .. } | ra::Effect::StatefulDroppedPending(_)
+        )));
+        assert!(std::net::TcpStream::connect(&address).is_err());
+        assert!(std::net::TcpStream::connect(&replication).is_err());
+        let proof = node.instance_disposal().unwrap();
+        assert_eq!(proof.body.replica.id, request.replica.id);
+        replay(&mut node, &close, false).await;
+        node.fm_work(fube_node::local::FmWork::DeleteReplica(
+            Box::new(DeleteReplica::new(request.clone(), false)),
+            admission().fm_source,
+            generation,
+        ))
+        .unwrap();
+        let duplicate = until(&mut node, |n| n.pending_commands() == 0 && n.quiescent()).await;
+        assert!(duplicate
+            .iter()
+            .any(|r| matches!(r.dispatch.effect, ra::Effect::DeleteReplicaReply(_))));
+        assert!(!duplicate
+            .iter()
+            .any(|r| matches!(r.dispatch.effect, ra::Effect::ReleaseUsage { .. })));
+        assert_eq!(
+            node.instance_disposal().unwrap().acquisition,
+            proof.acquisition
+        );
+        assert!(node
+            .add_primary_from_fm(
+                request,
+                &admission().fm_source,
+                &GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                }
+            )
+            .is_err());
+        assert_eq!(count(&node, "LOCAL_CALLBACK create_replica"), 1);
         let root = node.activation().root().unwrap().to_path_buf();
         cleanup(&mut node, &store).await;
         assert!(!root.exists());

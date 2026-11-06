@@ -95,18 +95,36 @@ class CatalogTests(unittest.TestCase):
         for action in ["NodeUp", "NodeUpAck", "AddInstance", "AddInstanceReply", "RemoveInstance",
                        "RemoveInstanceReply", "ReplicaUp", "ReplicaUpReply",
                        "ServiceTypeNotification", "ServiceTypeNotificationReply",
-                       "AddPrimary", "AddPrimaryReply"]:
+                       "AddPrimary", "AddPrimaryReply", "DeleteReplica", "DeleteReplicaReply"]:
             self.assertIn("selected", records[action]["status"])
-        for action in ["RemoveReplica", "DeleteReplica", "ReplicaDropped", "ReplicaDown"]:
+        for action in ["RemoveReplica", "ReplicaDropped", "ReplicaDown"]:
             self.assertNotIn("selected", records[action]["status"])
         self.assertIn("not a", CATALOG.read_text())
+
+    def test_delete_replica_mapping_retains_native_schema_and_bounded_evidence(self):
+        records = {r["symbol"]: r for r in rows()}
+        for action, actor, body in [
+            ("DeleteReplica", "RA", "DeleteReplicaMessageBody"),
+            ("DeleteReplicaReply", "FM", "ReplicaReplyMessageBody"),
+        ]:
+            record = records[action]
+            self.assertEqual(record["factory_actor"], actor)
+            self.assertEqual(record["body"], body)
+            self.assertIn("selected", record["status"])
+            self.assertIn("codec", record["status"])
+        text = CATALOG.read_text()
+        for term in ["C5", "delete_replica_message", "decode_delete_replica",
+                     "delete_replica_reply_message", "decode_delete_replica_reply",
+                     "58 inputs", "62 bundle files", "59 types/199 fields",
+                     "force=false", "GenerationHeader"]:
+            self.assertIn(term, text)
 
     def test_removal_mapping_retains_native_and_runtime_boundaries(self):
         removal = (ROOT / "docs/cluster/RaStatelessRemoval.md").read_text()
         for term in [REVISION, "Obliterate", "ReplicaUp", "ForceDelete", "StaleRequest",
                      "not execution", "trusted", "format 2", "volatile",
-                     "queued/in-flight Open", "55 files"]:
-            if term == "55 files":
+                     "queued/in-flight Open", "62 files"]:
+            if term == "62 files":
                 self.assertIn(term, (ROOT / "tests/ra_protocol/README.md").read_text())
             else:
                 self.assertIn(term, removal)
@@ -121,7 +139,7 @@ class CatalogTests(unittest.TestCase):
             self.assertIn(term, replacement)
         records = {r["symbol"]: r for r in rows()}
         self.assertIn("drop-resend-replacement", records["AddInstance"]["status"])
-        self.assertEqual(sum("selected" in r["status"] for r in records.values()), 12)
+        self.assertEqual(sum("selected" in r["status"] for r in records.values()), 14)
 
 
 if __name__ == "__main__":

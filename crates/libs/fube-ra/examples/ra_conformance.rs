@@ -223,6 +223,36 @@ fn rich_ptop() -> PToP {
     }
 }
 
+fn rich_deletion() -> DeleteReplica {
+    let mut body = support::rich_request();
+    body.unit.target = 1;
+    body.unit.minimum = 1;
+    body.service.target = 1;
+    body.service.minimum = 1;
+    body.service.stateful = true;
+    body.service.persisted = false;
+    body.replica.current_role = 4;
+    body.replica.previous_role = 1;
+    body.replica.state = 2;
+    body.replica.up = true;
+    DeleteReplica::new(body, false)
+}
+
+fn rich_deletion_reply(error: i64) -> DeleteReplicaReply {
+    let mut body = support::rich_reply(error);
+    body.unit.target = 1;
+    body.unit.minimum = 1;
+    body.replica = Replica {
+        node: body.replica.node,
+        id: body.replica.id,
+        instance: body.replica.instance,
+        state: 3,
+        up: false,
+        ..Replica::default()
+    };
+    body
+}
+
 fn native_envelope(input: &Path, body: &str, ack: bool) -> Message {
     let mut headers: Vec<_> = [
         (ACTOR, if ack { "actor-13" } else { "actor-11" }),
@@ -448,6 +478,92 @@ fn main() {
         RemoveInstanceReply::default(),
     );
     check(input, output, "rich-remove-reply", support::rich_reply(0));
+    for (name, body) in [
+        ("default-delete-replica", DeleteReplica::default()),
+        ("rich-delete-replica", rich_deletion()),
+    ] {
+        check(input, output, name, body.clone());
+        for from_fmm in [false, true] {
+            let native = Message {
+                headers: [
+                    (ACTOR, "actor-12"),
+                    (ACTION, "action-DeleteReplica"),
+                    (HIGH_PRIORITY, "priority"),
+                    (
+                        GENERATION_HEADER,
+                        if from_fmm {
+                            "fmm-generation"
+                        } else {
+                            "fm-generation"
+                        },
+                    ),
+                ]
+                .into_iter()
+                .map(|(id, name)| Header {
+                    id,
+                    value: fs::read(input.join(format!("{name}.bin"))).unwrap(),
+                })
+                .collect(),
+                body: fs::read(input.join(format!("{name}.bin"))).unwrap(),
+            };
+            let generation = support::rich_generation(from_fmm);
+            assert_eq!(
+                decode_delete_replica(&native).unwrap(),
+                (body.clone(), generation.clone())
+            );
+            let made = delete_replica_message(&body, &generation).unwrap();
+            factory_contract(&native, &made);
+            assert_eq!(
+                decode_delete_replica(&made).unwrap(),
+                (body.clone(), generation)
+            );
+            assert!(decode_remove_instance(&native).is_err());
+            assert!(decode_add_primary(&native).is_err());
+        }
+        reject_prefixes::<DeleteReplica>(input, name);
+    }
+    for (name, body) in [
+        (
+            "default-delete-replica-reply",
+            DeleteReplicaReply::default(),
+        ),
+        ("rich-delete-replica-reply-0", rich_deletion_reply(0)),
+        (
+            "rich-delete-replica-reply--2147017398",
+            rich_deletion_reply(-2_147_017_398),
+        ),
+    ] {
+        check(input, output, name, body.clone());
+        for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
+            let native = Message {
+                headers: [
+                    (ACTOR, actor),
+                    (ACTION, "action-DeleteReplicaReply"),
+                    (HIGH_PRIORITY, "priority"),
+                ]
+                .into_iter()
+                .map(|(id, name)| Header {
+                    id,
+                    value: fs::read(input.join(format!("{name}.bin"))).unwrap(),
+                })
+                .collect(),
+                body: fs::read(input.join(format!("{name}.bin"))).unwrap(),
+            };
+            assert_eq!(
+                decode_delete_replica_reply(&native).unwrap(),
+                (body.clone(), owner)
+            );
+            let made = delete_replica_reply_message(&body, owner).unwrap();
+            factory_contract(&native, &made);
+            assert_eq!(
+                decode_delete_replica_reply(&made).unwrap(),
+                (body.clone(), owner)
+            );
+            assert!(decode_remove_instance_reply(&native).is_err());
+            assert!(decode_add_primary_reply(&native).is_err());
+        }
+        reject_prefixes::<DeleteReplicaReply>(input, name);
+    }
     check(
         input,
         output,
@@ -471,6 +587,8 @@ fn main() {
         "ReplicaUpReply",
         "AddPrimary",
         "AddPrimaryReply",
+        "DeleteReplica",
+        "DeleteReplicaReply",
         "ServiceTypeNotification",
         "ServiceTypeNotificationReply",
         "NodeUp",
@@ -576,5 +694,5 @@ fn main() {
             }
         }
     }
-    println!("51 cases verified; all selected-body proper prefixes rejected");
+    println!("58 cases verified; all selected-body proper prefixes rejected");
 }

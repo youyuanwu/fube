@@ -171,6 +171,37 @@ int main(int argc,char** argv) {
         run(mode,dir,"default-remove-reply",remove_reply);
         c=0; rich(remove_reply,c); remove_reply.errorCode_.value_=Enum(0);
         run(mode,dir,"rich-remove-reply",remove_reply);
+        DeleteReplicaMessageBody deletion;
+        run(mode,dir,"default-delete-replica",deletion);
+        c=0; rich(deletion,c);
+        deletion.isForce_=false;
+        deletion.fudesc_.targetReplicaSetSize_=1;
+        deletion.fudesc_.minReplicaSetSize_=1;
+        deletion.service_.targetReplicaSetSize_=1;
+        deletion.service_.minReplicaSetSize_=1;
+        deletion.service_.isStateful_=true;
+        deletion.service_.hasPersistedState_=false;
+        deletion.replica_.currentConfigurationRole_=Enum(4);
+        deletion.replica_.previousConfigurationRole_=Enum(1);
+        deletion.replica_.state_=Enum(2);
+        deletion.replica_.isUp_=true;
+        run(mode,dir,"rich-delete-replica",deletion);
+        ReplicaReplyMessageBody deletion_reply;
+        run(mode,dir,"default-delete-replica-reply",deletion_reply);
+        c=0; rich(deletion_reply,c);
+        deletion_reply.fudesc_.targetReplicaSetSize_=1;
+        deletion_reply.fudesc_.minReplicaSetSize_=1;
+        ReplicaDescription dropped;
+        dropped.federationNodeInstance_=deletion_reply.replica_.federationNodeInstance_;
+        dropped.replicaId_=deletion_reply.replica_.replicaId_;
+        dropped.instanceId_=deletion_reply.replica_.instanceId_;
+        dropped.state_=Enum(3);
+        dropped.isUp_=false;
+        deletion_reply.replica_=std::move(dropped);
+        for(LONG error:{0, -2147017398}) {
+            deletion_reply.errorCode_.value_=Enum(error);
+            run(mode,dir,"rich-delete-replica-reply-"+std::to_string(error),deletion_reply);
+        }
         // Native empty ctor leaves bools unspecified: explicitly initialize the fixture.
         ReplicaUpMessageBody up;
         up.isLastReplicaUpMessage_=false; up.isFromFMM_=false;
@@ -180,7 +211,7 @@ int main(int argc,char** argv) {
             up.isLastReplicaUpMessage_=last!=0; up.isFromFMM_=fmm!=0;
             run(mode,dir,"rich-replica-up-"+std::to_string(last)+"-"+std::to_string(fmm),up);
         }
-        for(auto name:{u"RemoveInstance",u"RemoveInstanceReply",u"ReplicaUp",u"ReplicaUpReply",u"AddPrimary",u"AddPrimaryReply"}) {
+        for(auto name:{u"RemoveInstance",u"RemoveInstanceReply",u"ReplicaUp",u"ReplicaUpReply",u"AddPrimary",u"AddPrimaryReply",u"DeleteReplica",u"DeleteReplicaReply"}) {
             action.action_=text(name);
             std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
             run(mode,dir,"action-"+ascii,action);
@@ -240,6 +271,12 @@ int main(int argc,char** argv) {
         bad=encode(removal); bad.resize(bad.size()/2);
         DeleteReplicaMessageBody rejected_removal;
         if(decode(bad,rejected_removal)) throw std::runtime_error("native accepted truncated removal");
+        bad=encode(deletion); bad.resize(bad.size()/2);
+        DeleteReplicaMessageBody rejected_deletion;
+        if(decode(bad,rejected_deletion)) throw std::runtime_error("native accepted truncated DeleteReplica");
+        bad=encode(deletion_reply); bad.resize(bad.size()/2);
+        ReplicaReplyMessageBody rejected_deletion_reply;
+        if(decode(bad,rejected_deletion_reply)) throw std::runtime_error("native accepted truncated DeleteReplicaReply");
         bad=encode(up); bad.resize(bad.size()/2);
         ReplicaUpMessageBody rejected_up;
         if(decode(bad,rejected_up)) throw std::runtime_error("native accepted truncated report");
@@ -258,7 +295,7 @@ int main(int argc,char** argv) {
         bad=encode(ptop); bad.resize(bad.size()/2);
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
-        std::cout << "native rejects 9 truncations OK\n";
+        std::cout << "native rejects 11 truncations OK\n";
         return 0;
     } catch(const std::exception& error) {
         std::cerr << error.what() << "\n"; return 1;

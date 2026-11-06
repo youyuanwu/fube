@@ -82,8 +82,8 @@ pub struct Placement {
     pub retirement: Option<RetirementReceipt>,
     remove_received: bool,
     pending: Option<PendingPhase>,
-    primary_created_at: Option<Instant>,
-    primary_last_action: Option<Instant>,
+    action_updated_at: Option<Instant>,
+    action_last_at: Option<Instant>,
 }
 #[derive(Clone)]
 pub struct Operation {
@@ -123,8 +123,8 @@ impl Placement {
             retirement: None,
             remove_received: false,
             pending: None,
-            primary_created_at: None,
-            primary_last_action: None,
+            action_updated_at: None,
+            action_last_at: None,
         }
     }
     pub fn admit_profile(&mut self, profile: ActualProfile) -> Result<()> {
@@ -254,8 +254,8 @@ fn exact_replica(expected: &Replica, actual: &Replica, canonical: bool) -> Resul
             } else {
                 expected.version.clone()
             }
-        || actual.current_role != expected.current_role
-        || actual.previous_role != expected.previous_role
+        || actual.current_role != if canonical { 1 } else { expected.current_role }
+        || actual.previous_role != if canonical { 1 } else { expected.previous_role }
     {
         return Err("foreign/stale replica incarnation/version".into());
     }
@@ -337,16 +337,20 @@ impl Ledger {
                 placement.pending = Some(PendingPhase::Create);
                 if placement.launch.profile == crate::ServiceProfile::StatefulSingleton {
                     let now = Instant::now();
-                    placement.primary_created_at = Some(now);
-                    placement.primary_last_action = Some(now);
+                    placement.action_updated_at = Some(now);
+                    placement.action_last_at = Some(now);
                 }
                 Accepted::Create(index, Box::new(body))
             }
             "delete" => {
                 let index = usize::from(command.node.unwrap() - 1);
                 let placement = &mut self.placements[index];
-                if placement.launch.profile == crate::ServiceProfile::StatefulSingleton {
-                    return Err("stateful FM deletion is gated; use original owned shutdown".into());
+                if placement.launch.profile == crate::ServiceProfile::StatefulSingleton
+                    && placement.observed != Observed::Running
+                {
+                    return Err(
+                        "stateful normal deletion requires the completed original Primary".into(),
+                    );
                 }
                 if !placement.created
                     || !placement.link_alive
@@ -366,6 +370,11 @@ impl Ledger {
                 placement.observed = Observed::Pending;
                 placement.delete_op = Some(command.op.clone());
                 placement.pending = Some(PendingPhase::Delete);
+                if placement.launch.profile == crate::ServiceProfile::StatefulSingleton {
+                    let now = Instant::now();
+                    placement.action_updated_at = Some(now);
+                    placement.action_last_at = Some(now);
+                }
                 if let Some(op) = superseded {
                     self.complete(
                         &op,
@@ -416,7 +425,10 @@ impl Ledger {
         placement.pending = None;
         placement.observed = Observed::Unknown;
         placement.error = Some(error.clone());
-        let operations = if placement.reusable {
+        let operations = if placement
+            .retired
+            .contains(&(placement.replica, placement.incarnation))
+        {
             [None, None]
         } else {
             [placement.create_op.clone(), placement.delete_op.clone()]
@@ -478,6 +490,19 @@ impl Ledger {
             if removing {
                 if placement.desired != Desired::Absent || body.replica.state != 3 {
                     return Err("Remove reply is not the requested disposed instance".into());
+                }
+                if placement.launch.profile == crate::ServiceProfile::StatefulSingleton
+                    && body.replica
+                        != (Replica {
+                            node: expected.replica.node.clone(),
+                            id: expected.replica.id,
+                            instance: expected.replica.instance,
+                            up: false,
+                            state: 3,
+                            ..Replica::default()
+                        })
+                {
+                    return Err("DeleteReplica reply is not the native dropped description".into());
                 }
             } else {
                 if body.replica.state != 2 || !body.replica.up {
@@ -583,7 +608,7 @@ impl Ledger {
         placement.observed = Observed::Absent;
         placement.endpoint = None;
         placement.error = None;
-        placement.reusable = true;
+        placement.reusable = placement.launch.profile == crate::ServiceProfile::Stateless;
         placement
             .retired
             .push((placement.replica, placement.incarnation));
@@ -604,19 +629,35 @@ impl Ledger {
     }
     /// Native Replica::CanGenerateAction and PendingTask's creating-primary branch.
     pub fn primary_retry(&mut self, index: usize, now: Instant) -> Result<Option<AddPrimary>> {
+        self.retry_body(index, PendingPhase::Create, now)
+    }
+    pub fn deletion_retry(&mut self, index: usize, now: Instant) -> Result<Option<DeleteReplica>> {
+        if self.placements[index].remove_received {
+            return Ok(None);
+        }
+        Ok(self
+            .retry_body(index, PendingPhase::Delete, now)?
+            .map(|body| DeleteReplica::new(body, false)))
+    }
+    fn retry_body(
+        &mut self,
+        index: usize,
+        phase: PendingPhase,
+        now: Instant,
+    ) -> Result<Option<AddInstance>> {
         let placement = &mut self.placements[index];
         if placement.launch.profile != crate::ServiceProfile::StatefulSingleton
             || !placement.link_alive
-            || placement.pending != Some(PendingPhase::Create)
+            || placement.pending != Some(phase)
         {
             return Ok(None);
         }
         let created = placement
-            .primary_created_at
-            .ok_or("missing original Primary retry owner")?;
+            .action_updated_at
+            .ok_or("missing original stateful retry owner")?;
         let last = placement
-            .primary_last_action
-            .ok_or("missing original Primary action time")?;
+            .action_last_at
+            .ok_or("missing original stateful action time")?;
         let interval = if now > created + Duration::from_secs(60) {
             Duration::from_secs(60)
         } else {
@@ -626,7 +667,7 @@ impl Ledger {
             return Ok(None);
         }
         let body = placement.body()?;
-        placement.primary_last_action = Some(now);
+        placement.action_last_at = Some(now);
         Ok(Some(body))
     }
 }

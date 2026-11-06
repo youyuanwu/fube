@@ -1518,6 +1518,26 @@ fn remove(value: AddInstance, force: bool) -> Command {
         },
     }
 }
+fn primary_delete(value: AddInstance, force: bool) -> Command {
+    Command::DeleteReplica {
+        body: Box::new(DeleteReplica::new(value, force)),
+        source: admission().fm_source,
+        generation: GenerationHeader {
+            number: admission().generation,
+            for_fm_replica: false,
+        },
+    }
+}
+fn primary_body() -> AddPrimary {
+    let mut request = body(1);
+    request.service.stateful = true;
+    request.service.partitions = 1;
+    request.service.target = 1;
+    request.service.minimum = 1;
+    request.replica.current_role = 4;
+    request.unit.current.configuration = (1 << 32) + 5;
+    request
+}
 async fn run(executor: &Executor, command: Command) -> Disposition {
     executor.submit(command).unwrap().wait(WAIT).await.unwrap()
 }
@@ -1545,19 +1565,27 @@ fn operations(hooks: &Hooks) -> Vec<&'static str> {
         .collect()
 }
 async fn make_ready(executor: &Executor, request: &AddInstance) -> u64 {
-    let first = executor.submit(add(request.clone())).unwrap();
+    let first = executor
+        .submit(if request.service.stateful {
+            primary_add(request.clone())
+        } else {
+            add(request.clone())
+        })
+        .unwrap();
     first.wait(WAIT).await.unwrap();
     assert!(matches!(
         effects(executor).as_slice(),
         [Effect::Open { .. }]
     ));
     registered(executor, request, first.id).await;
-    run(
-        executor,
-        Command::CompleteOpen(Box::new(complete(request, first.id))),
-    )
-    .await;
-    assert!(matches!(effects(executor).as_slice(), [Effect::Reply(r)] if r.error==0));
+    let mut completion = complete(request, first.id);
+    if request.service.stateful {
+        completion.unit = state(executor).body.unit.clone();
+        completion.replica.replication_endpoint = "127.0.0.1:12345".into();
+    }
+    run(executor, Command::CompleteOpen(Box::new(completion))).await;
+    assert!(matches!(effects(executor).as_slice(),
+        [Effect::Reply(r)] | [Effect::PrimaryReply(r)] if r.error==0));
     first.id
 }
 fn close_completion(executor: &Executor, error: i64) -> CloseCompletion {
@@ -1613,6 +1641,146 @@ fn ack(mut report: ReplicaUp, in_dropped: bool) -> Command {
             for_fm_replica: false,
         },
     }
+}
+
+#[tokio::test]
+async fn native_stateful_delete_uses_original_epoch_id_and_canonical_reply_without_report_ack() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    let request = primary_body();
+    assert!(matches!(
+        executor
+            .submit(primary_delete(request.clone(), false))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    make_ready(&executor, &request).await;
+    let old = state(&executor);
+    for command in [
+        remove(request.clone(), false),
+        primary_delete(request.clone(), true),
+    ] {
+        assert!(matches!(
+            executor.submit(command).unwrap().wait(WAIT).await,
+            Err(Failure::Unsupported(_))
+        ));
+    }
+    let mut wrong_source = admission().fm_source;
+    wrong_source.instance += 1;
+    for (source, generation, expected) in [
+        (
+            wrong_source,
+            GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+            false,
+        ),
+        (
+            admission().fm_source,
+            GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: true,
+            },
+            false,
+        ),
+        (
+            admission().fm_source,
+            GenerationHeader {
+                number: GenerationNumber {
+                    generation: 6,
+                    ..admission().generation
+                },
+                for_fm_replica: false,
+            },
+            true,
+        ),
+    ] {
+        let result = executor
+            .submit(Command::DeleteReplica {
+                body: Box::new(DeleteReplica::new(request.clone(), false)),
+                source,
+                generation,
+            })
+            .unwrap()
+            .wait(WAIT)
+            .await;
+        if expected {
+            assert_eq!(result, Ok(Disposition::IgnoredStale));
+        } else {
+            assert!(matches!(
+                result,
+                Err(Failure::Admission(_) | Failure::Unsupported(_))
+            ));
+        }
+    }
+    for stale in 0..2 {
+        let mut incoming = request.clone();
+        if stale == 0 {
+            incoming.unit.current.configuration -= 1;
+        } else {
+            incoming.replica.id += 1;
+        }
+        assert_eq!(
+            run(&executor, primary_delete(incoming, false)).await,
+            Disposition::IgnoredStale
+        );
+        assert!(Arc::ptr_eq(&old, &state(&executor)));
+    }
+    assert!(effects(&executor).is_empty());
+    // Native DeleteLocalReplica matches ReplicaId, not the FM's instance: the
+    // local replica may have restarted since FM observed it.
+    let mut incoming = request.clone();
+    incoming.replica.instance -= 1;
+    run(&executor, primary_delete(incoming, false)).await;
+    let closing = state(&executor);
+    assert!(closing.local_deleted && !closing.cleanup_pending);
+    assert!(matches!(effects(&executor).as_slice(),
+        [Effect::Close { flags: 8, body, .. }] if body.replica.current_role == 4));
+    assert_eq!(
+        run(&executor, primary_delete(request.clone(), false)).await,
+        Disposition::IgnoredPending
+    );
+    assert!(effects(&executor).is_empty());
+    let mut wrong_role = close_completion(&executor, 0);
+    wrong_role.replica.current_role = 2;
+    assert_eq!(
+        run(&executor, Command::CompleteClose(Box::new(wrong_role))).await,
+        Disposition::IgnoredStale
+    );
+    close_done(&executor, 0).await;
+    let closed = state(&executor);
+    assert_eq!(closed.phase, Phase::Closed);
+    assert!(closed.local_deleted && closed.cleanup_pending);
+    assert_eq!(closed.primary_deactivation, Some((Epoch::default(), -2)));
+    assert!(closed.usage.is_none() && closed.runtime.is_none());
+    let actions = effects(&executor);
+    assert!(matches!(actions.as_slice(), [
+        Effect::ReleaseRegistration(_), Effect::ReleaseUsage { .. },
+        Effect::Health(HealthEvent::Close), Effect::DeleteReplicaReply(reply)
+    ] if reply.replica == Replica {
+        node: admission().local_node, id: request.replica.id, instance: request.replica.instance,
+        up: false, state: 3, ..Replica::default()
+    } && reply.unit == old.body.unit && reply.error == 0));
+    let writes = operations(&hooks).len();
+    run(&executor, primary_delete(request.clone(), false)).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::DeleteReplicaReply(_)]
+    ));
+    assert_eq!(operations(&hooks).len(), writes);
+    assert_eq!(close_done(&executor, 0).await, Disposition::IgnoredStale);
+    assert!(matches!(
+        executor
+            .submit(primary_add(request))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    assert!(effects(&executor).is_empty());
+    finish(&store, &executor).await;
 }
 
 #[tokio::test]
@@ -3090,104 +3258,113 @@ async fn replacement_close_and_recreation_store_failures_keep_resources_and_prop
 #[tokio::test]
 async fn removal_and_finish_close_keep_private_proposals_and_same_unknown_ticket() {
     // Rust-specific real P1 Store invariants, not native test translations.
-    for finish_stage in [false, true] {
-        for (unknown, fail) in [(false, true), (true, false), (true, true)] {
-            let (store, executor, hooks) = setup(if unknown {
-                Duration::from_millis(50)
-            } else {
-                WAIT
-            })
-            .await;
-            let request = body(1);
-            make_ready(&executor, &request).await;
-            if finish_stage {
-                run(&executor, remove(request.clone(), false)).await;
-                effects(&executor);
-            }
-            let old = state(&executor);
-            let writes = operations(&hooks).len();
-            let command = if finish_stage {
-                Command::CompleteClose(Box::new(close_completion(&executor, 0)))
-            } else {
-                remove(request.clone(), false)
-            };
-            let (entered, release) = hooks.pause(fail);
-            let ticket = executor.submit(command).unwrap();
-            entered.await.unwrap();
-            let queued = executor.submit(remove(request.clone(), false)).unwrap();
-            assert!(Arc::ptr_eq(&old, &state(&executor)));
-            assert!(effects(&executor).is_empty());
-            if unknown {
-                assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
-                assert!(executor.snapshot([1; 16]).fenced);
-                assert_eq!(queued.status(), Status::Pending);
-                assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
-                // Operation.wait's observation deadline may precede the P1
-                // supervisor's fence. Observe the actual public fence before
-                // releasing the backend; do not assume those clocks coincide.
-                tokio::time::timeout(WAIT, async {
-                    while store.stats().lifecycle != fube_ra_store::Lifecycle::Fenced {
-                        tokio::task::yield_now().await;
-                    }
+    for stateful in [false, true] {
+        for finish_stage in [false, true] {
+            for (unknown, fail) in [(false, true), (true, false), (true, true)] {
+                let (store, executor, hooks) = setup(if unknown {
+                    Duration::from_millis(50)
+                } else {
+                    WAIT
                 })
-                .await
-                .unwrap();
-            }
-            assert_eq!(operations(&hooks).len(), writes + 1); // no replacement/resubmit
-            release.send(()).unwrap();
-            let result = ticket.resolve(WAIT).await;
-            if fail {
-                assert!(matches!(result, Err(Failure::Store(_))));
-            } else {
-                assert_eq!(result, Ok(Disposition::Applied));
-            }
-            let queued_result = queued.resolve(WAIT).await;
-            if unknown && fail && !finish_stage {
-                // P1 can finish draining/closing the fenced store between
-                // publishing the failed write and this queued submission.
-                // Both admission states reject it without another backend call.
-                assert!(
-                    matches!(queued_result, Err(Failure::Store(ref e)) if matches!(e.kind, ErrorKind::Fenced | ErrorKind::Closed)),
-                    "queued removal after witnessed store fence: {queued_result:?}"
-                );
+                .await;
+                let request = if stateful { primary_body() } else { body(1) };
+                let deletion = |request| {
+                    if stateful {
+                        primary_delete(request, false)
+                    } else {
+                        remove(request, false)
+                    }
+                };
+                make_ready(&executor, &request).await;
+                if finish_stage {
+                    run(&executor, deletion(request.clone())).await;
+                    effects(&executor);
+                }
+                let old = state(&executor);
+                let writes = operations(&hooks).len();
+                let command = if finish_stage {
+                    Command::CompleteClose(Box::new(close_completion(&executor, 0)))
+                } else {
+                    deletion(request.clone())
+                };
+                let (entered, release) = hooks.pause(fail);
+                let ticket = executor.submit(command).unwrap();
+                entered.await.unwrap();
+                let queued = executor.submit(deletion(request.clone())).unwrap();
                 assert!(Arc::ptr_eq(&old, &state(&executor)));
-                assert_eq!(operations(&hooks).len(), writes + 1);
-            } else {
-                queued_result.unwrap();
-            }
-            let actions = executor.take_effects();
-            if fail {
-                assert!(actions.iter().all(|d| d.operation == queued.id));
-                if unknown && !finish_stage {
-                    assert!(actions.is_empty());
+                assert!(effects(&executor).is_empty());
+                if unknown {
+                    assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+                    assert!(executor.snapshot([1; 16]).fenced);
+                    assert_eq!(queued.status(), Status::Pending);
+                    assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+                    // Operation.wait's observation deadline may precede the P1
+                    // supervisor's fence. Observe the actual public fence before
+                    // releasing the backend; do not assume those clocks coincide.
+                    tokio::time::timeout(WAIT, async {
+                        while store.stats().lifecycle != fube_ra_store::Lifecycle::Fenced {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
                 }
-                // Finish failed: queued duplicate cannot complete pending close.
-                if finish_stage {
+                assert_eq!(operations(&hooks).len(), writes + 1); // no replacement/resubmit
+                release.send(()).unwrap();
+                let result = ticket.resolve(WAIT).await;
+                if fail {
+                    assert!(matches!(result, Err(Failure::Store(_))));
+                } else {
+                    assert_eq!(result, Ok(Disposition::Applied));
+                }
+                let queued_result = queued.resolve(WAIT).await;
+                if unknown && fail && !finish_stage {
+                    // P1 can finish draining/closing the fenced store between
+                    // publishing the failed write and this queued submission.
+                    // Both admission states reject it without another backend call.
+                    assert!(
+                        matches!(queued_result, Err(Failure::Store(ref e)) if matches!(e.kind, ErrorKind::Fenced | ErrorKind::Closed)),
+                        "queued removal after witnessed store fence: {queued_result:?}"
+                    );
                     assert!(Arc::ptr_eq(&old, &state(&executor)));
-                    assert!(actions.is_empty());
-                }
-            } else {
-                assert_eq!(actions[0].operation, ticket.id);
-                if finish_stage {
-                    assert!(matches!(
-                        actions.last().unwrap().effect,
-                        Effect::RemoveReply(_)
-                    ));
-                    assert_eq!(actions.last().unwrap().operation, queued.id);
+                    assert_eq!(operations(&hooks).len(), writes + 1);
                 } else {
-                    assert_eq!(actions.len(), 1); // duplicate did not issue another Close
+                    queued_result.unwrap();
                 }
+                let actions = executor.take_effects();
+                if fail {
+                    assert!(actions.iter().all(|d| d.operation == queued.id));
+                    if unknown && !finish_stage {
+                        assert!(actions.is_empty());
+                    }
+                    // Finish failed: queued duplicate cannot complete pending close.
+                    if finish_stage {
+                        assert!(Arc::ptr_eq(&old, &state(&executor)));
+                        assert!(actions.is_empty());
+                    }
+                } else {
+                    assert_eq!(actions[0].operation, ticket.id);
+                    if finish_stage {
+                        assert!(matches!(
+                            actions.last().unwrap().effect,
+                            Effect::RemoveReply(_) | Effect::DeleteReplicaReply(_)
+                        ));
+                        assert_eq!(actions.last().unwrap().operation, queued.id);
+                    } else {
+                        assert_eq!(actions.len(), 1); // duplicate did not issue another Close
+                    }
+                }
+                assert!(!executor.snapshot([1; 16]).fenced);
+                assert_eq!(
+                    old.phase,
+                    if finish_stage {
+                        Phase::Closing
+                    } else {
+                        Phase::Ready
+                    }
+                );
+                finish(&store, &executor).await;
             }
-            assert!(!executor.snapshot([1; 16]).fenced);
-            assert_eq!(
-                old.phase,
-                if finish_stage {
-                    Phase::Closing
-                } else {
-                    Phase::Ready
-                }
-            );
-            finish(&store, &executor).await;
         }
     }
 }

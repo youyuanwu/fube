@@ -16,9 +16,11 @@ joined disposal/lease-loss fencing. This does not enable FM/peer control,
 promotion/adoption, native stateful deployment or full M2.
 Broader H3 and deployed RA/RAP composition remain gated.**
 The separate [fresh stateful FM profile](MinimalFmCluster.md#initial-stateful-fm-control)
-now admits native-shaped AddPrimary/Reply through the production Node/RA/RAP.
+now admits native-shaped AddPrimary/Reply and normal DeleteReplica/Reply through
+the production Node/RA/RAP.
 It preserves the original finite lease/accounting/cleanup boundaries and does
-not widen local profiles or enable stateful deletion, reconfiguration or recovery.
+not widen local profiles or enable force deletion, stateful recreation,
+reconfiguration or recovery.
 [`fube-hosting`](../../crates/libs/fube-hosting/src/lib.rs) provides
 a native-derived, deterministically driven core plus a separately owned local
 IPC service, not a complete running node. H1's original model evidence is not
