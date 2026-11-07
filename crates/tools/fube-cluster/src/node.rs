@@ -936,6 +936,8 @@ pub(crate) mod report_tests {
         LeaseLoss,
         CloseProvider,
         CloseService,
+        DropProvider,
+        DropService,
     }
 
     #[derive(Default)]
@@ -1585,11 +1587,16 @@ pub(crate) mod report_tests {
             .root()
             .ok_or("missing owned root")?
             .join(format!("deployment/{application}_App1/work"))
-            .join(if mode == StatefulDown::CloseProvider {
-                "local-provider-dispose.release"
-            } else {
-                "local-dispose.release"
-            });
+            .join(
+                if matches!(
+                    mode,
+                    StatefulDown::CloseProvider | StatefulDown::DropProvider
+                ) {
+                    "local-provider-dispose.release"
+                } else {
+                    "local-dispose.release"
+                },
+            );
         fs::write(path, b"release original disposer").map_err(err)
     }
 
@@ -1654,10 +1661,17 @@ pub(crate) mod report_tests {
         {
             return Err("independent public write/readback did not complete".into());
         }
-        let graceful = matches!(
-            mode,
-            StatefulDown::CloseProvider | StatefulDown::CloseService
-        );
+        let close_mode = match mode {
+            StatefulDown::CloseProvider | StatefulDown::CloseService => Some(ra::CloseMode::Close),
+            StatefulDown::DropProvider | StatefulDown::DropService => Some(ra::CloseMode::Drop),
+            StatefulDown::Crash | StatefulDown::LeaseLoss => None,
+        };
+        let graceful = close_mode.is_some();
+        let expected_stage = if close_mode == Some(ra::CloseMode::Drop) {
+            ra::FmStage::ReplicaDropped
+        } else {
+            ra::FmStage::ReplicaDown
+        };
         let replication_endpoint = traffic
             .add_reply
             .as_ref()
@@ -1669,10 +1683,13 @@ pub(crate) mod report_tests {
             .split_once('/')
             .ok_or("replication endpoint lacks native actor suffix")?
             .0;
-        if graceful {
-            node.close(body.unit.id.clone(), ra::CloseMode::Close)
-                .map_err(err)?;
-            let marker = if mode == StatefulDown::CloseProvider {
+        if let Some(close_mode) = close_mode {
+            node.close(body.unit.id.clone(), close_mode).map_err(err)?;
+            let provider_barrier = matches!(
+                mode,
+                StatefulDown::CloseProvider | StatefulDown::DropProvider
+            );
+            let marker = if provider_barrier {
                 "LOCAL_DATA_PROVIDER dispose begin"
             } else {
                 "LOCAL_DISPOSE begin"
@@ -1692,8 +1709,7 @@ pub(crate) mod report_tests {
                 },
             )
             .await?;
-            node.close(body.unit.id.clone(), ra::CloseMode::Close)
-                .map_err(err)?;
+            node.close(body.unit.id.clone(), close_mode).map_err(err)?;
             for _ in 0..20 {
                 step(launch, node, adapter, fm, link, &mut traffic).await?;
             }
@@ -1710,6 +1726,26 @@ pub(crate) mod report_tests {
                 return Err(
                     "held graceful disposal published completion/report or released usage".into(),
                 );
+            }
+            if close_mode == ra::CloseMode::Drop {
+                if provider_barrier {
+                    for command in [b"write\n".as_slice(), b"read\n".as_slice()] {
+                        let response = data_request(&endpoint, command).await?;
+                        if response != "ERR NotPrimary\n" && response != "ERR ObjectClosed\n" {
+                            return Err(format!(
+                                "held Drop left public access enabled: {response}"
+                            ));
+                        }
+                    }
+                } else if tokio::net::TcpStream::connect(&endpoint).await.is_ok()
+                    || tokio::net::TcpStream::connect(replication_address)
+                        .await
+                        .is_ok()
+                {
+                    return Err(
+                        "held service Drop retained an application/replication listener".into(),
+                    );
+                }
             }
             release_disposal(node, mode)?;
         } else if mode == StatefulDown::LeaseLoss {
@@ -1734,13 +1770,15 @@ pub(crate) mod report_tests {
             .committed
             .ok_or("lost FT disappeared")?;
         if state.phase != ra::Phase::Closed
-            || state.fm_stage != ra::FmStage::ReplicaDown
+            || state.fm_stage != expected_stage
             || state.local_deleted
             || node.retained_usage() != 0
             || node.instance_disposal().is_some() != graceful
             || adapter.report_pending.as_ref() != Some(&report)
         {
-            return Err("Close/loss did not retain the exact native Down reporting owner".into());
+            return Err(
+                "terminal completion did not retain the exact native reporting stage".into(),
+            );
         }
         let disposal = node.instance_disposal();
         if let Some(proof) = &disposal {
@@ -1784,13 +1822,17 @@ pub(crate) mod report_tests {
                 "stateful report retry did not retain the native 30-second interval".into(),
             );
         }
-        for stale in 0..3 {
+        for stale in 0..4 {
             let mut invalid = reply.clone();
             let info = &mut invalid.replicas.0[0];
             match stale {
                 0 => info.replicas.0[0].description.up = true,
                 1 => info.replicas.0[0].description.instance -= 1,
-                _ => info.unit.current.configuration -= 1,
+                2 => info.unit.current.configuration -= 1,
+                _ if expected_stage == ra::FmStage::ReplicaDropped => {
+                    info.replicas.0[0].description.state = 2;
+                }
+                _ => info.replicas.0[0].description.node.instance += 1,
             }
             acknowledge_without_sending_captured_report(launch, node, adapter, fm, link, &invalid)
                 .await?;
@@ -1798,14 +1840,17 @@ pub(crate) mod report_tests {
             if node
                 .snapshot(entity)
                 .committed
-                .is_none_or(|s| s.fm_stage != ra::FmStage::ReplicaDown)
+                .is_none_or(|s| s.fm_stage != expected_stage)
                 || adapter.report_pending.is_none()
                 || node.instance_disposal().is_some() != graceful
             {
                 return Err("stale ACK retired the original loss obligation".into());
             }
         }
-        if matches!(mode, StatefulDown::LeaseLoss | StatefulDown::CloseProvider) {
+        if matches!(
+            mode,
+            StatefulDown::LeaseLoss | StatefulDown::CloseProvider | StatefulDown::DropProvider
+        ) {
             // Intentionally lose the first valid ACK; run the actual native-default timer.
             let retry_end = Instant::now() + Duration::from_secs(35);
             while traffic.reports.len() == 1 {
@@ -1840,7 +1885,7 @@ pub(crate) mod report_tests {
             || node.instance_disposal().is_some() != graceful
             || node.retained_usage() != 0
         {
-            return Err("native down ACK did not delete only the closed metadata".into());
+            return Err("native terminal ACK did not delete only the closed metadata".into());
         }
         if let Some(original) = &disposal {
             let after = node
@@ -1951,8 +1996,12 @@ pub(crate) mod report_tests {
             let args = match mode {
                 StatefulDown::Crash => "--stateful-primary --crash-after-ms 5000",
                 StatefulDown::LeaseLoss => "--stateful-primary",
-                StatefulDown::CloseProvider => "--stateful-primary --block-provider-dispose",
-                StatefulDown::CloseService => "--stateful-primary --block-dispose",
+                StatefulDown::CloseProvider | StatefulDown::DropProvider => {
+                    "--stateful-primary --block-provider-dispose"
+                }
+                StatefulDown::CloseService | StatefulDown::DropService => {
+                    "--stateful-primary --block-dispose"
+                }
             };
             node.start(
                 &launch.package,
@@ -1966,7 +2015,10 @@ pub(crate) mod report_tests {
                     .await;
             let released = if matches!(
                 mode,
-                StatefulDown::CloseProvider | StatefulDown::CloseService
+                StatefulDown::CloseProvider
+                    | StatefulDown::CloseService
+                    | StatefulDown::DropProvider
+                    | StatefulDown::DropService
             ) {
                 release_disposal(&node, mode)
             } else {

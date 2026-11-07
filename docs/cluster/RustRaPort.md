@@ -32,7 +32,10 @@ processed-list acknowledgment, including native closed-FT deletion afterward.
 The [graceful singleton Close slice](MinimalFmCluster.md#graceful-singleton-close-reporting)
 now uses the same native Down-stage/report/ACK path after real RAP disposal and
 committed Close, keeping original disposal proof independent.
-FM records lost volatile state, not recovery/reuse; Drop/Abort and closed-
+The [normal singleton Drop slice](MinimalFmCluster.md#normal-singleton-drop-reporting)
+now reports through native ReplicaDropped stage with dropped-description ACK
+checks, without relabeling closing/closed Down lifetimes.
+FM records lost volatile state, not recovery/reuse; Abort/ForceAbort and closed-
 AddPrimary reporting and broader stateful choreography remain staged.
 
 This is the persistence and porting companion to the

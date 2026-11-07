@@ -238,8 +238,11 @@ owner and can delete the already closed FT; it never creates original-runtime
 disposal proof or permission to recreate. Graceful Close of that original FM
 singleton now uses the same native Down-stage reporting after committed RAP
 disposal and exact H2 release; independently joined Node disposal proof survives
-metadata ACK processing. Local-only Close, Drop/Abort and closed-AddPrimary
-reporting remain staged.
+metadata ACK processing. Normal Drop of the original FM singleton now reports
+with native ReplicaDropped stage and requires a dropped-description ACK, with
+the same real RAP cleanup/commit/exact-release boundaries. It cannot relabel an
+already-closing/closed Down lifetime. Local-only Close/Drop, Abort/ForceAbort
+and closed-AddPrimary reporting remain staged.
 Stateful force deletion/reconfiguration, replacement/reopen, FMM and recovery
 remain gated; local profiles still reject network deletion.
 

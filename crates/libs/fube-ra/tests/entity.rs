@@ -1644,29 +1644,35 @@ fn ack(mut report: ReplicaUp, in_dropped: bool) -> Command {
 }
 
 #[tokio::test]
-async fn fm_stateful_down_reports_dropped_with_down_stage_and_follows_native_ack_lists() {
-    for graceful in [false, true] {
+async fn fm_stateful_terminal_reports_use_native_stages_and_ack_lists() {
+    for mode in [CloseMode::AppHostDown, CloseMode::Close, CloseMode::Drop] {
+        let expected_stage = if mode == CloseMode::Drop {
+            FmStage::ReplicaDropped
+        } else {
+            FmStage::ReplicaDown
+        };
         for in_dropped in [false, true] {
             let (store, executor, hooks) = setup(WAIT).await;
             let request = primary_body();
             make_ready(&executor, &request).await;
             let host = state(&executor).runtime.as_ref().unwrap().host.clone();
-            if graceful {
+            if mode != CloseMode::AppHostDown {
                 run(
                     &executor,
                     Command::CloseLocal {
                         unit: request.unit.id.clone(),
-                        mode: CloseMode::Close,
+                        mode,
                     },
                 )
                 .await;
                 assert_eq!(state(&executor).phase, Phase::Closing);
                 assert!(state(&executor).usage.is_some());
                 assert!(matches!(effects(&executor).as_slice(),
-                [Effect::Close { flags: 0, body, .. }]
-                if body.replica.current_role == 4));
+                [Effect::Close { flags, body, .. }]
+                if *flags == if mode == CloseMode::Drop { 8 } else { 0 }
+                    && body.replica.current_role == 4));
             }
-            let down = if graceful {
+            let completion = if mode != CloseMode::AppHostDown {
                 Command::CompleteClose(Box::new(close_completion(&executor, 0)))
             } else {
                 Command::HostDown(Box::new(HostDown {
@@ -1674,11 +1680,11 @@ async fn fm_stateful_down_reports_dropped_with_down_stage_and_follows_native_ack
                     host,
                 }))
             };
-            run(&executor, down).await;
+            run(&executor, completion).await;
             let closed = state(&executor);
             assert_eq!(
                 (closed.phase, closed.fm_stage),
-                (Phase::Closed, FmStage::ReplicaDown)
+                (Phase::Closed, expected_stage)
             );
             assert!(!closed.local_deleted && !closed.cleanup_pending);
             assert!(closed.runtime.is_none() && closed.usage.is_none());
@@ -1711,7 +1717,7 @@ async fn fm_stateful_down_reports_dropped_with_down_stage_and_follows_native_ack
             assert!(!info.local_deleted && !info.report_from_primary);
             assert_eq!(info.intermediate, Epoch::default());
             let pending = state(&executor);
-            for stale in 0..5 {
+            for stale in 0..if mode == CloseMode::Drop { 6 } else { 5 } {
                 let mut invalid = (*report).clone();
                 let info = &mut invalid.dropped.0[0];
                 match stale {
@@ -1719,7 +1725,8 @@ async fn fm_stateful_down_reports_dropped_with_down_stage_and_follows_native_ack
                     1 => info.replicas.0[0].description.instance -= 1,
                     2 => info.replicas.0[0].description.node.instance += 1,
                     3 => info.unit.current.configuration -= 1,
-                    _ => info.replicas.0[0].description.id += 1,
+                    4 => info.replicas.0[0].description.id += 1,
+                    _ => info.replicas.0[0].description.state = 2,
                 }
                 assert_eq!(
                     run(&executor, ack(invalid, in_dropped)).await,
@@ -1768,8 +1775,13 @@ async fn fm_stateful_down_reports_dropped_with_down_stage_and_follows_native_ack
 }
 
 #[tokio::test]
-async fn fm_stateful_down_and_ack_keep_private_proposals_until_actual_commit_resolution() {
-    for graceful in [false, true] {
+async fn fm_stateful_terminal_and_ack_keep_private_proposals_until_actual_commit_resolution() {
+    for mode in [CloseMode::AppHostDown, CloseMode::Close, CloseMode::Drop] {
+        let expected_stage = if mode == CloseMode::Drop {
+            FmStage::ReplicaDropped
+        } else {
+            FmStage::ReplicaDown
+        };
         for ack_stage in [false, true] {
             for (unknown, fail) in [(false, true), (true, false), (true, true)] {
                 let (store, executor, hooks) = setup(if unknown {
@@ -1781,23 +1793,24 @@ async fn fm_stateful_down_and_ack_keep_private_proposals_until_actual_commit_res
                 let request = primary_body();
                 make_ready(&executor, &request).await;
                 let host = state(&executor).runtime.as_ref().unwrap().host.clone();
-                if graceful {
+                if mode != CloseMode::AppHostDown {
                     run(
                         &executor,
                         Command::CloseLocal {
                             unit: request.unit.id.clone(),
-                            mode: CloseMode::Close,
+                            mode,
                         },
                     )
                     .await;
                     assert!(matches!(
                         effects(&executor).as_slice(),
-                        [Effect::Close { flags: 0, .. }]
+                        [Effect::Close { flags, .. }]
+                        if *flags == if mode == CloseMode::Drop { 8 } else { 0 }
                     ));
                 }
                 let completion = close_completion(&executor, 0);
-                let down = || {
-                    if graceful {
+                let terminal = || {
+                    if mode != CloseMode::AppHostDown {
                         Command::CompleteClose(Box::new(completion.clone()))
                     } else {
                         Command::HostDown(Box::new(HostDown {
@@ -1807,7 +1820,7 @@ async fn fm_stateful_down_and_ack_keep_private_proposals_until_actual_commit_res
                     }
                 };
                 let report = if ack_stage {
-                    run(&executor, down()).await;
+                    run(&executor, terminal()).await;
                     effects(&executor);
                     run(&executor, Command::RetryReport(request.unit.id.clone())).await;
                     let Effect::ReplicaUp(report) = effects(&executor).remove(0) else {
@@ -1819,7 +1832,7 @@ async fn fm_stateful_down_and_ack_keep_private_proposals_until_actual_commit_res
                 };
                 let command = || match &report {
                     Some(report) => ack((**report).clone(), false),
-                    None => down(),
+                    None => terminal(),
                 };
                 let old = state(&executor);
                 let writes = operations(&hooks).len();
@@ -1860,7 +1873,7 @@ async fn fm_stateful_down_and_ack_keep_private_proposals_until_actual_commit_res
                             .iter()
                             .all(|effect| matches!(effect.effect, Effect::DeleteReplicaReply(_))));
                     } else {
-                        assert_eq!(state(&executor).fm_stage, FmStage::ReplicaDown);
+                        assert_eq!(state(&executor).fm_stage, expected_stage);
                         assert_eq!(
                             actions
                                 .iter()
@@ -1890,8 +1903,103 @@ async fn fm_stateful_down_and_ack_keep_private_proposals_until_actual_commit_res
 }
 
 #[tokio::test]
-async fn fm_stateful_drop_abort_and_closed_add_primary_reporting_remain_gated() {
-    for mode in [CloseMode::Drop, CloseMode::ForceAbort] {
+async fn fm_stateful_abort_and_closed_add_primary_reporting_remain_gated() {
+    let mode = CloseMode::ForceAbort;
+    let (store, executor, _) = setup(WAIT).await;
+    let request = primary_body();
+    make_ready(&executor, &request).await;
+    run(
+        &executor,
+        Command::CloseLocal {
+            unit: request.unit.id.clone(),
+            mode,
+        },
+    )
+    .await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::Close { .. }]
+    ));
+    close_done(&executor, 0).await;
+    assert_eq!(state(&executor).fm_stage, FmStage::None);
+    assert!(!state(&executor).local_deleted);
+    let retained = effects(&executor);
+    assert!(retained.iter().any(|effect|
+            matches!(effect, Effect::StatefulClosePending { mode: actual, .. } if *actual == mode)));
+    assert!(!retained
+        .iter()
+        .any(|effect| matches!(effect, Effect::RequestReportRetry | Effect::ReplicaUp(_))));
+    assert_eq!(
+        run(&executor, Command::RetryReport(request.unit.id.clone())).await,
+        Disposition::IgnoredPending
+    );
+    assert!(effects(&executor).is_empty());
+    run(&executor, primary_add(request)).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::StatefulDroppedPending(_)]
+    ));
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn fm_stateful_drop_does_not_relabel_closing_or_closed_down_lifetime() {
+    let (store, executor, _) = setup(WAIT).await;
+    let request = primary_body();
+    make_ready(&executor, &request).await;
+    run(
+        &executor,
+        Command::CloseLocal {
+            unit: request.unit.id.clone(),
+            mode: CloseMode::Close,
+        },
+    )
+    .await;
+    effects(&executor);
+    let closing = state(&executor);
+    assert_eq!(
+        run(
+            &executor,
+            Command::CloseLocal {
+                unit: request.unit.id.clone(),
+                mode: CloseMode::Drop,
+            }
+        )
+        .await,
+        Disposition::IgnoredPending
+    );
+    assert_eq!(state(&executor), closing);
+    assert!(effects(&executor).is_empty());
+    close_done(&executor, 0).await;
+    effects(&executor);
+    for reported in [false, true] {
+        let closed = state(&executor);
+        assert_eq!(closed.fm_stage, FmStage::ReplicaDown);
+        assert_eq!(closed.report_sequence, u64::from(reported));
+        run(
+            &executor,
+            Command::CloseLocal {
+                unit: request.unit.id.clone(),
+                mode: CloseMode::Drop,
+            },
+        )
+        .await;
+        assert_eq!(state(&executor), closed);
+        assert!(effects(&executor).is_empty());
+        if !reported {
+            run(&executor, Command::RetryReport(request.unit.id.clone())).await;
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::ReplicaUp(_)]
+            ));
+        }
+    }
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn fm_stateful_drop_ack_requires_dropped_state_before_first_retry() {
+    for in_dropped in [false, true] {
         let (store, executor, _) = setup(WAIT).await;
         let request = primary_body();
         make_ready(&executor, &request).await;
@@ -1899,33 +2007,60 @@ async fn fm_stateful_drop_abort_and_closed_add_primary_reporting_remain_gated() 
             &executor,
             Command::CloseLocal {
                 unit: request.unit.id.clone(),
-                mode,
+                mode: CloseMode::Drop,
             },
         )
         .await;
-        assert!(matches!(
-            effects(&executor).as_slice(),
-            [Effect::Close { .. }]
-        ));
+        effects(&executor);
         close_done(&executor, 0).await;
+        effects(&executor);
+        let current = state(&executor);
+        assert_eq!(current.fm_stage, FmStage::ReplicaDropped);
+        assert_eq!(current.report_sequence, 0);
+        let report = ReplicaUp {
+            dropped: fube_transport::serialization::serde::ObjectArray(vec![FailoverUnitInfo {
+                service: current.body.service.clone(),
+                unit: current.body.unit.clone(),
+                replicas: fube_transport::serialization::serde::ObjectArray(vec![ReplicaInfo {
+                    description: Replica {
+                        node: request.replica.node.clone(),
+                        id: request.replica.id,
+                        instance: request.replica.instance,
+                        state: 3,
+                        up: false,
+                        ..Replica::default()
+                    },
+                    intermediate_role: 1,
+                }]),
+                ..FailoverUnitInfo::default()
+            }]),
+            ..ReplicaUp::default()
+        };
+        let mut stale = report.clone();
+        stale.dropped.0[0].replicas.0[0].description.state = 2;
+        assert_eq!(
+            run(&executor, ack(stale, in_dropped)).await,
+            Disposition::IgnoredStale
+        );
+        assert_eq!(state(&executor), current);
+        assert!(effects(&executor).is_empty());
+        run(&executor, ack(report, in_dropped)).await;
+        assert!(state(&executor).local_deleted);
         assert_eq!(state(&executor).fm_stage, FmStage::None);
-        assert!(!state(&executor).local_deleted);
-        let retained = effects(&executor);
-        assert!(retained.iter().any(|effect|
-            matches!(effect, Effect::StatefulClosePending { mode: actual, .. } if *actual == mode)));
-        assert!(!retained
-            .iter()
-            .any(|effect| matches!(effect, Effect::RequestReportRetry | Effect::ReplicaUp(_))));
+        let terminal = effects(&executor);
+        if in_dropped {
+            assert!(terminal.is_empty());
+        } else {
+            assert!(matches!(
+                terminal.as_slice(),
+                [Effect::DeleteReplicaReply(_)]
+            ));
+        }
         assert_eq!(
             run(&executor, Command::RetryReport(request.unit.id.clone())).await,
             Disposition::IgnoredPending
         );
         assert!(effects(&executor).is_empty());
-        run(&executor, primary_add(request)).await;
-        assert!(matches!(
-            effects(&executor).as_slice(),
-            [Effect::StatefulDroppedPending(_)]
-        ));
         finish(&store, &executor).await;
     }
 }

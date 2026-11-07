@@ -218,7 +218,7 @@ impl Placement {
                         || info.intermediate != Epoch::default()
                         || info.replicas.0[0].intermediate_role != 1
                     {
-                        return Err("unsupported stateful down report".into());
+                        return Err("unsupported stateful terminal report".into());
                     }
                     continue;
                 }
