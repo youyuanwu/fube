@@ -69,7 +69,13 @@ FM still records lost volatile state, not recovery or reusable absence.
 Valid unsolicited disposal sidecars cannot retire that loss or break its live
 session; malformed/cross-owner proofs still reject.
 This enables no new CLI operation or local-only-profile authority.
-Drop/Abort and closed-AddPrimary reporting stay staged.
+Normal `CloseMode::Drop` now also reports that original FM singleton, but uses
+native **ReplicaDropped stage**, not Down. It sends the same canonical dropped
+ReplicaUp entry after committed real RAP cleanup and exact release; only a
+dropped description can clear its stage. Existing retry/ACK, metadata deletion
+and independent disposal boundaries are unchanged. A late Drop does not relabel
+an already-closing/closed Down lifetime.
+Abort/ForceAbort and closed-AddPrimary reporting stay staged.
 See [source semantics and qualification limits](../../../docs/cluster/MinimalFmCluster.md#unexpected-singleton-app-host-loss).
 
 The root is operator-owned and private (0700). Its parent must already exist.
@@ -199,4 +205,8 @@ full native handler execution or unexpected-loss CLI/Federation parity.
 The same composition covers graceful Close with separately held provider and
 service disposal, no premature report/release, original-host survival and both
 listener releases, stale/duplicate/lost ACKs and unchanged original disposal
-proof. Close uses native ReplicaDown stage; it does not enable Drop/Abort reports.
+proof. Close uses native ReplicaDown stage. Normal Drop additionally exercises
+native ReplicaDropped stage, non-dropped ACK rejection, public access fencing,
+both disposal barriers and the actual lost-ACK retry. Model tests preserve
+already-closing/closed Down lifetimes and stage-eligible ACKs before the first
+retry. Abort/ForceAbort reporting remains gated.

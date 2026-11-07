@@ -415,14 +415,18 @@ FM requires both semantic completion and the source-bound Node disposal proof.
 Original singleton app-host loss now also has real ReplicaUp/Reply delivery:
 native Down stage with a dropped payload, processed-list ACK and closed-FT
 metadata deletion, never a graceful-disposal or recovery receipt. Focused
-`fm_stateful_down`, `stateful_loss_is` and `stateful_app_down` cases cover actual
+`fm_stateful_terminal`, `stateful_loss_is` and `stateful_app_terminal` cases cover actual
 commit veto/unknown outcomes, real app crash/lease expiry, stale/duplicate ACKs,
 the native-default 30-second lost-ACK retry and independent sibling data.
 The down cases also cover graceful Close of the original FM singleton, held
 provider/service disposal with no premature reporting/release, both listener
 releases while the host remains alive and original disposal proof retained
-independently across metadata ACKs. Drop/Abort and closed-AddPrimary reporting
-remain gated, as do local-only profile FM authority and stateful recreation.
+independently across metadata ACKs. Normal Drop adds native ReplicaDropped-stage
+reporting, non-dropped ACK rejection in both lists and before the first retry,
+held provider/service disposal with public access fencing and lost-ACK retry.
+`fm_stateful_drop` cases also preserve already-closing/closed Down lifetimes.
+Abort/ForceAbort and closed-AddPrimary reporting remain gated, as do local-only
+profile FM authority and stateful recreation.
 Run the `fube-cluster` unit and
 foreground targets as well as RA protocol/entity and local-app lifecycle tests.
 Archived tests require both fixed app binaries; the nextest inventory declares

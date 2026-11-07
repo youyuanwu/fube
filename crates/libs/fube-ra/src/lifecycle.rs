@@ -208,12 +208,19 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
             state.primary_deactivation = Some((Epoch::default(), -2));
         }
         if state.fm_primary
-            && matches!(mode, CloseMode::Close | CloseMode::AppHostDown)
+            && matches!(
+                mode,
+                CloseMode::Close | CloseMode::AppHostDown | CloseMode::Drop
+            )
             && !state.local_deleted
         {
-            // Native OnReplicaDown(false, instance) retains ReplicaDown stage,
-            // while the closed volatile FT is serialized in ReplicaUp's dropped list.
-            state.fm_stage = FmStage::ReplicaDown;
+            // Native Drop uses OnDropped; Close/AppHostDown use OnReplicaDown.
+            // Both serialize the closed volatile FT in ReplicaUp's dropped list.
+            state.fm_stage = if mode == CloseMode::Drop {
+                FmStage::ReplicaDropped
+            } else {
+                FmStage::ReplicaDown
+            };
             effects.push(Effect::RequestReportRetry);
         } else if mode != CloseMode::Delete {
             effects.push(Effect::StatefulClosePending {
@@ -907,18 +914,22 @@ pub(super) fn transition(
                     ));
                 }
                 if current.phase != Phase::Closed
-                    || (current.fm_stage != FmStage::ReplicaDown && current.report_sequence == 0)
+                    || (!matches!(
+                        current.fm_stage,
+                        FmStage::ReplicaDown | FmStage::ReplicaDropped
+                    ) && current.report_sequence == 0)
                     || info.unit != current.body.unit
                     || replica.node != current.body.replica.node
                     || replica.instance != current.body.replica.instance
                     || replica.up
-                    || (dropped && replica.state != 3)
+                    || ((dropped || current.fm_stage == FmStage::ReplicaDropped)
+                        && replica.state != 3)
                 {
                     return Ok(Transition::ignored(Disposition::IgnoredStale));
                 }
                 if info.service != current.body.service {
                     return Err(Failure::Unsupported(
-                        "stateful down-report description changes are gated",
+                        "stateful terminal-report description changes are gated",
                     ));
                 }
             }
