@@ -324,6 +324,45 @@ fn statuses_use_expiring_type_history_coalescing_priority_and_separate_message_s
     assert_eq!(consumer.message_sequence(), 3);
 }
 
+#[test]
+fn status_retry_capture_replaces_sequence_and_ack_cannot_clear_newer_or_opposite_work() {
+    let mut consumer = LocalStatusConsumer::new(4, 16 * 1024).unwrap();
+    let a = body().service.service_type;
+    let mut b = a.clone();
+    b.name = "Other".into();
+    consumer.consume(a.clone(), 1, false, true, 0).unwrap();
+    consumer.consume(b.clone(), 1, true, true, 0).unwrap();
+    let (enabled, first) = consumer.capture().unwrap().unwrap();
+    assert!(!enabled && first.types.0 == vec![a.clone()]);
+    let (_, retry) = consumer.capture().unwrap().unwrap();
+    assert!(retry.sequence > first.sequence);
+    assert!(!consumer.acknowledge(false, first.sequence));
+    assert!(consumer.acknowledge(false, retry.sequence));
+    assert_eq!(consumer.pending().len(), 1);
+    let (enabled, next) = consumer.capture().unwrap().unwrap();
+    assert!(enabled && next.types.0 == vec![b.clone()]);
+    consumer.consume(b.clone(), 2, false, true, 1).unwrap();
+    assert!(!consumer.acknowledge(true, next.sequence));
+    let (enabled, final_message) = consumer.capture().unwrap().unwrap();
+    assert!(!enabled && final_message.types.0 == vec![b]);
+    assert!(consumer.acknowledge(false, final_message.sequence));
+    assert!(consumer.capture().unwrap().is_none());
+}
+
+#[test]
+fn status_cleanup_callback_expires_history_without_waiting_for_lazy_deadline_or_clearing_pending() {
+    let mut consumer = LocalStatusConsumer::new(1, 16 * 1024).unwrap();
+    let id = body().service.service_type;
+    consumer.consume(id.clone(), 10, false, true, 0).unwrap();
+    consumer.cleanup(6_000_000_000).unwrap();
+    assert_eq!(consumer.pending().len(), 1);
+    assert_eq!(
+        consumer.consume(id, 1, true, true, 6_000_000_001).unwrap(),
+        Disposition::HostingStatusProcessed
+    );
+    assert_eq!(consumer.next_enabled(), Some(true));
+}
+
 #[tokio::test]
 async fn local_registered_retries_without_fm_readiness_and_keeps_effect_reservation() {
     let store = Arc::new(

@@ -10,10 +10,10 @@ The producer compiles the **unmodified** native `FabricStream.cpp`,
 `FabricSerializable.cpp`, `FabricSerializableStream.cpp`,
 `FabricSerializationTypes.cpp`, `ByteCompressor.h` and
 `Common/FabricSerializationHelper.h`. It mechanically extracts field macros
-and member declarations for 59 schema types/199 members, including the selected
+and member declarations for 73 schema types/233 members, including the selected
 Add, inherited DeleteReplica, reply, ReplicaUp/Reply and service-type
 notification request/reply bodies, NodeUp/Ack's complete schema closure and the
-six-field Federation PToP header value.
+six-field Federation PToP header value, node controls, status and complete load graph.
 The native helper macros generate their actual Write/Read methods. Nested
 fields are not inferred from Rust or encoded as handwritten wire bytes.
 
@@ -35,7 +35,7 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 58 inputs.
+The C++ producer independently constructs expected values and emits 101 inputs.
 The existing 36 cases and their contracts are retained:
 default/rich AddInstance, default/error AddInstanceReply, default/rich Remove
 (force false/true), default/rich removal reply, explicit-empty/rich ReplicaUp
@@ -52,7 +52,7 @@ Nondefault cases cover GUID/raw NodeId, high-bit instances, negative LSN/epochs,
 UTF-16/surrogates, enums/errors, all service collections and null/Invalid/both
 derived scaling variants. Rust rejects every proper prefix of rich body
 fixtures including both rich force bodies and the rich/partial notification
-bodies; native rejects eleven truncated bodies, including NodeUp, Ack, PToP
+bodies; native rejects 26 truncated bodies, including NodeUp, Ack, PToP
 and the distinct DeleteReplica/Reply fixtures.
 Non-polymorphic Delete inheritance invokes base rich traversal and native
 base/derived scopes, not a flattened or nested replacement. ReplicaUp's empty
@@ -63,7 +63,7 @@ ReplicaInfo's rich fixture initializes its intermediate role explicitly.
 Six AddPrimary cases retain the original 45 and add default/rich request and
 reply bodies plus both literal actions. The native body types remain
 ReplicaMessageBody and ReplicaReplyMessageBody, so schema counts stay
-59 types/199 fields. Rust checks production AddPrimary factories/decoders
+59 types/199 fields at that stage. Rust checks production AddPrimary factories/decoders
 against native-produced action/actor/priority/generation bytes, including
 FM/FMM reply-owner asymmetry and proper-prefix rejection. Header/schema support
 does not enable FMM execution or claim full native AddPrimary handler parity.
@@ -88,7 +88,8 @@ Native [DeleteReplicaMessageBody.h:10–55](https://github.com/microsoft/service
 inherits ReplicaMessageBody (`fudesc_`, `replica_`, `service_`) and adds only
 `isForce_`. The request alias preserves those native base/derived scopes.
 The reply alias retains ReplicaReplyMessageBody (`fudesc_`, `replica_`,
-`errorCode_`). No new schema type is invented: counts remain 59 types/199 fields.
+`errorCode_`). No new schema type was invented in that extension: its counts
+remained 59 types/199 fields.
 Replica role and state values come from the pinned common `ReplicaRole.h`
 and `ReplicaStates.h`, not declaration-order guesses in Rust.
 
@@ -113,6 +114,61 @@ native decoder executes two additional truncated-body rejections. This is
 wire/schema evidence only, not original handler execution, native FM
 interoperability, or authorization of force deletion, recreation,
 reconfiguration, FMM execution or recovery.
+
+### Stage-two node control/load and endpoint codecs
+
+All original 58 cases, 59 types/199 fields, 62 files and eleven native
+truncation rejections remain preserved. This extension adds **43 inputs**:
+initialized empty and rich roots for all thirteen actions; their thirteen
+literal action headers; two signed high-bit/FMM activation request values;
+legacy-only and modern-only ReportLoad roots. Current totals are **101 cases,
+73 types/233 fields, 105 bundle files and 26 native truncation rejections**.
+Every proper prefix of every new body fixture is rejected by Rust.
+
+The new roots are NodeActivateRequest/Reply, NodeDeactivateRequest/Reply,
+NodeUpdateServiceRequest/Reply, ServiceTypeEnabled/Disabled and both replies,
+ReplicaEndpointUpdated/Reply and ReportLoad. All thirteen pinned RSMessage
+factory defaults are **priority=false**, including endpoint messages.
+Incoming FM→RA requests and type-status/endpoint replies have the sender's
+actual GenerationHeader. RA→FM node replies, type-status, endpoint and load
+sends do not invent one. Native-supported node-reply/endpoint owners retain
+FM=11 and FMM=10; status/load outbound paths remain ordinary FM only.
+Rust exercises each production decoder and factory against native-produced
+literal action/actor/priority/generation fixtures. Its separately constructed
+bodies are encoded, compared with production-factory output and re-decoded by
+the actual native stream. No private runtime/data-engine type is used.
+
+Both distinct native activation request classes and both reply classes are
+extracted, despite their shared Rust wire shapes. Empty fixtures explicitly
+initialize unspecified native scalar members; they are not claims about native
+empty-constructor guarantees. Nondefault cases exercise negative signed
+sequences, high-bit uint64 service/status sequences, multiple full service types
+and complete nondefault ServiceDescription (including scaling policies).
+Endpoint fixtures retain complete native ReplicaMessageBody/ReplicaReplyMessageBody.
+
+The load closure mechanically retains:
+
+* ReportLoadMessageBody: legacy reports, modern descriptions, primitive StopwatchTime.
+* ReportLoadInfo: FailoverUnitId, role, LoadMetric vector; **not isStateful_**.
+* LoadMetric: name, uint32 value.
+* LoadMetricStats: name, last value, count, both doubles, primitive last-report time.
+* LoadOrMoveCostDescription: primitive Guid, service, stateful, primary and secondary
+  vectors and native `map<NodeId,vector<LoadMetricStats>>`; **not isReset_**.
+
+The C++ fixture uses the actual native map/ArrayPair helper, not a handwritten
+encoding. Each rich modern report has one map entry with raw 16-byte NodeId and
+two stats values; both report vectors and primary/secondary vectors are nonempty.
+The singleton comparator adapter limitation described below remains explicit:
+map ordering/duplicate semantics are not qualified. Modern-only production may
+emit empty legacy reports without deleting the complete legacy schema.
+
+Codec evidence does not claim native handler/full FM parity. Bounded execution
+is separate execution work: **one FT per real Node**, multi-FT RA model/store
+coordination and ordinary FM production only. **Live endpoint publication is
+deferred to stage 5**: pinned EndpointPublishState derives its publication
+timeout from reconfiguration duration and asserts pending publication requires
+active reconfiguration. Encoding or acknowledging an endpoint body cannot
+substitute for those state-machine preconditions.
 
 ### Bootstrap and source identity header extension
 
@@ -193,8 +249,8 @@ env PATH=/nonexistent /usr/bin/python3 -m tests.ra_protocol.consumer \
   --expected-head COMMIT --expected-source SOURCE_DIGEST
 ```
 
-The bundle has exactly 58 `native/*.bin`, `schema.h`, `native-oracle`,
-`ra-conformance` and `manifest.json` (62 files total). No other files are
+The bundle has exactly 101 `native/*.bin`, `schema.h`, `native-oracle`,
+`ra-conformance` and `manifest.json` (105 files total). No other files are
 accepted. The consumer verifies exact coverage/type/member counts, regular files, hashes,
 provenance and both compiled source identities **before** execution. Missing,
 modified, wrong-source and symlink inputs fail; it imports no producer and
@@ -205,6 +261,7 @@ production/execution claim:
 
 ```sh
 python3 -m unittest tests.offline.cluster.test_ra_protocol_inputs -v
+python3 -m unittest tests.ra_protocol.test_stage2 -v
 cargo test --locked -p fube-ra
 ```
 
@@ -216,8 +273,8 @@ final delivery produces again at the clean reviewed implementation head.
 
 ## Separate actual-native helper evidence
 
-The helper producer is **not part of, and does not change**, the 58-case,
-59-type/199-field wire bundle or its compiler-free consumer. It compiles
+The helper producer is **not part of, and does not change**, the 101-case,
+73-type/233-field wire bundle or its compiler-free consumer. It compiles
 unmodified `pal/wc16.c`, `RetryableErrorState.cpp` and
 `RetryableErrorStateThresholdCollection.cpp`. Identifier, `LargeInteger`,
 `NodeId`, `GenerationNumber`, `CheckGenerationHeader` and `GetGenerationState`

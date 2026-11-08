@@ -57,9 +57,24 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
                 | "AddPrimaryReply"
                 | "RemoveInstanceReply"
                 | "DeleteReplicaReply"
+                | "NodeActivateReply"
+                | "NodeDeactivateReply"
+                | "NodeUpdateServiceReply"
+                | "ServiceTypeEnabled"
+                | "ServiceTypeDisabled"
+                | "ReportLoad"
         )
         || props.expects_reply != (props.action == "NodeUp")
-        || props.high_priority != (props.action != "ServiceTypeNotification")
+        || props.high_priority
+            != matches!(
+                props.action.as_str(),
+                "NodeUp"
+                    | "ReplicaUp"
+                    | "AddInstanceReply"
+                    | "AddPrimaryReply"
+                    | "RemoveInstanceReply"
+                    | "DeleteReplicaReply"
+            )
     {
         return Err(fube_transport::Error::Protocol("unsupported FM ingress"));
     }
@@ -70,7 +85,15 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
     if props.actor != RA_ACTOR
         || props.expects_reply
         || props.uncorrelated_reply
-        || props.high_priority != (props.action != "ServiceTypeNotificationReply")
+        || props.high_priority
+            != matches!(
+                props.action.as_str(),
+                "AddInstance"
+                    | "AddPrimary"
+                    | "RemoveInstance"
+                    | "DeleteReplica"
+                    | "ReplicaUpReply"
+            )
         || !matches!(
             props.action.as_str(),
             "AddInstance"
@@ -79,6 +102,11 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
                 | "DeleteReplica"
                 | "ReplicaUpReply"
                 | "ServiceTypeNotificationReply"
+                | "NodeActivateRequest"
+                | "NodeDeactivateRequest"
+                | "NodeUpdateServiceRequest"
+                | "ServiceTypeEnabledReply"
+                | "ServiceTypeDisabledReply"
         )
     {
         return Err(fube_transport::Error::Protocol("unsupported node ingress"));
@@ -196,6 +224,27 @@ pub fn predecode(message: &Message) -> Result<()> {
         }
         "ServiceTypeNotification" | "ServiceTypeNotificationReply" => {
             decode::<ServiceTypeNotification>(&message.body)?;
+        }
+        "NodeActivateRequest" | "NodeDeactivateRequest" => {
+            decode::<NodeActivationRequest>(&message.body)?;
+        }
+        "NodeActivateReply" | "NodeDeactivateReply" => {
+            decode::<NodeActivationReply>(&message.body)?;
+        }
+        "NodeUpdateServiceRequest" => {
+            decode::<NodeUpdateServiceRequest>(&message.body)?;
+        }
+        "NodeUpdateServiceReply" => {
+            decode::<NodeUpdateServiceReply>(&message.body)?;
+        }
+        "ServiceTypeEnabled" | "ServiceTypeDisabled" => {
+            decode::<ServiceTypeUpdate>(&message.body)?;
+        }
+        "ServiceTypeEnabledReply" | "ServiceTypeDisabledReply" => {
+            decode::<ServiceTypeUpdateReply>(&message.body)?;
+        }
+        "ReportLoad" => {
+            decode::<ReportLoad>(&message.body)?;
         }
         _ => return Err("unsupported native action retained at boundary".into()),
     }

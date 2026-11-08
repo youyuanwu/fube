@@ -51,6 +51,34 @@ rich_fields!(FabricVersion: code, config);
 rich_fields!(FabricVersionInstance: version, instance);
 rich_fields!(ServicePackageInfo: package, version);
 rich_fields!(ServicePackageResourceGovernance: governed, legacy_cpu_cores, memory_mb, cpu_cores);
+rich_fields!(NodeActivationRequest: sequence, from_fmm);
+rich_fields!(NodeActivationReply: sequence);
+rich_fields!(NodeUpdateServiceRequest: service);
+rich_fields!(NodeUpdateServiceReply: service, instance, version);
+rich_fields!(ServiceTypeUpdate: types, sequence);
+rich_fields!(ServiceTypeUpdateReply: sequence);
+rich_fields!(LoadMetricValue: name, value);
+rich_fields!(LoadMetricStats: name, value, count, weighted_sum, weight, time);
+rich_fields!(NodeLoads: node, loads);
+rich_fields!(ReportLoad: legacy, reports, time);
+
+impl Rich for LegacyLoadReport {
+    fn rich(&mut self, c: &mut i32) {
+        self.unit.rich(c);
+        self.role = enumeration(c);
+        self.metrics.rich(c);
+    }
+}
+impl Rich for LoadDescription {
+    fn rich(&mut self, c: &mut i32) {
+        self.partition.rich(c);
+        self.service.rich(c);
+        self.stateful.rich(c);
+        self.primary.rich(c);
+        self.secondary.rich(c);
+        self.nodes = ObjectArray(vec![filled(c)]);
+    }
+}
 
 fn strings(c: &mut i32) -> CountedStrings<Vec<String>> {
     CountedStrings(vec![filled(c), filled(c)])
@@ -319,6 +347,328 @@ fn check<T: Serialize + DeserializeOwned + Debug + PartialEq>(
     )
     .unwrap();
     println!("{name} native->Rust OK; Rust output produced");
+}
+
+fn stage_two_envelope(
+    input: &Path,
+    name: &str,
+    action: &str,
+    actor: &str,
+    generation: Option<bool>,
+) -> Message {
+    let mut headers: Vec<_> = [
+        (ACTOR, actor.to_string()),
+        (ACTION, format!("action-{action}")),
+        (HIGH_PRIORITY, "priority-false".to_string()),
+    ]
+    .into_iter()
+    .map(|(id, name)| Header {
+        id,
+        value: fs::read(input.join(format!("{name}.bin"))).unwrap(),
+    })
+    .collect();
+    if let Some(fmm) = generation {
+        headers.push(Header {
+            id: GENERATION_HEADER,
+            value: fs::read(input.join(if fmm {
+                "fmm-generation.bin"
+            } else {
+                "fm-generation.bin"
+            }))
+            .unwrap(),
+        });
+    }
+    Message {
+        headers,
+        body: fs::read(input.join(format!("{name}.bin"))).unwrap(),
+    }
+}
+
+fn check_incoming<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone>(
+    input: &Path,
+    output: &Path,
+    name: &str,
+    action: &str,
+    expected: T,
+    make: fn(&T, &GenerationHeader) -> fube_transport::Result<Message>,
+    decode: fn(&Message) -> fube_transport::Result<(T, GenerationHeader)>,
+) {
+    check(input, output, name, expected.clone());
+    for fmm in [false, true] {
+        let native = stage_two_envelope(input, name, action, "actor-12", Some(fmm));
+        let generation = support::rich_generation(fmm);
+        assert_eq!(
+            decode(&native).unwrap(),
+            (expected.clone(), generation.clone())
+        );
+        let made = make(&expected, &generation).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(
+            made.body,
+            fs::read(output.join(format!("{name}.bin"))).unwrap()
+        );
+        assert_eq!(decode(&made).unwrap(), (expected.clone(), generation));
+    }
+    reject_prefixes::<T>(input, name);
+}
+
+fn check_owner_outgoing<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone>(
+    input: &Path,
+    output: &Path,
+    name: &str,
+    action: &str,
+    expected: T,
+    make: fn(&T, Owner) -> fube_transport::Result<Message>,
+    decode: fn(&Message) -> fube_transport::Result<(T, Owner)>,
+) {
+    check(input, output, name, expected.clone());
+    for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
+        let native = stage_two_envelope(input, name, action, actor, None);
+        assert_eq!(decode(&native).unwrap(), (expected.clone(), owner));
+        let made = make(&expected, owner).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(
+            made.body,
+            fs::read(output.join(format!("{name}.bin"))).unwrap()
+        );
+        assert_eq!(decode(&made).unwrap(), (expected.clone(), owner));
+    }
+    reject_prefixes::<T>(input, name);
+}
+
+fn check_fm_outgoing<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone>(
+    input: &Path,
+    output: &Path,
+    name: &str,
+    action: &str,
+    expected: T,
+    make: fn(&T) -> fube_transport::Result<Message>,
+    decode: fn(&Message) -> fube_transport::Result<T>,
+) {
+    check(input, output, name, expected.clone());
+    let native = stage_two_envelope(input, name, action, "actor-11", None);
+    assert_eq!(decode(&native).unwrap(), expected);
+    let made = make(&expected).unwrap();
+    factory_contract(&native, &made);
+    assert_eq!(
+        made.body,
+        fs::read(output.join(format!("{name}.bin"))).unwrap()
+    );
+    assert_eq!(decode(&made).unwrap(), expected);
+    reject_prefixes::<T>(input, name);
+}
+
+fn stage_two(input: &Path, output: &Path) {
+    for (profile, rich) in [("empty", false), ("rich", true)] {
+        macro_rules! expected {
+            ($t:ty) => {
+                if rich {
+                    filled::<$t>(&mut 0)
+                } else {
+                    <$t>::default()
+                }
+            };
+        }
+        for (root, action, make, decode) in [
+            (
+                "node-activate-request",
+                "NodeActivateRequest",
+                node_activate_request_message as fn(&NodeActivationRequest, &GenerationHeader) -> _,
+                decode_node_activate_request as fn(&Message) -> _,
+            ),
+            (
+                "node-deactivate-request",
+                "NodeDeactivateRequest",
+                node_deactivate_request_message,
+                decode_node_deactivate_request,
+            ),
+        ] {
+            let mut body = expected!(NodeActivationRequest);
+            body.from_fmm = false;
+            check_incoming(
+                input,
+                output,
+                &format!("{profile}-{root}"),
+                action,
+                body,
+                make,
+                decode,
+            );
+        }
+        for (root, action, make, decode) in [
+            (
+                "node-activate-reply",
+                "NodeActivateReply",
+                node_activate_reply_message as fn(&NodeActivationReply, Owner) -> _,
+                decode_node_activate_reply as fn(&Message) -> _,
+            ),
+            (
+                "node-deactivate-reply",
+                "NodeDeactivateReply",
+                node_deactivate_reply_message,
+                decode_node_deactivate_reply,
+            ),
+        ] {
+            check_owner_outgoing(
+                input,
+                output,
+                &format!("{profile}-{root}"),
+                action,
+                expected!(NodeActivationReply),
+                make,
+                decode,
+            );
+        }
+        check_incoming(
+            input,
+            output,
+            &format!("{profile}-node-update-service-request"),
+            "NodeUpdateServiceRequest",
+            expected!(NodeUpdateServiceRequest),
+            node_update_service_request_message,
+            decode_node_update_service_request,
+        );
+        check_owner_outgoing(
+            input,
+            output,
+            &format!("{profile}-node-update-service-reply"),
+            "NodeUpdateServiceReply",
+            expected!(NodeUpdateServiceReply),
+            node_update_service_reply_message,
+            decode_node_update_service_reply,
+        );
+        for (root, action, make, decode) in [
+            (
+                "service-type-enabled",
+                "ServiceTypeEnabled",
+                service_type_enabled_message as fn(&ServiceTypeUpdate) -> _,
+                decode_service_type_enabled as fn(&Message) -> _,
+            ),
+            (
+                "service-type-disabled",
+                "ServiceTypeDisabled",
+                service_type_disabled_message,
+                decode_service_type_disabled,
+            ),
+        ] {
+            check_fm_outgoing(
+                input,
+                output,
+                &format!("{profile}-{root}"),
+                action,
+                expected!(ServiceTypeUpdate),
+                make,
+                decode,
+            );
+        }
+        for (root, action, make, decode) in [
+            (
+                "service-type-enabled-reply",
+                "ServiceTypeEnabledReply",
+                service_type_enabled_reply_message
+                    as fn(&ServiceTypeUpdateReply, &GenerationHeader) -> _,
+                decode_service_type_enabled_reply as fn(&Message) -> _,
+            ),
+            (
+                "service-type-disabled-reply",
+                "ServiceTypeDisabledReply",
+                service_type_disabled_reply_message,
+                decode_service_type_disabled_reply,
+            ),
+        ] {
+            check_incoming(
+                input,
+                output,
+                &format!("{profile}-{root}"),
+                action,
+                expected!(ServiceTypeUpdateReply),
+                make,
+                decode,
+            );
+        }
+        check_owner_outgoing(
+            input,
+            output,
+            &format!("{profile}-replica-endpoint-updated"),
+            "ReplicaEndpointUpdated",
+            expected!(AddInstance),
+            replica_endpoint_updated_message,
+            decode_replica_endpoint_updated,
+        );
+        let endpoint_reply = if rich {
+            support::rich_reply(-2_147_017_398)
+        } else {
+            AddInstanceReply::default()
+        };
+        check_incoming(
+            input,
+            output,
+            &format!("{profile}-replica-endpoint-updated-reply"),
+            "ReplicaEndpointUpdatedReply",
+            endpoint_reply,
+            replica_endpoint_updated_reply_message,
+            decode_replica_endpoint_updated_reply,
+        );
+        check_fm_outgoing(
+            input,
+            output,
+            &format!("{profile}-report-load"),
+            "ReportLoad",
+            expected!(ReportLoad),
+            report_load_message,
+            decode_report_load,
+        );
+    }
+    for (root, action, make, decode) in [
+        (
+            "node-activate-request",
+            "NodeActivateRequest",
+            node_activate_request_message as fn(&NodeActivationRequest, &GenerationHeader) -> _,
+            decode_node_activate_request as fn(&Message) -> _,
+        ),
+        (
+            "node-deactivate-request",
+            "NodeDeactivateRequest",
+            node_deactivate_request_message,
+            decode_node_deactivate_request,
+        ),
+    ] {
+        check_incoming(
+            input,
+            output,
+            &format!("fmm-{root}"),
+            action,
+            NodeActivationRequest {
+                sequence: i64::MIN + 17,
+                from_fmm: true,
+            },
+            make,
+            decode,
+        );
+    }
+    for legacy in [false, true] {
+        let c = &mut 0;
+        let mut body = ReportLoad::default();
+        if legacy {
+            body.legacy = filled(c);
+        } else {
+            body.reports = filled(c);
+        }
+        body.time = filled(c);
+        check_fm_outgoing(
+            input,
+            output,
+            if legacy {
+                "legacy-report-load"
+            } else {
+                "modern-report-load"
+            },
+            "ReportLoad",
+            body,
+            report_load_message,
+            decode_report_load,
+        );
+    }
 }
 
 fn main() {
@@ -593,6 +943,19 @@ fn main() {
         "ServiceTypeNotificationReply",
         "NodeUp",
         "NodeUpAck",
+        "NodeActivateRequest",
+        "NodeActivateReply",
+        "NodeDeactivateRequest",
+        "NodeDeactivateReply",
+        "NodeUpdateServiceRequest",
+        "NodeUpdateServiceReply",
+        "ServiceTypeEnabled",
+        "ServiceTypeDisabled",
+        "ServiceTypeEnabledReply",
+        "ServiceTypeDisabledReply",
+        "ReplicaEndpointUpdated",
+        "ReplicaEndpointUpdatedReply",
+        "ReportLoad",
     ] {
         check(
             input,
@@ -694,5 +1057,6 @@ fn main() {
             }
         }
     }
-    println!("58 cases verified; all selected-body proper prefixes rejected");
+    stage_two(input, output);
+    println!("101 cases verified; all selected-body proper prefixes rejected");
 }

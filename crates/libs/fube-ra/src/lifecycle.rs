@@ -67,6 +67,7 @@ pub enum CloseMode {
     Close = 7,
     /// Native non-force Abort: RAP Abort, without ForceAbort's admission rules.
     Abort = 8,
+    DeactivateNode = 9,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) struct LocalCloseRequest {
@@ -213,6 +214,7 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
             && matches!(
                 mode,
                 CloseMode::Close
+                    | CloseMode::DeactivateNode
                     | CloseMode::AppHostDown
                     | CloseMode::Drop
                     | CloseMode::Abort
@@ -222,7 +224,10 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
         {
             // Close/AppHostDown use OnReplicaDown; other terminal origins use OnDropped.
             // Both serialize the closed volatile FT in ReplicaUp's dropped list.
-            state.fm_stage = if matches!(mode, CloseMode::Close | CloseMode::AppHostDown) {
+            state.fm_stage = if matches!(
+                mode,
+                CloseMode::Close | CloseMode::DeactivateNode | CloseMode::AppHostDown
+            ) {
                 FmStage::ReplicaDown
             } else {
                 FmStage::ReplicaDropped
@@ -237,7 +242,7 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
             });
         }
     } else if !state.local_deleted {
-        state.fm_stage = if mode == CloseMode::AppHostDown {
+        state.fm_stage = if matches!(mode, CloseMode::AppHostDown | CloseMode::DeactivateNode) {
             FmStage::ReplicaDown
         } else {
             FmStage::ReplicaDropped
@@ -267,7 +272,10 @@ pub(super) fn close_retry(state: &EntityState, effects: &mut Vec<Effect>) {
                 .is_some_and(|mode| mode.force() || mode == CloseMode::Abort)
             {
                 4
-            } else if state.close_mode == Some(CloseMode::Close) {
+            } else if matches!(
+                state.close_mode,
+                Some(CloseMode::Close | CloseMode::DeactivateNode)
+            ) {
                 0
             } else {
                 8

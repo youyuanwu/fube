@@ -29,6 +29,25 @@ CASES = {
     "rich-delete-replica-reply-0", "rich-delete-replica-reply--2147017398",
     "action-DeleteReplica", "action-DeleteReplicaReply",
 }
+STAGE_TWO_ACTIONS = {
+    "NodeActivateRequest", "NodeActivateReply", "NodeDeactivateRequest", "NodeDeactivateReply",
+    "NodeUpdateServiceRequest", "NodeUpdateServiceReply", "ServiceTypeEnabled",
+    "ServiceTypeDisabled", "ServiceTypeEnabledReply", "ServiceTypeDisabledReply",
+    "ReplicaEndpointUpdated", "ReplicaEndpointUpdatedReply", "ReportLoad",
+}
+STAGE_TWO_ROOTS = {
+    "node-activate-request", "node-activate-reply", "node-deactivate-request",
+    "node-deactivate-reply", "node-update-service-request", "node-update-service-reply",
+    "service-type-enabled", "service-type-disabled", "service-type-enabled-reply",
+    "service-type-disabled-reply", "replica-endpoint-updated", "replica-endpoint-updated-reply",
+    "report-load",
+}
+CASES |= {f"{profile}-{root}" for root in STAGE_TWO_ROOTS for profile in ["empty", "rich"]}
+CASES |= {f"action-{action}" for action in STAGE_TWO_ACTIONS}
+CASES |= {"fmm-node-activate-request", "fmm-node-deactivate-request",
+          "legacy-report-load", "modern-report-load"}
+SCHEMA_TYPES = 73
+SCHEMA_FIELDS = 233
 
 
 def validate(bundle, expected_head, expected_source):
@@ -48,8 +67,8 @@ def validate(bundle, expected_head, expected_source):
     calculated_source = hashlib.sha256(
         json.dumps(manifest.get("source_inputs", {}), sort_keys=True).encode()
     ).hexdigest()
-    if (calculated_source != expected_source or manifest.get("schema_types") != 59
-            or manifest.get("schema_fields") != 199
+    if (calculated_source != expected_source or manifest.get("schema_types") != SCHEMA_TYPES
+            or manifest.get("schema_fields") != SCHEMA_FIELDS
             or manifest.get("native_constants") != {"PToP": 0x8013, "PToPDirect": 0}
             or not manifest.get("native_sources")):
         raise ValueError("source/schema manifest mismatch")

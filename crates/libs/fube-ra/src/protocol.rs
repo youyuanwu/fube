@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod bootstrap;
 pub use bootstrap::*;
+pub mod node_control;
+pub use node_control::*;
 
 pub const GENERATION_HEADER: u16 = 0x8018;
 pub const RA_ACTOR: i64 = 12;

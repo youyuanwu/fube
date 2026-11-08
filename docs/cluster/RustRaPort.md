@@ -495,8 +495,8 @@ complete every native branch of its handlers.
 The [source-pinned catalog](NativeRaProtocol.md) contains **58 FM-boundary action
 definitions**, including common registration, plus **eight peer RA actions**.
 There are 67 directional contracts because DoReconfiguration also has a peer
-send path. The current 14 selected action codecs have bounded handler coverage,
-not complete native contracts; 44 FM-boundary actions and all eight peer actions
+send path. The current 27 selected action codecs have bounded handler/helper coverage,
+not complete native contracts; 31 FM-boundary actions and all eight peer actions
 remain unselected, alongside broader branches of the selected handlers.
 
 Stage 1 is now implemented for the bounded volatile 1/1 FM profile; see
@@ -506,7 +506,7 @@ This does not qualify every native handler branch or complete P4/M2.
 | Stage | Remaining scope | Completion gate |
 |---|---|---|
 | 1. Finish singleton lifecycle | Abort/ForceAbort reporting, closed-AddPrimary handling and remaining DeleteReplica branches, then explicitly authorized fresh-lifetime recreation. | Preserve native close/report/ACK semantics and exact original accounting. Reporting and metadata completion cannot substitute for disposal proof or relabel lost volatile data as recovered empty state. |
-| 2. Complete node-wide coordination | Broader P2 multi-entity execution; NodeActivateRequest/Reply, NodeDeactivateRequest/Reply, NodeUpdateServiceRequest/Reply, ServiceTypeEnabled/Disabled and their replies, full registration notifications, ReplicaEndpointUpdated/Reply and ReportLoad. | Preserve sequence/version checks and action-specific completion barriers. Deactivation replies follow required replica closure, not admission; ReportLoad remains best-effort without an invented per-report ACK. |
+| 2. Complete node-wide coordination | Bounded implementation: broader P2 multi-entity execution; NodeActivateRequest/Reply, NodeDeactivateRequest/Reply, NodeUpdateServiceRequest/Reply, ServiceTypeEnabled/Disabled and their replies, existing registration notifications and complete ReportLoad codecs/forwarding. ReplicaEndpointUpdated/Reply codecs and endpoint helper only; live publication moves to stage 5. | Preserve sequence/version checks and action-specific completion barriers. Deactivation replies follow required replica closure, not admission; ReportLoad remains best-effort without an invented per-report ACK. Keep one FT per deployed Node; qualify multiple FTs in RA model/store tests. |
 | 3. Complete ordinary-FM generation and upload | GenerationProposal/Reply, GenerationUpdate/Reject, LFUMUpload/Reply, nonempty NodeUp/NodeUpAck reconciliation and full ReplicaUp/Reply batching/final-upload handling. | Preserve proposed/receive/send generations and per-entity commit barriers. Only the correct semantic completion advances upload/readiness; keep restart serving disabled until stage 6. |
 | 4. Build and remove remote replicas | AddReplica/Reply through peer CreateReplica/Reply and real RAP build; RemoveReplica/Reply through replicator removal. | Require real copy/application ACKs and activation before Ready/FM success. CreateReplicaReply is not AddReplicaReply; RemoveReplica is not DeleteReplica on the remote node. |
 | 5. Implement reconfiguration | DoReconfiguration/Reply, peer GetLSN/Reply, Deactivate/Reply and Activate/Reply, ChangeConfiguration and DatalossReport. Include peer swap continuation. | Preserve native phase ordering, separate previous/current quorum obligations, catch-up/cancellation, old-primary fencing and endpoint publication. Qualify secondary replacement before primary transfer. |
@@ -531,7 +531,27 @@ and the native ServiceBusy no-op distinctly from unsupported success-shaped
 stubs. Federation membership remains excluded, but peer reliability traffic
 remains required.
 
-Stage 2 and later remain staged.
+Stage 2 is implemented within those explicit bounds; see
+[node-wide coordination](MinimalFmCluster.md#node-wide-coordination-stage-2).
+The coordinator includes accepted entries with private creation/close commits,
+retains reply capacity through multi-entity completion, binds service jobs to
+their owned group and suppresses group success after an updated job's failed
+commit. Native 900-second close deadlines and 15-second checks terminate only
+captured original hosts, once per monitor; termination is not closure proof.
+Status work keeps native five-second minimum starts, 30-second retries,
+current-sequence acknowledgments and independent history cleanup.
+
+The endpoint helper preserves the native separation from FM message state.
+Its timeout and pending/completed/reset behavior are qualified, but live
+publication remains gated: native invariants require an active reconfiguration.
+Stage 5 must integrate that helper with real RAP endpoint updates and FM replies,
+not publish a fresh Primary endpoint through a fabricated reconfiguration.
+
+Stage-two codec evidence contains 101 bidirectional cases, 73 types/233 fields,
+105 bundle files and 26 native truncation rejections. Native-derived model/store
+and actual native-free process/IPC tests do not supply complete normalized C++
+handler traces or native FM/Federation interoperability. Stages 3–8 and those
+broader evidence gates remain incomplete.
 
 ## 10. Limits and remaining implementation choices
 

@@ -218,6 +218,598 @@ async fn registration_actions(
 
 const CLOCK_ORIGIN: i64 = 1_000_000_000;
 
+fn node_control(sequence: i64, activated: bool) -> Command {
+    let body = NodeActivationRequest {
+        sequence,
+        from_fmm: false,
+    };
+    let source = admission().fm_source;
+    let generation = GenerationHeader {
+        number: admission().generation,
+        for_fm_replica: false,
+    };
+    if activated {
+        Command::NodeActivate {
+            body,
+            source,
+            generation,
+        }
+    } else {
+        Command::NodeDeactivate {
+            body,
+            source,
+            generation,
+        }
+    }
+}
+fn node_service_update(service: Service) -> Command {
+    Command::NodeUpdateService {
+        body: Box::new(NodeUpdateServiceRequest { service }),
+        source: admission().fm_source,
+        generation: GenerationHeader {
+            number: admission().generation,
+            for_fm_replica: false,
+        },
+    }
+}
+
+#[tokio::test]
+async fn fresh_node_activation_seed_cannot_replace_accepted_or_bootstrapped_intent() {
+    for initially_seeded in [false, true] {
+        let (store, executor, _) = setup(WAIT).await;
+        if initially_seeded {
+            executor
+                .seed_fresh_node_activation(NodeActivationInfo {
+                    activated: true,
+                    sequence: 1,
+                })
+                .unwrap();
+            assert!(matches!(
+                executor.seed_fresh_node_activation(NodeActivationInfo {
+                    activated: false,
+                    sequence: 0
+                }),
+                Err(Failure::Unsupported(_))
+            ));
+        }
+        run(&executor, node_control(2, false)).await;
+        effects(&executor);
+        assert!(matches!(
+            executor.seed_fresh_node_activation(NodeActivationInfo {
+                activated: true,
+                sequence: 100
+            }),
+            Err(Failure::Unsupported(_))
+        ));
+        assert_eq!(
+            executor.node_activation(),
+            NodeActivationInfo {
+                activated: false,
+                sequence: 2
+            }
+        );
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn node_service_groups_bind_jobs_and_suppress_reply_after_definite_or_unknown_commit_failure()
+{
+    for unknown in [false, true] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(30)
+        } else {
+            WAIT
+        })
+        .await;
+        let one = primary_body();
+        let mut two = one.clone();
+        two.unit.id.guid.0 = [2; 16];
+        two.unit.consistency.id = two.unit.id.clone();
+        if unknown {
+            two.service.name = "fabric:/unrelated".into();
+        }
+        make_ready(&executor, &one).await;
+        make_ready(&executor, &two).await;
+        let mut service = one.service.clone();
+        service.update_version = 1;
+        let parent = executor
+            .submit(node_service_update(service.clone()))
+            .unwrap();
+        parent.wait(WAIT).await.unwrap();
+        effects(&executor);
+        let mut forged = service.clone();
+        forged.update_version = 99;
+        let invalid = executor
+            .submit(Command::UpdateServiceForNode {
+                unit: one.unit.id.clone(),
+                work: parent.id,
+                body: Box::new(NodeUpdateServiceRequest { service: forged }),
+            })
+            .unwrap();
+        assert!(matches!(
+            invalid.wait(WAIT).await,
+            Err(Failure::Admission(_))
+        ));
+        assert_eq!(state(&executor).body.service.update_version, 0);
+        let (entered, release) = hooks.pause(true);
+        let job = executor
+            .submit(Command::UpdateServiceForNode {
+                unit: one.unit.id.clone(),
+                work: parent.id,
+                body: Box::new(NodeUpdateServiceRequest {
+                    service: service.clone(),
+                }),
+            })
+            .unwrap();
+        entered.await.unwrap();
+        if unknown {
+            assert_eq!(job.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.snapshot([1; 16]).fenced);
+        }
+        assert!(effects(&executor).is_empty());
+        release.send(()).unwrap();
+        assert!(matches!(job.resolve(WAIT).await, Err(Failure::Store(_))));
+        run(
+            &executor,
+            Command::UpdateServiceForNode {
+                unit: two.unit.id.clone(),
+                work: parent.id,
+                body: Box::new(NodeUpdateServiceRequest {
+                    service: service.clone(),
+                }),
+            },
+        )
+        .await;
+        assert!(!effects(&executor)
+            .iter()
+            .any(|effect| matches!(effect, Effect::NodeUpdateServiceReply(_))));
+        assert_eq!(
+            executor
+                .snapshot([2; 16])
+                .committed
+                .unwrap()
+                .body
+                .service
+                .update_version,
+            if unknown { 0 } else { 1 }
+        );
+        if !unknown {
+            let retry = executor
+                .submit(node_service_update(service.clone()))
+                .unwrap();
+            retry.wait(WAIT).await.unwrap();
+            effects(&executor);
+            for unit in [one.unit.id.clone(), two.unit.id.clone()] {
+                run(
+                    &executor,
+                    Command::UpdateServiceForNode {
+                        unit,
+                        work: retry.id,
+                        body: Box::new(NodeUpdateServiceRequest {
+                            service: service.clone(),
+                        }),
+                    },
+                )
+                .await;
+            }
+            assert_eq!(
+                effects(&executor)
+                    .iter()
+                    .filter(|effect| matches!(effect, Effect::NodeUpdateServiceReply(_)))
+                    .count(),
+                1
+            );
+        }
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn node_deactivation_includes_private_creation_and_new_activation_cancels_queued_close() {
+    let (store, executor, hooks) = setup(Duration::from_millis(30)).await;
+    let (entered, release) = hooks.pause(false);
+    let creating = executor.submit(primary_add(primary_body())).unwrap();
+    entered.await.unwrap();
+    assert_eq!(creating.wait(WAIT).await, Err(Failure::Unknown));
+    run(&executor, node_control(2, false)).await;
+    let scheduled = effects(&executor);
+    assert!(scheduled.iter().any(|effect| matches!(effect, Effect::NodeDeactivateUnits { units, .. } if units == &vec![[1; 16]])));
+    run(&executor, Command::CheckNodeDeactivation { sequence: 2 }).await;
+    assert!(!effects(&executor).iter().any(|effect| matches!(
+        effect,
+        Effect::NodeDeactivateReply(_) | Effect::TerminateHost { .. }
+    )));
+    let closing = executor
+        .submit(Command::CloseForNodeDeactivation {
+            unit: primary_body().unit.id,
+            sequence: 2,
+        })
+        .unwrap();
+    run(&executor, node_control(3, true)).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::NodeActivateReply(_)]
+    ));
+    release.send(()).unwrap();
+    creating.resolve(WAIT).await.unwrap();
+    assert_eq!(closing.wait(WAIT).await.unwrap(), Disposition::IgnoredStale);
+    assert_eq!(state(&executor).phase, Phase::Opening);
+    assert_eq!(executor.pending_node_deactivation(), None);
+    assert!(!effects(&executor)
+        .iter()
+        .any(|effect| matches!(effect, Effect::NodeDeactivateReply(_))));
+    run(&executor, Command::CheckNodeDeactivation { sequence: 2 }).await;
+    assert!(effects(&executor).is_empty());
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn deactivation_monitor_uses_dynamic_deadline_deduplicates_hosts_and_waits_for_real_hostdown()
+{
+    let store = Store::new(MemoryBackend::new(), StoreSettings::default())
+        .await
+        .unwrap();
+    let clock = TestClock::new();
+    let executor = Executor::new_with_clock(
+        Arc::new(store.clone()),
+        admission(),
+        Settings::default(),
+        clock.clone(),
+    )
+    .unwrap();
+    let one = primary_body();
+    let mut two = one.clone();
+    two.unit.id.guid.0 = [2; 16];
+    two.unit.consistency.id = two.unit.id.clone();
+    make_ready(&executor, &one).await;
+    make_ready(&executor, &two).await;
+    run(&executor, node_control(5, false)).await;
+    effects(&executor);
+    for request in [&one, &two] {
+        run(
+            &executor,
+            Command::CloseForNodeDeactivation {
+                unit: request.unit.id.clone(),
+                sequence: 5,
+            },
+        )
+        .await;
+    }
+    effects(&executor);
+    clock.set(CLOCK_ORIGIN + 9_000_000_000 - 1);
+    run(&executor, Command::CheckNodeDeactivation { sequence: 5 }).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::ArmNodeDeactivationCheck {
+            after_ticks: 150_000_000,
+            ..
+        }]
+    ));
+    executor
+        .config()
+        .set_node(NodeProperty::DeactivationCloseTimeoutTicks, 10);
+    executor
+        .config()
+        .set_node(NodeProperty::DeactivationCheckIntervalTicks, 25);
+    run(&executor, Command::CheckNodeDeactivation { sequence: 5 }).await;
+    let timed = effects(&executor);
+    assert_eq!(timed.iter().filter(|effect| matches!(effect, Effect::TerminateHost { registration: r } if r.host == registration().host)).count(), 1);
+    assert!(timed.iter().any(|effect| matches!(
+        effect,
+        Effect::ArmNodeDeactivationCheck {
+            after_ticks: 25,
+            ..
+        }
+    )));
+    run(&executor, Command::CheckNodeDeactivation { sequence: 5 }).await;
+    assert!(!effects(&executor).iter().any(|effect| matches!(
+        effect,
+        Effect::TerminateHost { .. } | Effect::NodeDeactivateReply(_)
+    )));
+    for request in [&one, &two] {
+        run(
+            &executor,
+            Command::HostDown(Box::new(HostDown {
+                unit: request.unit.id.clone(),
+                host: registration().host,
+            })),
+        )
+        .await;
+    }
+    assert_eq!(
+        effects(&executor)
+            .iter()
+            .filter(|effect| matches!(effect, Effect::NodeDeactivateReply(_)))
+            .count(),
+        1
+    );
+    run(&executor, node_control(5, false)).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::NodeDeactivateReply(body)] if body.sequence == 5)
+    );
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn deactivation_unknown_close_does_not_escape_reply_or_terminate_fenced_entity() {
+    let (store, executor, hooks) = setup(Duration::from_millis(30)).await;
+    make_ready(&executor, &primary_body()).await;
+    executor
+        .config()
+        .set_node(NodeProperty::DeactivationCloseTimeoutTicks, 0);
+    run(&executor, node_control(4, false)).await;
+    effects(&executor);
+    run(
+        &executor,
+        Command::CloseForNodeDeactivation {
+            unit: primary_body().unit.id,
+            sequence: 4,
+        },
+    )
+    .await;
+    effects(&executor);
+    let (entered, release) = hooks.pause(false);
+    let closed = executor
+        .submit(Command::CompleteClose(Box::new(close_completion(
+            &executor, 0,
+        ))))
+        .unwrap();
+    entered.await.unwrap();
+    assert_eq!(closed.wait(WAIT).await, Err(Failure::Unknown));
+    run(&executor, Command::CheckNodeDeactivation { sequence: 4 }).await;
+    assert!(!effects(&executor).iter().any(|effect| matches!(
+        effect,
+        Effect::TerminateHost { .. } | Effect::NodeDeactivateReply(_)
+    )));
+    release.send(()).unwrap();
+    closed.resolve(WAIT).await.unwrap();
+    assert_eq!(
+        effects(&executor)
+            .iter()
+            .filter(|effect| matches!(effect, Effect::NodeDeactivateReply(_)))
+            .count(),
+        1
+    );
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn node_control_empty_inventory_and_service_completion_respect_effect_capacity() {
+    let store = Store::new(MemoryBackend::new(), StoreSettings::default())
+        .await
+        .unwrap();
+    let executor = Executor::new(
+        Arc::new(store.clone()),
+        admission(),
+        Settings {
+            max_effects: 9,
+            ..Settings::default()
+        },
+    )
+    .unwrap();
+    run(&executor, node_control(1, false)).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::NodeDeactivateReply(_)]
+    ));
+    run(&executor, node_control(2, true)).await;
+    effects(&executor);
+    run(&executor, node_service_update(primary_body().service)).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::NodeUpdateServiceReply(_)]
+    ));
+    make_ready(&executor, &primary_body()).await;
+    let mut service = primary_body().service;
+    service.update_version = 1;
+    let parent = executor
+        .submit(node_service_update(service.clone()))
+        .unwrap();
+    parent.wait(WAIT).await.unwrap();
+    // The schedule occupies one slot and the group retains its reply slot.
+    assert!(matches!(
+        executor.submit(Command::UpdateServiceForNode {
+            unit: primary_body().unit.id.clone(),
+            work: parent.id,
+            body: Box::new(NodeUpdateServiceRequest {
+                service: service.clone()
+            }),
+        }),
+        Err(Failure::Capacity)
+    ));
+    effects(&executor);
+    run(
+        &executor,
+        Command::UpdateServiceForNode {
+            unit: primary_body().unit.id,
+            work: parent.id,
+            body: Box::new(NodeUpdateServiceRequest { service }),
+        },
+    )
+    .await;
+    assert!(executor.statistics().effects <= 9);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn node_deactivation_waits_for_all_original_entities_and_stale_activation_cannot_reopen() {
+    let (store, executor, _) = setup(WAIT).await;
+    let one = primary_body();
+    let mut two = primary_body();
+    two.unit.id.guid.0 = [2; 16];
+    two.unit.consistency.id = two.unit.id.clone();
+    make_ready(&executor, &one).await;
+    make_ready(&executor, &two).await;
+    let control = |sequence, activate| {
+        let body = NodeActivationRequest {
+            sequence,
+            from_fmm: false,
+        };
+        if activate {
+            Command::NodeActivate {
+                body,
+                source: admission().fm_source,
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            }
+        } else {
+            Command::NodeDeactivate {
+                body,
+                source: admission().fm_source,
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            }
+        }
+    };
+    run(&executor, control(8, false)).await;
+    let actions = effects(&executor);
+    let [Effect::NodeDeactivateUnits { sequence, units }, Effect::ArmNodeDeactivationCheck { .. }] =
+        actions.as_slice()
+    else {
+        panic!("owned multi-entity close");
+    };
+    assert_eq!(units.len(), 2);
+    for unit in units {
+        executor
+            .submit(Command::CloseForNodeDeactivation {
+                unit: PartitionId {
+                    guid: fube_transport::serialization::serde::Guid(*unit),
+                },
+                sequence: *sequence,
+            })
+            .unwrap()
+            .wait(WAIT)
+            .await
+            .unwrap();
+    }
+    let close_effects = effects(&executor);
+    assert_eq!(
+        close_effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::Close { flags: 0, .. }))
+            .count(),
+        2
+    );
+    for (index, request) in [&one, &two].into_iter().enumerate() {
+        let current = executor.snapshot(request.unit.id.guid.0).committed.unwrap();
+        run(
+            &executor,
+            Command::CompleteClose(Box::new(CloseCompletion {
+                unit: current.body.unit.clone(),
+                replica: current.body.replica.clone(),
+                error: 0,
+            })),
+        )
+        .await;
+        let replies = effects(&executor);
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|effect| matches!(effect, Effect::NodeDeactivateReply(_)))
+                .count(),
+            index
+        );
+    }
+    run(&executor, control(8, true)).await;
+    assert!(!executor.node_activation().activated);
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::NodeActivateReply(body)] if body.sequence == 8)
+    );
+    run(&executor, control(9, true)).await;
+    assert!(executor.node_activation().activated);
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::NodeActivateReply(_)]
+    ));
+    assert!(
+        executor
+            .snapshot(one.unit.id.guid.0)
+            .committed
+            .unwrap()
+            .phase
+            == Phase::Closed
+    );
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn node_service_update_reply_requires_all_issued_commits_and_not_rap_completion() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    let request = primary_body();
+    make_ready(&executor, &request).await;
+    let mut service = request.service.clone();
+    service.update_version += 1;
+    let parent = executor
+        .submit(Command::NodeUpdateService {
+            body: Box::new(NodeUpdateServiceRequest {
+                service: service.clone(),
+            }),
+            source: admission().fm_source,
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        })
+        .unwrap();
+    parent.wait(WAIT).await.unwrap();
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::NodeUpdateServiceUnits { .. }]
+    ));
+    let (entered, release) = hooks.pause(false);
+    let update = executor
+        .submit(Command::UpdateServiceForNode {
+            unit: request.unit.id.clone(),
+            work: parent.id,
+            body: Box::new(NodeUpdateServiceRequest {
+                service: service.clone(),
+            }),
+        })
+        .unwrap();
+    entered.await.unwrap();
+    assert!(effects(&executor).is_empty());
+    release.send(()).unwrap();
+    update.wait(WAIT).await.unwrap();
+    let applied = effects(&executor);
+    assert!(applied.iter().any(|effect| matches!(effect, Effect::NodeUpdateServiceReply(body) if body.version == service.update_version)));
+    assert!(state(&executor).service_description_pending);
+    finish(&store, &executor).await;
+}
+
+#[test]
+fn endpoint_publish_helper_waits_for_native_timeout_and_requires_reconfiguration() {
+    let mut state = EndpointPublishState::default();
+    let mut available = false;
+    assert!(!state.endpoint_updated(9, 10, &mut available));
+    assert!(state.validate(false, false, available).is_err());
+    assert!(state.validate(true, true, available).is_err());
+    assert_eq!(state.timer(9, 10, &mut available), (false, true));
+    assert_eq!(state.timer(10, 10, &mut available), (true, false));
+    assert_eq!(state.timer(11, 10, &mut available), (false, false));
+    state.start_reconfiguration();
+    assert!(
+        available,
+        "native StartReconfiguration does not reset external FM state"
+    );
+    assert!(state.validate(true, false, available).is_err());
+    available = false; // The enclosing reconfiguration resets its own FM stage.
+    assert!(state.endpoint_updated(10, 10, &mut available));
+    state.acknowledge(&mut available);
+    assert!(!available);
+    assert!(!state.endpoint_updated(100, 10, &mut available));
+    assert_eq!(state.timer(100, 10, &mut available), (false, false));
+    state.clear(&mut available);
+    state.start_reconfiguration();
+    assert!(!state.endpoint_updated(1, 10, &mut available));
+    state.clear(&mut available);
+    assert_eq!(state.timer(100, 10, &mut available), (false, false));
+}
+
 #[tokio::test]
 async fn local_stateful_idle_open_is_commit_gated_and_cannot_enable_primary_or_network_add() {
     let (store, executor, hooks) = setup(WAIT).await;
@@ -1580,7 +2172,13 @@ async fn make_ready(executor: &Executor, request: &AddInstance) -> u64 {
     registered(executor, request, first.id).await;
     let mut completion = complete(request, first.id);
     if request.service.stateful {
-        completion.unit = state(executor).body.unit.clone();
+        completion.unit = executor
+            .snapshot(request.unit.id.guid.0)
+            .committed
+            .unwrap()
+            .body
+            .unit
+            .clone();
         completion.replica.replication_endpoint = "127.0.0.1:12345".into();
     }
     run(executor, Command::CompleteOpen(Box::new(completion))).await;

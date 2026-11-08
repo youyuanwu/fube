@@ -894,6 +894,87 @@ fn gone(pid: u32) -> bool {
     !Path::new(&format!("/proc/{pid}")).exists()
 }
 
+#[test]
+fn node_intent_supersedes_pending_work_without_accepting_stale_completion_or_creation() {
+    use fm::Accepted;
+    let mut ledger = ledger();
+    let Accepted::NodeControl(_, false, first) = ledger.accept(command("deactivate", "deactivate", Some(1))).unwrap() else { panic!("deactivation"); };
+    assert!(ledger.accept(command("premature-create", "create", Some(1))).is_err());
+    let now = Instant::now();
+    assert!(ledger.node_control_retry(0, now).is_none());
+    let retry = ledger.node_control_retry(0, now + Duration::from_secs(6)).unwrap();
+    assert!(!retry.0 && retry.1 == first);
+    let Accepted::NodeControl(_, true, next) = ledger.accept(command("activate", "activate", Some(1))).unwrap() else { panic!("activation"); };
+    assert!(next.sequence > first.sequence);
+    assert_eq!(ledger.result("deactivate")["state"], "unknown");
+    ledger.node_control_reply(0, false, NodeActivationReply { sequence: first.sequence }).unwrap();
+    assert_eq!(ledger.result("activate")["state"], "pending");
+    ledger.node_control_reply(0, true, NodeActivationReply { sequence: next.sequence }).unwrap();
+    assert_eq!(ledger.result("activate")["state"], "complete");
+    assert!(ledger.node_control_retry(0, now + Duration::from_secs(60)).is_none());
+    ledger.accept(command("deactivate-again", "deactivate", Some(1))).unwrap();
+    ledger.lost(0, "original session lost".into());
+    assert_eq!(ledger.result("deactivate-again")["state"], "unknown");
+}
+
+#[test]
+fn service_update_resends_same_description_and_ignores_old_or_duplicate_replies() {
+    let mut ledger = ledger();
+    let mut service = ledger.placements[0].body().unwrap().service;
+    service.update_version = 2;
+    ledger.placements[0].service_update = Some(service.clone());
+    let now = Instant::now();
+    ledger.placements[0].service_retry_at = Some(now + Duration::from_secs(5));
+    assert!(ledger.service_update_retry(0, now).is_none());
+    assert_eq!(ledger.service_update_retry(0, now + Duration::from_secs(6)).unwrap().service, service);
+    let mut reply = NodeUpdateServiceReply { service: service.name.clone(), instance: service.instance, version: 1 };
+    ledger.service_reply(0, reply.clone()).unwrap();
+    assert!(ledger.placements[0].service_update.is_some());
+    reply.version = 2;
+    ledger.service_reply(0, reply.clone()).unwrap();
+    ledger.service_reply(0, reply).unwrap();
+    assert!(ledger.service_update_retry(0, now + Duration::from_secs(60)).is_none());
+    assert_eq!(ledger.placements[0].service_description, Some(service));
+}
+
+#[tokio::test]
+async fn real_node_coordination_and_public_load_preserve_original_disposal_and_sibling() {
+    use node::report_tests::NodeClose;
+    for mode in [NodeClose::Provider, NodeClose::Service, NodeClose::Timeout, NodeClose::Cancel] {
+        let fixture = Fixture::new("node-coordination");
+        let mut config = fixture.config();
+        config.profile = ServiceProfile::StatefulSingleton;
+        config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+        let mut cluster = Cluster::new(config).unwrap();
+        cluster.prepare().unwrap();
+        cluster.spawn(0).await.unwrap();
+        cluster.execute(command("sibling", "create", Some(1))).await.unwrap();
+        until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Running).await;
+        let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
+        let pid = cluster.children[0].metadata.as_ref().unwrap().profile.as_ref().unwrap().app_pid;
+        until(&mut cluster, |_| {
+            let mut socket = TcpStream::connect(&endpoint).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            socket.write_all(b"read\n").unwrap();
+            let mut response = String::new();
+            socket.take(512).read_to_string(&mut response).unwrap();
+            response.starts_with("OK ")
+        }).await;
+        let launch = cluster.ledger.placements[1].launch.clone();
+        let result = node::report_tests::run_node_coordination(&launch, mode).await;
+        cluster.children[0].process.as_mut().unwrap().check_alive().unwrap();
+        let mut socket = TcpStream::connect(endpoint).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        socket.write_all(b"read\n").unwrap();
+        let mut response = String::new();
+        socket.take(512).read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("OK "), "{response}");
+        assert_eq!(cluster.shutdown().await["clean"], true);
+        assert!(gone(pid));
+        result.unwrap().unwrap();
+    }
+}
+
 #[tokio::test]
 async fn executable_nodes_preserve_uncertainty_sibling_contact_and_clean_handoff() {
     let fixture = Fixture::new("uncertain");

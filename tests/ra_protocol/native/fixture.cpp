@@ -96,6 +96,12 @@ template<class T> void run(const std::string& mode,const std::filesystem::path& 
     }
     std::cout << name << " " << mode << " OK\n";
 }
+template<class T> void reject_truncated(T value) {
+    auto bytes=encode(value);
+    bytes.resize(bytes.size()/2);
+    T received;
+    if(decode(bytes,received)) throw std::runtime_error("native accepted truncated stage-two body");
+}
 inline FabricVersionInstance fresh_version() {
     FabricVersionInstance value;
     value.version_.codeVersion_.majorVersion_=1;
@@ -261,6 +267,85 @@ int main(int argc,char** argv) {
         run(mode,dir,"direct-ptop",ptop);
         c=0; rich(ptop,c); ptop.actor_=Enum(2); ptop.exactInstance_=false;
         run(mode,dir,"rich-ptop",ptop);
+        // Initialized empty values, not guarantees about native empty constructors.
+        NodeActivateRequestMessageBody activate;
+        run(mode,dir,"empty-node-activate-request",activate);
+        c=0; rich(activate,c); activate.isFromFmm_=false;
+        run(mode,dir,"rich-node-activate-request",activate);
+        reject_truncated(activate);
+        activate.isFromFmm_=true; activate.sequenceNumber_=INT64_MIN+17;
+        run(mode,dir,"fmm-node-activate-request",activate);
+        NodeActivateReplyMessageBody activated;
+        run(mode,dir,"empty-node-activate-reply",activated);
+        c=0; rich(activated,c);
+        run(mode,dir,"rich-node-activate-reply",activated);
+        reject_truncated(activated);
+        NodeDeactivateRequestMessageBody deactivate;
+        run(mode,dir,"empty-node-deactivate-request",deactivate);
+        c=0; rich(deactivate,c); deactivate.isFromFmm_=false;
+        run(mode,dir,"rich-node-deactivate-request",deactivate);
+        reject_truncated(deactivate);
+        deactivate.isFromFmm_=true; deactivate.sequenceNumber_=INT64_MIN+17;
+        run(mode,dir,"fmm-node-deactivate-request",deactivate);
+        NodeDeactivateReplyMessageBody deactivated;
+        run(mode,dir,"empty-node-deactivate-reply",deactivated);
+        c=0; rich(deactivated,c);
+        run(mode,dir,"rich-node-deactivate-reply",deactivated);
+        reject_truncated(deactivated);
+        NodeUpdateServiceRequestMessageBody service_update;
+        run(mode,dir,"empty-node-update-service-request",service_update);
+        c=0; rich(service_update,c);
+        run(mode,dir,"rich-node-update-service-request",service_update);
+        reject_truncated(service_update);
+        NodeUpdateServiceReplyMessageBody service_updated;
+        run(mode,dir,"empty-node-update-service-reply",service_updated);
+        c=0; rich(service_updated,c);
+        run(mode,dir,"rich-node-update-service-reply",service_updated);
+        reject_truncated(service_updated);
+        for(auto state:{"enabled","disabled"}) {
+            ServiceTypeUpdateMessageBody types;
+            run(mode,dir,std::string("empty-service-type-")+state,types);
+            c=0; rich(types,c);
+            run(mode,dir,std::string("rich-service-type-")+state,types);
+            reject_truncated(types);
+            ServiceTypeUpdateReplyMessageBody types_reply;
+            run(mode,dir,std::string("empty-service-type-")+state+"-reply",types_reply);
+            c=0; rich(types_reply,c);
+            run(mode,dir,std::string("rich-service-type-")+state+"-reply",types_reply);
+            reject_truncated(types_reply);
+        }
+        ReplicaMessageBody endpoint;
+        run(mode,dir,"empty-replica-endpoint-updated",endpoint);
+        c=0; rich(endpoint,c);
+        run(mode,dir,"rich-replica-endpoint-updated",endpoint);
+        reject_truncated(endpoint);
+        ReplicaReplyMessageBody endpoint_reply;
+        run(mode,dir,"empty-replica-endpoint-updated-reply",endpoint_reply);
+        c=0; rich(endpoint_reply,c); endpoint_reply.errorCode_.value_=Enum(-2147017398);
+        run(mode,dir,"rich-replica-endpoint-updated-reply",endpoint_reply);
+        reject_truncated(endpoint_reply);
+        ReportLoadMessageBody load;
+        run(mode,dir,"empty-report-load",load);
+        c=0; rich(load,c);
+        run(mode,dir,"rich-report-load",load);
+        reject_truncated(load);
+        ReportLoadMessageBody legacy_load;
+        c=0; rich(legacy_load.reports_,c); rich(legacy_load.senderTime_,c);
+        run(mode,dir,"legacy-report-load",legacy_load);
+        reject_truncated(legacy_load);
+        ReportLoadMessageBody modern_load;
+        c=0; rich(modern_load.reportsNew_,c); rich(modern_load.senderTime_,c);
+        run(mode,dir,"modern-report-load",modern_load);
+        reject_truncated(modern_load);
+        for(auto name:{u"NodeActivateRequest",u"NodeActivateReply",u"NodeDeactivateRequest",
+                      u"NodeDeactivateReply",u"NodeUpdateServiceRequest",u"NodeUpdateServiceReply",
+                      u"ServiceTypeEnabled",u"ServiceTypeDisabled",u"ServiceTypeEnabledReply",
+                      u"ServiceTypeDisabledReply",u"ReplicaEndpointUpdated",
+                      u"ReplicaEndpointUpdatedReply",u"ReportLoad"}) {
+            action.action_=text(name);
+            std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
+            run(mode,dir,"action-"+ascii,action);
+        }
         // Native rejection is executed, not inferred from Rust behavior.
         auto bad=encode(request); bad.resize(bad.size()/2);
         ReplicaMessageBody rejected_request;
@@ -295,7 +380,7 @@ int main(int argc,char** argv) {
         bad=encode(ptop); bad.resize(bad.size()/2);
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
-        std::cout << "native rejects 11 truncations OK\n";
+        std::cout << "native rejects 26 truncations OK\n";
         return 0;
     } catch(const std::exception& error) {
         std::cerr << error.what() << "\n"; return 1;

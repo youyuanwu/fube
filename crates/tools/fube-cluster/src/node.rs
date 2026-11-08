@@ -21,6 +21,12 @@ struct Escrow {
 }
 #[derive(Default)]
 struct Adapter {
+    status_due: Option<Instant>,
+    status_last_start: Option<Instant>,
+    status_requested: bool,
+    status_cleanup_due: Option<Instant>,
+    status_cleanup_command: Option<u64>,
+    status_capture: Option<u64>,
     escrow: VecDeque<Escrow>,
     replies: VecDeque<ra::Dispatched>,
     error: Option<String>,
@@ -93,7 +99,8 @@ impl Adapter {
             }
             let delay = match &dispatch.effect {
                 ra::Effect::RequestServiceTypeWork { after_ticks, .. }
-                | ra::Effect::ArmServiceTypeRetry { after_ticks, .. } => ticks(*after_ticks),
+                | ra::Effect::ArmServiceTypeRetry { after_ticks, .. }
+                | ra::Effect::ArmNodeDeactivationCheck { after_ticks, .. } => ticks(*after_ticks),
                 ra::Effect::RequestReportRetry
                     if node
                         .snapshot(dispatch.entity)
@@ -119,7 +126,10 @@ impl Adapter {
                 if matches!(receipt.disposition, LocalDisposition::LocalResponse)
                     && matches!(
                         receipt.dispatch.effect,
-                        ra::Effect::Reply(_)
+                        ra::Effect::NodeActivateReply(_)
+                            | ra::Effect::NodeDeactivateReply(_)
+                            | ra::Effect::NodeUpdateServiceReply(_)
+                            | ra::Effect::Reply(_)
                             | ra::Effect::PrimaryReply(_)
                             | ra::Effect::RemoveReply(_)
                             | ra::Effect::DeleteReplicaReply(_)
@@ -133,6 +143,13 @@ impl Adapter {
     fn commands(&mut self, node: &mut Node) -> Result<()> {
         for receipt in node.take_command_receipts() {
             let disposition = receipt.result.map_err(err)?;
+            if self.status_capture == Some(receipt.id) {
+                self.status_capture = None;
+                self.status_last_start = Some(Instant::now());
+            }
+            if self.status_cleanup_command == Some(receipt.id) {
+                self.status_cleanup_command = None;
+            }
             if let Some(index) = self
                 .acknowledgements
                 .iter()
@@ -219,9 +236,55 @@ impl Adapter {
         self.capture(node);
         self.commands(node)?;
         self.retire_reports(node);
+        self.escrow.retain(|item| {
+            !matches!(item.original.effect, ra::Effect::ArmNodeDeactivationCheck { sequence, .. }
+                if item.submitted.is_none() && node.pending_node_deactivation() != Some(sequence))
+        });
+        if !node.has_service_type_status() {
+            self.status_due = None;
+            self.status_requested = false;
+        }
+        let now = Instant::now();
+        let cleanup_interval = ticks(
+            node.native_config()
+                .node(ra::NodeProperty::StatusCleanupIntervalTicks),
+        )
+        .max(Duration::from_nanos(100));
+        let cleanup_due = self
+            .status_cleanup_due
+            .get_or_insert(now + cleanup_interval);
+        if *cleanup_due <= now && self.status_cleanup_command.is_none() {
+            self.status_cleanup_command =
+                Some(node.fm_work(FmWork::CleanupTypeStatus).map_err(err)?);
+            *cleanup_due = now + cleanup_interval;
+        }
+        let minimum = ticks(
+            node.native_config()
+                .node(ra::NodeProperty::StatusNodeIntervalTicks),
+        );
+        if (self.status_requested || self.status_due.is_some_and(|due| due <= now))
+            && self
+                .status_last_start
+                .is_none_or(|start| now >= start + minimum)
+            && self.status_capture.is_none()
+            && link.is_some()
+        {
+            self.status_capture = Some(node.fm_work(FmWork::CaptureTypeStatus).map_err(err)?);
+            self.status_requested = false;
+            self.status_due = None;
+        }
         if let Some(link) = link {
             if let Some(reply) = self.replies.front() {
                 let message = match &reply.effect {
+                    ra::Effect::NodeActivateReply(body) => {
+                        node_activate_reply_message(body, Owner::Fm)
+                    }
+                    ra::Effect::NodeDeactivateReply(body) => {
+                        node_deactivate_reply_message(body, Owner::Fm)
+                    }
+                    ra::Effect::NodeUpdateServiceReply(body) => {
+                        node_update_service_reply_message(body, Owner::Fm)
+                    }
                     ra::Effect::Reply(body) => add_instance_reply_message(body, Owner::Fm),
                     ra::Effect::PrimaryReply(body) => add_primary_reply_message(body, Owner::Fm),
                     ra::Effect::RemoveReply(body) => remove_instance_reply_message(body, Owner::Fm),
@@ -264,6 +327,44 @@ impl Adapter {
             let sent = item.sent;
             let entity = item.original.entity;
             let work = match &effect {
+                ra::Effect::ServiceTypeStatusWork => {
+                    self.status_requested = true;
+                    self.escrow.remove(index);
+                    return Ok(());
+                }
+                ra::Effect::ServiceTypeStatus { enabled, body } => {
+                    let Some(link) = link else {
+                        continue;
+                    };
+                    let message = if *enabled {
+                        service_type_enabled_message(body)
+                    } else {
+                        service_type_disabled_message(body)
+                    }
+                    .map_err(err)?;
+                    link.send(message).await?;
+                    self.status_due = Some(
+                        Instant::now()
+                            + ticks(
+                                node.native_config()
+                                    .node(ra::NodeProperty::StatusRetryIntervalTicks),
+                            )
+                            .max(Duration::from_nanos(100)),
+                    );
+                    self.escrow.remove(index);
+                    return Ok(());
+                }
+                ra::Effect::ReportLoad(body) => {
+                    let Some(link) = link else {
+                        continue;
+                    };
+                    link.send(report_load_message(body).map_err(err)?).await?;
+                    self.escrow.remove(index);
+                    return Ok(());
+                }
+                ra::Effect::ArmNodeDeactivationCheck { sequence, .. } => {
+                    Some(FmWork::CheckNodeDeactivation(*sequence))
+                }
                 ra::Effect::RequestServiceTypeWork { work, .. } => {
                     Some(FmWork::CaptureServiceTypeWork(*work))
                 }
@@ -347,13 +448,18 @@ impl Adapter {
         Ok(())
     }
     fn pending(&self) -> usize {
-        self.escrow.len() + self.replies.len() + self.acknowledgements.len()
+        self.escrow.len()
+            + self.replies.len()
+            + self.acknowledgements.len()
+            + usize::from(self.status_capture.is_some())
+            + usize::from(self.status_cleanup_command.is_some())
     }
     fn semantic_pending(&self) -> usize {
         self.notification_pending
             .as_ref()
             .map_or(0, |body| body.infos.0.len())
             + usize::from(self.report_pending.is_some())
+            + usize::from(self.status_due.is_some() || self.status_requested)
     }
     fn replica_drained(&self, node: &Node) -> bool {
         let replica_work = |dispatch: &ra::Dispatched| dispatch.effect.is_replica_reporting();
@@ -546,6 +652,8 @@ async fn run_owned(launch: &Launch) -> Result<()> {
         },
     )
     .map_err(err)?;
+    node.apply_fresh_node_up_ack(&ack, &generation)
+        .map_err(err)?;
     let mut adapter = Adapter::default();
     let arguments = if launch.profile == ServiceProfile::StatefulSingleton {
         vec![("Arguments".into(), "--stateful-primary".into())]
@@ -750,6 +858,41 @@ fn receive_command(
 ) -> Result<Option<(u64, SemanticAck)>> {
     wire::predecode(message)?;
     match message.properties().map_err(err)?.action.as_str() {
+        "ServiceTypeEnabledReply" | "ServiceTypeDisabledReply" => {
+            let enabled = message.properties().map_err(err)?.action == "ServiceTypeEnabledReply";
+            let (body, generation) = if enabled {
+                decode_service_type_enabled_reply(message)
+            } else {
+                decode_service_type_disabled_reply(message)
+            }
+            .map_err(err)?;
+            node.fm_work(FmWork::TypeStatusReply(
+                enabled,
+                body,
+                launch.fm.clone(),
+                generation,
+            ))
+            .map_err(err)?;
+        }
+        "NodeActivateRequest" => {
+            let (body, generation) = decode_node_activate_request(message).map_err(err)?;
+            node.fm_work(FmWork::NodeActivate(body, launch.fm.clone(), generation))
+                .map_err(err)?;
+        }
+        "NodeDeactivateRequest" => {
+            let (body, generation) = decode_node_deactivate_request(message).map_err(err)?;
+            node.fm_work(FmWork::NodeDeactivate(body, launch.fm.clone(), generation))
+                .map_err(err)?;
+        }
+        "NodeUpdateServiceRequest" => {
+            let (body, generation) = decode_node_update_service_request(message).map_err(err)?;
+            node.fm_work(FmWork::NodeUpdateService(
+                Box::new(body),
+                launch.fm.clone(),
+                generation,
+            ))
+            .map_err(err)?;
+        }
         "AddInstance" => {
             let (body, generation) = decode_add_instance(message).map_err(err)?;
             node.add_from_fm(body, &launch.fm, &generation)
@@ -936,6 +1079,13 @@ pub(crate) mod report_tests {
         ForceAbortService,
         ForceDelete,
     }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum NodeClose {
+        Provider,
+        Service,
+        Timeout,
+        Cancel,
+    }
 
     #[derive(Default)]
     struct Traffic {
@@ -944,6 +1094,11 @@ pub(crate) mod report_tests {
         removed: bool,
         add_reply: Option<AddInstanceReply>,
         remove_reply: Option<AddInstanceReply>,
+        activations: Vec<i64>,
+        deactivations: Vec<i64>,
+        service_updates: Vec<NodeUpdateServiceReply>,
+        loads: Vec<ReportLoad>,
+        statuses: Vec<(bool, ServiceTypeUpdate)>,
     }
 
     async fn links(launch: &Launch) -> Result<(Link, Link)> {
@@ -1017,6 +1172,59 @@ pub(crate) mod report_tests {
             .await?
         {
             match incoming.message.properties().map_err(err)?.action.as_str() {
+                "NodeActivateReply" | "NodeDeactivateReply" => {
+                    let activate =
+                        incoming.message.properties().map_err(err)?.action == "NodeActivateReply";
+                    let (body, owner) = if activate {
+                        decode_node_activate_reply(&incoming.message)
+                    } else {
+                        decode_node_deactivate_reply(&incoming.message)
+                    }
+                    .map_err(err)?;
+                    if owner != Owner::Fm {
+                        return Err("unexpected FMM node reply".into());
+                    }
+                    if activate {
+                        traffic.activations.push(body.sequence);
+                    } else {
+                        traffic.deactivations.push(body.sequence);
+                    }
+                }
+                "NodeUpdateServiceReply" => {
+                    let (body, owner) =
+                        decode_node_update_service_reply(&incoming.message).map_err(err)?;
+                    if owner != Owner::Fm {
+                        return Err("unexpected FMM service reply".into());
+                    }
+                    traffic.service_updates.push(body);
+                }
+                "ReportLoad" => {
+                    traffic
+                        .loads
+                        .push(decode_report_load(&incoming.message).map_err(err)?);
+                }
+                action @ ("ServiceTypeEnabled" | "ServiceTypeDisabled") => {
+                    let enabled = action == "ServiceTypeEnabled";
+                    let body = if enabled {
+                        decode_service_type_enabled(&incoming.message)
+                    } else {
+                        decode_service_type_disabled(&incoming.message)
+                    }
+                    .map_err(err)?;
+                    let reply = ServiceTypeUpdateReply {
+                        sequence: body.sequence,
+                    };
+                    fm.send(
+                        if enabled {
+                            service_type_enabled_reply_message(&reply, &launch.generation)
+                        } else {
+                            service_type_disabled_reply_message(&reply, &launch.generation)
+                        }
+                        .map_err(err)?,
+                    )
+                    .await?;
+                    traffic.statuses.push((enabled, body));
+                }
                 "ServiceTypeNotification" => {
                     let body = decode_service_type_notification(&incoming.message).map_err(err)?;
                     fm.send(
@@ -1086,7 +1294,11 @@ pub(crate) mod report_tests {
         let end = Instant::now() + Duration::from_secs(10);
         while !ready(node, adapter, traffic) {
             if Instant::now() >= end {
-                return Err("live adapter/RA progress deadline".into());
+                return Err(format!(
+                    "live adapter/RA progress deadline: added={} service_replies={} loads={} activate={:?} deactivate={:?} commands={} error={:?} logs={:?}",
+                    traffic.added, traffic.service_updates.len(), traffic.loads.len(), traffic.activations,
+                    traffic.deactivations, node.pending_commands(), node.last_error(), node.activation().logs(),
+                ));
             }
             step(launch, node, adapter, fm, link, traffic).await?;
             tokio::task::yield_now().await;
@@ -1568,6 +1780,342 @@ pub(crate) mod report_tests {
         })
         .await
         .map_err(err)?
+    }
+
+    async fn exercise_node_coordination(
+        launch: &Launch,
+        node: &mut Node,
+        adapter: &mut Adapter,
+        fm: &Link,
+        link: &Link,
+        mode: NodeClose,
+    ) -> Result<()> {
+        let body = add_body(launch, &actual_profile(node)?);
+        let entity = body.unit.id.guid.0;
+        let mut traffic = Traffic::default();
+        fm.send(add_primary_message(&body, &launch.generation).map_err(err)?)
+            .await?;
+        until(launch, node, adapter, fm, link, &mut traffic, |_, _, t| {
+            t.added
+        })
+        .await?;
+        let endpoint = traffic
+            .add_reply
+            .as_ref()
+            .ok_or("missing original Primary")?
+            .replica
+            .service_endpoint
+            .clone();
+        let identity = node
+            .activation()
+            .identity()
+            .ok_or("missing original host")?
+            .clone();
+        let usage = node
+            .snapshot(entity)
+            .committed
+            .ok_or("missing original state")?
+            .usage;
+        let ready_end = Instant::now() + Duration::from_secs(2);
+        loop {
+            let response = data_request(&endpoint, b"read\n").await?;
+            if response.starts_with("OK ") {
+                break;
+            }
+            if response != "ERR NotPrimary\n" || Instant::now() >= ready_end {
+                return Err(format!("public Primary readiness failed: {response}"));
+            }
+            step(launch, node, adapter, fm, link, &mut traffic).await?;
+        }
+        let mut service = body.service.clone();
+        service.update_version = 1;
+        service.metrics = fube_transport::serialization::serde::ObjectArray(vec![Metric {
+            name: "LocalWork".into(),
+            weight: 1,
+            primary: 0,
+            secondary: 0,
+        }]);
+        fm.send(
+            node_update_service_request_message(
+                &NodeUpdateServiceRequest {
+                    service: service.clone(),
+                },
+                &launch.generation,
+            )
+            .map_err(err)?,
+        )
+        .await?;
+        until(
+            launch,
+            node,
+            adapter,
+            fm,
+            link,
+            &mut traffic,
+            |node, _, t| {
+                t.service_updates.len() == 1
+                    && node
+                        .snapshot(entity)
+                        .committed
+                        .is_some_and(|state| !state.service_description_pending)
+            },
+        )
+        .await?;
+        if traffic.service_updates[0].version != 1
+            || node
+                .snapshot(entity)
+                .committed
+                .is_none_or(|state| state.body.service != service || state.usage != usage)
+            || node
+                .activation()
+                .identity()
+                .is_none_or(|current| current.host_id != identity.host_id)
+        {
+            return Err(
+                "service update changed original lifetime or did not commit native description"
+                    .into(),
+            );
+        }
+        let report = data_request(&endpoint, b"load\n").await?;
+        if report != "OK load=7\n" {
+            return Err(format!(
+                "public partition report_load failed after real RAP description update: {report}"
+            ));
+        }
+        until(launch, node, adapter, fm, link, &mut traffic, |_, _, t| {
+            !t.loads.is_empty()
+        })
+        .await?;
+        let load = &traffic.loads[0];
+        if !load.legacy.0.is_empty()
+            || load.reports.0.len() != 1
+            || load.reports.0[0].partition != body.unit.id.guid
+            || load.reports.0[0].service != service.name
+            || !load.reports.0[0].stateful
+            || load.reports.0[0].primary.0.len() != 1
+            || load.reports.0[0].primary.0[0].name != "LocalWork"
+            || load.reports.0[0].primary.0[0].value != 7
+        {
+            return Err("public load was not forwarded with native Primary identity/value".into());
+        }
+        if !data_request(&endpoint, b"write\n")
+            .await?
+            .contains("assigned=1 applied=1 committed=1 value=acknowledged")
+        {
+            return Err("node-control fixture did not retain real nonempty data".into());
+        }
+        if mode == NodeClose::Timeout {
+            node.native_config()
+                .set_node(ra::NodeProperty::DeactivationCloseTimeoutTicks, 0);
+            node.native_config()
+                .set_node(ra::NodeProperty::DeactivationCheckIntervalTicks, 100_000);
+        }
+        let inactive = NodeActivationRequest {
+            sequence: 2,
+            from_fmm: false,
+        };
+        fm.send(node_deactivate_request_message(&inactive, &launch.generation).map_err(err)?)
+            .await?;
+        until(
+            launch,
+            node,
+            adapter,
+            fm,
+            link,
+            &mut traffic,
+            |node, _, _| {
+                node.snapshot(entity)
+                    .committed
+                    .is_some_and(|state| state.phase == ra::Phase::Closing)
+            },
+        )
+        .await?;
+        if mode != NodeClose::Timeout {
+            let marker = if mode == NodeClose::Service {
+                "LOCAL_DISPOSE begin"
+            } else {
+                "LOCAL_DATA_PROVIDER dispose begin"
+            };
+            until(
+                launch,
+                node,
+                adapter,
+                fm,
+                link,
+                &mut traffic,
+                |node, _, _| {
+                    node.activation()
+                        .logs()
+                        .iter()
+                        .any(|line| line.contains(marker))
+                },
+            )
+            .await?;
+            for _ in 0..10 {
+                step(launch, node, adapter, fm, link, &mut traffic).await?;
+            }
+            if !traffic.deactivations.is_empty()
+                || node.instance_disposal().is_some()
+                || node
+                    .snapshot(entity)
+                    .committed
+                    .is_none_or(|state| state.usage != usage)
+            {
+                return Err("DeactivateReply escaped held original disposal".into());
+            }
+            fm.send(node_activate_request_message(&inactive, &launch.generation).map_err(err)?)
+                .await?;
+            until(launch, node, adapter, fm, link, &mut traffic, |_, _, t| {
+                t.activations == vec![2]
+            })
+            .await?;
+            if mode == NodeClose::Cancel {
+                fm.send(
+                    node_activate_request_message(
+                        &NodeActivationRequest {
+                            sequence: 3,
+                            from_fmm: false,
+                        },
+                        &launch.generation,
+                    )
+                    .map_err(err)?,
+                )
+                .await?;
+                until(launch, node, adapter, fm, link, &mut traffic, |_, _, t| {
+                    t.activations == vec![2, 3]
+                })
+                .await?;
+            }
+            release_disposal(
+                node,
+                if mode == NodeClose::Service {
+                    StatefulDown::CloseService
+                } else {
+                    StatefulDown::CloseProvider
+                },
+            )?;
+        }
+        until(
+            launch,
+            node,
+            adapter,
+            fm,
+            link,
+            &mut traffic,
+            |node, _, t| {
+                node.snapshot(entity)
+                    .committed
+                    .is_some_and(|state| state.phase == ra::Phase::Closed)
+                    && (mode == NodeClose::Cancel || t.deactivations == vec![2])
+            },
+        )
+        .await?;
+        if mode == NodeClose::Cancel && !traffic.deactivations.is_empty() {
+            return Err("cancelled close monitor sent obsolete deactivation reply".into());
+        }
+        if mode == NodeClose::Timeout {
+            until(
+                launch,
+                node,
+                adapter,
+                fm,
+                link,
+                &mut traffic,
+                |node, _, _| {
+                    node.activation()
+                        .process_status()
+                        .is_some_and(|status| status.exit_observed)
+                },
+            )
+            .await?;
+            if node.instance_disposal().is_some() {
+                return Err("forced host termination fabricated disposal proof".into());
+            }
+        } else {
+            until(
+                launch,
+                node,
+                adapter,
+                fm,
+                link,
+                &mut traffic,
+                |node, _, _| node.instance_disposal().is_some(),
+            )
+            .await?;
+        }
+        fm.send(
+            node_activate_request_message(
+                &NodeActivationRequest {
+                    sequence: 4,
+                    from_fmm: false,
+                },
+                &launch.generation,
+            )
+            .map_err(err)?,
+        )
+        .await?;
+        until(launch, node, adapter, fm, link, &mut traffic, |_, _, t| {
+            t.activations.last() == Some(&4)
+        })
+        .await?;
+        if node
+            .snapshot(entity)
+            .committed
+            .is_none_or(|state| state.phase != ra::Phase::Closed)
+            || node
+                .activation()
+                .logs()
+                .iter()
+                .filter(|line| line.contains("LOCAL_CALLBACK create_replica"))
+                .count()
+                != 1
+        {
+            return Err("node activation adopted or recreated lost volatile data".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn run_node_coordination(
+        launch: &Launch,
+        mode: NodeClose,
+    ) -> Result<Result<()>> {
+        let (mut node, store) = create_node(launch).await?;
+        let mut adapter = Adapter::default();
+        let result = async {
+            node.start(
+                &launch.package,
+                APPLICATION,
+                &[(
+                    "Arguments".into(),
+                    if mode == NodeClose::Service {
+                        "--stateful-primary --block-dispose"
+                    } else {
+                        "--stateful-primary --block-provider-dispose"
+                    }
+                    .into(),
+                )],
+            )
+            .map_err(err)?;
+            let (fm, link) = links(launch).await?;
+            let result =
+                exercise_node_coordination(launch, &mut node, &mut adapter, &fm, &link, mode).await;
+            if mode != NodeClose::Timeout {
+                release_disposal(
+                    &node,
+                    if mode == NodeClose::Service {
+                        StatefulDown::CloseService
+                    } else {
+                        StatefulDown::CloseProvider
+                    },
+                )?;
+            }
+            let fm_closed = fm.close().await;
+            let node_closed = link.close().await;
+            result.and(fm_closed).and(node_closed)
+        }
+        .await;
+        cleanup(launch, &mut node, &store, &mut adapter).await?;
+        Ok(result)
     }
 
     fn release_disposal(node: &Node, mode: StatefulDown) -> Result<()> {

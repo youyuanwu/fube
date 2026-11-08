@@ -488,3 +488,349 @@ fn notification_collections_reject_truncation_trailing_data_and_codec_bound_over
     body.infos.0 = vec![ServiceTypeInfo::default(); 4097];
     assert!(service_type_notification_message(&body).is_err());
 }
+
+#[test]
+fn node_control_sequences_owners_and_full_service_descriptions_are_lossless() {
+    for from_fmm in [false, true] {
+        let generation = support::rich_generation(from_fmm);
+        let owner = if from_fmm { Owner::Fmm } else { Owner::Fm };
+        for sequence in [0, -1, i64::MIN + 17, i64::MAX] {
+            let body = NodeActivationRequest { sequence, from_fmm };
+            let activation = node_activate_request_message(&body, &generation).unwrap();
+            let deactivation = node_deactivate_request_message(&body, &generation).unwrap();
+            assert_eq!(
+                decode_node_activate_request(&activation).unwrap(),
+                (body.clone(), generation.clone())
+            );
+            assert_eq!(
+                decode_node_deactivate_request(&deactivation).unwrap(),
+                (body, generation.clone())
+            );
+            assert!(decode_node_activate_request(&deactivation).is_err());
+            assert!(decode_node_deactivate_request(&activation).is_err());
+            let body = NodeActivationReply { sequence };
+            let activation = node_activate_reply_message(&body, owner).unwrap();
+            let deactivation = node_deactivate_reply_message(&body, owner).unwrap();
+            assert_eq!(
+                decode_node_activate_reply(&activation).unwrap(),
+                (body.clone(), owner)
+            );
+            assert_eq!(
+                decode_node_deactivate_reply(&deactivation).unwrap(),
+                (body, owner)
+            );
+            assert!(decode_node_activate_reply(&deactivation).is_err());
+        }
+        let body = NodeUpdateServiceRequest {
+            service: support::rich_request().service,
+        };
+        let message = node_update_service_request_message(&body, &generation).unwrap();
+        assert_eq!(
+            decode_node_update_service_request(&message).unwrap(),
+            (body.clone(), generation)
+        );
+        let reply = NodeUpdateServiceReply {
+            service: body.service.name,
+            instance: u64::MAX,
+            version: 0x8000_0000_0000_0001,
+        };
+        let message = node_update_service_reply_message(&reply, owner).unwrap();
+        assert_eq!(
+            decode_node_update_service_reply(&message).unwrap(),
+            (reply, owner)
+        );
+    }
+}
+
+#[test]
+fn service_type_status_and_endpoint_actions_do_not_alias_shared_schemas() {
+    use fube_transport::serialization::serde::ObjectArray;
+    let types = support::rich_notification()
+        .infos
+        .0
+        .into_iter()
+        .map(|info| info.versioned.id)
+        .collect();
+    let body = ServiceTypeUpdate {
+        types: ObjectArray(types),
+        sequence: u64::MAX,
+    };
+    let enabled = service_type_enabled_message(&body).unwrap();
+    let disabled = service_type_disabled_message(&body).unwrap();
+    assert_eq!(decode_service_type_enabled(&enabled).unwrap(), body);
+    assert_eq!(decode_service_type_disabled(&disabled).unwrap(), body);
+    assert!(decode_service_type_disabled(&enabled).is_err());
+    assert!(decode_service_type_enabled(&disabled).is_err());
+    assert!(decode_service_type_notification(&enabled).is_err());
+    let reply = ServiceTypeUpdateReply {
+        sequence: body.sequence,
+    };
+    for fmm in [false, true] {
+        let generation = support::rich_generation(fmm);
+        let enabled = service_type_enabled_reply_message(&reply, &generation).unwrap();
+        let disabled = service_type_disabled_reply_message(&reply, &generation).unwrap();
+        assert_eq!(
+            decode_service_type_enabled_reply(&enabled).unwrap(),
+            (reply.clone(), generation.clone())
+        );
+        assert_eq!(
+            decode_service_type_disabled_reply(&disabled).unwrap(),
+            (reply.clone(), generation.clone())
+        );
+        assert!(decode_service_type_disabled_reply(&enabled).is_err());
+        let body = support::rich_reply(-2_147_017_398);
+        let endpoint = replica_endpoint_updated_reply_message(&body, &generation).unwrap();
+        assert_eq!(
+            decode_replica_endpoint_updated_reply(&endpoint).unwrap(),
+            (body, generation)
+        );
+        assert!(decode_add_instance_reply(&endpoint).is_err());
+    }
+    for owner in [Owner::Fm, Owner::Fmm] {
+        let body = support::rich_request();
+        let endpoint = replica_endpoint_updated_message(&body, owner).unwrap();
+        assert_eq!(
+            decode_replica_endpoint_updated(&endpoint).unwrap(),
+            (body, owner)
+        );
+        assert!(decode_add_instance(&endpoint).is_err());
+    }
+}
+
+#[test]
+fn stage_two_factory_defaults_and_malformed_headers_match_native_asymmetry() {
+    use fube_transport::{message::Message, Result};
+    type Decoder = fn(&Message) -> Result<()>;
+    let generation = support::rich_generation(false);
+    let request = NodeActivationRequest {
+        sequence: -9,
+        from_fmm: false,
+    };
+    let reply = NodeActivationReply { sequence: -9 };
+    let service = NodeUpdateServiceRequest {
+        service: support::rich_request().service,
+    };
+    let updated = NodeUpdateServiceReply {
+        service: "fabric:/π🦀".into(),
+        instance: u64::MAX,
+        version: 9,
+    };
+    let status = ServiceTypeUpdate::default();
+    let status_reply = ServiceTypeUpdateReply { sequence: u64::MAX };
+    let contracts: Vec<(&str, Message, bool, Decoder)> = vec![
+        (
+            "NodeActivateRequest",
+            node_activate_request_message(&request, &generation).unwrap(),
+            true,
+            |m| decode_node_activate_request(m).map(|_| ()),
+        ),
+        (
+            "NodeDeactivateRequest",
+            node_deactivate_request_message(&request, &generation).unwrap(),
+            true,
+            |m| decode_node_deactivate_request(m).map(|_| ()),
+        ),
+        (
+            "NodeActivateReply",
+            node_activate_reply_message(&reply, Owner::Fm).unwrap(),
+            false,
+            |m| decode_node_activate_reply(m).map(|_| ()),
+        ),
+        (
+            "NodeDeactivateReply",
+            node_deactivate_reply_message(&reply, Owner::Fm).unwrap(),
+            false,
+            |m| decode_node_deactivate_reply(m).map(|_| ()),
+        ),
+        (
+            "NodeUpdateServiceRequest",
+            node_update_service_request_message(&service, &generation).unwrap(),
+            true,
+            |m| decode_node_update_service_request(m).map(|_| ()),
+        ),
+        (
+            "NodeUpdateServiceReply",
+            node_update_service_reply_message(&updated, Owner::Fm).unwrap(),
+            false,
+            |m| decode_node_update_service_reply(m).map(|_| ()),
+        ),
+        (
+            "ServiceTypeEnabled",
+            service_type_enabled_message(&status).unwrap(),
+            false,
+            |m| decode_service_type_enabled(m).map(|_| ()),
+        ),
+        (
+            "ServiceTypeDisabled",
+            service_type_disabled_message(&status).unwrap(),
+            false,
+            |m| decode_service_type_disabled(m).map(|_| ()),
+        ),
+        (
+            "ServiceTypeEnabledReply",
+            service_type_enabled_reply_message(&status_reply, &generation).unwrap(),
+            true,
+            |m| decode_service_type_enabled_reply(m).map(|_| ()),
+        ),
+        (
+            "ServiceTypeDisabledReply",
+            service_type_disabled_reply_message(&status_reply, &generation).unwrap(),
+            true,
+            |m| decode_service_type_disabled_reply(m).map(|_| ()),
+        ),
+        (
+            "ReplicaEndpointUpdated",
+            replica_endpoint_updated_message(&support::rich_request(), Owner::Fm).unwrap(),
+            false,
+            |m| decode_replica_endpoint_updated(m).map(|_| ()),
+        ),
+        (
+            "ReplicaEndpointUpdatedReply",
+            replica_endpoint_updated_reply_message(&support::rich_reply(0), &generation).unwrap(),
+            true,
+            |m| decode_replica_endpoint_updated_reply(m).map(|_| ()),
+        ),
+        (
+            "ReportLoad",
+            report_load_message(&ReportLoad::default()).unwrap(),
+            false,
+            |m| decode_report_load(m).map(|_| ()),
+        ),
+    ];
+    for (action, original, incoming, decode) in contracts {
+        let properties = original.properties().unwrap();
+        assert_eq!(properties.action, action);
+        assert_eq!(properties.actor, if incoming { RA_ACTOR } else { FM_ACTOR });
+        assert!(
+            !properties.high_priority,
+            "{action}: native ordinary factory default"
+        );
+        assert_eq!(
+            original.headers.iter().any(|h| h.id == GENERATION_HEADER),
+            incoming
+        );
+        assert!(decode(&original).is_ok());
+        let mut required = vec![ACTOR, ACTION, HIGH_PRIORITY];
+        if incoming {
+            required.push(GENERATION_HEADER);
+        }
+        for id in required {
+            let mut missing = original.clone();
+            missing.headers.retain(|h| h.id != id);
+            assert!(decode(&missing).is_err(), "{action}: missing {id}");
+            let mut duplicate = original.clone();
+            duplicate.headers.push(
+                original
+                    .headers
+                    .iter()
+                    .find(|h| h.id == id)
+                    .unwrap()
+                    .clone(),
+            );
+            assert!(decode(&duplicate).is_err(), "{action}: duplicate {id}");
+            let mut malformed = original.clone();
+            malformed
+                .headers
+                .iter_mut()
+                .find(|h| h.id == id)
+                .unwrap()
+                .value
+                .clear();
+            assert!(decode(&malformed).is_err(), "{action}: malformed {id}");
+        }
+        let mut wrong = original.clone();
+        wrong.headers[0] = Header::actor(if incoming { FM_ACTOR } else { RA_ACTOR }).unwrap();
+        assert!(decode(&wrong).is_err(), "{action}: wrong actor");
+        let mut wrong = original.clone();
+        wrong.headers[1] = Header::action("ServiceBusy").unwrap();
+        assert!(decode(&wrong).is_err(), "{action}: wrong action");
+        let mut high = original.clone();
+        high.headers[2] = Header::boolean(HIGH_PRIORITY, true).unwrap();
+        assert!(
+            decode(&high).is_ok(),
+            "{action}: priority is metadata, not semantic admission"
+        );
+        for end in 0..original.body.len() {
+            let mut truncated = original.clone();
+            truncated.body.truncate(end);
+            assert!(decode(&truncated).is_err(), "{action}: proper prefix {end}");
+        }
+        let mut trailing = original;
+        trailing.body.push(0);
+        assert!(decode(&trailing).is_err(), "{action}: trailing data");
+    }
+}
+
+#[test]
+fn complete_load_legacy_and_modern_map_scopes_roundtrip_and_reject_bad_node_ids() {
+    use fube_transport::serialization::serde::{Guid, ObjectArray};
+    let stats = LoadMetricStats {
+        name: "cpuπ🦀".into(),
+        value: u32::MAX,
+        count: 17,
+        weighted_sum: -123.5,
+        weight: 0.125,
+        time: i64::MIN + 7,
+    };
+    let legacy = ObjectArray(vec![LegacyLoadReport {
+        unit: PartitionId {
+            guid: Guid([0xa5; 16]),
+        },
+        role: 4,
+        metrics: ObjectArray(vec![LoadMetricValue {
+            name: "legacy".into(),
+            value: u32::MAX,
+        }]),
+    }]);
+    let reports = ObjectArray(vec![LoadDescription {
+        partition: Guid([0x5a; 16]),
+        service: "fabric:/load".into(),
+        stateful: true,
+        primary: ObjectArray(vec![stats.clone()]),
+        secondary: ObjectArray(vec![stats.clone(), LoadMetricStats::default()]),
+        nodes: ObjectArray(vec![NodeLoads {
+            node: [0x80; 16],
+            loads: ObjectArray(vec![stats.clone()]),
+        }]),
+    }]);
+    for body in [
+        ReportLoad::default(),
+        ReportLoad {
+            legacy: legacy.clone(),
+            reports: ObjectArray(vec![]),
+            time: -1,
+        },
+        ReportLoad {
+            legacy: ObjectArray(vec![]),
+            reports: reports.clone(),
+            time: i64::MAX,
+        },
+        ReportLoad {
+            legacy,
+            reports,
+            time: i64::MIN,
+        },
+    ] {
+        let message = report_load_message(&body).unwrap();
+        assert_eq!(decode_report_load(&message).unwrap(), body);
+        for end in 0..message.body.len() {
+            assert!(from_slice::<ReportLoad>(&message.body[..end]).is_err());
+        }
+    }
+    #[derive(Serialize)]
+    struct BadNodeLoads {
+        node: ByteArray,
+        loads: ObjectArray<Vec<LoadMetricStats>>,
+    }
+    for len in [0, 15, 17] {
+        let bytes = to_vec(&BadNodeLoads {
+            node: ByteArray(vec![0; len]),
+            loads: ObjectArray(vec![stats.clone()]),
+        })
+        .unwrap();
+        assert!(from_slice::<NodeLoads>(&bytes).is_err());
+    }
+    let mut overflow = ReportLoad::default();
+    overflow.legacy.0 = vec![LegacyLoadReport::default(); 4097];
+    assert!(report_load_message(&overflow).is_err());
+}

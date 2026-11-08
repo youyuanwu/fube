@@ -25,7 +25,7 @@ fube-cluster --root /absolute/private/stateful-profile \
   --app /absolute/hosting-local-app --stateful-singleton
 ```
 
-Use `create`, `status`, `delete` and `quit` in this variant. `AddPrimary`/`AddPrimaryReply`
+Use `create`, `status`, `delete`, `activate`, `deactivate` and `quit` in this variant. `AddPrimary`/`AddPrimaryReply`
 use the native shared ReplicaMessageBody/ReplicaReplyMessageBody schemas and
 distinct actions; no local Open observation becomes an FM acknowledgment.
 FM stays pending until the exact original semantic Primary/Ready reply.
@@ -115,6 +115,17 @@ live node; replica and RA-instance IDs both strictly increase. Old completed
 operation retries retain their original lifetime/endpoint. Loss or unproved
 cleanup does not enable recreation. A reported endpoint is numeric loopback; independently send
 exactly `identity\n` and read its bounded JSON/newline identity response.
+
+`activate`/`deactivate` use the same node/operation format and native sequence
+contracts. Deactivation waits for committed replica closure, with the native
+900-second original-host termination deadline; activation does not reopen lost
+volatile data or establish serving. A newer opposite intent supersedes pending
+work. Node intent and programmatic `Cluster::update_service` requests retry at
+the native default five-second FM scan interval. Status includes current intent,
+pending control, type status, service-update version and load receipt presence.
+Real service-description/load IPC and node-wide barriers are described in
+[stage-two coordination](../../../docs/cluster/MinimalFmCluster.md#node-wide-coordination-stage-2).
+Live endpoint publication, general multi-FT deployment and FMM remain gated.
 
 Native NodeUp/Ack and the final empty ReplicaUp/Reply precede RA construction.
 FM learns the actual generated package version from the original node's bounded

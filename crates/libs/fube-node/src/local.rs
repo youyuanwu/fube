@@ -142,6 +142,9 @@ pub struct PackageRegistration {
 }
 #[derive(Clone)]
 enum Work {
+    Status(ServiceType, u64, bool),
+    Load(Box<ReportLoad>),
+    Description(Box<ra::ServiceDescriptionCompletion>),
     Add(Arc<AddInstance>),
     StatefulOpen(Arc<AddInstance>),
     PrimaryOpen(Arc<AddInstance>),
@@ -153,12 +156,26 @@ enum Work {
     Closed(ra::CloseCompletion),
     Event(ipc::Delivery, ra::EntityId),
     Retry(PartitionId, bool),
+    RetryDescription(PartitionId),
 }
 /// Narrow network adapter commands. The adapter owns the admitted session;
 /// source/generation are still validated here and by the RA. Captured work is
 /// never semantic acknowledgement.
 #[derive(Clone)]
 pub enum FmWork {
+    CaptureTypeStatus,
+    CleanupTypeStatus,
+    CheckNodeDeactivation(i64),
+    TypeStatusReply(bool, ServiceTypeUpdateReply, NodeInstance, GenerationHeader),
+    NodeActivate(NodeActivateRequest, NodeInstance, GenerationHeader),
+    NodeDeactivate(NodeDeactivateRequest, NodeInstance, GenerationHeader),
+    NodeUpdateService(
+        Box<NodeUpdateServiceRequest>,
+        NodeInstance,
+        GenerationHeader,
+    ),
+    CloseNodeUnit(PartitionId, i64),
+    UpdateNodeUnit(PartitionId, u64, Box<NodeUpdateServiceRequest>),
     Remove(Box<RemoveInstance>, NodeInstance, GenerationHeader),
     DeleteReplica(Box<DeleteReplica>, NodeInstance, GenerationHeader),
     ReplicaUpReply(ReplicaUp, NodeInstance, GenerationHeader),
@@ -376,7 +393,16 @@ impl Node {
         if !stateless
             && !matches!(
                 work,
-                FmWork::DeleteReplica(..)
+                FmWork::NodeActivate(..)
+                    | FmWork::CaptureTypeStatus
+                    | FmWork::CleanupTypeStatus
+                    | FmWork::CheckNodeDeactivation(..)
+                    | FmWork::TypeStatusReply(..)
+                    | FmWork::NodeDeactivate(..)
+                    | FmWork::NodeUpdateService(..)
+                    | FmWork::CloseNodeUnit(..)
+                    | FmWork::UpdateNodeUnit(..)
+                    | FmWork::DeleteReplica(..)
                     | FmWork::ReplicaUpReply(..)
                     | FmWork::RetryReport(_)
                     | FmWork::ServiceTypeReply(..)
@@ -391,6 +417,9 @@ impl Node {
             return Err(Error::Unsupported);
         }
         match &work {
+            FmWork::NodeActivate(_, source, generation)
+            | FmWork::TypeStatusReply(_, _, source, generation)
+            | FmWork::NodeDeactivate(_, source, generation) => self.admit_fm(source, generation)?,
             FmWork::Remove(body, source, generation) => {
                 self.admit_fm(source, generation)?;
                 if self
@@ -399,6 +428,28 @@ impl Node {
                     .is_none_or(|b| b.unit.id != body.replica.0.unit.id)
                 {
                     return Err(Error::Unsupported);
+                }
+            }
+            FmWork::NodeUpdateService(body, source, generation) => {
+                self.admit_fm(source, generation)?;
+                if let Some(selected) = &self.selected {
+                    let service = &body.service;
+                    if service.name == selected.service.name
+                        && service.instance == selected.service.instance
+                        && (service.stateful != selected.service.stateful
+                            || service.persisted
+                            || service.group
+                            || service.service_type != selected.service.service_type
+                            || service.application != selected.service.application
+                            || service.version != selected.service.version
+                            || service.target != 1
+                            || service.minimum != 1
+                            || service.partitions != 1
+                            || service.activation_mode != 0
+                            || !service.scaling.0.is_empty())
+                    {
+                        return Err(Error::Unsupported);
+                    }
                 }
             }
             FmWork::DeleteReplica(body, source, generation) => {
@@ -471,7 +522,29 @@ impl Node {
     pub fn package_registration(&self) -> &PackageRegistration {
         &self.package_registration
     }
+    pub fn has_service_type_status(&self) -> bool {
+        self.ra.has_service_type_status()
+    }
+    pub fn native_config(&self) -> Arc<ra::NativeConfig> {
+        self.ra.config()
+    }
+    pub fn pending_node_deactivation(&self) -> Option<i64> {
+        self.ra.pending_node_deactivation()
+    }
+    pub fn apply_fresh_node_up_ack(
+        &self,
+        body: &NodeUpAck,
+        generation: &GenerationHeader,
+    ) -> Result<()> {
+        self.admit_fm(&self.admission.fm_source, generation)?;
+        self.ra.seed_fresh_node_activation(ra::NodeActivationInfo {
+            activated: body.activated,
+            sequence: body.activation_sequence,
+        })?;
+        Ok(())
+    }
     pub fn pending_status(&self) -> &[ra::PendingStatus] {
+        // Diagnostic local Hosting projection; the RA owns FM pending/ACK state.
         self.statuses.pending()
     }
     pub fn last_error(&self) -> Option<&Error> {
@@ -817,6 +890,13 @@ impl Node {
     }
     fn build(&self, work: &Work) -> ra::Command {
         match work {
+            Work::Status(id, sequence, enabled) => ra::Command::HostingServiceTypeStatus {
+                service_type: id.clone(),
+                sequence: *sequence,
+                enabled: *enabled,
+            },
+            Work::Load(body) => ra::Command::ReportLoad(body.clone()),
+            Work::Description(body) => ra::Command::CompleteServiceDescription(body.clone()),
             Work::StatefulOpen(body) => ra::Command::OpenLocalStateful(Box::new((**body).clone())),
             Work::PrimaryOpen(body) => ra::Command::OpenLocalPrimary(Box::new((**body).clone())),
             Work::AddPrimary(body, source, generation) => ra::Command::AddPrimary {
@@ -833,6 +913,45 @@ impl Node {
                 },
             },
             Work::Fm(work) => match work {
+                FmWork::CaptureTypeStatus => ra::Command::CaptureServiceTypeStatus,
+                FmWork::CleanupTypeStatus => ra::Command::CleanupServiceTypeStatus,
+                FmWork::CheckNodeDeactivation(sequence) => ra::Command::CheckNodeDeactivation {
+                    sequence: *sequence,
+                },
+                FmWork::TypeStatusReply(enabled, body, source, generation) => {
+                    ra::Command::ServiceTypeStatusReply {
+                        enabled: *enabled,
+                        body: body.clone(),
+                        source: source.clone(),
+                        generation: generation.clone(),
+                    }
+                }
+                FmWork::NodeActivate(body, source, generation) => ra::Command::NodeActivate {
+                    body: body.clone(),
+                    source: source.clone(),
+                    generation: generation.clone(),
+                },
+                FmWork::NodeDeactivate(body, source, generation) => ra::Command::NodeDeactivate {
+                    body: body.clone(),
+                    source: source.clone(),
+                    generation: generation.clone(),
+                },
+                FmWork::NodeUpdateService(body, source, generation) => {
+                    ra::Command::NodeUpdateService {
+                        body: body.clone(),
+                        source: source.clone(),
+                        generation: generation.clone(),
+                    }
+                }
+                FmWork::CloseNodeUnit(unit, sequence) => ra::Command::CloseForNodeDeactivation {
+                    unit: unit.clone(),
+                    sequence: *sequence,
+                },
+                FmWork::UpdateNodeUnit(unit, work, body) => ra::Command::UpdateServiceForNode {
+                    unit: unit.clone(),
+                    work: *work,
+                    body: body.clone(),
+                },
                 FmWork::Remove(body, source, generation) => ra::Command::Remove {
                     body: body.clone(),
                     source: source.clone(),
@@ -875,6 +994,7 @@ impl Node {
             Work::Closed(v) => ra::Command::CompleteClose(Box::new(v.clone())),
             Work::Retry(unit, true) => ra::Command::RetryClose(unit.clone()),
             Work::Retry(unit, false) => ra::Command::RetryOpen(unit.clone()),
+            Work::RetryDescription(unit) => ra::Command::RetryServiceDescription(unit.clone()),
             Work::Event(v, id) => command(
                 v,
                 *id,
@@ -1007,11 +1127,13 @@ impl Node {
             self.retry_at = Instant::now() + RETRY;
             if let Some(body) = &self.selected {
                 let state = self.ra.snapshot(body.unit.id.guid.0);
-                if state
-                    .committed
-                    .is_some_and(|s| matches!(s.phase, ra::Phase::Opening | ra::Phase::Closing))
-                {
-                    self.retry(body.unit.id.clone())?;
+                if let Some(state) = state.committed {
+                    let unit = body.unit.id.clone();
+                    if matches!(state.phase, ra::Phase::Opening | ra::Phase::Closing) {
+                        self.retry(unit)?;
+                    } else if state.service_description_pending {
+                        self.enqueue(Work::RetryDescription(unit))?;
+                    }
                 }
             }
         }
@@ -1146,6 +1268,41 @@ impl Node {
             return Ok(());
         };
         let disposition = match &dispatch.effect {
+            ra::Effect::NodeDeactivateUnits { sequence, units } => {
+                if units.len() > 1 {
+                    return Err(Error::Unsupported);
+                }
+                if !self.room() {
+                    return Ok(());
+                }
+                for unit in units {
+                    self.enqueue(Work::Fm(FmWork::CloseNodeUnit(
+                        PartitionId {
+                            guid: fube_transport::serialization::serde::Guid(*unit),
+                        },
+                        *sequence,
+                    )))?;
+                }
+                LocalDisposition::LocalResponse
+            }
+            ra::Effect::NodeUpdateServiceUnits { work, body, units } => {
+                if units.len() > 1 {
+                    return Err(Error::Unsupported);
+                }
+                if !self.room() {
+                    return Ok(());
+                }
+                for unit in units {
+                    self.enqueue(Work::Fm(FmWork::UpdateNodeUnit(
+                        PartitionId {
+                            guid: fube_transport::serialization::serde::Guid(*unit),
+                        },
+                        *work,
+                        body.clone(),
+                    )))?;
+                }
+                LocalDisposition::LocalResponse
+            }
             ra::Effect::Open {
                 token,
                 lookup,
@@ -1165,17 +1322,12 @@ impl Node {
                 LocalDisposition::LocalResponse
             }
             ra::Effect::RuntimeOpen {
-                body,
-                registration,
-                flags,
-                ..
+                body, registration, ..
             }
             | ra::Effect::Close {
-                body,
-                registration,
-                flags,
-                ..
-            } => {
+                body, registration, ..
+            }
+            | ra::Effect::UpdateServiceDescription { body, registration } => {
                 let Some(lease) = self.activation.host_lease() else {
                     self.effects.pop_front();
                     self.receipts.push_back(EffectReceipt {
@@ -1188,15 +1340,18 @@ impl Node {
                 if registration.host != identity.host_id {
                     return Err(Error::Protocol);
                 }
-                let bytes = rap::request(registration, body, *flags)?;
+                let (action, flags) = match &dispatch.effect {
+                    ra::Effect::RuntimeOpen { flags, .. } => ("ReplicaOpen", *flags),
+                    ra::Effect::Close { flags, .. } => ("ReplicaClose", *flags),
+                    ra::Effect::UpdateServiceDescription { .. } => {
+                        ("ProxyUpdateServiceDescription", 0)
+                    }
+                    _ => unreachable!(),
+                };
+                let bytes = rap::request(registration, body, flags)?;
                 if bytes.len() > BODY {
                     return Err(Error::Capacity);
                 }
-                let action = if matches!(dispatch.effect, ra::Effect::RuntimeOpen { .. }) {
-                    "ReplicaOpen"
-                } else {
-                    "ReplicaClose"
-                };
                 match lease.send_lifecycle(action, bytes) {
                     Ok(send) => {
                         self.route = Some(Route {
@@ -1224,11 +1379,10 @@ impl Node {
             }
             ra::Effect::ReleaseRegistration(_) => LocalDisposition::RegistrationReferenceReleased,
             ra::Effect::TerminateHost { registration } => {
-                if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
-                    || self
-                        .activation
-                        .identity()
-                        .is_none_or(|identity| identity.host_id != registration.host)
+                if self
+                    .activation
+                    .identity()
+                    .is_none_or(|identity| identity.host_id != registration.host)
                     || self
                         .route
                         .as_ref()
@@ -1249,12 +1403,32 @@ impl Node {
             ra::Effect::Health(_) | ra::Effect::OpeningHealth(_) => {
                 LocalDisposition::HealthProcessingDisabled
             }
+            ra::Effect::NodeUpdateServiceReply(body) => {
+                if let Some(selected) = &mut self.selected {
+                    if body.service == selected.service.name
+                        && body.instance == selected.service.instance
+                    {
+                        if let Some(state) = self.ra.snapshot(selected.unit.id.guid.0).committed {
+                            if state.body.service.update_version == body.version {
+                                selected.service = state.body.service.clone();
+                            }
+                        }
+                    }
+                }
+                LocalDisposition::LocalResponse
+            }
             ra::Effect::Reply(_)
+            | ra::Effect::NodeActivateReply(_)
+            | ra::Effect::NodeDeactivateReply(_)
             | ra::Effect::PrimaryReply(_)
             | ra::Effect::LocalStatefulOpenReply(_)
             | ra::Effect::RemoveReply(_)
             | ra::Effect::DeleteReplicaReply(_) => LocalDisposition::LocalResponse,
             ra::Effect::RequestReportRetry
+            | ra::Effect::ServiceTypeStatusWork
+            | ra::Effect::ServiceTypeStatus { .. }
+            | ra::Effect::ArmNodeDeactivationCheck { .. }
+            | ra::Effect::ReportLoad(_)
             | ra::Effect::StatefulClosePending { .. }
             | ra::Effect::StatefulDroppedPending(_)
             | ra::Effect::ReplicaUp(_)
@@ -1267,10 +1441,8 @@ impl Node {
                 }
                 self.external.push(dispatch.clone());
                 LocalDisposition::ExternalPending
-            }
-            // These are outside the preflighted local command/action allowlist.
-            // Retain original effect, fail explicitly, never acknowledge success.
-            ra::Effect::UpdateServiceDescription { .. } => return Err(Error::Unsupported),
+            } // These are outside the preflighted local command/action allowlist.
+              // Retain original effect, fail explicitly, never acknowledge success.
         };
         self.effects.pop_front();
         self.receipts.push_back(EffectReceipt {
@@ -1300,6 +1472,33 @@ impl Node {
         };
         if !reply.belongs_to(&route.lease) {
             return Err(Error::Protocol);
+        }
+        let action = reply.action().map_err(|_| Error::Protocol)?;
+        if action == "RAPReportLoad" {
+            let report: ReportLoad = decode(reply.body())?;
+            self.enqueue(Work::Load(Box::new(report)))?;
+            self.held_reply = None;
+            return Ok(());
+        }
+        if action == "ProxyUpdateServiceDescriptionReply" {
+            #[derive(Deserialize)]
+            struct Reply {
+                error: i64,
+                unit: FailoverUnit,
+                replica: Replica,
+                service: Service,
+            }
+            let body: Reply = decode(reply.body())?;
+            self.enqueue(Work::Description(Box::new(
+                ra::ServiceDescriptionCompletion {
+                    error: body.error,
+                    unit: body.unit,
+                    replica: body.replica,
+                    service: body.service,
+                },
+            )))?;
+            self.held_reply = None;
+            return Ok(());
         }
         let body: rap::Reply = decode(reply.body())?;
         if !body.remote.0.is_empty() || body.flags & !12 != 0 {
@@ -1421,6 +1620,7 @@ impl Node {
                 };
                 self.statuses
                     .consume_local(service_type(id), sequence, enabled, 0)?;
+                self.enqueue(Work::Status(service_type(id), sequence, enabled))?;
             }
             ipc::Delivery::Obligation(h::Obligation::TypesUnregistered { types }) => {
                 let premise = self.activation.premise().ok_or(Error::Protocol)?;

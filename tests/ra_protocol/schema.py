@@ -73,6 +73,20 @@ MODELS = [
     ("UpgradeDescription", COMMON + "UpgradeDescription.h", ""),
     ("NodeUpAckMessageBody", COMMON + "NodeUpAckMessageBody.h", ""),
     ("PToPHeader", "Federation/PToPHeader.h", ""),
+    ("StopwatchTime", "Common/StopwatchTime.h", None),
+    ("NodeActivateRequestMessageBody", COMMON + "NodeActivateRequestMessageBody.h", ""),
+    ("NodeActivateReplyMessageBody", COMMON + "NodeActivateReplyMessageBody.h", ""),
+    ("NodeDeactivateRequestMessageBody", COMMON + "NodeDeactivateRequestMessageBody.h", ""),
+    ("NodeDeactivateReplyMessageBody", COMMON + "NodeDeactivateReplyMessageBody.h", ""),
+    ("NodeUpdateServiceRequestMessageBody", COMMON + "NodeUpdateServiceRequestMessageBody.h", ""),
+    ("NodeUpdateServiceReplyMessageBody", COMMON + "NodeUpdateServiceReplyMessageBody.h", ""),
+    ("ServiceTypeUpdateMessageBody", COMMON + "ServiceTypeUpdateMessageBody.h", ""),
+    ("ServiceTypeUpdateReplyMessageBody", COMMON + "ServiceTypeUpdateReplyMessageBody.h", ""),
+    ("LoadMetric", "Reliability/LoadBalancing/LoadMetric.h", ""),
+    ("ReportLoadInfo", COMMON + "ReportLoadInfo.h", ""),
+    ("LoadMetricStats", "Reliability/LoadBalancing/LoadMetricStats.h", ""),
+    ("LoadOrMoveCostDescription", "Reliability/LoadBalancing/LoadOrMoveCostDescription.h", ""),
+    ("ReportLoadMessageBody", COMMON + "ReportLoadMessageBody.h", ""),
 ]
 
 EXTRA_NATIVE_INPUTS = [
@@ -85,11 +99,21 @@ EXTRA_NATIVE_INPUTS = [
     "Reliability/Failover/ra/Communication.FMTransport.h",
     "Reliability/Failover/ra/Infrastructure.MessageUtility.h",
     "Reliability/Failover/FederationWrapper.cpp",
+    "Reliability/Failover/fm/NodeCache.cpp",
+    "Reliability/Failover/fm/DeactivateNodesContext.cpp",
+    "Reliability/Failover/fm/UpdateServiceContext.cpp",
+    "Reliability/Failover/fm/FailoverManager.cpp",
+    "Reliability/Failover/ra/Node.ServiceTypeUpdateProcessor.cpp",
+    "Reliability/Failover/ra/Node.NodeDeactivationMessageProcessor.cpp",
+    "Reliability/Failover/ra/Node.NodeDeactivationState.cpp",
+    "Reliability/Failover/ra/Communication.FMMessageBuilder.cpp",
+    "Reliability/Failover/ra/ReconfigurationAgent.cpp",
+    "Reliability/Failover/ra/EndpointPublishState.cpp",
 ]
 
 ENUMS = {
     "ErrorCodeValue::Enum", "FABRIC_SERVICE_PARTITION_KIND", "ReplicaRole::Enum",
-    "ReplicaStates::Enum", "FABRIC_SERVICE_CORRELATION_SCHEME",
+    "ReplicaStates::Enum", "Reliability::ReplicaRole::Enum", "FABRIC_SERVICE_CORRELATION_SCHEME",
     "FABRIC_SERVICE_LOAD_METRIC_WEIGHT", "FABRIC_PLACEMENT_POLICY_TYPE",
     "ScalingTriggerKind::Enum", "ScalingMechanismKind::Enum",
     "ServicePackageActivationMode::Enum", "ServiceModel::ServicePackageActivationMode::Enum", "Actor::Enum",
@@ -132,7 +156,7 @@ def adapted(native_type):
     if match:
         item = "byte" if match[2] == "byte" else adapted(match[2])
         return f"std::{match[1]}<{item}>"
-    match = re.fullmatch(r"(?:std::)?map<\s*([^,<>]+)\s*,\s*([^,<>]+)\s*>", native_type)
+    match = re.fullmatch(r"(?:std::)?map<\s*([^,<>]+)\s*,\s*(.*?)\s*>", native_type)
     if match:
         return f"std::map<{adapted(match[1])}, {adapted(match[2])}>"
     simple = native_type.rsplit("::", 1)[-1]
@@ -207,7 +231,8 @@ def generate(native, destination):
         "enum class Enum : LONG { Zero = 0 };",
         f"constexpr LONG PTOP_DIRECT_ACTOR = {constants['PToPDirect']};",
         "inline void rich(Enum& v,int& c) { v=Enum(++c%5); }",
-        "struct NodeId { ULONG64 high_ = 0, low_ = 0; };",
+        "struct NodeId { ULONG64 high_ = 0, low_ = 0;",
+        ' bool operator<(const NodeId&) const { throw std::runtime_error("fixture requires singleton structured maps"); } };',
         "inline void rich(NodeId& v,int& c) { ++c; for(size_t i=0;i<16;++i)reinterpret_cast<UCHAR*>(&v)[i]=(c+i)%256; }",
         "FABRIC_SERIALIZE_AS_BYTEARRAY(NodeId);",
         "inline bool same(NodeId a, NodeId b) { return a.high_ == b.high_ && a.low_ == b.low_; }",
@@ -265,12 +290,14 @@ def generate(native, destination):
             f" bool operator==(const {name}& other) const {{ return {comparison}; }}",
             f" {macro}({', '.join(f for f, _, _ in fields)});", "};",
         ]
-        if name not in {"GuidValue", "TimeSpan", "ErrorCode"}:
+        if base is not None:
             output.append(f"DEFINE_USER_ARRAY_UTILITY({name});")
         if name == "ServicePackageResourceGovernanceDescription":
             output.append("DEFINE_USER_MAP_UTILITY(ServicePackageIdentifier, ServicePackageResourceGovernanceDescription);")
         if name == "CodePackageContainersImagesDescription":
             output.append("DEFINE_USER_MAP_UTILITY(ServicePackageIdentifier, CodePackageContainersImagesDescription);")
+        if name == "LoadMetricStats":
+            output.append("DEFINE_USER_MAP_UTILITY(NodeId, std::vector<LoadMetricStats>);")
     output += ['#include "scaling.inc"']
     # Rich fixture traversal follows native macro order, not declaration order.
     # Field values are supplied by fixture.cpp, independently of Rust.

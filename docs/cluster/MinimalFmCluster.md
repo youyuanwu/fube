@@ -88,6 +88,57 @@ Loss of the FM link makes observation unknown; the app may remain serving.
 Original node and app owners remain responsible for cleanup through independent
 owner control. No replacement is authorized by link or node PID disappearance.
 
+## Node-wide coordination (stage 2)
+
+Both fixed profiles accept `activate` and `deactivate` with a node and operation
+ID. NodeUpAck seeds the actual activation sequence. Native node requests retain
+normal-FM generation and sequence/intent checks; activation replies acknowledge
+intent, not serving replicas. Deactivation replies follow all required serialized
+close jobs and committed closure. Older requests cannot change intent; a repeated
+completed deactivation can replay its reply without another Close/acquisition.
+A newer opposite intent cancels the old monitor. Operator status distinguishes
+pending node work and reports superseded/lost work as unknown.
+
+The native-derived close monitor uses a dynamically readable 900-second deadline
+and 15-second check interval. Its one-time termination pass deduplicates original
+host registrations; fenced/private commits cannot authorize termination or a
+successful reply. Actual HostDown/closure still completes the barrier. Forced
+exit supplies no graceful provider/service disposal proof. Closed volatile data
+is not reopened/adopted by activation, and FM loss remains nonreusable.
+
+`Cluster::update_service(index, service)` sends native NodeUpdateServiceRequest
+within the same fixed identity/profile. Each RA group waits for all entity jobs;
+only a failed commit for a job that actually updated the description suppresses
+the node reply. That reply does not wait for RAP's separate description reply.
+The original session sends ProxyUpdateServiceDescription and retries its pending
+obligation; matched RAP completion clears only that obligation. The bounded FM
+resends node intent/service work at the native default five-second scan interval,
+retaining the original sequence/body and accepting stale/duplicate replies safely.
+Dynamic FM scan configuration is not enabled.
+
+Hosting Enabled/Disabled status has separate native staleness/coalescing ownership,
+disabled priority, sorted type bodies and a fresh message sequence on each
+captured retry. The owned adapter honors the dynamic five-second minimum start
+interval and 30-second retry; only the current sequence clears the corresponding
+pending kind. Hourly cleanup retains ten-minute event history independently of
+unacknowledged pending status. The older prepared-registration profile's local
+diagnostic projection does not gain FM authority.
+
+Actual public partition `report_load` reaches the original actor-12 IPC inbox,
+RA and ordinary FM as ReportLoad. Complete legacy/modern schemas are retained;
+the deployed profile admits modern reports for its current owned service/FT.
+Reporting is best-effort, with no per-report semantic ACK or persistence claim.
+Service updates may change declared metrics, not widen topology or ownership.
+
+Multi-FT closure/update barriers, definite/unknown commits, pending creation,
+stale intent and capacity are tested in the generic RA executor. Real acceptance
+keeps **one FT per Node** and exercises updated metrics/public load, held provider
+and service disposal, forced original-host termination, cancellation and an
+independently serving sibling. Endpoint codecs/helper are included, but live
+endpoint publication remains gated until stage-5 reconfiguration. Codec/model/
+native-free results are not complete C++ handler traces, native FM interoperability,
+general multi-FT deployment or complete P2/P4/M2 parity.
+
 ## Initial stateful FM control
 
 Run the same executable with `--app /absolute/hosting-local-app

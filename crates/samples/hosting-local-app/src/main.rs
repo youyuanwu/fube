@@ -9,9 +9,9 @@ use fube_runtime::{
     },
     ApiFuture, Cancellation, Epoch, Error, IPrimaryReplicator, IReplicator,
     IStatefulServiceFactory, IStatefulServicePartition, IStatefulServiceReplica,
-    IStatelessServiceFactory, IStatelessServiceInstance, IStatelessServicePartition, OpenMode,
-    ReplicaInformation, ReplicaRole, ReplicaSetConfig, ReplicaSetQuorumMode, Result, Runtime,
-    RuntimeReplicator, ServicePartitionAccessStatus,
+    IStatelessServiceFactory, IStatelessServiceInstance, IStatelessServicePartition, LoadMetric,
+    OpenMode, ReplicaInformation, ReplicaRole, ReplicaSetConfig, ReplicaSetQuorumMode, Result,
+    Runtime, RuntimeReplicator, ServicePartitionAccessStatus,
 };
 use std::{
     io::Write,
@@ -426,7 +426,22 @@ impl PrimaryState {
                 marker(&format!("LOCAL_PRIMARY acknowledged sequence={sequence}"));
             }
             b"read\n" => self.authority(false)?,
-            _ => return Err(Error::InvalidInput("fixture accepts only read/write")),
+            b"load\n" => {
+                self.authority(false)?;
+                let partition = self.partition.clone();
+                self.native
+                    .execution()
+                    .try_reserve()?
+                    .run_owned(move || {
+                        partition.report_load(&[LoadMetric {
+                            name: "LocalWork".into(),
+                            value: 7,
+                        }])
+                    })
+                    .await?;
+                return Ok("OK load=7\n".into());
+            }
+            _ => return Err(Error::InvalidInput("fixture accepts only read/write/load")),
         }
         let native = self.native.status()?;
         let engine = self.data.snapshot();

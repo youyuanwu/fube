@@ -1,4 +1,4 @@
-//! Bounded entity execution, not a running RA, Hosting adapter or outbox.
+//! Bounded entity/node execution, not full RA/Federation or a durable outbox.
 //! Stateless native messages and separate trusted-local volatile Idle lifecycle.
 //!
 //! One owned supervisor hosts bounded per-entity workers independently of caller
@@ -32,6 +32,12 @@ pub use description::ServiceDescriptionCompletion;
 #[path = "config.rs"]
 mod config;
 pub use config::*;
+#[path = "node_coordination.rs"]
+mod node_coordination;
+pub use node_coordination::NodeActivationInfo;
+#[path = "endpoint_publish.rs"]
+mod endpoint_publish;
+pub use endpoint_publish::EndpointPublishState;
 #[path = "hosting_events.rs"]
 mod hosting_events;
 pub use hosting_events::*;
@@ -250,6 +256,47 @@ pub struct OpenCompletion {
     pub detail: ProxyErrorDetail,
 }
 pub enum Command {
+    HostingServiceTypeStatus {
+        service_type: ServiceType,
+        sequence: u64,
+        enabled: bool,
+    },
+    CaptureServiceTypeStatus,
+    CleanupServiceTypeStatus,
+    ServiceTypeStatusReply {
+        enabled: bool,
+        body: ServiceTypeUpdateReply,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    ReportLoad(Box<ReportLoad>),
+    NodeActivate {
+        body: NodeActivateRequest,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    NodeDeactivate {
+        body: NodeDeactivateRequest,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    CheckNodeDeactivation {
+        sequence: i64,
+    },
+    NodeUpdateService {
+        body: Box<NodeUpdateServiceRequest>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    CloseForNodeDeactivation {
+        unit: PartitionId,
+        sequence: i64,
+    },
+    UpdateServiceForNode {
+        unit: PartitionId,
+        work: u64,
+        body: Box<NodeUpdateServiceRequest>,
+    },
     #[cfg(feature = "qualification")]
     QualificationTerminate(PartitionId),
     Add {
@@ -323,6 +370,32 @@ pub enum Command {
     },
 }
 enum Kind {
+    HostingServiceTypeStatus,
+    CaptureServiceTypeStatus,
+    CleanupServiceTypeStatus,
+    ServiceTypeStatusReply {
+        enabled: bool,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    ReportLoad,
+    NodeActivate {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    NodeDeactivate {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    CheckNodeDeactivation,
+    NodeUpdateService {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    CloseForNodeDeactivation,
+    UpdateServiceForNode {
+        work: u64,
+    },
     #[cfg(feature = "qualification")]
     QualificationTerminate,
     Add {
@@ -374,7 +447,16 @@ impl Kind {
     fn node_work(&self) -> bool {
         matches!(
             self,
-            Self::NotificationRequest
+            Self::HostingServiceTypeStatus
+                | Self::CaptureServiceTypeStatus
+                | Self::CleanupServiceTypeStatus
+                | Self::ServiceTypeStatusReply { .. }
+                | Self::ReportLoad
+                | Self::NodeActivate { .. }
+                | Self::NodeDeactivate { .. }
+                | Self::CheckNodeDeactivation
+                | Self::NodeUpdateService { .. }
+                | Self::NotificationRequest
                 | Self::NotificationCapture
                 | Self::NotificationComplete
                 | Self::NotificationTimer
@@ -435,6 +517,28 @@ pub struct Snapshot {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
+    ServiceTypeStatusWork,
+    ServiceTypeStatus {
+        enabled: bool,
+        body: Box<ServiceTypeUpdate>,
+    },
+    ReportLoad(Box<ReportLoad>),
+    NodeActivateReply(NodeActivateReply),
+    NodeDeactivateReply(NodeDeactivateReply),
+    NodeUpdateServiceReply(NodeUpdateServiceReply),
+    NodeDeactivateUnits {
+        sequence: i64,
+        units: Vec<EntityId>,
+    },
+    ArmNodeDeactivationCheck {
+        sequence: i64,
+        after_ticks: i64,
+    },
+    NodeUpdateServiceUnits {
+        work: u64,
+        body: Box<NodeUpdateServiceRequest>,
+        units: Vec<EntityId>,
+    },
     /// Resolve service-type registration. RAP Open may run only after Registered
     /// has published RuntimeOpen for this token.
     Open {
@@ -467,7 +571,7 @@ pub enum Effect {
         registration: RuntimeRegistration,
         flags: i64,
     },
-    /// Trusted local RAP adapter obligation, NOT an enabled IPC wire codec.
+    /// Owned original-session RAP obligation, independent of the node/FM reply.
     /// The captured body remains sendable even if a subsequent Close clears pending.
     UpdateServiceDescription {
         body: Arc<AddInstance>,
@@ -542,12 +646,15 @@ pub struct Statistics {
 }
 #[derive(Default)]
 struct View {
+    statuses: Option<LocalStatusConsumer>,
     entities: BTreeMap<EntityId, Snapshot>,
     effects: VecDeque<Dispatched>,
     stats: Statistics,
     reserved_effects: usize,
     accepting: bool,
+    activation_seeded: bool,
     notification: notification::Coordinator,
+    node: node_coordination::Coordinator,
 }
 struct Shared {
     consumer_lifetime: ConsumerLifetime,
@@ -609,7 +716,12 @@ impl Executor {
             config: Arc::new(NativeConfig::new(&settings)),
             notification_clock,
             view: Mutex::new(View {
+                statuses: Some(LocalStatusConsumer::new(
+                    settings.max_service_types,
+                    settings.max_command_bytes,
+                )?),
                 accepting: true,
+                node: node_coordination::Coordinator::new(admission.node_activated),
                 ..View::default()
             }),
             settings,
@@ -651,6 +763,76 @@ impl Executor {
 
     pub fn submit(&self, command: Command) -> Result<Ticket> {
         let (entity, kind, bytes) = match command {
+            Command::HostingServiceTypeStatus {
+                service_type,
+                sequence,
+                enabled,
+            } => (
+                [0; 16],
+                Kind::HostingServiceTypeStatus,
+                to_vec(&(service_type, sequence, enabled)),
+            ),
+            Command::CaptureServiceTypeStatus => {
+                ([0; 16], Kind::CaptureServiceTypeStatus, to_vec(&0u64))
+            }
+            Command::CleanupServiceTypeStatus => {
+                ([0; 16], Kind::CleanupServiceTypeStatus, to_vec(&0u64))
+            }
+            Command::ServiceTypeStatusReply {
+                enabled,
+                body,
+                source,
+                generation,
+            } => (
+                [0; 16],
+                Kind::ServiceTypeStatusReply {
+                    enabled,
+                    source,
+                    generation,
+                },
+                to_vec(&body),
+            ),
+            Command::ReportLoad(body) => ([0; 16], Kind::ReportLoad, to_vec(&body)),
+            Command::NodeActivate {
+                body,
+                source,
+                generation,
+            } => (
+                [0; 16],
+                Kind::NodeActivate { source, generation },
+                to_vec(&body),
+            ),
+            Command::NodeDeactivate {
+                body,
+                source,
+                generation,
+            } => (
+                [0; 16],
+                Kind::NodeDeactivate { source, generation },
+                to_vec(&body),
+            ),
+            Command::CheckNodeDeactivation { sequence } => {
+                ([0; 16], Kind::CheckNodeDeactivation, to_vec(&sequence))
+            }
+            Command::NodeUpdateService {
+                body,
+                source,
+                generation,
+            } => (
+                [0; 16],
+                Kind::NodeUpdateService { source, generation },
+                to_vec(&body),
+            ),
+            Command::CloseForNodeDeactivation { unit, sequence } => (
+                unit.guid.0,
+                Kind::CloseForNodeDeactivation,
+                to_vec(&sequence),
+            ),
+            Command::UpdateServiceForNode { unit, work, body } => (
+                unit.guid.0,
+                Kind::UpdateServiceForNode { work },
+                to_vec(&body),
+            ),
             #[cfg(feature = "qualification")]
             Command::QualificationTerminate(unit) => {
                 (unit.guid.0, Kind::QualificationTerminate, to_vec(&unit))
@@ -789,6 +971,8 @@ impl Executor {
             Kind::Retry | Kind::RetryReport | Kind::RetryServiceDescription => 1,
             Kind::CompleteServiceDescription => 0,
             Kind::HostingRegistered | Kind::HostingRuntimeClosed | Kind::HostingHostClosed => 8,
+            Kind::NodeDeactivate { .. } => 3,
+            Kind::CheckNodeDeactivation => self.shared.settings.max_entities + 1,
             kind if kind.node_work() => 2,
             _ => 8,
         };
@@ -846,6 +1030,33 @@ impl Executor {
             .get(&entity)
             .cloned()
             .unwrap_or_default()
+    }
+    pub fn node_activation(&self) -> NodeActivationInfo {
+        lock(&self.shared.view).node.activation
+    }
+    pub fn pending_node_deactivation(&self) -> Option<i64> {
+        lock(&self.shared.view).node.pending_deactivation()
+    }
+    pub fn has_service_type_status(&self) -> bool {
+        lock(&self.shared.view)
+            .statuses
+            .as_ref()
+            .is_some_and(|state| !state.pending().is_empty())
+    }
+    pub fn seed_fresh_node_activation(&self, info: NodeActivationInfo) -> Result<()> {
+        let mut view = lock(&self.shared.view);
+        if !view.accepting
+            || !view.entities.is_empty()
+            || view.activation_seeded
+            || view.stats.accepted != 0
+        {
+            return Err(Failure::Unsupported(
+                "nonempty node activation bootstrap is gated",
+            ));
+        }
+        view.node.activation = info;
+        view.activation_seeded = true;
+        Ok(())
     }
     /// Bounded current routing inventory; the serialized worker still performs
     /// final committed-state validation after this potentially stale snapshot.
@@ -955,11 +1166,146 @@ fn finish_node(shared: &Shared, work: Submission, admission: &Admission) {
     // Work/byte/effect admission is already reserved. A fallible clock/counter/
     // codec preparation never publishes a partially advanced coordinator.
     let mut notification = view.notification.clone();
+    let mut node = view.node.clone();
+    let mut statuses = view
+        .statuses
+        .clone()
+        .expect("initialized node status owner");
+    statuses.configure_history(&shared.config);
     let mut disposition = Disposition::Applied;
     let outcome = if !admission.owner_ready {
+        disposition = Disposition::IgnoredNotReady;
         Ok(vec![])
     } else {
         match &work.kind {
+            Kind::HostingServiceTypeStatus => from_slice::<(ServiceType, u64, bool)>(&work.bytes)
+                .map_err(|_| Failure::Admission("invalid Hosting type status"))
+                .and_then(|(id, sequence, enabled)| {
+                    let previous = statuses.message_sequence();
+                    let result = statuses.consume(
+                        id,
+                        sequence,
+                        enabled,
+                        admission.owner_ready,
+                        shared.notification_clock.now_ticks(),
+                    )?;
+                    disposition = result;
+                    Ok(if statuses.message_sequence() != previous {
+                        vec![Effect::ServiceTypeStatusWork]
+                    } else {
+                        vec![]
+                    })
+                }),
+            Kind::CaptureServiceTypeStatus => statuses.capture().map(|body| {
+                body.map_or_else(Vec::new, |(enabled, body)| {
+                    vec![Effect::ServiceTypeStatus {
+                        enabled,
+                        body: Box::new(body),
+                    }]
+                })
+            }),
+            Kind::CleanupServiceTypeStatus => statuses
+                .cleanup(shared.notification_clock.now_ticks())
+                .map(|_| vec![]),
+            Kind::CheckNodeDeactivation => from_slice::<i64>(&work.bytes)
+                .map_err(|_| Failure::Admission("invalid node deactivation monitor"))
+                .map(|sequence| {
+                    node.check(
+                        sequence,
+                        &view.entities,
+                        shared.notification_clock.now_ticks(),
+                        &shared.config,
+                    )
+                }),
+            Kind::ServiceTypeStatusReply {
+                enabled,
+                source,
+                generation,
+            } => node_coordination::admit(source, generation, admission).and_then(|ready| {
+                if !ready {
+                    disposition = Disposition::IgnoredStale;
+                    return Ok(vec![]);
+                }
+                let body: ServiceTypeUpdateReply = from_slice(&work.bytes)
+                    .map_err(|_| Failure::Admission("invalid type status reply"))?;
+                if !statuses.acknowledge(*enabled, body.sequence) {
+                    disposition = Disposition::IgnoredStale;
+                }
+                Ok(vec![])
+            }),
+            Kind::ReportLoad => from_slice::<ReportLoad>(&work.bytes)
+                .map_err(|_| Failure::Admission("invalid RAP load report"))
+                .and_then(|body| {
+                    if !body.legacy.0.is_empty()
+                        || body.reports.0.is_empty()
+                        || body.reports.0.iter().any(|report| {
+                            view.entities.get(&report.partition.0).is_none_or(|entry| {
+                                entry.committed.as_ref().is_none_or(|state| {
+                                    entry.fenced
+                                        || state.runtime.is_none()
+                                        || state.body.service.name != report.service
+                                        || state.body.service.stateful != report.stateful
+                                })
+                            })
+                        })
+                    {
+                        return Err(Failure::Admission(
+                            "load report is outside current runtime ownership",
+                        ));
+                    }
+                    Ok(vec![Effect::ReportLoad(Box::new(body))])
+                }),
+            Kind::NodeActivate { source, generation }
+            | Kind::NodeDeactivate { source, generation }
+            | Kind::NodeUpdateService { source, generation } => {
+                node_coordination::admit(source, generation, admission).and_then(|ready| {
+                    if !ready {
+                        disposition = Disposition::IgnoredStale;
+                        return Ok(vec![]);
+                    }
+                    match &work.kind {
+                        Kind::NodeActivate { .. } | Kind::NodeDeactivate { .. } => {
+                            let body: NodeActivationRequest = from_slice(&work.bytes)
+                                .map_err(|_| Failure::Admission("invalid node activation body"))?;
+                            if body.from_fmm {
+                                return Err(Failure::Unsupported("FMM node control is gated"));
+                            }
+                            if matches!(work.kind, Kind::NodeActivate { .. }) {
+                                Ok(node.activate(&body))
+                            } else {
+                                let units = view.entities.keys().copied().collect();
+                                let mut effects = node.deactivate(&body, units);
+                                if effects.iter().any(|effect| {
+                                    matches!(effect, Effect::NodeDeactivateUnits { .. })
+                                }) {
+                                    effects.push(Effect::ArmNodeDeactivationCheck {
+                                        sequence: body.sequence,
+                                        after_ticks: shared
+                                            .config
+                                            .node(NodeProperty::DeactivationCheckIntervalTicks)
+                                            .max(1),
+                                    });
+                                }
+                                Ok(effects)
+                            }
+                        }
+                        Kind::NodeUpdateService { .. } => {
+                            let body: NodeUpdateServiceRequest = from_slice(&work.bytes)
+                                .map_err(|_| Failure::Admission("invalid node service update"))?;
+                            // Include accepted entries whose first commit is private.
+                            // Each serialized job rechecks service identity/version.
+                            let units = view.entities.keys().copied().collect();
+                            node.update_service(
+                                work.id,
+                                body,
+                                units,
+                                shared.settings.max_outstanding,
+                            )
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+            }
             Kind::NotificationRequest => {
                 notification.request(&shared.config, &*shared.notification_clock)
             }
@@ -1017,8 +1363,13 @@ fn finish_node(shared: &Shared, work: Submission, admission: &Admission) {
     };
     let result = match outcome {
         Ok(effects) => {
-            assert!(effects.len() <= work.reserved_effects);
+            let retained = node.reserved_replies();
+            let previous = view.node.reserved_replies();
+            assert!(effects.len() + retained.saturating_sub(previous) <= work.reserved_effects);
+            view.reserved_effects = view.reserved_effects + retained - previous;
             view.notification = notification;
+            view.node = node;
+            view.statuses = Some(statuses);
             for effect in effects {
                 view.effects.push_back(Dispatched {
                     operation: work.id,
@@ -1272,6 +1623,35 @@ fn transition(
             })
         }
         Kind::Complete => opening::complete(work, state, config),
+        Kind::CloseForNodeDeactivation => {
+            let Some(current) = state.filter(|state| state.phase != Phase::Closed) else {
+                return Ok(Transition::ignored(Disposition::IgnoredStale));
+            };
+            let mut state = current.clone();
+            let mut effects = vec![];
+            if !lifecycle::start_close(&mut state, CloseMode::DeactivateNode, work.id, &mut effects)
+            {
+                return Ok(Transition::ignored(Disposition::IgnoredPending));
+            }
+            Ok(lifecycle::changed(state, effects, true))
+        }
+        Kind::UpdateServiceForNode { .. } => {
+            let body: NodeUpdateServiceRequest = from_slice(&work.bytes).map_err(decode_error)?;
+            let Some(current) = state else {
+                return Ok(Transition::ignored(Disposition::IgnoredStale));
+            };
+            let mut state = current.clone();
+            let mut effects = vec![];
+            if description::update(&mut state, &body.service, &mut effects) {
+                Ok(lifecycle::changed(state, effects, true))
+            } else {
+                Ok(Transition {
+                    update: Update::None,
+                    effects,
+                    disposition: Disposition::Applied,
+                })
+            }
+        }
         Kind::CompleteServiceDescription | Kind::RetryServiceDescription => {
             description::transition(work, state, admission)
         }
@@ -1477,7 +1857,43 @@ async fn entity_worker(
 ) {
     let mut committed: Option<Arc<EntityState>> = None;
     while let Some(work) = receiver.recv().await {
-        let mut outcome = transition(&work, committed.as_deref(), &admission, &shared.config);
+        let mut effective_admission = admission.clone();
+        effective_admission.node_activated = lock(&shared.view).node.activation.activated;
+        let binding = match &work.kind {
+            Kind::CloseForNodeDeactivation => from_slice::<i64>(&work.bytes)
+                .map_err(|_| Failure::Admission("invalid deactivation job"))
+                .map(|sequence| lock(&shared.view).node.admits_close(sequence, work.entity)),
+            Kind::UpdateServiceForNode { work: parent } => {
+                from_slice::<NodeUpdateServiceRequest>(&work.bytes)
+                    .map_err(|_| Failure::Admission("invalid node service job"))
+                    .and_then(|body| {
+                        if lock(&shared.view)
+                            .node
+                            .admits_update(*parent, work.entity, &body)
+                        {
+                            Ok(true)
+                        } else {
+                            Err(Failure::Admission("service job does not match owned group"))
+                        }
+                    })
+            }
+            _ => Ok(true),
+        };
+        let bound = binding == Ok(true);
+        let mut outcome = if bound {
+            transition(
+                &work,
+                committed.as_deref(),
+                &effective_admission,
+                &shared.config,
+            )
+        } else {
+            binding.map(|_| Transition::ignored(Disposition::IgnoredStale))
+        };
+        let service_changed = matches!(work.kind, Kind::UpdateServiceForNode { .. })
+            && outcome
+                .as_ref()
+                .is_ok_and(|transition| matches!(transition.update, Update::Durable(_)));
         if let Ok(transition) = &mut outcome {
             if let Err(error) =
                 track_lookups(&work, committed.as_deref(), transition, &shared.settings)
@@ -1583,6 +1999,40 @@ async fn entity_worker(
             }
         };
         view.entities.get_mut(&work.entity).unwrap().fenced = false;
+        let reserved_node_replies = view.node.reserved_replies();
+        if bound && matches!(work.kind, Kind::CloseForNodeDeactivation) {
+            if let Ok(sequence) = from_slice(&work.bytes) {
+                view.node.complete_deactivation_job(
+                    sequence,
+                    work.entity,
+                    shared.notification_clock.now_ticks(),
+                );
+            }
+        }
+        if let Kind::UpdateServiceForNode { work: parent } = work.kind {
+            if bound {
+                if let Some(effect) =
+                    view.node
+                        .complete_update(parent, work.entity, service_changed, result.is_ok())
+                {
+                    view.effects.push_back(Dispatched {
+                        operation: work.id,
+                        entity: [0; 16],
+                        effect,
+                    });
+                }
+            }
+        }
+        let entities = view.entities.clone();
+        if let Some(effect) = view.node.check_closed(&entities) {
+            view.effects.push_back(Dispatched {
+                operation: work.id,
+                entity: [0; 16],
+                effect,
+            });
+        }
+        view.reserved_effects =
+            view.reserved_effects + view.node.reserved_replies() - reserved_node_replies;
         view.stats.outstanding -= 1;
         view.stats.queued_bytes -= work.charge;
         view.reserved_effects -= work.reserved_effects;

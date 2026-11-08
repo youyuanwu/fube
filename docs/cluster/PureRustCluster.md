@@ -29,6 +29,14 @@ FM-resend recreation and directly required description helpers.
 It uses trusted simulated Hosting/RAP, not the live RA/Hosting/process architecture
 proposed here, and adds no recovery, outbox or process/power-loss guarantee.
 
+**Node-wide coordination update (2026-11-08):**
+[stage two](MinimalFmCluster.md#node-wide-coordination-stage-2) implements normal-FM
+activation/deactivation and commit-aware service-update groups, native status
+retries and real public load forwarding. Multi-FT barriers are qualified in
+RA model/store tests; real Nodes remain single-FT. Endpoint publication has
+codecs/helper evidence only and stays gated until active reconfiguration.
+This does not complete P2/P4/M2 or supply native FM/Federation handler parity.
+
 **Hosting update (2026-10-31):** [H1](RustHosting.md#implemented-h1-model)
 implements an in-memory native-derived host/runtime/declared-type registry,
 scoped lookup, typed enqueue observations and explicit modeled package/clock

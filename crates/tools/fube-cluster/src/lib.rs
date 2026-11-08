@@ -289,6 +289,47 @@ impl Cluster {
         let action = incoming.message.properties().map_err(err)?.action;
         let generation = self.children[index].launch.generation.clone();
         match action.as_str() {
+            "ServiceTypeEnabled" | "ServiceTypeDisabled" => {
+                let enabled = action == "ServiceTypeEnabled";
+                let body = if enabled {
+                    decode_service_type_enabled(&incoming.message)
+                } else {
+                    decode_service_type_disabled(&incoming.message)
+                }
+                .map_err(err)?;
+                let reply = self.ledger.type_status(index, enabled, &body)?;
+                let message = if enabled {
+                    service_type_enabled_reply_message(&reply, &generation)
+                } else {
+                    service_type_disabled_reply_message(&reply, &generation)
+                }
+                .map_err(err)?;
+                link.send(message).await?;
+            }
+            "NodeActivateReply" | "NodeDeactivateReply" => {
+                let activate = action == "NodeActivateReply";
+                let (body, owner) = if activate {
+                    decode_node_activate_reply(&incoming.message)
+                } else {
+                    decode_node_deactivate_reply(&incoming.message)
+                }
+                .map_err(err)?;
+                if owner != Owner::Fm {
+                    return Err("FMM activation unsupported".into());
+                }
+                self.ledger.node_control_reply(index, activate, body)?;
+            }
+            "NodeUpdateServiceReply" => {
+                let (body, owner) =
+                    decode_node_update_service_reply(&incoming.message).map_err(err)?;
+                if owner != Owner::Fm {
+                    return Err("FMM service update unsupported".into());
+                }
+                self.ledger.service_reply(index, body)?;
+            }
+            "ReportLoad" => self
+                .ledger
+                .load(index, decode_report_load(&incoming.message).map_err(err)?)?,
             "NodeUp" => {
                 let body = decode_node_up(&incoming.message).map_err(err)?;
                 body.validate_fresh_stateless().map_err(err)?;
@@ -310,6 +351,8 @@ impl Cluster {
                     );
                 }
                 let ack = NodeUpAck::fresh_activated(body.node.version, 1).map_err(err)?;
+                placement.activation_sequence = ack.activation_sequence;
+                placement.activated = ack.activated;
                 let response = node_up_ack_message(&ack, &generation).map_err(err)?;
                 let context = incoming
                     .reply
@@ -418,6 +461,10 @@ impl Cluster {
                 Ok(()) => self.retry_deletion(index).await,
                 Err(error) => Err(error),
             };
+            let result = match result {
+                Ok(()) => self.retry_node_work(index).await,
+                Err(error) => Err(error),
+            };
             if let Err(error) = result {
                 self.ledger.lost(index, error);
                 if let Some(link) = &self.children[index].link {
@@ -425,6 +472,30 @@ impl Cluster {
                 }
             }
         }
+    }
+    async fn retry_node_work(&mut self, index: usize) -> Result<()> {
+        let now = Instant::now();
+        let control = self.ledger.node_control_retry(index, now);
+        let service = self.ledger.service_update_retry(index, now);
+        let child = &self.children[index];
+        let link = child.link.as_ref().ok_or("original node link absent")?;
+        if let Some((activate, body)) = control {
+            let message = if activate {
+                node_activate_request_message(&body, &child.launch.generation)
+            } else {
+                node_deactivate_request_message(&body, &child.launch.generation)
+            }
+            .map_err(err)?;
+            link.send(message).await?;
+        }
+        if let Some(body) = service {
+            link.send(
+                node_update_service_request_message(&body, &child.launch.generation)
+                    .map_err(err)?,
+            )
+            .await?;
+        }
+        Ok(())
     }
     async fn retry_primary(&mut self, index: usize) -> Result<()> {
         let Some(body) = self.ledger.primary_retry(index, Instant::now())? else {
@@ -499,6 +570,24 @@ impl Cluster {
         }
         let op = command.op.clone();
         match self.ledger.accept(command)? {
+            Accepted::NodeControl(index, activate, body) => {
+                let generation = &self.children[index].launch.generation;
+                let message = if activate {
+                    node_activate_request_message(&body, generation)
+                } else {
+                    node_deactivate_request_message(&body, generation)
+                }
+                .map_err(err)?;
+                let result = self.children[index]
+                    .link
+                    .as_ref()
+                    .ok_or("original link absent")?
+                    .send(message)
+                    .await;
+                if let Err(error) = result {
+                    self.ledger.lost(index, error);
+                }
+            }
             Accepted::Duplicate(outcome) => return Ok(outcome),
             Accepted::Create(index, body) => {
                 let factory =
@@ -548,6 +637,55 @@ impl Cluster {
             Accepted::Quit => {}
         }
         Ok(self.ledger.result(&op))
+    }
+    pub async fn update_service(&mut self, index: usize, service: Service) -> Result<()> {
+        let placement = self
+            .ledger
+            .placements
+            .get_mut(index)
+            .ok_or("node index out of range")?;
+        if !placement.link_alive
+            || placement.bootstrap != Bootstrap::Admitted
+            || placement.service_update.is_some()
+        {
+            return Err(
+                "service update requires current admitted node without pending update".into(),
+            );
+        }
+        let expected = placement.body()?.service;
+        if service.name != expected.name
+            || service.instance != expected.instance
+            || service.stateful != expected.stateful
+            || service.persisted
+            || service.group
+            || service.service_type != expected.service_type
+            || service.application != expected.application
+            || service.version != expected.version
+            || service.target != expected.target
+            || service.minimum != expected.minimum
+            || service.partitions != expected.partitions
+            || service.activation_mode != expected.activation_mode
+            || !service.scaling.0.is_empty()
+            || service.update_version < expected.update_version
+        {
+            return Err("service update is outside admitted fixed profile/version".into());
+        }
+        let message = node_update_service_request_message(
+            &NodeUpdateServiceRequest {
+                service: service.clone(),
+            },
+            &placement.launch.generation,
+        )
+        .map_err(err)?;
+        self.children[index]
+            .link
+            .as_ref()
+            .ok_or("original link absent")?
+            .send(message)
+            .await?;
+        placement.service_update = Some(service);
+        placement.service_retry_at = Some(Instant::now() + Duration::from_secs(5));
+        Ok(())
     }
     pub async fn shutdown(&mut self) -> Value {
         if let Some(receipt) = &self.finished {

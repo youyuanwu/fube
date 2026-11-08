@@ -27,8 +27,8 @@ impl Command {
             return Err("operation identity must be 1..64 ASCII identifier bytes".into());
         }
         match (self.action.as_str(), self.node) {
-            ("create" | "delete", Some(1 | 2)) | ("status" | "quit", None) => Ok(()),
-            _ => Err("expected create/delete with node 1|2, or status/quit without node".into()),
+            ("create" | "delete" | "activate" | "deactivate", Some(1 | 2)) | ("status" | "quit", None) => Ok(()),
+            _ => Err("expected create/delete/activate/deactivate with node 1|2, or status/quit without node".into()),
         }
     }
 }
@@ -64,6 +64,16 @@ enum PendingPhase {
 
 #[derive(Clone)]
 pub struct Placement {
+    pub activated: bool,
+    pub activation_sequence: i64,
+    node_control: Option<(String, bool, i64)>,
+    node_control_retry_at: Option<Instant>,
+    pub(crate) service_retry_at: Option<Instant>,
+    pub last_load: Option<ReportLoad>,
+    pub service_description: Option<Service>,
+    pub service_update: Option<Service>,
+    pub type_enabled: bool,
+    pub type_sequence: u64,
     pub launch: Launch,
     pub profile: Option<ActualProfile>,
     pub bootstrap: Bootstrap,
@@ -97,6 +107,7 @@ pub struct Ledger {
     pub operations: Vec<Operation>,
 }
 pub enum Accepted {
+    NodeControl(usize, bool, NodeActivationRequest),
     Duplicate(Value),
     Create(usize, Box<AddInstance>),
     Delete(usize, Box<RemoveInstance>),
@@ -106,6 +117,16 @@ pub enum Accepted {
 impl Placement {
     pub fn new(launch: Launch) -> Self {
         Self {
+            activated: true,
+            activation_sequence: -1,
+            node_control: None,
+            node_control_retry_at: None,
+            service_retry_at: None,
+            last_load: None,
+            service_description: None,
+            service_update: None,
+            type_enabled: true,
+            type_sequence: 0,
             replica: launch.replica,
             incarnation: launch.incarnation,
             launch,
@@ -149,6 +170,9 @@ impl Placement {
         );
         body.replica.id = replica;
         body.replica.instance = incarnation;
+        if let Some(service) = &self.service_description {
+            body.service = service.clone();
+        }
         Ok(body)
     }
     fn retired_replica(&self, replica: &Replica, canonical: bool) -> Result<bool> {
@@ -262,6 +286,12 @@ impl Placement {
             "reusable":self.reusable, "retired_lifetimes":self.retired.len(),
             "retirement":self.retirement,
             "loss_reported":self.loss_reported, "native_replica_deleted":self.remove_received,
+            "activated":self.activated, "activation_sequence":self.activation_sequence,
+            "node_control_pending":self.node_control,
+            "type_enabled":self.type_enabled, "type_sequence":self.type_sequence,
+            "service_update_version":self.service_description.as_ref().map(|s| s.update_version),
+            "service_update_pending":self.service_update.is_some(),
+            "load_report_received":self.last_load.is_some(),
             "app_pid": self.profile.as_ref().map(|p| p.app_pid),
             "runtime_root": self.profile.as_ref().map(|p| &p.runtime_root),
         })
@@ -362,10 +392,51 @@ impl Ledger {
             );
         }
         let accepted = match command.action.as_str() {
+            "activate" | "deactivate" => {
+                let index = usize::from(command.node.unwrap() - 1);
+                let placement = &mut self.placements[index];
+                if placement.bootstrap != Bootstrap::Admitted
+                    || !placement.link_alive
+                    || placement
+                        .node_control
+                        .as_ref()
+                        .is_some_and(|(_, intent, _)| *intent == (command.action == "activate"))
+                {
+                    return Err(
+                        "node activation requires admitted current session without same-intent pending control"
+                            .into(),
+                    );
+                }
+                let activate = command.action == "activate";
+                let sequence = placement
+                    .activation_sequence
+                    .checked_add(1)
+                    .ok_or("activation sequence exhausted")?;
+                let superseded =
+                    placement
+                        .node_control
+                        .replace((command.op.clone(), activate, sequence));
+                placement.activation_sequence = sequence;
+                placement.node_control_retry_at = Some(Instant::now() + Duration::from_secs(5));
+                if let Some((op, _, _)) = superseded {
+                    self.complete(&op, json!({"op":op,"state":"unknown","error":"superseded by newer node intent"}));
+                }
+                Accepted::NodeControl(
+                    index,
+                    activate,
+                    NodeActivationRequest {
+                        sequence,
+                        from_fmm: false,
+                    },
+                )
+            }
             "create" => {
                 let index = usize::from(command.node.unwrap() - 1);
                 let placement = &mut self.placements[index];
                 if placement.bootstrap != Bootstrap::Admitted
+                    || !placement.activated
+                    || !placement.type_enabled
+                    || placement.node_control.is_some()
                     || !placement.link_alive
                     || (placement.created && !placement.reusable)
                 {
@@ -466,6 +537,121 @@ impl Ledger {
             .map(|item| item.outcome.clone())
             .unwrap_or_else(|| json!({"state":"rejected"}))
     }
+    pub fn node_control_reply(
+        &mut self,
+        index: usize,
+        activate: bool,
+        body: NodeActivationReply,
+    ) -> Result<()> {
+        let placement = &mut self.placements[index];
+        let Some((op, expected, sequence)) = placement.node_control.clone() else {
+            if body.sequence <= placement.activation_sequence {
+                return Ok(());
+            }
+            return Err("unsolicited node activation reply".into());
+        };
+        if body.sequence < sequence {
+            return Ok(());
+        }
+        if activate != expected || body.sequence != sequence {
+            return Err("node activation reply does not match current sequence/intent".into());
+        }
+        placement.node_control = None;
+        placement.node_control_retry_at = None;
+        placement.activated = activate;
+        placement.activation_sequence = sequence;
+        self.complete(
+            &op,
+            json!({"op":op,"state":"complete","activated":activate,"sequence":sequence}),
+        );
+        Ok(())
+    }
+    pub fn node_control_retry(
+        &mut self,
+        index: usize,
+        now: Instant,
+    ) -> Option<(bool, NodeActivationRequest)> {
+        let placement = &mut self.placements[index];
+        let (_, activate, sequence) = placement.node_control.as_ref()?;
+        if !placement.link_alive || placement.node_control_retry_at.is_none_or(|due| due > now) {
+            return None;
+        }
+        placement.node_control_retry_at = Some(now + Duration::from_secs(5));
+        Some((
+            *activate,
+            NodeActivationRequest {
+                sequence: *sequence,
+                from_fmm: false,
+            },
+        ))
+    }
+    pub fn service_update_retry(
+        &mut self,
+        index: usize,
+        now: Instant,
+    ) -> Option<NodeUpdateServiceRequest> {
+        let placement = &mut self.placements[index];
+        let service = placement.service_update.as_ref()?;
+        if !placement.link_alive || placement.service_retry_at.is_none_or(|due| due > now) {
+            return None;
+        }
+        placement.service_retry_at = Some(now + Duration::from_secs(5));
+        Some(NodeUpdateServiceRequest {
+            service: service.clone(),
+        })
+    }
+    pub fn service_reply(&mut self, index: usize, body: NodeUpdateServiceReply) -> Result<()> {
+        let placement = &mut self.placements[index];
+        let expected = placement
+            .service_update
+            .as_ref()
+            .or(placement.service_description.as_ref())
+            .ok_or("unsolicited service update reply")?;
+        if body.service != expected.name
+            || body.instance != expected.instance
+            || body.version > expected.update_version
+        {
+            return Err("service update reply does not match current request".into());
+        }
+        if body.version == expected.update_version && placement.service_update.is_some() {
+            placement.service_description = placement.service_update.take();
+            placement.service_retry_at = None;
+        }
+        Ok(())
+    }
+    pub fn load(&mut self, index: usize, body: ReportLoad) -> Result<()> {
+        let placement = &mut self.placements[index];
+        let expected = placement.body()?;
+        if !body.legacy.0.is_empty()
+            || body.reports.0.len() != 1
+            || body.reports.0[0].partition != expected.unit.id.guid
+            || body.reports.0[0].service != expected.service.name
+            || body.reports.0[0].stateful != expected.service.stateful
+        {
+            return Err("load report outside admitted fixed partition/service".into());
+        }
+        placement.last_load = Some(body);
+        Ok(())
+    }
+    pub fn type_status(
+        &mut self,
+        index: usize,
+        enabled: bool,
+        body: &ServiceTypeUpdate,
+    ) -> Result<ServiceTypeUpdateReply> {
+        let placement = &mut self.placements[index];
+        let profile = placement.profile.as_ref().ok_or("profile not admitted")?;
+        if body.types.0.len() != 1 || body.types.0[0] != profile.service_type {
+            return Err("type status outside admitted fixed type".into());
+        }
+        if body.sequence > placement.type_sequence {
+            placement.type_enabled = enabled;
+            placement.type_sequence = body.sequence;
+        }
+        Ok(ServiceTypeUpdateReply {
+            sequence: body.sequence,
+        })
+    }
     pub fn complete(&mut self, op: &str, mut outcome: Value) {
         if let Some(operation) = self
             .operations
@@ -488,6 +674,7 @@ impl Ledger {
         placement.pending = None;
         placement.observed = Observed::Unknown;
         placement.error = Some(error.clone());
+        let control = placement.node_control.take().map(|(op, _, _)| op);
         let operations = if placement
             .retired
             .contains(&(placement.replica, placement.incarnation))
@@ -503,6 +690,9 @@ impl Ledger {
                 &operation,
                 json!({"op":operation,"state":"unknown","error":error}),
             );
+        }
+        if let Some(op) = control {
+            self.complete(&op, json!({"op":op,"state":"unknown","error":error}));
         }
     }
     pub fn down(&mut self, index: usize) {
