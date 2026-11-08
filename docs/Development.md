@@ -425,8 +425,15 @@ independently across metadata ACKs. Normal Drop adds native ReplicaDropped-stage
 reporting, non-dropped ACK rejection in both lists and before the first retry,
 held provider/service disposal with public access fencing and lost-ACK retry.
 `fm_stateful_drop` cases also preserve already-closing/closed Down lifetimes.
-Abort/ForceAbort and closed-AddPrimary reporting remain gated, as do local-only
-profile FM authority and stateful recreation.
+Abort/ForceAbort now use RAP Abort and native ReplicaDropped stage, with both
+real disposal barriers. `fm_stateful_closed_add_primary`,
+`fm_stateful_force_delete`, `fm_stateful_delete_tombstones` and
+`fm_stateful_fresh_recreation` cover the remaining bounded singleton branches;
+force Delete terminates the original host without a graceful disposal receipt.
+Normal deletion plus independent original proof now permits explicit fresh
+recreation, with empty public data, new acknowledged writes/acquisitions and
+stale predecessor frames on the original session. Local-only profile FM
+authority, live replacement/adoption, reconfiguration and recovery remain gated.
 Run the `fube-cluster` unit and
 foreground targets as well as RA protocol/entity and local-app lifecycle tests.
 Archived tests require both fixed app binaries; the nextest inventory declares

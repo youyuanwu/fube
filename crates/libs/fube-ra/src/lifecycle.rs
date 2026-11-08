@@ -65,6 +65,8 @@ pub enum CloseMode {
     AppHostDown = 6,
     /// Native ordinary Close (including matching RuntimeClosed).
     Close = 7,
+    /// Native non-force Abort: RAP Abort, without ForceAbort's admission rules.
+    Abort = 8,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) struct LocalCloseRequest {
@@ -210,19 +212,25 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
         if state.fm_primary
             && matches!(
                 mode,
-                CloseMode::Close | CloseMode::AppHostDown | CloseMode::Drop
+                CloseMode::Close
+                    | CloseMode::AppHostDown
+                    | CloseMode::Drop
+                    | CloseMode::Abort
+                    | CloseMode::ForceAbort
+                    | CloseMode::Obliterate
             )
-            && !state.local_deleted
         {
-            // Native Drop uses OnDropped; Close/AppHostDown use OnReplicaDown.
+            // Close/AppHostDown use OnReplicaDown; other terminal origins use OnDropped.
             // Both serialize the closed volatile FT in ReplicaUp's dropped list.
-            state.fm_stage = if mode == CloseMode::Drop {
-                FmStage::ReplicaDropped
-            } else {
+            state.fm_stage = if matches!(mode, CloseMode::Close | CloseMode::AppHostDown) {
                 FmStage::ReplicaDown
+            } else {
+                FmStage::ReplicaDropped
             };
-            effects.push(Effect::RequestReportRetry);
-        } else if mode != CloseMode::Delete {
+            if !state.local_deleted {
+                effects.push(Effect::RequestReportRetry);
+            }
+        } else if !state.fm_primary && mode != CloseMode::Delete {
             effects.push(Effect::StatefulClosePending {
                 body: state.body.clone(),
                 mode,
@@ -254,7 +262,10 @@ pub(super) fn close_retry(state: &EntityState, effects: &mut Vec<Effect>) {
             token: state.close_token,
             body: Arc::new(body),
             registration: registration.clone(),
-            flags: if state.close_mode.is_some_and(CloseMode::force) {
+            flags: if state
+                .close_mode
+                .is_some_and(|mode| mode.force() || mode == CloseMode::Abort)
+            {
                 4
             } else if state.close_mode == Some(CloseMode::Close) {
                 0
@@ -404,6 +415,10 @@ pub(super) fn add_existing(
             state.local_deleted = false;
             state.cleanup_pending = false;
             state.fm_stage = FmStage::None;
+            state.report_sequence = 0;
+            if state.fm_primary {
+                state.primary_deactivation = Some((state.body.unit.current, 0));
+            }
             state.retry_attempts = 0;
             state.open_failures = 0;
             state.registration_failures = 0;
@@ -451,35 +466,18 @@ pub(super) fn create_body(mut body: AddInstance) -> AddInstance {
     body
 }
 
-/// ReconfigurationAgent.cpp:1731-1847, bounded to one original volatile lifetime.
-pub(super) fn primary_existing(current: &EntityState, body: &AddPrimary) -> Result<Transition> {
-    if current.local_deleted {
-        return Err(Failure::Unsupported("stateful recreation is gated"));
-    }
-    if body.service != current.body.service || body.replica.id > current.body.replica.id {
+/// ReconfigurationAgent.cpp:1731-1821 shares Add's Drop/resend/closed-report rules.
+pub(super) fn primary_existing(
+    work: &Submission,
+    current: &EntityState,
+    body: &AddPrimary,
+) -> Result<Transition> {
+    if body.service != current.body.service {
         return Err(Failure::Unsupported(
-            "stateful replacement/description changes are gated",
+            "stateful description changes are gated",
         ));
     }
-    let mut effects = Vec::new();
-    if current.phase == Phase::Ready && body.replica.instance == current.body.replica.instance {
-        effects.push(reply(&current.body, 0, true));
-    } else if current.phase == Phase::Closed {
-        if body.replica.instance > current.body.replica.instance {
-            return Err(Failure::Unsupported("stateful reopen/adoption is gated"));
-        }
-        effects.push(Effect::StatefulDroppedPending(current.body.clone()));
-        if body.replica.instance < current.body.replica.instance {
-            let mut captured = body.clone();
-            captured.unit = current.body.unit.clone();
-            effects.push(reply(&captured, STALE_REQUEST, true));
-        }
-    }
-    Ok(Transition {
-        update: Update::None,
-        effects,
-        disposition: Disposition::Applied,
-    })
+    add_existing(work, current, body)
 }
 
 pub(super) fn transition(
@@ -496,6 +494,7 @@ pub(super) fn transition(
                 4 => CloseMode::ForceAbort,
                 5 => CloseMode::Drop,
                 7 => CloseMode::Close,
+                8 => CloseMode::Abort,
                 _ => return Err(Failure::Unsupported("unsupported local Close mode")),
             };
             if !admission.owner_ready || !admission.node_open {
@@ -504,6 +503,9 @@ pub(super) fn transition(
             let Some(current) = current else {
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             };
+            if mode == CloseMode::Abort && !current.fm_primary {
+                return Err(Failure::Unsupported("local-only Abort is gated"));
+            }
             let mut state = current.clone();
             let mut effects = Vec::new();
             if !start_close(&mut state, mode, work.id, &mut effects) {
@@ -520,23 +522,27 @@ pub(super) fn transition(
             let body = request.replica.0;
             let stateful = matches!(work.kind, Kind::DeleteReplica { .. });
             if stateful {
-                let Some(original) = current.filter(|state| state.fm_primary) else {
-                    return Err(Failure::Unsupported(
-                        "stateful deletion requires the original FM Primary lifetime",
-                    ));
-                };
-                if request.deletion.0.force
-                    || !body.service.stateful
-                    || body.service != original.body.service
+                if !body.service.stateful
+                    || body.service.persisted
+                    || body.service.group
+                    || body.service.partitions != 1
+                    || body.service.target != 1
+                    || body.service.minimum != 1
+                    || body.service.activation_mode != 0
+                    || !body.service.scaling.0.is_empty()
                     || body.replica.node != admission.local_node
-                    || body.unit.consistency != original.body.unit.consistency
+                    || body.unit.consistency.id != body.unit.id
+                    || body.unit.consistency.kind != 1
+                    || current.is_some_and(|original| {
+                        !original.fm_primary
+                            || body.service != original.body.service
+                            || body.unit.consistency != original.body.unit.consistency
+                    })
                     || body.replica.id < 0
                     || body.replica.instance < 0
-                    || (original.phase == Phase::Closed
-                        && body.replica.id > original.body.replica.id)
                 {
                     return Err(Failure::Unsupported(
-                        "only original volatile singleton normal deletion is enabled",
+                        "only admitted volatile singleton deletion is enabled",
                     ));
                 }
             } else {
@@ -548,7 +554,7 @@ pub(super) fn transition(
             if !admission.node_open || !admission.owner_ready {
                 return Ok(Transition::ignored(Disposition::IgnoredNotReady));
             }
-            if let Some(current) = current.filter(|_| !stateful) {
+            if let Some(current) = current {
                 if current.phase != Phase::Closed
                     && body.replica.id == current.body.replica.id
                     && body.replica.instance > current.body.replica.instance
@@ -560,8 +566,8 @@ pub(super) fn transition(
             }
             let mut state = current.cloned().unwrap_or_else(|| EntityState {
                 requested_version: body.service.version.clone(),
-                fm_primary: false,
-                primary_deactivation: None,
+                fm_primary: stateful,
+                primary_deactivation: stateful.then_some((Epoch::default(), -2)),
                 // TryCreateFailoverUnit constructs from ID, consistency and
                 // service, NOT the incoming previous epoch/target/minimum.
                 body: Arc::new(AddInstance {

@@ -683,7 +683,7 @@ impl Ledger {
         placement.observed = Observed::Absent;
         placement.endpoint = None;
         placement.error = None;
-        placement.reusable = placement.launch.profile == crate::ServiceProfile::Stateless;
+        placement.reusable = true;
         placement
             .retired
             .push((placement.replica, placement.incarnation));

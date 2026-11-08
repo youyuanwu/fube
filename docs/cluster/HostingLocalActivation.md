@@ -241,10 +241,15 @@ disposal and exact H2 release; independently joined Node disposal proof survives
 metadata ACK processing. Normal Drop of the original FM singleton now reports
 with native ReplicaDropped stage and requires a dropped-description ACK, with
 the same real RAP cleanup/commit/exact-release boundaries. It cannot relabel an
-already-closing/closed Down lifetime. Local-only Close/Drop, Abort/ForceAbort
-and closed-AddPrimary reporting remain staged.
-Stateful force deletion/reconfiguration, replacement/reopen, FMM and recovery
-remain gated; local profiles still reject network deletion.
+already-closing/closed Down lifetime. Local-only FM reporting remains staged.
+The [singleton lifecycle completion](MinimalFmCluster.md#singleton-lifecycle-completion-and-fresh-recreation)
+adds Abort/ForceAbort and closed-AddPrimary reporting, native force Delete and
+missing/closed tombstone handling. Explicit fresh recreation after verified
+normal deletion uses the resident original host but new service/provider
+objects, real Open(New), initial deactivation and exact new H2 acquisition.
+Terminal loss/metadata completion cannot authorize FM reuse.
+Stateful reconfiguration, live replacement/adoption, FMM and recovery remain
+gated; local profiles still reject network deletion/recreation.
 
 Real foreground/channel tests exercise exact semantic completion, a lost reply
 and original-lifetime retry, public acknowledged write/readback, normal FM

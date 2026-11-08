@@ -43,9 +43,11 @@ completes. It sends native `DeleteReplica(force=false)` and waits for the
 matching `DeleteReplicaReply` plus original Node disposal/accounting proof.
 Lost replies retry the same lifetime with native 10/60-second action intervals.
 Normal Delete produces no terminal ReplicaDown/ReplicaDropped-report ACK.
-The deleted tombstone remains retained; stateful replacement/recreation,
-force deletion, promotion, `DoReconfiguration`, copy/build, FMM and recovery
-remain explicitly gated. `quit` uses the original
+The deleted tombstone remains retained. A subsequent explicit `create`, only
+after both deletion inputs match, opens fresh empty volatile data under higher
+replica/instance identities while retaining the original node/app host.
+Live replacement/adoption, promotion, `DoReconfiguration`, copy/build, FMM and
+recovery remain explicitly gated. `quit` uses the original
 owned local cleanup path, retaining terminal stateful reporting as pending
 escrow rather than manufacturing ReplicaUp acknowledgments.
 
@@ -75,7 +77,14 @@ ReplicaUp entry after committed real RAP cleanup and exact release; only a
 dropped description can clear its stage. Existing retry/ACK, metadata deletion
 and independent disposal boundaries are unchanged. A late Drop does not relabel
 an already-closing/closed Down lifetime.
-Abort/ForceAbort and closed-AddPrimary reporting stay staged.
+Abort/ForceAbort now report through ReplicaDropped stage after RAP Abort and
+committed exact release. Abort retains non-force close admission. Closed
+AddPrimary sends the original canonical dropped report without relabeling the
+stage or allocating a use; deleted tombstones suppress that report.
+Native force DeleteReplica terminates the exact original host via Obliterate
+and reports only after HostDown, without graceful disposal/reuse proof.
+The CLI's `delete` remains normal; no force/reset escape is introduced.
+See [singleton lifecycle completion and fresh recreation](../../../docs/cluster/MinimalFmCluster.md#singleton-lifecycle-completion-and-fresh-recreation).
 See [source semantics and qualification limits](../../../docs/cluster/MinimalFmCluster.md#unexpected-singleton-app-host-loss).
 
 The root is operator-owned and private (0700). Its parent must already exist.
@@ -194,8 +203,9 @@ deployed native FM/Federation qualification.
 Stateful tests additionally exercise the real foreground FM/RA processes,
 acknowledged public write/readback, dropped AddPrimaryReply with original-lifetime
 retry, native retry-interval boundaries, FM normal deletion with both disposal
-barriers, a lost DeleteReplicaReply, independent sibling contact and gated
-force deletion/recreation. The
+barriers, a lost DeleteReplicaReply, independent sibling contact and explicitly
+requested fresh-data recreation after verified normal deletion. Same-session
+predecessor frames and old receipts cannot retire the successor. The
 archive includes both fixed app binaries; no consumer-side build fallback exists.
 Owned app-crash/lease-loss compositions additionally exercise real FM channels,
 native processed-versus-dropped reply semantics, a lost ACK with the actual
@@ -209,4 +219,7 @@ proof. Close uses native ReplicaDown stage. Normal Drop additionally exercises
 native ReplicaDropped stage, non-dropped ACK rejection, public access fencing,
 both disposal barriers and the actual lost-ACK retry. Model tests preserve
 already-closing/closed Down lifetimes and stage-eligible ACKs before the first
-retry. Abort/ForceAbort reporting remains gated.
+retry. Abort/ForceAbort additionally cover both real disposal barriers and
+original-host survival; force Delete covers actual original-host termination
+without manufactured destructor receipts. Closed AddPrimary resends cross the
+same live channel without another acquisition or stage relabeling.

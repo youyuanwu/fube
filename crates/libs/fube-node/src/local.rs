@@ -114,6 +114,8 @@ pub enum LocalDisposition {
     Written,
     WriteFailed,
     ExactUsageReleased,
+    /// Exact original app host physically retired; logical H2 cleanup may remain.
+    HostTerminated,
     RegistrationReferenceReleased,
     /// Constructed local health work under explicitly disabled HM processing.
     HealthProcessingDisabled,
@@ -401,15 +403,20 @@ impl Node {
             }
             FmWork::DeleteReplica(body, source, generation) => {
                 self.admit_fm(source, generation)?;
-                let selected = self.selected.as_ref().ok_or(Error::Unsupported)?;
                 let incoming = &body.replica.0;
-                if !self.live.load(Ordering::SeqCst)
+                self.check_service(incoming, true)?;
+                let closed = self
+                    .ra
+                    .snapshot(incoming.unit.id.guid.0)
+                    .committed
+                    .is_some_and(|state| state.phase == ra::Phase::Closed);
+                if (!self.live.load(Ordering::SeqCst) && !closed)
                     || !self.ra.consumer_lifetime().is_accepting()
-                    || body.deletion.0.force
-                    || incoming.unit.id != selected.unit.id
-                    || incoming.unit.consistency != selected.unit.consistency
-                    || incoming.service != selected.service
-                    || incoming.replica.node != self.admission.local_node
+                    || self.selected.as_ref().is_some_and(|selected| {
+                        incoming.unit.id != selected.unit.id
+                            || incoming.unit.consistency != selected.unit.consistency
+                            || incoming.service != selected.service
+                    })
                     || incoming.replica.id < 0
                     || incoming.replica.instance < 0
                     || to_vec(body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
@@ -449,7 +456,17 @@ impl Node {
                 _ => {}
             }
         }
-        self.enqueue(Work::Fm(work))
+        let selected = match &work {
+            FmWork::DeleteReplica(body, ..) if self.selected.is_none() => {
+                Some(body.replica.0.clone())
+            }
+            _ => None,
+        };
+        let id = self.enqueue(Work::Fm(work))?;
+        if let Some(selected) = selected {
+            self.selected = Some(selected);
+        }
+        Ok(id)
     }
     pub fn package_registration(&self) -> &PackageRegistration {
         &self.package_registration
@@ -579,46 +596,14 @@ impl Node {
         self.admit_fm(source, generation)?;
         self.authorize_open(body, 4, Some((source.clone(), generation.clone())))
     }
-    fn authorize_open(
-        &mut self,
-        body: AddInstance,
-        role: i64,
-        fm: Option<(NodeInstance, GenerationHeader)>,
-    ) -> Result<u64> {
-        let stateful = role != 1;
-        if !self.live.load(Ordering::SeqCst) || !self.ra.consumer_lifetime().is_accepting() {
-            return Err(Error::Busy);
-        }
-        let bytes = to_vec(&body).map_err(|_| Error::Unsupported)?;
-        if bytes.len() > ADD_BODY {
-            return Err(Error::Capacity);
-        }
-        let body: AddInstance = decode(&bytes)?;
+    fn check_service(&self, body: &AddInstance, stateful: bool) -> Result<()> {
         let premise = self.activation.premise().ok_or(Error::Unsupported)?;
-        let identity = self.activation.identity().ok_or(Error::Unsupported)?;
         let expected = self.activation.declared_type().ok_or(Error::Unsupported)?;
-        let lookup = self.activation.lookup_registration(&h::LookupRequest {
-            service_type: expected.clone(),
-            version: premise.version.clone(),
-            activation: h::Activation::SHARED,
-            service_name: premise.service_name.clone(),
-            application_name: premise.application_name.clone(),
-            should_activate: false,
-        })?;
-        // Type admission can precede registration; the declared package/type is
-        // still exact. An arbitrary unregistered type is not an allowed profile.
-        if lookup.result == Err(h::Error::InvalidServiceType)
-            || service_type(&expected) != body.service.service_type
+        if service_type(&expected) != body.service.service_type
             || body.service.version != version(&premise.version)
-            || body.replica.version != version(&premise.version)
             || body.service.application != premise.application_name
             || body.service.name != premise.service_name
             || body.replica.node != self.admission.local_node
-            || body.replica.current_role != role
-            || body.replica.state != 1
-            || !body.replica.up
-            || body.replica.id < 0
-            || body.replica.instance < 0
             || body.service.stateful != stateful
             || body.service.persisted
             || body.service.group
@@ -632,6 +617,55 @@ impl Node {
             || body.unit.consistency.low != 0
             || body.unit.consistency.high != 0
             || body.unit.consistency.id != body.unit.id
+        {
+            return Err(Error::Unsupported);
+        }
+        Ok(())
+    }
+    fn authorize_open(
+        &mut self,
+        body: AddInstance,
+        role: i64,
+        fm: Option<(NodeInstance, GenerationHeader)>,
+    ) -> Result<u64> {
+        let stateful = role != 1;
+        let current = self.ra.snapshot(body.unit.id.guid.0).committed;
+        let closed_request = fm.is_some()
+            && current.as_ref().is_some_and(|state| {
+                state.phase == ra::Phase::Closed
+                    && body.replica.instance <= state.body.replica.instance
+            });
+        if (!self.live.load(Ordering::SeqCst) && !closed_request)
+            || !self.ra.consumer_lifetime().is_accepting()
+        {
+            return Err(Error::Busy);
+        }
+        let bytes = to_vec(&body).map_err(|_| Error::Unsupported)?;
+        if bytes.len() > ADD_BODY {
+            return Err(Error::Capacity);
+        }
+        let body: AddInstance = decode(&bytes)?;
+        self.check_service(&body, stateful)?;
+        let premise = self.activation.premise().ok_or(Error::Unsupported)?;
+        let identity = self.activation.identity().ok_or(Error::Unsupported)?;
+        let expected = self.activation.declared_type().ok_or(Error::Unsupported)?;
+        let lookup = self.activation.lookup_registration(&h::LookupRequest {
+            service_type: expected.clone(),
+            version: premise.version.clone(),
+            activation: h::Activation::SHARED,
+            service_name: premise.service_name.clone(),
+            application_name: premise.application_name.clone(),
+            should_activate: false,
+        })?;
+        // Type admission can precede registration; the declared package/type is
+        // still exact. An arbitrary unregistered type is not an allowed profile.
+        if (lookup.result == Err(h::Error::InvalidServiceType) && !closed_request)
+            || body.replica.version != version(&premise.version)
+            || body.replica.current_role != role
+            || body.replica.state != 1
+            || !body.replica.up
+            || body.replica.id < 0
+            || body.replica.instance < 0
             || identity.code.package_sequence <= 0
         {
             return Err(Error::Unsupported);
@@ -653,10 +687,6 @@ impl Node {
                 return Err(Error::Unsupported);
             }
         }
-        let current = self.ra.snapshot(body.unit.id.guid.0).committed;
-        if fm.is_some() && current.as_ref().is_some_and(|state| state.local_deleted) {
-            return Err(Error::Unsupported);
-        }
         if stateful
             && fm.is_none()
             && (self
@@ -669,13 +699,41 @@ impl Node {
         {
             return Err(Error::Unsupported);
         }
-        if fm.is_some()
-            && self.selected.as_ref().is_some_and(|selected| {
-                body.replica.id > selected.replica.id
-                    || body.replica.instance > selected.replica.instance
-            })
-        {
-            return Err(Error::Unsupported);
+        if fm.is_some() {
+            if let Some(current) = &current {
+                let admitted_retry = self.pending.iter().any(|pending| {
+                    matches!(&pending.work, Work::AddPrimary(approved, ..) if approved.as_ref() == &body)
+                        && pending.ticket.as_ref().is_none_or(|ticket| {
+                            matches!(
+                                ticket.observation(),
+                                ra::TicketObservation::Status(
+                                    ra::Status::Pending
+                                        | ra::Status::Unknown
+                                        | ra::Status::Complete(Ok(_))
+                                )
+                            )
+                        })
+                });
+                if current.phase != ra::Phase::Closed && body.replica.id > current.body.replica.id {
+                    return Err(Error::Unsupported);
+                }
+                if current.phase == ra::Phase::Closed
+                    && body.replica.instance > current.body.replica.instance
+                    && (!current.local_deleted
+                        || current.fm_stage != ra::FmStage::None
+                        || body.replica.id <= current.body.replica.id
+                        || (!admitted_retry
+                            && ((self.instance_disposal().is_none() && current.open_token != 0)
+                                || !self.quiescent()
+                                || !self.commands.is_empty()
+                                || self
+                                    .external
+                                    .iter()
+                                    .any(|work| work.effect.is_replica_reporting()))))
+                {
+                    return Err(Error::Busy);
+                }
+            }
         }
         // `selected` is the immutable admitted profile, NOT current replica
         // authority. An ignored stale Add cannot replace committed identity.
@@ -729,8 +787,13 @@ impl Node {
             || !self.ra.consumer_lifetime().is_accepting()
             || !matches!(
                 mode,
-                ra::CloseMode::Close | ra::CloseMode::Drop | ra::CloseMode::ForceAbort
+                ra::CloseMode::Close
+                    | ra::CloseMode::Drop
+                    | ra::CloseMode::Abort
+                    | ra::CloseMode::ForceAbort
             )
+            || (mode == ra::CloseMode::Abort
+                && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary)
             || self.selected.as_ref().is_none_or(|b| b.unit.id != unit)
         {
             return Err(Error::Unsupported);
@@ -1160,6 +1223,29 @@ impl Node {
                 LocalDisposition::ExactUsageReleased
             }
             ra::Effect::ReleaseRegistration(_) => LocalDisposition::RegistrationReferenceReleased,
+            ra::Effect::TerminateHost { registration } => {
+                if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+                    || self
+                        .activation
+                        .identity()
+                        .is_none_or(|identity| identity.host_id != registration.host)
+                    || self
+                        .route
+                        .as_ref()
+                        .is_none_or(|route| route.runtime != registration.runtime)
+                {
+                    return Err(Error::Unsupported);
+                }
+                self.stop_admission();
+                match self.activation.terminate() {
+                    Ok(true) => {}
+                    Err(h::local::LocalError::Busy)
+                        if self.activation.cleanup_status().logical_retired => {}
+                    Ok(false) | Err(h::local::LocalError::Busy) => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                }
+                LocalDisposition::HostTerminated
+            }
             ra::Effect::Health(_) | ra::Effect::OpeningHealth(_) => {
                 LocalDisposition::HealthProcessingDisabled
             }
@@ -1184,9 +1270,7 @@ impl Node {
             }
             // These are outside the preflighted local command/action allowlist.
             // Retain original effect, fail explicitly, never acknowledge success.
-            ra::Effect::TerminateHost { .. } | ra::Effect::UpdateServiceDescription { .. } => {
-                return Err(Error::Unsupported)
-            }
+            ra::Effect::UpdateServiceDescription { .. } => return Err(Error::Unsupported),
         };
         self.effects.pop_front();
         self.receipts.push_back(EffectReceipt {

@@ -448,12 +448,12 @@ pub enum Effect {
     PrimaryReply(Box<AddPrimaryReply>),
     /// Local observation only; never serialize this as AddInstance/CreateReplicaReply.
     LocalStatefulOpenReply(Box<AddInstanceReply>),
-    /// Retained terminal reporting outside the FM singleton Close/AppHostDown/Drop slice.
+    /// Retained terminal reporting for local-only stateful profiles.
     StatefulClosePending {
         body: Arc<AddInstance>,
         mode: CloseMode,
     },
-    /// Native closed AddPrimary's dropped report, retained without a fake FM ACK.
+    /// Legacy gated observation; enabled closed AddPrimary sends ReplicaUp directly.
     StatefulDroppedPending(Arc<AddPrimary>),
     RuntimeOpen {
         token: u64,
@@ -512,6 +512,18 @@ pub enum Effect {
         acquisition: u64,
     },
     OpeningHealth(Box<OpeningHealthReport>),
+}
+impl Effect {
+    /// Per-replica report obligations, distinct from node-wide type notifications.
+    pub fn is_replica_reporting(&self) -> bool {
+        matches!(
+            self,
+            Self::RequestReportRetry
+                | Self::ReplicaUp(_)
+                | Self::StatefulClosePending { .. }
+                | Self::StatefulDroppedPending(_)
+        )
+    }
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dispatched {
@@ -1212,7 +1224,7 @@ fn transition(
             }
             if let Some(current) = state {
                 if fm_primary {
-                    return lifecycle::primary_existing(current, &body);
+                    return lifecycle::primary_existing(work, current, &body);
                 }
                 if local_stateful {
                     return Ok(Transition {

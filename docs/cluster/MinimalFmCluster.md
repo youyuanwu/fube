@@ -111,12 +111,14 @@ RA registration/Open and the final Primary/Ready reply remain commit-gated.
 Unknown store completion holds the original reply/duplicate until resolution.
 Ready duplicate requests reply from the existing FT without adopting the
 request epoch or acquiring another use. Closed/stale requests retain dropped
-reporting obligations; unsupported replacement/reopen paths fail admission.
+reporting obligations through direct ReplicaUp delivery; live replacement and
+unproved reopen paths fail admission.
 FM does not turn a transport write into readiness. An independent application
 client verifies one public admitted/applied/acknowledged write and readback.
 
-Stateful force deletion, recreation, reconfiguration, FMM, copy/build,
-multi-replica movement and recovery remain gated. Owned local shutdown joins resource/listener disposal,
+Disposal-gated fresh recreation and native force Delete handling are described
+below. Reconfiguration, FMM, copy/build, multi-replica movement and recovery
+remain gated. Owned local shutdown joins resource/listener disposal,
 exact usage and physical cleanup while retaining stateful reporting escrow.
 Cleanup receipts do not imply native terminal-report acknowledgment.
 
@@ -148,16 +150,16 @@ same native 10/60-second action predicates without another use or lifetime.
 Failed/unknown commits cannot publish deletion completion or release.
 
 The deleted tombstone, app host, factory and package remain resident under
-their original owners; **stateful recreation stays rejected** even after
-verified deletion. Duplicate operator operations retain their original outcome.
+their original owners. A later explicit `create` can authorize a fresh lifetime
+only after this verified deletion. Duplicate operator operations retain their original outcome.
 Normal deletion does not acknowledge unrelated terminal reporting escrow.
 
 ### Unexpected singleton app-host loss
 
 The FM singleton profile now reports original app-host loss, including finite
-lease fencing, over real `ReplicaUp`/`ReplicaUpReply` delivery. Graceful Close
-of that same lifetime and normal Drop are covered separately below; Abort and closed-
-AddPrimary reporting remain staged. Local Idle and local-Primary profiles do
+lease fencing, over real `ReplicaUp`/`ReplicaUpReply` delivery. Graceful Close,
+normal Drop and the remaining singleton terminal origins are covered below.
+Local Idle and local-Primary profiles do
 not gain FM reporting authority.
 
 Pinned `FailoverUnit.cpp:5472-5544` and `FMMessageState.cpp:148-176` distinguish
@@ -234,8 +236,8 @@ verify acknowledged public write/readback before Close, independently observe
 both listeners retire while the original host remains alive, lose a valid ACK
 and exercise the native-default retry, and verify unchanged original disposal
 lineage and independently serving sibling data. RA tests cover both ACK lists
-and actual store veto/unknown resolution. Normal Drop is covered below; Abort, closed-AddPrimary
-reporting, recreation/reconfiguration and recovery remain gated. These tests
+and actual store veto/unknown resolution. Normal Drop and the remaining
+singleton lifecycle paths are covered below; reconfiguration and recovery remain gated. These tests
 do not establish full native handler or native FM/Federation interoperability.
 
 ### Normal singleton Drop reporting
@@ -268,7 +270,7 @@ Native `CanCloseLocalReplica` and StartClose's closed-FT return
 (`FailoverUnit.cpp:4781-4842,4916-4942`) are preserved: a normal Drop cannot
 supersede an already-closing Close, and a Drop of an already-closed Down lifetime
 does not relabel its original report. Abort/ForceAbort and closed-AddPrimary
-reporting, recreation/reconfiguration and recovery remain gated.
+handling are covered below; reconfiguration and recovery remain gated.
 
 Model tests cover both ACK lists, stage-eligible acknowledgment before the first
 retry, non-dropped/stale replies, duplicate completion and actual store
@@ -280,6 +282,77 @@ These are bounded native-free compositions, not full native handler execution,
 native stateful deployment or FM/Federation interoperability qualification.
 Owner shutdown without a live FM session retains unacknowledged reporting;
 physical cleanup does not synthesize its semantic ACK.
+
+### Singleton lifecycle completion and fresh recreation
+
+The bounded volatile 1/1 FM profile now supports the remaining stage-one
+terminal origins. Native `ReplicaCloseMode.h:113-133,179-198` distinguishes
+non-force Abort from ForceAbort: both send RAP Abort (`flags=4`), but only
+ForceAbort has force-close admission. Both use OnDropped/ReplicaDropped stage
+after successful disposal and the actual Close commit
+(`FailoverUnit.cpp:4781-4842,5472-5544`). Closed/closing Down lifetimes are not
+relabeled. Local-only profiles still gain no FM reporting authority.
+
+Native force `DeleteReplica` is different: DeleteLocalReplica chooses
+Obliterate for an open FT (`ReconfigurationAgent.cpp:777-835`).
+The committed action terminates the exact original app host; matching HostDown
+then finishes closure and schedules ReplicaDropped-stage reporting
+(`FailoverUnit.cpp:4951-4957,5047-5070,5472-5544`). It does not send RAP Close
+or manufacture a graceful DeleteReplicaReply/disposal receipt. Process cleanup
+can precede exact H2 release, and the logical owner remains retained until RA
+commits that release. Subsequent processed-list acknowledgment can delete closed
+metadata and send DeleteReplicaReply, but FM still records lost volatile data
+without reuse authority. Force is supported on the admitted native command;
+the operator CLI's `delete` remains normal `force=false`, with no new force/reset
+escape.
+
+Missing/closed DeleteReplica tombstones preserve native
+UpdateInstanceForClosedReplica ordering: advance a higher epoch and higher
+ReplicaId/instance before the command's own guards
+(`FailoverUnit.cpp:366-390`, `ReconfigurationAgent.cpp:786-829`). Normal stale
+epochs reject; force bypasses that epoch guard, never the ReplicaId guard.
+Closed force requests use normal Delete completion without killing the host.
+These metadata-only replies cannot prove disposal of a service object.
+Delete-error escalation to ForceAbort retains native ReplicaDropped stage but
+suppresses payload delivery for an already locally deleted FT. A later normal
+Delete retry completes closed metadata; no gated report effect can strand its
+independently proved disposal/accounting.
+
+For closed AddPrimary, the native handler sends a canonical dropped ReplicaUp
+directly; an older requested instance additionally receives StaleRequest with
+the requested replica description and existing FT description. This does not
+change the existing report stage or allocate another use
+(`ReconfigurationAgent.cpp:1782-1821`, `FailoverUnit.cpp:4720-4742`).
+Locally deleted tombstones suppress dropped reporting
+(`FailoverUnit.cpp:4015-4038`). These non-creating requests remain processable
+on the original FM session even after app-host retirement.
+
+After normal operator deletion joins its semantic reply with independently
+proved original disposal/accounting, a new explicit `create` allocates higher
+ReplicaId and instance values. Node refuses unproved predecessor reuse.
+Identical retransmits share the original admitted create while its commit is
+pending/unknown; conflicting payloads cannot reuse that approval or acquire
+another use.
+Original per-replica reporting must drain before reuse; unrelated node-wide
+type-notification obligations stay independently owned across lifetimes.
+Committed RA creation resets previous configuration, report state and initial
+deactivation to `(current configuration epoch, 0)`, and invokes real RAP
+Open(New). The original node, app host, factory and package remain resident;
+the new service/provider has fresh empty volatile data, not recovered history.
+Old native frames, receipts and completions cannot retire or resurrect the
+successor. Lost lifetimes remain nonreusable even after metadata completion or
+a genuine unsolicited disposal proof.
+
+Focused model tests cover canonical reports, both ACK lists, closed/stale
+requests, tombstone/force guards and actual commit veto/unknown resolution.
+Real channels hold Abort/ForceAbort provider/service disposal, verify public
+access/listener fencing and lost-ACK retry, and terminate the original host for
+force Delete without destructor proof. Foreground and library tests exercise
+fresh empty data, new acknowledged writes, exact new acquisitions, stale frames
+on the same original session and unaffected sibling data across recreation.
+Live replacement/adoption, description changes, persisted state, FMM, peer
+control and recovery remain gated. No full native handler trace or native
+FM/Federation interoperability is established by these compositions.
 
 ## Shutdown and restart safety
 

@@ -24,8 +24,8 @@ now enables native-shaped AddPrimary/Reply with source-derived commit, initial
 deactivation, duplicate/stale and retry semantics over actual FM/RA channels.
 Normal FM DeleteReplica/Reply now closes that original volatile lifetime with
 source-derived epoch/ReplicaId checks, canonical dropped replies, native retry
-and separately joined disposal/accounting proof. Force deletion, recreation,
-DoReconfiguration, peer control, recovery and complete P4/M2 remain gated.
+and separately joined disposal/accounting proof. DoReconfiguration, peer control,
+recovery and complete P4/M2 remain gated.
 The [unexpected singleton loss slice](MinimalFmCluster.md#unexpected-singleton-app-host-loss)
 now delivers AppHostDown's ReplicaDown-stage/dropped-list ReplicaUp and its
 processed-list acknowledgment, including native closed-FT deletion afterward.
@@ -35,8 +35,12 @@ committed Close, keeping original disposal proof independent.
 The [normal singleton Drop slice](MinimalFmCluster.md#normal-singleton-drop-reporting)
 now reports through native ReplicaDropped stage with dropped-description ACK
 checks, without relabeling closing/closed Down lifetimes.
-FM records lost volatile state, not recovery/reuse; Abort/ForceAbort and closed-
-AddPrimary reporting and broader stateful choreography remain staged.
+The [singleton lifecycle completion](MinimalFmCluster.md#singleton-lifecycle-completion-and-fresh-recreation)
+adds Abort/ForceAbort reporting, closed-AddPrimary delivery, native force Delete
+and missing/closed tombstone handling, plus explicitly authorized fresh
+recreation after normal deletion joins original disposal/accounting proof.
+FM records terminal loss as lost volatile state, not recovery/reuse;
+broader stateful choreography remains staged.
 
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's
@@ -481,6 +485,54 @@ runtime dependency must be declared in producer artifacts and the consumer
 profile. Power-loss/filesystem guarantees require separate qualification beyond
 ordinary process termination.
 
+### FM-call completion roadmap
+
+This is the recommended dependency order, not a claim of complete FM support
+or a replacement for P1–P5 and M1–M4. Split each stage into small,
+independently qualified increments; completing one bounded profile does not
+complete every native branch of its handlers.
+
+The [source-pinned catalog](NativeRaProtocol.md) contains **58 FM-boundary action
+definitions**, including common registration, plus **eight peer RA actions**.
+There are 67 directional contracts because DoReconfiguration also has a peer
+send path. The current 14 selected action codecs have bounded handler coverage,
+not complete native contracts; 44 FM-boundary actions and all eight peer actions
+remain unselected, alongside broader branches of the selected handlers.
+
+Stage 1 is now implemented for the bounded volatile 1/1 FM profile; see
+[its supported paths and evidence limits](MinimalFmCluster.md#singleton-lifecycle-completion-and-fresh-recreation).
+This does not qualify every native handler branch or complete P4/M2.
+
+| Stage | Remaining scope | Completion gate |
+|---|---|---|
+| 1. Finish singleton lifecycle | Abort/ForceAbort reporting, closed-AddPrimary handling and remaining DeleteReplica branches, then explicitly authorized fresh-lifetime recreation. | Preserve native close/report/ACK semantics and exact original accounting. Reporting and metadata completion cannot substitute for disposal proof or relabel lost volatile data as recovered empty state. |
+| 2. Complete node-wide coordination | Broader P2 multi-entity execution; NodeActivateRequest/Reply, NodeDeactivateRequest/Reply, NodeUpdateServiceRequest/Reply, ServiceTypeEnabled/Disabled and their replies, full registration notifications, ReplicaEndpointUpdated/Reply and ReportLoad. | Preserve sequence/version checks and action-specific completion barriers. Deactivation replies follow required replica closure, not admission; ReportLoad remains best-effort without an invented per-report ACK. |
+| 3. Complete ordinary-FM generation and upload | GenerationProposal/Reply, GenerationUpdate/Reject, LFUMUpload/Reply, nonempty NodeUp/NodeUpAck reconciliation and full ReplicaUp/Reply batching/final-upload handling. | Preserve proposed/receive/send generations and per-entity commit barriers. Only the correct semantic completion advances upload/readiness; keep restart serving disabled until stage 6. |
+| 4. Build and remove remote replicas | AddReplica/Reply through peer CreateReplica/Reply and real RAP build; RemoveReplica/Reply through replicator removal. | Require real copy/application ACKs and activation before Ready/FM success. CreateReplicaReply is not AddReplicaReply; RemoveReplica is not DeleteReplica on the remote node. |
+| 5. Implement reconfiguration | DoReconfiguration/Reply, peer GetLSN/Reply, Deactivate/Reply and Activate/Reply, ChangeConfiguration and DatalossReport. Include peer swap continuation. | Preserve native phase ordering, separate previous/current quorum obligations, catch-up/cancellation, old-primary fencing and endpoint publication. Qualify secondary replacement before primary transfer. |
+| 6. Enable durable RA restart | P5 loading/fixups, crash-window reconciliation, fresh incarnation and recovery with the original FM surviving. | Historical records cannot restore Primary authority. Prove predecessor fencing; rebuild volatile replicas from eligible survivors with valid history/quorum evidence or report data loss. |
+| 7. Add FMM ownership/rebuild | Independent FM/FMM readiness and generation domains, owner-specific uploads, GFUMTransfer and FM-service replica handling. | Supply matching FM/FMM/common-layer counterparts and required FM-service functionality. Ordinary FM acknowledgments cannot stand in for FMM; this does not authorize transparent FM restart. |
+| 8. Finish upgrades and catalog closure | Application/fabric upgrade and cancellation pairs, real Hosting/version adapters, remaining supported profiles and legacy/deprecated behavior. Resolve the PartitionNotification endpoint gap. | Every catalog entry needs its exact implementation or source-defined rejection/no-op behavior and evidence. Do not invent a successful handler to conceal a missing counterpart. |
+
+Every enabled exchange requires bidirectional native codec evidence,
+source-derived behavioral scenarios, normalized native/Rust handler traces and
+real RA/Hosting/RAP acceptance where applicable. Cover stale, duplicate,
+reordered and lost traffic, definite/unknown commits and independent physical
+cleanup. Missing required evidence must fail capability admission. Existing
+codec/helper and bounded native-free results do not establish full native
+handler or interoperability qualification.
+
+Message coverage is not full SF feature parity. Every native execution branch
+also needs its backing functionality, including persisted-service storage and
+genuine upgrade infrastructure where required; SQLite RA metadata supplies
+neither. Until qualified, active unsupported branches remain explicit gates,
+not completed contracts. Preserve source-defined legacy rejection/deprecation
+and the native ServiceBusy no-op distinctly from unsupported success-shaped
+stubs. Federation membership remains excluded, but peer reliability traffic
+remains required.
+
+Stage 2 and later remain staged.
+
 ## 10. Limits and remaining implementation choices
 
 SQLite solves local transactions, not state-machine correctness, app-data
@@ -497,10 +549,10 @@ optional later protocol redesign. Broader native RA feature parity, persisted
 service storage, warm app adoption, transparent FM restart and native database
 migration require separate qualification beyond message preservation.
 
-The next work is broader P2 lifecycle infrastructure and the cluster M1
-interfaces, including real Hosting/RAP integration and native behavioral traces.
+Follow the [FM-call completion roadmap](#fm-call-completion-roadmap) for the
+remaining dependency order and the P1–P5/M1–M4 gates for qualification.
 This design document itself supplies no runnable cluster commands or evidence
-of those unimplemented stages.
+of the unimplemented stages.
 
 [native-store]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Storage.Api.IKeyValueStore.h#L16-L64
 [native-adapter]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/Storage.LocalStoreAdapter.cpp#L205-L245

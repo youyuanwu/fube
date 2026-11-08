@@ -144,7 +144,7 @@ fn contact(endpoint: &str) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 #[test]
-fn foreground_stateful_singleton_creates_writes_reads_and_deletes_through_fm_control() {
+fn foreground_stateful_singleton_recreates_fresh_data_after_verified_fm_deletion() {
     let root = support::parent().join(format!("fm-primary-{}", uuid::Uuid::new_v4()));
     let mut foreground = Foreground::start_profile(&root, true);
     assert_eq!(foreground.read()["event"], "ready");
@@ -210,7 +210,7 @@ fn foreground_stateful_singleton_creates_writes_reads_and_deletes_through_fm_con
     }
     let status = deleted.expect("DeleteReplicaReply plus original-node disposal did not complete");
     let node = &status["status"]["nodes"][0];
-    assert_eq!(node["reusable"], false);
+    assert_eq!(node["reusable"], true);
     assert_eq!(node["retired_lifetimes"], 1);
     assert_eq!(node["retirement"]["app_pid"], expected.app_pid);
     assert_eq!(node["retirement"]["node_pid"], expected.node_pid);
@@ -219,15 +219,59 @@ fn foreground_stateful_singleton_creates_writes_reads_and_deletes_through_fm_con
         foreground.command(&json!({"op":"delete","action":"delete","node":1}))["state"],
         "complete"
     );
+    let replacement = foreground.command(&json!({"op":"replacement","action":"create","node":1}));
+    assert_eq!(replacement["state"], "pending");
     assert_eq!(
-        foreground.command(&json!({"op":"replacement","action":"create","node":1}))["state"],
-        "rejected"
+        replacement["replica"].as_i64().unwrap(),
+        pending["replica"].as_i64().unwrap() + 1
     );
+    assert_eq!(
+        replacement["incarnation"].as_i64().unwrap(),
+        pending["incarnation"].as_i64().unwrap() + 1
+    );
+    let mut fresh = None;
+    for attempt in 0..40 {
+        let status =
+            foreground.command(&json!({"op":format!("fresh-status-{attempt}"),"action":"status"}));
+        if status["status"]["nodes"][0]["observed"] == "running" {
+            fresh = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let status = fresh.expect("fresh AddPrimary did not complete under original host");
+    let fresh_endpoint = status["status"]["nodes"][0]["endpoint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let fresh_request = |command: &[u8]| {
+        let mut socket = TcpStream::connect(&fresh_endpoint).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        socket.write_all(command).unwrap();
+        let mut response = String::new();
+        socket.take(512).read_to_string(&mut response).unwrap();
+        response
+    };
+    let end = Instant::now() + Duration::from_secs(2);
+    while fresh_request(b"read\n") == "ERR NotPrimary\n" {
+        assert!(Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let empty = fresh_request(b"read\n");
+    assert!(
+        empty.contains("assigned=0 applied=0 committed=0 value=\n"),
+        "{empty}"
+    );
+    assert_eq!(fresh_request(b"write\n"), written);
+    assert_eq!(fresh_request(b"read\n"), written);
     assert_eq!(process_start(expected.node_pid), expected.node_start);
     assert_eq!(process_start(expected.app_pid), expected.app_start);
     foreground.finish();
     assert!(!Path::new(&format!("/proc/{}", expected.app_pid)).exists());
     assert!(TcpStream::connect(&endpoint).is_err());
+    assert!(TcpStream::connect(&fresh_endpoint).is_err());
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -356,15 +356,7 @@ impl Adapter {
             + usize::from(self.report_pending.is_some())
     }
     fn replica_drained(&self, node: &Node) -> bool {
-        let replica_work = |dispatch: &ra::Dispatched| {
-            matches!(
-                dispatch.effect,
-                ra::Effect::RequestReportRetry
-                    | ra::Effect::ReplicaUp(_)
-                    | ra::Effect::StatefulClosePending { .. }
-                    | ra::Effect::StatefulDroppedPending(_)
-            )
-        };
+        let replica_work = |dispatch: &ra::Dispatched| dispatch.effect.is_replica_reporting();
         self.replies.is_empty()
             && self.report_pending.is_none()
             && !self
@@ -938,6 +930,11 @@ pub(crate) mod report_tests {
         CloseService,
         DropProvider,
         DropService,
+        AbortProvider,
+        AbortService,
+        ForceAbortProvider,
+        ForceAbortService,
+        ForceDelete,
     }
 
     #[derive(Default)]
@@ -1590,7 +1587,10 @@ pub(crate) mod report_tests {
             .join(
                 if matches!(
                     mode,
-                    StatefulDown::CloseProvider | StatefulDown::DropProvider
+                    StatefulDown::CloseProvider
+                        | StatefulDown::DropProvider
+                        | StatefulDown::AbortProvider
+                        | StatefulDown::ForceAbortProvider
                 ) {
                     "local-provider-dispose.release"
                 } else {
@@ -1664,10 +1664,18 @@ pub(crate) mod report_tests {
         let close_mode = match mode {
             StatefulDown::CloseProvider | StatefulDown::CloseService => Some(ra::CloseMode::Close),
             StatefulDown::DropProvider | StatefulDown::DropService => Some(ra::CloseMode::Drop),
-            StatefulDown::Crash | StatefulDown::LeaseLoss => None,
+            StatefulDown::AbortProvider | StatefulDown::AbortService => Some(ra::CloseMode::Abort),
+            StatefulDown::ForceAbortProvider | StatefulDown::ForceAbortService => {
+                Some(ra::CloseMode::ForceAbort)
+            }
+            StatefulDown::Crash | StatefulDown::LeaseLoss | StatefulDown::ForceDelete => None,
         };
         let graceful = close_mode.is_some();
-        let expected_stage = if close_mode == Some(ra::CloseMode::Drop) {
+        let expected_stage = if matches!(
+            close_mode,
+            Some(ra::CloseMode::Drop | ra::CloseMode::Abort | ra::CloseMode::ForceAbort)
+        ) || mode == StatefulDown::ForceDelete
+        {
             ra::FmStage::ReplicaDropped
         } else {
             ra::FmStage::ReplicaDown
@@ -1687,7 +1695,10 @@ pub(crate) mod report_tests {
             node.close(body.unit.id.clone(), close_mode).map_err(err)?;
             let provider_barrier = matches!(
                 mode,
-                StatefulDown::CloseProvider | StatefulDown::DropProvider
+                StatefulDown::CloseProvider
+                    | StatefulDown::DropProvider
+                    | StatefulDown::AbortProvider
+                    | StatefulDown::ForceAbortProvider
             );
             let marker = if provider_barrier {
                 "LOCAL_DATA_PROVIDER dispose begin"
@@ -1727,13 +1738,13 @@ pub(crate) mod report_tests {
                     "held graceful disposal published completion/report or released usage".into(),
                 );
             }
-            if close_mode == ra::CloseMode::Drop {
+            if close_mode != ra::CloseMode::Close {
                 if provider_barrier {
                     for command in [b"write\n".as_slice(), b"read\n".as_slice()] {
                         let response = data_request(&endpoint, command).await?;
                         if response != "ERR NotPrimary\n" && response != "ERR ObjectClosed\n" {
                             return Err(format!(
-                                "held Drop left public access enabled: {response}"
+                                "held terminal disposal left public access enabled: {response}"
                             ));
                         }
                     }
@@ -1743,7 +1754,7 @@ pub(crate) mod report_tests {
                         .is_ok()
                 {
                     return Err(
-                        "held service Drop retained an application/replication listener".into(),
+                        "held service disposal retained an application/replication listener".into(),
                     );
                 }
             }
@@ -1753,6 +1764,15 @@ pub(crate) mod report_tests {
                 .host_lease()
                 .ok_or("missing original lease")?
                 .stop_renewal();
+        } else if mode == StatefulDown::ForceDelete {
+            fm.send(
+                delete_replica_message(
+                    &DeleteReplica::new((*body).clone(), true),
+                    &launch.generation,
+                )
+                .map_err(err)?,
+            )
+            .await?;
         }
         until(
             launch,
@@ -1781,6 +1801,28 @@ pub(crate) mod report_tests {
             );
         }
         let disposal = node.instance_disposal();
+        fm.send(add_primary_message(&body, &launch.generation).map_err(err)?)
+            .await?;
+        until(
+            launch,
+            node,
+            adapter,
+            fm,
+            link,
+            &mut traffic,
+            |_, _, traffic| traffic.reports.len() == 2,
+        )
+        .await?;
+        if traffic.reports[1] != report
+            || node
+                .snapshot(entity)
+                .committed
+                .is_none_or(|state| state.fm_stage != expected_stage || state.usage.is_some())
+        {
+            return Err(
+                "closed AddPrimary changed the original stage or allocated a lifetime".into(),
+            );
+        }
         if let Some(proof) = &disposal {
             if proof.body.replica.id != body.replica.id
                 || proof.body.replica.instance != body.replica.instance
@@ -1849,17 +1891,21 @@ pub(crate) mod report_tests {
         }
         if matches!(
             mode,
-            StatefulDown::LeaseLoss | StatefulDown::CloseProvider | StatefulDown::DropProvider
+            StatefulDown::LeaseLoss
+                | StatefulDown::CloseProvider
+                | StatefulDown::DropProvider
+                | StatefulDown::ForceAbortProvider
         ) {
             // Intentionally lose the first valid ACK; run the actual native-default timer.
             let retry_end = Instant::now() + Duration::from_secs(35);
-            while traffic.reports.len() == 1 {
+            let before_retry = traffic.reports.len();
+            while traffic.reports.len() == before_retry {
                 if Instant::now() >= retry_end {
                     return Err("lost ACK did not retry".into());
                 }
                 step(launch, node, adapter, fm, link, &mut traffic).await?;
             }
-            if traffic.reports[1] != report || node.retained_usage() != 0 {
+            if traffic.reports.last() != Some(&report) || node.retained_usage() != 0 {
                 return Err("retry changed lifetime or acquired another use".into());
             }
         }
@@ -1995,13 +2041,15 @@ pub(crate) mod report_tests {
         let result = async {
             let args = match mode {
                 StatefulDown::Crash => "--stateful-primary --crash-after-ms 5000",
-                StatefulDown::LeaseLoss => "--stateful-primary",
-                StatefulDown::CloseProvider | StatefulDown::DropProvider => {
-                    "--stateful-primary --block-provider-dispose"
-                }
-                StatefulDown::CloseService | StatefulDown::DropService => {
-                    "--stateful-primary --block-dispose"
-                }
+                StatefulDown::LeaseLoss | StatefulDown::ForceDelete => "--stateful-primary",
+                StatefulDown::CloseProvider
+                | StatefulDown::DropProvider
+                | StatefulDown::AbortProvider
+                | StatefulDown::ForceAbortProvider => "--stateful-primary --block-provider-dispose",
+                StatefulDown::CloseService
+                | StatefulDown::DropService
+                | StatefulDown::AbortService
+                | StatefulDown::ForceAbortService => "--stateful-primary --block-dispose",
             };
             node.start(
                 &launch.package,
@@ -2019,6 +2067,10 @@ pub(crate) mod report_tests {
                     | StatefulDown::CloseService
                     | StatefulDown::DropProvider
                     | StatefulDown::DropService
+                    | StatefulDown::AbortProvider
+                    | StatefulDown::AbortService
+                    | StatefulDown::ForceAbortProvider
+                    | StatefulDown::ForceAbortService
             ) {
                 release_disposal(&node, mode)
             } else {
@@ -2038,6 +2090,136 @@ pub(crate) mod report_tests {
     }
     pub(crate) async fn run_reuse(launch: &Launch) -> Result<Result<()>> {
         run_case(launch, true).await
+    }
+    async fn exercise_stateful_tombstone(
+        launch: &Launch,
+        node: &mut Node,
+        adapter: &mut Adapter,
+        fm: &Link,
+        link: &Link,
+    ) -> Result<()> {
+        let body = add_body(launch, &actual_profile(node)?);
+        let entity = body.unit.id.guid.0;
+        let mut traffic = Traffic::default();
+        fm.send(
+            delete_replica_message(&DeleteReplica::new(body.clone(), true), &launch.generation)
+                .map_err(err)?,
+        )
+        .await?;
+        until(
+            launch,
+            node,
+            adapter,
+            fm,
+            link,
+            &mut traffic,
+            |node, adapter, traffic| {
+                traffic.removed && adapter.replica_drained(node) && node.quiescent()
+            },
+        )
+        .await?;
+        if node.snapshot(entity).committed.is_none_or(|state| {
+            state.phase != ra::Phase::Closed || !state.local_deleted || state.open_token != 0
+        }) || node.retained_usage() != 0
+            || node.instance_disposal().is_some()
+            || node
+                .activation()
+                .logs()
+                .iter()
+                .any(|line| line.contains("LOCAL_CALLBACK create_replica"))
+        {
+            return Err("metadata-only Delete created a service or fabricated disposal".into());
+        }
+        let mut successor = body.clone();
+        successor.replica.id += 1;
+        successor.replica.instance += 1;
+        let mut next = launch.clone();
+        next.replica = successor.replica.id;
+        next.incarnation = successor.replica.instance;
+        traffic.removed = false;
+        fm.send(add_primary_message(&successor, &launch.generation).map_err(err)?)
+            .await?;
+        until(
+            &next,
+            node,
+            adapter,
+            fm,
+            link,
+            &mut traffic,
+            |_, _, traffic| traffic.added,
+        )
+        .await?;
+        let endpoint = traffic
+            .add_reply
+            .as_ref()
+            .ok_or("missing fresh reply")?
+            .replica
+            .service_endpoint
+            .clone();
+        let end = Instant::now() + Duration::from_secs(2);
+        loop {
+            let response = data_request(&endpoint, b"read\n").await?;
+            if response.contains("assigned=0 applied=0 committed=0 value=\n") {
+                break;
+            }
+            if response != "ERR NotPrimary\n" || Instant::now() >= end {
+                return Err(format!(
+                    "metadata tombstone did not admit fresh empty data: {response}"
+                ));
+            }
+            step(&next, node, adapter, fm, link, &mut traffic).await?;
+        }
+        fm.send(
+            delete_replica_message(
+                &DeleteReplica::new(successor.clone(), false),
+                &launch.generation,
+            )
+            .map_err(err)?,
+        )
+        .await?;
+        until(
+            &next,
+            node,
+            adapter,
+            fm,
+            link,
+            &mut traffic,
+            |node, adapter, traffic| {
+                traffic.removed
+                    && adapter.replica_drained(node)
+                    && node.instance_disposal().is_some()
+            },
+        )
+        .await?;
+        if node.instance_disposal().is_none_or(|proof| {
+            proof.body.replica.id != successor.replica.id
+                || proof.body.replica.instance != successor.replica.instance
+        }) || node.retained_usage() != 0
+        {
+            return Err("fresh service lacked its own exact original disposal".into());
+        }
+        Ok(())
+    }
+    pub(crate) async fn run_stateful_tombstone(launch: &Launch) -> Result<Result<()>> {
+        let (mut node, store) = create_node(launch).await?;
+        let mut adapter = Adapter::default();
+        let result = async {
+            node.start(
+                &launch.package,
+                APPLICATION,
+                &[("Arguments".into(), "--stateful-primary".into())],
+            )
+            .map_err(err)?;
+            let (fm, link) = links(launch).await?;
+            let result =
+                exercise_stateful_tombstone(launch, &mut node, &mut adapter, &fm, &link).await;
+            let fm_closed = fm.close().await;
+            let node_closed = link.close().await;
+            result.and(fm_closed).and(node_closed)
+        }
+        .await;
+        cleanup(launch, &mut node, &store, &mut adapter).await?;
+        Ok(result)
     }
     async fn create_node(launch: &Launch) -> Result<(Node, Arc<Store>)> {
         private_dir(&launch.directory)?;

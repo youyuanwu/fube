@@ -88,10 +88,11 @@ The [minimal FM tool](MinimalFmCluster.md#initial-stateful-fm-control) now has a
 explicit fresh volatile 1/1 variant using real AddPrimary/Reply, committed
 RA/RAP bootstrap, native initial deactivation/duplicate/retry semantics and
 independent acknowledged application write/readback. Each configured node hosts
-one independent singleton lifetime, not a multi-replica set.
+one independent singleton partition, not a multi-replica set.
 Normal FM DeleteReplica/Reply now retires that same lifetime through committed
 RAP Close and separately joined original disposal/accounting proof. The deleted
-tombstone remains nonreusable. Original singleton AppHostDown reporting now
+tombstone remains retained; explicitly requested fresh lifetimes now require
+both normal deletion and original disposal/accounting proof. Original singleton AppHostDown reporting now
 delivers ReplicaUp/Reply with native down-stage/dropped-payload and processed-
 reply semantics. Graceful Close of the original FM singleton now shares that
 native Down-stage path after committed RAP disposal, with its positive Node
@@ -99,8 +100,11 @@ proof independent from metadata ACKs. FM exposes lost volatile data, not
 recovered/reusable state. Normal Drop now reports native ReplicaDropped stage
 through the same wire exchange, requiring a dropped-description ACK and keeping
 already-closing/closed Down lifetimes unchanged.
-Abort/ForceAbort and closed-AddPrimary reporting, stateful force deletion/recreation, reconfiguration/
-peer control, recovery and complete P4/M2 remain staged.
+The [singleton lifecycle completion](MinimalFmCluster.md#singleton-lifecycle-completion-and-fresh-recreation)
+also adds Abort/ForceAbort reporting, closed-AddPrimary delivery and native force
+Delete/tombstone handling. Force host termination cannot supply graceful
+disposal or recovery proof. Reconfiguration/peer control, recovery and complete
+P4/M2 remain staged.
 
 | Area | Decision |
 |---|---|

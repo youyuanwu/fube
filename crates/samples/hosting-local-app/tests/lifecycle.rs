@@ -337,6 +337,7 @@ fn primary_endpoint(node: &Node) -> String {
     node.activation()
         .logs()
         .iter()
+        .rev()
         .find_map(|line| {
             line.split_once("LOCAL_PRIMARY listening endpoint=")
                 .map(|(_, endpoint)| endpoint.trim().to_owned())
@@ -644,7 +645,7 @@ async fn stateful_fm_delete_waits_for_real_provider_and_service_disposal_before_
             let mut source = admission().fm_source;
             let mut header = generation.clone();
             match invalid {
-                0 => body.deletion.0.force = true,
+                0 => body.replica.0.service.persisted = true,
                 1 => source.instance += 1,
                 2 => header.for_fm_replica = true,
                 _ => header.number.generation -= 1,
@@ -783,17 +784,78 @@ async fn stateful_fm_delete_waits_for_real_provider_and_service_disposal_before_
             node.instance_disposal().unwrap().acquisition,
             proof.acquisition
         );
-        assert!(node
-            .add_primary_from_fm(
-                request,
-                &admission().fm_source,
-                &GenerationHeader {
-                    number: admission().generation,
-                    for_fm_replica: false,
-                }
-            )
-            .is_err());
+        node.add_primary_from_fm(
+            request.clone(),
+            &admission().fm_source,
+            &GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        )
+        .unwrap();
+        let unchanged = until(&mut node, |n| n.pending_commands() == 0 && n.quiescent()).await;
+        assert!(unchanged.iter().all(|receipt| !matches!(
+            receipt.dispatch.effect,
+            ra::Effect::RuntimeOpen { .. } | ra::Effect::ReplicaUp(_) | ra::Effect::PrimaryReply(_)
+        )));
+        assert_eq!(
+            node.instance_disposal().unwrap().acquisition,
+            proof.acquisition
+        );
         assert_eq!(count(&node, "LOCAL_CALLBACK create_replica"), 1);
+        let mut successor = request;
+        successor.replica.id += 1;
+        successor.replica.instance += 1;
+        let generation = GenerationHeader {
+            number: admission().generation,
+            for_fm_replica: false,
+        };
+        for _ in 0..2 {
+            node.add_primary_from_fm(successor.clone(), &admission().fm_source, &generation)
+                .unwrap();
+        }
+        assert_eq!(node.pending_commands(), 2);
+        let mut conflicting = successor.clone();
+        conflicting.unit.current.configuration += 1;
+        assert_eq!(
+            node.add_primary_from_fm(conflicting, &admission().fm_source, &generation),
+            Err(fube_node::local::Error::Busy)
+        );
+        until(&mut node, |node| {
+            node.pending_commands() == 0
+                && node
+                    .snapshot(successor.unit.id.guid.0)
+                    .committed
+                    .is_some_and(|state| {
+                        state.phase == ra::Phase::Ready
+                            && state.body.replica.id == successor.replica.id
+                    })
+        })
+        .await;
+        assert_eq!(count(&node, "LOCAL_CALLBACK create_replica"), 2);
+        assert_eq!(node.retained_usage(), 1);
+        let fresh_endpoint = primary_endpoint(&node);
+        primary_ready(&mut node, &fresh_endpoint).await;
+        assert!(primary_request(&fresh_endpoint, "read\n")
+            .await
+            .contains("assigned=0 applied=0 committed=0 value=\n"));
+        assert_eq!(primary_request(&fresh_endpoint, "write\n").await, written);
+        assert_eq!(primary_request(&fresh_endpoint, "read\n").await, written);
+        node.fm_work(fube_node::local::FmWork::DeleteReplica(
+            Box::new(DeleteReplica::new(successor.clone(), false)),
+            admission().fm_source,
+            generation,
+        ))
+        .unwrap();
+        until(&mut node, |node| {
+            node.instance_disposal()
+                .is_some_and(|new_proof| new_proof.body.replica.id == successor.replica.id)
+        })
+        .await;
+        assert_ne!(
+            node.instance_disposal().unwrap().acquisition,
+            proof.acquisition
+        );
         let root = node.activation().root().unwrap().to_path_buf();
         cleanup(&mut node, &store).await;
         assert!(!root.exists());
