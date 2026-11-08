@@ -96,8 +96,10 @@ delivers ReplicaUp/Reply with native down-stage/dropped-payload and processed-
 reply semantics. Graceful Close of the original FM singleton now shares that
 native Down-stage path after committed RAP disposal, with its positive Node
 proof independent from metadata ACKs. FM exposes lost volatile data, not
-recovered/reusable state.
-Drop/Abort and closed-AddPrimary reporting, stateful force deletion/recreation, reconfiguration/
+recovered/reusable state. Normal Drop now reports native ReplicaDropped stage
+through the same wire exchange, requiring a dropped-description ACK and keeping
+already-closing/closed Down lifetimes unchanged.
+Abort/ForceAbort and closed-AddPrimary reporting, stateful force deletion/recreation, reconfiguration/
 peer control, recovery and complete P4/M2 remain staged.
 
 | Area | Decision |

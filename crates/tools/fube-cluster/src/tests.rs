@@ -764,10 +764,11 @@ fn stateful_loss_is_processed_not_echoed_and_native_deletion_never_supplies_disp
 }
 
 #[tokio::test]
-async fn stateful_app_down_and_lost_ack_retire_only_original_reporting_without_touching_sibling() {
+async fn stateful_app_terminal_and_lost_ack_retire_only_original_reporting_without_touching_sibling() {
     use node::report_tests::StatefulDown;
     for mode in [StatefulDown::Crash, StatefulDown::LeaseLoss,
-        StatefulDown::CloseProvider, StatefulDown::CloseService] {
+        StatefulDown::CloseProvider, StatefulDown::CloseService,
+        StatefulDown::DropProvider, StatefulDown::DropService] {
         let fixture = Fixture::new("stateful-loss");
         let mut config = fixture.config();
         config.profile = ServiceProfile::StatefulSingleton;
