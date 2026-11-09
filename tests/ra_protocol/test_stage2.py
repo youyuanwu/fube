@@ -19,7 +19,7 @@ class StageTwoCatalogTests(unittest.TestCase):
         records = {row["action"]: row for row in rows}
         self.assertEqual(len(rows), 119)
         self.assertEqual(sum(row["boundary"] == "true" for row in rows), 66)
-        self.assertEqual(sum("selected" in row["status"] for row in rows), 27)
+        self.assertEqual(sum("selected" in row["status"] for row in rows), 31)
         for action in consumer.STAGE_TWO_ACTIONS:
             with self.subTest(action=action):
                 row = records[action]
@@ -115,6 +115,7 @@ class StageTwoReceiptTests(unittest.TestCase):
             "schema_types": consumer.SCHEMA_TYPES, "schema_fields": consumer.SCHEMA_FIELDS,
             "target": "Linux-x86_64-short-wchar",
             "native_constants": {"PToP": 0x8013, "PToPDirect": 0},
+            "generation_factories": consumer.GENERATION_FACTORIES,
             "evidence": "source-baseline-native-stream-with-schema-adapters",
             "cases": sorted(consumer.CASES),
             "files": {name: hashlib.sha256((self.bundle / name).read_bytes()).hexdigest()
@@ -127,7 +128,10 @@ class StageTwoReceiptTests(unittest.TestCase):
 
     def test_complete_inventory_is_accepted_but_old_schema_counts_are_not(self):
         self.assertEqual(consumer.validate(self.bundle, "a" * 40, self.source), self.manifest)
-        for key, old in [("schema_types", 59), ("schema_fields", 199)]:
+        for key, old in [
+            ("schema_types", 59), ("schema_fields", 199),
+            ("schema_types", 73), ("schema_fields", 233),
+        ]:
             current = self.manifest[key]
             self.manifest[key] = old
             self.save()
@@ -158,6 +162,37 @@ class StageTwoReceiptTests(unittest.TestCase):
                     path.write_bytes(original)
             execute.assert_not_called()
         self.assertFalse((self.root / "output").exists())
+
+    def test_every_generation_case_is_required_before_any_execution(self):
+        with patch.object(consumer.subprocess, "check_output") as execute:
+            for case in sorted(consumer.GENERATION_CASES):
+                with self.subTest(case=case):
+                    self.manifest["cases"].remove(case)
+                    self.save()
+                    with self.assertRaises(ValueError):
+                        consumer.consume(self.bundle, self.root / "output", "a" * 40, self.source)
+                    self.manifest["cases"] = sorted(consumer.CASES)
+                    self.save()
+                    path = self.bundle / f"native/{case}.bin"
+                    original = path.read_bytes()
+                    path.write_bytes(b"tampered-generation-model")
+                    with self.assertRaisesRegex(ValueError, "integrity"):
+                        consumer.consume(self.bundle, self.root / "output", "a" * 40, self.source)
+                    path.write_bytes(original)
+            execute.assert_not_called()
+        self.assertFalse((self.root / "output").exists())
+
+    def test_generation_factory_metadata_cannot_be_substituted(self):
+        for action in consumer.GENERATION_ACTIONS:
+            for key, wrong in [("actor", 10), ("high_priority", False)]:
+                with self.subTest(action=action, field=key):
+                    self.manifest["generation_factories"] = {
+                        name: dict(fields) for name, fields in consumer.GENERATION_FACTORIES.items()
+                    }
+                    self.manifest["generation_factories"][action][key] = wrong
+                    self.save()
+                    with self.assertRaisesRegex(ValueError, "source/schema"):
+                        consumer.validate(self.bundle, "a" * 40, self.source)
 
 
 if __name__ == "__main__":

@@ -46,8 +46,25 @@ CASES |= {f"{profile}-{root}" for root in STAGE_TWO_ROOTS for profile in ["empty
 CASES |= {f"action-{action}" for action in STAGE_TWO_ACTIONS}
 CASES |= {"fmm-node-activate-request", "fmm-node-deactivate-request",
           "legacy-report-load", "modern-report-load"}
-SCHEMA_TYPES = 73
-SCHEMA_FIELDS = 233
+GENERATION_ACTIONS = {
+    "GenerationProposal", "GenerationProposalReply", "GenerationUpdate", "GenerationUpdateReject",
+}
+GENERATION_FACTORIES = {
+    action: {"actor": 12 if action in {"GenerationProposal", "GenerationUpdate"} else 11,
+             "high_priority": True}
+    for action in GENERATION_ACTIONS
+}
+GENERATION_CASES = {
+    "empty-generation-proposal", "default-generation-proposal-reply",
+    "rich-generation-proposal-reply-0", "rich-generation-proposal-reply--2147017398",
+    "rich-generation-proposal-reply--2147017441", "tie-generation-proposal-reply",
+    "default-generation-update", "rich-generation-update",
+    "default-generation-update-reject", "high-generation-update-reject",
+    "tie-generation-update-reject",
+} | {f"action-{action}" for action in GENERATION_ACTIONS}
+CASES |= GENERATION_CASES
+SCHEMA_TYPES = 75
+SCHEMA_FIELDS = 237
 
 
 def validate(bundle, expected_head, expected_source):
@@ -70,6 +87,7 @@ def validate(bundle, expected_head, expected_source):
     if (calculated_source != expected_source or manifest.get("schema_types") != SCHEMA_TYPES
             or manifest.get("schema_fields") != SCHEMA_FIELDS
             or manifest.get("native_constants") != {"PToP": 0x8013, "PToPDirect": 0}
+            or manifest.get("generation_factories") != GENERATION_FACTORIES
             or not manifest.get("native_sources")):
         raise ValueError("source/schema manifest mismatch")
     expected_files = {"schema.h", "native-oracle", "ra-conformance"} | {

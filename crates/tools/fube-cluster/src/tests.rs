@@ -7,6 +7,86 @@ use std::{
     os::unix::fs::PermissionsExt,
 };
 
+#[test]
+fn generation_round_retries_restarts_and_stops_before_upload_completion() {
+    use fm::{GenerationHandshake, GenerationPhase, GenerationWork};
+    let initial = launches()[0].generation.number.clone();
+    let mut round = GenerationHandshake::new(&initial).unwrap();
+    let first = round.number.clone();
+    let now = Instant::now();
+    assert!(matches!(round.next(0, now), Some(GenerationWork::Propose(_))));
+    assert!(round.next(0, now).is_none());
+    round.proposal_reply(0, &GenerationProposalReply {
+        proposed: first.clone(), current: first.clone(), error: -1,
+    }).unwrap();
+    assert!(matches!(
+        round.next(0, now + Duration::from_secs(5)),
+        Some(GenerationWork::Propose(header)) if header.number == first
+    ));
+    let mut higher = first.clone();
+    higher.generation += 3;
+    round.proposal_reply(0, &GenerationProposalReply {
+        proposed: first.clone(), current: higher.clone(), error: 0,
+    }).unwrap();
+    assert_eq!(round.number.generation, higher.generation + 1);
+    let current = round.number.clone();
+    round.proposal_reply(1, &GenerationProposalReply {
+        proposed: first.clone(), current: first, error: 0,
+    }).unwrap();
+    assert_eq!(round.phase, GenerationPhase::Proposing);
+    for index in 0..2 {
+        round.proposal_reply(index, &GenerationProposalReply {
+            proposed: current.clone(), current: current.clone(), error: 0,
+        }).unwrap();
+    }
+    assert_eq!(round.phase, GenerationPhase::AwaitingUpload);
+    let now = Instant::now();
+    for index in 0..2 {
+        assert!(matches!(
+            round.next(index, now),
+            Some(GenerationWork::Update(header)) if header.number == current
+        ));
+        assert!(round.next(index, now + Duration::from_secs(4)).is_none());
+        assert!(matches!(
+            round.next(index, now + Duration::from_secs(5)),
+            Some(GenerationWork::Update(_))
+        ));
+        assert!(round.next(index, now + Duration::from_secs(14)).is_none());
+        assert!(round.next(index, now + Duration::from_secs(15)).is_some());
+    }
+    round.reject(&initial).unwrap();
+    assert_eq!(round.number, current);
+    round.reject(&current).unwrap();
+    assert_eq!(round.number.generation, current.generation + 1);
+    assert_eq!(round.phase, GenerationPhase::Proposing);
+    assert_eq!(round.updates_sent, [false; 2]);
+    let mut exhausted = round.number.clone();
+    exhausted.generation = i64::MAX;
+    let before = round.number.clone();
+    assert!(round.reject(&exhausted).is_err());
+    assert_eq!(round.number, before);
+}
+
+#[test]
+fn generation_rebuild_gates_mutations_without_relabeling_existing_serving_state() {
+    let mut ledger = ledger();
+    ledger.accept(command("a", "create", Some(1))).unwrap();
+    assert!(ledger.begin_generation().is_err());
+    ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
+    let prior = ledger.result("a");
+    ledger.begin_generation().unwrap();
+    assert_eq!(ledger.status()["generation_handshake"]["complete"], false);
+    assert_eq!(ledger.placements[0].observed, Observed::Running);
+    for action in ["create", "delete", "activate", "deactivate"] {
+        assert!(ledger.accept(command(action, action, Some(2))).is_err());
+    }
+    assert!(matches!(
+        ledger.accept(command("a", "create", Some(1))).unwrap(),
+        Accepted::Duplicate(outcome) if outcome == prior
+    ));
+    assert!(ledger.begin_generation().is_err());
+}
+
 fn launches() -> [Launch; 2] {
     [1, 2].map(|placement| Launch {
         profile: ServiceProfile::Stateless,
@@ -489,6 +569,61 @@ fn assert_identity(actual: &Value, launch: &Launch, node_pid: u32, app_pid: u32)
     assert_eq!(actual["replica"], launch.replica);
     assert_eq!(actual["incarnation"], launch.incarnation as u64);
 }
+#[tokio::test]
+async fn real_generation_handshake_uses_correlated_replies_and_keeps_upload_gated() {
+    let fixture = Fixture::new("generation-handshake");
+    let mut cluster = Cluster::new(fixture.config()).unwrap();
+    cluster.start().await.unwrap();
+    let result: Result<()> = async {
+        let link = cluster.children[0].link.as_ref().unwrap();
+        let initial = cluster.children[0].launch.generation.clone();
+        let mut high = initial.clone();
+        high.number.generation += 10;
+        link.send(generation_update_message(
+            &GenerationUpdate { fm_service_epoch: Epoch::default() }, &high,
+        ).map_err(err)?).await?;
+        let mut rejected = link.receive(wire::deadline()).await?
+            .ok_or("missing native GenerationUpdateReject")?;
+        let proposed = decode_generation_update_reject(&rejected.message).map_err(err)?;
+        assert_eq!(proposed, initial.number);
+        if let Some(handoff) = rejected.handoff.as_mut() { handoff.acknowledge(); }
+        let reply = link.request(generation_proposal_message(&high).map_err(err)?).await?;
+        let reply = decode_generation_proposal_reply(&reply).map_err(err)?;
+        assert_eq!(reply.proposed, high.number);
+        assert_eq!(reply.current, high.number);
+        assert_eq!(reply.error, 0);
+        cluster.execute(command("sibling", "create", Some(2))).await?;
+        until(&mut cluster, |c| c.ledger.placements[1].observed == Observed::Running).await;
+        let sibling = cluster.ledger.placements[1].endpoint.clone().unwrap();
+        let started = cluster.begin_generation_handshake()?;
+        assert_eq!(started["complete"], false);
+        until(&mut cluster, |c| {
+            let Some(round) = &c.ledger.generation else { return false; };
+            round.number.generation > high.number.generation
+                && round.updates_sent == [true; 2]
+                && c.status()["nodes"].as_array().unwrap().iter().all(|node| {
+                    node["retained_work"]["generations"]["upload_pending"] == true
+                        && node["retained_work"]["generations"]["receive"]
+                            == json!(round.number)
+                })
+        }).await;
+        let status = cluster.status();
+        assert_eq!(status["generation_handshake"]["phase"], "awaiting_upload");
+        assert_eq!(status["generation_handshake"]["complete"], false);
+        for node in status["nodes"].as_array().unwrap() {
+            assert_eq!(node["retained_work"]["generations"]["send"], json!(initial.number));
+            assert_eq!(node["link_alive"], true);
+        }
+        assert_eq!(contact(&sibling)["service"], SERVICE);
+        assert!(!cluster.ledger.placements[0].created);
+        assert!(cluster.execute(command("blocked", "create", Some(1))).await.is_err());
+        Ok(())
+    }.await;
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    result.unwrap();
+}
+
 #[tokio::test]
 async fn stateful_add_primary_lost_reply_retries_the_original_native_lifetime() {
     let fixture = Fixture::new("primary-retry");

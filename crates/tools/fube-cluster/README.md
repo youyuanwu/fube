@@ -127,6 +127,16 @@ Real service-description/load IPC and node-wide barriers are described in
 [stage-two coordination](../../../docs/cluster/MinimalFmCluster.md#node-wide-coordination-stage-2).
 Live endpoint publication, general multi-FT deployment and FMM remain gated.
 
+The programmatic `Cluster::begin_generation_handshake()` starts the bounded
+ordinary-FM GenerationProposal/Reply and GenerationUpdate/Reject round.
+It requires two admitted nodes without pending lifecycle/control requests.
+This is opt-in, not a CLI command or a change to default bootstrap. Proposed,
+receive and send generations remain distinct; only receive changes on a
+matching Update. The round stops at `awaiting_upload`, `complete=false`:
+LFUM upload is not implemented, send generation does not advance, and new
+mutations/service updates are gated. Existing serving replicas and independent
+owned shutdown are not replaced. See the [stage-3 increment and remaining gates](../../../docs/cluster/MinimalFmCluster.md#ordinary-fm-generation-handshake-stage-3-increment).
+
 Native NodeUp/Ack and the final empty ReplicaUp/Reply precede RA construction.
 FM learns the actual generated package version from the original node's bounded
 private startup metadata, not a lifecycle ACK. Required Add/Remove and selected

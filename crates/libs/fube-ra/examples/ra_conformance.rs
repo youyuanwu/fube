@@ -671,6 +671,215 @@ fn stage_two(input: &Path, output: &Path) {
     }
 }
 
+fn generation_number(generation: i64, high: u64, low: u64) -> GenerationNumber {
+    let mut owner = [0; 16];
+    owner[..8].copy_from_slice(&high.to_le_bytes());
+    owner[8..].copy_from_slice(&low.to_le_bytes());
+    GenerationNumber { generation, owner }
+}
+
+fn generation_envelope(
+    input: &Path,
+    name: &str,
+    action: &str,
+    incoming: bool,
+    fmm: bool,
+) -> Message {
+    let mut message = stage_two_envelope(
+        input,
+        name,
+        action,
+        if incoming { "actor-12" } else { "actor-11" },
+        incoming.then_some(fmm),
+    );
+    message.headers[2] = Header {
+        id: HIGH_PRIORITY,
+        value: fs::read(input.join("priority.bin")).unwrap(),
+    };
+    message
+}
+
+fn reject_generation_envelopes(
+    original: &Message,
+    with_generation: bool,
+    decode: fn(&Message) -> fube_transport::Result<()>,
+) {
+    for id in [ACTOR, ACTION, HIGH_PRIORITY]
+        .into_iter()
+        .chain(with_generation.then_some(GENERATION_HEADER))
+    {
+        let mut missing = original.clone();
+        missing.headers.retain(|h| h.id != id);
+        assert!(decode(&missing).is_err());
+        let header = original.headers.iter().find(|h| h.id == id).unwrap();
+        let mut duplicate = original.clone();
+        duplicate.headers.push(header.clone());
+        assert!(decode(&duplicate).is_err());
+        let mut malformed = original.clone();
+        malformed
+            .headers
+            .iter_mut()
+            .find(|h| h.id == id)
+            .unwrap()
+            .value
+            .pop();
+        assert!(decode(&malformed).is_err());
+    }
+    let mut wrong = original.clone();
+    wrong.headers[0] = Header::actor(FMM_ACTOR).unwrap();
+    assert!(decode(&wrong).is_err());
+    wrong.headers[0] = original.headers[0].clone();
+    wrong.headers[1] = Header::action("LFUMUpload").unwrap();
+    assert!(decode(&wrong).is_err());
+    if !with_generation {
+        let mut unexpected = original.clone();
+        unexpected
+            .headers
+            .push(GenerationHeader::default().header().unwrap());
+        assert!(decode(&unexpected).is_err());
+    }
+    let mut trailing = original.clone();
+    trailing.body.push(0);
+    assert!(decode(&trailing).is_err());
+    let mut shape = original.clone();
+    shape.body = to_vec(&GenerationHeader::default()).unwrap();
+    assert!(decode(&shape).is_err());
+}
+
+fn generation_handshake(input: &Path, output: &Path) {
+    let empty = fs::read(input.join("empty-generation-proposal.bin")).unwrap();
+    assert!(empty.is_empty());
+    for fmm in [false, true] {
+        let native = generation_envelope(
+            input,
+            "empty-generation-proposal",
+            "GenerationProposal",
+            true,
+            fmm,
+        );
+        let expected = support::rich_generation(fmm);
+        assert_eq!(decode_generation_proposal(&native).unwrap(), expected);
+        let made = generation_proposal_message(&expected).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(made.body, empty);
+        assert_eq!(decode_generation_proposal(&made).unwrap(), expected);
+        reject_generation_envelopes(&native, true, |m| decode_generation_proposal(m).map(|_| ()));
+        let mut bad = native.clone();
+        bad.body = to_vec(&GenerationNumber::default()).unwrap();
+        assert!(decode_generation_proposal(&bad).is_err());
+    }
+    fs::write(output.join("empty-generation-proposal.bin"), []).unwrap();
+    let proposed = generation_number(i64::MAX, 0x8000_0000_0000_0001, u64::MAX);
+    let current = generation_number(i64::MAX, 0x8000_0000_0000_0002, 0);
+    let mut replies = vec![(
+        "default-generation-proposal-reply".to_string(),
+        GenerationProposalReply::default(),
+    )];
+    for error in [0, -2_147_017_398, -2_147_017_441] {
+        // The native rich traversal consumes counter, owner, counter, owner, error.
+        replies.push((
+            format!("rich-generation-proposal-reply-{error}"),
+            GenerationProposalReply {
+                proposed: support::rich_generation(false).number,
+                current: generation_number(
+                    -0x1234_5678_0003,
+                    u64::from_le_bytes([4, 5, 6, 7, 8, 9, 10, 11]),
+                    u64::from_le_bytes([12, 13, 14, 15, 16, 17, 18, 19]),
+                ),
+                error,
+            },
+        ));
+    }
+    replies.push((
+        "tie-generation-proposal-reply".to_string(),
+        GenerationProposalReply {
+            proposed: proposed.clone(),
+            current: current.clone(),
+            error: -2_147_017_398,
+        },
+    ));
+    for (name, body) in replies {
+        check(input, output, &name, body.clone());
+        let native = generation_envelope(input, &name, "GenerationProposalReply", false, false);
+        assert_eq!(decode_generation_proposal_reply(&native).unwrap(), body);
+        let made = generation_proposal_reply_message(&body).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(
+            made.body,
+            fs::read(output.join(format!("{name}.bin"))).unwrap()
+        );
+        assert_eq!(decode_generation_proposal_reply(&made).unwrap(), body);
+        reject_generation_envelopes(&native, false, |m| {
+            decode_generation_proposal_reply(m).map(|_| ())
+        });
+        reject_prefixes::<GenerationProposalReply>(input, &name);
+    }
+    assert!(proposed.older_than(&current));
+    let lower_low = generation_number(i64::MAX, 0x8000_0000_0000_0001, u64::MAX - 1);
+    assert!(lower_low.older_than(&proposed));
+    assert!(!proposed.older_than(&lower_low));
+    for (name, body) in [
+        ("default-generation-update", GenerationUpdate::default()),
+        (
+            "rich-generation-update",
+            GenerationUpdate {
+                fm_service_epoch: Epoch {
+                    configuration: i64::MIN + 17,
+                    data_loss: i64::MAX - 29,
+                },
+            },
+        ),
+    ] {
+        check(input, output, name, body.clone());
+        let native = generation_envelope(input, name, "GenerationUpdate", true, false);
+        let generation = support::rich_generation(false);
+        assert_eq!(
+            decode_generation_update(&native).unwrap(),
+            (body.clone(), generation.clone())
+        );
+        let made = generation_update_message(&body, &generation).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(
+            made.body,
+            fs::read(output.join(format!("{name}.bin"))).unwrap()
+        );
+        assert_eq!(
+            decode_generation_update(&made).unwrap(),
+            (body.clone(), generation)
+        );
+        reject_generation_envelopes(&native, true, |m| decode_generation_update(m).map(|_| ()));
+        let mut fmm = generation_envelope(input, name, "GenerationUpdate", true, true);
+        assert!(decode_generation_update(&fmm).is_err());
+        fmm.body.clear();
+        assert!(decode_generation_update(&fmm).is_err());
+        assert!(generation_update_message(&body, &support::rich_generation(true)).is_err());
+        reject_prefixes::<GenerationUpdate>(input, name);
+    }
+    for (name, body) in [
+        (
+            "default-generation-update-reject",
+            GenerationNumber::default(),
+        ),
+        ("high-generation-update-reject", proposed),
+        ("tie-generation-update-reject", lower_low),
+    ] {
+        check(input, output, name, body.clone());
+        let native = generation_envelope(input, name, "GenerationUpdateReject", false, false);
+        assert_eq!(decode_generation_update_reject(&native).unwrap(), body);
+        let made = generation_update_reject_message(&body).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(
+            made.body,
+            fs::read(output.join(format!("{name}.bin"))).unwrap()
+        );
+        assert_eq!(decode_generation_update_reject(&made).unwrap(), body);
+        reject_generation_envelopes(&native, false, |m| {
+            decode_generation_update_reject(m).map(|_| ())
+        });
+        reject_prefixes::<GenerationNumber>(input, name);
+    }
+}
+
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
     if args.len() == 2 && args[1] == "--identity" {
@@ -956,6 +1165,10 @@ fn main() {
         "ReplicaEndpointUpdated",
         "ReplicaEndpointUpdatedReply",
         "ReportLoad",
+        "GenerationProposal",
+        "GenerationProposalReply",
+        "GenerationUpdate",
+        "GenerationUpdateReject",
     ] {
         check(
             input,
@@ -1058,5 +1271,6 @@ fn main() {
         }
     }
     stage_two(input, output);
-    println!("101 cases verified; all selected-body proper prefixes rejected");
+    generation_handshake(input, output);
+    println!("116 cases verified; all selected-body proper prefixes rejected");
 }

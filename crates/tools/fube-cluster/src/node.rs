@@ -710,7 +710,13 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     .await
                 {
                     Ok(Some(mut incoming)) => {
-                        match receive_command(launch, &mut node, &incoming.message) {
+                        let received =
+                            match receive_generation(launch, &node, current, &mut incoming).await {
+                                Ok(true) => Ok(None),
+                                Ok(false) => receive_command(launch, &mut node, &incoming.message),
+                                Err(error) => Err(error),
+                            };
+                        match received {
                             Ok(acknowledgement) => {
                                 if let Some(acknowledgement) = acknowledgement {
                                     adapter.acknowledgements.push(acknowledgement);
@@ -772,6 +778,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 }
             }
             if next_observation <= Instant::now() {
+                let generations = node.generation_state();
                 let observation = serde_json::json!({
                     "deployment":launch.deployment, "session":launch.session,
                     "node_pid":std::process::id(), "external_pending":node.external_pending().len(),
@@ -779,6 +786,11 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     "semantic_pending":adapter.semantic_pending(),
                     "staged_status":format!("{:?}", node.pending_status()),
                     "error":adapter.error, "link_alive":link.is_some(),
+                    "generations": {
+                        "proposed":generations.proposed, "receive":generations.receive,
+                        "send":generations.send, "upload_pending":generations.upload_pending,
+                        "upload_supported":false,
+                    },
                 });
                 if let Err(error) =
                     write_json(&launch.directory.join("observation.json"), &observation)
@@ -947,6 +959,46 @@ fn receive_command(
         _ => return Err("unsupported command".into()),
     }
     Ok(None)
+}
+async fn receive_generation(
+    launch: &Launch,
+    node: &Node,
+    link: &Link,
+    incoming: &mut fube_transport::channel::IncomingMessage<
+        fube_transport::native_channel::GatewayTarget,
+    >,
+) -> Result<bool> {
+    let message = &incoming.message;
+    match message.properties().map_err(err)?.action.as_str() {
+        "GenerationProposal" => {
+            wire::predecode(message)?;
+            let header = decode_generation_proposal(message).map_err(err)?;
+            let body = node
+                .process_generation_proposal(&launch.fm, &header)
+                .map_err(err)?;
+            let reply = generation_proposal_reply_message(&body).map_err(err)?;
+            incoming
+                .reply
+                .take()
+                .ok_or("GenerationProposal missing consuming request context")?
+                .reply(link.seal(reply)?, wire::deadline())
+                .await
+                .map_err(err)?;
+        }
+        "GenerationUpdate" => {
+            wire::predecode(message)?;
+            let (body, header) = decode_generation_update(message).map_err(err)?;
+            if let ra::GenerationUpdateOutcome::Rejected(proposed) = node
+                .process_generation_update(&launch.fm, &body, &header)
+                .map_err(err)?
+            {
+                link.send(generation_update_reject_message(&proposed).map_err(err)?)
+                    .await?;
+            }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 async fn cleanup(
     launch: &Launch,

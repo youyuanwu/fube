@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod bootstrap;
 pub use bootstrap::*;
+pub mod generation;
+pub use generation::*;
 pub mod node_control;
 pub use node_control::*;
 

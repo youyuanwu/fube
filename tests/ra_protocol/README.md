@@ -10,10 +10,11 @@ The producer compiles the **unmodified** native `FabricStream.cpp`,
 `FabricSerializable.cpp`, `FabricSerializableStream.cpp`,
 `FabricSerializationTypes.cpp`, `ByteCompressor.h` and
 `Common/FabricSerializationHelper.h`. It mechanically extracts field macros
-and member declarations for 73 schema types/233 members, including the selected
+and member declarations for 75 schema types/237 members, including the selected
 Add, inherited DeleteReplica, reply, ReplicaUp/Reply and service-type
 notification request/reply bodies, NodeUp/Ack's complete schema closure and the
-six-field Federation PToP header value, node controls, status and complete load graph.
+six-field Federation PToP header value, node controls, status, complete load graph
+and generation-handshake reply/update bodies.
 The native helper macros generate their actual Write/Read methods. Nested
 fields are not inferred from Rust or encoded as handwritten wire bytes.
 
@@ -35,7 +36,7 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 101 inputs.
+The C++ producer independently constructs expected values and emits 116 inputs.
 The existing 36 cases and their contracts are retained:
 default/rich AddInstance, default/error AddInstanceReply, default/rich Remove
 (force false/true), default/rich removal reply, explicit-empty/rich ReplicaUp
@@ -52,7 +53,7 @@ Nondefault cases cover GUID/raw NodeId, high-bit instances, negative LSN/epochs,
 UTF-16/surrogates, enums/errors, all service collections and null/Invalid/both
 derived scaling variants. Rust rejects every proper prefix of rich body
 fixtures including both rich force bodies and the rich/partial notification
-bodies; native rejects 26 truncated bodies, including NodeUp, Ack, PToP
+bodies; native rejects 31 truncated bodies, including NodeUp, Ack, PToP
 and the distinct DeleteReplica/Reply fixtures.
 Non-polymorphic Delete inheritance invokes base rich traversal and native
 base/derived scopes, not a flattened or nested replacement. ReplicaUp's empty
@@ -121,7 +122,7 @@ All original 58 cases, 59 types/199 fields, 62 files and eleven native
 truncation rejections remain preserved. This extension adds **43 inputs**:
 initialized empty and rich roots for all thirteen actions; their thirteen
 literal action headers; two signed high-bit/FMM activation request values;
-legacy-only and modern-only ReportLoad roots. Current totals are **101 cases,
+legacy-only and modern-only ReportLoad roots. Stage-two totals were **101 cases,
 73 types/233 fields, 105 bundle files and 26 native truncation rejections**.
 Every proper prefix of every new body fixture is rejected by Rust.
 
@@ -169,6 +170,58 @@ deferred to stage 5**: pinned EndpointPublishState derives its publication
 timeout from reconfiguration duration and asserts pending publication requires
 active reconfiguration. Encoding or acknowledging an endpoint body cannot
 substitute for those state-machine preconditions.
+
+### Generation-handshake-only codecs
+
+Fifteen inputs retain all prior 101 cases and increase the current wire gate to
+**116 cases, 75 types/237 fields, 120 bundle files and 31 native truncation
+rejections**. This is generation-handshake only, not LFUM upload, complete stage
+three, rebuild completion or native runtime interoperability. Historical bundle
+receipts are unchanged; a new source-bound development receipt does not relabel
+old development receipts as clean-head production.
+
+The four literal action fixtures are GenerationProposal, GenerationProposalReply,
+GenerationUpdate and GenerationUpdateReject. Source-extracted RSMessage factory
+definitions are validated and recorded in the manifest: all default to
+priority=true; proposal/update target RA=12 and reply/reject use FM=11.
+GenerationProposal has exactly zero body bytes, not a serialized empty object.
+Its FM/FMM owner flag remains in GenerationHeader. Native
+`fm/RebuildContext.cpp:85–88` uses BroadcastRequest and
+`ReliabilitySubsystem.cpp:318–386` preprocesses it and replies through the
+original request context. Therefore the reply does **not** go through
+SendToFMM and keeps Actor FM=11 even for an FMM proposal. It has no
+GenerationHeader. Correlation IDs and the consuming reply context belong to
+the transport composition, not the body factory.
+
+The native reply body is `(GenerationNumber proposedGeneration_,
+GenerationNumber currentGeneration_, ErrorCode error_)`. ErrorCode retains the
+native primitive LONG64 schema, not a nested object or diagnostic string.
+Default, rich success/two nonzero errors and a tied signed-generation/high-bit
+NodeId fixture run in both directions. The high owner fixture deliberately has
+the lower high limb but the larger low limb; a separate reject fixture compares
+equal-high owners differing only in low limb. Rust exercises production
+`older_than` on the decoded values. Actual original-native comparator execution
+remains the separate 64-pair helper gate below; wire adapters do not pretend to
+execute native generation algorithms.
+
+GenerationUpdate contains exactly one Epoch object, whose wire field order is
+**configuration, data loss**, opposite its native constructor arguments.
+Initialized default and distinct `INT64_MIN+17`/`INT64_MAX-29` fields are checked.
+The ordinary-FM body is mandatory; the native FMM bodyless branch is rejected,
+including an attempted full-body FMM update. It is not a successful stub.
+GenerationUpdateReject directly serializes GenerationNumber, without a wrapper
+or GenerationHeader. Its selected destination is ordinary FM=11; native
+`GenerationStateManager.cpp:272–282` uses SendToFMM/Actor=10 for the excluded
+FMM branch. Three rejection-body fixtures cover default and high/tied owners.
+
+Every new nonempty fixture rejects all proper prefixes in Rust, and native
+executes five additional truncated-body rejections. Production decoder tests
+reject malformed/missing/duplicate headers, cross-actions, wrong actor,
+unexpected reply/reject generation headers, bodyless FM update, wrong body
+shape and trailing bytes. Priority is parsed as valid native factory metadata,
+not treated as proof of negotiation success. Receive-generation progress is
+not send-generation advancement: LFUMUpload/Reply and pending-upload completion
+remain separate, unselected work.
 
 ### Bootstrap and source identity header extension
 
@@ -249,8 +302,8 @@ env PATH=/nonexistent /usr/bin/python3 -m tests.ra_protocol.consumer \
   --expected-head COMMIT --expected-source SOURCE_DIGEST
 ```
 
-The bundle has exactly 101 `native/*.bin`, `schema.h`, `native-oracle`,
-`ra-conformance` and `manifest.json` (105 files total). No other files are
+The bundle has exactly 116 `native/*.bin`, `schema.h`, `native-oracle`,
+`ra-conformance` and `manifest.json` (120 files total). No other files are
 accepted. The consumer verifies exact coverage/type/member counts, regular files, hashes,
 provenance and both compiled source identities **before** execution. Missing,
 modified, wrong-source and symlink inputs fail; it imports no producer and
@@ -262,6 +315,7 @@ production/execution claim:
 ```sh
 python3 -m unittest tests.offline.cluster.test_ra_protocol_inputs -v
 python3 -m unittest tests.ra_protocol.test_stage2 -v
+python3 -m unittest tests.ra_protocol.test_generation -v
 cargo test --locked -p fube-ra
 ```
 
@@ -273,8 +327,8 @@ final delivery produces again at the clean reviewed implementation head.
 
 ## Separate actual-native helper evidence
 
-The helper producer is **not part of, and does not change**, the 101-case,
-73-type/233-field wire bundle or its compiler-free consumer. It compiles
+The helper producer is **not part of, and does not change**, the 116-case,
+75-type/237-field wire bundle or its compiler-free consumer. It compiles
 unmodified `pal/wc16.c`, `RetryableErrorState.cpp` and
 `RetryableErrorStateThresholdCollection.cpp`. Identifier, `LargeInteger`,
 `NodeId`, `GenerationNumber`, `CheckGenerationHeader` and `GetGenerationState`

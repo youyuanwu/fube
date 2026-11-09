@@ -100,7 +100,18 @@ template<class T> void reject_truncated(T value) {
     auto bytes=encode(value);
     bytes.resize(bytes.size()/2);
     T received;
-    if(decode(bytes,received)) throw std::runtime_error("native accepted truncated stage-two body");
+    if(decode(bytes,received)) throw std::runtime_error("native accepted truncated body");
+}
+inline void bodyless(const std::string& mode,const std::filesystem::path& dir,
+                     const std::string& name) {
+    auto path=dir/(name+".bin");
+    if(mode=="produce") {
+        std::ofstream output(path,std::ios::binary);
+        if(!output) throw std::runtime_error("bodyless write failed");
+    } else if(!read_file(path).empty()) {
+        throw std::runtime_error("bodyless proposal has a body");
+    }
+    std::cout << name << " " << mode << " OK\n";
 }
 inline FabricVersionInstance fresh_version() {
     FabricVersionInstance value;
@@ -346,6 +357,49 @@ int main(int argc,char** argv) {
             std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
             run(mode,dir,"action-"+ascii,action);
         }
+        bodyless(mode,dir,"empty-generation-proposal");
+        if(GenerationProposalActor!=12 || GenerationUpdateActor!=12 ||
+           GenerationProposalReplyActor!=11 || GenerationUpdateRejectActor!=11 ||
+           !GenerationProposalPriority || !GenerationProposalReplyPriority ||
+           !GenerationUpdatePriority || !GenerationUpdateRejectPriority)
+            throw std::runtime_error("native generation factory metadata mismatch");
+        GenerationProposalReplyMessageBody proposal_reply;
+        run(mode,dir,"default-generation-proposal-reply",proposal_reply);
+        c=0; rich(proposal_reply,c);
+        for(LONG error:{0, -2147017398, -2147017441}) {
+            proposal_reply.error_.value_=Enum(error);
+            run(mode,dir,"rich-generation-proposal-reply-"+std::to_string(error),proposal_reply);
+        }
+        reject_truncated(proposal_reply);
+        proposal_reply.proposedGeneration_.generation_=INT64_MAX;
+        proposal_reply.proposedGeneration_.owner_.high_=0x8000000000000001ULL;
+        proposal_reply.proposedGeneration_.owner_.low_=UINT64_MAX;
+        proposal_reply.currentGeneration_.generation_=INT64_MAX;
+        proposal_reply.currentGeneration_.owner_.high_=0x8000000000000002ULL;
+        proposal_reply.currentGeneration_.owner_.low_=0;
+        proposal_reply.error_.value_=Enum(-2147017398);
+        run(mode,dir,"tie-generation-proposal-reply",proposal_reply);
+        reject_truncated(proposal_reply);
+        GenerationUpdateMessageBody generation_update;
+        run(mode,dir,"default-generation-update",generation_update);
+        generation_update.fmServiceEpoch_.configurationVersion_=INT64_MIN+17;
+        generation_update.fmServiceEpoch_.dataLossVersion_=INT64_MAX-29;
+        run(mode,dir,"rich-generation-update",generation_update);
+        reject_truncated(generation_update);
+        GenerationNumber generation_reject;
+        run(mode,dir,"default-generation-update-reject",generation_reject);
+        generation_reject=proposal_reply.proposedGeneration_;
+        run(mode,dir,"high-generation-update-reject",generation_reject);
+        reject_truncated(generation_reject);
+        generation_reject.owner_.low_=UINT64_MAX-1;
+        run(mode,dir,"tie-generation-update-reject",generation_reject);
+        reject_truncated(generation_reject);
+        for(auto name:{u"GenerationProposal",u"GenerationProposalReply",
+                      u"GenerationUpdate",u"GenerationUpdateReject"}) {
+            action.action_=text(name);
+            std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
+            run(mode,dir,"action-"+ascii,action);
+        }
         // Native rejection is executed, not inferred from Rust behavior.
         auto bad=encode(request); bad.resize(bad.size()/2);
         ReplicaMessageBody rejected_request;
@@ -380,7 +434,7 @@ int main(int argc,char** argv) {
         bad=encode(ptop); bad.resize(bad.size()/2);
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
-        std::cout << "native rejects 26 truncations OK\n";
+        std::cout << "native rejects 31 truncations OK\n";
         return 0;
     } catch(const std::exception& error) {
         std::cerr << error.what() << "\n"; return 1;

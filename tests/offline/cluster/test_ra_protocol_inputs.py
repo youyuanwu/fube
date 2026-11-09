@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tests.ra_protocol.consumer import CASES, REVISION, consume, validate
+from tests.ra_protocol.consumer import CASES, GENERATION_FACTORIES, REVISION, consume, validate
 from tests.ra_protocol import schema
 
 
@@ -29,7 +29,8 @@ class InputTests(unittest.TestCase):
             "format": 1, "native_revision": REVISION, "head": "a" * 40,
             "source_digest": self.source, "source_inputs": self.inputs,
             "native_sources": {"model-only": "not-execution"},
-            "schema_types": 73, "schema_fields": 233, "target": "Linux-x86_64-short-wchar",
+            "schema_types": 75, "schema_fields": 237, "target": "Linux-x86_64-short-wchar",
+            "generation_factories": GENERATION_FACTORIES,
             "native_constants": {"PToP": 0x8013, "PToPDirect": 0},
             "evidence": "source-baseline-native-stream-with-schema-adapters",
             "cases": sorted(CASES),
@@ -43,8 +44,8 @@ class InputTests(unittest.TestCase):
 
     def test_inventory_model_is_valid_not_an_execution_claim(self):
         manifest = validate(self.bundle, "a" * 40, self.source)
-        self.assertEqual(len(manifest["cases"]), 101)
-        self.assertEqual(len(manifest["files"]) + 1, 105)
+        self.assertEqual(len(manifest["cases"]), 116)
+        self.assertEqual(len(manifest["files"]) + 1, 120)
 
     def test_exact_schema_counts_and_extra_files_are_rejected(self):
         for key in ["schema_types", "schema_fields"]:

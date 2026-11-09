@@ -139,6 +139,49 @@ endpoint publication remains gated until stage-5 reconfiguration. Codec/model/
 native-free results are not complete C++ handler traces, native FM interoperability,
 general multi-FT deployment or complete P2/P4/M2 parity.
 
+## Ordinary-FM generation handshake (stage-3 increment)
+
+The ordinary-FM proposal/reply and update/reject paths are enabled on the
+original bounded session. Proposal is a consuming correlated request, not a
+one-way notification; all four native factories are high priority. Proposal
+and Update carry GenerationHeader, while Reply and Reject do not. Preprocessing
+retains the highest proposal even before owner readiness; a non-open RA returns
+the native RANotReadyForUse error after recording it. FMM and a local FM-service
+FT remain gated, including the latter's epoch/ForceAbort dependency.
+
+Proposed, receive and send generations are separate session-only values,
+initially seeded from fresh NodeUpAck. An Update matching the proposal changes
+receive and records that upload is required, with no successful Update reply.
+An unmatched Update sends the native proposed-generation rejection; messages
+below receive are ignored. The generation/publication lock also protects
+locked-entity admission. Already-running commits retain their original
+operation/fence; definite failure and uncertainty cannot publish private state
+or fabricate an uploaded inventory. No snapshot job, LFUMUpload or upload ACK
+is implemented yet, so the handshake never advances send generation or grants
+new serving/restart authority.
+
+Programmatic `Cluster::begin_generation_handshake()` opts the two original,
+admitted nodes into a bounded FM round only when lifecycle/control requests
+are not pending. It is not a new CLI command and does not change default
+startup. The FM retries proposals and pending updates, restarting negotiation
+above a higher proposal or qualifying rejection. Retry timing uses native
+five-/ten-second defaults; dynamic FM rebuild configuration and Federation
+broadcast membership are not enabled. The round intentionally remains
+`awaiting_upload`, `complete=false`, with mutations/service updates gated.
+Existing replicas are not reopened or relabeled as recovered; independent
+owner shutdown and real application access remain available.
+
+Only generation-control messages bypass the deployed envelope's frozen launch
+generation. Other live action families remain restricted to that original
+generation until LFUM completion is implemented; the generic RA model does
+apply current receive-generation admission. This is not a fully rebuilt FM or
+native Federation interoperability. Focused model/store tests cover stale and
+duplicate traffic, reordered proposals, definite/unknown commits and queued
+entity admission. Real nodes exercise correlated replies, rejection,
+renegotiation, unchanged send generation and independent sibling access.
+Bidirectional native codecs and native ordering/admission helpers are separate
+from the still-required complete C++ handler traces and interoperability gates.
+
 ## Initial stateful FM control
 
 Run the same executable with `--app /absolute/hosting-local-app

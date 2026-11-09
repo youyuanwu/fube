@@ -289,6 +289,12 @@ impl Cluster {
         let action = incoming.message.properties().map_err(err)?.action;
         let generation = self.children[index].launch.generation.clone();
         match action.as_str() {
+            "GenerationUpdateReject" => {
+                let current = decode_generation_update_reject(&incoming.message).map_err(err)?;
+                if let Some(round) = &mut self.ledger.generation {
+                    round.reject(&current)?;
+                }
+            }
             "ServiceTypeEnabled" | "ServiceTypeDisabled" => {
                 let enabled = action == "ServiceTypeEnabled";
                 let body = if enabled {
@@ -368,6 +374,12 @@ impl Cluster {
                 let (body, owner) = decode_replica_up(&incoming.message).map_err(err)?;
                 if owner != Owner::Fm {
                     return Err("FMM report unsupported".into());
+                }
+                if self.ledger.generation.is_some() {
+                    if let Some(handoff) = incoming.handoff.as_mut() {
+                        handoff.acknowledge();
+                    }
+                    return Ok(()); // Rebuild cannot acknowledge inventory without LFUM support.
                 }
                 let response = self.ledger.report(index, &body)?;
                 let Some(response) = response else {
@@ -454,6 +466,7 @@ impl Cluster {
             };
             let result = result.and_then(|()| self.read_retirement(index));
             let result = match result {
+                Ok(()) if self.ledger.generation.is_some() => self.retry_generation(index).await,
                 Ok(()) => self.retry_primary(index).await,
                 Err(error) => Err(error),
             };
@@ -473,7 +486,62 @@ impl Cluster {
             }
         }
     }
+    /// Begin the bounded native handshake, not a completed FM rebuild. New
+    /// mutations remain gated until the future LFUM implementation completes.
+    pub fn begin_generation_handshake(&mut self) -> Result<Value> {
+        if self.finished.is_some() || self.children.len() != 2 {
+            return Err("generation handshake requires the original running cluster".into());
+        }
+        self.ledger.begin_generation()?;
+        Ok(self.status()["generation_handshake"].clone())
+    }
+    async fn retry_generation(&mut self, index: usize) -> Result<()> {
+        let Some(work) = self
+            .ledger
+            .generation
+            .as_mut()
+            .and_then(|round| round.next(index, Instant::now()))
+        else {
+            return Ok(());
+        };
+        let link = self.children[index]
+            .link
+            .as_ref()
+            .ok_or("original generation link absent")?;
+        match work {
+            fm::GenerationWork::Propose(header) => {
+                if let Some(message) = link
+                    .request_optional(generation_proposal_message(&header).map_err(err)?)
+                    .await?
+                {
+                    wire::predecode(&message)?;
+                    let body = decode_generation_proposal_reply(&message).map_err(err)?;
+                    self.ledger
+                        .generation
+                        .as_mut()
+                        .ok_or("generation owner lost")?
+                        .proposal_reply(index, &body)?;
+                }
+            }
+            fm::GenerationWork::Update(header) => {
+                link.send(
+                    generation_update_message(
+                        &GenerationUpdate {
+                            fm_service_epoch: Epoch::default(),
+                        },
+                        &header,
+                    )
+                    .map_err(err)?,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
     async fn retry_node_work(&mut self, index: usize) -> Result<()> {
+        if self.ledger.generation.is_some() {
+            return Ok(());
+        }
         let now = Instant::now();
         let control = self.ledger.node_control_retry(index, now);
         let service = self.ledger.service_update_retry(index, now);
@@ -511,6 +579,9 @@ impl Cluster {
             .await
     }
     async fn retry_deletion(&mut self, index: usize) -> Result<()> {
+        if self.ledger.generation.is_some() {
+            return Ok(());
+        }
         let Some(body) = self.ledger.deletion_retry(index, Instant::now())? else {
             return Ok(());
         };
@@ -639,6 +710,9 @@ impl Cluster {
         Ok(self.ledger.result(&op))
     }
     pub async fn update_service(&mut self, index: usize, service: Service) -> Result<()> {
+        if self.ledger.generation.is_some() {
+            return Err("service update is gated while generation upload is pending".into());
+        }
         let placement = self
             .ledger
             .placements

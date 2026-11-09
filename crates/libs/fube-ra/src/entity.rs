@@ -41,6 +41,9 @@ pub use endpoint_publish::EndpointPublishState;
 #[path = "hosting_events.rs"]
 mod hosting_events;
 pub use hosting_events::*;
+#[path = "generation.rs"]
+mod generation;
+pub use generation::{GenerationState, GenerationUpdateOutcome};
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -646,6 +649,8 @@ pub struct Statistics {
 }
 #[derive(Default)]
 struct View {
+    generations: GenerationState,
+    generations_touched: bool,
     statuses: Option<LocalStatusConsumer>,
     entities: BTreeMap<EntityId, Snapshot>,
     effects: VecDeque<Dispatched>,
@@ -657,6 +662,8 @@ struct View {
     node: node_coordination::Coordinator,
 }
 struct Shared {
+    fm_source: NodeInstance,
+    node_open: bool,
     consumer_lifetime: ConsumerLifetime,
     view: Mutex<View>,
     settings: Settings,
@@ -710,12 +717,15 @@ impl Executor {
         let (sender, receiver) = mpsc::channel(settings.max_outstanding);
         let (done, closed) = watch::channel(None);
         let shared = Arc::new(Shared {
+            fm_source: admission.fm_source.clone(),
+            node_open: admission.node_open,
             consumer_lifetime: ConsumerLifetime {
                 accepting: Arc::new(AtomicBool::new(true)),
             },
             config: Arc::new(NativeConfig::new(&settings)),
             notification_clock,
             view: Mutex::new(View {
+                generations: GenerationState::seeded(admission.generation.clone()),
                 statuses: Some(LocalStatusConsumer::new(
                     settings.max_service_types,
                     settings.max_command_bytes,
@@ -1048,6 +1058,7 @@ impl Executor {
         if !view.accepting
             || !view.entities.is_empty()
             || view.activation_seeded
+            || view.generations_touched
             || view.stats.accepted != 0
         {
             return Err(Failure::Unsupported(
@@ -1163,6 +1174,9 @@ async fn supervise(
 
 fn finish_node(shared: &Shared, work: Submission, admission: &Admission) {
     let mut view = lock(&shared.view);
+    let mut admission = admission.clone();
+    admission.generation = view.generations.receive.clone();
+    let admission = &admission;
     // Work/byte/effect admission is already reserved. A fallible clock/counter/
     // codec preparation never publishes a partially advanced coordinator.
     let mut notification = view.notification.clone();
@@ -1857,8 +1871,6 @@ async fn entity_worker(
 ) {
     let mut committed: Option<Arc<EntityState>> = None;
     while let Some(work) = receiver.recv().await {
-        let mut effective_admission = admission.clone();
-        effective_admission.node_activated = lock(&shared.view).node.activation.activated;
         let binding = match &work.kind {
             Kind::CloseForNodeDeactivation => from_slice::<i64>(&work.bytes)
                 .map_err(|_| Failure::Admission("invalid deactivation job"))
@@ -1881,6 +1893,10 @@ async fn entity_worker(
         };
         let bound = binding == Ok(true);
         let mut outcome = if bound {
+            let view = lock(&shared.view);
+            let mut effective_admission = admission.clone();
+            effective_admission.node_activated = view.node.activation.activated;
+            effective_admission.generation = view.generations.receive.clone();
             transition(
                 &work,
                 committed.as_deref(),

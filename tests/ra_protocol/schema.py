@@ -54,6 +54,8 @@ MODELS = [
     ("ReplicaUpMessageBody", COMMON + "ReplicaUpMessageBody.h", ""),
     ("GenerationNumber", "Reliability/Failover/GenerationNumber.h", ""),
     ("GenerationHeader", COMMON + "GenerationHeader.h", ""),
+    ("GenerationProposalReplyMessageBody", COMMON + "GenerationProposalReplyMessageBody.h", ""),
+    ("GenerationUpdateMessageBody", COMMON + "GenerationUpdateMessageBody.h", ""),
     ("ActorHeader", "Transport/ActorHeader.h", ""),
     ("ActionHeader", "Transport/ActionHeader.h", ""),
     ("HighPriorityHeader", "Transport/HighPriorityHeader.h", ""),
@@ -109,6 +111,12 @@ EXTRA_NATIVE_INPUTS = [
     "Reliability/Failover/ra/Communication.FMMessageBuilder.cpp",
     "Reliability/Failover/ra/ReconfigurationAgent.cpp",
     "Reliability/Failover/ra/EndpointPublishState.cpp",
+    "Reliability/Failover/ReliabilitySubsystem.cpp",
+    "Reliability/Failover/fm/RebuildContext.cpp",
+    "Reliability/Failover/ra/GenerationStateManager.cpp",
+    "Reliability/Failover/GenerationNumber.cpp",
+    "ServiceModel/federation/NodeId.cpp",
+    "Common/LargeInteger.cpp",
 ]
 
 ENUMS = {
@@ -222,9 +230,30 @@ def native_constants(native):
     return result
 
 
+def generation_factories(native):
+    root = native / "src/prod/src"
+    text = (root / COMMON / "RSMessage.cpp").read_text()
+    result = {}
+    for action, factory, actor in [
+        ("GenerationProposal", "CreateFMToRAMessage", 12),
+        ("GenerationProposalReply", "CreateRAToFMMessage", 11),
+        ("GenerationUpdate", "CreateFMToRAMessage", 12),
+        ("GenerationUpdateReject", "CreateRAToFMMessage", 11),
+    ]:
+        match = re.findall(
+            rf'RSMessage::{action}\s*=\s*(\w+)\(L"([^"]+)",\s*(true|false)\b',
+            text,
+        )
+        if match != [(factory, action, "true")]:
+            raise ValueError(f"native generation factory changed: {action}")
+        result[action] = {"actor": actor, "high_priority": True}
+    return result
+
+
 def generate(native, destination):
     models = extract(native)
     constants = native_constants(native)
+    factories = generation_factories(native)
     output = [
         "// Generated from pinned native headers; source macro/member provenance below.",
         "#pragma once", "#include <Serialization.h>", "#include <FabricSerializationHelper.h>",
@@ -251,6 +280,11 @@ def generate(native, destination):
         "// NodeDescription.h:93; native uint is adapted to ULONG.",
         "DEFINE_USER_MAP_UTILITY(std::wstring, ULONG);",
     ]
+    for action, factory in factories.items():
+        output += [
+            f"constexpr LONG {action}Actor = {factory['actor']};",
+            f"constexpr bool {action}Priority = true;",
+        ]
     for name, path, base, macro, fields in models:
         inheritance = "" if base is None else f" : {base or 'Serialization::FabricSerializable'}"
         output += [f"// {path} (native field types retained in comments)", f"struct {name}{inheritance} {{"]

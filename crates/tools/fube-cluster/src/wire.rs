@@ -63,6 +63,7 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
                 | "ServiceTypeEnabled"
                 | "ServiceTypeDisabled"
                 | "ReportLoad"
+                | "GenerationUpdateReject"
         )
         || props.expects_reply != (props.action == "NodeUp")
         || props.high_priority
@@ -74,6 +75,7 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
                     | "AddPrimaryReply"
                     | "RemoveInstanceReply"
                     | "DeleteReplicaReply"
+                    | "GenerationUpdateReject"
             )
     {
         return Err(fube_transport::Error::Protocol("unsupported FM ingress"));
@@ -83,7 +85,7 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
 fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result<()> {
     bounded(message)?;
     if props.actor != RA_ACTOR
-        || props.expects_reply
+        || props.expects_reply != (props.action == "GenerationProposal")
         || props.uncorrelated_reply
         || props.high_priority
             != matches!(
@@ -93,6 +95,8 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
                     | "RemoveInstance"
                     | "DeleteReplica"
                     | "ReplicaUpReply"
+                    | "GenerationProposal"
+                    | "GenerationUpdate"
             )
         || !matches!(
             props.action.as_str(),
@@ -107,6 +111,8 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
                 | "NodeUpdateServiceRequest"
                 | "ServiceTypeEnabledReply"
                 | "ServiceTypeDisabledReply"
+                | "GenerationProposal"
+                | "GenerationUpdate"
         )
     {
         return Err(fube_transport::Error::Protocol("unsupported node ingress"));
@@ -127,18 +133,27 @@ fn ack(message: &Message, props: &Properties) -> fube_transport::Result<()> {
     }
     Ok(())
 }
-fn reject(_: &Message, _: &Properties) -> fube_transport::Result<()> {
-    Err(fube_transport::Error::Protocol(
-        "ordinary reply unsupported",
-    ))
-}
-fn fm_out(message: &Message, props: &Properties, kind: OutboundKind) -> fube_transport::Result<()> {
-    if kind == OutboundKind::Rpc {
+fn proposal_ack(message: &Message, props: &Properties) -> fube_transport::Result<()> {
+    bounded(message)?;
+    if props.actor != FM_ACTOR
+        || props.action != "GenerationProposalReply"
+        || props.expects_reply
+        || props.uncorrelated_reply
+        || !props.high_priority
+    {
         return Err(fube_transport::Error::Protocol(
-            "FM reverse RPC unsupported",
+            "unsupported generation proposal reply",
         ));
     }
-    node_ingress(message, props)
+    Ok(())
+}
+fn fm_out(message: &Message, props: &Properties, kind: OutboundKind) -> fube_transport::Result<()> {
+    if (kind == OutboundKind::Rpc) != (props.action == "GenerationProposal") {
+        return Err(fube_transport::Error::Protocol("wrong FM send mechanism"));
+    }
+    let mut canonical = message.properties()?;
+    canonical.expects_reply = canonical.action == "GenerationProposal";
+    node_ingress(message, &canonical)
 }
 fn node_out(
     message: &Message,
@@ -156,7 +171,7 @@ fn node_out(
 pub fn composition(fm: bool) -> fube_transport::Result<ChannelComposition> {
     Ok(ChannelComposition {
         outbound: if fm { fm_out } else { node_out },
-        ordinary_reply: if fm { reject } else { ack },
+        ordinary_reply: if fm { proposal_ack } else { ack },
         actors: ActorDemux::new(vec![ActorRegistration {
             actor: if fm { FM_ACTOR } else { RA_ACTOR },
             authorize: if fm { fm_ingress } else { node_ingress },
@@ -167,7 +182,10 @@ pub fn composition(fm: bool) -> fube_transport::Result<ChannelComposition> {
                 reply: ack,
             })
         } else {
-            None
+            Some(RequestPolicy {
+                incoming: node_ingress,
+                reply: proposal_ack,
+            })
         },
         duplex: None,
         ordered_ingress: true,
@@ -204,6 +222,20 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 pub fn predecode(message: &Message) -> Result<()> {
     use fube_ra::protocol::*;
     match message.properties().map_err(err)?.action.as_str() {
+        "GenerationProposal" => {
+            if !message.body.is_empty() {
+                return Err("GenerationProposal must be bodyless".into());
+            }
+        }
+        "GenerationProposalReply" => {
+            decode::<fube_ra::protocol::GenerationProposalReply>(&message.body)?;
+        }
+        "GenerationUpdate" => {
+            decode::<GenerationUpdate>(&message.body)?;
+        }
+        "GenerationUpdateReject" => {
+            decode::<GenerationNumber>(&message.body)?;
+        }
         "NodeUp" => {
             decode::<NodeUp>(&message.body)?;
         }
@@ -303,8 +335,14 @@ impl Link {
             .iter()
             .filter(|header| header.id == GENERATION_HEADER);
         if let Some(header) = headers.next() {
+            let generation: GenerationHeader = decode(&header.value)?;
+            let negotiation = matches!(
+                message.properties().map_err(err)?.action.as_str(),
+                "GenerationProposal" | "GenerationUpdate"
+            );
             if headers.next().is_some()
-                || decode::<GenerationHeader>(&header.value)? != self.generation
+                || generation.for_fm_replica
+                || (!negotiation && generation != self.generation)
             {
                 return Err("foreign/stale/duplicate native FM generation".into());
             }
@@ -318,12 +356,21 @@ impl Link {
             .map_err(err)
     }
     pub async fn request(&self, message: Message) -> Result<Message> {
+        self.request_optional(message)
+            .await?
+            .ok_or("native request reply timeout".into())
+    }
+    pub async fn request_optional(&self, message: Message) -> Result<Option<Message>> {
         let (future, _) =
             self.channel
                 .request_tracked(&self.target, self.seal(message)?, deadline());
-        let reply = future.await.map_err(err)?;
+        let reply = match future.await {
+            Ok(reply) => reply,
+            Err(fube_transport::Error::Timeout) => return Ok(None),
+            Err(error) => return Err(err(error)),
+        };
         self.validate(&reply)?;
-        Ok(reply)
+        Ok(Some(reply))
     }
     pub async fn receive(&self, until: Instant) -> Result<Option<IncomingMessage<GatewayTarget>>> {
         match self.channel.receiver().map_err(err)?.receive(until).await {

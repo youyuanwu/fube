@@ -8,6 +8,206 @@ use fube_transport::{
 };
 use serde::Serialize;
 
+fn generation_owner(high: u64, low: u64) -> [u8; 16] {
+    let mut owner = [0; 16];
+    owner[..8].copy_from_slice(&high.to_le_bytes());
+    owner[8..].copy_from_slice(&low.to_le_bytes());
+    owner
+}
+
+#[test]
+fn generation_handshake_preserves_bodyless_proposal_correlated_reply_and_epoch_order() {
+    let proposed = GenerationNumber {
+        generation: i64::MAX,
+        owner: generation_owner(0x8000_0000_0000_0001, u64::MAX),
+    };
+    let current = GenerationNumber {
+        generation: i64::MAX,
+        owner: generation_owner(0x8000_0000_0000_0002, 0),
+    };
+    assert!(proposed.older_than(&current));
+    assert!(!current.older_than(&proposed));
+    for fmm in [false, true] {
+        let generation = GenerationHeader {
+            number: proposed.clone(),
+            for_fm_replica: fmm,
+        };
+        let proposal = generation_proposal_message(&generation).unwrap();
+        assert!(proposal.body.is_empty());
+        assert_eq!(decode_generation_proposal(&proposal).unwrap(), generation);
+        for error in [0, -2_147_017_398, i64::MIN, i64::MAX] {
+            let reply = GenerationProposalReply {
+                proposed: proposed.clone(),
+                current: current.clone(),
+                error,
+            };
+            let message = generation_proposal_reply_message(&reply).unwrap();
+            assert_eq!(message.properties().unwrap().actor, FM_ACTOR);
+            assert!(!message.headers.iter().any(|h| h.id == GENERATION_HEADER));
+            assert_eq!(decode_generation_proposal_reply(&message).unwrap(), reply);
+        }
+    }
+    let generation = GenerationHeader {
+        number: proposed,
+        for_fm_replica: false,
+    };
+    let update = GenerationUpdate {
+        fm_service_epoch: Epoch {
+            configuration: -0x1234,
+            data_loss: 0x5678,
+        },
+    };
+    let message = generation_update_message(&update, &generation).unwrap();
+    assert_eq!(
+        decode_generation_update(&message).unwrap(),
+        (update.clone(), generation.clone())
+    );
+    #[derive(Serialize)]
+    struct NativeEpoch {
+        configuration: i64,
+        data_loss: i64,
+    }
+    #[derive(Serialize)]
+    struct NativeUpdate {
+        epoch: NativeEpoch,
+    }
+    assert_eq!(
+        message.body,
+        to_vec(&NativeUpdate {
+            epoch: NativeEpoch {
+                configuration: -0x1234,
+                data_loss: 0x5678,
+            },
+        })
+        .unwrap()
+    );
+    let reject = generation_update_reject_message(&current).unwrap();
+    assert_eq!(reject.body, to_vec(&current).unwrap());
+    assert_eq!(decode_generation_update_reject(&reject).unwrap(), current);
+    let mut fmm = generation;
+    fmm.for_fm_replica = true;
+    assert!(generation_update_message(&update, &fmm).is_err());
+    let mut unsupported = message;
+    unsupported.headers.retain(|h| h.id != GENERATION_HEADER);
+    unsupported.headers.push(fmm.header().unwrap());
+    assert!(decode_generation_update(&unsupported).is_err());
+    unsupported.body.clear();
+    assert!(decode_generation_update(&unsupported).is_err());
+}
+
+#[test]
+fn generation_handshake_rejects_bad_headers_shapes_truncation_and_fmm_update() {
+    use fube_transport::{message::Message, Result};
+    type Decoder = fn(&Message) -> Result<()>;
+    let generation = support::rich_generation(false);
+    let reply = GenerationProposalReply {
+        proposed: generation.number.clone(),
+        current: GenerationNumber::default(),
+        error: -2_147_017_398,
+    };
+    let update = GenerationUpdate {
+        fm_service_epoch: Epoch {
+            configuration: i64::MIN,
+            data_loss: i64::MAX,
+        },
+    };
+    let contracts: Vec<(Message, bool, Decoder)> = vec![
+        (
+            generation_proposal_message(&generation).unwrap(),
+            true,
+            |m| decode_generation_proposal(m).map(|_| ()),
+        ),
+        (
+            generation_proposal_reply_message(&reply).unwrap(),
+            false,
+            |m| decode_generation_proposal_reply(m).map(|_| ()),
+        ),
+        (
+            generation_update_message(&update, &generation).unwrap(),
+            true,
+            |m| decode_generation_update(m).map(|_| ()),
+        ),
+        (
+            generation_update_reject_message(&generation.number).unwrap(),
+            false,
+            |m| decode_generation_update_reject(m).map(|_| ()),
+        ),
+    ];
+    for (original, with_generation, decode) in &contracts {
+        let properties = original.properties().unwrap();
+        assert!(properties.high_priority);
+        assert_eq!(
+            properties.actor,
+            if *with_generation { RA_ACTOR } else { FM_ACTOR }
+        );
+        for id in [ACTOR, ACTION, HIGH_PRIORITY]
+            .into_iter()
+            .chain(with_generation.then_some(GENERATION_HEADER))
+        {
+            let mut missing = original.clone();
+            missing.headers.retain(|h| h.id != id);
+            assert!(decode(&missing).is_err());
+            let mut duplicate = original.clone();
+            duplicate.headers.push(
+                original
+                    .headers
+                    .iter()
+                    .find(|h| h.id == id)
+                    .unwrap()
+                    .clone(),
+            );
+            assert!(decode(&duplicate).is_err());
+            let mut malformed = original.clone();
+            malformed
+                .headers
+                .iter_mut()
+                .find(|h| h.id == id)
+                .unwrap()
+                .value
+                .clear();
+            assert!(decode(&malformed).is_err());
+        }
+        let mut wrong = original.clone();
+        wrong.headers[0] = Header::actor(FMM_ACTOR).unwrap();
+        assert!(decode(&wrong).is_err());
+        for (other, _, _) in &contracts {
+            if other.properties().unwrap().action != properties.action {
+                let mut wrong = original.clone();
+                wrong.headers[1] = other.headers[1].clone();
+                assert!(decode(&wrong).is_err());
+            }
+        }
+        if !with_generation {
+            let mut unexpected = original.clone();
+            unexpected.headers.push(generation.header().unwrap());
+            assert!(decode(&unexpected).is_err());
+        }
+        for end in 0..original.body.len() {
+            let mut truncated = original.clone();
+            truncated.body.truncate(end);
+            assert!(decode(&truncated).is_err());
+        }
+        let mut trailing = original.clone();
+        trailing.body.push(0);
+        assert!(decode(&trailing).is_err());
+        let mut shape = original.clone();
+        shape.body = to_vec(&generation).unwrap();
+        assert!(decode(&shape).is_err());
+        // Priority remains a factory default, not semantic negotiation success.
+        let mut low = original.clone();
+        low.headers[2] = Header::boolean(HIGH_PRIORITY, false).unwrap();
+        assert!(decode(&low).is_ok());
+    }
+    let mut proposal = generation_proposal_message(&generation).unwrap();
+    #[derive(Serialize)]
+    struct Empty {}
+    proposal.body = to_vec(&Empty {}).unwrap();
+    assert!(decode_generation_proposal(&proposal).is_err());
+    let mut missing_body = generation_update_message(&update, &generation).unwrap();
+    missing_body.body.clear();
+    assert!(decode_generation_update(&missing_body).is_err());
+}
+
 #[test]
 fn native_defaults_are_not_zeroed_rust_layouts() {
     let body = AddInstance::default();

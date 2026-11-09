@@ -166,6 +166,224 @@ fn registration() -> RuntimeRegistration {
         code_package: "Code".into(),
     }
 }
+fn generation_header(number: i64) -> GenerationHeader {
+    GenerationHeader {
+        number: GenerationNumber {
+            generation: number,
+            owner: admission().fm_source.id,
+        },
+        for_fm_replica: false,
+    }
+}
+
+#[tokio::test]
+async fn generation_proposals_bypass_readiness_and_preserve_receive_and_send() {
+    let store = Store::new(MemoryBackend::new(), StoreSettings::default())
+        .await
+        .unwrap();
+    for node_open in [true, false] {
+        let mut initial = admission();
+        initial.owner_ready = false;
+        initial.node_open = node_open;
+        let executor =
+            Executor::new(Arc::new(store.clone()), initial, Settings::default()).unwrap();
+        for number in [9, 8, 9] {
+            let reply = executor
+                .process_generation_proposal(&admission().fm_source, &generation_header(number))
+                .unwrap();
+            assert_eq!(reply.proposed, generation_header(number).number);
+            assert_eq!(reply.current, generation_header(9).number);
+            assert_eq!(reply.error, if node_open { 0 } else { RA_NOT_READY });
+        }
+        let state = executor.generation_state();
+        assert_eq!(state.proposed, generation_header(9).number);
+        assert_eq!(state.receive, admission().generation);
+        assert_eq!(state.send, admission().generation);
+        assert!(!state.upload_pending);
+        let mut foreign = admission().fm_source;
+        foreign.instance += 1;
+        assert!(executor
+            .process_generation_proposal(&foreign, &generation_header(10))
+            .is_err());
+        let mut fmm = generation_header(10);
+        fmm.for_fm_replica = true;
+        assert!(matches!(
+            executor.process_generation_proposal(&admission().fm_source, &fmm),
+            Err(Failure::Unsupported(_))
+        ));
+        assert_eq!(executor.generation_state(), state);
+        assert_eq!(
+            executor
+                .process_generation_update(
+                    &admission().fm_source,
+                    &GenerationUpdate {
+                        fm_service_epoch: Epoch::default()
+                    },
+                    &generation_header(9),
+                )
+                .unwrap(),
+            if node_open {
+                GenerationUpdateOutcome::UploadRequired
+            } else {
+                GenerationUpdateOutcome::IgnoredNotReady
+            }
+        );
+        assert_eq!(executor.generation_state().send, admission().generation);
+        assert!(executor
+            .seed_fresh_node_activation(NodeActivationInfo {
+                activated: true,
+                sequence: 99
+            })
+            .is_err());
+        executor.close(WAIT).await.unwrap();
+    }
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn generation_update_rejects_mismatches_and_never_acks_upload_or_advances_send() {
+    let (store, executor, _) = setup(WAIT).await;
+    let source = admission().fm_source;
+    let update = GenerationUpdate {
+        fm_service_epoch: Epoch::default(),
+    };
+    assert_eq!(
+        executor
+            .process_generation_update(&source, &update, &generation_header(8))
+            .unwrap(),
+        GenerationUpdateOutcome::Rejected(admission().generation)
+    );
+    executor
+        .process_generation_proposal(&source, &generation_header(8))
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            executor
+                .process_generation_update(&source, &update, &generation_header(8))
+                .unwrap(),
+            GenerationUpdateOutcome::UploadRequired
+        );
+    }
+    executor
+        .process_generation_proposal(&source, &generation_header(10))
+        .unwrap();
+    assert_eq!(
+        executor
+            .process_generation_update(&source, &update, &generation_header(9))
+            .unwrap(),
+        GenerationUpdateOutcome::Rejected(generation_header(10).number)
+    );
+    assert_eq!(
+        executor
+            .process_generation_update(&source, &update, &generation_header(7))
+            .unwrap(),
+        GenerationUpdateOutcome::IgnoredStale
+    );
+    let state = executor.generation_state();
+    assert_eq!(state.proposed, generation_header(10).number);
+    assert_eq!(state.receive, generation_header(8).number);
+    assert_eq!(state.send, admission().generation);
+    assert!(state.upload_pending);
+    assert!(executor.take_effects().is_empty());
+    let ticket = executor.submit(add(body(1))).unwrap();
+    assert_eq!(ticket.wait(WAIT).await.unwrap(), Disposition::IgnoredStale);
+    assert!(executor.snapshot([1; 16]).committed.is_none());
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn generation_update_does_not_publish_private_commits_and_queued_work_rechecks_receive() {
+    for fail in [true, false] {
+        let (store, executor, hooks) = setup(Duration::from_millis(40)).await;
+        let (entered, release) = hooks.pause(fail);
+        let first = executor.submit(add(body(1))).unwrap();
+        entered.await.unwrap();
+        let queued = executor.submit(add(body(1))).unwrap();
+        executor
+            .process_generation_proposal(&admission().fm_source, &generation_header(8))
+            .unwrap();
+        assert_eq!(
+            executor
+                .process_generation_update(
+                    &admission().fm_source,
+                    &GenerationUpdate {
+                        fm_service_epoch: Epoch::default()
+                    },
+                    &generation_header(8),
+                )
+                .unwrap(),
+            GenerationUpdateOutcome::UploadRequired
+        );
+        assert!(executor.snapshot([1; 16]).committed.is_none());
+        assert!(executor.take_effects().is_empty());
+        if !fail {
+            assert_eq!(first.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.snapshot([1; 16]).fenced);
+            assert_eq!(hooks.calls.load(Ordering::SeqCst), 1);
+        }
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(first.wait(WAIT).await, Err(Failure::Store(_))));
+        } else {
+            for _ in 0..300 {
+                if matches!(first.status(), Status::Complete(_)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(first.wait(WAIT).await.unwrap(), Disposition::Applied);
+        }
+        assert_eq!(queued.wait(WAIT).await.unwrap(), Disposition::IgnoredStale);
+        assert_eq!(hooks.calls.load(Ordering::SeqCst), 1);
+        let effects = executor.take_effects();
+        if fail {
+            assert!(effects.is_empty());
+            assert!(executor.snapshot([1; 16]).committed.is_none());
+        } else {
+            assert_eq!(effects.len(), 1);
+            assert!(matches!(effects[0].effect, Effect::Open { .. }));
+        }
+        assert_eq!(executor.generation_state().send, admission().generation);
+        assert!(executor.generation_state().upload_pending);
+        finish(&store, &executor).await;
+    }
+}
+#[tokio::test]
+async fn generation_update_cannot_skip_the_local_fm_service_epoch_branch() {
+    let (store, executor, _) = setup(WAIT).await;
+    let mut request = body(1);
+    request.unit.id.guid.0 = [0; 16];
+    request.unit.id.guid.0[15] = 1;
+    request.unit.consistency.id = request.unit.id.clone();
+    executor
+        .submit(add(request))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .unwrap();
+    executor.take_effects();
+    executor
+        .process_generation_proposal(&admission().fm_source, &generation_header(8))
+        .unwrap();
+    let before = executor.generation_state();
+    assert!(matches!(
+        executor.process_generation_update(
+            &admission().fm_source,
+            &GenerationUpdate {
+                fm_service_epoch: Epoch {
+                    configuration: 999,
+                    data_loss: 9
+                }
+            },
+            &generation_header(8),
+        ),
+        Err(Failure::Unsupported(_))
+    ));
+    assert_eq!(executor.generation_state(), before);
+    assert!(executor.take_effects().is_empty());
+    finish(&store, &executor).await;
+}
+
 async fn registered(executor: &Executor, request: &AddInstance, token: u64) {
     let actions = registration_actions(executor, request, token).await;
     assert!(matches!(

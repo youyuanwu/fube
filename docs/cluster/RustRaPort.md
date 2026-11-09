@@ -495,8 +495,8 @@ complete every native branch of its handlers.
 The [source-pinned catalog](NativeRaProtocol.md) contains **58 FM-boundary action
 definitions**, including common registration, plus **eight peer RA actions**.
 There are 67 directional contracts because DoReconfiguration also has a peer
-send path. The current 27 selected action codecs have bounded handler/helper coverage,
-not complete native contracts; 31 FM-boundary actions and all eight peer actions
+send path. The current 31 selected action codecs have bounded handler/helper coverage,
+not complete native contracts; 27 FM-boundary actions and all eight peer actions
 remain unselected, alongside broader branches of the selected handlers.
 
 Stage 1 is now implemented for the bounded volatile 1/1 FM profile; see
@@ -507,7 +507,7 @@ This does not qualify every native handler branch or complete P4/M2.
 |---|---|---|
 | 1. Finish singleton lifecycle | Abort/ForceAbort reporting, closed-AddPrimary handling and remaining DeleteReplica branches, then explicitly authorized fresh-lifetime recreation. | Preserve native close/report/ACK semantics and exact original accounting. Reporting and metadata completion cannot substitute for disposal proof or relabel lost volatile data as recovered empty state. |
 | 2. Complete node-wide coordination | Bounded implementation: broader P2 multi-entity execution; NodeActivateRequest/Reply, NodeDeactivateRequest/Reply, NodeUpdateServiceRequest/Reply, ServiceTypeEnabled/Disabled and their replies, existing registration notifications and complete ReportLoad codecs/forwarding. ReplicaEndpointUpdated/Reply codecs and endpoint helper only; live publication moves to stage 5. | Preserve sequence/version checks and action-specific completion barriers. Deactivation replies follow required replica closure, not admission; ReportLoad remains best-effort without an invented per-report ACK. Keep one FT per deployed Node; qualify multiple FTs in RA model/store tests. |
-| 3. Complete ordinary-FM generation and upload | GenerationProposal/Reply, GenerationUpdate/Reject, LFUMUpload/Reply, nonempty NodeUp/NodeUpAck reconciliation and full ReplicaUp/Reply batching/final-upload handling. | Preserve proposed/receive/send generations and per-entity commit barriers. Only the correct semantic completion advances upload/readiness; keep restart serving disabled until stage 6. |
+| 3. Complete ordinary-FM generation and upload | Bounded generation-handshake increment implemented: GenerationProposal/Reply and GenerationUpdate/Reject. Remaining: LFUMUpload/Reply, nonempty NodeUp/NodeUpAck reconciliation and full ReplicaUp/Reply batching/final-upload handling. | Preserve proposed/receive/send generations and per-entity commit barriers. Only the correct semantic completion advances upload/readiness; keep restart serving disabled until stage 6. |
 | 4. Build and remove remote replicas | AddReplica/Reply through peer CreateReplica/Reply and real RAP build; RemoveReplica/Reply through replicator removal. | Require real copy/application ACKs and activation before Ready/FM success. CreateReplicaReply is not AddReplicaReply; RemoveReplica is not DeleteReplica on the remote node. |
 | 5. Implement reconfiguration | DoReconfiguration/Reply, peer GetLSN/Reply, Deactivate/Reply and Activate/Reply, ChangeConfiguration and DatalossReport. Include peer swap continuation. | Preserve native phase ordering, separate previous/current quorum obligations, catch-up/cancellation, old-primary fencing and endpoint publication. Qualify secondary replacement before primary transfer. |
 | 6. Enable durable RA restart | P5 loading/fixups, crash-window reconciliation, fresh incarnation and recovery with the original FM surviving. | Historical records cannot restore Primary authority. Prove predecessor fencing; rebuild volatile replicas from eligible survivors with valid history/quorum evidence or report data loss. |
@@ -540,6 +540,19 @@ commit. Native 900-second close deadlines and 15-second checks terminate only
 captured original hosts, once per monitor; termination is not closure proof.
 Status work keeps native five-second minimum starts, 30-second retries,
 current-sequence acknowledgments and independent history cleanup.
+
+The first stage-3 increment implements the ordinary-FM generation handshake;
+see [its opt-in execution and upload gate](MinimalFmCluster.md#ordinary-fm-generation-handshake-stage-3-increment).
+Proposal preprocessing retains the highest proposed generation independently
+of receive/send and replies through the original correlated request context.
+GenerationUpdate accepts only the current proposal, drops below-receive traffic
+and otherwise rejects with the native proposed-generation body. Entity workers
+read the current receive generation under the publication lock; private/unknown
+commits remain owned and cannot become inventory or upload success. Send
+generation never advances from the handshake. LFUM snapshot jobs and their
+per-entity completion barriers are still part of the next increment, not
+implemented by an `upload_pending` flag. The local FM-service epoch/ForceAbort
+branch and FMM domain remain capability-gated.
 
 The endpoint helper preserves the native separation from FM message state.
 Its timeout and pending/completed/reset behavior are qualified, but live

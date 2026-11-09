@@ -531,6 +531,26 @@ impl Node {
     pub fn pending_node_deactivation(&self) -> Option<i64> {
         self.ra.pending_node_deactivation()
     }
+    pub fn generation_state(&self) -> ra::GenerationState {
+        self.ra.generation_state()
+    }
+    pub fn process_generation_proposal(
+        &self,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<GenerationProposalReply> {
+        Ok(self.ra.process_generation_proposal(source, generation)?)
+    }
+    pub fn process_generation_update(
+        &self,
+        source: &NodeInstance,
+        body: &GenerationUpdate,
+        generation: &GenerationHeader,
+    ) -> Result<ra::GenerationUpdateOutcome> {
+        Ok(self
+            .ra
+            .process_generation_update(source, body, generation)?)
+    }
     pub fn apply_fresh_node_up_ack(
         &self,
         body: &NodeUpAck,

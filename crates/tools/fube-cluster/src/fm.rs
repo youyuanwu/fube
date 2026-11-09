@@ -105,6 +105,113 @@ pub struct Operation {
 pub struct Ledger {
     pub placements: [Placement; 2],
     pub operations: Vec<Operation>,
+    pub(crate) generation: Option<GenerationHandshake>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GenerationPhase {
+    Proposing,
+    AwaitingUpload,
+}
+pub(crate) enum GenerationWork {
+    Propose(GenerationHeader),
+    Update(GenerationHeader),
+}
+pub(crate) struct GenerationHandshake {
+    pub number: GenerationNumber,
+    pub phase: GenerationPhase,
+    proposed: [bool; 2],
+    pub updates_sent: [bool; 2],
+    retry_at: [Instant; 2],
+}
+impl GenerationHandshake {
+    pub fn new(current: &GenerationNumber) -> Result<Self> {
+        Ok(Self {
+            number: Self::successor(current, current.owner)?,
+            phase: GenerationPhase::Proposing,
+            proposed: [false; 2],
+            updates_sent: [false; 2],
+            retry_at: [Instant::now(); 2],
+        })
+    }
+    fn successor(current: &GenerationNumber, owner: [u8; 16]) -> Result<GenerationNumber> {
+        Ok(GenerationNumber {
+            generation: current
+                .generation
+                .checked_add(1)
+                .ok_or("FM generation counter exhausted")?,
+            owner,
+        })
+    }
+    fn restart(&mut self, current: &GenerationNumber) -> Result<()> {
+        let next = Self::successor(current, self.number.owner)?;
+        self.number = next;
+        self.phase = GenerationPhase::Proposing;
+        self.proposed = [false; 2];
+        self.updates_sent = [false; 2];
+        self.retry_at = [Instant::now(); 2];
+        Ok(())
+    }
+    pub fn proposal_reply(&mut self, index: usize, body: &GenerationProposalReply) -> Result<()> {
+        if self.phase != GenerationPhase::Proposing
+            || body.proposed != self.number
+            || body.error != 0
+        {
+            return Ok(());
+        }
+        if body.current.older_than(&body.proposed) {
+            return Err("invalid generation proposal high-water mark".into());
+        }
+        if body.current != self.number {
+            return self.restart(&body.current);
+        }
+        self.proposed[index] = true;
+        if self.proposed.iter().all(|accepted| *accepted) {
+            self.phase = GenerationPhase::AwaitingUpload;
+            self.retry_at = [Instant::now(); 2];
+        }
+        Ok(())
+    }
+    pub fn reject(&mut self, current: &GenerationNumber) -> Result<()> {
+        if !current.older_than(&self.number) {
+            self.restart(current)?;
+        }
+        Ok(())
+    }
+    pub fn next(&mut self, index: usize, now: Instant) -> Option<GenerationWork> {
+        if now < self.retry_at[index] {
+            return None;
+        }
+        let header = GenerationHeader {
+            number: self.number.clone(),
+            for_fm_replica: false,
+        };
+        match self.phase {
+            GenerationPhase::Proposing if !self.proposed[index] => {
+                self.retry_at[index] = now + Duration::from_secs(5);
+                Some(GenerationWork::Propose(header))
+            }
+            GenerationPhase::AwaitingUpload => {
+                let retry = if self.updates_sent[index] { 10 } else { 5 };
+                self.updates_sent[index] = true;
+                self.retry_at[index] = now + Duration::from_secs(retry);
+                Some(GenerationWork::Update(header))
+            }
+            _ => None,
+        }
+    }
+    fn status(&self) -> Value {
+        json!({
+            "generation": self.number,
+            "phase": match self.phase {
+                GenerationPhase::Proposing => "proposing",
+                GenerationPhase::AwaitingUpload => "awaiting_upload",
+            },
+            "proposal_replies": self.proposed,
+            "updates_sent": self.updates_sent,
+            "upload_supported": false,
+            "complete": false,
+        })
+    }
 }
 pub enum Accepted {
     NodeControl(usize, bool, NodeActivationRequest),
@@ -325,6 +432,23 @@ fn exact_replica(expected: &Replica, actual: &Replica, canonical: bool) -> Resul
     Ok(())
 }
 impl Ledger {
+    pub fn begin_generation(&mut self) -> Result<()> {
+        if self.generation.is_some()
+            || self.placements.iter().any(|placement| {
+                placement.bootstrap != Bootstrap::Admitted
+                    || !placement.link_alive
+                    || placement.pending.is_some()
+                    || placement.node_control.is_some()
+                    || placement.service_update.is_some()
+            })
+        {
+            return Err("generation handshake requires two admitted idle control sessions".into());
+        }
+        self.generation = Some(GenerationHandshake::new(
+            &self.placements[0].launch.generation.number,
+        )?);
+        Ok(())
+    }
     pub fn report(&mut self, index: usize, body: &ReplicaUp) -> Result<Option<ReplicaUp>> {
         if !self.placements[index].link_alive {
             return Err("report requires the original live node session".into());
@@ -371,6 +495,7 @@ impl Ledger {
         Self {
             placements: [Placement::new(one), Placement::new(two)],
             operations: vec![],
+            generation: None,
         }
     }
     pub fn accept(&mut self, command: Command) -> Result<Accepted> {
@@ -385,6 +510,11 @@ impl Ledger {
             } else {
                 Err("operation identity reused with different canonical content".into())
             };
+        }
+        if self.generation.is_some() && !matches!(command.action.as_str(), "status" | "quit") {
+            return Err(
+                "generation rebuild is awaiting gated LFUM upload; mutations disabled".into(),
+            );
         }
         if self.operations.len() == 64 {
             return Err(
@@ -885,6 +1015,7 @@ impl Ledger {
     }
     pub fn status(&self) -> Value {
         json!({"nodes":self.placements.iter().map(Placement::status).collect::<Vec<_>>(),
+            "generation_handshake": self.generation.as_ref().map(GenerationHandshake::status),
             "operations":self.operations.iter().map(|op|
                 if op.command.action == "status" {
                     json!({"op":op.command.op,"state":op.outcome["state"],"kind":"status"})
