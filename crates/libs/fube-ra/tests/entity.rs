@@ -2338,6 +2338,445 @@ fn primary_delete(value: AddInstance, force: bool) -> Command {
         },
     }
 }
+fn peer_source() -> NodeInstance {
+    NodeInstance {
+        id: [6; 16],
+        instance: 40,
+    }
+}
+fn peer_request() -> CreateReplica {
+    let mut request = primary_body();
+    request.replica.current_role = 2;
+    let epoch = request.unit.current;
+    CreateReplica::new(
+        request,
+        ReplicaDeactivationInfo {
+            epoch,
+            catchup_lsn: 0,
+        },
+    )
+}
+fn peer_create(body: CreateReplica) -> Command {
+    Command::CreateReplica {
+        body: Box::new(body),
+        source: peer_source(),
+        generation: GenerationHeader {
+            number: admission().generation,
+            for_fm_replica: false,
+        },
+    }
+}
+
+#[tokio::test]
+async fn peer_idle_open_reply_waits_for_both_commits_and_preserves_original_sender() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    executor.bind_peer(peer_source()).unwrap();
+    assert!(executor.bind_peer(peer_source()).is_err());
+    let request = peer_request();
+    let (entered, release) = hooks.pause(false);
+    let created = executor.submit(peer_create(request.clone())).unwrap();
+    entered.await.unwrap();
+    let duplicate = executor.submit(peer_create(request.clone())).unwrap();
+    assert!(executor.snapshot([1; 16]).committed.is_none());
+    assert!(executor.take_effects().is_empty());
+    release.send(()).unwrap();
+    created.wait(WAIT).await.unwrap();
+    assert_eq!(
+        duplicate.wait(WAIT).await.unwrap(),
+        Disposition::IgnoredPending
+    );
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::Open { .. }]
+    ));
+    registered(&executor, &request.replica.0, created.id).await;
+    let opened = state(&executor);
+    let mut completion = complete(&opened.body, created.id);
+    completion.replica.service_endpoint.clear();
+    let mut missing_endpoint = completion.clone();
+    missing_endpoint.replica.replication_endpoint.clear();
+    assert!(matches!(
+        executor
+            .submit(Command::CompleteOpen(Box::new(missing_endpoint)))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Admission(_))
+    ));
+    completion.replica.replication_endpoint = "127.0.0.1:12345".into();
+    let (entered, release) = hooks.pause(false);
+    let completed = executor
+        .submit(Command::CompleteOpen(Box::new(completion)))
+        .unwrap();
+    entered.await.unwrap();
+    assert_eq!(state(&executor).phase, Phase::Opening);
+    assert!(executor.take_effects().is_empty());
+    release.send(()).unwrap();
+    completed.wait(WAIT).await.unwrap();
+    let reply = match effects(&executor).as_slice() {
+        [Effect::PeerCreateReplicaReply { target, body }] => {
+            assert_eq!(target, &peer_source());
+            (**body).clone()
+        }
+        other => panic!("not the original peer reply: {other:?}"),
+    };
+    assert_eq!(
+        (reply.replica.current_role, reply.replica.state, reply.error),
+        (2, 1, 0)
+    );
+    assert!(reply.replica.service_endpoint.is_empty());
+    assert!(!reply.replica.replication_endpoint.is_empty());
+    let committed = state(&executor);
+    let token = committed.open_token;
+    let usage = committed.usage;
+    let writes = hooks.calls.load(Ordering::SeqCst);
+    for _ in 0..2 {
+        run(&executor, peer_create(request.clone())).await;
+        assert!(matches!(effects(&executor).as_slice(),
+            [Effect::PeerCreateReplicaReply { body, .. }] if **body == reply));
+    }
+    let mut stale = request.clone();
+    stale.replica.0.replica.instance -= 1;
+    assert_eq!(
+        run(&executor, peer_create(stale)).await,
+        Disposition::IgnoredStale
+    );
+    assert!(executor.take_effects().is_empty());
+    let mut stale_epoch = request;
+    stale_epoch.replica.0.unit.current.configuration -= 1;
+    stale_epoch.deactivation.epoch = stale_epoch.replica.0.unit.current;
+    assert_eq!(
+        run(&executor, peer_create(stale_epoch)).await,
+        Disposition::IgnoredStale
+    );
+    assert!(executor.take_effects().is_empty());
+    assert_eq!(state(&executor).open_token, token);
+    assert_eq!(state(&executor).usage, usage);
+    assert_eq!(hooks.calls.load(Ordering::SeqCst), writes);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn peer_idle_failed_or_unknown_open_commit_cannot_publish_reply_or_reopen() {
+    for fail in [true, false] {
+        let (store, executor, hooks) = setup(if fail {
+            WAIT
+        } else {
+            Duration::from_millis(40)
+        })
+        .await;
+        executor.bind_peer(peer_source()).unwrap();
+        let request = peer_request();
+        let created = executor.submit(peer_create(request.clone())).unwrap();
+        created.wait(WAIT).await.unwrap();
+        executor.take_effects();
+        registered(&executor, &request.replica.0, created.id).await;
+        let mut completion = complete(&state(&executor).body, created.id);
+        completion.replica.service_endpoint.clear();
+        completion.replica.replication_endpoint = "127.0.0.1:12345".into();
+        let (entered, release) = hooks.pause(fail);
+        let ticket = executor
+            .submit(Command::CompleteOpen(Box::new(completion.clone())))
+            .unwrap();
+        entered.await.unwrap();
+        let repeated = executor.submit(peer_create(request)).unwrap();
+        if !fail {
+            assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.snapshot([1; 16]).fenced);
+        }
+        assert_eq!(state(&executor).phase, Phase::Opening);
+        assert!(executor.take_effects().is_empty());
+        release.send(()).unwrap();
+        if fail {
+            assert!(matches!(ticket.wait(WAIT).await, Err(Failure::Store(_))));
+            assert_eq!(
+                repeated.wait(WAIT).await.unwrap(),
+                Disposition::IgnoredPending
+            );
+            assert!(executor.take_effects().is_empty());
+            run(&executor, Command::CompleteOpen(Box::new(completion))).await;
+        } else {
+            repeated.wait(WAIT).await.unwrap();
+        }
+        let effects = effects(&executor);
+        assert!(effects
+            .iter()
+            .all(|effect| matches!(effect, Effect::PeerCreateReplicaReply { .. })));
+        assert_eq!(effects.len(), if fail { 1 } else { 2 });
+        assert_eq!(state(&executor).body.replica.current_role, 2);
+        assert_eq!(state(&executor).body.replica.state, 1);
+        assert_eq!(hooks.calls.load(Ordering::SeqCst), if fail { 3 } else { 2 });
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn peer_creation_rejects_unbound_foreign_primary_and_persisted_requests() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    let unbound = Executor::new(Arc::new(store.clone()), admission(), Settings::default()).unwrap();
+    assert!(matches!(
+        unbound
+            .submit(peer_create(peer_request()))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Admission(_))
+    ));
+    assert!(unbound.take_effects().is_empty());
+    unbound.close(WAIT).await.unwrap();
+    executor.bind_peer(peer_source()).unwrap();
+    let request = peer_request();
+    for invalid in [
+        Command::CreateReplica {
+            body: Box::new(request.clone()),
+            source: admission().fm_source,
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        },
+        Command::CreateReplica {
+            body: Box::new(request.clone()),
+            source: NodeInstance {
+                instance: peer_source().instance - 1,
+                ..peer_source()
+            },
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        },
+        Command::CreateReplica {
+            body: Box::new(request.clone()),
+            source: peer_source(),
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: true,
+            },
+        },
+        peer_create({
+            let mut value = request.clone();
+            value.replica.0.replica.current_role = 4;
+            value
+        }),
+        peer_create({
+            let mut value = request;
+            value.replica.0.service.persisted = true;
+            value
+        }),
+    ] {
+        assert!(executor.submit(invalid).unwrap().wait(WAIT).await.is_err());
+    }
+    let mut stale = admission().generation;
+    stale.generation -= 1;
+    assert_eq!(
+        run(
+            &executor,
+            Command::CreateReplica {
+                body: Box::new(peer_request()),
+                source: peer_source(),
+                generation: GenerationHeader {
+                    number: stale,
+                    for_fm_replica: false
+                },
+            }
+        )
+        .await,
+        Disposition::IgnoredStale
+    );
+    assert!(executor.take_effects().is_empty());
+    assert!(executor.snapshot([1; 16]).committed.is_none());
+    assert_eq!(hooks.calls.load(Ordering::SeqCst), 0);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn peer_terminal_registration_failure_keeps_error_reply_and_gated_fm_obligation() {
+    let (store, executor, _) = setup(WAIT).await;
+    executor.bind_peer(peer_source()).unwrap();
+    let request = peer_request();
+    let created = executor.submit(peer_create(request.clone())).unwrap();
+    created.wait(WAIT).await.unwrap();
+    executor.take_effects();
+    let lookup = *state(&executor).registration_lookups.keys().next().unwrap();
+    run(
+        &executor,
+        Command::Registered(Box::new(RegistrationCompletion {
+            unit: request.replica.0.unit.id.clone(),
+            token: created.id,
+            lookup,
+            error: APPLICATION_INSTANCE_DELETED,
+            ..RegistrationCompletion::default()
+        })),
+    )
+    .await;
+    let actions = effects(&executor);
+    assert!(actions.iter().any(|effect| matches!(effect,
+        Effect::PeerCreateReplicaReply { target, body }
+            if target == &peer_source() && body.error == APPLICATION_INSTANCE_DELETED
+    )));
+    assert!(actions.iter().any(|effect| matches!(
+        effect,
+        Effect::StatefulClosePending {
+            mode: CloseMode::Drop,
+            ..
+        }
+    )));
+    assert_eq!(state(&executor).phase, Phase::Closed);
+    assert!(state(&executor).usage.is_none());
+    assert!(executor
+        .submit(peer_create(request))
+        .unwrap()
+        .wait(WAIT)
+        .await
+        .is_err());
+    assert!(executor.take_effects().is_empty());
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn peer_selected_package_instance_does_not_change_original_request_or_repeat_open() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    executor.bind_peer(peer_source()).unwrap();
+    let request = peer_request();
+    let created = executor.submit(peer_create(request.clone())).unwrap();
+    created.wait(WAIT).await.unwrap();
+    executor.take_effects();
+    let lookup = *state(&executor).registration_lookups.keys().next().unwrap();
+    let mut selected = request.replica.0.service.version.clone();
+    selected.instance += 1;
+    let mut runtime = registration();
+    runtime.acquisition = lookup;
+    run(
+        &executor,
+        Command::Registered(Box::new(RegistrationCompletion {
+            unit: request.replica.0.unit.id.clone(),
+            token: created.id,
+            lookup,
+            registration: runtime,
+            error: HOSTING_REGISTRATION_VERSION_MISMATCH,
+            version: selected.clone(),
+            usage_acquired: true,
+            ..RegistrationCompletion::default()
+        })),
+    )
+    .await;
+    executor.take_effects();
+    assert_eq!(
+        state(&executor).requested_version,
+        request.replica.0.service.version
+    );
+    assert_eq!(state(&executor).body.service.version, selected);
+    let mut completion = complete(&state(&executor).body, created.id);
+    completion.replica.service_endpoint.clear();
+    completion.replica.replication_endpoint = "127.0.0.1:12345".into();
+    run(&executor, Command::CompleteOpen(Box::new(completion))).await;
+    assert!(matches!(effects(&executor).as_slice(),
+        [Effect::PeerCreateReplicaReply { body, .. }] if body.replica.version == selected
+    ));
+    let writes = hooks.calls.load(Ordering::SeqCst);
+    run(&executor, peer_create(request)).await;
+    assert!(matches!(effects(&executor).as_slice(),
+        [Effect::PeerCreateReplicaReply { body, .. }] if body.replica.version == selected
+    ));
+    assert_eq!(hooks.calls.load(Ordering::SeqCst), writes);
+    assert_eq!(state(&executor).open_token, created.id);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn primary_peer_open_observation_never_builds_or_changes_quorum_and_close_fences_late_reply()
+{
+    let (store, executor, _) = setup(WAIT).await;
+    executor.bind_peer(peer_source()).unwrap();
+    make_ready(&executor, &primary_body()).await;
+    let primary = state(&executor);
+    let target = Replica {
+        node: peer_source(),
+        id: 41,
+        instance: 51,
+        current_role: 2,
+        state: 1,
+        version: primary.body.service.version.clone(),
+        ..Replica::default()
+    };
+    let create = || Command::CreateRemoteIdle {
+        unit: primary.body.unit.id.clone(),
+        replica: target.clone(),
+    };
+    run(&executor, create()).await;
+    let body = match effects(&executor).as_slice() {
+        [Effect::PeerCreateReplica { target, body }] => {
+            assert_eq!(target, &peer_source());
+            (**body).clone()
+        }
+        other => panic!("missing owned peer request: {other:?}"),
+    };
+    assert_eq!(body.deactivation.epoch, primary.body.unit.current);
+    run(&executor, create()).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::PeerCreateReplica { .. }]
+    ));
+    let mut reply = CreateReplicaReply {
+        unit: body.replica.0.unit.clone(),
+        replica: target,
+        error: 0,
+    };
+    reply.replica.replication_endpoint = "127.0.0.1:12346".into();
+    reply.replica.version.instance += 1;
+    let ack = |body: CreateReplicaReply| Command::CreateReplicaReply {
+        body: Box::new(body),
+        source: peer_source(),
+        generation: GenerationHeader {
+            number: admission().generation,
+            for_fm_replica: false,
+        },
+    };
+    let mut stale = reply.clone();
+    stale.replica.instance -= 1;
+    assert_eq!(run(&executor, ack(stale)).await, Disposition::IgnoredStale);
+    assert!(state(&executor)
+        .remote_idle
+        .as_ref()
+        .unwrap()
+        .reply
+        .is_none());
+    run(&executor, ack(reply.clone())).await;
+    assert_eq!(
+        state(&executor)
+            .remote_idle
+            .as_ref()
+            .unwrap()
+            .reply
+            .as_ref(),
+        Some(&reply)
+    );
+    assert_eq!(state(&executor).body, primary.body);
+    assert_eq!(
+        state(&executor).primary_deactivation,
+        primary.primary_deactivation
+    );
+    assert!(executor.take_effects().is_empty());
+    assert_eq!(
+        run(&executor, ack(reply.clone())).await,
+        Disposition::IgnoredStale
+    );
+    run(
+        &executor,
+        Command::CloseLocal {
+            unit: primary.body.unit.id.clone(),
+            mode: CloseMode::Close,
+        },
+    )
+    .await;
+    executor.take_effects();
+    assert!(state(&executor).remote_idle.is_none());
+    assert_eq!(run(&executor, ack(reply)).await, Disposition::IgnoredStale);
+    assert!(executor.take_effects().is_empty());
+    finish(&store, &executor).await;
+}
+
 fn primary_body() -> AddPrimary {
     let mut request = body(1);
     request.service.stateful = true;

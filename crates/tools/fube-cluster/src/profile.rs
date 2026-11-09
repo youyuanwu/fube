@@ -19,13 +19,17 @@ pub enum ServiceProfile {
     #[default]
     Stateless,
     StatefulSingleton,
+    StatefulPeerIdle,
 }
 impl ServiceProfile {
     pub fn service(self) -> &'static str {
         match self {
             Self::Stateless => SERVICE,
-            Self::StatefulSingleton => "fabric:/Cluster/Singleton",
+            Self::StatefulSingleton | Self::StatefulPeerIdle => "fabric:/Cluster/Singleton",
         }
+    }
+    pub fn stateful(self) -> bool {
+        self != Self::Stateless
     }
 }
 
@@ -159,6 +163,17 @@ mod json_generation {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Peer {
+    #[serde(with = "json_node")]
+    pub node: NodeInstance,
+    pub session: String,
+    pub partition: String,
+    pub replica: i64,
+    pub incarnation: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Launch {
     #[serde(default)]
     pub profile: ServiceProfile,
@@ -178,6 +193,8 @@ pub struct Launch {
     pub partition: String,
     pub replica: i64,
     pub incarnation: i64,
+    #[serde(default)]
+    pub peer: Option<Peer>,
 }
 impl Launch {
     pub fn name(&self) -> String {
@@ -207,6 +224,23 @@ impl Launch {
         ] {
             uuid::Uuid::parse_str(id).map_err(err)?;
         }
+        match (&self.peer, self.profile) {
+            (Some(peer), ServiceProfile::StatefulPeerIdle)
+                if peer.node != self.node
+                    && peer.node.id != self.fm.id
+                    && peer.node.id != self.node.id
+                    && peer.node.instance > 0
+                    && peer.session != self.session
+                    && peer.partition == self.partition
+                    && peer.replica >= 0
+                    && peer.replica != self.replica
+                    && peer.incarnation > 0 =>
+            {
+                uuid::Uuid::parse_str(&peer.session).map_err(err)?;
+            }
+            (None, ServiceProfile::Stateless | ServiceProfile::StatefulSingleton) => {}
+            _ => return Err("invalid original peer binding".into()),
+        }
         Ok(())
     }
 }
@@ -220,6 +254,8 @@ pub struct Metadata {
     pub node: NodeInstance,
     pub pid: u32,
     pub address: SocketAddr,
+    #[serde(default)]
+    pub peer_address: Option<SocketAddr>,
     pub profile: Option<ActualProfile>,
 }
 
@@ -268,7 +304,7 @@ pub fn fixed_type() -> ServiceType {
 pub fn fixed_type_for(profile: ServiceProfile) -> ServiceType {
     let (application, package, name) = match profile {
         ServiceProfile::Stateless => ("ClusterStatelessApp", "ClusterService", TYPE),
-        ServiceProfile::StatefulSingleton => (
+        ServiceProfile::StatefulSingleton | ServiceProfile::StatefulPeerIdle => (
             "HostingLocalStatefulApp",
             "LocalService",
             "LocalStatefulType",
@@ -311,7 +347,7 @@ pub fn add_body(launch: &Launch, profile: &ActualProfile) -> AddInstance {
     body.service.partitions = 1;
     body.service.target = 1;
     body.service.minimum = 1;
-    if launch.profile == ServiceProfile::StatefulSingleton {
+    if launch.profile.stateful() {
         body.service.stateful = true;
         body.replica.current_role = 4;
         body.unit.current.configuration = (1 << 32) + 1;

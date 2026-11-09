@@ -18,6 +18,8 @@ pub mod generation;
 pub use generation::*;
 pub mod node_control;
 pub use node_control::*;
+pub mod peer;
+pub use peer::*;
 
 pub const GENERATION_HEADER: u16 = 0x8018;
 pub const RA_ACTOR: i64 = 12;

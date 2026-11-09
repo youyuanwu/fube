@@ -47,6 +47,8 @@ MODELS = [
     ("ServiceScalingPolicyDescription", FAILOVER + "ServiceScalingPolicyDescription.h", ""),
     ("ServiceDescription", FAILOVER + "ServiceDescription.h", ""),
     ("ReplicaMessageBody", COMMON + "ReplicaMessageBody.h", ""),
+    ("ReplicaDeactivationInfo", COMMON + "ReplicaDeactivationInfo.h", ""),
+    ("RAReplicaMessageBody", COMMON + "RAReplicaMessageBody.h", "ReplicaMessageBody"),
     ("DeleteReplicaMessageBody", COMMON + "DeleteReplicaMessageBody.h", "ReplicaMessageBody"),
     ("ReplicaReplyMessageBody", COMMON + "ReplicaReplyMessageBody.h", ""),
     ("ReplicaInfo", COMMON + "ReplicaInfo.h", ""),
@@ -97,6 +99,14 @@ EXTRA_NATIVE_INPUTS = [
     COMMON + "RSMessage.cpp", COMMON + "RSMessage.h",
     COMMON + "ReplicaRole.h", COMMON + "ReplicaStates.h",
     COMMON + "ReplicaDescription.cpp", "Common/ErrorCodeValue.h",
+    COMMON + "RAReplicaMessageBody.cpp", COMMON + "ReplicaDeactivationInfo.cpp",
+    "ServiceModel/reliability/failover/epoch.cpp",
+    "Reliability/Failover/ra/Infrastructure.SendMessageActions.h",
+    "Reliability/Failover/ra/Communication.MessageMetadataTable.cpp",
+    "Reliability/Failover/ra/MessageHandler.cpp",
+    "Reliability/Failover/ra/MessageContext.h",
+    "Reliability/Failover/ra/infrastructure.FailoverUnitEntityTraits.cpp",
+    "Reliability/Failover/ra/FailoverUnit.cpp",
     "Reliability/Failover/fm/SendMessageAction.cpp",
     "Reliability/Failover/ra/Communication.FMTransport.h",
     "Reliability/Failover/ra/Infrastructure.MessageUtility.h",
@@ -147,6 +157,7 @@ DEFAULTS = {
     ("ReplicaDescription", "lastAcknowledgedLSN_"): "-1",
     ("ReplicaDescription", "firstAcknowledgedLSN_"): "-1",
     ("ReplicaDescription", "state_"): "Enum(2)",
+    ("ReplicaDeactivationInfo", "catchupLSN_"): "-1",
     ("ServiceDescription", "defaultMoveCost_"): "1",
     ("ServiceDescription", "replicaRestartWaitDuration_"): "TimeSpan::minimum()",
     ("ServiceDescription", "quorumLossWaitDuration_"): "TimeSpan::minimum()",
@@ -250,10 +261,24 @@ def generation_factories(native):
     return result
 
 
+def peer_factories(native):
+    text = (native / "src/prod/src" / COMMON / "RSMessage.cpp").read_text()
+    result = {}
+    for action in ["CreateReplica", "CreateReplicaReply"]:
+        matches = re.findall(
+            rf'RSMessage::{action}\s*=\s*(\w+)\(L"([^"]+)",\s*(true|false)\b',
+            text,
+        )
+        if matches != [("CreateRAToRAMessage", action, "true")]:
+            raise ValueError(f"native peer factory changed: {action}")
+        result[action] = {"actor": 12, "high_priority": True}
+    return result
+
+
 def generate(native, destination):
     models = extract(native)
     constants = native_constants(native)
-    factories = generation_factories(native)
+    factories = generation_factories(native) | peer_factories(native)
     output = [
         "// Generated from pinned native headers; source macro/member provenance below.",
         "#pragma once", "#include <Serialization.h>", "#include <FabricSerializationHelper.h>",

@@ -10,11 +10,12 @@ The producer compiles the **unmodified** native `FabricStream.cpp`,
 `FabricSerializable.cpp`, `FabricSerializableStream.cpp`,
 `FabricSerializationTypes.cpp`, `ByteCompressor.h` and
 `Common/FabricSerializationHelper.h`. It mechanically extracts field macros
-and member declarations for 75 schema types/237 members, including the selected
+and member declarations for 77 schema types/240 members, including the selected
 Add, inherited DeleteReplica, reply, ReplicaUp/Reply and service-type
 notification request/reply bodies, NodeUp/Ack's complete schema closure and the
 six-field Federation PToP header value, node controls, status, complete load graph
-and generation-handshake reply/update bodies.
+and generation-handshake reply/update bodies, RAReplicaMessageBody and nested
+ReplicaDeactivationInfo.
 The native helper macros generate their actual Write/Read methods. Nested
 fields are not inferred from Rust or encoded as handwritten wire bytes.
 
@@ -36,7 +37,7 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 116 inputs.
+The C++ producer independently constructs expected values and emits 124 inputs.
 The existing 36 cases and their contracts are retained:
 default/rich AddInstance, default/error AddInstanceReply, default/rich Remove
 (force false/true), default/rich removal reply, explicit-empty/rich ReplicaUp
@@ -53,7 +54,7 @@ Nondefault cases cover GUID/raw NodeId, high-bit instances, negative LSN/epochs,
 UTF-16/surrogates, enums/errors, all service collections and null/Invalid/both
 derived scaling variants. Rust rejects every proper prefix of rich body
 fixtures including both rich force bodies and the rich/partial notification
-bodies; native rejects 31 truncated bodies, including NodeUp, Ack, PToP
+bodies; native rejects 34 truncated bodies, including NodeUp, Ack, PToP
 and the distinct DeleteReplica/Reply fixtures.
 Non-polymorphic Delete inheritance invokes base rich traversal and native
 base/derived scopes, not a flattened or nested replacement. ReplicaUp's empty
@@ -173,7 +174,7 @@ substitute for those state-machine preconditions.
 
 ### Generation-handshake-only codecs
 
-Fifteen inputs retain all prior 101 cases and increase the current wire gate to
+Fifteen inputs retain all prior 101 cases and increased the then-current wire gate to
 **116 cases, 75 types/237 fields, 120 bundle files and 31 native truncation
 rejections**. This is generation-handshake only, not LFUM upload, complete stage
 three, rebuild completion or native runtime interoperability. Historical bundle
@@ -222,6 +223,58 @@ shape and trailing bytes. Priority is parsed as valid native factory metadata,
 not treated as proof of negotiation success. Receive-generation progress is
 not send-generation advancement: LFUMUpload/Reply and pending-upload completion
 remain separate, unselected work.
+
+### First peer creation codecs
+
+Eight inputs retain all preceding 116 cases, 75 types/237 fields, 120 bundle
+files and 31 native truncation rejections. The new totals are **124 cases,
+77 types/240 fields, 128 bundle files and 34 native truncation rejections**:
+
+* `default-create-replica`, `rich-create-replica`, `initial-create-replica`;
+* `default-create-replica-reply`, `rich-create-replica-reply-0`,
+  `rich-create-replica-reply--2147017398`;
+* `action-CreateReplica`, `action-CreateReplicaReply`.
+
+The mechanically extracted RAReplicaMessageBody inherits ReplicaMessageBody
+and adds one nested ReplicaDeactivationInfo in its next native scope. The info
+preserves Epoch (configuration, data loss) then signed catchup LSN. Native
+default construction is zero invalid Epoch/LSN=-1; rich cases exercise distinct
+signed fields, and the initial case carries CC epoch/0. Nondefault bases retain
+the complete service graph and explicitly select volatile, Idle, InBuild/up
+1/1 fields without altering any previous Add/Delete/notification fixture.
+The reply retains complete ReplicaReplyMessageBody, success/StaleRequest
+primitive errors, real endpoint string fields, and Idle **InBuild=1**, not
+Ready. These are independently constructed schema values, not captured runtime
+endpoints or proof of actual RAP invocation.
+
+Pinned RSMessage.cpp:115–116 selects Actor RA=12/priority=true for **both**
+actions. The producer validates their source initializers and records
+`peer_factories` in the manifest, just as generation factories are source-bound.
+ReconfigurationAgent.cpp:3453–3468,3504–3528 and
+Infrastructure.SendMessageActions.h:53–88 route both actions through the same
+send action. GenerationStateManager.cpp:23–27 unconditionally adds that RA's
+per-owner send GenerationHeader. FederationWrapper.cpp:199–230 preserves it;
+MessageHandler.cpp:237–244,815–822 uses the presence-asserting native reader.
+Missing peer generation must not become an invented zero/default generation.
+Unlike FM replies, these semantic peer replies target RA and carry generation.
+
+Rust exercises both production factories and decoders against native-produced
+actor/action/priority/generation values, including both owner flags, with
+independently constructed bodies returned to the native stream. Every proper
+prefix of all six new nonempty bodies is rejected. Native executes three
+additional truncated-body rejections. Header tests reject wrong/cross actions,
+actors FM/FMM, missing/malformed/duplicate generation or factory headers, and
+flattened/nested/absent deactivation scope shapes. The schema's normal
+forward-compatible base-reader behavior is retained; action checks distinguish
+shared-schema actions.
+
+This is the first peer codec increment only: no AddReplica, BuildIdleReplica,
+copy, quorum, serving, GetLSN, Deactivate or Activate. Native successful RAP Open
+updates endpoints and sends CreateReplicaReply; the full native primary handler
+immediately continues into build, which is deliberately outside this slice.
+Model/real-session execution and runtime receipts are separate from this
+source-baseline native-stream/schema-adapter gate. No production native handler
+trace or Federation/binary interoperability is claimed.
 
 ### Bootstrap and source identity header extension
 
@@ -302,8 +355,8 @@ env PATH=/nonexistent /usr/bin/python3 -m tests.ra_protocol.consumer \
   --expected-head COMMIT --expected-source SOURCE_DIGEST
 ```
 
-The bundle has exactly 116 `native/*.bin`, `schema.h`, `native-oracle`,
-`ra-conformance` and `manifest.json` (120 files total). No other files are
+The bundle has exactly 124 `native/*.bin`, `schema.h`, `native-oracle`,
+`ra-conformance` and `manifest.json` (128 files total). No other files are
 accepted. The consumer verifies exact coverage/type/member counts, regular files, hashes,
 provenance and both compiled source identities **before** execution. Missing,
 modified, wrong-source and symlink inputs fail; it imports no producer and
@@ -316,6 +369,7 @@ production/execution claim:
 python3 -m unittest tests.offline.cluster.test_ra_protocol_inputs -v
 python3 -m unittest tests.ra_protocol.test_stage2 -v
 python3 -m unittest tests.ra_protocol.test_generation -v
+python3 -m unittest tests.ra_protocol.test_peer -v
 cargo test --locked -p fube-ra
 ```
 

@@ -14,30 +14,61 @@ fn generation_round_retries_restarts_and_stops_before_upload_completion() {
     let mut round = GenerationHandshake::new(&initial).unwrap();
     let first = round.number.clone();
     let now = Instant::now();
-    assert!(matches!(round.next(0, now), Some(GenerationWork::Propose(_))));
+    assert!(matches!(
+        round.next(0, now),
+        Some(GenerationWork::Propose(_))
+    ));
     assert!(round.next(0, now).is_none());
-    round.proposal_reply(0, &GenerationProposalReply {
-        proposed: first.clone(), current: first.clone(), error: -1,
-    }).unwrap();
+    round
+        .proposal_reply(
+            0,
+            &GenerationProposalReply {
+                proposed: first.clone(),
+                current: first.clone(),
+                error: -1,
+            },
+        )
+        .unwrap();
     assert!(matches!(
         round.next(0, now + Duration::from_secs(5)),
         Some(GenerationWork::Propose(header)) if header.number == first
     ));
     let mut higher = first.clone();
     higher.generation += 3;
-    round.proposal_reply(0, &GenerationProposalReply {
-        proposed: first.clone(), current: higher.clone(), error: 0,
-    }).unwrap();
+    round
+        .proposal_reply(
+            0,
+            &GenerationProposalReply {
+                proposed: first.clone(),
+                current: higher.clone(),
+                error: 0,
+            },
+        )
+        .unwrap();
     assert_eq!(round.number.generation, higher.generation + 1);
     let current = round.number.clone();
-    round.proposal_reply(1, &GenerationProposalReply {
-        proposed: first.clone(), current: first, error: 0,
-    }).unwrap();
+    round
+        .proposal_reply(
+            1,
+            &GenerationProposalReply {
+                proposed: first.clone(),
+                current: first,
+                error: 0,
+            },
+        )
+        .unwrap();
     assert_eq!(round.phase, GenerationPhase::Proposing);
     for index in 0..2 {
-        round.proposal_reply(index, &GenerationProposalReply {
-            proposed: current.clone(), current: current.clone(), error: 0,
-        }).unwrap();
+        round
+            .proposal_reply(
+                index,
+                &GenerationProposalReply {
+                    proposed: current.clone(),
+                    current: current.clone(),
+                    error: 0,
+                },
+            )
+            .unwrap();
     }
     assert_eq!(round.phase, GenerationPhase::AwaitingUpload);
     let now = Instant::now();
@@ -72,7 +103,9 @@ fn generation_rebuild_gates_mutations_without_relabeling_existing_serving_state(
     let mut ledger = ledger();
     ledger.accept(command("a", "create", Some(1))).unwrap();
     assert!(ledger.begin_generation().is_err());
-    ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
+    ledger
+        .reply(0, ready_reply(&ledger.placements[0]), false)
+        .unwrap();
     let prior = ledger.result("a");
     ledger.begin_generation().unwrap();
     assert_eq!(ledger.status()["generation_handshake"]["complete"], false);
@@ -115,6 +148,7 @@ fn launches() -> [Launch; 2] {
         partition: format!("00000000-0000-4000-8000-00000000001{placement}"),
         replica: i64::from(placement),
         incarnation: 800 + i64::from(placement),
+        peer: None,
     })
 }
 fn profile(launch: &Launch) -> ActualProfile {
@@ -140,7 +174,9 @@ fn ledger() -> Ledger {
 }
 fn stateful_ledger() -> Ledger {
     let mut launches = launches();
-    for launch in &mut launches { launch.profile = ServiceProfile::StatefulSingleton; }
+    for launch in &mut launches {
+        launch.profile = ServiceProfile::StatefulSingleton;
+    }
     let mut ledger = Ledger::new(launches);
     for placement in &mut ledger.placements {
         placement.bootstrap = Bootstrap::Metadata;
@@ -151,6 +187,265 @@ fn stateful_ledger() -> Ledger {
     }
     ledger
 }
+fn peer_idle_launches() -> [Launch; 2] {
+    let mut launches = launches();
+    launches[1].partition = launches[0].partition.clone();
+    for index in 0..2 {
+        let remote = &launches[1 - index];
+        launches[index].peer = Some(Peer {
+            node: remote.node.clone(),
+            session: remote.session.clone(),
+            partition: remote.partition.clone(),
+            replica: remote.replica,
+            incarnation: remote.incarnation,
+        });
+        launches[index].profile = ServiceProfile::StatefulPeerIdle;
+    }
+    launches
+}
+
+#[test]
+fn peer_idle_profile_binds_one_partition_and_never_admits_a_second_fm_primary() {
+    let launches = peer_idle_launches();
+    for launch in &launches {
+        launch.validate().unwrap();
+    }
+    let mut ledger = Ledger::new(launches);
+    for placement in &mut ledger.placements {
+        placement.bootstrap = Bootstrap::Metadata;
+        let mut actual = profile(&placement.launch);
+        actual.service = placement.launch.profile.service().into();
+        actual.service_type = fixed_type_for(placement.launch.profile);
+        placement.admit_profile(actual).unwrap();
+    }
+    assert!(ledger.accept(command("wrong", "create", Some(2))).is_err());
+    assert!(ledger.operations.is_empty());
+    assert!(matches!(
+        ledger
+            .accept(command("primary", "create", Some(1)))
+            .unwrap(),
+        Accepted::Create(0, _)
+    ));
+    ledger
+        .reply(0, ready_reply(&ledger.placements[0]), false)
+        .unwrap();
+    assert!(ledger.accept(command("delete", "delete", Some(1))).is_err());
+    assert!(ledger
+        .accept(command("generation", "deactivate", Some(2)))
+        .is_err());
+    assert!(!ledger.placements[1].created);
+    let mut invalid = ledger.placements[0].launch.clone();
+    invalid.peer.as_mut().unwrap().replica = invalid.replica;
+    assert!(invalid.validate().is_err());
+}
+
+fn data_contact(endpoint: &str, request: &[u8]) -> String {
+    let mut socket =
+        TcpStream::connect_timeout(&endpoint.parse().unwrap(), Duration::from_secs(2)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    socket.write_all(request).unwrap();
+    let mut response = String::new();
+    socket.take(1024).read_to_string(&mut response).unwrap();
+    response
+}
+
+async fn peer_idle_catch<F: std::future::Future>(future: F) -> std::thread::Result<F::Output> {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(error) => std::task::Poll::Ready(Err(error)),
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn peer_idle_real_original_children_open_only_idle_and_keep_primary_serving() {
+    let fixture = Fixture::new("peer-idle");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::StatefulPeerIdle;
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    cluster.start().await.unwrap();
+    let mut endpoint = None;
+    let result = peer_idle_catch(async {
+        assert_eq!(
+            cluster.children[0].launch.partition,
+            cluster.children[1].launch.partition
+        );
+        assert_ne!(
+            cluster.children[0].launch.replica,
+            cluster.children[1].launch.replica
+        );
+        assert_ne!(
+            cluster.children[0]
+                .metadata
+                .as_ref()
+                .unwrap()
+                .profile
+                .as_ref()
+                .unwrap()
+                .app_pid,
+            cluster.children[1]
+                .metadata
+                .as_ref()
+                .unwrap()
+                .profile
+                .as_ref()
+                .unwrap()
+                .app_pid,
+        );
+        for child in &cluster.children {
+            assert_eq!(
+                child
+                    .metadata
+                    .as_ref()
+                    .unwrap()
+                    .profile
+                    .as_ref()
+                    .unwrap()
+                    .version
+                    .instance,
+                1
+            );
+        }
+        assert!(cluster.create_idle_replica().await.is_err());
+        assert!(cluster
+            .execute(command("wrong-node", "create", Some(2)))
+            .await
+            .is_err());
+        assert!(cluster.begin_generation_handshake().is_err());
+        cluster
+            .execute(command("primary", "create", Some(1)))
+            .await?;
+        until(&mut cluster, |cluster| {
+            cluster.ledger.placements[0].observed == Observed::Running
+        })
+        .await;
+        let primary = cluster.ledger.placements[0].endpoint.clone().unwrap();
+        endpoint = Some(primary.clone());
+        let ready_end = Instant::now() + Duration::from_secs(2);
+        while !data_contact(&primary, b"read\n").starts_with("OK ") {
+            if Instant::now() >= ready_end {
+                return Err("public Primary readiness deadline".into());
+            }
+            cluster.drive().await;
+        }
+        assert_eq!(cluster.create_idle_replica().await?["state"], "pending");
+        until(&mut cluster, |cluster| {
+            let status = cluster.status();
+            status["peer_idle"]["state"] == "open"
+                && status["nodes"][1]["catalog_notified"] == true
+                && status["nodes"][1]["retained_work"]["semantic_pending"] == 0
+                && status["nodes"][1]["retained_work"]["commands"] == 0
+        })
+        .await;
+        let status = cluster.status();
+        let written = data_contact(&primary, b"write\n");
+        assert!(
+            written.contains("assigned=1 applied=1 committed=1 value=acknowledged"),
+            "{written}"
+        );
+        assert_eq!(data_contact(&primary, b"read\n"), written);
+        let remote = status["peer_idle"]["source"]["reply"].clone();
+        assert_eq!(remote["error"], 0);
+        assert_eq!(remote["replica"]["current_role"], 2);
+        assert_eq!(remote["replica"]["state"], 1);
+        assert_eq!(remote["replica"]["service_endpoint"], "");
+        assert!(!remote["replica"]["replication_endpoint"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+        assert_eq!(status["peer_idle"]["built"], false);
+        assert_eq!(status["peer_idle"]["serving"], false);
+        assert_eq!(status["nodes"][1]["created_lifetime"], false);
+        assert_eq!(status["nodes"][1]["observed"], "absent");
+        assert_eq!(status["nodes"][1]["catalog_notified"], true);
+        assert_eq!(status["nodes"][1]["retained_work"]["semantic_pending"], 0);
+        assert_eq!(status["nodes"][1]["retained_work"]["link_alive"], true);
+        assert_eq!(status["nodes"][1]["retained_work"]["error"], Value::Null);
+        let original = status["nodes"][1]["retained_work"]["local_replica"].clone();
+        let primary_replica = &status["nodes"][0]["retained_work"]["local_replica"];
+        assert_ne!(
+            primary_replica["registration"]["host"],
+            original["registration"]["host"]
+        );
+        assert_ne!(
+            primary_replica["registration"]["runtime"],
+            original["registration"]["runtime"]
+        );
+        assert_ne!(
+            primary_replica["package_sequence"],
+            original["package_sequence"]
+        );
+        assert!(original["registration"]["acquisition"].as_u64().unwrap() > 0);
+        assert_eq!(original["retained_usage"], 1);
+        let application = &status["nodes"][1]["retained_work"]["app_observation"];
+        assert_eq!(application["opens"], 1);
+        assert_eq!(application["provider_acquisitions"], 1);
+        assert_eq!(application["idle_access_denied"], true);
+        assert_eq!(application["idle_write_denials"], 2);
+        cluster.create_idle_replica().await?;
+        until(&mut cluster, |cluster| {
+            cluster.status()["nodes"][1]["retained_work"]["commands"] == 0
+                && cluster.status()["nodes"][0]["retained_work"]["commands"] == 0
+        })
+        .await;
+        let end = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < end {
+            cluster.drive().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let retried = cluster.status();
+        assert_eq!(retried["peer_idle"]["source"]["reply"], remote);
+        assert_eq!(
+            retried["nodes"][1]["retained_work"]["local_replica"],
+            original
+        );
+        assert_eq!(
+            retried["nodes"][1]["retained_work"]["app_observation"],
+            *application
+        );
+        assert_eq!(data_contact(&primary, b"read\n"), written);
+        assert!(cluster
+            .ledger
+            .placements
+            .iter()
+            .all(|placement| placement.link_alive));
+        Ok::<(), String>(())
+    })
+    .await;
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    if let Some(endpoint) = endpoint {
+        assert!(TcpStream::connect(endpoint).is_err());
+    }
+    result.unwrap().unwrap();
+}
+#[tokio::test]
+async fn peer_idle_stale_native_requests_cannot_reopen_and_peer_loss_preserves_fm() {
+    let fixture = Fixture::new("peer-idle-stale");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::StatefulPeerIdle;
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    cluster.prepare().unwrap();
+    let launches = [
+        cluster.ledger.placements[0].launch.clone(),
+        cluster.ledger.placements[1].launch.clone(),
+    ];
+    let result = node::report_tests::run_peer_idle_stale(&launches).await;
+    assert_eq!(cluster.shutdown().await["clean"], true);
+    result.unwrap().unwrap();
+}
+
 fn command(op: &str, action: &str, node: Option<u8>) -> Command {
     Command {
         op: op.into(),
@@ -165,155 +460,190 @@ fn ready_reply(placement: &fm::Placement) -> AddInstanceReply {
         replica: Replica {
             state: 2,
             service_endpoint: "127.0.0.1:23456".into(),
-            replication_endpoint: if body.service.stateful { "127.0.0.1:23457".into() } else { String::new() },
+            replication_endpoint: if body.service.stateful {
+                "127.0.0.1:23457".into()
+            } else {
+                String::new()
+            },
             ..body.replica
         },
         error: 0,
     }
 }
-    fn remove_reply(placement: &fm::Placement) -> AddInstanceReply {
-        let mut reply = ready_reply(placement);
-        reply.replica = Replica {
-            node: reply.replica.node,
-            id: reply.replica.id,
-            instance: reply.replica.instance,
-            up: false,
-            state: 3,
-            ..Replica::default()
-        };
-        reply
+fn remove_reply(placement: &fm::Placement) -> AddInstanceReply {
+    let mut reply = ready_reply(placement);
+    reply.replica = Replica {
+        node: reply.replica.node,
+        id: reply.replica.id,
+        instance: reply.replica.instance,
+        up: false,
+        state: 3,
+        ..Replica::default()
+    };
+    reply
+}
+fn retirement(placement: &fm::Placement) -> RetirementReceipt {
+    RetirementReceipt {
+        deployment: placement.launch.deployment.clone(),
+        session: placement.launch.session.clone(),
+        node: placement.launch.node.clone(),
+        fm: placement.launch.fm.clone(),
+        generation: placement.launch.generation.clone(),
+        node_pid: 555,
+        app_pid: placement.profile.as_ref().unwrap().app_pid,
+        runtime_root: placement.profile.as_ref().unwrap().runtime_root.clone(),
+        disposal: fube_node::local::InstanceDisposal {
+            body: placement.body().unwrap(),
+            host: "original-host".into(),
+            runtime: "original-runtime".into(),
+            command: 8,
+            ra_operation: 19,
+            lookup: 3,
+            acquisition: 42,
+        },
     }
-    fn retirement(placement: &fm::Placement) -> RetirementReceipt {
-        RetirementReceipt {
-            deployment: placement.launch.deployment.clone(),
-            session: placement.launch.session.clone(),
-            node: placement.launch.node.clone(),
-            fm: placement.launch.fm.clone(),
-            generation: placement.launch.generation.clone(),
-            node_pid: 555,
-            app_pid: placement.profile.as_ref().unwrap().app_pid,
-            runtime_root: placement.profile.as_ref().unwrap().runtime_root.clone(),
-            disposal: fube_node::local::InstanceDisposal {
-                body: placement.body().unwrap(),
-                host: "original-host".into(),
-                runtime: "original-runtime".into(),
-                command: 8,
-                ra_operation: 19,
-                lookup: 3,
-                acquisition: 42,
-            },
-        }
-    }
+}
 
-    #[test]
-    fn serialized_retirement_join_rejects_missing_old_and_cross_owner_proofs_in_both_orders() {
-        let parent = support::parent();
-        let root = parent.join(format!("receipt-{}", uuid::Uuid::new_v4()));
-        private_dir(&root).unwrap();
-        let path = root.join("retirement.json");
-        for proof_first in [false, true] {
-            let mut ledger = ledger();
-            ledger.accept(command("a", "create", Some(1))).unwrap();
-            let first = ready_reply(&ledger.placements[0]);
-            ledger.reply(0, first.clone(), false).unwrap();
-            let first_result = ledger.result("a");
-            ledger.accept(command("d", "delete", Some(1))).unwrap();
-            let old_proof = retirement(&ledger.placements[0]);
-            let removed = remove_reply(&ledger.placements[0]);
-            if proof_first {
-                write_json(&path, &old_proof).unwrap();
-                ledger.read_retirement(0, &path, 555).unwrap();
-                assert_eq!(ledger.result("d")["state"], "pending");
-                assert!(ledger.accept(command("early", "create", Some(1))).is_err());
-                ledger.reply(0, removed, true).unwrap();
-            } else {
-                let _ = fs::remove_file(&path);
-                ledger.reply(0, removed, true).unwrap();
-                ledger.read_retirement(0, &path, 555).unwrap();
-                assert_eq!(ledger.result("d")["state"], "pending");
-                assert!(ledger.accept(command("early", "create", Some(1))).is_err());
-                write_json(&path, &old_proof).unwrap();
-                ledger.read_retirement(0, &path, 555).unwrap();
-            }
-            assert_eq!(ledger.result("d")["cleanup"], "verified_original_instance");
-            let deleted = ledger.result("d");
-            ledger.accept(command("b", "create", Some(1))).unwrap();
-            assert_eq!(ledger.placements[0].replica, first.replica.id + 1);
-            assert_eq!(ledger.placements[0].incarnation, first.replica.instance + 1);
-            ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
-            ledger.accept(command("e", "delete", Some(1))).unwrap();
-            ledger.reply(0, remove_reply(&ledger.placements[0]), true).unwrap();
-            // The serialized, otherwise valid old proof cannot discharge B.
-            write_json(&path, &old_proof).unwrap();
-            ledger.read_retirement(0, &path, 555).unwrap();
-            assert_eq!(ledger.result("e")["state"], "pending");
-            let identity = (ledger.placements[0].replica, ledger.placements[0].incarnation);
-            let operations = ledger.operations.len();
-            assert!(ledger.accept(command("premature", "create", Some(1))).is_err());
-            assert_eq!(ledger.operations.len(), operations);
-            assert_eq!((ledger.placements[0].replica, ledger.placements[0].incarnation), identity);
-            let current = retirement(&ledger.placements[0]);
-            let mut sibling = current.clone();
-            sibling.session = ledger.placements[1].launch.session.clone();
-            write_json(&path, &sibling).unwrap();
-            assert!(ledger.read_retirement(0, &path, 555).is_err());
-            assert_eq!(ledger.result("e")["state"], "pending");
-            write_json(&path, &current).unwrap();
-            ledger.read_retirement(0, &path, 555).unwrap();
-            assert_eq!(ledger.result("e")["state"], "complete");
-            ledger.accept(command("c", "create", Some(1))).unwrap();
-            ledger.lost(0, "current link lost".into());
-            assert_eq!(ledger.result("a"), first_result, "predecessor snapshot is frozen");
-            assert_eq!(ledger.result("d"), deleted);
-            assert!(matches!(ledger.accept(command("a", "create", Some(1))).unwrap(),
-                Accepted::Duplicate(value) if value == first_result));
-            assert!(ledger.accept(command("a", "create", Some(2))).is_err());
-            assert!(ledger.accept(command("after-loss", "create", Some(1))).is_err());
-        }
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn retired_native_frames_do_not_mutate_successor_and_identity_overflow_does_not_consume_history() {
+#[test]
+fn serialized_retirement_join_rejects_missing_old_and_cross_owner_proofs_in_both_orders() {
+    let parent = support::parent();
+    let root = parent.join(format!("receipt-{}", uuid::Uuid::new_v4()));
+    private_dir(&root).unwrap();
+    let path = root.join("retirement.json");
+    for proof_first in [false, true] {
         let mut ledger = ledger();
         ledger.accept(command("a", "create", Some(1))).unwrap();
-        let old = ready_reply(&ledger.placements[0]);
-        ledger.reply(0, old.clone(), false).unwrap();
+        let first = ready_reply(&ledger.placements[0]);
+        ledger.reply(0, first.clone(), false).unwrap();
+        let first_result = ledger.result("a");
         ledger.accept(command("d", "delete", Some(1))).unwrap();
+        let old_proof = retirement(&ledger.placements[0]);
         let removed = remove_reply(&ledger.placements[0]);
-        ledger.reply(0, removed.clone(), true).unwrap();
-        ledger.retirement(0, retirement(&ledger.placements[0]), 555).unwrap();
+        if proof_first {
+            write_json(&path, &old_proof).unwrap();
+            ledger.read_retirement(0, &path, 555).unwrap();
+            assert_eq!(ledger.result("d")["state"], "pending");
+            assert!(ledger.accept(command("early", "create", Some(1))).is_err());
+            ledger.reply(0, removed, true).unwrap();
+        } else {
+            let _ = fs::remove_file(&path);
+            ledger.reply(0, removed, true).unwrap();
+            ledger.read_retirement(0, &path, 555).unwrap();
+            assert_eq!(ledger.result("d")["state"], "pending");
+            assert!(ledger.accept(command("early", "create", Some(1))).is_err());
+            write_json(&path, &old_proof).unwrap();
+            ledger.read_retirement(0, &path, 555).unwrap();
+        }
+        assert_eq!(ledger.result("d")["cleanup"], "verified_original_instance");
+        let deleted = ledger.result("d");
         ledger.accept(command("b", "create", Some(1))).unwrap();
-        let current = ready_reply(&ledger.placements[0]);
-        ledger.reply(0, current.clone(), false).unwrap();
-        let status = ledger.status();
-        ledger.reply(0, old, false).unwrap();
-        ledger.reply(0, removed.clone(), true).unwrap();
-        let report = ReplicaUp {
-            dropped: ObjectArray(vec![FailoverUnitInfo {
-                unit: removed.unit,
-                service: ledger.placements[0].body().unwrap().service,
-                replicas: ObjectArray(vec![ReplicaInfo {
-                    description: removed.replica,
-                    intermediate_role: 1,
-                }]),
-                ..FailoverUnitInfo::default()
-            }]),
-            ..ReplicaUp::default()
-        };
-        assert!(ledger.placements[0].report(&report).unwrap().is_none());
-        assert_eq!(ledger.status(), status);
-        assert!(ledger.placements[0].link_alive);
+        assert_eq!(ledger.placements[0].replica, first.replica.id + 1);
+        assert_eq!(ledger.placements[0].incarnation, first.replica.instance + 1);
+        ledger
+            .reply(0, ready_reply(&ledger.placements[0]), false)
+            .unwrap();
         ledger.accept(command("e", "delete", Some(1))).unwrap();
-        ledger.reply(0, remove_reply(&ledger.placements[0]), true).unwrap();
-        ledger.retirement(0, retirement(&ledger.placements[0]), 555).unwrap();
-        ledger.placements[0].incarnation = i64::MAX;
-        let prior = ledger.operations.len();
-        let replica = ledger.placements[0].replica;
-        assert!(ledger.accept(command("overflow", "create", Some(1))).is_err());
-        assert_eq!(ledger.operations.len(), prior);
-        assert_eq!(ledger.placements[0].replica, replica);
+        ledger
+            .reply(0, remove_reply(&ledger.placements[0]), true)
+            .unwrap();
+        // The serialized, otherwise valid old proof cannot discharge B.
+        write_json(&path, &old_proof).unwrap();
+        ledger.read_retirement(0, &path, 555).unwrap();
+        assert_eq!(ledger.result("e")["state"], "pending");
+        let identity = (
+            ledger.placements[0].replica,
+            ledger.placements[0].incarnation,
+        );
+        let operations = ledger.operations.len();
+        assert!(ledger
+            .accept(command("premature", "create", Some(1)))
+            .is_err());
+        assert_eq!(ledger.operations.len(), operations);
+        assert_eq!(
+            (
+                ledger.placements[0].replica,
+                ledger.placements[0].incarnation
+            ),
+            identity
+        );
+        let current = retirement(&ledger.placements[0]);
+        let mut sibling = current.clone();
+        sibling.session = ledger.placements[1].launch.session.clone();
+        write_json(&path, &sibling).unwrap();
+        assert!(ledger.read_retirement(0, &path, 555).is_err());
+        assert_eq!(ledger.result("e")["state"], "pending");
+        write_json(&path, &current).unwrap();
+        ledger.read_retirement(0, &path, 555).unwrap();
+        assert_eq!(ledger.result("e")["state"], "complete");
+        ledger.accept(command("c", "create", Some(1))).unwrap();
+        ledger.lost(0, "current link lost".into());
+        assert_eq!(
+            ledger.result("a"),
+            first_result,
+            "predecessor snapshot is frozen"
+        );
+        assert_eq!(ledger.result("d"), deleted);
+        assert!(
+            matches!(ledger.accept(command("a", "create", Some(1))).unwrap(),
+                Accepted::Duplicate(value) if value == first_result)
+        );
+        assert!(ledger.accept(command("a", "create", Some(2))).is_err());
+        assert!(ledger
+            .accept(command("after-loss", "create", Some(1)))
+            .is_err());
     }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retired_native_frames_do_not_mutate_successor_and_identity_overflow_does_not_consume_history() {
+    let mut ledger = ledger();
+    ledger.accept(command("a", "create", Some(1))).unwrap();
+    let old = ready_reply(&ledger.placements[0]);
+    ledger.reply(0, old.clone(), false).unwrap();
+    ledger.accept(command("d", "delete", Some(1))).unwrap();
+    let removed = remove_reply(&ledger.placements[0]);
+    ledger.reply(0, removed.clone(), true).unwrap();
+    ledger
+        .retirement(0, retirement(&ledger.placements[0]), 555)
+        .unwrap();
+    ledger.accept(command("b", "create", Some(1))).unwrap();
+    let current = ready_reply(&ledger.placements[0]);
+    ledger.reply(0, current.clone(), false).unwrap();
+    let status = ledger.status();
+    ledger.reply(0, old, false).unwrap();
+    ledger.reply(0, removed.clone(), true).unwrap();
+    let report = ReplicaUp {
+        dropped: ObjectArray(vec![FailoverUnitInfo {
+            unit: removed.unit,
+            service: ledger.placements[0].body().unwrap().service,
+            replicas: ObjectArray(vec![ReplicaInfo {
+                description: removed.replica,
+                intermediate_role: 1,
+            }]),
+            ..FailoverUnitInfo::default()
+        }]),
+        ..ReplicaUp::default()
+    };
+    assert!(ledger.placements[0].report(&report).unwrap().is_none());
+    assert_eq!(ledger.status(), status);
+    assert!(ledger.placements[0].link_alive);
+    ledger.accept(command("e", "delete", Some(1))).unwrap();
+    ledger
+        .reply(0, remove_reply(&ledger.placements[0]), true)
+        .unwrap();
+    ledger
+        .retirement(0, retirement(&ledger.placements[0]), 555)
+        .unwrap();
+    ledger.placements[0].incarnation = i64::MAX;
+    let prior = ledger.operations.len();
+    let replica = ledger.placements[0].replica;
+    assert!(ledger
+        .accept(command("overflow", "create", Some(1)))
+        .is_err());
+    assert_eq!(ledger.operations.len(), prior);
+    assert_eq!(ledger.placements[0].replica, replica);
+}
 
 #[test]
 fn private_launch_metadata_roundtrip_does_not_use_native_byte_array_json_visitors() {
@@ -333,6 +663,7 @@ fn private_launch_metadata_roundtrip_does_not_use_native_byte_array_json_visitor
         node: launch.node,
         pid: 555,
         address: "127.0.0.1:23456".parse().unwrap(),
+        peer_address: None,
         profile: Some(profile(&decoded)),
     };
     let bytes = serde_json::to_vec(&metadata).unwrap();
@@ -452,22 +783,38 @@ fn finite_identities_are_not_evicted_and_uncertainty_retains_authority() {
 
     let mut repeated = self::ledger();
     for cycle in 0..2 {
-        repeated.accept(command(&format!("c{cycle}"), "create", Some(1))).unwrap();
-        repeated.reply(0, ready_reply(&repeated.placements[0]), false).unwrap();
-        repeated.accept(command(&format!("d{cycle}"), "delete", Some(1))).unwrap();
-        repeated.reply(0, remove_reply(&repeated.placements[0]), true).unwrap();
-        repeated.retirement(0, retirement(&repeated.placements[0]), 555).unwrap();
+        repeated
+            .accept(command(&format!("c{cycle}"), "create", Some(1)))
+            .unwrap();
+        repeated
+            .reply(0, ready_reply(&repeated.placements[0]), false)
+            .unwrap();
+        repeated
+            .accept(command(&format!("d{cycle}"), "delete", Some(1)))
+            .unwrap();
+        repeated
+            .reply(0, remove_reply(&repeated.placements[0]), true)
+            .unwrap();
+        repeated
+            .retirement(0, retirement(&repeated.placements[0]), 555)
+            .unwrap();
     }
     let old = repeated.result("c0");
     let replica = repeated.placements[0].replica;
     for index in 4..64 {
-        repeated.accept(command(&format!("s{index}"), "status", None)).unwrap();
+        repeated
+            .accept(command(&format!("s{index}"), "status", None))
+            .unwrap();
     }
-    assert!(repeated.accept(command("capacity", "create", Some(1))).is_err());
+    assert!(repeated
+        .accept(command("capacity", "create", Some(1)))
+        .is_err());
     assert_eq!(repeated.placements[0].replica, replica);
     assert_eq!(repeated.operations.len(), 64);
-    assert!(matches!(repeated.accept(command("c0", "create", Some(1))).unwrap(),
-        Accepted::Duplicate(value) if value == old));
+    assert!(
+        matches!(repeated.accept(command("c0", "create", Some(1))).unwrap(),
+        Accepted::Duplicate(value) if value == old)
+    );
     assert!(repeated.accept(command("c0", "create", Some(2))).is_err());
 }
 
@@ -475,10 +822,14 @@ fn finite_identities_are_not_evicted_and_uncertainty_retains_authority() {
 fn semantic_remove_then_disconnect_cannot_be_repaired_by_a_late_local_receipt() {
     let mut ledger = ledger();
     ledger.accept(command("c", "create", Some(1))).unwrap();
-    ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
+    ledger
+        .reply(0, ready_reply(&ledger.placements[0]), false)
+        .unwrap();
     ledger.accept(command("d", "delete", Some(1))).unwrap();
     let proof = retirement(&ledger.placements[0]);
-    ledger.reply(0, remove_reply(&ledger.placements[0]), true).unwrap();
+    ledger
+        .reply(0, remove_reply(&ledger.placements[0]), true)
+        .unwrap();
     assert_eq!(ledger.result("d")["state"], "pending");
     ledger.lost(0, "original channel lost before proof".into());
     ledger.retirement(0, proof, 555).unwrap();
@@ -579,46 +930,73 @@ async fn real_generation_handshake_uses_correlated_replies_and_keeps_upload_gate
         let initial = cluster.children[0].launch.generation.clone();
         let mut high = initial.clone();
         high.number.generation += 10;
-        link.send(generation_update_message(
-            &GenerationUpdate { fm_service_epoch: Epoch::default() }, &high,
-        ).map_err(err)?).await?;
-        let mut rejected = link.receive(wire::deadline()).await?
+        link.send(
+            generation_update_message(
+                &GenerationUpdate {
+                    fm_service_epoch: Epoch::default(),
+                },
+                &high,
+            )
+            .map_err(err)?,
+        )
+        .await?;
+        let mut rejected = link
+            .receive(wire::deadline())
+            .await?
             .ok_or("missing native GenerationUpdateReject")?;
         let proposed = decode_generation_update_reject(&rejected.message).map_err(err)?;
         assert_eq!(proposed, initial.number);
-        if let Some(handoff) = rejected.handoff.as_mut() { handoff.acknowledge(); }
-        let reply = link.request(generation_proposal_message(&high).map_err(err)?).await?;
+        if let Some(handoff) = rejected.handoff.as_mut() {
+            handoff.acknowledge();
+        }
+        let reply = link
+            .request(generation_proposal_message(&high).map_err(err)?)
+            .await?;
         let reply = decode_generation_proposal_reply(&reply).map_err(err)?;
         assert_eq!(reply.proposed, high.number);
         assert_eq!(reply.current, high.number);
         assert_eq!(reply.error, 0);
-        cluster.execute(command("sibling", "create", Some(2))).await?;
-        until(&mut cluster, |c| c.ledger.placements[1].observed == Observed::Running).await;
+        cluster
+            .execute(command("sibling", "create", Some(2)))
+            .await?;
+        until(&mut cluster, |c| {
+            c.ledger.placements[1].observed == Observed::Running
+        })
+        .await;
         let sibling = cluster.ledger.placements[1].endpoint.clone().unwrap();
         let started = cluster.begin_generation_handshake()?;
         assert_eq!(started["complete"], false);
         until(&mut cluster, |c| {
-            let Some(round) = &c.ledger.generation else { return false; };
+            let Some(round) = &c.ledger.generation else {
+                return false;
+            };
             round.number.generation > high.number.generation
                 && round.updates_sent == [true; 2]
                 && c.status()["nodes"].as_array().unwrap().iter().all(|node| {
                     node["retained_work"]["generations"]["upload_pending"] == true
-                        && node["retained_work"]["generations"]["receive"]
-                            == json!(round.number)
+                        && node["retained_work"]["generations"]["receive"] == json!(round.number)
                 })
-        }).await;
+        })
+        .await;
         let status = cluster.status();
         assert_eq!(status["generation_handshake"]["phase"], "awaiting_upload");
         assert_eq!(status["generation_handshake"]["complete"], false);
         for node in status["nodes"].as_array().unwrap() {
-            assert_eq!(node["retained_work"]["generations"]["send"], json!(initial.number));
+            assert_eq!(
+                node["retained_work"]["generations"]["send"],
+                json!(initial.number)
+            );
             assert_eq!(node["link_alive"], true);
         }
         assert_eq!(contact(&sibling)["service"], SERVICE);
         assert!(!cluster.ledger.placements[0].created);
-        assert!(cluster.execute(command("blocked", "create", Some(1))).await.is_err());
+        assert!(cluster
+            .execute(command("blocked", "create", Some(1)))
+            .await
+            .is_err());
         Ok(())
-    }.await;
+    }
+    .await;
     let cleanup = cluster.shutdown().await;
     assert_eq!(cleanup["clean"], true, "{cleanup}");
     result.unwrap();
@@ -632,44 +1010,86 @@ async fn stateful_add_primary_lost_reply_retries_the_original_native_lifetime() 
     config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
     let mut cluster = Cluster::new(config).unwrap();
     cluster.start().await.unwrap();
-    cluster.execute(command("primary", "create", Some(1))).await.unwrap();
+    cluster
+        .execute(command("primary", "create", Some(1)))
+        .await
+        .unwrap();
     let end = Instant::now() + Duration::from_secs(8);
     let original = loop {
         let link = cluster.children[0].link.as_ref().unwrap();
-        if let Some(mut incoming) = link.receive(Instant::now() + Duration::from_millis(10)).await.unwrap() {
+        if let Some(mut incoming) = link
+            .receive(Instant::now() + Duration::from_millis(10))
+            .await
+            .unwrap()
+        {
             let action = incoming.message.properties().unwrap().action;
             let reply = match action.as_str() {
                 "AddPrimaryReply" => Some(decode_add_primary_reply(&incoming.message).unwrap().0),
                 "ServiceTypeNotification" => {
                     let body = decode_service_type_notification(&incoming.message).unwrap();
                     let admitted = cluster.ledger.placements[0].notification(&body).unwrap();
-                    link.send(service_type_notification_reply_message(&admitted,
-                        &cluster.children[0].launch.generation).unwrap()).await.unwrap();
+                    link.send(
+                        service_type_notification_reply_message(
+                            &admitted,
+                            &cluster.children[0].launch.generation,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
                     None
                 }
                 other => panic!("unexpected original Primary ingress {other}"),
             };
-            if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
-            if let Some(reply) = reply { break reply; } // Intentionally lose semantic processing, not the live link.
+            if let Some(handoff) = incoming.handoff.as_mut() {
+                handoff.acknowledge();
+            }
+            if let Some(reply) = reply {
+                break reply;
+            } // Intentionally lose semantic processing, not the live link.
         }
         assert!(Instant::now() < end, "initial Primary reply not observed");
     };
     assert_eq!(cluster.ledger.placements[0].observed, Observed::Pending);
     assert!(cluster.ledger.placements[0].endpoint.is_none());
-    let app_pid = cluster.children[0].metadata.as_ref().unwrap().profile.as_ref().unwrap().app_pid;
-    until_with_budget(&mut cluster, Duration::from_secs(15), |cluster|
-        cluster.ledger.placements[0].observed == Observed::Running).await;
+    let app_pid = cluster.children[0]
+        .metadata
+        .as_ref()
+        .unwrap()
+        .profile
+        .as_ref()
+        .unwrap()
+        .app_pid;
+    until_with_budget(&mut cluster, Duration::from_secs(15), |cluster| {
+        cluster.ledger.placements[0].observed == Observed::Running
+    })
+    .await;
     let placement = &cluster.ledger.placements[0];
-    assert_eq!((placement.replica, placement.incarnation), (original.replica.id, original.replica.instance));
-    assert_eq!(placement.endpoint.as_ref().unwrap(), &original.replica.service_endpoint);
+    assert_eq!(
+        (placement.replica, placement.incarnation),
+        (original.replica.id, original.replica.instance)
+    );
+    assert_eq!(
+        placement.endpoint.as_ref().unwrap(),
+        &original.replica.service_endpoint
+    );
     let endpoint = placement.endpoint.clone().unwrap();
     let mut socket = TcpStream::connect(&endpoint).unwrap();
-    socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
     socket.write_all(b"write\n").unwrap();
     let mut response = String::new();
     socket.take(512).read_to_string(&mut response).unwrap();
-    assert!(response.contains("assigned=1 applied=1 committed=1 value=acknowledged"), "{response}");
-    assert!(cluster.ledger.primary_retry(0, Instant::now() + Duration::from_secs(100)).unwrap().is_none());
+    assert!(
+        response.contains("assigned=1 applied=1 committed=1 value=acknowledged"),
+        "{response}"
+    );
+    assert!(cluster
+        .ledger
+        .primary_retry(0, Instant::now() + Duration::from_secs(100))
+        .unwrap()
+        .is_none());
     assert!(cluster.shutdown().await["clean"] == true);
     assert!(gone(app_pid));
     assert!(TcpStream::connect(&endpoint).is_err());
@@ -681,33 +1101,82 @@ fn stateful_primary_retry_preserves_native_minimum_and_maximum_action_intervals(
     ledger.accept(command("create", "create", Some(1))).unwrap();
     let initial = ledger.placements[0].body().unwrap();
     let now = Instant::now();
-    assert!(ledger.primary_retry(0, now + Duration::from_secs(9)).unwrap().is_none());
-    assert_eq!(ledger.primary_retry(0, now + Duration::from_secs(11)).unwrap().unwrap(), initial);
-    assert!(ledger.primary_retry(0, now + Duration::from_secs(61)).unwrap().is_none());
-    assert_eq!(ledger.primary_retry(0, now + Duration::from_secs(72)).unwrap().unwrap(), initial);
+    assert!(ledger
+        .primary_retry(0, now + Duration::from_secs(9))
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        ledger
+            .primary_retry(0, now + Duration::from_secs(11))
+            .unwrap()
+            .unwrap(),
+        initial
+    );
+    assert!(ledger
+        .primary_retry(0, now + Duration::from_secs(61))
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        ledger
+            .primary_retry(0, now + Duration::from_secs(72))
+            .unwrap()
+            .unwrap(),
+        initial
+    );
     assert!(ledger.accept(command("delete", "delete", Some(1))).is_err());
-    assert!(ledger.accept(command("replacement", "create", Some(1))).is_err());
+    assert!(ledger
+        .accept(command("replacement", "create", Some(1)))
+        .is_err());
 }
 
 #[test]
 fn stateful_delete_requires_both_original_inputs_before_explicit_fresh_recreation() {
     for proof_first in [false, true] {
         let mut ledger = stateful_ledger();
-        assert!(ledger.accept(command("missing", "delete", Some(1))).is_err());
+        assert!(ledger
+            .accept(command("missing", "delete", Some(1)))
+            .is_err());
         ledger.accept(command("create", "create", Some(1))).unwrap();
-        assert!(ledger.accept(command("opening", "delete", Some(1))).is_err());
-        ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
+        assert!(ledger
+            .accept(command("opening", "delete", Some(1)))
+            .is_err());
+        ledger
+            .reply(0, ready_reply(&ledger.placements[0]), false)
+            .unwrap();
         let original = ledger.placements[0].body().unwrap();
-        let Accepted::Delete(_, request) = ledger.accept(command("delete", "delete", Some(1))).unwrap() else {
+        let Accepted::Delete(_, request) =
+            ledger.accept(command("delete", "delete", Some(1))).unwrap()
+        else {
             panic!("normal stateful delete expected");
         };
         assert_eq!(*request, DeleteReplica::new(original.clone(), false));
-        assert!(ledger.primary_retry(0, Instant::now() + Duration::from_secs(100)).unwrap().is_none());
+        assert!(ledger
+            .primary_retry(0, Instant::now() + Duration::from_secs(100))
+            .unwrap()
+            .is_none());
         let now = Instant::now();
-        assert!(ledger.deletion_retry(0, now + Duration::from_secs(9)).unwrap().is_none());
-        assert_eq!(ledger.deletion_retry(0, now + Duration::from_secs(11)).unwrap().unwrap(), *request);
-        assert!(ledger.deletion_retry(0, now + Duration::from_secs(61)).unwrap().is_none());
-        assert_eq!(ledger.deletion_retry(0, now + Duration::from_secs(72)).unwrap().unwrap(), *request);
+        assert!(ledger
+            .deletion_retry(0, now + Duration::from_secs(9))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            ledger
+                .deletion_retry(0, now + Duration::from_secs(11))
+                .unwrap()
+                .unwrap(),
+            *request
+        );
+        assert!(ledger
+            .deletion_retry(0, now + Duration::from_secs(61))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            ledger
+                .deletion_retry(0, now + Duration::from_secs(72))
+                .unwrap()
+                .unwrap(),
+            *request
+        );
         let correct = remove_reply(&ledger.placements[0]);
         for forged in 0..4 {
             let mut reply = correct.clone();
@@ -724,31 +1193,56 @@ fn stateful_delete_requires_both_original_inputs_before_explicit_fresh_recreatio
         foreign.disposal.acquisition = 0;
         assert!(ledger.retirement(0, foreign, 555).is_err());
         if proof_first {
-            ledger.retirement(0, retirement(&ledger.placements[0]), 555).unwrap();
+            ledger
+                .retirement(0, retirement(&ledger.placements[0]), 555)
+                .unwrap();
         } else {
             ledger.reply(0, correct.clone(), true).unwrap();
-            assert!(ledger.deletion_retry(0, now + Duration::from_secs(200)).unwrap().is_none());
+            assert!(ledger
+                .deletion_retry(0, now + Duration::from_secs(200))
+                .unwrap()
+                .is_none());
         }
         assert_eq!(ledger.result("delete")["state"], "pending");
         assert_eq!(ledger.placements[0].observed, Observed::Pending);
-        assert!(ledger.accept(command("premature", "create", Some(1))).is_err());
+        assert!(ledger
+            .accept(command("premature", "create", Some(1)))
+            .is_err());
         if proof_first {
             ledger.reply(0, correct.clone(), true).unwrap();
         } else {
-            ledger.retirement(0, retirement(&ledger.placements[0]), 555).unwrap();
+            ledger
+                .retirement(0, retirement(&ledger.placements[0]), 555)
+                .unwrap();
         }
         assert_eq!(ledger.result("delete")["state"], "complete");
         assert_eq!(ledger.placements[0].observed, Observed::Absent);
         assert!(ledger.placements[0].reusable);
-        assert_eq!(ledger.placements[0].retired, [(original.replica.id, original.replica.instance)]);
+        assert_eq!(
+            ledger.placements[0].retired,
+            [(original.replica.id, original.replica.instance)]
+        );
         let old_proof = retirement(&ledger.placements[0]);
         ledger.reply(0, correct.clone(), true).unwrap();
-        ledger.retirement(0, retirement(&ledger.placements[0]), 555).unwrap();
-        assert!(matches!(ledger.accept(command("delete", "delete", Some(1))).unwrap(), Accepted::Duplicate(_)));
-        assert!(ledger.deletion_retry(0, now + Duration::from_secs(200)).unwrap().is_none());
-        ledger.accept(command("replacement", "create", Some(1))).unwrap();
+        ledger
+            .retirement(0, retirement(&ledger.placements[0]), 555)
+            .unwrap();
+        assert!(matches!(
+            ledger.accept(command("delete", "delete", Some(1))).unwrap(),
+            Accepted::Duplicate(_)
+        ));
+        assert!(ledger
+            .deletion_retry(0, now + Duration::from_secs(200))
+            .unwrap()
+            .is_none());
+        ledger
+            .accept(command("replacement", "create", Some(1)))
+            .unwrap();
         assert_eq!(ledger.placements[0].replica, original.replica.id + 1);
-        assert_eq!(ledger.placements[0].incarnation, original.replica.instance + 1);
+        assert_eq!(
+            ledger.placements[0].incarnation,
+            original.replica.instance + 1
+        );
         let fresh = ledger.status();
         ledger.reply(0, correct, true).unwrap();
         ledger.retirement(0, old_proof, 555).unwrap();
@@ -766,7 +1260,8 @@ async fn stateful_missing_delete_is_metadata_only_and_fresh_open_has_its_own_dis
     let mut cluster = Cluster::new(config).unwrap();
     cluster.prepare().unwrap();
     let result = node::report_tests::run_stateful_tombstone(&cluster.ledger.placements[0].launch)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert_eq!(cluster.shutdown().await["clean"], true);
     result.unwrap();
 }
@@ -780,74 +1275,151 @@ async fn stateful_delete_lost_reply_retries_original_lifetime_after_independent_
     let mut cluster = Cluster::new(config).unwrap();
     cluster.start().await.unwrap();
     for node in 1..=2 {
-        cluster.execute(command(&format!("primary-{node}"), "create", Some(node))).await.unwrap();
+        cluster
+            .execute(command(&format!("primary-{node}"), "create", Some(node)))
+            .await
+            .unwrap();
     }
-    until(&mut cluster, |c| c.ledger.placements.iter().all(|p| p.observed == Observed::Running)).await;
-    let profile = cluster.children[0].metadata.as_ref().unwrap().profile.as_ref().unwrap().clone();
+    until(&mut cluster, |c| {
+        c.ledger
+            .placements
+            .iter()
+            .all(|p| p.observed == Observed::Running)
+    })
+    .await;
+    let profile = cluster.children[0]
+        .metadata
+        .as_ref()
+        .unwrap()
+        .profile
+        .as_ref()
+        .unwrap()
+        .clone();
     let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
     let sibling = cluster.ledger.placements[1].endpoint.clone().unwrap();
     let request = |endpoint: &str, command: &[u8]| {
         let mut socket = TcpStream::connect(endpoint).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         socket.write_all(command).unwrap();
         let mut response = String::new();
         socket.take(512).read_to_string(&mut response).unwrap();
         response
     };
-    until(&mut cluster, |_| request(&endpoint, b"read\n").starts_with("OK ")).await;
+    until(&mut cluster, |_| {
+        request(&endpoint, b"read\n").starts_with("OK ")
+    })
+    .await;
     let written = request(&endpoint, b"write\n");
-    assert!(written.contains("assigned=1 applied=1 committed=1 value=acknowledged"), "{written}");
+    assert!(
+        written.contains("assigned=1 applied=1 committed=1 value=acknowledged"),
+        "{written}"
+    );
     assert_eq!(request(&endpoint, b"read\n"), written);
     let original = cluster.ledger.placements[0].body().unwrap();
-    cluster.execute(command("delete", "delete", Some(1))).await.unwrap();
+    cluster
+        .execute(command("delete", "delete", Some(1)))
+        .await
+        .unwrap();
     let end = Instant::now() + Duration::from_secs(8);
     loop {
         let link = cluster.children[0].link.as_ref().unwrap();
-        if let Some(mut incoming) = link.receive(Instant::now() + Duration::from_millis(10)).await.unwrap() {
+        if let Some(mut incoming) = link
+            .receive(Instant::now() + Duration::from_millis(10))
+            .await
+            .unwrap()
+        {
             let action = incoming.message.properties().unwrap().action;
             let lost = match action.as_str() {
                 "DeleteReplicaReply" => {
                     let reply = decode_delete_replica_reply(&incoming.message).unwrap().0;
-                    assert_eq!((reply.replica.id, reply.replica.instance), (original.replica.id, original.replica.instance));
+                    assert_eq!(
+                        (reply.replica.id, reply.replica.instance),
+                        (original.replica.id, original.replica.instance)
+                    );
                     true
                 }
                 "ServiceTypeNotification" => {
                     let body = decode_service_type_notification(&incoming.message).unwrap();
-                    link.send(service_type_notification_reply_message(&body,
-                        &cluster.children[0].launch.generation).unwrap()).await.unwrap();
+                    link.send(
+                        service_type_notification_reply_message(
+                            &body,
+                            &cluster.children[0].launch.generation,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
                     false
                 }
                 other => panic!("unexpected DeleteReplica ingress {other}"),
             };
-            if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
-            if lost { break; }
+            if let Some(handoff) = incoming.handoff.as_mut() {
+                handoff.acknowledge();
+            }
+            if lost {
+                break;
+            }
         }
-        assert!(Instant::now() < end, "initial DeleteReplicaReply not observed");
+        assert!(
+            Instant::now() < end,
+            "initial DeleteReplicaReply not observed"
+        );
     }
     // Physical/service retirement by itself must not complete the lost FM reply.
-    until(&mut cluster, |c| c.ledger.placements[0].retirement.is_some()).await;
+    until(&mut cluster, |c| {
+        c.ledger.placements[0].retirement.is_some()
+    })
+    .await;
     assert_eq!(cluster.ledger.result("delete")["state"], "pending");
     assert!(TcpStream::connect(&endpoint).is_err());
     assert!(Path::new(&format!("/proc/{}", profile.app_pid)).exists());
     assert!(request(&sibling, b"read\n").starts_with("OK "));
-    until_with_budget(&mut cluster, Duration::from_secs(15), |c|
-        c.ledger.placements[0].observed == Observed::Absent).await;
+    until_with_budget(&mut cluster, Duration::from_secs(15), |c| {
+        c.ledger.placements[0].observed == Observed::Absent
+    })
+    .await;
     assert_eq!(cluster.ledger.result("delete")["state"], "complete");
     assert_eq!(cluster.ledger.placements[0].replica, original.replica.id);
     assert!(cluster.ledger.placements[0].reusable);
-    assert_eq!(cluster.execute(command("delete", "delete", Some(1))).await.unwrap()["state"], "complete");
+    assert_eq!(
+        cluster
+            .execute(command("delete", "delete", Some(1)))
+            .await
+            .unwrap()["state"],
+        "complete"
+    );
     let old_proof = cluster.ledger.placements[0].retirement.clone().unwrap();
-    cluster.execute(command("recreate", "create", Some(1))).await.unwrap();
-    until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Running).await;
+    cluster
+        .execute(command("recreate", "create", Some(1)))
+        .await
+        .unwrap();
+    until(&mut cluster, |c| {
+        c.ledger.placements[0].observed == Observed::Running
+    })
+    .await;
     let fresh_endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
-    until(&mut cluster, |_| request(&fresh_endpoint, b"read\n").starts_with("OK ")).await;
+    until(&mut cluster, |_| {
+        request(&fresh_endpoint, b"read\n").starts_with("OK ")
+    })
+    .await;
     let empty = request(&fresh_endpoint, b"read\n");
-    assert!(empty.contains("assigned=0 applied=0 committed=0 value=\n"), "{empty}");
+    assert!(
+        empty.contains("assigned=0 applied=0 committed=0 value=\n"),
+        "{empty}"
+    );
     let fresh_written = request(&fresh_endpoint, b"write\n");
     assert!(fresh_written.contains("assigned=1 applied=1 committed=1 value=acknowledged"));
     assert_eq!(request(&fresh_endpoint, b"read\n"), fresh_written);
-    assert_eq!(cluster.ledger.placements[0].replica, original.replica.id + 1);
-    assert_eq!(cluster.ledger.placements[0].incarnation, original.replica.instance + 1);
+    assert_eq!(
+        cluster.ledger.placements[0].replica,
+        original.replica.id + 1
+    );
+    assert_eq!(
+        cluster.ledger.placements[0].incarnation,
+        original.replica.instance + 1
+    );
     let fresh = cluster.ledger.placements[0].body().unwrap();
     let mut old_placement = cluster.ledger.placements[0].clone();
     old_placement.replica = original.replica.id;
@@ -865,37 +1437,72 @@ async fn stateful_delete_lost_reply_retries_original_lifetime_after_independent_
     }
     let end = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(mut incoming) = link.receive(Instant::now() + Duration::from_millis(10)).await.unwrap() {
+        if let Some(mut incoming) = link
+            .receive(Instant::now() + Duration::from_millis(10))
+            .await
+            .unwrap()
+        {
             let action = incoming.message.properties().unwrap().action;
             let barrier = match action.as_str() {
                 "AddPrimaryReply" => {
                     let reply = decode_add_primary_reply(&incoming.message).unwrap().0;
-                    assert_eq!((reply.replica.id, reply.replica.instance), (fresh.replica.id, fresh.replica.instance));
+                    assert_eq!(
+                        (reply.replica.id, reply.replica.instance),
+                        (fresh.replica.id, fresh.replica.instance)
+                    );
                     assert_eq!(reply.error, 0);
                     true
                 }
                 "ServiceTypeNotification" => {
                     let body = decode_service_type_notification(&incoming.message).unwrap();
-                    link.send(service_type_notification_reply_message(&body, generation).unwrap()).await.unwrap();
+                    link.send(service_type_notification_reply_message(&body, generation).unwrap())
+                        .await
+                        .unwrap();
                     false
                 }
                 other => panic!("stale frames emitted unexpected successor work {other}"),
             };
-            if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
-            if barrier { break; }
+            if let Some(handoff) = incoming.handoff.as_mut() {
+                handoff.acknowledge();
+            }
+            if barrier {
+                break;
+            }
         }
-        assert!(Instant::now() < end, "same-session successor reply barrier did not complete");
+        assert!(
+            Instant::now() < end,
+            "same-session successor reply barrier did not complete"
+        );
     }
     assert_eq!(request(&fresh_endpoint, b"read\n"), fresh_written);
-    cluster.execute(command("delete-fresh", "delete", Some(1))).await.unwrap();
-    until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Absent).await;
+    cluster
+        .execute(command("delete-fresh", "delete", Some(1)))
+        .await
+        .unwrap();
+    until(&mut cluster, |c| {
+        c.ledger.placements[0].observed == Observed::Absent
+    })
+    .await;
     let new_proof = cluster.ledger.placements[0].retirement.as_ref().unwrap();
     assert_ne!(old_proof.disposal.lookup, new_proof.disposal.lookup);
-    assert_ne!(old_proof.disposal.acquisition, new_proof.disposal.acquisition);
+    assert_ne!(
+        old_proof.disposal.acquisition,
+        new_proof.disposal.acquisition
+    );
     assert_eq!(cluster.ledger.placements[0].retired.len(), 2);
     assert!(TcpStream::connect(&fresh_endpoint).is_err());
     assert!(request(&sibling, b"read\n").starts_with("OK "));
-    assert_eq!(cluster.children[0].metadata.as_ref().unwrap().profile.as_ref().unwrap().app_pid, profile.app_pid);
+    assert_eq!(
+        cluster.children[0]
+            .metadata
+            .as_ref()
+            .unwrap()
+            .profile
+            .as_ref()
+            .unwrap()
+            .app_pid,
+        profile.app_pid
+    );
     assert_eq!(cluster.shutdown().await["clean"], true);
     assert!(gone(profile.app_pid));
     assert!(!profile.runtime_root.exists());
@@ -905,10 +1512,13 @@ fn stateful_loss_report(placement: &fm::Placement) -> ReplicaUp {
     let body = placement.body().unwrap();
     ReplicaUp {
         dropped: ObjectArray(vec![FailoverUnitInfo {
-            unit: body.unit, service: body.service,
-            intermediate: Epoch::default(), report_from_primary: false,
+            unit: body.unit,
+            service: body.service,
+            intermediate: Epoch::default(),
+            report_from_primary: false,
             replicas: ObjectArray(vec![ReplicaInfo {
-                description: remove_reply(placement).replica, intermediate_role: 1,
+                description: remove_reply(placement).replica,
+                intermediate_role: 1,
             }]),
             local_deleted: false,
         }]),
@@ -921,9 +1531,13 @@ fn stateful_loss_is_processed_not_echoed_and_native_deletion_never_supplies_disp
     for deleting in [false, true] {
         let mut ledger = stateful_ledger();
         ledger.accept(command("create", "create", Some(1))).unwrap();
-        ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
+        ledger
+            .reply(0, ready_reply(&ledger.placements[0]), false)
+            .unwrap();
         let original = ledger.placements[0].body().unwrap();
-        if deleting { ledger.accept(command("delete", "delete", Some(1))).unwrap(); }
+        if deleting {
+            ledger.accept(command("delete", "delete", Some(1))).unwrap();
+        }
         let report = stateful_loss_report(&ledger.placements[0]);
         for forged in 0..5 {
             let mut invalid = report.clone();
@@ -942,28 +1556,60 @@ fn stateful_loss_is_processed_not_echoed_and_native_deletion_never_supplies_disp
         assert_eq!(ack.replicas, report.dropped);
         assert!(ack.dropped.0.is_empty() && !ack.last && !ack.from_fmm);
         assert_eq!(ledger.placements[0].observed, Observed::Lost);
-        assert_eq!(ledger.placements[0].desired, if deleting { Desired::Absent } else { Desired::Running });
+        assert_eq!(
+            ledger.placements[0].desired,
+            if deleting {
+                Desired::Absent
+            } else {
+                Desired::Running
+            }
+        );
         assert!(ledger.placements[0].link_alive && ledger.placements[0].endpoint.is_none());
         assert!(ledger.placements[0].retirement.is_none() && !ledger.placements[0].reusable);
         assert_eq!(ledger.result("create")["state"], "lost");
         let now = Instant::now();
-        assert!(ledger.deletion_retry(0, now + Duration::from_secs(9)).unwrap().is_none());
-        assert_eq!(ledger.deletion_retry(0, now + Duration::from_secs(11)).unwrap().unwrap(),
-            DeleteReplica::new(original, false));
-        ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
+        assert!(ledger
+            .deletion_retry(0, now + Duration::from_secs(9))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            ledger
+                .deletion_retry(0, now + Duration::from_secs(11))
+                .unwrap()
+                .unwrap(),
+            DeleteReplica::new(original, false)
+        );
+        ledger
+            .reply(0, ready_reply(&ledger.placements[0]), false)
+            .unwrap();
         assert_eq!(ledger.placements[0].observed, Observed::Lost);
         assert_eq!(ledger.report(0, &report).unwrap(), Some(ack));
         let mut failed = ready_reply(&ledger.placements[0]);
         failed.error = -7;
         ledger.reply(0, failed, true).unwrap();
         assert!(ledger.placements[0].error.as_ref().unwrap().contains("-7"));
-        assert_eq!(ledger.placements[0].status()["native_replica_deleted"], false);
-        ledger.reply(0, remove_reply(&ledger.placements[0]), true).unwrap();
-        ledger.reply(0, remove_reply(&ledger.placements[0]), true).unwrap();
-        assert_eq!(ledger.placements[0].status()["native_replica_deleted"], true);
-        assert!(ledger.deletion_retry(0, now + Duration::from_secs(200)).unwrap().is_none());
+        assert_eq!(
+            ledger.placements[0].status()["native_replica_deleted"],
+            false
+        );
+        ledger
+            .reply(0, remove_reply(&ledger.placements[0]), true)
+            .unwrap();
+        ledger
+            .reply(0, remove_reply(&ledger.placements[0]), true)
+            .unwrap();
+        assert_eq!(
+            ledger.placements[0].status()["native_replica_deleted"],
+            true
+        );
+        assert!(ledger
+            .deletion_retry(0, now + Duration::from_secs(200))
+            .unwrap()
+            .is_none());
         let before = ledger.status();
-        ledger.retirement(0, retirement(&ledger.placements[0]), 555).unwrap();
+        ledger
+            .retirement(0, retirement(&ledger.placements[0]), 555)
+            .unwrap();
         assert_eq!(ledger.status(), before);
         let mut foreign = retirement(&ledger.placements[0]);
         foreign.node.instance += 1;
@@ -971,21 +1617,35 @@ fn stateful_loss_is_processed_not_echoed_and_native_deletion_never_supplies_disp
         assert_eq!(ledger.placements[0].observed, Observed::Lost);
         assert!(!ledger.placements[0].reusable && ledger.placements[0].retirement.is_none());
         assert!(ledger.placements[0].retired.is_empty());
-        assert!(ledger.accept(command("replacement", "create", Some(1))).is_err());
-        assert!(ledger.accept(command("fresh-delete", "delete", Some(1))).is_err());
-        if deleting { assert_eq!(ledger.result("delete")["state"], "lost"); }
+        assert!(ledger
+            .accept(command("replacement", "create", Some(1)))
+            .is_err());
+        assert!(ledger
+            .accept(command("fresh-delete", "delete", Some(1)))
+            .is_err());
+        if deleting {
+            assert_eq!(ledger.result("delete")["state"], "lost");
+        }
     }
 }
 
 #[tokio::test]
-async fn stateful_app_terminal_and_lost_ack_retire_only_original_reporting_without_touching_sibling() {
+async fn stateful_app_terminal_and_lost_ack_retire_only_original_reporting_without_touching_sibling(
+) {
     use node::report_tests::StatefulDown;
-    for mode in [StatefulDown::Crash, StatefulDown::LeaseLoss,
-        StatefulDown::CloseProvider, StatefulDown::CloseService,
-        StatefulDown::DropProvider, StatefulDown::DropService,
-        StatefulDown::AbortProvider, StatefulDown::AbortService,
-        StatefulDown::ForceAbortProvider, StatefulDown::ForceAbortService,
-        StatefulDown::ForceDelete] {
+    for mode in [
+        StatefulDown::Crash,
+        StatefulDown::LeaseLoss,
+        StatefulDown::CloseProvider,
+        StatefulDown::CloseService,
+        StatefulDown::DropProvider,
+        StatefulDown::DropService,
+        StatefulDown::AbortProvider,
+        StatefulDown::AbortService,
+        StatefulDown::ForceAbortProvider,
+        StatefulDown::ForceAbortService,
+        StatefulDown::ForceDelete,
+    ] {
         let fixture = Fixture::new("stateful-loss");
         let mut config = fixture.config();
         config.profile = ServiceProfile::StatefulSingleton;
@@ -993,13 +1653,28 @@ async fn stateful_app_terminal_and_lost_ack_retire_only_original_reporting_witho
         let mut cluster = Cluster::new(config).unwrap();
         cluster.prepare().unwrap();
         cluster.spawn(0).await.unwrap();
-        cluster.execute(command("sibling", "create", Some(1))).await.unwrap();
-        until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Running).await;
+        cluster
+            .execute(command("sibling", "create", Some(1)))
+            .await
+            .unwrap();
+        until(&mut cluster, |c| {
+            c.ledger.placements[0].observed == Observed::Running
+        })
+        .await;
         let sibling = cluster.ledger.placements[0].endpoint.clone().unwrap();
-        let sibling_pid = cluster.children[0].metadata.as_ref().unwrap().profile.as_ref().unwrap().app_pid;
+        let sibling_pid = cluster.children[0]
+            .metadata
+            .as_ref()
+            .unwrap()
+            .profile
+            .as_ref()
+            .unwrap()
+            .app_pid;
         let request = |command: &[u8]| {
             let mut socket = TcpStream::connect(&sibling).unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             socket.write_all(command).unwrap();
             let mut response = String::new();
             socket.take(512).read_to_string(&mut response).unwrap();
@@ -1007,12 +1682,31 @@ async fn stateful_app_terminal_and_lost_ack_retire_only_original_reporting_witho
         };
         until(&mut cluster, |_| request(b"read\n").starts_with("OK ")).await;
         let written = request(b"write\n");
-        assert!(written.contains("assigned=1 applied=1 committed=1 value=acknowledged"), "{written}");
+        assert!(
+            written.contains("assigned=1 applied=1 committed=1 value=acknowledged"),
+            "{written}"
+        );
         let launch = cluster.ledger.placements[1].launch.clone();
-        let result = node::report_tests::run_stateful_down(&launch, &mut cluster.ledger, mode).await;
+        let result =
+            node::report_tests::run_stateful_down(&launch, &mut cluster.ledger, mode).await;
         assert_eq!(request(b"read\n"), written);
-        cluster.children[0].process.as_mut().unwrap().check_alive().unwrap();
-        assert_eq!(cluster.children[0].metadata.as_ref().unwrap().profile.as_ref().unwrap().app_pid, sibling_pid);
+        cluster.children[0]
+            .process
+            .as_mut()
+            .unwrap()
+            .check_alive()
+            .unwrap();
+        assert_eq!(
+            cluster.children[0]
+                .metadata
+                .as_ref()
+                .unwrap()
+                .profile
+                .as_ref()
+                .unwrap()
+                .app_pid,
+            sibling_pid
+        );
         let loss = cluster.ledger.placements[1].status();
         assert_eq!(loss["observed"], "lost");
         assert_eq!(loss["loss_reported"], true);
@@ -1033,21 +1727,55 @@ fn gone(pid: u32) -> bool {
 fn node_intent_supersedes_pending_work_without_accepting_stale_completion_or_creation() {
     use fm::Accepted;
     let mut ledger = ledger();
-    let Accepted::NodeControl(_, false, first) = ledger.accept(command("deactivate", "deactivate", Some(1))).unwrap() else { panic!("deactivation"); };
-    assert!(ledger.accept(command("premature-create", "create", Some(1))).is_err());
+    let Accepted::NodeControl(_, false, first) = ledger
+        .accept(command("deactivate", "deactivate", Some(1)))
+        .unwrap()
+    else {
+        panic!("deactivation");
+    };
+    assert!(ledger
+        .accept(command("premature-create", "create", Some(1)))
+        .is_err());
     let now = Instant::now();
     assert!(ledger.node_control_retry(0, now).is_none());
-    let retry = ledger.node_control_retry(0, now + Duration::from_secs(6)).unwrap();
+    let retry = ledger
+        .node_control_retry(0, now + Duration::from_secs(6))
+        .unwrap();
     assert!(!retry.0 && retry.1 == first);
-    let Accepted::NodeControl(_, true, next) = ledger.accept(command("activate", "activate", Some(1))).unwrap() else { panic!("activation"); };
+    let Accepted::NodeControl(_, true, next) = ledger
+        .accept(command("activate", "activate", Some(1)))
+        .unwrap()
+    else {
+        panic!("activation");
+    };
     assert!(next.sequence > first.sequence);
     assert_eq!(ledger.result("deactivate")["state"], "unknown");
-    ledger.node_control_reply(0, false, NodeActivationReply { sequence: first.sequence }).unwrap();
+    ledger
+        .node_control_reply(
+            0,
+            false,
+            NodeActivationReply {
+                sequence: first.sequence,
+            },
+        )
+        .unwrap();
     assert_eq!(ledger.result("activate")["state"], "pending");
-    ledger.node_control_reply(0, true, NodeActivationReply { sequence: next.sequence }).unwrap();
+    ledger
+        .node_control_reply(
+            0,
+            true,
+            NodeActivationReply {
+                sequence: next.sequence,
+            },
+        )
+        .unwrap();
     assert_eq!(ledger.result("activate")["state"], "complete");
-    assert!(ledger.node_control_retry(0, now + Duration::from_secs(60)).is_none());
-    ledger.accept(command("deactivate-again", "deactivate", Some(1))).unwrap();
+    assert!(ledger
+        .node_control_retry(0, now + Duration::from_secs(60))
+        .is_none());
+    ledger
+        .accept(command("deactivate-again", "deactivate", Some(1)))
+        .unwrap();
     ledger.lost(0, "original session lost".into());
     assert_eq!(ledger.result("deactivate-again")["state"], "unknown");
 }
@@ -1061,21 +1789,38 @@ fn service_update_resends_same_description_and_ignores_old_or_duplicate_replies(
     let now = Instant::now();
     ledger.placements[0].service_retry_at = Some(now + Duration::from_secs(5));
     assert!(ledger.service_update_retry(0, now).is_none());
-    assert_eq!(ledger.service_update_retry(0, now + Duration::from_secs(6)).unwrap().service, service);
-    let mut reply = NodeUpdateServiceReply { service: service.name.clone(), instance: service.instance, version: 1 };
+    assert_eq!(
+        ledger
+            .service_update_retry(0, now + Duration::from_secs(6))
+            .unwrap()
+            .service,
+        service
+    );
+    let mut reply = NodeUpdateServiceReply {
+        service: service.name.clone(),
+        instance: service.instance,
+        version: 1,
+    };
     ledger.service_reply(0, reply.clone()).unwrap();
     assert!(ledger.placements[0].service_update.is_some());
     reply.version = 2;
     ledger.service_reply(0, reply.clone()).unwrap();
     ledger.service_reply(0, reply).unwrap();
-    assert!(ledger.service_update_retry(0, now + Duration::from_secs(60)).is_none());
+    assert!(ledger
+        .service_update_retry(0, now + Duration::from_secs(60))
+        .is_none());
     assert_eq!(ledger.placements[0].service_description, Some(service));
 }
 
 #[tokio::test]
 async fn real_node_coordination_and_public_load_preserve_original_disposal_and_sibling() {
     use node::report_tests::NodeClose;
-    for mode in [NodeClose::Provider, NodeClose::Service, NodeClose::Timeout, NodeClose::Cancel] {
+    for mode in [
+        NodeClose::Provider,
+        NodeClose::Service,
+        NodeClose::Timeout,
+        NodeClose::Cancel,
+    ] {
         let fixture = Fixture::new("node-coordination");
         let mut config = fixture.config();
         config.profile = ServiceProfile::StatefulSingleton;
@@ -1083,23 +1828,46 @@ async fn real_node_coordination_and_public_load_preserve_original_disposal_and_s
         let mut cluster = Cluster::new(config).unwrap();
         cluster.prepare().unwrap();
         cluster.spawn(0).await.unwrap();
-        cluster.execute(command("sibling", "create", Some(1))).await.unwrap();
-        until(&mut cluster, |c| c.ledger.placements[0].observed == Observed::Running).await;
+        cluster
+            .execute(command("sibling", "create", Some(1)))
+            .await
+            .unwrap();
+        until(&mut cluster, |c| {
+            c.ledger.placements[0].observed == Observed::Running
+        })
+        .await;
         let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
-        let pid = cluster.children[0].metadata.as_ref().unwrap().profile.as_ref().unwrap().app_pid;
+        let pid = cluster.children[0]
+            .metadata
+            .as_ref()
+            .unwrap()
+            .profile
+            .as_ref()
+            .unwrap()
+            .app_pid;
         until(&mut cluster, |_| {
             let mut socket = TcpStream::connect(&endpoint).unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             socket.write_all(b"read\n").unwrap();
             let mut response = String::new();
             socket.take(512).read_to_string(&mut response).unwrap();
             response.starts_with("OK ")
-        }).await;
+        })
+        .await;
         let launch = cluster.ledger.placements[1].launch.clone();
         let result = node::report_tests::run_node_coordination(&launch, mode).await;
-        cluster.children[0].process.as_mut().unwrap().check_alive().unwrap();
+        cluster.children[0]
+            .process
+            .as_mut()
+            .unwrap()
+            .check_alive()
+            .unwrap();
         let mut socket = TcpStream::connect(endpoint).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         socket.write_all(b"read\n").unwrap();
         let mut response = String::new();
         socket.take(512).read_to_string(&mut response).unwrap();
@@ -1146,9 +1914,9 @@ async fn executable_nodes_preserve_uncertainty_sibling_contact_and_clean_handoff
     // Native notification eligibility starts at monotonic zero. A fresh runner
     // may need the full type interval plus a retry before its first notification.
     let settings = fube_ra::entity::Settings::default();
-    let notification_budget = Duration::from_millis(
-        settings.notification_type_ms + settings.notification_retry_ms,
-    ) + Duration::from_secs(12);
+    let notification_budget =
+        Duration::from_millis(settings.notification_type_ms + settings.notification_retry_ms)
+            + Duration::from_secs(12);
     until_with_budget(&mut cluster, notification_budget, |cluster| {
         cluster
             .ledger

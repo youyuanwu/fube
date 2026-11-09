@@ -61,6 +61,7 @@ rich_fields!(LoadMetricValue: name, value);
 rich_fields!(LoadMetricStats: name, value, count, weighted_sum, weight, time);
 rich_fields!(NodeLoads: node, loads);
 rich_fields!(ReportLoad: legacy, reports, time);
+rich_fields!(ReplicaDeactivationInfo: epoch, catchup_lsn);
 
 impl Rich for LegacyLoadReport {
     fn rich(&mut self, c: &mut i32) {
@@ -264,6 +265,38 @@ fn rich_deletion() -> DeleteReplica {
     body.replica.state = 2;
     body.replica.up = true;
     DeleteReplica::new(body, false)
+}
+
+fn rich_creation(initial: bool) -> CreateReplica {
+    let c = &mut 0;
+    let mut body = filled::<AddInstance>(c);
+    let mut info = filled::<ReplicaDeactivationInfo>(c);
+    body.unit.target = 1;
+    body.unit.minimum = 1;
+    body.service.target = 1;
+    body.service.minimum = 1;
+    body.service.stateful = true;
+    body.service.persisted = false;
+    body.replica.current_role = 2;
+    body.replica.previous_role = 1;
+    body.replica.state = 1;
+    body.replica.up = true;
+    if initial {
+        info.epoch = body.unit.current;
+        info.catchup_lsn = 0;
+    }
+    CreateReplica::new(body, info)
+}
+
+fn rich_creation_reply(error: i64) -> CreateReplicaReply {
+    let mut reply = support::rich_reply(error);
+    reply.unit.target = 1;
+    reply.unit.minimum = 1;
+    reply.replica.current_role = 2;
+    reply.replica.previous_role = 1;
+    reply.replica.state = 1;
+    reply.replica.up = true;
+    reply
 }
 
 fn rich_deletion_reply(error: i64) -> DeleteReplicaReply {
@@ -678,6 +711,88 @@ fn generation_number(generation: i64, high: u64, low: u64) -> GenerationNumber {
     GenerationNumber { generation, owner }
 }
 
+fn peer_contracts(input: &Path, output: &Path) {
+    for (name, body) in [
+        ("default-create-replica", CreateReplica::default()),
+        ("rich-create-replica", rich_creation(false)),
+        ("initial-create-replica", rich_creation(true)),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "CreateReplica",
+            body,
+            create_replica_message,
+            decode_create_replica,
+        );
+    }
+    for (name, body) in [
+        (
+            "default-create-replica-reply",
+            CreateReplicaReply::default(),
+        ),
+        ("rich-create-replica-reply-0", rich_creation_reply(0)),
+        (
+            "rich-create-replica-reply--2147017398",
+            rich_creation_reply(-2_147_017_398),
+        ),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "CreateReplicaReply",
+            body,
+            create_replica_reply_message,
+            decode_create_replica_reply,
+        );
+    }
+    for action in ["CreateReplica", "CreateReplicaReply"] {
+        check(
+            input,
+            output,
+            &format!("action-{action}"),
+            Scalar {
+                value: action.to_string(),
+            },
+        );
+    }
+}
+
+fn check_peer<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone>(
+    input: &Path,
+    output: &Path,
+    name: &str,
+    action: &str,
+    expected: T,
+    make: fn(&T, &GenerationHeader) -> fube_transport::Result<Message>,
+    decode: fn(&Message) -> fube_transport::Result<(T, GenerationHeader)>,
+) {
+    check(input, output, name, expected.clone());
+    for fmm in [false, true] {
+        let mut native = stage_two_envelope(input, name, action, "actor-12", Some(fmm));
+        native
+            .headers
+            .iter_mut()
+            .find(|h| h.id == HIGH_PRIORITY)
+            .unwrap()
+            .value = fs::read(input.join("priority.bin")).unwrap();
+        let generation = support::rich_generation(fmm);
+        assert_eq!(
+            decode(&native).unwrap(),
+            (expected.clone(), generation.clone())
+        );
+        let made = make(&expected, &generation).unwrap();
+        factory_contract(&native, &made);
+        assert_eq!(made.body, to_vec(&expected).unwrap());
+        assert_eq!(decode(&made).unwrap(), (expected.clone(), generation));
+        native.headers.retain(|h| h.id != GENERATION_HEADER);
+        assert!(decode(&native).is_err());
+    }
+    reject_prefixes::<T>(input, name);
+}
+
 fn generation_envelope(
     input: &Path,
     name: &str,
@@ -897,6 +1012,7 @@ fn main() {
     let input = Path::new(&args[1]);
     let output = Path::new(&args[2]);
     assert!(input.is_dir() && output.is_dir());
+    peer_contracts(input, output);
     check(input, output, "default-request", AddInstance::default());
     check(input, output, "rich-request", support::rich_request());
     check(input, output, "default-reply", AddInstanceReply::default());

@@ -131,10 +131,15 @@ async fn run() -> Result<bool> {
     }
     let profile = if arguments.len() == 5 && arguments[4] == "--stateful-singleton" {
         ServiceProfile::StatefulSingleton
+    } else if arguments.len() == 5 && arguments[4] == "--stateful-peer-idle" {
+        ServiceProfile::StatefulPeerIdle
     } else if arguments.len() == 4 {
         ServiceProfile::Stateless
     } else {
-        return Err("expected optional --stateful-singleton after --root/--app".into());
+        return Err(
+            "expected optional --stateful-singleton or --stateful-peer-idle after --root/--app"
+                .into(),
+        );
     };
     if arguments[0] != "--root" || arguments[2] != "--app" {
         return Err(

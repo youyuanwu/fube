@@ -63,8 +63,16 @@ GENERATION_CASES = {
     "tie-generation-update-reject",
 } | {f"action-{action}" for action in GENERATION_ACTIONS}
 CASES |= GENERATION_CASES
-SCHEMA_TYPES = 75
-SCHEMA_FIELDS = 237
+PEER_ACTIONS = {"CreateReplica", "CreateReplicaReply"}
+PEER_FACTORIES = {action: {"actor": 12, "high_priority": True} for action in PEER_ACTIONS}
+PEER_CASES = {
+    "default-create-replica", "rich-create-replica", "initial-create-replica",
+    "default-create-replica-reply", "rich-create-replica-reply-0",
+    "rich-create-replica-reply--2147017398",
+} | {f"action-{action}" for action in PEER_ACTIONS}
+CASES |= PEER_CASES
+SCHEMA_TYPES = 77
+SCHEMA_FIELDS = 240
 
 
 def validate(bundle, expected_head, expected_source):
@@ -88,6 +96,7 @@ def validate(bundle, expected_head, expected_source):
             or manifest.get("schema_fields") != SCHEMA_FIELDS
             or manifest.get("native_constants") != {"PToP": 0x8013, "PToPDirect": 0}
             or manifest.get("generation_factories") != GENERATION_FACTORIES
+            or manifest.get("peer_factories") != PEER_FACTORIES
             or not manifest.get("native_sources")):
         raise ValueError("source/schema manifest mismatch")
     expected_files = {"schema.h", "native-oracle", "ra-conformance"} | {

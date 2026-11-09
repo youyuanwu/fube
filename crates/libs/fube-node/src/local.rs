@@ -142,6 +142,9 @@ pub struct PackageRegistration {
 }
 #[derive(Clone)]
 enum Work {
+    PeerIdle(PartitionId, Replica),
+    PeerCreate(Arc<CreateReplica>, NodeInstance, GenerationHeader),
+    PeerReply(Arc<CreateReplicaReply>, NodeInstance, GenerationHeader),
     Status(ServiceType, u64, bool),
     Load(Box<ReportLoad>),
     Description(Box<ra::ServiceDescriptionCompletion>),
@@ -387,7 +390,23 @@ impl Node {
     }
     pub fn fm_work(&mut self, work: FmWork) -> Result<u64> {
         let stateless = self.activation.profile() == h::local::Profile::Stateless;
-        if !stateless && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary {
+        let peer_background = self.activation.profile()
+            == h::local::Profile::VolatileStatefulLifecycle
+            && self.ra.peer().is_some()
+            && matches!(
+                work,
+                FmWork::CaptureTypeStatus
+                    | FmWork::CleanupTypeStatus
+                    | FmWork::TypeStatusReply(..)
+                    | FmWork::ServiceTypeReply(..)
+                    | FmWork::CaptureServiceTypeWork(_)
+                    | FmWork::CompleteServiceTypeWork(_)
+                    | FmWork::ServiceTypeRetryTimer(_)
+            );
+        if !stateless
+            && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            && !peer_background
+        {
             return Err(Error::Unsupported);
         }
         if !stateless
@@ -533,6 +552,91 @@ impl Node {
     }
     pub fn generation_state(&self) -> ra::GenerationState {
         self.ra.generation_state()
+    }
+    pub fn bind_peer(&self, source: NodeInstance) -> Result<()> {
+        Ok(self.ra.bind_peer(source)?)
+    }
+    pub fn create_idle_on_peer(&mut self, replica: Replica) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            || !self.live.load(Ordering::SeqCst)
+            || self.ra.generation_state().upload_pending
+            || self.ra.peer().as_ref() != Some(&replica.node)
+        {
+            return Err(Error::Unsupported);
+        }
+        let unit = self
+            .selected
+            .as_ref()
+            .ok_or(Error::Unsupported)?
+            .unit
+            .id
+            .clone();
+        if !self.ra.node_activation().activated
+            || self
+                .ra
+                .snapshot(unit.guid.0)
+                .committed
+                .is_none_or(|state| state.phase != ra::Phase::Ready || !state.fm_primary)
+        {
+            return Err(Error::Busy);
+        }
+        self.enqueue(Work::PeerIdle(unit, replica))
+    }
+    pub fn create_replica_from_peer(
+        &mut self,
+        body: CreateReplica,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+            || self.ra.peer().as_ref() != Some(source)
+            || generation.for_fm_replica
+            || !self.live.load(Ordering::SeqCst)
+            || !self.ra.consumer_lifetime().is_accepting()
+        {
+            return Err(Error::Unsupported);
+        }
+        let base = &body.replica.0;
+        self.check_service(base, true)?;
+        if to_vec(&body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
+            || self.selected.as_ref().is_some_and(|selected| {
+                selected.unit.id != base.unit.id || selected.service != base.service
+            })
+        {
+            return Err(Error::Unsupported);
+        }
+        let selected = base.clone();
+        let id = self.enqueue(Work::PeerCreate(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))?;
+        if self.selected.is_none()
+            && !generation
+                .number
+                .older_than(&self.ra.generation_state().receive)
+        {
+            self.selected = Some(selected);
+        }
+        Ok(id)
+    }
+    pub fn create_replica_reply_from_peer(
+        &mut self,
+        body: CreateReplicaReply,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            || self.ra.peer().as_ref() != Some(source)
+            || generation.for_fm_replica
+        {
+            return Err(Error::Unsupported);
+        }
+        self.enqueue(Work::PeerReply(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
     }
     pub fn process_generation_proposal(
         &self,
@@ -910,6 +1014,20 @@ impl Node {
     }
     fn build(&self, work: &Work) -> ra::Command {
         match work {
+            Work::PeerIdle(unit, replica) => ra::Command::CreateRemoteIdle {
+                unit: unit.clone(),
+                replica: replica.clone(),
+            },
+            Work::PeerCreate(body, source, generation) => ra::Command::CreateReplica {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::PeerReply(body, source, generation) => ra::Command::CreateReplicaReply {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
             Work::Status(id, sequence, enabled) => ra::Command::HostingServiceTypeStatus {
                 service_type: id.clone(),
                 sequence: *sequence,
@@ -1044,9 +1162,20 @@ impl Node {
         match front.ticket.as_ref().unwrap().observation() {
             ra::TicketObservation::OwnerLost => return Err(Error::OwnerLost),
             ra::TicketObservation::Status(ra::Status::Complete(result)) => {
-                // A definite failed accepted command is retained, never silently
-                // resubmitted or treated as consuming a registration offer.
+                // Peer commands own no acquired registration offer. Report their
+                // definite failure without stranding unrelated cleanup callbacks.
                 if let Err(error) = &result {
+                    if matches!(
+                        front.work,
+                        Work::PeerIdle(..) | Work::PeerCreate(..) | Work::PeerReply(..)
+                    ) {
+                        let front = self.pending.pop_front().unwrap();
+                        self.commands.push_back(CommandReceipt {
+                            id: front.id,
+                            result,
+                        });
+                        return Ok(());
+                    }
                     return Err(error.clone().into());
                 }
                 if let Work::Registered(event) = &front.work {
@@ -1438,6 +1567,8 @@ impl Node {
                 LocalDisposition::LocalResponse
             }
             ra::Effect::Reply(_)
+            | ra::Effect::PeerCreateReplica { .. }
+            | ra::Effect::PeerCreateReplicaReply { .. }
             | ra::Effect::NodeActivateReply(_)
             | ra::Effect::NodeDeactivateReply(_)
             | ra::Effect::PrimaryReply(_)

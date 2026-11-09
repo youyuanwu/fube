@@ -44,6 +44,9 @@ pub use hosting_events::*;
 #[path = "generation.rs"]
 mod generation;
 pub use generation::{GenerationState, GenerationUpdateOutcome};
+#[path = "peer.rs"]
+mod peer;
+pub use peer::{PeerCreation, RemoteIdle};
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -312,6 +315,21 @@ pub enum Command {
         source: NodeInstance,
         generation: GenerationHeader,
     },
+    CreateReplica {
+        body: Box<CreateReplica>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
+    /// Trusted local authorization to open a learner, not FM AddReplica.
+    CreateRemoteIdle {
+        unit: PartitionId,
+        replica: Replica,
+    },
+    CreateReplicaReply {
+        body: Box<CreateReplicaReply>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
     /// Trusted local volatile Idle Open, not AddPrimary/CreateReplica network admission.
     OpenLocalStateful(Box<AddInstance>),
     /// Trusted local fresh 1/1 Primary Open, not promotion or FM AddPrimary admission.
@@ -373,6 +391,16 @@ pub enum Command {
     },
 }
 enum Kind {
+    CreateReplica {
+        source: NodeInstance,
+        generation: GenerationHeader,
+        deactivation: ReplicaDeactivationInfo,
+    },
+    CreateRemoteIdle,
+    CreateReplicaReply {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
     HostingServiceTypeStatus,
     CaptureServiceTypeStatus,
     CleanupServiceTypeStatus,
@@ -488,6 +516,10 @@ pub struct EntityState {
     pub fm_primary: bool,
     /// Native FM Primary deactivation info, including the dropped tombstone sentinel.
     pub primary_deactivation: Option<(Epoch, i64)>,
+    /// Session-only original peer responsibility; never restored by metadata.
+    pub peer_creation: Option<PeerCreation>,
+    /// A remote Open observation, not a built/active replica or quorum member.
+    pub remote_idle: Option<RemoteIdle>,
     pub phase: Phase,
     pub open_token: u64,
     /// Volatile retry bookkeeping; not a native disk record or durable outbox.
@@ -520,6 +552,14 @@ pub struct Snapshot {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
+    PeerCreateReplica {
+        target: NodeInstance,
+        body: Box<CreateReplica>,
+    },
+    PeerCreateReplicaReply {
+        target: NodeInstance,
+        body: Box<CreateReplicaReply>,
+    },
     ServiceTypeStatusWork,
     ServiceTypeStatus {
         enabled: bool,
@@ -649,6 +689,7 @@ pub struct Statistics {
 }
 #[derive(Default)]
 struct View {
+    peer: Option<NodeInstance>,
     generations: GenerationState,
     generations_touched: bool,
     statuses: Option<LocalStatusConsumer>,
@@ -662,6 +703,7 @@ struct View {
     node: node_coordination::Coordinator,
 }
 struct Shared {
+    local_node: NodeInstance,
     fm_source: NodeInstance,
     node_open: bool,
     consumer_lifetime: ConsumerLifetime,
@@ -717,6 +759,7 @@ impl Executor {
         let (sender, receiver) = mpsc::channel(settings.max_outstanding);
         let (done, closed) = watch::channel(None);
         let shared = Arc::new(Shared {
+            local_node: admission.local_node.clone(),
             fm_source: admission.fm_source.clone(),
             node_open: admission.node_open,
             consumer_lifetime: ConsumerLifetime {
@@ -864,6 +907,31 @@ impl Executor {
                 Kind::AddPrimary { source, generation },
                 to_vec(&body),
             ),
+            Command::CreateReplica {
+                body,
+                source,
+                generation,
+            } => (
+                body.replica.0.unit.id.guid.0,
+                Kind::CreateReplica {
+                    source,
+                    generation,
+                    deactivation: body.deactivation.clone(),
+                },
+                to_vec(&body.replica.0),
+            ),
+            Command::CreateRemoteIdle { unit, replica } => {
+                (unit.guid.0, Kind::CreateRemoteIdle, to_vec(&replica))
+            }
+            Command::CreateReplicaReply {
+                body,
+                source,
+                generation,
+            } => (
+                body.unit.id.guid.0,
+                Kind::CreateReplicaReply { source, generation },
+                to_vec(&body),
+            ),
             Command::CompleteOpen(body) => (body.unit.id.guid.0, Kind::Complete, to_vec(&body)),
             Command::OpenLocalStateful(body) => {
                 (body.unit.id.guid.0, Kind::OpenLocalStateful, to_vec(&body))
@@ -976,6 +1044,7 @@ impl Executor {
             // resources synchronously. Closed Add reports + stale-replies at most.
             Kind::Add { .. }
             | Kind::AddPrimary { .. }
+            | Kind::CreateReplica { .. }
             | Kind::OpenLocalStateful
             | Kind::OpenLocalPrimary => 2,
             Kind::Retry | Kind::RetryReport | Kind::RetryServiceDescription => 1,
@@ -1445,21 +1514,48 @@ fn transition(
     state: Option<&EntityState>,
     admission: &Admission,
     config: &NativeConfig,
+    peer: Option<&NodeInstance>,
 ) -> Result<Transition> {
     let decode_error = |_| Failure::Admission("invalid native command payload");
     match &work.kind {
         #[cfg(feature = "qualification")]
         Kind::QualificationTerminate => panic!("explicit qualification worker termination"),
+        Kind::CreateRemoteIdle => peer::start_remote(work, state, admission, peer),
+        Kind::CreateReplicaReply { source, generation } => {
+            peer::complete_remote(work, state, source, generation, admission, peer)
+        }
         Kind::Add { .. }
         | Kind::AddPrimary { .. }
+        | Kind::CreateReplica { .. }
         | Kind::OpenLocalStateful
         | Kind::OpenLocalPrimary => {
             let body: AddInstance = from_slice(&work.bytes).map_err(decode_error)?;
+            let peer_creation = match &work.kind {
+                Kind::CreateReplica {
+                    source,
+                    generation,
+                    deactivation,
+                } => {
+                    peer::admit(source, generation, admission, peer)?;
+                    if generation.number.older_than(&admission.generation) {
+                        return Ok(Transition::ignored(Disposition::IgnoredStale));
+                    }
+                    if deactivation.epoch != body.unit.current || deactivation.catchup_lsn != 0 {
+                        return Err(Failure::Unsupported("only initial-primary peer creation"));
+                    }
+                    Some(PeerCreation {
+                        source: source.clone(),
+                        deactivation: deactivation.clone(),
+                    })
+                }
+                _ => None,
+            };
             let fm_primary = matches!(work.kind, Kind::AddPrimary { .. });
-            let local_stateful =
-                fm_primary || matches!(work.kind, Kind::OpenLocalStateful | Kind::OpenLocalPrimary);
+            let local_stateful = fm_primary
+                || peer_creation.is_some()
+                || matches!(work.kind, Kind::OpenLocalStateful | Kind::OpenLocalPrimary);
             let role = match work.kind {
-                Kind::OpenLocalStateful => 2,
+                Kind::OpenLocalStateful | Kind::CreateReplica { .. } => 2,
                 Kind::OpenLocalPrimary | Kind::AddPrimary { .. } => 4,
                 _ => 1,
             };
@@ -1533,6 +1629,16 @@ fn transition(
             // Native locked-entity TCP admission precedes processor prechecks,
             // description updates and identity decisions. No receipt-time latch.
             if let Some(current) = state {
+                if current.peer_creation.as_ref().map(|origin| &origin.source)
+                    != peer_creation.as_ref().map(|origin| &origin.source)
+                {
+                    return Err(Failure::Unsupported(
+                        "cannot change original peer creation authority",
+                    ));
+                }
+                if peer_creation.is_some() && current.phase == Phase::Closed {
+                    return Err(Failure::Unsupported("peer tombstone recreation is gated"));
+                }
                 if current.body.service.stateful != local_stateful {
                     return Err(Failure::Unsupported(
                         "cannot change entity lifecycle profile",
@@ -1545,6 +1651,7 @@ fn transition(
                 }
                 if local_stateful
                     && !fm_primary
+                    && peer_creation.is_none()
                     && (current.body.replica.id != body.replica.id
                         || current.body.replica.instance != body.replica.instance
                         || current.body.replica.current_role != role
@@ -1568,6 +1675,20 @@ fn transition(
                     if body.replica.instance < current.body.replica.instance {
                         return Ok(Transition::ignored(Disposition::IgnoredStale));
                     }
+                    if peer_creation.is_some() {
+                        let mut requested_service = body.service.clone();
+                        if requested_service.version == current.requested_version {
+                            requested_service.version = current.body.service.version.clone();
+                        }
+                        if requested_service != current.body.service
+                            || body.replica.id != current.body.replica.id
+                            || body.unit.current != current.body.unit.current
+                        {
+                            return Err(Failure::Unsupported(
+                                "peer restart/replacement/reconfiguration is gated",
+                            ));
+                        }
+                    }
                     if body.replica.id == current.body.replica.id
                         && body.replica.instance > current.body.replica.instance
                     {
@@ -1583,7 +1704,18 @@ fn transition(
             if !admission.node_activated {
                 return Ok(Transition {
                     update: Update::None,
-                    effects: vec![reply(&body, RA_NOT_READY, fm_primary)],
+                    effects: vec![if let Some(peer) = &peer_creation {
+                        Effect::PeerCreateReplicaReply {
+                            target: peer.source.clone(),
+                            body: Box::new(CreateReplicaReply {
+                                unit: body.unit.clone(),
+                                replica: body.replica.clone(),
+                                error: RA_NOT_READY,
+                            }),
+                        }
+                    } else {
+                        reply(&body, RA_NOT_READY, fm_primary)
+                    }],
                     disposition: Disposition::Applied,
                 });
             }
@@ -1594,7 +1726,7 @@ fn transition(
                 if local_stateful {
                     return Ok(Transition {
                         update: Update::None,
-                        effects: vec![reply(&current.body, 0, false)],
+                        effects: vec![peer::creation_reply(current, &current.body, 0)],
                         disposition: Disposition::Applied,
                     });
                 }
@@ -1607,6 +1739,8 @@ fn transition(
                     requested_version: body.service.version.clone(),
                     fm_primary,
                     primary_deactivation: fm_primary.then_some((body.unit.current, 0)),
+                    peer_creation,
+                    remote_idle: None,
                     phase: Phase::Opening,
                     open_token: work.id,
                     retry_attempts: 0,
@@ -1897,12 +2031,19 @@ async fn entity_worker(
             let mut effective_admission = admission.clone();
             effective_admission.node_activated = view.node.activation.activated;
             effective_admission.generation = view.generations.receive.clone();
-            transition(
-                &work,
-                committed.as_deref(),
-                &effective_admission,
-                &shared.config,
-            )
+            if matches!(work.kind, Kind::CreateRemoteIdle) && view.generations.upload_pending {
+                Err(Failure::Unsupported(
+                    "peer creation is gated during generation rebuild",
+                ))
+            } else {
+                transition(
+                    &work,
+                    committed.as_deref(),
+                    &effective_admission,
+                    &shared.config,
+                    view.peer.as_ref(),
+                )
+            }
         } else {
             binding.map(|_| Transition::ignored(Disposition::IgnoredStale))
         };
@@ -2194,8 +2335,9 @@ mod tests {
             reserved_effects: 2,
             result,
         };
-        let Update::Durable(mut state) =
-            transition(&work, None, &admission, &config).unwrap().update
+        let Update::Durable(mut state) = transition(&work, None, &admission, &config, None)
+            .unwrap()
+            .update
         else {
             panic!("creation");
         };
@@ -2210,7 +2352,7 @@ mod tests {
             for upgrading in [false, true] {
                 admission.node_activated = false;
                 admission.fabric_upgrading = upgrading;
-                let result = transition(&work, Some(&state), &admission, &config).unwrap();
+                let result = transition(&work, Some(&state), &admission, &config, None).unwrap();
                 assert_eq!(result.disposition, Disposition::IgnoredPending);
                 assert!(matches!(result.update, Update::None));
                 assert!(result.effects.is_empty());

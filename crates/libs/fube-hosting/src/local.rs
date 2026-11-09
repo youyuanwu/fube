@@ -61,6 +61,9 @@ pub struct Options {
     /// Actual caller-owned node identity for the app's runtime context. None
     /// preserves the existing standalone local-activation profile.
     pub node: Option<NodeContext>,
+    /// Deployment-wide package version, independent of each physical package
+    /// incarnation. None preserves the standalone generated-version profile.
+    pub service_package_version_instance: Option<u64>,
 }
 #[derive(Debug, Clone)]
 pub struct NodeContext {
@@ -79,6 +82,7 @@ impl Options {
             residency: ResidencyConfig::default(),
             required: ipc::RequiredCapabilities::default(),
             node: None,
+            service_package_version_instance: None,
         }
     }
 }
@@ -141,6 +145,7 @@ impl Activation {
             return Err(LocalError::InvalidOptions);
         }
         if options.registration_timeout.is_zero()
+            || options.service_package_version_instance == Some(0)
             || options.run_parent.to_str().is_none()
             || options.registration_timeout > Duration::from_secs(30)
             || options.cleanup_budget.is_zero()
@@ -275,7 +280,10 @@ impl Activation {
                     },
                     value: wire::Rollout { major: 1, minor: 0 },
                 },
-                instance: package_sequence as u64,
+                instance: self
+                    .options
+                    .service_package_version_instance
+                    .unwrap_or(package_sequence as u64),
             },
             application_name: package.application_name.clone(),
         };

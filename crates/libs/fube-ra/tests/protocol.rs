@@ -16,6 +16,178 @@ fn generation_owner(high: u64, low: u64) -> [u8; 16] {
 }
 
 #[test]
+fn peer_creation_preserves_native_scopes_deactivation_and_reply_values() {
+    let mut base = support::rich_request();
+    base.replica.current_role = 2;
+    base.replica.previous_role = 1;
+    base.replica.state = 1;
+    base.service.stateful = true;
+    base.service.persisted = false;
+    for (epoch, catchup_lsn) in [
+        (Epoch::default(), -1),
+        (base.unit.current, 0),
+        (
+            Epoch {
+                configuration: i64::MIN + 17,
+                data_loss: i64::MAX - 29,
+            },
+            i64::MAX,
+        ),
+    ] {
+        let info = ReplicaDeactivationInfo { epoch, catchup_lsn };
+        let request = CreateReplica::new(base.clone(), info.clone());
+        assert_eq!(request.replica.0, base);
+        assert_eq!(request.deactivation, info);
+        for fmm in [false, true] {
+            let generation = support::rich_generation(fmm);
+            let message = create_replica_message(&request, &generation).unwrap();
+            assert_eq!(message.properties().unwrap().actor, RA_ACTOR);
+            assert!(message.properties().unwrap().high_priority);
+            assert_eq!(
+                decode_create_replica(&message).unwrap(),
+                (request.clone(), generation)
+            );
+            assert!(decode_add_primary(&message).is_err());
+            assert!(decode_delete_replica(&message).is_err());
+            assert_eq!(from_slice::<AddInstance>(&message.body).unwrap(), base);
+        }
+    }
+    for error in [0, -2_147_017_398, -2_147_017_441, i64::MIN, i64::MAX] {
+        let mut reply = support::rich_reply(error);
+        reply.replica.current_role = 2;
+        reply.replica.previous_role = 1;
+        reply.replica.state = 1;
+        reply.replica.replication_endpoint = "127.0.0.2:45678/idle-π".into();
+        let generation = support::rich_generation(false);
+        let message = create_replica_reply_message(&reply, &generation).unwrap();
+        assert_eq!(
+            decode_create_replica_reply(&message).unwrap(),
+            (reply, generation)
+        );
+        assert!(decode_add_primary_reply(&message).is_err());
+        assert!(decode_delete_replica_reply(&message).is_err());
+    }
+}
+
+#[test]
+fn peer_creation_rejects_bad_headers_shapes_and_every_proper_prefix() {
+    use fube_transport::serialization::serde::Inline;
+    use fube_transport::{message::Message, Result};
+    type Decoder = fn(&Message) -> Result<()>;
+    let base = support::rich_request();
+    let info = ReplicaDeactivationInfo {
+        epoch: base.unit.current,
+        catchup_lsn: -0x1234,
+    };
+    let request = CreateReplica::new(base.clone(), info.clone());
+    let generation = support::rich_generation(false);
+    let contracts: [(Message, Decoder); 2] = [
+        (
+            create_replica_message(&request, &generation).unwrap(),
+            |m| decode_create_replica(m).map(|_| ()),
+        ),
+        (
+            create_replica_reply_message(&support::rich_reply(0), &generation).unwrap(),
+            |m| decode_create_replica_reply(m).map(|_| ()),
+        ),
+    ];
+    for (original, decode) in &contracts {
+        for id in [ACTOR, ACTION, HIGH_PRIORITY, GENERATION_HEADER] {
+            let mut missing = original.clone();
+            missing.headers.retain(|h| h.id != id);
+            assert!(decode(&missing).is_err());
+            let mut duplicate = original.clone();
+            duplicate.headers.push(
+                original
+                    .headers
+                    .iter()
+                    .find(|h| h.id == id)
+                    .unwrap()
+                    .clone(),
+            );
+            assert!(decode(&duplicate).is_err());
+            let mut malformed = original.clone();
+            malformed
+                .headers
+                .iter_mut()
+                .find(|h| h.id == id)
+                .unwrap()
+                .value
+                .clear();
+            assert!(decode(&malformed).is_err());
+        }
+        for actor in [FM_ACTOR, FMM_ACTOR] {
+            let mut wrong = original.clone();
+            wrong.headers[0] = Header::actor(actor).unwrap();
+            assert!(decode(&wrong).is_err());
+        }
+        for action in [
+            "AddInstance",
+            "AddPrimary",
+            "AddReplica",
+            "GetLSN",
+            "Deactivate",
+            "Activate",
+            "DeleteReplica",
+        ] {
+            let mut wrong = original.clone();
+            wrong.headers[1] = Header::action(action).unwrap();
+            assert!(decode(&wrong).is_err());
+        }
+        for (other, _) in &contracts {
+            if other.properties().unwrap().action != original.properties().unwrap().action {
+                let mut wrong = original.clone();
+                wrong.headers[1] = other.headers[1].clone();
+                assert!(decode(&wrong).is_err());
+            }
+        }
+        for end in 0..original.body.len() {
+            let mut truncated = original.clone();
+            truncated.body.truncate(end);
+            assert!(
+                decode(&truncated).is_err(),
+                "accepted proper prefix at {end}"
+            );
+        }
+        let mut trailing = original.clone();
+        trailing.body.push(0);
+        assert!(decode(&trailing).is_err());
+        // Priority is a factory default, not semantic admission.
+        let mut low = original.clone();
+        low.headers[2] = Header::boolean(HIGH_PRIORITY, false).unwrap();
+        assert!(decode(&low).is_ok());
+    }
+    #[derive(Serialize)]
+    struct Flattened {
+        replica: Inline<AddInstance>,
+        info: ReplicaDeactivationInfo,
+    }
+    #[derive(Serialize)]
+    struct Nested {
+        replica: AddInstance,
+        info: ReplicaDeactivationInfo,
+    }
+    let mut malformed = contracts[0].0.clone();
+    for body in [
+        to_vec(&base).unwrap(),
+        to_vec(&Flattened {
+            replica: Inline(base.clone()),
+            info: info.clone(),
+        })
+        .unwrap(),
+        to_vec(&Nested {
+            replica: base,
+            info,
+        })
+        .unwrap(),
+        to_vec(&DeleteReplica::default()).unwrap(),
+    ] {
+        malformed.body = body;
+        assert!(decode_create_replica(&malformed).is_err());
+    }
+}
+
+#[test]
 fn generation_handshake_preserves_bodyless_proposal_correlated_reply_and_epoch_order() {
     let proposed = GenerationNumber {
         generation: i64::MAX,

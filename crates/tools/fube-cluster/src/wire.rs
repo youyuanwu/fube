@@ -168,6 +168,50 @@ fn node_out(
     canonical.expects_reply = canonical.action == "NodeUp";
     fm_ingress(message, &canonical)
 }
+fn peer_ingress(message: &Message, props: &Properties) -> fube_transport::Result<()> {
+    bounded(message)?;
+    if props.actor != RA_ACTOR
+        || !props.high_priority
+        || props.expects_reply
+        || props.uncorrelated_reply
+        || !matches!(
+            props.action.as_str(),
+            "CreateReplica" | "CreateReplicaReply"
+        )
+        || message
+            .headers
+            .iter()
+            .filter(|header| header.id == GENERATION_HEADER)
+            .count()
+            != 1
+    {
+        return Err(fube_transport::Error::Protocol("unsupported peer ingress"));
+    }
+    Ok(())
+}
+fn peer_out(
+    message: &Message,
+    props: &Properties,
+    kind: OutboundKind,
+) -> fube_transport::Result<()> {
+    if kind == OutboundKind::Rpc {
+        return Err(fube_transport::Error::Protocol("peer traffic is one-way"));
+    }
+    peer_ingress(message, props)
+}
+pub fn peer_composition() -> fube_transport::Result<ChannelComposition> {
+    Ok(ChannelComposition {
+        outbound: peer_out,
+        ordinary_reply: peer_ingress,
+        actors: ActorDemux::new(vec![ActorRegistration {
+            actor: RA_ACTOR,
+            authorize: peer_ingress,
+        }])?,
+        requests: None,
+        duplex: None,
+        ordered_ingress: true,
+    })
+}
 pub fn composition(fm: bool) -> fube_transport::Result<ChannelComposition> {
     Ok(ChannelComposition {
         outbound: if fm { fm_out } else { node_out },
@@ -245,6 +289,12 @@ pub fn predecode(message: &Message) -> Result<()> {
         "AddInstance" | "AddPrimary" => {
             decode::<AddInstance>(&message.body)?;
         }
+        "CreateReplica" => {
+            decode::<CreateReplica>(&message.body)?;
+        }
+        "CreateReplicaReply" => {
+            decode::<CreateReplicaReply>(&message.body)?;
+        }
         "RemoveInstance" | "DeleteReplica" => {
             decode::<RemoveInstance>(&message.body)?;
         }
@@ -291,6 +341,9 @@ pub struct Link {
     generation: GenerationHeader,
 }
 impl Link {
+    pub fn generation(&self) -> &GenerationHeader {
+        &self.generation
+    }
     // Only the launch owner constructs a Link, from its original one-use
     // admitted Channel. Deployment/session binding is local capability state,
     // not a fabricated universal native header or a reconnect credential.
@@ -427,6 +480,67 @@ fn validate_source(message: &Message, local: &NodeInstance, remote: &NodeInstanc
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn peer_idle_channel_admits_only_generation_bound_high_priority_one_way_ra_actions() {
+        use fube_ra::protocol::*;
+        let generation = GenerationHeader {
+            number: GenerationNumber {
+                owner: [9; 16],
+                generation: 7,
+            },
+            for_fm_replica: false,
+        };
+        let body = CreateReplica::new(AddInstance::default(), ReplicaDeactivationInfo::default());
+        for message in [
+            create_replica_message(&body, &generation).unwrap(),
+            create_replica_reply_message(&CreateReplicaReply::default(), &generation).unwrap(),
+        ] {
+            let properties = message.properties().unwrap();
+            peer_ingress(&message, &properties).unwrap();
+            predecode(&message).unwrap();
+            assert!(peer_out(&message, &properties, OutboundKind::Rpc).is_err());
+            for invalid in [
+                Properties {
+                    actor: FM_ACTOR,
+                    ..message.properties().unwrap()
+                },
+                Properties {
+                    high_priority: false,
+                    ..message.properties().unwrap()
+                },
+                Properties {
+                    expects_reply: true,
+                    ..message.properties().unwrap()
+                },
+                Properties {
+                    uncorrelated_reply: true,
+                    ..message.properties().unwrap()
+                },
+                Properties {
+                    action: "AddPrimary".into(),
+                    ..message.properties().unwrap()
+                },
+            ] {
+                assert!(peer_ingress(&message, &invalid).is_err());
+            }
+            let mut missing = message.clone();
+            missing
+                .headers
+                .retain(|header| header.id != GENERATION_HEADER);
+            assert!(peer_ingress(&missing, &properties).is_err());
+            let mut duplicate = message.clone();
+            duplicate.headers.push(
+                message
+                    .headers
+                    .iter()
+                    .find(|header| header.id == GENERATION_HEADER)
+                    .unwrap()
+                    .clone(),
+            );
+            assert!(peer_ingress(&duplicate, &properties).is_err());
+        }
+    }
+
     #[test]
     fn native_sender_incarnations_are_not_taken_from_node_description_or_actor() {
         let local = NodeInstance {

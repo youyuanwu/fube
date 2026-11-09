@@ -341,6 +341,7 @@ fn start_close_inner(
         mark_deleted(state);
     }
     state.phase = Phase::Closing;
+    state.remote_idle = None;
     state.service_description_pending = false;
     state.close_mode = Some(mode);
     state.close_token = token;
@@ -576,6 +577,8 @@ pub(super) fn transition(
                 requested_version: body.service.version.clone(),
                 fm_primary: stateful,
                 primary_deactivation: stateful.then_some((Epoch::default(), -2)),
+                peer_creation: None,
+                remote_idle: None,
                 // TryCreateFailoverUnit constructs from ID, consistency and
                 // service, NOT the incoming previous epoch/target/minimum.
                 body: Arc::new(AddInstance {

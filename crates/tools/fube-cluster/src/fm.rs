@@ -341,7 +341,7 @@ impl Placement {
                     return Ok(None);
                 }
                 exact_replica(&expected.replica, replica, true)?;
-                if self.launch.profile == crate::ServiceProfile::StatefulSingleton {
+                if self.launch.profile.stateful() {
                     if !dropped
                         || replica != &dropped_replica(&expected.replica)
                         || info.local_deleted
@@ -365,7 +365,7 @@ impl Placement {
                 }
             }
         }
-        if self.launch.profile == crate::ServiceProfile::StatefulSingleton {
+        if self.launch.profile.stateful() {
             // Native ProcessDroppedReplica's result is processed_, not dropped_.
             return Ok(Some(ReplicaUp {
                 replicas: body.dropped.clone(),
@@ -384,8 +384,8 @@ impl Placement {
             "node": self.launch.placement, "node_id": crate::profile::node_hex(&self.launch.node),
             "node_instance": self.launch.node.instance, "session": self.launch.session,
             "partition": self.launch.partition, "replica": self.replica,
-            "incarnation": self.incarnation, "service": crate::profile::SERVICE,
-            "service_type": crate::profile::TYPE,
+            "incarnation": self.incarnation, "service": self.launch.profile.service(),
+            "service_type": crate::profile::fixed_type_for(self.launch.profile).name,
             "desired": self.desired, "observed": self.observed,
             "endpoint": self.endpoint, "created_lifetime": self.created,
             "link_alive": self.link_alive, "error": self.error,
@@ -457,7 +457,7 @@ impl Ledger {
         let placement = &mut self.placements[index];
         if response.is_some()
             && placement.bootstrap == Bootstrap::Admitted
-            && placement.launch.profile == crate::ServiceProfile::StatefulSingleton
+            && placement.launch.profile.stateful()
         {
             if !placement.loss_reported {
                 placement.action_updated_at = Some(Instant::now());
@@ -515,6 +515,15 @@ impl Ledger {
             return Err(
                 "generation rebuild is awaiting gated LFUM upload; mutations disabled".into(),
             );
+        }
+        if self.placements[0].launch.profile == crate::ServiceProfile::StatefulPeerIdle
+            && (matches!(
+                command.action.as_str(),
+                "delete" | "activate" | "deactivate"
+            ) || (command.action == "create"
+                && (command.node != Some(1) || self.placements[0].created)))
+        {
+            return Err("peer-idle profile admits only the original node1 Primary creation, status and quit".into());
         }
         if self.operations.len() == 64 {
             return Err(
@@ -599,7 +608,7 @@ impl Ledger {
                 placement.observed = Observed::Pending;
                 placement.create_op = Some(command.op.clone());
                 placement.pending = Some(PendingPhase::Create);
-                if placement.launch.profile == crate::ServiceProfile::StatefulSingleton {
+                if placement.launch.profile.stateful() {
                     let now = Instant::now();
                     placement.action_updated_at = Some(now);
                     placement.action_last_at = Some(now);
@@ -609,9 +618,7 @@ impl Ledger {
             "delete" => {
                 let index = usize::from(command.node.unwrap() - 1);
                 let placement = &mut self.placements[index];
-                if placement.launch.profile == crate::ServiceProfile::StatefulSingleton
-                    && placement.observed != Observed::Running
-                {
+                if placement.launch.profile.stateful() && placement.observed != Observed::Running {
                     return Err(
                         "stateful normal deletion requires the completed original Primary".into(),
                     );
@@ -634,7 +641,7 @@ impl Ledger {
                 placement.observed = Observed::Pending;
                 placement.delete_op = Some(command.op.clone());
                 placement.pending = Some(PendingPhase::Delete);
-                if placement.launch.profile == crate::ServiceProfile::StatefulSingleton {
+                if placement.launch.profile.stateful() {
                     let now = Instant::now();
                     placement.action_updated_at = Some(now);
                     placement.action_last_at = Some(now);
@@ -888,7 +895,7 @@ impl Ledger {
                 if placement.desired != Desired::Absent || body.replica.state != 3 {
                     return Err("Remove reply is not the requested disposed instance".into());
                 }
-                if placement.launch.profile == crate::ServiceProfile::StatefulSingleton
+                if placement.launch.profile.stateful()
                     && body.replica != dropped_replica(&expected.replica)
                 {
                     return Err("DeleteReplica reply is not the native dropped description".into());
@@ -904,7 +911,7 @@ impl Ledger {
                     .map_err(|_| "non-numeric app endpoint")?;
                 if !address.ip().is_loopback()
                     || address.port() == 0
-                    || if placement.launch.profile == crate::ServiceProfile::StatefulSingleton {
+                    || if placement.launch.profile.stateful() {
                         body.replica.replication_endpoint.is_empty()
                     } else {
                         !body.replica.replication_endpoint.is_empty()
@@ -1042,7 +1049,7 @@ impl Ledger {
         now: Instant,
     ) -> Result<Option<AddInstance>> {
         let placement = &mut self.placements[index];
-        if placement.launch.profile != crate::ServiceProfile::StatefulSingleton
+        if !placement.launch.profile.stateful()
             || !placement.link_alive
             || (placement.pending != Some(phase)
                 && !(phase == PendingPhase::Delete && placement.loss_reported))

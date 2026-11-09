@@ -11,6 +11,36 @@ An explicit `--stateful-singleton` variant admits the existing
 The two nodes host independent singleton partitions, not two replicas or an HA
 configuration. Stateless remains the default.
 
+`--stateful-peer-idle` is a separate fresh-start, fixed-generation opt-in:
+node1 alone receives FM AddPrimary; node2 is the bound remote volatile Idle
+for the **same partition**, with a distinct replica identity. After the Primary
+is ready, programmatic `Cluster::create_idle_replica().await` submits a trusted
+local Primary-RA command and returns `pending`. Poll `status()["peer_idle"]`
+for the committed CreateReplicaReply observation (`open`, never built/serving).
+Retrying this API retains the exact original remote lifetime.
+Both actual activations use the deployment-wide package version `1.0:1.0:1`;
+their physical package sequence, acquisition, runtime and process owners remain
+independently generated. Existing profiles keep their generated package versions.
+
+Each child publishes a separate one-use peer listener; only the original
+capability-bearing parent stdin command lets node1 dial after both original
+children are admitted. CreateReplica and CreateReplicaReply are high-priority
+one-way RA messages, with native GenerationHeader and exact PToP NodeInstance
+headers on a separate bounded Channel, never an FM relay.
+Peer ingress also checks the configured shared partition and exact target
+node/replica/incarnation before first-FT admission, for both request and reply.
+Node2 runs
+`--stateful-lifecycle --data-replicator`; its real Open returns Idle/InBuild,
+an actual replication endpoint, no service endpoint and denied read/write access.
+Peer receipts and pending commands remain bounded independently of FM work.
+The originally bound Idle drains package notification/status work through its
+original FM session; that background path grants no FM placement/control authority.
+Peer loss does not dispose an application, fabricate a reply or reconnect.
+This profile admits CLI `create` on node1, `status`, and `quit` only; it rejects
+new FM generations, mutation of the fixed service, and node2 FM creation.
+There is no build/copy pump, AddReplicaReply, quorum addition, serving secondary,
+failover, replacement, or recovery. Both original owners retain normal cleanup.
+
 Build both executables, then run:
 
 ```sh

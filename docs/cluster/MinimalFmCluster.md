@@ -182,6 +182,52 @@ renegotiation, unchanged send generation and independent sibling access.
 Bidirectional native codecs and native ordering/admission helpers are separate
 from the still-required complete C++ handler traces and interoperability gates.
 
+## Peer-created Idle replica (stage-4 increment)
+
+The explicit `--stateful-peer-idle` profile uses the same volatile
+`hosting-local-app` package, one shared partition, two original nodes and
+distinct replica identities. Only node 1 can be FM-created as the initial
+Primary; node 2 is reserved for peer-authorized Idle creation. Existing
+stateless and independent-singleton profiles are unchanged. Each node still
+hosts at most one FT.
+
+After the original Primary is open, programmatic
+`Cluster::create_idle_replica()` authorizes that Primary RA to issue native
+CreateReplica on its separately bound original peer session. It does not
+forge a Primary source at FM or implement FM AddReplica. Native body
+inheritance, deactivation information, generation and PToP NodeInstance
+headers remain intact. The original loopback peer connection is bounded and
+non-reconnectable; neither a packet write nor peer loss completes creation.
+
+Destination RA records the original sender and commits the new lifetime before
+registration or RAP Open. Its CreateReplicaReply waits for the Open-completion
+commit and returns the actual replication endpoint. The replica remains
+Idle/InBuild, with no service endpoint or read/write access. Repeated creation
+while opening performs no second Open/acquisition; an identical retry after
+Open replays the native response. Stale epochs, instances and generations
+cannot replace that lifetime. Original disposal/Hosting usage and app-process
+cleanup retain their existing independent ownership.
+The deployment assigns both actual package versions `1.0:1.0:1`; physical
+package/code incarnations, runtime IDs and acquisitions remain independently
+minted on each node. This does not bypass Hosting's operational version-mismatch
+gate or invent a deactivation-if-unused outcome. The RA model separately
+preserves requested versus selected versions for its native-derived scenarios.
+Terminal peer creation failures preserve the native error response and retain
+their still-gated FM dropped-report obligation; they cannot become successful
+remote Open observations or silently discard cleanup/reporting responsibility.
+
+The Primary retains a bounded remote-Open observation. An exact current peer
+reply is not proof of copy, build, active membership, quorum or serving
+readiness. Primary Close invalidates the observation and fences late replies.
+Fresh-start/fixed-generation admission is required; LFUM rebuild, peer
+recreation/adoption, persisted state, ActiveSecondary promotion, AddReplica
+and reconfiguration remain gated. The next increment must connect real RAP
+build and destination application copy/replication ACKs before any
+AddReplicaReply or active-member claim.
+
+These are native-derived model/store and native-free real-process contracts,
+not full C++ handler traces or native Federation interoperability.
+
 ## Initial stateful FM control
 
 Run the same executable with `--app /absolute/hosting-local-app

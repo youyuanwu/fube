@@ -176,7 +176,13 @@ fn fail(state: &mut EntityState, error: i64, effects: &mut Vec<Effect>) {
     }
     release_usage(state, effects);
     effects.push(Effect::Health(HealthEvent::Close));
-    effects.push(reply(&captured, error, state.fm_primary));
+    effects.push(peer::creation_reply(state, &captured, error));
+    if state.peer_creation.is_some() {
+        effects.push(Effect::StatefulClosePending {
+            body: state.body.clone(),
+            mode: CloseMode::Drop,
+        });
+    }
 }
 pub(super) fn registration_success(event: &RegistrationCompletion) -> bool {
     event.error == 0
@@ -328,6 +334,9 @@ pub(super) fn complete(
                     || if current.body.replica.current_role == 4 {
                         event.replica.service_endpoint.is_empty()
                             || event.replica.replication_endpoint.is_empty()
+                    } else if current.peer_creation.is_some() {
+                        !event.replica.service_endpoint.is_empty()
+                            || event.replica.replication_endpoint.is_empty()
                     } else {
                         !event.replica.service_endpoint.is_empty()
                     }))
@@ -369,6 +378,6 @@ pub(super) fn complete(
     if state.fm_primary {
         state.primary_deactivation = Some((state.body.unit.current, 0));
     }
-    effects.push(reply(&state.body, 0, state.fm_primary));
+    effects.push(peer::creation_reply(&state, &state.body, 0));
     Ok(lifecycle::changed(state, effects, true))
 }

@@ -96,11 +96,13 @@ template<class T> void run(const std::string& mode,const std::filesystem::path& 
     }
     std::cout << name << " " << mode << " OK\n";
 }
+size_t native_truncation_rejections=0;
 template<class T> void reject_truncated(T value) {
     auto bytes=encode(value);
     bytes.resize(bytes.size()/2);
     T received;
     if(decode(bytes,received)) throw std::runtime_error("native accepted truncated body");
+    ++native_truncation_rejections;
 }
 inline void bodyless(const std::string& mode,const std::filesystem::path& dir,
                      const std::string& name) {
@@ -219,6 +221,42 @@ int main(int argc,char** argv) {
             deletion_reply.errorCode_.value_=Enum(error);
             run(mode,dir,"rich-delete-replica-reply-"+std::to_string(error),deletion_reply);
         }
+        if(CreateReplicaActor!=12 || CreateReplicaReplyActor!=12 ||
+           !CreateReplicaPriority || !CreateReplicaReplyPriority)
+            throw std::runtime_error("native peer factory metadata mismatch");
+        RAReplicaMessageBody peer;
+        run(mode,dir,"default-create-replica",peer);
+        c=0; rich(peer,c);
+        peer.fudesc_.targetReplicaSetSize_=1;
+        peer.fudesc_.minReplicaSetSize_=1;
+        peer.service_.targetReplicaSetSize_=1;
+        peer.service_.minReplicaSetSize_=1;
+        peer.service_.isStateful_=true;
+        peer.service_.hasPersistedState_=false;
+        peer.replica_.currentConfigurationRole_=Enum(2);
+        peer.replica_.previousConfigurationRole_=Enum(1);
+        peer.replica_.state_=Enum(1);
+        peer.replica_.isUp_=true;
+        run(mode,dir,"rich-create-replica",peer);
+        reject_truncated(peer);
+        peer.deactivationInfo_.deactivationEpoch_=peer.fudesc_.ccEpoch_;
+        peer.deactivationInfo_.catchupLSN_=0;
+        run(mode,dir,"initial-create-replica",peer);
+        reject_truncated(peer);
+        ReplicaReplyMessageBody peer_reply;
+        run(mode,dir,"default-create-replica-reply",peer_reply);
+        c=0; rich(peer_reply,c);
+        peer_reply.fudesc_.targetReplicaSetSize_=1;
+        peer_reply.fudesc_.minReplicaSetSize_=1;
+        peer_reply.replica_.currentConfigurationRole_=Enum(2);
+        peer_reply.replica_.previousConfigurationRole_=Enum(1);
+        peer_reply.replica_.state_=Enum(1);
+        peer_reply.replica_.isUp_=true;
+        for(LONG error:{0, -2147017398}) {
+            peer_reply.errorCode_.value_=Enum(error);
+            run(mode,dir,"rich-create-replica-reply-"+std::to_string(error),peer_reply);
+        }
+        reject_truncated(peer_reply);
         // Native empty ctor leaves bools unspecified: explicitly initialize the fixture.
         ReplicaUpMessageBody up;
         up.isLastReplicaUpMessage_=false; up.isFromFMM_=false;
@@ -228,7 +266,7 @@ int main(int argc,char** argv) {
             up.isLastReplicaUpMessage_=last!=0; up.isFromFMM_=fmm!=0;
             run(mode,dir,"rich-replica-up-"+std::to_string(last)+"-"+std::to_string(fmm),up);
         }
-        for(auto name:{u"RemoveInstance",u"RemoveInstanceReply",u"ReplicaUp",u"ReplicaUpReply",u"AddPrimary",u"AddPrimaryReply",u"DeleteReplica",u"DeleteReplicaReply"}) {
+        for(auto name:{u"RemoveInstance",u"RemoveInstanceReply",u"ReplicaUp",u"ReplicaUpReply",u"AddPrimary",u"AddPrimaryReply",u"DeleteReplica",u"DeleteReplicaReply",u"CreateReplica",u"CreateReplicaReply"}) {
             action.action_=text(name);
             std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
             run(mode,dir,"action-"+ascii,action);
@@ -404,37 +442,50 @@ int main(int argc,char** argv) {
         auto bad=encode(request); bad.resize(bad.size()/2);
         ReplicaMessageBody rejected_request;
         if(decode(bad,rejected_request)) throw std::runtime_error("native accepted truncated request");
+        ++native_truncation_rejections;
         bad=encode(reply); bad.resize(5);
         ReplicaReplyMessageBody rejected_reply;
         if(decode(bad,rejected_reply)) throw std::runtime_error("native accepted truncated reply");
+        ++native_truncation_rejections;
         bad=encode(removal); bad.resize(bad.size()/2);
         DeleteReplicaMessageBody rejected_removal;
         if(decode(bad,rejected_removal)) throw std::runtime_error("native accepted truncated removal");
+        ++native_truncation_rejections;
         bad=encode(deletion); bad.resize(bad.size()/2);
         DeleteReplicaMessageBody rejected_deletion;
         if(decode(bad,rejected_deletion)) throw std::runtime_error("native accepted truncated DeleteReplica");
+        ++native_truncation_rejections;
         bad=encode(deletion_reply); bad.resize(bad.size()/2);
         ReplicaReplyMessageBody rejected_deletion_reply;
         if(decode(bad,rejected_deletion_reply)) throw std::runtime_error("native accepted truncated DeleteReplicaReply");
+        ++native_truncation_rejections;
         bad=encode(up); bad.resize(bad.size()/2);
         ReplicaUpMessageBody rejected_up;
         if(decode(bad,rejected_up)) throw std::runtime_error("native accepted truncated report");
+        ++native_truncation_rejections;
         bad=encode(notification); bad.resize(bad.size()/2);
         ServiceTypeNotificationRequestMessageBody rejected_notification;
         if(decode(bad,rejected_notification)) throw std::runtime_error("native accepted truncated notification");
+        ++native_truncation_rejections;
         bad=encode(notification_reply); bad.resize(bad.size()/2);
         ServiceTypeNotificationReplyMessageBody rejected_notification_reply;
         if(decode(bad,rejected_notification_reply)) throw std::runtime_error("native accepted truncated notification reply");
+        ++native_truncation_rejections;
         bad=encode(node_up); bad.resize(bad.size()/2);
         NodeUpMessageBody rejected_node_up;
         if(decode(bad,rejected_node_up)) throw std::runtime_error("native accepted truncated NodeUp");
+        ++native_truncation_rejections;
         bad=encode(ack); bad.resize(bad.size()/2);
         NodeUpAckMessageBody rejected_ack;
         if(decode(bad,rejected_ack)) throw std::runtime_error("native accepted truncated NodeUpAck");
+        ++native_truncation_rejections;
         bad=encode(ptop); bad.resize(bad.size()/2);
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
-        std::cout << "native rejects 31 truncations OK\n";
+        ++native_truncation_rejections;
+        if(native_truncation_rejections!=34)
+            throw std::runtime_error("native truncation coverage mismatch");
+        std::cout << "native rejects " << native_truncation_rejections << " truncations OK\n";
         return 0;
     } catch(const std::exception& error) {
         std::cerr << error.what() << "\n"; return 1;
