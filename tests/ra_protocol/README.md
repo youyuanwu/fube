@@ -163,6 +163,12 @@ started from the original opened Idle. Committed Close-origin lineage and
 late-Close rejection keep partial cleanup separate from disposal; actual held
 provider/service process-loss acceptance and Close/loss/ACK commit barriers
 remain independent from these unchanged codec cases and native-handler evidence.
+Successful normal Close of the original opened peer Idle now uses those same
+report/ACK/metadata shapes without HostDown. Its Applied completion and actual
+original-runtime disposal/usage proof are separate from FM acknowledgment;
+held provider/service disposal, a real lost-ACK retry and metadata replay add
+lifecycle evidence, not wire cases, schema types, reuse authority or native
+C++ handler execution.
 
 ### Stage-two node control/load and endpoint codecs
 

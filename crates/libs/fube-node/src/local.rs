@@ -619,7 +619,7 @@ impl Node {
                                                 && self.route.is_none())
                                             || (state.failed_open_error().is_some()
                                                 && self.runtime_open_failure().is_some())
-                                            || state.peer_host_loss()
+                                            || state.peer_terminal_report()
                                             || state.local_deleted)))
                         }
                     };

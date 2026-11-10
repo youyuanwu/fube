@@ -166,6 +166,20 @@ covered by model/store tests. No child-node Close-control feature is added.
 Opening loss, other pending-close modes and broader unknown targets remain
 gated; no wire schema or native handler qualification is added.
 
+Successful normal Close of that original opened Idle now uses the same native
+ReplicaDown-stage/dropped-list report and processed ACK/closed metadata Delete,
+without requiring HostDown. Only a matching Applied successful normal RAP Close
+with the retained opened origin enables it. Real disposal and exact original
+usage release remain independently certified by `Node::instance_disposal()`;
+ACK/metadata replay does not replace or change that proof or issue another
+Close. The app host/runtime/factory stay resident. FM records lost volatile
+state, not a reusable placement: even a valid retirement sidecar is not reuse
+authority in this terminal-report flow, and Primary pending-remove needs its
+own reply. Controlled process/Channel tests hold provider/service disposal,
+lose/retry an ACK at the unchanged 30-second cadence, replay metadata replies
+and retain healthy Primary writes. Initial-Open, failed or other-mode Close
+does not gain this reporting authority.
+
 After an original CreateReplicaReply error, the Primary retains only a failed
 observation/tombstone (`creation_aborted=true`), not live creation/build authority.
 FM sends the original Add descriptor, never fields from the failed reply.

@@ -457,6 +457,48 @@ and uncertainty. This adds no child-node Close-control feature or wire schema.
 Opening loss, other pending-close modes, broader down/arbitrary-unknown cleanup
 and replacement remain gated.
 
+### Graceful opened destination Close reporting
+
+Successful normal Close of the original opened peer Idle now reports to FM,
+instead of retaining the unsupported StatefulClosePending placeholder.
+Native `FailoverUnit.cpp:5472-5511` calls OnReplicaDown for ordinary Close;
+the volatile FT therefore retains **ReplicaDown stage** while its canonical
+description travels in ReplicaUp's **dropped list**, just as for host loss.
+
+Only a matching successful RAP Close of the committed opened-origin normal
+Close records this terminal origin. The completion commit precedes original
+registration/usage release and report work; initial-Open cancellation, failed
+Close, Drop/Abort and arbitrary closed lifetimes do not gain this authority.
+If HostDown wins first, late Close replies remain stale and provide no
+disposal proof. If successful Close wins, later HostDown cannot reclassify it.
+
+The original runtime awaits real provider/service disposal before replying.
+The existing Node `instance_disposal()` proof still requires that exact Applied
+Close completion, original runtime/host and paired lookup/acquisition release,
+plus drained local work. It can be observed before FM acknowledgment and stays
+unchanged through the processed-list ACK and closed metadata Delete/reply;
+metadata handling issues no second RAP Close or usage release.
+The original app host, runtime and factory stay resident.
+
+FM still records the closed volatile lifetime as `lost`, retains historical
+Add results and clears current Idle readiness. Genuine disposal evidence is
+separate from that native report acknowledgment: a validated retirement sidecar
+does not authorize retirement/reuse in this terminal-report flow. Explicit
+operator deletion remains incomplete, Primary pending-remove needs its own
+RemoveReplicaReply, and no replacement/recovery is authorized.
+The existing publisher may persist the original Close proof after metadata
+deletion; that does not change those FM authority boundaries.
+
+Controlled owned-Node/production-adapter/process/Channel acceptance holds real
+provider or service disposal, releases it without killing the app, and verifies
+the exact original proof before ACK and after metadata reply replay. It checks
+stale ACKs, the unchanged native 30-second report retry after losing an ACK,
+late traffic and independent Primary removal/writes. Both original nodes
+continue to progress during that retry. Model/store tests cover separate
+completion/ACK commit failure and uncertainty, excluded Close origins and late
+HostDown. No child-node Close-control feature, wire schema or native C++
+handler/interoperability qualification is added.
+
 ### Deleting the original opened destination Idle
 
 `Cluster::delete_idle_replica_via_fm()` independently authorizes normal

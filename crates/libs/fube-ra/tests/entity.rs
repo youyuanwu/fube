@@ -2774,22 +2774,22 @@ async fn peer_normal_close_host_loss_preserves_open_origin_and_fences_late_close
                 Command::CompleteClose(Box::new(completion.clone())),
             )
             .await;
-            assert!(effects(&executor).iter().any(|effect| matches!(
-                effect,
-                Effect::StatefulClosePending {
-                    mode: CloseMode::Close,
-                    ..
-                }
-            )));
+            assert!(effects(&executor)
+                .iter()
+                .any(|effect| matches!(effect, Effect::RequestReportRetry)));
             let closed = state(&executor);
             assert_eq!(run(&executor, host_down).await, Disposition::IgnoredStale);
             assert!(Arc::ptr_eq(&closed, &state(&executor)));
             assert!(!closed.peer_host_loss());
+            assert!(closed.peer_terminal_report());
             assert_eq!(
                 run(&executor, Command::RetryReport(request.replica.0.unit.id)).await,
-                Disposition::IgnoredPending
+                Disposition::Applied
             );
-            assert!(effects(&executor).is_empty());
+            assert!(matches!(
+                effects(&executor).as_slice(),
+                [Effect::ReplicaUp(_)]
+            ));
         } else {
             run(&executor, host_down).await;
             let lost = state(&executor);
@@ -3024,7 +3024,289 @@ async fn peer_pending_close_without_proven_open_origin_does_not_gain_host_loss_r
 }
 
 #[tokio::test]
-async fn peer_opening_loss_and_unowned_close_do_not_gain_host_loss_reporting() {
+async fn peer_graceful_close_reports_down_only_after_success_and_acks_only_closed_metadata() {
+    for in_dropped in [false, true] {
+        let (store, executor, _) = setup(WAIT).await;
+        let request = make_peer_idle_ready(&executor).await;
+        let original = state(&executor);
+        run(
+            &executor,
+            Command::CloseLocal {
+                unit: request.replica.0.unit.id.clone(),
+                mode: CloseMode::Close,
+            },
+        )
+        .await;
+        assert!(!state(&executor).peer_terminal_report());
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::Close { flags: 0, .. }]
+        ));
+        let completion = close_completion(&executor, 0);
+        run(
+            &executor,
+            Command::CompleteClose(Box::new(completion.clone())),
+        )
+        .await;
+        let closed = state(&executor);
+        assert!(closed.peer_terminal_report() && !closed.peer_host_loss());
+        assert!(closed.peer_creation.as_ref().unwrap().close_completed);
+        assert_eq!(
+            (closed.phase, closed.fm_stage),
+            (Phase::Closed, FmStage::ReplicaDown)
+        );
+        assert!(closed.runtime.is_none() && closed.usage.is_none() && !closed.local_deleted);
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [
+                Effect::ReleaseRegistration(_),
+                Effect::ReleaseUsage { .. },
+                Effect::RequestReportRetry,
+                Effect::Health(HealthEvent::Close)
+            ]
+        ));
+        assert_eq!(
+            run(&executor, Command::CompleteClose(Box::new(completion))).await,
+            Disposition::IgnoredStale
+        );
+        assert_eq!(
+            run(
+                &executor,
+                Command::HostDown(Box::new(HostDown {
+                    unit: request.replica.0.unit.id.clone(),
+                    host: original.runtime.as_ref().unwrap().host.clone(),
+                }))
+            )
+            .await,
+            Disposition::IgnoredStale
+        );
+        assert!(Arc::ptr_eq(&closed, &state(&executor)));
+        assert!(effects(&executor).is_empty());
+        run(
+            &executor,
+            Command::RetryReport(request.replica.0.unit.id.clone()),
+        )
+        .await;
+        let Effect::ReplicaUp(report) = effects(&executor).remove(0) else {
+            panic!("native Close report");
+        };
+        assert!(
+            report.replicas.0.is_empty()
+                && report.dropped.0.len() == 1
+                && !report.last
+                && !report.from_fmm
+        );
+        assert_eq!(report.dropped.0[0].unit, original.body.unit);
+        for stale in 0..4 {
+            let mut invalid = (*report).clone();
+            let info = &mut invalid.dropped.0[0];
+            match stale {
+                0 => info.replicas.0[0].description.up = true,
+                1 => info.replicas.0[0].description.instance -= 1,
+                2 => info.unit.current.configuration -= 1,
+                _ => info.replicas.0[0].description.node.instance += 1,
+            }
+            assert_eq!(
+                run(&executor, ack(invalid, in_dropped)).await,
+                Disposition::IgnoredStale
+            );
+            assert!(effects(&executor).is_empty());
+        }
+        run(
+            &executor,
+            Command::RetryReport(request.replica.0.unit.id.clone()),
+        )
+        .await;
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::ReplicaUp(retried)] if retried == &report)
+        );
+        for _ in 0..2 {
+            run(&executor, ack((*report).clone(), in_dropped)).await;
+            assert!(state(&executor).local_deleted && state(&executor).peer_terminal_report());
+            assert_eq!(state(&executor).fm_stage, FmStage::None);
+            let actions = effects(&executor);
+            if in_dropped {
+                assert!(actions.is_empty());
+            } else {
+                assert!(matches!(
+                    actions.as_slice(),
+                    [Effect::DeleteReplicaReply(_)]
+                ));
+            }
+        }
+        assert_eq!(
+            run(&executor, peer_create(request)).await,
+            Disposition::IgnoredStale
+        );
+        assert!(effects(&executor).is_empty());
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn peer_graceful_close_completion_and_ack_keep_disposal_and_reporting_behind_commit() {
+    for acknowledging in [false, true] {
+        for (unknown, fail) in [(false, true), (true, false), (true, true)] {
+            let (store, executor, hooks) = setup(if unknown {
+                Duration::from_millis(50)
+            } else {
+                WAIT
+            })
+            .await;
+            let request = make_peer_idle_ready(&executor).await;
+            run(
+                &executor,
+                Command::CloseLocal {
+                    unit: request.replica.0.unit.id.clone(),
+                    mode: CloseMode::Close,
+                },
+            )
+            .await;
+            effects(&executor);
+            let completion = close_completion(&executor, 0);
+            let report = if acknowledging {
+                run(
+                    &executor,
+                    Command::CompleteClose(Box::new(completion.clone())),
+                )
+                .await;
+                effects(&executor);
+                run(
+                    &executor,
+                    Command::RetryReport(request.replica.0.unit.id.clone()),
+                )
+                .await;
+                let Effect::ReplicaUp(report) = effects(&executor).remove(0) else {
+                    panic!("report");
+                };
+                Some(report)
+            } else {
+                None
+            };
+            let command = || match &report {
+                Some(report) => ack((**report).clone(), false),
+                None => Command::CompleteClose(Box::new(completion.clone())),
+            };
+            let original = state(&executor);
+            let (entered, release) = hooks.pause(fail);
+            let ticket = executor.submit(command()).unwrap();
+            entered.await.unwrap();
+            assert!(Arc::ptr_eq(&original, &state(&executor)));
+            assert!(effects(&executor).is_empty());
+            if unknown {
+                assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+                assert!(executor.snapshot([1; 16]).fenced);
+                assert!(effects(&executor).is_empty());
+            }
+            release.send(()).unwrap();
+            if fail {
+                assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+                assert!(Arc::ptr_eq(&original, &state(&executor)));
+                assert!(effects(&executor).is_empty());
+                if unknown {
+                    finish(&store, &executor).await;
+                    continue;
+                }
+                run(&executor, command()).await;
+            } else {
+                assert_eq!(ticket.resolve(WAIT).await, Ok(Disposition::Applied));
+            }
+            assert!(state(&executor).peer_terminal_report() && !state(&executor).peer_host_loss());
+            assert_eq!(state(&executor).local_deleted, acknowledging);
+            let actions = effects(&executor);
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|effect| matches!(effect, Effect::ReleaseUsage { .. }))
+                    .count(),
+                usize::from(!acknowledging)
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|effect| matches!(effect, Effect::RequestReportRetry))
+                    .count(),
+                usize::from(!acknowledging)
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|effect| matches!(effect, Effect::DeleteReplicaReply(_)))
+                    .count(),
+                usize::from(acknowledging)
+            );
+            assert!(!actions.iter().any(|effect| matches!(
+                effect,
+                Effect::Close { .. } | Effect::StatefulClosePending { .. }
+            )));
+            finish(&store, &executor).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn peer_graceful_close_reporting_excludes_unopened_drop_and_failed_close_origins() {
+    for origin in 0..3 {
+        let (store, executor, _) = setup(WAIT).await;
+        let request = if origin == 0 {
+            executor.bind_peer(peer_source()).unwrap();
+            let request = peer_request();
+            run(&executor, peer_create(request.clone())).await;
+            effects(&executor);
+            registered(&executor, &request.replica.0, state(&executor).open_token).await;
+            request
+        } else {
+            make_peer_idle_ready(&executor).await
+        };
+        run(
+            &executor,
+            Command::CloseLocal {
+                unit: request.replica.0.unit.id.clone(),
+                mode: if origin == 1 {
+                    CloseMode::Drop
+                } else {
+                    CloseMode::Close
+                },
+            },
+        )
+        .await;
+        effects(&executor);
+        if origin == 2 {
+            executor
+                .config()
+                .set(RetryState::Closing, Threshold::Drop, 2);
+            for _ in 0..2 {
+                close_done(&executor, -55).await;
+                assert!(!state(&executor).peer_terminal_report());
+                assert!(
+                    !state(&executor)
+                        .peer_creation
+                        .as_ref()
+                        .unwrap()
+                        .close_completed
+                );
+                assert!(!effects(&executor)
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::RequestReportRetry)));
+            }
+            assert_eq!(state(&executor).close_mode, Some(CloseMode::ForceAbort));
+        }
+        close_done(&executor, 0).await;
+        assert!(!state(&executor).peer_terminal_report());
+        assert!(effects(&executor)
+            .iter()
+            .any(|effect| matches!(effect, Effect::StatefulClosePending { .. })));
+        assert_eq!(
+            run(&executor, Command::RetryReport(request.replica.0.unit.id)).await,
+            Disposition::IgnoredPending
+        );
+        assert!(effects(&executor).is_empty());
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn peer_opening_loss_does_not_report_and_completed_close_is_not_host_loss() {
     for opening in [false, true] {
         let (store, executor, _) = setup(WAIT).await;
         let request = if opening {
@@ -3063,15 +3345,37 @@ async fn peer_opening_loss_and_unowned_close_do_not_gain_host_loss_reporting() {
             close_done(&executor, 0).await;
         }
         assert!(!state(&executor).peer_host_loss());
-        assert_eq!(state(&executor).fm_stage, FmStage::None);
-        assert!(effects(&executor)
-            .iter()
-            .any(|effect| matches!(effect, Effect::StatefulClosePending { .. })));
+        assert_eq!(state(&executor).peer_terminal_report(), !opening);
+        assert_eq!(
+            state(&executor).fm_stage,
+            if opening {
+                FmStage::None
+            } else {
+                FmStage::ReplicaDown
+            }
+        );
+        let actions = effects(&executor);
+        assert_eq!(
+            actions
+                .iter()
+                .any(|effect| matches!(effect, Effect::StatefulClosePending { .. })),
+            opening
+        );
         assert_eq!(
             run(&executor, Command::RetryReport(request.replica.0.unit.id)).await,
-            Disposition::IgnoredPending
+            if opening {
+                Disposition::IgnoredPending
+            } else {
+                Disposition::Applied
+            }
         );
-        assert!(effects(&executor).is_empty());
+        let actions = effects(&executor);
+        assert_eq!(
+            actions
+                .iter()
+                .any(|effect| matches!(effect, Effect::ReplicaUp(_))),
+            !opening
+        );
         finish(&store, &executor).await;
     }
 }

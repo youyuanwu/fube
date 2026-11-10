@@ -1633,6 +1633,7 @@ fn transition(
                         open_error: None,
                         host_down: false,
                         close_started_open: false,
+                        close_completed: false,
                     })
                 }
                 _ => None,

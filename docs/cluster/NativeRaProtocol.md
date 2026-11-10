@@ -249,6 +249,18 @@ or other pending-close modes. Held real provider/service disposal followed by
 process loss uses the existing report/ACK/metadata path without a disposal
 receipt. Controlled Node/process/Channel acceptance and separate three-stage
 commit/race tests add no wire types or native handler execution claim.
+Successful normal Close now uses [FT:5472-5511][ft]'s OnReplicaDown path for
+the original opened peer Idle as well, without requiring AppHostDown.
+Only the matching Applied successful RAP Close records that terminal origin;
+failure/initial-Open/other-mode cleanup remains gated. The real runtime's
+disposal-before-reply and exact original usage-release proof remain distinct
+from ReplicaUp's processed ACK and closed metadata Delete/reply, with no second
+RAP Close or release. FM records lost volatile state and preserves independent
+Primary removal and no-reuse gates; a retirement sidecar is not replacement
+authority in this flow. Held provider/service disposal, actual 30-second
+lost-ACK retry, metadata reply replay and stable original proof have controlled
+Node/process/Channel coverage, separately from completion/ACK commit tests and
+native C++ handler execution.
 
 ### Stage-two native codec contracts and execution boundary
 

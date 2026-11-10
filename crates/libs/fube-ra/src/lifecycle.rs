@@ -210,7 +210,7 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
         if state.fm_primary {
             state.primary_deactivation = Some((Epoch::default(), -2));
         }
-        if (state.fm_primary || (mode == CloseMode::AppHostDown && state.peer_host_loss()))
+        if (state.fm_primary || state.peer_terminal_report())
             && matches!(
                 mode,
                 CloseMode::Close
@@ -576,7 +576,7 @@ pub(super) fn transition(
                                 && original.runtime.is_some() == original.usage.is_some())
                             || original.failed_registration_error().is_some()
                             || original.failed_open_error().is_some()
-                            || original.peer_host_loss()
+                            || original.peer_terminal_report()
                             || original.local_deleted)
                         || original.body.replica.current_role != 2
                     {
@@ -829,6 +829,11 @@ pub(super) fn transition(
             let mode = state.close_mode.unwrap();
             let mut effects = Vec::new();
             if event.error == 0 {
+                if mode == CloseMode::Close && state.runtime.is_some() && state.usage.is_some() {
+                    if let Some(peer) = &mut state.peer_creation {
+                        peer.close_completed = peer.close_started_open;
+                    }
+                }
                 if config
                     .policy(if state.local_deleted {
                         RetryState::Deleting
@@ -959,7 +964,7 @@ pub(super) fn transition(
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             }
             if current.body.service.stateful {
-                if !current.fm_primary && !current.peer_host_loss() {
+                if !current.fm_primary && !current.peer_terminal_report() {
                     return Err(Failure::Unsupported(
                         "local stateful terminal-report ACK is gated",
                     ));

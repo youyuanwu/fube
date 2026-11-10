@@ -10,9 +10,17 @@ pub struct PeerCreation {
     pub host_down: bool,
     /// Normal Close committed from the original successfully opened Idle.
     pub close_started_open: bool,
+    /// Matching successful RAP completion, not an FM ACK or disposal receipt.
+    pub close_completed: bool,
 }
 
 impl EntityState {
+    pub fn peer_terminal_report(&self) -> bool {
+        self.peer_creation
+            .as_ref()
+            .is_some_and(|peer| peer.host_down || peer.close_completed)
+    }
+
     pub fn peer_host_loss(&self) -> bool {
         self.peer_creation
             .as_ref()
