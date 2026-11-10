@@ -843,7 +843,7 @@ fn replica_contracts(input: &Path, output: &Path) {
     }
     for (name, body) in [
         ("default-remove-replica", RemoveReplica::default()),
-        ("rich-remove-replica", request),
+        ("rich-remove-replica", request.clone()),
     ] {
         check_peer(
             input,
@@ -863,6 +863,17 @@ fn replica_contracts(input: &Path, output: &Path) {
         "default-remove-replica-reply".to_owned(),
         RemoveReplicaReply::default(),
     )];
+    let mut cancelled_create = RemoveReplicaReply {
+        unit: request.unit,
+        replica: request.replica,
+        error: 0,
+    };
+    cancelled_create.replica.service_endpoint.clear();
+    cancelled_create.replica.replication_endpoint.clear();
+    replies.push((
+        "in-create-remove-replica-reply".to_owned(),
+        cancelled_create,
+    ));
     for error in [0, -2_147_017_398] {
         let mut reply = support::rich_reply(error);
         reply.unit.target = 1;

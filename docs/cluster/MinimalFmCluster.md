@@ -258,7 +258,7 @@ Peer creation failure returns an AddReplicaReply error, leaving FM cleanup
 required; the bounded original observation is retained for error replay instead
 of authorizing another lifetime. RAP build errors remain diagnostics/pending
 and retry through existing nonterminal cleanup, not failed FM completion.
-Broader replacement, configuration repair and pre-Open cleanup remain
+Broader replacement, configuration repair and failed-Open cleanup remain
 gated. Manual create/build cannot adopt or mutate an FM-owned Idle.
 Local explicit removal cancels the FM add obligation and fences queued/late
 success; cancellation does not fabricate RemoveReplicaReply. Primary Close
@@ -328,11 +328,11 @@ still joins and disposes that original owner. No FM RemoveReplicaReply or
 destination DeleteReplica completion is inferred.
 
 The separate programmatic `Cluster::remove_idle_replica_via_fm()` API now sends
-native FM RemoveReplica for the original opened Idle, including a manual
-unbuilt/copied Idle or an FM-owned pending/failed/successful build. It freezes
+native FM RemoveReplica for the original FM-owned pending creation or opened Idle,
+including a manual unbuilt/copied Idle or an FM-owned pending/failed/successful build. It freezes
 the original FT/service/remote incarnation and retries on native 10/60-second
-cadence. RA records FM removal ownership and InDrop intent before RAP dispatch.
-Ordinary RAP errors remain pending; successful removal emits RemoveReplicaReply,
+cadence. After Open, RA records FM removal ownership and InDrop intent before RAP dispatch.
+After Open, ordinary RAP errors remain pending; successful removal emits RemoveReplicaReply,
 and completed duplicate requests replay that reply without another user removal.
 Only the matching original Primary/FT/remote success clears FM pending-remove.
 Poll `peer_idle.fm_removal` (also root `idle_removal`), not diagnostic
@@ -345,9 +345,29 @@ Unresolved original-session loss leaves unknown/pending-remove, never recovery.
 Local removal cannot take over an FM-owned removal. The destination lifetime,
 data, registration and usage remain intact until normal shutdown; FM completion
 does not imply remote deletion or active configuration change. Native
-InCreate/down/not-found, failed-Open cleanup and replacement remain gated
+down/not-found, failed-Open cleanup and replacement remain gated
 ([RA:2044-2140,4094-4149](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ReconfigurationAgent.cpp#L2044-L2140),
 [FM:201-214](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/fm/FailoverUnitMessageProcessor.cpp#L201-L214)).
+
+For the original pending FM creation, RA follows native
+`ReconfigurationAgent.cpp:2092-2106`'s InCreate branch and
+`FailoverUnit.cpp:360-364`: retire creation bookkeeping and reply immediately,
+**without RAP removal or InDrop**. The success reply echoes FM's exact
+InBuild=1/empty-endpoint descriptor; the post-Open RAP path still replies with
+Dropped=3 and its actual endpoint. FM accepts the exact echo for the original
+pending incarnation and reports `completion=creation_cancelled`, separately
+from `completion=replicator_removed`. Both require the actual RemoveReplicaReply
+to clear pending-remove; reply loss still requires frozen retry/replay.
+
+InCreate means no accepted CreateReplicaReply at the Primary, not proof the
+destination never opened. The bounded profile retains a session-only
+incarnation tombstone, ignores late CreateReplicaReply success/error and build
+completion, and cannot restart the cancelled FM add. An already dispatched
+CreateReplica can still Open the destination before or after FM cancellation;
+that lifetime remains owned, Idle/non-serving and normally shut down, not
+silently deleted. If the Primary accepted Open first, ordinary RAP removal
+applies instead. Removal before any original pending FM Add, manual pre-Open
+removal, failed-Open cleanup and arbitrary unknown/replacement remain gated.
 
 This increment deliberately retains Idle/InBuild metadata, no service endpoint,
 denied read/write access and no active membership or quorum change even after
@@ -372,6 +392,10 @@ FM removal acceptance drops an actual RemoveReplicaReply, proves pending-remove
 survives child removal telemetry, retries the original request for replay and
 rejects delayed AddReplicaReply resurrection. Both unbuilt and copied manual
 Idles also qualify FM removal without disposing the destination.
+Controlled peer-channel tests retain the actual original CreateReplica or its
+real Open reply across cancellation, replay the FM reply and deliver late Open
+through the original session. They prove no RAP build, one intact destination
+Open and continued Primary writes/reads in both orderings.
 
 These are native-derived model/store and native-free real-process contracts,
 not full C++ handler traces or native Federation interoperability.

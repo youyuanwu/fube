@@ -37,7 +37,7 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 138 inputs.
+The C++ producer independently constructs expected values and emits 139 inputs.
 The existing 36 cases and their contracts are retained:
 default/rich AddInstance, default/error AddInstanceReply, default/rich Remove
 (force false/true), default/rich removal reply, explicit-empty/rich ReplicaUp
@@ -54,7 +54,7 @@ Nondefault cases cover GUID/raw NodeId, high-bit instances, negative LSN/epochs,
 UTF-16/surrogates, enums/errors, all service collections and null/Invalid/both
 derived scaling variants. Rust rejects every proper prefix of rich body
 fixtures including both rich force bodies and the rich/partial notification
-bodies; native rejects 38 truncated bodies, including NodeUp, Ack, PToP
+bodies; native rejects 39 truncated bodies, including NodeUp, Ack, PToP
 and the distinct DeleteReplica/Reply fixtures.
 Non-polymorphic Delete inheritance invokes base rich traversal and native
 base/derived scopes, not a flattened or nested replacement. ReplicaUp's empty
@@ -329,9 +329,19 @@ cross-action decoders cannot confuse RemoveReplica with AddReplica,
 RemoveInstance or DeleteReplica. Both actual native truncated-body rejections
 are measured. This remains source-baseline native-stream/schema-adapter evidence,
 not native handler traces or deployed native FM/Federation interoperability.
+The additional `in-create-remove-replica-reply` case independently constructs
+native `ReplicaReplyMessageBody` by echoing the original Idle/InBuild descriptor,
+with both endpoints empty and success. This is native
+`ReconfigurationAgent.cpp:2092-2106`'s reply form, not the post-Open RAP
+Dropped=3 reply. It increases the gate to **139 cases, 143 bundle files and
+39 measured native truncation rejections**, retaining 77 types/240 fields.
+Rust reconstructs and verifies the exact echo, factory/envelope and every proper
+prefix; the native decoder compares every field and rejects an additional
+truncation. Existing receipt guards require the new case before execution.
 Native-free FM/RA/RAP execution, lost-reply replay and Primary/destination
-lifetime checks are separate acceptance tests. Pre-Open/down/not-found cleanup,
-replacement and active configuration remain gated.
+lifetime checks are separate acceptance tests. Original InCreate cancellation
+is supported without RAP; failed-Open/down/not-found cleanup, replacement and
+active configuration remain gated.
 
 ### Bootstrap and source identity header extension
 

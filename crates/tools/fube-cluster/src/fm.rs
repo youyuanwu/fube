@@ -1249,15 +1249,20 @@ impl Ledger {
         {
             return Ok(());
         }
-        if body.replica.current_role != 2
-            || body.replica.previous_role != 1
-            || body.replica.state != 3
-            || !body.replica.up
-            || body.replica.version != removal.body.replica.version
-            || !body.replica.service_endpoint.is_empty()
-            || body.replica.replication_endpoint.is_empty()
-            || (!removal.body.replica.replication_endpoint.is_empty()
-                && body.replica.replication_endpoint != removal.body.replica.replication_endpoint)
+        let cancelled_creation = removal.body.replica.state == 1
+            && removal.body.replica.replication_endpoint.is_empty()
+            && body.replica == removal.body.replica;
+        if !cancelled_creation
+            && (body.replica.current_role != 2
+                || body.replica.previous_role != 1
+                || body.replica.state != 3
+                || !body.replica.up
+                || body.replica.version != removal.body.replica.version
+                || !body.replica.service_endpoint.is_empty()
+                || body.replica.replication_endpoint.is_empty()
+                || (!removal.body.replica.replication_endpoint.is_empty()
+                    && body.replica.replication_endpoint
+                        != removal.body.replica.replication_endpoint))
         {
             return Err("RemoveReplicaReply is not the original removed Idle".into());
         }
@@ -1297,6 +1302,11 @@ impl Ledger {
         };
         json!({"state":state, "kind":"fm_idle_removal",
             "pending_remove":removal.reply.is_none(), "removed":state == "removed",
+            "completion":removal.reply.as_ref().map(|reply| if reply.replica.state == 1 {
+                "creation_cancelled"
+            } else {
+                "replicator_removed"
+            }),
             "request":removal.body, "reply":removal.reply,
             "destination_deleted":false, "serving":false})
     }

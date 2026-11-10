@@ -326,6 +326,58 @@ fn fm_idle_removal_keeps_pending_until_matching_reply_and_never_resurrects_add()
 }
 
 #[test]
+fn fm_in_create_removal_requires_exact_echo_and_keeps_completion_separate_from_open() {
+    for lost in [false, true] {
+        let mut ledger = Ledger::new(peer_idle_launches());
+        for placement in &mut ledger.placements {
+            placement.bootstrap = Bootstrap::Metadata;
+            let mut actual = profile(&placement.launch);
+            actual.service = placement.launch.profile.service().into();
+            actual.service_type = fixed_type_for(placement.launch.profile);
+            placement.admit_profile(actual).unwrap();
+        }
+        ledger.accept(command("primary", "create", Some(1))).unwrap();
+        ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
+        let now = Instant::now();
+        let request = ledger.request_idle(now).unwrap();
+        let removing = ledger.request_idle_removal(now).unwrap();
+        assert_eq!(removing, request);
+        assert_eq!(ledger.idle_removal_status()["state"], "pending");
+        let reply = RemoveReplicaReply {
+            unit: request.unit.clone(), replica: request.replica.clone(), error: 0,
+        };
+        for field in 0..3 {
+            let mut invalid = reply.clone();
+            match field {
+                0 => invalid.replica.state = 2,
+                1 => invalid.replica.replication_endpoint = "unobserved".into(),
+                _ => invalid.replica.last_lsn += 1,
+            }
+            assert!(ledger.idle_removal_reply(0, invalid).is_err());
+        }
+        ledger.idle_removal_reply(1, reply.clone()).unwrap();
+        assert_eq!(ledger.idle_removal_status()["pending_remove"], true);
+        assert_eq!(ledger.idle_removal_retry(0, now + Duration::from_secs(11)), Some(removing));
+        if lost {
+            ledger.lost(0, "original session lost".into());
+        }
+        ledger.idle_removal_reply(0, reply.clone()).unwrap();
+        assert_eq!(ledger.idle_removal_status()["state"], if lost { "unknown" } else { "removed" });
+        assert_eq!(ledger.idle_removal_status()["completion"], if lost { Value::Null } else { json!("creation_cancelled") });
+        assert_eq!(ledger.idle_removal_status()["destination_deleted"], false);
+        let mut late = reply;
+        late.replica.state = 2;
+        late.replica.replication_endpoint = "127.0.0.1:23457".into();
+        ledger.idle_reply(0, late).unwrap();
+        assert_eq!(ledger.idle_status()["ready"], false);
+        assert!(ledger.idle_retry(0, now + Duration::from_secs(120)).is_none());
+        assert!(ledger.idle_removal_retry(0, now + Duration::from_secs(120)).is_none());
+        assert_eq!(ledger.placements[1].observed, Observed::Absent);
+        assert!(!ledger.placements[1].created);
+    }
+}
+
+#[test]
 fn peer_idle_profile_binds_one_partition_and_never_admits_a_second_fm_primary() {
     let launches = peer_idle_launches();
     for launch in &launches {
@@ -872,6 +924,64 @@ async fn fm_add_idle_copies_real_state_and_recovers_lost_reply_without_resurrect
         }).await;
         let cleanup = cluster.shutdown().await;
         assert_eq!(cleanup["clean"], true, "{cleanup}");
+        result.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn fm_can_cancel_original_pending_add_without_waiting_for_open_telemetry() {
+    let fixture = Fixture::new("fm-pending-create-cancel");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::StatefulPeerIdle;
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    cluster.start().await.unwrap();
+    let result = peer_idle_catch(async {
+        assert!(cluster.remove_idle_replica_via_fm().await.is_err());
+        cluster.execute(command("primary", "create", Some(1))).await?;
+        until(&mut cluster, |cluster| cluster.ledger.placements[0].observed == Observed::Running).await;
+        assert_eq!(cluster.add_idle_replica().await?["state"], "pending");
+        let add = cluster.ledger.idle.as_ref().unwrap().body.clone();
+        assert_eq!(cluster.remove_idle_replica_via_fm().await?["state"], "pending");
+        assert_eq!(cluster.ledger.idle_status()["state"], "cancelled");
+        until(&mut cluster, |cluster| {
+            cluster.ledger.idle_removal_status()["removed"] == true
+                && cluster.status()["peer_idle"]["target"]["open"] == true
+        }).await;
+        let removed = cluster.ledger.idle_removal_status();
+        assert!(matches!(removed["completion"].as_str(), Some("creation_cancelled" | "replicator_removed")));
+        assert_eq!(removed["destination_deleted"], false);
+        assert_eq!(removed["pending_remove"], false);
+        cluster.send_idle(&add).await?;
+        for _ in 0..15 { cluster.drive().await; }
+        assert_eq!(cluster.ledger.idle_status()["ready"], false);
+        assert_eq!(cluster.remove_idle_replica_via_fm().await?["state"], "removed");
+        let status = cluster.status();
+        assert_eq!(status["peer_idle"]["serving"], false);
+        assert_eq!(status["nodes"][1]["retained_work"]["app_observation"]["opens"], 1);
+        assert_eq!(status["peer_idle"]["target"]["replica"]["current_role"], 2);
+        assert_eq!(status["peer_idle"]["target"]["replica"]["state"], 1);
+        Ok::<(), String>(())
+    }).await;
+    assert_eq!(cluster.shutdown().await["clean"], true);
+    result.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn fm_in_create_cancel_fences_actual_peer_open_before_and_after_completion() {
+    for open_before_cancel in [false, true] {
+        let fixture = Fixture::new("peer-idle-create-cancel");
+        let mut config = fixture.config();
+        config.profile = ServiceProfile::StatefulPeerIdle;
+        config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+        let mut cluster = Cluster::new(config).unwrap();
+        cluster.prepare().unwrap();
+        let launches = [
+            cluster.ledger.placements[0].launch.clone(),
+            cluster.ledger.placements[1].launch.clone(),
+        ];
+        let result = node::report_tests::run_peer_idle_cancel(&launches, open_before_cancel).await;
+        assert_eq!(cluster.shutdown().await["clean"], true);
         result.unwrap().unwrap();
     }
 }

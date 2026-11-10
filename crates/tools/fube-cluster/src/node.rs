@@ -1579,6 +1579,7 @@ pub(crate) mod report_tests {
         removed: bool,
         add_reply: Option<AddInstanceReply>,
         remove_reply: Option<AddInstanceReply>,
+        idle_removals: Vec<RemoveReplicaReply>,
         activations: Vec<i64>,
         deactivations: Vec<i64>,
         service_updates: Vec<NodeUpdateServiceReply>,
@@ -1757,6 +1758,14 @@ pub(crate) mod report_tests {
                     }
                     traffic.removed = true;
                     traffic.remove_reply = Some(body);
+                }
+                "RemoveReplicaReply" => {
+                    let (body, owner) =
+                        decode_remove_replica_reply(&incoming.message).map_err(err)?;
+                    if owner != Owner::Fm || body.error != 0 || traffic.idle_removals.len() == 4 {
+                        return Err("unexpected Idle removal reply or unbounded retry".into());
+                    }
+                    traffic.idle_removals.push(body);
                 }
                 other => return Err(format!("unexpected FM test ingress {other}")),
             }
@@ -3395,6 +3404,310 @@ pub(crate) mod report_tests {
             return Err("unbound peer topology poisoned selection or acquired usage".into());
         }
         Ok(())
+    }
+
+    pub(crate) async fn run_peer_idle_cancel(
+        launches: &[Launch; 2],
+        open_before_cancel: bool,
+    ) -> Result<Result<()>> {
+        let (mut source, source_store) = create_node(&launches[0]).await?;
+        let (mut target, target_store) = create_node(&launches[1]).await?;
+        let mut source_adapter = Adapter::default();
+        let mut target_adapter = Adapter::default();
+        let result = async {
+            source
+                .start(
+                    &launches[0].package,
+                    APPLICATION,
+                    &[("Arguments".into(), "--stateful-primary".into())],
+                )
+                .map_err(err)?;
+            target
+                .start(
+                    &launches[1].package,
+                    APPLICATION,
+                    &[(
+                        "Arguments".into(),
+                        "--stateful-lifecycle --data-replicator".into(),
+                    )],
+                )
+                .map_err(err)?;
+            let (fm, fm_link) = links(&launches[0]).await?;
+            let body = add_body(&launches[0], &actual_profile(&source)?);
+            let entity = body.unit.id.guid.0;
+            fm.send(add_primary_message(&body, &launches[0].generation).map_err(err)?)
+                .await?;
+            let mut traffic = Traffic::default();
+            until(
+                &launches[0],
+                &mut source,
+                &mut source_adapter,
+                &fm,
+                &fm_link,
+                &mut traffic,
+                |_, adapter, traffic| traffic.added && adapter.notification_pending.is_none(),
+            )
+            .await?;
+            let endpoint = traffic
+                .add_reply
+                .as_ref()
+                .ok_or("missing Primary reply")?
+                .replica
+                .service_endpoint
+                .clone();
+            let ready_end = Instant::now() + Duration::from_secs(2);
+            while !data_request(&endpoint, b"read\n").await?.starts_with("OK ") {
+                if Instant::now() >= ready_end {
+                    return Err("Primary readiness deadline".into());
+                }
+                step(
+                    &launches[0],
+                    &mut source,
+                    &mut source_adapter,
+                    &fm,
+                    &fm_link,
+                    &mut traffic,
+                )
+                .await?;
+            }
+            if !data_request(&endpoint, b"write\n")
+                .await?
+                .contains("committed=1 value=acknowledged")
+            {
+                return Err("Primary write before cancellation failed".into());
+            }
+            let mut request = body.clone();
+            request.replica = add_body(&launches[1], &actual_profile(&target)?).replica;
+            request.replica.current_role = 2;
+            fm.send(add_replica_message(&request, &launches[0].generation).map_err(err)?)
+                .await?;
+            until(
+                &launches[0],
+                &mut source,
+                &mut source_adapter,
+                &fm,
+                &fm_link,
+                &mut traffic,
+                |_, adapter, _| !adapter.peer_replies.is_empty(),
+            )
+            .await?;
+            let held = source_adapter
+                .peer_replies
+                .pop_front()
+                .ok_or("missing original CreateReplica")?;
+            let ra::Effect::PeerCreateReplica { body: create, .. } = held.effect else {
+                return Err("unexpected original peer effect".into());
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
+            let address = listener.local_addr().map_err(err)?.to_string();
+            let (source_link, target_link) =
+                tokio::join!(dial_peer(&launches[0], &address), async {
+                    let (stream, _) = listener.accept().await.map_err(err)?;
+                    accept_peer(&launches[1], stream).await
+                });
+            drop(listener);
+            let source_link = source_link?;
+            let target_link = target_link?;
+            let operation = async {
+                if open_before_cancel {
+                    source_link
+                        .send(
+                            create_replica_message(&create, &launches[0].generation)
+                                .map_err(err)?,
+                        )
+                        .await?;
+                    let end = Instant::now() + Duration::from_secs(8);
+                    while target_adapter.peer_last_reply.is_none() {
+                        peer_step(
+                            &launches[1],
+                            &mut target,
+                            &mut target_adapter,
+                            &target_link,
+                            None,
+                        )
+                        .await?;
+                        step(
+                            &launches[0],
+                            &mut source,
+                            &mut source_adapter,
+                            &fm,
+                            &fm_link,
+                            &mut traffic,
+                        )
+                        .await?;
+                        if Instant::now() >= end {
+                            return Err("destination Open deadline".into());
+                        }
+                    }
+                }
+                // Hold either CreateReplica or its real Open reply outside the Primary RA.
+                fm.send(remove_replica_message(&request, &launches[0].generation).map_err(err)?)
+                    .await?;
+                until(
+                    &launches[0],
+                    &mut source,
+                    &mut source_adapter,
+                    &fm,
+                    &fm_link,
+                    &mut traffic,
+                    |_, _, traffic| traffic.idle_removals.len() == 1,
+                )
+                .await?;
+                let expected = RemoveReplicaReply {
+                    unit: request.unit.clone(),
+                    replica: request.replica.clone(),
+                    error: 0,
+                };
+                if traffic.idle_removals[0] != expected {
+                    return Err("InCreate removal did not echo the original FM descriptor".into());
+                }
+                // Deliberately lose the first reply, then retry the original request.
+                fm.send(remove_replica_message(&request, &launches[0].generation).map_err(err)?)
+                    .await?;
+                until(
+                    &launches[0],
+                    &mut source,
+                    &mut source_adapter,
+                    &fm,
+                    &fm_link,
+                    &mut traffic,
+                    |_, _, traffic| traffic.idle_removals.len() == 2,
+                )
+                .await?;
+                if traffic.idle_removals[1] != expected {
+                    return Err("InCreate removal replay changed the reply".into());
+                }
+                if !open_before_cancel {
+                    source_link
+                        .send(
+                            create_replica_message(&create, &launches[0].generation)
+                                .map_err(err)?,
+                        )
+                        .await?;
+                }
+                let end = Instant::now() + Duration::from_secs(8);
+                loop {
+                    peer_step(
+                        &launches[1],
+                        &mut target,
+                        &mut target_adapter,
+                        &target_link,
+                        None,
+                    )
+                    .await?;
+                    if let Some(mut incoming) = source_link
+                        .receive(Instant::now() + Duration::from_millis(1))
+                        .await?
+                    {
+                        let reply = decode_create_replica_reply(&incoming.message)
+                            .map_err(err)?
+                            .0;
+                        if reply.error != 0 || reply.replica.replication_endpoint.is_empty() {
+                            return Err("destination did not actually Open".into());
+                        }
+                        let command = receive_peer(&launches[0], &mut source, &incoming.message)?
+                            .ok_or("late peer reply capacity")?;
+                        source_adapter.peer_commands.push(command);
+                        if let Some(handoff) = incoming.handoff.as_mut() {
+                            handoff.acknowledge();
+                        }
+                        break;
+                    }
+                    if Instant::now() >= end {
+                        return Err("late CreateReplicaReply deadline".into());
+                    }
+                }
+                until(
+                    &launches[0],
+                    &mut source,
+                    &mut source_adapter,
+                    &fm,
+                    &fm_link,
+                    &mut traffic,
+                    |_, adapter, _| adapter.peer_commands.is_empty(),
+                )
+                .await?;
+                let current = source
+                    .snapshot(entity)
+                    .committed
+                    .ok_or("Primary disappeared")?;
+                let remote = current
+                    .remote_idle
+                    .as_ref()
+                    .ok_or("cancellation tombstone disappeared")?;
+                if remote.reply.is_some()
+                    || remote.build.is_some()
+                    || remote.ready
+                    || remote.remove_reply().as_ref() != Some(&expected)
+                {
+                    return Err(
+                        "late Open resurrected cancelled creation or started RAP build".into(),
+                    );
+                }
+                let idle = target
+                    .snapshot(entity)
+                    .committed
+                    .ok_or("destination disappeared")?;
+                if idle.phase != ra::Phase::Ready
+                    || idle.body.replica.current_role != 2
+                    || idle.body.replica.state != 1
+                    || target.retained_usage() != 1
+                    || target
+                        .activation()
+                        .logs()
+                        .iter()
+                        .filter(|line| line.contains("LOCAL_CALLBACK open"))
+                        .count()
+                        != 1
+                {
+                    return Err("cancellation disposed or reopened the original destination".into());
+                }
+                let continued = data_request(&endpoint, b"write-more\n").await?;
+                if !continued.contains("committed=2 value=continued")
+                    || data_request(&endpoint, b"read\n").await? != continued
+                {
+                    return Err("cancellation changed healthy Primary serving".into());
+                }
+                let state: serde_json::Value =
+                    serde_json::from_str(&data_request(&endpoint, b"state\n").await?)
+                        .map_err(err)?;
+                if state["peers"]
+                    .as_array()
+                    .is_none_or(|peers| !peers.is_empty())
+                {
+                    return Err("cancelled creation reached the Primary replicator".into());
+                }
+                Ok(())
+            }
+            .await;
+            let source_closed = source_link.close().await;
+            let target_closed = target_link.close().await;
+            let fm_closed = fm.close().await;
+            let node_closed = fm_link.close().await;
+            operation
+                .and(source_closed)
+                .and(target_closed)
+                .and(fm_closed)
+                .and(node_closed)
+        }
+        .await;
+        let source_cleanup = cleanup(
+            &launches[0],
+            &mut source,
+            &source_store,
+            &mut source_adapter,
+        )
+        .await;
+        let target_cleanup = cleanup(
+            &launches[1],
+            &mut target,
+            &target_store,
+            &mut target_adapter,
+        )
+        .await;
+        source_cleanup?;
+        target_cleanup?;
+        Ok(result)
     }
 
     pub(crate) async fn run_peer_idle_stale(launches: &[Launch; 2]) -> Result<Result<()>> {

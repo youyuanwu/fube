@@ -84,6 +84,7 @@ REPLICA_CASES = {
     "default-remove-replica", "rich-remove-replica", "default-remove-replica-reply",
     "rich-remove-replica-reply-0", "rich-remove-replica-reply--2147017398",
     "action-RemoveReplica", "action-RemoveReplicaReply",
+    "in-create-remove-replica-reply",
 }
 CASES |= REPLICA_CASES
 SCHEMA_TYPES = 77

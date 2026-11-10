@@ -614,15 +614,23 @@ pub(super) fn remove_from_fm(
         .remote_idle
         .as_ref()
         .ok_or(Failure::Unsupported("unknown-Idle removal is gated"))?;
-    let opened = remote
-        .reply
-        .as_ref()
-        .filter(|reply| reply.error == 0)
-        .ok_or(Failure::Unsupported("removal before peer Open is gated"))?;
-    if body.replica.node == remote.target && body.replica.instance < opened.replica.instance {
-        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    if current.body.replica.current_role != 4
+        || current.body.replica.state != 2
+        || current.runtime.is_none()
+        || current.peer_creation.is_some()
+        || peer != Some(&remote.target)
+    {
+        return Err(Failure::Unsupported(
+            "removal requires the original current Primary and peer",
+        ));
+    }
+    if remote.reply.as_ref().is_some_and(|reply| reply.error != 0) {
+        return Err(Failure::Unsupported("failed-Open cleanup is gated"));
     }
     let expected = &remote.body.replica.0.replica;
+    if body.replica.node == remote.target && body.replica.instance < expected.instance {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    }
     let mut replica = body.replica.clone();
     // FM may still have InBuild/empty endpoint after losing AddReplicaReply.
     replica.state = expected.state;
@@ -632,10 +640,17 @@ pub(super) fn remove_from_fm(
         || replica != *expected
         || !matches!(body.replica.state, 1 | 2)
         || (!body.replica.replication_endpoint.is_empty()
-            && body.replica.replication_endpoint != opened.replica.replication_endpoint)
+            && remote.reply.as_ref().is_none_or(|opened| {
+                body.replica.replication_endpoint != opened.replica.replication_endpoint
+            }))
     {
         return Err(Failure::Unsupported(
-            "RemoveReplica requires the original opened Idle and FT",
+            "RemoveReplica requires the original Idle and FT",
+        ));
+    }
+    if remote.reply.is_none() && remote.fm_request.as_deref() != Some(&body) {
+        return Err(Failure::Unsupported(
+            "InCreate removal requires the original pending FM request",
         ));
     }
     if let Some(removal) = &remote.removal {
@@ -651,6 +666,25 @@ pub(super) fn remove_from_fm(
                 false,
             ));
         }
+    }
+    if remote.reply.is_none() {
+        let mut state = current.clone();
+        let remote = state.remote_idle.as_mut().expect("checked remote");
+        remote.ready = false;
+        // Native InCreate removal echoes FM's descriptor, without InDrop or RAP.
+        remote.removal = Some(RemoteRemoval {
+            body: current.body.clone(),
+            replica: body.replica.clone(),
+            fm_request: Some(Arc::new(body)),
+            result: Some(0),
+            detail: ProxyErrorDetail::default(),
+        });
+        let reply = remote.remove_reply().expect("completed InCreate removal");
+        return Ok(lifecycle::changed(
+            state,
+            vec![Effect::RemoveReplicaReply(reply)],
+            false,
+        ));
     }
     let mut transition = start_removal(Some(current), admission, peer)?;
     if let Update::Memory(state) = &mut transition.update {

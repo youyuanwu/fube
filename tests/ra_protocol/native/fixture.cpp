@@ -306,6 +306,14 @@ int main(int argc,char** argv) {
             run(mode,dir,"rich-remove-replica-reply-"+std::to_string(error),idle_remove_reply);
         }
         reject_truncated(idle_remove_reply);
+        ReplicaReplyMessageBody cancelled_create;
+        cancelled_create.fudesc_=idle_remove.fudesc_;
+        cancelled_create.replica_=idle_remove.replica_;
+        cancelled_create.replica_.serviceLocation_.clear();
+        cancelled_create.replica_.replicationEndpoint_.clear();
+        cancelled_create.errorCode_.value_=Enum(0);
+        run(mode,dir,"in-create-remove-replica-reply",cancelled_create);
+        reject_truncated(cancelled_create);
         // Native empty ctor leaves bools unspecified: explicitly initialize the fixture.
         ReplicaUpMessageBody up;
         up.isLastReplicaUpMessage_=false; up.isFromFMM_=false;
@@ -532,7 +540,7 @@ int main(int argc,char** argv) {
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
         ++native_truncation_rejections;
-        if(native_truncation_rejections!=38)
+        if(native_truncation_rejections!=39)
             throw std::runtime_error("native truncation coverage mismatch");
         std::cout << "native rejects " << native_truncation_rejections << " truncations OK\n";
         return 0;

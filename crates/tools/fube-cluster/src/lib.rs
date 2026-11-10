@@ -932,8 +932,8 @@ impl Cluster {
         }
         Ok(json!({"state":"pending","kind":"peer_idle_removal","built":false,"serving":false}))
     }
-    /// FM removes the original opened Idle's Primary-side replication session.
-    /// Only RemoveReplicaReply clears pending_remove; the destination stays open.
+    /// FM cancels pending creation or removes the opened Idle's replication session.
+    /// Only RemoveReplicaReply clears pending_remove, never destination deletion.
     pub async fn remove_idle_replica_via_fm(&mut self) -> Result<Value> {
         if self.finished.is_some()
             || self.children.len() != 2
@@ -945,9 +945,12 @@ impl Cluster {
         if current["state"] == "removed" || current["state"] == "unknown" {
             return Ok(current);
         }
-        if self.ledger.idle_removal.is_none() && self.status()["peer_idle"]["state"] != "open" {
+        if self.ledger.idle_removal.is_none()
+            && self.status()["peer_idle"]["state"] != "open"
+            && self.ledger.idle_status()["state"] != "pending"
+        {
             return Err(
-                "FM removal before original peer Open or manual-removal adoption is gated".into(),
+                "FM removal requires original pending FM creation or an opened Idle".into(),
             );
         }
         let body = self.ledger.request_idle_removal(Instant::now())?;
