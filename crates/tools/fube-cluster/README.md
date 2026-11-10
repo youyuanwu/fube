@@ -52,6 +52,28 @@ is ignored by the Primary and cannot start build; any resulting destination
 service remains owned until explicit cleanup or shutdown. Manual pre-Open,
 down/arbitrary-unknown cleanup and replacement remain gated.
 
+`Cluster::delete_idle_replica_via_fm().await` separately authorizes native
+`DeleteReplica(force=false)` on the **already-opened original destination**,
+after FM abandonment has been requested. It need not wait for
+`RemoveReplicaReply`: native FM schedules destination Delete independently of
+Primary pending-remove. Poll `peer_idle.fm_deletion` (also root `idle_deletion`).
+`destination_deleted=true` records the matching canonical dropped
+DeleteReplicaReply; `disposed=true` records the independent original-node
+disposal/committed-Close/exact-usage-release receipt. Only both inputs produce
+`state=deleted`/`complete=true`. Child observations or transport writes cannot
+complete either barrier. The original Delete retries on native 10/60-second
+cadence until its semantic reply, without another Close, Open or acquisition.
+Destination deletion never clears pending-remove; only RemoveReplicaReply does.
+Destination-owner loss leaves unresolved cleanup unknown, while Primary-owner
+loss does not undo independently owned destination deletion.
+The app host/package remain resident and `reusable=false`; no replacement is
+authorized. Normal Delete produces no terminal ReplicaUp report. Delayed
+original CreateReplica is ignored by the deleted tombstone and cannot reopen
+the Idle. Pre-Open/absent deletion, force and broader peer cleanup remain gated.
+An original failed Add keeps its error even if an already-opened destination is
+explicitly deleted; semantic deletion clears to-be-dropped, and joined disposal
+clears destination-cleanup-required, separately from pending-remove.
+
 After an original CreateReplicaReply error, the Primary retains only a failed
 observation/tombstone (`creation_aborted=true`), not live creation/build authority.
 FM sends the original Add descriptor, never fields from the failed reply.
@@ -109,14 +131,15 @@ Node2 runs
 an actual replication endpoint, no service endpoint and denied read/write access.
 Peer receipts and pending commands remain bounded independently of FM work.
 The originally bound Idle drains package notification/status work through its
-original FM session; that background path grants no FM placement/control authority.
+original FM session; that background path grants no FM creation/promotion authority.
+Normal original-Idle deletion is separately admitted as described above.
 Peer loss does not dispose an application, fabricate a reply or reconnect.
 This profile admits CLI `create` on node1, `status`, and `quit` only; it rejects
 new FM generations, mutation of the fixed service, and node2 FM creation.
 Build completion still leaves Idle/InBuild metadata, no service endpoint and
 denied access. There is no quorum addition, serving secondary, failover,
 replacement, or recovery. Removal
-before peer Open through the local API and remote deletion remain gated; both original owners retain
+before peer Open through the local API and destination deletion before Open remain gated; both original owners retain
 normal cleanup.
 
 Build both executables, then run:

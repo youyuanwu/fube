@@ -181,7 +181,7 @@ fn semantic_reply(state: &EntityState, mode: CloseMode, effects: &mut Vec<Effect
             replica: dropped_description(state),
             error: 0,
         });
-        effects.push(if state.fm_primary {
+        effects.push(if state.body.service.stateful {
             Effect::DeleteReplicaReply(body)
         } else {
             Effect::RemoveReply(body)
@@ -543,7 +543,7 @@ pub(super) fn transition(
                     || body.unit.consistency.id != body.unit.id
                     || body.unit.consistency.kind != 1
                     || current.is_some_and(|original| {
-                        !original.fm_primary
+                        (!original.fm_primary && original.peer_creation.is_none())
                             || body.service != original.body.service
                             || body.unit.consistency != original.body.unit.consistency
                     })
@@ -551,8 +551,21 @@ pub(super) fn transition(
                     || body.replica.instance < 0
                 {
                     return Err(Failure::Unsupported(
-                        "only admitted volatile singleton deletion is enabled",
+                        "only admitted original volatile replica deletion is enabled",
                     ));
+                }
+                if let Some(original) = current.filter(|state| state.peer_creation.is_some()) {
+                    if request.deletion.0.force
+                        || (original.phase != Phase::Ready && !original.local_deleted)
+                        || original.body.replica.current_role != 2
+                    {
+                        return Err(Failure::Unsupported(
+                            "peer deletion requires an already opened original Idle",
+                        ));
+                    }
+                    if body.replica.id != original.body.replica.id {
+                        return Ok(Transition::ignored(Disposition::IgnoredStale));
+                    }
                 }
             } else {
                 check_stateless(&body, admission)?;

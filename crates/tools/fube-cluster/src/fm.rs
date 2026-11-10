@@ -108,6 +108,14 @@ pub struct Ledger {
     pub(crate) generation: Option<GenerationHandshake>,
     pub(crate) idle: Option<IdleBuild>,
     pub(crate) idle_removal: Option<IdleRemoval>,
+    pub(crate) idle_deletion: Option<IdleDeletion>,
+}
+pub(crate) struct IdleDeletion {
+    pub body: DeleteReplica,
+    pub reply: Option<DeleteReplicaReply>,
+    unknown: bool,
+    started: Instant,
+    last: Instant,
 }
 pub(crate) struct IdleRemoval {
     pub body: RemoveReplica,
@@ -524,6 +532,7 @@ impl Ledger {
             generation: None,
             idle: None,
             idle_removal: None,
+            idle_deletion: None,
         }
     }
     pub fn accept(&mut self, command: Command) -> Result<Accepted> {
@@ -834,6 +843,11 @@ impl Ledger {
         }
     }
     pub fn lost(&mut self, index: usize, error: String) {
+        if index == 1 && !self.idle_deletion_complete() {
+            if let Some(deletion) = &mut self.idle_deletion {
+                deletion.unknown = true;
+            }
+        }
         if let Some(removal) = &mut self.idle_removal {
             if removal.reply.is_none() {
                 removal.unknown = true;
@@ -869,6 +883,11 @@ impl Ledger {
         }
     }
     pub fn down(&mut self, index: usize) {
+        if index == 1 && !self.idle_deletion_complete() {
+            if let Some(deletion) = &mut self.idle_deletion {
+                deletion.unknown = true;
+            }
+        }
         if let Some(removal) = &mut self.idle_removal {
             if removal.reply.is_none() {
                 removal.unknown = true;
@@ -895,6 +914,12 @@ impl Ledger {
         }
     }
     pub fn reply(&mut self, index: usize, body: AddInstanceReply, removing: bool) -> Result<()> {
+        if index == 1
+            && removing
+            && self.placements[index].launch.profile == crate::ServiceProfile::StatefulPeerIdle
+        {
+            return self.idle_deletion_reply(index, body);
+        }
         let placement = &mut self.placements[index];
         if !placement.link_alive || !placement.created || placement.bootstrap != Bootstrap::Admitted
         {
@@ -1025,6 +1050,18 @@ impl Ledger {
         if replica.id != placement.replica || replica.instance != placement.incarnation {
             return Err("unrecognized retirement lifetime".into());
         }
+        if index == 1 && placement.launch.profile == crate::ServiceProfile::StatefulPeerIdle {
+            if placement.link_alive
+                && self
+                    .idle_deletion
+                    .as_ref()
+                    .is_some_and(|deletion| !deletion.unknown)
+            {
+                placement.retirement = Some(proof);
+                self.finish_idle_deletion();
+            }
+            return Ok(());
+        }
         if placement.loss_reported {
             // Graceful Close can supply genuine disposal after a dropped report.
             // Its validated sidecar is not retirement/recovery authority.
@@ -1068,6 +1105,7 @@ impl Ledger {
         json!({"nodes":self.placements.iter().map(Placement::status).collect::<Vec<_>>(),
             "idle_build":self.idle_status(),
             "idle_removal":self.idle_removal_status(),
+            "idle_deletion":self.idle_deletion_status(),
             "generation_handshake": self.generation.as_ref().map(GenerationHandshake::status),
             "operations":self.operations.iter().map(|op|
                 if op.command.action == "status" {
@@ -1079,6 +1117,7 @@ impl Ledger {
     pub fn request_idle(&mut self, now: Instant) -> Result<AddReplica> {
         if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
             || self.idle_removal.is_some()
+            || self.idle_deletion.is_some()
             || self.generation.is_some()
             || self.placements[0].observed != Observed::Running
             || self
@@ -1187,8 +1226,10 @@ impl Ledger {
         };
         json!({"state":state, "kind":"fm_idle_build", "ready":state == "ready",
             "serving":false, "request":idle.body, "reply":idle.reply,
-            "to_be_dropped":error.is_some_and(|e| e != 0),
-            "destination_cleanup_required":error.is_some_and(|e| e != 0),
+            "to_be_dropped":(error.is_some_and(|e| e != 0) || self.idle_deletion.is_some())
+                && !self.idle_destination_deleted(),
+            "destination_cleanup_required":(error.is_some_and(|e| e != 0) || self.idle_deletion.is_some())
+                && !self.idle_deletion_complete(),
             "error":error, "cleanup_required":(idle.cancelled || error.is_some_and(|e| e != 0))
                 && self.idle_removal.as_ref().is_none_or(|removal| removal.reply.is_none())})
     }
@@ -1325,7 +1366,118 @@ impl Ledger {
                 "replicator_removed"
             }),
             "request":removal.body, "reply":removal.reply,
-            "destination_deleted":false, "serving":false})
+            "destination_deleted":self.idle_destination_deleted(), "serving":false})
+    }
+    fn idle_destination_deleted(&self) -> bool {
+        self.idle_deletion
+            .as_ref()
+            .is_some_and(|deletion| deletion.reply.is_some())
+    }
+    fn idle_deletion_complete(&self) -> bool {
+        self.idle_destination_deleted() && self.placements[1].retirement.is_some()
+    }
+    /// Native PendingTask schedules Delete independently of PendingRemove.
+    /// The caller bounds first admission to the already-opened original Idle.
+    pub fn request_idle_deletion(&mut self, now: Instant) -> Result<DeleteReplica> {
+        if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
+            || self.generation.is_some()
+            || !self.placements[1].link_alive
+            || !self.placements[1].activated
+            || self.placements[1].bootstrap != Bootstrap::Admitted
+        {
+            return Err("Idle deletion requires the original admitted destination session".into());
+        }
+        if self.idle_deletion_complete() {
+            return Err("original destination deletion is already complete".into());
+        }
+        if let Some(deletion) = &mut self.idle_deletion {
+            if deletion.unknown {
+                return Err("original destination deletion is unknown".into());
+            }
+            deletion.last = now;
+            return Ok(deletion.body.clone());
+        }
+        let removal = self
+            .idle_removal
+            .as_ref()
+            .ok_or("Idle deletion requires original FM abandonment")?;
+        if removal.unknown || self.placements[0].observed != Observed::Running {
+            return Err("original Idle abandonment owner is unknown".into());
+        }
+        let body = DeleteReplica::new(removal.body.clone(), false);
+        self.idle_deletion = Some(IdleDeletion {
+            body: body.clone(),
+            reply: None,
+            unknown: false,
+            started: now,
+            last: now,
+        });
+        self.placements[1].created = true;
+        self.placements[1].observed = Observed::Pending;
+        Ok(body)
+    }
+    pub fn idle_deletion_reply(&mut self, index: usize, body: DeleteReplicaReply) -> Result<()> {
+        let Some(deletion) = &mut self.idle_deletion else {
+            return Ok(());
+        };
+        let expected = &deletion.body.replica.0;
+        if index != 1
+            || deletion.unknown
+            || deletion.reply.is_some()
+            || !self.placements[1].link_alive
+            || body.unit != expected.unit
+            || body.replica.node != expected.replica.node
+            || body.replica.id != expected.replica.id
+            || body.replica.instance != expected.replica.instance
+            || body.error != 0
+        {
+            return Ok(());
+        }
+        if body.replica != dropped_replica(&expected.replica) {
+            return Err("Idle DeleteReplicaReply is not the native dropped description".into());
+        }
+        deletion.reply = Some(body);
+        self.placements[1].remove_received = true;
+        self.finish_idle_deletion();
+        Ok(())
+    }
+    fn finish_idle_deletion(&mut self) {
+        if self.idle_deletion_complete() {
+            let placement = &mut self.placements[1];
+            placement.observed = Observed::Absent;
+            placement.endpoint = None;
+            placement.error = None;
+            // Disposal of the predecessor is not fresh-lifetime authorization.
+            placement.reusable = false;
+        }
+    }
+    pub fn idle_deletion_retry(&mut self, index: usize, now: Instant) -> Option<DeleteReplica> {
+        let deletion = self.idle_deletion.as_mut()?;
+        if index != 1
+            || deletion.unknown
+            || deletion.reply.is_some()
+            || self.generation.is_some()
+            || !self.placements[1].link_alive
+            || !self.placements[1].activated
+            || !action_retry_due(deletion.started, deletion.last, now)
+        {
+            return None;
+        }
+        deletion.last = now;
+        Some(deletion.body.clone())
+    }
+    pub fn idle_deletion_status(&self) -> Value {
+        let Some(deletion) = &self.idle_deletion else {
+            return json!({"state":"absent","destination_deleted":false,"disposed":false,"complete":false});
+        };
+        let complete = self.idle_deletion_complete();
+        json!({"state":if complete { "deleted" } else if deletion.unknown { "unknown" } else { "pending" },
+            "kind":"fm_idle_deletion", "request":deletion.body, "reply":deletion.reply,
+            "destination_deleted":self.idle_destination_deleted(),
+            "disposed":self.placements[1].retirement.is_some(),
+            "complete":complete, "cleanup_required":!complete,
+            "pending_remove":self.idle_removal.as_ref().is_some_and(|removal| removal.reply.is_none()),
+            "reusable":false, "serving":false})
     }
     /// Native Replica::CanGenerateAction and PendingTask's creating-primary branch.
     pub fn primary_retry(&mut self, index: usize, now: Instant) -> Result<Option<AddPrimary>> {

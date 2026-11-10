@@ -554,6 +554,10 @@ impl Cluster {
                 Ok(()) => self.retry_idle_removal(index).await,
                 Err(error) => Err(error),
             };
+            let result = match result {
+                Ok(()) => self.retry_idle_deletion(index).await,
+                Err(error) => Err(error),
+            };
             if let Err(error) = result {
                 self.ledger.lost(index, error);
                 if let Some(link) = &self.children[index].link {
@@ -709,6 +713,24 @@ impl Cluster {
             .send(message)
             .await
     }
+    async fn retry_idle_deletion(&mut self, index: usize) -> Result<()> {
+        let Some(body) = self.ledger.idle_deletion_retry(index, Instant::now()) else {
+            return Ok(());
+        };
+        self.send_idle_deletion(&body).await
+    }
+    async fn send_idle_deletion(&self, body: &DeleteReplica) -> Result<()> {
+        let child = self
+            .children
+            .get(1)
+            .ok_or("missing original destination owner")?;
+        child
+            .link
+            .as_ref()
+            .ok_or("original destination link absent")?
+            .send(delete_replica_message(body, &child.launch.generation).map_err(err)?)
+            .await
+    }
     fn read_retirement(&mut self, index: usize) -> Result<()> {
         let child = &self.children[index];
         let path = child.launch.directory.join("retirement.json");
@@ -773,6 +795,7 @@ impl Cluster {
                 "build":source["peer_idle"]["build"],
                 "fm":self.ledger.idle_status(),
                 "fm_removal":self.ledger.idle_removal_status(),
+                "fm_deletion":self.ledger.idle_deletion_status(),
                 "ready":source["peer_idle"]["ready"] == true,
                 "removal":source["peer_idle"]["removal"],
                 "source":source["peer_idle"], "target":target["local_replica"],
@@ -962,6 +985,32 @@ impl Cluster {
             return Err(error);
         }
         Ok(self.ledger.idle_removal_status())
+    }
+    /// Delete the already-opened original abandoned destination, independently
+    /// of Primary-side RemoveReplica completion. Both reply and disposal proof
+    /// are required for completed cleanup; no successor lifetime is authorized.
+    pub async fn delete_idle_replica_via_fm(&mut self) -> Result<Value> {
+        if self.finished.is_some()
+            || self.children.len() != 2
+            || self.config.profile != ServiceProfile::StatefulPeerIdle
+        {
+            return Err("FM Idle deletion requires the original peer-idle profile".into());
+        }
+        let current = self.ledger.idle_deletion_status();
+        if current["state"] == "deleted" || current["state"] == "unknown" {
+            return Ok(current);
+        }
+        if self.ledger.idle_deletion.is_none()
+            && self.status()["peer_idle"]["target"]["open"] != true
+        {
+            return Err("FM Idle deletion requires the already-opened original destination".into());
+        }
+        let body = self.ledger.request_idle_deletion(Instant::now())?;
+        if let Err(error) = self.send_idle_deletion(&body).await {
+            self.ledger.lost(1, error.clone());
+            return Err(error);
+        }
+        Ok(self.ledger.idle_deletion_status())
     }
     /// Returns the retained operation outcome, never transport-write success.
     /// `quit` is accepted here; the foreground then calls owned shutdown.

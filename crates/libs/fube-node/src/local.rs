@@ -408,8 +408,7 @@ impl Node {
     }
     pub fn fm_work(&mut self, work: FmWork) -> Result<u64> {
         let stateless = self.activation.profile() == h::local::Profile::Stateless;
-        let peer_background = self.activation.profile()
-            == h::local::Profile::VolatileStatefulLifecycle
+        let peer_work = self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
             && self.ra.peer().is_some()
             && matches!(
                 work,
@@ -420,10 +419,11 @@ impl Node {
                     | FmWork::CaptureServiceTypeWork(_)
                     | FmWork::CompleteServiceTypeWork(_)
                     | FmWork::ServiceTypeRetryTimer(_)
+                    | FmWork::DeleteReplica(..)
             );
         if !stateless
             && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
-            && !peer_background
+            && !peer_work
         {
             return Err(Error::Unsupported);
         }
@@ -493,11 +493,21 @@ impl Node {
                 self.admit_fm(source, generation)?;
                 let incoming = &body.replica.0;
                 self.check_service(incoming, true)?;
-                let closed = self
-                    .ra
-                    .snapshot(incoming.unit.id.guid.0)
-                    .committed
+                let current = self.ra.snapshot(incoming.unit.id.guid.0).committed;
+                let closed = current
+                    .as_ref()
                     .is_some_and(|state| state.phase == ra::Phase::Closed);
+                if peer_work
+                    && (body.deletion.0.force
+                        || current.as_ref().is_none_or(|state| {
+                            state.peer_creation.is_none()
+                                || (state.phase != ra::Phase::Ready && !state.local_deleted)
+                                || state.body.replica.current_role != 2
+                                || state.body.replica.id != incoming.replica.id
+                        }))
+                {
+                    return Err(Error::Unsupported);
+                }
                 if (!self.live.load(Ordering::SeqCst) && !closed)
                     || !self.ra.consumer_lifetime().is_accepting()
                     || self.selected.as_ref().is_some_and(|selected| {

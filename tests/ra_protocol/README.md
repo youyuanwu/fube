@@ -117,6 +117,13 @@ wire/schema evidence only, not original handler execution, native FM
 interoperability, or authorization of force deletion, recreation,
 reconfiguration, FMM execution or recovery.
 
+The bounded original opened-Idle destination deletion also reuses these
+inherited DeleteReplica/Reply bodies and factories; it adds no wire schema or
+fixture shape. Separate RA/store and real-process FM/Node/RAP tests qualify
+Idle deletion, held disposal, independent pending-remove, lost reply/replay and
+late-creation tombstones. They do not execute the native C++ deletion handler
+or expand the codec oracle's interoperability claims.
+
 ### Stage-two node control/load and endpoint codecs
 
 All original 58 cases, 59 types/199 fields, 62 files and eleven native

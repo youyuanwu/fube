@@ -344,7 +344,7 @@ and retains terminal same-incarnation tombstones. A lost RemoveReplicaReply
 leaves FM pending even after diagnostic RAP success; frozen retry obtains replay.
 Unresolved original-session loss leaves unknown/pending-remove, never recovery.
 Local removal cannot take over an FM-owned removal. The destination lifetime,
-data, registration and usage remain intact until normal shutdown; FM completion
+data, registration and usage remain intact until separate deletion or normal shutdown; FM completion
 does not imply remote deletion or active configuration change. Native
 down/arbitrary-not-found cleanup and replacement remain gated
 ([RA:2044-2140,4094-4149](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ReconfigurationAgent.cpp#L2044-L2140),
@@ -392,7 +392,44 @@ cleanup; a lost reply remains pending and uses normal 10/60-second retries.
 replacement is inferred. Arbitrary unknown replicas and later incarnations
 still reject before dispatch.
 
-This increment deliberately retains Idle/InBuild metadata, no service endpoint,
+### Deleting the original opened destination Idle
+
+`Cluster::delete_idle_replica_via_fm()` independently authorizes normal
+`DeleteReplica(force=false)` for the already-opened original destination after
+FM abandonment has been requested. It reuses stateful Delete/RAP Close,
+canonical dropped DeleteReplicaReply and original disposal/accounting proof;
+it is not another Primary-side RemoveReplica operation.
+Native `fm/PendingTask.cpp:124-157` schedules pending-remove at the Primary
+and to-be-dropped deletion at the destination independently, without a
+RemoveReplicaReply-before-Delete barrier. `FailoverUnitMessageProcessor.cpp:201-255`
+clears pending-remove only on RemoveReplicaReply, but processes successful
+DeleteReplicaReply as dropped/deleted. `Replica.cpp:300-306` then clears
+to-be-dropped. The original failed Add outcome is retained, not converted to Ready.
+
+The bounded ledger freezes the original FT/service/target incarnation and
+retries Delete every 10 seconds, backing off to 60 seconds after the first
+minute. Only the matching original destination's canonical dropped reply sets
+`peer_idle.fm_deletion.destination_deleted` (also root `idle_deletion`).
+The separately validated original-runtime disposal/Applied-Close/exact-H2-release
+receipt sets `disposed`. Both are required for `state=deleted`/`complete=true`;
+arrival order is irrelevant, and a lost semantic reply remains pending despite
+physical disposal. Delete completion does not clear pending-remove or authorize
+a fresh lifetime. The destination app host, factory, package and tombstone remain
+resident with `reusable=false`; normal shutdown still owns their cleanup.
+Destination-session loss leaves unresolved deletion unknown; source-session
+loss does not supply or undo destination completion.
+
+RA admits only this already-opened peer-created Idle and its original deletion
+retries. Native DeleteLocalReplica epoch/ReplicaId checks still apply; an older
+FM replica instance does not block deletion of the matching local ReplicaId.
+Delete intent and Close completion remain behind their own commits. The reply
+uses native None/None/Dropped/down metadata, invalid version/LSNs and no endpoints.
+Normal deletion schedules no ReplicaDown/ReplicaDropped report. Same-incarnation
+CreateReplica after deletion is ignored without Open, build or usage acquisition.
+Missing/pre-Open destination deletion, force, arbitrary unknown/replacement,
+active membership and recovery remain gated.
+
+Before explicit deletion, creation/build deliberately retains Idle/InBuild metadata, no service endpoint,
 denied read/write access and no active membership or quorum change even after
 copy completes. Manual build sends no AddReplicaReply; only the distinct
 FM-owned flow above emits that reply. The real-process acceptance writes
@@ -426,6 +463,16 @@ after cleanup produces a real late Open that cannot trigger build or Ready.
 Both original application processes remain owned and the Primary stays writable.
 This is controlled wire-error/native-free process evidence, not execution of a
 native C++ Open-failure handler or proof of destination disposal.
+Separate destination-deletion acceptance holds actual provider and service
+disposal independently, proving no early reply/release while the Primary can
+still write. It loses the first real DeleteReplicaReply, supplies original
+disposal proof, retries for the identical semantic reply and completes Delete
+while FM still awaits RemoveReplicaReply. Delayed original CreateReplica and
+AddReplica cannot reopen/rebuild or acquire another use. An additional public
+Cluster API acceptance deletes an Idle containing real nonempty copied data,
+joins the actual child-published retirement receipt and preserves Primary
+writes/readback. These are native-free application-process/Channel tests, not
+native C++ deletion-handler execution.
 
 These are native-derived model/store and native-free real-process contracts,
 not full C++ handler traces or native Federation interoperability.

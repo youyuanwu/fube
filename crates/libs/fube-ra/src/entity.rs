@@ -1720,6 +1720,19 @@ fn transition(
                     ));
                 }
                 if peer_creation.is_some() && current.phase == Phase::Closed {
+                    // Native SendReplicaDroppedMessage suppresses a locally deleted replica.
+                    let mut service = body.service.clone();
+                    if service.version == current.requested_version {
+                        service.version = current.body.service.version.clone();
+                    }
+                    if current.local_deleted
+                        && body.replica.id == current.body.replica.id
+                        && body.replica.instance == current.body.replica.instance
+                        && body.unit.current == current.body.unit.current
+                        && service == current.body.service
+                    {
+                        return Ok(Transition::ignored(Disposition::IgnoredStale));
+                    }
                     return Err(Failure::Unsupported("peer tombstone recreation is gated"));
                 }
                 if current.body.service.stateful != local_stateful {

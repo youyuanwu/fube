@@ -2510,6 +2510,202 @@ async fn peer_idle_failed_or_unknown_open_commit_cannot_publish_reply_or_reopen(
     }
 }
 
+async fn make_peer_idle_ready(executor: &Executor) -> CreateReplica {
+    executor.bind_peer(peer_source()).unwrap();
+    let request = peer_request();
+    run(executor, peer_create(request.clone())).await;
+    effects(executor);
+    registered(executor, &request.replica.0, state(executor).open_token).await;
+    let mut completion = complete(&state(executor).body, 0);
+    completion.replica.service_endpoint.clear();
+    completion.replica.replication_endpoint = "127.0.0.1:12345".into();
+    run(executor, Command::CompleteOpen(Box::new(completion))).await;
+    assert!(matches!(
+        effects(executor).as_slice(),
+        [Effect::PeerCreateReplicaReply { .. }]
+    ));
+    request
+}
+
+#[tokio::test]
+async fn fm_peer_idle_delete_uses_stateful_reply_and_retains_original_deleted_tombstone() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    let request = make_peer_idle_ready(&executor).await;
+    let original = state(&executor);
+    assert!(!original.fm_primary);
+    let mut stale = request.replica.0.clone();
+    stale.replica.id += 1;
+    assert_eq!(
+        run(&executor, primary_delete(stale, false)).await,
+        Disposition::IgnoredStale
+    );
+    let mut stale = request.replica.0.clone();
+    stale.unit.current.configuration -= 1;
+    assert_eq!(
+        run(&executor, primary_delete(stale, false)).await,
+        Disposition::IgnoredStale
+    );
+    assert!(matches!(
+        executor
+            .submit(primary_delete(request.replica.0.clone(), true))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    assert!(Arc::ptr_eq(&original, &state(&executor)));
+    assert!(effects(&executor).is_empty());
+    let mut incoming = request.replica.0.clone();
+    incoming.replica.instance -= 1;
+    run(&executor, primary_delete(incoming, false)).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::Close { flags: 8, body, .. }]
+        if body.replica.current_role == 2 && body.replica.state == 3
+            && body.replica.replication_endpoint == original.body.replica.replication_endpoint)
+    );
+    assert!(state(&executor).local_deleted && state(&executor).usage.is_some());
+    assert_eq!(
+        run(&executor, primary_delete(request.replica.0.clone(), false)).await,
+        Disposition::IgnoredPending
+    );
+    assert!(effects(&executor).is_empty());
+    close_done(&executor, 0).await;
+    let actions = effects(&executor);
+    let expected = Replica {
+        node: admission().local_node,
+        id: request.replica.0.replica.id,
+        instance: request.replica.0.replica.instance,
+        up: false,
+        state: 3,
+        ..Replica::default()
+    };
+    assert!(matches!(actions.as_slice(), [
+        Effect::ReleaseRegistration(_), Effect::ReleaseUsage { .. },
+        Effect::Health(HealthEvent::Close), Effect::DeleteReplicaReply(reply)
+    ] if reply.replica == expected && reply.error == 0));
+    let closed = state(&executor);
+    assert!(closed.local_deleted && closed.cleanup_pending);
+    assert_eq!(closed.fm_stage, FmStage::None);
+    assert!(closed.usage.is_none() && closed.runtime.is_none());
+    assert_eq!(closed.peer_creation, original.peer_creation);
+    let writes = hooks.calls.load(Ordering::SeqCst);
+    run(&executor, primary_delete(request.replica.0.clone(), false)).await;
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::DeleteReplicaReply(reply)] if reply.replica == expected)
+    );
+    assert_eq!(
+        run(&executor, peer_create(request.clone())).await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    let mut replacement = request;
+    replacement.replica.0.replica.id += 1;
+    replacement.replica.0.replica.instance += 1;
+    assert!(matches!(
+        executor
+            .submit(peer_create(replacement))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    assert_eq!(hooks.calls.load(Ordering::SeqCst), writes);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn fm_peer_idle_delete_rejects_pending_open_and_unowned_closed_cleanup() {
+    let (store, executor, _) = setup(WAIT).await;
+    executor.bind_peer(peer_source()).unwrap();
+    let request = peer_request();
+    run(&executor, peer_create(request.clone())).await;
+    effects(&executor);
+    for closed in [false, true] {
+        if closed {
+            run(
+                &executor,
+                Command::CloseLocal {
+                    unit: request.replica.0.unit.id.clone(),
+                    mode: CloseMode::ForceAbort,
+                },
+            )
+            .await;
+            effects(&executor);
+            assert_eq!(state(&executor).phase, Phase::Closed);
+        }
+        let before = state(&executor);
+        assert!(matches!(
+            executor
+                .submit(primary_delete(request.replica.0.clone(), false))
+                .unwrap()
+                .wait(WAIT)
+                .await,
+            Err(Failure::Unsupported(_))
+        ));
+        assert!(Arc::ptr_eq(&before, &state(&executor)));
+        assert!(effects(&executor).is_empty());
+        assert!(!state(&executor).local_deleted);
+    }
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn fm_peer_idle_delete_and_close_commit_barriers_fence_reply_and_usage_release() {
+    for completing in [false, true] {
+        for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+            let (store, executor, hooks) = setup(if unknown {
+                Duration::from_millis(50)
+            } else {
+                WAIT
+            })
+            .await;
+            let request = make_peer_idle_ready(&executor).await;
+            let command = if completing {
+                run(&executor, primary_delete(request.replica.0.clone(), false)).await;
+                effects(&executor);
+                Command::CompleteClose(Box::new(close_completion(&executor, 0)))
+            } else {
+                primary_delete(request.replica.0.clone(), false)
+            };
+            let old = state(&executor);
+            let (entered, release) = hooks.pause(fail);
+            let submitted = executor.submit(command).unwrap();
+            entered.await.unwrap();
+            assert!(Arc::ptr_eq(&old, &state(&executor)));
+            assert!(effects(&executor).is_empty());
+            if unknown {
+                assert_eq!(submitted.wait(WAIT).await, Err(Failure::Unknown));
+                assert!(executor.snapshot([1; 16]).fenced);
+                assert!(effects(&executor).is_empty());
+            }
+            release.send(()).unwrap();
+            let result = submitted.resolve(WAIT).await;
+            if fail {
+                assert!(matches!(result, Err(Failure::Store(_))));
+                assert!(Arc::ptr_eq(&old, &state(&executor)));
+                assert!(effects(&executor).is_empty());
+            } else {
+                assert_eq!(result, Ok(Disposition::Applied));
+                if completing {
+                    assert!(matches!(
+                        effects(&executor).last(),
+                        Some(Effect::DeleteReplicaReply(_))
+                    ));
+                    assert!(state(&executor).usage.is_none());
+                    assert_eq!(state(&executor).fm_stage, FmStage::None);
+                } else {
+                    assert!(
+                        matches!(effects(&executor).as_slice(), [Effect::Close { flags: 8, body, .. }]
+                        if body.replica.current_role == 2 && body.replica.state == 3)
+                    );
+                    assert!(state(&executor).usage.is_some());
+                }
+            }
+            finish(&store, &executor).await;
+        }
+    }
+}
+
 #[tokio::test]
 async fn peer_creation_rejects_unbound_foreign_primary_and_persisted_requests() {
     let (store, executor, hooks) = setup(WAIT).await;
