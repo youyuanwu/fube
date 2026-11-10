@@ -749,6 +749,14 @@ impl Cluster {
             index,
             &child.launch.directory.join("pre-open-cancellation.json"),
             node_pid,
+        )?;
+        self.ledger.read_failed_registration(
+            index,
+            &child
+                .launch
+                .directory
+                .join("failed-registration-deletion.json"),
+            node_pid,
         )
     }
     pub fn status(&self) -> Value {
@@ -998,7 +1006,8 @@ impl Cluster {
     }
     /// Delete the original abandoned destination independently of Primary Remove.
     /// Cleanup joins the native reply with original disposal, pre-Open
-    /// cancellation or never-created absence; none authorizes a successor.
+    /// cancellation, known pre-Open failure or never-created absence;
+    /// none authorizes a successor.
     pub async fn delete_idle_replica_via_fm(&mut self) -> Result<Value> {
         if self.finished.is_some()
             || self.children.len() != 2
@@ -1022,13 +1031,24 @@ impl Cluster {
                 && target["registration"].is_null()
                 && target["retained_usage"] == 0
                 && self.ledger.idle_absence_allowed();
-            if target["open"] != true && !registered_open && !pre_registration && !unobserved {
-                return Err("FM Idle deletion requires the original opening/opened destination or an absent unanswered FM Add".into());
+            let failed_registration = target["phase"] == "Closed"
+                && target["pre_open_failure"]["error"]
+                    .as_i64()
+                    .is_some_and(|error| self.ledger.idle_failed_creation_error() == Some(error));
+            if target["open"] != true
+                && !registered_open
+                && !pre_registration
+                && !unobserved
+                && !failed_registration
+            {
+                return Err("FM Idle deletion requires an original opening/opened or known registration-failed destination, or an absent unanswered FM Add".into());
             }
             target_kind = if unobserved {
                 fm::IdleDeleteTarget::Unobserved
             } else if pre_registration {
                 fm::IdleDeleteTarget::PreRegistration
+            } else if failed_registration {
+                fm::IdleDeleteTarget::FailedRegistration
             } else {
                 fm::IdleDeleteTarget::Runtime
             };

@@ -190,6 +190,14 @@ pub(super) fn registration_success(event: &RegistrationCompletion) -> bool {
             && !event.registration.host.is_empty()
             && (!event.upgrade_present || event.required_upgrade <= event.version.instance))
 }
+fn fail_registration(state: &mut EntityState, error: i64, effects: &mut Vec<Effect>) {
+    if state.runtime.is_none() && state.usage.is_none() {
+        if let Some(peer) = &mut state.peer_creation {
+            peer.registration_error = Some(error);
+        }
+    }
+    fail(state, error, effects);
+}
 pub(super) fn registered(
     mut state: EntityState,
     event: RegistrationCompletion,
@@ -256,11 +264,11 @@ pub(super) fn registered(
                     },
                 ));
             }
-            Action::Drop => fail(&mut state, event.error, &mut effects),
+            Action::Drop => fail_registration(&mut state, event.error, &mut effects),
             Action::None => {}
         }
     } else {
-        fail(&mut state, event.error, &mut effects);
+        fail_registration(&mut state, event.error, &mut effects);
     }
     // Native registration retry job selects memory update even for terminal FSR.
     Ok(lifecycle::changed(state, effects, false))

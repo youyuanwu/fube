@@ -2769,6 +2769,199 @@ async fn fm_peer_idle_delete_rejects_unowned_closed_cleanup() {
     finish(&store, &executor).await;
 }
 
+async fn fail_peer_registration(executor: &Executor, request: &CreateReplica, error: i64) {
+    executor.bind_peer(peer_source()).unwrap();
+    run(executor, peer_create(request.clone())).await;
+    effects(executor);
+    run(
+        executor,
+        Command::RetryOpen(request.replica.0.unit.id.clone()),
+    )
+    .await;
+    effects(executor);
+    let opening = state(executor);
+    let lookup = *opening.registration_lookups.keys().next().unwrap();
+    executor
+        .config()
+        .set(RetryState::Registration, Threshold::Drop, 1);
+    run(
+        executor,
+        Command::Registered(Box::new(RegistrationCompletion {
+            unit: request.replica.0.unit.id.clone(),
+            token: opening.open_token,
+            lookup,
+            error,
+            ..RegistrationCompletion::default()
+        })),
+    )
+    .await;
+    let actions = effects(executor);
+    assert!(
+        matches!(actions.as_slice(), [Effect::Health(HealthEvent::Close),
+        Effect::PeerCreateReplicaReply { body, .. }, Effect::StatefulClosePending { .. }]
+        if body.error == error && body.replica.state == 1)
+    );
+    assert_eq!(state(executor).failed_registration_error(), Some(error));
+}
+
+#[tokio::test]
+async fn failed_peer_registration_delete_preserves_error_and_drains_late_acquisition_without_rap() {
+    for error in [
+        HOSTING_SERVICE_TYPE_DISABLED,
+        HOSTING_SERVICE_TYPE_NOT_REGISTERED,
+    ] {
+        let (store, executor, _) = setup(WAIT).await;
+        let request = peer_request();
+        fail_peer_registration(&executor, &request, error).await;
+        let failed = state(&executor);
+        assert!(!failed.local_deleted && !failed.cleanup_pending);
+        run(&executor, primary_delete(request.replica.0.clone(), false)).await;
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::DeleteReplicaReply(reply)]
+            if reply.unit == failed.body.unit && reply.replica.current_role == 1
+                && reply.replica.state == 3 && !reply.replica.up)
+        );
+        assert!(state(&executor).local_deleted && state(&executor).cleanup_pending);
+        assert_eq!(state(&executor).close_token, 0);
+        assert_eq!(state(&executor).failed_registration_error(), Some(error));
+        assert!(matches!(
+            registration_actions(&executor, &request.replica.0, failed.open_token)
+                .await
+                .as_slice(),
+            [Effect::ReleaseRegistration(_), Effect::ReleaseUsage { .. }]
+        ));
+        assert!(state(&executor).registration_lookups.is_empty());
+        assert_eq!(
+            run(&executor, peer_create(request.clone())).await,
+            Disposition::IgnoredStale
+        );
+        assert!(effects(&executor).is_empty());
+        run(&executor, primary_delete(request.replica.0, false)).await;
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::DeleteReplicaReply(_)]
+        ));
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn failed_registration_delete_commit_barrier_never_releases_lookup_or_reply_early() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        let request = peer_request();
+        fail_peer_registration(&executor, &request, HOSTING_SERVICE_TYPE_DISABLED).await;
+        let original = state(&executor);
+        let (entered, release) = hooks.pause(fail);
+        let deletion = executor
+            .submit(primary_delete(request.replica.0.clone(), false))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(Arc::ptr_eq(&original, &state(&executor)));
+        assert!(effects(&executor).is_empty());
+        if unknown {
+            assert_eq!(deletion.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.snapshot([1; 16]).fenced);
+            assert!(effects(&executor).is_empty());
+        }
+        release.send(()).unwrap();
+        let result = deletion.resolve(WAIT).await;
+        if fail {
+            assert!(matches!(result, Err(Failure::Store(_))));
+            assert!(Arc::ptr_eq(&original, &state(&executor)));
+            assert!(effects(&executor).is_empty());
+            run(&executor, primary_delete(request.replica.0.clone(), false)).await;
+        } else {
+            assert_eq!(result, Ok(Disposition::Applied));
+        }
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::DeleteReplicaReply(_)]
+        ));
+        assert_eq!(
+            state(&executor).registration_lookups,
+            original.registration_lookups
+        );
+        assert!(matches!(
+            registration_actions(&executor, &request.replica.0, original.open_token)
+                .await
+                .as_slice(),
+            [Effect::ReleaseRegistration(_), Effect::ReleaseUsage { .. }]
+        ));
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn runtime_open_failure_does_not_authorize_failed_registration_delete() {
+    for registration_after_runtime_loss in [false, true] {
+        let (store, executor, _) = setup(WAIT).await;
+        executor.bind_peer(peer_source()).unwrap();
+        let request = peer_request();
+        run(&executor, peer_create(request.clone())).await;
+        effects(&executor);
+        registered(&executor, &request.replica.0, state(&executor).open_token).await;
+        if !registration_after_runtime_loss {
+            executor
+                .config()
+                .set(RetryState::Opening, Threshold::Drop, 1);
+        }
+        let mut completion = complete(&state(&executor).body, 0);
+        completion.error = if registration_after_runtime_loss {
+            APPLICATION_HOST_CRASH
+        } else {
+            -55
+        };
+        completion.flags = if registration_after_runtime_loss {
+            0
+        } else {
+            4
+        };
+        run(&executor, Command::CompleteOpen(Box::new(completion))).await;
+        effects(&executor);
+        if registration_after_runtime_loss {
+            assert!(state(&executor).usage.is_some());
+            run(
+                &executor,
+                Command::RetryOpen(request.replica.0.unit.id.clone()),
+            )
+            .await;
+            effects(&executor);
+            let current = state(&executor);
+            let lookup = *current.registration_lookups.keys().next().unwrap();
+            run(
+                &executor,
+                Command::Registered(Box::new(RegistrationCompletion {
+                    unit: request.replica.0.unit.id.clone(),
+                    token: current.open_token,
+                    lookup,
+                    error: HOSTING_SERVICE_TYPE_DISABLED,
+                    ..RegistrationCompletion::default()
+                })),
+            )
+            .await;
+            effects(&executor);
+        }
+        assert_eq!(state(&executor).phase, Phase::Closed);
+        assert_eq!(state(&executor).failed_registration_error(), None);
+        assert!(matches!(
+            executor
+                .submit(primary_delete(request.replica.0, false))
+                .unwrap()
+                .wait(WAIT)
+                .await,
+            Err(Failure::Unsupported(_))
+        ));
+        assert!(effects(&executor).is_empty());
+        finish(&store, &executor).await;
+    }
+}
+
 #[tokio::test]
 async fn fm_pre_registration_peer_delete_drains_late_lookup_without_rap_or_absent_ft_shape() {
     let (store, executor, _) = setup(WAIT).await;

@@ -559,6 +559,7 @@ pub(super) fn transition(
                         || !(original.phase == Phase::Ready
                             || (original.phase == Phase::Opening
                                 && original.runtime.is_some() == original.usage.is_some())
+                            || original.failed_registration_error().is_some()
                             || original.local_deleted)
                         || original.body.replica.current_role != 2
                     {

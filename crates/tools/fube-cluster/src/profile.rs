@@ -432,6 +432,58 @@ impl PreOpenCancellationReceipt {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct FailedRegistrationReceipt {
+    pub deployment: String,
+    pub session: String,
+    #[serde(with = "json_node")]
+    pub node: NodeInstance,
+    #[serde(with = "json_node")]
+    pub fm: NodeInstance,
+    #[serde(with = "json_generation")]
+    pub generation: GenerationHeader,
+    pub node_pid: u32,
+    pub app_pid: u32,
+    pub runtime_root: PathBuf,
+    pub deletion: fube_node::local::FailedRegistrationDeletion,
+}
+impl FailedRegistrationReceipt {
+    pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
+        let failure = &self.deletion.failure;
+        if launch.profile != ServiceProfile::StatefulPeerIdle
+            || launch.placement != 2
+            || launch.peer.is_none()
+            || self.deployment != launch.deployment
+            || self.session != launch.session
+            || self.node != launch.node
+            || self.fm != launch.fm
+            || self.generation != launch.generation
+            || self.node_pid != node_pid
+            || self.app_pid != profile.app_pid
+            || self.runtime_root != profile.runtime_root
+            || failure.body != pre_open_cancelled_body(&add_body(launch, profile))
+            || failure.error == 0
+            || failure.creation == 0
+            || failure.lookup == 0
+            || failure.command == 0
+            || failure.ra_operation == 0
+            || self.deletion.command == 0
+            || self.deletion.ra_operation == 0
+            || failure.command == self.deletion.command
+            || failure.ra_operation == self.deletion.ra_operation
+            || failure.creation == failure.ra_operation
+            || failure.creation == self.deletion.ra_operation
+        {
+            return Err(
+                "failed registration deletion does not match the original owner/failure lineage"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AbsenceReceipt {
     pub deployment: String,
     pub session: String,

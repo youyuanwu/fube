@@ -4,6 +4,25 @@ use super::*;
 pub struct PeerCreation {
     pub source: NodeInstance,
     pub deactivation: ReplicaDeactivationInfo,
+    /// Terminal registration failure before any adopted runtime/usage.
+    pub registration_error: Option<i64>,
+}
+
+impl EntityState {
+    pub fn failed_registration_error(&self) -> Option<i64> {
+        if self.phase != Phase::Closed
+            || self.open_token == 0
+            || self.close_token != 0
+            || self.runtime.is_some()
+            || self.usage.is_some()
+        {
+            return None;
+        }
+        self.peer_creation
+            .as_ref()?
+            .registration_error
+            .filter(|error| *error != 0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

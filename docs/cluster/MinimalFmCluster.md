@@ -487,7 +487,8 @@ Admission freezes the observed target branch. A registered lifetime requires
 disposal; observed pre-registration Opening cannot downgrade to missing-FT
 absence on retry. An unobserved original creation permits the corresponding
 source-bound proof for the actual outcome. If registration wins the race,
-genuine disposal remains required. Other failed/unknown lifetimes, force,
+genuine disposal remains required. The known pre-Open registration failure
+branch below is separate; other failed/unknown lifetimes, force,
 arbitrary targets, replacement and recovery remain gated.
 
 Real-process/Channel acceptance holds the original FT before lookup adoption,
@@ -499,6 +500,44 @@ production cancellation publisher, then releases registration after completion.
 The Primary remains writable. Definite/unknown commits preserve their barriers.
 The new receipt is trusted-local metadata, not a native wire schema or evidence
 of native C++ handler execution/interoperability.
+
+### Deleting the original destination after pre-Open registration failure
+
+Normal FM Delete also handles the original Idle after definitive registration
+failure, while preserving the original failed Add outcome. Native
+`FailoverUnit.cpp:5212-5235,5610-5657` closes failed creation; the ordinary
+closed Delete path (`ReconfigurationAgent.cpp:777-834`,
+`FailoverUnit.cpp:4916-4940`) then marks the retained FT deleted and replies
+without RAP Close. The created FT keeps its 1/1 description. Only failure
+before runtime/usage adoption records this bounded origin; a later registration
+error after runtime loss does not qualify.
+
+The original Node retains the applied registration command/ticket, original
+creation token, issued lookup and native error. After applied Delete it joins
+that lineage with its separate Delete command/ticket and waits for unfenced,
+drained lookup/usage/command/effect ownership, no runtime route and the live
+original app/node. `failed-registration-deletion.json` is a distinct local
+receipt, not a Close/disposal or zero-history absence receipt.
+FM requires the original failed Add and freezes its error at deletion admission;
+only the matching receipt plus DeleteReplicaReply reports
+`completion=failed_registration`, `failed_registration=true`,
+`disposed=false`, `never_created=false`, `pre_open_cancelled=false`.
+`created_lifetime=false` and `reusable=false` remain explicit.
+The failed Add/error survives; Primary pending-remove needs its own reply.
+The committed Delete also retires the matching failed-create report placeholder
+without claiming runtime cleanup or inventing a report acknowledgment.
+
+Real-process/Channel acceptance holds actual factory registration and uses the
+existing native dynamic registration Drop threshold of one for qualification;
+production defaults are unchanged. The real Hosting lookup fails, the actual
+peer error is forwarded as AddReplicaReply, then lost Delete reply/replay and
+late factory registration/Create preserve the tombstone, failure and healthy
+Primary writes. Model/store tests cover late acquired offers, definite/unknown
+Delete commits, mismatched lineage/error and independent owner loss. This is
+controlled owned-Node/production-adapter acceptance, not a new child-node
+policy-control feature or native C++ handler/interoperability qualification.
+Runtime Open failures, unknown/missing failure lineage, other absent/down
+branches and replacement remain gated.
 
 ### Deleting the original destination before CreateReplica
 
@@ -539,7 +578,7 @@ Primary pending-remove still requires its own RemoveReplicaReply.
 Only the original unanswered FM Add permits absent cleanup. An already-opened
 original or registered in-flight Open still uses genuine disposal proof;
 pre-registration Opening uses the distinct cancellation proof above.
-Failed or unknown absent lifetimes, force, arbitrary targets and later incarnations remain
+Other failed or unknown absent lifetimes, force, arbitrary targets and later incarnations remain
 gated. No fresh lifetime, restart recovery or active membership is authorized.
 
 Controlled real application-process/Channel acceptance holds the original

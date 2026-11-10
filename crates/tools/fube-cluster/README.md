@@ -112,7 +112,21 @@ on retry; registration winning the race instead requires genuine disposal.
 Unobserved original creation retains the appropriate actual-outcome proof.
 Held real lookup ownership after the native reply, late registration/traffic,
 reply replay and actual child adapters qualify these separate barriers.
-Failed/unknown absent lifetimes, arbitrary targets,
+The original known pre-Open registration failure also supports normal closed
+Delete without RAP Close. `failed-registration-deletion.json` binds the actual
+applied registration failure/lookup/creation lineage and separate applied
+Delete, and publishes only after original local ownership drains without a
+runtime route. FM freezes the failed Add error and joins that receipt with
+DeleteReplicaReply: `completion=failed_registration`,
+`failed_registration=true`, with disposal/absence/pre-Open-cancellation flags
+false, no created runtime lifetime and no reuse. The failed Add/error and
+Primary pending-remove remain independent. Deleted metadata retires only the
+matching failed-create report placeholder, not a runtime cleanup obligation.
+Actual Hosting/process/Channel acceptance uses an existing dynamic Drop=1
+registration policy for qualification, without changing production defaults.
+Late registration/Create, lost replies and commit/lineage guards are covered.
+Runtime Open failures (including later registration failure after runtime loss),
+other failed/unknown absent lifetimes, arbitrary targets,
 future incarnations and replacement are not authorized by this branch.
 
 After an original CreateReplicaReply error, the Primary retains only a failed

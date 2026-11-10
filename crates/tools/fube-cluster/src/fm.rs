@@ -1,6 +1,7 @@
 use crate::profile::{
     absent_replica_body, add_body, dropped_replica, pre_open_cancelled_body, AbsenceReceipt,
-    ActualProfile, Launch, PreOpenCancellationReceipt, Result, RetirementReceipt,
+    ActualProfile, FailedRegistrationReceipt, Launch, PreOpenCancellationReceipt, Result,
+    RetirementReceipt,
 };
 use fube_ra::protocol::*;
 use fube_transport::serialization::serde::ObjectArray;
@@ -119,6 +120,8 @@ pub(crate) struct IdleDeletion {
     target: IdleDeleteTarget,
     absence: Option<AbsenceReceipt>,
     cancellation: Option<PreOpenCancellationReceipt>,
+    failed_registration: Option<FailedRegistrationReceipt>,
+    failure_error: Option<i64>,
     unknown: bool,
     started: Instant,
     last: Instant,
@@ -128,6 +131,7 @@ pub(crate) enum IdleDeleteTarget {
     Runtime,
     Unobserved,
     PreRegistration,
+    FailedRegistration,
 }
 pub(crate) struct IdleRemoval {
     pub body: RemoveReplica,
@@ -553,6 +557,7 @@ impl Ledger {
         if deletion.target != IdleDeleteTarget::Unobserved
             || placement.retirement.is_some()
             || deletion.cancellation.is_some()
+            || deletion.failed_registration.is_some()
             || proof.absence.body != absent_replica_body(&deletion.body.replica.0)
             || deletion
                 .reply
@@ -594,9 +599,12 @@ impl Ledger {
         if deletion.unknown || !placement.link_alive {
             return Ok(());
         }
-        if deletion.target == IdleDeleteTarget::Runtime
-            || deletion.absence.is_some()
+        if matches!(
+            deletion.target,
+            IdleDeleteTarget::Runtime | IdleDeleteTarget::FailedRegistration
+        ) || deletion.absence.is_some()
             || placement.retirement.is_some()
+            || deletion.failed_registration.is_some()
             || proof.cancellation.body != pre_open_cancelled_body(&deletion.body.replica.0)
             || deletion
                 .reply
@@ -608,6 +616,54 @@ impl Ledger {
             );
         }
         deletion.cancellation = Some(proof);
+        self.finish_idle_deletion();
+        Ok(())
+    }
+    pub fn read_failed_registration(
+        &mut self,
+        index: usize,
+        path: &std::path::Path,
+        node_pid: u32,
+    ) -> Result<()> {
+        if !path.try_exists().map_err(crate::profile::err)? {
+            return Ok(());
+        }
+        self.failed_registration(index, crate::profile::read_json(path)?, node_pid)
+    }
+    pub fn failed_registration(
+        &mut self,
+        index: usize,
+        proof: FailedRegistrationReceipt,
+        node_pid: u32,
+    ) -> Result<()> {
+        let placement = &self.placements[index];
+        proof.validate(
+            &placement.launch,
+            placement.profile.as_ref().ok_or("missing profile")?,
+            node_pid,
+        )?;
+        let Some(deletion) = &mut self.idle_deletion else {
+            return Ok(());
+        };
+        if deletion.unknown || !placement.link_alive {
+            return Ok(());
+        }
+        if deletion.target != IdleDeleteTarget::FailedRegistration
+            || deletion.failure_error != Some(proof.deletion.failure.error)
+            || deletion.absence.is_some()
+            || deletion.cancellation.is_some()
+            || placement.retirement.is_some()
+            || proof.deletion.failure.body != pre_open_cancelled_body(&deletion.body.replica.0)
+            || deletion
+                .reply
+                .as_ref()
+                .is_some_and(|reply| reply.unit != proof.deletion.failure.body.unit)
+        {
+            return Err(
+                "failed registration proof cannot replace another failure or cleanup origin".into(),
+            );
+        }
+        deletion.failed_registration = Some(proof);
         self.finish_idle_deletion();
         Ok(())
     }
@@ -1139,7 +1195,9 @@ impl Ledger {
         }
         if index == 1 && placement.launch.profile == crate::ServiceProfile::StatefulPeerIdle {
             if self.idle_deletion.as_ref().is_some_and(|deletion| {
-                deletion.absence.is_some() || deletion.cancellation.is_some()
+                deletion.absence.is_some()
+                    || deletion.cancellation.is_some()
+                    || deletion.target == IdleDeleteTarget::FailedRegistration
             }) {
                 return Err("disposal cannot replace a no-runtime destination proof".into());
             }
@@ -1478,12 +1536,27 @@ impl Ledger {
         self.idle_destination_deleted()
             && (self.placements[1].retirement.is_some()
                 || self.idle_deletion.as_ref().is_some_and(|deletion| {
-                    deletion.absence.is_some() || deletion.cancellation.is_some()
+                    deletion.absence.is_some()
+                        || deletion.cancellation.is_some()
+                        || deletion.failed_registration.is_some()
                 }))
     }
     pub fn idle_absence_allowed(&self) -> bool {
         matches!((&self.idle, &self.idle_removal), (Some(idle), Some(removal))
             if idle.reply.is_none() && !idle.unknown && !removal.unknown && idle.body == removal.body)
+    }
+    pub fn idle_failed_creation_error(&self) -> Option<i64> {
+        let (Some(idle), Some(removal)) = (&self.idle, &self.idle_removal) else {
+            return None;
+        };
+        (!idle.unknown && !removal.unknown && removal.failed_creation && idle.body == removal.body)
+            .then(|| {
+                idle.reply
+                    .as_ref()
+                    .map(|reply| reply.error)
+                    .filter(|error| *error != 0)
+            })
+            .flatten()
     }
     /// Native PendingTask schedules Delete independently of PendingRemove.
     /// Pre-runtime completion is restricted to the original unanswered FM Add.
@@ -1518,7 +1591,13 @@ impl Ledger {
             return Err("original Idle abandonment owner is unknown".into());
         }
         let body = DeleteReplica::new(removal.body.clone(), false);
-        if target != IdleDeleteTarget::Runtime && !self.idle_absence_allowed() {
+        let failure_error = self.idle_failed_creation_error();
+        if (target == IdleDeleteTarget::FailedRegistration && failure_error.is_none())
+            || (matches!(
+                target,
+                IdleDeleteTarget::Unobserved | IdleDeleteTarget::PreRegistration
+            ) && !self.idle_absence_allowed())
+        {
             return Err("pre-runtime cleanup requires the original unanswered FM Add".into());
         }
         self.idle_deletion = Some(IdleDeletion {
@@ -1527,6 +1606,12 @@ impl Ledger {
             target,
             absence: None,
             cancellation: None,
+            failed_registration: None,
+            failure_error: if target == IdleDeleteTarget::FailedRegistration {
+                failure_error
+            } else {
+                None
+            },
             unknown: false,
             started: now,
             last: now,
@@ -1567,6 +1652,10 @@ impl Ledger {
                 .cancellation
                 .as_ref()
                 .is_some_and(|proof| proof.cancellation.body.unit != body.unit)
+            || deletion
+                .failed_registration
+                .as_ref()
+                .is_some_and(|proof| proof.deletion.failure.body.unit != body.unit)
             || self.placements[1]
                 .retirement
                 .as_ref()
@@ -1608,7 +1697,7 @@ impl Ledger {
     }
     pub fn idle_deletion_status(&self) -> Value {
         let Some(deletion) = &self.idle_deletion else {
-            return json!({"state":"absent","destination_deleted":false,"disposed":false,"never_created":false,"pre_open_cancelled":false,"complete":false});
+            return json!({"state":"absent","destination_deleted":false,"disposed":false,"never_created":false,"pre_open_cancelled":false,"failed_registration":false,"complete":false});
         };
         let complete = self.idle_deletion_complete();
         json!({"state":if complete { "deleted" } else if deletion.unknown { "unknown" } else { "pending" },
@@ -1617,9 +1706,11 @@ impl Ledger {
             "disposed":self.placements[1].retirement.is_some(),
             "never_created":deletion.absence.is_some(),
             "pre_open_cancelled":deletion.cancellation.is_some(),
+            "failed_registration":deletion.failed_registration.is_some(),
             "completion":if !complete { None } else if self.placements[1].retirement.is_some() { Some("disposed") }
                 else if deletion.absence.is_some() { Some("never_created") }
-                else if deletion.cancellation.is_some() { Some("pre_open_cancelled") } else { None },
+                else if deletion.cancellation.is_some() { Some("pre_open_cancelled") }
+                else if deletion.failed_registration.is_some() { Some("failed_registration") } else { None },
             "complete":complete, "cleanup_required":!complete,
             "pending_remove":self.idle_removal.as_ref().is_some_and(|removal| removal.reply.is_none()),
             "reusable":false, "serving":false})

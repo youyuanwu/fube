@@ -421,6 +421,83 @@ fn absent_idle_cleanup_rejects_foreign_or_opened_proofs_and_retains_unknown_owne
 }
 
 #[test]
+fn failed_registration_delete_requires_matching_original_failure_and_independent_native_reply() {
+    for proof_first in [false, true] {
+        let mut ledger = peer_idle_ledger();
+        let now = Instant::now();
+        let add = ledger.request_idle(now).unwrap();
+        assert!(ledger.request_idle_deletion(now, IdleDeleteTarget::FailedRegistration).is_err());
+        ledger.idle_reply(0, AddReplicaReply { unit: add.unit, replica: add.replica, error: -995 }).unwrap();
+        let removal = ledger.request_idle_removal(now).unwrap();
+        let deleting = ledger.request_idle_deletion(now, IdleDeleteTarget::FailedRegistration).unwrap();
+        let proof = failed_registration_receipt(&ledger.placements[1], -995);
+        let reply = remove_reply(&ledger.placements[1]);
+        if proof_first { ledger.failed_registration(1, proof.clone(), 555).unwrap(); }
+        else { ledger.reply(1, reply.clone(), true).unwrap(); }
+        assert_eq!(ledger.idle_deletion_status()["complete"], false);
+        assert_eq!(ledger.idle_deletion_status()["completion"], Value::Null);
+        assert_eq!(ledger.idle_deletion_status()["disposed"], false);
+        ledger.failed_registration(1, proof.clone(), 555).unwrap();
+        ledger.reply(1, reply, true).unwrap();
+        assert_eq!(ledger.idle_deletion_status()["completion"], "failed_registration");
+        assert_eq!(ledger.idle_deletion_status()["state"], "deleted");
+        assert_eq!(ledger.idle_deletion_status()["pending_remove"], true);
+        assert_eq!(ledger.idle_status()["state"], "failed");
+        assert_eq!(ledger.idle_status()["error"], -995);
+        assert_eq!(ledger.idle_status()["destination_cleanup_required"], false);
+        assert!(!ledger.placements[1].created && !ledger.placements[1].reusable);
+        assert!(ledger.retirement(1, retirement(&ledger.placements[1]), 555).is_err());
+        assert!(ledger.absence(1, absence_receipt(&ledger.placements[1]), 555).is_err());
+        assert!(ledger.pre_open_cancellation(1, pre_open_receipt(&ledger.placements[1]), 555).is_err());
+        ledger.idle_removal_reply(0, RemoveReplicaReply { unit: removal.unit, replica: removal.replica, error: 0 }).unwrap();
+        assert_eq!(ledger.idle_removal_status()["completion"], "failed_creation_retired");
+        assert_eq!(ledger.idle_status()["error"], -995);
+        assert_eq!(deleting.replica.0.replica.id, proof.deletion.failure.body.replica.id);
+        ledger.lost(1, "later owner loss".into());
+        assert_eq!(ledger.idle_deletion_status()["state"], "deleted");
+    }
+}
+
+#[test]
+fn failed_registration_receipts_reject_foreign_unknown_and_other_cleanup_origins() {
+    let now = Instant::now();
+    for lost in [None, Some(0), Some(1)] {
+        let mut ledger = peer_idle_ledger();
+        let add = ledger.request_idle(now).unwrap();
+        ledger.idle_reply(0, AddReplicaReply { unit: add.unit, replica: add.replica, error: -995 }).unwrap();
+        ledger.request_idle_deletion(now, IdleDeleteTarget::FailedRegistration).unwrap();
+        let proof = failed_registration_receipt(&ledger.placements[1], -995);
+        for kind in 0..10 {
+            let mut foreign = proof.clone();
+            match kind {
+                0 => foreign.node.instance += 1,
+                1 => foreign.session = ledger.placements[0].launch.session.clone(),
+                2 => foreign.deletion.failure.error = -994,
+                3 => foreign.deletion.failure.body.replica.instance += 1,
+                4 => foreign.deletion.failure.body.unit.target = 0,
+                5 => foreign.deletion.failure.creation = 0,
+                6 => foreign.deletion.failure.ra_operation = foreign.deletion.ra_operation,
+                7 => foreign.deletion.command = foreign.deletion.failure.command,
+                8 => foreign.node_pid += 1,
+                _ => foreign.app_pid += 1,
+            }
+            assert!(ledger.failed_registration(1, foreign, 555).is_err());
+        }
+        if let Some(index) = lost { ledger.lost(index, "original session loss".into()); }
+        ledger.reply(1, remove_reply(&ledger.placements[1]), true).unwrap();
+        ledger.failed_registration(1, proof, 555).unwrap();
+        assert_eq!(ledger.idle_deletion_status()["state"], if lost == Some(1) { "unknown" } else { "deleted" });
+    }
+    for target in [IdleDeleteTarget::Runtime, IdleDeleteTarget::PreRegistration, IdleDeleteTarget::Unobserved] {
+        let mut ledger = peer_idle_ledger();
+        ledger.request_idle(now).unwrap();
+        ledger.request_idle_removal(now).unwrap();
+        ledger.request_idle_deletion(now, target).unwrap();
+        assert!(ledger.failed_registration(1, failed_registration_receipt(&ledger.placements[1], -995), 555).is_err());
+    }
+}
+
+#[test]
 fn pre_registration_delete_joins_distinct_cancellation_and_reply_in_both_orders() {
     for target in [IdleDeleteTarget::PreRegistration, IdleDeleteTarget::Unobserved] {
         for proof_first in [false, true] {
@@ -1419,6 +1496,22 @@ async fn registered_open_idle_delete_drains_actual_open_and_disposal_before_repl
 }
 
 #[tokio::test]
+async fn failed_registration_delete_uses_actual_lookup_failure_and_replays_lost_reply_without_erasing_add_error() {
+    let fixture = Fixture::new("peer-idle-failed-registration-delete");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::StatefulPeerIdle;
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    cluster.prepare().unwrap();
+    let launches = [cluster.ledger.placements[0].launch.clone(), cluster.ledger.placements[1].launch.clone()];
+    let result = node::report_tests::run_peer_creation_removal(
+        &launches, node::report_tests::PeerCreationOutcome::DeleteFailedRegistration,
+    ).await;
+    assert_eq!(cluster.shutdown().await["clean"], true);
+    result.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn pre_registration_delete_drains_actual_late_acquisition_before_publishing_cancellation() {
     let fixture = Fixture::new("peer-idle-prereg-delete");
     let mut config = fixture.config();
@@ -1815,6 +1908,22 @@ fn pre_open_receipt(placement: &fm::Placement) -> PreOpenCancellationReceipt {
         runtime_root: placement.profile.as_ref().unwrap().runtime_root.clone(),
         cancellation: fube_node::local::PreOpenCancellation {
             body: pre_open_cancelled_body(&placement.body().unwrap()), creation: 1, command: 8, ra_operation: 19,
+        },
+    }
+}
+
+fn failed_registration_receipt(placement: &fm::Placement, error: i64) -> FailedRegistrationReceipt {
+    FailedRegistrationReceipt {
+        deployment: placement.launch.deployment.clone(), session: placement.launch.session.clone(),
+        node: placement.launch.node.clone(), fm: placement.launch.fm.clone(), generation: placement.launch.generation.clone(),
+        node_pid: 555, app_pid: placement.profile.as_ref().unwrap().app_pid,
+        runtime_root: placement.profile.as_ref().unwrap().runtime_root.clone(),
+        deletion: fube_node::local::FailedRegistrationDeletion {
+            failure: fube_node::local::PreOpenRegistrationFailure {
+                body: pre_open_cancelled_body(&placement.body().unwrap()), creation: 1, lookup: 2,
+                command: 4, ra_operation: 3, error,
+            },
+            command: 8, ra_operation: 19,
         },
     }
 }

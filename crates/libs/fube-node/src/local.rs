@@ -262,6 +262,24 @@ pub struct PreOpenCancellation {
     pub command: u64,
     pub ra_operation: u64,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreOpenRegistrationFailure {
+    #[serde(with = "disposal_body")]
+    pub body: AddInstance,
+    pub creation: u64,
+    pub lookup: u64,
+    pub command: u64,
+    pub ra_operation: u64,
+    pub error: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailedRegistrationDeletion {
+    pub failure: PreOpenRegistrationFailure,
+    pub command: u64,
+    pub ra_operation: u64,
+}
 fn pre_open_cancelled(state: &ra::EntityState, creation: u64) -> bool {
     state.phase == ra::Phase::Closed
         && state.local_deleted
@@ -339,6 +357,8 @@ pub struct Node {
     disposal: Option<DisposalWitness>,
     absence: Option<ReplicaAbsence>,
     pre_open: Option<PreOpenCancellation>,
+    registration_failure: Option<PreOpenRegistrationFailure>,
+    failed_registration: Option<FailedRegistrationDeletion>,
     #[cfg(feature = "qualification")]
     hold_replies: bool,
 }
@@ -399,6 +419,8 @@ impl Node {
             disposal: None,
             absence: None,
             pre_open: None,
+            registration_failure: None,
+            failed_registration: None,
             #[cfg(feature = "qualification")]
             hold_replies: false,
         })
@@ -565,6 +587,9 @@ impl Node {
                                             || (state.phase == ra::Phase::Opening
                                                 && state.runtime.is_some()
                                                     == state.usage.is_some())
+                                            || (state.failed_registration_error().is_some()
+                                                && self.registration_failure.is_some()
+                                                && self.route.is_none())
                                             || state.local_deleted)))
                         }
                     };
@@ -929,6 +954,43 @@ impl Node {
             && state.registration_lookups.is_empty()
             && *state.body == proof.body)
             .then(|| proof.clone())
+    }
+
+    /// Applied native registration failure, not a cleanup or Delete receipt.
+    pub fn pre_open_registration_failure(&self) -> Option<PreOpenRegistrationFailure> {
+        let failure = self.registration_failure.as_ref()?;
+        let snapshot = self.ra.snapshot(failure.body.unit.id.guid.0);
+        let state = snapshot.committed?;
+        (!snapshot.fenced
+            && self.live.load(Ordering::SeqCst)
+            && self.ra.consumer_lifetime().is_accepting()
+            && state.failed_registration_error() == Some(failure.error)
+            && state.open_token == failure.creation
+            && *state.body == failure.body
+            && self.route.is_none()
+            && self.last_error.is_none()
+            && self.activation.session_status().ok().flatten()?.connected
+            && !self.activation.process_status()?.exit_observed)
+            .then(|| failure.clone())
+    }
+
+    pub fn failed_registration_deletion(&self) -> Option<FailedRegistrationDeletion> {
+        let proof = self.failed_registration.as_ref()?;
+        let failure = self.pre_open_registration_failure()?;
+        let snapshot = self.ra.snapshot(failure.body.unit.id.guid.0);
+        let state = snapshot.committed?;
+        (!snapshot.fenced
+            && state.local_deleted
+            && state.cleanup_pending
+            && state.registration_lookups.is_empty()
+            && self.quiescent()
+            && self.commands.is_empty()
+            && self.receipts.is_empty()
+            && self.rejected_reply.is_none()
+            && self.disposal.is_none()
+            && self.absence.is_none()
+            && self.pre_open.is_none())
+        .then(|| proof.clone())
     }
 
     fn room(&self) -> bool {
@@ -1473,6 +1535,48 @@ impl Node {
                     }
                 }
                 let front = self.pending.pop_front().unwrap();
+                if result == Ok(ra::Disposition::Applied)
+                    && self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
+                    && self.ra.peer().is_some()
+                    && self.route.is_none()
+                {
+                    if let Work::Registered(event) = &front.work {
+                        let snapshot = self.ra.snapshot(event.unit.guid.0);
+                        if let Some(state) = snapshot.committed.filter(|_| !snapshot.fenced) {
+                            if !state.local_deleted
+                                && state.failed_registration_error() == Some(event.error)
+                                && state.open_token == event.token
+                                && self.registration_failure.is_none()
+                            {
+                                self.registration_failure = Some(PreOpenRegistrationFailure {
+                                    body: (*state.body).clone(),
+                                    creation: event.token,
+                                    lookup: event.lookup,
+                                    command: front.id,
+                                    ra_operation: front.ticket.as_ref().unwrap().id,
+                                    error: event.error,
+                                });
+                            }
+                        }
+                    }
+                    if let Work::Fm(FmWork::DeleteReplica(body, ..)) = &front.work {
+                        if let Some(failure) = self.pre_open_registration_failure() {
+                            let state = self.ra.snapshot(body.replica.0.unit.id.guid.0);
+                            if !state.fenced
+                                && state
+                                    .committed
+                                    .is_some_and(|s| s.local_deleted && s.cleanup_pending)
+                                && self.failed_registration.is_none()
+                            {
+                                self.failed_registration = Some(FailedRegistrationDeletion {
+                                    failure,
+                                    command: front.id,
+                                    ra_operation: front.ticket.as_ref().unwrap().id,
+                                });
+                            }
+                        }
+                    }
+                }
                 if result == Ok(ra::Disposition::Applied) && self.pre_open.is_none() {
                     if let (Some(creation), Work::Fm(FmWork::DeleteReplica(body, ..))) =
                         (front.pre_open, &front.work)

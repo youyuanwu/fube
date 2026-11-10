@@ -137,6 +137,12 @@ and native immediate Close without registration/RAP. Its distinct source-bound
 pre-Open cancellation receipt waits for exact late lookup/acquisition drain;
 it is neither a runtime disposal receipt nor zero-history missing-FT absence.
 That trusted-local DTO and real-process/child tests add no wire cases or schemas.
+Known pre-Open registration failure similarly reuses closed Delete and its
+created 1/1 FT description. Applied original failure/lookup/creation and Delete
+lineage has a distinct drained-ownership local receipt; the failed Add error
+is preserved. Controlled real Hosting/process/Channel acceptance uses the
+existing native dynamic registration Drop=1 threshold, not a new wire schema
+or a changed production default. Native C++ handler execution remains separate.
 
 ### Stage-two node control/load and endpoint codecs
 
