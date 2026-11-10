@@ -125,7 +125,18 @@ matching failed-create report placeholder, not a runtime cleanup obligation.
 Actual Hosting/process/Channel acceptance uses an existing dynamic Drop=1
 registration policy for qualification, without changing production defaults.
 Late registration/Create, lost replies and commit/lineage guards are covered.
-Runtime Open failures (including later registration failure after runtime loss),
+Terminal runtime Open failure has a separate `failed-open-deletion.json`
+receipt: the original runtime's error reply follows Abort/final release, then
+the Applied terminal Open completion, exact original usage release and separate
+Applied closed Delete must all match. No RAP Close is fabricated. FM freezes
+the failed Add error and joins that receipt with DeleteReplicaReply, reporting
+`completion=failed_open`, `failed_open=true`, `disposed=true`. Other cleanup
+origin flags remain false. Failed Add and Primary pending-remove stay independent;
+no reuse is granted. Actual process/Channel tests hold provider/service disposal
+and fail the initial Idle role callback within RAP Open, using the existing
+dynamic Open Drop=1 threshold for qualification only. Production defaults and
+native wire schemas are unchanged.
+Host loss (including later registration failure after runtime loss),
 other failed/unknown absent lifetimes, arbitrary targets,
 future incarnations and replacement are not authorized by this branch.
 

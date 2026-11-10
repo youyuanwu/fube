@@ -285,7 +285,14 @@ pub(super) fn runtime_failure(
         .policy(RetryState::Opening)
         .failure(&mut state.open_failures)?
     {
-        Action::Drop => fail(&mut state, error, &mut effects),
+        Action::Drop => {
+            if error != APPLICATION_HOST_CRASH && state.runtime.is_some() && state.usage.is_some() {
+                if let Some(peer) = &mut state.peer_creation {
+                    peer.open_error = Some(error);
+                }
+            }
+            fail(&mut state, error, &mut effects);
+        }
         Action::Warning => effects.push(health(HealthEvent::OpenWarning, error, detail)),
         Action::None => {}
     }

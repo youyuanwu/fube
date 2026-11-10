@@ -143,6 +143,13 @@ lineage has a distinct drained-ownership local receipt; the failed Add error
 is preserved. Controlled real Hosting/process/Channel acceptance uses the
 existing native dynamic registration Drop=1 threshold, not a new wire schema
 or a changed production default. Native C++ handler execution remains separate.
+Terminal runtime Open failure uses the same native closed Delete shape after
+RAP's actual Abort/final release. A separate local failed-Open receipt binds the
+Applied failure and Delete to the exact original runtime and usage acquisition;
+it is not a successful-Close, registration-failure or absence receipt.
+Controlled process/Channel acceptance holds real provider/service disposal and
+uses the existing dynamic Open Drop=1 threshold for qualification only.
+These source-derived lifecycle tests add no wire cases or schema types.
 
 ### Stage-two node control/load and endpoint codecs
 

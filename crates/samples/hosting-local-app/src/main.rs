@@ -68,6 +68,8 @@ struct Arguments {
     block_open: bool,
     #[arg(long, requires = "stateful_lifecycle", conflicts_with_all = ["stateful_primary", "block_open"])]
     block_registration: bool,
+    #[arg(long, requires = "data_replicator", conflicts_with_all = ["stateful_primary", "block_open", "block_registration", "open_delay_ms"])]
+    fail_open: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -78,6 +80,7 @@ struct Mode {
     close_error: bool,
     open_delay: u64,
     block_open: bool,
+    fail_open: bool,
 }
 struct Factory(Mode);
 struct StatefulFactory {
@@ -275,6 +278,13 @@ impl IStatefulServiceReplica for StatefulReplica {
                 ));
             }
             marker(&format!("LOCAL_CALLBACK role {role:?}"));
+            if role == ReplicaRole::IdleSecondary && self.resource.mode.fail_open {
+                marker("LOCAL_OPEN failed");
+                return Err(Error::Remote {
+                    code: 0x80004005u32 as i32 as i64,
+                    message: "fixture initial Idle service role failure".into(),
+                });
+            }
             if role == ReplicaRole::Primary {
                 let data = self.data.lock().unwrap().clone().expect("real data owner");
                 let before = data.snapshot();
@@ -979,6 +989,7 @@ async fn main() {
         close_error: args.close_error_block_dispose,
         open_delay: args.open_delay_ms.unwrap_or(0),
         block_open: args.block_open,
+        fail_open: args.fail_open,
     };
     let stateful_registration = args.stateful_register;
     let native = data_replicator.then(|| runtime.native_integration_provider());
@@ -1168,6 +1179,15 @@ mod argument_tests {
                 .unwrap()
                 .block_open
         );
+        for hold in ["--block-dispose", "--block-provider-dispose"] {
+            assert!(
+                parse(&format!(
+                    "--stateful-lifecycle --data-replicator --fail-open {hold}"
+                ))
+                .unwrap()
+                .fail_open
+            );
+        }
     }
 
     #[test]
@@ -1183,6 +1203,10 @@ mod argument_tests {
             "--delay-ms",
             "--open-delay-ms invalid",
             "--block-open",
+            "--fail-open",
+            "--stateful-lifecycle --fail-open",
+            "--stateful-lifecycle --data-replicator --fail-open --block-open",
+            "--stateful-lifecycle --data-replicator --fail-open --block-registration",
             "--stateful-primary --block-open",
             "--stateful-lifecycle --block-open --open-delay-ms 1",
             "--block-registration",

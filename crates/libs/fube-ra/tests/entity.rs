@@ -2898,7 +2898,7 @@ async fn failed_registration_delete_commit_barrier_never_releases_lookup_or_repl
 }
 
 #[tokio::test]
-async fn runtime_open_failure_does_not_authorize_failed_registration_delete() {
+async fn runtime_open_failure_has_distinct_delete_origin_and_host_loss_does_not() {
     for registration_after_runtime_loss in [false, true] {
         let (store, executor, _) = setup(WAIT).await;
         executor.bind_peer(peer_source()).unwrap();
@@ -2949,16 +2949,140 @@ async fn runtime_open_failure_does_not_authorize_failed_registration_delete() {
         }
         assert_eq!(state(&executor).phase, Phase::Closed);
         assert_eq!(state(&executor).failed_registration_error(), None);
-        assert!(matches!(
-            executor
-                .submit(primary_delete(request.replica.0, false))
-                .unwrap()
-                .wait(WAIT)
-                .await,
-            Err(Failure::Unsupported(_))
-        ));
-        assert!(effects(&executor).is_empty());
+        if registration_after_runtime_loss {
+            assert_eq!(state(&executor).failed_open_error(), None);
+            assert!(matches!(
+                executor
+                    .submit(primary_delete(request.replica.0, false))
+                    .unwrap()
+                    .wait(WAIT)
+                    .await,
+                Err(Failure::Unsupported(_))
+            ));
+            assert!(effects(&executor).is_empty());
+        } else {
+            assert_eq!(state(&executor).failed_open_error(), Some(-55));
+            let failed = state(&executor);
+            for _ in 0..2 {
+                run(&executor, primary_delete(request.replica.0.clone(), false)).await;
+                let actions = effects(&executor);
+                assert!(
+                    matches!(actions.as_slice(), [Effect::DeleteReplicaReply(reply)]
+                    if reply.unit == failed.body.unit && reply.replica == Replica {
+                        node: request.replica.0.replica.node.clone(),
+                        id: request.replica.0.replica.id,
+                        instance: request.replica.0.replica.instance,
+                        state: 3, up: false, ..Replica::default()
+                    }),
+                    "{actions:?}"
+                );
+                assert_eq!(state(&executor).close_token, 0);
+                assert_eq!(state(&executor).failed_open_error(), Some(-55));
+            }
+            assert_eq!(
+                run(&executor, peer_create(request.clone())).await,
+                Disposition::IgnoredStale
+            );
+            assert!(effects(&executor).is_empty());
+            for error in [0, -55] {
+                let mut late = complete(&request.replica.0, failed.open_token);
+                late.error = error;
+                late.flags = ABORT;
+                late.replica.service_endpoint.clear();
+                late.replica.replication_endpoint = "tcp://late-open".into();
+                let deleted = state(&executor);
+                assert_eq!(
+                    run(&executor, Command::CompleteOpen(Box::new(late))).await,
+                    Disposition::IgnoredStale
+                );
+                assert!(Arc::ptr_eq(&deleted, &state(&executor)));
+                assert!(effects(&executor).is_empty());
+            }
+        }
         finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn failed_open_and_delete_require_their_own_applied_commits() {
+    for deleting in [false, true] {
+        for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+            let (store, executor, hooks) = setup(if unknown {
+                Duration::from_millis(50)
+            } else {
+                WAIT
+            })
+            .await;
+            executor.bind_peer(peer_source()).unwrap();
+            let request = peer_request();
+            run(&executor, peer_create(request.clone())).await;
+            effects(&executor);
+            registered(&executor, &request.replica.0, state(&executor).open_token).await;
+            executor
+                .config()
+                .set(RetryState::Opening, Threshold::Drop, 1);
+            let mut completion = complete(&state(&executor).body, 0);
+            completion.error = -55;
+            completion.flags = ABORT;
+            let command = if deleting {
+                run(
+                    &executor,
+                    Command::CompleteOpen(Box::new(completion.clone())),
+                )
+                .await;
+                let actions = effects(&executor);
+                assert!(actions
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::ReleaseUsage { .. })));
+                assert!(actions.iter().any(|effect| matches!(effect, Effect::PeerCreateReplicaReply { body, .. } if body.error == -55)));
+                primary_delete(request.replica.0.clone(), false)
+            } else {
+                Command::CompleteOpen(Box::new(completion.clone()))
+            };
+            let original = state(&executor);
+            let (entered, release) = hooks.pause(fail);
+            let ticket = executor.submit(command).unwrap();
+            entered.await.unwrap();
+            assert!(Arc::ptr_eq(&original, &state(&executor)));
+            assert!(effects(&executor).is_empty());
+            if unknown {
+                assert_eq!(ticket.wait(WAIT).await, Err(Failure::Unknown));
+                assert!(executor.snapshot([1; 16]).fenced);
+                assert!(effects(&executor).is_empty());
+            }
+            release.send(()).unwrap();
+            if fail {
+                assert!(matches!(ticket.resolve(WAIT).await, Err(Failure::Store(_))));
+                assert!(Arc::ptr_eq(&original, &state(&executor)));
+                assert!(effects(&executor).is_empty());
+                run(
+                    &executor,
+                    if deleting {
+                        primary_delete(request.replica.0.clone(), false)
+                    } else {
+                        Command::CompleteOpen(Box::new(completion))
+                    },
+                )
+                .await;
+            } else {
+                assert_eq!(ticket.resolve(WAIT).await, Ok(Disposition::Applied));
+            }
+            let actions = effects(&executor);
+            assert_eq!(state(&executor).failed_open_error(), Some(-55));
+            assert_eq!(state(&executor).local_deleted, deleting);
+            assert_eq!(state(&executor).close_token, 0);
+            assert!(!actions
+                .iter()
+                .any(|effect| matches!(effect, Effect::Close { .. })));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|effect| matches!(effect, Effect::DeleteReplicaReply(_)))
+                    .count(),
+                usize::from(deleting)
+            );
+            finish(&store, &executor).await;
+        }
     }
 }
 

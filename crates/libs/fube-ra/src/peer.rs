@@ -6,9 +6,25 @@ pub struct PeerCreation {
     pub deactivation: ReplicaDeactivationInfo,
     /// Terminal registration failure before any adopted runtime/usage.
     pub registration_error: Option<i64>,
+    pub open_error: Option<i64>,
 }
 
 impl EntityState {
+    pub fn failed_open_error(&self) -> Option<i64> {
+        if self.phase != Phase::Closed
+            || self.open_token == 0
+            || self.close_token != 0
+            || self.runtime.is_some()
+            || self.usage.is_some()
+        {
+            return None;
+        }
+        self.peer_creation
+            .as_ref()?
+            .open_error
+            .filter(|error| *error != 0)
+    }
+
     pub fn failed_registration_error(&self) -> Option<i64> {
         if self.phase != Phase::Closed
             || self.open_token == 0

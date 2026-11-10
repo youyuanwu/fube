@@ -538,6 +538,9 @@ impl Adapter {
                     if node
                         .failed_registration_deletion()
                         .is_some_and(|proof| proof.failure.body == **body)
+                        || node.failed_open_deletion().is_some_and(|proof| {
+                            pre_open_cancelled_body(&proof.failure.disposal.body) == **body
+                        })
                     {
                         self.escrow.remove(index);
                         return Ok(());
@@ -821,6 +824,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     let mut published_absence = None;
     let mut published_pre_open = None;
     let mut published_failed_registration = None;
+    let mut published_failed_open = None;
     if failure.is_none() {
         loop {
             // Owned stop remains independent of FM connectivity. Link loss is
@@ -998,6 +1002,10 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     failure = Some(error);
                     break;
                 }
+                if let Err(error) = publish_failed_open(launch, &node, &mut published_failed_open) {
+                    failure = Some(error);
+                    break;
+                }
                 if let Some(disposal) = node.instance_disposal() {
                     let state = node.snapshot(disposal.body.unit.id.guid.0);
                     let deleted = !state.fenced
@@ -1047,6 +1055,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         "phase":format!("{:?}",state.phase), "replica":state.body.replica,
                         "open_token":state.open_token, "usage":format!("{:?}",state.usage),
                         "pre_open_failure":node.pre_open_registration_failure(),
+                        "runtime_open_failure":node.runtime_open_failure(),
                         "retained_usage":node.retained_usage(), "reply":adapter.peer_last_reply,
                         "registration":state.runtime.as_ref().map(|runtime| serde_json::json!({
                             "host":runtime.host, "runtime":runtime.runtime, "acquisition":runtime.acquisition,
@@ -1396,6 +1405,39 @@ fn publish_failed_registration(
     *published = Some(lifetime);
     Ok(())
 }
+fn publish_failed_open(
+    launch: &Launch,
+    node: &Node,
+    published: &mut Option<(i64, i64)>,
+) -> Result<()> {
+    let Some(deletion) = node.failed_open_deletion() else {
+        return Ok(());
+    };
+    let replica = &deletion.failure.disposal.body.replica;
+    let lifetime = (replica.id, replica.instance);
+    if *published == Some(lifetime) {
+        return Ok(());
+    }
+    let profile = actual_profile(node)?;
+    let receipt = FailedOpenReceipt {
+        deployment: launch.deployment.clone(),
+        session: launch.session.clone(),
+        node: launch.node.clone(),
+        fm: launch.fm.clone(),
+        generation: launch.generation.clone(),
+        node_pid: std::process::id(),
+        app_pid: profile.app_pid,
+        runtime_root: profile.runtime_root,
+        deletion,
+    };
+    write_json(
+        &launch.directory.join("failed-open-deletion.json"),
+        &receipt,
+    )?;
+    *published = Some(lifetime);
+    Ok(())
+}
+
 fn receive_command(
     launch: &Launch,
     node: &mut Node,
@@ -3605,6 +3647,8 @@ pub(crate) mod report_tests {
         DeleteOpeningService,
         DeletePreRegistration,
         DeleteFailedRegistration,
+        DeleteFailedOpenProvider,
+        DeleteFailedOpenService,
     }
 
     pub(crate) async fn run_peer_creation_removal(
@@ -3620,7 +3664,9 @@ pub(crate) mod report_tests {
         );
         let provider = matches!(
             outcome,
-            PeerCreationOutcome::DeleteProvider | PeerCreationOutcome::DeleteOpeningProvider
+            PeerCreationOutcome::DeleteProvider
+                | PeerCreationOutcome::DeleteOpeningProvider
+                | PeerCreationOutcome::DeleteFailedOpenProvider
         );
         let opening = matches!(
             outcome,
@@ -3629,12 +3675,23 @@ pub(crate) mod report_tests {
         let absent = matches!(outcome, PeerCreationOutcome::DeleteAbsent);
         let pre_registration = matches!(outcome, PeerCreationOutcome::DeletePreRegistration);
         let failed_registration = matches!(outcome, PeerCreationOutcome::DeleteFailedRegistration);
+        let failed_open = matches!(
+            outcome,
+            PeerCreationOutcome::DeleteFailedOpenProvider
+                | PeerCreationOutcome::DeleteFailedOpenService
+        );
+        let actual_failure = failed_registration || failed_open;
         let (mut source, source_store) = create_node(&launches[0]).await?;
         let (mut target, target_store) = create_node(&launches[1]).await?;
         if failed_registration {
             target
                 .native_config()
                 .set(ra::RetryState::Registration, ra::Threshold::Drop, 1);
+        }
+        if failed_open {
+            target
+                .native_config()
+                .set(ra::RetryState::Opening, ra::Threshold::Drop, 1);
         }
         let mut source_adapter = Adapter::default();
         let mut target_adapter = Adapter::default();
@@ -3652,10 +3709,11 @@ pub(crate) mod report_tests {
                     APPLICATION,
                     &[(
                         "Arguments".into(),
-                        format!("--stateful-lifecycle --data-replicator{}{}{}", if deleting {
+                        format!("--stateful-lifecycle --data-replicator{}{}{}{}", if deleting || failed_open {
                             if provider { " --block-provider-dispose" } else { " --block-dispose" }
                         } else { "" }, if opening { " --block-open" } else { "" },
-                        if failed_registration { " --block-registration" } else { "" }),
+                        if failed_registration { " --block-registration" } else { "" },
+                        if failed_open { " --fail-open" } else { "" }),
                     )],
                 )
                 .map_err(err)?;
@@ -3789,7 +3847,7 @@ pub(crate) mod report_tests {
                         || target.retained_usage() != 0
                     { return Err("pre-registration fixture adopted a runtime before Delete".into()); }
                 }
-                if matches!(outcome, PeerCreationOutcome::Opened) || deleting || failed_registration {
+                if matches!(outcome, PeerCreationOutcome::Opened) || deleting || actual_failure {
                     source_link
                         .send(
                             create_replica_message(&create, &launches[0].generation)
@@ -3797,7 +3855,10 @@ pub(crate) mod report_tests {
                         )
                         .await?;
                     let end = Instant::now() + Duration::from_secs(8);
-                    while if opening {
+                    while if failed_open {
+                        !target.activation().logs().iter().any(|line| line.contains(
+                            if provider { "LOCAL_DATA_PROVIDER dispose begin" } else { "LOCAL_DISPOSE begin" }))
+                    } else if opening {
                         !target.activation().logs().iter().any(|line| line.contains("LOCAL_OPEN held"))
                     } else { target_adapter.peer_last_reply.is_none() } {
                         peer_step(
@@ -3821,22 +3882,39 @@ pub(crate) mod report_tests {
                             return Err("destination Open deadline".into());
                         }
                     }
+                    if failed_open {
+                        if target.runtime_open_failure().is_some() || target.failed_open_deletion().is_some()
+                            || target.instance_disposal().is_some() || target.retained_usage() != 1
+                            || target_adapter.peer_last_reply.is_some() || !traffic.idle_adds.is_empty()
+                            || ledger.request_idle_deletion(Instant::now(), crate::fm::IdleDeleteTarget::FailedOpen).is_ok()
+                            || !data_request(&endpoint, b"read\n").await?.contains("value=acknowledged")
+                        { return Err("held failed-Open disposal published failure/cleanup or changed Primary serving".into()); }
+                        release_disposal(&target, if provider { StatefulDown::CloseProvider } else { StatefulDown::CloseService })?;
+                        let end = Instant::now() + Duration::from_secs(5);
+                        while target_adapter.peer_last_reply.is_none() {
+                            peer_step(&launches[1], &mut target, &mut target_adapter, &target_link, None).await?;
+                            if Instant::now() >= end { return Err("failed Open disposal/reply deadline".into()); }
+                        }
+                    }
                 }
-                let failed = matches!(outcome, PeerCreationOutcome::Failed) || failed_registration;
-                let creation_error = if failed_registration { ra::HOSTING_SERVICE_TYPE_NOT_REGISTERED } else { ra::RA_NOT_READY };
-                if failed_registration {
+                let failed = matches!(outcome, PeerCreationOutcome::Failed) || actual_failure;
+                let creation_error = if failed_registration { ra::HOSTING_SERVICE_TYPE_NOT_REGISTERED }
+                    else if failed_open { 0x80004005u32 as i32 as i64 } else { ra::RA_NOT_READY };
+                if actual_failure {
                     let end = Instant::now() + Duration::from_secs(5);
                     while traffic.idle_adds.is_empty() {
                         peer_step(&launches[0], &mut source, &mut source_adapter, &source_link, Some(&fm_link)).await?;
                         step(&launches[0], &mut source, &mut source_adapter, &fm, &fm_link, &mut traffic).await?;
                         if Instant::now() >= end { return Err("original registration AddReplicaReply deadline".into()); }
                     }
-                    if traffic.idle_adds[0].error != creation_error || target.pre_open_registration_failure().is_none()
-                        || target.failed_registration_deletion().is_some()
+                    if traffic.idle_adds[0].error != creation_error
+                        || (failed_registration && target.pre_open_registration_failure().is_none())
+                        || (failed_open && target.runtime_open_failure().is_none())
+                        || target.failed_registration_deletion().is_some() || target.failed_open_deletion().is_some()
                     { return Err("registration failure was not actual original pre-Open lineage".into()); }
                     ledger.idle_reply(0, traffic.idle_adds[0].clone())?;
                 }
-                if failed && !failed_registration {
+                if failed && !actual_failure {
                     let failure = CreateReplicaReply {
                         unit: request.unit.clone(),
                         replica: request.replica.clone(),
@@ -3934,20 +4012,93 @@ pub(crate) mod report_tests {
                 if traffic.idle_removals[1] != expected {
                     return Err("local cleanup replay changed the reply".into());
                 }
-                if !deleting && !absent && !pre_registration && !failed_registration {
+                if !deleting && !absent && !pre_registration && !actual_failure {
                     ledger.idle_removal_reply(0, traffic.idle_removals[1].clone())?;
                 }
-                if ledger.idle_removal_status()["pending_remove"] != (deleting || absent || pre_registration || failed_registration)
+                if ledger.idle_removal_status()["pending_remove"] != (deleting || absent || pre_registration || actual_failure)
                     || (failed
                         && (ledger.idle_status()["state"] != "failed"
                             || ledger.idle_status()["error"] != creation_error
                             || ledger.idle_status()["destination_cleanup_required"] != true
-                            || (!failed_registration && ledger.idle_removal_status()["completion"]
+                            || (!actual_failure && ledger.idle_removal_status()["completion"]
                                 != "failed_creation_retired")))
                 {
                     return Err(
                         "semantic cleanup erased the original failure or claimed disposal".into(),
                     );
+                }
+                if failed_open {
+                    let (target_fm, target_fm_link) = links(&launches[1]).await?;
+                    let result = async {
+                        let deleting = ledger.request_idle_deletion(Instant::now(), crate::fm::IdleDeleteTarget::FailedOpen)?;
+                        target_fm.send(delete_replica_message(&deleting, &launches[1].generation).map_err(err)?).await?;
+                        let mut target_traffic = Traffic::default();
+                        until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
+                            &mut target_traffic, |node, adapter, traffic| traffic.removed && adapter.replica_drained(node)
+                                && node.failed_open_deletion().is_some()).await?;
+                        let lost = target_traffic.remove_reply.take().ok_or("missing failed Open DeleteReplicaReply")?;
+                        let proof = target.failed_open_deletion().ok_or("missing original failed Open disposal lineage")?;
+                        let disposal = &proof.failure.disposal;
+                        if proof.failure.error != creation_error || disposal.ra_operation == proof.ra_operation
+                            || proof.failure.creation == proof.ra_operation || lost.unit != disposal.body.unit
+                            || disposal.lookup == 0 || disposal.acquisition == 0 || target.retained_usage() != 0
+                            || target.instance_disposal().is_some() || target.replica_absence().is_some()
+                            || target.pre_open_cancellation().is_some() || target.failed_registration_deletion().is_some()
+                            || target.snapshot(entity).committed.is_none_or(|state| state.close_token != 0)
+                        { return Err("failed Open deletion fabricated Close or substituted a no-runtime proof".into()); }
+                        let mut published = None;
+                        publish_failed_open(&launches[1], &target, &mut published)?;
+                        ledger.read_failed_open(1, &launches[1].directory.join("failed-open-deletion.json"), std::process::id())?;
+                        if ledger.idle_deletion_status()["state"] != "pending"
+                            || ledger.idle_deletion_status()["disposed"] != true
+                            || ledger.idle_deletion_status()["destination_deleted"] != false
+                            || ledger.idle_deletion_status()["completion"] != serde_json::Value::Null
+                        { return Err("failed Open disposal alone completed the lost semantic Delete reply".into()); }
+                        let retry = ledger.idle_deletion_retry(1, Instant::now() + Duration::from_secs(11))
+                            .ok_or("missing original failed Open Delete retry")?;
+                        if retry != deleting { return Err("failed Open Delete retry changed the descriptor".into()); }
+                        target_traffic.removed = false;
+                        target_fm.send(delete_replica_message(&retry, &launches[1].generation).map_err(err)?).await?;
+                        until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
+                            &mut target_traffic, |_, _, traffic| traffic.removed).await?;
+                        if target_traffic.remove_reply.as_ref() != Some(&lost) { return Err("failed Open Delete replay changed its reply".into()); }
+                        ledger.reply(1, lost, true)?;
+                        if ledger.idle_deletion_status()["completion"] != "failed_open"
+                            || ledger.idle_deletion_status()["pending_remove"] != true
+                            || ledger.idle_status()["error"] != creation_error || ledger.idle_status()["state"] != "failed"
+                            || ledger.placements[1].reusable
+                        { return Err("failed Open deletion erased Add failure or completed Primary removal".into()); }
+                        source_link.send(create_replica_message(&create, &launches[0].generation).map_err(err)?).await?;
+                        fm.send(add_replica_message(&request, &launches[0].generation).map_err(err)?).await?;
+                        for _ in 0..20 {
+                            peer_step(&launches[1], &mut target, &mut target_adapter, &target_link, Some(&target_fm_link)).await?;
+                            step(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link, &mut target_traffic).await?;
+                            step(&launches[0], &mut source, &mut source_adapter, &fm, &fm_link, &mut traffic).await?;
+                        }
+                        let logs = target.activation().logs();
+                        if serde_json::to_value(target.failed_open_deletion()).map_err(err)?
+                                != serde_json::to_value(Some(&proof)).map_err(err)?
+                            || target.snapshot(entity).committed.is_none_or(|state| !state.local_deleted || state.phase != ra::Phase::Closed)
+                            || target.retained_usage() != 0 || target_adapter.peer_command_error.is_some()
+                            || !target_traffic.reports.is_empty()
+                            || logs.iter().filter(|line| line.contains("LOCAL_CALLBACK open")).count() != 1
+                            || logs.iter().filter(|line| line.contains("LOCAL_CALLBACK abort")).count() != 1
+                            || logs.iter().any(|line| line.contains("LOCAL_CALLBACK close"))
+                            || logs.iter().filter(|line| line.contains("LOCAL_DATA_PROVIDER acquired")).count() != 1
+                            || !logs.iter().any(|line| line.contains("LOCAL_DATA_PROVIDER disposed empty"))
+                            || !logs.iter().any(|line| line.contains("LOCAL_DISPOSE complete"))
+                        { return Err("late Create resurrected the failed deleted lifetime or required another Close".into()); }
+                        ledger.idle_removal_reply(0, traffic.idle_removals[1].clone())?;
+                        let continued = data_request(&endpoint, b"write-more\n").await?;
+                        if !continued.contains("committed=2 value=continued") || data_request(&endpoint, b"read\n").await? != continued
+                            || ledger.idle_status()["error"] != creation_error
+                            || ledger.idle_removal_status()["completion"] != "failed_creation_retired"
+                        { return Err("failed Open cleanup changed Primary serving or original failure".into()); }
+                        Ok(())
+                    }.await;
+                    let closed = target_fm.close().await;
+                    let node_closed = target_fm_link.close().await;
+                    return result.and(closed).and(node_closed);
                 }
                 if failed_registration {
                     let (target_fm, target_fm_link) = links(&launches[1]).await?;
@@ -4444,6 +4595,9 @@ pub(crate) mod report_tests {
             .await;
             if failed_registration {
                 release_fixture_barrier(&target, "local-registration.release")?;
+            }
+            if failed_open {
+                release_disposal(&target, if provider { StatefulDown::CloseProvider } else { StatefulDown::CloseService })?;
             }
             if deleting {
                 if opening {

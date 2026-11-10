@@ -536,8 +536,45 @@ Primary writes. Model/store tests cover late acquired offers, definite/unknown
 Delete commits, mismatched lineage/error and independent owner loss. This is
 controlled owned-Node/production-adapter acceptance, not a new child-node
 policy-control feature or native C++ handler/interoperability qualification.
-Runtime Open failures, unknown/missing failure lineage, other absent/down
+Unknown/missing failure lineage, other absent/down
 branches and replacement remain gated.
+
+### Deleting the original destination after terminal runtime Open failure
+
+The same API admits the original Idle after a definitive runtime Open failure.
+Native `FailoverUnit.cpp:5212-5235` treats terminal Open failure as already
+closed by RAP; `StartCloseLocalReplica` at `4916-4940` then marks closed
+metadata deleted without another RAP Close. The existing Rust runtime awaits
+replicator-before-service Abort and final resource release before its error
+ReplicaOpenReply. A failed reply alone is not destination cleanup.
+
+The original Node captures that exact eligible reply's runtime/host, original
+creation token and paired lookup/acquisition. Only the Applied terminal Open
+completion and exact usage release validate the failure; a separate Applied
+Delete and drained original local work permit `failed-open-deletion.json`.
+No successful Close command, pre-Open failure, cancellation or missing-FT
+absence is fabricated. A nonterminal failure, host crash, fenced/unknown
+outcome or missing original ownership cannot supply this proof.
+
+FM freezes the original failed Add error and requires this distinct receipt
+plus the canonical DeleteReplicaReply, in either order. Completion reports
+`completion=failed_open`, `failed_open=true`, `disposed=true`, with all
+absence/pre-Open-cancellation/registration-failure flags false.
+The failed Add/error survives; Primary pending-remove still requires its own
+RemoveReplicaReply. Deleted metadata suppresses only the matching failed-create
+report placeholder. No replacement or reuse is authorized.
+
+Controlled owned-Node/production-adapter/process/Channel acceptance fails the
+initial Idle service role callback inside real RAP Open, after actual data
+replicator construction/Open. Independent provider and service disposal holds
+prevent early error/proof publication. The existing dynamic Open Drop=1
+threshold selects the terminal native branch for qualification; production
+defaults are unchanged and no child policy-control feature is added.
+Lost Delete reply/replay, late Create/Add, retained error and healthy Primary
+writes are exercised. Model/store tests cover separate failure/Delete commits,
+definite failure, uncertainty, foreign lineage/proof conflicts and owner loss.
+This adds no native wire schema or C++ handler/interoperability qualification.
+Host-loss and other failed/unknown absent/down cleanup remain gated.
 
 ### Deleting the original destination before CreateReplica
 

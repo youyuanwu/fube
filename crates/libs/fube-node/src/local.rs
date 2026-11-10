@@ -280,6 +280,22 @@ pub struct FailedRegistrationDeletion {
     pub command: u64,
     pub ra_operation: u64,
 }
+/// An original runtime's failed Open reply follows Abort and final release,
+/// not a successful Close. Its Applied failure and usage release are separate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeOpenFailure {
+    pub disposal: InstanceDisposal,
+    pub creation: u64,
+    pub error: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailedOpenDeletion {
+    pub failure: RuntimeOpenFailure,
+    pub command: u64,
+    pub ra_operation: u64,
+}
 fn pre_open_cancelled(state: &ra::EntityState, creation: u64) -> bool {
     state.phase == ra::Phase::Closed
         && state.local_deleted
@@ -328,6 +344,11 @@ struct DisposalWitness {
     applied: bool,
     released: bool,
 }
+struct OpenFailureWitness {
+    disposal: DisposalWitness,
+    creation: u64,
+    error: i64,
+}
 
 /// One singleton service/package owner. Finite adapter escrow: 32 commands,
 /// effects/receipts and acquisitions each, 64KiB wire bodies, 32 external pending
@@ -359,6 +380,8 @@ pub struct Node {
     pre_open: Option<PreOpenCancellation>,
     registration_failure: Option<PreOpenRegistrationFailure>,
     failed_registration: Option<FailedRegistrationDeletion>,
+    open_failure: Option<OpenFailureWitness>,
+    failed_open: Option<FailedOpenDeletion>,
     #[cfg(feature = "qualification")]
     hold_replies: bool,
 }
@@ -421,6 +444,8 @@ impl Node {
             pre_open: None,
             registration_failure: None,
             failed_registration: None,
+            open_failure: None,
+            failed_open: None,
             #[cfg(feature = "qualification")]
             hold_replies: false,
         })
@@ -590,6 +615,8 @@ impl Node {
                                             || (state.failed_registration_error().is_some()
                                                 && self.registration_failure.is_some()
                                                 && self.route.is_none())
+                                            || (state.failed_open_error().is_some()
+                                                && self.runtime_open_failure().is_some())
                                             || state.local_deleted)))
                         }
                     };
@@ -990,6 +1017,56 @@ impl Node {
             && self.disposal.is_none()
             && self.absence.is_none()
             && self.pre_open.is_none())
+        .then(|| proof.clone())
+    }
+
+    pub fn runtime_open_failure(&self) -> Option<RuntimeOpenFailure> {
+        let witness = self.open_failure.as_ref()?;
+        let disposal = &witness.disposal;
+        let proof = &disposal.proof;
+        let snapshot = self.ra.snapshot(proof.body.unit.id.guid.0);
+        let state = snapshot.committed?;
+        let mut closed = proof.body.clone();
+        closed.replica.state = 3;
+        closed.replica.up = false;
+        (!snapshot.fenced
+            && disposal.applied
+            && disposal.released
+            && state.failed_open_error() == Some(witness.error)
+            && state.open_token == witness.creation
+            && *state.body == closed
+            && state.registration_lookups.is_empty()
+            && self.usage.is_empty()
+            && self.live.load(Ordering::SeqCst)
+            && self.ra.consumer_lifetime().is_accepting()
+            && self.rejected_reply.is_none()
+            && self.last_error.is_none()
+            && self.route.as_ref()?.runtime == proof.runtime
+            && self.activation.identity()?.host_id == proof.host
+            && self.activation.session_status().ok().flatten()?.connected
+            && !self.activation.process_status()?.exit_observed)
+            .then(|| RuntimeOpenFailure {
+                disposal: proof.clone(),
+                creation: witness.creation,
+                error: witness.error,
+            })
+    }
+
+    pub fn failed_open_deletion(&self) -> Option<FailedOpenDeletion> {
+        let proof = self.failed_open.as_ref()?;
+        let failure = self.runtime_open_failure()?;
+        let snapshot = self.ra.snapshot(failure.disposal.body.unit.id.guid.0);
+        let state = snapshot.committed?;
+        (!snapshot.fenced
+            && state.local_deleted
+            && state.cleanup_pending
+            && self.quiescent()
+            && self.commands.is_empty()
+            && self.receipts.is_empty()
+            && self.disposal.is_none()
+            && self.absence.is_none()
+            && self.pre_open.is_none()
+            && self.failed_registration.is_none())
         .then(|| proof.clone())
     }
 
@@ -1535,6 +1612,48 @@ impl Node {
                     }
                 }
                 let front = self.pending.pop_front().unwrap();
+                if let Work::Open(event) = &front.work {
+                    if let Some(witness) = &mut self.open_failure {
+                        if witness.disposal.proof.command == front.id {
+                            let snapshot = self.ra.snapshot(event.unit.id.guid.0);
+                            if result == Ok(ra::Disposition::Applied)
+                                && !snapshot.fenced
+                                && snapshot.committed.is_some_and(|state| {
+                                    state.failed_open_error() == Some(event.error)
+                                        && state.open_token == witness.creation
+                                        && !state.local_deleted
+                                })
+                            {
+                                witness.disposal.proof.ra_operation =
+                                    front.ticket.as_ref().unwrap().id;
+                                witness.disposal.applied = true;
+                            } else {
+                                self.open_failure = None;
+                            }
+                        }
+                    }
+                }
+                if result == Ok(ra::Disposition::Applied) {
+                    if let Work::Fm(FmWork::DeleteReplica(body, ..)) = &front.work {
+                        if let Some(failure) = self.runtime_open_failure() {
+                            let snapshot = self.ra.snapshot(body.replica.0.unit.id.guid.0);
+                            if !snapshot.fenced
+                                && snapshot.committed.is_some_and(|state| {
+                                    state.local_deleted
+                                        && state.cleanup_pending
+                                        && state.body.unit == failure.disposal.body.unit
+                                })
+                                && self.failed_open.is_none()
+                            {
+                                self.failed_open = Some(FailedOpenDeletion {
+                                    failure,
+                                    command: front.id,
+                                    ra_operation: front.ticket.as_ref().unwrap().id,
+                                });
+                            }
+                        }
+                    }
+                }
                 if result == Ok(ra::Disposition::Applied)
                     && self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
                     && self.ra.peer().is_some()
@@ -1723,6 +1842,17 @@ impl Node {
                 if let Some(witness) = &mut self.disposal {
                     if lineage == (witness.proof.lookup, witness.proof.acquisition, true) {
                         witness.released = true;
+                    }
+                }
+                if let Some(witness) = &mut self.open_failure {
+                    if lineage
+                        == (
+                            witness.disposal.proof.lookup,
+                            witness.disposal.proof.acquisition,
+                            true,
+                        )
+                    {
+                        witness.disposal.released = true;
                     }
                 }
                 Ok(())
@@ -2153,9 +2283,9 @@ impl Node {
             }),
             _ => return Err(Error::Unsupported),
         };
-        // Capture provenance only for an exact currently eligible successful
-        // original-runtime Close, never from Closed/host-down/Remove accounting.
-        let witness = if matches!(&work, Work::Closed(event) if event.error == 0
+        // The original runtime replies only after disposal/final release.
+        // Failed Open and successful Close keep separate Applied lineage.
+        let closed = matches!(&work, Work::Closed(event) if event.error == 0
             && event.unit == state.body.unit
             && event.replica.node == state.body.replica.node
             && event.replica.id == state.body.replica.id
@@ -2164,8 +2294,24 @@ impl Node {
             && state.phase == ra::Phase::Closing
             && state.close_mode != Some(ra::CloseMode::Obliterate)
             && state.body.replica.up
-            && self.disposal.is_none()
-        {
+            && self.disposal.is_none();
+        let failed_open = matches!(&work, Work::Open(event) if event.error != 0
+            && event.error != ra::APPLICATION_HOST_CRASH
+            && event.error != ra::PROXY_STATE_CHANGED_ON_DATA_LOSS
+            && event.unit == state.body.unit
+            && event.replica.node == state.body.replica.node
+            && event.replica.id == state.body.replica.id
+            && event.replica.instance == state.body.replica.instance
+            && event.replica.current_role == state.body.replica.current_role
+            && event.replica.previous_role == state.body.replica.previous_role
+            && event.replica.up && event.replica.state != 0)
+            && state.phase == ra::Phase::Opening
+            && state.peer_creation.is_some()
+            && state.close_token == 0
+            && self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
+            && self.open_failure.is_none()
+            && self.disposal.is_none();
+        let witness = if closed || failed_open {
             state.usage.and_then(|lookup| {
                 self.usage
                     .iter()
@@ -2188,10 +2334,22 @@ impl Node {
         } else {
             None
         };
+        let error = match &work {
+            Work::Open(event) => event.error,
+            _ => 0,
+        };
         let id = self.enqueue(work)?;
         if let Some(mut witness) = witness {
             witness.proof.command = id;
-            self.disposal = Some(witness);
+            if failed_open {
+                self.open_failure = Some(OpenFailureWitness {
+                    disposal: witness,
+                    creation: state.open_token,
+                    error,
+                });
+            } else {
+                self.disposal = Some(witness);
+            }
         }
         self.held_reply = None;
         Ok(())

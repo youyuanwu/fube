@@ -484,6 +484,65 @@ impl FailedRegistrationReceipt {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct FailedOpenReceipt {
+    pub deployment: String,
+    pub session: String,
+    #[serde(with = "json_node")]
+    pub node: NodeInstance,
+    #[serde(with = "json_node")]
+    pub fm: NodeInstance,
+    #[serde(with = "json_generation")]
+    pub generation: GenerationHeader,
+    pub node_pid: u32,
+    pub app_pid: u32,
+    pub runtime_root: PathBuf,
+    pub deletion: fube_node::local::FailedOpenDeletion,
+}
+impl FailedOpenReceipt {
+    pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
+        let failure = &self.deletion.failure;
+        let disposal = &failure.disposal;
+        let mut original = add_body(launch, profile);
+        original.replica.current_role = 2;
+        if launch.profile != ServiceProfile::StatefulPeerIdle
+            || launch.placement != 2
+            || launch.peer.is_none()
+            || self.deployment != launch.deployment
+            || self.session != launch.session
+            || self.node != launch.node
+            || self.fm != launch.fm
+            || self.generation != launch.generation
+            || self.node_pid != node_pid
+            || self.app_pid != profile.app_pid
+            || self.runtime_root != profile.runtime_root
+            || disposal.body != original
+            || disposal.host.is_empty()
+            || disposal.runtime.is_empty()
+            || disposal.command == 0
+            || disposal.ra_operation == 0
+            || disposal.lookup == 0
+            || disposal.acquisition == 0
+            || failure.error == 0
+            || failure.error == fube_ra::entity::APPLICATION_HOST_CRASH
+            || failure.error == fube_ra::entity::PROXY_STATE_CHANGED_ON_DATA_LOSS
+            || failure.creation == 0
+            || failure.creation == disposal.ra_operation
+            || failure.creation == self.deletion.ra_operation
+            || self.deletion.command == 0
+            || self.deletion.ra_operation == 0
+            || self.deletion.command == disposal.command
+            || self.deletion.ra_operation == disposal.ra_operation
+        {
+            return Err(
+                "failed Open deletion does not match the original runtime/failure lineage".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AbsenceReceipt {
     pub deployment: String,
     pub session: String,

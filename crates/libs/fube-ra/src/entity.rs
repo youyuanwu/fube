@@ -1630,6 +1630,7 @@ fn transition(
                         source: source.clone(),
                         deactivation: deactivation.clone(),
                         registration_error: None,
+                        open_error: None,
                     })
                 }
                 _ => None,
