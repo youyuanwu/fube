@@ -12,12 +12,21 @@ pub struct RemoteIdle {
     pub body: Arc<CreateReplica>,
     pub reply: Option<CreateReplicaReply>,
     pub build: Option<RemoteBuild>,
+    pub removal: Option<RemoteRemoval>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoteBuild {
     pub body: Arc<AddInstance>,
     /// None is pending, not proof of failure or permission to replace a peer.
+    pub result: Option<i64>,
+    pub detail: ProxyErrorDetail,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteRemoval {
+    pub body: Arc<AddInstance>,
+    pub replica: Replica,
     pub result: Option<i64>,
     pub detail: ProxyErrorDetail,
 }
@@ -30,6 +39,8 @@ pub struct BuildCompletion {
     pub error: i64,
     pub detail: ProxyErrorDetail,
 }
+
+pub type RemovalCompletion = BuildCompletion;
 
 impl Executor {
     /// One original configured peer, bound before any local FT is accepted.
@@ -147,7 +158,7 @@ pub(super) fn start_remote(
         if previous.body.as_ref() != &body || previous.target != target.node {
             return Err(Failure::Unsupported("remote Idle replacement is gated"));
         }
-        if previous.reply.is_some() {
+        if previous.reply.is_some() || previous.removal.is_some() {
             return Ok(Transition::ignored(Disposition::IgnoredStale));
         }
     }
@@ -157,6 +168,7 @@ pub(super) fn start_remote(
         body: Arc::new(body.clone()),
         reply: None,
         build: None,
+        removal: None,
     });
     Ok(lifecycle::changed(
         state,
@@ -237,6 +249,9 @@ pub(super) fn start_build(
         .remote_idle
         .as_ref()
         .ok_or(Failure::Unsupported("no opened peer Idle"))?;
+    if remote.removal.is_some() {
+        return Err(Failure::Unsupported("peer Idle removal is terminal"));
+    }
     let reply = remote
         .reply
         .as_ref()
@@ -256,16 +271,12 @@ pub(super) fn start_build(
             "build requires the original current Primary and peer",
         ));
     }
-    if let Some(build) = &remote.build {
-        if let Some(error) = build.result {
-            return if error == 0 {
-                Ok(Transition::ignored(Disposition::IgnoredStale))
-            } else {
-                Err(Failure::Unsupported(
-                    "failed build requires explicit replicator removal cleanup",
-                ))
-            };
-        }
+    if remote
+        .build
+        .as_ref()
+        .is_some_and(|build| build.result == Some(0))
+    {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
     }
     let mut state = current.clone();
     let body = remote
@@ -304,13 +315,9 @@ pub(super) fn complete_build(
     let Some(build) = &remote.build else {
         return Ok(Transition::ignored(Disposition::IgnoredStale));
     };
-    let mut local = event.local;
-    // RAP may refresh progress while retaining this exact invocation identity.
-    local.first_lsn = build.body.replica.first_lsn;
-    local.last_lsn = build.body.replica.last_lsn;
-    if build.result.is_some()
-        || event.unit != build.body.unit
-        || local != build.body.replica
+    if remote.removal.is_some()
+        || build.result == Some(0)
+        || !matches_local(&build.body, &event)
         || remote
             .reply
             .as_ref()
@@ -329,4 +336,109 @@ pub(super) fn complete_build(
     build.result = Some(event.error);
     build.detail = event.detail;
     Ok(lifecycle::changed(state, vec![], false))
+}
+
+pub(super) fn start_removal(
+    current: Option<&EntityState>,
+    admission: &Admission,
+    peer: Option<&NodeInstance>,
+) -> Result<Transition> {
+    let current = current.ok_or(Failure::Admission("removal requires an existing Primary"))?;
+    if !admission.node_open || !admission.owner_ready || !admission.node_activated {
+        return Ok(Transition::ignored(Disposition::IgnoredNotReady));
+    }
+    let remote = current
+        .remote_idle
+        .as_ref()
+        .ok_or(Failure::Unsupported("no opened peer Idle"))?;
+    let reply = remote
+        .reply
+        .as_ref()
+        .filter(|reply| reply.error == 0)
+        .ok_or(Failure::Unsupported("peer Open has not succeeded"))?;
+    let registration = current
+        .runtime
+        .as_ref()
+        .ok_or(Failure::Unsupported("no original runtime"))?;
+    if current.phase != Phase::Ready
+        || !current.fm_primary
+        || current.body.replica.current_role != 4
+        || current.peer_creation.is_some()
+        || peer != Some(&remote.target)
+    {
+        return Err(Failure::Unsupported(
+            "removal requires the original current Primary and peer",
+        ));
+    }
+    if remote
+        .removal
+        .as_ref()
+        .is_some_and(|removal| removal.result == Some(0))
+    {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    }
+    let mut removal = remote.removal.clone().unwrap_or_else(|| {
+        let mut replica = reply.replica.clone();
+        // Native RA InDrop maps to Dropped on the RAP wire, not remote deletion.
+        replica.state = 3;
+        RemoteRemoval {
+            body: current.body.clone(),
+            replica,
+            result: None,
+            detail: ProxyErrorDetail::default(),
+        }
+    });
+    removal.result = None;
+    let effect = Effect::RemoveIdle {
+        body: removal.body.clone(),
+        replica: Box::new(removal.replica.clone()),
+        registration: registration.clone(),
+    };
+    let mut state = current.clone();
+    state.remote_idle.as_mut().expect("checked remote").removal = Some(removal);
+    Ok(lifecycle::changed(state, vec![effect], false))
+}
+
+pub(super) fn complete_removal(
+    work: &Submission,
+    current: Option<&EntityState>,
+) -> Result<Transition> {
+    let event: RemovalCompletion =
+        from_slice(&work.bytes).map_err(|_| Failure::Admission("invalid removal completion"))?;
+    let Some(current) = current.filter(|state| state.phase == Phase::Ready && state.fm_primary)
+    else {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    };
+    let Some(removal) = current
+        .remote_idle
+        .as_ref()
+        .and_then(|remote| remote.removal.as_ref())
+    else {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    };
+    if removal.result == Some(0)
+        || !matches_local(&removal.body, &event)
+        || event.remote != removal.replica
+    {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    }
+    let mut state = current.clone();
+    let removal = state
+        .remote_idle
+        .as_mut()
+        .expect("checked remote")
+        .removal
+        .as_mut()
+        .expect("checked removal");
+    removal.result = Some(event.error);
+    removal.detail = event.detail;
+    Ok(lifecycle::changed(state, vec![], false))
+}
+
+fn matches_local(body: &AddInstance, event: &BuildCompletion) -> bool {
+    let mut local = event.local.clone();
+    // RAP may refresh progress while retaining this exact invocation identity.
+    local.first_lsn = body.replica.first_lsn;
+    local.last_lsn = body.replica.last_lsn;
+    event.unit == body.unit && local == body.replica
 }

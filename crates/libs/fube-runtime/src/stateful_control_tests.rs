@@ -304,6 +304,10 @@ async fn concurrent_builds_remove_cancel_and_tombstones_preserve_remote_incarnat
         (removed.remote.0[0].id, removed.remote.0[0].instance),
         (200, 1)
     );
+    assert_eq!(
+        *calls.removals.lock().unwrap(),
+        [crate::ReplicaRemoval::Idle]
+    );
     calls.build_release.notify_waiters();
     let built: ProxyReply =
         from_slice(&h.receive("ReplicatorBuildIdleReplicaReply").await.body).unwrap();
@@ -311,6 +315,129 @@ async fn concurrent_builds_remove_cancel_and_tombstones_preserve_remote_incarnat
     h.send("ReplicatorBuildIdleReplica", &build_a).await;
     h.no_reply().await;
     assert_eq!(calls.builds.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn idle_removal_before_build_is_idempotent_and_suppresses_delayed_build() {
+    let mut h = Harness::new().await;
+    let calls = register(&h);
+    let open = request(&h, 2, 1, 20);
+    h.send("ReplicaOpen", &open).await;
+    h.receive("ReplicaOpenReply").await;
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    let mut idle = peer(&open.local, 2);
+    idle.current_role = 2;
+    idle.state = 3;
+    let remove = control(&open, "ReplicatorRemoveIdleReplica", vec![idle.clone()]);
+    for _ in 0..2 {
+        h.send("ReplicatorRemoveIdleReplica", &remove).await;
+        let reply: ProxyReply =
+            from_slice(&h.receive("ReplicatorRemoveIdleReplicaReply").await.body).unwrap();
+        assert_eq!(reply.error.error, 0);
+        assert_eq!(reply.remote.0.len(), 1);
+        assert_eq!(
+            (
+                reply.remote.0[0].id,
+                reply.remote.0[0].instance,
+                reply.remote.0[0].state
+            ),
+            (idle.id, idle.instance, idle.state),
+        );
+        h.engine
+            .shared
+            .stateful
+            .wait_remote_idle([2; 16], [2; 16])
+            .await;
+    }
+    idle.state = 1;
+    let build = control(&open, "ReplicatorBuildIdleReplica", vec![idle]);
+    h.send("ReplicatorBuildIdleReplica", &build).await;
+    h.no_reply().await;
+    assert!(calls.builds.lock().unwrap().is_empty());
+    assert!(calls.removals.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn replicator_absence_completes_retry_cleanup_and_terminal_idle_removal() {
+    for mode in [43, 44] {
+        let mut h = Harness::new().await;
+        let calls = register(&h);
+        let open = request(&h, 2, 1, mode);
+        h.send("ReplicaOpen", &open).await;
+        h.receive("ReplicaOpenReply").await;
+        h.engine.shared.stateful.wait_idle([2; 16]).await;
+        let mut idle = peer(&open.local, 2);
+        idle.current_role = 2;
+        let build = control(&open, "ReplicatorBuildIdleReplica", vec![idle.clone()]);
+        h.send("ReplicatorBuildIdleReplica", &build).await;
+        let first: ProxyReply =
+            from_slice(&h.receive("ReplicatorBuildIdleReplicaReply").await.body).unwrap();
+        assert_eq!(first.error.error, if mode == 43 { -993 } else { 0 });
+        h.engine
+            .shared
+            .stateful
+            .wait_remote_idle([2; 16], [2; 16])
+            .await;
+        if mode == 43 {
+            h.send("ReplicatorBuildIdleReplica", &build).await;
+            h.engine
+                .shared
+                .stateful
+                .wait_remote_idle([2; 16], [2; 16])
+                .await;
+            h.no_reply().await;
+            assert_eq!(
+                *calls.removals.lock().unwrap(),
+                [crate::ReplicaRemoval::BuildRetryCleanup]
+            );
+            h.send("ReplicatorBuildIdleReplica", &build).await;
+            let rebuilt: ProxyReply =
+                from_slice(&h.receive("ReplicatorBuildIdleReplicaReply").await.body).unwrap();
+            assert_eq!(rebuilt.error.error, 0);
+            h.engine
+                .shared
+                .stateful
+                .wait_remote_idle([2; 16], [2; 16])
+                .await;
+        }
+        idle.state = 3;
+        let remove = control(&open, "ReplicatorRemoveIdleReplica", vec![idle]);
+        if mode == 44 {
+            calls.uncertain_removal.store(true, Ordering::Release);
+            h.send("ReplicatorRemoveIdleReplica", &remove).await;
+            let reply: ProxyReply =
+                from_slice(&h.receive("ReplicatorRemoveIdleReplicaReply").await.body).unwrap();
+            assert_eq!(reply.error.error, 0x80071be8u32 as i32 as i64);
+            h.engine
+                .shared
+                .stateful
+                .wait_remote_idle([2; 16], [2; 16])
+                .await;
+            calls.uncertain_removal.store(false, Ordering::Release);
+        }
+        for _ in 0..2 {
+            h.send("ReplicatorRemoveIdleReplica", &remove).await;
+            let reply: ProxyReply =
+                from_slice(&h.receive("ReplicatorRemoveIdleReplicaReply").await.body).unwrap();
+            assert_eq!(reply.error.error, 0);
+            h.engine
+                .shared
+                .stateful
+                .wait_remote_idle([2; 16], [2; 16])
+                .await;
+        }
+        assert_eq!(
+            calls.removals.lock().unwrap().last(),
+            Some(&crate::ReplicaRemoval::Idle)
+        );
+        assert_eq!(calls.removals.lock().unwrap().len(), 2);
+        h.send("ReplicatorBuildIdleReplica", &build).await;
+        h.no_reply().await;
+        assert_eq!(
+            calls.builds.lock().unwrap().len(),
+            if mode == 43 { 2 } else { 1 }
+        );
+    }
 }
 
 #[tokio::test]

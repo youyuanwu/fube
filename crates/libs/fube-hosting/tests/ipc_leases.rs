@@ -963,7 +963,11 @@ async fn semantic_lifecycle_is_one_way_on_the_owned_session_and_allows_priority_
     assert_eq!(received.body(), &[7, 8]);
     assert!(lease.take_lifecycle_reply().is_none());
     // Only the lease had a correlated response. Lifecycle ingress emits none.
-    for action in ["ReplicaClose", "ReplicatorBuildIdleReplica"] {
+    for action in [
+        "ReplicaClose",
+        "ReplicatorBuildIdleReplica",
+        "ReplicatorRemoveIdleReplica",
+    ] {
         let send = lease.send_lifecycle(action, vec![9]).unwrap();
         let request = read_message(&mut peer.socket).await.unwrap();
         let p = request.properties().unwrap();
@@ -981,20 +985,22 @@ async fn semantic_lifecycle_is_one_way_on_the_owned_session_and_allows_priority_
         .unwrap();
         send.result().unwrap().unwrap();
     }
-    let mut built = peer.frame(12, "ReplicatorBuildIdleReplicaReply", vec![10]);
-    built
-        .headers
-        .retain(|h| h.id != EXPECTS_REPLY && h.id != fube_transport::message::TIMEOUT);
-    write_message(&mut peer.socket, &built).await.unwrap();
-    let ping = peer.frame(15, "", vec![]);
-    peer.raw(ping).await.unwrap();
-    let received = lease.take_lifecycle_reply().unwrap();
-    assert!(received.belongs_to(&lease));
-    assert_eq!(
-        received.action().unwrap(),
-        "ReplicatorBuildIdleReplicaReply"
-    );
-    assert_eq!(received.body(), &[10]);
+    for action in [
+        "ReplicatorBuildIdleReplicaReply",
+        "ReplicatorRemoveIdleReplicaReply",
+    ] {
+        let mut reply = peer.frame(12, action, vec![10]);
+        reply
+            .headers
+            .retain(|h| h.id != EXPECTS_REPLY && h.id != fube_transport::message::TIMEOUT);
+        write_message(&mut peer.socket, &reply).await.unwrap();
+        let ping = peer.frame(15, "", vec![]);
+        peer.raw(ping).await.unwrap();
+        let received = lease.take_lifecycle_reply().unwrap();
+        assert!(received.belongs_to(&lease));
+        assert_eq!(received.action().unwrap(), action);
+        assert_eq!(received.body(), &[10]);
+    }
     // Replaying the same actual wire ID cannot regain admission.
     write_message(&mut peer.socket, &semantic).await.unwrap();
     disconnected(&server, &lease).await;

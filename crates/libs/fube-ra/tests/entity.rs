@@ -2806,6 +2806,13 @@ async fn opened_peer_primary() -> (Store, Executor, CreateReplicaReply) {
         pending.wait(WAIT).await,
         Err(Failure::Unsupported(_))
     ));
+    let premature = executor
+        .submit(Command::RemoveRemoteIdle(primary.body.unit.id.clone()))
+        .unwrap();
+    assert!(matches!(
+        premature.wait(WAIT).await,
+        Err(Failure::Unsupported(_))
+    ));
     replica.replication_endpoint = "127.0.0.1:12346".into();
     let reply = CreateReplicaReply {
         unit: primary.body.unit.clone(),
@@ -2935,7 +2942,7 @@ async fn peer_build_is_explicit_correlated_and_never_grants_membership() {
 }
 
 #[tokio::test]
-async fn peer_build_errors_retain_cleanup_and_close_fences_late_success() {
+async fn peer_build_errors_retry_the_original_rap_obligation_and_close_fences_late_success() {
     for error in [0, -2_147_017_398] {
         let (store, executor, remote) = opened_peer_primary().await;
         let primary = state(&executor);
@@ -2944,7 +2951,7 @@ async fn peer_build_errors_retain_cleanup_and_close_fences_late_success() {
             Command::BuildRemoteIdle(primary.body.unit.id.clone()),
         )
         .await;
-        effects(&executor);
+        let first = effects(&executor);
         let event = BuildCompletion {
             unit: primary.body.unit.clone(),
             local: primary.body.replica.clone(),
@@ -2961,13 +2968,39 @@ async fn peer_build_errors_retain_cleanup_and_close_fences_late_success() {
             let build = after.remote_idle.as_ref().unwrap().build.as_ref().unwrap();
             assert_eq!(build.result, Some(error));
             assert_eq!(build.detail, event.detail);
-            let retry = executor
-                .submit(Command::BuildRemoteIdle(primary.body.unit.id.clone()))
-                .unwrap();
-            assert!(matches!(
-                retry.wait(WAIT).await,
-                Err(Failure::Unsupported(_))
-            ));
+            run(
+                &executor,
+                Command::BuildRemoteIdle(primary.body.unit.id.clone()),
+            )
+            .await;
+            assert_eq!(effects(&executor), first);
+            assert_eq!(
+                state(&executor)
+                    .remote_idle
+                    .as_ref()
+                    .unwrap()
+                    .build
+                    .as_ref()
+                    .unwrap()
+                    .result,
+                None,
+            );
+            // A repeated failure does not consume a later native success.
+            run(&executor, Command::CompleteBuild(Box::new(event.clone()))).await;
+            let mut success = event.clone();
+            success.error = 0;
+            run(&executor, Command::CompleteBuild(Box::new(success))).await;
+            assert_eq!(
+                state(&executor)
+                    .remote_idle
+                    .as_ref()
+                    .unwrap()
+                    .build
+                    .as_ref()
+                    .unwrap()
+                    .result,
+                Some(0),
+            );
         }
         run(
             &executor,
@@ -2988,6 +3021,224 @@ async fn peer_build_errors_retain_cleanup_and_close_fences_late_success() {
         assert!(effects(&executor).is_empty());
         finish(&store, &executor).await;
     }
+}
+
+#[tokio::test]
+async fn peer_idle_removal_is_terminal_for_unbuilt_pending_successful_and_failed_builds() {
+    for (started, result) in [
+        (false, None),
+        (true, None),
+        (true, Some(0)),
+        (true, Some(-993)),
+    ] {
+        let (store, executor, remote) = opened_peer_primary().await;
+        let primary = state(&executor);
+        let build = || Command::BuildRemoteIdle(primary.body.unit.id.clone());
+        let built = BuildCompletion {
+            unit: primary.body.unit.clone(),
+            local: primary.body.replica.clone(),
+            remote: remote.replica.clone(),
+            error: 0,
+            detail: ProxyErrorDetail::default(),
+        };
+        assert_eq!(
+            run(&executor, Command::CompleteRemoval(Box::new(built.clone()))).await,
+            Disposition::IgnoredStale,
+        );
+        if started {
+            run(&executor, build()).await;
+            effects(&executor);
+            if let Some(error) = result {
+                let mut event = built.clone();
+                event.error = error;
+                run(&executor, Command::CompleteBuild(Box::new(event))).await;
+            }
+        }
+        let remove = || Command::RemoveRemoteIdle(primary.body.unit.id.clone());
+        run(&executor, remove()).await;
+        let first = effects(&executor);
+        let mut dropped = remote.replica.clone();
+        dropped.state = 3;
+        assert!(
+            matches!(&first[..], [Effect::RemoveIdle { body, replica, registration }]
+            if body == &primary.body && **replica == dropped
+                && Some(registration) == primary.runtime.as_ref())
+        );
+        assert_eq!(state(&executor).body, primary.body);
+        assert_eq!(
+            state(&executor)
+                .remote_idle
+                .as_ref()
+                .unwrap()
+                .removal
+                .as_ref()
+                .unwrap()
+                .result,
+            None,
+        );
+        run(&executor, remove()).await;
+        assert_eq!(effects(&executor), first);
+        assert!(matches!(
+            executor.submit(build()).unwrap().wait(WAIT).await,
+            Err(Failure::Unsupported(_))
+        ));
+        assert_eq!(
+            run(&executor, Command::CompleteBuild(Box::new(built.clone()))).await,
+            Disposition::IgnoredStale,
+        );
+        let removed = RemovalCompletion {
+            remote: dropped,
+            ..built
+        };
+        for event in [
+            {
+                let mut e = removed.clone();
+                e.remote.instance += 1;
+                e
+            },
+            {
+                let mut e = removed.clone();
+                e.local.id += 1;
+                e
+            },
+            {
+                let mut e = removed.clone();
+                e.unit.current.configuration += 1;
+                e
+            },
+            {
+                let mut e = removed.clone();
+                e.remote.replication_endpoint = "foreign".into();
+                e
+            },
+        ] {
+            assert_eq!(
+                run(&executor, Command::CompleteRemoval(Box::new(event))).await,
+                Disposition::IgnoredStale,
+            );
+        }
+        let mut failed = removed.clone();
+        failed.error = -992;
+        failed.detail.message = "partial removal requires retry".into();
+        run(
+            &executor,
+            Command::CompleteRemoval(Box::new(failed.clone())),
+        )
+        .await;
+        let after = state(&executor);
+        let removal = after
+            .remote_idle
+            .as_ref()
+            .unwrap()
+            .removal
+            .as_ref()
+            .unwrap();
+        assert_eq!(removal.result, Some(-992));
+        assert_eq!(removal.detail, failed.detail);
+        run(&executor, remove()).await;
+        assert_eq!(effects(&executor), first);
+        run(&executor, Command::CompleteRemoval(Box::new(failed))).await;
+        let mut progress = removed.clone();
+        progress.local.first_lsn = 12;
+        progress.local.last_lsn = 14;
+        run(&executor, Command::CompleteRemoval(Box::new(progress))).await;
+        let after = state(&executor);
+        assert_eq!(
+            after
+                .remote_idle
+                .as_ref()
+                .unwrap()
+                .removal
+                .as_ref()
+                .unwrap()
+                .result,
+            Some(0)
+        );
+        assert_eq!(
+            after.remote_idle.as_ref().unwrap().reply,
+            Some(remote.clone())
+        );
+        assert_eq!(after.body, primary.body);
+        assert_eq!(after.runtime, primary.runtime);
+        assert_eq!(after.usage, primary.usage);
+        assert_eq!(run(&executor, remove()).await, Disposition::IgnoredStale);
+        assert_eq!(
+            run(
+                &executor,
+                Command::CompleteRemoval(Box::new(removed.clone()))
+            )
+            .await,
+            Disposition::IgnoredStale,
+        );
+        let mut original = remote.replica;
+        original.replication_endpoint.clear();
+        assert_eq!(
+            run(
+                &executor,
+                Command::CreateRemoteIdle {
+                    unit: primary.body.unit.id.clone(),
+                    replica: original,
+                }
+            )
+            .await,
+            Disposition::IgnoredStale,
+        );
+        assert!(effects(&executor).is_empty());
+        run(
+            &executor,
+            Command::CloseLocal {
+                unit: primary.body.unit.id.clone(),
+                mode: CloseMode::Close,
+            },
+        )
+        .await;
+        effects(&executor);
+        assert_eq!(
+            run(&executor, Command::CompleteRemoval(Box::new(removed))).await,
+            Disposition::IgnoredStale,
+        );
+        assert!(state(&executor).remote_idle.is_none());
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
+async fn primary_close_fences_pending_idle_removal_without_claiming_remote_disposal() {
+    let (store, executor, remote) = opened_peer_primary().await;
+    let primary = state(&executor);
+    run(
+        &executor,
+        Command::RemoveRemoteIdle(primary.body.unit.id.clone()),
+    )
+    .await;
+    effects(&executor);
+    let mut replica = remote.replica;
+    replica.state = 3;
+    let completion = RemovalCompletion {
+        unit: primary.body.unit.clone(),
+        local: primary.body.replica.clone(),
+        remote: replica,
+        error: 0,
+        detail: ProxyErrorDetail::default(),
+    };
+    run(
+        &executor,
+        Command::CloseLocal {
+            unit: primary.body.unit.id.clone(),
+            mode: CloseMode::Close,
+        },
+    )
+    .await;
+    let closing = state(&executor);
+    assert_eq!(closing.phase, Phase::Closing);
+    assert!(closing.remote_idle.is_none());
+    effects(&executor);
+    assert_eq!(
+        run(&executor, Command::CompleteRemoval(Box::new(completion))).await,
+        Disposition::IgnoredStale,
+    );
+    assert!(effects(&executor).is_empty());
+    finish(&store, &executor).await;
 }
 
 fn primary_body() -> AddPrimary {

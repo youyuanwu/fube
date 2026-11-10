@@ -46,7 +46,9 @@ mod generation;
 pub use generation::{GenerationState, GenerationUpdateOutcome};
 #[path = "peer.rs"]
 mod peer;
-pub use peer::{BuildCompletion, PeerCreation, RemoteBuild, RemoteIdle};
+pub use peer::{
+    BuildCompletion, PeerCreation, RemoteBuild, RemoteIdle, RemoteRemoval, RemovalCompletion,
+};
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -328,6 +330,9 @@ pub enum Command {
     /// Trusted local authorization to copy into the opened original peer Idle.
     BuildRemoteIdle(PartitionId),
     CompleteBuild(Box<BuildCompletion>),
+    /// Terminal Primary-side Idle removal, not destination DeleteReplica.
+    RemoveRemoteIdle(PartitionId),
+    CompleteRemoval(Box<RemovalCompletion>),
     CreateReplicaReply {
         body: Box<CreateReplicaReply>,
         source: NodeInstance,
@@ -402,6 +407,8 @@ enum Kind {
     CreateRemoteIdle,
     BuildRemoteIdle,
     CompleteBuild,
+    RemoveRemoteIdle,
+    CompleteRemoval,
     CreateReplicaReply {
         source: NodeInstance,
         generation: GenerationHeader,
@@ -557,6 +564,11 @@ pub struct Snapshot {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
+    RemoveIdle {
+        body: Arc<AddInstance>,
+        replica: Box<Replica>,
+        registration: RuntimeRegistration,
+    },
     BuildIdle {
         body: Arc<AddInstance>,
         replica: Box<Replica>,
@@ -936,6 +948,10 @@ impl Executor {
             Command::BuildRemoteIdle(unit) => (unit.guid.0, Kind::BuildRemoteIdle, to_vec(&unit)),
             Command::CompleteBuild(body) => {
                 (body.unit.id.guid.0, Kind::CompleteBuild, to_vec(&body))
+            }
+            Command::RemoveRemoteIdle(unit) => (unit.guid.0, Kind::RemoveRemoteIdle, to_vec(&unit)),
+            Command::CompleteRemoval(body) => {
+                (body.unit.id.guid.0, Kind::CompleteRemoval, to_vec(&body))
             }
             Command::CreateReplicaReply {
                 body,
@@ -1537,6 +1553,8 @@ fn transition(
         Kind::CreateRemoteIdle => peer::start_remote(work, state, admission, peer),
         Kind::BuildRemoteIdle => peer::start_build(state, admission, peer),
         Kind::CompleteBuild => peer::complete_build(work, state),
+        Kind::RemoveRemoteIdle => peer::start_removal(state, admission, peer),
+        Kind::CompleteRemoval => peer::complete_removal(work, state),
         Kind::CreateReplicaReply { source, generation } => {
             peer::complete_remote(work, state, source, generation, admission, peer)
         }
@@ -2047,11 +2065,13 @@ async fn entity_worker(
             let mut effective_admission = admission.clone();
             effective_admission.node_activated = view.node.activation.activated;
             effective_admission.generation = view.generations.receive.clone();
-            if matches!(work.kind, Kind::CreateRemoteIdle | Kind::BuildRemoteIdle)
-                && view.generations.upload_pending
+            if matches!(
+                work.kind,
+                Kind::CreateRemoteIdle | Kind::BuildRemoteIdle | Kind::RemoveRemoteIdle
+            ) && view.generations.upload_pending
             {
                 Err(Failure::Unsupported(
-                    "peer creation is gated during generation rebuild",
+                    "peer control is gated during generation rebuild",
                 ))
             } else {
                 transition(

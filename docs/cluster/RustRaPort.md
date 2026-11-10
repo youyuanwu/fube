@@ -46,7 +46,10 @@ now connects an original Primary RA to one destination RA for the same
 partition. Native CreateReplica/Reply opens a real volatile Idle with its
 replication endpoint, not a built or active replica. A separate explicit
 build now copies real nonempty state and continues replication through RAP
-and application ACKs; AddReplica, active membership and reconfiguration remain gated.
+and application ACKs. Explicit Primary-side Idle removal now uses RAP's native
+cancellation/retry/tombstone semantics, separately from failed-build retry cleanup
+and remote deletion; FM orchestration, active membership and reconfiguration
+remain gated.
 
 This is the persistence and porting companion to the
 [basic pure-Rust cluster design](PureRustCluster.md). Keep the native RA's
@@ -515,7 +518,7 @@ This does not qualify every native handler branch or complete P4/M2.
 | 1. Finish singleton lifecycle | Abort/ForceAbort reporting, closed-AddPrimary handling and remaining DeleteReplica branches, then explicitly authorized fresh-lifetime recreation. | Preserve native close/report/ACK semantics and exact original accounting. Reporting and metadata completion cannot substitute for disposal proof or relabel lost volatile data as recovered empty state. |
 | 2. Complete node-wide coordination | Bounded implementation: broader P2 multi-entity execution; NodeActivateRequest/Reply, NodeDeactivateRequest/Reply, NodeUpdateServiceRequest/Reply, ServiceTypeEnabled/Disabled and their replies, existing registration notifications and complete ReportLoad codecs/forwarding. ReplicaEndpointUpdated/Reply codecs and endpoint helper only; live publication moves to stage 5. | Preserve sequence/version checks and action-specific completion barriers. Deactivation replies follow required replica closure, not admission; ReportLoad remains best-effort without an invented per-report ACK. Keep one FT per deployed Node; qualify multiple FTs in RA model/store tests. |
 | 3. Complete ordinary-FM generation and upload | Bounded generation-handshake increment implemented: GenerationProposal/Reply and GenerationUpdate/Reject. Remaining: LFUMUpload/Reply, nonempty NodeUp/NodeUpAck reconciliation and full ReplicaUp/Reply batching/final-upload handling. | Preserve proposed/receive/send generations and per-entity commit barriers. Only the correct semantic completion advances upload/readiness; keep restart serving disabled until stage 6. |
-| 4. Build and remove remote replicas | Fresh CreateReplica/Reply opens an InBuild Idle on the second node of one shared partition. Explicit RAP build now copies nonempty state/retry results and continues replication with application ACKs. Remaining: FM AddReplica/Reply, metadata/configuration completion and RemoveReplica/Reply through replicator removal. | Copy completion alone grants no active membership, serving or FM success. CreateReplicaReply is not AddReplicaReply; RemoveReplica is not DeleteReplica on the remote node. |
+| 4. Build and remove remote replicas | Fresh CreateReplica/Reply opens an InBuild Idle on the second node of one shared partition. Explicit RAP build copies nonempty state/retry results and continues replication with application ACKs. Explicit original-Idle removal now covers pre-build, pending, successful and failed builds through native RAP cancellation/retry/tombstones, separately from nonterminal build-retry cleanup. Remaining: FM AddReplica/Reply and RemoveReplica/Reply orchestration, metadata/configuration completion and broader removal branches. | Copy completion alone grants no active membership, serving or FM success. CreateReplicaReply is not AddReplicaReply; Primary-side replicator removal is neither remote DeleteReplica nor active-configuration removal. |
 | 5. Implement reconfiguration | DoReconfiguration/Reply, peer GetLSN/Reply, Deactivate/Reply and Activate/Reply, ChangeConfiguration and DatalossReport. Include peer swap continuation. | Preserve native phase ordering, separate previous/current quorum obligations, catch-up/cancellation, old-primary fencing and endpoint publication. Qualify secondary replacement before primary transfer. |
 | 6. Enable durable RA restart | P5 loading/fixups, crash-window reconciliation, fresh incarnation and recovery with the original FM surviving. | Historical records cannot restore Primary authority. Prove predecessor fencing; rebuild volatile replicas from eligible survivors with valid history/quorum evidence or report data loss. |
 | 7. Add FMM ownership/rebuild | Independent FM/FMM readiness and generation domains, owner-specific uploads, GFUMTransfer and FM-service replica handling. | Supply matching FM/FMM/common-layer counterparts and required FM-service functionality. Ordinary FM acknowledgments cannot stand in for FMM; this does not authorize transparent FM restart. |
@@ -580,8 +583,14 @@ copy/application-ACK barrier, including nonempty state and retry results;
 continuing writes are also applied and ACKed on the destination. The Idle stays
 non-serving and unconfigured. No active membership, AddReplicaReply, catch-up
 quorum or quorum change is inferred. LFUM/restart/FMM and peer
-recreation/promotion remain gated. This detour does not complete stage 3 or
-the full stage-4 FM build/removal choreography.
+recreation/promotion remain gated. Explicit `Cluster::remove_idle_replica()`
+now abandons that opened original Idle through
+ReplicatorRemoveIdleReplica/Reply, fencing late build completion and retaining
+terminal incarnation tombstones. Failed-build retries instead use RAP's
+nonterminal cleanup before rebuilding; no successful build implicitly requests
+removal. Neither path disposes the destination service or changes membership.
+This detour does not complete stage 3 or the full stage-4 FM build/removal
+choreography.
 
 Stage-two codec evidence contains 101 bidirectional cases, 73 types/233 fields,
 105 bundle files and 26 native truncation rejections. Native-derived model/store

@@ -689,13 +689,16 @@ impl Cluster {
                     .as_str()
                     .is_some_and(|value| !value.is_empty())
                 && target["local_replica"]["open"] == true;
-            let built = opened && source["peer_idle"]["build"]["result"] == 0;
+            let removing = source["peer_idle"]["removal"].is_object();
+            let removed = removing && source["peer_idle"]["removal"]["result"] == 0;
+            let built = opened && !removing && source["peer_idle"]["build"]["result"] == 0;
             status["peer_idle"] = json!({
                 "requested":self.peer_idle_requested,
-                "state": if failed { "failed" } else if opened { "open" } else if self.peer_idle_requested { "pending" } else { "absent" },
+                "state": if removed { "removed" } else if removing { "removing" } else if failed { "failed" } else if opened { "open" } else if self.peer_idle_requested { "pending" } else { "absent" },
                 "error": if failed { reply["error"].clone() } else { Value::Null },
                 "built":built, "serving":false,
                 "build":source["peer_idle"]["build"],
+                "removal":source["peer_idle"]["removal"],
                 "source":source["peer_idle"], "target":target["local_replica"],
                 "peer_link_alive":[source["peer_link_alive"],target["peer_link_alive"]],
                 "peer_error":[source["peer_error"],target["peer_error"]],
@@ -723,7 +726,10 @@ impl Cluster {
             );
         }
         let current = self.status()["peer_idle"].clone();
-        if current["state"] == "failed" {
+        if matches!(
+            current["state"].as_str(),
+            Some("failed" | "removing" | "removed")
+        ) {
             return Ok(current);
         }
         let child = &mut self.children[0];
@@ -763,12 +769,6 @@ impl Cluster {
         if current["built"] == true {
             return Ok(current);
         }
-        if let Some(error) = current["build"]["result"].as_i64() {
-            return Ok(
-                json!({"state":"failed","kind":"peer_idle_build","error":error,
-                "detail":current["build"]["detail"],"built":false,"serving":false}),
-            );
-        }
         let child = &mut self.children[0];
         child
             .process
@@ -783,6 +783,44 @@ impl Cluster {
             )
             .map_err(err)?;
         Ok(json!({"state":"pending","kind":"peer_idle_build","built":false,"serving":false}))
+    }
+    /// Remove the original Idle from the Primary's replicator, not its remote
+    /// application. Pending calls retry cancellation/cleanup; success is terminal.
+    pub async fn remove_idle_replica(&mut self) -> Result<Value> {
+        if self.config.profile != ServiceProfile::StatefulPeerIdle
+            || self.finished.is_some()
+            || self.children.len() != 2
+            || self.ledger.generation.is_some()
+            || self.ledger.placements[0].observed != fm::Observed::Running
+            || self.ledger.placements.iter().any(|placement| {
+                !placement.link_alive
+                    || placement.bootstrap != Bootstrap::Admitted
+                    || !placement.activated
+            })
+        {
+            return Err("peer removal requires the original Ready Primary and opened Idle".into());
+        }
+        let current = self.status()["peer_idle"].clone();
+        if current["state"] == "removed" {
+            return Ok(current);
+        }
+        if !matches!(current["state"].as_str(), Some("open" | "removing")) {
+            return Err("peer removal requires the original opened Idle".into());
+        }
+        let child = &mut self.children[0];
+        child
+            .process
+            .as_mut()
+            .ok_or("missing original Primary owner")?
+            .command(
+                format!(
+                    "remove-idle {} {}\n",
+                    child.launch.session, child.launch.capability
+                )
+                .as_bytes(),
+            )
+            .map_err(err)?;
+        Ok(json!({"state":"pending","kind":"peer_idle_removal","built":false,"serving":false}))
     }
     /// Returns the retained operation outcome, never transport-write success.
     /// `quit` is accepted here; the foreground then calls owned shutdown.

@@ -23,9 +23,25 @@ Primary-to-Idle copy through RAP. It returns `pending`; poll `peer_idle.built`
 for the original runtime's semantic build completion. The joined destination
 application pump applies copied values/retry results and continuing replication
 before explicit operation ACKs. Pending retries reuse the request; native errors
-remain in `peer_idle.build.result/detail`, and failed-build retry cleanup stays gated.
+remain in `peer_idle.build.result/detail`. Retrying a failed build resends the
+original request: RAP first performs nonterminal `BuildRetryCleanup`, with no
+successful build reply, then a later retry can rebuild that same incarnation.
 Close fences late completions. Destination data observations under
 `nodes[1].retained_work.app_observation.idle_data` are diagnostics, not authority.
+`Cluster::remove_idle_replica().await` explicitly abandons the opened original
+Idle, whether build has not started, is pending, succeeded or failed. It returns
+`pending`; poll `peer_idle.state` for `removed`. Repeat pending calls to retry
+cancellation/cleanup through the original RAP session. An in-flight build is
+cancelled first, not acknowledged as removed. Only the matching semantic
+`ReplicatorRemoveIdleReplicaReply` completes removal; frame writes do not.
+Errors remain visible in `peer_idle.removal.result/detail` and are retryable.
+RAP normalizes only SF's replica-does-not-exist error to successful absence.
+Removal intent fences late build replies, and terminal tombstones reject delayed
+builds/recreation of this incarnation. Completed removal retries are idempotent.
+This is not automatic after successful build, not retry cleanup and not remote
+DeleteReplica: the destination service, copied data, registration and usage stay
+owned until normal shutdown. The removal descriptor's `state=3` is the Primary's
+native InDrop wire view; the destination remains Idle/InBuild and non-serving.
 Both actual activations use the deployment-wide package version `1.0:1.0:1`;
 their physical package sequence, acquisition, runtime and process owners remain
 independently generated. Existing profiles keep their generated package versions.
@@ -47,8 +63,10 @@ Peer loss does not dispose an application, fabricate a reply or reconnect.
 This profile admits CLI `create` on node1, `status`, and `quit` only; it rejects
 new FM generations, mutation of the fixed service, and node2 FM creation.
 Build completion still leaves Idle/InBuild metadata, no service endpoint and
-denied access. There is no AddReplicaReply, quorum addition, serving secondary,
-failover, replacement, or recovery. Both original owners retain normal cleanup.
+denied access. There is no FM AddReplica/Reply or RemoveReplica/Reply orchestration,
+quorum addition, serving secondary, failover, replacement, or recovery. Removal
+before peer Open and remote deletion remain gated; both original owners retain
+normal cleanup.
 
 Build both executables, then run:
 

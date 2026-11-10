@@ -245,9 +245,54 @@ The build API returns `pending`, not build success. Poll
 `status()["peer_idle"]["built"]`; only the exact original semantic RAP reply
 can publish that observation. Pending retries reuse the frozen request, completed
 retries do not rebuild, and Primary Close fences late completions. A native
-build error remains visible in `peer_idle.build.result/detail`; retrying a failed
-build returns `state=failed`. Removal/retry-cleanup after such failure is still
-gated, not silently treated as a fresh build.
+build error remains visible in `peer_idle.build.result/detail`. Explicit retry
+resends the frozen build request, not a fresh remote lifetime. RAP first removes
+partial build resources with `BuildRetryCleanup`, suppressing build completion;
+only a subsequent retry can build the same incarnation. Failed cleanup remains
+an obligation, not successful copy or permission to replace a peer.
+
+Separate `Cluster::remove_idle_replica()` abandons the opened original Idle
+before build, during build, or after successful/failed build. Primary RA publishes
+its frozen removal obligation before sending `ReplicatorRemoveIdleReplica` over
+the original Hosting/runtime session. Native RA InDrop maps to `state=3`
+(Dropped) in that request's remote descriptor; this does not change the
+destination's actual role or lifecycle. The request retains the original
+replica ID/incarnation/endpoint, empty runtime, default service and zero flags.
+This API does not admit removal before peer Open, FM RemoveReplica or arbitrary
+remote replacement.
+
+The existing RAP issues native `ReplicaRemoval::Idle` authority before calling
+`IPrimaryReplicator::remove_replica`. If build is still running, RAP cancels it
+and suppresses completion until a later removal retry can drain/clean up.
+Removing an unbuilt remote records a tombstone without inventing a user callback.
+Already-removed retries succeed idempotently; the exact SF
+`FABRIC_E_REPLICA_DOES_NOT_EXIST` result is normalized to successful absence,
+but uncertain completion, other errors and stale invocation authority cannot
+become success.
+Retry cleanup is nonterminal; explicit Idle removal is terminal and suppresses
+delayed Build for that incarnation. Removal does not change an active
+configuration or its quorum.
+
+The removal API returns `pending`, not removal success. Repeat pending calls
+to retry the original cancellation/cleanup obligation; no autonomous peer retry
+or reconnect is introduced. Poll `peer_idle.state` (`removing` or `removed`) and
+`peer_idle.removal.result/detail`. Only a matching semantic RAP success publishes
+`removed`; native errors remain visible and retryable. Once removal intent is
+published, RA rejects new builds and ignores late build completions. Primary
+Close fences pending removal replies. The session-only original observation is
+retained as a tombstone, not reusable remote authority.
+
+This follows the pinned native
+`ra/ReconfigurationAgent.cpp:2050-2138,4094-4150`,
+`ra/FailoverUnitProxy.cpp:960-1060` and
+`ra/FailoverUnitProxy.ReplicatorBuildIdleReplicaAsyncOperation.cpp:119-180,317-353`
+under `Reliability/Failover`: failed-build retry cleanup is different from an
+explicit removal, and successful build does not automatically request removal.
+Native `Replication/ReplicaManager.cpp:1783-1831` removes the Primary-side Idle
+replication session, not the destination service/data. The destination remains
+opened with its original registration, usage and copied state; normal shutdown
+still joins and disposes that original owner. No FM RemoveReplicaReply or
+destination DeleteReplica completion is inferred.
 
 This increment deliberately retains Idle/InBuild metadata, no service endpoint,
 denied read/write access and no active membership or quorum change even after
@@ -256,6 +301,12 @@ before build, observes nonempty copied values and retry results on the actual
 destination, then proves a second write is applied/ACKed there while the peer
 remains unconfigured and non-serving. `write-more\n` and `state\n` are bounded
 sample controls for that observation, not RA authority or recovery APIs.
+Additional real-process acceptance removes the Idle before and after real
+nonempty copy, proves the Primary can still acknowledge/read a subsequent
+write, and verifies that the destination remains opened with unchanged copied
+data rather than being deleted or recreated. Controlled RAP/model cases cover
+failed builds, in-flight cancellation/retry, removal failures, stale replies,
+absent-replica normalization and delayed-build tombstones.
 
 These are native-derived model/store and native-free real-process contracts,
 not full C++ handler traces or native Federation interoperability.

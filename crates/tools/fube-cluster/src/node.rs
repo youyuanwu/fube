@@ -792,16 +792,17 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                                         Err(error) => adapter.peer_error = Some(error),
                                     }
                                 }
-                                Ok(parts) if parts.len() == 3 && matches!(parts[0], "create-idle" | "build-idle")
+                                Ok(parts) if parts.len() == 3 && matches!(parts[0], "create-idle" | "build-idle" | "remove-idle")
                                     && parts[1] == launch.session && parts[2] == launch.capability
                                     && launch.placement == 1 && launch.peer.is_some() => {
                                     let submitted = if adapter.peer_commands.len() == 32 {
                                         Err("peer command receipt capacity".into())
                                     } else {
-                                        if parts[0] == "create-idle" {
-                                            create_idle(launch, &mut node)
-                                        } else {
-                                            node.build_idle_on_peer().map_err(err)
+                                        match parts[0] {
+                                            "create-idle" => create_idle(launch, &mut node),
+                                            "build-idle" => node.build_idle_on_peer().map_err(err),
+                                            "remove-idle" => node.remove_idle_on_peer().map_err(err),
+                                            _ => unreachable!(),
                                         }
                                     };
                                     match submitted {
@@ -994,6 +995,10 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                                 "reply":remote.reply,
                                 "build":remote.build.as_ref().map(|build| serde_json::json!({
                                     "result":build.result, "detail":build.detail,
+                                })),
+                                "removal":remote.removal.as_ref().map(|removal| serde_json::json!({
+                                    "replica":removal.replica,
+                                    "result":removal.result, "detail":removal.detail,
                                 })),
                             })
                         });

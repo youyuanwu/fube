@@ -97,7 +97,7 @@ pub mod rap {
         })
         .map_err(|_| Error::Protocol)
     }
-    pub fn build_request(body: &AddInstance, replica: &Replica) -> Result<Vec<u8>> {
+    pub fn idle_request(body: &AddInstance, replica: &Replica) -> Result<Vec<u8>> {
         to_vec(&Request {
             runtime: String::new(),
             unit: body.unit.clone(),
@@ -108,6 +108,7 @@ pub mod rap {
         })
         .map_err(|_| Error::Protocol)
     }
+    pub use idle_request as build_request;
 }
 
 struct Gate {
@@ -155,6 +156,8 @@ pub struct PackageRegistration {
 enum Work {
     BuildIdle(PartitionId),
     Built(ra::BuildCompletion),
+    RemoveIdle(PartitionId),
+    Removed(ra::RemovalCompletion),
     PeerIdle(PartitionId, Replica),
     PeerCreate(Arc<CreateReplica>, NodeInstance, GenerationHeader),
     PeerReply(Arc<CreateReplicaReply>, NodeInstance, GenerationHeader),
@@ -597,6 +600,13 @@ impl Node {
     }
     /// Copy into the already opened original peer; no FM or quorum completion.
     pub fn build_idle_on_peer(&mut self) -> Result<u64> {
+        self.control_idle_on_peer(false)
+    }
+    /// Remove only the original Primary's Idle session, not the remote service.
+    pub fn remove_idle_on_peer(&mut self) -> Result<u64> {
+        self.control_idle_on_peer(true)
+    }
+    fn control_idle_on_peer(&mut self, remove: bool) -> Result<u64> {
         if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
             || !self.live.load(Ordering::SeqCst)
             || self.ra.generation_state().upload_pending
@@ -611,7 +621,11 @@ impl Node {
             .unit
             .id
             .clone();
-        self.enqueue(Work::BuildIdle(unit))
+        self.enqueue(if remove {
+            Work::RemoveIdle(unit)
+        } else {
+            Work::BuildIdle(unit)
+        })
     }
     pub fn create_replica_from_peer(
         &mut self,
@@ -1047,6 +1061,8 @@ impl Node {
         match work {
             Work::BuildIdle(unit) => ra::Command::BuildRemoteIdle(unit.clone()),
             Work::Built(event) => ra::Command::CompleteBuild(Box::new(event.clone())),
+            Work::RemoveIdle(unit) => ra::Command::RemoveRemoteIdle(unit.clone()),
+            Work::Removed(event) => ra::Command::CompleteRemoval(Box::new(event.clone())),
             Work::PeerIdle(unit, replica) => ra::Command::CreateRemoteIdle {
                 unit: unit.clone(),
                 replica: replica.clone(),
@@ -1204,6 +1220,7 @@ impl Node {
                             | Work::PeerCreate(..)
                             | Work::PeerReply(..)
                             | Work::BuildIdle(..)
+                            | Work::RemoveIdle(..)
                     ) {
                         let front = self.pending.pop_front().unwrap();
                         self.commands.push_back(CommandReceipt {
@@ -1515,6 +1532,9 @@ impl Node {
             | ra::Effect::UpdateServiceDescription { body, registration }
             | ra::Effect::BuildIdle {
                 body, registration, ..
+            }
+            | ra::Effect::RemoveIdle {
+                body, registration, ..
             } => {
                 let Some(lease) = self.activation.host_lease() else {
                     self.effects.pop_front();
@@ -1535,10 +1555,13 @@ impl Node {
                         ("ProxyUpdateServiceDescription", 0)
                     }
                     ra::Effect::BuildIdle { .. } => ("ReplicatorBuildIdleReplica", 0),
+                    ra::Effect::RemoveIdle { .. } => ("ReplicatorRemoveIdleReplica", 0),
                     _ => unreachable!(),
                 };
-                let bytes = if let ra::Effect::BuildIdle { replica, .. } = &dispatch.effect {
-                    rap::build_request(body, replica)?
+                let bytes = if let ra::Effect::BuildIdle { replica, .. }
+                | ra::Effect::RemoveIdle { replica, .. } = &dispatch.effect
+                {
+                    rap::idle_request(body, replica)?
                 } else {
                     rap::request(registration, body, flags)?
                 };
@@ -1696,9 +1719,12 @@ impl Node {
             return Ok(());
         }
         let body: rap::Reply = decode(reply.body())?;
-        let build = action == "ReplicatorBuildIdleReplicaReply";
-        if (build && (body.remote.0.len() != 1 || body.flags != 0))
-            || (!build && (!body.remote.0.is_empty() || body.flags & !12 != 0))
+        let idle = matches!(
+            action.as_str(),
+            "ReplicatorBuildIdleReplicaReply" | "ReplicatorRemoveIdleReplicaReply"
+        );
+        if (idle && (body.remote.0.len() != 1 || body.flags != 0))
+            || (!idle && (!body.remote.0.is_empty() || body.flags & !12 != 0))
         {
             return Err(Error::Protocol);
         }
@@ -1719,21 +1745,28 @@ impl Node {
             return Err(Error::Protocol);
         }
         let work = match reply.action().map_err(|_| Error::Protocol)?.as_str() {
-            "ReplicatorBuildIdleReplicaReply" => Work::Built(ra::BuildCompletion {
-                unit: body.unit,
-                local: body.local,
-                remote: body
-                    .remote
-                    .0
-                    .into_iter()
-                    .next()
-                    .expect("checked one remote"),
-                error: body.error.error,
-                detail: ra::ProxyErrorDetail {
-                    message: body.error.message,
-                    api: body.error.api,
-                },
-            }),
+            "ReplicatorBuildIdleReplicaReply" | "ReplicatorRemoveIdleReplicaReply" => {
+                let event = ra::BuildCompletion {
+                    unit: body.unit,
+                    local: body.local,
+                    remote: body
+                        .remote
+                        .0
+                        .into_iter()
+                        .next()
+                        .expect("checked one remote"),
+                    error: body.error.error,
+                    detail: ra::ProxyErrorDetail {
+                        message: body.error.message,
+                        api: body.error.api,
+                    },
+                };
+                if action == "ReplicatorBuildIdleReplicaReply" {
+                    Work::Built(event)
+                } else {
+                    Work::Removed(event)
+                }
+            }
             "ReplicaOpenReply" => Work::Open(ra::OpenCompletion {
                 unit: body.unit,
                 replica: body.local,

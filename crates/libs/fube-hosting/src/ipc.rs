@@ -274,6 +274,7 @@ impl HostLease {
                 | "ReplicaClose"
                 | "ProxyUpdateServiceDescription"
                 | "ReplicatorBuildIdleReplica"
+                | "ReplicatorRemoveIdleReplica"
         ) || body.len() > MAX_INPUT
         {
             return Err(protocol("unsupported local lifecycle action/body"));
@@ -1373,6 +1374,7 @@ async fn run_connection(
                         | "ReplicaCloseReply"
                         | "ProxyUpdateServiceDescriptionReply"
                         | "ReplicatorBuildIdleReplicaReply"
+                        | "ReplicatorRemoveIdleReplicaReply"
                         | "RAPReportLoad"
                 )
             {
@@ -1465,6 +1467,7 @@ fn hosting_composition() -> TransportResult<ChannelComposition> {
                     | "ReplicaClose"
                     | "ProxyUpdateServiceDescription"
                     | "ReplicatorBuildIdleReplica"
+                    | "ReplicatorRemoveIdleReplica"
             )
             || p.expects_reply
             || p.relates_to != MessageId::default()

@@ -25,6 +25,7 @@ struct StatefulCalls {
     configuration_release: Notify,
     remove_release: Notify,
     configuration_failure: AtomicBool,
+    uncertain_removal: AtomicBool,
     configurations: Mutex<Vec<(ReplicaSetConfiguration, Option<ReplicaSetConfiguration>)>>,
     builds: Mutex<Vec<crate::ReplicaInformation>>,
     removals: Mutex<Vec<crate::ReplicaRemoval>>,
@@ -437,7 +438,7 @@ impl IPrimaryReplicator for ReplicatorFixture {
             released.as_mut().enable();
             self.0.record("build");
             self.0.builds.lock().unwrap().push(replica);
-            if matches!(self.1, 40 | 42) && self.0.builds.lock().unwrap().len() == 1 {
+            if matches!(self.1, 40 | 42 | 43) && self.0.builds.lock().unwrap().len() == 1 {
                 return Err(Error::Remote {
                     code: -993,
                     message: "partial build resources require cleanup".into(),
@@ -462,6 +463,17 @@ impl IPrimaryReplicator for ReplicatorFixture {
         }
         self.0.record("remove");
         self.0.removals.lock().unwrap().push(reason);
+        if matches!(self.1, 43 | 44) {
+            let error = Error::Remote {
+                code: 0x80071be8u32 as i32 as i64,
+                message: "replica does not exist".into(),
+            };
+            return Err(if self.0.uncertain_removal.load(Ordering::Acquire) {
+                error.uncertain()
+            } else {
+                error
+            });
+        }
         if matches!(self.1, 41 | 42)
             && self
                 .0
