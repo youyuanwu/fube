@@ -744,6 +744,11 @@ impl Cluster {
             index,
             &child.launch.directory.join("absence.json"),
             node_pid,
+        )?;
+        self.ledger.read_pre_open_cancellation(
+            index,
+            &child.launch.directory.join("pre-open-cancellation.json"),
+            node_pid,
         )
     }
     pub fn status(&self) -> Value {
@@ -992,8 +997,8 @@ impl Cluster {
         Ok(self.ledger.idle_removal_status())
     }
     /// Delete the original abandoned destination independently of Primary Remove.
-    /// Cleanup joins the native reply with original disposal or committed
-    /// never-created absence proof; neither authorizes a successor lifetime.
+    /// Cleanup joins the native reply with original disposal, pre-Open
+    /// cancellation or never-created absence; none authorizes a successor.
     pub async fn delete_idle_replica_via_fm(&mut self) -> Result<Value> {
         if self.finished.is_some()
             || self.children.len() != 2
@@ -1005,21 +1010,32 @@ impl Cluster {
         if current["state"] == "deleted" || current["state"] == "unknown" {
             return Ok(current);
         }
-        let mut allow_absence = false;
+        let mut target_kind = fm::IdleDeleteTarget::Runtime;
         if self.ledger.idle_deletion.is_none() {
             let status = self.status();
             let target = &status["peer_idle"]["target"];
-            allow_absence = target.is_null() && self.ledger.idle_absence_allowed();
+            let unobserved = target.is_null() && self.ledger.idle_absence_allowed();
             let registered_open = target["phase"] == "Opening"
                 && target["registration"].is_object()
                 && target["retained_usage"] == 1;
-            if target["open"] != true && !registered_open && !allow_absence {
-                return Err("FM Idle deletion requires the original opened/registered opening destination or an absent unanswered FM Add".into());
+            let pre_registration = target["phase"] == "Opening"
+                && target["registration"].is_null()
+                && target["retained_usage"] == 0
+                && self.ledger.idle_absence_allowed();
+            if target["open"] != true && !registered_open && !pre_registration && !unobserved {
+                return Err("FM Idle deletion requires the original opening/opened destination or an absent unanswered FM Add".into());
             }
+            target_kind = if unobserved {
+                fm::IdleDeleteTarget::Unobserved
+            } else if pre_registration {
+                fm::IdleDeleteTarget::PreRegistration
+            } else {
+                fm::IdleDeleteTarget::Runtime
+            };
         }
         let body = self
             .ledger
-            .request_idle_deletion(Instant::now(), allow_absence)?;
+            .request_idle_deletion(Instant::now(), target_kind)?;
         if let Err(error) = self.send_idle_deletion(&body).await {
             self.ledger.lost(1, error.clone());
             return Err(error);

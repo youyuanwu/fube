@@ -210,6 +210,7 @@ struct Pending {
     id: u64,
     work: Work,
     ticket: Option<ra::Ticket>,
+    pre_open: Option<u64>,
 }
 struct Usage {
     lookup: u64,
@@ -249,6 +250,30 @@ pub struct ReplicaAbsence {
     pub body: AddInstance,
     pub command: u64,
     pub ra_operation: u64,
+}
+/// Original peer creation cancelled before registration adoption/RAP Open.
+/// Outstanding lookup offers must drain before this can be published.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreOpenCancellation {
+    #[serde(with = "disposal_body")]
+    pub body: AddInstance,
+    pub creation: u64,
+    pub command: u64,
+    pub ra_operation: u64,
+}
+fn pre_open_cancelled(state: &ra::EntityState, creation: u64) -> bool {
+    state.phase == ra::Phase::Closed
+        && state.local_deleted
+        && state.cleanup_pending
+        && state.open_token == creation
+        && creation != 0
+        && state.close_token != 0
+        && state.runtime.is_none()
+        && state.usage.is_none()
+        && state.peer_creation.is_some()
+        && state.remote_idle.is_none()
+        && state.fm_stage == ra::FmStage::None
 }
 fn never_created(state: &ra::EntityState) -> bool {
     state.phase == ra::Phase::Closed
@@ -313,6 +338,7 @@ pub struct Node {
     rejected_reply: Option<ipc::LifecycleReply>,
     disposal: Option<DisposalWitness>,
     absence: Option<ReplicaAbsence>,
+    pre_open: Option<PreOpenCancellation>,
     #[cfg(feature = "qualification")]
     hold_replies: bool,
 }
@@ -372,6 +398,7 @@ impl Node {
             rejected_reply: None,
             disposal: None,
             absence: None,
+            pre_open: None,
             #[cfg(feature = "qualification")]
             hold_replies: false,
         })
@@ -537,7 +564,7 @@ impl Node {
                                         && (state.phase == ra::Phase::Ready
                                             || (state.phase == ra::Phase::Opening
                                                 && state.runtime.is_some()
-                                                && state.usage.is_some())
+                                                    == state.usage.is_some())
                                             || state.local_deleted)))
                         }
                     };
@@ -873,6 +900,37 @@ impl Node {
             .then(|| proof.clone())
     }
 
+    /// Certify the applied pre-registration Delete only after every original
+    /// lookup offer and exact acquisition has drained without a RAP route.
+    pub fn pre_open_cancellation(&self) -> Option<PreOpenCancellation> {
+        let proof = self.pre_open.as_ref()?;
+        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+            || self.ra.peer().is_none()
+            || !self.live.load(Ordering::SeqCst)
+            || !self.ra.consumer_lifetime().is_accepting()
+            || !self.quiescent()
+            || !self.commands.is_empty()
+            || !self.receipts.is_empty()
+            || self.rejected_reply.is_some()
+            || self.last_error.is_some()
+            || self.route.is_some()
+            || self.disposal.is_some()
+            || self.absence.is_some()
+            || !self.activation.session_status().ok().flatten()?.connected
+            || self.activation.process_status()?.exit_observed
+        {
+            return None;
+        }
+        let snapshot = self.ra.snapshot(proof.body.unit.id.guid.0);
+        let state = snapshot.committed?;
+        (!snapshot.fenced
+            && pre_open_cancelled(&state, proof.creation)
+            && state.close_token == proof.ra_operation
+            && state.registration_lookups.is_empty()
+            && *state.body == proof.body)
+            .then(|| proof.clone())
+    }
+
     fn room(&self) -> bool {
         self.pending.len() + self.commands.len() < SLOTS
     }
@@ -885,6 +943,7 @@ impl Node {
             id,
             work,
             ticket: None,
+            pre_open: None,
         });
         self.next = id;
         Ok(id)
@@ -1342,8 +1401,33 @@ impl Node {
         };
         if front.ticket.is_none() {
             let command = self.build(&front.work);
+            let pre_open = match &front.work {
+                Work::Fm(FmWork::DeleteReplica(body, ..))
+                    if self.activation.profile()
+                        == h::local::Profile::VolatileStatefulLifecycle
+                        && self.ra.peer().is_some()
+                        && self.route.is_none() =>
+                {
+                    self.ra
+                        .snapshot(body.replica.0.unit.id.guid.0)
+                        .committed
+                        .filter(|state| {
+                            state.phase == ra::Phase::Opening
+                                && state.runtime.is_none()
+                                && state.usage.is_none()
+                                && state.peer_creation.is_some()
+                                && state.close_token == 0
+                        })
+                        .map(|state| state.open_token)
+                }
+                _ => None,
+            };
             match self.ra.submit(command) {
-                Ok(ticket) => self.pending.front_mut().unwrap().ticket = Some(ticket),
+                Ok(ticket) => {
+                    let pending = self.pending.front_mut().unwrap();
+                    pending.ticket = Some(ticket);
+                    pending.pre_open = pre_open;
+                }
                 Err(ra::Failure::Capacity) => return Ok(()),
                 Err(error) => return Err(error.into()),
             }
@@ -1389,6 +1473,26 @@ impl Node {
                     }
                 }
                 let front = self.pending.pop_front().unwrap();
+                if result == Ok(ra::Disposition::Applied) && self.pre_open.is_none() {
+                    if let (Some(creation), Work::Fm(FmWork::DeleteReplica(body, ..))) =
+                        (front.pre_open, &front.work)
+                    {
+                        let ticket = front.ticket.as_ref().unwrap();
+                        let snapshot = self.ra.snapshot(body.replica.0.unit.id.guid.0);
+                        if let Some(state) = snapshot.committed.filter(|_| !snapshot.fenced) {
+                            if pre_open_cancelled(&state, creation)
+                                && state.close_token == ticket.id
+                            {
+                                self.pre_open = Some(PreOpenCancellation {
+                                    body: (*state.body).clone(),
+                                    creation,
+                                    command: front.id,
+                                    ra_operation: ticket.id,
+                                });
+                            }
+                        }
+                    }
+                }
                 if result == Ok(ra::Disposition::Applied)
                     && self.absence.is_none()
                     && self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle

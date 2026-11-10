@@ -30,6 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
         "delay_ms", "crash_after_ms", "shutdown_after_ms", "no_register",
         "exit_before_attach", "stateful_register", "block_dispose",
         "close_error_block_dispose", "block_provider_dispose", "open_delay_ms",
+        "block_registration",
     ])),
     group(clap::ArgGroup::new("data").args(["stateful_primary", "data_replicator"]).multiple(true)))]
 struct Arguments {
@@ -65,6 +66,8 @@ struct Arguments {
         conflicts_with_all = ["open_delay_ms", "stateful_primary"]
     )]
     block_open: bool,
+    #[arg(long, requires = "stateful_lifecycle", conflicts_with_all = ["stateful_primary", "block_open"])]
+    block_registration: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -951,6 +954,24 @@ async fn main() {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
     let runtime = Runtime::attach().await.expect("owned Hosting attach");
+    if args.block_registration {
+        let work =
+            PathBuf::from(std::env::var_os("Fabric_Folder_App_Work").expect("owned work folder"));
+        std::fs::write(
+            work.join("local-registration.held"),
+            b"original registration",
+        )
+        .expect("publish fixture registration barrier");
+        marker("LOCAL_REGISTRATION held");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !work.join("local-registration.release").exists() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("bounded fixture registration barrier timed out");
+        marker("LOCAL_REGISTRATION released");
+    }
     let mode = Mode {
         primary,
         block_dispose: args.block_dispose || args.close_error_block_dispose,
@@ -994,6 +1015,14 @@ async fn main() {
     std::io::stdout()
         .flush()
         .expect("flush registration marker");
+    if args.block_registration {
+        std::fs::write(
+            PathBuf::from(std::env::var_os("Fabric_Folder_App_Work").expect("owned work folder"))
+                .join("local-registration.complete"),
+            b"original factory registered",
+        )
+        .expect("publish fixture registration completion");
+    }
     if let Some(ms) = args.crash_after_ms {
         tokio::time::sleep(Duration::from_millis(ms)).await;
         std::process::exit(23);
@@ -1130,6 +1159,11 @@ mod argument_tests {
         assert!(parse("--stateful-register").unwrap().stateful_register);
         assert!(parse("--delay-ms 0").is_ok());
         assert!(
+            parse("--stateful-lifecycle --data-replicator --block-registration")
+                .unwrap()
+                .block_registration
+        );
+        assert!(
             parse("--stateful-lifecycle --data-replicator --block-open --block-dispose")
                 .unwrap()
                 .block_open
@@ -1151,6 +1185,9 @@ mod argument_tests {
             "--block-open",
             "--stateful-primary --block-open",
             "--stateful-lifecycle --block-open --open-delay-ms 1",
+            "--block-registration",
+            "--stateful-primary --block-registration",
+            "--stateful-lifecycle --block-registration --block-open",
             "--delay-ms -1",
             "--crash-after-ms 18446744073709551616",
         ] {

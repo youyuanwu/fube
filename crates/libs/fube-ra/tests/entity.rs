@@ -2738,39 +2738,142 @@ async fn fm_absent_peer_delete_commit_barrier_fences_reply_and_queued_creation()
 }
 
 #[tokio::test]
-async fn fm_peer_idle_delete_rejects_unregistered_open_and_unowned_closed_cleanup() {
+async fn fm_peer_idle_delete_rejects_unowned_closed_cleanup() {
     let (store, executor, _) = setup(WAIT).await;
     executor.bind_peer(peer_source()).unwrap();
     let request = peer_request();
     run(&executor, peer_create(request.clone())).await;
     effects(&executor);
-    for closed in [false, true] {
-        if closed {
-            run(
-                &executor,
-                Command::CloseLocal {
-                    unit: request.replica.0.unit.id.clone(),
-                    mode: CloseMode::ForceAbort,
-                },
-            )
-            .await;
-            effects(&executor);
-            assert_eq!(state(&executor).phase, Phase::Closed);
-        }
-        let before = state(&executor);
-        assert!(matches!(
-            executor
-                .submit(primary_delete(request.replica.0.clone(), false))
-                .unwrap()
-                .wait(WAIT)
-                .await,
-            Err(Failure::Unsupported(_))
-        ));
-        assert!(Arc::ptr_eq(&before, &state(&executor)));
-        assert!(effects(&executor).is_empty());
-        assert!(!state(&executor).local_deleted);
-    }
+    run(
+        &executor,
+        Command::CloseLocal {
+            unit: request.replica.0.unit.id.clone(),
+            mode: CloseMode::ForceAbort,
+        },
+    )
+    .await;
+    effects(&executor);
+    assert_eq!(state(&executor).phase, Phase::Closed);
+    let before = state(&executor);
+    assert!(matches!(
+        executor
+            .submit(primary_delete(request.replica.0.clone(), false))
+            .unwrap()
+            .wait(WAIT)
+            .await,
+        Err(Failure::Unsupported(_))
+    ));
+    assert!(Arc::ptr_eq(&before, &state(&executor)));
+    assert!(effects(&executor).is_empty());
+    assert!(!state(&executor).local_deleted);
     finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn fm_pre_registration_peer_delete_drains_late_lookup_without_rap_or_absent_ft_shape() {
+    let (store, executor, _) = setup(WAIT).await;
+    executor.bind_peer(peer_source()).unwrap();
+    let request = peer_request();
+    run(&executor, peer_create(request.clone())).await;
+    effects(&executor);
+    let opening = state(&executor);
+    let lookup = *opening.registration_lookups.keys().next().unwrap();
+    run(&executor, primary_delete(request.replica.0.clone(), false)).await;
+    let actions = effects(&executor);
+    assert!(
+        matches!(actions.as_slice(), [Effect::Health(HealthEvent::Close), Effect::DeleteReplicaReply(reply)]
+        if reply.unit == opening.body.unit && reply.unit.target == 1
+            && reply.replica.current_role == 1 && reply.replica.state == 3 && !reply.replica.up)
+    );
+    let closed = state(&executor);
+    assert_eq!(closed.phase, Phase::Closed);
+    assert!(closed.local_deleted && closed.cleanup_pending);
+    assert_eq!(closed.open_token, opening.open_token);
+    assert_ne!(closed.close_token, 0);
+    assert_eq!(closed.registration_lookups, opening.registration_lookups);
+    assert!(closed.runtime.is_none() && closed.usage.is_none());
+    assert_eq!(closed.peer_creation, opening.peer_creation);
+    let disposed = registration_actions(&executor, &request.replica.0, opening.open_token).await;
+    assert!(
+        matches!(disposed.as_slice(), [Effect::ReleaseRegistration(registration), Effect::ReleaseUsage { acquisition }]
+        if *acquisition == lookup && registration.acquisition == lookup)
+    );
+    assert!(state(&executor).registration_lookups.is_empty());
+    run(&executor, primary_delete(request.replica.0.clone(), false)).await;
+    assert_eq!(effects(&executor), vec![actions.last().unwrap().clone()]);
+    assert_eq!(
+        run(&executor, peer_create(request.clone())).await,
+        Disposition::IgnoredStale
+    );
+    run(
+        &executor,
+        Command::CompleteOpen(Box::new(complete(&request.replica.0, 0))),
+    )
+    .await;
+    assert!(effects(&executor).is_empty());
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn fm_pre_registration_peer_delete_commit_barrier_retains_original_lookup_and_reply() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        executor.bind_peer(peer_source()).unwrap();
+        let request = peer_request();
+        run(&executor, peer_create(request.clone())).await;
+        effects(&executor);
+        let opening = state(&executor);
+        let (entered, release) = hooks.pause(fail);
+        let deletion = executor
+            .submit(primary_delete(request.replica.0.clone(), false))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(Arc::ptr_eq(&opening, &state(&executor)));
+        assert!(effects(&executor).is_empty());
+        let late = executor.submit(peer_create(request.clone())).unwrap();
+        if unknown {
+            assert_eq!(deletion.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.snapshot([1; 16]).fenced);
+            assert_eq!(late.status(), Status::Pending);
+            assert!(effects(&executor).is_empty());
+        }
+        release.send(()).unwrap();
+        let result = deletion.resolve(WAIT).await;
+        if fail {
+            assert!(matches!(result, Err(Failure::Store(_))));
+            assert_eq!(late.resolve(WAIT).await, Ok(Disposition::IgnoredPending));
+            assert!(Arc::ptr_eq(&opening, &state(&executor)));
+            assert!(effects(&executor).is_empty());
+            run(&executor, primary_delete(request.replica.0.clone(), false)).await;
+        } else {
+            assert_eq!(result, Ok(Disposition::Applied));
+            assert_eq!(late.resolve(WAIT).await, Ok(Disposition::IgnoredStale));
+        }
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [
+                Effect::Health(HealthEvent::Close),
+                Effect::DeleteReplicaReply(_)
+            ]
+        ));
+        assert_eq!(
+            state(&executor).registration_lookups,
+            opening.registration_lookups
+        );
+        assert!(matches!(
+            registration_actions(&executor, &request.replica.0, opening.open_token)
+                .await
+                .as_slice(),
+            [Effect::ReleaseRegistration(_), Effect::ReleaseUsage { .. }]
+        ));
+        assert!(state(&executor).registration_lookups.is_empty());
+        finish(&store, &executor).await;
+    }
 }
 
 #[tokio::test]

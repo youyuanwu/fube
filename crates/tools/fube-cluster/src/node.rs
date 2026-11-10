@@ -804,6 +804,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     let mut next_observation = Instant::now();
     let mut published_retirement = None;
     let mut published_absence = None;
+    let mut published_pre_open = None;
     if failure.is_none() {
         loop {
             // Owned stop remains independent of FM connectivity. Link loss is
@@ -966,6 +967,12 @@ async fn run_owned(launch: &Launch) -> Result<()> {
             }
             if link.is_some() && adapter.error.is_none() && adapter.replica_drained(&node) {
                 if let Err(error) = publish_absence(launch, &node, &mut published_absence) {
+                    failure = Some(error);
+                    break;
+                }
+                if let Err(error) =
+                    publish_pre_open_cancellation(launch, &node, &mut published_pre_open)
+                {
                     failure = Some(error);
                     break;
                 }
@@ -1295,6 +1302,40 @@ fn publish_absence(launch: &Launch, node: &Node, published: &mut Option<(i64, i6
         absence,
     };
     write_json(&launch.directory.join("absence.json"), &receipt)?;
+    *published = Some(lifetime);
+    Ok(())
+}
+fn publish_pre_open_cancellation(
+    launch: &Launch,
+    node: &Node,
+    published: &mut Option<(i64, i64)>,
+) -> Result<()> {
+    let Some(cancellation) = node.pre_open_cancellation() else {
+        return Ok(());
+    };
+    let lifetime = (
+        cancellation.body.replica.id,
+        cancellation.body.replica.instance,
+    );
+    if *published == Some(lifetime) {
+        return Ok(());
+    }
+    let profile = actual_profile(node)?;
+    let receipt = PreOpenCancellationReceipt {
+        deployment: launch.deployment.clone(),
+        session: launch.session.clone(),
+        node: launch.node.clone(),
+        fm: launch.fm.clone(),
+        generation: launch.generation.clone(),
+        node_pid: std::process::id(),
+        app_pid: profile.app_pid,
+        runtime_root: profile.runtime_root,
+        cancellation,
+    };
+    write_json(
+        &launch.directory.join("pre-open-cancellation.json"),
+        &receipt,
+    )?;
     *published = Some(lifetime);
     Ok(())
 }
@@ -3505,6 +3546,7 @@ pub(crate) mod report_tests {
         DeleteAbsent,
         DeleteOpeningProvider,
         DeleteOpeningService,
+        DeletePreRegistration,
     }
 
     pub(crate) async fn run_peer_creation_removal(
@@ -3527,6 +3569,7 @@ pub(crate) mod report_tests {
             PeerCreationOutcome::DeleteOpeningProvider | PeerCreationOutcome::DeleteOpeningService
         );
         let absent = matches!(outcome, PeerCreationOutcome::DeleteAbsent);
+        let pre_registration = matches!(outcome, PeerCreationOutcome::DeletePreRegistration);
         let (mut source, source_store) = create_node(&launches[0]).await?;
         let (mut target, target_store) = create_node(&launches[1]).await?;
         let mut source_adapter = Adapter::default();
@@ -3653,6 +3696,34 @@ pub(crate) mod report_tests {
             let source_link = source_link?;
             let target_link = target_link?;
             let operation = async {
+                if pre_registration {
+                    let end = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        target.drive().map_err(err)?;
+                        target_adapter.advance(&mut target, None).await?;
+                        if target.pending_commands() == 0 && target.activation().logs().iter().any(|line| line.contains("LOCAL_REGISTERED")) {
+                            break;
+                        }
+                        if Instant::now() >= end { return Err("original factory registration deadline".into()); }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    source_link.send(create_replica_message(&create, &launches[0].generation).map_err(err)?).await?;
+                    let mut incoming = target_link.receive(Instant::now() + Duration::from_secs(2)).await?
+                        .ok_or("missing original Create before lookup")?;
+                    let id = receive_peer(&launches[1], &mut target, &incoming.message)?.ok_or("original Create capacity")?;
+                    target_adapter.peer_commands.push(id);
+                    if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
+                    target.drive().map_err(err)?;
+                    while target.snapshot(entity).committed.is_none() {
+                        if Instant::now() >= end { return Err("original pre-registration Create commit deadline".into()); }
+                        tokio::task::yield_now().await;
+                    }
+                    let opening = target.snapshot(entity).committed.ok_or("missing original opening Idle")?;
+                    if opening.phase != ra::Phase::Opening || opening.runtime.is_some()
+                        || opening.usage.is_some() || opening.registration_lookups.is_empty()
+                        || target.retained_usage() != 0
+                    { return Err("pre-registration fixture adopted a runtime before Delete".into()); }
+                }
                 if matches!(outcome, PeerCreationOutcome::Opened) || deleting {
                     source_link
                         .send(
@@ -3785,10 +3856,10 @@ pub(crate) mod report_tests {
                 if traffic.idle_removals[1] != expected {
                     return Err("local cleanup replay changed the reply".into());
                 }
-                if !deleting && !absent {
+                if !deleting && !absent && !pre_registration {
                     ledger.idle_removal_reply(0, traffic.idle_removals[1].clone())?;
                 }
-                if ledger.idle_removal_status()["pending_remove"] != (deleting || absent)
+                if ledger.idle_removal_status()["pending_remove"] != (deleting || absent || pre_registration)
                     || (failed
                         && (ledger.idle_status()["state"] != "failed"
                             || ledger.idle_status()["error"] != ra::RA_NOT_READY
@@ -3800,13 +3871,98 @@ pub(crate) mod report_tests {
                         "semantic cleanup erased the original failure or claimed disposal".into(),
                     );
                 }
+                if pre_registration {
+                    let (target_fm, target_fm_link) = links(&launches[1]).await?;
+                    let result = async {
+                        let deleting = ledger.request_idle_deletion(Instant::now(), crate::fm::IdleDeleteTarget::PreRegistration)?;
+                        let before = target.pending_commands();
+                        target_fm.send(delete_replica_message(&deleting, &launches[1].generation).map_err(err)?).await?;
+                        let end = Instant::now() + Duration::from_secs(5);
+                        while target.pending_commands() == before {
+                            receive(&launches[1], &mut target, &mut target_adapter, &target_fm_link).await?;
+                            if Instant::now() >= end { return Err("pre-registration Delete ingress deadline".into()); }
+                        }
+                        while !target_adapter.replies.iter().any(|work| matches!(work.effect, ra::Effect::DeleteReplicaReply(_))) {
+                            target.drive().map_err(err)?;
+                            target_adapter.capture(&mut target);
+                            if Instant::now() >= end { return Err("pre-registration Delete effect deadline".into()); }
+                            tokio::task::yield_now().await;
+                        }
+                        if target.retained_usage() != 1 || target.pre_open_cancellation().is_some()
+                            || target.instance_disposal().is_some() || target.replica_absence().is_some()
+                            || target.snapshot(entity).committed.is_none_or(|state| state.phase != ra::Phase::Closed
+                                || state.runtime.is_some() || state.usage.is_some() || !state.local_deleted)
+                        { return Err("held late lookup ownership was released or certified early".into()); }
+                        let lost = loop {
+                            target_adapter.advance(&mut target, Some(&target_fm_link)).await?;
+                            if let Some(mut incoming) = target_fm.receive(Instant::now() + Duration::from_millis(1)).await? {
+                                let reply = decode_delete_replica_reply(&incoming.message).map_err(err)?.0;
+                                if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
+                                break reply;
+                            }
+                            if Instant::now() >= end { return Err("pre-registration semantic reply deadline".into()); }
+                        };
+                        if target.retained_usage() != 1 || target.pre_open_cancellation().is_some() {
+                            return Err("Delete reply was mistaken for draining the original lookup".into());
+                        }
+                        let mut target_traffic = Traffic::default();
+                        until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
+                            &mut target_traffic, |node, adapter, _| adapter.replica_drained(node)
+                                && node.pre_open_cancellation().is_some()).await?;
+                        let mut published = None;
+                        publish_pre_open_cancellation(&launches[1], &target, &mut published)?;
+                        ledger.read_pre_open_cancellation(1, &launches[1].directory.join("pre-open-cancellation.json"), std::process::id())?;
+                        if ledger.idle_deletion_status()["pre_open_cancelled"] != true
+                            || ledger.idle_deletion_status()["state"] != "pending"
+                            || ledger.idle_deletion_status()["completion"] != serde_json::Value::Null
+                            || ledger.idle_deletion_status()["disposed"] != false
+                            || ledger.idle_deletion_status()["never_created"] != false
+                        { return Err("pre-Open proof completed a lost native reply or fabricated another proof".into()); }
+                        let retry = ledger.idle_deletion_retry(1, Instant::now() + Duration::from_secs(11))
+                            .ok_or("missing pre-registration Delete retry")?;
+                        if retry != deleting { return Err("pre-registration Delete retry changed lineage".into()); }
+                        target_fm.send(delete_replica_message(&retry, &launches[1].generation).map_err(err)?).await?;
+                        until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
+                            &mut target_traffic, |_, _, traffic| traffic.removed).await?;
+                        if target_traffic.remove_reply.as_ref() != Some(&lost) { return Err("pre-registration Delete replay changed reply".into()); }
+                        ledger.reply(1, lost, true)?;
+                        if ledger.idle_deletion_status()["completion"] != "pre_open_cancelled"
+                            || ledger.idle_deletion_status()["pending_remove"] != true
+                            || ledger.placements[1].created || ledger.placements[1].reusable
+                            || ledger.placements[1].retirement.is_some()
+                        { return Err("pre-registration cancellation fabricated runtime creation, disposal or Primary removal".into()); }
+                        let proof = serde_json::to_value(target.pre_open_cancellation()).map_err(err)?;
+                        source_link.send(create_replica_message(&create, &launches[0].generation).map_err(err)?).await?;
+                        fm.send(add_replica_message(&request, &launches[0].generation).map_err(err)?).await?;
+                        for _ in 0..15 {
+                            peer_step(&launches[1], &mut target, &mut target_adapter, &target_link, Some(&target_fm_link)).await?;
+                            step(&launches[0], &mut source, &mut source_adapter, &fm, &fm_link, &mut traffic).await?;
+                        }
+                        if target.retained_usage() != 0 || target.replica_absence().is_some() || target.instance_disposal().is_some()
+                            || serde_json::to_value(target.pre_open_cancellation()).map_err(err)? != proof
+                            || target_adapter.peer_last_reply.is_some() || target_adapter.peer_command_error.is_some()
+                            || !target_traffic.reports.is_empty()
+                            || target.activation().logs().iter().any(|line| line.contains("LOCAL_CALLBACK")
+                                || line.contains("LOCAL_DATA_PROVIDER acquired") || line.contains("LOCAL_RESOURCE acquired"))
+                        { return Err("late pre-registration traffic reopened or reacquired the deleted Idle".into()); }
+                        ledger.idle_removal_reply(0, traffic.idle_removals[1].clone())?;
+                        let continued = data_request(&endpoint, b"write-more\n").await?;
+                        if !continued.contains("committed=2 value=continued") || data_request(&endpoint, b"read\n").await? != continued {
+                            return Err("pre-registration cancellation changed healthy Primary serving".into());
+                        }
+                        Ok(())
+                    }.await;
+                    let closed = target_fm.close().await;
+                    let node_closed = target_fm_link.close().await;
+                    return result.and(closed).and(node_closed);
+                }
                 if absent {
                     let (target_fm, target_fm_link) = links(&launches[1]).await?;
                     let operation = async {
                         if target.snapshot(entity).committed.is_some() || target.replica_absence().is_some() {
                             return Err("absent deletion did not start before original Create delivery".into());
                         }
-                        let deleting = ledger.request_idle_deletion(Instant::now(), true)?;
+                        let deleting = ledger.request_idle_deletion(Instant::now(), crate::fm::IdleDeleteTarget::Unobserved)?;
                         let mut target_traffic = Traffic::default();
                         target_fm.send(delete_replica_message(&deleting, &launches[1].generation).map_err(err)?).await?;
                         until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
@@ -4000,7 +4156,7 @@ pub(crate) mod report_tests {
                 if deleting {
                     let (target_fm, target_fm_link) = links(&launches[1]).await?;
                     let deletion = async {
-                        let deleting = ledger.request_idle_deletion(Instant::now(), false)?;
+                        let deleting = ledger.request_idle_deletion(Instant::now(), crate::fm::IdleDeleteTarget::Runtime)?;
                         if receive_command(&launches[1], &mut target,
                             &delete_replica_message(&DeleteReplica::new(deleting.replica.0.clone(), true),
                                 &launches[1].generation).map_err(err)?).is_ok()

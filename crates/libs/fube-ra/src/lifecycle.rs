@@ -558,13 +558,12 @@ pub(super) fn transition(
                     if request.deletion.0.force
                         || !(original.phase == Phase::Ready
                             || (original.phase == Phase::Opening
-                                && original.runtime.is_some()
-                                && original.usage.is_some())
+                                && original.runtime.is_some() == original.usage.is_some())
                             || original.local_deleted)
                         || original.body.replica.current_role != 2
                     {
                         return Err(Failure::Unsupported(
-                            "peer deletion requires an opened or registered opening original Idle",
+                            "peer deletion requires an original opening or opened Idle",
                         ));
                     }
                     if body.replica.id != original.body.replica.id {

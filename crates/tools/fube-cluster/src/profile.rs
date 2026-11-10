@@ -379,6 +379,57 @@ pub fn absent_replica_body(body: &AddInstance) -> AddInstance {
     }
 }
 
+pub fn pre_open_cancelled_body(body: &AddInstance) -> AddInstance {
+    let mut body = body.clone();
+    body.replica.current_role = 2;
+    body.replica.state = 3;
+    body.replica.up = false;
+    body
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreOpenCancellationReceipt {
+    pub deployment: String,
+    pub session: String,
+    #[serde(with = "json_node")]
+    pub node: NodeInstance,
+    #[serde(with = "json_node")]
+    pub fm: NodeInstance,
+    #[serde(with = "json_generation")]
+    pub generation: GenerationHeader,
+    pub node_pid: u32,
+    pub app_pid: u32,
+    pub runtime_root: PathBuf,
+    pub cancellation: fube_node::local::PreOpenCancellation,
+}
+impl PreOpenCancellationReceipt {
+    pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
+        if launch.profile != ServiceProfile::StatefulPeerIdle
+            || launch.placement != 2
+            || launch.peer.is_none()
+            || self.deployment != launch.deployment
+            || self.session != launch.session
+            || self.node != launch.node
+            || self.fm != launch.fm
+            || self.generation != launch.generation
+            || self.node_pid != node_pid
+            || self.app_pid != profile.app_pid
+            || self.runtime_root != profile.runtime_root
+            || self.cancellation.body != pre_open_cancelled_body(&add_body(launch, profile))
+            || self.cancellation.creation == 0
+            || self.cancellation.command == 0
+            || self.cancellation.ra_operation == 0
+            || self.cancellation.creation == self.cancellation.ra_operation
+        {
+            return Err(
+                "pre-Open cancellation proof does not match the original peer creation".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AbsenceReceipt {

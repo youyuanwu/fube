@@ -70,7 +70,7 @@ loss does not undo independently owned destination deletion.
 The app host/package remain resident and `reusable=false`; no replacement is
 authorized. Normal Delete produces no terminal ReplicaUp report. Delayed
 original CreateReplica is ignored by the deleted tombstone and cannot reopen
-the Idle. Deletion during pre-registration Opening, force and broader peer cleanup remain gated.
+the Idle. Force and broader peer cleanup remain gated.
 An original failed Add keeps its error even if an already-opened destination is
 explicitly deleted; semantic deletion clears to-be-dropped, and joined disposal
 clears destination-cleanup-required, separately from pending-remove.
@@ -98,7 +98,20 @@ and aborted before the service, never opened or published as Ready.
 This branch freezes disposal as required: retries cannot downgrade it to
 never-created absence. Held real Open and independently held provider/service
 disposal, late traffic, reply replay and actual child adapters qualify the path.
-Pre-registration Open remains gated, not successful absence.
+The original unanswered FM Add also admits pre-registration Opening. Native
+InCreate/no-registration Delete commits the tombstone/reply without RAP Close;
+late lookup offers release their exact acquisitions without RuntimeOpen.
+The distinct `pre-open-cancellation.json` proof binds original creation and
+applied Delete lineage, and is published only after local lookup/usage drain
+with no runtime route. Its join with DeleteReplicaReply reports
+`completion=pre_open_cancelled`, `pre_open_cancelled=true`, `disposed=false`,
+`never_created=false`, `created_lifetime=false`, `reusable=false`.
+The FT retains its original 1/1 description, unlike missing-FT absence.
+Observed pre-registration cancellation cannot downgrade to zero-history absence
+on retry; registration winning the race instead requires genuine disposal.
+Unobserved original creation retains the appropriate actual-outcome proof.
+Held real lookup ownership after the native reply, late registration/traffic,
+reply replay and actual child adapters qualify these separate barriers.
 Failed/unknown absent lifetimes, arbitrary targets,
 future incarnations and replacement are not authorized by this branch.
 
@@ -167,8 +180,7 @@ new FM generations, mutation of the fixed service, and node2 FM creation.
 Build completion still leaves Idle/InBuild metadata, no service endpoint and
 denied access. There is no quorum addition, serving secondary, failover,
 replacement, or recovery. Removal
-before peer Open through the local API and destination deletion during
-pre-registration Opening remain gated; both original owners retain
+before peer Open through the local API remains gated; both original owners retain
 normal cleanup.
 
 Build both executables, then run:

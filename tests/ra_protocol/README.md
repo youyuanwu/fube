@@ -117,7 +117,7 @@ wire/schema evidence only, not original handler execution, native FM
 interoperability, or authorization of force deletion, recreation,
 reconfiguration, FMM execution or recovery.
 
-The bounded original opened/registered-opening/never-created Idle destination deletion also reuses these
+The bounded original opened/opening/never-created Idle destination deletion also reuses these
 inherited DeleteReplica/Reply bodies and factories; it adds no wire schema or
 fixture shape. Separate RA/store and real-process FM/Node/RAP tests qualify
 Idle deletion, held disposal, independent pending-remove, lost reply/replay and
@@ -132,6 +132,11 @@ returned controls remain owned for replicator-before-service Abort. Its frozen
 FM admission requires genuine disposal proof, not never-created absence.
 Held callback/provider/service and real child-adapter tests are separate from
 these unchanged 139 wire cases and 77 schema types/240 fields.
+Pre-registration Opening instead uses the original created FT's 1/1 description
+and native immediate Close without registration/RAP. Its distinct source-bound
+pre-Open cancellation receipt waits for exact late lookup/acquisition drain;
+it is neither a runtime disposal receipt nor zero-history missing-FT absence.
+That trusted-local DTO and real-process/child tests add no wire cases or schemas.
 
 ### Stage-two node control/load and endpoint codecs
 

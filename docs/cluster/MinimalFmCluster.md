@@ -426,14 +426,15 @@ Delete intent and Close completion remain behind their own commits. The reply
 uses native None/None/Dropped/down metadata, invalid version/LSNs and no endpoints.
 Normal deletion schedules no ReplicaDown/ReplicaDropped report. Same-incarnation
 CreateReplica after deletion is ignored without Open, build or usage acquisition.
-Deletion during pre-registration Opening, force, arbitrary unknown/replacement,
+Force, arbitrary unknown/replacement,
 active membership and recovery remain gated.
 
 ### Deleting the original registered destination during Open
 
 The same API also admits the original Idle while RAP Open is in flight, once
 the committed RA state owns its runtime registration and original usage lease.
-Pre-registration Opening remains gated. Normal Delete commits deleted/Closing
+Pre-registration Opening uses the separate cancellation proof below.
+Normal Delete commits deleted/Closing
 intent and sends Drop-flagged RAP Close without waiting for Primary Remove.
 Native `FailoverUnit.cpp:4916-5028` clears Open-pending and retains Close-pending;
 `ReconfigurationAgent.cpp:3782-3828` ignores late Open replies.
@@ -458,6 +459,46 @@ fencing, no build and a writable original Primary. Public Cluster acceptance
 uses both actual child adapters and the production retirement publisher.
 Definite/unknown commits retain their original publication barriers.
 This adds no native wire shape or native C++ handler qualification.
+
+### Deleting the original destination during pre-registration Opening
+
+The original unanswered FM Add may also delete an Idle whose CreateReplica has
+committed Opening but has not adopted runtime registration/usage.
+Native `FailoverUnit.cpp:4980-5028` marks deleted, clears Open-pending and
+immediately finishes Close for InCreate without ServiceTypeRegistration.
+No RAP Open/Close or user-service disposal is invented. The reply retains the
+created FT's original 1/1 description, not the missing-FT constructor's zero
+target/minimum, and uses the same canonical dropped replica metadata.
+Late acquired lookup results are consumed as stale and release their exact
+registration/usage ownership without authorizing RuntimeOpen.
+
+The original Node captures the actual creation token and applied Delete
+command/ticket lineage. A distinct `pre-open-cancellation.json` sidecar is
+published only from its live original owner, unfenced deleted tombstone and
+fully drained commands/effects/lookups/acquisitions, with no runtime route or
+disposal witness. FM joins it with DeleteReplicaReply in either order:
+`completion=pre_open_cancelled`, `pre_open_cancelled=true`, `disposed=false`,
+`never_created=false`, `created_lifetime=false`, `reusable=false`.
+The original FT/lookup history is not relabeled as zero-history absence.
+Native metadata success alone cannot certify that a late acquisition drained.
+Primary pending-remove still requires its own RemoveReplicaReply.
+
+Admission freezes the observed target branch. A registered lifetime requires
+disposal; observed pre-registration Opening cannot downgrade to missing-FT
+absence on retry. An unobserved original creation permits the corresponding
+source-bound proof for the actual outcome. If registration wins the race,
+genuine disposal remains required. Other failed/unknown lifetimes, force,
+arbitrary targets, replacement and recovery remain gated.
+
+Real-process/Channel acceptance holds the original FT before lookup adoption,
+then holds an actual acquired lookup after the native Delete reply. It proves
+no early local proof, exact late release, lost-reply retry/replay, stable
+tombstone/lineage and no callback/build resurrection. Public Cluster acceptance
+holds original factory registration, drives both real child adapters and the
+production cancellation publisher, then releases registration after completion.
+The Primary remains writable. Definite/unknown commits preserve their barriers.
+The new receipt is trusted-local metadata, not a native wire schema or evidence
+of native C++ handler execution/interoperability.
 
 ### Deleting the original destination before CreateReplica
 
@@ -497,8 +538,8 @@ publish it early. Destination-owner loss leaves unresolved cleanup unknown;
 Primary pending-remove still requires its own RemoveReplicaReply.
 Only the original unanswered FM Add permits absent cleanup. An already-opened
 original or registered in-flight Open still uses genuine disposal proof;
-pre-registration Opening, failed or
-unknown absent lifetimes, force, arbitrary targets and later incarnations remain
+pre-registration Opening uses the distinct cancellation proof above.
+Failed or unknown absent lifetimes, force, arbitrary targets and later incarnations remain
 gated. No fresh lifetime, restart recovery or active membership is authorized.
 
 Controlled real application-process/Channel acceptance holds the original
