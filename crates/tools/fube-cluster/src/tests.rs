@@ -254,6 +254,78 @@ fn fm_idle_ledger_requires_semantic_ready_reply_and_fences_failure_loss_and_remo
 }
 
 #[test]
+fn fm_idle_removal_keeps_pending_until_matching_reply_and_never_resurrects_add() {
+    for lost in [false, true] {
+        let mut ledger = Ledger::new(peer_idle_launches());
+        for placement in &mut ledger.placements {
+            placement.bootstrap = Bootstrap::Metadata;
+            let mut actual = profile(&placement.launch);
+            actual.service = placement.launch.profile.service().into();
+            actual.service_type = fixed_type_for(placement.launch.profile);
+            placement.admit_profile(actual).unwrap();
+        }
+        let now = Instant::now();
+        assert!(ledger.request_idle_removal(now).is_err());
+        ledger.accept(command("primary", "create", Some(1))).unwrap();
+        ledger.reply(0, ready_reply(&ledger.placements[0]), false).unwrap();
+        let add = ledger.request_idle(now).unwrap();
+        let request = ledger.request_idle_removal(now).unwrap();
+        assert_eq!(request, add);
+        assert_eq!(ledger.idle_status()["state"], "cancelled");
+        assert!(ledger.idle_retry(0, now + Duration::from_secs(11)).is_none());
+        assert!(ledger.request_idle(now).is_err());
+        assert_eq!(ledger.idle_removal_status()["pending_remove"], true);
+        let mut reply = RemoveReplicaReply {
+            unit: request.unit.clone(), replica: request.replica.clone(), error: 0,
+        };
+        reply.replica.state = 3;
+        reply.replica.replication_endpoint = "127.0.0.1:23457".into();
+        let mut failed = reply.clone();
+        failed.error = -992;
+        ledger.idle_removal_reply(0, failed).unwrap();
+        ledger.idle_removal_reply(1, reply.clone()).unwrap();
+        for field in 0..4 {
+            let mut stale = reply.clone();
+            match field {
+                0 => stale.replica.instance -= 1,
+                1 => stale.replica.node.instance += 1,
+                2 => stale.replica.id += 1,
+                _ => stale.unit.current.configuration += 1,
+            }
+            ledger.idle_removal_reply(0, stale).unwrap();
+        }
+        let mut invalid = reply.clone();
+        invalid.replica.state = 2;
+        assert!(ledger.idle_removal_reply(0, invalid).is_err());
+        assert_eq!(ledger.idle_removal_status()["state"], "pending");
+        assert!(ledger.idle_removal_retry(0, now + Duration::from_secs(10)).is_none());
+        assert_eq!(ledger.idle_removal_retry(0, now + Duration::from_secs(11)), Some(request.clone()));
+        assert!(ledger.idle_removal_retry(1, now + Duration::from_secs(30)).is_none());
+        assert!(ledger.idle_removal_retry(0, now + Duration::from_secs(61)).is_none());
+        assert_eq!(ledger.idle_removal_retry(0, now + Duration::from_secs(72)), Some(request));
+        if lost {
+            ledger.lost(0, "original Primary session lost".into());
+        }
+        ledger.idle_removal_reply(0, reply.clone()).unwrap();
+        assert_eq!(ledger.idle_removal_status()["state"], if lost { "unknown" } else { "removed" });
+        assert_eq!(ledger.idle_removal_status()["pending_remove"], lost);
+        assert!(ledger.idle_removal_retry(0, now + Duration::from_secs(150)).is_none());
+        let mut late = reply.clone();
+        late.replica.state = 2;
+        ledger.idle_reply(0, late).unwrap();
+        assert_eq!(ledger.idle_status()["ready"], false);
+        assert_eq!(ledger.idle_status()["cleanup_required"], lost);
+        ledger.idle_removal_reply(0, reply).unwrap();
+        assert_eq!(ledger.placements[1].observed, Observed::Absent);
+        assert!(!ledger.placements[1].created);
+        if !lost {
+            ledger.down(0);
+            assert_eq!(ledger.idle_removal_status()["state"], "removed");
+        }
+    }
+}
+
+#[test]
 fn peer_idle_profile_binds_one_partition_and_never_admits_a_second_fm_primary() {
     let launches = peer_idle_launches();
     for launch in &launches {
@@ -560,7 +632,7 @@ async fn peer_idle_build_copies_nonempty_state_and_continues_replication_without
 
 #[tokio::test]
 async fn peer_idle_removal_retires_only_the_primary_session_before_or_after_copy() {
-    for build in [false, true] {
+    for (build, fm) in [(false, false), (true, false), (false, true), (true, true)] {
         let fixture = Fixture::new(if build { "built-idle-remove" } else { "unbuilt-idle-remove" });
         let mut config = fixture.config();
         config.profile = ServiceProfile::StatefulPeerIdle;
@@ -569,9 +641,11 @@ async fn peer_idle_removal_retires_only_the_primary_session_before_or_after_copy
         cluster.start().await.unwrap();
         let result = peer_idle_catch(async {
             assert!(cluster.remove_idle_replica().await.is_err());
+            assert!(cluster.remove_idle_replica_via_fm().await.is_err());
             cluster.execute(command("primary", "create", Some(1))).await?;
             until(&mut cluster, |cluster| cluster.ledger.placements[0].observed == Observed::Running).await;
             assert!(cluster.remove_idle_replica().await.is_err());
+            assert!(cluster.remove_idle_replica_via_fm().await.is_err());
             let primary = cluster.ledger.placements[0].endpoint.clone().unwrap();
             let end = Instant::now() + Duration::from_secs(2);
             while !data_contact(&primary, b"read\n").starts_with("OK ") {
@@ -590,8 +664,14 @@ async fn peer_idle_removal_retires_only_the_primary_session_before_or_after_copy
                         && cluster.status()["nodes"][1]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 1
                 }).await;
             }
-            assert_eq!(cluster.remove_idle_replica().await?["state"], "pending");
-            until(&mut cluster, |cluster| cluster.status()["peer_idle"]["state"] == "removed").await;
+            let pending = if fm {
+                cluster.remove_idle_replica_via_fm().await?
+            } else {
+                cluster.remove_idle_replica().await?
+            };
+            assert_eq!(pending["state"], "pending");
+            until(&mut cluster, |cluster| cluster.status()["peer_idle"]["state"] == "removed"
+                && (!fm || cluster.ledger.idle_removal_status()["removed"] == true)).await;
             let removed = cluster.status();
             assert_eq!(removed["peer_idle"]["built"], false);
             assert_eq!(removed["peer_idle"]["serving"], false);
@@ -601,7 +681,13 @@ async fn peer_idle_removal_retires_only_the_primary_session_before_or_after_copy
             assert_eq!(original["open"], true);
             assert_eq!(original["replica"]["state"], 1);
             assert_eq!(original["replica"]["current_role"], 2);
-            assert_eq!(cluster.remove_idle_replica().await?["state"], "removed");
+            if fm {
+                assert_eq!(cluster.remove_idle_replica_via_fm().await?["state"], "removed");
+                assert!(cluster.remove_idle_replica().await.is_err());
+                assert_eq!(removed["idle_removal"]["pending_remove"], false);
+            } else {
+                assert_eq!(cluster.remove_idle_replica().await?["state"], "removed");
+            }
             assert_eq!(cluster.create_idle_replica().await?["state"], "removed");
             assert!(cluster.build_idle_replica().await.is_err());
             let source: Value = serde_json::from_str(&data_contact(&primary, b"state\n")).map_err(err)?;
@@ -689,11 +775,46 @@ async fn fm_add_idle_copies_real_state_and_recovers_lost_reply_without_resurrect
             assert_eq!(cluster.ledger.idle_status()["state"], "pending");
             if cancel {
                 cluster.send_idle(&request).await?;
-                cluster.remove_idle_replica().await?;
+                assert_eq!(cluster.remove_idle_replica_via_fm().await?["state"], "pending");
+                let remove_request = cluster.ledger.idle_removal.as_ref().unwrap().body.clone();
+                let end = Instant::now() + Duration::from_secs(12);
+                let removed = loop {
+                    let mut dropped = None;
+                    for index in 0..2 {
+                        let incoming = cluster.children[index].link.as_ref().unwrap()
+                            .receive(Instant::now() + Duration::from_millis(2)).await?;
+                        if let Some(mut incoming) = incoming {
+                            if incoming.message.properties().map_err(err)?.action == "RemoveReplicaReply" {
+                                let (body, owner) = decode_remove_replica_reply(&incoming.message).map_err(err)?;
+                                assert_eq!(owner, Owner::Fm);
+                                assert_eq!(index, 0);
+                                if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
+                                dropped = Some(body);
+                            } else {
+                                cluster.receive_message(index, incoming).await?;
+                            }
+                        }
+                    }
+                    if let Some(body) = dropped { break body; }
+                    assert!(Instant::now() < end, "lost removal reply: {}", cluster.status());
+                };
+                assert_eq!(removed.error, 0);
+                assert_eq!(removed.replica.state, 3);
                 until(&mut cluster, |cluster| cluster.status()["peer_idle"]["state"] == "removed").await;
+                assert_eq!(cluster.ledger.idle_removal_status()["state"], "pending");
+                assert_eq!(cluster.ledger.idle_removal_status()["pending_remove"], true);
+                let retry = cluster.ledger.idle_removal_retry(0, Instant::now() + Duration::from_secs(11))
+                    .ok_or("missing FM removal retry")?;
+                assert_eq!(retry, remove_request);
+                cluster.send_idle_removal(&retry).await?;
+                until(&mut cluster, |cluster| cluster.ledger.idle_removal_status()["removed"] == true).await;
+                assert_eq!(cluster.ledger.idle_removal.as_ref().unwrap().reply.as_ref(), Some(&removed));
+                assert_eq!(cluster.remove_idle_replica_via_fm().await?["state"], "removed");
                 assert_eq!(cluster.ledger.idle_status()["state"], "cancelled");
                 cluster.ledger.idle_reply(0, dropped)?;
                 assert_eq!(cluster.ledger.idle_status()["ready"], false);
+                cluster.send_idle(&request).await?;
+                cluster.send_idle_removal(&retry).await?;
             } else {
                 let retry = cluster.ledger.idle_retry(0, Instant::now() + Duration::from_secs(11))
                     .ok_or("missing FM semantic retry")?;
@@ -732,6 +853,20 @@ async fn fm_add_idle_copies_real_state_and_recovers_lost_reply_without_resurrect
                 assert_eq!(source["peers"][0]["configured"], false);
                 assert_eq!(source["peers"][0]["building"], false);
                 assert_eq!(status["peer_idle"]["ready"], true);
+                assert_eq!(cluster.remove_idle_replica_via_fm().await?["state"], "pending");
+                until(&mut cluster, |cluster| {
+                    cluster.ledger.idle_removal_status()["removed"] == true
+                        && cluster.status()["peer_idle"]["state"] == "removed"
+                        && cluster.status()["peer_idle"]["ready"] == false
+                }).await;
+                let after = cluster.status();
+                assert_eq!(after["peer_idle"]["target"], *target);
+                assert_eq!(after["peer_idle"]["built"], false);
+                assert_eq!(after["peer_idle"]["ready"], false);
+                assert_eq!(after["peer_idle"]["fm"]["ready"], false);
+                assert_eq!(after["idle_removal"]["pending_remove"], false);
+                assert_eq!(after["nodes"][1]["retained_work"]["app_observation"]["idle_data"]["provider"], data["provider"]);
+                assert_eq!(data_contact(&primary, b"read\n"), write);
             }
             Ok::<(), String>(())
         }).await;

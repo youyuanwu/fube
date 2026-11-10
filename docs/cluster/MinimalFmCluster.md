@@ -258,7 +258,7 @@ Peer creation failure returns an AddReplicaReply error, leaving FM cleanup
 required; the bounded original observation is retained for error replay instead
 of authorizing another lifetime. RAP build errors remain diagnostics/pending
 and retry through existing nonterminal cleanup, not failed FM completion.
-Broader replacement, configuration repair and FM RemoveReplica/Reply remain
+Broader replacement, configuration repair and pre-Open cleanup remain
 gated. Manual create/build cannot adopt or mutate an FM-owned Idle.
 Local explicit removal cancels the FM add obligation and fences queued/late
 success; cancellation does not fabricate RemoveReplicaReply. Primary Close
@@ -291,8 +291,8 @@ the original Hosting/runtime session. Native RA InDrop maps to `state=3`
 (Dropped) in that request's remote descriptor; this does not change the
 destination's actual role or lifecycle. The request retains the original
 replica ID/incarnation/endpoint, empty runtime, default service and zero flags.
-This API does not admit removal before peer Open, FM RemoveReplica or arbitrary
-remote replacement.
+This local API does not admit removal before peer Open, issue FM RemoveReplica
+or authorize arbitrary remote replacement.
 
 The existing RAP issues native `ReplicaRemoval::Idle` authority before calling
 `IPrimaryReplicator::remove_replica`. If build is still running, RAP cancels it
@@ -327,6 +327,28 @@ opened with its original registration, usage and copied state; normal shutdown
 still joins and disposes that original owner. No FM RemoveReplicaReply or
 destination DeleteReplica completion is inferred.
 
+The separate programmatic `Cluster::remove_idle_replica_via_fm()` API now sends
+native FM RemoveReplica for the original opened Idle, including a manual
+unbuilt/copied Idle or an FM-owned pending/failed/successful build. It freezes
+the original FT/service/remote incarnation and retries on native 10/60-second
+cadence. RA records FM removal ownership and InDrop intent before RAP dispatch.
+Ordinary RAP errors remain pending; successful removal emits RemoveReplicaReply,
+and completed duplicate requests replay that reply without another user removal.
+Only the matching original Primary/FT/remote success clears FM pending-remove.
+Poll `peer_idle.fm_removal` (also root `idle_removal`), not diagnostic
+`peer_idle.state=removed`, to determine FM completion.
+
+Removal cancels pending FM add, fences late build and queued AddReplicaReply,
+and retains terminal same-incarnation tombstones. A lost RemoveReplicaReply
+leaves FM pending even after diagnostic RAP success; frozen retry obtains replay.
+Unresolved original-session loss leaves unknown/pending-remove, never recovery.
+Local removal cannot take over an FM-owned removal. The destination lifetime,
+data, registration and usage remain intact until normal shutdown; FM completion
+does not imply remote deletion or active configuration change. Native
+InCreate/down/not-found, failed-Open cleanup and replacement remain gated
+([RA:2044-2140,4094-4149](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ReconfigurationAgent.cpp#L2044-L2140),
+[FM:201-214](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/fm/FailoverUnitMessageProcessor.cpp#L201-L214)).
+
 This increment deliberately retains Idle/InBuild metadata, no service endpoint,
 denied read/write access and no active membership or quorum change even after
 copy completes. Manual build sends no AddReplicaReply; only the distinct
@@ -346,6 +368,10 @@ AddReplicaReply, proves FM stays pending, retries the same AddReplica to receive
 the cached Ready-Idle result, and checks ongoing replication without another
 destination Open. A separate removal race rejects late success while preserving
 the destination service/data and a writable original Primary.
+FM removal acceptance drops an actual RemoveReplicaReply, proves pending-remove
+survives child removal telemetry, retries the original request for replay and
+rejects delayed AddReplicaReply resurrection. Both unbuilt and copied manual
+Idles also qualify FM removal without disposing the destination.
 
 These are native-derived model/store and native-free real-process contracts,
 not full C++ handler traces or native Federation interoperability.

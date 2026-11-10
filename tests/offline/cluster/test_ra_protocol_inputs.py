@@ -48,8 +48,8 @@ class InputTests(unittest.TestCase):
 
     def test_inventory_model_is_valid_not_an_execution_claim(self):
         manifest = validate(self.bundle, "a" * 40, self.source)
-        self.assertEqual(len(manifest["cases"]), 131)
-        self.assertEqual(len(manifest["files"]) + 1, 135)
+        self.assertEqual(len(manifest["cases"]), 138)
+        self.assertEqual(len(manifest["files"]) + 1, 142)
 
     def test_exact_schema_counts_and_extra_files_are_rejected(self):
         for key in ["schema_types", "schema_fields"]:

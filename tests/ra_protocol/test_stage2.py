@@ -19,7 +19,7 @@ class StageTwoCatalogTests(unittest.TestCase):
         records = {row["action"]: row for row in rows}
         self.assertEqual(len(rows), 119)
         self.assertEqual(sum(row["boundary"] == "true" for row in rows), 66)
-        self.assertEqual(sum("selected" in row["status"] for row in rows), 35)
+        self.assertEqual(sum("selected" in row["status"] for row in rows), 37)
         for action in consumer.STAGE_TWO_ACTIONS:
             with self.subTest(action=action):
                 row = records[action]
@@ -196,7 +196,7 @@ class StageTwoReceiptTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "source/schema"):
                         consumer.validate(self.bundle, "a" * 40, self.source)
 
-    def test_add_replica_cases_and_factory_metadata_are_required_before_execution(self):
+    def test_replica_cases_and_factory_metadata_are_required_before_execution(self):
         with patch.object(consumer.subprocess, "check_output") as execute:
             for case in consumer.REPLICA_CASES:
                 self.manifest["cases"].remove(case)

@@ -152,6 +152,7 @@ impl Adapter {
                             | ra::Effect::Reply(_)
                             | ra::Effect::PrimaryReply(_)
                             | ra::Effect::AddReplicaReply(_)
+                            | ra::Effect::RemoveReplicaReply(_)
                             | ra::Effect::RemoveReply(_)
                             | ra::Effect::DeleteReplicaReply(_)
                     )
@@ -338,7 +339,10 @@ impl Adapter {
         }
         if let Some(link) = link {
             if let Some(reply) = self.replies.front() {
-                if let ra::Effect::AddReplicaReply(body) = &reply.effect {
+                if let ra::Effect::AddReplicaReply(body) | ra::Effect::RemoveReplicaReply(body) =
+                    &reply.effect
+                {
+                    let removing = matches!(reply.effect, ra::Effect::RemoveReplicaReply(_));
                     let snapshot = node.snapshot(reply.entity);
                     if snapshot.fenced
                         || snapshot.committed.as_ref().is_none_or(|state| {
@@ -347,7 +351,13 @@ impl Adapter {
                                 || state
                                     .remote_idle
                                     .as_ref()
-                                    .and_then(ra::RemoteIdle::add_reply)
+                                    .and_then(|remote| {
+                                        if removing {
+                                            remote.remove_reply()
+                                        } else {
+                                            remote.add_reply()
+                                        }
+                                    })
                                     .as_ref()
                                     != Some(body)
                         })
@@ -369,6 +379,9 @@ impl Adapter {
                     ra::Effect::Reply(body) => add_instance_reply_message(body, Owner::Fm),
                     ra::Effect::PrimaryReply(body) => add_primary_reply_message(body, Owner::Fm),
                     ra::Effect::AddReplicaReply(body) => add_replica_reply_message(body, Owner::Fm),
+                    ra::Effect::RemoveReplicaReply(body) => {
+                        remove_replica_reply_message(body, Owner::Fm)
+                    }
                     ra::Effect::RemoveReply(body) => remove_instance_reply_message(body, Owner::Fm),
                     ra::Effect::DeleteReplicaReply(body) => {
                         delete_replica_reply_message(body, Owner::Fm)
@@ -1019,6 +1032,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                                     "result":build.result, "detail":build.detail,
                                 })),
                                 "removal":remote.removal.as_ref().map(|removal| serde_json::json!({
+                                    "fm_owned":removal.fm_request.is_some(),
                                     "replica":removal.replica,
                                     "result":removal.result, "detail":removal.detail,
                                 })),
@@ -1306,13 +1320,19 @@ fn receive_command(
             node.add_primary_from_fm(body, &launch.fm, &generation)
                 .map_err(err)?;
         }
-        "AddReplica" => {
-            let (body, generation) = decode_add_replica(message).map_err(err)?;
+        "AddReplica" | "RemoveReplica" => {
+            let removing = message.properties().map_err(err)?.action == "RemoveReplica";
+            let (body, generation) = if removing {
+                decode_remove_replica(message)
+            } else {
+                decode_add_replica(message)
+            }
+            .map_err(err)?;
             let peer = launch
                 .peer
                 .as_ref()
                 .filter(|_| launch.placement == 1)
-                .ok_or("AddReplica requires the original coordinating Primary")?;
+                .ok_or("replica control requires the original coordinating Primary")?;
             fixed_peer_target(
                 launch,
                 &body.unit.id,
@@ -1321,8 +1341,12 @@ fn receive_command(
                 peer.replica,
                 peer.incarnation,
             )?;
-            node.add_replica_from_fm(body, &launch.fm, &generation)
-                .map_err(err)?;
+            if removing {
+                node.remove_replica_from_fm(body, &launch.fm, &generation)
+            } else {
+                node.add_replica_from_fm(body, &launch.fm, &generation)
+            }
+            .map_err(err)?;
         }
         "RemoveInstance" => {
             let (body, generation) = decode_remove_instance(message).map_err(err)?;

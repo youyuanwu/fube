@@ -30,6 +30,19 @@ Local explicit removal cancels the FM add obligation and fences late success,
 without claiming FM RemoveReplicaReply or destination disposal. Original session
 loss yields unknown, never recovery or transparent adoption.
 
+`Cluster::remove_idle_replica_via_fm().await` lets FM abandon the original opened
+Idle through native RemoveReplica/Reply, whether unbuilt, building, built or
+failed build. Poll `peer_idle.fm_removal` (also root `idle_removal`) for
+`state=removed`/`pending_remove=false`; diagnostic `peer_idle.state=removed`
+does not complete FM. The frozen request retries on the same 10/60-second
+cadence. RA retains ordinary RAP errors for retry and replays successful replies
+on duplicate FM requests without another removal. A lost reply leaves FM pending.
+Removal cancels any FM add and fences delayed/queued AddReplicaReply and build
+success. Unresolved original-owner loss yields unknown, not recovery. Destination
+service/data and registration remain intact; no remote deletion, active membership
+or automatic removal after successful build is inferred. Pre-Open/down/unknown
+cleanup, failed-Open cleanup and replacement remain gated.
+
 The earlier manual path remains separate: `Cluster::create_idle_replica().await` submits a trusted
 local Primary-RA command and returns `pending`. Poll `status()["peer_idle"]`
 for the committed CreateReplicaReply observation (`open`, not built/serving).
@@ -79,8 +92,8 @@ Peer loss does not dispose an application, fabricate a reply or reconnect.
 This profile admits CLI `create` on node1, `status`, and `quit` only; it rejects
 new FM generations, mutation of the fixed service, and node2 FM creation.
 Build completion still leaves Idle/InBuild metadata, no service endpoint and
-denied access. There is no FM RemoveReplica/Reply orchestration,
-quorum addition, serving secondary, failover, replacement, or recovery. Removal
+denied access. There is no quorum addition, serving secondary, failover,
+replacement, or recovery. Removal
 before peer Open and remote deletion remain gated; both original owners retain
 normal cleanup.
 

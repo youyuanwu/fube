@@ -37,7 +37,7 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 131 inputs.
+The C++ producer independently constructs expected values and emits 138 inputs.
 The existing 36 cases and their contracts are retained:
 default/rich AddInstance, default/error AddInstanceReply, default/rich Remove
 (force false/true), default/rich removal reply, explicit-empty/rich ReplicaUp
@@ -54,7 +54,7 @@ Nondefault cases cover GUID/raw NodeId, high-bit instances, negative LSN/epochs,
 UTF-16/surrogates, enums/errors, all service collections and null/Invalid/both
 derived scaling variants. Rust rejects every proper prefix of rich body
 fixtures including both rich force bodies and the rich/partial notification
-bodies; native rejects 36 truncated bodies, including NodeUp, Ack, PToP
+bodies; native rejects 38 truncated bodies, including NodeUp, Ack, PToP
 and the distinct DeleteReplica/Reply fixtures.
 Non-polymorphic Delete inheritance invokes base rich traversal and native
 base/derived scopes, not a flattened or nested replacement. ReplicaUp's empty
@@ -302,8 +302,36 @@ This is schema-adapter/native-stream evidence, not native handler execution.
 The bounded native-free FM/RA/Hosting/RAP build, lost-reply replay and removal
 race acceptance is separately described in
 [MinimalFmCluster.md](../../docs/cluster/MinimalFmCluster.md).
-Active membership, reconfiguration, FM removal, recovery and deployed native
+Active membership, reconfiguration, recovery and deployed native
 FM/Federation interoperability remain gated.
+
+### FM RemoveReplica/Reply codecs
+
+Seven cases extend the preceding 131 inputs to **138**, retaining
+**77 types/240 fields**, with **142 bundle files** and **38 measured native
+truncation rejections**:
+`default-remove-replica`, `rich-remove-replica`,
+`default-remove-replica-reply`, `rich-remove-replica-reply-0`,
+`rich-remove-replica-reply--2147017398`, `action-RemoveReplica` and
+`action-RemoveReplicaReply`.
+RemoveReplica uses bare ReplicaMessageBody, not the inherited DeleteReplica
+body used by RemoveInstance/DeleteReplica. Its rich request is Idle/InBuild;
+the reply has the Primary's InDrop wire state Dropped=3 while retaining the
+remote identity, endpoints and up flag. It is not a remote deletion receipt.
+
+The producer mechanically verifies both native RemoveReplica factory definitions
+and binds them in `replica_factories`; the consumer requires exact metadata and
+every case before execution. Rust checks public factories/decoders against
+native-produced body/envelope values: request actor RA=12, true priority and
+actual GenerationHeader; reply actor FM=11 (FMM=10 codec owner only), true
+priority and no mandatory generation. Every proper prefix is rejected;
+cross-action decoders cannot confuse RemoveReplica with AddReplica,
+RemoveInstance or DeleteReplica. Both actual native truncated-body rejections
+are measured. This remains source-baseline native-stream/schema-adapter evidence,
+not native handler traces or deployed native FM/Federation interoperability.
+Native-free FM/RA/RAP execution, lost-reply replay and Primary/destination
+lifetime checks are separate acceptance tests. Pre-Open/down/not-found cleanup,
+replacement and active configuration remain gated.
 
 ### Bootstrap and source identity header extension
 

@@ -470,6 +470,15 @@ impl Cluster {
                 }
                 self.ledger.idle_reply(index, body)?;
             }
+            "RemoveReplicaReply" => {
+                let (body, owner) = decode_remove_replica_reply(&incoming.message).map_err(err)?;
+                if owner != Owner::Fm || self.config.profile != ServiceProfile::StatefulPeerIdle {
+                    return Err(
+                        "RemoveReplicaReply requires the original peer-idle FM profile".into(),
+                    );
+                }
+                self.ledger.idle_removal_reply(index, body)?;
+            }
             "AddInstanceReply"
             | "AddPrimaryReply"
             | "RemoveInstanceReply"
@@ -539,6 +548,10 @@ impl Cluster {
             };
             let result = match result {
                 Ok(()) => self.retry_idle(index).await,
+                Err(error) => Err(error),
+            };
+            let result = match result {
+                Ok(()) => self.retry_idle_removal(index).await,
                 Err(error) => Err(error),
             };
             if let Err(error) = result {
@@ -662,6 +675,24 @@ impl Cluster {
             .send(add_replica_message(body, &child.launch.generation).map_err(err)?)
             .await
     }
+    async fn retry_idle_removal(&mut self, index: usize) -> Result<()> {
+        let Some(body) = self.ledger.idle_removal_retry(index, Instant::now()) else {
+            return Ok(());
+        };
+        self.send_idle_removal(&body).await
+    }
+    async fn send_idle_removal(&self, body: &RemoveReplica) -> Result<()> {
+        let child = self
+            .children
+            .first()
+            .ok_or("missing original Primary owner")?;
+        child
+            .link
+            .as_ref()
+            .ok_or("original Primary link absent")?
+            .send(remove_replica_message(body, &child.launch.generation).map_err(err)?)
+            .await
+    }
     async fn retry_deletion(&mut self, index: usize) -> Result<()> {
         if self.ledger.generation.is_some() {
             return Ok(());
@@ -741,6 +772,7 @@ impl Cluster {
                 "built":built, "serving":false,
                 "build":source["peer_idle"]["build"],
                 "fm":self.ledger.idle_status(),
+                "fm_removal":self.ledger.idle_removal_status(),
                 "ready":source["peer_idle"]["ready"] == true,
                 "removal":source["peer_idle"]["removal"],
                 "source":source["peer_idle"], "target":target["local_replica"],
@@ -839,6 +871,7 @@ impl Cluster {
         if self.finished.is_some()
             || self.children.len() != 2
             || self.config.profile != ServiceProfile::StatefulPeerIdle
+            || self.ledger.idle_removal.is_some()
             || self.peer_idle_requested && self.ledger.idle.is_none()
         {
             return Err("FM AddReplica requires the original unused peer-idle profile".into());
@@ -858,6 +891,9 @@ impl Cluster {
     /// Remove the original Idle from the Primary's replicator, not its remote
     /// application. Pending calls retry cancellation/cleanup; success is terminal.
     pub async fn remove_idle_replica(&mut self) -> Result<Value> {
+        if self.ledger.idle_removal.is_some() {
+            return Err("FM owns this removal; use remove_idle_replica_via_fm".into());
+        }
         if self.config.profile != ServiceProfile::StatefulPeerIdle
             || self.finished.is_some()
             || self.children.len() != 2
@@ -895,6 +931,31 @@ impl Cluster {
             idle.cancelled = true;
         }
         Ok(json!({"state":"pending","kind":"peer_idle_removal","built":false,"serving":false}))
+    }
+    /// FM removes the original opened Idle's Primary-side replication session.
+    /// Only RemoveReplicaReply clears pending_remove; the destination stays open.
+    pub async fn remove_idle_replica_via_fm(&mut self) -> Result<Value> {
+        if self.finished.is_some()
+            || self.children.len() != 2
+            || self.config.profile != ServiceProfile::StatefulPeerIdle
+        {
+            return Err("FM RemoveReplica requires the original peer-idle profile".into());
+        }
+        let current = self.ledger.idle_removal_status();
+        if current["state"] == "removed" || current["state"] == "unknown" {
+            return Ok(current);
+        }
+        if self.ledger.idle_removal.is_none() && self.status()["peer_idle"]["state"] != "open" {
+            return Err(
+                "FM removal before original peer Open or manual-removal adoption is gated".into(),
+            );
+        }
+        let body = self.ledger.request_idle_removal(Instant::now())?;
+        if let Err(error) = self.send_idle_removal(&body).await {
+            self.ledger.lost(0, error.clone());
+            return Err(error);
+        }
+        Ok(self.ledger.idle_removal_status())
     }
     /// Returns the retained operation outcome, never transport-write success.
     /// `quit` is accepted here; the foreground then calls owned shutdown.

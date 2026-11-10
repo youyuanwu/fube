@@ -107,6 +107,14 @@ pub struct Ledger {
     pub operations: Vec<Operation>,
     pub(crate) generation: Option<GenerationHandshake>,
     pub(crate) idle: Option<IdleBuild>,
+    pub(crate) idle_removal: Option<IdleRemoval>,
+}
+pub(crate) struct IdleRemoval {
+    pub body: RemoveReplica,
+    pub reply: Option<RemoveReplicaReply>,
+    unknown: bool,
+    started: Instant,
+    last: Instant,
 }
 pub(crate) struct IdleBuild {
     pub body: AddReplica,
@@ -115,6 +123,14 @@ pub(crate) struct IdleBuild {
     unknown: bool,
     started: Instant,
     last: Instant,
+}
+fn action_retry_due(started: Instant, last: Instant, now: Instant) -> bool {
+    let interval = if now > started + Duration::from_secs(60) {
+        60
+    } else {
+        10
+    };
+    now > last + Duration::from_secs(interval)
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GenerationPhase {
@@ -506,6 +522,7 @@ impl Ledger {
             operations: vec![],
             generation: None,
             idle: None,
+            idle_removal: None,
         }
     }
     pub fn accept(&mut self, command: Command) -> Result<Accepted> {
@@ -816,6 +833,11 @@ impl Ledger {
         }
     }
     pub fn lost(&mut self, index: usize, error: String) {
+        if let Some(removal) = &mut self.idle_removal {
+            if removal.reply.is_none() {
+                removal.unknown = true;
+            }
+        }
         if let Some(idle) = &mut self.idle {
             idle.unknown = true;
         }
@@ -846,6 +868,11 @@ impl Ledger {
         }
     }
     pub fn down(&mut self, index: usize) {
+        if let Some(removal) = &mut self.idle_removal {
+            if removal.reply.is_none() {
+                removal.unknown = true;
+            }
+        }
         if let Some(idle) = &mut self.idle {
             idle.unknown = true;
         }
@@ -1039,6 +1066,7 @@ impl Ledger {
     pub fn status(&self) -> Value {
         json!({"nodes":self.placements.iter().map(Placement::status).collect::<Vec<_>>(),
             "idle_build":self.idle_status(),
+            "idle_removal":self.idle_removal_status(),
             "generation_handshake": self.generation.as_ref().map(GenerationHandshake::status),
             "operations":self.operations.iter().map(|op|
                 if op.command.action == "status" {
@@ -1049,6 +1077,7 @@ impl Ledger {
     }
     pub fn request_idle(&mut self, now: Instant) -> Result<AddReplica> {
         if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
+            || self.idle_removal.is_some()
             || self.generation.is_some()
             || self.placements[0].observed != Observed::Running
             || self
@@ -1129,12 +1158,7 @@ impl Ledger {
         {
             return None;
         }
-        let interval = if now > idle.started + Duration::from_secs(60) {
-            60
-        } else {
-            10
-        };
-        if now <= idle.last + Duration::from_secs(interval) {
+        if !action_retry_due(idle.started, idle.last, now) {
             return None;
         }
         idle.last = now;
@@ -1158,7 +1182,123 @@ impl Ledger {
         };
         json!({"state":state, "kind":"fm_idle_build", "ready":state == "ready",
             "serving":false, "request":idle.body, "reply":idle.reply,
-            "error":error, "cleanup_required":idle.cancelled || error.is_some_and(|e| e != 0)})
+            "error":error, "cleanup_required":(idle.cancelled || error.is_some_and(|e| e != 0))
+                && self.idle_removal.as_ref().is_none_or(|removal| removal.reply.is_none())})
+    }
+    pub fn request_idle_removal(&mut self, now: Instant) -> Result<RemoveReplica> {
+        if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
+            || self.generation.is_some()
+            || self.placements[0].observed != Observed::Running
+            || self
+                .placements
+                .iter()
+                .any(|p| !p.link_alive || !p.activated || p.bootstrap != Bootstrap::Admitted)
+        {
+            return Err("Idle removal requires the original admitted Primary profile".into());
+        }
+        if let Some(removal) = &mut self.idle_removal {
+            if removal.unknown || removal.reply.is_some() {
+                return Err("original FM Idle removal is no longer pending".into());
+            }
+            removal.last = now;
+            return Ok(removal.body.clone());
+        }
+        if self.idle.as_ref().is_some_and(|idle| {
+            idle.cancelled
+                || idle.unknown
+                || idle.reply.as_ref().is_some_and(|reply| reply.error != 0)
+        }) {
+            return Err("failed creation or cancelled Idle cleanup is gated".into());
+        }
+        let mut body = self.placements[0].body()?;
+        body.replica = self.placements[1].body()?.replica;
+        body.replica.current_role = 2;
+        if body.replica.version != body.service.version {
+            return Err("peer packages do not share the original deployment version".into());
+        }
+        if let Some(idle) = &mut self.idle {
+            body = idle.body.clone();
+            if let Some(reply) = &idle.reply {
+                body.replica = reply.replica.clone();
+            }
+            idle.cancelled = true;
+        }
+        self.idle_removal = Some(IdleRemoval {
+            body: body.clone(),
+            reply: None,
+            unknown: false,
+            started: now,
+            last: now,
+        });
+        Ok(body)
+    }
+    pub fn idle_removal_reply(&mut self, index: usize, body: RemoveReplicaReply) -> Result<()> {
+        let Some(removal) = &mut self.idle_removal else {
+            return Ok(());
+        };
+        if index != 0
+            || removal.unknown
+            || removal.reply.is_some()
+            || self.placements[0].observed != Observed::Running
+            || self.placements.iter().any(|p| !p.link_alive)
+            || body.unit != removal.body.unit
+            || body.replica.node != removal.body.replica.node
+            || body.replica.id != removal.body.replica.id
+            || body.replica.instance != removal.body.replica.instance
+            || body.error != 0
+        {
+            return Ok(());
+        }
+        if body.replica.current_role != 2
+            || body.replica.previous_role != 1
+            || body.replica.state != 3
+            || !body.replica.up
+            || body.replica.version != removal.body.replica.version
+            || !body.replica.service_endpoint.is_empty()
+            || body.replica.replication_endpoint.is_empty()
+            || (!removal.body.replica.replication_endpoint.is_empty()
+                && body.replica.replication_endpoint != removal.body.replica.replication_endpoint)
+        {
+            return Err("RemoveReplicaReply is not the original removed Idle".into());
+        }
+        removal.reply = Some(body);
+        Ok(())
+    }
+    pub fn idle_removal_retry(&mut self, index: usize, now: Instant) -> Option<RemoveReplica> {
+        let removal = self.idle_removal.as_mut()?;
+        if index != 0
+            || self.generation.is_some()
+            || removal.unknown
+            || removal.reply.is_some()
+            || self.placements[0].observed != Observed::Running
+            || self
+                .placements
+                .iter()
+                .any(|p| !p.link_alive || !p.activated)
+        {
+            return None;
+        }
+        if !action_retry_due(removal.started, removal.last, now) {
+            return None;
+        }
+        removal.last = now;
+        Some(removal.body.clone())
+    }
+    pub fn idle_removal_status(&self) -> Value {
+        let Some(removal) = &self.idle_removal else {
+            return json!({"state":"absent","pending_remove":false,"removed":false});
+        };
+        let state = if removal.reply.is_some() {
+            "removed"
+        } else if removal.unknown {
+            "unknown"
+        } else {
+            "pending"
+        };
+        json!({"state":state, "kind":"fm_idle_removal",
+            "pending_remove":removal.reply.is_none(), "removed":state == "removed",
+            "request":removal.body, "reply":removal.reply,
+            "destination_deleted":false, "serving":false})
     }
     /// Native Replica::CanGenerateAction and PendingTask's creating-primary branch.
     pub fn primary_retry(&mut self, index: usize, now: Instant) -> Result<Option<AddPrimary>> {
@@ -1192,12 +1332,7 @@ impl Ledger {
         let last = placement
             .action_last_at
             .ok_or("missing original stateful action time")?;
-        let interval = if now > created + Duration::from_secs(60) {
-            Duration::from_secs(60)
-        } else {
-            Duration::from_secs(10)
-        };
-        if now <= last + interval {
+        if !action_retry_due(created, last, now) {
             return Ok(None);
         }
         let body = placement.body()?;

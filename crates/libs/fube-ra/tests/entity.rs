@@ -3262,6 +3262,238 @@ fn fm_add_idle(body: AddReplica) -> Command {
         },
     }
 }
+fn fm_remove_idle(body: RemoveReplica) -> Command {
+    Command::RemoveReplica {
+        body: Box::new(body),
+        source: admission().fm_source,
+        generation: GenerationHeader {
+            number: admission().generation,
+            for_fm_replica: false,
+        },
+    }
+}
+
+#[tokio::test]
+async fn fm_remove_idle_retries_failed_and_pending_builds_and_replays_only_semantic_success() {
+    for outcome in [None, Some(-993), Some(0)] {
+        let (store, executor, _) = setup(WAIT).await;
+        executor.bind_peer(peer_source()).unwrap();
+        assert!(executor.submit(fm_remove_idle(primary_body())).is_err());
+        assert!(executor.entity_ids().is_empty());
+        make_ready(&executor, &primary_body()).await;
+        let primary = state(&executor);
+        let mut request = fm_idle_request(&primary);
+        assert!(executor
+            .submit(fm_remove_idle(request.clone()))
+            .unwrap()
+            .wait(WAIT)
+            .await
+            .is_err());
+        assert!(state(&executor).remote_idle.is_none());
+        run(&executor, fm_add_idle(request.clone())).await;
+        effects(&executor);
+        assert!(executor
+            .submit(fm_remove_idle(request.clone()))
+            .unwrap()
+            .wait(WAIT)
+            .await
+            .is_err());
+        assert!(state(&executor)
+            .remote_idle
+            .as_ref()
+            .unwrap()
+            .removal
+            .is_none());
+        let mut opened = CreateReplicaReply {
+            unit: request.unit.clone(),
+            replica: request.replica.clone(),
+            error: 0,
+        };
+        opened.replica.replication_endpoint = "127.0.0.1:12346".into();
+        run(&executor, peer_opened(opened.clone())).await;
+        effects(&executor);
+        let built = BuildCompletion {
+            unit: primary.body.unit.clone(),
+            local: primary.body.replica.clone(),
+            remote: opened.replica.clone(),
+            error: 0,
+            detail: ProxyErrorDetail::default(),
+        };
+        if let Some(error) = outcome {
+            let mut completion = built.clone();
+            completion.error = error;
+            run(&executor, Command::CompleteBuild(Box::new(completion))).await;
+            effects(&executor);
+            if error == 0 {
+                request.replica = opened.replica.clone();
+                request.replica.state = 2;
+            }
+        }
+        for command in [
+            Command::RemoveReplica {
+                body: Box::new(request.clone()),
+                source: peer_source(),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            },
+            Command::RemoveReplica {
+                body: Box::new(request.clone()),
+                source: admission().fm_source,
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: true,
+                },
+            },
+            {
+                let mut foreign = request.clone();
+                foreign.replica.instance += 1;
+                fm_remove_idle(foreign)
+            },
+            {
+                let mut foreign = request.clone();
+                foreign.unit.current.configuration += 1;
+                fm_remove_idle(foreign)
+            },
+            {
+                let mut foreign = request.clone();
+                foreign.replica.replication_endpoint = "foreign".into();
+                fm_remove_idle(foreign)
+            },
+        ] {
+            assert!(executor.submit(command).unwrap().wait(WAIT).await.is_err());
+        }
+        assert!(effects(&executor).is_empty());
+        run(&executor, fm_remove_idle(request.clone())).await;
+        let first = effects(&executor);
+        let mut dropped = opened.replica.clone();
+        dropped.state = 3;
+        assert!(
+            matches!(&first[..], [Effect::RemoveIdle { body, replica, registration }]
+                if body == &primary.body && **replica == dropped
+                    && Some(registration) == primary.runtime.as_ref())
+        );
+        assert!(!state(&executor).remote_idle.as_ref().unwrap().ready);
+        assert!(state(&executor)
+            .remote_idle
+            .as_ref()
+            .unwrap()
+            .add_reply()
+            .is_none());
+        run(&executor, fm_remove_idle(request.clone())).await;
+        assert_eq!(effects(&executor), first);
+        let mut changed = request.clone();
+        changed.replica.state = if request.replica.state == 1 { 2 } else { 1 };
+        assert!(executor
+            .submit(fm_remove_idle(changed))
+            .unwrap()
+            .wait(WAIT)
+            .await
+            .is_err());
+        assert_eq!(
+            state(&executor)
+                .remote_idle
+                .as_ref()
+                .unwrap()
+                .removal
+                .as_ref()
+                .unwrap()
+                .fm_request
+                .as_deref(),
+            Some(&request)
+        );
+        assert_eq!(
+            run(&executor, Command::CompleteBuild(Box::new(built.clone()))).await,
+            Disposition::IgnoredStale
+        );
+        assert_eq!(
+            run(&executor, fm_add_idle(fm_idle_request(&primary))).await,
+            Disposition::IgnoredStale
+        );
+        let mut completion = RemovalCompletion {
+            remote: dropped.clone(),
+            ..built
+        };
+        for field in 0..3 {
+            let mut foreign = completion.clone();
+            match field {
+                0 => foreign.remote.instance += 1,
+                1 => foreign.local.id += 1,
+                _ => foreign.unit.current.configuration += 1,
+            }
+            assert_eq!(
+                run(&executor, Command::CompleteRemoval(Box::new(foreign))).await,
+                Disposition::IgnoredStale
+            );
+        }
+        completion.error = -992;
+        completion.detail.message = "retry native cancellation/removal".into();
+        run(
+            &executor,
+            Command::CompleteRemoval(Box::new(completion.clone())),
+        )
+        .await;
+        assert!(effects(&executor).is_empty());
+        assert_eq!(
+            state(&executor)
+                .remote_idle
+                .as_ref()
+                .unwrap()
+                .removal
+                .as_ref()
+                .unwrap()
+                .result,
+            Some(-992)
+        );
+        run(&executor, fm_remove_idle(request.clone())).await;
+        assert_eq!(effects(&executor), first);
+        completion.error = 0;
+        completion.detail = ProxyErrorDetail::default();
+        run(
+            &executor,
+            Command::CompleteRemoval(Box::new(completion.clone())),
+        )
+        .await;
+        let reply = vec![Effect::RemoveReplicaReply(RemoveReplicaReply {
+            unit: primary.body.unit.clone(),
+            replica: dropped,
+            error: 0,
+        })];
+        assert_eq!(effects(&executor), reply);
+        run(&executor, fm_remove_idle(request.clone())).await;
+        assert_eq!(effects(&executor), reply);
+        assert_eq!(
+            run(
+                &executor,
+                Command::CompleteRemoval(Box::new(completion.clone()))
+            )
+            .await,
+            Disposition::IgnoredStale
+        );
+        assert_eq!(state(&executor).body, primary.body);
+        assert_eq!(state(&executor).runtime, primary.runtime);
+        run(
+            &executor,
+            Command::CloseLocal {
+                unit: request.unit.id.clone(),
+                mode: CloseMode::Close,
+            },
+        )
+        .await;
+        effects(&executor);
+        assert_eq!(
+            run(&executor, fm_remove_idle(request)).await,
+            Disposition::IgnoredStale
+        );
+        assert_eq!(
+            run(&executor, Command::CompleteRemoval(Box::new(completion))).await,
+            Disposition::IgnoredStale
+        );
+        assert!(effects(&executor).is_empty());
+        finish(&store, &executor).await;
+    }
+}
 fn peer_opened(body: CreateReplicaReply) -> Command {
     Command::CreateReplicaReply {
         body: Box::new(body),
@@ -3271,6 +3503,46 @@ fn peer_opened(body: CreateReplicaReply) -> Command {
             for_fm_replica: false,
         },
     }
+}
+
+#[tokio::test]
+async fn fm_remove_unbuilt_idle_keeps_original_lifetime_and_close_fences_pending_reply() {
+    let (store, executor, opened) = opened_peer_primary().await;
+    let primary = state(&executor);
+    let request = primary.remote_idle.as_ref().unwrap().body.replica.0.clone();
+    run(&executor, fm_remove_idle(request.clone())).await;
+    assert!(matches!(
+        &effects(&executor)[..],
+        [Effect::RemoveIdle { .. }]
+    ));
+    let mut dropped = opened.replica;
+    dropped.state = 3;
+    let completion = RemovalCompletion {
+        unit: primary.body.unit.clone(),
+        local: primary.body.replica.clone(),
+        remote: dropped,
+        error: 0,
+        detail: ProxyErrorDetail::default(),
+    };
+    run(
+        &executor,
+        Command::CloseLocal {
+            unit: request.unit.id.clone(),
+            mode: CloseMode::Close,
+        },
+    )
+    .await;
+    effects(&executor);
+    assert_eq!(
+        run(&executor, Command::CompleteRemoval(Box::new(completion))).await,
+        Disposition::IgnoredStale
+    );
+    assert_eq!(
+        run(&executor, fm_remove_idle(request)).await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    finish(&store, &executor).await;
 }
 
 #[tokio::test]

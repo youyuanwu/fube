@@ -790,7 +790,7 @@ fn replica_contracts(input: &Path, output: &Path) {
     request.replica.up = true;
     for (name, body) in [
         ("default-add-replica", AddReplica::default()),
-        ("rich-add-replica", request),
+        ("rich-add-replica", request.clone()),
     ] {
         check(input, output, name, body.clone());
         for fmm in [false, true] {
@@ -841,7 +841,68 @@ fn replica_contracts(input: &Path, output: &Path) {
         }
         reject_prefixes::<AddReplicaReply>(input, &name);
     }
-    for action in ["AddReplica", "AddReplicaReply"] {
+    for (name, body) in [
+        ("default-remove-replica", RemoveReplica::default()),
+        ("rich-remove-replica", request),
+    ] {
+        check_peer(
+            input,
+            output,
+            name,
+            "RemoveReplica",
+            body,
+            remove_replica_message,
+            decode_remove_replica,
+        );
+        let native = generation_envelope(input, name, "RemoveReplica", true, false);
+        assert!(decode_add_replica(&native).is_err());
+        assert!(decode_remove_instance(&native).is_err());
+        assert!(decode_delete_replica(&native).is_err());
+    }
+    let mut replies = vec![(
+        "default-remove-replica-reply".to_owned(),
+        RemoveReplicaReply::default(),
+    )];
+    for error in [0, -2_147_017_398] {
+        let mut reply = support::rich_reply(error);
+        reply.unit.target = 1;
+        reply.unit.minimum = 1;
+        reply.replica.current_role = 2;
+        reply.replica.previous_role = 1;
+        reply.replica.state = 3;
+        reply.replica.up = true;
+        reply.replica.service_endpoint.clear();
+        replies.push((format!("rich-remove-replica-reply-{error}"), reply));
+    }
+    for (name, body) in replies {
+        check(input, output, &name, body.clone());
+        for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
+            let mut native = stage_two_envelope(input, &name, "RemoveReplicaReply", actor, None);
+            native
+                .headers
+                .iter_mut()
+                .find(|h| h.id == HIGH_PRIORITY)
+                .unwrap()
+                .value = fs::read(input.join("priority.bin")).unwrap();
+            assert_eq!(
+                decode_remove_replica_reply(&native).unwrap(),
+                (body.clone(), owner)
+            );
+            factory_contract(
+                &native,
+                &remove_replica_reply_message(&body, owner).unwrap(),
+            );
+            assert!(decode_add_replica_reply(&native).is_err());
+            assert!(decode_delete_replica_reply(&native).is_err());
+        }
+        reject_prefixes::<RemoveReplicaReply>(input, &name);
+    }
+    for action in [
+        "AddReplica",
+        "AddReplicaReply",
+        "RemoveReplica",
+        "RemoveReplicaReply",
+    ] {
         check(
             input,
             output,

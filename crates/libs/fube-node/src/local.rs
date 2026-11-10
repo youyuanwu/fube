@@ -169,6 +169,7 @@ enum Work {
     PrimaryOpen(Arc<AddInstance>),
     AddPrimary(Arc<AddPrimary>, NodeInstance, GenerationHeader),
     AddReplica(Arc<AddReplica>, NodeInstance, GenerationHeader),
+    RemoveReplica(Arc<RemoveReplica>, NodeInstance, GenerationHeader),
     Fm(FmWork),
     Close(PartitionId, ra::CloseMode),
     Registered(ra::RegistrationCompletion),
@@ -845,6 +846,32 @@ impl Node {
         source: &NodeInstance,
         generation: &GenerationHeader,
     ) -> Result<u64> {
+        self.admit_remote_control(&body, source, generation)?;
+        self.enqueue(Work::AddReplica(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    pub fn remove_replica_from_fm(
+        &mut self,
+        body: RemoveReplica,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        self.admit_remote_control(&body, source, generation)?;
+        self.enqueue(Work::RemoveReplica(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
+    fn admit_remote_control(
+        &self,
+        body: &AddInstance,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<()> {
         self.admit_fm(source, generation)?;
         if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
             || !self.live.load(Ordering::SeqCst)
@@ -857,11 +884,7 @@ impl Node {
         {
             return Err(Error::Unsupported);
         }
-        self.enqueue(Work::AddReplica(
-            Arc::new(body),
-            source.clone(),
-            generation.clone(),
-        ))
+        Ok(())
     }
     fn check_service(&self, body: &AddInstance, stateful: bool) -> Result<()> {
         let premise = self.activation.premise().ok_or(Error::Unsupported)?;
@@ -1087,6 +1110,11 @@ impl Node {
             Work::BuildIdle(unit) => ra::Command::BuildRemoteIdle(unit.clone()),
             Work::Built(event) => ra::Command::CompleteBuild(Box::new(event.clone())),
             Work::AddReplica(body, source, generation) => ra::Command::AddReplica {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
+            Work::RemoveReplica(body, source, generation) => ra::Command::RemoveReplica {
                 body: Box::new((**body).clone()),
                 source: source.clone(),
                 generation: generation.clone(),
@@ -1670,6 +1698,7 @@ impl Node {
             | ra::Effect::NodeDeactivateReply(_)
             | ra::Effect::PrimaryReply(_)
             | ra::Effect::AddReplicaReply(_)
+            | ra::Effect::RemoveReplicaReply(_)
             | ra::Effect::LocalStatefulOpenReply(_)
             | ra::Effect::RemoveReply(_)
             | ra::Effect::DeleteReplicaReply(_) => LocalDisposition::LocalResponse,

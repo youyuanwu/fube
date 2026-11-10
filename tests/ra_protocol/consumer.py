@@ -74,11 +74,16 @@ CASES |= PEER_CASES
 REPLICA_FACTORIES = {
     "AddReplica": {"actor": 12, "high_priority": True},
     "AddReplicaReply": {"actor": 11, "high_priority": True},
+    "RemoveReplica": {"actor": 12, "high_priority": True},
+    "RemoveReplicaReply": {"actor": 11, "high_priority": True},
 }
 REPLICA_CASES = {
     "default-add-replica", "rich-add-replica", "default-add-replica-reply",
     "rich-add-replica-reply-0", "rich-add-replica-reply--2147017398",
     "action-AddReplica", "action-AddReplicaReply",
+    "default-remove-replica", "rich-remove-replica", "default-remove-replica-reply",
+    "rich-remove-replica-reply-0", "rich-remove-replica-reply--2147017398",
+    "action-RemoveReplica", "action-RemoveReplicaReply",
 }
 CASES |= REPLICA_CASES
 SCHEMA_TYPES = 77

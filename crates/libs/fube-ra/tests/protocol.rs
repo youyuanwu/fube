@@ -16,6 +16,62 @@ fn generation_owner(high: u64, low: u64) -> [u8; 16] {
 }
 
 #[test]
+fn remove_replica_uses_replica_body_not_delete_scopes_and_distinct_native_headers() {
+    let body = support::rich_request();
+    let generation = support::rich_generation(false);
+    let original = remove_replica_message(&body, &generation).unwrap();
+    assert_eq!(
+        decode_remove_replica(&original).unwrap(),
+        (body.clone(), generation)
+    );
+    assert_eq!(original.body, to_vec(&body).unwrap());
+    assert!(original.properties().unwrap().high_priority);
+    assert!(decode_add_replica(&original).is_err());
+    assert!(decode_remove_instance(&original).is_err());
+    assert!(decode_delete_replica(&original).is_err());
+    for id in [ACTOR, ACTION, HIGH_PRIORITY, GENERATION_HEADER] {
+        let mut missing = original.clone();
+        missing.headers.retain(|header| header.id != id);
+        assert!(decode_remove_replica(&missing).is_err());
+        let mut duplicate = original.clone();
+        duplicate.headers.push(
+            original
+                .headers
+                .iter()
+                .find(|h| h.id == id)
+                .unwrap()
+                .clone(),
+        );
+        assert!(decode_remove_replica(&duplicate).is_err());
+    }
+    for actor in [FM_ACTOR, FMM_ACTOR] {
+        let mut wrong = original.clone();
+        wrong.headers[0] = Header::actor(actor).unwrap();
+        assert!(decode_remove_replica(&wrong).is_err());
+    }
+    for n in 0..original.body.len() {
+        let mut short = original.clone();
+        short.body.truncate(n);
+        assert!(decode_remove_replica(&short).is_err());
+    }
+    for error in [0, -2_147_017_398] {
+        let mut reply = support::rich_reply(error);
+        reply.replica.current_role = 2;
+        reply.replica.state = 3;
+        for owner in [Owner::Fm, Owner::Fmm] {
+            let message = remove_replica_reply_message(&reply, owner).unwrap();
+            assert!(!message.headers.iter().any(|h| h.id == GENERATION_HEADER));
+            assert_eq!(
+                decode_remove_replica_reply(&message).unwrap(),
+                (reply.clone(), owner)
+            );
+            assert!(decode_add_replica_reply(&message).is_err());
+            assert!(decode_delete_replica_reply(&message).is_err());
+        }
+    }
+}
+
+#[test]
 fn add_replica_is_a_distinct_native_fm_action_with_ready_idle_reply_and_strict_headers() {
     let request = support::rich_request();
     let generation = support::rich_generation(false);

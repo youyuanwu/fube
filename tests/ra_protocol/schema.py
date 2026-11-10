@@ -281,6 +281,8 @@ def replica_factories(native):
     for action, factory, actor in [
         ("AddReplica", "CreateFMToRAMessage", 12),
         ("AddReplicaReply", "CreateRAToFMMessage", 11),
+        ("RemoveReplica", "CreateFMToRAMessage", 12),
+        ("RemoveReplicaReply", "CreateRAToFMMessage", 11),
     ]:
         matches = re.findall(
             rf'RSMessage::{action}\s*=\s*(\w+)\(L"([^"]+)",\s*(true|false)\b', text,

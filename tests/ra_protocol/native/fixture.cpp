@@ -258,7 +258,9 @@ int main(int argc,char** argv) {
         }
         reject_truncated(peer_reply);
         if(AddReplicaActor!=12 || AddReplicaReplyActor!=11 ||
-           !AddReplicaPriority || !AddReplicaReplyPriority)
+           RemoveReplicaActor!=12 || RemoveReplicaReplyActor!=11 ||
+           !AddReplicaPriority || !AddReplicaReplyPriority ||
+           !RemoveReplicaPriority || !RemoveReplicaReplyPriority)
             throw std::runtime_error("native replica factory metadata mismatch");
         ReplicaMessageBody idle;
         run(mode,dir,"default-add-replica",idle);
@@ -290,6 +292,20 @@ int main(int argc,char** argv) {
             run(mode,dir,"rich-add-replica-reply-"+std::to_string(error),idle_reply);
         }
         reject_truncated(idle_reply);
+        ReplicaMessageBody idle_remove;
+        run(mode,dir,"default-remove-replica",idle_remove);
+        idle_remove=idle;
+        run(mode,dir,"rich-remove-replica",idle_remove);
+        reject_truncated(idle_remove);
+        ReplicaReplyMessageBody idle_remove_reply;
+        run(mode,dir,"default-remove-replica-reply",idle_remove_reply);
+        idle_remove_reply=idle_reply;
+        idle_remove_reply.replica_.state_=Enum(3);
+        for(LONG error:{0, -2147017398}) {
+            idle_remove_reply.errorCode_.value_=Enum(error);
+            run(mode,dir,"rich-remove-replica-reply-"+std::to_string(error),idle_remove_reply);
+        }
+        reject_truncated(idle_remove_reply);
         // Native empty ctor leaves bools unspecified: explicitly initialize the fixture.
         ReplicaUpMessageBody up;
         up.isLastReplicaUpMessage_=false; up.isFromFMM_=false;
@@ -299,7 +315,7 @@ int main(int argc,char** argv) {
             up.isLastReplicaUpMessage_=last!=0; up.isFromFMM_=fmm!=0;
             run(mode,dir,"rich-replica-up-"+std::to_string(last)+"-"+std::to_string(fmm),up);
         }
-        for(auto name:{u"RemoveInstance",u"RemoveInstanceReply",u"ReplicaUp",u"ReplicaUpReply",u"AddPrimary",u"AddPrimaryReply",u"DeleteReplica",u"DeleteReplicaReply",u"CreateReplica",u"CreateReplicaReply",u"AddReplica",u"AddReplicaReply"}) {
+        for(auto name:{u"RemoveInstance",u"RemoveInstanceReply",u"ReplicaUp",u"ReplicaUpReply",u"AddPrimary",u"AddPrimaryReply",u"DeleteReplica",u"DeleteReplicaReply",u"CreateReplica",u"CreateReplicaReply",u"AddReplica",u"AddReplicaReply",u"RemoveReplica",u"RemoveReplicaReply"}) {
             action.action_=text(name);
             std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
             run(mode,dir,"action-"+ascii,action);
@@ -516,7 +532,7 @@ int main(int argc,char** argv) {
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
         ++native_truncation_rejections;
-        if(native_truncation_rejections!=36)
+        if(native_truncation_rejections!=38)
             throw std::runtime_error("native truncation coverage mismatch");
         std::cout << "native rejects " << native_truncation_rejections << " truncations OK\n";
         return 0;

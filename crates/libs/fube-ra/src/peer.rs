@@ -18,6 +18,16 @@ pub struct RemoteIdle {
 }
 
 impl RemoteIdle {
+    pub fn remove_reply(&self) -> Option<RemoveReplicaReply> {
+        let removal = self.removal.as_ref()?;
+        removal.fm_request.as_ref()?;
+        (removal.result == Some(0)).then(|| RemoveReplicaReply {
+            unit: removal.body.unit.clone(),
+            replica: removal.replica.clone(),
+            error: 0,
+        })
+    }
+
     pub fn add_reply(&self) -> Option<AddReplicaReply> {
         self.fm_request.as_ref()?;
         if self.removal.is_some() {
@@ -46,6 +56,7 @@ pub struct RemoteBuild {
 pub struct RemoteRemoval {
     pub body: Arc<AddInstance>,
     pub replica: Replica,
+    pub fm_request: Option<Arc<RemoveReplica>>,
     pub result: Option<i64>,
     pub detail: ProxyErrorDetail,
 }
@@ -547,6 +558,7 @@ pub(super) fn start_removal(
         RemoteRemoval {
             body: current.body.clone(),
             replica,
+            fm_request: None,
             result: None,
             detail: ProxyErrorDetail::default(),
         }
@@ -558,8 +570,100 @@ pub(super) fn start_removal(
         registration: registration.clone(),
     };
     let mut state = current.clone();
-    state.remote_idle.as_mut().expect("checked remote").removal = Some(removal);
+    let remote = state.remote_idle.as_mut().expect("checked remote");
+    remote.ready = false;
+    remote.removal = Some(removal);
     Ok(lifecycle::changed(state, vec![effect], false))
+}
+
+pub(super) fn remove_from_fm(
+    work: &Submission,
+    current: Option<&EntityState>,
+    source: &NodeInstance,
+    generation: &GenerationHeader,
+    admission: &Admission,
+    peer: Option<&NodeInstance>,
+) -> Result<Transition> {
+    if source != &admission.fm_source {
+        return Err(Failure::Admission("configured FM session mismatch"));
+    }
+    if generation.for_fm_replica {
+        return Err(Failure::Unsupported("FM-service replica removal is gated"));
+    }
+    if generation.number.older_than(&admission.generation) {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    }
+    if generation.number != admission.generation {
+        return Err(Failure::Unsupported(
+            "peer removal requires the original fixed generation",
+        ));
+    }
+    let body: RemoveReplica =
+        from_slice(&work.bytes).map_err(|_| Failure::Admission("invalid RemoveReplica body"))?;
+    let Some(current) = current.filter(|state| state.phase == Phase::Ready && state.fm_primary)
+    else {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    };
+    if !admission.node_open || !admission.owner_ready || !admission.node_activated {
+        return Ok(Transition::ignored(Disposition::IgnoredNotReady));
+    }
+    if body.unit.current.older_than(current.body.unit.current) {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    }
+    let remote = current
+        .remote_idle
+        .as_ref()
+        .ok_or(Failure::Unsupported("unknown-Idle removal is gated"))?;
+    let opened = remote
+        .reply
+        .as_ref()
+        .filter(|reply| reply.error == 0)
+        .ok_or(Failure::Unsupported("removal before peer Open is gated"))?;
+    if body.replica.node == remote.target && body.replica.instance < opened.replica.instance {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    }
+    let expected = &remote.body.replica.0.replica;
+    let mut replica = body.replica.clone();
+    // FM may still have InBuild/empty endpoint after losing AddReplicaReply.
+    replica.state = expected.state;
+    replica.replication_endpoint = expected.replication_endpoint.clone();
+    if body.unit != current.body.unit
+        || body.service != current.body.service
+        || replica != *expected
+        || !matches!(body.replica.state, 1 | 2)
+        || (!body.replica.replication_endpoint.is_empty()
+            && body.replica.replication_endpoint != opened.replica.replication_endpoint)
+    {
+        return Err(Failure::Unsupported(
+            "RemoveReplica requires the original opened Idle and FT",
+        ));
+    }
+    if let Some(removal) = &remote.removal {
+        if removal.fm_request.as_deref() != Some(&body) {
+            return Err(Failure::Unsupported(
+                "replacement or manual-removal adoption is gated",
+            ));
+        }
+        if let Some(reply) = remote.remove_reply() {
+            return Ok(lifecycle::changed(
+                current.clone(),
+                vec![Effect::RemoveReplicaReply(reply)],
+                false,
+            ));
+        }
+    }
+    let mut transition = start_removal(Some(current), admission, peer)?;
+    if let Update::Memory(state) = &mut transition.update {
+        state
+            .remote_idle
+            .as_mut()
+            .expect("checked remote")
+            .removal
+            .as_mut()
+            .expect("started removal")
+            .fm_request = Some(Arc::new(body));
+    }
+    Ok(transition)
 }
 
 pub(super) fn complete_removal(
@@ -595,7 +699,14 @@ pub(super) fn complete_removal(
         .expect("checked removal");
     removal.result = Some(event.error);
     removal.detail = event.detail;
-    Ok(lifecycle::changed(state, vec![], false))
+    let effects = state
+        .remote_idle
+        .as_ref()
+        .and_then(RemoteIdle::remove_reply)
+        .map(Effect::RemoveReplicaReply)
+        .into_iter()
+        .collect();
+    Ok(lifecycle::changed(state, effects, false))
 }
 
 fn matches_local(body: &AddInstance, event: &BuildCompletion) -> bool {
