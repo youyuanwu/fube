@@ -16,8 +16,16 @@ node1 alone receives FM AddPrimary; node2 is the bound remote volatile Idle
 for the **same partition**, with a distinct replica identity. After the Primary
 is ready, programmatic `Cluster::create_idle_replica().await` submits a trusted
 local Primary-RA command and returns `pending`. Poll `status()["peer_idle"]`
-for the committed CreateReplicaReply observation (`open`, never built/serving).
+for the committed CreateReplicaReply observation (`open`, not built/serving).
 Retrying this API retains the exact original remote lifetime.
+After Open, `Cluster::build_idle_replica().await` explicitly requests actual
+Primary-to-Idle copy through RAP. It returns `pending`; poll `peer_idle.built`
+for the original runtime's semantic build completion. The joined destination
+application pump applies copied values/retry results and continuing replication
+before explicit operation ACKs. Pending retries reuse the request; native errors
+remain in `peer_idle.build.result/detail`, and failed-build retry cleanup stays gated.
+Close fences late completions. Destination data observations under
+`nodes[1].retained_work.app_observation.idle_data` are diagnostics, not authority.
 Both actual activations use the deployment-wide package version `1.0:1.0:1`;
 their physical package sequence, acquisition, runtime and process owners remain
 independently generated. Existing profiles keep their generated package versions.
@@ -38,7 +46,8 @@ original FM session; that background path grants no FM placement/control authori
 Peer loss does not dispose an application, fabricate a reply or reconnect.
 This profile admits CLI `create` on node1, `status`, and `quit` only; it rejects
 new FM generations, mutation of the fixed service, and node2 FM creation.
-There is no build/copy pump, AddReplicaReply, quorum addition, serving secondary,
+Build completion still leaves Idle/InBuild metadata, no service endpoint and
+denied access. There is no AddReplicaReply, quorum addition, serving secondary,
 failover, replacement, or recovery. Both original owners retain normal cleanup.
 
 Build both executables, then run:
@@ -63,7 +72,8 @@ The original creating-primary request retries under native default per-replica
 10/60-second minimum/maximum action intervals, without changing identity or
 reopening the replica. Dynamic FM configuration is not enabled by this profile.
 Independently send `write\n` then `read\n` to the reported application endpoint.
-The bounded fixture accepts one fixed nonzero public mutation, applies its
+The bounded fixture accepts fixed nonzero public mutations (`write` and the
+optional continuing `write-more`), applies each
 admitted sequence before awaiting quorum completion, and returns progress/value.
 It rejects writes before runtime/engine role, epoch, readiness and access agree.
 This is volatile singleton acknowledgment, not durability or replicated copy.

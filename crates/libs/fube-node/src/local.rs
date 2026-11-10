@@ -97,6 +97,17 @@ pub mod rap {
         })
         .map_err(|_| Error::Protocol)
     }
+    pub fn build_request(body: &AddInstance, replica: &Replica) -> Result<Vec<u8>> {
+        to_vec(&Request {
+            runtime: String::new(),
+            unit: body.unit.clone(),
+            local: body.replica.clone(),
+            remote: ObjectArray(vec![replica.clone()]),
+            service: Service::default(),
+            flags: 0,
+        })
+        .map_err(|_| Error::Protocol)
+    }
 }
 
 struct Gate {
@@ -142,6 +153,8 @@ pub struct PackageRegistration {
 }
 #[derive(Clone)]
 enum Work {
+    BuildIdle(PartitionId),
+    Built(ra::BuildCompletion),
     PeerIdle(PartitionId, Replica),
     PeerCreate(Arc<CreateReplica>, NodeInstance, GenerationHeader),
     PeerReply(Arc<CreateReplicaReply>, NodeInstance, GenerationHeader),
@@ -582,6 +595,24 @@ impl Node {
         }
         self.enqueue(Work::PeerIdle(unit, replica))
     }
+    /// Copy into the already opened original peer; no FM or quorum completion.
+    pub fn build_idle_on_peer(&mut self) -> Result<u64> {
+        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            || !self.live.load(Ordering::SeqCst)
+            || self.ra.generation_state().upload_pending
+            || self.ra.peer().is_none()
+        {
+            return Err(Error::Unsupported);
+        }
+        let unit = self
+            .selected
+            .as_ref()
+            .ok_or(Error::Unsupported)?
+            .unit
+            .id
+            .clone();
+        self.enqueue(Work::BuildIdle(unit))
+    }
     pub fn create_replica_from_peer(
         &mut self,
         body: CreateReplica,
@@ -1014,6 +1045,8 @@ impl Node {
     }
     fn build(&self, work: &Work) -> ra::Command {
         match work {
+            Work::BuildIdle(unit) => ra::Command::BuildRemoteIdle(unit.clone()),
+            Work::Built(event) => ra::Command::CompleteBuild(Box::new(event.clone())),
             Work::PeerIdle(unit, replica) => ra::Command::CreateRemoteIdle {
                 unit: unit.clone(),
                 replica: replica.clone(),
@@ -1167,7 +1200,10 @@ impl Node {
                 if let Err(error) = &result {
                     if matches!(
                         front.work,
-                        Work::PeerIdle(..) | Work::PeerCreate(..) | Work::PeerReply(..)
+                        Work::PeerIdle(..)
+                            | Work::PeerCreate(..)
+                            | Work::PeerReply(..)
+                            | Work::BuildIdle(..)
                     ) {
                         let front = self.pending.pop_front().unwrap();
                         self.commands.push_back(CommandReceipt {
@@ -1476,7 +1512,10 @@ impl Node {
             | ra::Effect::Close {
                 body, registration, ..
             }
-            | ra::Effect::UpdateServiceDescription { body, registration } => {
+            | ra::Effect::UpdateServiceDescription { body, registration }
+            | ra::Effect::BuildIdle {
+                body, registration, ..
+            } => {
                 let Some(lease) = self.activation.host_lease() else {
                     self.effects.pop_front();
                     self.receipts.push_back(EffectReceipt {
@@ -1495,9 +1534,14 @@ impl Node {
                     ra::Effect::UpdateServiceDescription { .. } => {
                         ("ProxyUpdateServiceDescription", 0)
                     }
+                    ra::Effect::BuildIdle { .. } => ("ReplicatorBuildIdleReplica", 0),
                     _ => unreachable!(),
                 };
-                let bytes = rap::request(registration, body, flags)?;
+                let bytes = if let ra::Effect::BuildIdle { replica, .. } = &dispatch.effect {
+                    rap::build_request(body, replica)?
+                } else {
+                    rap::request(registration, body, flags)?
+                };
                 if bytes.len() > BODY {
                     return Err(Error::Capacity);
                 }
@@ -1652,7 +1696,10 @@ impl Node {
             return Ok(());
         }
         let body: rap::Reply = decode(reply.body())?;
-        if !body.remote.0.is_empty() || body.flags & !12 != 0 {
+        let build = action == "ReplicatorBuildIdleReplicaReply";
+        if (build && (body.remote.0.len() != 1 || body.flags != 0))
+            || (!build && (!body.remote.0.is_empty() || body.flags & !12 != 0))
+        {
             return Err(Error::Protocol);
         }
         let Some(state) = self.ra.snapshot(body.unit.id.guid.0).committed else {
@@ -1672,6 +1719,21 @@ impl Node {
             return Err(Error::Protocol);
         }
         let work = match reply.action().map_err(|_| Error::Protocol)?.as_str() {
+            "ReplicatorBuildIdleReplicaReply" => Work::Built(ra::BuildCompletion {
+                unit: body.unit,
+                local: body.local,
+                remote: body
+                    .remote
+                    .0
+                    .into_iter()
+                    .next()
+                    .expect("checked one remote"),
+                error: body.error.error,
+                detail: ra::ProxyErrorDetail {
+                    message: body.error.message,
+                    api: body.error.api,
+                },
+            }),
             "ReplicaOpenReply" => Work::Open(ra::OpenCompletion {
                 unit: body.unit,
                 replica: body.local,

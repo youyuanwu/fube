@@ -430,6 +430,86 @@ async fn peer_idle_real_original_children_open_only_idle_and_keep_primary_servin
     result.unwrap().unwrap();
 }
 #[tokio::test]
+async fn peer_idle_build_copies_nonempty_state_and_continues_replication_without_membership() {
+    let fixture = Fixture::new("peer-idle-build");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::StatefulPeerIdle;
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    cluster.start().await.unwrap();
+    let result = peer_idle_catch(async {
+        assert!(cluster.build_idle_replica().await.is_err());
+        cluster.execute(command("primary", "create", Some(1))).await?;
+        until(&mut cluster, |cluster| cluster.ledger.placements[0].observed == Observed::Running).await;
+        let primary = cluster.ledger.placements[0].endpoint.clone().unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        while !data_contact(&primary, b"read\n").starts_with("OK ") {
+            assert!(Instant::now() < end);
+            cluster.drive().await;
+        }
+        let write = data_contact(&primary, b"write\n");
+        assert!(write.contains("assigned=1 applied=1 committed=1 value=acknowledged"), "{write}");
+        cluster.create_idle_replica().await?;
+        until(&mut cluster, |cluster| cluster.status()["peer_idle"]["state"] == "open").await;
+        let original = cluster.status()["peer_idle"]["target"].clone();
+        assert_eq!(cluster.status()["peer_idle"]["built"], false);
+        assert_eq!(cluster.build_idle_replica().await?["state"], "pending");
+        let end = Instant::now() + Duration::from_secs(12);
+        loop {
+            cluster.drive().await;
+            let status = cluster.status();
+            if status["peer_idle"]["built"] == true
+                && status["nodes"][1]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 1
+            {
+                break;
+            }
+            if Instant::now() >= end {
+                return Err(format!("build deadline; source={}, status={status}", data_contact(&primary, b"state\n")));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let status = cluster.status();
+        let copied = &status["nodes"][1]["retained_work"]["app_observation"]["idle_data"];
+        assert_eq!(copied["provider"]["values"]["value"], "acknowledged");
+        assert_eq!(copied["provider"]["results"]["primary-write"], 1);
+        assert_eq!(copied["provider"]["copy_in_progress"], false);
+        assert_eq!(copied["role"], "IdleSecondary");
+        assert_eq!(copied["ready"], false);
+        assert_ne!(copied["read"], "Granted");
+        assert_ne!(copied["write"], "Granted");
+        assert_eq!(copied["application_acknowledged"], true);
+        assert_eq!(status["peer_idle"]["serving"], false);
+        assert_eq!(status["peer_idle"]["target"], original);
+        assert_eq!(data_contact(&primary, b"read\n"), write);
+        let continued = data_contact(&primary, b"write-more\n");
+        assert!(continued.contains("assigned=2 applied=2 committed=2 value=continued"), "{continued}");
+        until(&mut cluster, |cluster| {
+            cluster.status()["nodes"][1]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 2
+                && serde_json::from_str::<Value>(&data_contact(&primary, b"state\n"))
+                    .unwrap()["peers"][0]["applied"] == 2
+        }).await;
+        let source: Value = serde_json::from_str(&data_contact(&primary, b"state\n")).map_err(err)?;
+        let status = cluster.status();
+        let target = &status["nodes"][1]["retained_work"]["app_observation"]["idle_data"];
+        assert_eq!(target["provider"]["values"], source["provider"]["values"]);
+        assert_eq!(target["provider"]["results"], source["provider"]["results"]);
+        assert_eq!(source["peers"].as_array().unwrap().len(), 1);
+        assert_eq!(source["peers"][0]["configured"], false);
+        assert_eq!(source["peers"][0]["building"], false);
+        assert_eq!(source["peers"][0]["copy_horizon"], 1);
+        assert_eq!(source["peers"][0]["applied"], 2);
+        assert_eq!(target["ready"], false);
+        assert_eq!(cluster.build_idle_replica().await?["built"], true);
+        assert_eq!(cluster.status()["peer_idle"]["target"], original);
+        assert_eq!(cluster.status()["nodes"][1]["observed"], "absent");
+        Ok::<(), String>(())
+    }).await;
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    result.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn peer_idle_stale_native_requests_cannot_reopen_and_peer_loss_preserves_fm() {
     let fixture = Fixture::new("peer-idle-stale");
     let mut config = fixture.config();

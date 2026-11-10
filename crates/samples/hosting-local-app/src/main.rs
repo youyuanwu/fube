@@ -1,8 +1,8 @@
 //! Explicitly minimal native-free local Hosting package fixtures.
 use clap::Parser;
 use fube_data::{
-    extensions::ReplicationEndpointOptions, IOperationDataStream, IStateProvider, MemoryProvider,
-    Mutation,
+    extensions::ReplicationEndpointOptions, IOperation, IOperationDataStream, IStateProvider,
+    MemoryProvider, Mutation,
 };
 use fube_runtime::{
     extensions::{
@@ -80,6 +80,8 @@ struct StatefulReplica {
     partition: Mutex<Option<Arc<dyn IStatefulServicePartition>>>,
     native: Option<NativeRuntimeIntegration>,
     data: Mutex<Option<Arc<RuntimeReplicator>>>,
+    memory: Mutex<Option<Arc<MemoryProvider>>>,
+    secondary: Mutex<Option<SecondaryPump>>,
     primary: Mutex<Option<PrimaryService>>,
 }
 struct ObservedProvider {
@@ -90,6 +92,10 @@ struct ObservedProvider {
 }
 struct PrimaryService {
     address: String,
+    stopped: Cancellation,
+    thread: Option<JoinHandle<()>>,
+}
+struct SecondaryPump {
     stopped: Cancellation,
     thread: Option<JoinHandle<()>>,
 }
@@ -152,6 +158,8 @@ impl IStatefulServiceFactory for StatefulFactory {
             partition: Mutex::new(None),
             native,
             data: Mutex::new(None),
+            memory: Mutex::new(None),
+            secondary: Mutex::new(None),
             primary: Mutex::new(None),
         }))
     }
@@ -185,6 +193,7 @@ impl IStatefulServiceReplica for StatefulReplica {
                     primary: self.resource.mode.primary,
                 });
                 let memory = provider.memory.clone();
+                *self.memory.lock().unwrap() = Some(memory.clone());
                 marker("LOCAL_DATA_PROVIDER acquired");
                 let control = native.create_replicator(
                     partition.clone(),
@@ -313,6 +322,16 @@ impl IStatefulServiceReplica for StatefulReplica {
                             after.progress.assigned
                         ));
                     }
+                    let mut secondary = self.secondary.lock().unwrap();
+                    if secondary.is_some() {
+                        return Err(Error::Protocol("Idle pump already owns the streams"));
+                    }
+                    *secondary = Some(SecondaryPump::start(
+                        self.native.as_ref().expect("real data integration").clone(),
+                        partition,
+                        data,
+                        self.memory.lock().unwrap().clone().expect("real provider"),
+                    )?);
                 }
             }
             Ok(String::new())
@@ -329,6 +348,9 @@ impl IStatefulServiceReplica for StatefulReplica {
 }
 impl StatefulReplica {
     fn release_data(&self) {
+        if let Some(mut secondary) = self.secondary.lock().unwrap().take() {
+            secondary.join();
+        }
         if let Some(mut primary) = self.primary.lock().unwrap().take() {
             primary.join();
         }
@@ -388,14 +410,27 @@ impl Drop for ObservedProvider {
             );
         }
         let state = self.memory.snapshot();
-        if self.primary && state.last != 0 {
-            assert_eq!(state.last, 1);
+        if state.copy_in_progress {
+            assert!(!self.primary, "Primary cannot own partial destination copy");
+        }
+        if state.last != 0 {
+            assert!((1..=2).contains(&state.last));
             assert_eq!(
                 state.values.get("value").map(String::as_str),
-                Some("acknowledged")
+                Some(if state.last == 1 {
+                    "acknowledged"
+                } else {
+                    "continued"
+                })
             );
             assert_eq!(state.results.get("primary-write"), Some(&1));
-            assert_eq!((state.values.len(), state.results.len()), (1, 1));
+            if state.last == 2 {
+                assert_eq!(state.results.get("primary-write-2"), Some(&2));
+            }
+            assert_eq!(
+                (state.values.len(), state.results.len()),
+                (1, state.last as usize)
+            );
         } else {
             assert_eq!(state.last, 0);
             assert!(state.values.is_empty() && state.results.is_empty());
@@ -438,17 +473,26 @@ impl PrimaryState {
     }
     async fn request(&self, request: &[u8], stopped: Cancellation) -> Result<String> {
         match request {
-            b"write\n" => {
+            b"write\n" | b"write-more\n" => {
                 self.authority(true)?;
+                let more = request == b"write-more\n";
+                if more && !self.memory.snapshot().results.contains_key("primary-write") {
+                    return Err(Error::InvalidInput(
+                        "continuing write requires the original write",
+                    ));
+                }
                 let mutation = Mutation {
-                    id: "primary-write".into(),
+                    id: if more {
+                        "primary-write-2"
+                    } else {
+                        "primary-write"
+                    }
+                    .into(),
                     key: "value".into(),
-                    value: "acknowledged".into(),
+                    value: if more { "continued" } else { "acknowledged" }.into(),
                 };
                 if self.memory.admission(&mutation)?.is_some() {
-                    return Err(Error::InvalidInput(
-                        "fixture permits one acknowledged write",
-                    ));
+                    return Err(Error::InvalidInput("fixture request already acknowledged"));
                 }
                 let operation =
                     mutation.operation_for_epoch(self.native.status()?.current_epoch.primary())?;
@@ -464,6 +508,15 @@ impl PrimaryState {
                 marker(&format!("LOCAL_PRIMARY acknowledged sequence={sequence}"));
             }
             b"read\n" => self.authority(false)?,
+            b"state\n" => {
+                self.authority(false)?;
+                return Ok(format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "provider":self.memory.snapshot(), "peers":self.data.snapshot().peers,
+                    })
+                ));
+            }
             b"load\n" => {
                 self.authority(false)?;
                 let partition = self.partition.clone();
@@ -479,7 +532,11 @@ impl PrimaryState {
                     .await?;
                 return Ok("OK load=7\n".into());
             }
-            _ => return Err(Error::InvalidInput("fixture accepts only read/write/load")),
+            _ => {
+                return Err(Error::InvalidInput(
+                    "fixture accepts only read/write/write-more/state/load",
+                ))
+            }
         }
         let native = self.native.status()?;
         let engine = self.data.snapshot();
@@ -585,6 +642,116 @@ impl PrimaryService {
     }
 }
 impl Drop for PrimaryService {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
+fn apply_secondary(
+    provider: &MemoryProvider,
+    operation: &dyn IOperation,
+    copy: bool,
+) -> Result<()> {
+    let data = operation.get_data()?;
+    if copy {
+        provider.apply_copy(&data)?;
+    } else {
+        provider.apply_replication(operation.get_metadata()?.sequence_number, &data)?;
+    }
+    operation.acknowledge()
+}
+
+impl SecondaryPump {
+    fn start(
+        native: NativeRuntimeIntegration,
+        partition: Arc<dyn IStatefulServicePartition>,
+        data: Arc<RuntimeReplicator>,
+        memory: Arc<MemoryProvider>,
+    ) -> Result<Self> {
+        let state = data.get_state_replicator();
+        let copy = state.get_copy_stream()?;
+        let replication = state.get_replication_stream()?;
+        let data = Arc::downgrade(&data);
+        let stopped = Cancellation::default();
+        let stop = stopped.clone();
+        let (ready, readiness) = std::sync::mpsc::sync_channel(1);
+        let thread =
+            std::thread::Builder::new()
+                .name("local-idle-copy".into())
+                .spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            ready.send(Err(error)).expect("report pump startup failure");
+                            return;
+                        }
+                    };
+                    ready.send(Ok(())).expect("report owned pump startup");
+                    runtime.block_on(async {
+                        let result = async {
+                        // Copy EOS and replication EOS are independent. Consuming copy
+                        // first prevents application replication into a partial snapshot.
+                        for (stream, copying) in [(copy, true), (replication, false)] {
+                            loop {
+                                let operation = tokio::select! {
+                                    biased;
+                                    _ = stop.cancelled() => return Ok(()),
+                                    item = stream.get_operation(stop.clone()) => item?,
+                                };
+                                let Some(operation) = operation else { break };
+                                native.status()?;
+                                apply_secondary(&memory, operation.as_ref(), copying)?;
+                                if !memory.snapshot().copy_in_progress {
+                                    let owner = data.upgrade().ok_or(Error::Closed)?;
+                                    marker(&format!("LOCAL_IDLE_DATA {}", serde_json::json!({
+                                        "provider":memory.snapshot(),
+                                        "role":format!("{:?}",owner.snapshot().role),
+                                        "ready":owner.snapshot().ready,
+                                        "read":format!("{:?}",partition.get_read_status()?),
+                                        "write":format!("{:?}",partition.get_write_status()?),
+                                        "application_acknowledged":true,
+                                    })));
+                                }
+                            }
+                        }
+                        Ok::<(), Error>(())
+                    }.await;
+                        if let Err(error) = result {
+                            if !stop.is_cancelled() {
+                                if let Some(data) =
+                                    data.upgrade().filter(|data| !data.snapshot().closed)
+                                {
+                                    marker(&format!("LOCAL_IDLE_DATA_ERROR {error}"));
+                                    data.close(Cancellation::default())
+                                        .await
+                                        .expect("fence failed destination pump");
+                                }
+                            }
+                        }
+                    });
+                })?;
+        if let Err(error) = readiness.recv().expect("pump startup receipt") {
+            thread.join().expect("join failed pump startup");
+            return Err(error.into());
+        }
+        Ok(Self {
+            stopped,
+            thread: Some(thread),
+        })
+    }
+    fn join(&mut self) {
+        self.stopped.cancel();
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .expect("join actual destination application pump");
+        }
+    }
+}
+impl Drop for SecondaryPump {
     fn drop(&mut self) {
         self.join();
     }
@@ -812,6 +979,105 @@ async fn main() {
 #[cfg(test)]
 mod argument_tests {
     use super::*;
+
+    struct Operation {
+        sequence: i64,
+        data: fube_data::OperationData,
+        acknowledgement: Box<dyn Fn() -> Result<()> + Send + Sync>,
+    }
+    impl IOperation for Operation {
+        fn get_metadata(&self) -> Result<fube_data::OperationMetadata> {
+            Ok(fube_data::OperationMetadata {
+                operation_type: fube_data::OperationType::Normal,
+                sequence_number: self.sequence,
+                atomic_group_id: -1,
+            })
+        }
+        fn get_data(&self) -> Result<fube_data::OperationData> {
+            Ok(self.data.clone())
+        }
+        fn acknowledge(&self) -> Result<()> {
+            (self.acknowledgement)()
+        }
+    }
+
+    #[tokio::test]
+    async fn destination_applies_copy_and_replication_before_ack_and_never_acks_failed_apply() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let source = MemoryProvider::new();
+        let target = MemoryProvider::new();
+        let first = Mutation {
+            id: "original".into(),
+            key: "value".into(),
+            value: "copied".into(),
+        }
+        .operation()
+        .unwrap();
+        source.apply_replication(1, &first).unwrap();
+        let stream = source.get_copy_state(1, None).unwrap();
+        let mut copied = Vec::new();
+        while let Some(data) = stream.get_next(Cancellation::default()).await.unwrap() {
+            copied.push(data);
+        }
+        let count = copied.len();
+        let acknowledgements = Arc::new(AtomicUsize::new(0));
+        for (index, data) in copied.into_iter().enumerate() {
+            let target_at_ack = target.clone();
+            let acknowledgements = acknowledgements.clone();
+            let operation = Operation {
+                sequence: index as i64 + 1,
+                data,
+                acknowledgement: Box::new(move || {
+                    if index + 1 == count {
+                        let state = target_at_ack.snapshot();
+                        assert!(!state.copy_in_progress);
+                        assert_eq!(state.last, 1);
+                        assert_eq!(state.values["value"], "copied");
+                        assert_eq!(state.results["original"], 1);
+                    }
+                    acknowledgements.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+            };
+            apply_secondary(&target, &operation, true).unwrap();
+        }
+        let at_ack = target.clone();
+        let acks = acknowledgements.clone();
+        let second = Mutation {
+            id: "tail".into(),
+            key: "value".into(),
+            value: "replicated".into(),
+        }
+        .operation()
+        .unwrap();
+        let operation = Operation {
+            sequence: 2,
+            data: second.clone(),
+            acknowledgement: Box::new(move || {
+                let state = at_ack.snapshot();
+                assert_eq!(state.last, 2);
+                assert_eq!(state.values["value"], "replicated");
+                assert_eq!(state.results["tail"], 2);
+                acks.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        };
+        apply_secondary(&target, &operation, false).unwrap();
+        assert_eq!(acknowledgements.load(Ordering::SeqCst), count + 1);
+        let invalid = Operation {
+            sequence: 4,
+            data: Mutation {
+                id: "gap".into(),
+                key: "value".into(),
+                value: "invalid".into(),
+            }
+            .operation()
+            .unwrap(),
+            acknowledgement: Box::new(|| panic!("failed apply cannot acknowledge")),
+        };
+        assert!(apply_secondary(&target, &invalid, false).is_err());
+        assert_eq!(target.snapshot().last, 2);
+    }
 
     fn parse(suffix: &str) -> std::result::Result<Arguments, clap::Error> {
         let input = format!("hosting-local-app {suffix}");

@@ -689,11 +689,13 @@ impl Cluster {
                     .as_str()
                     .is_some_and(|value| !value.is_empty())
                 && target["local_replica"]["open"] == true;
+            let built = opened && source["peer_idle"]["build"]["result"] == 0;
             status["peer_idle"] = json!({
                 "requested":self.peer_idle_requested,
                 "state": if failed { "failed" } else if opened { "open" } else if self.peer_idle_requested { "pending" } else { "absent" },
                 "error": if failed { reply["error"].clone() } else { Value::Null },
-                "built":false, "serving":false,
+                "built":built, "serving":false,
+                "build":source["peer_idle"]["build"],
                 "source":source["peer_idle"], "target":target["local_replica"],
                 "peer_link_alive":[source["peer_link_alive"],target["peer_link_alive"]],
                 "peer_error":[source["peer_error"],target["peer_error"]],
@@ -739,6 +741,48 @@ impl Cluster {
             .map_err(err)?;
         self.peer_idle_requested = true;
         Ok(json!({"state":"pending","kind":"peer_idle_open","built":false,"serving":false}))
+    }
+    /// Ask the original Primary runtime to build its already opened peer Idle.
+    /// Completion proves copy/application ACK, not active configuration or FM AddReplica.
+    pub async fn build_idle_replica(&mut self) -> Result<Value> {
+        if self.config.profile != ServiceProfile::StatefulPeerIdle
+            || self.finished.is_some()
+            || self.children.len() != 2
+            || self.ledger.generation.is_some()
+            || self.ledger.placements[0].observed != fm::Observed::Running
+            || self.ledger.placements.iter().any(|placement| {
+                !placement.link_alive
+                    || placement.bootstrap != Bootstrap::Admitted
+                    || !placement.activated
+            })
+            || self.status()["peer_idle"]["state"] != "open"
+        {
+            return Err("peer build requires the original Ready Primary and opened Idle".into());
+        }
+        let current = self.status()["peer_idle"].clone();
+        if current["built"] == true {
+            return Ok(current);
+        }
+        if let Some(error) = current["build"]["result"].as_i64() {
+            return Ok(
+                json!({"state":"failed","kind":"peer_idle_build","error":error,
+                "detail":current["build"]["detail"],"built":false,"serving":false}),
+            );
+        }
+        let child = &mut self.children[0];
+        child
+            .process
+            .as_mut()
+            .ok_or("missing original Primary owner")?
+            .command(
+                format!(
+                    "build-idle {} {}\n",
+                    child.launch.session, child.launch.capability
+                )
+                .as_bytes(),
+            )
+            .map_err(err)?;
+        Ok(json!({"state":"pending","kind":"peer_idle_build","built":false,"serving":false}))
     }
     /// Returns the retained operation outcome, never transport-write success.
     /// `quit` is accepted here; the foreground then calls owned shutdown.

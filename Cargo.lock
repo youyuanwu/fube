@@ -588,6 +588,7 @@ dependencies = [
  "fube-ra-store",
  "fube-runtime",
  "fube-transport",
+ "serde_json",
  "tokio",
  "uuid",
 ]

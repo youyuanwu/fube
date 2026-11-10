@@ -11,6 +11,24 @@ pub struct RemoteIdle {
     pub target: NodeInstance,
     pub body: Arc<CreateReplica>,
     pub reply: Option<CreateReplicaReply>,
+    pub build: Option<RemoteBuild>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteBuild {
+    pub body: Arc<AddInstance>,
+    /// None is pending, not proof of failure or permission to replace a peer.
+    pub result: Option<i64>,
+    pub detail: ProxyErrorDetail,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BuildCompletion {
+    pub unit: FailoverUnit,
+    pub local: Replica,
+    pub remote: Replica,
+    pub error: i64,
+    pub detail: ProxyErrorDetail,
 }
 
 impl Executor {
@@ -138,6 +156,7 @@ pub(super) fn start_remote(
         target: target.node.clone(),
         body: Arc::new(body.clone()),
         reply: None,
+        build: None,
     });
     Ok(lifecycle::changed(
         state,
@@ -202,5 +221,112 @@ pub(super) fn complete_remote(
         .as_mut()
         .expect("checked remote owner")
         .reply = Some(body);
+    Ok(lifecycle::changed(state, vec![], false))
+}
+
+pub(super) fn start_build(
+    current: Option<&EntityState>,
+    admission: &Admission,
+    peer: Option<&NodeInstance>,
+) -> Result<Transition> {
+    let current = current.ok_or(Failure::Admission("build requires an existing Primary"))?;
+    if !admission.node_open || !admission.owner_ready || !admission.node_activated {
+        return Ok(Transition::ignored(Disposition::IgnoredNotReady));
+    }
+    let remote = current
+        .remote_idle
+        .as_ref()
+        .ok_or(Failure::Unsupported("no opened peer Idle"))?;
+    let reply = remote
+        .reply
+        .as_ref()
+        .filter(|reply| reply.error == 0)
+        .ok_or(Failure::Unsupported("peer Open has not succeeded"))?;
+    let registration = current
+        .runtime
+        .as_ref()
+        .ok_or(Failure::Unsupported("no original runtime"))?;
+    if current.phase != Phase::Ready
+        || !current.fm_primary
+        || current.body.replica.current_role != 4
+        || current.peer_creation.is_some()
+        || peer != Some(&remote.target)
+    {
+        return Err(Failure::Unsupported(
+            "build requires the original current Primary and peer",
+        ));
+    }
+    if let Some(build) = &remote.build {
+        if let Some(error) = build.result {
+            return if error == 0 {
+                Ok(Transition::ignored(Disposition::IgnoredStale))
+            } else {
+                Err(Failure::Unsupported(
+                    "failed build requires explicit replicator removal cleanup",
+                ))
+            };
+        }
+    }
+    let mut state = current.clone();
+    let body = remote
+        .build
+        .as_ref()
+        .map_or_else(|| current.body.clone(), |build| build.body.clone());
+    state.remote_idle.as_mut().expect("checked remote").build = Some(RemoteBuild {
+        body: body.clone(),
+        result: None,
+        detail: ProxyErrorDetail::default(),
+    });
+    Ok(lifecycle::changed(
+        state,
+        vec![Effect::BuildIdle {
+            body,
+            replica: Box::new(reply.replica.clone()),
+            registration: registration.clone(),
+        }],
+        false,
+    ))
+}
+
+pub(super) fn complete_build(
+    work: &Submission,
+    current: Option<&EntityState>,
+) -> Result<Transition> {
+    let event: BuildCompletion =
+        from_slice(&work.bytes).map_err(|_| Failure::Admission("invalid build completion"))?;
+    let Some(current) = current.filter(|state| state.phase == Phase::Ready && state.fm_primary)
+    else {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    };
+    let Some(remote) = &current.remote_idle else {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    };
+    let Some(build) = &remote.build else {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    };
+    let mut local = event.local;
+    // RAP may refresh progress while retaining this exact invocation identity.
+    local.first_lsn = build.body.replica.first_lsn;
+    local.last_lsn = build.body.replica.last_lsn;
+    if build.result.is_some()
+        || event.unit != build.body.unit
+        || local != build.body.replica
+        || remote
+            .reply
+            .as_ref()
+            .is_none_or(|reply| reply.error != 0 || reply.replica != event.remote)
+    {
+        return Ok(Transition::ignored(Disposition::IgnoredStale));
+    }
+    let mut state = current.clone();
+    let build = state
+        .remote_idle
+        .as_mut()
+        .expect("checked remote")
+        .build
+        .as_mut()
+        .expect("checked build");
+    build.result = Some(event.error);
+    build.detail = event.detail;
     Ok(lifecycle::changed(state, vec![], false))
 }

@@ -221,9 +221,41 @@ reply is not proof of copy, build, active membership, quorum or serving
 readiness. Primary Close invalidates the observation and fences late replies.
 Fresh-start/fixed-generation admission is required; LFUM rebuild, peer
 recreation/adoption, persisted state, ActiveSecondary promotion, AddReplica
-and reconfiguration remain gated. The next increment must connect real RAP
-build and destination application copy/replication ACKs before any
-AddReplicaReply or active-member claim.
+and reconfiguration remain gated.
+
+After observing `status()["peer_idle"]["state"] == "open"`, the separate
+programmatic `Cluster::build_idle_replica()` submits a trusted local build
+authorization. Primary RA publishes its frozen build obligation before sending
+`ReplicatorBuildIdleReplica` through the original Hosting/runtime session.
+The existing RAP binds the native invocation before calling
+`IPrimaryReplicator::build_replica`; the request uses the native empty-runtime,
+default-service control shape and one exact opened remote descriptor.
+No new FM or peer network action is enabled.
+
+The destination application owns a joined copy/replication pump using public
+`IStateReplicator`/`IOperationStream`/`IOperation` contracts. It applies the
+complete copy (including values and the retry-result ledger) before consuming
+continuing replication; every delivered operation is applied before its
+explicit ACK. Copy EOS does not stop the replication pump. Original shutdown
+joins the pump and retains the existing provider/service disposal boundaries.
+Application pump errors are logged and fence the data owner; failed application
+apply cannot ACK.
+
+The build API returns `pending`, not build success. Poll
+`status()["peer_idle"]["built"]`; only the exact original semantic RAP reply
+can publish that observation. Pending retries reuse the frozen request, completed
+retries do not rebuild, and Primary Close fences late completions. A native
+build error remains visible in `peer_idle.build.result/detail`; retrying a failed
+build returns `state=failed`. Removal/retry-cleanup after such failure is still
+gated, not silently treated as a fresh build.
+
+This increment deliberately retains Idle/InBuild metadata, no service endpoint,
+denied read/write access and no active membership or quorum change even after
+copy completes. It sends no AddReplicaReply. The real-process acceptance writes
+before build, observes nonempty copied values and retry results on the actual
+destination, then proves a second write is applied/ACKed there while the peer
+remains unconfigured and non-serving. `write-more\n` and `state\n` are bounded
+sample controls for that observation, not RA authority or recovery APIs.
 
 These are native-derived model/store and native-free real-process contracts,
 not full C++ handler traces or native Federation interoperability.

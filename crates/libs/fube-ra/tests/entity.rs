@@ -2777,6 +2777,219 @@ async fn primary_peer_open_observation_never_builds_or_changes_quorum_and_close_
     finish(&store, &executor).await;
 }
 
+async fn opened_peer_primary() -> (Store, Executor, CreateReplicaReply) {
+    let (store, executor, _) = setup(WAIT).await;
+    executor.bind_peer(peer_source()).unwrap();
+    make_ready(&executor, &primary_body()).await;
+    let primary = state(&executor);
+    let mut replica = primary.body.replica.clone();
+    replica.node = peer_source();
+    replica.id += 1;
+    replica.instance += 1;
+    replica.current_role = 2;
+    replica.state = 1;
+    replica.service_endpoint.clear();
+    replica.replication_endpoint.clear();
+    run(
+        &executor,
+        Command::CreateRemoteIdle {
+            unit: primary.body.unit.id.clone(),
+            replica: replica.clone(),
+        },
+    )
+    .await;
+    effects(&executor);
+    let pending = executor
+        .submit(Command::BuildRemoteIdle(primary.body.unit.id.clone()))
+        .unwrap();
+    assert!(matches!(
+        pending.wait(WAIT).await,
+        Err(Failure::Unsupported(_))
+    ));
+    replica.replication_endpoint = "127.0.0.1:12346".into();
+    let reply = CreateReplicaReply {
+        unit: primary.body.unit.clone(),
+        replica,
+        error: 0,
+    };
+    run(
+        &executor,
+        Command::CreateReplicaReply {
+            body: Box::new(reply.clone()),
+            source: peer_source(),
+            generation: GenerationHeader {
+                number: admission().generation,
+                for_fm_replica: false,
+            },
+        },
+    )
+    .await;
+    assert!(effects(&executor).is_empty());
+    (store, executor, reply)
+}
+
+#[tokio::test]
+async fn peer_build_is_explicit_correlated_and_never_grants_membership() {
+    let (store, executor, remote) = opened_peer_primary().await;
+    let primary = state(&executor);
+    let build = || Command::BuildRemoteIdle(primary.body.unit.id.clone());
+    run(&executor, build()).await;
+    let first = effects(&executor);
+    assert!(
+        matches!(&first[..], [Effect::BuildIdle { body, replica, registration: runtime }]
+        if body == &primary.body && **replica == remote.replica && Some(runtime) == primary.runtime.as_ref())
+    );
+    assert_eq!(
+        state(&executor)
+            .remote_idle
+            .as_ref()
+            .unwrap()
+            .build
+            .as_ref()
+            .unwrap()
+            .result,
+        None
+    );
+    run(&executor, build()).await;
+    assert_eq!(effects(&executor), first);
+    let event = BuildCompletion {
+        unit: primary.body.unit.clone(),
+        local: primary.body.replica.clone(),
+        remote: remote.replica.clone(),
+        error: 0,
+        detail: ProxyErrorDetail::default(),
+    };
+    for event in [
+        {
+            let mut e = event.clone();
+            e.remote.instance += 1;
+            e
+        },
+        {
+            let mut e = event.clone();
+            e.local.id += 1;
+            e
+        },
+        {
+            let mut e = event.clone();
+            e.unit.current.configuration += 1;
+            e
+        },
+        {
+            let mut e = event.clone();
+            e.remote.replication_endpoint = "foreign".into();
+            e
+        },
+    ] {
+        assert_eq!(
+            run(&executor, Command::CompleteBuild(Box::new(event))).await,
+            Disposition::IgnoredStale
+        );
+    }
+    assert_eq!(
+        state(&executor)
+            .remote_idle
+            .as_ref()
+            .unwrap()
+            .build
+            .as_ref()
+            .unwrap()
+            .result,
+        None
+    );
+    let mut progress = event.clone();
+    progress.local.last_lsn = 12;
+    run(&executor, Command::CompleteBuild(Box::new(progress))).await;
+    let after = state(&executor);
+    assert_eq!(
+        after
+            .remote_idle
+            .as_ref()
+            .unwrap()
+            .build
+            .as_ref()
+            .unwrap()
+            .result,
+        Some(0)
+    );
+    assert_eq!(after.body, primary.body);
+    assert_eq!(
+        after
+            .remote_idle
+            .as_ref()
+            .unwrap()
+            .reply
+            .as_ref()
+            .unwrap()
+            .replica
+            .state,
+        1
+    );
+    assert_eq!(run(&executor, build()).await, Disposition::IgnoredStale);
+    assert_eq!(
+        run(&executor, Command::CompleteBuild(Box::new(event))).await,
+        Disposition::IgnoredStale
+    );
+    assert!(effects(&executor).is_empty());
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn peer_build_errors_retain_cleanup_and_close_fences_late_success() {
+    for error in [0, -2_147_017_398] {
+        let (store, executor, remote) = opened_peer_primary().await;
+        let primary = state(&executor);
+        run(
+            &executor,
+            Command::BuildRemoteIdle(primary.body.unit.id.clone()),
+        )
+        .await;
+        effects(&executor);
+        let event = BuildCompletion {
+            unit: primary.body.unit.clone(),
+            local: primary.body.replica.clone(),
+            remote: remote.replica,
+            error,
+            detail: ProxyErrorDetail {
+                message: "original build error".into(),
+                ..Default::default()
+            },
+        };
+        if error != 0 {
+            run(&executor, Command::CompleteBuild(Box::new(event.clone()))).await;
+            let after = state(&executor);
+            let build = after.remote_idle.as_ref().unwrap().build.as_ref().unwrap();
+            assert_eq!(build.result, Some(error));
+            assert_eq!(build.detail, event.detail);
+            let retry = executor
+                .submit(Command::BuildRemoteIdle(primary.body.unit.id.clone()))
+                .unwrap();
+            assert!(matches!(
+                retry.wait(WAIT).await,
+                Err(Failure::Unsupported(_))
+            ));
+        }
+        run(
+            &executor,
+            Command::CloseLocal {
+                unit: primary.body.unit.id.clone(),
+                mode: CloseMode::Close,
+            },
+        )
+        .await;
+        effects(&executor);
+        let mut late = event;
+        late.error = 0;
+        assert_eq!(
+            run(&executor, Command::CompleteBuild(Box::new(late))).await,
+            Disposition::IgnoredStale
+        );
+        assert!(state(&executor).remote_idle.is_none());
+        assert!(effects(&executor).is_empty());
+        finish(&store, &executor).await;
+    }
+}
+
 fn primary_body() -> AddPrimary {
     let mut request = body(1);
     request.service.stateful = true;

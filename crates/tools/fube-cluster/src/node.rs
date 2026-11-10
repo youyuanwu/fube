@@ -792,13 +792,17 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                                         Err(error) => adapter.peer_error = Some(error),
                                     }
                                 }
-                                Ok(parts) if parts.len() == 3 && parts[0] == "create-idle"
+                                Ok(parts) if parts.len() == 3 && matches!(parts[0], "create-idle" | "build-idle")
                                     && parts[1] == launch.session && parts[2] == launch.capability
                                     && launch.placement == 1 && launch.peer.is_some() => {
                                     let submitted = if adapter.peer_commands.len() == 32 {
                                         Err("peer command receipt capacity".into())
                                     } else {
-                                        create_idle(launch, &mut node)
+                                        if parts[0] == "create-idle" {
+                                            create_idle(launch, &mut node)
+                                        } else {
+                                            node.build_idle_on_peer().map_err(err)
+                                        }
                                     };
                                     match submitted {
                                         Ok(id) => adapter.peer_commands.push(id),
@@ -988,9 +992,20 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                             serde_json::json!({
                                 "replica":remote.body.replica.0.replica,
                                 "reply":remote.reply,
+                                "build":remote.build.as_ref().map(|build| serde_json::json!({
+                                    "result":build.result, "detail":build.detail,
+                                })),
                             })
                         });
                 let app_logs = node.activation().logs();
+                let idle_data = app_logs
+                    .iter()
+                    .rev()
+                    .find_map(|line| line.split_once("LOCAL_IDLE_DATA ").map(|(_, body)| body))
+                    .map(|body| {
+                        serde_json::from_str::<serde_json::Value>(body)
+                            .unwrap_or_else(|error| serde_json::json!({"error":err(error)}))
+                    });
                 let observation = serde_json::json!({
                     "deployment":launch.deployment, "session":launch.session,
                     "node_pid":std::process::id(), "external_pending":node.external_pending().len(),
@@ -1002,6 +1017,9 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                     "peer_command_error":adapter.peer_command_error,
                     "peer_idle":remote_idle, "local_replica":local_replica,
                     "app_observation":{
+                        "idle_data":idle_data,
+                        "idle_data_error":app_logs.iter().rev()
+                            .find_map(|line| line.split_once("LOCAL_IDLE_DATA_ERROR ").map(|(_, error)| error)),
                         "opens":app_logs.iter().filter(|line| line.contains("LOCAL_CALLBACK open")).count(),
                         "provider_acquisitions":app_logs.iter().filter(|line| line.contains("LOCAL_DATA_PROVIDER acquired")).count(),
                         "idle_access_denied":app_logs.iter().any(|line| line.contains("LOCAL_ACCESS denied")),

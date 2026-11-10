@@ -46,7 +46,7 @@ mod generation;
 pub use generation::{GenerationState, GenerationUpdateOutcome};
 #[path = "peer.rs"]
 mod peer;
-pub use peer::{PeerCreation, RemoteIdle};
+pub use peer::{BuildCompletion, PeerCreation, RemoteBuild, RemoteIdle};
 
 pub type EntityId = [u8; 16];
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -325,6 +325,9 @@ pub enum Command {
         unit: PartitionId,
         replica: Replica,
     },
+    /// Trusted local authorization to copy into the opened original peer Idle.
+    BuildRemoteIdle(PartitionId),
+    CompleteBuild(Box<BuildCompletion>),
     CreateReplicaReply {
         body: Box<CreateReplicaReply>,
         source: NodeInstance,
@@ -397,6 +400,8 @@ enum Kind {
         deactivation: ReplicaDeactivationInfo,
     },
     CreateRemoteIdle,
+    BuildRemoteIdle,
+    CompleteBuild,
     CreateReplicaReply {
         source: NodeInstance,
         generation: GenerationHeader,
@@ -518,7 +523,7 @@ pub struct EntityState {
     pub primary_deactivation: Option<(Epoch, i64)>,
     /// Session-only original peer responsibility; never restored by metadata.
     pub peer_creation: Option<PeerCreation>,
-    /// A remote Open observation, not a built/active replica or quorum member.
+    /// Session-only remote Open/build observations, never active membership.
     pub remote_idle: Option<RemoteIdle>,
     pub phase: Phase,
     pub open_token: u64,
@@ -552,6 +557,11 @@ pub struct Snapshot {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
+    BuildIdle {
+        body: Arc<AddInstance>,
+        replica: Box<Replica>,
+        registration: RuntimeRegistration,
+    },
     PeerCreateReplica {
         target: NodeInstance,
         body: Box<CreateReplica>,
@@ -922,6 +932,10 @@ impl Executor {
             ),
             Command::CreateRemoteIdle { unit, replica } => {
                 (unit.guid.0, Kind::CreateRemoteIdle, to_vec(&replica))
+            }
+            Command::BuildRemoteIdle(unit) => (unit.guid.0, Kind::BuildRemoteIdle, to_vec(&unit)),
+            Command::CompleteBuild(body) => {
+                (body.unit.id.guid.0, Kind::CompleteBuild, to_vec(&body))
             }
             Command::CreateReplicaReply {
                 body,
@@ -1521,6 +1535,8 @@ fn transition(
         #[cfg(feature = "qualification")]
         Kind::QualificationTerminate => panic!("explicit qualification worker termination"),
         Kind::CreateRemoteIdle => peer::start_remote(work, state, admission, peer),
+        Kind::BuildRemoteIdle => peer::start_build(state, admission, peer),
+        Kind::CompleteBuild => peer::complete_build(work, state),
         Kind::CreateReplicaReply { source, generation } => {
             peer::complete_remote(work, state, source, generation, admission, peer)
         }
@@ -2031,7 +2047,9 @@ async fn entity_worker(
             let mut effective_admission = admission.clone();
             effective_admission.node_activated = view.node.activation.activated;
             effective_admission.generation = view.generations.receive.clone();
-            if matches!(work.kind, Kind::CreateRemoteIdle) && view.generations.upload_pending {
+            if matches!(work.kind, Kind::CreateRemoteIdle | Kind::BuildRemoteIdle)
+                && view.generations.upload_pending
+            {
                 Err(Failure::Unsupported(
                     "peer creation is gated during generation rebuild",
                 ))
