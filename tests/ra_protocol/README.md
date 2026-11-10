@@ -151,6 +151,14 @@ Controlled process/Channel acceptance holds real provider/service disposal and
 uses the existing dynamic Open Drop=1 threshold for qualification only.
 These source-derived lifecycle tests add no wire cases or schema types.
 
+Opened peer Idle AppHostDown now reuses the existing ReplicaUp dropped list,
+native ReplicaDown stage, processed-list ACK and closed DeleteReplicaReply.
+Source-bound original FM Add/node ownership gates, separate loss/ACK commits
+and the unchanged 30-second retry are lifecycle evidence, not new schemas.
+Actual two-child destination app termination, lost ACK/metadata reply replay
+and healthy Primary writes do not establish native C++ handler execution,
+runtime disposal or replacement permission. The oracle remains 139 cases.
+
 ### Stage-two node control/load and endpoint codecs
 
 All original 58 cases, 59 types/199 fields, 62 files and eleven native

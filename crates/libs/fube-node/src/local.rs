@@ -519,6 +519,8 @@ impl Node {
                     | FmWork::CompleteServiceTypeWork(_)
                     | FmWork::ServiceTypeRetryTimer(_)
                     | FmWork::DeleteReplica(..)
+                    | FmWork::RetryReport(_)
+                    | FmWork::ReplicaUpReply(..)
             );
         if !stateless
             && self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
@@ -617,6 +619,7 @@ impl Node {
                                                 && self.route.is_none())
                                             || (state.failed_open_error().is_some()
                                                 && self.runtime_open_failure().is_some())
+                                            || state.peer_host_loss()
                                             || state.local_deleted)))
                         }
                     };

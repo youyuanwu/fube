@@ -210,7 +210,7 @@ fn finish_close(state: &mut EntityState, effects: &mut Vec<Effect>) {
         if state.fm_primary {
             state.primary_deactivation = Some((Epoch::default(), -2));
         }
-        if state.fm_primary
+        if (state.fm_primary || (mode == CloseMode::AppHostDown && state.peer_host_loss()))
             && matches!(
                 mode,
                 CloseMode::Close
@@ -337,6 +337,16 @@ fn start_close_inner(
         return;
     }
     let was_creating = state.phase == Phase::Opening;
+    if mode == CloseMode::AppHostDown
+        && state.phase == Phase::Ready
+        && state.body.replica.current_role == 2
+        && state.runtime.is_some()
+        && state.usage.is_some()
+    {
+        if let Some(peer) = &mut state.peer_creation {
+            peer.host_down = true;
+        }
+    }
     if mode.deletes() {
         mark_deleted(state);
     }
@@ -561,6 +571,7 @@ pub(super) fn transition(
                                 && original.runtime.is_some() == original.usage.is_some())
                             || original.failed_registration_error().is_some()
                             || original.failed_open_error().is_some()
+                            || original.peer_host_loss()
                             || original.local_deleted)
                         || original.body.replica.current_role != 2
                     {
@@ -943,7 +954,7 @@ pub(super) fn transition(
                 return Ok(Transition::ignored(Disposition::IgnoredStale));
             }
             if current.body.service.stateful {
-                if !current.fm_primary {
+                if !current.fm_primary && !current.peer_host_loss() {
                     return Err(Failure::Unsupported(
                         "local stateful terminal-report ACK is gated",
                     ));

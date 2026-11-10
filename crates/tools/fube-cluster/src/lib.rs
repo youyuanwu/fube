@@ -809,17 +809,22 @@ impl Cluster {
                 && target["local_replica"]["open"] == true;
             let removing = source["peer_idle"]["removal"].is_object();
             let removed = removing && source["peer_idle"]["removal"]["result"] == 0;
-            let built = opened && !removing && source["peer_idle"]["build"]["result"] == 0;
+            let destination_lost = self.ledger.placements[1].loss_reported;
+            let built = !destination_lost
+                && opened
+                && !removing
+                && source["peer_idle"]["build"]["result"] == 0;
             status["peer_idle"] = json!({
                 "requested":self.peer_idle_requested,
-                "state": if removed { "removed" } else if removing { "removing" } else if failed { "failed" } else if opened { "open" } else if self.peer_idle_requested { "pending" } else { "absent" },
+                "state": if destination_lost { "lost" } else if removed { "removed" } else if removing { "removing" } else if failed { "failed" } else if opened { "open" } else if self.peer_idle_requested { "pending" } else { "absent" },
                 "error": if failed { reply["error"].clone() } else { Value::Null },
                 "built":built, "serving":false,
                 "build":source["peer_idle"]["build"],
                 "fm":self.ledger.idle_status(),
                 "fm_removal":self.ledger.idle_removal_status(),
                 "fm_deletion":self.ledger.idle_deletion_status(),
-                "ready":source["peer_idle"]["ready"] == true,
+                "ready":!destination_lost && source["peer_idle"]["ready"] == true,
+                "destination_lost":destination_lost,
                 "removal":source["peer_idle"]["removal"],
                 "source":source["peer_idle"], "target":target["local_replica"],
                 "peer_link_alive":[source["peer_link_alive"],target["peer_link_alive"]],
@@ -978,7 +983,7 @@ impl Cluster {
         }
         Ok(json!({"state":"pending","kind":"peer_idle_removal","built":false,"serving":false}))
     }
-    /// FM retires pending/failed creation or removes the opened Idle's replication session.
+    /// FM retires pending/failed creation or removes the opened/lost Idle's replication session.
     /// Only RemoveReplicaReply clears pending_remove, never destination deletion.
     pub async fn remove_idle_replica_via_fm(&mut self) -> Result<Value> {
         if self.finished.is_some()
@@ -995,11 +1000,12 @@ impl Cluster {
             && self.status()["peer_idle"]["state"] != "open"
             && !matches!(
                 self.ledger.idle_status()["state"].as_str(),
-                Some("pending" | "failed")
+                Some("pending" | "failed" | "lost")
             )
         {
             return Err(
-                "FM removal requires original pending/failed FM creation or an opened Idle".into(),
+                "FM removal requires original pending/failed FM creation or an opened/lost Idle"
+                    .into(),
             );
         }
         let body = self.ledger.request_idle_removal(Instant::now())?;

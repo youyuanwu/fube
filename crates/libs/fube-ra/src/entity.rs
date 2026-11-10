@@ -1631,6 +1631,7 @@ fn transition(
                         deactivation: deactivation.clone(),
                         registration_error: None,
                         open_error: None,
+                        host_down: false,
                     })
                 }
                 _ => None,

@@ -392,6 +392,50 @@ cleanup; a lost reply remains pending and uses normal 10/60-second retries.
 replacement is inferred. Arbitrary unknown replicas and later incarnations
 still reject before dispatch.
 
+### Unexpected opened destination app-host loss
+
+The original peer-created Idle now reports actual AppHostDown observed while
+its Open has completed (RA Ready, still Idle/InBuild). The RA retains this
+specific origin; local-only Idle, opening/failed creation and arbitrary closed
+peer lifetimes do not gain terminal-report authority.
+
+Native `FailoverUnit.cpp:5472-5544` calls OnReplicaDown for AppHostDown, even
+though a volatile FT closes as dropped. RA therefore retains **ReplicaDown
+stage** and sends the canonical description in ReplicaUp's **dropped list**.
+The host-loss commit must apply before releasing the exact original Hosting
+usage or publishing report work. The original node adapter sends immediately
+and retains the unchanged native 30-second retry while unacknowledged.
+
+FM admits only the original destination on its live node session, with the
+frozen original FM Add and exact partition/service/epoch/replica lineage.
+This also permits an opened destination's report before FM receives AddReplicaReply;
+the report never supplies serving or build success. Native
+`fm/ReplicaUpdateTask.cpp:68-93,302-337` returns the entry in the **processed
+list** of ReplicaUpReply. The committed ACK follows native closed Delete and
+DeleteReplicaReply, without RAP Close. A dropped-list ACK instead follows
+closed ForceDelete without that reply. FM can retry normal metadata Delete
+using the original Idle descriptor on its existing 10/60-second cadence.
+
+Status records `state=lost`, `destination_lost=true`, `ready=false`, with
+`native_replica_deleted` tracking the separate metadata reply. Historical Add
+replies/errors remain retained, but late success cannot restore readiness or
+restart creation. Physical cleanup is still owned independently:
+`destination_cleanup_required` remains true, with no retirement/disposal,
+absence, cancellation or failed-Open receipt and no reuse/replacement.
+Primary pending-remove is unchanged until its own RemoveReplicaReply; the
+existing explicit FM removal API can also retire the Primary session after
+the destination loss. No automatic reconfiguration/recovery is introduced.
+
+Real two-child acceptance kills the exact destination app while both original
+RA/FM sessions and the healthy Primary remain alive. It holds Primary removal,
+rejects a stale ACK, waits the actual 30-second report retry, loses/replays the
+metadata Delete reply, then verifies independent Primary removal and writes.
+Model/store tests cover pending/acknowledged Add, unrelated reports, independent
+owner loss and separate failed/unknown loss/ACK commits. These are source-derived
+and native-free process/Channel results, not native C++ handler execution or
+FM/Federation interoperability. Opening/already-closing loss, broader down/
+arbitrary-unknown cleanup and replacement remain gated.
+
 ### Deleting the original opened destination Idle
 
 `Cluster::delete_idle_replica_via_fm()` independently authorizes normal
@@ -574,7 +618,8 @@ Lost Delete reply/replay, late Create/Add, retained error and healthy Primary
 writes are exercised. Model/store tests cover separate failure/Delete commits,
 definite failure, uncertainty, foreign lineage/proof conflicts and owner loss.
 This adds no native wire schema or C++ handler/interoperability qualification.
-Host-loss and other failed/unknown absent/down cleanup remain gated.
+Opening/already-closing host-loss and other failed/unknown absent/down cleanup
+remain gated.
 
 ### Deleting the original destination before CreateReplica
 

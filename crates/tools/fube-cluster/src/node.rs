@@ -50,7 +50,7 @@ fn report_retry(node: &Node, entity: ra::EntityId) -> Duration {
     if node
         .snapshot(entity)
         .committed
-        .is_some_and(|state| state.fm_primary)
+        .is_some_and(|state| state.fm_primary || state.peer_host_loss())
     {
         STATEFUL_REPORT_RETRY
     } else {
@@ -110,7 +110,7 @@ impl Adapter {
                     if node
                         .snapshot(dispatch.entity)
                         .committed
-                        .is_some_and(|s| s.fm_primary) =>
+                        .is_some_and(|s| s.fm_primary || s.peer_host_loss()) =>
                 {
                     Duration::ZERO
                 }
@@ -1054,6 +1054,8 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                         "open":state.phase == ra::Phase::Ready && state.runtime.is_some(),
                         "phase":format!("{:?}",state.phase), "replica":state.body.replica,
                         "open_token":state.open_token, "usage":format!("{:?}",state.usage),
+                        "fm_stage":format!("{:?}",state.fm_stage),
+                        "local_deleted":state.local_deleted,
                         "pre_open_failure":node.pre_open_registration_failure(),
                         "runtime_open_failure":node.runtime_open_failure(),
                         "retained_usage":node.retained_usage(), "reply":adapter.peer_last_reply,

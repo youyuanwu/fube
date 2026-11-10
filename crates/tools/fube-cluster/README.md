@@ -50,7 +50,7 @@ service/data and registration remain intact; no remote deletion, active membersh
 or automatic removal after successful build is inferred. A late destination Open
 is ignored by the Primary and cannot start build; any resulting destination
 service remains owned until explicit cleanup or shutdown. Manual pre-Open,
-down/arbitrary-unknown cleanup and replacement remain gated.
+broader down/arbitrary-unknown cleanup and replacement remain gated.
 
 `Cluster::delete_idle_replica_via_fm().await` separately authorizes native
 `DeleteReplica(force=false)` on the **original destination**,
@@ -139,6 +139,23 @@ native wire schemas are unchanged.
 Host loss (including later registration failure after runtime loss),
 other failed/unknown absent lifetimes, arbitrary targets,
 future incarnations and replacement are not authorized by this branch.
+
+The separate original **opened Idle app-host-loss** path sends native
+ReplicaDown-stage/dropped-list ReplicaUp on its still-live destination node
+session. FM requires its frozen original Add and returns the entry in the
+processed ACK list. RA commits closed metadata Delete and sends
+DeleteReplicaReply without RAP Close; FM retries that metadata request with
+the original Idle descriptor. The unchanged native report retry is 30 seconds.
+Status records `lost`/`destination_lost`, clears current readiness and retains
+the historical Add reply/error. `native_replica_deleted` is metadata only:
+there is no disposal/absence/failure cleanup receipt, completed physical
+cleanup, reuse or replacement. Primary pending-remove needs its own reply,
+and explicit FM Primary-side removal remains available after loss.
+Actual two-child acceptance kills the original destination app, holds Primary
+removal, exercises stale/lost ACK and metadata reply replay, and verifies
+continued Primary writes. Pending-Add and commit/owner cases have separate
+model/store coverage. Opening/already-closing loss and broader unknown targets
+remain gated; no wire schema or native handler qualification is added.
 
 After an original CreateReplicaReply error, the Primary retains only a failed
 observation/tombstone (`creation_aborted=true`), not live creation/build authority.

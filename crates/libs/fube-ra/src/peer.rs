@@ -7,9 +7,16 @@ pub struct PeerCreation {
     /// Terminal registration failure before any adopted runtime/usage.
     pub registration_error: Option<i64>,
     pub open_error: Option<i64>,
+    pub host_down: bool,
 }
 
 impl EntityState {
+    pub fn peer_host_loss(&self) -> bool {
+        self.peer_creation
+            .as_ref()
+            .is_some_and(|peer| peer.host_down)
+    }
+
     pub fn failed_open_error(&self) -> Option<i64> {
         if self.phase != Phase::Closed
             || self.open_token == 0

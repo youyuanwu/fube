@@ -219,6 +219,93 @@ fn peer_idle_ledger() -> Ledger {
 }
 
 #[test]
+fn peer_host_loss_processes_only_owned_creation_and_never_completes_primary_remove_or_disposal() {
+    for add_acknowledged in [false, true] {
+        for removing in [false, true] {
+            let mut ledger = peer_idle_ledger();
+            let now = Instant::now();
+            let report = stateful_loss_report(&ledger.placements[1]);
+            assert!(ledger.report(1, &report).is_err());
+            let add = ledger.request_idle(now).unwrap();
+            let mut added = AddReplicaReply { unit: add.unit.clone(), replica: add.replica.clone(), error: 0 };
+            added.replica.state = 2;
+            added.replica.replication_endpoint = "127.0.0.1:23457".into();
+            if add_acknowledged { ledger.idle_reply(0, added.clone()).unwrap(); }
+            let removal = removing.then(|| ledger.request_idle_removal(now).unwrap());
+            let before_add = ledger.idle.as_ref().unwrap().reply.clone();
+            let reply = ledger.report(1, &report).unwrap().unwrap();
+            assert_eq!(reply.replicas, report.dropped);
+            assert!(reply.dropped.0.is_empty() && !reply.last && !reply.from_fmm);
+            assert_eq!(ledger.placements[0].observed, Observed::Running);
+            assert_eq!(ledger.placements[1].observed, Observed::Lost);
+            assert_eq!(ledger.idle_status()["state"], "lost");
+            assert_eq!(ledger.idle_status()["ready"], false);
+            assert_eq!(ledger.idle_status()["destination_lost"], true);
+            assert_eq!(ledger.idle_removal_status()["pending_remove"], removing);
+            assert!(ledger.placements[1].retirement.is_none() && !ledger.placements[1].reusable);
+            assert!(ledger.request_idle(now).is_err());
+            assert!(ledger.idle_retry(0, now + Duration::from_secs(11)).is_none());
+            assert!(ledger.request_idle_deletion(now, IdleDeleteTarget::Runtime).is_err());
+            assert!(ledger.deletion_retry(1, Instant::now() + Duration::from_secs(9)).unwrap().is_none());
+            assert_eq!(ledger.deletion_retry(1, Instant::now() + Duration::from_secs(11)).unwrap(), Some(DeleteReplica::new(add, false)));
+            ledger.idle_reply(0, added).unwrap();
+            assert_eq!(ledger.idle.as_ref().unwrap().reply, before_add);
+            assert_eq!(ledger.report(1, &report).unwrap(), Some(reply));
+            ledger.reply(1, remove_reply(&ledger.placements[1]), true).unwrap();
+            assert_eq!(ledger.placements[1].status()["native_replica_deleted"], true);
+            assert_eq!(ledger.placements[1].observed, Observed::Lost);
+            assert_eq!(ledger.idle_status()["destination_cleanup_required"], true);
+            assert_eq!(ledger.idle_deletion_status()["complete"], false);
+            assert_eq!(ledger.idle_deletion_status()["disposed"], false);
+            assert!(ledger.deletion_retry(1, now + Duration::from_secs(200)).unwrap().is_none());
+            let before = ledger.status();
+            ledger.retirement(1, retirement(&ledger.placements[1]), 555).unwrap();
+            assert_eq!(ledger.status(), before);
+            assert_eq!(ledger.idle_removal_status()["pending_remove"], removing);
+            if let Some(removal) = removal {
+                let mut replica = removal.replica;
+                if add_acknowledged { replica.state = 3; }
+                ledger.idle_removal_reply(0, RemoveReplicaReply { unit: removal.unit, replica, error: 0 }).unwrap();
+                assert_eq!(ledger.idle_removal_status()["pending_remove"], false);
+                assert_eq!(ledger.idle_status()["state"], "lost");
+            }
+        }
+    }
+}
+
+#[test]
+fn peer_host_loss_rejects_foreign_reports_and_requires_the_original_live_destination_session() {
+    let now = Instant::now();
+    for lost in [None, Some(0), Some(1)] {
+        let mut ledger = peer_idle_ledger();
+        ledger.request_idle(now).unwrap();
+        let report = stateful_loss_report(&ledger.placements[1]);
+        for kind in 0..7 {
+            let mut foreign = report.clone();
+            let info = &mut foreign.dropped.0[0];
+            match kind {
+                0 => info.replicas.0[0].description.up = true,
+                1 => info.replicas.0[0].description.instance -= 1,
+                2 => info.replicas.0[0].description.node.instance += 1,
+                3 => info.unit.current.configuration += 1,
+                4 => info.local_deleted = true,
+                5 => info.replicas.0[0].description.current_role = 2,
+                _ => foreign.from_fmm = true,
+            }
+            assert!(ledger.report(1, &foreign).is_err());
+            assert!(!ledger.placements[1].loss_reported);
+        }
+        if let Some(index) = lost { ledger.lost(index, "original session lost".into()); }
+        if lost == Some(1) { assert!(ledger.report(1, &report).is_err()); }
+        else {
+            assert!(ledger.report(1, &report).unwrap().is_some());
+            assert_eq!(ledger.placements[1].observed, Observed::Lost);
+            assert!(ledger.placements[1].retirement.is_none() && !ledger.placements[1].reusable);
+        }
+    }
+}
+
+#[test]
 fn idle_destination_delete_joins_independent_reply_and_disposal_without_clearing_pending_remove() {
     for proof_first in [false, true] {
         for failed in [false, true] {
@@ -964,6 +1051,141 @@ async fn peer_idle_catch<F: std::future::Future>(future: F) -> std::thread::Resu
         }
     })
     .await
+}
+
+async fn hold_peer_loss_frame(
+    cluster: &mut Cluster,
+    node: usize,
+    action: &str,
+    budget: Duration,
+) -> Result<fube_transport::message::Message> {
+    let end = Instant::now() + budget;
+    loop {
+        for index in 0..2 {
+            if let Some(mut incoming) = cluster.children[index].link.as_ref().unwrap()
+                .receive(Instant::now() + Duration::from_millis(2)).await?
+            {
+                if index == node && incoming.message.properties().map_err(err)?.action == action {
+                    if let Some(handoff) = incoming.handoff.as_mut() { handoff.acknowledge(); }
+                    return Ok(incoming.message);
+                }
+                cluster.receive_message(index, incoming).await?;
+            }
+        }
+        if Instant::now() >= end { return Err(format!("held {action} deadline: {}", cluster.status())); }
+    }
+}
+
+#[tokio::test]
+async fn peer_idle_app_host_loss_retries_native_report_and_metadata_reply_without_completing_primary_remove() {
+    let fixture = Fixture::new("peer-idle-host-loss");
+    let mut config = fixture.config();
+    config.profile = ServiceProfile::StatefulPeerIdle;
+    config.app = support::binary("hosting-local-app", "FUBE_CLUSTER_STATEFUL_APP");
+    let mut cluster = Cluster::new(config).unwrap();
+    cluster.start().await.unwrap();
+    let result = peer_idle_catch(async {
+        cluster.execute(command("primary", "create", Some(1))).await?;
+        until(&mut cluster, |cluster| cluster.ledger.placements[0].observed == Observed::Running).await;
+        let endpoint = cluster.ledger.placements[0].endpoint.clone().unwrap();
+        until(&mut cluster, |_| data_contact(&endpoint, b"read\n").starts_with("OK ")).await;
+        assert!(data_contact(&endpoint, b"write\n").contains("committed=1 value=acknowledged"));
+        cluster.add_idle_replica().await?;
+        until(&mut cluster, |cluster| cluster.ledger.idle_status()["ready"] == true
+            && cluster.status()["peer_idle"]["state"] == "open"
+            && cluster.status()["nodes"][1]["retained_work"]["app_observation"]["idle_data"]["provider"]["last"] == 1).await;
+        let add = cluster.ledger.idle.as_ref().unwrap().body.clone();
+        let added = cluster.ledger.idle.as_ref().unwrap().reply.clone();
+        let original_token = cluster.status()["peer_idle"]["target"]["open_token"].clone();
+        cluster.remove_idle_replica_via_fm().await?;
+        let removed = hold_peer_loss_frame(&mut cluster, 0, "RemoveReplicaReply", Duration::from_secs(12)).await?;
+        let (removed, owner) = decode_remove_replica_reply(&removed).map_err(err)?;
+        assert_eq!(owner, Owner::Fm);
+        assert_eq!(cluster.ledger.idle_removal_status()["pending_remove"], true);
+        let profile = cluster.children[1].metadata.as_ref().unwrap().profile.as_ref().unwrap().clone();
+        assert!(std::process::Command::new("kill").args(["-KILL", &profile.app_pid.to_string()])
+            .status().map_err(err)?.success());
+        let first = hold_peer_loss_frame(&mut cluster, 1, "ReplicaUp", Duration::from_secs(12)).await?;
+        let (report, owner) = decode_replica_up(&first).map_err(err)?;
+        assert_eq!(owner, Owner::Fm);
+        assert_eq!(report, stateful_loss_report(&cluster.ledger.placements[1]));
+        let reply = cluster.ledger.report(1, &report)?.ok_or("missing original Idle loss ACK")?;
+        assert_eq!(reply.replicas, report.dropped);
+        assert!(reply.dropped.0.is_empty());
+        assert_eq!(cluster.ledger.placements[1].observed, Observed::Lost);
+        assert_eq!(cluster.ledger.placements[0].observed, Observed::Running);
+        assert_eq!(cluster.status()["peer_idle"]["ready"], false);
+        assert_eq!(cluster.ledger.idle_removal_status()["pending_remove"], true);
+        let mut stale = reply.clone();
+        stale.replicas.0[0].replicas.0[0].description.instance -= 1;
+        cluster.children[1].link.as_ref().unwrap().send(
+            replica_up_reply_message(&stale, &cluster.children[1].launch.generation).map_err(err)?).await?;
+        let started = Instant::now();
+        let retried = hold_peer_loss_frame(&mut cluster, 1, "ReplicaUp", Duration::from_secs(35)).await?;
+        assert!(started.elapsed() >= Duration::from_secs(25));
+        assert_eq!(decode_replica_up(&retried).map_err(err)?.0, report);
+        assert_eq!(cluster.ledger.report(1, &report)?, Some(reply.clone()));
+        assert_eq!(cluster.status()["peer_idle"]["target"]["fm_stage"], "ReplicaDown");
+        assert_eq!(cluster.status()["peer_idle"]["target"]["retained_usage"], 0);
+        let generation = cluster.children[1].launch.generation.clone();
+        cluster.children[1].link.as_ref().unwrap().send(replica_up_reply_message(&reply, &generation).map_err(err)?).await?;
+        let deleted = hold_peer_loss_frame(&mut cluster, 1, "DeleteReplicaReply", Duration::from_secs(12)).await?;
+        let (deleted, owner) = decode_delete_replica_reply(&deleted).map_err(err)?;
+        assert_eq!(owner, Owner::Fm);
+        assert_eq!(cluster.ledger.placements[1].status()["native_replica_deleted"], false);
+        let retry = cluster.ledger.deletion_retry(1, Instant::now())?.ok_or("missing lost metadata Delete retry")?;
+        assert_eq!(retry, DeleteReplica::new(add.clone(), false));
+        cluster.children[1].link.as_ref().unwrap().send(delete_replica_message(&retry, &generation).map_err(err)?).await?;
+        let replay = hold_peer_loss_frame(&mut cluster, 1, "DeleteReplicaReply", Duration::from_secs(12)).await?;
+        assert_eq!(decode_delete_replica_reply(&replay).map_err(err)?.0, deleted);
+        cluster.ledger.reply(1, deleted, true)?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = cluster.status();
+                if status["peer_idle"]["target"]["local_deleted"] == true
+                    && status["peer_idle"]["target"]["fm_stage"] == "None" { break; }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }).await.map_err(err)?;
+        assert_eq!(cluster.ledger.placements[1].observed, Observed::Lost);
+        assert_eq!(cluster.ledger.placements[1].status()["native_replica_deleted"], true);
+        assert_eq!(cluster.ledger.idle_removal_status()["pending_remove"], true);
+        assert_eq!(cluster.ledger.idle_status()["state"], "lost");
+        assert_eq!(cluster.ledger.idle_status()["destination_cleanup_required"], true);
+        assert_eq!(cluster.ledger.idle_deletion_status()["complete"], false);
+        assert_eq!(cluster.ledger.idle_deletion_status()["disposed"], false);
+        assert!(cluster.ledger.placements[1].retirement.is_none() && !cluster.ledger.placements[1].reusable);
+        assert_eq!(cluster.status()["peer_idle"]["target"]["open_token"], original_token);
+        for name in ["retirement.json", "absence.json", "pre-open-cancellation.json",
+            "failed-registration-deletion.json", "failed-open-deletion.json"]
+        {
+            assert!(!cluster.children[1].launch.directory.join(name).exists(), "{name}");
+        }
+        cluster.ledger.idle_removal_reply(0, removed)?;
+        assert_eq!(cluster.ledger.idle_removal_status()["pending_remove"], false);
+        cluster.send_idle(&add).await?;
+        for _ in 0..15 { cluster.drive().await; }
+        assert_eq!(cluster.ledger.idle.as_ref().unwrap().reply, added);
+        assert_eq!(cluster.status()["peer_idle"]["state"], "lost");
+        assert!(cluster.add_idle_replica().await.is_err());
+        assert!(cluster.delete_idle_replica_via_fm().await.is_err());
+        assert!(cluster.execute(command("replacement", "create", Some(2))).await.is_err());
+        let continued = data_contact(&endpoint, b"write-more\n");
+        assert!(continued.contains("committed=2 value=continued"), "{continued}");
+        assert_eq!(data_contact(&endpoint, b"read\n"), continued);
+        for child in &mut cluster.children { child.process.as_mut().unwrap().check_alive().map_err(err)?; }
+        let terminated = match fs::read_to_string(format!("/proc/{}/stat", profile.app_pid)) {
+            Ok(stat) => stat.rsplit_once(')').is_some_and(|(_, rest)|
+                matches!(rest.split_whitespace().next(), Some("Z" | "X"))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(err(error)),
+        };
+        assert!(terminated);
+        Ok::<(), String>(())
+    }).await;
+    let cleanup = cluster.shutdown().await;
+    assert_eq!(cleanup["clean"], true, "{cleanup}");
+    result.unwrap().unwrap();
 }
 
 #[tokio::test]

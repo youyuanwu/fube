@@ -227,6 +227,19 @@ extends the same schemas with Abort/ForceAbort, closed-AddPrimary, native
 force Delete/tombstone behavior and disposal-gated fresh recreation. The
 additional model/process evidence does not change codec counts or establish
 full native handler execution.
+The original opened peer Idle now uses the same AppHostDown down-stage/dropped
+report and processed-list ACK, followed by closed metadata Delete without RAP.
+Only loss observed in the original open peer lifetime gains RA report authority;
+FM requires its frozen original Add and exact live destination session/lineage.
+Known pending Add can join this loss report, never serving/build success.
+The existing immediate-send/30-second retry and 10/60-second metadata Delete
+retry preserve loss independently from Primary pending-remove and disposal.
+Historical Add replies remain retained while current Idle readiness becomes
+lost; no cleanup receipt, recovery or replacement is fabricated.
+Actual two-child app-process loss, stale/lost ACK, metadata reply replay and
+healthy Primary writes are qualified separately from model/store commit/owner
+barriers and native C++ handler execution. See the
+[opened destination loss guide](MinimalFmCluster.md#unexpected-opened-destination-app-host-loss).
 
 ### Stage-two native codec contracts and execution boundary
 
@@ -538,7 +551,7 @@ reporting `failed_open` with genuine disposal while retaining the Add failure
 and independent Primary pending-remove. Held provider/service disposal and
 actual process/Channel acceptance use the existing dynamic Open Drop=1 policy
 for qualification only; production defaults remain unchanged.
-Host-loss and other failed/unknown absent lifetimes, force, arbitrary targets
+Opening/already-closing host-loss and other failed/unknown absent lifetimes, force, arbitrary targets
 and replacement remain gated. No wire type/shape or native handler qualification
 is added by the trusted-local absence DTO.
 
