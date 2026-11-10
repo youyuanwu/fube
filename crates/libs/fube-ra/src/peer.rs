@@ -18,6 +18,10 @@ pub struct RemoteIdle {
 }
 
 impl RemoteIdle {
+    pub fn creation_failed(&self) -> bool {
+        self.reply.as_ref().is_some_and(|reply| reply.error != 0)
+    }
+
     pub fn remove_reply(&self) -> Option<RemoveReplicaReply> {
         let removal = self.removal.as_ref()?;
         removal.fm_request.as_ref()?;
@@ -624,9 +628,7 @@ pub(super) fn remove_from_fm(
             "removal requires the original current Primary and peer",
         ));
     }
-    if remote.reply.as_ref().is_some_and(|reply| reply.error != 0) {
-        return Err(Failure::Unsupported("failed-Open cleanup is gated"));
-    }
+    let local_only = remote.reply.is_none() || remote.creation_failed();
     let expected = &remote.body.replica.0.replica;
     if body.replica.node == remote.target && body.replica.instance < expected.instance {
         return Ok(Transition::ignored(Disposition::IgnoredStale));
@@ -648,9 +650,9 @@ pub(super) fn remove_from_fm(
             "RemoveReplica requires the original Idle and FT",
         ));
     }
-    if remote.reply.is_none() && remote.fm_request.as_deref() != Some(&body) {
+    if local_only && remote.fm_request.as_deref() != Some(&body) {
         return Err(Failure::Unsupported(
-            "InCreate removal requires the original pending FM request",
+            "creation cleanup requires the original FM request",
         ));
     }
     if let Some(removal) = &remote.removal {
@@ -667,11 +669,11 @@ pub(super) fn remove_from_fm(
             ));
         }
     }
-    if remote.reply.is_none() {
+    if local_only {
         let mut state = current.clone();
         let remote = state.remote_idle.as_mut().expect("checked remote");
         remote.ready = false;
-        // Native InCreate removal echoes FM's descriptor, without InDrop or RAP.
+        // Native InCreate/absent-after-abort cleanup echoes FM without InDrop or RAP.
         remote.removal = Some(RemoteRemoval {
             body: current.body.clone(),
             replica: body.replica.clone(),
@@ -679,7 +681,9 @@ pub(super) fn remove_from_fm(
             result: Some(0),
             detail: ProxyErrorDetail::default(),
         });
-        let reply = remote.remove_reply().expect("completed InCreate removal");
+        let reply = remote
+            .remove_reply()
+            .expect("completed local creation cleanup");
         return Ok(lifecycle::changed(
             state,
             vec![Effect::RemoveReplicaReply(reply)],

@@ -254,11 +254,12 @@ CreateReplica or RAP build as appropriate; Ready duplicates resend the same
 reply without another Open/build. A lost FM reply cannot turn child telemetry
 into FM success.
 
-Peer creation failure returns an AddReplicaReply error, leaving FM cleanup
-required; the bounded original observation is retained for error replay instead
+Peer creation failure returns an AddReplicaReply error. FM preserves that failed
+outcome, marks the original replica to-be-dropped and freezes pending-remove;
+the bounded original observation is retained for error replay and cleanup instead
 of authorizing another lifetime. RAP build errors remain diagnostics/pending
 and retry through existing nonterminal cleanup, not failed FM completion.
-Broader replacement, configuration repair and failed-Open cleanup remain
+Broader replacement, configuration repair and unowned/down cleanup remain
 gated. Manual create/build cannot adopt or mutate an FM-owned Idle.
 Local explicit removal cancels the FM add obligation and fences queued/late
 success; cancellation does not fabricate RemoveReplicaReply. Primary Close
@@ -328,7 +329,7 @@ still joins and disposes that original owner. No FM RemoveReplicaReply or
 destination DeleteReplica completion is inferred.
 
 The separate programmatic `Cluster::remove_idle_replica_via_fm()` API now sends
-native FM RemoveReplica for the original FM-owned pending creation or opened Idle,
+native FM RemoveReplica for the original FM-owned pending/failed creation or opened Idle,
 including a manual unbuilt/copied Idle or an FM-owned pending/failed/successful build. It freezes
 the original FT/service/remote incarnation and retries on native 10/60-second
 cadence. After Open, RA records FM removal ownership and InDrop intent before RAP dispatch.
@@ -345,7 +346,7 @@ Unresolved original-session loss leaves unknown/pending-remove, never recovery.
 Local removal cannot take over an FM-owned removal. The destination lifetime,
 data, registration and usage remain intact until normal shutdown; FM completion
 does not imply remote deletion or active configuration change. Native
-down/not-found, failed-Open cleanup and replacement remain gated
+down/arbitrary-not-found cleanup and replacement remain gated
 ([RA:2044-2140,4094-4149](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ReconfigurationAgent.cpp#L2044-L2140),
 [FM:201-214](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/fm/FailoverUnitMessageProcessor.cpp#L201-L214)).
 
@@ -367,7 +368,29 @@ CreateReplica can still Open the destination before or after FM cancellation;
 that lifetime remains owned, Idle/non-serving and normally shut down, not
 silently deleted. If the Primary accepted Open first, ordinary RAP removal
 applies instead. Removal before any original pending FM Add, manual pre-Open
-removal, failed-Open cleanup and arbitrary unknown/replacement remain gated.
+removal and arbitrary unknown/replacement remain gated.
+
+After an original CreateReplicaReply error, native
+`ReconfigurationAgent.cpp:2898-2910` calls AbortAddIdleReplica
+(`FailoverUnit.cpp:348-352`) and replies to FM with the failure. The bounded RA
+retains the original failed observation as a session-only tombstone, not live
+creation authority; late success cannot start build or replace it. FM follows
+`FailoverUnitMessageProcessor.cpp:64-89`: keep the Add error, mark
+`to_be_dropped=true` and create the original pending-remove obligation.
+Its frozen RemoveReplica uses the original FM Add descriptor, not a possibly
+different failed reply's endpoint/state/version. The native absent-replica branch
+(`ReconfigurationAgent.cpp:2070-2080`) echoes that exact descriptor without
+InDrop or RAP, and duplicates replay it.
+
+Only the matching semantic success clears pending-remove and reports
+`completion=failed_creation_retired`. The FM add remains failed, including after
+cleanup; a lost reply remains pending and uses normal 10/60-second retries.
+`remove_idle_replica_via_fm()` explicitly resends the already-owned obligation.
+`cleanup_required=false` describes completed Primary/FM bookkeeping only:
+`to_be_dropped` and `destination_cleanup_required` remain true, with
+`destination_deleted=false`. No destination disposal, active membership or
+replacement is inferred. Arbitrary unknown replicas and later incarnations
+still reject before dispatch.
 
 This increment deliberately retains Idle/InBuild metadata, no service endpoint,
 denied read/write access and no active membership or quorum change even after
@@ -396,6 +419,13 @@ Controlled peer-channel tests retain the actual original CreateReplica or its
 real Open reply across cancellation, replay the FM reply and deliver late Open
 through the original session. They prove no RAP build, one intact destination
 Open and continued Primary writes/reads in both orderings.
+The failed-creation variant injects a correlated native error on the original
+peer channel, consumes the actual forwarded AddReplicaReply at FM, drops the
+first removal reply and retries it. Delivering the held original CreateReplica
+after cleanup produces a real late Open that cannot trigger build or Ready.
+Both original application processes remain owned and the Primary stays writable.
+This is controlled wire-error/native-free process evidence, not execution of a
+native C++ Open-failure handler or proof of destination disposal.
 
 These are native-derived model/store and native-free real-process contracts,
 not full C++ handler traces or native Federation interoperability.

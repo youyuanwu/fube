@@ -339,8 +339,14 @@ Rust reconstructs and verifies the exact echo, factory/envelope and every proper
 prefix; the native decoder compares every field and rejects an additional
 truncation. Existing receipt guards require the new case before execution.
 Native-free FM/RA/RAP execution, lost-reply replay and Primary/destination
-lifetime checks are separate acceptance tests. Original InCreate cancellation
-is supported without RAP; failed-Open/down/not-found cleanup, replacement and
+lifetime checks are separate acceptance tests. The same exact original-descriptor
+echo is used by native absent-after-AbortAddIdleReplica cleanup
+(`ReconfigurationAgent.cpp:2070-2080,2898-2910`). Original failed-creation cleanup
+therefore adds no action/schema/fixture: the gate stays 139 cases and 39 native
+truncation rejections. RA/FM tests separately qualify the original failure,
+pending-remove, lost reply/replay and late-success fences; codec evidence does
+not execute that native handler. Original InCreate cancellation and failed
+creation cleanup use no RAP; down/arbitrary-not-found cleanup, replacement and
 active configuration remain gated.
 
 ### Bootstrap and source identity header extension

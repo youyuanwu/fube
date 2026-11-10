@@ -24,14 +24,15 @@ stays Idle/InBuild, non-serving and unconfigured.
 FM retains and retries the original AddReplica every 10 seconds, backing off to
 60 seconds after the first minute. Duplicate creation/build requests preserve
 the original lifetime; Ready duplicates resend the reply without another build.
-Peer Open failure yields an explicit failed FM outcome requiring future removal;
+Peer creation/Open failure preserves the failed FM outcome and automatically
+marks the original replica `to_be_dropped` with a frozen pending-remove obligation;
 RAP build errors remain pending and retry through nonterminal cleanup.
 Local explicit removal cancels the FM add obligation and fences late success,
 without claiming FM RemoveReplicaReply or destination disposal. Original session
 loss yields unknown, never recovery or transparent adoption.
 
 `Cluster::remove_idle_replica_via_fm().await` lets FM cancel its original pending
-creation or abandon the original opened Idle through native RemoveReplica/Reply,
+creation, retire failed creation or abandon the original opened Idle through native RemoveReplica/Reply,
 whether unbuilt, building, built or failed build.
 If the Primary RA has not accepted CreateReplicaReply, native InCreate removal
 retires creation bookkeeping and immediately replies with the exact original
@@ -49,7 +50,20 @@ service/data and registration remain intact; no remote deletion, active membersh
 or automatic removal after successful build is inferred. A late destination Open
 is ignored by the Primary and cannot start build; any resulting destination
 service remains owned until explicit cleanup or shutdown. Manual pre-Open,
-down/unknown cleanup, failed-Open cleanup and replacement remain gated.
+down/arbitrary-unknown cleanup and replacement remain gated.
+
+After an original CreateReplicaReply error, the Primary retains only a failed
+observation/tombstone (`creation_aborted=true`), not live creation/build authority.
+FM sends the original Add descriptor, never fields from the failed reply.
+Native absent-after-abort RemoveReplica echoes that descriptor without RAP;
+`completion=failed_creation_retired` clears only pending-remove. The FM add stays
+`state=failed` with its original error. `cleanup_required=false` then means
+Primary/FM bookkeeping is complete; `to_be_dropped` and
+`destination_cleanup_required` remain true, and `destination_deleted` stays false.
+The normal 10/60-second retry path sends the frozen removal; calling
+`remove_idle_replica_via_fm()` explicitly resends it immediately. Reply loss,
+stale success and original-owner loss cannot turn failure into Ready or grant
+replacement. Ordinary successful build never schedules removal automatically.
 
 The earlier manual path remains separate: `Cluster::create_idle_replica().await` submits a trusted
 local Primary-RA command and returns `pending`. Poll `status()["peer_idle"]`

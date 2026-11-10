@@ -868,15 +868,15 @@ impl Cluster {
     }
     /// FM AddReplica owns peer creation, RAP build and semantic Ready-Idle completion.
     pub async fn add_idle_replica(&mut self) -> Result<Value> {
+        let current = self.ledger.idle_status();
         if self.finished.is_some()
             || self.children.len() != 2
             || self.config.profile != ServiceProfile::StatefulPeerIdle
-            || self.ledger.idle_removal.is_some()
+            || (self.ledger.idle_removal.is_some() && current["state"] != "failed")
             || self.peer_idle_requested && self.ledger.idle.is_none()
         {
             return Err("FM AddReplica requires the original unused peer-idle profile".into());
         }
-        let current = self.ledger.idle_status();
         if current["state"] != "absent" && current["state"] != "pending" {
             return Ok(current);
         }
@@ -932,7 +932,7 @@ impl Cluster {
         }
         Ok(json!({"state":"pending","kind":"peer_idle_removal","built":false,"serving":false}))
     }
-    /// FM cancels pending creation or removes the opened Idle's replication session.
+    /// FM retires pending/failed creation or removes the opened Idle's replication session.
     /// Only RemoveReplicaReply clears pending_remove, never destination deletion.
     pub async fn remove_idle_replica_via_fm(&mut self) -> Result<Value> {
         if self.finished.is_some()
@@ -947,10 +947,13 @@ impl Cluster {
         }
         if self.ledger.idle_removal.is_none()
             && self.status()["peer_idle"]["state"] != "open"
-            && self.ledger.idle_status()["state"] != "pending"
+            && !matches!(
+                self.ledger.idle_status()["state"].as_str(),
+                Some("pending" | "failed")
+            )
         {
             return Err(
-                "FM removal requires original pending FM creation or an opened Idle".into(),
+                "FM removal requires original pending/failed FM creation or an opened Idle".into(),
             );
         }
         let body = self.ledger.request_idle_removal(Instant::now())?;

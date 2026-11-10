@@ -112,6 +112,7 @@ pub struct Ledger {
 pub(crate) struct IdleRemoval {
     pub body: RemoveReplica,
     pub reply: Option<RemoveReplicaReply>,
+    failed_creation: bool,
     unknown: bool,
     started: Instant,
     last: Instant,
@@ -1140,7 +1141,11 @@ impl Ledger {
         {
             return Err("AddReplicaReply is not the original Ready Idle".into());
         }
+        let failed = body.error != 0;
         idle.reply = Some(body);
+        if failed {
+            self.request_idle_removal(Instant::now())?;
+        }
         Ok(())
     }
     pub fn idle_retry(&mut self, index: usize, now: Instant) -> Option<AddReplica> {
@@ -1182,6 +1187,8 @@ impl Ledger {
         };
         json!({"state":state, "kind":"fm_idle_build", "ready":state == "ready",
             "serving":false, "request":idle.body, "reply":idle.reply,
+            "to_be_dropped":error.is_some_and(|e| e != 0),
+            "destination_cleanup_required":error.is_some_and(|e| e != 0),
             "error":error, "cleanup_required":(idle.cancelled || error.is_some_and(|e| e != 0))
                 && self.idle_removal.as_ref().is_none_or(|removal| removal.reply.is_none())})
     }
@@ -1203,12 +1210,12 @@ impl Ledger {
             removal.last = now;
             return Ok(removal.body.clone());
         }
-        if self.idle.as_ref().is_some_and(|idle| {
-            idle.cancelled
-                || idle.unknown
-                || idle.reply.as_ref().is_some_and(|reply| reply.error != 0)
-        }) {
-            return Err("failed creation or cancelled Idle cleanup is gated".into());
+        if self
+            .idle
+            .as_ref()
+            .is_some_and(|idle| idle.cancelled || idle.unknown)
+        {
+            return Err("cancelled or unknown Idle cleanup is gated".into());
         }
         let mut body = self.placements[0].body()?;
         body.replica = self.placements[1].body()?.replica;
@@ -1216,16 +1223,23 @@ impl Ledger {
         if body.replica.version != body.service.version {
             return Err("peer packages do not share the original deployment version".into());
         }
+        let mut failed_creation = false;
         if let Some(idle) = &mut self.idle {
             body = idle.body.clone();
             if let Some(reply) = &idle.reply {
-                body.replica = reply.replica.clone();
+                failed_creation = reply.error != 0;
+                if !failed_creation {
+                    body.replica = reply.replica.clone();
+                }
             }
-            idle.cancelled = true;
+            if !failed_creation {
+                idle.cancelled = true;
+            }
         }
         self.idle_removal = Some(IdleRemoval {
             body: body.clone(),
             reply: None,
+            failed_creation,
             unknown: false,
             started: now,
             last: now,
@@ -1249,11 +1263,12 @@ impl Ledger {
         {
             return Ok(());
         }
-        let cancelled_creation = removal.body.replica.state == 1
+        let echoed_creation = removal.body.replica.state == 1
             && removal.body.replica.replication_endpoint.is_empty()
             && body.replica == removal.body.replica;
-        if !cancelled_creation
-            && (body.replica.current_role != 2
+        if !echoed_creation
+            && (removal.failed_creation
+                || body.replica.current_role != 2
                 || body.replica.previous_role != 1
                 || body.replica.state != 3
                 || !body.replica.up
@@ -1302,7 +1317,9 @@ impl Ledger {
         };
         json!({"state":state, "kind":"fm_idle_removal",
             "pending_remove":removal.reply.is_none(), "removed":state == "removed",
-            "completion":removal.reply.as_ref().map(|reply| if reply.replica.state == 1 {
+            "completion":removal.reply.as_ref().map(|reply| if removal.failed_creation {
+                "failed_creation_retired"
+            } else if reply.replica.state == 1 {
                 "creation_cancelled"
             } else {
                 "replicator_removed"

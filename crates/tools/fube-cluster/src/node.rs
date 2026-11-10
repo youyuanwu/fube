@@ -1028,6 +1028,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                                 "fm_owned":remote.fm_request.is_some(),
                                 "ready":remote.ready && remote.removal.is_none(),
                                 "reply":remote.reply,
+                                "creation_aborted":remote.creation_failed(),
                                 "build":remote.build.as_ref().map(|build| serde_json::json!({
                                     "result":build.result, "detail":build.detail,
                                 })),
@@ -1580,6 +1581,7 @@ pub(crate) mod report_tests {
         add_reply: Option<AddInstanceReply>,
         remove_reply: Option<AddInstanceReply>,
         idle_removals: Vec<RemoveReplicaReply>,
+        idle_adds: Vec<AddReplicaReply>,
         activations: Vec<i64>,
         deactivations: Vec<i64>,
         service_updates: Vec<NodeUpdateServiceReply>,
@@ -1766,6 +1768,13 @@ pub(crate) mod report_tests {
                         return Err("unexpected Idle removal reply or unbounded retry".into());
                     }
                     traffic.idle_removals.push(body);
+                }
+                "AddReplicaReply" => {
+                    let (body, owner) = decode_add_replica_reply(&incoming.message).map_err(err)?;
+                    if owner != Owner::Fm || traffic.idle_adds.len() == 4 {
+                        return Err("unexpected Idle build reply or unbounded retry".into());
+                    }
+                    traffic.idle_adds.push(body);
                 }
                 other => return Err(format!("unexpected FM test ingress {other}")),
             }
@@ -3406,9 +3415,16 @@ pub(crate) mod report_tests {
         Ok(())
     }
 
-    pub(crate) async fn run_peer_idle_cancel(
+    #[derive(Clone, Copy)]
+    pub(crate) enum PeerCreationOutcome {
+        Pending,
+        Opened,
+        Failed,
+    }
+
+    pub(crate) async fn run_peer_creation_removal(
         launches: &[Launch; 2],
-        open_before_cancel: bool,
+        outcome: PeerCreationOutcome,
     ) -> Result<Result<()>> {
         let (mut source, source_store) = create_node(&launches[0]).await?;
         let (mut target, target_store) = create_node(&launches[1]).await?;
@@ -3476,9 +3492,25 @@ pub(crate) mod report_tests {
             {
                 return Err("Primary write before cancellation failed".into());
             }
-            let mut request = body.clone();
-            request.replica = add_body(&launches[1], &actual_profile(&target)?).replica;
-            request.replica.current_role = 2;
+            let mut ledger = crate::fm::Ledger::new(launches.clone());
+            for (index, node) in [&source, &target].into_iter().enumerate() {
+                ledger.placements[index].bootstrap = crate::fm::Bootstrap::Metadata;
+                ledger.placements[index].admit_profile(actual_profile(node)?)?;
+            }
+            ledger.accept(crate::fm::Command {
+                op: "original-primary".into(),
+                action: "create".into(),
+                node: Some(1),
+            })?;
+            ledger.reply(
+                0,
+                traffic
+                    .add_reply
+                    .clone()
+                    .ok_or("missing original Primary reply")?,
+                false,
+            )?;
+            let request = ledger.request_idle(Instant::now())?;
             fm.send(add_replica_message(&request, &launches[0].generation).map_err(err)?)
                 .await?;
             until(
@@ -3509,7 +3541,7 @@ pub(crate) mod report_tests {
             let source_link = source_link?;
             let target_link = target_link?;
             let operation = async {
-                if open_before_cancel {
+                if matches!(outcome, PeerCreationOutcome::Opened) {
                     source_link
                         .send(
                             create_replica_message(&create, &launches[0].generation)
@@ -3540,8 +3572,59 @@ pub(crate) mod report_tests {
                         }
                     }
                 }
+                let failed = matches!(outcome, PeerCreationOutcome::Failed);
+                if failed {
+                    let failure = CreateReplicaReply {
+                        unit: request.unit.clone(),
+                        replica: request.replica.clone(),
+                        error: ra::RA_NOT_READY,
+                    };
+                    target_link
+                        .send(
+                            create_replica_reply_message(&failure, &launches[1].generation)
+                                .map_err(err)?,
+                        )
+                        .await?;
+                    let end = Instant::now() + Duration::from_secs(8);
+                    while traffic.idle_adds.is_empty() {
+                        peer_step(
+                            &launches[0],
+                            &mut source,
+                            &mut source_adapter,
+                            &source_link,
+                            Some(&fm_link),
+                        )
+                        .await?;
+                        step(
+                            &launches[0],
+                            &mut source,
+                            &mut source_adapter,
+                            &fm,
+                            &fm_link,
+                            &mut traffic,
+                        )
+                        .await?;
+                        if Instant::now() >= end {
+                            return Err("failed AddReplicaReply deadline".into());
+                        }
+                    }
+                    if traffic.idle_adds[0] != failure {
+                        return Err("original peer error was not forwarded to FM".into());
+                    }
+                    ledger.idle_reply(0, traffic.idle_adds[0].clone())?;
+                    if ledger.idle_status()["state"] != "failed"
+                        || ledger.idle_status()["to_be_dropped"] != true
+                        || ledger.idle_removal_status()["pending_remove"] != true
+                    {
+                        return Err("failed add lost its error or pending-remove obligation".into());
+                    }
+                }
                 // Hold either CreateReplica or its real Open reply outside the Primary RA.
-                fm.send(remove_replica_message(&request, &launches[0].generation).map_err(err)?)
+                let removing = ledger.request_idle_removal(Instant::now())?;
+                if removing != request {
+                    return Err("cleanup adopted the failed reply descriptor".into());
+                }
+                fm.send(remove_replica_message(&removing, &launches[0].generation).map_err(err)?)
                     .await?;
                 until(
                     &launches[0],
@@ -3559,10 +3642,21 @@ pub(crate) mod report_tests {
                     error: 0,
                 };
                 if traffic.idle_removals[0] != expected {
-                    return Err("InCreate removal did not echo the original FM descriptor".into());
+                    return Err("local cleanup did not echo the original FM descriptor".into());
                 }
                 // Deliberately lose the first reply, then retry the original request.
-                fm.send(remove_replica_message(&request, &launches[0].generation).map_err(err)?)
+                if ledger.idle_removal_status()["state"] != "pending" {
+                    return Err(
+                        "transport/RA progress completed FM without its semantic reply".into(),
+                    );
+                }
+                let retry = ledger
+                    .idle_removal_retry(0, Instant::now() + Duration::from_secs(11))
+                    .ok_or("missing original FM cleanup retry")?;
+                if retry != removing {
+                    return Err("FM cleanup retry changed the original request".into());
+                }
+                fm.send(remove_replica_message(&retry, &launches[0].generation).map_err(err)?)
                     .await?;
                 until(
                     &launches[0],
@@ -3575,9 +3669,22 @@ pub(crate) mod report_tests {
                 )
                 .await?;
                 if traffic.idle_removals[1] != expected {
-                    return Err("InCreate removal replay changed the reply".into());
+                    return Err("local cleanup replay changed the reply".into());
                 }
-                if !open_before_cancel {
+                ledger.idle_removal_reply(0, traffic.idle_removals[1].clone())?;
+                if ledger.idle_removal_status()["pending_remove"] != false
+                    || (failed
+                        && (ledger.idle_status()["state"] != "failed"
+                            || ledger.idle_status()["error"] != ra::RA_NOT_READY
+                            || ledger.idle_status()["destination_cleanup_required"] != true
+                            || ledger.idle_removal_status()["completion"]
+                                != "failed_creation_retired"))
+                {
+                    return Err(
+                        "semantic cleanup erased the original failure or claimed disposal".into(),
+                    );
+                }
+                if !matches!(outcome, PeerCreationOutcome::Opened) {
                     source_link
                         .send(
                             create_replica_message(&create, &launches[0].generation)
@@ -3635,10 +3742,12 @@ pub(crate) mod report_tests {
                     .remote_idle
                     .as_ref()
                     .ok_or("cancellation tombstone disappeared")?;
-                if remote.reply.is_some()
+                if remote.reply.as_ref().map(|reply| reply.error)
+                    != failed.then_some(ra::RA_NOT_READY)
                     || remote.build.is_some()
                     || remote.ready
                     || remote.remove_reply().as_ref() != Some(&expected)
+                    || traffic.idle_adds.len() != usize::from(failed)
                 {
                     return Err(
                         "late Open resurrected cancelled creation or started RAP build".into(),
