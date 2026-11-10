@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+clap.workspace = true
 fube-data.workspace = true
 fube-runtime.workspace = true
 tokio.workspace = true

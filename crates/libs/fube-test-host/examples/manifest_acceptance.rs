@@ -1,4 +1,5 @@
 //! Caller-owned probes for this fixture only; not general host admission.
+use clap::Parser;
 use fube_test_host::{run_manifest, HostError, LifecycleStage, ManifestOptions, Result, Scenario};
 use std::{
     io::{Read, Write},
@@ -6,6 +7,19 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
+
+#[derive(Parser)]
+#[command(about = "Probe native manifest service lifecycle and cleanup")]
+struct Arguments {
+    native: PathBuf,
+    deps: PathBuf,
+    package: PathBuf,
+    run_parent: PathBuf,
+    #[arg(value_parser = ["close", "abort"])]
+    scenario: String,
+    #[arg(value_parser = ["opaque"])]
+    mode: Option<String>,
+}
 
 fn require(value: bool, message: &str) -> Result<()> {
     if value {
@@ -16,18 +30,13 @@ fn require(value: bool, message: &str) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    require(
-        args.len() == 6 || args.len() == 7,
-        "usage: manifest_acceptance NATIVE DEPS PACKAGE RUN_PARENT close|abort [opaque]",
-    )?;
-    let scenario = match args[5].as_str() {
-        "close" => Scenario::Close,
-        "abort" => Scenario::Abort,
-        _ => return Err(HostError("expected close or abort".into())),
+    let args = Arguments::parse();
+    let scenario = if args.scenario == "abort" {
+        Scenario::Abort
+    } else {
+        Scenario::Close
     };
-    let opaque = args.get(6).map(|s| s == "opaque").unwrap_or(false);
-    require(args.len() != 7 || opaque, "unknown acceptance mode")?;
+    let opaque = args.mode.is_some();
     let mut parameters = Vec::new();
     let (service, service_type) = if scenario == Scenario::Abort {
         parameters.extend([
@@ -42,15 +51,15 @@ fn main() -> Result<()> {
     if scenario == Scenario::Abort || opaque {
         parameters.push(("Arguments".into(), format!(
             "--manifest-fixture --type {service_type} --service fabric:/ManifestQualification/{service} --terminal {} --endpoint {}",
-            args[5], if opaque { "opaque" } else { "socket" })));
+            args.scenario, if opaque { "opaque" } else { "socket" })));
     }
     let mut observed = Vec::new();
     let report = run_manifest(
         ManifestOptions {
-            native_directory: PathBuf::from(&args[1]),
-            dependency_directory: PathBuf::from(&args[2]),
-            package_directory: PathBuf::from(&args[3]),
-            run_parent: PathBuf::from(&args[4]),
+            native_directory: args.native,
+            dependency_directory: args.deps,
+            package_directory: args.package,
+            run_parent: args.run_parent,
             application_name: "fabric:/ManifestQualification".into(),
             parameters,
         },

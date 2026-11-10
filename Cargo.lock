@@ -315,6 +315,7 @@ name = "fube-client"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "clap",
  "fube-transport",
  "openapi-service-fabric",
  "reqwest",
@@ -329,6 +330,7 @@ dependencies = [
 name = "fube-cluster"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "fube-hosting",
  "fube-local-host",
  "fube-node",
@@ -404,6 +406,7 @@ dependencies = [
 name = "fube-ra"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "fube-ra-store",
  "fube-transport",
  "serde",
@@ -455,6 +458,7 @@ dependencies = [
 name = "fube-test-host"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "fube-hosting",
  "fube-local-host",
  "fube-node",
@@ -576,6 +580,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "hosting-local-app"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "fube-data",
  "fube-hosting",
  "fube-node",
@@ -952,6 +957,7 @@ dependencies = [
 name = "native-replicator-oracle"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "fube-data",
  "mssf-com",
  "mssf-core",
@@ -1326,6 +1332,7 @@ name = "stateless-test-app"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "clap",
  "mssf-core",
  "mssf-util",
  "serde_json",

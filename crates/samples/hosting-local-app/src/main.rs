@@ -1,4 +1,5 @@
 //! Explicitly minimal native-free local Hosting package fixtures.
+use clap::Parser;
 use fube_data::{
     extensions::ReplicationEndpointOptions, IOperationDataStream, IStateProvider, MemoryProvider,
     Mutation,
@@ -22,6 +23,43 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[derive(Parser)]
+#[command(version, about = "Native-free local Hosting lifecycle fixture",
+    group(clap::ArgGroup::new("fault").args([
+        "delay_ms", "crash_after_ms", "shutdown_after_ms", "no_register",
+        "exit_before_attach", "stateful_register", "block_dispose",
+        "close_error_block_dispose", "block_provider_dispose", "open_delay_ms",
+    ])),
+    group(clap::ArgGroup::new("data").args(["stateful_primary", "data_replicator"]).multiple(true)))]
+struct Arguments {
+    #[arg(long, conflicts_with_all = ["stateful_lifecycle", "data_replicator"])]
+    stateful_primary: bool,
+    #[arg(long)]
+    stateful_lifecycle: bool,
+    #[arg(long, requires = "stateful_lifecycle")]
+    data_replicator: bool,
+    #[arg(long)]
+    delay_ms: Option<u64>,
+    #[arg(long)]
+    crash_after_ms: Option<u64>,
+    #[arg(long)]
+    shutdown_after_ms: Option<u64>,
+    #[arg(long)]
+    no_register: bool,
+    #[arg(long)]
+    exit_before_attach: bool,
+    #[arg(long)]
+    stateful_register: bool,
+    #[arg(long)]
+    block_dispose: bool,
+    #[arg(long)]
+    close_error_block_dispose: bool,
+    #[arg(long, requires = "data")]
+    block_provider_dispose: bool,
+    #[arg(long)]
+    open_delay_ms: Option<u64>,
+}
 
 #[derive(Clone, Copy, Default)]
 struct Mode {
@@ -704,64 +742,27 @@ impl Drop for Instance {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // These explicit fault modes are for owned-lifecycle qualification only.
-    let args: Vec<_> = std::env::args().skip(1).collect();
-    let primary = args.first().is_some_and(|s| s == "--stateful-primary");
-    let stateful_lifecycle = primary || args.first().is_some_and(|s| s == "--stateful-lifecycle");
-    let args = if stateful_lifecycle {
-        &args[1..]
-    } else {
-        &args[..]
-    };
-    let explicit_data =
-        !primary && stateful_lifecycle && args.first().is_some_and(|s| s == "--data-replicator");
-    let data_replicator = primary || explicit_data;
-    let args = if explicit_data { &args[1..] } else { args };
-    let delay = match args {
-        [flag, value]
-            if flag == "--delay-ms"
-                || flag == "--crash-after-ms"
-                || flag == "--shutdown-after-ms" =>
-        {
-            Some((
-                flag.as_str(),
-                value.parse::<u64>().expect("integer milliseconds"),
-            ))
-        }
-        [] => None,
-        [flag] if flag == "--no-register" || flag == "--exit-before-attach" => None,
-        [flag] if flag == "--stateful-register" => None,
-        [flag] if flag == "--block-dispose" || flag == "--close-error-block-dispose" => None,
-        [flag] if flag == "--block-provider-dispose" && data_replicator => None,
-        [flag, _] if flag == "--open-delay-ms" => None,
-        _ => panic!("unsupported fixture arguments"),
-    };
-    if args.first().is_some_and(|s| s == "--exit-before-attach") {
+    let args = Arguments::parse();
+    let primary = args.stateful_primary;
+    let stateful_lifecycle = primary || args.stateful_lifecycle;
+    let data_replicator = primary || args.data_replicator;
+    if args.exit_before_attach {
         std::process::exit(17);
     }
-    if let Some(("--delay-ms", ms)) = delay {
+    if let Some(ms) = args.delay_ms {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
     let runtime = Runtime::attach().await.expect("owned Hosting attach");
     let mode = Mode {
         primary,
-        block_dispose: args
-            .first()
-            .is_some_and(|s| s == "--block-dispose" || s == "--close-error-block-dispose"),
-        block_provider_dispose: args
-            .first()
-            .is_some_and(|s| s == "--block-provider-dispose"),
-        close_error: args
-            .first()
-            .is_some_and(|s| s == "--close-error-block-dispose"),
-        open_delay: if args.first().is_some_and(|s| s == "--open-delay-ms") {
-            args[1].parse().expect("integer callback milliseconds")
-        } else {
-            0
-        },
+        block_dispose: args.block_dispose || args.close_error_block_dispose,
+        block_provider_dispose: args.block_provider_dispose,
+        close_error: args.close_error_block_dispose,
+        open_delay: args.open_delay_ms.unwrap_or(0),
     };
-    let stateful_registration = args.first().is_some_and(|s| s == "--stateful-register");
+    let stateful_registration = args.stateful_register;
     let native = data_replicator.then(|| runtime.native_integration_provider());
-    let _runtime = if args.first().is_some_and(|s| s == "--no-register") {
+    let _runtime = if args.no_register {
         runtime
     } else {
         runtime
@@ -794,11 +795,11 @@ async fn main() {
     std::io::stdout()
         .flush()
         .expect("flush registration marker");
-    if let Some(("--crash-after-ms", ms)) = delay {
+    if let Some(ms) = args.crash_after_ms {
         tokio::time::sleep(Duration::from_millis(ms)).await;
         std::process::exit(23);
     }
-    if let Some(("--shutdown-after-ms", ms)) = delay {
+    if let Some(ms) = args.shutdown_after_ms {
         tokio::time::sleep(Duration::from_millis(ms)).await;
         _runtime
             .shutdown()
@@ -806,4 +807,48 @@ async fn main() {
             .expect("orderly Runtime/session shutdown");
     }
     std::future::pending::<()>().await;
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+
+    fn parse(suffix: &str) -> std::result::Result<Arguments, clap::Error> {
+        let input = format!("hosting-local-app {suffix}");
+        Arguments::try_parse_from(input.split_whitespace())
+    }
+
+    #[test]
+    fn preserves_stateful_data_and_exclusive_fault_modes() {
+        assert!(!parse("").unwrap().stateful_lifecycle);
+        let args = parse("--stateful-lifecycle --data-replicator --open-delay-ms 4000").unwrap();
+        assert!(args.stateful_lifecycle && args.data_replicator);
+        assert_eq!(args.open_delay_ms, Some(4000));
+        assert!(
+            parse("--stateful-primary --block-provider-dispose")
+                .unwrap()
+                .stateful_primary
+        );
+        assert!(parse("--stateful-register").unwrap().stateful_register);
+        assert!(parse("--delay-ms 0").is_ok());
+    }
+
+    #[test]
+    fn rejects_conflicting_profiles_faults_and_invalid_delays() {
+        for suffix in [
+            "--stateful-primary --stateful-lifecycle",
+            "--stateful-primary --data-replicator",
+            "--data-replicator",
+            "--block-provider-dispose",
+            "--stateful-lifecycle --block-provider-dispose",
+            "--no-register --delay-ms 1",
+            "--block-dispose --close-error-block-dispose",
+            "--delay-ms",
+            "--open-delay-ms invalid",
+            "--delay-ms -1",
+            "--crash-after-ms 18446744073709551616",
+        ] {
+            assert!(parse(suffix).is_err(), "{suffix}");
+        }
+    }
 }

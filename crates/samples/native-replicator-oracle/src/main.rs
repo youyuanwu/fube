@@ -1,12 +1,21 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License. See LICENSE.service-fabric-apps-rs at the repository root.
 
+use clap::Parser;
 use native_replicator_oracle::{
     data::{operation_data, read_segments},
     provider::snapshot_provider,
     stream::{end_get_next, operation_data_stream, StreamItem},
 };
 use serde_json::json;
+
+#[derive(Parser)]
+#[command(version, about = "Test-only native classic replicator ABI fixture")]
+struct Arguments {
+    /// Check the ABI adapters without starting a native activated host.
+    #[arg(long)]
+    abi_self_test: bool,
+}
 
 fn self_test() -> windows_core::Result<()> {
     let expected = vec![vec![1, 2, 3], Vec::new(), vec![4, 5]];
@@ -41,8 +50,8 @@ fn self_test() -> windows_core::Result<()> {
 }
 
 fn main() -> std::process::ExitCode {
-    let args: Vec<_> = std::env::args().skip(1).collect();
-    if args == ["--abi-self-test"] {
+    let args = Arguments::parse();
+    if args.abi_self_test {
         return match self_test() {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(error) => {
@@ -50,10 +59,6 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::FAILURE
             }
         };
-    }
-    if !args.is_empty() {
-        eprintln!("usage: native-replicator-oracle [--abi-self-test]");
-        return std::process::ExitCode::FAILURE;
     }
     let result = std::panic::catch_unwind(|| {
         tokio::runtime::Builder::new_multi_thread()

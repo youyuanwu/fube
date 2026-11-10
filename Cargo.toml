@@ -24,6 +24,7 @@ members = [
 ]
 
 [workspace.dependencies]
+clap = { version = "4", features = ["derive"] }
 fube-core = { path = "./crates/libs/fube-core" }
 fube-transport = { path = "./crates/libs/fube-transport" }
 fube-client = { path = "./crates/libs/fube-client" }

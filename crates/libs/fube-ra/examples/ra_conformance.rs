@@ -1,14 +1,30 @@
 //! Compiler-free consumer of independently native-produced fixtures.
 mod support;
 
+use clap::Parser;
 use fube_ra::protocol::*;
 use fube_transport::{
     message::{Header, Message, ACTION, ACTOR, HIGH_PRIORITY},
     serialization::serde::{from_slice, to_vec, CountedStrings, ObjectArray},
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::{fmt::Debug, fs, path::Path};
+use std::{
+    fmt::Debug,
+    fs,
+    path::{Path, PathBuf},
+};
 use support::Rich;
+
+#[derive(Parser)]
+#[command(about = "Consume independently native-produced RA protocol fixtures")]
+struct Arguments {
+    #[arg(required_unless_present = "identity")]
+    native_input: Option<PathBuf>,
+    #[arg(required_unless_present = "identity")]
+    rust_output: Option<PathBuf>,
+    #[arg(long, conflicts_with_all = ["native_input", "rust_output"])]
+    identity: bool,
+}
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Scalar<T> {
@@ -996,21 +1012,22 @@ fn generation_handshake(input: &Path, output: &Path) {
 }
 
 fn main() {
-    let args: Vec<_> = std::env::args_os().collect();
-    if args.len() == 2 && args[1] == "--identity" {
+    let args = Arguments::parse();
+    if args.identity {
         println!(
             "{}",
             option_env!("FUBE_RA_SOURCE_DIGEST").unwrap_or("unbound")
         );
         return;
     }
-    assert_eq!(
-        args.len(),
-        3,
-        "usage: ra_conformance NATIVE_INPUT RUST_OUTPUT"
-    );
-    let input = Path::new(&args[1]);
-    let output = Path::new(&args[2]);
+    let input = args
+        .native_input
+        .as_deref()
+        .expect("clap requires native input");
+    let output = args
+        .rust_output
+        .as_deref()
+        .expect("clap requires Rust output");
     assert!(input.is_dir() && output.is_dir());
     peer_contracts(input, output);
     check(input, output, "default-request", AddInstance::default());
@@ -1389,4 +1406,31 @@ fn main() {
     stage_two(input, output);
     generation_handshake(input, output);
     println!("116 cases verified; all selected-body proper prefixes rejected");
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+
+    #[test]
+    fn identity_and_fixture_paths_are_exclusive_and_complete() {
+        assert!(
+            Arguments::try_parse_from(["ra_conformance", "--identity"])
+                .unwrap()
+                .identity
+        );
+        let args = Arguments::try_parse_from(["ra_conformance", "/input", "/output"]).unwrap();
+        assert_eq!(args.native_input, Some(PathBuf::from("/input")));
+        assert_eq!(args.rust_output, Some(PathBuf::from("/output")));
+        for args in [
+            vec![],
+            vec!["/input"],
+            vec!["--identity", "/input", "/output"],
+            vec!["/input", "/output", "extra"],
+        ] {
+            assert!(
+                Arguments::try_parse_from(std::iter::once("ra_conformance").chain(args)).is_err()
+            );
+        }
+    }
 }

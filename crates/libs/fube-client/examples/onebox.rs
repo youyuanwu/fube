@@ -1,14 +1,183 @@
 use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
 
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use fube_client::{
     ApplicationDefinitionKindFilter, ApplicationListFilter, ApplicationQueryDescription,
-    ClientOptions, Error, FabricClient, HealthEventsFilter, NamingUri, NodeHealthPolicy,
-    NodeHealthQueryDescription, NodeHealthQueryParameters, NodeQueryDescription, Result,
+    ClientOptions, FabricClient, HealthEventsFilter, NamingUri, NodeHealthPolicy,
+    NodeHealthQueryDescription, NodeHealthQueryParameters, NodeQueryDescription, Paging,
     ServiceListFilter, ServiceQueryDescription, ServiceQueryParameters, DEFAULT_TIMEOUT,
 };
 
-const USAGE: &str =
-    "usage: onebox --clear IP:port ping|node-list [--timeout-seconds N]\n       onebox --clear IP:port name-exists|create-name|delete-name fabric:/name [--timeout-seconds N]\n       onebox --clear IP:port node-health NODE [--events-filter U32] [--warning-as-error true|false] [--timeout-seconds N]\n       onebox --clear IP:port application-list [--name URI|--type NAME|--definition-kind U32] [--exclude-parameters true|false] [--max-results N] [--continuation-token TOKEN] [--timeout-seconds N]\n       onebox --clear IP:port service-list APP_URI [--name URI|--type NAME] [--max-results N] [--continuation-token TOKEN] [--timeout-seconds N]";
+#[derive(Parser)]
+#[command(about = "Query or update an unsecured native Service Fabric gateway")]
+struct Arguments {
+    #[arg(long, value_name = "IP:PORT")]
+    clear: SocketAddr,
+    #[command(flatten)]
+    timeout: TimeoutArguments,
+    #[command(subcommand)]
+    command: Command,
+}
+
+impl Arguments {
+    fn validate(self) -> Result<Self, clap::Error> {
+        // A global clap option would silently override a value across subcommands.
+        if self.timeout.timeout_seconds.is_some() && self.command.timeout().is_some() {
+            return Err(Self::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--timeout-seconds cannot be used more than once",
+            ));
+        }
+        Ok(self)
+    }
+
+    fn timeout(&self) -> Duration {
+        self.timeout
+            .timeout_seconds
+            .or(self.command.timeout())
+            .unwrap_or(DEFAULT_TIMEOUT)
+    }
+}
+
+#[derive(Args)]
+struct TimeoutArguments {
+    #[arg(long, value_parser = timeout)]
+    timeout_seconds: Option<Duration>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Ping(TimeoutArguments),
+    NodeList(TimeoutArguments),
+    NameExists {
+        name: NamingUri,
+        #[command(flatten)]
+        timeout: TimeoutArguments,
+    },
+    CreateName {
+        name: NamingUri,
+        #[command(flatten)]
+        timeout: TimeoutArguments,
+    },
+    DeleteName {
+        name: NamingUri,
+        #[command(flatten)]
+        timeout: TimeoutArguments,
+    },
+    NodeHealth {
+        node: String,
+        #[arg(long)]
+        events_filter: Option<u32>,
+        #[arg(long, action = clap::ArgAction::Set)]
+        warning_as_error: Option<bool>,
+        #[command(flatten)]
+        timeout: TimeoutArguments,
+    },
+    ApplicationList(ApplicationListArguments),
+    ServiceList(ServiceListArguments),
+}
+
+impl Command {
+    fn timeout(&self) -> Option<Duration> {
+        match self {
+            Self::Ping(timeout)
+            | Self::NodeList(timeout)
+            | Self::NameExists { timeout, .. }
+            | Self::CreateName { timeout, .. }
+            | Self::DeleteName { timeout, .. }
+            | Self::NodeHealth { timeout, .. } => timeout.timeout_seconds,
+            Self::ApplicationList(args) => args.timeout.timeout_seconds,
+            Self::ServiceList(args) => args.timeout.timeout_seconds,
+        }
+    }
+}
+
+#[derive(Args)]
+#[group(id = "application_filter", multiple = false)]
+struct ApplicationFilter {
+    #[arg(long)]
+    name: Option<NamingUri>,
+    #[arg(long = "type")]
+    type_name: Option<String>,
+    #[arg(long, value_parser = definition_kind)]
+    definition_kind: Option<ApplicationDefinitionKindFilter>,
+}
+
+#[derive(Args)]
+struct ApplicationListArguments {
+    #[command(flatten)]
+    filter: ApplicationFilter,
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+    exclude_parameters: bool,
+    #[command(flatten)]
+    paging: PagingArguments,
+    #[command(flatten)]
+    timeout: TimeoutArguments,
+}
+
+#[derive(Args)]
+#[group(id = "service_filter", multiple = false)]
+struct ServiceFilter {
+    #[arg(long)]
+    name: Option<NamingUri>,
+    #[arg(long = "type")]
+    type_name: Option<String>,
+}
+
+#[derive(Args)]
+struct ServiceListArguments {
+    application: NamingUri,
+    #[command(flatten)]
+    filter: ServiceFilter,
+    #[command(flatten)]
+    paging: PagingArguments,
+    #[command(flatten)]
+    timeout: TimeoutArguments,
+}
+
+#[derive(Args)]
+struct PagingArguments {
+    #[arg(long)]
+    continuation_token: Option<String>,
+    #[arg(long, value_parser = max_results)]
+    max_results: Option<NonZeroU64>,
+}
+
+impl From<PagingArguments> for Paging {
+    fn from(value: PagingArguments) -> Self {
+        Self {
+            continuation_token: value.continuation_token,
+            max_results: value.max_results,
+        }
+    }
+}
+
+fn timeout(value: &str) -> Result<Duration, String> {
+    let seconds = value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or("timeout must be positive finite seconds")?;
+    let timeout = Duration::try_from_secs_f64(seconds).map_err(|_| "timeout is out of range")?;
+    fube_transport::connection::deadline_after(timeout).map_err(|error| error.to_string())?;
+    Ok(timeout)
+}
+
+fn max_results(value: &str) -> Result<NonZeroU64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .and_then(NonZeroU64::new)
+        .filter(|v| v.get() <= i64::MAX as u64)
+        .ok_or_else(|| "max-results must be 1..i64::MAX".into())
+}
+
+fn definition_kind(value: &str) -> Result<ApplicationDefinitionKindFilter, String> {
+    let bits = value
+        .parse()
+        .map_err(|_| "definition filter must be UInt32")?;
+    ApplicationDefinitionKindFilter::try_from_bits(bits).map_err(|error| error.to_string())
+}
 
 #[derive(Debug)]
 enum Operation {
@@ -22,136 +191,66 @@ enum Operation {
     ServiceList(ServiceQueryDescription),
 }
 
-fn list_arguments(args: &[String], application: Option<&str>) -> Result<Operation> {
-    let mut query = ApplicationQueryDescription::default();
-    let mut selected = false;
-    let mut exclude_set = false;
-    let (pairs, remainder) = args.as_chunks::<2>();
-    if !remainder.is_empty() {
-        return Err(Error::InvalidInput(USAGE));
-    }
-    for [key, value] in pairs {
-        match key.as_str() {
-            "--name" | "--type" | "--definition-kind" if !selected => {
-                query.parameters.filter = match key.as_str() {
-                    "--name" => ApplicationListFilter::Name(value.parse()?),
-                    "--type" => ApplicationListFilter::TypeName(value.clone()),
-                    _ if application.is_none() => ApplicationListFilter::DefinitionKind(
-                        ApplicationDefinitionKindFilter::try_from_bits(value.parse().map_err(
-                            |_| Error::InvalidInput("definition filter must be UInt32"),
-                        )?)?,
-                    ),
-                    _ => return Err(Error::InvalidInput(USAGE)),
+impl From<Command> for Operation {
+    fn from(command: Command) -> Self {
+        match command {
+            Command::Ping(_) => Self::Ping,
+            Command::NodeList(_) => Self::NodeList,
+            Command::NameExists { name, .. } => Self::NameExists(name),
+            Command::CreateName { name, .. } => Self::CreateName(name),
+            Command::DeleteName { name, .. } => Self::DeleteName(name),
+            Command::NodeHealth {
+                node,
+                events_filter,
+                warning_as_error,
+                ..
+            } => {
+                let mut query =
+                    NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(node));
+                query.parameters.events_filter =
+                    events_filter.map(|bits| HealthEventsFilter::from_bits_retain(bits).into());
+                query.parameters.health_policy =
+                    warning_as_error.map(|consider_warning_as_error| NodeHealthPolicy {
+                        consider_warning_as_error,
+                    });
+                Self::NodeHealth(query)
+            }
+            Command::ApplicationList(args) => {
+                let mut query = ApplicationQueryDescription::default();
+                query.parameters.filter = if let Some(name) = args.filter.name {
+                    ApplicationListFilter::Name(name)
+                } else if let Some(name) = args.filter.type_name {
+                    ApplicationListFilter::TypeName(name)
+                } else if let Some(kind) = args.filter.definition_kind {
+                    ApplicationListFilter::DefinitionKind(kind)
+                } else {
+                    ApplicationListFilter::All
                 };
-                selected = true;
+                query.parameters.exclude_application_parameters = args.exclude_parameters;
+                query.paging = args.paging.into();
+                Self::ApplicationList(query)
             }
-            "--exclude-parameters" if application.is_none() && !exclude_set => {
-                query.parameters.exclude_application_parameters = value
-                    .parse()
-                    .map_err(|_| Error::InvalidInput("exclude-parameters must be true or false"))?;
-                exclude_set = true;
+            Command::ServiceList(args) => {
+                let mut query =
+                    ServiceQueryDescription::new(ServiceQueryParameters::new(args.application));
+                query.parameters.filter = if let Some(name) = args.filter.name {
+                    ServiceListFilter::Name(name)
+                } else if let Some(name) = args.filter.type_name {
+                    ServiceListFilter::TypeName(name)
+                } else {
+                    ServiceListFilter::All
+                };
+                query.paging = args.paging.into();
+                Self::ServiceList(query)
             }
-            "--continuation-token" if query.paging.continuation_token.is_none() => {
-                query.paging.continuation_token = Some(value.clone());
-            }
-            "--max-results" if query.paging.max_results.is_none() => {
-                let count = value
-                    .parse::<u64>()
-                    .ok()
-                    .and_then(NonZeroU64::new)
-                    .filter(|v| v.get() <= i64::MAX as u64)
-                    .ok_or(Error::InvalidInput("max-results must be 1..i64::MAX"))?;
-                query.paging.max_results = Some(count);
-            }
-            _ => return Err(Error::InvalidInput(USAGE)),
         }
-    }
-    if let Some(application) = application {
-        let mut service =
-            ServiceQueryDescription::new(ServiceQueryParameters::new(application.parse()?));
-        service.parameters.filter = match query.parameters.filter {
-            ApplicationListFilter::All => ServiceListFilter::All,
-            ApplicationListFilter::Name(value) => ServiceListFilter::Name(value),
-            ApplicationListFilter::TypeName(value) => ServiceListFilter::TypeName(value),
-            ApplicationListFilter::DefinitionKind(_) => return Err(Error::InvalidInput(USAGE)),
-        };
-        service.paging = query.paging;
-        Ok(Operation::ServiceList(service))
-    } else {
-        Ok(Operation::ApplicationList(query))
     }
 }
 
-fn arguments(mut args: Vec<String>) -> Result<(SocketAddr, Operation, Duration)> {
-    let mut timeout = DEFAULT_TIMEOUT;
-    if let Some(index) = args.iter().position(|arg| arg == "--timeout-seconds") {
-        let seconds = args
-            .get(index + 1)
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .ok_or(Error::InvalidInput(
-                "timeout must be positive finite seconds",
-            ))?;
-        timeout = Duration::try_from_secs_f64(seconds)
-            .map_err(|_| Error::InvalidInput("timeout is out of range"))?;
-        fube_transport::connection::deadline_after(timeout)?;
-        args.drain(index..=index + 1);
-    }
-    if args.len() < 3 || args[0] != "--clear" {
-        return Err(Error::InvalidInput(USAGE));
-    }
-    let endpoint = args[1]
-        .parse()
-        .map_err(|_| Error::InvalidInput("clear endpoint must be an IP:port socket address"))?;
-    let operation = match args[2].as_str() {
-        "ping" if args.len() == 3 => Operation::Ping,
-        "node-list" if args.len() == 3 => Operation::NodeList,
-        "application-list" => list_arguments(&args[3..], None)?,
-        "service-list" if args.len() >= 4 => list_arguments(&args[4..], Some(&args[3]))?,
-        "name-exists" if args.len() == 4 => Operation::NameExists(args[3].parse()?),
-        "create-name" if args.len() == 4 => Operation::CreateName(args[3].parse()?),
-        "delete-name" if args.len() == 4 => Operation::DeleteName(args[3].parse()?),
-        "node-health" if args.len() >= 4 => {
-            let mut query =
-                NodeHealthQueryDescription::new(NodeHealthQueryParameters::new(&args[3]));
-            let (options, remainder) = args[4..].as_chunks::<2>();
-            for pair in options {
-                match pair[0].as_str() {
-                    "--events-filter" if query.parameters.events_filter.is_none() => {
-                        query.parameters.events_filter = Some(
-                            HealthEventsFilter::from_bits_retain(pair[1].parse().map_err(
-                                |_| {
-                                    Error::InvalidInput(
-                                        "events filter must be a decimal UInt32 mask",
-                                    )
-                                },
-                            )?)
-                            .into(),
-                        );
-                    }
-                    "--warning-as-error" if query.parameters.health_policy.is_none() => {
-                        query.parameters.health_policy = Some(NodeHealthPolicy {
-                            consider_warning_as_error: pair[1].parse().map_err(|_| {
-                                Error::InvalidInput("warning-as-error must be true or false")
-                            })?,
-                        });
-                    }
-                    _ => return Err(Error::InvalidInput(USAGE)),
-                }
-            }
-            if !remainder.is_empty() {
-                return Err(Error::InvalidInput(USAGE));
-            }
-            Operation::NodeHealth(query)
-        }
-        _ => return Err(Error::InvalidInput(USAGE)),
-    };
-    Ok((endpoint, operation, timeout))
-}
-
-async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let (endpoint, operation, timeout) = arguments(std::env::args().skip(1).collect())?;
-    let endpoint = FabricClient::endpoint_clear(endpoint)?.connect_timeout(timeout);
+async fn run(arguments: Arguments) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let timeout = arguments.timeout();
+    let operation = Operation::from(arguments.command);
+    let endpoint = FabricClient::endpoint_clear(arguments.clear)?.connect_timeout(timeout);
     let channel = endpoint.connect().await?;
     let client = FabricClient::new(
         channel,
@@ -220,13 +319,11 @@ async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn parse(suffix: &str) -> Result<(SocketAddr, Operation, Duration)> {
-        arguments(
-            format!("--clear 127.0.0.1:19000 {suffix}")
-                .split_whitespace()
-                .map(String::from)
-                .collect(),
-        )
+    fn parse(suffix: &str) -> Result<(SocketAddr, Operation, Duration), clap::Error> {
+        let input = format!("onebox --clear 127.0.0.1:19000 {suffix}");
+        let args = Arguments::try_parse_from(input.split_whitespace())?.validate()?;
+        let timeout = args.timeout();
+        Ok((args.clear, args.command.into(), timeout))
     }
 
     #[test]
@@ -267,12 +364,15 @@ mod tests {
             "node-health N0020 --events-filter 0 --events-filter 1",
             "node-health N0020 --warning-as-error true --warning-as-error false",
             "ping --timeout-seconds 1 --timeout-seconds 2",
+            "--timeout-seconds 1 ping --timeout-seconds 2",
             "create-name",
             "delete-name",
             "create-name fabric:/owned extra",
             "delete-name fabric:/owned --recursive",
             "create-name fabric:/owned --timeout-seconds 0",
             "delete-name fabric:/owned --timeout-seconds NaN",
+            "ping --timeout-seconds inf",
+            "ping --timeout-seconds 1e100",
             "create-name fabric:/owned --timeout-seconds 1 --timeout-seconds 2",
             "name-exists fabric:/",
             "create-name fabric:/bad//name",
@@ -296,6 +396,9 @@ mod tests {
             matches!(operation, Operation::DeleteName(name) if name.as_str() == "fabric:/owned")
         );
         assert_eq!(timeout, DEFAULT_TIMEOUT);
+        let (_, operation, timeout) = parse("--timeout-seconds 0.25 ping").unwrap();
+        assert!(matches!(operation, Operation::Ping));
+        assert_eq!(timeout, Duration::from_millis(250));
     }
 
     #[test]
@@ -337,7 +440,10 @@ mod tests {
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run().await {
+    let arguments = Arguments::parse()
+        .validate()
+        .unwrap_or_else(|error| error.exit());
+    if let Err(error) = run(arguments).await {
         eprintln!("{error}");
         std::process::exit(1);
     }
