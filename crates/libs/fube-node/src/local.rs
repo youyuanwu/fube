@@ -240,6 +240,29 @@ pub struct InstanceDisposal {
     pub lookup: u64,
     pub acquisition: u64,
 }
+/// An applied Delete of an original peer replica that never issued Open/Close.
+/// This certifies committed absence, not disposal of a runtime/service object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaAbsence {
+    #[serde(with = "disposal_body")]
+    pub body: AddInstance,
+    pub command: u64,
+    pub ra_operation: u64,
+}
+fn never_created(state: &ra::EntityState) -> bool {
+    state.phase == ra::Phase::Closed
+        && state.local_deleted
+        && state.cleanup_pending
+        && state.open_token == 0
+        && state.close_token == 0
+        && state.runtime.is_none()
+        && state.usage.is_none()
+        && state.peer_creation.is_none()
+        && state.remote_idle.is_none()
+        && state.registration_lookups.is_empty()
+        && state.fm_stage == ra::FmStage::None
+}
 mod disposal_body {
     use super::*;
     pub fn serialize<S: serde::Serializer>(
@@ -289,6 +312,7 @@ pub struct Node {
     held_reply: Option<ipc::LifecycleReply>,
     rejected_reply: Option<ipc::LifecycleReply>,
     disposal: Option<DisposalWitness>,
+    absence: Option<ReplicaAbsence>,
     #[cfg(feature = "qualification")]
     hold_replies: bool,
 }
@@ -347,6 +371,7 @@ impl Node {
             held_reply: None,
             rejected_reply: None,
             disposal: None,
+            absence: None,
             #[cfg(feature = "qualification")]
             hold_replies: false,
         })
@@ -497,16 +522,35 @@ impl Node {
                 let closed = current
                     .as_ref()
                     .is_some_and(|state| state.phase == ra::Phase::Closed);
-                if peer_work
-                    && (body.deletion.0.force
-                        || current.as_ref().is_none_or(|state| {
-                            state.peer_creation.is_none()
-                                || (state.phase != ra::Phase::Ready && !state.local_deleted)
-                                || state.body.replica.current_role != 2
-                                || state.body.replica.id != incoming.replica.id
-                        }))
-                {
-                    return Err(Error::Unsupported);
+                if peer_work {
+                    let eligible = match &current {
+                        None => self.selected.is_none() || self.pending.iter().any(|pending| {
+                            matches!(&pending.work, Work::Fm(FmWork::DeleteReplica(original, ..))
+                                if original == body)
+                        }),
+                        Some(state) => {
+                            state.body.replica.id == incoming.replica.id
+                                && ((never_created(state)
+                                    && state.body.replica.instance == incoming.replica.instance)
+                                    || (state.peer_creation.is_some()
+                                        && state.body.replica.current_role == 2
+                                        && (state.phase == ra::Phase::Ready
+                                            || state.local_deleted)))
+                        }
+                    };
+                    if body.deletion.0.force
+                        || !eligible
+                        || (current.is_none()
+                            && (incoming.replica.current_role != 2
+                                || incoming.replica.previous_role != 1
+                                || incoming.replica.state != 1
+                                || !incoming.replica.up
+                                || incoming.replica.version != incoming.service.version
+                                || !incoming.replica.service_endpoint.is_empty()
+                                || !incoming.replica.replication_endpoint.is_empty()))
+                    {
+                        return Err(Error::Unsupported);
+                    }
                 }
                 if (!self.live.load(Ordering::SeqCst) && !closed)
                     || !self.ra.consumer_lifetime().is_accepting()
@@ -798,6 +842,32 @@ impl Node {
             return None;
         }
         Some(witness.proof.clone())
+    }
+
+    /// Publish applied absent-Delete lineage only while the never-opened
+    /// tombstone remains committed and all original local work is drained.
+    pub fn replica_absence(&self) -> Option<ReplicaAbsence> {
+        let proof = self.absence.as_ref()?;
+        if self.activation.profile() != h::local::Profile::VolatileStatefulLifecycle
+            || self.ra.peer().is_none()
+            || !self.live.load(Ordering::SeqCst)
+            || !self.ra.consumer_lifetime().is_accepting()
+            || !self.quiescent()
+            || !self.commands.is_empty()
+            || !self.receipts.is_empty()
+            || self.rejected_reply.is_some()
+            || self.last_error.is_some()
+            || self.route.is_some()
+            || self.disposal.is_some()
+            || !self.activation.session_status().ok().flatten()?.connected
+            || self.activation.process_status()?.exit_observed
+        {
+            return None;
+        }
+        let snapshot = self.ra.snapshot(proof.body.unit.id.guid.0);
+        let state = snapshot.committed?;
+        (!snapshot.fenced && never_created(&state) && *state.body == proof.body)
+            .then(|| proof.clone())
     }
 
     fn room(&self) -> bool {
@@ -1316,6 +1386,24 @@ impl Node {
                     }
                 }
                 let front = self.pending.pop_front().unwrap();
+                if result == Ok(ra::Disposition::Applied)
+                    && self.absence.is_none()
+                    && self.activation.profile() == h::local::Profile::VolatileStatefulLifecycle
+                    && self.ra.peer().is_some()
+                {
+                    if let Work::Fm(FmWork::DeleteReplica(body, ..)) = &front.work {
+                        let snapshot = self.ra.snapshot(body.replica.0.unit.id.guid.0);
+                        if let Some(state) = snapshot.committed.filter(|_| !snapshot.fenced) {
+                            if never_created(&state) {
+                                self.absence = Some(ReplicaAbsence {
+                                    body: (*state.body).clone(),
+                                    command: front.id,
+                                    ra_operation: front.ticket.as_ref().unwrap().id,
+                                });
+                            }
+                        }
+                    }
+                }
                 if let Some(witness) = &mut self.disposal {
                     if witness.proof.command == front.id
                         && matches!(front.work, Work::Closed(_))

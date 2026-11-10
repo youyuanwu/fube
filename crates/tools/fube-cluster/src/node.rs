@@ -803,6 +803,7 @@ async fn run_owned(launch: &Launch) -> Result<()> {
     let mut failure = startup.err();
     let mut next_observation = Instant::now();
     let mut published_retirement = None;
+    let mut published_absence = None;
     if failure.is_none() {
         loop {
             // Owned stop remains independent of FM connectivity. Link loss is
@@ -964,6 +965,10 @@ async fn run_owned(launch: &Launch) -> Result<()> {
                 }
             }
             if link.is_some() && adapter.error.is_none() && adapter.replica_drained(&node) {
+                if let Err(error) = publish_absence(launch, &node, &mut published_absence) {
+                    failure = Some(error);
+                    break;
+                }
                 if let Some(disposal) = node.instance_disposal() {
                     let state = node.snapshot(disposal.body.unit.id.guid.0);
                     let deleted = !state.fenced
@@ -1269,6 +1274,30 @@ fn actual_profile(node: &Node) -> Result<ActualProfile> {
             .to_owned(),
     })
 }
+fn publish_absence(launch: &Launch, node: &Node, published: &mut Option<(i64, i64)>) -> Result<()> {
+    let Some(absence) = node.replica_absence() else {
+        return Ok(());
+    };
+    let lifetime = (absence.body.replica.id, absence.body.replica.instance);
+    if *published == Some(lifetime) {
+        return Ok(());
+    }
+    let profile = actual_profile(node)?;
+    let receipt = AbsenceReceipt {
+        deployment: launch.deployment.clone(),
+        session: launch.session.clone(),
+        node: launch.node.clone(),
+        fm: launch.fm.clone(),
+        generation: launch.generation.clone(),
+        node_pid: std::process::id(),
+        app_pid: profile.app_pid,
+        runtime_root: profile.runtime_root,
+        absence,
+    };
+    write_json(&launch.directory.join("absence.json"), &receipt)?;
+    *published = Some(lifetime);
+    Ok(())
+}
 fn receive_command(
     launch: &Launch,
     node: &mut Node,
@@ -1360,6 +1389,28 @@ fn receive_command(
         }
         "DeleteReplica" => {
             let (body, generation) = decode_delete_replica(message).map_err(err)?;
+            if launch.profile == ServiceProfile::StatefulPeerIdle && launch.placement == 2 {
+                let incoming = &body.replica.0;
+                // Native Delete matches ReplicaId, not FM's potentially older instance.
+                let instance = if incoming.replica.instance < launch.incarnation
+                    && node
+                        .snapshot(incoming.unit.id.guid.0)
+                        .committed
+                        .is_some_and(|state| state.peer_creation.is_some())
+                {
+                    incoming.replica.instance
+                } else {
+                    launch.incarnation
+                };
+                fixed_peer_target(
+                    launch,
+                    &body.replica.0.unit.id,
+                    &body.replica.0.replica,
+                    &launch.node,
+                    launch.replica,
+                    instance,
+                )?;
+            }
             node.fm_work(FmWork::DeleteReplica(
                 Box::new(body),
                 launch.fm.clone(),
@@ -3422,6 +3473,7 @@ pub(crate) mod report_tests {
         Failed,
         DeleteProvider,
         DeleteService,
+        DeleteAbsent,
     }
 
     pub(crate) async fn run_peer_creation_removal(
@@ -3433,6 +3485,7 @@ pub(crate) mod report_tests {
             PeerCreationOutcome::DeleteProvider | PeerCreationOutcome::DeleteService
         );
         let provider = matches!(outcome, PeerCreationOutcome::DeleteProvider);
+        let absent = matches!(outcome, PeerCreationOutcome::DeleteAbsent);
         let (mut source, source_store) = create_node(&launches[0]).await?;
         let (mut target, target_store) = create_node(&launches[1]).await?;
         let mut source_adapter = Adapter::default();
@@ -3520,10 +3573,14 @@ pub(crate) mod report_tests {
                 false,
             )?;
             let request = ledger.request_idle(Instant::now())?;
-            if deleting && receive_command(&launches[1], &mut target,
-                &delete_replica_message(&DeleteReplica::new(request.clone(), false), &launches[1].generation).map_err(err)?).is_ok()
-            {
-                return Err("peer Delete admitted an absent/not-yet-opened destination".into());
+            if deleting {
+                let mut foreign = request.clone();
+                foreign.replica.instance += 1;
+                if receive_command(&launches[1], &mut target,
+                    &delete_replica_message(&DeleteReplica::new(foreign, false), &launches[1].generation).map_err(err)?).is_ok()
+                {
+                    return Err("peer Delete admitted an unrelated destination incarnation".into());
+                }
             }
             fm.send(add_replica_message(&request, &launches[0].generation).map_err(err)?)
                 .await?;
@@ -3685,10 +3742,10 @@ pub(crate) mod report_tests {
                 if traffic.idle_removals[1] != expected {
                     return Err("local cleanup replay changed the reply".into());
                 }
-                if !deleting {
+                if !deleting && !absent {
                     ledger.idle_removal_reply(0, traffic.idle_removals[1].clone())?;
                 }
-                if ledger.idle_removal_status()["pending_remove"] != deleting
+                if ledger.idle_removal_status()["pending_remove"] != (deleting || absent)
                     || (failed
                         && (ledger.idle_status()["state"] != "failed"
                             || ledger.idle_status()["error"] != ra::RA_NOT_READY
@@ -3699,6 +3756,99 @@ pub(crate) mod report_tests {
                     return Err(
                         "semantic cleanup erased the original failure or claimed disposal".into(),
                     );
+                }
+                if absent {
+                    let (target_fm, target_fm_link) = links(&launches[1]).await?;
+                    let operation = async {
+                        if target.snapshot(entity).committed.is_some() || target.replica_absence().is_some() {
+                            return Err("absent deletion did not start before original Create delivery".into());
+                        }
+                        let deleting = ledger.request_idle_deletion(Instant::now())?;
+                        let mut target_traffic = Traffic::default();
+                        target_fm.send(delete_replica_message(&deleting, &launches[1].generation).map_err(err)?).await?;
+                        until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
+                            &mut target_traffic, |node, adapter, traffic| traffic.removed
+                                && adapter.replica_drained(node) && node.replica_absence().is_some()).await?;
+                        let lost = target_traffic.remove_reply.take().ok_or("missing absent DeleteReplicaReply")?;
+                        let tombstone = target.snapshot(entity).committed.ok_or("missing absent tombstone")?;
+                        if lost.unit != tombstone.body.unit || lost.replica != tombstone.body.replica
+                            || lost.unit.target != 0 || lost.unit.minimum != 0
+                            || target.instance_disposal().is_some() || target.retained_usage() != 0
+                        {
+                            return Err("absent Delete fabricated runtime disposal or a created FT description".into());
+                        }
+                        let mut published = None;
+                        publish_absence(&launches[1], &target, &mut published)?;
+                        let path = launches[1].directory.join("absence.json");
+                        ledger.read_absence(1, &path, std::process::id())?;
+                        if ledger.idle_deletion_status()["state"] != "pending"
+                            || ledger.idle_deletion_status()["never_created"] != true
+                            || ledger.idle_deletion_status()["disposed"] != false
+                            || ledger.idle_deletion_status()["destination_deleted"] != false
+                        {
+                            return Err("absence observation completed the lost semantic Delete reply".into());
+                        }
+                        let retry = ledger.idle_deletion_retry(1, Instant::now() + Duration::from_secs(11))
+                            .ok_or("missing absent Delete retry")?;
+                        if retry != deleting { return Err("absent Delete retry changed the original descriptor".into()); }
+                        target_traffic.removed = false;
+                        target_fm.send(delete_replica_message(&retry, &launches[1].generation).map_err(err)?).await?;
+                        until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
+                            &mut target_traffic, |_, _, traffic| traffic.removed).await?;
+                        if target_traffic.remove_reply.as_ref() != Some(&lost) {
+                            return Err("absent Delete replay changed its canonical native reply".into());
+                        }
+                        ledger.reply(1, lost, true)?;
+                        if ledger.idle_deletion_status()["state"] != "deleted"
+                            || ledger.idle_deletion_status()["completion"] != "never_created"
+                            || ledger.idle_deletion_status()["pending_remove"] != true
+                            || ledger.placements[1].created || ledger.placements[1].reusable
+                            || ledger.placements[1].retirement.is_some()
+                        {
+                            return Err("absent Delete fabricated disposal, creation, reuse or Primary removal".into());
+                        }
+                        let original_proof = serde_json::to_value(target.replica_absence()).map_err(err)?;
+                        source_link.send(create_replica_message(&create, &launches[0].generation).map_err(err)?).await?;
+                        let end = Instant::now() + Duration::from_secs(5);
+                        loop {
+                            peer_step(&launches[1], &mut target, &mut target_adapter, &target_link, Some(&target_fm_link)).await?;
+                            if !target_adapter.peer_commands.is_empty() { break; }
+                            if Instant::now() >= end { return Err("held original Create did not reach deleted destination".into()); }
+                        }
+                        for _ in 0..15 {
+                            peer_step(&launches[1], &mut target, &mut target_adapter, &target_link, Some(&target_fm_link)).await?;
+                            step(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link, &mut target_traffic).await?;
+                            step(&launches[0], &mut source, &mut source_adapter, &fm, &fm_link, &mut traffic).await?;
+                        }
+                        if target.snapshot(entity).committed.is_none_or(|state| state.open_token != 0
+                                || state.phase != ra::Phase::Closed || !state.local_deleted)
+                            || target.retained_usage() != 0 || target.instance_disposal().is_some()
+                            || target_adapter.peer_command_error.is_some() || target_adapter.peer_last_reply.is_some()
+                            || !target_traffic.reports.is_empty()
+                            || serde_json::to_value(target.replica_absence()).map_err(err)? != original_proof
+                            || target.activation().logs().iter().any(|line| line.contains("LOCAL_CALLBACK create_replica")
+                                || line.contains("LOCAL_CALLBACK open") || line.contains("LOCAL_CALLBACK close")
+                                || line.contains("LOCAL_DATA_PROVIDER acquired") || line.contains("LOCAL_DISPOSE begin"))
+                        {
+                            return Err("late Create opened/acquired/disposed a never-created destination".into());
+                        }
+                        let primary = source.snapshot(entity).committed.ok_or("Primary disappeared")?;
+                        if primary.remote_idle.as_ref().is_none_or(|remote| remote.build.is_some() || remote.ready || remote.reply.is_some()) {
+                            return Err("late Create resurrected the cancelled source build".into());
+                        }
+                        ledger.idle_removal_reply(0, traffic.idle_removals[1].clone())?;
+                        let continued = data_request(&endpoint, b"write-more\n").await?;
+                        if !continued.contains("committed=2 value=continued")
+                            || data_request(&endpoint, b"read\n").await? != continued
+                            || ledger.idle_deletion_status()["pending_remove"] != false
+                        {
+                            return Err("absent destination cleanup changed healthy Primary serving".into());
+                        }
+                        Ok(())
+                    }.await;
+                    let fm_closed = target_fm.close().await;
+                    let node_closed = target_fm_link.close().await;
+                    return operation.and(fm_closed).and(node_closed);
                 }
                 if !matches!(outcome, PeerCreationOutcome::Opened) && !deleting {
                     source_link
@@ -3812,7 +3962,9 @@ pub(crate) mod report_tests {
                         {
                             return Err("peer Delete admitted force/host termination".into());
                         }
-                        target_fm.send(delete_replica_message(&deleting, &launches[1].generation).map_err(err)?).await?;
+                        let mut older_instance = deleting.clone();
+                        older_instance.replica.0.replica.instance -= 1;
+                        target_fm.send(delete_replica_message(&older_instance, &launches[1].generation).map_err(err)?).await?;
                         let mut target_traffic = Traffic::default();
                         let marker = if provider { "LOCAL_DATA_PROVIDER dispose begin" } else { "LOCAL_DISPOSE begin" };
                         until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
@@ -3867,7 +4019,7 @@ pub(crate) mod report_tests {
                         if ledger.idle_deletion_status()["state"] != "deleted"
                             || ledger.idle_deletion_status()["pending_remove"] != true
                             || ledger.placements[1].reusable
-                            || target.retained_usage() != 0
+                            || target.retained_usage() != 0 || target.replica_absence().is_some()
                         {
                             return Err("destination Delete completed Primary removal or authorized replacement".into());
                         }

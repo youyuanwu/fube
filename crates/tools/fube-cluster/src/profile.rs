@@ -355,6 +355,71 @@ pub fn add_body(launch: &Launch, profile: &ActualProfile) -> AddInstance {
     body
 }
 
+pub fn dropped_replica(replica: &Replica) -> Replica {
+    Replica {
+        node: replica.node.clone(),
+        id: replica.id,
+        instance: replica.instance,
+        up: false,
+        state: 3,
+        ..Replica::default()
+    }
+}
+
+pub fn absent_replica_body(body: &AddInstance) -> AddInstance {
+    AddInstance {
+        unit: FailoverUnit {
+            id: body.unit.id.clone(),
+            consistency: body.unit.consistency.clone(),
+            current: body.unit.current,
+            ..FailoverUnit::default()
+        },
+        replica: dropped_replica(&body.replica),
+        service: body.service.clone(),
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbsenceReceipt {
+    pub deployment: String,
+    pub session: String,
+    #[serde(with = "json_node")]
+    pub node: NodeInstance,
+    #[serde(with = "json_node")]
+    pub fm: NodeInstance,
+    #[serde(with = "json_generation")]
+    pub generation: GenerationHeader,
+    pub node_pid: u32,
+    pub app_pid: u32,
+    pub runtime_root: PathBuf,
+    pub absence: fube_node::local::ReplicaAbsence,
+}
+impl AbsenceReceipt {
+    pub fn validate(&self, launch: &Launch, profile: &ActualProfile, node_pid: u32) -> Result<()> {
+        if launch.profile != ServiceProfile::StatefulPeerIdle
+            || launch.placement != 2
+            || launch.peer.is_none()
+            || self.deployment != launch.deployment
+            || self.session != launch.session
+            || self.node != launch.node
+            || self.fm != launch.fm
+            || self.generation != launch.generation
+            || self.node_pid != node_pid
+            || self.app_pid != profile.app_pid
+            || self.runtime_root != profile.runtime_root
+            || self.absence.body != absent_replica_body(&add_body(launch, profile))
+            || self.absence.command == 0
+            || self.absence.ra_operation == 0
+        {
+            return Err(
+                "absence proof does not match the original never-created peer replica".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Trusted local original-owner observation, deliberately outside native
 /// schemas. Semantic RemoveInstance/DeleteReplica and this proof are separate inputs.
 #[derive(Clone, Debug, Serialize, Deserialize)]

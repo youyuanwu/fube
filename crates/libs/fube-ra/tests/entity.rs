@@ -2614,6 +2614,130 @@ async fn fm_peer_idle_delete_uses_stateful_reply_and_retains_original_deleted_to
 }
 
 #[tokio::test]
+async fn fm_delete_before_peer_create_retains_native_absent_tombstone_without_open_or_reporting() {
+    let (store, executor, hooks) = setup(WAIT).await;
+    executor.bind_peer(peer_source()).unwrap();
+    let request = peer_request();
+    run(&executor, primary_delete(request.replica.0.clone(), false)).await;
+    let absent = state(&executor);
+    let expected_unit = FailoverUnit {
+        id: request.replica.0.unit.id.clone(),
+        consistency: request.replica.0.unit.consistency.clone(),
+        current: request.replica.0.unit.current,
+        ..FailoverUnit::default()
+    };
+    let expected = DeleteReplicaReply {
+        unit: expected_unit.clone(),
+        replica: Replica {
+            node: admission().local_node,
+            id: request.replica.0.replica.id,
+            instance: request.replica.0.replica.instance,
+            up: false,
+            state: 3,
+            ..Replica::default()
+        },
+        error: 0,
+    };
+    assert_eq!(absent.body.unit, expected_unit);
+    assert_eq!(absent.phase, Phase::Closed);
+    assert!(absent.local_deleted && absent.cleanup_pending);
+    assert_eq!((absent.open_token, absent.close_token), (0, 0));
+    assert!(
+        absent.runtime.is_none()
+            && absent.usage.is_none()
+            && absent.registration_lookups.is_empty()
+    );
+    assert!(absent.peer_creation.is_none() && absent.remote_idle.is_none());
+    assert!(
+        matches!(effects(&executor).as_slice(), [Effect::DeleteReplicaReply(reply)] if **reply == expected)
+    );
+    let writes = hooks.calls.load(Ordering::SeqCst);
+    for _ in 0..2 {
+        assert_eq!(
+            run(&executor, peer_create(request.clone())).await,
+            Disposition::IgnoredStale
+        );
+        assert!(effects(&executor).is_empty());
+        run(&executor, primary_delete(request.replica.0.clone(), false)).await;
+        assert!(
+            matches!(effects(&executor).as_slice(), [Effect::DeleteReplicaReply(reply)] if **reply == expected)
+        );
+    }
+    for future in 0..2 {
+        let mut replacement = request.clone();
+        if future == 0 {
+            replacement.replica.0.replica.id += 1;
+        }
+        replacement.replica.0.replica.instance += 1;
+        assert!(matches!(
+            executor
+                .submit(peer_create(replacement))
+                .unwrap()
+                .wait(WAIT)
+                .await,
+            Err(Failure::Unsupported(_))
+        ));
+        assert!(effects(&executor).is_empty());
+    }
+    assert_eq!(hooks.calls.load(Ordering::SeqCst), writes);
+    assert!(Arc::ptr_eq(&absent, &state(&executor)));
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn fm_absent_peer_delete_commit_barrier_fences_reply_and_queued_creation() {
+    for (unknown, fail) in [(false, false), (false, true), (true, false)] {
+        let (store, executor, hooks) = setup(if unknown {
+            Duration::from_millis(50)
+        } else {
+            WAIT
+        })
+        .await;
+        executor.bind_peer(peer_source()).unwrap();
+        let request = peer_request();
+        let (entered, release) = hooks.pause(fail);
+        let deletion = executor
+            .submit(primary_delete(request.replica.0.clone(), false))
+            .unwrap();
+        entered.await.unwrap();
+        assert!(executor.snapshot([1; 16]).committed.is_none());
+        assert!(effects(&executor).is_empty());
+        let late = (!fail).then(|| executor.submit(peer_create(request.clone())).unwrap());
+        if unknown {
+            assert_eq!(deletion.wait(WAIT).await, Err(Failure::Unknown));
+            assert!(executor.snapshot([1; 16]).fenced);
+            assert_eq!(late.as_ref().unwrap().status(), Status::Pending);
+            assert!(effects(&executor).is_empty());
+        }
+        release.send(()).unwrap();
+        let result = deletion.resolve(WAIT).await;
+        if fail {
+            assert!(matches!(result, Err(Failure::Store(_))));
+            assert!(executor.snapshot([1; 16]).committed.is_none());
+            assert!(effects(&executor).is_empty());
+            run(&executor, primary_delete(request.replica.0.clone(), false)).await;
+            assert_eq!(
+                run(&executor, peer_create(request)).await,
+                Disposition::IgnoredStale
+            );
+        } else {
+            assert_eq!(result, Ok(Disposition::Applied));
+            assert_eq!(
+                late.unwrap().resolve(WAIT).await,
+                Ok(Disposition::IgnoredStale)
+            );
+        }
+        assert!(matches!(
+            effects(&executor).as_slice(),
+            [Effect::DeleteReplicaReply(_)]
+        ));
+        assert_eq!(state(&executor).open_token, 0);
+        assert!(state(&executor).runtime.is_none() && state(&executor).usage.is_none());
+        finish(&store, &executor).await;
+    }
+}
+
+#[tokio::test]
 async fn fm_peer_idle_delete_rejects_pending_open_and_unowned_closed_cleanup() {
     let (store, executor, _) = setup(WAIT).await;
     executor.bind_peer(peer_source()).unwrap();

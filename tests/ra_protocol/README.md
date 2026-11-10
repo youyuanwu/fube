@@ -117,11 +117,15 @@ wire/schema evidence only, not original handler execution, native FM
 interoperability, or authorization of force deletion, recreation,
 reconfiguration, FMM execution or recovery.
 
-The bounded original opened-Idle destination deletion also reuses these
+The bounded original opened/never-created Idle destination deletion also reuses these
 inherited DeleteReplica/Reply bodies and factories; it adds no wire schema or
 fixture shape. Separate RA/store and real-process FM/Node/RAP tests qualify
 Idle deletion, held disposal, independent pending-remove, lost reply/replay and
-late-creation tombstones. They do not execute the native C++ deletion handler
+late-creation tombstones. The missing-FT reply uses native constructor-default
+FT target/minimum (zero) rather than copying the FM Add's 1/1 description.
+Its source-bound applied-Delete absence sidecar is a separate trusted-local DTO,
+not a new native schema or a fabricated runtime disposal receipt. Commit/model
+tests and actual child/Channel acceptance cover those semantics. They do not execute the native C++ deletion handler
 or expand the codec oracle's interoperability claims.
 
 ### Stage-two node control/load and endpoint codecs

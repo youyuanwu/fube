@@ -1712,13 +1712,6 @@ fn transition(
             // Native locked-entity TCP admission precedes processor prechecks,
             // description updates and identity decisions. No receipt-time latch.
             if let Some(current) = state {
-                if current.peer_creation.as_ref().map(|origin| &origin.source)
-                    != peer_creation.as_ref().map(|origin| &origin.source)
-                {
-                    return Err(Failure::Unsupported(
-                        "cannot change original peer creation authority",
-                    ));
-                }
                 if peer_creation.is_some() && current.phase == Phase::Closed {
                     // Native SendReplicaDroppedMessage suppresses a locally deleted replica.
                     let mut service = body.service.clone();
@@ -1734,6 +1727,13 @@ fn transition(
                         return Ok(Transition::ignored(Disposition::IgnoredStale));
                     }
                     return Err(Failure::Unsupported("peer tombstone recreation is gated"));
+                }
+                if current.peer_creation.as_ref().map(|origin| &origin.source)
+                    != peer_creation.as_ref().map(|origin| &origin.source)
+                {
+                    return Err(Failure::Unsupported(
+                        "cannot change original peer creation authority",
+                    ));
                 }
                 if current.body.service.stateful != local_stateful {
                     return Err(Failure::Unsupported(

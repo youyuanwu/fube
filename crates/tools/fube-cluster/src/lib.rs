@@ -739,7 +739,12 @@ impl Cluster {
             .as_ref()
             .ok_or("original node owner absent")?
             .pid();
-        self.ledger.read_retirement(index, &path, node_pid)
+        self.ledger.read_retirement(index, &path, node_pid)?;
+        self.ledger.read_absence(
+            index,
+            &child.launch.directory.join("absence.json"),
+            node_pid,
+        )
     }
     pub fn status(&self) -> Value {
         let mut status = self.ledger.status();
@@ -986,9 +991,9 @@ impl Cluster {
         }
         Ok(self.ledger.idle_removal_status())
     }
-    /// Delete the already-opened original abandoned destination, independently
-    /// of Primary-side RemoveReplica completion. Both reply and disposal proof
-    /// are required for completed cleanup; no successor lifetime is authorized.
+    /// Delete the original abandoned destination independently of Primary Remove.
+    /// Cleanup joins the native reply with original disposal or committed
+    /// never-created absence proof; neither authorizes a successor lifetime.
     pub async fn delete_idle_replica_via_fm(&mut self) -> Result<Value> {
         if self.finished.is_some()
             || self.children.len() != 2
@@ -1000,10 +1005,12 @@ impl Cluster {
         if current["state"] == "deleted" || current["state"] == "unknown" {
             return Ok(current);
         }
-        if self.ledger.idle_deletion.is_none()
-            && self.status()["peer_idle"]["target"]["open"] != true
-        {
-            return Err("FM Idle deletion requires the already-opened original destination".into());
+        if self.ledger.idle_deletion.is_none() {
+            let status = self.status();
+            let target = &status["peer_idle"]["target"];
+            if target["open"] != true && !(target.is_null() && self.ledger.idle_absence_allowed()) {
+                return Err("FM Idle deletion requires the original opened destination or an absent unanswered FM Add".into());
+            }
         }
         let body = self.ledger.request_idle_deletion(Instant::now())?;
         if let Err(error) = self.send_idle_deletion(&body).await {

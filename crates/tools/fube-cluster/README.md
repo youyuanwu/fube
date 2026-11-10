@@ -53,13 +53,14 @@ service remains owned until explicit cleanup or shutdown. Manual pre-Open,
 down/arbitrary-unknown cleanup and replacement remain gated.
 
 `Cluster::delete_idle_replica_via_fm().await` separately authorizes native
-`DeleteReplica(force=false)` on the **already-opened original destination**,
+`DeleteReplica(force=false)` on the **original destination**,
 after FM abandonment has been requested. It need not wait for
 `RemoveReplicaReply`: native FM schedules destination Delete independently of
 Primary pending-remove. Poll `peer_idle.fm_deletion` (also root `idle_deletion`).
 `destination_deleted=true` records the matching canonical dropped
 DeleteReplicaReply; `disposed=true` records the independent original-node
-disposal/committed-Close/exact-usage-release receipt. Only both inputs produce
+disposal/committed-Close/exact-usage-release receipt for an opened lifetime.
+The reply and matching cleanup proof together produce
 `state=deleted`/`complete=true`. Child observations or transport writes cannot
 complete either barrier. The original Delete retries on native 10/60-second
 cadence until its semantic reply, without another Close, Open or acquisition.
@@ -69,10 +70,29 @@ loss does not undo independently owned destination deletion.
 The app host/package remain resident and `reusable=false`; no replacement is
 authorized. Normal Delete produces no terminal ReplicaUp report. Delayed
 original CreateReplica is ignored by the deleted tombstone and cannot reopen
-the Idle. Pre-Open/absent deletion, force and broader peer cleanup remain gated.
+the Idle. Deletion during Open, force and broader peer cleanup remain gated.
 An original failed Add keeps its error even if an already-opened destination is
 explicitly deleted; semantic deletion clears to-be-dropped, and joined disposal
 clears destination-cleanup-required, separately from pending-remove.
+
+For the original **unanswered FM Add**, deletion also admits a destination
+that has no FT yet. RA commits the native missing-FT deleted tombstone and
+returns the canonical dropped reply, with the constructor's zero target/minimum
+and invalid package/LSNs, without registration lookup, RAP Open/Close or usage.
+A distinct `absence.json` sidecar carries the original Node's applied Delete
+command/RA-operation lineage and committed never-opened metadata. It is
+published only after original local work drains, with zero Open/Close history.
+FM joins that independently validated proof with the matching native reply and
+reports `completion=never_created`, `never_created=true`, `disposed=false`.
+An opened lifetime instead reports `completion=disposed`. Neither an absence
+observation alone nor a semantic reply alone completes cleanup. No runtime
+disposal or release receipt is invented for a service that never existed.
+The actual app host/package remain resident; `created_lifetime=false` and
+`reusable=false` distinguish metadata deletion from a created/reusable service.
+Late original CreateReplica is ignored without a dropped report or Open.
+First admission rejects an observed in-flight Open; that race remains gated,
+not successful absence. Failed/unknown absent lifetimes, arbitrary targets,
+future incarnations and replacement are not authorized by this branch.
 
 After an original CreateReplicaReply error, the Primary retains only a failed
 observation/tombstone (`creation_aborted=true`), not live creation/build authority.
@@ -139,7 +159,7 @@ new FM generations, mutation of the fixed service, and node2 FM creation.
 Build completion still leaves Idle/InBuild metadata, no service endpoint and
 denied access. There is no quorum addition, serving secondary, failover,
 replacement, or recovery. Removal
-before peer Open through the local API and destination deletion before Open remain gated; both original owners retain
+before peer Open through the local API and destination deletion during Open remain gated; both original owners retain
 normal cleanup.
 
 Build both executables, then run:

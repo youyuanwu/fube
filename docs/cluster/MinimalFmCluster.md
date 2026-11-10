@@ -426,8 +426,61 @@ Delete intent and Close completion remain behind their own commits. The reply
 uses native None/None/Dropped/down metadata, invalid version/LSNs and no endpoints.
 Normal deletion schedules no ReplicaDown/ReplicaDropped report. Same-incarnation
 CreateReplica after deletion is ignored without Open, build or usage acquisition.
-Missing/pre-Open destination deletion, force, arbitrary unknown/replacement,
+Deletion during Open, force, arbitrary unknown/replacement,
 active membership and recovery remain gated.
+
+### Deleting the original destination before CreateReplica
+
+For an original unanswered FM Add whose destination has no FT, the same
+`delete_idle_replica_via_fm()` API now authorizes normal deletion after FM
+abandonment intent, without waiting for Primary RemoveReplicaReply.
+This follows `ra/ReconfigurationAgent.cpp:777-834,4279-4293`,
+`ra/FailoverUnit.cpp:49-73,366-391` and
+`common/FailoverUnitDescription.cpp:11-29`: TryCreateFailoverUnit constructs a closed FT from
+ID/consistency/service, then UpdateInstanceForClosedReplica installs the
+original replica identity/current epoch before normal Delete.
+Its committed reply uses that native FT description, with previous epoch,
+target and minimum left at their constructor defaults (zero), and a canonical
+None/None/Dropped/down replica with invalid package/LSNs and no endpoints.
+It is not an echo of FM's original InBuild/1/1 descriptor, a RAP operation or a
+service disposal.
+
+The original Node retains the actual applied Delete command and RA-operation
+identities. `replica_absence()` publishes that distinct trusted-local proof only
+while the committed deleted tombstone has zero Open/Close tokens, no runtime,
+lookup or usage history, no RAP route/disposal witness and fully drained local
+work. The source-bound `absence.json` sidecar is independent of native messages
+and checked against the original node/session/generation, process/profile and
+frozen request. FM must join it with the matching canonical DeleteReplicaReply;
+either arrival order is valid. `peer_idle.fm_deletion` / root `idle_deletion`
+then reports `completion=never_created`, `never_created=true`, `disposed=false`
+and `state=deleted`/`complete=true`. There is no forged Close/disposal/H2-release
+lineage. `created_lifetime=false`, no retirement receipt and `reusable=false`
+remain explicit even though native replica metadata is deleted.
+
+Late same-incarnation CreateReplica follows the native closed/equal-instance
+branch (`ReconfigurationAgent.cpp:2283-2323`) without opening; the locally
+deleted FT suppresses its dropped report
+(`FailoverUnit.cpp:4015-4037,4720-4738`). Retries replay the original Delete reply
+and retain the original absence lineage. Definite/unknown commits cannot
+publish it early. Destination-owner loss leaves unresolved cleanup unknown;
+Primary pending-remove still requires its own RemoveReplicaReply.
+Only the original unanswered FM Add permits absent cleanup. An already-opened
+original still uses genuine disposal proof; observed/in-flight Open, failed or
+unknown absent lifetimes, force, arbitrary targets and later incarnations remain
+gated. No fresh lifetime, restart recovery or active membership is authorized.
+
+Controlled real application-process/Channel acceptance holds the original
+CreateReplica, loses the first actual DeleteReplicaReply, publishes/validates
+absence and retries for identical semantic replay before delivering late
+creation. The target performs zero create/Open/Close/provider-acquisition
+callbacks and retains zero usage, while the Primary can acknowledge/read its
+next write. A second public Cluster API test delays only original peer binding:
+both actual child processes run the production adapter and absence publisher;
+Delete completes even while the queued peer request holds back the independent
+Primary reply. Binding the original peer then delivers late creation without
+resurrection and allows FM's own pending-remove reply to complete. These are
+native-free process tests, not native C++ handler traces.
 
 Before explicit deletion, creation/build deliberately retains Idle/InBuild metadata, no service endpoint,
 denied read/write access and no active membership or quorum change even after
