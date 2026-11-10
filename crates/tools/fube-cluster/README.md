@@ -13,8 +13,24 @@ configuration. Stateless remains the default.
 
 `--stateful-peer-idle` is a separate fresh-start, fixed-generation opt-in:
 node1 alone receives FM AddPrimary; node2 is the bound remote volatile Idle
-for the **same partition**, with a distinct replica identity. After the Primary
-is ready, programmatic `Cluster::create_idle_replica().await` submits a trusted
+for the **same partition**, with a distinct replica identity.
+After the Primary is ready, `Cluster::add_idle_replica().await` lets FM own the
+complete native AddReplica -> CreateReplica/Reply -> RAP build -> AddReplicaReply
+sequence. It returns `pending`; poll `status()["peer_idle"]["fm"]` for
+`state=ready`/`ready=true`. Only the actual AddReplicaReply completes FM build,
+not the separate child `peer_idle.built`/`ready` observations.
+The Primary/FM remote description becomes Ready/Idle; the destination still
+stays Idle/InBuild, non-serving and unconfigured.
+FM retains and retries the original AddReplica every 10 seconds, backing off to
+60 seconds after the first minute. Duplicate creation/build requests preserve
+the original lifetime; Ready duplicates resend the reply without another build.
+Peer Open failure yields an explicit failed FM outcome requiring future removal;
+RAP build errors remain pending and retry through nonterminal cleanup.
+Local explicit removal cancels the FM add obligation and fences late success,
+without claiming FM RemoveReplicaReply or destination disposal. Original session
+loss yields unknown, never recovery or transparent adoption.
+
+The earlier manual path remains separate: `Cluster::create_idle_replica().await` submits a trusted
 local Primary-RA command and returns `pending`. Poll `status()["peer_idle"]`
 for the committed CreateReplicaReply observation (`open`, not built/serving).
 Retrying this API retains the exact original remote lifetime.
@@ -63,7 +79,7 @@ Peer loss does not dispose an application, fabricate a reply or reconnect.
 This profile admits CLI `create` on node1, `status`, and `quit` only; it rejects
 new FM generations, mutation of the fixed service, and node2 FM creation.
 Build completion still leaves Idle/InBuild metadata, no service endpoint and
-denied access. There is no FM AddReplica/Reply or RemoveReplica/Reply orchestration,
+denied access. There is no FM RemoveReplica/Reply orchestration,
 quorum addition, serving secondary, failover, replacement, or recovery. Removal
 before peer Open and remote deletion remain gated; both original owners retain
 normal cleanup.

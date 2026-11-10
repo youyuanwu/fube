@@ -19,7 +19,7 @@ class StageTwoCatalogTests(unittest.TestCase):
         records = {row["action"]: row for row in rows}
         self.assertEqual(len(rows), 119)
         self.assertEqual(sum(row["boundary"] == "true" for row in rows), 66)
-        self.assertEqual(sum("selected" in row["status"] for row in rows), 33)
+        self.assertEqual(sum("selected" in row["status"] for row in rows), 35)
         for action in consumer.STAGE_TWO_ACTIONS:
             with self.subTest(action=action):
                 row = records[action]
@@ -117,6 +117,7 @@ class StageTwoReceiptTests(unittest.TestCase):
             "native_constants": {"PToP": 0x8013, "PToPDirect": 0},
             "generation_factories": consumer.GENERATION_FACTORIES,
             "peer_factories": consumer.PEER_FACTORIES,
+            "replica_factories": consumer.REPLICA_FACTORIES,
             "evidence": "source-baseline-native-stream-with-schema-adapters",
             "cases": sorted(consumer.CASES),
             "files": {name: hashlib.sha256((self.bundle / name).read_bytes()).hexdigest()
@@ -194,6 +195,26 @@ class StageTwoReceiptTests(unittest.TestCase):
                     self.save()
                     with self.assertRaisesRegex(ValueError, "source/schema"):
                         consumer.validate(self.bundle, "a" * 40, self.source)
+
+    def test_add_replica_cases_and_factory_metadata_are_required_before_execution(self):
+        with patch.object(consumer.subprocess, "check_output") as execute:
+            for case in consumer.REPLICA_CASES:
+                self.manifest["cases"].remove(case)
+                self.save()
+                with self.assertRaises(ValueError):
+                    consumer.consume(self.bundle, self.root / "output", "a" * 40, self.source)
+                self.manifest["cases"] = sorted(consumer.CASES)
+            for action in consumer.REPLICA_FACTORIES:
+                for key, wrong in [("actor", 10), ("high_priority", False)]:
+                    self.manifest["replica_factories"] = {
+                        name: dict(fields) for name, fields in consumer.REPLICA_FACTORIES.items()
+                    }
+                    self.manifest["replica_factories"][action][key] = wrong
+                    self.save()
+                    with self.assertRaisesRegex(ValueError, "source/schema"):
+                        consumer.validate(self.bundle, "a" * 40, self.source)
+            execute.assert_not_called()
+        self.assertFalse((self.root / "output").exists())
 
     def test_every_peer_case_and_factory_is_required_before_any_execution(self):
         with patch.object(consumer.subprocess, "check_output") as execute:

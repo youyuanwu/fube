@@ -322,9 +322,22 @@ impl Cluster {
         let incoming = link
             .receive(Instant::now() + Duration::from_millis(1))
             .await?;
-        let Some(mut incoming) = incoming else {
+        let Some(incoming) = incoming else {
             return Ok(());
         };
+        self.receive_message(index, incoming).await
+    }
+    async fn receive_message(
+        &mut self,
+        index: usize,
+        mut incoming: fube_transport::channel::IncomingMessage<
+            fube_transport::native_channel::GatewayTarget,
+        >,
+    ) -> Result<()> {
+        let link = self.children[index]
+            .link
+            .as_ref()
+            .ok_or("original node link absent")?;
         wire::predecode(&incoming.message)?;
         let action = incoming.message.properties().map_err(err)?.action;
         let generation = self.children[index].launch.generation.clone();
@@ -450,6 +463,13 @@ impl Cluster {
                 )
                 .await?;
             }
+            "AddReplicaReply" => {
+                let (body, owner) = decode_add_replica_reply(&incoming.message).map_err(err)?;
+                if owner != Owner::Fm || self.config.profile != ServiceProfile::StatefulPeerIdle {
+                    return Err("AddReplicaReply requires the original peer-idle FM profile".into());
+                }
+                self.ledger.idle_reply(index, body)?;
+            }
             "AddInstanceReply"
             | "AddPrimaryReply"
             | "RemoveInstanceReply"
@@ -515,6 +535,10 @@ impl Cluster {
             };
             let result = match result {
                 Ok(()) => self.retry_node_work(index).await,
+                Err(error) => Err(error),
+            };
+            let result = match result {
+                Ok(()) => self.retry_idle(index).await,
                 Err(error) => Err(error),
             };
             if let Err(error) = result {
@@ -620,6 +644,24 @@ impl Cluster {
             .send(message)
             .await
     }
+    async fn retry_idle(&mut self, index: usize) -> Result<()> {
+        let Some(body) = self.ledger.idle_retry(index, Instant::now()) else {
+            return Ok(());
+        };
+        self.send_idle(&body).await
+    }
+    async fn send_idle(&self, body: &AddReplica) -> Result<()> {
+        let child = self
+            .children
+            .first()
+            .ok_or("missing original Primary owner")?;
+        child
+            .link
+            .as_ref()
+            .ok_or("original Primary link absent")?
+            .send(add_replica_message(body, &child.launch.generation).map_err(err)?)
+            .await
+    }
     async fn retry_deletion(&mut self, index: usize) -> Result<()> {
         if self.ledger.generation.is_some() {
             return Ok(());
@@ -698,6 +740,8 @@ impl Cluster {
                 "error": if failed { reply["error"].clone() } else { Value::Null },
                 "built":built, "serving":false,
                 "build":source["peer_idle"]["build"],
+                "fm":self.ledger.idle_status(),
+                "ready":source["peer_idle"]["ready"] == true,
                 "removal":source["peer_idle"]["removal"],
                 "source":source["peer_idle"], "target":target["local_replica"],
                 "peer_link_alive":[source["peer_link_alive"],target["peer_link_alive"]],
@@ -710,6 +754,9 @@ impl Cluster {
     /// Ask the original Primary RA to open its bound remote Idle. This is not
     /// an FM operation, build completion, or permission to serve.
     pub async fn create_idle_replica(&mut self) -> Result<Value> {
+        if self.ledger.idle.is_some() {
+            return Err("FM owns this Idle; use add_idle_replica".into());
+        }
         if self.config.profile != ServiceProfile::StatefulPeerIdle
             || self.finished.is_some()
             || self.children.len() != 2
@@ -751,6 +798,9 @@ impl Cluster {
     /// Ask the original Primary runtime to build its already opened peer Idle.
     /// Completion proves copy/application ACK, not active configuration or FM AddReplica.
     pub async fn build_idle_replica(&mut self) -> Result<Value> {
+        if self.ledger.idle.is_some() {
+            return Err("FM owns this Idle's build choreography".into());
+        }
         if self.config.profile != ServiceProfile::StatefulPeerIdle
             || self.finished.is_some()
             || self.children.len() != 2
@@ -783,6 +833,27 @@ impl Cluster {
             )
             .map_err(err)?;
         Ok(json!({"state":"pending","kind":"peer_idle_build","built":false,"serving":false}))
+    }
+    /// FM AddReplica owns peer creation, RAP build and semantic Ready-Idle completion.
+    pub async fn add_idle_replica(&mut self) -> Result<Value> {
+        if self.finished.is_some()
+            || self.children.len() != 2
+            || self.config.profile != ServiceProfile::StatefulPeerIdle
+            || self.peer_idle_requested && self.ledger.idle.is_none()
+        {
+            return Err("FM AddReplica requires the original unused peer-idle profile".into());
+        }
+        let current = self.ledger.idle_status();
+        if current["state"] != "absent" && current["state"] != "pending" {
+            return Ok(current);
+        }
+        let body = self.ledger.request_idle(Instant::now())?;
+        self.peer_idle_requested = true;
+        if let Err(error) = self.send_idle(&body).await {
+            self.ledger.lost(0, error.clone());
+            return Err(error);
+        }
+        Ok(self.ledger.idle_status())
     }
     /// Remove the original Idle from the Primary's replicator, not its remote
     /// application. Pending calls retry cancellation/cleanup; success is terminal.
@@ -820,6 +891,9 @@ impl Cluster {
                 .as_bytes(),
             )
             .map_err(err)?;
+        if let Some(idle) = &mut self.ledger.idle {
+            idle.cancelled = true;
+        }
         Ok(json!({"state":"pending","kind":"peer_idle_removal","built":false,"serving":false}))
     }
     /// Returns the retained operation outcome, never transport-write success.

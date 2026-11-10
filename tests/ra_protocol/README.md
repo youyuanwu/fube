@@ -37,7 +37,7 @@ not the complete production C++ RA classes, KTL/PAL qualification, a native
 handler trace test, or interoperability with the SF 11.8.121.4 qualification
 binaries. Neither runtime nor Federation compatibility follows from it.
 
-The C++ producer independently constructs expected values and emits 124 inputs.
+The C++ producer independently constructs expected values and emits 131 inputs.
 The existing 36 cases and their contracts are retained:
 default/rich AddInstance, default/error AddInstanceReply, default/rich Remove
 (force false/true), default/rich removal reply, explicit-empty/rich ReplicaUp
@@ -54,7 +54,7 @@ Nondefault cases cover GUID/raw NodeId, high-bit instances, negative LSN/epochs,
 UTF-16/surrogates, enums/errors, all service collections and null/Invalid/both
 derived scaling variants. Rust rejects every proper prefix of rich body
 fixtures including both rich force bodies and the rich/partial notification
-bodies; native rejects 34 truncated bodies, including NodeUp, Ack, PToP
+bodies; native rejects 36 truncated bodies, including NodeUp, Ack, PToP
 and the distinct DeleteReplica/Reply fixtures.
 Non-polymorphic Delete inheritance invokes base rich traversal and native
 base/derived scopes, not a flattened or nested replacement. ReplicaUp's empty
@@ -275,6 +275,35 @@ immediately continues into build, which is deliberately outside this slice.
 Model/real-session execution and runtime receipts are separate from this
 source-baseline native-stream/schema-adapter gate. No production native handler
 trace or Federation/binary interoperability is claimed.
+
+### FM AddReplica/Reply codecs
+
+Seven cases extend the preceding 124 inputs to 131, retaining 77 types/240 fields
+and producing 135 bundle files:
+`default-add-replica`, `rich-add-replica`, `default-add-replica-reply`,
+`rich-add-replica-reply-0`, `rich-add-replica-reply--2147017398`,
+`action-AddReplica` and `action-AddReplicaReply`.
+Both actions reuse native ReplicaMessageBody/ReplicaReplyMessageBody. The rich
+request selects a volatile 1/1 Idle/InBuild; the successful reply is Ready/Idle
+with no service endpoint, while the error reply remains InBuild. Actual native
+streams reject two additional truncated bodies, for 36 measured rejections.
+
+Source extraction verifies exact native FM-to-RA and RA-to-FM factory names,
+literal actions, actor RA=12/FM=11 and high priority=true. The producer binds
+that `replica_factories` metadata into the manifest; the compiler-free consumer
+requires every new case and exact metadata before executing either binary.
+Rust checks both public factories/decoders against independently produced
+native fields and envelope values, with FM/FMM generation preservation on
+requests and FM/FMM reply-owner codec support without a mandatory reply
+GenerationHeader. Every proper prefix is rejected, and cross-action decoding
+cannot reinterpret a peer CreateReplicaReply as FM completion.
+
+This is schema-adapter/native-stream evidence, not native handler execution.
+The bounded native-free FM/RA/Hosting/RAP build, lost-reply replay and removal
+race acceptance is separately described in
+[MinimalFmCluster.md](../../docs/cluster/MinimalFmCluster.md).
+Active membership, reconfiguration, FM removal, recovery and deployed native
+FM/Federation interoperability remain gated.
 
 ### Bootstrap and source identity header extension
 

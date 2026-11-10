@@ -3241,6 +3241,239 @@ async fn primary_close_fences_pending_idle_removal_without_claiming_remote_dispo
     finish(&store, &executor).await;
 }
 
+fn fm_idle_request(primary: &EntityState) -> AddReplica {
+    let mut body = (*primary.body).clone();
+    body.replica.node = peer_source();
+    body.replica.id += 1;
+    body.replica.instance += 1;
+    body.replica.current_role = 2;
+    body.replica.state = 1;
+    body.replica.service_endpoint.clear();
+    body.replica.replication_endpoint.clear();
+    body
+}
+fn fm_add_idle(body: AddReplica) -> Command {
+    Command::AddReplica {
+        body: Box::new(body),
+        source: admission().fm_source,
+        generation: GenerationHeader {
+            number: admission().generation,
+            for_fm_replica: false,
+        },
+    }
+}
+fn peer_opened(body: CreateReplicaReply) -> Command {
+    Command::CreateReplicaReply {
+        body: Box::new(body),
+        source: peer_source(),
+        generation: GenerationHeader {
+            number: admission().generation,
+            for_fm_replica: false,
+        },
+    }
+}
+
+#[tokio::test]
+async fn fm_add_idle_retries_creation_build_and_ready_reply_without_granting_membership() {
+    let (store, executor, _) = setup(WAIT).await;
+    executor.bind_peer(peer_source()).unwrap();
+    make_ready(&executor, &primary_body()).await;
+    let primary = state(&executor);
+    let request = fm_idle_request(&primary);
+    run(&executor, fm_add_idle(request.clone())).await;
+    let create = effects(&executor);
+    assert!(
+        matches!(&create[..], [Effect::PeerCreateReplica { target, body }]
+        if target == &peer_source() && body.replica.0 == request)
+    );
+    let creating = state(&executor);
+    let remote = creating.remote_idle.as_ref().unwrap();
+    assert_eq!(remote.fm_request.as_deref(), Some(&request));
+    assert!(remote.reply.is_none() && remote.build.is_none() && !remote.ready);
+    run(&executor, fm_add_idle(request.clone())).await;
+    assert_eq!(effects(&executor), create);
+    let mut opened = CreateReplicaReply {
+        unit: request.unit.clone(),
+        replica: request.replica.clone(),
+        error: 0,
+    };
+    opened.replica.replication_endpoint = "127.0.0.1:12346".into();
+    let mut foreign = opened.clone();
+    foreign.replica.instance += 1;
+    assert_eq!(
+        run(&executor, peer_opened(foreign)).await,
+        Disposition::IgnoredStale
+    );
+    run(&executor, peer_opened(opened.clone())).await;
+    let build = effects(&executor);
+    assert!(
+        matches!(&build[..], [Effect::BuildIdle { body, replica, registration }]
+        if body == &primary.body && **replica == opened.replica
+            && Some(registration) == primary.runtime.as_ref())
+    );
+    run(&executor, fm_add_idle(request.clone())).await;
+    assert_eq!(effects(&executor), build);
+    let mut completion = BuildCompletion {
+        unit: primary.body.unit.clone(),
+        local: primary.body.replica.clone(),
+        remote: opened.replica.clone(),
+        error: -993,
+        detail: ProxyErrorDetail::default(),
+    };
+    run(
+        &executor,
+        Command::CompleteBuild(Box::new(completion.clone())),
+    )
+    .await;
+    assert!(effects(&executor).is_empty()); // Native build errors do not finish FM AddReplica.
+    assert!(!state(&executor).remote_idle.as_ref().unwrap().ready);
+    run(&executor, fm_add_idle(request.clone())).await;
+    assert_eq!(effects(&executor), build);
+    completion.error = 0;
+    completion.local.last_lsn = 12;
+    run(
+        &executor,
+        Command::CompleteBuild(Box::new(completion.clone())),
+    )
+    .await;
+    let mut ready = opened.clone();
+    ready.replica.state = 2;
+    let reply = vec![Effect::AddReplicaReply(ready)];
+    assert_eq!(effects(&executor), reply);
+    let built = state(&executor);
+    assert!(built.remote_idle.as_ref().unwrap().ready);
+    assert_eq!(
+        built.remote_idle.as_ref().unwrap().reply.as_ref(),
+        Some(&opened)
+    );
+    assert_eq!(built.body, primary.body);
+    assert_eq!(built.runtime, primary.runtime);
+    run(&executor, fm_add_idle(request.clone())).await;
+    assert_eq!(effects(&executor), reply);
+    run(&executor, peer_opened(opened)).await;
+    assert_eq!(effects(&executor), reply);
+    run(
+        &executor,
+        Command::RemoveRemoteIdle(request.unit.id.clone()),
+    )
+    .await;
+    assert!(matches!(
+        &effects(&executor)[..],
+        [Effect::RemoveIdle { .. }]
+    ));
+    assert_eq!(
+        run(&executor, fm_add_idle(request)).await,
+        Disposition::IgnoredStale
+    );
+    assert_eq!(
+        run(&executor, Command::CompleteBuild(Box::new(completion))).await,
+        Disposition::IgnoredStale
+    );
+    assert!(state(&executor)
+        .remote_idle
+        .as_ref()
+        .unwrap()
+        .add_reply()
+        .is_none());
+    assert!(effects(&executor).is_empty());
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
+async fn fm_add_idle_admission_open_failure_and_close_never_fabricate_ready() {
+    for close in [false, true] {
+        let (store, executor, _) = setup(WAIT).await;
+        executor.bind_peer(peer_source()).unwrap();
+        let absent = primary_body();
+        assert!(executor.submit(fm_add_idle(absent)).is_err());
+        assert!(executor.entity_ids().is_empty());
+        make_ready(&executor, &primary_body()).await;
+        let primary = state(&executor);
+        let request = fm_idle_request(&primary);
+        for command in [
+            Command::AddReplica {
+                body: Box::new(request.clone()),
+                source: peer_source(),
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: false,
+                },
+            },
+            Command::AddReplica {
+                body: Box::new(request.clone()),
+                source: admission().fm_source,
+                generation: GenerationHeader {
+                    number: admission().generation,
+                    for_fm_replica: true,
+                },
+            },
+            {
+                let mut foreign = request.clone();
+                foreign.unit.current.configuration += 1;
+                fm_add_idle(foreign)
+            },
+        ] {
+            assert!(executor.submit(command).unwrap().wait(WAIT).await.is_err());
+        }
+        assert!(state(&executor).remote_idle.is_none());
+        assert!(effects(&executor).is_empty());
+        run(&executor, fm_add_idle(request.clone())).await;
+        effects(&executor);
+        let mut reply = CreateReplicaReply {
+            unit: request.unit.clone(),
+            replica: request.replica.clone(),
+            error: APPLICATION_INSTANCE_DELETED,
+        };
+        if close {
+            reply.error = 0;
+            reply.replica.replication_endpoint = "127.0.0.1:12346".into();
+            run(&executor, peer_opened(reply.clone())).await;
+            effects(&executor);
+            run(
+                &executor,
+                Command::CloseLocal {
+                    unit: request.unit.id.clone(),
+                    mode: CloseMode::Close,
+                },
+            )
+            .await;
+            effects(&executor);
+            let event = BuildCompletion {
+                unit: primary.body.unit.clone(),
+                local: primary.body.replica.clone(),
+                remote: reply.replica.clone(),
+                error: 0,
+                detail: ProxyErrorDetail::default(),
+            };
+            assert_eq!(
+                run(&executor, Command::CompleteBuild(Box::new(event))).await,
+                Disposition::IgnoredStale
+            );
+            assert_eq!(
+                run(&executor, fm_add_idle(request)).await,
+                Disposition::IgnoredStale
+            );
+            assert!(state(&executor).remote_idle.is_none());
+        } else {
+            run(&executor, peer_opened(reply.clone())).await;
+            assert_eq!(effects(&executor), [Effect::AddReplicaReply(reply.clone())]);
+            run(&executor, fm_add_idle(request.clone())).await;
+            assert_eq!(effects(&executor), [Effect::AddReplicaReply(reply)]);
+            assert!(!state(&executor).remote_idle.as_ref().unwrap().ready);
+            let mut replacement = request;
+            replacement.replica.instance += 1;
+            assert!(executor
+                .submit(fm_add_idle(replacement))
+                .unwrap()
+                .wait(WAIT)
+                .await
+                .is_err());
+        }
+        assert!(effects(&executor).is_empty());
+        finish(&store, &executor).await;
+    }
+}
+
 fn primary_body() -> AddPrimary {
     let mut request = body(1);
     request.service.stateful = true;

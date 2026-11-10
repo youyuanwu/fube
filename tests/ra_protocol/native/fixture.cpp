@@ -257,6 +257,39 @@ int main(int argc,char** argv) {
             run(mode,dir,"rich-create-replica-reply-"+std::to_string(error),peer_reply);
         }
         reject_truncated(peer_reply);
+        if(AddReplicaActor!=12 || AddReplicaReplyActor!=11 ||
+           !AddReplicaPriority || !AddReplicaReplyPriority)
+            throw std::runtime_error("native replica factory metadata mismatch");
+        ReplicaMessageBody idle;
+        run(mode,dir,"default-add-replica",idle);
+        c=0; rich(idle,c);
+        idle.fudesc_.targetReplicaSetSize_=1;
+        idle.fudesc_.minReplicaSetSize_=1;
+        idle.service_.targetReplicaSetSize_=1;
+        idle.service_.minReplicaSetSize_=1;
+        idle.service_.isStateful_=true;
+        idle.service_.hasPersistedState_=false;
+        idle.replica_.currentConfigurationRole_=Enum(2);
+        idle.replica_.previousConfigurationRole_=Enum(1);
+        idle.replica_.state_=Enum(1);
+        idle.replica_.isUp_=true;
+        run(mode,dir,"rich-add-replica",idle);
+        reject_truncated(idle);
+        ReplicaReplyMessageBody idle_reply;
+        run(mode,dir,"default-add-replica-reply",idle_reply);
+        c=0; rich(idle_reply,c);
+        idle_reply.fudesc_.targetReplicaSetSize_=1;
+        idle_reply.fudesc_.minReplicaSetSize_=1;
+        idle_reply.replica_.currentConfigurationRole_=Enum(2);
+        idle_reply.replica_.previousConfigurationRole_=Enum(1);
+        idle_reply.replica_.isUp_=true;
+        idle_reply.replica_.serviceLocation_.clear();
+        for(LONG error:{0, -2147017398}) {
+            idle_reply.errorCode_.value_=Enum(error);
+            idle_reply.replica_.state_=Enum(error==0 ? 2 : 1);
+            run(mode,dir,"rich-add-replica-reply-"+std::to_string(error),idle_reply);
+        }
+        reject_truncated(idle_reply);
         // Native empty ctor leaves bools unspecified: explicitly initialize the fixture.
         ReplicaUpMessageBody up;
         up.isLastReplicaUpMessage_=false; up.isFromFMM_=false;
@@ -266,7 +299,7 @@ int main(int argc,char** argv) {
             up.isLastReplicaUpMessage_=last!=0; up.isFromFMM_=fmm!=0;
             run(mode,dir,"rich-replica-up-"+std::to_string(last)+"-"+std::to_string(fmm),up);
         }
-        for(auto name:{u"RemoveInstance",u"RemoveInstanceReply",u"ReplicaUp",u"ReplicaUpReply",u"AddPrimary",u"AddPrimaryReply",u"DeleteReplica",u"DeleteReplicaReply",u"CreateReplica",u"CreateReplicaReply"}) {
+        for(auto name:{u"RemoveInstance",u"RemoveInstanceReply",u"ReplicaUp",u"ReplicaUpReply",u"AddPrimary",u"AddPrimaryReply",u"DeleteReplica",u"DeleteReplicaReply",u"CreateReplica",u"CreateReplicaReply",u"AddReplica",u"AddReplicaReply"}) {
             action.action_=text(name);
             std::string ascii; for(const auto ch:std::u16string(name)) ascii.push_back(char(ch));
             run(mode,dir,"action-"+ascii,action);
@@ -483,7 +516,7 @@ int main(int argc,char** argv) {
         PToPHeader rejected_ptop;
         if(decode(bad,rejected_ptop)) throw std::runtime_error("native accepted truncated PToP");
         ++native_truncation_rejections;
-        if(native_truncation_rejections!=34)
+        if(native_truncation_rejections!=36)
             throw std::runtime_error("native truncation coverage mismatch");
         std::cout << "native rejects " << native_truncation_rejections << " truncations OK\n";
         return 0;

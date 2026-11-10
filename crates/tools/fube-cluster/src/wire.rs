@@ -55,6 +55,7 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
                 | "ServiceTypeNotification"
                 | "AddInstanceReply"
                 | "AddPrimaryReply"
+                | "AddReplicaReply"
                 | "RemoveInstanceReply"
                 | "DeleteReplicaReply"
                 | "NodeActivateReply"
@@ -73,6 +74,7 @@ fn fm_ingress(message: &Message, props: &Properties) -> fube_transport::Result<(
                     | "ReplicaUp"
                     | "AddInstanceReply"
                     | "AddPrimaryReply"
+                    | "AddReplicaReply"
                     | "RemoveInstanceReply"
                     | "DeleteReplicaReply"
                     | "GenerationUpdateReject"
@@ -92,6 +94,7 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
                 props.action.as_str(),
                 "AddInstance"
                     | "AddPrimary"
+                    | "AddReplica"
                     | "RemoveInstance"
                     | "DeleteReplica"
                     | "ReplicaUpReply"
@@ -102,6 +105,7 @@ fn node_ingress(message: &Message, props: &Properties) -> fube_transport::Result
             props.action.as_str(),
             "AddInstance"
                 | "AddPrimary"
+                | "AddReplica"
                 | "RemoveInstance"
                 | "DeleteReplica"
                 | "ReplicaUpReply"
@@ -286,7 +290,7 @@ pub fn predecode(message: &Message) -> Result<()> {
         "NodeUpAck" => {
             decode::<NodeUpAck>(&message.body)?;
         }
-        "AddInstance" | "AddPrimary" => {
+        "AddInstance" | "AddPrimary" | "AddReplica" => {
             decode::<AddInstance>(&message.body)?;
         }
         "CreateReplica" => {
@@ -298,7 +302,11 @@ pub fn predecode(message: &Message) -> Result<()> {
         "RemoveInstance" | "DeleteReplica" => {
             decode::<RemoveInstance>(&message.body)?;
         }
-        "AddInstanceReply" | "AddPrimaryReply" | "RemoveInstanceReply" | "DeleteReplicaReply" => {
+        "AddInstanceReply"
+        | "AddPrimaryReply"
+        | "AddReplicaReply"
+        | "RemoveInstanceReply"
+        | "DeleteReplicaReply" => {
             decode::<AddInstanceReply>(&message.body)?;
         }
         "ReplicaUp" | "ReplicaUpReply" => {

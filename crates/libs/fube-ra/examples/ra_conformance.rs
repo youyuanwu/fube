@@ -776,6 +776,83 @@ fn peer_contracts(input: &Path, output: &Path) {
     }
 }
 
+fn replica_contracts(input: &Path, output: &Path) {
+    let mut request = support::rich_request();
+    request.unit.target = 1;
+    request.unit.minimum = 1;
+    request.service.target = 1;
+    request.service.minimum = 1;
+    request.service.stateful = true;
+    request.service.persisted = false;
+    request.replica.current_role = 2;
+    request.replica.previous_role = 1;
+    request.replica.state = 1;
+    request.replica.up = true;
+    for (name, body) in [
+        ("default-add-replica", AddReplica::default()),
+        ("rich-add-replica", request),
+    ] {
+        check(input, output, name, body.clone());
+        for fmm in [false, true] {
+            let native = generation_envelope(input, name, "AddReplica", true, fmm);
+            let generation = support::rich_generation(fmm);
+            assert_eq!(
+                decode_add_replica(&native).unwrap(),
+                (body.clone(), generation.clone())
+            );
+            factory_contract(&native, &add_replica_message(&body, &generation).unwrap());
+            assert!(decode_add_primary(&native).is_err());
+            assert!(decode_create_replica(&native).is_err());
+        }
+        reject_prefixes::<AddReplica>(input, name);
+    }
+    let mut replies = vec![(
+        "default-add-replica-reply".to_owned(),
+        AddReplicaReply::default(),
+    )];
+    for error in [0, -2_147_017_398] {
+        let mut reply = support::rich_reply(error);
+        reply.unit.target = 1;
+        reply.unit.minimum = 1;
+        reply.replica.current_role = 2;
+        reply.replica.previous_role = 1;
+        reply.replica.state = if error == 0 { 2 } else { 1 };
+        reply.replica.up = true;
+        reply.replica.service_endpoint.clear();
+        replies.push((format!("rich-add-replica-reply-{error}"), reply));
+    }
+    for (name, body) in replies {
+        check(input, output, &name, body.clone());
+        for (actor, owner) in [("actor-11", Owner::Fm), ("actor-10", Owner::Fmm)] {
+            let mut native = stage_two_envelope(input, &name, "AddReplicaReply", actor, None);
+            native
+                .headers
+                .iter_mut()
+                .find(|h| h.id == HIGH_PRIORITY)
+                .unwrap()
+                .value = fs::read(input.join("priority.bin")).unwrap();
+            assert_eq!(
+                decode_add_replica_reply(&native).unwrap(),
+                (body.clone(), owner)
+            );
+            factory_contract(&native, &add_replica_reply_message(&body, owner).unwrap());
+            assert!(decode_add_primary_reply(&native).is_err());
+            assert!(decode_create_replica_reply(&native).is_err());
+        }
+        reject_prefixes::<AddReplicaReply>(input, &name);
+    }
+    for action in ["AddReplica", "AddReplicaReply"] {
+        check(
+            input,
+            output,
+            &format!("action-{action}"),
+            Scalar {
+                value: action.to_owned(),
+            },
+        );
+    }
+}
+
 fn check_peer<T: Serialize + DeserializeOwned + Debug + PartialEq + Clone>(
     input: &Path,
     output: &Path,
@@ -1030,6 +1107,7 @@ fn main() {
         .expect("clap requires Rust output");
     assert!(input.is_dir() && output.is_dir());
     peer_contracts(input, output);
+    replica_contracts(input, output);
     check(input, output, "default-request", AddInstance::default());
     check(input, output, "rich-request", support::rich_request());
     check(input, output, "default-reply", AddInstanceReply::default());

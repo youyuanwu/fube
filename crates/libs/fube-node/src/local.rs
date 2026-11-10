@@ -168,6 +168,7 @@ enum Work {
     StatefulOpen(Arc<AddInstance>),
     PrimaryOpen(Arc<AddInstance>),
     AddPrimary(Arc<AddPrimary>, NodeInstance, GenerationHeader),
+    AddReplica(Arc<AddReplica>, NodeInstance, GenerationHeader),
     Fm(FmWork),
     Close(PartitionId, ra::CloseMode),
     Registered(ra::RegistrationCompletion),
@@ -838,6 +839,30 @@ impl Node {
         self.admit_fm(source, generation)?;
         self.authorize_open(body, 4, Some((source.clone(), generation.clone())))
     }
+    pub fn add_replica_from_fm(
+        &mut self,
+        body: AddReplica,
+        source: &NodeInstance,
+        generation: &GenerationHeader,
+    ) -> Result<u64> {
+        self.admit_fm(source, generation)?;
+        if self.activation.profile() != h::local::Profile::VolatileStatefulFmPrimary
+            || !self.live.load(Ordering::SeqCst)
+            || self.ra.generation_state().upload_pending
+            || self.ra.peer().as_ref() != Some(&body.replica.node)
+            || self.selected.as_ref().is_none_or(|selected| {
+                body.unit != selected.unit || body.service != selected.service
+            })
+            || to_vec(&body).map_err(|_| Error::Protocol)?.len() > ADD_BODY
+        {
+            return Err(Error::Unsupported);
+        }
+        self.enqueue(Work::AddReplica(
+            Arc::new(body),
+            source.clone(),
+            generation.clone(),
+        ))
+    }
     fn check_service(&self, body: &AddInstance, stateful: bool) -> Result<()> {
         let premise = self.activation.premise().ok_or(Error::Unsupported)?;
         let expected = self.activation.declared_type().ok_or(Error::Unsupported)?;
@@ -1061,6 +1086,11 @@ impl Node {
         match work {
             Work::BuildIdle(unit) => ra::Command::BuildRemoteIdle(unit.clone()),
             Work::Built(event) => ra::Command::CompleteBuild(Box::new(event.clone())),
+            Work::AddReplica(body, source, generation) => ra::Command::AddReplica {
+                body: Box::new((**body).clone()),
+                source: source.clone(),
+                generation: generation.clone(),
+            },
             Work::RemoveIdle(unit) => ra::Command::RemoveRemoteIdle(unit.clone()),
             Work::Removed(event) => ra::Command::CompleteRemoval(Box::new(event.clone())),
             Work::PeerIdle(unit, replica) => ra::Command::CreateRemoteIdle {
@@ -1639,6 +1669,7 @@ impl Node {
             | ra::Effect::NodeActivateReply(_)
             | ra::Effect::NodeDeactivateReply(_)
             | ra::Effect::PrimaryReply(_)
+            | ra::Effect::AddReplicaReply(_)
             | ra::Effect::LocalStatefulOpenReply(_)
             | ra::Effect::RemoveReply(_)
             | ra::Effect::DeleteReplicaReply(_) => LocalDisposition::LocalResponse,

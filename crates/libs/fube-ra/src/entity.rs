@@ -317,6 +317,11 @@ pub enum Command {
         source: NodeInstance,
         generation: GenerationHeader,
     },
+    AddReplica {
+        body: Box<AddReplica>,
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
     CreateReplica {
         body: Box<CreateReplica>,
         source: NodeInstance,
@@ -399,6 +404,10 @@ pub enum Command {
     },
 }
 enum Kind {
+    AddReplica {
+        source: NodeInstance,
+        generation: GenerationHeader,
+    },
     CreateReplica {
         source: NodeInstance,
         generation: GenerationHeader,
@@ -564,6 +573,7 @@ pub struct Snapshot {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
+    AddReplicaReply(AddReplicaReply),
     RemoveIdle {
         body: Arc<AddInstance>,
         replica: Box<Replica>,
@@ -929,6 +939,15 @@ impl Executor {
                 Kind::AddPrimary { source, generation },
                 to_vec(&body),
             ),
+            Command::AddReplica {
+                body,
+                source,
+                generation,
+            } => (
+                body.unit.id.guid.0,
+                Kind::AddReplica { source, generation },
+                to_vec(&body),
+            ),
             Command::CreateReplica {
                 body,
                 source,
@@ -1099,6 +1118,9 @@ impl Executor {
             return Err(Failure::Closed);
         }
         let new_entity = !node_work && !view.entities.contains_key(&entity);
+        if new_entity && matches!(kind, Kind::AddReplica { .. }) {
+            return Err(Failure::Admission("AddReplica requires an existing FT"));
+        }
         if view.stats.outstanding >= settings.max_outstanding
             || view.stats.queued_bytes + charge > settings.max_queued_bytes
             || view.effects.len() + view.reserved_effects + reserved_effects > settings.max_effects
@@ -1551,6 +1573,9 @@ fn transition(
         #[cfg(feature = "qualification")]
         Kind::QualificationTerminate => panic!("explicit qualification worker termination"),
         Kind::CreateRemoteIdle => peer::start_remote(work, state, admission, peer),
+        Kind::AddReplica { source, generation } => {
+            peer::add_from_fm(work, state, source, generation, admission, peer)
+        }
         Kind::BuildRemoteIdle => peer::start_build(state, admission, peer),
         Kind::CompleteBuild => peer::complete_build(work, state),
         Kind::RemoveRemoteIdle => peer::start_removal(state, admission, peer),
@@ -2067,7 +2092,10 @@ async fn entity_worker(
             effective_admission.generation = view.generations.receive.clone();
             if matches!(
                 work.kind,
-                Kind::CreateRemoteIdle | Kind::BuildRemoteIdle | Kind::RemoveRemoteIdle
+                Kind::CreateRemoteIdle
+                    | Kind::BuildRemoteIdle
+                    | Kind::RemoveRemoteIdle
+                    | Kind::AddReplica { .. }
             ) && view.generations.upload_pending
             {
                 Err(Failure::Unsupported(

@@ -275,10 +275,26 @@ def peer_factories(native):
     return result
 
 
+def replica_factories(native):
+    text = (native / "src/prod/src" / COMMON / "RSMessage.cpp").read_text()
+    result = {}
+    for action, factory, actor in [
+        ("AddReplica", "CreateFMToRAMessage", 12),
+        ("AddReplicaReply", "CreateRAToFMMessage", 11),
+    ]:
+        matches = re.findall(
+            rf'RSMessage::{action}\s*=\s*(\w+)\(L"([^"]+)",\s*(true|false)\b', text,
+        )
+        if matches != [(factory, action, "true")]:
+            raise ValueError(f"native replica factory changed: {action}")
+        result[action] = {"actor": actor, "high_priority": True}
+    return result
+
+
 def generate(native, destination):
     models = extract(native)
     constants = native_constants(native)
-    factories = generation_factories(native) | peer_factories(native)
+    factories = generation_factories(native) | peer_factories(native) | replica_factories(native)
     output = [
         "// Generated from pinned native headers; source macro/member provenance below.",
         "#pragma once", "#include <Serialization.h>", "#include <FabricSerializationHelper.h>",

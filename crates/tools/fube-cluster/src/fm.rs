@@ -106,6 +106,15 @@ pub struct Ledger {
     pub placements: [Placement; 2],
     pub operations: Vec<Operation>,
     pub(crate) generation: Option<GenerationHandshake>,
+    pub(crate) idle: Option<IdleBuild>,
+}
+pub(crate) struct IdleBuild {
+    pub body: AddReplica,
+    pub reply: Option<AddReplicaReply>,
+    pub cancelled: bool,
+    unknown: bool,
+    started: Instant,
+    last: Instant,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GenerationPhase {
@@ -496,6 +505,7 @@ impl Ledger {
             placements: [Placement::new(one), Placement::new(two)],
             operations: vec![],
             generation: None,
+            idle: None,
         }
     }
     pub fn accept(&mut self, command: Command) -> Result<Accepted> {
@@ -806,6 +816,9 @@ impl Ledger {
         }
     }
     pub fn lost(&mut self, index: usize, error: String) {
+        if let Some(idle) = &mut self.idle {
+            idle.unknown = true;
+        }
         let placement = &mut self.placements[index];
         placement.link_alive = false;
         placement.pending = None;
@@ -833,6 +846,9 @@ impl Ledger {
         }
     }
     pub fn down(&mut self, index: usize) {
+        if let Some(idle) = &mut self.idle {
+            idle.unknown = true;
+        }
         let placement = &mut self.placements[index];
         // A delayed down observation cannot undo confirmed disposal.
         if placement.observed == Observed::Absent {
@@ -1022,6 +1038,7 @@ impl Ledger {
     }
     pub fn status(&self) -> Value {
         json!({"nodes":self.placements.iter().map(Placement::status).collect::<Vec<_>>(),
+            "idle_build":self.idle_status(),
             "generation_handshake": self.generation.as_ref().map(GenerationHandshake::status),
             "operations":self.operations.iter().map(|op|
                 if op.command.action == "status" {
@@ -1029,6 +1046,119 @@ impl Ledger {
                 } else { op.outcome.clone() }).collect::<Vec<_>>(),
             "operation_capacity":64, "retained_operations":self.operations.len(),
             "unsupported":"all native families outside the selected fixed lifecycle profile"})
+    }
+    pub fn request_idle(&mut self, now: Instant) -> Result<AddReplica> {
+        if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
+            || self.generation.is_some()
+            || self.placements[0].observed != Observed::Running
+            || self
+                .placements
+                .iter()
+                .any(|p| !p.link_alive || !p.activated || p.bootstrap != Bootstrap::Admitted)
+        {
+            return Err(
+                "Idle build requires the original admitted two-node Primary profile".into(),
+            );
+        }
+        if let Some(idle) = &mut self.idle {
+            if idle.cancelled || idle.unknown || idle.reply.is_some() {
+                return Err("original FM Idle build is no longer pending".into());
+            }
+            idle.last = now;
+            return Ok(idle.body.clone());
+        }
+        let mut body = self.placements[0].body()?;
+        body.replica = self.placements[1].body()?.replica;
+        body.replica.current_role = 2;
+        if body.replica.version != body.service.version {
+            return Err("peer packages do not share the original deployment version".into());
+        }
+        self.idle = Some(IdleBuild {
+            body: body.clone(),
+            reply: None,
+            cancelled: false,
+            unknown: false,
+            started: now,
+            last: now,
+        });
+        Ok(body)
+    }
+    pub fn idle_reply(&mut self, index: usize, body: AddReplicaReply) -> Result<()> {
+        let Some(idle) = &mut self.idle else {
+            return Ok(());
+        };
+        if index != 0
+            || idle.cancelled
+            || idle.unknown
+            || idle.reply.is_some()
+            || self.placements[0].observed != Observed::Running
+            || self.placements.iter().any(|p| !p.link_alive)
+            || body.unit != idle.body.unit
+            || body.replica.node != idle.body.replica.node
+            || body.replica.id != idle.body.replica.id
+            || body.replica.instance != idle.body.replica.instance
+        {
+            return Ok(());
+        }
+        if body.error == 0
+            && (body.replica.current_role != 2
+                || body.replica.previous_role != 1
+                || body.replica.state != 2
+                || !body.replica.up
+                || body.replica.version != idle.body.replica.version
+                || !body.replica.service_endpoint.is_empty()
+                || body.replica.replication_endpoint.is_empty())
+        {
+            return Err("AddReplicaReply is not the original Ready Idle".into());
+        }
+        idle.reply = Some(body);
+        Ok(())
+    }
+    pub fn idle_retry(&mut self, index: usize, now: Instant) -> Option<AddReplica> {
+        let idle = self.idle.as_mut()?;
+        if index != 0
+            || self.generation.is_some()
+            || idle.cancelled
+            || idle.unknown
+            || idle.reply.is_some()
+            || self.placements[0].observed != Observed::Running
+            || self
+                .placements
+                .iter()
+                .any(|p| !p.link_alive || !p.activated)
+        {
+            return None;
+        }
+        let interval = if now > idle.started + Duration::from_secs(60) {
+            60
+        } else {
+            10
+        };
+        if now <= idle.last + Duration::from_secs(interval) {
+            return None;
+        }
+        idle.last = now;
+        Some(idle.body.clone())
+    }
+    pub fn idle_status(&self) -> Value {
+        let Some(idle) = &self.idle else {
+            return json!({"state":"absent","ready":false});
+        };
+        let error = idle.reply.as_ref().map(|reply| reply.error);
+        let state = if idle.unknown {
+            "unknown"
+        } else if idle.cancelled {
+            "cancelled"
+        } else if error == Some(0) {
+            "ready"
+        } else if error.is_some() {
+            "failed"
+        } else {
+            "pending"
+        };
+        json!({"state":state, "kind":"fm_idle_build", "ready":state == "ready",
+            "serving":false, "request":idle.body, "reply":idle.reply,
+            "error":error, "cleanup_required":idle.cancelled || error.is_some_and(|e| e != 0)})
     }
     /// Native Replica::CanGenerateAction and PendingTask's creating-primary branch.
     pub fn primary_retry(&mut self, index: usize, now: Instant) -> Result<Option<AddPrimary>> {

@@ -220,7 +220,7 @@ The Primary retains a bounded remote-Open observation. An exact current peer
 reply is not proof of copy, build, active membership, quorum or serving
 readiness. Primary Close invalidates the observation and fences late replies.
 Fresh-start/fixed-generation admission is required; LFUM rebuild, peer
-recreation/adoption, persisted state, ActiveSecondary promotion, AddReplica
+recreation/adoption, persisted state, ActiveSecondary promotion
 and reconfiguration remain gated.
 
 After observing `status()["peer_idle"]["state"] == "open"`, the separate
@@ -231,6 +231,39 @@ The existing RAP binds the native invocation before calling
 `IPrimaryReplicator::build_replica`; the request uses the native empty-runtime,
 default-service control shape and one exact opened remote descriptor.
 No new FM or peer network action is enabled.
+
+The separate `Cluster::add_idle_replica()` API now lets FM own the whole original
+Idle build, rather than requiring manual create/build calls. It sends native
+AddReplica to the Primary's existing FT (metadata F, not a creating command),
+with the exact original epoch, service, normal FM generation and remote
+incarnation. Primary RA publishes its frozen FM request before CreateReplica;
+successful peer Open publishes the actual endpoint and build obligation before
+RAP dispatch. Matching RAP build success marks the Primary-side remote Idle
+Ready and emits native AddReplicaReply. This is native
+`ReconfigurationAgent.cpp:1856-2042,2851-2939,4027-4091` and
+`FailoverUnit.cpp:427-505`'s ordinary N/I build branch, not activation.
+
+The destination remains Idle/InBuild, unconfigured, with denied access and no
+service endpoint. FM updates only its matching up/InBuild original Idle after
+receiving AddReplicaReply; it does not mark node2 as a serving Primary. Poll
+`peer_idle.fm.state`/`ready` (also `idle_build` in ledger status), not the separate
+diagnostic child `peer_idle.built`/`ready` fields. The method returns pending
+until that semantic reply is consumed. FM automatically retries the frozen
+request on the native 10/60-second action cadence. Pending duplicates resend
+CreateReplica or RAP build as appropriate; Ready duplicates resend the same
+reply without another Open/build. A lost FM reply cannot turn child telemetry
+into FM success.
+
+Peer creation failure returns an AddReplicaReply error, leaving FM cleanup
+required; the bounded original observation is retained for error replay instead
+of authorizing another lifetime. RAP build errors remain diagnostics/pending
+and retry through existing nonterminal cleanup, not failed FM completion.
+Broader replacement, configuration repair and FM RemoveReplica/Reply remain
+gated. Manual create/build cannot adopt or mutate an FM-owned Idle.
+Local explicit removal cancels the FM add obligation and fences queued/late
+success; cancellation does not fabricate RemoveReplicaReply. Primary Close
+also fences late build and queued FM success. Original session loss leaves FM
+unknown, not permission to reconnect or recover.
 
 The destination application owns a joined copy/replication pump using public
 `IStateReplicator`/`IOperationStream`/`IOperation` contracts. It applies the
@@ -296,7 +329,8 @@ destination DeleteReplica completion is inferred.
 
 This increment deliberately retains Idle/InBuild metadata, no service endpoint,
 denied read/write access and no active membership or quorum change even after
-copy completes. It sends no AddReplicaReply. The real-process acceptance writes
+copy completes. Manual build sends no AddReplicaReply; only the distinct
+FM-owned flow above emits that reply. The real-process acceptance writes
 before build, observes nonempty copied values and retry results on the actual
 destination, then proves a second write is applied/ACKed there while the peer
 remains unconfigured and non-serving. `write-more\n` and `state\n` are bounded
@@ -307,6 +341,11 @@ write, and verifies that the destination remains opened with unchanged copied
 data rather than being deleted or recreated. Controlled RAP/model cases cover
 failed builds, in-flight cancellation/retry, removal failures, stale replies,
 absent-replica normalization and delayed-build tombstones.
+FM-owned actual-process acceptance additionally drops the first real
+AddReplicaReply, proves FM stays pending, retries the same AddReplica to receive
+the cached Ready-Idle result, and checks ongoing replication without another
+destination Open. A separate removal race rejects late success while preserving
+the destination service/data and a writable original Primary.
 
 These are native-derived model/store and native-free real-process contracts,
 not full C++ handler traces or native Federation interoperability.
