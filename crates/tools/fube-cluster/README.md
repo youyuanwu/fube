@@ -154,8 +154,17 @@ and explicit FM Primary-side removal remains available after loss.
 Actual two-child acceptance kills the original destination app, holds Primary
 removal, exercises stale/lost ACK and metadata reply replay, and verifies
 continued Primary writes. Pending-Add and commit/owner cases have separate
-model/store coverage. Opening/already-closing loss and broader unknown targets
-remain gated; no wire schema or native handler qualification is added.
+model/store coverage.
+Normal RAP Close now preserves the original committed opened Idle's origin
+through Closing. AppHostDown can supersede that pending Close and use the same
+loss path, without treating partial provider/service cleanup or a late Close
+reply as disposal. Close winning first instead leaves later HostDown stale.
+Controlled owned-Node/process/Channel tests hold real provider/service disposal,
+kill the app, and verify metadata reply replay, late traffic and independent
+Primary removal/writes. Separate Close-origin/loss/ACK commit barriers are
+covered by model/store tests. No child-node Close-control feature is added.
+Opening loss, other pending-close modes and broader unknown targets remain
+gated; no wire schema or native handler qualification is added.
 
 After an original CreateReplicaReply error, the Primary retains only a failed
 observation/tombstone (`creation_aborted=true`), not live creation/build authority.

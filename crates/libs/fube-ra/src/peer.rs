@@ -8,6 +8,8 @@ pub struct PeerCreation {
     pub registration_error: Option<i64>,
     pub open_error: Option<i64>,
     pub host_down: bool,
+    /// Normal Close committed from the original successfully opened Idle.
+    pub close_started_open: bool,
 }
 
 impl EntityState {

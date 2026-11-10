@@ -158,6 +158,11 @@ and the unchanged 30-second retry are lifecycle evidence, not new schemas.
 Actual two-child destination app termination, lost ACK/metadata reply replay
 and healthy Primary writes do not establish native C++ handler execution,
 runtime disposal or replacement permission. The oracle remains 139 cases.
+The same lifecycle path now covers AppHostDown during normal RAP Close
+started from the original opened Idle. Committed Close-origin lineage and
+late-Close rejection keep partial cleanup separate from disposal; actual held
+provider/service process-loss acceptance and Close/loss/ACK commit barriers
+remain independent from these unchanged codec cases and native-handler evidence.
 
 ### Stage-two node control/load and endpoint codecs
 

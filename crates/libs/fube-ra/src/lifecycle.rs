@@ -337,14 +337,19 @@ fn start_close_inner(
         return;
     }
     let was_creating = state.phase == Phase::Opening;
-    if mode == CloseMode::AppHostDown
-        && state.phase == Phase::Ready
-        && state.body.replica.current_role == 2
-        && state.runtime.is_some()
-        && state.usage.is_some()
-    {
+    if state.body.replica.current_role == 2 && state.runtime.is_some() && state.usage.is_some() {
         if let Some(peer) = &mut state.peer_creation {
-            peer.host_down = true;
+            if mode == CloseMode::Close && state.phase == Phase::Ready {
+                peer.close_started_open = true;
+            }
+            if mode == CloseMode::AppHostDown
+                && (state.phase == Phase::Ready
+                    || (state.phase == Phase::Closing
+                        && state.close_mode == Some(CloseMode::Close)
+                        && peer.close_started_open))
+            {
+                peer.host_down = true;
+            }
         }
     }
     if mode.deletes() {

@@ -229,7 +229,8 @@ additional model/process evidence does not change codec counts or establish
 full native handler execution.
 The original opened peer Idle now uses the same AppHostDown down-stage/dropped
 report and processed-list ACK, followed by closed metadata Delete without RAP.
-Only loss observed in the original open peer lifetime gains RA report authority;
+Only loss observed in the original open peer lifetime, or a normal Close that
+committed from that opened lifetime, gains RA report authority;
 FM requires its frozen original Add and exact live destination session/lineage.
 Known pending Add can join this loss report, never serving/build success.
 The existing immediate-send/30-second retry and 10/60-second metadata Delete
@@ -240,6 +241,14 @@ Actual two-child app-process loss, stale/lost ACK, metadata reply replay and
 healthy Primary writes are qualified separately from model/store commit/owner
 barriers and native C++ handler execution. See the
 [opened destination loss guide](MinimalFmCluster.md#unexpected-opened-destination-app-host-loss).
+For normal Close in flight, native [RA:1144-1181,3903-3924][ra-main] and
+[FT:4831-4840,5422-5424,4948-5014][ft] allow volatile AppHostDown to supersede
+Close and ignore its late reply after closure. The Rust RA retains actual
+opened-origin Close lineage only after the Close commit, not for initial Open
+or other pending-close modes. Held real provider/service disposal followed by
+process loss uses the existing report/ACK/metadata path without a disposal
+receipt. Controlled Node/process/Channel acceptance and separate three-stage
+commit/race tests add no wire types or native handler execution claim.
 
 ### Stage-two native codec contracts and execution boundary
 
@@ -551,7 +560,7 @@ reporting `failed_open` with genuine disposal while retaining the Add failure
 and independent Primary pending-remove. Held provider/service disposal and
 actual process/Channel acceptance use the existing dynamic Open Drop=1 policy
 for qualification only; production defaults remain unchanged.
-Opening/already-closing host-loss and other failed/unknown absent lifetimes, force, arbitrary targets
+Opening/other-close-mode host-loss and other failed/unknown absent lifetimes, force, arbitrary targets
 and replacement remain gated. No wire type/shape or native handler qualification
 is added by the trusted-local absence DTO.
 

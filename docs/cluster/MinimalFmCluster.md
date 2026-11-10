@@ -399,6 +399,17 @@ its Open has completed (RA Ready, still Idle/InBuild). The RA retains this
 specific origin; local-only Idle, opening/failed creation and arbitrary closed
 peer lifetimes do not gain terminal-report authority.
 
+Normal RAP Close can now retain that original open origin through Closing.
+Only a Close started from the committed opened Idle with its runtime/usage
+records this lineage; a Close during initial Open does not qualify.
+Native `ReconfigurationAgent.cpp:1144-1181`,
+`FailoverUnit.cpp:4831-4840,5422-5424,4948-5014` allow AppHostDown to supersede
+pending Close and make volatile host loss terminal rather than retrying it.
+If HostDown wins, the same loss report/ACK/metadata path applies. Late
+ReplicaCloseReply is stale once the FT is closed
+(`ReconfigurationAgent.cpp:3903-3924`), never successful-Close disposal proof.
+If Close commits first, later HostDown is stale and does not reclassify it.
+
 Native `FailoverUnit.cpp:5472-5544` calls OnReplicaDown for AppHostDown, even
 though a volatile FT closes as dropped. RA therefore retains **ReplicaDown
 stage** and sends the canonical description in ReplicaUp's **dropped list**.
@@ -433,8 +444,18 @@ metadata Delete reply, then verifies independent Primary removal and writes.
 Model/store tests cover pending/acknowledged Add, unrelated reports, independent
 owner loss and separate failed/unknown loss/ACK commits. These are source-derived
 and native-free process/Channel results, not native C++ handler execution or
-FM/Federation interoperability. Opening/already-closing loss, broader down/
-arbitrary-unknown cleanup and replacement remain gated.
+FM/Federation interoperability.
+Separate controlled owned-Node/production-adapter/process/Channel acceptance
+holds provider or service disposal during an actual normal RAP Close, then
+kills the original app. Provider disposal can block before the service Close
+callback begins. No completed disposal is inferred from partially completed
+callbacks, HostDown's exact usage release or metadata deletion. Stale ACK,
+metadata reply replay, late Create/Add and independent Primary removal/writes
+retain their existing barriers. Model/store tests cover Close versus HostDown
+winning, late Close replies, and separate Close-origin/loss/ACK commit failures
+and uncertainty. This adds no child-node Close-control feature or wire schema.
+Opening loss, other pending-close modes, broader down/arbitrary-unknown cleanup
+and replacement remain gated.
 
 ### Deleting the original opened destination Idle
 
@@ -618,7 +639,7 @@ Lost Delete reply/replay, late Create/Add, retained error and healthy Primary
 writes are exercised. Model/store tests cover separate failure/Delete commits,
 definite failure, uncertainty, foreign lineage/proof conflicts and owner loss.
 This adds no native wire schema or C++ handler/interoperability qualification.
-Opening/already-closing host-loss and other failed/unknown absent/down cleanup
+Opening/other-close-mode host-loss and other failed/unknown absent/down cleanup
 remain gated.
 
 ### Deleting the original destination before CreateReplica
