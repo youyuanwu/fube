@@ -70,7 +70,7 @@ loss does not undo independently owned destination deletion.
 The app host/package remain resident and `reusable=false`; no replacement is
 authorized. Normal Delete produces no terminal ReplicaUp report. Delayed
 original CreateReplica is ignored by the deleted tombstone and cannot reopen
-the Idle. Deletion during Open, force and broader peer cleanup remain gated.
+the Idle. Deletion during pre-registration Opening, force and broader peer cleanup remain gated.
 An original failed Add keeps its error even if an already-opened destination is
 explicitly deleted; semantic deletion clears to-be-dropped, and joined disposal
 clears destination-cleanup-required, separately from pending-remove.
@@ -90,8 +90,16 @@ disposal or release receipt is invented for a service that never existed.
 The actual app host/package remain resident; `created_lifetime=false` and
 `reusable=false` distinguish metadata deletion from a created/reusable service.
 Late original CreateReplica is ignored without a dropped report or Open.
-First admission rejects an observed in-flight Open; that race remains gated,
-not successful absence. Failed/unknown absent lifetimes, arbitrary targets,
+First admission also permits the original registered in-flight Open with its
+committed runtime/usage ownership. Delete commits Closing, cancels RAP Open and
+retries Close after the original callback drains, on the unchanged 15-second
+Node cadence. A control returned after cancellation is retained for cleanup
+and aborted before the service, never opened or published as Ready.
+This branch freezes disposal as required: retries cannot downgrade it to
+never-created absence. Held real Open and independently held provider/service
+disposal, late traffic, reply replay and actual child adapters qualify the path.
+Pre-registration Open remains gated, not successful absence.
+Failed/unknown absent lifetimes, arbitrary targets,
 future incarnations and replacement are not authorized by this branch.
 
 After an original CreateReplicaReply error, the Primary retains only a failed
@@ -159,7 +167,8 @@ new FM generations, mutation of the fixed service, and node2 FM creation.
 Build completion still leaves Idle/InBuild metadata, no service endpoint and
 denied access. There is no quorum addition, serving secondary, failover,
 replacement, or recovery. Removal
-before peer Open through the local API and destination deletion during Open remain gated; both original owners retain
+before peer Open through the local API and destination deletion during
+pre-registration Opening remain gated; both original owners retain
 normal cleanup.
 
 Build both executables, then run:

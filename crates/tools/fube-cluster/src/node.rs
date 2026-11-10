@@ -1845,7 +1845,31 @@ pub(crate) mod report_tests {
         traffic: &mut Traffic,
         ready: impl Fn(&Node, &Adapter, &Traffic) -> bool,
     ) -> Result<()> {
-        let end = Instant::now() + Duration::from_secs(10);
+        until_with_budget(
+            launch,
+            node,
+            adapter,
+            fm,
+            link,
+            traffic,
+            Duration::from_secs(10),
+            ready,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn until_with_budget(
+        launch: &Launch,
+        node: &mut Node,
+        adapter: &mut Adapter,
+        fm: &Link,
+        link: &Link,
+        traffic: &mut Traffic,
+        budget: Duration,
+        ready: impl Fn(&Node, &Adapter, &Traffic) -> bool,
+    ) -> Result<()> {
+        let end = Instant::now() + budget;
         while !ready(node, adapter, traffic) {
             if Instant::now() >= end {
                 return Err(format!(
@@ -2673,6 +2697,23 @@ pub(crate) mod report_tests {
     }
 
     fn release_disposal(node: &Node, mode: StatefulDown) -> Result<()> {
+        release_fixture_barrier(
+            node,
+            if matches!(
+                mode,
+                StatefulDown::CloseProvider
+                    | StatefulDown::DropProvider
+                    | StatefulDown::AbortProvider
+                    | StatefulDown::ForceAbortProvider
+            ) {
+                "local-provider-dispose.release"
+            } else {
+                "local-dispose.release"
+            },
+        )
+    }
+
+    fn release_fixture_barrier(node: &Node, name: &str) -> Result<()> {
         let application = &node
             .activation()
             .premise()
@@ -2686,20 +2727,8 @@ pub(crate) mod report_tests {
             .root()
             .ok_or("missing owned root")?
             .join(format!("deployment/{application}_App1/work"))
-            .join(
-                if matches!(
-                    mode,
-                    StatefulDown::CloseProvider
-                        | StatefulDown::DropProvider
-                        | StatefulDown::AbortProvider
-                        | StatefulDown::ForceAbortProvider
-                ) {
-                    "local-provider-dispose.release"
-                } else {
-                    "local-dispose.release"
-                },
-            );
-        fs::write(path, b"release original disposer").map_err(err)
+            .join(name);
+        fs::write(path, b"release original callback/disposer").map_err(err)
     }
 
     async fn exercise_stateful_down(
@@ -3474,6 +3503,8 @@ pub(crate) mod report_tests {
         DeleteProvider,
         DeleteService,
         DeleteAbsent,
+        DeleteOpeningProvider,
+        DeleteOpeningService,
     }
 
     pub(crate) async fn run_peer_creation_removal(
@@ -3482,9 +3513,19 @@ pub(crate) mod report_tests {
     ) -> Result<Result<()>> {
         let deleting = matches!(
             outcome,
-            PeerCreationOutcome::DeleteProvider | PeerCreationOutcome::DeleteService
+            PeerCreationOutcome::DeleteProvider
+                | PeerCreationOutcome::DeleteService
+                | PeerCreationOutcome::DeleteOpeningProvider
+                | PeerCreationOutcome::DeleteOpeningService
         );
-        let provider = matches!(outcome, PeerCreationOutcome::DeleteProvider);
+        let provider = matches!(
+            outcome,
+            PeerCreationOutcome::DeleteProvider | PeerCreationOutcome::DeleteOpeningProvider
+        );
+        let opening = matches!(
+            outcome,
+            PeerCreationOutcome::DeleteOpeningProvider | PeerCreationOutcome::DeleteOpeningService
+        );
         let absent = matches!(outcome, PeerCreationOutcome::DeleteAbsent);
         let (mut source, source_store) = create_node(&launches[0]).await?;
         let (mut target, target_store) = create_node(&launches[1]).await?;
@@ -3504,9 +3545,9 @@ pub(crate) mod report_tests {
                     APPLICATION,
                     &[(
                         "Arguments".into(),
-                        format!("--stateful-lifecycle --data-replicator{}", if deleting {
+                        format!("--stateful-lifecycle --data-replicator{}{}", if deleting {
                             if provider { " --block-provider-dispose" } else { " --block-dispose" }
-                        } else { "" }),
+                        } else { "" }, if opening { " --block-open" } else { "" }),
                     )],
                 )
                 .map_err(err)?;
@@ -3620,7 +3661,9 @@ pub(crate) mod report_tests {
                         )
                         .await?;
                     let end = Instant::now() + Duration::from_secs(8);
-                    while target_adapter.peer_last_reply.is_none() {
+                    while if opening {
+                        !target.activation().logs().iter().any(|line| line.contains("LOCAL_OPEN held"))
+                    } else { target_adapter.peer_last_reply.is_none() } {
                         peer_step(
                             &launches[1],
                             &mut target,
@@ -3763,7 +3806,7 @@ pub(crate) mod report_tests {
                         if target.snapshot(entity).committed.is_some() || target.replica_absence().is_some() {
                             return Err("absent deletion did not start before original Create delivery".into());
                         }
-                        let deleting = ledger.request_idle_deletion(Instant::now())?;
+                        let deleting = ledger.request_idle_deletion(Instant::now(), true)?;
                         let mut target_traffic = Traffic::default();
                         target_fm.send(delete_replica_message(&deleting, &launches[1].generation).map_err(err)?).await?;
                         until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
@@ -3850,6 +3893,7 @@ pub(crate) mod report_tests {
                     let node_closed = target_fm_link.close().await;
                     return operation.and(fm_closed).and(node_closed);
                 }
+                if !opening {
                 if !matches!(outcome, PeerCreationOutcome::Opened) && !deleting {
                     source_link
                         .send(
@@ -3952,10 +3996,11 @@ pub(crate) mod report_tests {
                 {
                     return Err("cancelled creation reached the Primary replicator".into());
                 }
+                }
                 if deleting {
                     let (target_fm, target_fm_link) = links(&launches[1]).await?;
                     let deletion = async {
-                        let deleting = ledger.request_idle_deletion(Instant::now())?;
+                        let deleting = ledger.request_idle_deletion(Instant::now(), false)?;
                         if receive_command(&launches[1], &mut target,
                             &delete_replica_message(&DeleteReplica::new(deleting.replica.0.clone(), true),
                                 &launches[1].generation).map_err(err)?).is_ok()
@@ -3966,6 +4011,29 @@ pub(crate) mod report_tests {
                         older_instance.replica.0.replica.instance -= 1;
                         target_fm.send(delete_replica_message(&older_instance, &launches[1].generation).map_err(err)?).await?;
                         let mut target_traffic = Traffic::default();
+                        if opening {
+                            until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
+                                &mut target_traffic, |node, _, _| node.activation().logs().iter()
+                                    .any(|line| line.contains("LOCAL_OPEN cancelled"))).await?;
+                            let closing = target.snapshot(entity).committed.ok_or("missing closing original Idle")?;
+                            if closing.phase != ra::Phase::Closing || !closing.local_deleted || closing.cleanup_pending
+                                || closing.runtime.is_none() || target.retained_usage() != 1
+                                || target.instance_disposal().is_some() || target.replica_absence().is_some()
+                                || target_traffic.removed || !target_traffic.reports.is_empty()
+                                || target_adapter.peer_last_reply.is_some()
+                            {
+                                return Err("held registered Open completed deletion/creation or released ownership early".into());
+                            }
+                            source_link.send(create_replica_message(&create, &launches[0].generation).map_err(err)?).await?;
+                            peer_step(&launches[1], &mut target, &mut target_adapter, &target_link, Some(&target_fm_link)).await?;
+                        }
+                        let continued = data_request(&endpoint, b"write-more\n").await?;
+                        if !continued.contains("committed=2 value=continued") {
+                            return Err("held destination deletion blocked the Primary".into());
+                        }
+                        if opening {
+                            release_fixture_barrier(&target, "local-open.release")?;
+                        }
                         let marker = if provider { "LOCAL_DATA_PROVIDER dispose begin" } else { "LOCAL_DISPOSE begin" };
                         until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
                             &mut target_traffic, |node, _, _| node.activation().logs().iter().any(|line| line.contains(marker))).await?;
@@ -3982,13 +4050,13 @@ pub(crate) mod report_tests {
                         {
                             return Err("held Idle disposal published deletion or released its original use".into());
                         }
-                        let continued = data_request(&endpoint, b"write-more\n").await?;
-                        if !continued.contains("committed=2 value=continued") {
-                            return Err("held destination disposal blocked the Primary".into());
+                        if data_request(&endpoint, b"read\n").await? != continued {
+                            return Err("held destination disposal changed the Primary".into());
                         }
                         release_disposal(&target, if provider { StatefulDown::CloseProvider } else { StatefulDown::CloseService })?;
-                        until(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
-                            &mut target_traffic, |node, adapter, traffic| traffic.removed
+                        until_with_budget(&launches[1], &mut target, &mut target_adapter, &target_fm, &target_fm_link,
+                            &mut target_traffic, Duration::from_secs(if opening { 20 } else { 10 }),
+                            |node, adapter, traffic| traffic.removed
                                 && adapter.replica_drained(node) && node.instance_disposal().is_some()).await?;
                         let profile = actual_profile(&target)?;
                         let proof = RetirementReceipt {
@@ -4035,12 +4103,19 @@ pub(crate) mod report_tests {
                                 != serde_json::to_value(Some(&proof.disposal)).map_err(err)?
                             || target_adapter.peer_command_error.is_some()
                             || target.activation().logs().iter().filter(|line| line.contains("LOCAL_CALLBACK open")).count() != 1
-                            || target.activation().logs().iter().filter(|line| line.contains("LOCAL_CALLBACK close")).count() != 1
+                            || target.activation().logs().iter().filter(|line| line.contains("LOCAL_CALLBACK close")).count() != usize::from(!opening)
+                            || target.activation().logs().iter().filter(|line| line.contains("LOCAL_CALLBACK abort")).count() != usize::from(opening)
                             || target.activation().logs().iter().filter(|line| line.contains("LOCAL_DATA_PROVIDER acquired")).count() != 1
                             || !target_traffic.reports.is_empty()
                             || source.snapshot(entity).committed.is_none_or(|state| state.remote_idle.as_ref().is_none_or(|remote| remote.build.is_some() || remote.ready))
                         {
                             return Err("late peer/build traffic resurrected or reacquired the deleted Idle".into());
+                        }
+                        if opening && (target_adapter.peer_last_reply.is_some()
+                            || !traffic.idle_adds.is_empty()
+                            || !target.activation().logs().iter().any(|line| line.contains("LOCAL_OPEN released")))
+                        {
+                            return Err("cancelled Open published peer/FM creation success".into());
                         }
                         ledger.idle_removal_reply(0, traffic.idle_removals[1].clone())?;
                         if ledger.idle_deletion_status()["pending_remove"] != false
@@ -4058,6 +4133,9 @@ pub(crate) mod report_tests {
             }
             .await;
             if deleting {
+                if opening {
+                    release_fixture_barrier(&target, "local-open.release")?;
+                }
                 release_disposal(&target, if provider { StatefulDown::CloseProvider } else { StatefulDown::CloseService })?;
             }
             let source_closed = source_link.close().await;

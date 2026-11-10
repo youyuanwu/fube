@@ -59,6 +59,12 @@ struct Arguments {
     block_provider_dispose: bool,
     #[arg(long)]
     open_delay_ms: Option<u64>,
+    #[arg(
+        long,
+        requires = "stateful_lifecycle",
+        conflicts_with_all = ["open_delay_ms", "stateful_primary"]
+    )]
+    block_open: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -68,6 +74,7 @@ struct Mode {
     block_provider_dispose: bool,
     close_error: bool,
     open_delay: u64,
+    block_open: bool,
 }
 struct Factory(Mode);
 struct StatefulFactory {
@@ -169,7 +176,7 @@ impl IStatefulServiceReplica for StatefulReplica {
         &self,
         mode: OpenMode,
         partition: Arc<dyn IStatefulServicePartition>,
-        _: Cancellation,
+        cancel: Cancellation,
     ) -> ApiFuture<'_, Box<dyn IPrimaryReplicator>> {
         Box::pin(async move {
             assert_eq!(mode, OpenMode::New);
@@ -228,6 +235,30 @@ impl IStatefulServiceReplica for StatefulReplica {
                 Box::new(LocalControl(Mutex::new(None)))
             };
             tokio::time::sleep(Duration::from_millis(self.resource.mode.open_delay)).await;
+            if self.resource.mode.block_open {
+                marker("LOCAL_OPEN held");
+                let release = self.resource.resource.with_file_name("local-open.release");
+                std::fs::write(release.with_file_name("local-open.held"), b"original Open")
+                    .expect("publish fixture Open barrier");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut cancelled = false;
+                    while !release.exists() {
+                        if cancel.is_cancelled() && !cancelled {
+                            marker("LOCAL_OPEN cancelled");
+                            std::fs::write(
+                                release.with_file_name("local-open.cancelled"),
+                                b"original Close",
+                            )
+                            .expect("publish fixture Open cancellation");
+                            cancelled = true;
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                })
+                .await
+                .expect("bounded fixture Open barrier timed out");
+                marker("LOCAL_OPEN released");
+            }
             Ok(control)
         })
     }
@@ -926,6 +957,7 @@ async fn main() {
         block_provider_dispose: args.block_provider_dispose,
         close_error: args.close_error_block_dispose,
         open_delay: args.open_delay_ms.unwrap_or(0),
+        block_open: args.block_open,
     };
     let stateful_registration = args.stateful_register;
     let native = data_replicator.then(|| runtime.native_integration_provider());
@@ -1097,6 +1129,11 @@ mod argument_tests {
         );
         assert!(parse("--stateful-register").unwrap().stateful_register);
         assert!(parse("--delay-ms 0").is_ok());
+        assert!(
+            parse("--stateful-lifecycle --data-replicator --block-open --block-dispose")
+                .unwrap()
+                .block_open
+        );
     }
 
     #[test]
@@ -1111,6 +1148,9 @@ mod argument_tests {
             "--block-dispose --close-error-block-dispose",
             "--delay-ms",
             "--open-delay-ms invalid",
+            "--block-open",
+            "--stateful-primary --block-open",
+            "--stateful-lifecycle --block-open --open-delay-ms 1",
             "--delay-ms -1",
             "--crash-after-ms 18446744073709551616",
         ] {

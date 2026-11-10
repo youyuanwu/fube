@@ -535,6 +535,9 @@ impl Node {
                                     || (state.peer_creation.is_some()
                                         && state.body.replica.current_role == 2
                                         && (state.phase == ra::Phase::Ready
+                                            || (state.phase == ra::Phase::Opening
+                                                && state.runtime.is_some()
+                                                && state.usage.is_some())
                                             || state.local_deleted)))
                         }
                     };

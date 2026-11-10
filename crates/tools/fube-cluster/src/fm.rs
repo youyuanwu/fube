@@ -1436,7 +1436,11 @@ impl Ledger {
     }
     /// Native PendingTask schedules Delete independently of PendingRemove.
     /// Absence completion is restricted to the original unanswered FM Add.
-    pub fn request_idle_deletion(&mut self, now: Instant) -> Result<DeleteReplica> {
+    pub fn request_idle_deletion(
+        &mut self,
+        now: Instant,
+        allow_absence: bool,
+    ) -> Result<DeleteReplica> {
         if self.placements[0].launch.profile != crate::ServiceProfile::StatefulPeerIdle
             || self.generation.is_some()
             || !self.placements[1].link_alive
@@ -1463,17 +1467,19 @@ impl Ledger {
             return Err("original Idle abandonment owner is unknown".into());
         }
         let body = DeleteReplica::new(removal.body.clone(), false);
-        let absence_allowed = self.idle_absence_allowed();
+        if allow_absence && !self.idle_absence_allowed() {
+            return Err("absence requires the original unanswered FM Add".into());
+        }
         self.idle_deletion = Some(IdleDeletion {
             body: body.clone(),
             reply: None,
-            absence_allowed,
+            absence_allowed: allow_absence,
             absence: None,
             unknown: false,
             started: now,
             last: now,
         });
-        if !absence_allowed {
+        if !allow_absence {
             self.placements[1].created = true;
         }
         self.placements[1].observed = Observed::Pending;

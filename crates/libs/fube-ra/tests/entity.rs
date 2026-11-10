@@ -2738,7 +2738,7 @@ async fn fm_absent_peer_delete_commit_barrier_fences_reply_and_queued_creation()
 }
 
 #[tokio::test]
-async fn fm_peer_idle_delete_rejects_pending_open_and_unowned_closed_cleanup() {
+async fn fm_peer_idle_delete_rejects_unregistered_open_and_unowned_closed_cleanup() {
     let (store, executor, _) = setup(WAIT).await;
     executor.bind_peer(peer_source()).unwrap();
     let request = peer_request();
@@ -2774,8 +2774,82 @@ async fn fm_peer_idle_delete_rejects_pending_open_and_unowned_closed_cleanup() {
 }
 
 #[tokio::test]
+async fn fm_registered_peer_idle_delete_drains_open_without_publishing_creation() {
+    let (store, executor, _) = setup(WAIT).await;
+    executor.bind_peer(peer_source()).unwrap();
+    let request = peer_request();
+    run(&executor, peer_create(request.clone())).await;
+    effects(&executor);
+    registered(&executor, &request.replica.0, state(&executor).open_token).await;
+    let opening = state(&executor);
+    let mut late = complete(&opening.body, 0);
+    late.replica.service_endpoint.clear();
+    late.replica.replication_endpoint = "127.0.0.1:12345".into();
+    let mut older = request.replica.0.clone();
+    older.replica.instance -= 1;
+    run(&executor, primary_delete(older, false)).await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::Close { flags: 8, .. }]
+    ));
+    let closing = state(&executor);
+    assert_eq!(closing.phase, Phase::Closing);
+    assert!(closing.local_deleted && !closing.cleanup_pending);
+    assert_eq!(closing.runtime, opening.runtime);
+    assert_eq!(closing.usage, opening.usage);
+    assert_eq!(closing.peer_creation, opening.peer_creation);
+    assert_eq!(
+        run(&executor, peer_create(request.clone())).await,
+        Disposition::IgnoredPending
+    );
+    for error in [0, APPLICATION_HOST_CRASH, -5] {
+        late.error = error;
+        assert_eq!(
+            run(&executor, Command::CompleteOpen(Box::new(late.clone()))).await,
+            Disposition::IgnoredStale
+        );
+        assert!(effects(&executor).is_empty());
+        assert!(Arc::ptr_eq(&closing, &state(&executor)));
+    }
+    close_done(&executor, -5).await;
+    assert!(effects(&executor).is_empty());
+    assert_eq!(state(&executor).usage, opening.usage);
+    run(
+        &executor,
+        Command::RetryClose(request.replica.0.unit.id.clone()),
+    )
+    .await;
+    assert!(matches!(
+        effects(&executor).as_slice(),
+        [Effect::Close { flags: 8, .. }]
+    ));
+    close_done(&executor, 0).await;
+    let completed = effects(&executor);
+    assert!(matches!(completed.as_slice(), [
+        Effect::ReleaseRegistration(_), Effect::ReleaseUsage { .. },
+        Effect::Health(HealthEvent::Close), Effect::DeleteReplicaReply(reply)
+    ] if reply.replica.id == request.replica.0.replica.id
+        && reply.replica.instance == request.replica.0.replica.instance
+        && reply.replica.current_role == 1 && reply.replica.previous_role == 1
+        && reply.replica.state == 3 && !reply.replica.up
+        && reply.replica.replication_endpoint.is_empty()));
+    assert_eq!(state(&executor).fm_stage, FmStage::None);
+    assert!(state(&executor).cleanup_pending && state(&executor).usage.is_none());
+    assert_eq!(
+        run(&executor, peer_create(request.clone())).await,
+        Disposition::IgnoredStale
+    );
+    late.error = 0;
+    run(&executor, Command::CompleteOpen(Box::new(late))).await;
+    assert!(effects(&executor).is_empty());
+    run(&executor, primary_delete(request.replica.0, false)).await;
+    assert_eq!(effects(&executor), vec![completed.last().unwrap().clone()]);
+    finish(&store, &executor).await;
+}
+
+#[tokio::test]
 async fn fm_peer_idle_delete_and_close_commit_barriers_fence_reply_and_usage_release() {
-    for completing in [false, true] {
+    for (opening, completing) in [(false, false), (false, true), (true, false), (true, true)] {
         for (unknown, fail) in [(false, false), (false, true), (true, false)] {
             let (store, executor, hooks) = setup(if unknown {
                 Duration::from_millis(50)
@@ -2783,7 +2857,16 @@ async fn fm_peer_idle_delete_and_close_commit_barriers_fence_reply_and_usage_rel
                 WAIT
             })
             .await;
-            let request = make_peer_idle_ready(&executor).await;
+            let request = if opening {
+                executor.bind_peer(peer_source()).unwrap();
+                let request = peer_request();
+                run(&executor, peer_create(request.clone())).await;
+                effects(&executor);
+                registered(&executor, &request.replica.0, state(&executor).open_token).await;
+                request
+            } else {
+                make_peer_idle_ready(&executor).await
+            };
             let command = if completing {
                 run(&executor, primary_delete(request.replica.0.clone(), false)).await;
                 effects(&executor);
@@ -2797,6 +2880,14 @@ async fn fm_peer_idle_delete_and_close_commit_barriers_fence_reply_and_usage_rel
             entered.await.unwrap();
             assert!(Arc::ptr_eq(&old, &state(&executor)));
             assert!(effects(&executor).is_empty());
+            let late_open = (opening && !completing && !fail).then(|| {
+                let mut event = complete(&old.body, 0);
+                event.replica.service_endpoint.clear();
+                event.replica.replication_endpoint = "127.0.0.1:12345".into();
+                executor
+                    .submit(Command::CompleteOpen(Box::new(event)))
+                    .unwrap()
+            });
             if unknown {
                 assert_eq!(submitted.wait(WAIT).await, Err(Failure::Unknown));
                 assert!(executor.snapshot([1; 16]).fenced);
@@ -2804,6 +2895,9 @@ async fn fm_peer_idle_delete_and_close_commit_barriers_fence_reply_and_usage_rel
             }
             release.send(()).unwrap();
             let result = submitted.resolve(WAIT).await;
+            if let Some(late) = late_open {
+                assert_eq!(late.resolve(WAIT).await, Ok(Disposition::IgnoredStale));
+            }
             if fail {
                 assert!(matches!(result, Err(Failure::Store(_))));
                 assert!(Arc::ptr_eq(&old, &state(&executor)));

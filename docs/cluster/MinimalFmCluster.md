@@ -426,8 +426,38 @@ Delete intent and Close completion remain behind their own commits. The reply
 uses native None/None/Dropped/down metadata, invalid version/LSNs and no endpoints.
 Normal deletion schedules no ReplicaDown/ReplicaDropped report. Same-incarnation
 CreateReplica after deletion is ignored without Open, build or usage acquisition.
-Deletion during Open, force, arbitrary unknown/replacement,
+Deletion during pre-registration Opening, force, arbitrary unknown/replacement,
 active membership and recovery remain gated.
+
+### Deleting the original registered destination during Open
+
+The same API also admits the original Idle while RAP Open is in flight, once
+the committed RA state owns its runtime registration and original usage lease.
+Pre-registration Opening remains gated. Normal Delete commits deleted/Closing
+intent and sends Drop-flagged RAP Close without waiting for Primary Remove.
+Native `FailoverUnit.cpp:4916-5028` clears Open-pending and retains Close-pending;
+`ReconfigurationAgent.cpp:3782-3828` ignores late Open replies.
+`ReconfigurationAgentProxy.cpp:451-568` cancels incompatible work and relies on
+RA Close retries after the previous operation drains, rather than acknowledging
+cancellation as cleanup. The existing Node retry cadence remains 15 seconds.
+
+The runtime retains a control returned by a cancelled service Open solely for
+cleanup, aborting that replicator before the service through their existing
+interfaces. It does not open the control, publish endpoints or grant access.
+Delete's canonical reply and original runtime disposal/Applied-Close/exact
+usage-release proof still join independently. Admission freezes this branch
+as requiring disposal: neither retry nor the unanswered Add may downgrade it
+to `never_created`. Primary pending-remove needs its own RemoveReplicaReply;
+the destination tombstone grants no replacement.
+
+Real application-process/Channel tests hold registered service Open after real
+provider/replicator construction, observe Close cancellation, then independently
+hold provider or service disposal. They verify retained usage and no early
+reply/proof, native Close retry, lost Delete reply/replay, late Create/Open
+fencing, no build and a writable original Primary. Public Cluster acceptance
+uses both actual child adapters and the production retirement publisher.
+Definite/unknown commits retain their original publication barriers.
+This adds no native wire shape or native C++ handler qualification.
 
 ### Deleting the original destination before CreateReplica
 
@@ -466,7 +496,8 @@ and retain the original absence lineage. Definite/unknown commits cannot
 publish it early. Destination-owner loss leaves unresolved cleanup unknown;
 Primary pending-remove still requires its own RemoveReplicaReply.
 Only the original unanswered FM Add permits absent cleanup. An already-opened
-original still uses genuine disposal proof; observed/in-flight Open, failed or
+original or registered in-flight Open still uses genuine disposal proof;
+pre-registration Opening, failed or
 unknown absent lifetimes, force, arbitrary targets and later incarnations remain
 gated. No fresh lifetime, restart recovery or active membership is authorized.
 

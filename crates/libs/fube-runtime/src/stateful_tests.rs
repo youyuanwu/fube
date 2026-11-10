@@ -199,6 +199,7 @@ impl IStatefulServiceReplica for StatefulFixture {
                     _ = &mut released => {},
                     _ = cancellation.cancelled() => return Err(Error::Closed),
                 },
+                9 => cancellation.cancelled().await,
                 _ => {}
             }
             Ok(Box::new(ReplicatorFixture(
@@ -941,6 +942,34 @@ async fn stateful_abort_cancels_open_owner_and_fences_old_incarnation() {
     h.send("ReplicaClose", &request).await;
     h.no_reply().await;
     assert!(new.validate().is_ok());
+}
+
+#[tokio::test]
+async fn cancelled_open_returning_control_aborts_replicator_before_service_and_close_ack() {
+    let mut h = Harness::new().await;
+    let calls = register(&h);
+    let mut open = request(&h, 2, 1, 9);
+    h.send("ReplicaOpen", &open).await;
+    tokio::time::timeout(Duration::from_secs(2), calls.open_entered.notified())
+        .await
+        .unwrap();
+    open.flags = 8;
+    h.send("ReplicaClose", &open).await;
+    let reply: ProxyReply = from_slice(&h.receive("ReplicaOpenReply").await.body).unwrap();
+    assert_ne!(reply.error.error, 0);
+    h.engine.shared.stateful.wait_idle([2; 16]).await;
+    assert_eq!(
+        &calls.events.lock().unwrap()[..],
+        ["create", "serviceOpen", "replicatorAbort", "serviceAbort"]
+    );
+    h.send("ReplicaClose", &open).await;
+    let reply: ProxyReply = from_slice(&h.receive("ReplicaCloseReply").await.body).unwrap();
+    assert_eq!(reply.error.error, 0);
+    assert_eq!(
+        &calls.events.lock().unwrap()[..],
+        ["create", "serviceOpen", "replicatorAbort", "serviceAbort"]
+    );
+    assert!(calls.partitions.lock().unwrap()[0].validate().is_err());
 }
 
 #[tokio::test]

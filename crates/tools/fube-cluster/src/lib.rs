@@ -1005,14 +1005,21 @@ impl Cluster {
         if current["state"] == "deleted" || current["state"] == "unknown" {
             return Ok(current);
         }
+        let mut allow_absence = false;
         if self.ledger.idle_deletion.is_none() {
             let status = self.status();
             let target = &status["peer_idle"]["target"];
-            if target["open"] != true && !(target.is_null() && self.ledger.idle_absence_allowed()) {
-                return Err("FM Idle deletion requires the original opened destination or an absent unanswered FM Add".into());
+            allow_absence = target.is_null() && self.ledger.idle_absence_allowed();
+            let registered_open = target["phase"] == "Opening"
+                && target["registration"].is_object()
+                && target["retained_usage"] == 1;
+            if target["open"] != true && !registered_open && !allow_absence {
+                return Err("FM Idle deletion requires the original opened/registered opening destination or an absent unanswered FM Add".into());
             }
         }
-        let body = self.ledger.request_idle_deletion(Instant::now())?;
+        let body = self
+            .ledger
+            .request_idle_deletion(Instant::now(), allow_absence)?;
         if let Err(error) = self.send_idle_deletion(&body).await {
             self.ledger.lost(1, error.clone());
             return Err(error);
